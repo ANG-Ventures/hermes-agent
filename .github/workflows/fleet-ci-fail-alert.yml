@@ -220,7 +220,7 @@ jobs:
           # jobs list of a 90-job run 502s intermittently (2026-10-05, run 37197359967), and the
           # streak walk reads more runs than the old one; a transient 5xx must not page.
           ROUTE_DEADLINE=$((SECONDS + ${ROUTE_BUDGET_S:-150}))
-          api() { [ "$SECONDS" -lt "$ROUTE_DEADLINE" ] || return 1; curl -fsS --retry 2 --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
+          api() { [ "$SECONDS" -lt "$ROUTE_DEADLINE" ] || return 1; curl -fsS --retry 2 --retry-max-time 40 --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
           run_jobs() {  # run id -> {"jobs": [every job]}, following pages; rc!=0 on an API error or an incomplete list
             [ -n "${JOBS_CACHE:-}" ] && [ -s "$JOBS_CACHE/$1" ] && { cat "$JOBS_CACHE/$1"; return 0; }
             # A run can carry > 100 jobs. One page would drop a failed job (missed page) or a job
@@ -243,7 +243,9 @@ jobs:
           }
           BACKSTOP_S="${BACKSTOP_S:-3600}"   # = BACKSTOP_S in hermes-home scripts/main-red-summary.py
           JOBS_CACHE="$(mktemp -d)"           # the streak walk reads each run's jobs more than once
-          run_created() { api "actions/runs/$1" | jq -er '.created_at | fromdateiso8601'; }   # run id -> epoch
+          meta() {  # run id, field -> that field of the run in main's run listing (RUNS_RAW); "" if absent
+            jq -r --argjson id "$1" --arg f "$2" '[.workflow_runs[] | select(.id == $id) | .[$f] // ""][0] // ""' <<< "$RUNS_RAW"
+          }
           # The aggregate jobs (Tests complete, All required checks pass) fail whenever another
           # job fails. A gate step there ("Fail on skipped or failed ...", "Evaluate job results")
           # is derivative, and dropped, only when one of ITS prerequisite jobs failed or timed
@@ -280,6 +282,7 @@ jobs:
                 else "\(.id)\t\(.name)" end' <<< "$jobs")" || return 1
             while IFS=$'\t' read -r id name; do
               [ -n "$id" ] || continue
+              [ -n "${3:-}" ] && [ "$(sed -E 's# slice [0-9]+/[0-9]+$##' <<< "$name")" != "$3" ] && continue
               if [ "$id" = - ]; then items+="$name"$'\n'; continue; fi
               got="$(api "check-runs/$id/annotations?per_page=100" < /dev/null)" || return 1
               ann="$(jq -r '.[].message | select(test(": FAILED \\(not quarantined\\)$")) | sub(": FAILED \\(not quarantined\\)$"; "")' <<< "$got")" || return 1
@@ -403,8 +406,8 @@ jobs:
                 | . as [$jn, $sn] | if $sn != "" and ([$names[] | select(. == $sn)] | length) > 1
                   then error("ambiguous step name: \($jn) / \($sn)") else . end] | unique')" || ITEMS=error
             BR_Q="$(jq -rn --arg b "$DEFAULT_BRANCH" '$b | @uri')"
-            PREVS="$(api "actions/workflows/$WF_ID/runs?branch=$BR_Q&event=push&status=completed&per_page=50${WF_CREATED:+&created=%3C%3D$WF_CREATED}" \
-              | jq -r --argjson id "$WF_RUN_ID" --arg created "$WF_CREATED" '
+            RUNS_RAW="$(api "actions/workflows/$WF_ID/runs?branch=$BR_Q&event=push&status=completed&per_page=50${WF_CREATED:+&created=%3C%3D$WF_CREATED}")" || RUNS_RAW=""
+            PREVS="$([ -n "$RUNS_RAW" ] || exit 1; jq -r --argjson id "$WF_RUN_ID" --arg created "$WF_CREATED" '
                 # created_at has 1 s precision: another run created in the same second cannot be
                 # ordered against this one, so page instead of dropping it (Prism P1 569d6f572e69).
                 if $created != "" and any(.workflow_runs[]; .id != $id and .created_at == $created)
@@ -414,7 +417,7 @@ jobs:
                 # two earlier runs created in the same second cannot be ordered either: an older
                 # red could be walked before a newer green (Prism P1 d12fe5a4bf6d)
                 | if (group_by(.created_at) | any(length > 1)) then error("two main runs share a created_at") else . end
-                | sort_by(.created_at) | reverse | .[:20][] | .id')" || PREVS=error
+                | sort_by(.created_at) | reverse | .[:20][] | .id' <<< "$RUNS_RAW")" || PREVS=error
             # the pytest node ids this run failed (same_tests below)
             NODES="$(sig_of "$WF_RUN_ID" nodes)" || ITEMS=error
             if [ "$ITEMS" = error ] || [ "$PREVS" = error ] || [ "$ITEMS" = "[]" ]; then
@@ -424,6 +427,16 @@ jobs:
               # red (the step failed in one), green (it passed in all), differs (failed for a
               # different reason), unknown (did not run, or did not finish everywhere: look
               # further back), ambiguous (a job or step name repeats: cannot be matched).
+              # R (the latest earlier red) only PAGED the pair R + older when its notifier ran
+              # (R concluded failure; a cancelled run never notifies) and saw the older red (it had
+              # completed before R did: overlapping runs and later re-runs of an older commit are not
+              # seen; Prism P1 31122e0a54bf / 358db3d855b2 / 805a46df2012). Otherwise this red is the
+              # 2nd that pages.
+              paired() {  # R, older -> rc 0 when R's notifier paged the R+older pair
+                [ "$(meta "$1" conclusion)" = failure ] || return 1
+                local ru ou; ru="$(meta "$1" updated_at)"; ou="$(meta "$2" updated_at)"
+                ! [[ "$ou" > "$ru" ]]
+              }
               classify() {  # run id, items JSON -> one state per item; rc!=0 on an API error
                 run_jobs "$1" | jq -c --argjson items "$2" "$AGG_JQ"'
                   . as $r | [$items[] as [$j, $s]
@@ -449,10 +462,13 @@ jobs:
               # A slice item cannot tell two tests apart: a red of it is the SAME fault only when
               # every pytest node id this run failed also failed there (Prism P1 5515ab6c4f85;
               # ids compared whole, one per line: Prism P1 702860bc5678). Else: a different fault.
-              same_tests() {  # run id -> rc 0 when NODES (this run) all failed in it too
-                [ -z "$NODES" ] && return 0
-                local p; p="$(sig_of "$1" nodes)" || return 2
-                [ -z "$(comm -23 <(printf '%s\n' "$NODES") <(printf '%s\n' "$p") | grep -v '^$' || true)" ]
+              # scoped to ONE item (Prism P1 11312fe7c5f9): another job's new test must not reset it
+              same_tests() {  # run id, item job -> rc 0 same tests, 1 different, 2 API error
+                local c p
+                c="$(sig_of "$WF_RUN_ID" nodes "$2")" || return 2
+                [ -z "$c" ] && return 0
+                p="$(sig_of "$1" nodes "$2")" || return 2
+                [ -z "$(comm -23 <(printf '%s\n' "$c") <(printf '%s\n' "$p") | grep -v '^$' || true)" ] || return 1
               }
               tests_item() { jq -e '.[0] | test("Run tests")' <<< "$1" > /dev/null; }
               # STREAK (t_54478fb0, Apollo ruling B). Page only the SECOND consecutive red of an
@@ -476,14 +492,17 @@ jobs:
                   BAD="a failed job or step name is not unique in run $prev"; break
                 fi
                 HIT="$(jq -c --argjson st "$ST" '[to_entries[] | select($st[.key] == "red") | .value]' <<< "$LEFT")"
-                if [ -n "$NODES" ] && jq -e 'any(.[]; .[0] | test("Run tests"))' <<< "$HIT" > /dev/null; then
-                  same_tests "$prev"; rc=$?
-                  [ "$rc" = 2 ] && { BAD="cannot read the tests of run $prev"; break; }
-                  if [ "$rc" = 1 ]; then
-                    echo "different tests failed in run $prev: the slice item is a new fault"
-                    ST="$(jq -c --argjson l "$LEFT" '[to_entries[] | if .value == "red" and ($l[.key][0] | test("Run tests")) then "differs" else .value end]' <<< "$ST")"
-                    HIT="$(jq -c --argjson st "$ST" '[to_entries[] | select($st[.key] == "red") | .value]' <<< "$LEFT")"
-                  fi
+                if [ -n "$NODES" ]; then
+                  for TJ in $(jq -r '.[] | select(.[0] | test("Run tests")) | .[0] | @base64' <<< "$HIT"); do
+                    TJ="$(base64 -d <<< "$TJ")"
+                    if same_tests "$prev" "$TJ"; then rc=0; else rc=$?; fi
+                    [ "$rc" = 2 ] && { BAD="cannot read the tests of run $prev"; break 2; }
+                    if [ "$rc" = 1 ]; then
+                      echo "different tests failed in run $prev: $TJ is a new fault"
+                      ST="$(jq -c --argjson l "$LEFT" --arg j "$TJ" '[to_entries[] | if .value == "red" and $l[.key][0] == $j then "differs" else .value end]' <<< "$ST")"
+                    fi
+                  done
+                  HIT="$(jq -c --argjson st "$ST" '[to_entries[] | select($st[.key] == "red") | .value]' <<< "$LEFT")"
                 fi
                 NEWS="$(jq -c --argjson st "$ST" --argjson n "$NEWS" '$n + [to_entries[] | select($st[.key] == "green" or $st[.key] == "differs") | .value]' <<< "$LEFT")"
                 if [ "$HIT" != "[]" ]; then
@@ -506,9 +525,9 @@ jobs:
                   S1="$(classify "$older" "[$IT]" | jq -r '.[0]')" || { BAD="cannot read run $older"; break; }
                   case "$S1" in
                     red)
-                      KIND=old
-                      if tests_item "$IT"; then
-                        same_tests "$older"; rc=$?
+                      paired "$R" "$older" && KIND=old
+                      if [ "$KIND" = old ] && tests_item "$IT"; then
+                        if same_tests "$older" "$(jq -r '.[0]' <<< "$IT")"; then rc=0; else rc=$?; fi
                         [ "$rc" = 2 ] && { BAD="cannot read the tests of run $older"; break; }
                         [ "$rc" = 1 ] && KIND=second
                       fi
@@ -525,7 +544,7 @@ jobs:
                 # the window is between the two RUNS (created_at), so every item of one run pair gets
                 # the same answer here and in main-red-summary.py: one fault never pages from both
                 T1="$(jq -rn --arg c "$WF_CREATED" '$c | fromdateiso8601')" || T1=""
-                T0="$(run_created "$R")" || T0=""
+                T0="$(jq -rn --arg c "$(meta "$R" created_at)" '$c | fromdateiso8601')" || T0=""
                 if [ -n "$T1" ] && [ -n "$T0" ] && [ $((T1 - T0)) -ge "$BACKSTOP_S" ]; then
                   LATE="$(jq -c --argjson i "$IT" '. + [$i]' <<< "$LATE")"
                 else

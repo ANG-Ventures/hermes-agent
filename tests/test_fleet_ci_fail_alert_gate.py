@@ -555,11 +555,13 @@ def test_replay_2026_09_28_folds_already_red_tests_to_logs(tmp_path):
     api = _r10_api()
     routes = {int(rid): _replay(tmp_path, int(rid), api) for _ts, rid, _pr in R10["pages"]}
     paged = sorted(rid for rid, g in routes.items() if g["route"] == "alerts")
-    # 15 pages then; 3 now (t_54478fb0 main-red streak for the main pushes):
+    # 15 pages then; 2 now (t_54478fb0 main-red streak for the main pushes):
     #   36477241100 PR #1453       first red of test_no_new_source_proxy_asserts (queue ejection)
     #   36477804956 main 51e9b286  2nd consecutive "Python tests / Run tests" red (after 36476853851)
-    #   36490159001 main 553943bd  2nd consecutive red of the kanban test (after main 36480232265)
-    assert paged == [36477241100, 36477804956, 36490159001]
+    assert paged == [36477241100, 36477804956]
+    # main 553943bd: 2nd red of the kanban test, but 89 min after main 36480232265 (>= BACKSTOP_S):
+    # main-red-summary's persistence backstop owns that page
+    assert routes[36490159001]["card"] == "main-red-backstop (run 36480232265)"
     # main first reds -> #logs: 9d81866f Windows-only, aa9e59a3 slice 13, ebf35a80 (main went green at 22:48)
     for rid in (36475808846, 36476853851, 36496636054):
         assert routes[rid]["route"] == "logs" and routes[rid]["card"] == "first-red", (rid, routes[rid])
@@ -794,7 +796,8 @@ def _main_route(tmp_path, api, env_extra=None) -> dict:
            "FAKE_CURL_LOG": str(log), "FAKE_API": str(tmp_path / "api.json"),
            "GH_TOKEN": "x", "REPO": "o/r", "EVENT_NAME": "workflow_run", "DEFAULT_BRANCH": "main",
            "REPLAY_RUN_ID": "", "RUN_JSON": json.dumps(run), "KNOWN_RED": step["env"]["KNOWN_RED"],
-           **(env_extra or {})}
+           # fixtures space runs an hour apart; the backstop window has its own tests (BACKSTOP_S=3600)
+           "BACKSTOP_S": "86400", **(env_extra or {})}
     proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
@@ -861,24 +864,53 @@ def test_main_red_ignores_a_later_created_run(tmp_path):
 
 # persistence backstop handoff: main-red-summary.py pages a 2nd red that comes >= 60 min late
 # the window is between the two RUNS' created_at (this run 05:00:00Z), the value main-red-summary compares
-def _late_api(prior_created):
-    api = _main_api([(41, prior_created, "failure", _red_e2e())])
-    api["actions/runs/41"] = {"id": 41, "created_at": prior_created}
-    return api
+HOUR = {"BACKSTOP_S": "3600"}
 
 
 def test_main_red_second_red_inside_the_backstop_window_pages(tmp_path):
-    got = _main_route(tmp_path, _late_api("2026-10-04T04:00:01Z"))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:01Z", "failure", _red_e2e())]), env_extra=HOUR)
     assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
 
 
 def test_main_red_second_red_at_or_after_the_backstop_window_goes_to_logs(tmp_path):
-    got = _main_route(tmp_path, _late_api("2026-10-04T04:00:00Z"))
+    got = _main_route(tmp_path, _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e())]), env_extra=HOUR)
     assert got["route"] == "logs" and got["card"] == "main-red-backstop (run 41)", got["_stdout"]
-    # an unreadable run time cannot prove the backstop owns it: page
-    api = _late_api("2026-10-04T04:00:00Z")
-    del api["actions/runs/41"]
-    assert _main_route(tmp_path, api)["route"] == "alerts"
+
+
+# Prism P1 31122e0a54bf / 805a46df2012 / 358db3d855b2: R's notifier must have PAIRED R with the older red
+def _three(r41, r40):
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", _red_e2e()),
+                     (40, "2026-10-04T03:00:00Z", "failure", _red_e2e())])
+    runs = api["runs?branch=main&event=push"]["workflow_runs"]
+    runs[0].update(r41)
+    runs[1].update(r40)
+    return api
+
+
+def test_main_red_cancelled_middle_red_never_paged_so_this_one_pages(tmp_path):
+    got = _main_route(tmp_path, _three({"conclusion": "cancelled"}, {}))
+    assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
+
+
+def test_main_red_older_red_that_finished_after_r_was_never_paired(tmp_path):
+    # overlap / re-run: 40 completed after 41, so 41's notifier never saw 40 red
+    got = _main_route(tmp_path, _three({"updated_at": "2026-10-04T04:20:00Z"}, {"updated_at": "2026-10-04T04:30:00Z"}))
+    assert got["route"] == "alerts", got["_stdout"]
+    got = _main_route(tmp_path, _three({"updated_at": "2026-10-04T04:30:00Z"}, {"updated_at": "2026-10-04T03:20:00Z"}))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+
+
+# Prism P1 11312fe7c5f9: a new test in ANOTHER slice item must not reset this item's streak
+def test_main_red_node_check_is_scoped_to_the_item(tmp_path):
+    other = "Python tests / e2e"
+    red = _main_jobs((SLICE, "failure", {"Run tests": "failure"}), (other, "failure", {"e2e": "failure"}))
+    prior = {"jobs": [dict(j, id=j["id"] + 100) for j in _main_jobs((SLICE, "failure", {"Run tests": "failure"}))["jobs"]]}
+    api = _main_api([(41, "2026-10-04T04:00:00Z", "failure", prior)], current=red)
+    api["check-runs/700/annotations"] = _ann(QTEST)
+    api["check-runs/701/annotations"] = _ann(QTEST2)
+    api["check-runs/800/annotations"] = _ann(QTEST)
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "Python tests / Run tests" in got["summary"], got["_stdout"]
 
 
 def test_main_red_slices_are_one_item_and_the_window_spans_them(tmp_path):
