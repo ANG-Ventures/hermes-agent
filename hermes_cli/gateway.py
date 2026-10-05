@@ -3422,6 +3422,114 @@ def _refuse_temp_home_service_write(definition: str, kind: str) -> bool:
     return True
 
 
+_FOREIGN_SERVICE_OVERWRITE_ENV = "HERMES_ALLOW_FOREIGN_SERVICE_OVERWRITE"
+
+
+def _service_definition_is_hermes_generated(installed: str, kind: str) -> bool:
+    import re
+    """True when ``installed`` has the shape this CLI's generator writes.
+
+    The generated launchd plist always runs ``/usr/bin/osascript`` as ``ProgramArguments[0]``
+    (``launchd_program_arguments``); the generated systemd unit's ``ExecStart=`` is
+    ``installation_command``: the ``.hermes/bin/hermes`` launcher that ``_prepare_service_launcher``
+    publishes, or, on Nix/developer installs with no store Python, ``runtime_command``'s
+    ``<python> -I -c "...import hermes_bootstrap..."``. A definition whose launcher is anything else
+    (``venv/bin/python -m hermes_cli.main``, a checkout venv, an operator-hardened form) was written by
+    someone other than this CLI.
+    """
+    text = installed.lstrip("\ufeff")
+    if kind == "launchd plist":
+        import plistlib
+
+        # Parse, never regex: a commented-out <ProgramArguments> must not count, and launchd runs
+        # `Program` (when present) instead of ProgramArguments[0]. Unparseable means not ours.
+        try:
+            data = plistlib.loads(text.encode("utf-8"))
+        except Exception:
+            return False
+        if not isinstance(data, dict):
+            return False
+        args = data.get("ProgramArguments")
+        program = data.get("Program", args[0] if isinstance(args, list) and args else None)
+        return program == "/usr/bin/osascript" and isinstance(args, list) and args[:1] == ["/usr/bin/osascript"]
+    # systemd allows leading whitespace and whitespace around `=`.
+    lines = re.findall(r"^[ \t]*ExecStart[ \t]*=[ \t]*(.*)$", text, flags=re.M)
+    if not lines:
+        return False
+    # Every ExecStart= must be ours: systemd runs them all (oneshot) or the last one wins (simple), and a
+    # foreign line in either position means someone other than this CLI shaped the unit.
+    for line in lines:
+        # A quoted executable may contain spaces (a checkout under "/home/ace/Hermes Project/").
+        argv = re.findall(r'"([^"]*)"|(\S+)', line)
+        args = [quoted or bare for quoted, bare in argv]
+        if not args:
+            return False
+        # systemd executable prefixes (`-`, `@`, `:`, `+`, `!`, `!!`) are not part of the path.
+        args[0] = args[0].lstrip("-@:+!")
+        if args[0].endswith(("/.hermes/bin/hermes", "/.hermes/bin/hermes.cmd")):
+            continue
+        if args[1:3] == ["-I", "-c"] and "import hermes_bootstrap" in " ".join(args[3:4]):
+            continue
+        return False
+    return True
+
+
+def _foreign_service_overwrite_allowed(force: bool = False) -> bool:
+    return force or os.environ.get(_FOREIGN_SERVICE_OVERWRITE_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def _service_definition_is_protected(existing_path: Path, kind: str) -> bool:
+    """Silent twin of ``_refuse_foreign_service_overwrite``: True when a refresh of ``existing_path``
+    is skipped on purpose (foreign or unreadable definition, no override), so callers can tell a
+    deliberately preserved definition apart from a refresh that failed to reload."""
+    if _foreign_service_overwrite_allowed():
+        return False
+    try:
+        installed = existing_path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return not _service_definition_is_hermes_generated(installed, kind)
+
+
+def _refuse_foreign_service_overwrite(existing_path: Path, kind: str, *, force: bool = False) -> bool:
+    """Refuse to regenerate a gateway service definition this CLI did not write.
+
+    Incident 2026-10-04 (two hosts, one morning): on a Linux box a kanban worker ran ``hermes gateway
+    install`` with a scratch ``HERMES_HOME`` and rewrote the real user's hand-managed
+    ``hermes-gateway.service``; on a Mac a backtick inside a double-quoted ``--handoff`` string made
+    zsh run ``hermes gateway install``, which replaced an operator-hardened LaunchAgent (``venv/bin/python
+    -m hermes_cli.main gateway run --replace``) with the generated ``osascript`` form. That form could
+    not boot on that install, launchd crash-looped it ~40 times and the gateway was dead for 28 minutes.
+
+    The generator cannot know it is overwriting a deliberately different definition, so the rule is:
+    a definition whose launcher is not the one this CLI publishes is FOREIGN and is left alone unless the
+    operator says otherwise (``--force`` or ``HERMES_ALLOW_FOREIGN_SERVICE_OVERWRITE=1``). Returns True
+    when the write must be skipped.
+    """
+    if _foreign_service_overwrite_allowed(force):
+        return False
+    try:
+        installed = existing_path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        # Ownership cannot be established, so the definition is not ours to replace.
+        print(f"✗ Refusing to overwrite the gateway {kind} at {existing_path}: cannot read it ({exc}).")
+        print(f"  To replace it deliberately, re-run with --force or set {_FOREIGN_SERVICE_OVERWRITE_ENV}=1.")
+        return True
+    if _service_definition_is_hermes_generated(installed, kind):
+        return False
+    print(f"✗ Refusing to overwrite the gateway {kind} at {existing_path}: it was not generated by this CLI")
+    print(
+        "  (its launcher is not the one 'hermes gateway install' writes). A hand-managed or fleet-managed "
+        "service definition stays as it is. To replace it deliberately, re-run with --force or set "
+        f"{_FOREIGN_SERVICE_OVERWRITE_ENV}=1."
+    )
+    return True
+
+
 def _retire_hermes_replace_dropin(system: bool = False) -> bool:
     """Remove only the legacy ``--replace`` drop-in written by Hermes."""
     unit_path = get_systemd_unit_path(system=system)
@@ -3466,6 +3574,9 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
 
     # Structural variant: refuse ANY temp-dir HERMES_HOME (manual E2E homes lack the pytest markers).
     if _refuse_temp_home_service_write(new_unit, "systemd unit"):
+        return False
+    # A unit this CLI did not write (checkout-venv ExecStart, operator-hardened) is never "outdated".
+    if _refuse_foreign_service_overwrite(unit_path, "systemd unit"):
         return False
 
     _prepare_service_launcher(system=system, run_as_user=expected_user)
@@ -3657,6 +3768,8 @@ def systemd_install(
 
     if unit_path.exists() and not force:
         if not systemd_unit_is_current(system=system):
+            if _refuse_foreign_service_overwrite(unit_path, "systemd unit"):
+                return
             print(f"↻ Repairing outdated {scope_label} systemd service at: {unit_path}")
             refresh_systemd_unit_if_needed(system=system)
             if enable_on_startup:
@@ -3686,6 +3799,8 @@ def systemd_install(
     unit_path.parent.mkdir(parents=True, exist_ok=True)
     new_unit = generate_systemd_unit(system=system, run_as_user=run_as_user)
     if _refuse_temp_home_service_write(new_unit, "systemd unit"):
+        return
+    if unit_path.exists() and _refuse_foreign_service_overwrite(unit_path, "systemd unit", force=force):
         return
     print(f"Installing {scope_label} systemd service to: {unit_path}")
     _prepare_service_launcher(system=system, run_as_user=run_as_user)

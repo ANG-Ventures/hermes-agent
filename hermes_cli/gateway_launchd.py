@@ -553,6 +553,10 @@ def refresh_launchd_plist_if_needed() -> bool:
     new_plist = _gw().generate_launchd_plist()
     if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
         return False
+    # A plist this CLI did not write (fleet-hardened `venv/bin/python -m hermes_cli.main ...`) is not
+    # "outdated": regenerating it replaced a bootable job with one that crash-looped (2026-10-04).
+    if _gw()._refuse_foreign_service_overwrite(plist_path, "launchd plist"):
+        return False
 
     _gw()._prepare_service_launcher()
     plist_path.write_text(new_plist, encoding="utf-8")
@@ -621,6 +625,10 @@ def launchd_install(force: bool = False, *, start_now: bool = True):
             print("Use --force to reinstall")
             return
         if load:
+            # A protected (foreign) plist is refused here, before the "outdated" repair path, so the
+            # operator never sees a "could not be reloaded ... --force" hint for a definition we protect.
+            if _gw()._refuse_foreign_service_overwrite(plist_path, "launchd plist"):
+                return
             print(f"↻ Repairing outdated launchd service at: {plist_path}")
             if _gw().refresh_launchd_plist_if_needed():
                 print("✓ Service definition updated")
@@ -638,6 +646,8 @@ def launchd_install(force: bool = False, *, start_now: bool = True):
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     new_plist = _gw().generate_launchd_plist()
     if _gw()._refuse_temp_home_service_write(new_plist, "launchd plist"):
+        return
+    if plist_path.exists() and _gw()._refuse_foreign_service_overwrite(plist_path, "launchd plist", force=force):
         return
     print(f"Installing launchd service to: {plist_path}")
     _gw()._prepare_service_launcher()
@@ -816,7 +826,14 @@ def launchd_restart():
                 print("⚠ launchd did not revive the gateway after its graceful exit — forcing restart")
             else:
                 print(f"⚠ Gateway drain timed out after {wait_budget:.0f}s — forcing launchd restart")
-        if not refresh_ok and _gw().get_launchd_plist_path().exists() and not _gw().launchd_plist_is_current():
+        if (
+            not refresh_ok
+            and _gw().get_launchd_plist_path().exists()
+            and not _gw().launchd_plist_is_current()
+            # A foreign plist the refresh deliberately left alone is still registered: a raw bootstrap
+            # would fail EIO. Fall through to the kickstart path, which handles loaded and unloaded jobs.
+            and not _gw()._service_definition_is_protected(_gw().get_launchd_plist_path(), "launchd plist")
+        ):
             # The refresh attempted a reload and launchd never re-registered
             # the (rewritten) job: kickstart would hang on the same wall. The
             # bootout already happened inside the refresh — bootstrap is the
