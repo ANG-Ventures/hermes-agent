@@ -748,17 +748,15 @@ def _ensure_terminal_env_bridged() -> None:
 def _reapply_kanban_placement() -> None:
     """Keep a dispatcher worker-host placement over config-bridged values (#1522).
 
-    A kanban worker spilled onto a worker host (``kanban.worker_hosts``) gets
-    its ``TERMINAL_*`` values in ``KANBAN_WORKER_PLACEMENT``. The config.yaml
-    bridge above overrides env with the profile's ``terminal`` section (e.g.
-    ``backend: local``), which would silently run the tools on the dispatcher
-    host again. Re-asserting after every bridge keeps the placement.
+    A kanban worker spilled onto a pool host gets its ``TERMINAL_*`` values in
+    ``KANBAN_WORKER_PLACEMENT``. The config.yaml bridge above overrides env with
+    the profile's ``terminal`` section (e.g. ``backend: local``), which would
+    silently run the tools on the dispatcher host again. Re-asserting after
+    every bridge keeps the placement; on a worker placed at boot a failed
+    re-apply (raise OR missing variable) is a WARN + run counter (RC-9).
     """
-    try:
-        from hermes_cli.kanban_worker_hosts import reapply_placement_env
-        reapply_placement_env()
-    except Exception:
-        logger.debug("kanban worker placement re-apply failed", exc_info=True)
+    from hermes_cli.kanban_worker_hosts import reapply_or_record
+    reapply_or_record("terminal")
 
 
 def _timeout_param_description(cap: "int | None" = None) -> str:
@@ -903,6 +901,9 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_user": _tenv("TERMINAL_SSH_USER", ""),
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
         "ssh_key": _tenv("TERMINAL_SSH_KEY", ""),
+        # Internal bridge: a kanban pool placement turns ~/.hermes file sync
+        # off (KWLB: one shared kanbanw login serves every profile).
+        "ssh_sync_files": _tenv_bool("TERMINAL_SSH_SYNC_FILES", "true"),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting; local is always opt-in. Per-backend env vars override.
         "ssh_persistent": _tenv_bool(

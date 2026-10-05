@@ -711,6 +711,12 @@ class LoadGate:
         return sum(n for _, n in self._ramp)
 
     def snapshot(self) -> dict:
+        now = time.time()
+        pool = dict(self.pool)
+        if pool.get("planned"):
+            # admit() resets the block every tick, so a planned block is THIS
+            # tick's; the watch matches planned_at to updated_at (RC-8).
+            pool["planned_at"] = now
         return {
             "enabled": self.enabled,
             "state": self.state,
@@ -747,8 +753,8 @@ class LoadGate:
             "cpu_spill_resume": self.cpu_spill_resume,
             "cpu_pause": self.cpu_pause,
             "spill_keys_error": self.spill_keys_error,
-            "pool": self.pool,
-            "updated_at": time.time(),
+            "pool": pool,
+            "updated_at": now,
         }
 
     def _line(self) -> str:
@@ -882,6 +888,12 @@ def format_board_starvation_lines(
             f"or run `hermes kanban --board {slug} dispatch`"
         )
     return out
+
+
+def loadavg_supported() -> bool:
+    """False on hosts with no ``os.getloadavg`` (native Windows): the gate
+    has no load signal there and must not fail closed on its absence."""
+    return hasattr(os, "getloadavg")
 
 
 def sample_loadavg() -> "tuple[Optional[float], Optional[float]]":
