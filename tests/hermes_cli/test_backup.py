@@ -1215,6 +1215,42 @@ class TestBackupEdgeCases:
             assert zf.read("skills/newdir/keep.md") == b"durable\n"
             assert len(names) == len(set(names)), "re-scan must not duplicate already-listed entries"
 
+    def test_rescan_never_archives_the_open_staging_zip(self, tmp_path, monkeypatch, capsys):
+        """An output inside a non-excluded part of HERMES_HOME: the vanish-triggered re-scan runs
+        while the hidden ``.partial`` is open and must not archive it into itself (Prism P1
+        ee9ef2058ace on #1802). A stale partial left by a killed run is excluded too."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        doomed = hermes_home / "skills" / "rotated.md"
+        doomed.write_text("gone soon\n")
+        out_dir = hermes_home / "exports"
+        out_dir.mkdir()
+        out_zip = out_dir / "out.zip"
+        stale = out_dir / ".out.zip.1-2.partial"
+        stale.write_bytes(b"killed run leftovers")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        import hermes_cli.backup as backup_mod
+
+        real_iter = backup_mod._iter_backup_files
+        calls = []
+
+        def _iter_then_delete(*a, **kw):
+            listed = list(real_iter(*a, **kw))
+            if not calls:
+                doomed.unlink()  # forces the re-scan, which walks with the partial on disk
+            calls.append(1)
+            return iter(listed)
+
+        monkeypatch.setattr(backup_mod, "_iter_backup_files", _iter_then_delete)
+        assert backup_mod.run_backup(Namespace(output=str(out_zip))) is True
+        assert len(calls) == 2, "the vanish must trigger the re-scan"
+        with zipfile.ZipFile(out_zip) as zf:
+            partials = [n for n in zf.namelist() if n.endswith(".partial")]
+            assert partials == [], f"staging archive copied into itself: {partials}"
+            assert zf.testzip() is None
+
     def test_empty_hermes_home(self, tmp_path, monkeypatch):
         """Backup handles empty hermes home (no files to back up)."""
         hermes_home = tmp_path / ".hermes"
