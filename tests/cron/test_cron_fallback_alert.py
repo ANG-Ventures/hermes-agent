@@ -12,6 +12,8 @@ Invariants under test:
   INV-4  the alert can never crash the job (best-effort, swallowed).
   INV-5  the alert routes to the alert target, NOT the digest channel.
 """
+import pytest
+
 import cron.scheduler as sched
 
 
@@ -290,3 +292,51 @@ def test_undeclared_fallback_stays_loud_every_run(monkeypatch):
     for _ in range(3):
         sched._emit_cron_fallback_alert(UNDECLARED_JOB, _FakeAgent(FALLBACK_EVENT))
     assert len(calls) == 3
+
+
+# --- concurrent writers (Prism P1 on #1807, t_55458885) ----------------------
+# Parallel tick threads (cron.max_parallel_jobs) and a CLI `cron run` process can both record a
+# delivered notice. Unserialized, each loads the same snapshot and the last replace drops the
+# other's record, so that job's notice reposts on its next run.
+
+def test_parallel_marks_keep_every_record(tmp_path, monkeypatch):
+    import threading
+    import time
+    from cron.fork_ext import fallback_notice_gate as gate
+
+    real_load = gate._load
+
+    def slow_load(path):  # widen the read-modify-replace window so an unserialized race is certain
+        data = real_load(path)
+        time.sleep(0.05)
+        return data
+
+    monkeypatch.setattr(gate, "_load", slow_load)
+    jobs = [f"job{i}" for i in range(8)]
+    threads = [threading.Thread(target=gate.mark_noticed, args=(tmp_path, j, "a -> b", "2026-10-06"))
+               for j in jobs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(gate.already_noticed(tmp_path, j, "a -> b", "2026-10-06") for j in jobs)
+    assert not list((tmp_path / "cron").glob("*.tmp*"))  # no stray temp files left behind
+
+
+@pytest.mark.platforms("posix")
+def test_mark_waits_for_another_process_lock(tmp_path):
+    import fcntl
+    import threading
+    from cron.fork_ext import fallback_notice_gate as gate
+
+    cron_dir = tmp_path / "cron"
+    cron_dir.mkdir()
+    holder = open(cron_dir / ".fallback_notice_day.lock", "a+", encoding="utf-8")  # another writer (CLI process) holding it
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    t = threading.Thread(target=gate.mark_noticed, args=(tmp_path, "md", "a -> b", "2026-10-06"))
+    t.start()
+    t.join(0.3)
+    assert t.is_alive() and not (cron_dir / gate._STATE_NAME).exists()
+    holder.close()
+    t.join(5)
+    assert gate.already_noticed(tmp_path, "md", "a -> b", "2026-10-06")

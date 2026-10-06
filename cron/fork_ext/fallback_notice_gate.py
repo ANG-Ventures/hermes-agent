@@ -14,15 +14,26 @@ Fail-open: any error reading the state means "post it".
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-Unix: in-process lock only
+    fcntl = None
+
 logger = logging.getLogger(__name__)
 
 _STATE_NAME = "fallback_notice_day.json"
+_LOCK_NAME = ".fallback_notice_day.lock"
+_thread_lock = threading.Lock()
 
 
 def _today() -> str:
@@ -47,15 +58,42 @@ def already_noticed(home: Path, job_id: str, pair: str, day: Optional[str] = Non
         return False
 
 
+@contextlib.contextmanager
+def _state_lock(cron_dir: Path):
+    """Serialize the read-modify-replace: parallel tick threads share one process
+    (``cron.max_parallel_jobs``) and a CLI ``cron run`` is another process. Each writer
+    otherwise loads the same snapshot and the last replace drops the others' records."""
+    with _thread_lock:
+        fd = None
+        try:
+            if fcntl is not None:
+                try:
+                    fd = open(cron_dir / _LOCK_NAME, "a+", encoding="utf-8")
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except OSError as e:  # in-process lock still held
+                    logger.debug("fallback notice gate flock unavailable: %r", e)
+            yield
+        finally:
+            if fd is not None:
+                fd.close()  # releases the flock
+
+
 def mark_noticed(home: Path, job_id: str, pair: str, day: Optional[str] = None) -> None:
     """Record a DELIVERED notice. Called only after delivery succeeded."""
     try:
         path = Path(home) / "cron" / _STATE_NAME
-        data = _load(path)
-        data[str(job_id)] = {"day": day or _today(), "pair": pair}
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
-        tmp.replace(path)
+        with _state_lock(path.parent):
+            data = _load(path)
+            data[str(job_id)] = {"day": day or _today(), "pair": pair}
+            fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(data, sort_keys=True))
+                os.replace(tmp, path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
     except Exception as e:
         logger.debug("fallback notice gate write failed: %r", e)
