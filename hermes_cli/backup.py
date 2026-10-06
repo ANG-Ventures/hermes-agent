@@ -371,8 +371,16 @@ def _staging_prefix(final_path: Path) -> str:
 
 
 def _is_staging_of(path: Path, final_path: Path) -> bool:
-    """True when *path* is a staging file (open or left by a killed run) of *final_path*."""
-    return (path.name.startswith(_staging_prefix(final_path)) and path.name.endswith(".partial")
+    """True when *path* is a staging file (open or left by a killed run) of *final_path*.
+
+    Only the exact ``<pid>-<thread-id>`` shape ``_atomic_output_path`` writes matches, so a user
+    file that merely shares the prefix and suffix is still backed up.
+    """
+    prefix, name = _staging_prefix(final_path), path.name
+    if not (name.startswith(prefix) and name.endswith(".partial")):
+        return False
+    pid, sep, tid = name[len(prefix):-len(".partial")].partition("-")
+    return (bool(sep) and pid.isascii() and pid.isdigit() and tid.isascii() and tid.isdigit()
             and path.resolve().parent == final_path.resolve().parent)
 
 
