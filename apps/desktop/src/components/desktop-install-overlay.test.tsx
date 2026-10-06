@@ -596,6 +596,7 @@ describe('DesktopInstallOverlay first-run setup', () => {
   it('a late initial snapshot does not resurrect a dismissed failed install', async () => {
     const failed = bootstrapState({ error: 'cancelled by user' })
     const desktop = installDesktopMock(failed)
+
     let resolveSnapshot: (s: DesktopBootstrapState) => void = () => {}
     desktop.getBootstrapState.mockReturnValue(
       new Promise<DesktopBootstrapState>(resolve => {
