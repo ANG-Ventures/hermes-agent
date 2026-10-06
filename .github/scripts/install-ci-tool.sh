@@ -33,7 +33,18 @@ case "$tool" in
 esac
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
-curl -fsSL --retry 3 --retry-delay 5 -o "$scratch/$asset" "https://github.com/$release/$asset"
+# github.com release downloads blip (HTTP 500 for 15+ s, connection resets curl --retry skips);
+# each one ejected a merge-queue batch (t_eef956b2). Retry every curl failure for ~2 min.
+attempts=6
+for ((n = 1; ; n++)); do
+  curl -fsSL --connect-timeout 20 --max-time 120 -o "$scratch/$asset" "https://github.com/$release/$asset" && break
+  if ((n >= attempts)); then
+    printf 'download failed after %s attempts: %s\n' "$attempts" "$asset" >&2
+    exit 1
+  fi
+  printf 'download attempt %s/%s failed; retrying in %ss\n' "$n" "$attempts" "$((n * 5))" >&2
+  sleep "$((n * 5))"
+done
 printf '%s  %s\n' "$sha" "$scratch/$asset" | sha256sum -c -
 case "$tool" in
   ripgrep) tar -xzf "$scratch/$asset" -C "$scratch" --strip-components=1 "${asset%.tar.gz}/rg" ;;
