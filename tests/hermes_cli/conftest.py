@@ -28,6 +28,22 @@ def _quiet_host_loadavg(monkeypatch):
     monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0), raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_posix_descendants(request, monkeypatch):
+    """Stub the dashboard kill's descendant snapshot to ``{}`` (root-only kill).
+
+    ``_posix_descendants`` runs a real ``ps -A`` and walks the host's process tree from the
+    PIDs it is handed. Tests hand it synthetic PIDs (7001, 4242, 12345...); when one collides
+    with a live process on the CI runner, its real children are swept into the kill and the
+    test's ``os.kill`` fake records them (macOS lane, main 95bfafc3ec: ``[7001, 7012, 7012]``).
+    Tests that spawn real process trees opt out with ``@pytest.mark.real_posix_descendants``.
+    """
+    if request.node.get_closest_marker("real_posix_descendants"):
+        return
+    from hermes_cli import dashboard_procs
+    monkeypatch.setattr(dashboard_procs, "_posix_descendants", lambda roots: {})
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.
