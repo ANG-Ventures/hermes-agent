@@ -466,6 +466,9 @@ _SPECS = [
         _arg("--severity", choices=["warning", "error", "critical"],
              help="Only show diagnostics at or above this severity"),
         _arg("--task", help="Only show diagnostics for one task id"),
+        _arg("--placement", action="store_true",
+             help="Read-only pool placement view: band, streak and projected() per host, "
+                  "and the rung take() would pick now (no probe, no streak advance)"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
     ], aliases=["diag"], help="List active diagnostics on the current board"),
     # rehome (t_808bc8e6)

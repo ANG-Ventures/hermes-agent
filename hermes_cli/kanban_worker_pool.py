@@ -492,6 +492,9 @@ class TargetSignal:
     ledger_dir: Path                  # <root>/var/placement
     cpu_est: Optional[float] = None   # kanban's measured slope; None = policy prior
     clock: Callable[[], float] = time.time
+    # A fixed ledger read for _warm_pick (diagnostics --placement keeps one
+    # snapshot per report). None = read fresh per pick (RC7, the dispatcher).
+    reservations: Optional[List[Any]] = None
 
     def kanban_cpu_est(self) -> float:
         if self.cpu_est is not None and self.cpu_est > 0:
@@ -625,10 +628,13 @@ class SpilloverPlan:
         sig = self.signal
         assert sig is not None
         now = sig.clock()
-        try:
-            res = _ledger.read_all(sig.ledger_dir, sig.policy, now=now)
-        except Exception:  # an unreadable ledger never blocks a pick
-            res = []
+        if sig.reservations is not None:
+            res = list(sig.reservations)
+        else:
+            try:
+                res = _ledger.read_all(sig.ledger_dir, sig.policy, now=now)
+            except Exception:  # an unreadable ledger never blocks a pick
+                res = []
         cost = sig.kanban_cpu_est()
 
         def proj(n: str) -> float:

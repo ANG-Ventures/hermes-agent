@@ -2429,6 +2429,31 @@ def _rows_by_task(conn, table: str, ids: list[str]) -> dict[str, list]:
     return by
 
 
+def _cmd_diagnostics_placement(args: argparse.Namespace, config) -> int:
+    """``diagnostics --placement``: read-only; no ssh probe, no streak advance."""
+    from hermes_cli import kanban_load_gate as _klg
+    from hermes_cli import kanban_placement_diag as kpd
+
+    # The pool block, streaks and ledger are published under the shared kanban
+    # root by ITS dispatcher; rebuild the plan with that root's config, not the
+    # invoking profile's (a `-p x` read_signal/worker_hosts must not leak in).
+    from hermes_cli.config_effective import load_user_config_effective
+
+    root = kb.kanban_home()
+    try:
+        root_cfg = load_user_config_effective(root / "config.yaml")
+    except Exception as exc:  # never substitute the invoking profile's config
+        return _err(f"diagnostics --placement: cannot read {root / 'config.yaml'}: {exc}")
+    kcfg = (root_cfg or {}).get("kanban") if isinstance(root_cfg, dict) else None
+    rep = kpd.compute(root, kanban_cfg=kcfg if isinstance(kcfg, dict) else {},
+                      gate_state=_klg.read_state())
+    if getattr(args, "json", False):
+        _print_json(rep)
+    else:
+        print("\n".join(kpd.format_lines(rep)))
+    return 0
+
+
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board via the same rule engine the dashboard uses."""
     from hermes_cli import kanban_diagnostics as kd
@@ -2439,7 +2464,10 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     # relies on the gateway-embedded dispatcher.
     from hermes_cli.config import load_config
 
-    diag_config = kd.config_from_runtime_config(load_config())
+    runtime_config = load_config()
+    if getattr(args, "placement", False):
+        return _cmd_diagnostics_placement(args, runtime_config)
+    diag_config = kd.config_from_runtime_config(runtime_config)
 
     with kbc.connect_closing() as conn:
         # Either one-task mode or fleet mode.
