@@ -267,7 +267,7 @@ class ComputeHost:
                 request_id, sid, session, text, display_kind=frame.get("display_kind") or None,
                 display_metadata=(frame.get("display_metadata")
                                   if isinstance(frame.get("display_metadata"), dict) else None))
-            run_thread = session.get("_run_thread")
+            run_thread = server._session_run_thread(session)
             if run_thread is not None and hasattr(run_thread, "join"):
                 while run_thread.is_alive():
                     run_thread.join(timeout=1.0)
