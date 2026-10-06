@@ -1339,7 +1339,12 @@ class Mem0MemoryProvider(MemoryProvider):
         keep the 15s default → byte-identical to before this widening.
         """
         import urllib.request as _u
-        key = os.environ.get("OPENAI_API_KEY", "") or (self._config.get("openai_api_key", "") if self._config else "")
+        # Profile-scoped (multiplex: never the launch profile's key); no key -> caller's fallback.
+        try:
+            key = get_secret("OPENAI_API_KEY", "") or ""
+        except UnscopedSecretError:
+            key = ""
+        key = key or (self._config.get("openai_api_key", "") if self._config else "")
         if not key or not texts:
             return None
         model = (self._config.get("dedup_embed_model") if self._config else None) or "text-embedding-3-small"
@@ -1360,6 +1365,108 @@ class Mem0MemoryProvider(MemoryProvider):
         na = math.sqrt(sum(x * x for x in a))
         nb = math.sqrt(sum(x * x for x in b))
         return dot / (na * nb) if na and nb else 0.0
+
+    # -- Background-review write ladder (mem0_remember; tools/mem0_remember_tool.py) --------------
+    # The reviewer is unattended, so every write goes through: exact-hash skip -> similarity skip
+    # (cosine >= dedup_cosine_threshold against what search returns) -> write. A fact that CHANGES a
+    # stored one is written only with ``supersedes`` naming the stored text, so recall shows both and
+    # the newer row says what it replaces; nothing is overwritten or deleted. Cosine cannot tell a
+    # paraphrase from a value flip (2026-06-27 calibration: both land 0.6-0.99), which is why a
+    # near-match is returned to the reviewer to decide rather than guessed at here.
+
+    def _bgr_threshold(self) -> float:
+        try:
+            return float((self._config or {}).get("dedup_cosine_threshold", 0.95))
+        except (TypeError, ValueError):
+            return 0.95
+
+    @staticmethod
+    def _bgr_norm_hash(text: str) -> str:
+        import hashlib
+        # Case is kept: paths, hostnames and ids are case-sensitive pointers.
+        return hashlib.md5(" ".join((text or "").split()).encode("utf-8")).hexdigest()
+
+    def _bgr_nearest(self, client, fact: str):
+        """``(text, cosine)`` of the closest stored fact search returns, or ``(None, 0.0)``. Falls
+        back to normalized-text equality when embeddings are unavailable."""
+        rows = self._drop_forgotten(self._unwrap_results(
+            client.search(query=fact, filters=self._read_filters(), top_k=self._dedup_candidate_k())))
+        texts = [r.get("memory") for r in rows if isinstance(r, dict) and r.get("memory")]
+        if not texts:
+            return None, 0.0
+        vecs = self._dedup_embed([fact] + texts)
+        if not vecs or len(vecs) != len(texts) + 1:
+            norm = " ".join(fact.split())
+            same = next((t for t in texts if " ".join(t.split()) == norm), None)
+            return (same, 1.0) if same else (texts[0], 0.0)
+        scored = [(t, self._dedup_cos(vecs[0], v)) for t, v in zip(texts, vecs[1:])]
+        return max(scored, key=lambda tv: tv[1])
+
+    def _bgr_ledger(self, record: Dict[str, Any]) -> None:
+        """One row per reviewer write attempt in ``<home>/state/background-review-mem0.jsonl``."""
+        try:
+            from agent.redact import redact_sensitive_text
+            from hermes_cli.profiles import get_active_profile_name
+            path = self._hermes_home() / "state" / "background-review-mem0.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            row = {"ts": time.time(), "profile": get_active_profile_name(), **record}
+            for key in ("fact", "supersedes", "matched"):
+                if row.get(key):
+                    row[key] = redact_sensitive_text(str(row[key]), force=True)[:200]
+            with self._ledger_lock, open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning("background-review mem0 ledger write failed: %s", e)
+
+    def remember(self, fact: str, *, supersedes: str = "") -> Dict[str, Any]:
+        """Write one reviewer fact through the ladder; returns ``{"result", "verdict", ...}``."""
+        if not str((self._config or {}).get("user_id") or "").strip():
+            return {"error": "mem0_remember needs a configured mem0 user_id (pin_user_id or MEM0_USER_ID); "
+                             "refusing to write into a default bucket.", "verdict": "refused"}
+        if self._is_breaker_open():
+            return {"error": "Mem0 temporarily unavailable.", "verdict": "error"}
+        from .capture_scrub import scan as _secret_scan
+        if (hits := _secret_scan(fact) + _secret_scan(supersedes or "")):
+            # Deterministic boundary BEFORE any search/embed/add: the model's "never the secret"
+            # instruction is not one. The ledger gets the verdict, never the text.
+            self._bgr_ledger({"fact": "[withheld: secret-shaped]", "verdict": "refused_secret",
+                              "patterns": sorted(set(hits))})
+            return {"error": "Refused: the fact looks like it contains a secret ("
+                             + ", ".join(sorted(set(hits))) + "). Store a pointer, never the secret.",
+                    "verdict": "refused_secret"}
+        out: Dict[str, Any]
+        try:
+            client = self._get_client()
+            norm_hash = self._bgr_norm_hash(fact)
+            hit = [] if supersedes else self._unwrap_results(
+                client.search_meta_filtered(fact, {"dedup_hash": norm_hash}, top_k=1))
+            if self._drop_forgotten(hit):
+                out = {"result": "Already stored (exact match); nothing written.", "verdict": "deduped_exact"}
+            else:
+                matched, score = self._bgr_nearest(client, fact)
+                if not supersedes and matched and score >= self._bgr_threshold():
+                    out = {"result": "A near-identical fact is already stored; nothing written. If yours changes "
+                                     "or corrects it, call again with supersedes=<the stored text>.",
+                           "verdict": "deduped_similar", "matched": matched, "score": round(score, 3)}
+                else:
+                    filters = self._write_filters(write_kind="deliberate")
+                    meta = filters["metadata"]
+                    meta.update(write_origin="background_review", dedup_hash=norm_hash)
+                    content = fact
+                    if supersedes:
+                        meta["supersedes"] = supersedes[:500]
+                        content = f'{fact} (Supersedes: "{supersedes[:300]}")'
+                    client.add([{"role": "user", "content": content}], **filters, infer=False)
+                    out = {"result": "Fact stored.", "verdict": "stored_supersedes" if supersedes else "stored"}
+                    if matched:
+                        out.update(matched=matched, score=round(score, 3))
+            self._record_success()
+        except Exception as e:
+            self._record_failure()
+            out = {"error": f"Failed to remember: {e}", "verdict": "error"}
+        self._bgr_ledger({"fact": fact, "verdict": out["verdict"], "supersedes": supersedes or None,
+                          "matched": out.get("matched"), "score": out.get("score")})
+        return out
 
     @staticmethod
     def _unwrap_results(response: Any) -> list:

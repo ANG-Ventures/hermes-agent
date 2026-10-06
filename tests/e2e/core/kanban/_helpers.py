@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO = Path(__file__).resolve().parents[4]
 PY = sys.executable
@@ -110,7 +111,7 @@ class Board:
 
     # env / processes -------------------------------------------------------
     def env(self) -> dict[str, str]:
-        env = {k: v for k, v in os.environ.items()
+        env = {k: v for k, v in environ_snapshot().items()
                if not k.startswith("HERMES_") and not k.endswith(("_API_KEY", "_TOKEN"))}
         env.pop("PYTEST_CURRENT_TEST", None)
         env.update({
@@ -152,7 +153,7 @@ class Board:
     def dispatch(self, *extra: str) -> dict:
         res = self.cli_json("dispatch", *extra)
         for tid in [s["task_id"] for s in res.get("spawned", [])]:
-            pid = self.task(tid)["worker_pid"]
+            pid = self.run_pid(tid)
             if pid:
                 self.spawned_pids.add(int(pid))
         return res
@@ -187,6 +188,12 @@ class Board:
 
     def runs(self, tid: str) -> list[dict]:
         return self._q("SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,))
+
+    def run_pid(self, tid: str) -> Optional[int]:
+        """The latest run's worker pid. ``tasks.worker_pid`` is cleared when the card completes, and a
+        fake-LLM worker can complete before the caller reads it; the closed run row keeps the pid."""
+        runs = self.runs(tid)
+        return int(runs[-1]["worker_pid"]) if runs and runs[-1]["worker_pid"] else None
 
     def events(self, tid: str, kind: Optional[str] = None) -> list[dict]:
         rows = self._q("SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,))

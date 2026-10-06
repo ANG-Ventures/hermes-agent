@@ -11,8 +11,8 @@ from urllib.parse import urlparse
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.confab_notice import CONFAB_NOTICE_KEY, extract_confab_notice
 from agent.reasoning_effort import (
-    KIMI_K3_EFFORTS, KIMI_K3_OVERRIDES, OPENAI_COMPAT_WIRE_EFFORTS, TOKENHUB_EFFORTS, clamp_effort,
-    clamp_reasoning_config, kimi_supported_efforts, requested_effort,
+    OPENAI_COMPAT_WIRE_EFFORTS, EffortRoute, clamp_reasoning_config, has_reasoning_control,
+    profile_route_for, resolve_route_effort,
 )
 from agent.message_metadata import MESSAGE_UID
 from agent.message_sanitization import normalize_finish_reason as _normalize_finish_reason
@@ -481,27 +481,24 @@ class ChatCompletionsTransport(ProviderTransport):
         sanitized = _swap_developer_role(sanitized, params.get("model_lower", (model or "").lower()))
         api_kwargs = _base_kwargs(model, sanitized, tools, params)
 
-        is_kimi = params.get("is_kimi", False)
-        is_lmstudio = params.get("is_lmstudio", False)
         supports_reasoning = params.get("supports_reasoning", False)
         reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
         _apply_max_tokens(api_kwargs, model, reasoning_config, params)
 
-        # Kimi / TokenHub / LM Studio: top-level reasoning_effort (unless thinking disabled).
+        # Top-level ``reasoning_effort``: the caller hands the transport the route's vocabulary
+        # (``effort_route``, an EffortRoute) — no provider-name branch decides who gets the field.
         thinking_off = isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False
-        _e = requested_effort(reasoning_config)
-        if is_kimi and not thinking_off:
-            # K3 = low/high/max (server default high), K2-era = low/medium/high (default medium).
-            _supported = kimi_supported_efforts(model)
-            is_k3 = _supported is KIMI_K3_EFFORTS
-            api_kwargs["reasoning_effort"] = (
-                ("high" if is_k3 else "medium") if _e is None
-                else clamp_effort(_e, _supported, KIMI_K3_OVERRIDES if is_k3 else None)
-            )
-        if params.get("is_tokenhub", False) and not thinking_off:
-            api_kwargs["reasoning_effort"] = "high" if _e is None else clamp_effort(_e, TOKENHUB_EFFORTS)
-        if is_lmstudio and supports_reasoning:
-            _lm_effort = resolve_lmstudio_effort(reasoning_config, params.get("lmstudio_reasoning_options"))
+        effort_route = params.get("effort_route")
+        if isinstance(effort_route, EffortRoute):
+            _effort = resolve_route_effort(reasoning_config, effort_route)
+            if _effort is not None:
+                api_kwargs["reasoning_effort"] = _effort
+        else:
+            effort_route = None
+        # LM Studio publishes per-model ``allowed_options``; a level it cannot honor is omitted.
+        lmstudio_options = params.get("lmstudio_reasoning_options")
+        if lmstudio_options is not None and supports_reasoning:
+            _lm_effort = resolve_lmstudio_effort(reasoning_config, lmstudio_options)
             if _lm_effort is not None:
                 api_kwargs["reasoning_effort"] = _lm_effort
 
@@ -515,11 +512,11 @@ class ChatCompletionsTransport(ProviderTransport):
             _pareto_score_f = _pareto_score(params.get("openrouter_min_coding_score"))
             if _pareto_score_f is not None:
                 extra_body["plugins"] = [{"id": "pareto-router", "min_coding_score": _pareto_score_f}]
-        if is_kimi:
+        if effort_route is not None and effort_route.thinking_toggle:
             extra_body["thinking"] = {"type": "disabled" if thinking_off else "enabled"}
 
         # LM Studio is handled above via top-level reasoning_effort.
-        if supports_reasoning and not is_lmstudio:
+        if supports_reasoning and lmstudio_options is None:
             if params.get("is_github_models", False):
                 if params.get("github_reasoning_extra") is not None:
                     extra_body["reasoning"] = params["github_reasoning_extra"]
@@ -578,6 +575,18 @@ class ChatCompletionsTransport(ProviderTransport):
         for part in (profile_body, extra_body_from_profile, params.get("extra_body_additions")):
             if part:
                 extra_body.update(part)
+        # Capability flag, not a provider name: a profile that declares the top-level
+        # ``reasoning_effort`` knob gets the user's effort on every request its own hooks
+        # left without a reasoning control, clamped (with notice) onto the vocabulary it
+        # declares for the model. Only the PROFILE's projections are inspected — never the
+        # caller's extra_body_additions, tool schemas or messages, where a property merely
+        # named ``reasoning`` is data, not a wire control.
+        if getattr(profile, "supports_reasoning_effort", False) and not any(
+            has_reasoning_control(part) for part in (profile_body, extra_body_from_profile, top_level_from_profile)
+        ):
+            _effort = resolve_route_effort(reasoning_config, profile_route_for(profile, model))
+            if _effort is not None:
+                api_kwargs["reasoning_effort"] = _effort
         for k, v in (params.get("request_overrides") or {}).items():
             if k == "extra_body" and isinstance(v, dict):
                 extra_body.update(v)

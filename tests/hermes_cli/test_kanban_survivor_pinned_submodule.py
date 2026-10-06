@@ -196,3 +196,165 @@ def test_plain_hand_clone_inside_clone_still_refuses(board, scratch):
     with pytest.raises(survivor.SurvivorUnavailable) as caught:
         _complete(board, tid, ws)
     assert NESTED in str(caught.value)
+
+
+# --- recursive and by-sha-fetched pins (t_0b0f392d) --------------------------
+
+
+@pytest.fixture
+def three_level(tmp_path):
+    """project -> components/mid -> third_party/leaf, all pinned and clean."""
+    leaf = _init(tmp_path / "remotes" / "leaf", "leaf.c")
+    mid = _init(tmp_path / "remotes" / "mid", "mid.c")
+    git(mid, "submodule", "add", str(leaf), "third_party/leaf")
+    git(mid, "commit", "-m", "pin leaf")
+    project = _init(tmp_path / "remotes" / "project3")
+    git(project, "submodule", "add", str(mid), "components/mid")
+    git(project, "commit", "-m", "pin mid")
+    ws = tmp_path / "workspace3"
+    ws.mkdir()
+    git(ws, "clone", "--recurse-submodules", str(project), "sat")
+    sat = ws / "sat"
+    leaf_co = sat / "components" / "mid" / "third_party" / "leaf"
+    assert (leaf_co / ".git").exists(), "fixture: second-level submodule must be checked out"
+    (sat / "code.py").write_text("value = 2\n")
+    return ws, sat, leaf_co
+
+
+def test_recursive_clean_pinned_submodules_complete(board, three_level):
+    ws, _sat, _leaf = three_level
+    tid = _card(board, ws)
+    result = _complete(board, tid, ws)
+    assert _captured(result) == {"sat"}, result
+
+
+def test_dirty_second_level_submodule_still_refuses(board, three_level):
+    ws, _sat, leaf = three_level
+    (leaf / "leaf.c").write_text("value = 9\n")
+    tid = _card(board, ws)
+    with pytest.raises(survivor.SurvivorUnavailable) as caught:
+        _complete(board, tid, ws)
+    assert NESTED in str(caught.value)
+
+
+@pytest.fixture
+def pinned_off_branch(tmp_path):
+    """Gitlink names a commit no branch of the remote holds; clone fetches it by sha.
+
+    The house-voice shape: sat pins libpeer 9319aa4, an upstream merge that the
+    fork's branches do not contain, so the submodule has no remote-tracking ref
+    holding HEAD -- only FETCH_HEAD records that the remote served it.
+    """
+    lib = _init(tmp_path / "remotes" / "forklib", "lib.c")
+    git(lib, "config", "uploadpack.allowAnySHA1InWant", "true")
+    git(lib, "checkout", "-b", "side")
+    (lib / "lib.c").write_text("value = 7\n")
+    git(lib, "commit", "-am", "side only")
+    side = git(lib, "rev-parse", "HEAD")
+    project = _init(tmp_path / "remotes" / "project-side")
+    git(project, "submodule", "add", "-b", "side", str(lib), "deps/lib")
+    git(project, "commit", "-m", "pin side")
+    git(lib, "checkout", "main")
+    git(lib, "branch", "-D", "side")  # no branch holds the pin any more
+    ws = tmp_path / "workspace-side"
+    ws.mkdir()
+    git(ws, "clone", "--recurse-submodules", str(project), "sat")
+    sub = ws / "sat" / "deps" / "lib"
+    assert git(sub, "rev-parse", "HEAD") == side
+    assert not git(sub, "for-each-ref", "--contains", side, "refs/remotes"), \
+        "fixture: no remote-tracking ref may hold the pin"
+    (ws / "sat" / "code.py").write_text("value = 2\n")
+    return ws, sub
+
+
+def _pin_bundles(result):
+    return [b for b in result.get("bundles") or () if b.get("repository") == "sat/deps/lib"]
+
+
+def test_submodule_fetched_by_sha_from_its_remote_completes(board, pinned_off_branch):
+    ws, _sub = pinned_off_branch
+    tid = _card(board, ws)
+    result = _complete(board, tid, ws)
+    assert _captured(result) == {"sat"}, result
+
+
+def test_unretained_pin_objects_are_preserved_in_the_survivor(board, pinned_off_branch, tmp_path):
+    """Prism P1 048708e2: FETCH_HEAD proves the remote SERVED the pin, not that it RETAINS it.
+
+    No head of the remote contains the pinned commit (``side`` was deleted), so a
+    remote gc can prune it. The survivor must carry the commit itself.
+    """
+    ws, sub = pinned_off_branch
+    pin = git(sub, "rev-parse", "HEAD")
+    tid = _card(board, ws)
+
+    result = _complete(board, tid, ws)
+
+    bundles = _pin_bundles(result)
+    assert len(bundles) == 1, result
+    restored = tmp_path / "restored"
+    git(tmp_path, "init", "-q", "--bare", str(restored))
+    # Recovery = the remote's live heads (retained) + the bundle (the rest).
+    git(restored, "fetch", "-q", git(sub, "remote", "get-url", "origin"), "refs/heads/*:refs/heads/*")
+    git(restored, "fetch", "-q", bundles[0]["path"], "HEAD:refs/heads/pin")
+    assert git(restored, "rev-parse", "refs/heads/pin") == pin
+
+
+def test_reclamation_pass_keeps_exactly_one_pin_bundle(board, pinned_off_branch):
+    """Cleanup re-captures the on-disk pin; it must neither drop nor duplicate its bundle."""
+    ws, _sub = pinned_off_branch
+    tid = _card(board, ws)
+    _complete(board, tid, ws)
+
+    again = survivor.preserve(board, tid, cleanup=True, workspace=ws)
+
+    assert len(_pin_bundles(again)) == 1, again
+
+
+def test_retained_pin_adds_no_bundle(board, scratch):
+    """A pin a live head of the remote contains is reproducible: nothing extra stored."""
+    ws, _sat, _sub = scratch
+    tid = _card(board, ws)
+    result = _complete(board, tid, ws)
+    assert not [b for b in result.get("bundles") or () if b.get("repository") == "sat/components/lib"]
+
+
+def test_stale_tracking_ref_is_not_retention(board, scratch, upstream):
+    """Same class: a local remote-tracking ref can outlive the remote branch it mirrors."""
+    ws, _sat, sub = scratch
+    lib = Path(git(upstream, "config", "-f", ".gitmodules", "submodule.components/lib.url"))
+    pin = git(sub, "rev-parse", "HEAD")
+    git(lib, "checkout", "-q", "--detach")
+    git(lib, "branch", "-D", "main")  # remote no longer advertises any head holding the pin
+    assert git(sub, "for-each-ref", "--contains", pin, "refs/remotes"), "fixture: stale tracking ref"
+    tid = _card(board, ws)
+
+    result = _complete(board, tid, ws)
+
+    assert [b for b in result.get("bundles") or () if b.get("repository") == "sat/components/lib"], result
+
+
+@pytest.mark.parametrize("note", [
+    "'{sha}' of {url}",            # fetch by sha (git submodule update)
+    "branch 'main' of {url}",
+    "tag 'v1' of {url}",
+    "{url}",                        # bare URL: `git fetch <url>` with no refspec
+])
+def test_fetch_head_source_with_of_in_remote_path(tmp_path, note):
+    """Prism P1 590a301d: ``rpartition(" of ")`` split ``/repos/copy of lib`` inside the path."""
+    lib = _init(tmp_path / "copy of lib", "lib.c")
+    sha = git(lib, "rev-parse", "HEAD")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(lib), str(clone))
+    fetch_head = Path(git(clone, "rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD"))
+    fetch_head.write_text(f"{sha}\t\t{note.format(sha=sha, url=lib)}\n")
+    assert survivor._fetched_from_remote(clone, sha)
+
+
+def test_fetch_head_from_unconfigured_url_still_refuses(board, pinned_off_branch, tmp_path):
+    ws, sub = pinned_off_branch
+    git(sub, "remote", "set-url", "origin", str(tmp_path / "elsewhere"))
+    tid = _card(board, ws)
+    with pytest.raises(survivor.SurvivorUnavailable) as caught:
+        _complete(board, tid, ws)
+    assert NESTED in str(caught.value)

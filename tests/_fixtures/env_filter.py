@@ -338,4 +338,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "WHATSAPP_REQUIRE_MENTION",
     "DINGTALK_REQUIRE_MENTION",
     "MATRIX_REQUIRE_MENTION",
+    # Set on every kanban worker; a suite a worker runs would otherwise see every gateway
+    # service write refused (hermes_cli/gateway_service_owner.py).
+    "HERMES_GATEWAY_INSTALL_DISABLED",
 })

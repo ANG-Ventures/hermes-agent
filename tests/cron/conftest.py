@@ -45,6 +45,41 @@ def make_cron_provider():
     return _make
 
 
+@pytest.fixture
+def hermes_env(tmp_path):
+    """Isolated HERMES_HOME (with scripts/ and cron/) for cron job/scheduler tests.
+
+    hermes_constants, cron.jobs, cron.monitor and cron.scheduler cache get_hermes_home()
+    at import time, so they are reloaded under the temp home. Teardown restores each
+    module's pre-test namespace, so later tests in the worker don't inherit this test's
+    temp home through those import-time snapshots.
+    """
+    import importlib
+
+    import hermes_constants
+    import cron.jobs
+    import cron.monitor
+    import cron.scheduler
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "scripts").mkdir()
+    (home / "cron").mkdir()
+
+    modules = (hermes_constants, cron.jobs, cron.monitor, cron.scheduler)
+    saved = [(mod, dict(mod.__dict__)) for mod in modules]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("HERMES_HOME", str(home))
+        try:
+            for mod in modules:
+                importlib.reload(mod)
+            yield home
+        finally:
+            for mod, namespace in reversed(saved):
+                mod.__dict__.clear()
+                mod.__dict__.update(namespace)
+
+
 @pytest.fixture(autouse=True)
 def _no_managed_store(tmp_path, monkeypatch):
     """Point PM's store at an empty dir: script runs must not select the host install's

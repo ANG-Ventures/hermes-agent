@@ -325,6 +325,381 @@ def test_pr_red_or_dirty_pure():
     assert ow.pr_is_red_or_dirty({"state": "open", "failing": ["lint"]}) == "red: lint"
 
 
+_GATE, _ROLLUP = "Review label gate / Review label gate", "All required checks pass"
+# The real annotations on hermes-agent#1770 @ 5422e9c36 (2026-10-05): gate run 111871305156, aggregator 111884312146.
+_GATE_ANN = [{"annotation_level": "failure", "message": "Process completed with exit code 1."},
+             {"annotation_level": "failure",
+              "message": "CI-sensitive changes require the ci-reviewed label. Add the label and re-run this check."}]
+_ROLLUP_ANN = [{"annotation_level": "failure", "message": "Process completed with exit code 1."},
+               {"annotation_level": "failure", "message": "1 job(s) failed: review-labels"},
+               {"annotation_level": "failure",
+                "message": "review-labels concluded 'failure'; expected 'success' or 'skipped'"}]
+
+
+@pytest.mark.parametrize(("failing", "label_only", "labels", "mss", "want"), [
+    # t_9479baf8: gate + aggregator, each verified red only for the missing label -> label pending, no wake
+    ([_GATE, _ROLLUP], [True, True], [], "blocked", None),
+    ([_GATE], [True], ["bug"], "blocked", None),
+    # a run that did not verify (other failure reason, unreadable annotations) still wakes
+    ([_GATE, _ROLLUP], [True, False], [], "blocked", f"red: {_GATE}, {_ROLLUP}"),
+    ([_GATE, _ROLLUP], [False, True], [], "blocked", f"red: {_GATE}, {_ROLLUP}"),
+    ([_GATE, _ROLLUP], None, [], "blocked", f"red: {_GATE}, {_ROLLUP}"),          # never verified
+    ([_GATE, _ROLLUP, _ROLLUP], [True, True], [], "blocked",                      # a verdict missing per run
+     f"red: {_GATE}, {_ROLLUP}, {_ROLLUP}"),
+    # labelled and STILL red: the gate re-ran after the label and failed -> a real red
+    ([_GATE, _ROLLUP], [True, True], ["ci-reviewed"], "blocked", f"red: {_GATE}, {_ROLLUP}"),
+    # the aggregator alone is not the label gate
+    ([_ROLLUP], [True], [], "blocked", f"red: {_ROLLUP}"),
+    # label pending never hides a merge conflict
+    ([_GATE, _ROLLUP], [True, True], [], "dirty", "dirty (merge conflict)"),
+])
+def test_review_label_gate_is_label_pending_not_red(failing, label_only, labels, mss, want):
+    health = {"state": "open", "mergeable_state": mss, "failing": failing, "labels": labels, "label_only": label_only}
+    assert ow.pr_is_red_or_dirty(health) == want
+
+
+def test_rollup_failed_jobs_parses_evaluate_needs_annotation():
+    assert ow.rollup_failed_jobs(_ROLLUP_ANN) == frozenset({"review-labels"})
+    assert ow.rollup_failed_jobs([{"message": "2 job(s) failed: lint, tests"}]) == frozenset({"lint", "tests"})
+    assert ow.rollup_failed_jobs([{"message": "Process completed with exit code 1."}]) is None
+    assert ow.rollup_failed_jobs(None) is None
+
+
+@pytest.mark.parametrize(("run", "ann", "want"), [
+    ({"name": _GATE, "conclusion": "failure"}, _GATE_ANN, True),
+    # Prism P1 b796fe55bbc1: checkout / emit_review_status.py failure, timeout, cancel -> not the missing label
+    ({"name": _GATE, "conclusion": "failure"}, [{"message": "Process completed with exit code 1."}], False),
+    ({"name": _GATE, "conclusion": "timed_out"}, _GATE_ANN, False),
+    ({"name": _GATE, "conclusion": "cancelled"}, None, False),
+    ({"name": _GATE, "conclusion": "failure"}, None, False),
+    ({"name": _ROLLUP, "conclusion": "failure"}, _ROLLUP_ANN, True),
+    # Prism P1 c585adb654b0: the aggregator failed on a skipped required job / a real job
+    ({"name": _ROLLUP, "conclusion": "failure"}, [{"message": "1 job(s) failed: tests"}], False),
+    ({"name": _ROLLUP, "conclusion": "failure"}, [{"message": "2 job(s) failed: review-labels, tests"}], False),
+    ({"name": _ROLLUP, "conclusion": "failure"}, None, False),
+    ({"name": "tests / pytest", "conclusion": "failure"}, _GATE_ANN, False),
+])
+def test_label_gate_red_only_per_run(run, ann, want):
+    assert ow._label_gate_red_only(run, ann) is want
+
+
+def _fake_1770(monkeypatch, runs, anns, labels=(), calls=None):
+    sha = "5422e9c36d2e5b3b26e62c0bd11ffa3086256619"
+
+    def fake(path):
+        if calls is not None:
+            calls.append(path)
+        if path == "repos/ANG-Ventures/hermes-agent/pulls/1770":
+            return {"state": "open", "merged_at": None, "mergeable_state": "blocked", "head": {"sha": sha},
+                    "labels": [{"name": x} for x in labels]}
+        if path.startswith(f"repos/ANG-Ventures/hermes-agent/commits/{sha}/check-runs"):
+            rows = [dict(r, status="completed", check_suite={"id": 9}) for r in runs]
+            return {"check_runs": rows if path.endswith("&page=1") else []}
+        for rid, ann in anns.items():
+            if path == f"repos/ANG-Ventures/hermes-agent/check-runs/{rid}/annotations?per_page=100":
+                return ann
+        raise AssertionError(path)
+    monkeypatch.setattr(ow, "_gh_json", fake)
+    return ow.query_pr_health("ANG-Ventures/hermes-agent", 1770)
+
+
+def test_query_pr_health_1770_is_label_pending(monkeypatch):
+    """The #1770 handback 2026-10-05: gate + aggregator red on the missing label -> no 'cannot land' wake."""
+    health = _fake_1770(monkeypatch, [{"id": 1, "name": _GATE, "conclusion": "failure"},
+                                      {"id": 2, "name": _ROLLUP, "conclusion": "failure"}],
+                        {1: _GATE_ANN, 2: _ROLLUP_ANN}, labels=["fleet"])
+    assert health["labels"] == ["fleet"]
+    assert health["label_only"] == [True, True]
+    assert ow.pr_is_red_or_dirty(health) is None
+
+
+def test_query_pr_health_checks_every_rollup(monkeypatch):
+    """Prism P1 7d6845520733: two aggregator runs (different workflow prefixes); the second failed on skipped tests."""
+    other = "Other CI / All required checks pass"
+    health = _fake_1770(monkeypatch, [{"id": 1, "name": _GATE, "conclusion": "failure"},
+                                      {"id": 2, "name": _ROLLUP, "conclusion": "failure"},
+                                      {"id": 3, "name": other, "conclusion": "failure"}],
+                        {1: _GATE_ANN, 2: _ROLLUP_ANN, 3: [{"message": "1 job(s) failed: tests"}]})
+    assert sorted(health["failing"]) == sorted([_GATE, _ROLLUP, other])
+    assert ow.pr_is_red_or_dirty(health) is not None
+
+
+@pytest.mark.parametrize("gate_ann", [None, [{"message": "Process completed with exit code 1."}]])
+def test_query_pr_health_gate_failed_for_another_reason_wakes(monkeypatch, gate_ann):
+    health = _fake_1770(monkeypatch, [{"id": 1, "name": _GATE, "conclusion": "failure"},
+                                      {"id": 2, "name": _ROLLUP, "conclusion": "failure"}],
+                        {1: gate_ann, 2: _ROLLUP_ANN})
+    assert ow.pr_is_red_or_dirty(health) == f"red: {_GATE}, {_ROLLUP}"
+
+
+def test_query_pr_health_reads_no_annotations_for_a_code_red(monkeypatch):
+    calls = []
+    health = _fake_1770(monkeypatch, [{"id": 1, "name": _GATE, "conclusion": "failure"},
+                                      {"id": 4, "name": "tests / pytest", "conclusion": "failure"}], {}, calls=calls)
+    assert not [c for c in calls if "/annotations" in c]
+    assert "label_only" not in health
+    assert ow.pr_is_red_or_dirty(health) is not None
+
+
+# --- cancelled duplicate check runs (t_65e5d76f) ------------------------------
+
+# The real set on ANG-Ventures/hermes-home#2694 head 0a6680ba789e: two
+# concurrency-cancelled override_lint runs and the success that superseded them,
+# each in its own check suite, all workflow 368437559 / pull_request.
+_SHA_2694 = "0a6680ba789e159616aa8a0b3bd876937c5c54c1"
+_RUNS_2694 = [
+    {"id": 111348374621, "name": "override_lint / override_lint", "status": "completed",
+     "conclusion": "cancelled", "check_suite": {"id": 100688518781}},
+    {"id": 111348374885, "name": "override_lint / override_lint", "status": "completed",
+     "conclusion": "cancelled", "check_suite": {"id": 100688518866}},
+    {"id": 111348380187, "name": "override_lint / override_lint", "status": "completed",
+     "conclusion": "success", "check_suite": {"id": 100688523611}},
+]
+_WF_2694 = {"workflow_runs": [
+    {"check_suite_id": s, "workflow_id": 368437559, "event": "pull_request"}
+    for s in (100688518781, 100688518866, 100688523611)]}
+
+
+def _fake_gh(monkeypatch, runs, workflow_runs, calls=None):
+    def fake(path):
+        if calls is not None:
+            calls.append(path)
+        if path == "repos/ANG-Ventures/hermes-home/pulls/2694":
+            return {"state": "open", "merged_at": None, "mergeable_state": "clean",
+                    "head": {"sha": _SHA_2694}}
+        if path.startswith(f"repos/ANG-Ventures/hermes-home/commits/{_SHA_2694}/check-runs"):
+            return {"check_runs": runs} if path.endswith("&page=1") else {"check_runs": []}
+        if path.startswith("repos/ANG-Ventures/hermes-home/actions/runs?head_sha="):
+            if callable(workflow_runs):
+                return workflow_runs(path)
+            return workflow_runs if path.endswith("&page=1") else {"workflow_runs": []}
+        raise AssertionError(path)
+    monkeypatch.setattr(ow, "_gh_json", fake)
+
+
+def test_pr_2694_superseded_cancels_are_not_red(monkeypatch):
+    _fake_gh(monkeypatch, _RUNS_2694, _WF_2694)
+    health = ow.query_pr_health("ANG-Ventures/hermes-home", 2694)
+    assert health["failing"] == []
+    assert ow.pr_is_red_or_dirty(health) is None
+
+
+def test_pr_2694_unreadable_workflow_map_fails_closed(monkeypatch):
+    _fake_gh(monkeypatch, _RUNS_2694, None)
+    health = ow.query_pr_health("ANG-Ventures/hermes-home", 2694)
+    assert health["failing"] == ["override_lint / override_lint"] * 2
+
+
+def test_all_pass_head_skips_the_workflow_read(monkeypatch):
+    calls: list = []
+    runs = [dict(r, conclusion="success") for r in _RUNS_2694]
+    _fake_gh(monkeypatch, runs, _WF_2694, calls)
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694)["failing"] == []
+    assert not any("actions/runs" in c for c in calls)
+
+
+def test_superseded_suite_on_a_later_workflow_page_still_merges(monkeypatch):
+    """Prism P1 (#1706): >100 workflow runs on a head. The cancelled run's suite is
+    on page 2; reading page 1 only left it suite-keyed and the PR read red."""
+    filler = [{"check_suite_id": 900000 + n, "workflow_id": 1, "event": "push"} for n in range(100)]
+    pages = {1: filler,
+             2: [{"check_suite_id": s, "workflow_id": 368437559, "event": "pull_request"}
+                 for s in (100688518781, 100688518866, 100688523611)]}
+
+    def wf_pages(path):
+        return {"workflow_runs": pages.get(int(path.rsplit("page=", 1)[1]), [])}
+    _fake_gh(monkeypatch, _RUNS_2694, wf_pages)
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694)["failing"] == []
+
+
+def _paged_check_runs(monkeypatch, page_fn):
+    def fake(path):
+        if path == "repos/ANG-Ventures/hermes-home/pulls/2694":
+            return {"state": "open", "merged_at": None, "mergeable_state": "clean",
+                    "head": {"sha": _SHA_2694}}
+        if "/check-runs" in path:
+            return page_fn(int(path.rsplit("page=", 1)[1]))
+        return {"workflow_runs": []}
+    monkeypatch.setattr(ow, "_gh_json", fake)
+
+
+def test_unreadable_later_check_run_page_is_unknown_not_green(monkeypatch):
+    """Prism P1 (#1706 r2): a failure on page 1 + an unreadable page 2 must not read green."""
+    page1 = [{"id": n, "name": f"c{n}", "conclusion": "success", "check_suite": {"id": 1}}
+             for n in range(99)] + [{"id": 99, "name": "tests", "conclusion": "failure",
+                                     "check_suite": {"id": 1}}]
+    _paged_check_runs(monkeypatch, lambda page: {"check_runs": page1} if page == 1 else None)
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694) is None
+
+
+def test_page_cap_exhausted_is_unknown(monkeypatch):
+    """Prism P1 (#1706 r2): every page full up to the cap is a partial list, not a verdict."""
+    full = [{"id": n, "name": f"c{n}", "conclusion": "success", "check_suite": {"id": 1}}
+            for n in range(100)]
+    _paged_check_runs(monkeypatch, lambda page: {"check_runs": full})
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 2694) is None
+
+
+def _run(rid, concl, suite, name="lint"):
+    return {"id": rid, "name": name, "conclusion": concl, "check_suite": {"id": suite}}
+
+
+def test_red_check_names_rules():
+    wf = {1: (10, "pull_request"), 2: (10, "pull_request"), 3: (20, "pull_request"),
+          4: (10, "push")}
+    # all runs of a check cancelled: stays red
+    assert ow.red_check_names([_run(1, "cancelled", 1), _run(2, "cancelled", 2)], wf) == ["lint"]
+    # a later failure is never hidden by an earlier success
+    assert ow.red_check_names([_run(1, "success", 1), _run(2, "failure", 2)], wf) == ["lint"]
+    # a re-run success supersedes an earlier failure of the SAME check
+    assert ow.red_check_names([_run(1, "failure", 1), _run(2, "success", 2)], wf) == []
+    # skipped is no verdict: the failure still decides
+    assert ow.red_check_names([_run(1, "failure", 1), _run(2, "skipped", 2)], wf) == ["lint"]
+    # another workflow's same-named success hides nothing
+    assert ow.red_check_names([_run(1, "failure", 1), _run(3, "success", 3)], wf) == ["lint"]
+    assert ow.red_check_names([_run(1, "cancelled", 1), _run(3, "success", 3)], wf) == ["lint"]
+    # a push run is not a re-run of the pull_request run
+    assert ow.red_check_names([_run(1, "failure", 1), _run(4, "success", 4)], wf) == ["lint"]
+    # one suite: the newest run decides
+    assert ow.red_check_names([_run(1, "failure", 1), _run(2, "success", 1)]) == []
+    assert ow.red_check_names([_run(1, "timed_out", 1, "e2e")]) == ["e2e"]
+
+
+# --- re-triggered workflow runs (t_fb481152) --------------------------------
+
+# ANG-Ventures/hermes-agent#1716 head e76641293: the two override_lint rows, the
+# cancelled one 6 s before the identical re-trigger that passed.
+_SHA_1716 = "e76641293ab35ee4de3a90ea215e2f4242a19d27"
+_RUNS_1716 = [
+    {"id": 111388156989, "name": "override_lint / override_lint", "status": "completed",
+     "conclusion": "success", "check_suite": {"id": 100724626287}},
+    {"id": 111388147366, "name": "override_lint / override_lint", "status": "completed",
+     "conclusion": "cancelled", "check_suite": {"id": 100724617396}},
+]
+_WF_1716 = [
+    {"id": 37186083245, "check_suite_id": 100724626287, "workflow_id": 368437481,
+     "event": "pull_request", "conclusion": "success"},
+    {"id": 37186079963, "check_suite_id": 100724617396, "workflow_id": 368437481,
+     "event": "pull_request", "conclusion": "cancelled"},
+]
+
+# ANG-Ventures/hermes-agent#1718 head 94ad2960: every workflow was triggered twice
+# 1 s apart and GitHub cancelled the first set. The green Docker re-run SKIPPED its
+# publish jobs (so their only verdict rows are the cancelled ones), and the cancelled
+# CI run's always() aggregate wrote a FAILURE while the newer CI run was still going.
+_SHA_1718 = "94ad296012c75806b74f0481a42548e541ff1fed"
+_DOCKER_OLD, _DOCKER_NEW, _CI_OLD, _CI_NEW, _OL_OLD, _OL_NEW = (
+    100731181019, 100731182812, 100731181671, 100731183727, 100731181669, 100731183662)
+
+
+def _row(rid, suite, concl, name, status="completed"):
+    return {"id": rid, "name": name, "status": status, "conclusion": concl,
+            "check_suite": {"id": suite}}
+
+
+_RUNS_1718 = [
+    _row(111395931391, _DOCKER_NEW, "skipped", "merge"),
+    _row(111395931085, _DOCKER_NEW, "skipped", "publish"),
+    _row(111395931036, _DOCKER_NEW, "skipped", "Docker phase requirements met"),
+    _row(111395701466, _DOCKER_NEW, "success", "Detect affected areas"),
+    _row(111395644061, _DOCKER_NEW, "success", "Resolve release phase"),
+    _row(111395644032, _CI_OLD, "failure", "All required checks pass"),
+    _row(111395643404, _DOCKER_OLD, "cancelled", "Docker phase requirements met"),
+    _row(111395643354, _DOCKER_OLD, "cancelled", "merge"),
+    _row(111395643248, _DOCKER_OLD, "cancelled", "publish"),
+    _row(111395642464, _DOCKER_OLD, "cancelled", "Detect affected areas"),
+    _row(111395638931, _DOCKER_OLD, "cancelled", "Resolve release phase"),
+    _row(111395640160, _CI_OLD, "cancelled", "Detect affected areas"),
+    _row(111396234081, _CI_NEW, None, "Python tests / Run tests slice 3/16", "in_progress"),
+    _row(111395642183, _OL_NEW, "success", "override_lint / override_lint"),
+    _row(111395639950, _OL_OLD, "cancelled", "override_lint / override_lint"),
+]
+_WF_1718 = [
+    {"id": 37188536850, "check_suite_id": _DOCKER_OLD, "workflow_id": 304434613,
+     "event": "pull_request", "conclusion": "cancelled"},
+    {"id": 37188537099, "check_suite_id": _CI_OLD, "workflow_id": 340224912,
+     "event": "pull_request", "conclusion": "cancelled"},
+    {"id": 37188537097, "check_suite_id": _OL_OLD, "workflow_id": 368437481,
+     "event": "pull_request", "conclusion": "cancelled"},
+    {"id": 37188537568, "check_suite_id": _DOCKER_NEW, "workflow_id": 304434613,
+     "event": "pull_request", "conclusion": "success"},
+    {"id": 37188537908, "check_suite_id": _CI_NEW, "workflow_id": 340224912,
+     "event": "pull_request", "conclusion": None},
+    {"id": 37188537882, "check_suite_id": _OL_NEW, "workflow_id": 368437481,
+     "event": "pull_request", "conclusion": "success"},
+]
+
+
+def _fake_repo_gh(monkeypatch, repo, number, sha, runs, workflow_runs):
+    def fake(path):
+        if path == f"repos/{repo}/pulls/{number}":
+            return {"state": "open", "merged_at": None, "mergeable_state": "blocked",
+                    "head": {"sha": sha}}
+        if path.startswith(f"repos/{repo}/commits/{sha}/check-runs"):
+            return {"check_runs": runs if path.endswith("&page=1") else []}
+        if path.startswith(f"repos/{repo}/actions/runs?head_sha={sha}"):
+            if workflow_runs is None:
+                return None
+            return {"workflow_runs": workflow_runs if path.endswith("&page=1") else []}
+        raise AssertionError(path)
+    monkeypatch.setattr(ow, "_gh_json", fake)
+
+
+def test_pr_1716_two_row_override_lint_is_not_red(monkeypatch):
+    _fake_repo_gh(monkeypatch, "ANG-Ventures/hermes-agent", 1716, _SHA_1716, _RUNS_1716, _WF_1716)
+    health = ow.query_pr_health("ANG-Ventures/hermes-agent", 1716)
+    assert health["failing"] == []
+    assert ow.pr_is_red_or_dirty(health) is None
+
+
+def test_pr_1718_superseded_workflow_runs_are_not_red(monkeypatch):
+    _fake_repo_gh(monkeypatch, "ANG-Ventures/hermes-agent", 1718, _SHA_1718, _RUNS_1718, _WF_1718)
+    health = ow.query_pr_health("ANG-Ventures/hermes-agent", 1718)
+    assert health["failing"] == []
+    assert ow.pr_is_red_or_dirty(health) is None
+
+
+def test_pr_1718_unreadable_workflow_runs_fail_closed(monkeypatch):
+    _fake_repo_gh(monkeypatch, "ANG-Ventures/hermes-agent", 1718, _SHA_1718, _RUNS_1718, None)
+    failing = ow.query_pr_health("ANG-Ventures/hermes-agent", 1718)["failing"]
+    assert "All required checks pass" in failing and "publish" in failing
+
+
+def test_failure_in_the_newer_run_still_reads_red(monkeypatch):
+    runs = _RUNS_1718 + [_row(111396999999, _CI_NEW, "failure", "All required checks pass")]
+    _fake_repo_gh(monkeypatch, "ANG-Ventures/hermes-agent", 1718, _SHA_1718, runs, _WF_1718)
+    assert ow.query_pr_health("ANG-Ventures/hermes-agent", 1718)["failing"] == [
+        "All required checks pass"]
+
+
+def test_superseded_suites_rules():
+    wf = [{"id": 1, "check_suite_id": 11, "workflow_id": 7, "event": "pull_request",
+           "conclusion": "cancelled"},
+          {"id": 2, "check_suite_id": 12, "workflow_id": 7, "event": "pull_request",
+           "conclusion": "success"},
+          {"id": 3, "check_suite_id": 13, "workflow_id": 7, "event": "push",
+           "conclusion": "cancelled"},
+          {"id": 4, "check_suite_id": 14, "workflow_id": 8, "event": "pull_request",
+           "conclusion": "failure"},
+          {"id": 5, "check_suite_id": 15, "workflow_id": 8, "event": "pull_request",
+           "conclusion": "success"}]
+    # only a CANCELLED run with a newer run of the same (workflow, event) is superseded:
+    # the push run has no newer push sibling, and a failed run is never hidden this way
+    assert ow._superseded_suites(wf) == frozenset({11})
+    # the newest run of a workflow is never superseded, even when cancelled
+    assert ow._superseded_suites([dict(wf[1], conclusion="cancelled"), wf[0]]) == frozenset({11})
+
+
+def test_cancelled_then_skipped_same_check():
+    wf = {1: (10, "pull_request"), 2: (10, "pull_request")}
+    # a newer skipped run of the same check supersedes the cancelled one
+    assert ow.red_check_names([_run(1, "cancelled", 1), _run(2, "skipped", 2)], wf) == []
+    # an OLDER skipped run does not: the cancel is the latest word
+    assert ow.red_check_names([_run(1, "skipped", 1), _run(2, "cancelled", 2)], wf) == ["lint"]
+    # rows in a superseded suite are dropped whatever their conclusion
+    assert ow.red_check_names([_run(1, "failure", 1)], wf, frozenset({1})) == []
+
+
 def test_heartbeat_is_never_a_trigger_pure():
     assert "heartbeat" not in ow.SCAN_KINDS
     assert ow.is_stuck("heartbeat", {}) is False
@@ -459,3 +834,35 @@ def test_worker_only_gateway_skips_the_scan(env, monkeypatch):
     env["runner"]._active_profile_name = lambda: "daedalus"
     monkeypatch.setattr(ow, "scan", lambda *a, **k: (_ for _ in ()).throw(AssertionError("scanned")))
     assert asyncio.run(ow.tick(env["runner"], now=1.0, state=_held_state(env, 0))) == 0
+
+
+# --- t_121bd42e: cancelled-then-rerun ordering + the wake names the run url --
+
+def test_cancel_then_rerun_success_same_check_is_green():
+    # [cancelled@t0, success@t0+17s], one check: the newer run decides
+    runs = [_run(1, "cancelled", 1, "override_lint / override_lint"),
+            _run(2, "success", 1, "override_lint / override_lint")]
+    assert ow.red_check_names(runs) == []
+
+
+def test_trailing_cancel_after_success_keeps_current_rule():
+    # [success@t0, cancelled@t0+17s]: a cancel carries no verdict and the same-sha
+    # success still grades the head (mirrors kanban-review-merge-pass effective_checks)
+    runs = [_run(1, "success", 1), _run(2, "cancelled", 1)]
+    assert ow.red_check_names(runs) == []
+    # a cancel with no other verdict on the check is still red
+    assert ow.red_check_names([_run(2, "cancelled", 1)]) == ["lint"]
+
+
+def test_red_wake_text_names_the_judged_check_run_url(monkeypatch):
+    url_old = "https://github.com/o/r/runs/1"
+    url_new = "https://github.com/o/r/runs/2"
+    runs = [dict(_row(1, 7, "success", "e2e"), html_url=url_old),
+            dict(_row(2, 7, "failure", "e2e"), html_url=url_new)]
+    _fake_repo_gh(monkeypatch, "o/r", 5, "a" * 40, runs, [])
+    health = ow.query_pr_health("o/r", 5)
+    assert health["failing"] == ["e2e"]
+    assert health["failing_urls"] == [url_new]   # the newest run, the one that judged red
+    assert ow.pr_is_red_or_dirty(health) == f"red: e2e <{url_new}>"
+    # an older health dict without urls still renders names only
+    assert ow.pr_is_red_or_dirty({"state": "open", "failing": ["e2e"]}) == "red: e2e"

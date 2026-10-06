@@ -15,6 +15,7 @@ sibling sites fixed in the same sweep:
 - Codex/Responses transport: ultra → max for EVERY model, not just gpt-5.6.
 """
 
+from agent.reasoning_effort import kimi_effort_route, tokenhub_effort_route
 from agent.transports import get_transport
 import agent.transports.chat_completions  # noqa: F401
 import agent.transports.codex  # noqa: F401
@@ -28,7 +29,7 @@ def _kimi_kwargs(model, reasoning_config):
     return _cc().build_kwargs(
         model=model,
         messages=[{"role": "user", "content": "hi"}],
-        is_kimi=True,
+        effort_route=kimi_effort_route(model),
         reasoning_config=reasoning_config,
     )
 
@@ -87,7 +88,7 @@ class TestTokenHubEffortVocabulary:
         return _cc().build_kwargs(
             model="hunyuan-t2",
             messages=[{"role": "user", "content": "hi"}],
-            is_tokenhub=True,
+            effort_route=tokenhub_effort_route(),
             reasoning_config=reasoning_config,
         )
 

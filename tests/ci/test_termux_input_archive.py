@@ -1,5 +1,8 @@
 """CI runs archival before the exact tool and payload consumers."""
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -95,3 +98,57 @@ def test_scheduled_and_main_r2_consumers_skip_without_credentials():
         needs = {native["needs"]: {"result": "success", "outputs": {"configured": configured}}}
         assert gate(native["if"], {"release": release}, needs) is runs, (configured, release)
 
+
+
+def _run_r2_probe(step, tmp_path, env):
+    out, summary = tmp_path / "output", tmp_path / "summary"
+    out.write_text("", encoding="utf-8")
+    summary.write_text("", encoding="utf-8")
+    base = {k: v for k, v in os.environ.items() if not k.startswith("CLOUDFLARE_R2_")}
+    proc = subprocess.run(["bash", "-e", "-c", step["run"]], capture_output=True, text=True,
+                          env={**base, **env, "GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(summary)})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return out.read_text(encoding="utf-8"), proc.stdout + summary.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_canary_build_skips_green_when_r2_is_not_provisioned(tmp_path):
+    """2026-10-05 run 37271368247: a fork with no R2 bucket failed every canary at the archive step."""
+    validate = load("desktop-bundled-release.yml")["jobs"]["validate"]
+    steps = validate["steps"]
+    (probe,) = [s for s in steps if s.get("id") == "r2"]
+    (archive,) = [s for s in steps if s.get("run") == "python3 -m scripts.ci.archive_inputs"]
+    (admission,) = [s for s in steps if s.get("id") == "admission"]
+    assert R2_ENV | {"CLOUDFLARE_R2_PUBLIC_URL"} <= probe["env"].keys()
+    assert steps.index(probe) < steps.index(archive) < steps.index(admission)
+
+    output, notice = _run_r2_probe(probe, tmp_path, {})
+    assert "skip=true" in output and "skipped: R2 not provisioned" in notice
+    # Any R2 value at all means a provisioned (or half-provisioned) bucket: build, and fail loud if partial.
+    output, _ = _run_r2_probe(probe, tmp_path, {"CLOUDFLARE_R2_ACCOUNT_ID": "account"})
+    assert "skip=false" in output
+
+    canary = DOWNLOADABLE_DISPATCHES["tag"]
+    assert gate(probe["if"], canary, {}, job_if=False)
+    # Only the canary tag build may skip; stable, commit and channel builds always need R2.
+    for dispatch in ("candidate", "commit", "channel"):
+        assert not gate(probe["if"], DOWNLOADABLE_DISPATCHES[dispatch], {}, job_if=False), dispatch
+    # Disposable inputs on a canary tag are not a plain canary build: the probe must not
+    # turn admission's rejection into a green skip (Prism b4bfc20a62fa on #1763).
+    for disposable in ({"disposable_run": "98765"}, {"disposable_channel": "native-preview"}):
+        assert not gate(probe["if"], {**canary, **disposable}, {}, job_if=False), disposable
+    skipped = {"r2": {"outputs": {"skip": "true"}}}
+    built = {"r2": {"outputs": {"skip": "false"}}}
+    for step in (archive, admission):
+        assert not gate(step["if"], canary, {}, job_if=False, steps=skipped)
+        assert gate(step["if"], canary, {}, job_if=False, steps=built)
+        assert gate(step["if"], DOWNLOADABLE_DISPATCHES["commit"], {}, job_if=False, steps={})
+
+    # With admission skipped validate exports no job group, so no downstream job of a canary runs.
+    jobs = load("desktop-bundled-release.yml")["jobs"]
+    unadmitted = {"result": "success", "outputs": {}}
+    for name, job in jobs.items():
+        if name == "validate" or "if" not in job:
+            continue
+        needs = {n: (unadmitted if n == "validate" else {"result": "skipped", "outputs": {}}) for n in needs_of(job)}
+        assert not gate(job["if"], canary, needs), name

@@ -9,9 +9,12 @@ BEFORE the card leaves the worker. Card t_14b81673 (2026-09-25):
     in-flight so the worker can ``gh pr ready`` and retry.
 (b) STALE -> update. A head more than :data:`STALE_BEHIND_MAX` (20, the same
     number as fleet-merge.sh ``FLEET_MERGE_STALE_BASE_MAX``) commits behind its
-    base is updated with ``PUT .../update-branch`` bound to the head SHA we
-    measured (``expected_head_sha``), so fleet-merge never answers rc=12 for it
-    (#1218, #1123). CI re-runs on the new head.
+    base AND reported ``mergeable_state=behind`` (a strict up-to-date rule blocks
+    the merge, t_39a33e70) is updated with ``PUT .../update-branch`` bound to the
+    head SHA we measured (``expected_head_sha``). CI re-runs on the new head.
+    Merge-queue repos are left to fleet-merge's own stale-base gate. A far-behind
+    head whose ``mergeable_state`` is not computed yet (null/``unknown``) is
+    deferred: neither updated nor armed (t_6395b273).
 (c) GREEN -> arm. A fresh, non-draft PR whose head check-runs are all green on a
     non-milestone card is handed to ``scripts/fleet-merge.sh`` (the only
     sanctioned merge lane; it applies the FleetReview gate, attribution and
@@ -222,7 +225,17 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             entry["behind_by"] = None
             continue
         entry["behind_by"] = behind
-        if behind > behind_max:
+        # t_39a33e70: update only when GitHub says a strict up-to-date rule blocks the merge
+        # (mergeable_state=behind). A head merely behind a non-strict base merges as is, and on a
+        # merge-queue repo fleet-merge's stale-base gate updates a far-behind head itself; pushing
+        # here only re-ran CI (198 hermes-home handoff updates in 7 d to 2026-10-04).
+        mstate = pr.get("mergeable_state")
+        # t_6395b273: null/"unknown" = GitHub has not computed mergeability yet. A far-behind
+        # head may still be blocked by a strict rule, so neither update nor arm the stale SHA.
+        if behind > behind_max and mstate in (None, "", "unknown"):
+            entry["deferred"] = f"mergeable_state={mstate!r} not computed; not updated or armed"
+            continue
+        if behind > behind_max and mstate == "behind":
             upd = gh("-X", "PUT", f"repos/{ref.repo}/pulls/{ref.number}/update-branch",
                      "-f", f"expected_head_sha={head}")
             entry["update_branch"] = "requested" if upd is not None else "failed (fail-open)"

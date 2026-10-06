@@ -88,6 +88,23 @@ def test_legacy_connect_timeout_429_is_still_rate_limit():
     assert c.reason is FailoverReason.rate_limit
 
 
+@pytest.mark.parametrize("body", [
+    {"error": "upstream attempt timed out"},
+    {"error": {"code": "tui_turn_timeout", "message": "turn timed out"}},
+])
+def test_dtlr_v2_504_stall_still_falls_back(body):
+    """t_c95abb90: once dtlr negotiates v2 its 504 read-phase stall carries
+    ``conn`` (a retry-in-place class). The stall check runs first, so it stays
+    pool_stalled -> fallback instead of re-entering the same 7-minute stall."""
+    err = RelayError(504, body, {"x-relay-error-class": "conn",
+                                 "x-relay-error-hop": "relay->bridge",
+                                 "x-relay-seat": "sub-vps-18", "x-relay-eligible": "0",
+                                 "x-pool-other-eligible": "0"})
+    c = classify_api_error(err, provider="claude-dtlr", model="claude-fable-5-1")
+    assert c.reason is FailoverReason.pool_stalled
+    assert c.should_fallback is True and c.retryable is False
+
+
 @pytest.mark.parametrize("cls,reason,fallback", [
     ("pool_pressure", FailoverReason.overloaded, False),
     ("quota_model", FailoverReason.pool_exhausted, True),
@@ -263,6 +280,32 @@ def test_quota_seat_through_the_classifier_path_on_the_loop():
 def test_capability_header_is_pool_relay_scoped(provider, want):
     h = _pool_capability_headers(SimpleNamespace(provider=provider))
     assert (h == {"x-hermes-accepts": "error-class-v2"}) is want
+
+
+# t_c95abb90: the dlr relay (:18816) faces and the bpr relay's tui face run
+# the same relay code with error_class_v2 on, so they negotiate it too, under
+# every spelling the plugin registry accepts.
+D_BT_FACES = ("claude-dtlr", "claude-dtlrs", "claude-dtlrf", "claude-btpr", "claude-bpr-tui")
+
+
+@pytest.mark.parametrize("face", D_BT_FACES)
+def test_d_bt_faces_negotiate_error_class_v2(face):
+    h = _pool_capability_headers(SimpleNamespace(provider=face))
+    assert h == _pool_capability_headers(SimpleNamespace(provider="claude-bpr"))
+    assert h == {"x-hermes-accepts": "error-class-v2"}
+
+
+@pytest.mark.parametrize("face", ("claude-dtlr", "claude-btpr"))
+def test_build_api_kwargs_chat_completions_d_bt_face_carries_accepts(face):
+    agent = _make_agent([])
+    agent.provider = face
+    kw = _kwargs(agent)
+    assert kw["extra_headers"]["x-hermes-accepts"] == "error-class-v2"
+
+
+@pytest.mark.parametrize("pin", ("claude-dtlx-3", "claude-dtlxf-3", "claude-bpx-3"))
+def test_d_bt_direct_pins_stay_unnegotiated(pin):
+    assert _pool_capability_headers(SimpleNamespace(provider=pin)) == {}
 
 
 def test_merge_keeps_existing_extra_headers():

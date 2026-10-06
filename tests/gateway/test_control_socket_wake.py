@@ -456,3 +456,60 @@ def test_wake_downgraded_under_host_contention(store, tmp_path):
     assert result["delivered"] is False
     assert result["downgraded"] == "host load 71"
     assert adapter.handled == []
+
+
+def _lane_gate(tmp_path, capped_profile):
+    from hermes_cli.kanban_wake_gate import WakeGate
+
+    probed = []
+
+    def probe(profile):
+        probed.append(profile)
+        return f"lane prov-{profile} capped" if profile == capped_profile else None
+
+    gate = WakeGate(
+        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48}}},
+        ncpu=32, loadavg=lambda: (1.0, 1.0, 1.0), lane_probe=probe,
+        state_file=tmp_path / "wake_gate.json",
+    )
+    return gate, probed
+
+
+def test_omitted_profile_is_gated_as_the_gateways_active_profile(store, tmp_path):
+    """Prism #1679 P1 86be5c93cd27: with no ``profile`` the verb probed the
+    literal ``default`` lane. A gateway started with ``-p coder`` serves
+    coder, so coder's lane is the one that runs the turn."""
+    _human_turn(store)
+    adapter = RecordingAdapter()
+    runner = _runner(store, adapter)
+    runner._active_profile_name = lambda: "coder"
+    runner._kanban_wake_gate, probed = _lane_gate(tmp_path, "coder")
+    result = asyncio.run(runner._deliver_control_wake(_params()))
+    assert probed == ["coder"], probed
+    assert result["downgraded"] == "lane prov-coder capped", result
+    assert adapter.handled == []
+
+
+def test_capped_default_lane_does_not_downgrade_a_coder_gateway(store, tmp_path):
+    _human_turn(store)
+    adapter = RecordingAdapter()
+    runner = _runner(store, adapter)
+    runner._active_profile_name = lambda: "coder"
+    runner._kanban_wake_gate, probed = _lane_gate(tmp_path, "default")
+    result = asyncio.run(runner._deliver_control_wake(_params()))
+    assert "default" not in probed, probed
+    assert not result.get("downgraded"), result
+
+
+def test_omitted_profile_is_gated_as_the_routed_profile(store, tmp_path):
+    """``profile_routes`` can send this chat to another profile; the gate
+    probes the same profile ``_build_wake_source`` resolves."""
+    _human_turn(store)
+    adapter = RecordingAdapter()
+    runner = _runner(store, adapter)
+    runner._active_profile_name = lambda: "default"
+    runner._profile_name_for_source = lambda source: "routed"
+    runner._kanban_wake_gate, probed = _lane_gate(tmp_path, "routed")
+    result = asyncio.run(runner._deliver_control_wake(_params()))
+    assert probed == ["routed"], probed
+    assert result["downgraded"] == "lane prov-routed capped", result

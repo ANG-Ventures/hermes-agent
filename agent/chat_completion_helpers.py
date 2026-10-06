@@ -97,6 +97,8 @@ _POOL_HEADER_NAMES = (
     # claude-pool #193: "gave_up" = the relay already retried an empty-content
     # 200 on the same seat AND one other seat (t_9d411670).
     "x-pool-empty-content-retried",
+    # t_6eddafcd: the seats the relay's empty-content ladder tried, in order.
+    "x-pool-empty-content-attempts",
 )
 
 
@@ -2300,9 +2302,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         is_qwen_portal=_is_qwen,
         is_github_models=_is_gh,
         is_nvidia_nim=base_url_host_matches(_host, "integrate.api.nvidia.com"),
-        is_kimi=any(base_url_host_matches(agent.base_url, h) for h in ("api.kimi.com", "moonshot.ai", "moonshot.cn")),
-        is_tokenhub=base_url_host_matches(_host, "tokenhub.tencentmaas.com"),
-        is_lmstudio=_is_lmstudio,
+        effort_route=_legacy_effort_route(agent),
         is_custom_provider=agent.provider == "custom",
         qwen_prepare_fn=agent._qwen_prepare_chat_messages if _is_qwen else None,
         qwen_prepare_inplace_fn=agent._qwen_prepare_chat_messages_inplace if _is_qwen else None,
@@ -2312,6 +2312,18 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         provider_name=agent.provider,
     ))
+
+
+def _legacy_effort_route(agent):
+    """Top-level ``reasoning_effort`` vocabulary for an unregistered route, resolved from the endpoint
+    host (Moonshot/Kimi direct, Tencent TokenHub); None = the route has no top-level knob."""
+    from agent.reasoning_effort import kimi_effort_route, tokenhub_effort_route
+
+    if any(base_url_host_matches(agent.base_url, h) for h in ("api.kimi.com", "moonshot.ai", "moonshot.cn")):
+        return kimi_effort_route(agent.model)
+    if base_url_host_matches(agent._base_url_lower, "tokenhub.tencentmaas.com"):
+        return tokenhub_effort_route()
+    return None
 
 
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
@@ -2706,6 +2718,7 @@ _FALLBACK_ANNOUNCE_LABELS = {
     "payload_too_large": "payload too large",
     "image_too_large": "image too large",
     "format_error": "bad request",
+    "lane_incapable": "lane cannot serve this request",
 }
 
 
@@ -3240,6 +3253,7 @@ _FALLBACK_REASON_LABELS = {
     FailoverReason.provider_policy_blocked: "provider policy blocked the request",
     FailoverReason.content_policy_blocked: "content policy blocked the request",
     FailoverReason.format_error: "request format rejected",
+    FailoverReason.lane_incapable: "lane cannot serve the request shape",
     FailoverReason.role_alternation: "adjacent same-role messages rejected",
     FailoverReason.invalid_encrypted_content: "encrypted reasoning state rejected",
     FailoverReason.multimodal_tool_content_unsupported: "multimodal tool content unsupported",
@@ -3705,6 +3719,17 @@ def try_activate_fallback(
         quota_skipped = getattr(agent, "_quota_gate_skipped_providers", set()) or set()
         if fb_provider in quota_skipped:
             logger.debug("Fallback skip: %s is quota-exhausted per the usage registry", fb_provider)
+            continue
+        # A lane that declares it cannot serve this request's SHAPE (tools[] on an
+        # interactive bridge with hostTools off, a native image part on a Phase 1
+        # tui face) would only answer 400 and cost a banner plus a round-trip
+        # (2026-10-05 13:27 / 14:16: two dead hops per tool turn). One INFO line,
+        # no ledger row, no HTTP call; the chain order is untouched (t_1ed37625).
+        from agent.fallback_capability import lane_incapable_shape, stamped_request_shape
+
+        _incapable = lane_incapable_shape(fb_provider, stamped_request_shape(agent))
+        if _incapable:
+            logger.info("skipped %s: lane_incapable(%s)", fb_provider, _incapable)
             continue
         # A relay deploy-drain refuses EVERY model on the failing provider, so a
         # same-provider entry (a MODEL fallback, e.g. fable -> opus on claude-bpr)

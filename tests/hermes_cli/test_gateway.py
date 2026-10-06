@@ -375,6 +375,8 @@ def test_systemd_install_checks_linger_status(monkeypatch, tmp_path):
     monkeypatch.setattr(gateway.subprocess, "run", fake_run)
     monkeypatch.setattr(gateway, "_ensure_linger_enabled", lambda: helper_calls.append(True))
 
+    # The hermetic HERMES_HOME is a temp dir outside the account tree; admit it (admission: test_gateway_service_owner).
+    monkeypatch.setattr(gateway, "_native_service_homes", lambda: {gateway.get_hermes_home().resolve()})
     gateway.systemd_install(force=False)
 
     assert unit_path.exists()
@@ -407,7 +409,8 @@ def test_gateway_install_noninteractive_skips_legacy_unit_prompt(monkeypatch, tm
         "prompt_yes_no",
         lambda question, default=True: calls.append(("prompt", question)) or True,
     )
-    monkeypatch.setattr(gateway, "remove_legacy_hermes_units", lambda interactive=False: calls.append(("remove_legacy",)))
+    monkeypatch.setattr(gateway, "remove_legacy_hermes_units",
+                        lambda interactive=False: calls.append(("remove_legacy",)) or (1, []))
     monkeypatch.setattr(gateway, "print_legacy_unit_warning", lambda: None)
 
     fake_path = tmp_path / "hermes-gateway.service"
@@ -418,6 +421,8 @@ def test_gateway_install_noninteractive_skips_legacy_unit_prompt(monkeypatch, tm
     monkeypatch.setattr(gateway, "print_systemd_scope_conflict_warning", lambda: None)
     monkeypatch.setattr(gateway, "_service_scope_label", lambda system=False: "user")
 
+    # The hermetic HERMES_HOME is a temp dir outside the account tree; admit it (admission: test_gateway_service_owner).
+    monkeypatch.setattr(gateway, "_native_service_homes", lambda: {gateway.get_hermes_home().resolve()})
     gateway.systemd_install(non_interactive=True)
 
     # Legacy units removed without prompting.
@@ -1138,7 +1143,10 @@ def test_install_if_missing_only_installs_when_no_service_exists(monkeypatch, in
     monkeypatch.setattr(gateway, "_guard_named_profile_under_multiplexer", lambda force: None)
     monkeypatch.setattr(gateway, "_service_mgmt_blocked", lambda: False)
     monkeypatch.setattr(gateway, "_service_backend", lambda: "launchd")
-    monkeypatch.setattr(gateway, "launchd_install", lambda force, start_now: installs.append(force))
+    # The sandbox HERMES_HOME is a scratch home, which `gateway install` refuses by design.
+    monkeypatch.setattr("hermes_cli.gateway_service_owner.home_may_install_service", lambda home: True)
+    monkeypatch.setattr(gateway, "launchd_install",
+                        lambda force, start_now, force_unit_path=False: installs.append(force))
 
     gateway._cmd_install(SimpleNamespace(if_missing=True, force=False, system=False, run_as_user=None))
 

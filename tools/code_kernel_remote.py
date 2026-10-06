@@ -228,6 +228,8 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
             cell_source=RUNNER_CELL_SOURCE, capture_limit=MAX_STDOUT_BYTES, idle_exit=idle_exit))
         _ship_file_to_remote(env, f"{kernel_dir}/hermes_tools.py",
                              generate_hermes_tools_module(list(sandbox_tools), transport="file"))
+        from tools.code_execution_tool import _AGENT_TOOLS_ALIAS_MODULE
+        _ship_file_to_remote(env, f"{kernel_dir}/agent_tools.py", _AGENT_TOOLS_ALIAS_MODULE)
         # kernel.env is removed after sourcing: the runner's env keeps the
         # values, so the token file need not sit at rest for the kernel's
         # lifetime. runner.log is pre-created 600 so the launch redirect never

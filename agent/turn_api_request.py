@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Dict, Optional
 
+from agent.fallback_capability import stamp_request_shape
 from agent.message_sanitization import sanitize_outbound_kwargs, strip_images_for_rejecting_model
 from hermes_cli.observability.shared_metrics_efficiency import observe_request_tools
 from utils import env_var_enabled
@@ -121,6 +122,9 @@ def build_api_request(
     )
     # A model that rejected image content gets text only; history keeps the images.
     strip_images_for_rejecting_model(agent, api_messages)
+    # The attempt's wire shape (tools / native images), read by the fallback chain
+    # walker to skip a lane that declares it cannot serve it (t_1ed37625).
+    stamp_request_shape(agent, api_messages, tools_for_api)
     observe_request_tools(agent, tools_for_api)
     if tools_for_api == agent.tools:
         api_kwargs = agent._build_api_kwargs(api_messages)

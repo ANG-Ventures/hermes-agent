@@ -7,6 +7,8 @@ import threading
 from io import StringIO
 from pathlib import Path
 
+import pytest
+
 from scripts.hermes_parity import bisect, buckets, catchup, cli, forkdelta, gates, gitops, lint_manifest, lint_merge_traps, lint_unbound, state
 
 
@@ -474,6 +476,113 @@ def test_lint_manifest_requires_upstream_ref_for_absorbed_entry(tmp_path: Path) 
 
     assert not result.ok
     assert any("absorbed" in error and "requires upstream_ref" in error for error in result.errors)
+
+
+def test_lint_manifest_refuses_call_site_without_e2e_test(tmp_path: Path) -> None:
+    """D2b (t_96049446): a declared call site with no e2e test fails the whole lint, by name."""
+    entry = _schema_feature("footer fork kwargs", "fork-permanent")
+    entry["call_site"] = "gateway/run_turn.py::GatewayTurnMixin._hmwa_runtime_footer_line"
+    _write_fork_manifest(tmp_path, [entry])
+
+    result = lint_manifest.lint_manifest(tmp_path)
+
+    assert not result.ok
+    assert any(
+        "footer fork kwargs" in error and "_hmwa_runtime_footer_line" in error and "D2b" in error
+        for error in result.errors
+    ), result.errors
+
+
+def test_lint_call_sites_e2e_test_must_be_a_registered_test(tmp_path: Path) -> None:
+    entry = _schema_feature("footer fork kwargs", "fork-permanent")
+    entry["call_site"] = "gateway/run_turn.py::GatewayTurnMixin._hmwa_runtime_footer_line"
+    entry["call_site_tests"] = ["tests/gateway/test_x.py::test_render"]
+    manifest = _write_fork_manifest(tmp_path, [entry])
+
+    assert any("not in its tests list" in e for e in lint_manifest.lint_call_sites(manifest))
+
+    entry["tests"] = ["tests/gateway/test_x.py::test_render"]
+    manifest.write_text(json.dumps([entry]), encoding="utf-8")
+    assert lint_manifest.lint_call_sites(manifest) == []
+
+
+def test_lint_call_sites_ignores_entries_without_call_site(tmp_path: Path) -> None:
+    manifest = _write_fork_manifest(tmp_path, [_schema_feature("pure helper", "fork-permanent")])
+
+    assert lint_manifest.lint_call_sites(manifest) == []
+
+
+def _census_feature(verdict: str, evidence: str, residual: list[str] | None = None) -> dict[str, object]:
+    feature = _schema_feature("census feature", "upstream-intended")
+    census: dict[str, object] = {"verdict": verdict, "evidence": evidence}
+    if residual is not None:
+        census["residual"] = residual
+    feature["parity_census"] = census
+    return feature
+
+
+@pytest.mark.parametrize("verdict", ["EQUIVALENT-UPSTREAM", "ABSORBED-UPSTREAM"])
+def test_lint_manifest_rejects_upstream_sufficient_verdict_with_fork_only_remainder(
+    tmp_path: Path, verdict: str
+) -> None:
+    # Prism P1 on #1704: an upstream-sufficient verdict whose own evidence names a live
+    # fork-only delta lets a sync resolve toward upstream and drop that delta silently.
+    _write_fork_manifest(tmp_path, [_census_feature(
+        verdict,
+        "PARTIAL. Residual live fork delta: resolve_job_script_timeout, upstream 0 hits.",
+    )])
+
+    result = lint_manifest.lint_manifest(tmp_path)
+
+    assert not result.ok
+    assert any(verdict in error and "PARTIAL-UPSTREAM" in error for error in result.errors)
+
+
+def test_lint_manifest_rejects_upstream_sufficient_verdict_listing_residual(tmp_path: Path) -> None:
+    _write_fork_manifest(tmp_path, [_census_feature("EQUIVALENT-UPSTREAM", "same chain", ["helper()"])])
+
+    result = lint_manifest.lint_manifest(tmp_path)
+
+    assert not result.ok
+    assert any("lists a residual" in error for error in result.errors)
+
+
+def test_lint_manifest_partial_verdict_requires_residual(tmp_path: Path) -> None:
+    _write_fork_manifest(tmp_path, [_census_feature("PARTIAL-UPSTREAM", "PARTIAL. helper fork-only.")])
+    missing = lint_manifest.lint_manifest(tmp_path)
+    assert not missing.ok
+    assert any("requires a non-empty residual" in error for error in missing.errors)
+
+    (tmp_path / "docs" / "sync" / "fork-features.json").write_text(json.dumps([
+        _census_feature("PARTIAL-UPSTREAM", "PARTIAL. helper fork-only.", ["helper()"]),
+        _census_feature("EQUIVALENT-UPSTREAM", "byte-identical to upstream 7427b9d581"),
+    ]), encoding="utf-8")
+    assert lint_manifest.lint_manifest(tmp_path).ok
+
+
+def test_lint_manifest_rejects_unknown_census_verdict(tmp_path: Path) -> None:
+    _write_fork_manifest(tmp_path, [_census_feature("MOSTLY-UPSTREAM", "n/a")])
+
+    result = lint_manifest.lint_manifest(tmp_path)
+
+    assert not result.ok
+    assert any("invalid parity_census verdict" in error for error in result.errors)
+
+
+def test_repo_fork_manifest_call_sites_all_have_e2e_tests() -> None:
+    """D2b on the LIVE registry (t_96049446, Ace 10-04 12:13: "make sure we have regression testing
+    for that next time"). The fixture tests above prove the rule; this one proves the shipped
+    manifest obeys it, so stripping a ``call_site_tests`` list (or adding a ``call_site`` without
+    one) turns CI red on main instead of silently re-opening the footer class."""
+    manifest = Path(__file__).resolve().parents[2] / "docs" / "sync" / "fork-features.json"
+
+    assert lint_manifest.lint_call_sites(manifest) == []
+
+
+def test_repo_fork_manifest_census_verdicts_agree_with_evidence() -> None:
+    manifest = Path(__file__).resolve().parents[2] / "docs" / "sync" / "fork-features.json"
+
+    assert lint_manifest.lint_census(manifest) == []
 
 
 def test_load_manifest_defaults_legacy_lifecycle_to_fork_permanent(tmp_path: Path) -> None:

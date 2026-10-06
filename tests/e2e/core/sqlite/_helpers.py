@@ -36,6 +36,7 @@ from pathlib import Path
 
 from hermes_cli.sqlite_runtime import is_sqlite_wal_reset_vulnerable
 from tests.conformance.persistence._harness import REPO_ROOT, kill9_and_reap, wait_for
+from tests.e2e.environ_snapshot import environ_snapshot
 
 ROLES = Path(__file__).with_name("_roles.py")
 DEFAULT_SEED = 20260923
@@ -73,7 +74,7 @@ def episode_seed(label: str) -> int:
 
 def child_env(home: Path, hermes_home: Path) -> dict:
     """Probe hygiene: private HOME/HERMES_HOME, no provider credentials, repo importable."""
-    env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
+    env = {k: v for k, v in environ_snapshot().items() if not k.endswith("_API_KEY")}
     env.update({
         "HOME": str(home),
         "HERMES_HOME": str(hermes_home),
@@ -281,8 +282,21 @@ class Chamber:
                     pass  # torn final line of a SIGKILLed child
         return out
 
-    def errors(self) -> list[tuple[str, dict]]:
-        return [(name, e) for name in list(self.procs) for e in self.events(name) if e.get("event") == "error"]
+    def errors(self, since: dict[str, int] | None = None) -> list[tuple[str, dict]]:
+        """Error reports per role; with *since* (an :meth:`errors_mark`) only those reported after it,
+        so an episode sees its own errors and the shared reader's new ones, never an earlier episode's."""
+        out = []
+        for name in list(self.procs):
+            errs = [e for e in self.events(name) if e.get("event") == "error"]
+            out += [(name, e) for e in errs[(since or {}).get(name, 0):]]
+        return out
+
+    def errors_mark(self) -> dict[str, int]:
+        """Position to pass to :meth:`errors` (per-role error counts so far)."""
+        marks: dict[str, int] = {}
+        for name, _e in self.errors():
+            marks[name] = marks.get(name, 0) + 1
+        return marks
 
     def journal(self, name: str) -> tuple[dict[str, str], set[str]]:
         """``(intents: tok -> sid, acked tokens)`` for one writer run."""

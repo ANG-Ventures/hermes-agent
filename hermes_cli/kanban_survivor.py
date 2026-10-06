@@ -799,44 +799,132 @@ def _registered_nested(workspace):
 
 
 def _pinned_submodule(path, parent):
-    """True when ``path`` is a checked-out submodule holding no bytes of its own.
+    """The pinned sha when ``path`` is a checked-out submodule holding no bytes of its own.
 
     The parent's index pins a ``160000`` gitlink at ``path``; the submodule's
-    HEAD is exactly that sha; a remote-tracking ref in the submodule holds it;
-    and ``status --ignored`` shows nothing. Such a checkout is reproducible from
-    the parent commit plus the submodule's remote, so the parent's survivor
-    already covers it (t_adf672fb: t_327d1c1b's ``sat/`` clone with an
-    initialised ``esp-libopus`` was refused ahead of every survivor branch).
-    Any failed or ambiguous probe answers False -- the nested refusal stands.
+    HEAD is exactly that sha; a remote-tracking ref in the submodule holds it
+    (or FETCH_HEAD shows a configured remote served it by sha);
+    and ``status --ignored`` shows nothing. Such a checkout carries no working
+    bytes the parent's survivor does not name (t_adf672fb: t_327d1c1b's ``sat/``
+    clone with an initialised ``esp-libopus`` was refused ahead of every
+    survivor branch). Whether the remote still RETAINS the commit is a separate
+    question, answered by :func:`_unretained_pins`. Any failed or ambiguous
+    probe answers None -- the nested refusal stands.
     """
     try:
         rel = path.relative_to(parent).as_posix()
         entry = _git(parent, "ls-files", "--stage", "--", rel, check=False)
         lines = entry.stdout.decode("utf-8", "replace").splitlines()
         if entry.returncode or len(lines) != 1:
-            return False
+            return None
         meta, _, listed = lines[0].partition("\t")
         fields = meta.split()
         if listed != rel or len(fields) < 2 or fields[0] != "160000":
-            return False
+            return None
         head = _git(path, "rev-parse", "--verify", "HEAD", check=False)
         if head.returncode or head.stdout.decode().strip() != fields[1]:
-            return False
+            return None
         status = _git(path, "status", "--porcelain", "--ignored", "--untracked-files=all",
                       check=False)
         if status.returncode or status.stdout:
-            return False
+            return None
         held = _git(path, "for-each-ref", "--contains", fields[1], "--format=%(refname)",
                     "refs/remotes", check=False)
-        return held.returncode == 0 and bool(held.stdout.strip())
+        if held.returncode == 0 and held.stdout.strip():
+            return fields[1]
+        return fields[1] if _fetched_from_remote(path, fields[1]) else None
     except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _url_key(url):
+    url = url.strip().rstrip("/")
+    return url[:-4] if url.endswith(".git") else url
+
+
+def _fetched_from_remote(path, sha):
+    """True when FETCH_HEAD shows a configured remote served a tip holding ``sha``.
+
+    ``git submodule update`` fetches a pinned commit BY SHA when no branch of
+    the submodule's remote contains it (a fork whose gitlink names an upstream
+    merge GitHub serves from the fork network). No remote-tracking ref is
+    written then; FETCH_HEAD is the record that the remote answered for the sha
+    (t_0b0f392d: house-voice ``deps/libpeer`` at 9319aa4 held 5 cards).
+    """
+    head = _git(path, "rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD", check=False)
+    if head.returncode:
         return False
+    fetch_head = Path(head.stdout.decode().strip())
+    if not fetch_head.is_file():
+        return False
+    urls = _git(path, "config", "--get-regexp", r"^remote\..*\.url$", check=False)
+    remotes = {_url_key(line.split(" ", 1)[1])
+               for line in urls.stdout.decode("utf-8", "replace").splitlines() if " " in line}
+    for line in fetch_head.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        tip, _, rest = line.partition("\t")
+        source = _fetch_head_source(rest.partition("\t")[2])
+        if not source or _url_key(source) not in remotes:
+            continue
+        if _git(path, "merge-base", "--is-ancestor", sha, tip, check=False).returncode == 0:
+            return True
+    return False
 
 
-def _drop_pinned_submodules(repos, parent_of):
-    """``repos`` minus clean pinned submodules of their nearest enclosing repo."""
-    return [repo for repo in repos
-            if not ((parent := parent_of(repo)) is not None and _pinned_submodule(repo, parent))]
+#: The note column of a FETCH_HEAD line: ``[branch |tag |remote-tracking branch ]'<name>' of <url>``,
+#: or the bare ``<url>`` when HEAD was fetched. A ref name or sha holds no space or quote, so the
+#: delimiter is the first `` of `` after the quoted name -- never one inside the url
+#: (``/repos/copy of lib``, Prism P1 590a301d on hermes-agent#1751).
+_FETCH_NOTE = re.compile(r"(?:(?:branch|tag|remote-tracking branch) )?'[^' ]+' of (?P<url>.+)")
+
+
+def _fetch_head_source(note):
+    """The url a FETCH_HEAD note records, or '' for an empty note."""
+    match = _FETCH_NOTE.fullmatch(note)
+    return match["url"] if match else note
+
+
+def _drop_pinned_submodules(repos, parent_of, pins=None):
+    """``repos`` minus clean pinned submodules of their nearest enclosing repo.
+
+    ``pins``, when given, collects ``{submodule path: pinned sha}`` for every
+    submodule dropped, so the caller can make sure each commit survives.
+    """
+    kept = []
+    for repo in repos:
+        parent = parent_of(repo)
+        sha = _pinned_submodule(repo, parent) if parent is not None else None
+        if sha is None:
+            kept.append(repo)
+        elif pins is not None:
+            pins[repo] = sha
+    return kept
+
+
+def _unretained_pins(pins, workspace):
+    """``{path: sha}`` for the pins no head a durable remote advertises NOW contains.
+
+    FETCH_HEAD (and a local remote-tracking ref) prove only that the remote once
+    served the commit. A pin no live head holds is garbage-collectable on the
+    remote, and the parent's gitlink retains nothing in the submodule's
+    repository, so dropping it from the survivor would lose it once the checkout
+    goes (Prism P1 048708e2 on hermes-agent#1751). Same test every top-level
+    repository's clean HEAD passes: :func:`_remote_survivor` over ``ls-remote``.
+    """
+    return {path: sha for path, sha in pins.items()
+            if not _remote_survivor(path, sha, list(_published_refs(path, workspace)))}
+
+
+def _pin_bundle(path, workspace):
+    """A bundle of the submodule's HEAD (== its pin) minus what the remote's live heads hold."""
+    published = list(_published_refs(path, workspace))
+    present = _present_commits(path, sorted({ref["sha"] for ref in published}))
+    with tempfile.TemporaryDirectory(prefix="kanban-pin-") as tmp:
+        bundle = Path(tmp) / "pin.bundle"
+        # Named tip HEAD, not the bare sha: a bundle records refs, and the
+        # recoverer fetches `HEAD` out of it.
+        _git(path, "bundle", "create", str(bundle), "HEAD", "--stdin",
+             input=b"".join(f"^{other}\n".encode() for other in present))
+        return bundle.read_bytes()
 
 
 def _state(conn, task_id):
@@ -2774,7 +2862,8 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         registered = _registered_nested(workspace)
         if foreign:
             registered = [path for path in registered if not foreign.foreign(path)]
-        registered = _drop_pinned_submodules(registered, lambda _path: workspace)
+        pins = {}
+        registered = _drop_pinned_submodules(registered, lambda _path: workspace, pins)
         if registered:
             raise SurvivorUnavailable(
                 "survivor_unavailable: nested repository requires separate recovery "
@@ -2795,7 +2884,9 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         # bytes that repository's survivor does not already name (t_adf672fb).
         repos = _drop_pinned_submodules(repos, lambda repo: max(
             (other for other in repos if other != repo and repo.is_relative_to(other)),
-            key=lambda other: len(other.parts), default=None))
+            key=lambda other: len(other.parts), default=None), pins)
+        stage = "pinned submodule retention check"
+        unretained = _unretained_pins(pins, workspace)
         if any(a != b and a.is_relative_to(b) for a in repos for b in repos):
             # A patch cannot add a gitlink and files below the same path.
             raise SurvivorUnavailable("survivor_unavailable: nested repository requires separate recovery")
@@ -2819,7 +2910,9 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             # dropped from the recovery index unless carried across -- and
             # `bases` is written once, before dispatch, so it does not know
             # about a repository the worker cloned afterwards.
-            absent = _vouched_repositories(previous) - keys
+            # A dropped pin is ON DISK; its recorded pin bundle is re-cut below.
+            absent = (_vouched_repositories(previous) - keys
+                      - {str(path.relative_to(workspace)) for path in pins})
             # Coverage by an UNBOUND ref alone is not delete authority: it
             # authorised the completion that recorded it and nothing more (see
             # `_reusable`, `_authoritative_repositories`). Without this the
@@ -2999,6 +3092,13 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # omitted as derivable from `base_sha`, not lost.
                 entry["irreversible_delete"] = True
             repositories.append(entry)
+        for path, sha in sorted(unretained.items()):
+            # A pin no live remote head holds: its objects ride in the survivor.
+            key = str(path.relative_to(workspace))
+            stage = f"pinned submodule bundle {key}"
+            name = f"implementation-{len(bundles)}.bundle"
+            bundle = _store(conn, task_id, name, _pin_bundle(path, workspace), "application/x-git-bundle")
+            bundles.append(dict(bundle, repository=key, pinned_sha=sha))
         if repos and not bundles and len(refs) == len(repos) + len(carried):
             survivor = {"kind": "ref", "refs": refs}
             if any(ref.get("matched_by") == "canonical" for ref in refs):

@@ -170,6 +170,7 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     worker_started = threading.Event()
     release_worker = threading.Event()
     committed = threading.Event()
+    worker_returned = threading.Event()
     cleanup_done = threading.Event()
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
@@ -206,11 +207,13 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
             _spin_started = time.monotonic()
             while not release_worker.is_set():
                 if time.monotonic() - _spin_started > 20:
+                    worker_returned.set()
                     return (messages, None)
                 if commit_fence is not None:
                     commit_fence.touch_progress()
                 time.sleep(0.01)
             if commit_fence is not None and not commit_fence.begin_commit():
+                worker_returned.set()
                 return (messages, None)
             try:
                 self._session_db.archive_and_compact(
@@ -224,6 +227,7 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
             finally:
                 if commit_fence is not None:
                     commit_fence.finish_commit()
+                worker_returned.set()
 
     gateway_run = importlib.import_module("gateway.run")
     _write_turnhold_config(tmp_path)
@@ -232,13 +236,23 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     adapter = _CaptureAdapter()
     runner = _build_runner(gateway_run, adapter, fake_db)
 
-    started = time.monotonic()
     result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
-    elapsed = time.monotonic() - started
 
     # #90845/#92318 invariant intact: the turn is released at the budget.
     assert result == "ok"
-    assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
+    # DETERMINISTIC ORDERING WITNESS — replaces `assert elapsed < 5.0`.
+    # The wall-clock window also covers plugin discovery and handler setup
+    # (see test_session_hygiene.py, same replacement). Locally the window is
+    # 0.74s, of which plugin discovery is ~0.19s and the 0.3s hold ~0.36s;
+    # CI slice 5/16 on 2026-10-04 ran this file 10x slower (33.6s vs 3.2s)
+    # and measured 5.26s. The contract is ordering: the handler
+    # returns while the fenced worker is still streaming (it only stops once
+    # release_worker is set below), so it cannot have waited for the commit.
+    assert not worker_returned.is_set(), (
+        "the turn was held until the streaming compression worker finished — "
+        "the turn-hold budget did not release the turn"
+    )
+    assert not committed.is_set()
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
 

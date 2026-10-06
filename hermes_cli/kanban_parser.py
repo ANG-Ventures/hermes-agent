@@ -340,6 +340,10 @@ _SPECS = [
                   "any operator-profile session may act on. For cron/script minters with no "
                   "session of their own: create REFUSES a card that would be born unhomed. "
                   "Accepts 'operator' or 'operator:<name>'; exclusive with --session."),
+        _arg("--unhomed", action="store_true", default=False,
+             help="Mint the card with NO home session on purpose (same as --session none). "
+                  "Without it a worker, cron or gateway create that resolves no home is "
+                  "refused; the orphan watch infers a home for unhomed cards (t_6281f908)."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [
@@ -462,6 +466,9 @@ _SPECS = [
         _arg("--severity", choices=["warning", "error", "critical"],
              help="Only show diagnostics at or above this severity"),
         _arg("--task", help="Only show diagnostics for one task id"),
+        _arg("--placement", action="store_true",
+             help="Read-only pool placement view: band, streak and projected() per host, "
+                  "and the rung take() would pick now (no probe, no streak advance)"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
     ], aliases=["diag"], help="List active diagnostics on the current board"),
     # rehome (t_808bc8e6)
@@ -520,6 +527,15 @@ _SPECS = [
                   "Closes it done with outcome 'superseded'; no --result/--summary required, "
                   "but the pointer must be non-empty (an unnamed supersede is a silent delete "
                   "of the work)."),
+        _arg("--external", metavar="URL",
+             help="Terminal close for a card whose remaining step is an outside party's (an "
+                  "upstream maintainer merge): closes it done with outcome 'external', no "
+                  "--result/--summary/receipt/survivor PR required. URL = the upstream PR/issue "
+                  "(http/https). Requires --watcher."),
+        _arg("--watcher", metavar="ID",
+             help="With --external: the watcher that reopens the card when the upstream closes "
+                  "unmerged (e.g. the external-card-watch cron id). Recorded on the run and the "
+                  "completed event."),
         _arg("--draft-ok", metavar="REASON",
              help="Audited per-card override for the DRAFT-PR refusal: the handoff names a "
                   "draft PR that is intentionally left open (e.g. a CI vehicle for an upstream "  # windows-footgun: ok (string literal, not a call)
@@ -667,6 +683,10 @@ _SPECS = [
              help="Concrete changes required; first post a current-run review_coverage JSON comment"),
         _arg("--coverage",
              help="Review coverage JSON; records a run-attributed comment before transition (human CLI)"),
+        _arg("--operator-kind", dest="operator_kind", choices=list(kb.OPERATOR_KINDS), default=None,
+             help="With --operator: who sent it back, recorded on the changes_requested event "
+                  "(default human; automation passes machine so landing gates never treat it as a "
+                  "human CHANGES REQUESTED)"),
         # ``--operator "<who: why>"`` comes from the home-guard loop in build_parser;
         # on request-changes it is also the operator send-back (coverage waived).
     ], help="Reviewer verdict: return the active review run to its implementer"),
@@ -734,6 +754,18 @@ _SPECS = [
         _arg("--interval", type=float, default=0.5, help="Poll interval in seconds (default: 0.5)"),
     ], help="Live-stream task_events to the terminal (Ctrl+C to exit)"),
     _cmd("stats", [_json_flag()], help="Per-status + per-assignee counts + oldest-ready age"),
+    _cmd("session-closeout", [
+        _arg("session_ids", nargs="+", metavar="SESSION_ID",
+             help="Session id(s) whose cards (tasks.session_id) are closed out; pass every id of the chat lineage"),
+        _arg("--out", metavar="PATH", help="Write the markdown here (e.g. plans/closeouts/<date>_<name>.md)"),
+        _arg("--vault-out", metavar="PATH", help="Also write it into the Obsidian vault (e.g. <vault>/AI/Closeouts/x.md)"),
+        _arg("--vault", metavar="DIR", help="Vault root used to check that vault doc paths named by cards exist"),
+        _arg("--root", metavar="DIR", help="Fleet root holding kanban.db, state.db, blackbox/ (default: kanban home)"),
+        _arg("--no-network", action="store_true", help="Skip GitHub PR state reads (states print UNREAD)"),
+        _arg("--check", action="store_true", help="Exit 1 when any ang-closeout gate FAILs"),
+        _json_flag(help="Print the machine summary (counts, cards_listed, gates, open, cost) as JSON"),
+    ], help="Render one Obsidian-ready closeout for a session's cards: accounting, waves, rulings, "
+            "open remainder, cost, incidents, docs, ang-closeout gates (read-only)"),
     _cmd("home-index", [
         _arg("--check", action="store_true", help="Report drift only; exit 1 when drift >= 1"),
         _json_flag(),

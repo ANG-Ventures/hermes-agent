@@ -55,13 +55,19 @@ def test_e2e_self_hosted_architecture_and_hosted_fallback_binding():
     assert job["runs-on"].startswith("${{ fromJSON(github.event_name == 'merge_group' && "
                                      "vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && ")
     assert job["runs-on"].endswith(
-        "&& needs.placement.outputs.e2e_runs_on || ("
+        "&& needs.placement.outputs.e2e_runs_on || "
+        "vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && "
+        "(github.event_name == 'push' || github.event_name == 'merge_group' || "
+        "github.event.pull_request.head.repo.full_name == github.repository) "
+        "&& '[\"self-hosted\",\"Linux\",\"X64\",\"ace-e2e-vm\"]' || ("
         "contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') "
         "&& format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"')) "
-        "|| '[\"blacksmith-4vcpu-ubuntu-2404\"]')) }}"
+        "|| '[\"ubuntu-latest\"]')) }}"
     )
-    # The static last resort is Blacksmith 4vCPU (2026-10-03): e2e took 26 min
-    # on 2-core ubuntu-latest; a literal, so an unset repo var can never route it.
+    # The static last resort is GitHub-hosted ubuntu-latest (public repo, free
+    # minutes; t_e95fdb01): a literal, so an unset repo var can never route it.
+    # Blacksmith is reachable only through the overflow placement plan.
+    assert "blacksmith" not in job["runs-on"]
     assert "hermes-ci" not in job["runs-on"]
 
 

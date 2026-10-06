@@ -1791,18 +1791,37 @@ class GatewayTurnMixin:
         display_reasoning = escape_code_fences_for_display(display_reasoning)
         return t("gateway.reasoning.block", reasoning=display_reasoning, response=response)
 
-    def _hmwa_runtime_footer_line(self, agent_result, source, _turn_seconds):
+    async def _hmwa_runtime_footer_line(self, agent_result, source, _turn_seconds, session_entry=None,
+                                        session_key=None):
         """Runtime-metadata footer for the FINAL message of the turn; off by default
-        (display.runtime_footer.enabled=false)."""
-        from gateway.run import _load_gateway_config, _platform_config_key, _terminal_scope_cwd
+        (display.runtime_footer.enabled=false). Fork kwargs (provider, context figure, reasoning,
+        message stats) are pinned by tests/gateway/test_footer_consumer_in_turn.py."""
+        from gateway.run import (
+            _footer_context_tokens, _load_gateway_config, _platform_config_key,
+            _resolve_footer_message_stats, _terminal_scope_cwd,
+        )
         try:
             from gateway.runtime_footer import build_footer_line as _bfl
+            _footer_cfg = _load_gateway_config()
+            _msg_count, _msg_limit = await _resolve_footer_message_stats(
+                getattr(self, "_session_db", None), getattr(session_entry, "session_id", None), _footer_cfg,
+            )
             return _bfl(
-                user_config=_load_gateway_config(),
+                user_config=_footer_cfg,
                 platform_key=_platform_config_key(source.platform), model=agent_result.get("model"),
-                context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
+                provider=agent_result.get("provider"),
+                context_tokens=_footer_context_tokens(agent_result),
+                context_estimated=bool(agent_result.get("context_tokens_estimated")),
                 context_length=agent_result.get("context_length") or None,
                 cwd=_terminal_scope_cwd(""), turn_seconds=_turn_seconds,
+                reasoning=(
+                    self._footer_reasoning_label(
+                        reasoning_config=agent_result.get("reasoning_config"),
+                        source=source, session_key=session_key,
+                    )
+                    or None
+                ),
+                message_count=_msg_count, message_limit=_msg_limit,
                 requested_model=agent_result.get("requested_model"),
                 served_model=agent_result.get("served_model"),
             )
@@ -2365,6 +2384,12 @@ class GatewayTurnMixin:
 
     async def _handle_message_with_agent_admitted(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard and an admission slot."""
+        if getattr(event, "internal", False):
+            # t_07ffc6cb: a kanban wake that waited in the queue may be about a card
+            # that has since gone done/archived.
+            from gateway.kanban_wake_freshness import drop_stale
+            if await drop_stale(event):
+                return None
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -2469,7 +2494,9 @@ class GatewayTurnMixin:
                 _run_start_resume_marked_at=_run_start_resume_marked_at,
             )
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
-            _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
+            _footer_line = await self._hmwa_runtime_footer_line(
+                agent_result, source, _turn_seconds, session_entry=session_entry, session_key=session_key,
+            )
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
@@ -3983,6 +4010,10 @@ class GatewayTurnMixin:
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            from gateway.kanban_wake_freshness import drop_stale
+            while pending_event is not None and await drop_stale(pending_event):
+                pending_event = self._promote_queued_event(
+                    session_key, adapter, _dequeue_pending_event(adapter, session_key))
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):

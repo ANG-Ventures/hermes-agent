@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from tests.fakes.fake_llm_provider import FakeLLMServer, Text, write_hermes_home
+from tests.e2e.environ_snapshot import environ_snapshot
 
 pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux")
 
@@ -98,7 +99,7 @@ def test_resizes_keep_each_transcript_line_once_in_tmux_scrollback(tmp_path: Pat
 
     with llm:
         write_hermes_home(home / ".hermes", llm.base_url)
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("HERMES_", "TMUX"))}
+        env = {k: v for k, v in environ_snapshot().items() if not k.startswith(("HERMES_", "TMUX"))}
         env.update(HOME=str(home), HERMES_HOME=str(home / ".hermes"), PYTHONPATH=str(REPO_ROOT),
                    TERM="xterm-256color", PYTHONFAULTHANDLER="1")
         argv = [sys.executable, "-m", "hermes_cli.main", "chat", "--cli", "--yolo"]

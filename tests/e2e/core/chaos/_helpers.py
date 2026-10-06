@@ -27,6 +27,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -117,7 +118,7 @@ def hermetic_env(home: Path, hermes_home: Path, tag: str) -> dict[str, str]:
     """Child env: fake HOME/HERMES_HOME, no real credentials, repo importable, and a
     tag every descendant inherits so the orphan scan can find it after reparenting."""
     env = {
-        k: v for k, v in os.environ.items()
+        k: v for k, v in environ_snapshot().items()
         if not (
             k.endswith(("_API_KEY", "_TOKEN", "_SECRET"))
             or k.startswith(("HERMES_", "OPENROUTER", "ANTHROPIC", "OPENAI", "NOUS_"))

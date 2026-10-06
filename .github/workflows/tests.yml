@@ -149,6 +149,7 @@ jobs:
           fi
           MATRIX=$(python3 scripts/run_tests_parallel.py \
             --generate-slices "$SLICES" \
+            --full-slices '${{ inputs.slice_count }}' \
             "${IMPACT_ARGS[@]}" \
             --test-scope '${{ inputs.test_scope }}' \
             --self-hosted-slots "$CI_SELF_HOSTED_SLOTS" \
@@ -207,6 +208,7 @@ jobs:
             scripts/ci_overflow_request.py
             scripts/run_tests_parallel.py
             scripts/ci/list_os_marked_tests.py
+            scripts/ci/flake_quarantine.py
           if-no-files-found: error
           retention-days: 1
 
@@ -475,21 +477,68 @@ jobs:
           path: test_durations.json
           key: test-durations-${{ github.run_id }}
 
+  # Real python-telegram-bot tests (`test_*.py` named `*_ptb.py`). The slice env has no PTB on
+  # purpose (~29 gateway test files install a MagicMock `telegram` module), so
+  # --generate-slices leaves these files out and this job runs them with the
+  # `telegram` extra. A registry call_site_tests file that skips here is RED
+  # (run_tests_parallel._noop_guard), so a missing PTB cannot read green.
+  ptb-tests:
+    name: Run tests (real PTB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "telegram"]'
+          test-environment: 'true'
+          prune-python-cache: true
+
+      - name: Run *_ptb.py tests
+        run: |
+          # Same rule as run_tests_parallel: a test_*.py file whose name ends
+          # in _ptb.py (so tests/test_ptb.py is included).
+          mapfile -t files < <(find tests -name 'test_*.py' -name '*_ptb.py' | sort)
+          printf '%s\n' "${files[@]}"
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no *_ptb.py test files found"; exit 1; }
+          "$HERMES_PYTHON" -c "import telegram; print('python-telegram-bot', telegram.__version__)"
+          # --junit-dir: the registered call_site_tests nodeids are checked
+          # one by one against the junit (a skipped nodeid is RED).
+          scripts/run_tests.sh --junit-dir ci-junit "${files[@]}" -- -v
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
   e2e:
     needs: [generate, placement]
     if: always() && !cancelled() && needs.generate.result == 'success' && inputs.e2e
     # Managed mode with a validated, attempt-bound plan uses its labels; every
     # other case (static routing, switch OFF, or no plan) uses the legacy X64
     # expression over CI_RUNNER_LABELS — never a fixed local pool (t_42bed567).
-    # The static last-resort label is Blacksmith 4vCPU (a literal, never a
-    # vars.* expression: ci_overflow_integration.fallback_predicate and
+    # The static last-resort label is GitHub-hosted ubuntu-latest (a literal,
+    # never a vars.* expression: ci_overflow_integration.fallback_predicate and
     # tests/ci/test_plumbing_runner_routing pin it so the fallback can never
-    # resolve to an unset variable). e2e ran 26 min on 2-core ubuntu-latest
-    # across #1624 rounds 4-7 (2026-10-03).
+    # resolve to an unset variable). Public repo: GitHub-hosted minutes are
+    # free; Blacksmith is reached only through the overflow placement plan
+    # above, never a hardcoded label (t_e95fdb01, Ace ruling 2026-10-03).
+    # VM-class lane (t_78d851d1, Ace ladder 2026-10-03 rung 3): when the kill switch
+    # CI_E2E_VM_ENABLED is 'true' AND the Studio load gate (hermes-home
+    # scripts/ci-e2e-vm-gate.py) has set CI_E2E_VM_ROUTE=open (an ace-e2e-vm host
+    # reports load1 < nproc-8 and no inference/transcode burst), the job goes to
+    # the ace-e2e-vm runner on ACE-AI / ACE-MEDIA. Otherwise it falls through to
+    # the unchanged static tail below.
+    # TRUST GUARD (same rule as CI_BLACKSMITH_SLICES above): only push, merge_group and same-repo
+    # pull_request may reach the VM class. Fork PRs and workflow_dispatch never leave GitHub /
+    # Blacksmith: the class runs with seccomp/AppArmor unconfined on hosts we live on.
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; HERMES_TEST_WORKERS below bounds the trees.
-    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["blacksmith-4vcpu-ubuntu-2404"]')) }}
-    timeout-minutes: 30
+    runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","ace-e2e-vm"]' || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["ubuntu-latest"]')) }}
+    # 45, not 30: e2e measured 26 min on GitHub-hosted (#1624 rounds 4-7).
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -510,6 +559,11 @@ jobs:
           extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "messaging"]'
           test-environment: 'true'
           prune-python-cache: true
+          # Restore-only on self-hosted (ace-e2e-vm): saving pushed ~170 MB x3 up the home
+          # uplink and took 12 of the job's 26 min (proof run 37170873916). Hosted runs save.
+          save-tools-cache: ${{ runner.environment == 'self-hosted' && 'false' || 'true' }}
+          save-python-cache: ${{ runner.environment == 'self-hosted' && 'false' || 'true' }}
+          save-node-cache: ${{ runner.environment == 'self-hosted' && 'false' || 'true' }}
 
       - name: Install Node deps and build the Ink TUI
         # tests/e2e/core/terminal drives the real `hermes --tui` over a PTY;
@@ -611,10 +665,25 @@ jobs:
     # unprivileged-userns sysctl; the self-hosted pool runs no-new-privileges
     # containers (see the RUNNERS note in ci.yaml). Blacksmith VMs allow both
     # (hermes-home runs apt on them). Measured 2026-10-03 on #1624 rounds 4-7:
-    # the (git) shard took 48 min on 2-core ubuntu-latest and set every round's
-    # wall clock (52 min); upstream runs this job on a 32-core pool. Repo var
-    # CI_E2E_RUNNER overrides (outage fallback: set it to ubuntu-latest).
-    runs-on: ${{ vars.CI_E2E_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+    # the (git) shard took 48 min on 2-core ubuntu-latest before the per-file
+    # split (longest shard now 11.6 min on Blacksmith 4vCPU). Public repo:
+    # GitHub-hosted minutes are free, so ubuntu-latest is the default; repo var
+    # CI_E2E_RUNNER overrides (t_e95fdb01, Ace ruling 2026-10-03).
+    # VM-class lane (t_78d851d1): same switch + gate as the e2e job above. The
+    # ace-e2e-vm runner keeps no-new-privileges (no sudo) and ships bubblewrap in
+    # its image; seccomp/apparmor/systempaths are unconfined so bwrap can make its
+    # PID namespace (fleet-ops-scripts ci-runners/e2e-vm). Closed gate or switch
+    # off -> CI_E2E_RUNNER / ubuntu-latest exactly as before.
+    # Two shards stay off the VM class (proof run 37170873916): hosts/test_libc_musl needs a docker
+    # daemon (the class has no socket, so it skips and the suite reads red) and
+    # core/test_fresh_process_entrypoints asserts doctor never probes systemctl, which it does when
+    # /.dockerenv exists.
+    # Bounded slice (t_38cee27b): only shards NAMED in repo var CI_E2E_VM_SHARDS (comma list,
+    # exact shard names) go to the class; every other shard stays on CI_E2E_RUNNER /
+    # ubuntu-latest. Unset var -> no shard routes. 2026-10-04: routing all 31 shards to 2
+    # one-slot runners serialised them, 180 min wall vs 16 hosted (run 37197359967). The
+    # Studio gate opens the route only while idle slots >= 1 + len(CI_E2E_VM_SHARDS).
+    runs-on: ${{ vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && contains(format(',{0},', vars.CI_E2E_VM_SHARDS), format(',{0},', matrix.shard)) && matrix.shard != 'hosts/test_libc_musl' && matrix.shard != 'core/test_fresh_process_entrypoints' && fromJSON('["self-hosted","Linux","X64","ace-e2e-vm"]') || vars.CI_E2E_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -627,6 +696,17 @@ jobs:
           # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Persist the runner's git alternate
+        # ace-e2e-vm runners (t_78d851d1) export GIT_ALTERNATE_OBJECT_DIRECTORIES so
+        # checkout borrows objects from a host mirror. The suite spawns git with an
+        # allowlisted env that drops that var, so its local "remote" could not read
+        # them (run 37170424601: "Could not read 64eb1c8c"). Writing the alternate
+        # into the repo makes it env-independent. No-op where the var is unset.
+        run: |
+          [ -n "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" ] || exit 0
+          printf '%s\n' "$GIT_ALTERNATE_OBJECT_DIRECTORIES" | tr ':' '\n' >> "$(git rev-parse --git-path objects/info/alternates)"
+          git fsck --connectivity-only --no-progress >/dev/null 2>&1 || git count-objects -v
 
       - name: Fetch upstream release tags
         # Fork: the release tags (v2026.*) are cut on NousResearch/hermes-agent and this
@@ -698,9 +778,13 @@ jobs:
         # systemd bus, only the test tmp writable). Ubuntu 24.04 restricts
         # unprivileged user namespaces, which bwrap needs.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq bubblewrap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          # The ace-e2e-vm image ships bwrap and its container has no sudo
+          # (no-new-privileges): install/relax only where bwrap is missing.
+          if ! command -v bwrap >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq bubblewrap
+          fi
+          sudo -n sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
           # The suite's own probe (_bwrap_usable, same flags as every sandboxed
           # run): without it the suite silently runs the updater unsandboxed.
           source .venv/bin/activate
@@ -755,7 +839,7 @@ jobs:
   # into a visible failure (spec §3.7).
   tests-complete:
     name: Tests complete
-    needs: [generate, placement, test, e2e, e2e-upgrade-plan, e2e-upgrade]
+    needs: [generate, placement, test, ptb-tests, e2e, e2e-upgrade-plan, e2e-upgrade]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -805,6 +889,15 @@ jobs:
           E2E_RESULT: ${{ needs.e2e.result }}
           E2E_REQUESTED: ${{ inputs.e2e }}
         run: python3 scripts/ci_overflow_placement.py gate
+      - name: Fail on skipped or failed real-PTB tests
+        env:
+          PTB_RESULT: ${{ needs.ptb-tests.result }}
+        run: |
+          if [ "$PTB_RESULT" != success ]; then
+            echo "::error::ptb-tests result=$PTB_RESULT"
+            exit 1
+          fi
+          echo "ptb-tests passed"
       - name: Fail on skipped or failed e2e-upgrade shards
         # The upgrade shards are gated by inputs.e2e_upgrade (ci.yaml passes
         # the classifier's answer); when they were requested, a skip is a

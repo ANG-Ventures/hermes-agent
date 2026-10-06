@@ -39,6 +39,8 @@ _HERMES_CHILD_ALLOWED = frozenset({
     # Agent-process marker ("true"): the gh shim resolves the lane from the
     # profile home only when it is present (t_45c11886).
     "HERMES_AGENT",
+    # Kanban-worker kill switch for gateway service writes (hermes_cli/gateway_service_owner.py).
+    "HERMES_GATEWAY_INSTALL_DISABLED",
 })
 
 # Git lane env from agent.process_env_files / gh-lane-env.sh (t_45c11886). The

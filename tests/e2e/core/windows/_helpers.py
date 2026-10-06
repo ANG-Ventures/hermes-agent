@@ -28,6 +28,7 @@ from typing import Any, Callable, Iterable
 import hermes_yaml as yaml
 
 from tests.fakes.fake_llm_provider import FakeLLMServer, write_hermes_home
+from tests.e2e.environ_snapshot import environ_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 TURN_TIMEOUT = 180.0
@@ -56,7 +57,7 @@ class WinHome:
 
     def env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         env = {
-            k: v for k, v in os.environ.items()
+            k: v for k, v in environ_snapshot().items()
             if k in _PASSTHROUGH_ENV and not k.upper().endswith(_SECRET_SUFFIXES)
         }
         local = self.profile / "AppData" / "Local"

@@ -526,7 +526,6 @@ class TestChatCompletionsLmStudioReasoning:
     def test_omits_effort_when_high_not_allowed_toggle(self, transport):
         kw = transport.build_kwargs(
             model="gpt-oss", messages=[{"role": "user", "content": "Hi"}],
-            is_lmstudio=True,
             supports_reasoning=True,
             reasoning_config={"effort": "high"},
             lmstudio_reasoning_options=["off", "on"],
@@ -537,7 +536,6 @@ class TestChatCompletionsLmStudioReasoning:
     def test_passes_through_when_effort_allowed(self, transport):
         kw = transport.build_kwargs(
             model="gpt-oss", messages=[{"role": "user", "content": "Hi"}],
-            is_lmstudio=True,
             supports_reasoning=True,
             reasoning_config={"effort": "high"},
             lmstudio_reasoning_options=["off", "low", "medium", "high"],

@@ -1288,6 +1288,35 @@ def _has_replayable_sidecar(role: Any, content: Any, msg: Dict[str, Any]) -> boo
     )
 
 
+def _sidecar_carries_rendered_turn(sidecar: str, rendered: str, content: str) -> bool:
+    """True when ``sidecar`` (the bytes turn N sent) is the rendered row, optionally followed
+    by the normal ``\\n\\n`` context separator (memory-context, notes).
+
+    A Discord inbound turn also carries the triggering-message note between the stamp and
+    the authored text: ``_hmwa_apply_message_timestamp`` strips it from the persisted
+    content only (``strip_discord_triggering_note``), so the sidecar is
+    ``[ts] <note>\\n\\n<content>...`` while replay renders ``[ts] <content>``. Dropping
+    that sidecar rewrote every Discord user row on the next turn: -117 B (the note), or
+    ~-1575 B with a truncated mem0 block (t_f98bc0c5)."""
+    if sidecar == rendered or sidecar.startswith(rendered + "\n\n"):
+        return True
+    if not rendered.endswith(content):
+        return False
+    stamp = rendered[: len(rendered) - len(content)]
+    if not sidecar.startswith(stamp):
+        return False
+    from gateway.run_inbound import discord_triggering_note
+    head, _, tail = discord_triggering_note("\x00").partition("\x00")
+    rest = sidecar[len(stamp):]
+    if not rest.startswith(head):
+        return False
+    note_end = rest.find(tail + "\n\n", len(head))
+    if note_end < 0 or "`" in rest[len(head):note_end] or "\n" in rest[len(head):note_end]:
+        return False
+    rest = rest[note_end + len(tail) + 2:]
+    return rest == content or rest.startswith(content + "\n\n")
+
+
 def _build_gateway_agent_history(
     history: List[Dict[str, Any]], *, channel_prompt: Optional[str] = None,
     inject_timestamps: bool = False) -> tuple[List[Dict[str, Any]], Optional[str]]:
@@ -1295,6 +1324,7 @@ def _build_gateway_agent_history(
 
     Observed context stays out of ``conversation_history`` so consecutive-user repair can't merge it in."""
     from hermes_time import get_timezone as _get_msg_tz
+    from agent.compaction_stats import is_standalone_summary_content
     from gateway.message_timestamps import (
         render_user_content_with_timestamp as _render_msg_ts,
         strip_leading_message_timestamps as _strip_msg_ts,
@@ -1338,14 +1368,19 @@ def _build_gateway_agent_history(
                     continue
             # Keep user timestamps for the stale-dangerous-confirmation stripper in agent/replay_cleanup.py.
             entry = _build_replay_entry(role, content, msg, preserve_timestamp=(role == "user"))
-            if inject_timestamps and role == "user" and isinstance(content, str):
+            # A compaction summary is synthesized, never received: the compaction turn sends
+            # it bare, so a rendered stamp here rewrote msg[0] by +30 B next turn (t_f98bc0c5).
+            if (
+                inject_timestamps and role == "user" and isinstance(content, str)
+                and not is_standalone_summary_content(content)
+            ):
                 rendered = _render_msg_ts(content, replay_timestamp, tz=_msg_tz)
                 # Preserve only a sidecar matching the complete rendered message,
                 # optionally followed by the normal context separator. Cleanup
                 # above already invalidated sidecars containing stripped content.
                 sidecar = entry.get("api_content")
-                if rendered != content and sidecar and not (
-                    sidecar == rendered or sidecar.startswith(rendered + "\n\n")
+                if rendered != content and sidecar and not _sidecar_carries_rendered_turn(
+                    sidecar, rendered, content
                 ):
                     entry.pop("api_content", None)
                 entry["content"] = rendered
@@ -3616,6 +3651,37 @@ def _reconnect_needs_attention(info: dict, now: float) -> bool:
 # "No session DB pinned": lets ``_session_db`` distinguish "resolve from profile scope" from a
 # deliberate ``runner._session_db = None`` (disables DB commands). Mirrors gateway.session._DB_UNPINNED.
 _SESSION_DB_UNPINNED = object()
+
+
+async def _maybe_orphan_menu_reply(event, source) -> Optional[str]:
+    """t_6281f908: a bare-number reply to the 🏷 orphan menu re-homes that card.
+
+    None = not a menu reply (normal dispatch continues).
+
+    The menu is executable only when the platform says the replied-to message
+    was posted by THIS gateway's own bot (``reply_to_is_own_message``, set from
+    the author id, never from text). A user-authored message that copies the
+    option shape is just text and passes through (t_3ad14889 untrusted menus).
+    Platforms that do not stamp authorship fail closed."""
+    if not getattr(event, "reply_to_text", None):
+        return None
+    if getattr(event, "reply_to_is_own_message", False) is not True:
+        return None
+    try:
+        from gateway.kanban_orphan_menu import apply_choice, parse_choice
+
+        choice = parse_choice(getattr(event, "text", None), event.reply_to_text)
+    except Exception:
+        logger.debug("orphan menu parse failed", exc_info=True)
+        return None
+    if choice is None:
+        return None
+    actor = str(getattr(source, "user_name", None) or getattr(source, "user_id", None) or "")
+    try:
+        return await asyncio.to_thread(apply_choice, choice, actor=actor)
+    except Exception as exc:
+        logger.warning("orphan menu rehome failed: %s", exc)
+        return f"\u26a0 {choice.card or 'card'} not re-homed: {exc}"
 
 
 # Only explicit suspension can replace a routed conversation.

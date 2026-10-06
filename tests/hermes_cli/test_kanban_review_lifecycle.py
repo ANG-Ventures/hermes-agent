@@ -608,6 +608,52 @@ def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
         assert kbd.check_respawn_guard(conn, done_id) == "recent_success"
 
 
+def test_active_pr_guard_lifts_when_reviewer_and_prism_name_the_pr_after_send_back(
+    kanban_home: Path,
+) -> None:
+    """A send-back is followed within seconds by the reviewer's own note and a
+    Prism review, both naming the PR. Neither is the implementer acting on it,
+    so the handoff still lifts ``active_pr``; the implementer's next PR comment
+    guards again (t_da538470: 16 #alerts pages/day from merge-pass send-backs).
+    """
+    pr = "https://github.com/example/repo/pull/44"
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="send-back", assignee="dev")
+        claimed = kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="dev", body=f"Opened {pr} for review.")
+        _backdate_comments(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="PR ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        rclaim = kb.claim_review_task(conn, tid)
+        from tests.kanban_review_helpers import covered_request_changes
+        ok, _ = covered_request_changes(
+            conn, tid, reason=f"Prism P1 on {pr}", expected_run_id=rclaim.current_run_id,
+        )
+        assert ok and kb.get_task(conn, tid).status == "ready"
+        kb.add_comment(conn, tid, author="default", body=f"[review-merge-pass] HELD-FR {pr}")
+        kb.add_comment(conn, tid, author="fleetreview-route", body=f"Prism review of {pr}")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_comments SET created_at = created_at + 2 "
+                "WHERE task_id = ? AND author != 'dev'", (tid,),
+            )
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        for author in ("dev", "kanban"):
+            with kb.write_txn(conn):
+                conn.execute("DELETE FROM task_comments WHERE task_id = ? "
+                             "AND body LIKE 'Pushed%'", (tid,))
+            kb.add_comment(conn, tid, author=author, body=f"Pushed to {pr}")
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_comments SET created_at = created_at + 5 "
+                    "WHERE task_id = ? AND body LIKE 'Pushed%'", (tid,),
+                )
+            assert kbd.check_respawn_guard(conn, tid) == "active_pr", author
+
+
 def test_dispatch_json_exposes_suppression_reasons(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

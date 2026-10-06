@@ -10,6 +10,13 @@ import hermes_cli.gateway as gateway
 pytestmark = pytest.mark.platforms("linux")
 
 
+@pytest.fixture(autouse=True)
+def _admit_test_home(monkeypatch):
+    """The hermetic HERMES_HOME is a temp dir outside the account tree; systemd_install's home admission
+    (covered in test_gateway_service_owner.py) would refuse it before the linger step these tests pin."""
+    monkeypatch.setattr(gateway, "_native_service_homes", lambda: {gateway.get_hermes_home().resolve()})
+
+
 def _stub_linger_file(monkeypatch, tmp_path, *, exists: bool) -> None:
     """Point the ``/var/lib/systemd/linger/<user>`` probe at a real file under tmp_path.
 
@@ -224,7 +231,10 @@ def test_existing_system_install_repairs_linger_for_configured_user(monkeypatch,
     """Re-running install on an affected system service provisions linger for the unit's User=."""
     unit_path = tmp_path / "systemd" / "hermes-gateway.service"
     unit_path.parent.mkdir(parents=True)
-    unit_path.write_text("[Service]\nUser=alice\n", encoding="utf-8")
+    # Generated launcher shape: the install repair path refuses a foreign (hand-managed) unit (#1742).
+    unit_path.write_text(
+        "[Service]\nUser=alice\nExecStart=/home/alice/.hermes/bin/hermes gateway run\n", encoding="utf-8"
+    )
     helper_calls = []
 
     monkeypatch.setattr(gateway, "_require_root_for_system_service", lambda action: None)
@@ -246,7 +256,8 @@ def test_systemd_install_repair_path_keeps_linger_guarantee(monkeypatch, tmp_pat
     """Repairing a stale unit used to return before the linger step, so an upgraded headless
     user service died at logout (#12863). System scope never touches user linger."""
     unit_path = tmp_path / "hermes-gateway.service"
-    unit_path.write_text("old unit\n", encoding="utf-8")
+    # Generated launcher shape: the install repair path refuses a foreign (hand-managed) unit (#1742).
+    unit_path.write_text("[Service]\nExecStart=/home/u/.hermes/bin/hermes gateway run\n", encoding="utf-8")
     monkeypatch.setattr(gateway, "get_systemd_unit_path", lambda system=False: unit_path)
     monkeypatch.setattr(gateway, "systemd_unit_is_current", lambda system=False: False)
     monkeypatch.setattr(gateway, "has_legacy_hermes_units", lambda: False)

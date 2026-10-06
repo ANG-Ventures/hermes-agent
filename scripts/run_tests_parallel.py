@@ -237,6 +237,84 @@ def format_worker_sizing_log(
 #                        setup. The dedicated job sidesteps both costs.
 _SKIP_PARTS = {"integration", "e2e", "docker"}
 
+# Files that need an optional dep the slice env deliberately lacks. The slice
+# matrix leaves them out and the `ptb-tests` job in tests.yml runs them with
+# the dep installed. `*_ptb.py` needs real python-telegram-bot; ~29 gateway
+# test files install a MagicMock `telegram` module and are proven only without
+# the real one, so PTB stays out of the slice extras.
+_DEDICATED_LANE_SUFFIXES = ("_ptb.py",)
+
+# Registry whose `call_site_tests` must EXECUTE somewhere: a skip-only run of
+# one of those files is RED, not a ⚠ (D2b, t_34bb9bef).
+_CALL_SITE_MANIFEST = Path("docs/sync/fork-features.json")
+
+
+def _is_dedicated_lane_file(path: Path) -> bool:
+    return path.name.endswith(_DEDICATED_LANE_SUFFIXES)
+
+
+def _call_site_nodeids(repo_root: Path) -> dict[Path, set[str]]:
+    """Registry ``call_site_tests`` nodeids, keyed by their resolved file."""
+    try:
+        raw = json.loads((repo_root / _CALL_SITE_MANIFEST).read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return {}
+    out: dict[Path, set[str]] = {}
+    for entry in raw:
+        for node in entry.get("call_site_tests") or []:
+            node = str(node)
+            out.setdefault((repo_root / node.split("::", 1)[0]).resolve(), set()).add(node)
+    return out
+
+
+def _unexecuted_call_site_nodeids(
+    all_summaries: List[Tuple[Path, Dict[str, int]]], repo_root: Path,
+) -> List[Tuple[Path, List[str]]]:
+    """Registered call-site nodeids in this run that did not execute.
+
+    With a junit dir, every registered nodeid of a file in the run must appear
+    passed or failed in that file's junit: a skipped or uncollected nodeid
+    counts, even when a sibling test in the same file passed. A missing or
+    unreadable junit proves nothing and counts too. Without a junit dir (a
+    local run) the proxy is the file: a file that skipped every test.
+    """
+    registered = _call_site_nodeids(repo_root)
+    if not registered:
+        return []
+    # Lazy: stripped runner copies (tests/scripts runner-root, the placement
+    # artifact) ship only list_os_marked_tests.py, and have no manifest either.
+    from scripts.ci.flake_quarantine import JunitError, junit_outcomes
+    out: List[Tuple[Path, List[str]]] = []
+    seen: set[Path] = set()
+    for f, s in all_summaries:
+        rp = f.resolve()
+        if rp not in registered or rp in seen:
+            continue
+        seen.add(rp)
+        nodes = registered[rp]
+        junit = _junit_path(f, repo_root)
+        if junit is None:
+            storm = (s.get("skipped", 0) > 0 and s.get("passed", 0) == 0
+                     and s.get("failed", 0) == 0) or s.get("noop_skip")
+            if storm:
+                out.append((f, sorted(nodes)))
+            continue
+        try:
+            failed, passed = junit_outcomes(junit.read_bytes(), _format_file(f, repo_root))
+        except (OSError, JunitError):
+            out.append((f, sorted(nodes)))
+            continue
+        ran = failed | passed
+        # A registered id covers its parametrized cases (`n[...]`) and, for a
+        # class id, its members (`n::...`): any one of them executing counts.
+        missing = sorted(
+            n for n in nodes
+            if not any(r == n or r.startswith((n + "[", n + "::")) for r in ran)
+        )
+        if missing:
+            out.append((f, missing))
+    return out
+
 # Per-file wall-clock cap. Override
 # via --file-timeout or HERMES_TEST_FILE_TIMEOUT.
 #
@@ -789,11 +867,15 @@ def _scoped_plugin_matrix(
         return None
 
     plugin_root = repo_root / "tests" / "plugins" / plugin_name
-    plugin_files = _discover_files([plugin_root])
+    # Dedicated-lane files (*_ptb.py) run in their own job on every scope; a
+    # PTB-less plugin slice would only skip them (t_34bb9bef).
+    plugin_files = [f for f in _discover_files([plugin_root]) if not _is_dedicated_lane_file(f)]
     smoke_files = [repo_root / path for path in _CORE_SMOKE_TESTS]
     if not plugin_files or any(not path.is_file() for path in smoke_files):
         return None
-    dependent_files = _plugin_dependent_tests(plugin_name, repo_root)
+    dependent_files = [
+        f for f in _plugin_dependent_tests(plugin_name, repo_root) if not _is_dedicated_lane_file(f)
+    ]
     if len(dependent_files) > _MAX_PLUGIN_DEPENDENT_TESTS:
         return None
 
@@ -1867,6 +1949,17 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--full-slices",
+        metavar="N",
+        type=int,
+        default=None,
+        help=(
+            "Slice count for the full suite. Used by --generate-slices when an "
+            "impact set holds only dedicated-lane files (*_ptb.py) and the "
+            "full suite is sliced instead; defaults to --generate-slices."
+        ),
+    )
+    parser.add_argument(
         "--generate-slices",
         metavar="N",
         type=int,
@@ -2056,7 +2149,7 @@ def main() -> int:
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
-        "--file-timeout", "--idle-timeout", "--file-retries", "--slice", "--generate-slices", "--files", "--files-from",
+        "--file-timeout", "--idle-timeout", "--file-retries", "--slice", "--generate-slices", "--full-slices", "--files", "--files-from",
         "--changed-files-scope", "--test-scope",
         "--self-hosted-slots", "--self-hosted-labels", "--arm-hosted-slices",
         "--x64-hosted-min", "--blacksmith-slices", "--event", "--same-repo",
@@ -2308,6 +2401,22 @@ def main() -> int:
 
     # --generate-slices: compute LPT distribution and emit JSON, then exit.
     if args.generate_slices is not None:
+        lane_owned = [f for f in files if _is_dedicated_lane_file(f)]
+        if lane_owned:
+            files = [f for f in files if not _is_dedicated_lane_file(f)]
+            print(
+                f"{len(lane_owned)} dedicated-lane file(s) left out of the slices "
+                f"(run by the ptb-tests job): "
+                + ", ".join(_format_file(f, repo_root) for f in lane_owned),
+                file=sys.stderr,
+            )
+            if not files:
+                # An impact set made only of lane files: slice the full suite
+                # rather than emit an empty matrix, at the FULL slice count —
+                # args.generate_slices was sized for the tiny impact set.
+                files = [f for f in _discover_files([repo_root / "tests"])
+                         if not _is_dedicated_lane_file(f)]
+                args.generate_slices = max(args.generate_slices, args.full_slices or 0)
         durations = _load_durations(repo_root)
         slices = _compute_lpt_slices(
             files, args.generate_slices, durations, repo_root
@@ -2785,6 +2894,9 @@ def _noop_guard(
     Skip-storms (skipped>0, passed==0, failed==0) are a loud ⚠ *surfacing*,
     not a gate — a dep-missing skip-storm stays visible even where the dep is
     genuinely optional, without false-reding an optional-dep environment.
+    The exception is a nodeid named in the registry's ``call_site_tests``:
+    if it skipped or was not collected, the run is RED, because the D2b lint
+    counts it as coverage.
     """
     def _executed(s: Dict[str, int]) -> int:
         return s.get("passed", 0) + s.get("failed", 0)
@@ -2804,6 +2916,21 @@ def _noop_guard(
         for f, s in skip_storms:
             _n = s.get("skipped", 0)
             print(f"  ⚠  {_format_file(f, repo_root)}  ({_n} skipped, 0 run)")
+
+    # ── RED: a registry call_site_tests nodeid that did not execute ───────
+    # The ⚠ above is right for an optional dep, wrong for a registered
+    # call-site test: the D2b lint is satisfied by its nodeid, so a skipped
+    # nodeid leaves the call site with no executing test in any lane.
+    unexecuted = _unexecuted_call_site_nodeids(all_summaries, repo_root)
+    if unexecuted:
+        print()
+        n = sum(len(nodes) for _f, nodes in unexecuted)
+        print(f"=== {n} nodeid(s) named in {_CALL_SITE_MANIFEST} call_site_tests did not "
+              f"execute (skipped or not collected) — RED: a registered call-site test must run ===")
+        for _f, nodes in unexecuted:
+            for node in nodes:
+                print(f"    {node}")
+        red = True
 
     # ── ⚠ intentionally-testless files (tombstones / __main__ scripts) ────
     testless = [(f, s) for f, s in all_summaries if s.get("noop_testless")]

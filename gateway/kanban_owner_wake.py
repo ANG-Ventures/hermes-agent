@@ -54,6 +54,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+from gateway import kanban_wake_freshness as _fresh
+
 logger = logging.getLogger(__name__)
 
 COALESCE_SECONDS = 600.0
@@ -94,6 +96,7 @@ _NON_CHAT_PLATFORMS = frozenset({"local", "cli", "tui", "api_server", "webhook",
 _RED_CONCLUSIONS = frozenset({
     "failure", "timed_out", "cancelled", "action_required", "startup_failure",
 })
+_NO_VERDICT_CONCLUSIONS = frozenset({"cancelled", "skipped"})
 
 PrHealthFn = Callable[[str, int], Optional[dict]]
 
@@ -129,12 +132,72 @@ def is_stuck(kind: str, payload: Optional[dict]) -> bool:
     return kind == "reclaimed" and bool((payload or {}).get("heartbeat_stale"))
 
 
+# hermes-agent's review-labels.yml: a CI-sensitive diff is red on this gate (and the aggregator it fails) until
+# a maintainer applies ``ci-reviewed``. On a review handback that is the review being asked for, not a PR that
+# cannot land: the merge pass owns it (HELD-NEEDS-LABEL, or fleet-merge applies the label on an operator APPROVE).
+_LABEL_GATE_RE = re.compile(r"^(?:.+ / )?Review label gate$")
+_REQUIRED_ROLLUP_RE = re.compile(r"^(?:.+ / )?All required checks pass$")
+REVIEW_LABEL = "ci-reviewed"
+
+
+# scripts/ci/evaluate_needs.py prints ``::error::N job(s) failed: a, b`` on the aggregator run.
+_ROLLUP_FAILED_RE = re.compile(r"^\d+ job\(s\) failed: (.+)$")
+_LABEL_JOB = "review-labels"
+# review-labels.yml "Fail on missing label": the ONE annotation that means the label is what is missing. A failed
+# checkout / emit_review_status.py / timeout / cancel carries no such line and stays a real red (Prism P1 b796fe55bbc1).
+_MISSING_LABEL_MSG = "CI-sensitive changes require the ci-reviewed label."
+
+
+def rollup_failed_jobs(annotations: Optional[list]) -> Optional[frozenset]:
+    """The jobs the aggregator run says failed, from its ``N job(s) failed: ...`` annotation, or None (unreadable)."""
+    for a in annotations or []:
+        m = _ROLLUP_FAILED_RE.match(str((a or {}).get("message") or "").strip())
+        if m:
+            return frozenset(x.strip() for x in m.group(1).split(",") if x.strip())
+    return None
+
+
+def missing_label_only(annotations: Optional[list]) -> bool:
+    """True when a failed review-label gate run carries the workflow's explicit missing-label failure."""
+    return any(_MISSING_LABEL_MSG in str((a or {}).get("message") or "") for a in annotations or [])
+
+
+def _label_gate_red_only(run: dict, annotations: Optional[list]) -> bool:
+    """One failing check run's verdict: is it red ONLY because ``ci-reviewed`` is missing?"""
+    name, concl = str(run.get("name") or ""), str(run.get("conclusion") or "").lower()
+    if concl != "failure":   # cancelled / timed_out / action_required: never evidence of a missing label
+        return False
+    if _LABEL_GATE_RE.match(name):
+        return missing_label_only(annotations)
+    if _REQUIRED_ROLLUP_RE.match(name):
+        return rollup_failed_jobs(annotations) == frozenset({_LABEL_JOB})
+    return False
+
+
+def label_pending(health: Optional[dict]) -> bool:
+    """True when the PR has no ``ci-reviewed`` label, a review-label gate is among the reds, and EVERY failing check
+    run was verified (``label_only``, one bool per run of ``failing``) to be red only for the missing label: each gate
+    run carries the workflow's missing-label annotation and each aggregator run says it failed on ``review-labels``
+    alone (Prism P1 c585adb654b0, 7d6845520733, b796fe55bbc1). Unreadable annotations count as not verified."""
+    health = health or {}
+    names = [str(n) for n in health.get("failing") or [] if n]
+    verdicts = list(health.get("label_only") or [])
+    if REVIEW_LABEL in [str(x).strip().lower() for x in health.get("labels") or []]:
+        return False
+    if not names or len(verdicts) != len(names) or not any(_LABEL_GATE_RE.match(n) for n in names):
+        return False
+    return all(v is True for v in verdicts)
+
+
 def pr_is_red_or_dirty(health: Optional[dict]) -> Optional[str]:
-    """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, unknown)."""
+    """``"red: a, b"`` / ``"dirty"`` / ``"red: …; dirty"`` or None (green, pending, label pending, unknown)."""
     if not health or str(health.get("state") or "").lower() != "open":
         return None
     parts = []
-    failing = [str(n) for n in (health.get("failing") or []) if n]
+    names = [] if label_pending(health) else list(health.get("failing") or [])
+    urls = list(health.get("failing_urls") or [])
+    failing = [f"{n} <{u}>" if u else str(n)
+               for n, u in zip(names, urls + [""] * (len(names) - len(urls))) if n]
     if failing:
         parts.append("red: " + ", ".join(failing[:6]))
     if str(health.get("mergeable_state") or "").lower() == "dirty":
@@ -202,20 +265,165 @@ def _gh_json(path: str) -> Optional[Any]:
         return None
 
 
+def _gh_pages(path: str, key: str, max_pages: int = 10) -> Optional[list]:
+    """Every ``key`` row across REST pages of ``path`` (per_page=100), or None when
+    any page is unreadable or the page cap is hit (a partial list is not a verdict).
+    A head with >100 runs spills onto page 2+ (Prism P1)."""
+    rows: list = []
+    sep = "&" if "?" in path else "?"
+    for page in range(1, max_pages + 1):
+        data = _gh_json(f"{path}{sep}per_page=100&page={page}")
+        if not isinstance(data, dict):
+            return None
+        batch = data.get(key) or []
+        rows.extend(batch)
+        if len(batch) < 100:
+            return rows
+    return None
+
+
+def red_check_names(runs: list, workflows: Optional[dict] = None,
+                    superseded: frozenset = frozenset()) -> list[str]:
+    """Names of the checks that grade the head red; see red_check_runs()."""
+    return [str(r.get("name") or "?") for r in red_check_runs(runs, workflows, superseded)]
+
+
+def red_check_runs(runs: list, workflows: Optional[dict] = None,
+                   superseded: frozenset = frozenset()) -> list[dict]:
+    """The check-run rows that grade the head red (t_65e5d76f, t_fb481152); the
+    newest judging run per check, so its ``html_url`` is the one to open (t_121bd42e).
+
+    A head carries every run ever started on it: override_lint runs twice per
+    push and concurrency cancels the superseded one, so counting any red run
+    read green PRs red. Per key = (workflow, name) the newest run (highest id)
+    that is not cancelled/skipped decides. A key whose runs are ALL cancelled
+    stays red unless the same check also has a newer skipped/neutral run (a
+    re-trigger that skipped the job is not a cancelled check). A failure is
+    only superseded by a later run of the SAME check.
+    ``workflows`` maps check_suite id -> (workflow id, event); without an entry
+    the key is the suite, so a duplicate in another suite is never merged
+    (fails closed). ``superseded`` holds check_suite ids of CANCELLED workflow
+    runs that a newer run of the same (workflow, event) replaced: every row in
+    them (its cancelled jobs and the failure an ``if: always()`` aggregate
+    wrote while cancelling) is dropped; the newer run decides, and while it is
+    still running the check is pending, not red. Mirrors hermes-home
+    kanban-review-merge-pass effective_checks().
+    """
+    workflows = workflows or {}
+    live: dict = {}
+    cancelled: dict = {}
+    passed_over: dict = {}   # key -> newest id of a skipped/neutral run
+    for i, run in enumerate(runs or []):
+        if not isinstance(run, dict):
+            continue
+        name = str(run.get("name") or "?")
+        suite = (run.get("check_suite") or {}).get("id")
+        if suite is not None and suite in superseded:
+            continue
+        if suite in workflows:
+            key = ("wf", workflows[suite], name)
+        elif suite is not None:
+            key = ("suite", suite, name)
+        else:
+            key = ("row", i, name)
+        concl = str(run.get("conclusion") or "").lower()
+        rid = int(run.get("id") or 0)
+        if concl in _NO_VERDICT_CONCLUSIONS:
+            if concl == "cancelled":
+                prev = cancelled.get(key)
+                if prev is None or rid >= prev[0]:
+                    cancelled[key] = (rid, run)
+            else:
+                passed_over[key] = max(rid, passed_over.get(key, 0))
+            continue
+        rank = (rid, i)
+        if key not in live or rank > live[key][0]:
+            live[key] = (rank, run, concl)
+    red = [run for _rank, run, concl in live.values() if concl in _RED_CONCLUSIONS]
+    return red + [run for key, (rid, run) in cancelled.items()
+                  if key not in live and passed_over.get(key, -1) <= rid]
+
+
+def _needs_workflow_map(runs: list) -> bool:
+    """Merging suites into workflows only changes the verdict when a name with a
+    non-pass row spreads over >1 suite, or a cancelled row sits on a head with >1
+    suite (a cancelled workflow run a re-trigger may have superseded); skip the
+    REST read otherwise."""
+    suites: dict = {}
+    unsettled = set()
+    any_cancelled = False
+    for run in runs or []:
+        if not isinstance(run, dict):
+            continue
+        name = run.get("name")
+        suites.setdefault(name, set()).add((run.get("check_suite") or {}).get("id"))
+        concl = str(run.get("conclusion") or "").lower()
+        if concl not in ("success", "skipped", "neutral"):
+            unsettled.add(name)
+        any_cancelled = any_cancelled or concl == "cancelled"
+    if any(len(v) > 1 and k in unsettled for k, v in suites.items()):
+        return True
+    return any_cancelled and len(set().union(*suites.values())) > 1
+
+
+def _superseded_suites(rows: list) -> frozenset:
+    """check_suite ids of CANCELLED workflow runs with a newer run of the same
+    (workflow, event) on the head: GitHub cancels the first of two near-identical
+    triggers (t_fb481152: #1718 head 94ad2960, Docker/CI/override-lint/sast/
+    secret-scan all cancelled at 08:19:23 and re-run at 08:19:24)."""
+    newest: dict = {}
+    for r in rows:
+        wk = (r.get("workflow_id"), r.get("event"))
+        newest[wk] = max(newest.get(wk, 0), int(r.get("id") or 0))
+    return frozenset(
+        r["check_suite_id"] for r in rows
+        if str(r.get("conclusion") or "").lower() == "cancelled"
+        and r.get("workflow_id") is not None and r.get("id") is not None
+        and int(r["id"]) < newest[(r.get("workflow_id"), r.get("event"))])
+
+
+def _workflow_runs(repo: str, sha: str) -> tuple[dict, frozenset]:
+    """(check_suite id -> (workflow id, event), superseded suite ids); ({}, {})
+    when unreadable. A push run and a pull_request run of one workflow on one sha
+    are separate checks, not re-runs."""
+    rows = [r for r in (_gh_pages(f"repos/{repo}/actions/runs?head_sha={sha}", "workflow_runs") or [])
+            if isinstance(r, dict) and r.get("check_suite_id") is not None]
+    wf = {r["check_suite_id"]: (r.get("workflow_id"), r.get("event")) for r in rows}
+    return wf, _superseded_suites(rows)
+
+
 def query_pr_health(repo: str, number: int) -> Optional[dict]:
     """``{state, mergeable_state, failing: [check names]}`` or None (unknown)."""
     pr = _gh_json(f"repos/{repo}/pulls/{number}")
     if not isinstance(pr, dict) or not pr.get("state"):
         return None
     out = {"state": "merged" if pr.get("merged_at") else str(pr["state"]),
-           "mergeable_state": str(pr.get("mergeable_state") or ""), "failing": []}
+           "mergeable_state": str(pr.get("mergeable_state") or ""), "failing": [],
+           "labels": [str((x or {}).get("name") or "") for x in pr.get("labels") or [] if isinstance(x, dict)]}
     sha = (pr.get("head") or {}).get("sha")
     if out["state"] == "open" and sha:
-        runs = _gh_json(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")
-        for run in (runs or {}).get("check_runs") or []:
-            if isinstance(run, dict) and str(run.get("conclusion") or "") in _RED_CONCLUSIONS:
-                out["failing"].append(str(run.get("name") or "?"))
+        runs = _gh_pages(f"repos/{repo}/commits/{sha}/check-runs", "check_runs")
+        if runs is None:
+            return None  # unknown: retried, never read as green (Prism P1)
+        wf, superseded = _workflow_runs(repo, sha) if _needs_workflow_map(runs) else ({}, frozenset())
+        red = red_check_runs(runs, wf, superseded)
+        out["failing"] = [str(r.get("name") or "?") for r in red]
+        # the run each verdict came from, so the wake is verifiable in one click (t_121bd42e)
+        out["failing_urls"] = [str(r.get("html_url") or "") for r in red]
+        if red and REVIEW_LABEL not in [x.strip().lower() for x in out["labels"]] and any(_LABEL_GATE_RE.match(n) for n in out["failing"]) \
+                and all(_LABEL_GATE_RE.match(n) or _REQUIRED_ROLLUP_RE.match(n) for n in out["failing"]):
+            # only when label_pending could hold: verify EVERY failing run's own annotations (unreadable -> False)
+            out["label_only"] = [_label_gate_red_only(r, _run_annotations(repo, r)) for r in red]
     return out
+
+
+def _run_annotations(repo: str, run: dict) -> Optional[list]:
+    try:
+        rid = int(run.get("id"))
+    except (TypeError, ValueError):
+        return None
+    data = _gh_json(f"repos/{repo}/check-runs/{rid}/annotations?per_page=100")
+    return data if isinstance(data, list) else None
 
 
 def default_pr_health() -> Optional[PrHealthFn]:
@@ -446,7 +654,8 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
     except ValueError:
         payload = None
     kind = r["kind"]
-    item = {"event_id": int(r["id"]), "kind": kind, "actor_sid": r["actor_sid"] or ""}
+    item = {"event_id": int(r["id"]), "kind": kind, "actor_sid": r["actor_sid"] or "",
+            "event_ts": r["created_at"]}
     if kind == "blocked":
         trig = classify_block(payload)
         if trig is None:
@@ -475,14 +684,14 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
 
 
 def read_card(kb: Any, board: str, task_id: str) -> Optional[dict]:
-    """Current ``{session_id, body, title}`` of a card, or None if it is gone.
+    """Current ``{session_id, body, title, status}`` of a card, or None if it is gone.
 
     Read at DELIVERY time: a held event must follow a re-homed card and honour a
     ``wake: off`` added after it was queued (Prism P1s)."""
     conn = kb.connect_readonly(board=board)
     conn.row_factory = sqlite3.Row
     try:
-        row = conn.execute("SELECT session_id, body, title FROM tasks WHERE id = ?",
+        row = conn.execute("SELECT session_id, body, title, status FROM tasks WHERE id = ?",
                            (task_id,)).fetchone()
     finally:
         conn.close()
@@ -563,7 +772,8 @@ def has_wake_sub(kb: Any, board: str, task_id: str, origin: Any, profile: str) -
     return False
 
 
-async def deliver_turn(runner: Any, entry: Any, text: str) -> None:
+async def deliver_turn(runner: Any, entry: Any, text: str,
+                       cards: Optional[list[dict]] = None) -> None:
     """Enqueue one handoff turn into ``entry``'s session. Raises on no route."""
     from gateway.platforms.base import MessageEvent, MessageType
 
@@ -585,6 +795,15 @@ async def deliver_turn(runner: Any, entry: Any, text: str) -> None:
             # verified compression lineage and still drops it after a /new
             # (_resolve_async_delegation_session; Prism P1).
             "gateway_session_id": entry.session_id,
+            # Re-checked when a busy session dequeues the turn (t_07ffc6cb).
+            _fresh.META_KEY: [
+                _fresh.card_entry(c.get("board"), c["task_id"],
+                                  [i.get("kind") for i in c.get("items") or []],
+                                  max((i.get("event_ts") or 0 for i in c.get("items") or []),
+                                      default=None),
+                                  render_prompt([c]))
+                for c in cards or []
+            ],
         },
     )
     await adapter.handle_message(event)
@@ -644,6 +863,19 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         if current is None or wake_off(current.get("body")):
             state.pending.pop(key, None)  # card gone, or opted out while held
             continue
+        # t_07ffc6cb: a card that went done/archived while its events were held
+        # needs nothing from its owner any more.
+        live = []
+        for i in card["items"]:
+            if _fresh.is_stale(current.get("status"), str(i.get("kind") or "")):
+                _fresh.log_dropped(card["task_id"], str(i.get("kind")), i.get("event_ts"),
+                                   "owner-wake", current.get("status"), now)
+            else:
+                live.append(i)
+        if not live:
+            state.pending.pop(key, None)
+            continue
+        card["items"] = live
         card["home_sid"] = str(current.get("session_id") or "")
         card["title"] = current.get("title") or card.get("title") or ""
         try:
@@ -675,7 +907,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     for session_key, (entry, cards) in by_session.items():
         text = render_prompt([c for _k, c in cards])
         try:
-            await deliver_turn(runner, entry, text)
+            await deliver_turn(runner, entry, text, [c for _k, c in cards])
         except Exception as exc:
             logger.warning("kanban owner-wake: wake of %s failed (%s); held for retry",
                            session_key, exc)

@@ -19,6 +19,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_parser as kp
 from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES
 
 
@@ -547,6 +548,86 @@ def test_cli_operator_send_back_parked_review(
         assert rework == [
             f"changes requested (operator send-back, {OPERATOR}): rebase first"
         ]
+
+
+# --- operator_kind (t_86ca5b3d) ---------------------------------------------
+# A landing gate must tell a human CHANGES REQUESTED (holds) from automation's
+# send-back (never holds) by a FIELD on the changes_requested event, not by
+# parsing the operator string.
+
+def _changes_requested_payload(conn, tid):
+    return [p for k, p, _ in _kinds(conn, tid) if k == "changes_requested"][-1]
+
+
+def test_operator_send_back_defaults_to_human_kind(board: Path) -> None:
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        ok, _ = kb.request_changes(
+            conn, tid, reason="rebase first", claimer="apollo", operator=OPERATOR,
+        )
+        assert ok
+        assert _changes_requested_payload(conn, tid)["operator_kind"] == "human"
+
+
+def test_operator_send_back_records_machine_kind(board: Path) -> None:
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        ok, _ = kb.request_changes(
+            conn, tid, reason="HOLD-FR", claimer="apollo",
+            operator="merge-pass: prism soft gate HOLD f-1", operator_kind="machine",
+        )
+        assert ok
+        payload = _changes_requested_payload(conn, tid)
+        assert payload["operator_kind"] == "machine"
+        assert payload["operator"] == "merge-pass: prism soft gate HOLD f-1"
+
+
+@pytest.mark.parametrize("kind,operator,why", [
+    ("robot", OPERATOR, "operator_kind must be one of"),
+    ("machine", None, "operator_kind needs --operator"),
+])
+def test_operator_kind_refused_before_any_write(
+    board: Path, kind: str, operator, why: str,
+) -> None:
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        before, runs_before = _snapshot(conn, tid)
+        ok, detail = kb.request_changes(
+            conn, tid, reason="x", claimer="apollo", operator=operator, operator_kind=kind,
+        )
+        assert ok is False and why in detail
+        _assert_untouched(conn, tid, before, runs_before)
+
+
+def test_reviewer_send_back_event_has_no_operator_kind(board: Path) -> None:
+    """Only operator send-backs carry the field: a reviewer verdict is unchanged."""
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+        review = kb.claim_review_task(conn, tid, claimer="argus:1")
+        kb.add_comment(conn, tid, "argus", "review_coverage: " + COVERAGE,
+                       run_id=review.current_run_id)
+        ok, _ = kb.request_changes(conn, tid, reason="fix", expected_run_id=review.current_run_id)
+        assert ok
+        assert "operator_kind" not in _changes_requested_payload(conn, tid)
+
+
+def test_cli_operator_kind_machine_reaches_the_event(
+    board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260927_090000_operator")
+    with kb.connect() as conn:
+        tid = _parked_review(conn)
+    top = argparse.ArgumentParser()
+    kp.build_parser(top.add_subparsers(dest="cmd"))
+    ns = top.parse_args([
+        "kanban", "request-changes", tid, "HOLD-FR",
+        "--operator", "merge-pass: prism soft gate HOLD f-1", "--operator-kind", "machine",
+    ])
+    assert getattr(ns, "operator_kind", None) == "machine"
+    rc = kc._cmd_request_changes(ns)
+    assert rc == 0
+    with kb.connect() as conn:
+        assert _changes_requested_payload(conn, tid)["operator_kind"] == "machine"
 
 
 def test_cli_without_operator_still_needs_coverage(

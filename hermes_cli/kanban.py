@@ -43,6 +43,7 @@ from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError
 from hermes_cli.kanban_receipt import EXIT_NO_RECEIPT, ReceiptRequiredError
 from hermes_cli.kanban_identity import safe_comment_provenance
+from hermes_cli.kanban_held_repo import fmt_held_repo, held_repo
 from hermes_constants import get_default_hermes_root
 
 
@@ -309,10 +310,13 @@ def kanban_command(args: argparse.Namespace) -> int:
     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
     # import DB mutators directly.
     if _is_delegated_child_cli_mutation(args):
-        return _err("kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI")
+        refusal = "delegate_task child contexts cannot mutate Kanban tasks via the CLI"
+        _record_refused_block(args, refusal)
+        return _err(f"kanban: {refusal}")
 
     refusal = _non_owner_lifecycle_refusal(args)
     if refusal:
+        _record_refused_block(args, refusal)
         return _err(f"kanban: {refusal}")
 
     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
@@ -559,6 +563,26 @@ def _lifecycle_target_ids(args: argparse.Namespace) -> list[str]:
     return ids
 
 
+def _record_refused_block(args: argparse.Namespace, refusal: str) -> None:
+    """Comment a refused ``block`` on each target card so the refusal is visible on the board.
+
+    Without it the card stays ``running`` with an idle worker and nothing says
+    why (t_0809e21a). A comment is the one write a delegate child may make
+    (``kanban_db.add_comment`` marks it ``(subagent)``); failures only warn.
+    """
+    if getattr(args, "kanban_action", None) != "block":
+        return
+    body = f"kanban block REFUSED, the block did not land and the card status is unchanged: {refusal}"
+    for tid in _lifecycle_target_ids(args):
+        try:
+            run_id, session_ref = safe_comment_provenance(tid)
+            with kbc.connect_closing() as conn:
+                kb.add_comment(conn, tid, _profile_author(), body,
+                               run_id=run_id, session_ref=session_ref)
+        except Exception as exc:
+            print(f"kanban: could not record the refused block on {tid}: {exc}", file=sys.stderr)
+
+
 def _non_owner_lifecycle_refusal(args: argparse.Namespace) -> Optional[str]:
     """Refuse a lifecycle write on the ambient worker card by a non-owner.
 
@@ -768,6 +792,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if getattr(args, "unhomed", False):
+        if getattr(args, "session", None) is not None or (getattr(args, "home", None) or "").strip():
+            print("kanban: --unhomed is exclusive with --session/--home", file=sys.stderr)
+            return 2
+        args.session = "none"
     home_flag = (getattr(args, "home", None) or "").strip()
     if home_flag:
         if getattr(args, "session", None) is not None:
@@ -839,6 +868,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    if (task.unhomed and getattr(args, "session", None) is None
+            and not getattr(args, "json", False)):
+        # D-O2 (t_6281f908): a hand-typed create with no session is allowed
+        # but says so; the orphan watch will try to infer its home. Not with
+        # --json: ``run_slash`` merges stderr into its output, and the JSON
+        # carries ``"unhomed": true`` for a machine reader anyway.
+        print(
+            f"\n⚠  {task_id} has no home session (no session identity, no "
+            "homed --parent): its lifecycle lines fall back to #logs until it "
+            f"is re-homed (`hermes kanban rehome {task_id} --session <sid>`).",
+            file=sys.stderr,
+        )
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
@@ -1184,14 +1225,23 @@ def _cmd_show(args: argparse.Namespace) -> int:
         )
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
+        try:
+            from hermes_cli import kanban_pr_owner as kpo
 
+            pr_card_map = kpo.pr_card_map(conn, task.id)
+        except kb.sqlite3.Error:  # older/minimal board schema: no PR list
+            pr_card_map = {}
+
+    held = held_repo([c.body for c in comments]) if task.status in ("review", "blocked", "ready") else None
     if want_json:
         _print_json({
             "task": _task_to_dict(task),
             "home": _home_label(task.session_id, unhomed=task.unhomed),
             "latest_summary": latest_summary,
             "workspace_refusal": refusal,
+            "held_repo": held,
             "parents": parents, "children": children,
+            "pr_cards": pr_card_map,
             "parent_links": [{"id": pid, "kind": kind} for pid, kind in parent_links],
             "child_links": [{"id": cid, "kind": kind} for cid, kind in child_links],
             "comments": [
@@ -1216,6 +1266,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     guard_line = _fmt_current_respawn_guard(task.status, events)
     if guard_line:
         field("guard", guard_line)
+    if held:
+        field("held", fmt_held_repo(held))
     field("assignee", task.assignee or "-")
     if task.priority:
         field("priority", task.priority)
@@ -1264,6 +1316,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         field("parents", _fmt_links(parent_links))
     if children:
         field("children", _fmt_links(child_links))
+    for pr, others in (pr_card_map or {}).items():
+        field("pr-cards", f"{pr}: " + (", ".join(
+            f"{o['id']} ({o['status']}, {o['assignee'] or '-'})" for o in others) or "none other"))
     if task.body:
         _print_section("Body:", [task.body])
     if task.result:
@@ -2374,6 +2429,31 @@ def _rows_by_task(conn, table: str, ids: list[str]) -> dict[str, list]:
     return by
 
 
+def _cmd_diagnostics_placement(args: argparse.Namespace, config) -> int:
+    """``diagnostics --placement``: read-only; no ssh probe, no streak advance."""
+    from hermes_cli import kanban_load_gate as _klg
+    from hermes_cli import kanban_placement_diag as kpd
+
+    # The pool block, streaks and ledger are published under the shared kanban
+    # root by ITS dispatcher; rebuild the plan with that root's config, not the
+    # invoking profile's (a `-p x` read_signal/worker_hosts must not leak in).
+    from hermes_cli.config_effective import load_user_config_effective
+
+    root = kb.kanban_home()
+    try:
+        root_cfg = load_user_config_effective(root / "config.yaml")
+    except Exception as exc:  # never substitute the invoking profile's config
+        return _err(f"diagnostics --placement: cannot read {root / 'config.yaml'}: {exc}")
+    kcfg = (root_cfg or {}).get("kanban") if isinstance(root_cfg, dict) else None
+    rep = kpd.compute(root, kanban_cfg=kcfg if isinstance(kcfg, dict) else {},
+                      gate_state=_klg.read_state())
+    if getattr(args, "json", False):
+        _print_json(rep)
+    else:
+        print("\n".join(kpd.format_lines(rep)))
+    return 0
+
+
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board via the same rule engine the dashboard uses."""
     from hermes_cli import kanban_diagnostics as kd
@@ -2384,7 +2464,10 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     # relies on the gateway-embedded dispatcher.
     from hermes_cli.config import load_config
 
-    diag_config = kd.config_from_runtime_config(load_config())
+    runtime_config = load_config()
+    if getattr(args, "placement", False):
+        return _cmd_diagnostics_placement(args, runtime_config)
+    diag_config = kd.config_from_runtime_config(runtime_config)
 
     with kbc.connect_closing() as conn:
         # Either one-task mode or fleet mode.
@@ -2575,7 +2658,14 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         if len(body) > args.max_len:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
-    author = args.author or _profile_author()
+    author, claimed = _comment_author(args.author)
+    if claimed is not None:
+        print(
+            f"kanban: --author {claimed!r} needs the operator token "
+            f"({kb.OPERATOR_TOKEN_ENV}); commenting as {author!r}, "
+            "the requested author is kept as claimed_author",
+            file=sys.stderr,
+        )
     run_id, session_ref = safe_comment_provenance(args.task_id)
     with kb.connect_closing() as conn:
         if run_id is None:
@@ -2584,10 +2674,33 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             run_id = _operator_review_run_id(conn, args.task_id)
         kb.add_comment(
             conn, args.task_id, author, body,
-            run_id=run_id, session_ref=session_ref,
+            run_id=run_id, session_ref=session_ref, claimed_author=claimed,
         )
     print(f"Comment added to {args.task_id}")
     return 0
+
+
+def _comment_author(requested: Optional[str]) -> tuple[str, Optional[str]]:
+    """``(author, claimed_author)`` for a CLI comment.
+
+    ``env -u HERMES_KANBAN_TASK hermes kanban comment --author human:apollo``
+    wrote an operator-labelled comment from any worker shell (Prism gate spec
+    §8b). ``--author`` may now never raise a caller above its own identity: it
+    is honoured for an operator-profile caller (``RULING_AUTHORS``, already the
+    label every reader trusts, so a chosen label grants nothing; fleet crons run
+    there and deliberately pick NON-operator labels such as ``land-autopilot``),
+    or with the operator token (the same gate as ``--operator``/``--takeover``).
+    Any other caller writes as itself; the requested label survives only as
+    ``claimed_author`` on the ``commented`` event, for forensics.
+    """
+    from hermes_cli.kanban_worker_policy import RULING_AUTHORS
+
+    caller = _profile_author()
+    want = (requested or "").strip()
+    if (not want or want == caller or caller.strip().lower() in RULING_AUTHORS
+            or kb._operator_token_state() == "ok"):
+        return want or caller, None
+    return caller, want
 
 
 def _cmd_attach(args: argparse.Namespace) -> int:
@@ -2824,6 +2937,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     summary = getattr(args, "summary", None)
     superseded_by = getattr(args, "superseded_by", None)
     draft_ok = getattr(args, "draft_ok", None)
+    external = getattr(args, "external", None)
+    watcher = getattr(args, "watcher", None)
     raw_meta = getattr(args, "metadata", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
@@ -2835,9 +2950,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     survivor_reason = getattr(args, "reason", None)
     if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr
                          or survivor_unbound or survivor_none or survivor_reason or superseded_by
-                         or draft_ok is not None):
+                         or draft_ok is not None or external is not None or watcher is not None):
         return _err(
-            "kanban: --summary / --metadata / --superseded-by / --draft-ok / --survivor-ref / "
+            "kanban: --summary / --metadata / --superseded-by / --draft-ok / --external / "
+            "--watcher / --survivor-ref / "
             "--survivor-pr / --survivor-unbound / --survivor-none / --reason are per-task "
             "and can't be used with multiple ids (would apply the same handoff, and record "
             "the same survivor, for every task). "
@@ -2867,7 +2983,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # acceptance contract that protects complete.
             # A superseded close has no work for the judge to grade; gating it
             # would push the worker back into exiting silently.
-            gate_err = None if superseded_by is not None else _goal_gate_error(
+            gate_err = None if (superseded_by is not None or external is not None) else _goal_gate_error(
                 conn, tid, (summary or args.result or "").strip(), "completion",
                 "Re-scope with kanban edit, or record the block with kanban block instead of completing.",
                 "Provide evidence matching the task's acceptance criteria.")
@@ -2892,6 +3008,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     survivor_reason=survivor_reason,
                     superseded_by=superseded_by,
                     draft_ok=draft_ok,
+                    external=external,
+                    watcher=watcher,
                 )
             except kb.LiveClaimError:
                 failed.append(tid)
@@ -2909,7 +3027,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 no_receipt = True
                 print(f"cannot complete {tid}: {receipt_err}.", file=sys.stderr)
                 continue
-            except (kb.EmptySupersedeError, kb.EmptyDraftOverrideError) as supersede_err:
+            except (kb.EmptySupersedeError, kb.EmptyDraftOverrideError,
+                    kb.ExternalCloseError) as supersede_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
@@ -2939,6 +3058,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 if getattr(after, "status", None) == "review":
                     print(f"Routed {tid} to review, NOT done: "
                           f"{outcome or 'handoff names a still-OPEN PR'}")
+                elif external is not None:
+                    print(f"Completed {tid} (external: {external.strip()}, watcher {watcher.strip()})")
                 else:
                     print(f"Completed {tid}")
                 override = _draft_override_of(conn, tid, last_event)
@@ -3392,6 +3513,13 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     operator = (getattr(args, "operator", None) or "").strip() or None
+    if args.coverage is not None:
+        # Before any write (claim release, comment, transition): a refused
+        # record must not land on the card (t_c5bfb48b).
+        coverage_error = kb.review_coverage_text_error(args.coverage)
+        if coverage_error:
+            print(f"cannot request changes for {tid}: {coverage_error}", file=sys.stderr)
+            return 1
     with kb.connect_closing() as conn:
         # The caller must hold the review run: as its dispatcher-owned worker,
         # or as the operator session that made ``claim --review`` (human lane).
@@ -3448,27 +3576,20 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
-        elif args.coverage is not None:
-            kb.add_comment(
-                conn, tid, _profile_author(),
-                "review_coverage: " + str(kb.redact_review_value(args.coverage)),
-                run_id=held_run,
-            )
         ok, detail = kb.request_changes(
             conn,
             tid,
             reason=reason,
             expected_run_id=held_run,
             operator=operator,
+            operator_kind=getattr(args, "operator_kind", None),
+            # The coverage comment is written inside the transition's
+            # transaction, so a refused send-back rolls it back. ``claimer``
+            # authors it; on a parked card it also opens the review run.
+            coverage=args.coverage,
+            claimer=_profile_author(),
             **(
-                {
-                    # Open the review run as this session, and record the
-                    # coverage on it inside the same transaction so the
-                    # coverage gate can pass.
-                    "claimer": _profile_author(),
-                    "coverage": args.coverage,
-                    "session_ref": parked_session,
-                }
+                {"session_ref": parked_session}
                 if parked_session is not None or parked_override
                 else {}
             ),
@@ -3740,6 +3861,12 @@ def _print_stranded_by_triage(stranded) -> None:
     )
 
 
+def _cmd_session_closeout(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_session_closeout
+
+    return kanban_session_closeout.run(args)
+
+
 def _cmd_home_index(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_home_index
 
@@ -3813,6 +3940,29 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def rehome_apply(conn, task_id: str, sid: str, row: Optional[dict], target) -> bool:
+    """Stamp ``sid`` as the card's home and subscribe its chat (``target``, a
+    ``HomeTarget``). Shared by ``rehome`` and the gateway's orphan-menu reply
+    (t_6281f908). False = unknown id."""
+    if not kb.set_task_session(conn, task_id, sid):
+        return False
+    try:
+        origin = json.loads((row or {}).get("origin_json") or "{}")
+    except (TypeError, ValueError):
+        origin = {}
+    origin = origin if isinstance(origin, dict) else {}
+    kbn.add_notify_sub(
+        conn, task_id=task_id,
+        platform=target.platform, chat_id=target.chat_id,
+        thread_id=target.thread_id or None,
+        chat_type=origin.get("chat_type") or None,
+        user_id=origin.get("user_id") or None,
+        scope_id=origin.get("scope_id") or None,
+        notifier_profile=origin.get("profile") or _profile_author(),
+    )
+    return True
+
+
 def _cmd_rehome(args: argparse.Namespace) -> int:
     """Re-home a card (t_808bc8e6): stamp ``--session`` as its home and
     subscribe that session's origin chat. The orphan alert names this verb."""
@@ -3839,24 +3989,10 @@ def _cmd_rehome(args: argparse.Namespace) -> int:
         if kb.get_task(conn, args.task_id) is None:
             print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
-        if not kb.set_task_session(conn, args.task_id, sid):
+        if not rehome_apply(conn, args.task_id, sid, row, home.target):
             print(f"cannot rehome {args.task_id} (unknown id)", file=sys.stderr)
             return 1
-        try:
-            origin = json.loads((row or {}).get("origin_json") or "{}")
-        except (TypeError, ValueError):
-            origin = {}
-        origin = origin if isinstance(origin, dict) else {}
         target = home.target
-        kbn.add_notify_sub(
-            conn, task_id=args.task_id,
-            platform=target.platform, chat_id=target.chat_id,
-            thread_id=target.thread_id or None,
-            chat_type=origin.get("chat_type") or None,
-            user_id=origin.get("user_id") or None,
-            scope_id=origin.get("scope_id") or None,
-            notifier_profile=origin.get("profile") or _profile_author(),
-        )
     print(f"Re-homed {args.task_id} to session {sid} "
           f"({target.platform}:{target.chat_id}"
           + (f":{target.thread_id}" if target.thread_id else "") + ")")
@@ -4454,7 +4590,7 @@ _HANDLERS = {
     "triage-resolve": _cmd_triage_resolve,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
-    "home-index": _cmd_home_index,
+    "home-index": _cmd_home_index, "session-closeout": _cmd_session_closeout,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-status": _cmd_notify_status,
@@ -4504,9 +4640,13 @@ def run_slash(rest: str, *, session_id: Optional[str] = None) -> str:
     ``None`` falls back to :func:`_caller_session_id`'s normal resolution.
     """
     token = _SLASH_SESSION_ID.set((session_id or "").strip() or None)
+    # A typed CLI/TUI ``/kanban`` is hand-typed (D-O2, t_6281f908); the
+    # gateway's in-process call is classified as ``gateway`` before this.
+    hand = kb.HAND_TYPED_SLASH.set(True)
     try:
         return _run_slash(rest)
     finally:
+        kb.HAND_TYPED_SLASH.reset(hand)
         _SLASH_SESSION_ID.reset(token)
 
 

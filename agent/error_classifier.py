@@ -86,6 +86,11 @@ class FailoverReason(enum.Enum):
     model_entitlement = "model_entitlement"  # This account cannot use the requested model — rotate credential (model-scoped), else fall back
     incomplete_response = "incomplete_response"  # Codex/Responses turn stuck emitting reasoning only (no answer, no tool call) after replay + nudge — hand to a different provider
     format_error = "format_error"        # 400 bad request — abort or strip + retry
+    # OUR relay/bridge refused the request's SHAPE for this lane (claude-bpx tui
+    # ``tui_tools_unsupported`` / ``tui_images_unsupported``, relay ``mode_not_allowed``):
+    # deterministic for the lane, never Anthropic's answer. Fail over to the next hop,
+    # never retry in place (t_1ed37625).
+    lane_incapable = "lane_incapable"
     # Malformed CONVERSATION structure (a message array WE built: unanswered tool_use, stray
     # tool_result, forbidden role adjacency, tool_calls not followed by tool messages).
     # Deterministic on EVERY provider, so non-retryable AND non-failover: the chain would re-send
@@ -227,6 +232,18 @@ _POOL_MODEL_SCOPED_PATTERN = "no eligible sub for the requested model"
 # pool terminally 504'd without rotating. Exact body strings, not status/provider — the 504 does
 # not always survive onto the exception object and the custom-provider label is not stable.
 _POOL_STALLED_PATTERNS = ("upstream attempt timed out", "pool deadline exceeded")
+# The claude-bpx tui bridge's read-phase stall, passed through by the dlr relay: 504
+# ``error.code=tui_turn_timeout`` (bridge/src/tuiRunner.js TUI_ERRORS). Same terminal state as the
+# relay's own 504; it fell to the 5xx floor and was retried up to 3 x 600 s (t_bbb0dec5).
+_BRIDGE_STALLED_CODES = frozenset({"tui_turn_timeout"})
+# Relay no-eligible-sub bodies the relay itself classes ``pool_pressure`` (claude_pool_relay.py
+# _SYNTHETIC_PREFIX_CLASS): every sub that could serve it is operator-drained, or none serves the
+# requested bridge mode. Not a quota cap that frees in seconds, so they skip the pool_exhausted
+# same-provider capacity wait. Exact relay prefixes, matched on the body ``error`` string.
+_POOL_PRESSURE_NO_ELIGIBLE_PREFIXES = (
+    "no eligible sub: every subscription that could serve this request is drained",
+    "no eligible sub: no subscription that serves the requested bridge mode",
+)
 # Account/organization ENTITLEMENT block (2026-08-08): a lapsed subscription makes Anthropic answer
 # every request 403 permission_error "OAuth authentication is currently not allowed for this
 # organization." The token is valid, so the 403 bucket said `auth` and announced "(auth refresh)".
@@ -1008,6 +1025,11 @@ def _relay_verdict(c: _Ctx) -> Optional[Verdict]:
     with an honest reason."""
     if c.status_code in (None, 503) and _is_relay_deploy_drain(c.error, c.body):
         return _V_RELAY_DRAINING
+    # Read-phase stall before the stated class: the relay stamps ``conn`` on its own 504 attempt
+    # timeout (the class names the hop, not the recovery), and ``conn`` retries in place, which
+    # re-enters the same stall for another per_attempt_timeout_s (t_bbb0dec5).
+    if _is_read_phase_stall(c):
+        return _V_POOL_STALLED
     try:
         from agent.fallback_events import relay_error_class as _relay_error_class
         relay_class, _src = _relay_error_class(c.error)
@@ -1016,7 +1038,26 @@ def _relay_verdict(c: _Ctx) -> Optional[Verdict]:
     verdict = _RELAY_CLASS_VERDICTS.get(relay_class) if relay_class else None
     if verdict is not None:
         return verdict
+    if relay_class is None and _relay_body_error(c.body).startswith(_POOL_PRESSURE_NO_ELIGIBLE_PREFIXES):
+        # Un-negotiated bytes get the class the relay states for them under error-class-v2.
+        return _V_RELAY_POOL_PRESSURE
     return _V_STREAM_PARSE if isinstance(c.error, ProviderStreamParseError) else None
+
+
+def _relay_body_error(body: Any) -> str:
+    """The relay-synthetic ``{"error": "<string>"}`` value, lowercased; ``""`` for any other shape."""
+    err = body.get("error") if isinstance(body, dict) else None
+    return err.strip().lower() if isinstance(err, str) else ""
+
+
+def _is_read_phase_stall(c: _Ctx) -> bool:
+    """A box accepted the turn and stalled past its deadline: the relay's exact 504 bodies or the
+    tui bridge's ``tui_turn_timeout`` code. Never a bare 504 or a generic timeout word."""
+    if c.status_code not in (None, 504):
+        return False
+    if c.error_code.lower() in _BRIDGE_STALLED_CODES:
+        return True
+    return any(p in c.msg for p in _POOL_STALLED_PATTERNS)
 
 
 # Fork pool/relay bodies checked BEFORE status classification: each reaches the classifier two
@@ -1046,6 +1087,13 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     if _is_safeguard_refusal(c.error_code, c.body):
         return _v(_R.content_policy_blocked, retryable=False, should_fallback=False,
                   error_context={"error_code": SAFEGUARD_REFUSAL_ERROR_CODE})
+    # Our bridge/relay refusing the request SHAPE for this lane (400 tui_tools_unsupported /
+    # tui_images_unsupported, relay mode_not_allowed). Before status classification so it
+    # never reads as an unclassified Anthropic 400: the lane is incapable, the next hop may
+    # not be. error_context carries the code for the banner (t_1ed37625).
+    _lane_code = _lane_incapable_code(c)
+    if _lane_code:
+        return _v(_R.lane_incapable, **_ABORT_FALLBACK, error_context={"error_code": _lane_code})
     # Safety refusal before status classification so a 400 block isn't downgraded
     # to format_error and a status-less block isn't left retryable (#18028).
     if any(p in msg for p in _CONTENT_POLICY_BLOCKED_PATTERNS):
@@ -1767,6 +1815,16 @@ def is_safeguard_refusal(classified) -> bool:
     """Whether a ClassifiedError is a bridge safeguard refusal (never switch model)."""
     ctx = getattr(classified, "error_context", None) or {}
     return ctx.get("error_code") == SAFEGUARD_REFUSAL_ERROR_CODE
+
+
+def _lane_incapable_code(c: "_Ctx") -> Optional[str]:
+    """The bridge/relay lane-incapable machine code on this error, else None.
+
+    Same two body shapes as :func:`_is_safeguard_refusal` (HTTP envelope and the unwrapped
+    error object); the extracted ``c.error_code`` is checked first (t_1ed37625)."""
+    from agent.fallback_capability import body_lane_incapable_code, lane_incapable_code
+
+    return lane_incapable_code(c.error_code) or body_lane_incapable_code(c.body, c.msg)
 
 
 def _extract_error_code(body: dict) -> str:

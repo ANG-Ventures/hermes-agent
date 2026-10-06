@@ -57,7 +57,7 @@ def _task_id(rec: dict) -> str:
 
 def _run_one_card(board: Board, tid: str) -> None:
     board.dispatch()
-    pid = board.task(tid)["worker_pid"]
+    pid = board.run_pid(tid)
     assert pid, board.diag(tid)
     board.wait_worker_exit(tid, int(pid))
 
@@ -184,7 +184,7 @@ def test_worker_with_unresolvable_pinned_skill_still_starts_its_session(tmp_path
                 assert not board.runs(tid) or board.runs(tid)[-1]["worker_pid"] is None, board.diag(tid)
                 assert not srv.main_requests(), "no worker session for a refused card"
                 return
-            pid = task["worker_pid"]
+            pid = board.run_pid(tid)
             assert pid, board.diag(tid)
             board.wait_worker_exit(tid, int(pid))
             log = wait_until(lambda: board.worker_log(tid), 10, "worker log")

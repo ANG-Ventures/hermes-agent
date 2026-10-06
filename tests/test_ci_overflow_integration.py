@@ -21,7 +21,7 @@ MATRIX = ("${{ fromJSON(github.event_name != 'merge_group' && needs.generate.out
 # t_42bed567: no plan -> the static split (CI_RUNNER_LABELS), never the all-local pool.
 LOCAL_POOL = "'[\"self-hosted\",\"Linux\",\"X64\",\"hermes-ci\"]'"
 STATIC_E2E = ("(contains(fromJSON(vars.CI_RUNNER_LABELS || '[\"ubuntu-latest\"]'), 'self-hosted') && "
-              "format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"')) || '[\"blacksmith-4vcpu-ubuntu-2404\"]')")
+              "format('[\"{0}\",\"X64\"]', join(fromJSON(vars.CI_RUNNER_LABELS), '\",\"')) || '[\"ubuntu-latest\"]')")
 E2E_RUNS_ON = ("${{ fromJSON(needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && "
                "needs.placement.outputs.e2e_runs_on || " + STATIC_E2E + ") }}")
 

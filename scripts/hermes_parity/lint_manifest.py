@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import glob
 import importlib.util
+import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -67,6 +69,84 @@ def lint_schema(manifest_path: Path) -> list[str]:
             feature.upstream_ref is None or not feature.upstream_ref.strip()
         ):
             errors.append(f"absorbed feature requires upstream_ref: {feature.feature!r}")
+    return errors
+
+
+CENSUS_VERDICTS = frozenset({
+    "KEPT-FORK", "ABSORBED-UPSTREAM", "EQUIVALENT-UPSTREAM", "PARTIAL-UPSTREAM", "DROPPED-THIS-SYNC",
+})
+# Verdicts that tell a sync resolver "upstream's copy is enough". Evidence that names a live
+# fork-only remainder contradicts them: resolving toward upstream would drop that remainder.
+_UPSTREAM_SUFFICIENT = frozenset({"ABSORBED-UPSTREAM", "EQUIVALENT-UPSTREAM"})
+_RESIDUAL_MARKER = re.compile(
+    r"\bpartial\b|\bresidual\b|\bremainder\b|\bfork[- ]only\b|\bfork deltas?\b", re.IGNORECASE
+)
+
+
+def lint_census(manifest_path: Path) -> list[str]:
+    """Check each entry's ``parity_census`` verdict against its own evidence."""
+    with manifest_path.open("r", encoding="utf-8-sig") as fh:
+        raw = json.load(fh)
+    errors: list[str] = []
+    for entry in raw:
+        census = entry.get("parity_census")
+        if census is None:
+            continue
+        name = entry.get("feature")
+        verdict = census.get("verdict")
+        residual = census.get("residual") or []
+        if verdict not in CENSUS_VERDICTS:
+            errors.append(
+                f"invalid parity_census verdict for {name!r}: {verdict!r} "
+                f"(expected one of: {', '.join(sorted(CENSUS_VERDICTS))})"
+            )
+        elif verdict == "PARTIAL-UPSTREAM" and not residual:
+            errors.append(f"PARTIAL-UPSTREAM census for {name!r} requires a non-empty residual list")
+        elif verdict in _UPSTREAM_SUFFICIENT and residual:
+            errors.append(f"{verdict} census for {name!r} lists a residual fork delta; use PARTIAL-UPSTREAM")
+        elif verdict in _UPSTREAM_SUFFICIENT and _RESIDUAL_MARKER.search(str(census.get("evidence", ""))):
+            errors.append(
+                f"{verdict} census for {name!r} has evidence naming a fork-only remainder; "
+                "use PARTIAL-UPSTREAM with a residual list"
+            )
+    return errors
+
+
+def lint_call_sites(manifest_path: Path) -> list[str]:
+    """D2b: an entry that declares ``call_site`` must name the e2e test that drives it.
+
+    ``call_site`` is the upstream function the fork threads a kwarg / header / hook into.
+    ``call_site_tests`` lists the nodeids that exercise THAT function and assert the visible
+    effect; each must also be in ``tests`` so ``lint_nodeids`` proves it collects. A helper-only
+    test leaves the call site free to drop the fork's input silently (t_829a3079: the footer
+    consumer lost six kwargs while every registered test stayed green).
+    Coverage table: docs/sync/fork-call-site-coverage.md.
+    """
+    with manifest_path.open("r", encoding="utf-8-sig") as fh:
+        raw = json.load(fh)
+    errors: list[str] = []
+    for entry in raw:
+        call_site = entry.get("call_site")
+        if call_site is None:
+            continue
+        name = entry.get("feature")
+        if not isinstance(call_site, str) or not call_site.strip():
+            errors.append(f"call_site for {name!r} must be a non-empty 'path::symbol' string")
+            continue
+        e2e = entry.get("call_site_tests") or []
+        if not e2e:
+            errors.append(
+                f"call_site {call_site!r} for {name!r} has no call_site_tests naming an e2e test "
+                "that drives it (D2b)"
+            )
+            continue
+        listed = set(entry.get("tests") or [])
+        for node in e2e:
+            if node not in listed:
+                errors.append(
+                    f"call_site_tests entry {node!r} for {name!r} is not in its tests list, so "
+                    "nothing checks that it collects"
+                )
     return errors
 
 
@@ -152,6 +232,8 @@ def lint_manifest(
     if not manifest.exists():
         return ManifestLintResult(False, (f"manifest missing: {manifest.relative_to(repo)}",))
     errors = lint_schema(manifest)
+    errors.extend(lint_census(manifest))
+    errors.extend(lint_call_sites(manifest))
     errors.extend(lint_paths(repo, manifest))
     nodeids = forkdelta.manifest_nodeids(manifest)
     errors.extend(lint_nodeids(repo, nodeids))

@@ -20,6 +20,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "ChatModelPins/pin-mismatch symbols: fork 15 hits in gateway/, upstream 0; gateway/chat_model_pins.py absent upstream."},
     "surfaces": ["gateway", "cli"]
   },
   {
@@ -35,6 +36,7 @@
     "lifecycle": "absorbed",
     "upstream_ref": "tools/approval.py::_is_cron_approval_context + contextvars.copy_context() at tools/delegate_tool.py:2960,:4153",
     "absorbed_date": "2026-08-31",
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "ABSORBED-UPSTREAM", "evidence": "Reconfirmed (absorbed 2026-08-31, ownership already transferred). _is_cron_approval_context present on both (6/6 hits); upstream extraction 7926cf5e59 (2026-09-02) kept it ContextVar-first. No new D2 item."},
     "surfaces": [
       "cron",
       "gateway"
@@ -53,6 +55,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "Fork INVOCATION_ID/darwin exit-code branch in gateway/run_shutdown.py: fork 1, upstream 0. Deliberate deployment divergence (do not upstream), unchanged."},
     "surfaces": [
       "gateway"
     ],
@@ -75,6 +78,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "agent/fork_ext/compaction_ext.py absent upstream; upstream has no hygiene-success announce (only test_hygiene_warning_lifecycle cooldown/notice sink)."},
     "surfaces": [
       "gateway",
       "discord",
@@ -97,6 +101,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "toolsets.py 'messaging'/'moa' and mixture_of_agents: fork present, upstream 0 hits; tools/mixture_of_agents_tool.py absent upstream."},
     "surfaces": [
       "agent"
     ]
@@ -116,16 +121,35 @@
     "lifecycle": "absorbed",
     "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/52844",
     "absorbed_date": "2026-06-26",
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "ABSORBED-UPSTREAM", "evidence": "Reconfirmed (upstream #52844, parallel invention converged 2026-07-16). Upstream adapter still threads drop_pending_updates through _start_polling_resilient; fork keeps only the guard tests. No new D2 item."},
     "surfaces": [
       "telegram"
     ]
   },
   {
     "feature": "cron scheduler per-job reasoning and script timeout helpers",
+    "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
       "tests/cron/test_cron_script.py::TestRunJobScript",
       "tests/cron/test_per_job_reasoning_effort.py::TestResolution",
-      "tests/cron/test_reasoning_config_per_model.py::TestCronPerModelReasoningConfig"
+      "tests/cron/test_reasoning_config_per_model.py::TestCronPerModelReasoningConfig",
+      "tests/cron/test_cron_script_job_timeout.py::test_monitor_script_passes_job_ceiling",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_wiring_timeout_seconds",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_render_timeout_seconds",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_wiring_job_name",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_render_job_name",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_wiring_job_id",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_render_job_id"
+    ],
+    "call_site": "cron/scheduler.py::_job_script_kwargs",
+    "call_site_tests": [
+      "tests/cron/test_cron_script_job_timeout.py::test_monitor_script_passes_job_ceiling",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_wiring_timeout_seconds",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_render_timeout_seconds",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_wiring_job_name",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_render_job_name",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_wiring_job_id",
+      "tests/cron/test_cron_script_kwargs_isolated.py::test_render_job_id"
     ],
     "paths": [
       "cron/fork_ext/scheduler_ext.py",
@@ -135,16 +159,35 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "PARTIAL-UPSTREAM", "residual": ["cron/fork_ext/scheduler_ext.py::resolve_job_script_timeout (per-job/interval script-timeout ceiling; caller cron/scheduler.py:2242; upstream 0 hits)"], "evidence": "PARTIAL. Per-job reasoning: production on fork calls upstream's cron/scheduler.py::_resolve_job_reasoning_config (4e1dd1a74b, Victor Kyriazakos, 2026-08-20); fork scheduler_ext.resolve_cron_reasoning_config has no production caller (golden runner only). Global script-timeout chain: ledger F07-cron_tools_auth_misc.md row cron/scheduler_script.py::_get_script_timeout NO-PORT-NEEDED (upstream _timeout_from_env_or_config is the identical chain); fork get_script_timeout has no production caller. Residual live fork delta: resolve_job_script_timeout (per-job/interval ceiling, called from cron/scheduler.py:2242), upstream 0 hits."},
     "surfaces": [
       "cron"
     ],
-    "coverage_gap": "ROTTEN NODEID REPOINTED (2026-08-30 audit): `TestRunJobScript::test_script_timeout` does not exist; `grep -rn 'def test_script_timeout' tests/` is empty tree-wide. The class holds test_successful_script / test_script_relative_path / test_script_subprocess_env_sanitized. Repointed at the class so the entry collects, but the SCRIPT-TIMEOUT RESOLUTION CHAIN named in `why` is now UNCOVERED. The module docstring still advertises timeout coverage, suggesting a silent rename/drop. ACTION: restore a timeout test or amend `why` to stop claiming that behavior."
+    "coverage_gap": "ROTTEN NODEID REPOINTED (2026-08-30 audit): `TestRunJobScript::test_script_timeout` does not exist; the class is kept for output/env coverage only. RESOLVED 2026-10-04 (t_db03da56): the per-job script-timeout chain is covered end to end by tests/cron/test_cron_script_kwargs_isolated.py (run_one_job/run_job through _job_script_kwargs, per-kwarg wiring + visible effect) and the monitor path by test_monitor_script_passes_job_ceiling; both are in call_site_tests."
   },
   {
     "feature": "relay-pool session affinity and lane headers",
+    "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
       "tests/agent/test_pool_affinity_header.py",
-      "tests/fork_canaries/test_fork_canary_relay_lane_headers.py"
+      "tests/fork_canaries/test_fork_canary_relay_lane_headers.py",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_session",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_session",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_lane",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_lane",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_lane_src",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_lane_src",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_non_pool_provider_carries_none"
+    ],
+    "call_site": "agent/chat_completion_helpers.py::_build_anthropic_kwargs",
+    "call_site_tests": [
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_session",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_session",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_lane",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_lane",
+      "tests/agent/test_pool_affinity_call_site.py::test_wiring_x_hermes_lane_src",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_x_hermes_lane_src",
+      "tests/agent/test_pool_affinity_call_site.py::test_wire_non_pool_provider_carries_none"
     ],
     "paths": [
       "agent/fork_ext/relay_headers.py",
@@ -154,6 +197,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "agent/fork_ext/relay_headers.py absent upstream; upstream X-Hermes-Session-Id hits are session-id sanitizing, not pool affinity/lane stamping."},
     "surfaces": [
       "agent"
     ],
@@ -176,17 +220,32 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "gateway/fork_ext/restart_codec.py absent upstream; codec symbols fork 16, upstream 0."},
     "surfaces": [
       "gateway"
     ]
   },
   {
     "feature": "gateway restart policy, config bridge, and initiator breadcrumb helpers",
+    "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
       "tests/gateway/test_fork_ext_restart_policy.py",
       "tests/gateway/test_restart_cascade.py",
       "tests/gateway/test_auto_continue_interrupted_turns.py",
-      "tests/gateway/test_reboot_resume_reason.py"
+      "tests/gateway/test_reboot_resume_reason.py",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_every_fork_only_key_has_a_call_site_pair",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_call_site_passes_the_agent_section_to_the_fork_helper",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_wiring",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_effect",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_restart_breadcrumb_frozen_contract_is_consumed"
+    ],
+    "call_site": "gateway/run.py::_bridge_config_to_env",
+    "call_site_tests": [
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_every_fork_only_key_has_a_call_site_pair",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_call_site_passes_the_agent_section_to_the_fork_helper",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_wiring",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_effect",
+      "tests/gateway/test_restart_config_bridge_call_site.py::test_restart_breadcrumb_frozen_contract_is_consumed"
     ],
     "paths": [
       "gateway/fork_ext/restart_policy.py",
@@ -196,6 +255,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "gateway/fork_ext/restart_policy.py absent upstream; restart_policy/initiator symbols in gateway/ fork 24, upstream 0."},
     "surfaces": [
       "gateway"
     ]
@@ -215,6 +275,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "persisted_route_lookup / PersistedSessionRouteLookup: fork 12/31 hits, upstream 0. Upstream hermes_cli/route_identity.py is base-URL normalization, a different concern."},
     "surfaces": [
       "gateway"
     ]
@@ -235,6 +296,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "EQUIVALENT-UPSTREAM", "evidence": "Scope gate: production dispatch on fork uses agent/tool_executor.py::_tool_search_scoped_names + model_tools.py scoped_deferrable_names check, byte-identical to upstream (7427b9d581, teknium1, 2026-05-29). fork_ext/tool_gate.py tool_search_scoped_names / resolve_tool_search_unwrap / strip_blocked_delegate_toolsets have no production caller; only pre_tool_block_from_builtin_gate (a 5-line passthrough) is live. code_execution exemption is moot on both trees: DELEGATE_BLOCKED_TOOLS (identical F/U) does not contain execute_code, so _strip_blocked_tools never strips code_execution. The listed canary tests exist on upstream and exercise upstream code."},
     "surfaces": [
       "agent",
       "delegation"
@@ -255,6 +317,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "session_list_denorm: fork 21 hits, upstream 0; hermes_state_ext.py absent upstream."},
     "surfaces": [
       "state"
     ]
@@ -276,6 +339,7 @@
     "lifecycle": "absorbed",
     "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/65895",
     "absorbed_date": "2026-07-16",
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "ABSORBED-UPSTREAM", "evidence": "Reconfirmed (upstream #65895 / 7d27a31ce7, 2026-07-16). class ComputeHost present on both; upstream copy canonical. No new D2 item."},
     "surfaces": [
       "gateway"
     ]
@@ -298,6 +362,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "hermes_undo.py absent upstream; /redo CommandDef fork-only (3109924754, Kyzcreig, 2026-06-15). Upstream has its own coarser user-turn /undo row; the fork's half-turn rewind + redo branch is the contracted delta (its tests pass on fork/main)."},
     "surfaces": [
       "cli",
       "gateway",
@@ -322,6 +387,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "PARTIAL-UPSTREAM", "residual": ["gateway/slash_commands_session.py::_handle_branch_command fork deltas folded into upstream's handler: _branch_point_len stamp (upstream 0 hits), _branch_post_thread_intro, running-agent release on thread branch"], "evidence": "Upstream dbcbd9d9db (teknium1, 2026-09-20, #66023; design by Angello Picasso #66014/#66024): /branch opens a sibling thread by default on Discord/Telegram/Slack/Matrix, --here keeps in-place. Third-party parallel invention, not our submission. Converged THIS sync: ledger CI6-M1-gatewaya.md row test_branch_thread_command.py dropped the fork's Discord-only _handle_branch_command shadow and folded fork deltas (_branch_point_len, thread intro, running-agent release) into upstream's handler; GatewayRunner MRO resolves _handle_branch_command to gateway.slash_commands_session (upstream). Registry row + fork alias are upstream's."},
     "surfaces": [
       "cli",
       "gateway",
@@ -343,6 +409,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "CommandDef('merge'): fork 1, upstream 0."},
     "surfaces": [
       "gateway",
       "discord"
@@ -363,6 +430,7 @@
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "PARTIAL-UPSTREAM", "residual": ["route-aware ultrafast capability: hermes_cli/models.py::resolve_fast_mode_capability (upstream 0 hits)", "gateway/slash_commands.py::_handle_fast_command shadow handler wins the MRO (defect, follow-up t_0b4d7394)"], "evidence": "/fast is upstream's command (8779a268a7, Teknium, 2026-04-10); fork registry row is byte-identical to upstream (normal/fast/auto/cold). Upstream now has session scope + --global (slash_commands_model.py _apply_fast_selection). Fork delta = ultrafast tier + route-aware capability. DEFECT found: GatewayRunner MRO resolves _handle_fast_command to the fork's gateway/slash_commands.py copy, which rejects 'auto'/'cold' the registry advertises (probe on 2d966948b0: '/fast auto' -> 'Unknown argument: auto'). Same shadow-handler class CI6-M1 fixed for /branch; follow-up card filed."},
     "surfaces": [
       "cli",
       "gateway"
@@ -371,8 +439,30 @@
   },
   {
     "feature": "discord free-response channels: scalar coercion + quoted-bot-mention exemption",
+    "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
-      "tests/fork_canaries/test_fork_canary_discord_free_response.py"
+      "tests/fork_canaries/test_fork_canary_discord_free_response.py",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_quoted_other_bot_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_leading_other_bot_mention_suppressed",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_leading_nickname_form_mention_suppressed",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_other_bot_plus_self_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_no_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_only_mention_position_flips_dispatch",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_quoted_mention_outside_free_response_is_upstream_shape",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_exemption_is_scoped_to_free_response_even_without_require_mention",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_self_mention_rescues_leading_other_bot"
+    ],
+    "call_site": "plugins/platforms/discord/adapter.py::DiscordAdapter._discord_message_admission",
+    "call_site_tests": [
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_quoted_other_bot_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_leading_other_bot_mention_suppressed",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_leading_nickname_form_mention_suppressed",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_other_bot_plus_self_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_wiring_no_mention_dispatched",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_only_mention_position_flips_dispatch",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_quoted_mention_outside_free_response_is_upstream_shape",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_exemption_is_scoped_to_free_response_even_without_require_mention",
+      "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_self_mention_rescues_leading_other_bot"
     ],
     "paths": [
       "plugins/platforms/discord/adapter.py"
@@ -381,6 +471,7 @@
     "lifecycle": "absorbed",
     "upstream_ref": "cc8e5ec2af (scalar coercion, byte-identical upstream); remainder = our open upstream PR #72014",
     "absorbed_date": "2026-08-31",
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "PARTIAL-UPSTREAM", "residual": ["plugins/platforms/discord/adapter.py quoted-bot-mention exemption in free-response channels (upstream PR #72014 open)"], "evidence": "Reconfirmed partial absorption: scalar coercion upstream (cc8e5ec2af). Quoted-mention remainder still fork-only ('quoted' in discord plugin: fork 1, upstream 0); our upstream PR #72014 still OPEN (REST read 2026-10-03). No new D2 item."},
     "surfaces": [
       "discord"
     ],
@@ -389,17 +480,32 @@
   },
   {
     "feature": "telegram intake sentinel makes silent inbound update drops visible",
+    "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "tests": [
       "tests/gateway/test_telegram_intake_sentinel.py",
-      "tests/fork_canaries/test_fork_canary_telegram_intake_sentinel.py"
+      "tests/fork_canaries/test_fork_canary_telegram_intake_sentinel.py",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_wiring_sentinel_registered_before_group_zero_on_connect",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_wiring_sentinel_registered_on_rebuilt_app_after_failed_initialize",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_effect_sentinel_logs_before_group_zero_handler_runs",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_effect_sentinel_logs_when_group_zero_handler_raises",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_effect_sentinel_logs_when_group_zero_filters_the_update_out"
+    ],
+    "call_site": "plugins/platforms/telegram/adapter.py::TelegramAdapter._register_handlers",
+    "call_site_tests": [
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_wiring_sentinel_registered_before_group_zero_on_connect",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_wiring_sentinel_registered_on_rebuilt_app_after_failed_initialize",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_effect_sentinel_logs_before_group_zero_handler_runs",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_effect_sentinel_logs_when_group_zero_handler_raises",
+      "tests/plugins/test_telegram_intake_sentinel_wiring_ptb.py::test_effect_sentinel_logs_when_group_zero_filters_the_update_out"
     ],
     "paths": [
       "plugins/platforms/telegram/adapter.py"
     ],
-    "why": "PR #639 (fork/main 6cc7ca42ee). A user DM was fetched by the poller, offset-confirmed to Telegram (pending_update_count back to 0), and never reached any handler — gateway healthy throughout, ZERO log evidence, unattributable after the fact. An observation-only TypeHandler in group -1 sees every update before any filter/auth-prefilter/batching can discard it, giving per-update attribution plus WARNING-level gap detection with the exact missing update_id range. THE GROUP -1 PRIORITY IS THE WHOLE FEATURE: at group>=0 a handler can discard an update before the sentinel observes it, reopening the exact blind spot. Census: OUTSTANDING upstream. The complement canary locks the registration priority and the no-false-alarm rules (contiguous / first-update / duplicate+reordered) that the shipped file does not.",
+    "why": "PR #639 (fork/main 6cc7ca42ee). A user DM was fetched by the poller, offset-confirmed to Telegram (pending_update_count back to 0), and never reached any handler — gateway healthy throughout, ZERO log evidence, unattributable after the fact. An observation-only TypeHandler in group -1 sees every update before any filter/auth-prefilter/batching can discard it, giving per-update attribution plus WARNING-level gap detection with the exact missing update_id range. THE GROUP -1 PRIORITY IS THE WHOLE FEATURE: at group>=0 a handler can discard an update before the sentinel observes it, reopening the exact blind spot. Census: OUTSTANDING upstream. The complement canary locks the no-false-alarm rules (contiguous / first-update / duplicate+reordered) that the shipped file does not. The registration priority is driven through the real PTB Application (call_site_tests).",
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "intake sentinel symbols: fork present, upstream 0."},
     "surfaces": [
       "telegram"
     ],
@@ -418,6 +524,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "vendor checks in tools/cronjob_tools.py: fork 37 hits, upstream 0."},
     "surfaces": [
       "cron",
       "cli",
@@ -437,6 +544,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "Upstream tests/plugins/test_telegram_polling_progress_ptb.py lacks the MagicMock-eviction helper (diff shows fork-only _evict_mocked_telegram)."},
     "surfaces": [
       "telegram",
       "ci"
@@ -446,15 +554,55 @@
   {
     "feature": "gateway runtime footer fork fields: provider_model, context_full, reasoning",
     "tests": [
-      "tests/fork_canaries/test_fork_canary_runtime_footer_fields.py"
+      "tests/fork_canaries/test_fork_canary_runtime_footer_fields.py",
+      "tests/gateway/test_footer_consumer_in_turn.py::test_rendered_footer_leads_with_provider_model",
+      "tests/gateway/test_footer_consumer_in_turn.py::test_consumer_passes_provider_from_turn_result",
+      "tests/gateway/test_footer_consumer_in_turn.py::test_consumer_kwargs_are_superset_of_pre_split_fork_call",
+      "tests/gateway/test_footer_provider_in_turn_result.py",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_provider",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_provider",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_context_tokens",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_context_tokens",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_context_tokens_wrong_field_shows_precompaction",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_context_estimated",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_context_estimated",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_message_stats",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_message_stats",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_reasoning",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_reasoning",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_session_key_and_source",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_session_key",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_source"
     ],
+    "call_site": "gateway/run_turn.py::GatewayTurnMixin._hmwa_runtime_footer_line",
+    "call_site_tests": [
+      "tests/gateway/test_footer_consumer_in_turn.py::test_rendered_footer_leads_with_provider_model",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_provider",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_provider",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_context_tokens",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_context_tokens",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_context_tokens_wrong_field_shows_precompaction",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_context_estimated",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_context_estimated",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_message_stats",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_message_stats",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_reasoning",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_reasoning",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_wiring_session_key_and_source",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_session_key",
+      "tests/gateway/test_footer_consumer_kwargs_isolated.py::test_render_source"
+    ],
+    "call_site_coverage": "docs/sync/fork-call-site-coverage.md",
     "paths": [
-      "gateway/runtime_footer.py"
+      "gateway/runtime_footer.py",
+      "gateway/run_turn.py",
+      "gateway/run_turn_runner.py"
     ],
     "why": "Census 2026-08-29: PR #80661 is still OUTSTANDING upstream (provider_model / context_full / reasoning are absent from upstream's gateway/runtime_footer.py) WHILE the sibling `latency` field from #71990 WAS ABSORBED via #77611. That makes this single file a live merge seam where upstream owns part and the fork owns the rest — the classic silent-drop shape: resolve toward upstream and the footer just renders shorter, no exception, no red test. Also locks the SKIP-SILENTLY doctrine (a field with missing data contributes nothing rather than '?%'), which is the byte-stability property upstream explicitly endorsed when absorbing the latency field on the same design — so keeping it is also what keeps #80661 landable.",
     "lifecycle": "upstream-intended",
-    "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/80661",
+    "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/99292",
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "provider_model/context_full/reasoning absent from upstream gateway/runtime_footer.py. upstream_ref #80661 CLOSED unmerged 2026-08-31, superseded by #99292 (OPEN, REST read 2026-10-03); upstream_ref updated."},
     "surfaces": [
       "gateway",
       "discord",
@@ -481,6 +629,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "Route-transition announce contract (route_change/announce symbols fork 100, upstream 14 unrelated route_changed client hits); fork tests pass on fork/main."},
     "surfaces": ["gateway", "discord", "telegram", "cli"]
   },
   {
@@ -504,6 +653,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "Effort-only announce (from_effort/effort_only): fork present, upstream 0."},
     "surfaces": ["gateway", "discord", "telegram", "cli"]
   },
   {
@@ -522,6 +672,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": null,
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "CLI 'session limit' cap classification in agent/: fork 4, upstream 0."},
     "surfaces": ["gateway", "discord", "telegram", "cli", "cron"]
   },
   {
@@ -538,6 +689,7 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/122138",
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "Upstream still calls sync_plugin_provider_catalog() at module import (hermes_cli/models_catalog_static.py:405) and keeps eager _PROVIDER_PREFIXES; fork has no module-level call. Our upstream PR #122138 still OPEN."},
     "surfaces": [
       "cli",
       "gateway",
@@ -566,11 +718,32 @@
     "lifecycle": "upstream-intended",
     "upstream_ref": "https://github.com/NousResearch/hermes-agent/pull/123349",
     "absorbed_date": null,
+    "parity_census": {"sync": "2026-10-01", "date": "2026-10-03", "fork_sha": "2d966948b0", "upstream_sha": "612d8e44a2", "card": "t_c5133ddc", "verdict": "KEPT-FORK", "evidence": "provider_seam/GuardedDict: fork 242 hits, upstream 0 (2 unrelated test names). Our upstream PR #123349 still OPEN. Note: ledger F07-cron_tools_auth_misc.md row hermes_cli/model_switch_providers.py::list_authenticated_providers DROPPED the per-picker snapshot() pinning (facades remain the seam; refresh('picker') kept)."},
     "surfaces": [
       "cli",
       "gateway",
       "cron",
       "desktop"
+    ]
+  },
+  {
+    "feature": "gateway contracts accept the fork warm-client wire (session.create cache_scope, prompt.submit room) — frozen from pipecat-house-voice",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_warm_wire_contract.py",
+      "tests/tui_gateway/contracts/test_fork_warm_client_params.py"
+    ],
+    "paths": [
+      "tui_gateway/contracts/sessions.py",
+      "tui_gateway/contracts/prompt_voice.py",
+      "tests/fixtures/warm_wire_contract.json"
+    ],
+    "why": "The voice hub's warm client (pipecat-house-voice server/tier3_warm_client.py) drives this gateway over /api/ws and sends two params upstream does not know: session.create cache_scope (one prompt-cache scope for the warm pool, L3 t_c16a5ab2; read by methods_session._declared_cache_scope_param) and prompt.submit room (trusted origin room). The 2026-10-01 parity merge 2d966948b0 (#1624) replaced tui_gateway/contracts with extra=forbid models that dropped both; nothing in this repo failed, and on ACE-AI every tier-2 voice turn answered 4000 for ~30 min on 2026-10-03 19:30 PT (t_f146c725). Parity-merge rule: when upstream rewrites a Params model under tui_gateway/contracts, re-add every field in tests/fixtures/warm_wire_contract.json; the fixture is GENERATED by pipecat-house-voice scripts/export_warm_wire_fixture.py (pcv CI fails if its client changes without a re-export; the canary pins payload_sha256), never hand-edit it. RED-proven 2026-10-03 on the 2d966948b0 contract files (4 frames rejected with the incident's exact text) and by widening base.py to extra=allow (unknown-key arm).",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "voice"
     ]
   }
 ]

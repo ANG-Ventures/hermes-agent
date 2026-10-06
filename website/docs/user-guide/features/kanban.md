@@ -1092,6 +1092,8 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `wake_owner_session` | `true` | A card event that needs its owner enqueues a handoff TURN into the card's home session when that session is live in an operator gateway: a `needs_input` block, a block whose reason names a time or precondition, a stalled/crashed/gave-up/timed-out worker, the last blocker of open children going done, or a review handback whose PR is red or dirty. One wake per card per 10 min; all cards due for one session go in one turn. The lifecycle line still posts. A card body line `wake: off` opts that card out. |
 | `wake_owner_profiles` | `["default", "aegis"]` | Gateway profiles whose sessions count as operator sessions for `wake_owner_session`. |
 
+**Cards with no home (orphans).** `hermes kanban create` (and the `kanban_create` tool) refuses a card that resolves no home session (no session identity, no homed `--parent`, no homed worker lineage) when the caller is a dispatched worker, a cron script, or the gateway's in-process `/kanban`. Pass `--session <sid>`, `--home operator`, or `--unhomed` to mint it unhomed on purpose. A create typed by hand at a terminal is allowed and prints a warning. A gateway reply that is a bare number (`2`) to an orphan-card menu line re-homes that option's card. Re-homes are final.
+
 And the two auxiliary LLM slots:
 
 | Key | Purpose |
@@ -1219,6 +1221,7 @@ hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body 
 hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
 hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
+hermes kanban diagnostics --placement [--json]         # read-only pool view: band, streak, projected() per host + the rung take() would pick
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
 hermes kanban claim <id> [--ttl SECONDS]
@@ -1245,6 +1248,10 @@ hermes kanban dispatch [--dry-run] [--max N]           # one-shot pass
 hermes kanban daemon --force                           # DEPRECATED — standalone dispatcher (use `hermes gateway start` instead)
         [--failure-limit N] [--pidfile PATH] [-v]
 hermes kanban stats [--json]                           # per-status + per-assignee counts
+hermes kanban session-closeout <sid>... [--out PATH] [--vault-out PATH] [--vault DIR]
+        [--root DIR] [--no-network] [--check] [--json]  # read-only closeout of a session's cards on every board:
+                                                        # status accounting, waves/rounds, rulings, open remainder,
+                                                        # blackbox cost, root-cause ledger, ang-closeout gates
 hermes kanban log <id> [--tail BYTES]                  # worker log from ~/.hermes/kanban/logs/
 hermes kanban notify-subscribe <id>                    # gateway bridge hook (used by /kanban in the gateway)
         --platform <name> --chat-id <id> [--thread-id <id>] [--user-id <id>]

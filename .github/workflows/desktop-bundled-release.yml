@@ -273,11 +273,34 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: python3 -m scripts.releases.dispatch_log
 
+      - name: Skip the canary build when R2 is not provisioned
+        # A canary tag build whose environment carries NO R2 secret or var at
+        # all (a fork without a release bucket) skips admission, so every
+        # build job skips and this run ends green instead of failing at the
+        # archive step. Partial R2 config still runs and fails loudly. Any
+        # disposable input is not a plain canary build: admission must judge it.
+        id: r2
+        if: contains(inputs.tag, '+canary.') && inputs.release-phase == '' && inputs.build_commit == '' && inputs.channel == '' && inputs.disposable_channel == '' && inputs.disposable_run == ''
+        env:
+          CLOUDFLARE_R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
+          CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
+          CLOUDFLARE_R2_PUBLIC_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_URL }}
+        run: |
+          if [ -z "${CLOUDFLARE_R2_ACCOUNT_ID}${CLOUDFLARE_R2_ACCESS_KEY_ID}${CLOUDFLARE_R2_SECRET_ACCESS_KEY}${CLOUDFLARE_R2_BUCKET}${CLOUDFLARE_R2_PUBLIC_URL}" ]; then
+            echo '::notice title=Desktop canary build skipped::skipped: R2 not provisioned (no CLOUDFLARE_R2_* secret or var in release-signing)'
+            echo 'skipped: R2 not provisioned' >> "$GITHUB_STEP_SUMMARY"
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'skip=false' >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Archive every pinned input
         # Runner Python is intentional: the toolchain's upstream may be gone.
         # Same checkout contract the standalone archive job had: the tag ref
         # for tag builds, the dispatch head for commit builds.
-        if: inputs.disposable_run == '' && inputs.disposable_channel == '' && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
+        if: steps.r2.outputs.skip != 'true' && inputs.disposable_run == '' && inputs.disposable_channel == '' && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
         env:
           CLOUDFLARE_R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
           CLOUDFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
@@ -321,6 +344,7 @@ jobs:
 
       - name: Validate tag shape, pyproject lockstep, and ancestry on origin/main
         id: admission
+        if: steps.r2.outputs.skip != 'true'
         env:
           TAG: ${{ inputs.tag }}
           RELEASE_TAG: ${{ inputs.tag }}

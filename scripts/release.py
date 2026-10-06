@@ -416,6 +416,11 @@ def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/N
     return "\n".join(lines)
 
 
+# GitHub refuses a release body over 125,000 chars; the builds-table job later grows the body by its
+# download tables, so the canary keeps headroom under that.
+CANARY_BODY_BUDGET = 100_000
+
+
 def _resume_canary(tag: str, remote: str, repository: str, *, notes_file: Path | None = None) -> None:
     """Converge a tag-pushed canary through draft, dispatch, and protected head."""
     ref = f"refs/tags/{tag}"
@@ -528,6 +533,14 @@ def cmd_canary(args) -> None:
     changelog = generate_changelog(
         commits, tag_name, version, prev_tag=since, first_release=False, no_changelog=args.no_changelog
     )
+    if len(changelog) > CANARY_BODY_BUDGET:
+        # A scheduled canary has no operator to re-run it with --no-changelog (the stable path's answer).
+        # 2026-10-04 run 37203419975: since=None listed 13,025 commits, GitHub refused the draft (HTTP 422,
+        # body > 125,000 chars) after the tag was already pushed. Fall back to the frame without commit lines.
+        print(f"Changelog is {len(changelog)} chars (budget {CANARY_BODY_BUDGET}); publishing without commit lines")
+        changelog = generate_changelog(
+            commits, tag_name, version, prev_tag=since, first_release=False, no_changelog=True
+        )
 
     if not args.publish:
         print(changelog)

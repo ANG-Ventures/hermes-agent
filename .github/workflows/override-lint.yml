@@ -5,11 +5,15 @@
 # ANG-Ventures/fleet-floor-workflows (never a moving tag).
 #
 # Placeholders:
-#   88e090ebb883a1147d4086ea80ddf32637e8edd9   40-char commit SHA of the central repo
+#   b701cc0171ab91c92237672b8fcee9efe2e6af5d   40-char commit SHA of the central repo
 #   ubuntu-latest      public repo: GitHub-hosted. Private ANG-Ventures repos use the org's metered runner label.
 name: override-lint
 
-# path-filter-exempt: the check reads the PR BODY; `edited` must re-run it on a body-only change, and a path-filtered check would skip those.
+# path-filter-exempt: no `paths:` on purpose (Prism 7782a5f9dbf6, t_0e51de69). GitHub drops a filtered
+# workflow when the PR diff has more than 3,000 files and none of the first 3,000 match, so a big PR whose
+# code files sort late would skip the lint silently. The lint already ignores non-code and test files
+# itself (README "Caller path filters"), so an unfiltered run on a docs-only PR finds no hits and passes.
+# Not a required check.
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
@@ -20,7 +24,7 @@ permissions:
 
 jobs:
   override_lint:
-    uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/override-lint.yml@88e090ebb883a1147d4086ea80ddf32637e8edd9
+    uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/override-lint.yml@b701cc0171ab91c92237672b8fcee9efe2e6af5d
     with:
       runner: ubuntu-latest
       # Repos whose skills live elsewhere: pass the dirs grepped for the named override (warning only).

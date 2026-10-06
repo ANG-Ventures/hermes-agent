@@ -217,13 +217,43 @@ def _kanban_handler(tool_name: str) -> Callable:
                        f"Valid parameters: {', '.join(sorted(properties))}. Nothing changed.")
                 return fn(args, **kw)
             except _Reject as e:
-                return e.args[0]
+                return _loud_refusal(tool_name, args, e.args[0])
             except Exception as e:
                 if not isinstance(e, ValueError):
                     logger.exception(f"{tool_name} failed")
-                return tool_error(f"{tool_name}: {e}")
+                return _loud_refusal(tool_name, args, tool_error(f"{tool_name}: {e}"))
         return wrapper
     return deco
+
+
+# Refusals of these tools are written to the card thread as well as returned to
+# the caller: a refused block otherwise leaves the card ``running`` with an idle
+# worker and nothing on the board saying why (t_0809e21a, t_791348ae run 4).
+_LOUD_REFUSAL_TOOLS = frozenset({"kanban_block"})
+
+
+def _loud_refusal(tool_name: str, args: dict, error: str) -> str:
+    """Return *error* unchanged; for :data:`_LOUD_REFUSAL_TOOLS` also comment it on the card."""
+    if tool_name not in _LOUD_REFUSAL_TOOLS:
+        return error
+    tid = args.get("task_id") if isinstance(args.get("task_id"), str) else None
+    tid = tid or os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        return error
+    try:
+        message = json.loads(error).get("error", error)
+    except (ValueError, AttributeError):
+        message = error
+    body = (f"{tool_name} REFUSED, the block did not land and the card status is unchanged: "
+            f"{_redact(message)}")
+    try:
+        run_id, session_ref = safe_comment_provenance(str(tid))
+        with _board(args.get("board") if isinstance(args.get("board"), str) else None) as (kb, conn):
+            kb.add_comment(conn, str(tid), author=_persisted_identity(), body=body,
+                           run_id=run_id, session_ref=session_ref)
+    except Exception:
+        logger.warning("%s refusal could not be recorded on %s", tool_name, tid, exc_info=True)
+    return error
 
 
 def _reject_delegated_child_mutation(tool_name: str) -> None:
@@ -874,7 +904,7 @@ def _handle_complete(args: dict, **kw) -> str:
             # model reads a tool_error as terminal and blocks.
             return tool_error(
                 f"kanban_complete blocked: {supersede_err}. Your task is still in-flight "
-                f"(no state change). Retry with a non-empty superseded_by naming what "
+                f"(no state change). Retry with a short (<=500 chars), non-empty superseded_by naming what "
                 f"satisfied the premise.")
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
@@ -1313,6 +1343,9 @@ def _handle_create(args: dict, **kw) -> str:
     triage, skills, goal_mode = (
         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
         _parse_bool_arg(args, "goal_mode"))
+    # D-O1 (t_6281f908): a worker/cron/gateway create that resolves no home
+    # is refused unless ``unhomed`` is passed.
+    unhomed = _parse_bool_arg(args, "unhomed")
     # Fork arg name ``model_override`` is the surviving contract (tests + schema);
     # upstream's ``model`` alias is also accepted.
     model_override = args.get("model_override")
@@ -1368,7 +1401,8 @@ def _handle_create(args: dict, **kw) -> str:
             # Fan-out brake: worker-created cards park per kanban.worker_created_status.
             forced_status=_worker_policy.resolve_park_status(
                 initial_status=str(args.get("initial_status") or "running"), triage=bool(triage)),
-            created_by=_persisted_identity(), session_id=session_id,
+            created_by=_persisted_identity(), session_id=None if unhomed else session_id,
+            session_explicit=unhomed, require_home=True,
             duplicate_guard=True, force_reason=force_reason)
         dup_warning = kb.near_duplicate_warning(conn, new_tid)
         # Placeholder-assignee lint (``default``/``apollo``/``human:x``) runs inside

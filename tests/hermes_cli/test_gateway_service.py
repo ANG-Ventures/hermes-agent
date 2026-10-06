@@ -157,6 +157,54 @@ class TestSystemdServiceRefresh:
         ), "daemon-reload must not run when write was refused"
 
 
+class TestServiceUnitRefreshOptOut:
+    """A host that manages its own unit (ExecStart on a checkout venv) opts out of the refresh."""
+
+    def _stale_unit(self, tmp_path, monkeypatch):
+        unit_path = tmp_path / "gateway.service"
+        # An outdated unit this CLI generated (the launcher shape), so the refresh owns it.
+        unit_path.write_text("ExecStart=/home/u/.hermes/bin/hermes gateway run --old-flag\n", encoding="utf-8")
+        calls = []
+        monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
+        monkeypatch.setattr(gateway_cli, "systemd_unit_is_current", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_retire_hermes_replace_dropin", lambda system=False: False)
+        monkeypatch.setattr(
+            gateway_cli, "generate_systemd_unit",
+            lambda system=False, run_as_user=None: "ExecStart=/srv/checkout/.launcher/bin/gw\n",
+        )
+        monkeypatch.setattr(gateway_cli, "_refuse_temp_home_service_write", lambda unit, label: False)
+        monkeypatch.setattr(
+            gateway_cli, "_prepare_service_launcher",
+            lambda system=False, run_as_user=None: calls.append("launcher"),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_run_systemctl", lambda args, **kw: calls.append(tuple(args)),
+        )
+        return unit_path, calls
+
+    @pytest.mark.parametrize("value", ["1", "true", "YES"])
+    def test_knob_set_leaves_stale_unit_untouched(self, tmp_path, monkeypatch, value):
+        unit_path, calls = self._stale_unit(tmp_path, monkeypatch)
+        before = unit_path.read_text(encoding="utf-8")
+        monkeypatch.setenv("HERMES_DISABLE_SERVICE_UNIT_REFRESH", value)
+
+        assert gateway_cli.refresh_systemd_unit_if_needed(system=False) is False
+        assert unit_path.read_text(encoding="utf-8") == before
+        assert calls == []  # no launcher rewrite, no daemon-reload
+
+    @pytest.mark.parametrize("value", [None, "", "0"])
+    def test_knob_unset_rewrites_stale_unit(self, tmp_path, monkeypatch, value):
+        unit_path, calls = self._stale_unit(tmp_path, monkeypatch)
+        if value is None:
+            monkeypatch.delenv("HERMES_DISABLE_SERVICE_UNIT_REFRESH", raising=False)
+        else:
+            monkeypatch.setenv("HERMES_DISABLE_SERVICE_UNIT_REFRESH", value)
+
+        assert gateway_cli.refresh_systemd_unit_if_needed(system=False) is True
+        assert unit_path.read_text(encoding="utf-8") == gateway_cli.generate_systemd_unit()
+        assert calls == ["launcher", ("daemon-reload",)]
+
+
 class TestTempHomeServiceDefinitionGuard:
     """_temp_home_in_service_definition() — structural temp-dir detection."""
 
@@ -468,6 +516,7 @@ class TestLaunchdServiceRecovery:
         be delegated to a detached helper instead."""
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "_refuse_foreign_service_overwrite", lambda *a, **k: False)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
@@ -543,6 +592,7 @@ class TestLaunchdServiceRecovery:
         """
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "_refuse_foreign_service_overwrite", lambda *a, **k: False)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
@@ -594,6 +644,7 @@ class TestLaunchdServiceRecovery:
         """
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "_refuse_foreign_service_overwrite", lambda *a, **k: False)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
@@ -646,6 +697,7 @@ class TestLaunchdServiceRecovery:
         """
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "_refuse_foreign_service_overwrite", lambda *a, **k: False)
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
@@ -1966,6 +2018,8 @@ class TestDockerAwareGateway:
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_container", lambda: True)
+        # The sandbox HERMES_HOME is a scratch home, which `gateway install` refuses by design.
+        monkeypatch.setattr("hermes_cli.gateway_service_owner.home_may_install_service", lambda home: True)
         calls = []
         monkeypatch.setattr(
             gateway_cli,
@@ -2162,6 +2216,12 @@ class TestMigrateLegacyCommand:
 
 class TestSystemdInstallOffersLegacyRemoval:
     """Verify that systemd_install prompts to remove legacy units first."""
+
+    @pytest.fixture(autouse=True)
+    def _admit_test_home(self, monkeypatch):
+        # The per-test HERMES_HOME is a temp dir outside the account tree; home admission is covered
+        # in test_gateway_service_owner.py, the legacy-unit flow is what these tests pin.
+        monkeypatch.setattr(gateway_cli, "_native_service_homes", lambda: {gateway_cli.get_hermes_home().resolve()})
 
     def test_install_offers_removal_when_legacy_detected(
         self, tmp_path, monkeypatch, capsys
