@@ -130,16 +130,20 @@ def _ancestry() -> list[int]:
     return list(dict.fromkeys(pid for pid in chain if pid > 1))
 
 
-def _worker_rows(chain: list[int]) -> Optional[dict[int, list[tuple[str, str]]]]:
+def _worker_rows(chain: list[int]) -> tuple[dict[int, list[tuple[str, str]]], bool]:
     """``{pid: [(profile, worker_started_at), ...]}`` for every ``task_runs`` row
     whose ``worker_pid`` is in ``chain``, on every board (newest first).
 
     Every board is read at its PHYSICAL path, not through the caller's
     ``HERMES_KANBAN_DB`` pin, which would collapse every slug onto one DB
     (Prism 9e1b780a6387); the caller's write-target DB is read too. Rows
-    without a profile or fingerprint string are dropped. ``None`` when the
-    board list or ANY board is unreadable: an unread board may hold the
-    worker row, so absence is never proven from it (Prism c6316b5d4c3b).
+    without a profile or fingerprint string are dropped.
+
+    Returns ``(rows, complete)``. ``complete`` is False when the board list or
+    ANY board was unreadable: an unread board may hold the worker row, so
+    absence is never proven from an incomplete scan (Prism c6316b5d4c3b),
+    while a verified match on a readable board still identifies the worker
+    (Prism c4bf93c192f3).
     """
     try:
         from hermes_cli import kanban_db as kb
@@ -152,13 +156,14 @@ def _worker_rows(chain: list[int]) -> Optional[dict[int, list[tuple[str, str]]]]
         except Exception:
             pass
     except Exception:
-        return None
+        return {}, False
     import sqlite3
     from pathlib import Path
 
     found: dict[int, list[tuple[str, str]]] = {}
+    complete = True
     if not chain:
-        return found
+        return found, complete
     marks = ",".join("?" * len(chain))
     for raw in sorted(p for p in paths if p):
         path = Path(raw)
@@ -174,11 +179,12 @@ def _worker_rows(chain: list[int]) -> Optional[dict[int, list[tuple[str, str]]]]
             finally:
                 conn.close()
         except sqlite3.Error:
-            return None
+            complete = False
+            continue
         for pid, profile, started in rows:
             if profile and isinstance(started, str) and started:
                 found.setdefault(int(pid), []).append((str(profile), started))
-    return found
+    return found, complete
 
 
 def worker_ancestor_profile() -> Optional[str]:
@@ -198,7 +204,7 @@ def worker_ancestor_profile() -> Optional[str]:
     chain = _ancestry()
     if not chain:
         return None
-    found = _worker_rows(chain)
+    found, _complete = _worker_rows(chain)
     if not found:
         return None
     from hermes_cli.kanban_db_dispatch import _process_fingerprint
@@ -305,8 +311,8 @@ def _runs_under_operator_gateway(name: str) -> bool:
     except (AttributeError, OSError):
         pass
     below = [pid for pid in dict.fromkeys(below) if pid > 1 and pid != gw]
-    found = _worker_rows(below)
-    if found is None:  # an unreadable board is indeterminate, never "no worker"
+    found, complete = _worker_rows(below)
+    if not complete:  # an unreadable board is indeterminate, never "no worker"
         return False
     if not found:
         return True
@@ -320,6 +326,18 @@ def _runs_under_operator_gateway(name: str) -> bool:
             if started == UNVERIFIED_WORKER_FINGERPRINT or _process_fingerprint(pid) == started:
                 return False
     return True
+
+
+def routing_profile_identity(name: str) -> str:
+    """``name`` for ROUTING and FILTERS (notify subscription owner, ``list
+    --mine``): a dispatched worker's own profile when one is an ancestor, else
+    ``name`` unchanged. Never persisted as an author, so it needs no operator
+    proof and never takes the ``unverified:`` prefix, which would route to no
+    gateway and match no card (Prism 7c91838738d2 / 6c97e67077d9).
+    """
+    if not is_operator_label(name):
+        return name
+    return worker_ancestor_profile() or name
 
 
 def operator_label_proven(name: str) -> bool:

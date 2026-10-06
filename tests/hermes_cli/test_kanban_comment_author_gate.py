@@ -386,8 +386,52 @@ def test_unreadable_board_is_never_proof_of_no_worker(board, monkeypatch, operat
         return real(database, *a, **kw)
 
     monkeypatch.setattr(sqlite3, "connect", locked)
-    assert ki._worker_rows([12345]) is None
+    assert ki._worker_rows([12345]) == ({}, False)
     assert ki._runs_under_operator_gateway("apollo") is False
+
+
+def test_unreadable_other_board_keeps_a_verified_worker(board, monkeypatch):
+    """c4bf93c192f3 (#1793 r2): one unreadable board must not discard a verified
+    worker row on a readable board, or a worker with HERMES_PROFILE=default
+    stores ``unverified:default`` instead of its own profile."""
+    import os
+    import sqlite3
+
+    from hermes_cli import kanban_identity as ki
+
+    _seed_worker_run(board, os.getpid())
+    kb.create_board("other")
+    other = str(kb._board_db_path_ignoring_pin("other").resolve())
+    real = sqlite3.connect
+
+    def one_locked(database, *a, **kw):
+        if "mode=ro" in str(database) and other in str(database):
+            raise sqlite3.OperationalError("database is locked")
+        return real(database, *a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", one_locked)
+    rows, complete = ki._worker_rows([os.getpid()])
+    assert complete is False and os.getpid() in rows
+    assert ki.worker_ancestor_profile() == "daedalus"
+    assert _bare_comment(monkeypatch, "default", board) == "daedalus"
+
+
+def test_routing_identity_is_never_prefixed(board, monkeypatch):
+    """7c91838738d2 / 6c97e67077d9 (#1793 r2): notify ownership and --mine are
+    routing, not authorship. An unproven operator shell keeps its name there
+    (a gateway delivers only subscriptions its own profile owns)."""
+    from hermes_cli.kanban_identity import routing_profile_identity
+
+    monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV, raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    assert kc._profile_identity() == "default"
+    assert kc._profile_author() == "unverified:default"
+    assert routing_profile_identity("argus") == "argus"
+    out = kc.run_slash(f"notify-subscribe {board} --platform discord --chat-id 1")
+    with kb.connect() as conn:
+        owners = {r[0] for r in conn.execute(
+            "SELECT notifier_profile FROM kanban_notify_subs WHERE task_id=?", (board,))}
+    assert owners == {"default"}, out
 
 
 def test_multiplexer_serving_the_profile_counts_as_its_gateway(board, monkeypatch):
