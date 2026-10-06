@@ -1167,7 +1167,7 @@ class TestBackupEdgeCases:
 
         def _iter_then_delete(*a, **kw):
             listed = list(real_iter(*a, **kw))
-            doomed.unlink()
+            doomed.unlink(missing_ok=True)  # the re-scan calls the walk again
             return iter(listed)
 
         monkeypatch.setattr(backup_mod, "_iter_backup_files", _iter_then_delete)
@@ -1180,6 +1180,40 @@ class TestBackupEdgeCases:
             names = zf.namelist()
             assert "skills/rotated.md" not in names and "config.yaml" in names
             assert zf.testzip() is None
+
+    def test_file_renamed_after_scan_lands_under_its_new_name(self, tmp_path, monkeypatch, capsys):
+        """A durable file renamed between the scan and the zip vanishes from its listed path; the
+        re-scan must archive it at the new path, never report complete without its data (Prism
+        P1 1485d16eff65 on #1758)."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        moved_dir = hermes_home / "skills" / "olddir"
+        moved_dir.mkdir()
+        (moved_dir / "keep.md").write_text("durable\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        import hermes_cli.backup as backup_mod
+
+        real_iter = backup_mod._iter_backup_files
+        calls = []
+
+        def _iter_then_rename(*a, **kw):
+            listed = list(real_iter(*a, **kw))
+            if not calls:
+                moved_dir.rename(hermes_home / "skills" / "newdir")
+            calls.append(1)
+            return iter(listed)
+
+        monkeypatch.setattr(backup_mod, "_iter_backup_files", _iter_then_rename)
+        out_zip = tmp_path / "out.zip"
+        assert backup_mod.run_backup(Namespace(output=str(out_zip))) is True
+        assert "Re-scan archived" in capsys.readouterr().out
+        with zipfile.ZipFile(out_zip) as zf:
+            names = zf.namelist()
+            assert "skills/newdir/keep.md" in names and "skills/olddir/keep.md" not in names
+            assert zf.read("skills/newdir/keep.md") == b"durable\n"
+            assert len(names) == len(set(names)), "re-scan must not duplicate already-listed entries"
 
     def test_empty_hermes_home(self, tmp_path, monkeypatch):
         """Backup handles empty hermes home (no files to back up)."""
