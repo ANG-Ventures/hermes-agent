@@ -3717,11 +3717,12 @@ def claim_job_for_fire(
                     save_jobs(jobs)
             return False
         recurring = job.get("schedule", {}).get("kind") in {"cron", "interval"}
-        watermark = rewound_watermark(job, instant) if instant and recurring else None
+        watermark = rewound_watermark(job, instant) if instant else None
         if watermark:
-            # Rewound store: re-arm after the completed occurrence and refuse this claim. A slot
-            # genuinely missed after the watermark stays past-due for the due scan's catch-up.
-            nxt = compute_next_run(job["schedule"], watermark)
+            # Rewound store: refuse this claim. A recurring job re-arms after the completed
+            # occurrence (a slot genuinely missed after it stays past-due for the due scan's
+            # catch-up); a one-shot that already completed at a later reschedule has no successor.
+            nxt = compute_next_run(job["schedule"], watermark) if recurring else None
             if nxt:
                 job["next_run_at"] = nxt
                 save_jobs(jobs)
@@ -4284,7 +4285,9 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         if new_next:
             scan.persist(job["id"], next_run_at=new_next)
         return False
-    watermark = rewound_watermark(job, next_run) if recurring and not manual_run else None
+    watermark = rewound_watermark(job, next_run) if not manual_run else None
+    if watermark and not recurring:
+        return False  # a one-shot already completed at a later (rescheduled) instant: never replay
     if watermark:
         # Resume AFTER the newest completed occurrence, not at now: a slot between it and now
         # was genuinely missed and still flows through the ordinary catch-up policy below.

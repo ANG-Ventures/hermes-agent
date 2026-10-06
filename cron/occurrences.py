@@ -22,14 +22,11 @@ def completed_occurrence(job, instant):
     """True when *instant* itself completed. Unknown/failed/pruned attempts cannot prove completion:
     keep them eligible. A store rewound past a completed LATER occurrence is
     ``rewound_watermark``'s job, not this one's."""
-    from cron.constants import FIRE_CLAIM_SKEW_SECONDS
     from cron.executions import _transaction
 
     instant = scheduled_instant(instant)
     if instant is None:
         return False
-    # A skewed early fire (see claim_job_for_fire) legitimately completes just before its slot.
-    earliest_real = datetime.fromisoformat(instant) - timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS)
     try:
         with _transaction() as conn:
             rows = conn.execute(
@@ -38,10 +35,7 @@ def completed_occurrence(job, instant):
                 "AND status='completed'", (str(job['id']), instant)
             ).fetchall()
         for row in rows:
-            completed_at = scheduled_instant(row["finished_at"] or row["claimed_at"])
-            # Legacy or malformed timestamps remain proof; only positively identified poison
-            # rows — completions recorded before their claimed occurrence — are ignored.
-            if completed_at is None or datetime.fromisoformat(completed_at) >= earliest_real:
+            if proves_slot(row["finished_at"] or row["claimed_at"], instant):
                 # Both dedup gates (due scan and fire claim) consume the slot on True without a
                 # run or a ledger row, so this line is the only trace the skip leaves (#111414).
                 logger.warning(
@@ -56,9 +50,12 @@ def completed_occurrence(job, instant):
         return False
 
 
-def _proves_slot(completed_at, slot):
+def proves_slot(completed_at, slot):
     """A completion proves *slot* ran unless it is positively identified as poison: recorded more
-    than FIRE_CLAIM_SKEW_SECONDS before the slot it claims. Legacy/malformed stamps stay proof."""
+    than FIRE_CLAIM_SKEW_SECONDS before the slot it claims (a skewed early fire legitimately
+    completes just before it). Legacy/malformed stamps stay proof. The ONE predicate for every
+    reader and for ledger retention (``executions._prune_unlocked``): a row retention keeps must be
+    a row these readers accept, or a rejected poison row displaces the real watermark."""
     from cron.constants import FIRE_CLAIM_SKEW_SECONDS
 
     completed_at = scheduled_instant(completed_at)
@@ -68,6 +65,8 @@ def _proves_slot(completed_at, slot):
 
 def rewound_watermark(job, instant):
     """Newest validly completed occurrence of *job* LATER than the stored *instant*, or None.
+    Recurring and one-shot alike: a one-shot rescheduled later and completed, then restored from
+    an older snapshot, has already run.
 
     Non-None means the store's schedule went backwards: jobs.json was replaced by an older snapshot
     (a hand "level" from git, a restore). 2026-10-05 22:44 that fired 402 catch-ups, one per daily
@@ -91,7 +90,7 @@ def rewound_watermark(job, instant):
         return None
     for row in rows:
         slot = scheduled_instant(row["scheduled_instant"])
-        if slot is None or not _proves_slot(row["finished_at"] or row["claimed_at"], slot):
+        if slot is None or not proves_slot(row["finished_at"] or row["claimed_at"], slot):
             continue
         logger.warning(
             "cron.registry_rewound job='%s' id=%s: stored occurrence %s is older than occurrence "

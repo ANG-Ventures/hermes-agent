@@ -7,6 +7,7 @@ to match the claim-time fingerprint is not proof of death. Terminal states are i
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sqlite3
@@ -171,11 +172,36 @@ def _claim_age_seconds(claimed_at: str) -> float:
     return (_hermes_now() - datetime.fromisoformat(claimed_at)).total_seconds()
 
 
+def _rewind_proof_ids(conn: sqlite3.Connection) -> List[str]:
+    """Per job, the newest completion the occurrence readers accept as proof (``proves_slot``).
+
+    Chosen with the readers' own predicate, not by ``scheduled_instant`` alone: a poisoned
+    completion (recorded long before the future slot it claims) would otherwise hold the
+    exemption while the valid watermark for today's slot aged out, and a rewound store would then
+    re-run work that genuinely completed."""
+    from cron.occurrences import proves_slot, scheduled_instant
+
+    keep: Dict[str, str] = {}
+    rows = conn.execute(
+        "SELECT id, job_id, scheduled_instant, finished_at, claimed_at FROM executions "
+        "WHERE status='completed' AND scheduled_instant IS NOT NULL "
+        "ORDER BY job_id, julianday(scheduled_instant) DESC, id DESC"
+    ).fetchall()
+    for row in rows:
+        if row["job_id"] in keep:
+            continue
+        slot = scheduled_instant(row["scheduled_instant"])
+        if slot is not None and proves_slot(row["finished_at"] or row["claimed_at"], slot):
+            keep[row["job_id"]] = row["id"]
+    return list(keep.values())
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    # Each job's newest completed occurrence survives the cap: it is the proof
-    # completed_occurrence() reads when jobs.json is rewound to an older snapshot. The cap is
-    # fleet-wide (~1.5 h of history on a busy host), so without this a daily job's morning run
-    # was gone by evening and a rewound store re-fired it (2026-10-05 22:44, 402 catch-ups).
+    # Each job's newest VALID completed occurrence survives the cap: it is the proof
+    # completed_occurrence()/rewound_watermark() read when jobs.json is rewound to an older
+    # snapshot. The cap is fleet-wide (~1.5 h of history on a busy host), so without this a daily
+    # job's morning run was gone by evening and a rewound store re-fired it (2026-10-05 22:44,
+    # 402 catch-ups).
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM (
@@ -184,18 +210,9 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
                ORDER BY julianday(finished_at) DESC, finished_at DESC,
                         julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
              )
-             WHERE id NOT IN (
-               SELECT id FROM (
-                 SELECT id, ROW_NUMBER() OVER (
-                          PARTITION BY job_id
-                          ORDER BY julianday(scheduled_instant) DESC, id DESC
-                        ) AS rn
-                 FROM executions
-                 WHERE status='completed' AND scheduled_instant IS NOT NULL
-               ) WHERE rn = 1
-             )
+             WHERE id NOT IN (SELECT value FROM json_each(?))
            )""",
-        (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
+        (max(0, int(MAX_TERMINAL_EXECUTIONS)), json.dumps(_rewind_proof_ids(conn))),
     )
 
 
