@@ -237,3 +237,56 @@ def test_provider_only_entry_missing_runtime_provider_stays_undeclared():
     the switch — fail toward LOUD (undeclared), never silently calm."""
     job = {"id": "md", "fallback": [{"provider": "claude-app"}]}
     assert sched._fallback_was_declared(job, "", "claude-opus-4-8") is False
+
+
+# --- one declared notice per job per day (t_2efae1cd) -----------------------
+# 10-06: xai-oauth was walled all day; morning-digest's declared codex fallback fired on
+# every run and retry and #logs got the same "Cron fallback used" line 3x.
+
+def test_declared_fallback_posts_once_per_job_per_day(monkeypatch):
+    calls = _capture_deliver(monkeypatch)
+    for _ in range(3):
+        sched._emit_cron_fallback_alert(DECLARED_JOB, _FakeAgent(FALLBACK_EVENT))
+    assert len(calls) == 1
+
+
+def test_declared_notice_reposts_on_a_new_day(monkeypatch):
+    from cron.fork_ext import fallback_notice_gate as gate
+    calls = _capture_deliver(monkeypatch)
+    monkeypatch.setattr(gate, "_today", lambda: "2026-10-06")
+    sched._emit_cron_fallback_alert(DECLARED_JOB, _FakeAgent(FALLBACK_EVENT))
+    sched._emit_cron_fallback_alert(DECLARED_JOB, _FakeAgent(FALLBACK_EVENT))
+    monkeypatch.setattr(gate, "_today", lambda: "2026-10-07")
+    sched._emit_cron_fallback_alert(DECLARED_JOB, _FakeAgent(FALLBACK_EVENT))
+    assert len(calls) == 2
+
+
+def test_declared_notice_per_job_and_per_pair(monkeypatch):
+    calls = _capture_deliver(monkeypatch)
+    other_job = dict(DECLARED_JOB, id="xfb", name="x-feed-brief")
+    sched._emit_cron_fallback_alert(DECLARED_JOB, _FakeAgent(FALLBACK_EVENT))
+    sched._emit_cron_fallback_alert(other_job, _FakeAgent(FALLBACK_EVENT))
+    # a different primary failing over to the same declared model is new information
+    other_pair = dict(FALLBACK_EVENT, old_provider="xai-oauth", old_model="grok-4.7")
+    sched._emit_cron_fallback_alert(DECLARED_JOB, _FakeAgent(other_pair))
+    assert len(calls) == 3
+
+
+def test_failed_declared_delivery_is_not_recorded(monkeypatch):
+    sent = []
+
+    def flaky(job, content, success=True, adapters=None, loop=None, wrap_override=None):
+        sent.append(content)
+        return "discord down" if len(sent) == 1 else None
+
+    monkeypatch.setattr(sched, "_deliver_result", flaky)
+    for _ in range(3):
+        sched._emit_cron_fallback_alert(DECLARED_JOB, _FakeAgent(FALLBACK_EVENT))
+    assert len(sent) == 2  # the dropped one is retried; the delivered one is not repeated
+
+
+def test_undeclared_fallback_stays_loud_every_run(monkeypatch):
+    calls = _capture_deliver(monkeypatch)
+    for _ in range(3):
+        sched._emit_cron_fallback_alert(UNDECLARED_JOB, _FakeAgent(FALLBACK_EVENT))
+    assert len(calls) == 3

@@ -52,6 +52,7 @@ from hermes_cli.fallback_config import get_fallback_chain, scoped_fallback_chain
 from hermes_time import now as _hermes_now, safe_strftime
 from cron.fork_ext import scheduler_ext
 from cron.fork_ext import logs_digest_gate  # noqa: F401  (re-export parity with fork/main)
+from cron.fork_ext import fallback_notice_gate
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context, exit_non_dispatcher_owned_context)
@@ -2362,6 +2363,16 @@ def _emit_cron_fallback_alert(job: dict, agent, *, adapters=None, loop=None) -> 
 
         job_name = job.get("name", job.get("id", "?"))
         declared = _fallback_was_declared(job, new_provider, new_model)
+        # A declared fallback posts ONCE per job per day per primary->fallback pair (t_2efae1cd):
+        # a walled primary re-walks the same chain on every run/retry, and each line repeated
+        # the first. Undeclared switches stay loud on every run.
+        notice_pair = f"{old_label} -> {new_label}"
+        notice_home = _get_hermes_home()
+        if declared and fallback_notice_gate.already_noticed(
+                notice_home, job.get("id", "?"), notice_pair):
+            logger.info("Job '%s': declared fallback %s already noticed today; not reposting",
+                        job.get("id", "?"), notice_pair)
+            return
         # WHY the primary failed — surfaced from the recorded fallback event so
         # the notice reports the actual cause (rate limit / provider overloaded /
         # auth failed / …) instead of guessing. Falls back to a neutral phrase
@@ -2418,6 +2429,8 @@ def _emit_cron_fallback_alert(job: dict, agent, *, adapters=None, loop=None) -> 
                 job.get("id", "?"), err,
             )
         else:
+            if declared:
+                fallback_notice_gate.mark_noticed(notice_home, job.get("id", "?"), notice_pair)
             logger.warning(
                 "Job '%s': FALLBACK FIRED %s -> %s — loud alert sent to %s",
                 job.get("id", "?"), old_label, new_label, alert_deliver,
