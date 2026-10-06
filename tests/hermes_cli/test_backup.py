@@ -1251,6 +1251,30 @@ class TestBackupEdgeCases:
             assert partials == [], f"staging archive copied into itself: {partials}"
             assert zf.testzip() is None
 
+    def test_staging_exclusion_keeps_lookalike_user_files(self, tmp_path, monkeypatch):
+        """Only names ``_atomic_output_path`` can generate (``.<out>.<pid>-<tid>.partial``) are
+        staging; a user file sharing the prefix and suffix is backed up (Prism P1 6f519df1f73a)."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        out_dir = hermes_home / "exports"
+        out_dir.mkdir()
+        out_zip = out_dir / "out.zip"
+        (out_dir / ".out.zip.1-2.partial").write_bytes(b"killed run leftovers")
+        lookalikes = [".out.zip.notes.partial", ".out.zip.1-x.partial", ".out.zip.-2.partial",
+                      ".out.zip..partial", ".out.zip.1-2-3.partial"]
+        for name in lookalikes:
+            (out_dir / name).write_text("user data\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        import hermes_cli.backup as backup_mod
+
+        assert backup_mod.run_backup(Namespace(output=str(out_zip))) is True
+        with zipfile.ZipFile(out_zip) as zf:
+            names = set(zf.namelist())
+        assert {f"exports/{n}" for n in lookalikes} <= names, sorted(names)
+        assert "exports/.out.zip.1-2.partial" not in names
+
     def test_empty_hermes_home(self, tmp_path, monkeypatch):
         """Backup handles empty hermes home (no files to back up)."""
         hermes_home = tmp_path / ".hermes"
