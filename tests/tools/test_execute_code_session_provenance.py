@@ -232,8 +232,10 @@ def test_unresolvable_session_still_writes_the_comment(board, monkeypatch):
     assert rows[0].body == "no session here"
     assert rows[0].session_ref is None
     assert rows[0].run_id is None
-    # And the legacy render stays honest for the NULL row.
-    assert kb.format_comment_author(rows[0].author) == "apollo (provenance unknown)"
+    # And the legacy render stays honest for the NULL row. The child runs under
+    # pytest, not under Apollo's gateway, and carries no operator token, so its
+    # ``apollo`` is unproven and stored as a non-operator label (t_3b9dbdb1).
+    assert kb.format_comment_author(rows[0].author) == "unverified:apollo (provenance unknown)"
 
 
 # ---------------------------------------------------------------------------

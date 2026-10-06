@@ -40,6 +40,10 @@ def board(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_PROFILE", "apollo")
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    # The caller stands in for Apollo: prove it the way production does (the
+    # operator gateway's own process tree), not by the env name (t_3b9dbdb1).
+    from hermes_cli import kanban_identity as _ki
+    monkeypatch.setattr(_ki, "_runs_under_operator_gateway", lambda name: True)
     # The caller is NOT a dispatched worker: no task/run identity.
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)

@@ -42,6 +42,10 @@ def worker_env(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "apollo")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    # The caller stands in for Apollo: prove it the way production does (the
+    # operator gateway's own process tree), not by the env name (t_3b9dbdb1).
+    from hermes_cli import kanban_identity as _ki
+    monkeypatch.setattr(_ki, "_runs_under_operator_gateway", lambda name: True)
     for var in [k for k in os.environ if k.startswith("HERMES_KANBAN")]:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)

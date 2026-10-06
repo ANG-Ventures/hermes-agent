@@ -520,6 +520,15 @@ def _profile_author() -> str:
     return verified_profile_author(current_profile_name("user") or "user")
 
 
+def _profile_identity() -> str:
+    """The caller's profile for routing and filters (notify owner, ``--mine``),
+    never persisted as an author: worker ancestry still rewrites an operator
+    name, but an unproven one is not prefixed ``unverified:`` (t_3b9dbdb1)."""
+    from hermes_cli.kanban_identity import routing_profile_identity
+    from hermes_cli.profiles import current_profile_name
+    return routing_profile_identity(current_profile_name("user") or "user")
+
+
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     # "comment" is deliberately absent: a child may append a comment (t_70fcc2c3);
@@ -959,7 +968,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
 def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
-        assignee = _profile_author()
+        assignee = _profile_identity()
     if getattr(args, "home", False):
         home = _caller_session_id()
         if not home:
@@ -2699,10 +2708,16 @@ def _comment_author(requested: Optional[str]) -> tuple[str, Optional[str]]:
       its worker ancestry cannot be proven in every topology (a reparented,
       setsid'd helper), so missing ancestry never grants it (Prism
       d11c14fcd7fe);
-    * a service label (``land-autopilot``, ``themis``) is honoured for an
-      operator-profile caller that is NOT inside a dispatched worker, whatever
-      that worker's own profile label is (Prism 26d8f8ddc376);
+    * a service label (``land-autopilot``, ``themis``) is honoured for a
+      caller whose operator profile is PROVEN (``_profile_author`` kept the
+      ruling-author name: token, or the operator gateway's own process tree
+      with no worker in between) that is NOT inside a dispatched worker,
+      whatever that worker's own profile label is (Prism 26d8f8ddc376);
     * the operator token honours any label.
+
+    The caller's own name is no fast path for an operator label:
+    ``_profile_author`` already turned an unproven one into
+    ``unverified:<name>`` (Prism e8be54683982, t_3b9dbdb1).
 
     Otherwise the caller writes as itself; the requested label survives only
     as ``claimed_author`` on the ``commented`` event, for forensics.
@@ -3975,7 +3990,7 @@ def rehome_apply(conn, task_id: str, sid: str, row: Optional[dict], target) -> b
         chat_type=origin.get("chat_type") or None,
         user_id=origin.get("user_id") or None,
         scope_id=origin.get("scope_id") or None,
-        notifier_profile=origin.get("profile") or _profile_author(),
+        notifier_profile=origin.get("profile") or _profile_identity(),
     )
     return True
 
@@ -4032,7 +4047,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
             chat_type=args.chat_type, thread_id=args.thread_id, user_id=args.user_id,
             user_id_alt=getattr(args, "user_id_alt", None),
-            notifier_profile=args.notifier_profile or _profile_author(),
+            notifier_profile=args.notifier_profile or _profile_identity(),
             delivery_mode=(
                 getattr(args, "delivery_mode", None)
                 or ("notify+wake" if getattr(args, "wake", False) else None)

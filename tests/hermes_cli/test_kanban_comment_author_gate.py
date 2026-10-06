@@ -37,6 +37,21 @@ def board(tmp_path, monkeypatch):
     return tid
 
 
+@pytest.fixture
+def operator_gateway(monkeypatch):
+    """The root operator gateway is this test process's PARENT: the process sits
+    in that gateway's tree, like Apollo's cron scripts and terminal shells."""
+    import os
+
+    from hermes_cli import kanban_identity as ki
+
+    monkeypatch.setattr(
+        ki, "_operator_gateway_pids",
+        lambda name: frozenset({os.getppid()}) if name.strip().lower() in ("default", "apollo") else frozenset(),
+    )
+    return os.getppid()
+
+
 def _comment_as(monkeypatch, profile, tid, author, token=None):
     monkeypatch.setenv("HERMES_PROFILE", profile)
     if token is None:
@@ -72,7 +87,7 @@ def test_operator_token_honours_author(board, monkeypatch):
     assert "claimed_author" not in payload
 
 
-def test_operator_profile_keeps_its_service_label(board, monkeypatch):
+def test_operator_profile_keeps_its_service_label(board, monkeypatch, operator_gateway):
     """Fleet crons run as the operator profile and pick NON-operator labels on
     purpose (land-autopilot, themis): those must not collapse to ``default``."""
     author, payload = _comment_as(monkeypatch, "default", board, "land-autopilot")
@@ -138,10 +153,10 @@ def test_worker_with_operator_token_still_honoured(board, monkeypatch):
     assert "claimed_author" not in payload
 
 
-@pytest.mark.parametrize("fingerprint", ["unverified", "0|1", ""])
-def test_unproven_worker_row_is_not_a_worker(board, monkeypatch, fingerprint):
-    """A recycled pid (fingerprint mismatch), an unverified spawn or a legacy
-    row never re-labels the operator: the gate only acts on a proven worker."""
+@pytest.mark.parametrize("fingerprint", ["0|1", ""])
+def test_unproven_worker_row_is_not_a_worker(board, monkeypatch, operator_gateway, fingerprint):
+    """A recycled pid (fingerprint mismatch) or a legacy row never re-labels
+    the operator: the gate only acts on a proven worker."""
     import os
 
     _seed_worker_run(board, os.getpid(), fingerprint=fingerprint or None)
@@ -152,6 +167,18 @@ def test_unproven_worker_row_is_not_a_worker(board, monkeypatch, fingerprint):
     author, payload = _comment_as(monkeypatch, "default", board, "land-autopilot")
     assert author == "land-autopilot"
     assert "claimed_author" not in payload
+
+
+def test_unverified_spawn_fails_closed_for_authorship(board, monkeypatch, operator_gateway):
+    """An ``unverified`` spawn row (create time unreadable) is not re-labelled to
+    its worker profile, but it never lends operator authorship either: unlike
+    kill/reap, authorship fails closed (t_3b9dbdb1)."""
+    import os
+
+    _seed_worker_run(board, os.getpid(), fingerprint="unverified")
+    author, payload = _comment_as(monkeypatch, "default", board, "land-autopilot")
+    assert author == "unverified:default"
+    assert payload.get("claimed_author") == "land-autopilot"
 
 
 def test_agent_tool_identity_uses_worker_ancestry(board, monkeypatch):
@@ -196,7 +223,7 @@ def test_operator_label_needs_token_without_proven_worker(board, monkeypatch):
     proof of operator status, so an operator LABEL needs the token from any
     caller other than the label itself."""
     author, payload = _comment_as(monkeypatch, "default", board, "human:apollo")
-    assert author == "default"
+    assert author == "unverified:default"
     assert payload.get("claimed_author") == "human:apollo"
     author, payload = _comment_as(monkeypatch, "default", board, "human:apollo", TOKEN)
     assert author == "human:apollo"
@@ -229,3 +256,197 @@ def test_worker_on_another_board_is_found_under_a_repinned_db(board, monkeypatch
     with kb.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
     assert worker_ancestor_profile() == "daedalus"
+
+
+# ── t_3b9dbdb1 (Prism e8be54683982 / 05c79d97284b, residue of #1791): the
+# caller's OWN operator name was a fast path. An orphaned, setsid'd helper of a
+# worker (reparented to init, new session: no worker pid in its ancestry or
+# session) set HERMES_PROFILE=apollo and stored ``apollo`` with no run_id,
+# which find_ruled_parent / _ruled_since_block read as a ruling.
+
+
+def _bare_comment(monkeypatch, profile, tid, token=None, body="APOLLO RULED: go"):
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    if token is None:
+        monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, token)
+    top = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(top.add_subparsers(dest="command"))
+    assert kc.kanban_command(top.parse_args(["kanban", "comment", tid, body])) == 0
+    with kb.connect() as conn:
+        return conn.execute(
+            "SELECT author FROM task_comments WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)
+        ).fetchone()["author"]
+
+
+@pytest.mark.parametrize("profile", ["apollo", "default", "aegis"])
+def test_own_operator_name_without_proof_is_not_an_operator_label(board, monkeypatch, profile):
+    """The card's verify: no worker ancestry, HERMES_PROFILE=<operator>, no
+    token, ``comment`` -> the stored author is not an operator label."""
+    from hermes_cli.kanban_identity import is_operator_label
+
+    author = _bare_comment(monkeypatch, profile, board)
+    assert author == f"unverified:{profile}"
+    assert not is_operator_label(author)
+    # ...and --author <own name> takes the same road (no own-name fast path).
+    author, payload = _comment_as(monkeypatch, profile, board, profile)
+    assert not is_operator_label(author)
+    assert payload.get("claimed_author") == profile
+
+
+def test_token_carrying_operator_script_still_writes_apollo(board, monkeypatch):
+    assert _bare_comment(monkeypatch, "apollo", board, TOKEN) == "apollo"
+    author, payload = _comment_as(monkeypatch, "apollo", board, "apollo", TOKEN)
+    assert author == "apollo"
+    assert "claimed_author" not in payload
+
+
+def test_operator_gateway_tree_keeps_its_name(board, monkeypatch, operator_gateway):
+    """The gateway's in-process /kanban, its cron scripts and its sessions'
+    shells sit in the operator gateway's process tree: no token needed."""
+    assert _bare_comment(monkeypatch, "apollo", board) == "apollo"
+    assert _bare_comment(monkeypatch, "default", board) == "default"
+
+
+def test_reparented_helper_outside_the_gateway_tree_is_unverified(board, monkeypatch):
+    """A live operator gateway that is NOT an ancestor (the helper was
+    reparented to init) lends nothing."""
+    import subprocess
+    import sys
+
+    from hermes_cli import kanban_identity as ki
+
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        monkeypatch.setattr(ki, "_operator_gateway_pids", lambda name: frozenset({other.pid}))
+        assert _bare_comment(monkeypatch, "apollo", board) == "unverified:apollo"
+    finally:
+        other.kill()
+        other.wait()
+
+
+def test_worker_under_the_operator_gateway_is_still_its_worker(board, monkeypatch, operator_gateway):
+    """The dispatcher is the gateway: a worker below it is never the gateway."""
+    import os
+
+    _seed_worker_run(board, os.getpid())
+    assert _bare_comment(monkeypatch, "apollo", board) == "daedalus"
+
+
+def test_tool_identity_needs_proof_too(board, monkeypatch):
+    """Same class on the tool path (_persisted_identity, Prism 05c79d97284b)."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV, raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    assert kt._persisted_identity() == "unverified:default"
+    monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, TOKEN)
+    assert kt._persisted_identity() == "default"
+
+
+def test_unverified_comment_is_not_a_ruling(board, monkeypatch):
+    """End to end: the downgraded comment does not rule a parent."""
+    from hermes_cli.kanban_worker_policy import find_ruled_parent
+
+    _bare_comment(monkeypatch, "apollo", board)
+    with kb.connect() as conn:
+        ruled = find_ruled_parent(conn, [board])
+    assert (ruled or {}).get("why") != "ruling_comment"
+    _bare_comment(monkeypatch, "apollo", board, TOKEN)
+    with kb.connect() as conn:
+        assert find_ruled_parent(conn, [board])["why"] == "ruling_comment"
+
+
+# ── Prism round 1 on #1793 ───────────────────────────────────────────────────
+
+
+def test_unproven_human_label_is_not_an_operator_label(board, monkeypatch):
+    """58ee6155c6e1: a suffix kept ``human:apollo-unverified`` inside the
+    ``human:`` namespace that ``is_operator_label`` trusts."""
+    from hermes_cli.kanban_identity import is_operator_label
+
+    author = _bare_comment(monkeypatch, "human:apollo", board)
+    assert author == "unverified:human:apollo"
+    assert not is_operator_label(author)
+
+
+def test_unreadable_board_is_never_proof_of_no_worker(board, monkeypatch, operator_gateway):
+    """c6316b5d4c3b: a board that cannot be read may hold the worker row, so the
+    gateway-tree proof is denied rather than read as "no worker below"."""
+    import sqlite3
+
+    from hermes_cli import kanban_identity as ki
+
+    real = sqlite3.connect
+
+    def locked(database, *a, **kw):
+        if "mode=ro" in str(database):
+            raise sqlite3.OperationalError("database is locked")
+        return real(database, *a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", locked)
+    assert ki._worker_rows([12345]) == ({}, False)
+    assert ki._runs_under_operator_gateway("apollo") is False
+
+
+def test_unreadable_other_board_keeps_a_verified_worker(board, monkeypatch):
+    """c4bf93c192f3 (#1793 r2): one unreadable board must not discard a verified
+    worker row on a readable board, or a worker with HERMES_PROFILE=default
+    stores ``unverified:default`` instead of its own profile."""
+    import os
+    import sqlite3
+
+    from hermes_cli import kanban_identity as ki
+
+    _seed_worker_run(board, os.getpid())
+    kb.create_board("other")
+    other = str(kb._board_db_path_ignoring_pin("other").resolve())
+    real = sqlite3.connect
+
+    def one_locked(database, *a, **kw):
+        if "mode=ro" in str(database) and other in str(database):
+            raise sqlite3.OperationalError("database is locked")
+        return real(database, *a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", one_locked)
+    rows, complete = ki._worker_rows([os.getpid()])
+    assert complete is False and os.getpid() in rows
+    assert ki.worker_ancestor_profile() == "daedalus"
+    assert _bare_comment(monkeypatch, "default", board) == "daedalus"
+
+
+def test_routing_identity_is_never_prefixed(board, monkeypatch):
+    """7c91838738d2 / 6c97e67077d9 (#1793 r2): notify ownership and --mine are
+    routing, not authorship. An unproven operator shell keeps its name there
+    (a gateway delivers only subscriptions its own profile owns)."""
+    from hermes_cli.kanban_identity import routing_profile_identity
+
+    monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV, raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    assert kc._profile_identity() == "default"
+    assert kc._profile_author() == "unverified:default"
+    assert routing_profile_identity("argus") == "argus"
+    out = kc.run_slash(f"notify-subscribe {board} --platform discord --chat-id 1")
+    with kb.connect() as conn:
+        owners = {r[0] for r in conn.execute(
+            "SELECT notifier_profile FROM kanban_notify_subs WHERE task_id=?", (board,))}
+    assert owners == {"default"}, out
+
+
+def test_multiplexer_serving_the_profile_counts_as_its_gateway(board, monkeypatch):
+    """cfdcb98d4fbe: a served profile owns no gateway.pid; the host multiplexer
+    that serves it is its gateway."""
+    import os
+
+    from gateway import status as gs
+    from hermes_cli import kanban_identity as ki
+
+    (kb.kanban_home() / "profiles" / "aegis").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(gs, "live_gateway_pid_for_home", lambda home: None)
+    monkeypatch.setattr(
+        gs, "multiplexer_liveness_for_profile",
+        lambda home: (os.getppid(), {}) if str(home).endswith("aegis") else None,
+    )
+    assert ki._operator_gateway_pids("aegis") == frozenset({os.getppid()})
+    assert _bare_comment(monkeypatch, "aegis", board) == "aegis"

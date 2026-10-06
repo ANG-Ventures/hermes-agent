@@ -32,6 +32,10 @@ def kanban_home(tmp_path, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(kb, "_caller_session_lineage", lambda sid: ())
     monkeypatch.setattr(kb, "_UNSTAMPED_WARNED", [False])
+    # The caller stands in for Apollo: prove it the way production does (the
+    # operator gateway's own process tree), not by the env name (t_3b9dbdb1).
+    from hermes_cli import kanban_identity as _ki
+    monkeypatch.setattr(_ki, "_runs_under_operator_gateway", lambda name: True)
     kb.init_db()
     return home
 

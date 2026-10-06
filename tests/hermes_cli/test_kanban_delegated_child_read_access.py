@@ -20,8 +20,11 @@ import pytest
 ROOT = Path(__file__).parents[2]
 
 
-def _run(home: Path, *args: str, child: bool) -> subprocess.CompletedProcess[str]:
+def _run(home: Path, *args: str, child: bool, token: str | None = None) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    env.pop("KANBAN_OPERATOR_TOKEN", None)
+    if token is not None:
+        env["KANBAN_OPERATOR_TOKEN"] = token
     env["HERMES_HOME"] = str(home)
     env["HERMES_KANBAN_HOME"] = str(home)
     for name in ("HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_TASK"):
@@ -84,7 +87,14 @@ def test_child_log_verb_reaches_handler(board):
 
 def test_child_comment_appends_with_subagent_marker(board):
     home, tid = board
-    res = _run(home, "comment", tid, "note from a child", "--author", "bot-x", child=True)
+    # A caller-chosen label needs proof (t_3b9dbdb1): an unproven operator shell
+    # writes as ``unverified:<name>``. Present the operator token so the label
+    # survives and the assertion stays on the subagent marker.
+    token = "c" * 64
+    token_file = home / "kanban" / "operator-token"
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text(token, encoding="utf-8")
+    res = _run(home, "comment", tid, "note from a child", "--author", "bot-x", child=True, token=token)
     assert res.returncode == 0, res.stderr
     comments = _task(home, tid)["comments"]
     mine = [c for c in comments if c["body"] == "note from a child"]
