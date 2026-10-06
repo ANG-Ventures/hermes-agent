@@ -195,9 +195,10 @@ def _persisted_identity() -> str:
     from tool args: board records are injected into future workers' prompts, so a caller-supplied
     identity could forge an authoritative-looking author (see #19713).
     """
+    from hermes_cli.kanban_identity import verified_profile_author
     from hermes_cli.profiles import current_profile_name
 
-    return current_profile_name("worker") or "worker"
+    return verified_profile_author(current_profile_name("worker") or "worker")
 
 
 def _kanban_handler(tool_name: str) -> Callable:

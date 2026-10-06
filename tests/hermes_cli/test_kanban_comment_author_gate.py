@@ -78,3 +78,154 @@ def test_operator_profile_keeps_its_service_label(board, monkeypatch):
     author, payload = _comment_as(monkeypatch, "default", board, "land-autopilot")
     assert author == "land-autopilot"
     assert "claimed_author" not in payload
+
+
+# ── Prism 41fd439722e6 (#1782 post-merge): the operator-profile exemption was
+# keyed on the caller-selected HERMES_PROFILE. A worker shell could run
+# ``env -u HERMES_KANBAN_TASK HERMES_PROFILE=default ... --author human:apollo``.
+# The exemption now holds only when the process is not running under a
+# dispatched worker, read from process ancestry (task_runs.worker_pid + its
+# spawn fingerprint), which the environment cannot rewrite.
+
+
+def _seed_worker_run(tid, pid, profile="daedalus", fingerprint=None):
+    from hermes_cli.kanban_db_dispatch import _process_fingerprint
+
+    fp = _process_fingerprint(pid) if fingerprint is None else fingerprint
+    with kb.connect() as conn:
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, worker_pid, "
+            "worker_started_at, started_at) VALUES (?, ?, 'running', ?, ?, 0)",
+            (tid, profile, pid, fp),
+        )
+        conn.commit()
+
+
+def test_worker_selecting_default_profile_cannot_forge_author(board, monkeypatch, capsys):
+    """RED on aaac711c6: the forged label was stored as the comment author."""
+    import os
+
+    _seed_worker_run(board, os.getpid())
+    author, payload = _comment_as(monkeypatch, "default", board, "human:apollo")
+    assert author == "daedalus"
+    assert payload.get("claimed_author") == "human:apollo"
+    assert "claimed_author" in capsys.readouterr().err
+
+
+def test_worker_selecting_default_profile_writes_as_itself_without_author(board, monkeypatch):
+    """The bare default (no --author) is the same env-derived name: it must not
+    read ``default`` (a RULING_AUTHORS label) inside a worker either."""
+    import os
+
+    _seed_worker_run(board, os.getpid())
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    top = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(top.add_subparsers(dest="command"))
+    assert kc.kanban_command(top.parse_args(["kanban", "comment", board, "APOLLO RULED x"])) == 0
+    with kb.connect() as conn:
+        row = conn.execute(
+            "SELECT author FROM task_comments WHERE task_id=? ORDER BY id DESC LIMIT 1", (board,)
+        ).fetchone()
+    assert row["author"] == "daedalus"
+
+
+def test_worker_with_operator_token_still_honoured(board, monkeypatch):
+    import os
+
+    _seed_worker_run(board, os.getpid())
+    author, payload = _comment_as(monkeypatch, "default", board, "human:apollo", TOKEN)
+    assert author == "human:apollo"
+    assert "claimed_author" not in payload
+
+
+@pytest.mark.parametrize("fingerprint", ["unverified", "0|1", ""])
+def test_unproven_worker_row_is_not_a_worker(board, monkeypatch, fingerprint):
+    """A recycled pid (fingerprint mismatch), an unverified spawn or a legacy
+    row never re-labels the operator: the gate only acts on a proven worker."""
+    import os
+
+    _seed_worker_run(board, os.getpid(), fingerprint=fingerprint or None)
+    if not fingerprint:
+        with kb.connect() as conn:
+            conn.execute("UPDATE task_runs SET worker_started_at=NULL")
+            conn.commit()
+    author, payload = _comment_as(monkeypatch, "default", board, "land-autopilot")
+    assert author == "land-autopilot"
+    assert "claimed_author" not in payload
+
+
+def test_agent_tool_identity_uses_worker_ancestry(board, monkeypatch):
+    """Same class on the tool path: _persisted_identity is env-derived too."""
+    import os
+
+    from tools import kanban_tools as kt
+
+    _seed_worker_run(board, os.getpid())
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    assert kt._persisted_identity() == "daedalus"
+    monkeypatch.setenv("HERMES_PROFILE", "argus")
+    assert kt._persisted_identity() == "argus"   # non-operator names are not rewritten
+
+
+def test_triage_sweep_author_is_gated(board, monkeypatch):
+    """``specify``/``decompose --author`` writes the audit comment author: same gate."""
+    seen = {}
+
+    class _Mod:
+        @staticmethod
+        def list_triage_ids(tenant=None):
+            return []
+
+    def run_one(tid, author):
+        seen["author"] = author
+        return type("O", (), {"ok": True, "task_id": tid})()
+
+    monkeypatch.setenv("HERMES_PROFILE", "daedalus")
+    monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV, raising=False)
+    args = argparse.Namespace(all_triage=False, author="human:apollo", json=False,
+                              tenant=None, task_id=board)
+    kc._run_triage_sweep(args, "specify", _Mod, run_one, "specified", (), lambda o: "ok")
+    assert seen["author"] == "daedalus"
+
+
+# ── Prism round 1 on #1791 ──────────────────────────────────────────────────
+
+
+def test_operator_label_needs_token_without_proven_worker(board, monkeypatch):
+    """d11c14fcd7fe: missing worker ancestry (a reparented helper) is never
+    proof of operator status, so an operator LABEL needs the token from any
+    caller other than the label itself."""
+    author, payload = _comment_as(monkeypatch, "default", board, "human:apollo")
+    assert author == "default"
+    assert payload.get("claimed_author") == "human:apollo"
+    author, payload = _comment_as(monkeypatch, "default", board, "human:apollo", TOKEN)
+    assert author == "human:apollo"
+
+
+def test_worker_whose_profile_is_default_loses_the_exemption(board, monkeypatch):
+    """26d8f8ddc376: a dispatched run recorded as ``default`` is still a worker;
+    the service-label exemption is keyed on worker status, not on its label."""
+    import os
+
+    _seed_worker_run(board, os.getpid(), profile="default")
+    author, payload = _comment_as(monkeypatch, "default", board, "land-autopilot")
+    assert author == "default"
+    assert payload.get("claimed_author") == "land-autopilot"
+    author, payload = _comment_as(monkeypatch, "default", board, "human:apollo")
+    assert author == "default"
+    assert payload.get("claimed_author") == "human:apollo"
+
+
+def test_worker_on_another_board_is_found_under_a_repinned_db(board, monkeypatch, tmp_path):
+    """9e1b780a6387: ``HERMES_KANBAN_DB`` repinned to board B must not hide the
+    worker run recorded on board A."""
+    import os
+
+    from hermes_cli.kanban_identity import worker_ancestor_profile
+
+    _seed_worker_run(board, os.getpid())          # board A = default
+    kb.create_board("other")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb._board_db_path_ignoring_pin("other")))
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+    assert worker_ancestor_profile() == "daedalus"

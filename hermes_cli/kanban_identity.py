@@ -114,6 +114,103 @@ def resolve_comment_provenance(
     return run_id, derive_session_ref(session_id)
 
 
+def worker_ancestor_profile() -> Optional[str]:
+    """Profile of the dispatcher-spawned worker this process runs under, or None.
+
+    Read from process identity, not the environment: a worker shell can
+    ``env -u HERMES_KANBAN_TASK HERMES_PROFILE=default`` and every env-derived
+    identity then reads ``default`` (Prism 41fd439722e6, hermes-agent#1782).
+    Candidates are this process, its parent chain, and its SESSION id: workers
+    are spawned with ``start_new_session=True`` (worker pid == sid), so a
+    double-forked helper that init has adopted still carries the worker's sid
+    (Prism d11c14fcd7fe). A run counts only when its recorded ``worker_pid``
+    is a candidate AND that pid's spawn fingerprint still matches (a recycled
+    pid is never a worker; legacy and ``unverified`` rows are skipped). Every
+    board is read at its PHYSICAL path, not through the caller's
+    ``HERMES_KANBAN_DB`` pin, which would collapse every slug onto one DB
+    (Prism 9e1b780a6387); the caller's write-target DB is read too.
+    Unreadable psutil/board -> None.
+    """
+    try:
+        import psutil
+
+        me = psutil.Process()
+        chain = [me.pid] + [p.pid for p in me.parents()]
+    except Exception:
+        return None
+    try:
+        chain.append(os.getsid(0))
+    except (AttributeError, OSError):
+        pass
+    chain = list(dict.fromkeys(pid for pid in chain if pid > 1))
+    if not chain:
+        return None
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+
+        with kb.enumerating_boards():
+            paths = {str(kb._board_db_path_ignoring_pin(b["slug"]))
+                     for b in kb.list_boards() if b.get("slug")}
+        try:
+            paths.add(str(kb.kanban_db_path()))
+        except Exception:
+            pass
+    except Exception:
+        return None
+    import sqlite3
+    from pathlib import Path
+
+    found: dict[int, list[tuple[str, str]]] = {}
+    marks = ",".join("?" * len(chain))
+    for raw in sorted(p for p in paths if p):
+        path = Path(raw)
+        if not path.is_file():
+            continue
+        try:
+            conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
+            try:
+                rows = conn.execute(
+                    f"SELECT worker_pid, profile, worker_started_at FROM task_runs "
+                    f"WHERE worker_pid IN ({marks}) ORDER BY id DESC", tuple(chain),
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            continue
+        for pid, profile, started in rows:
+            if profile and isinstance(started, str) and "|" in started:
+                found.setdefault(int(pid), []).append((str(profile), started))
+    for pid in chain:  # nearest worker ancestor wins; the session id is last
+        for profile, started in found.get(pid, ()):
+            if _process_fingerprint(pid) == started:
+                return profile
+    return None
+
+
+def is_operator_label(name: Optional[str]) -> bool:
+    """An author label operator-trust readers honour: a ruling author, an
+    operator profile, or ``human:<name>``."""
+    from hermes_cli.kanban_db import OPERATOR_PROFILES
+    from hermes_cli.kanban_worker_policy import RULING_AUTHORS
+
+    v = (name or "").strip().lower()
+    return v in RULING_AUTHORS or v in OPERATOR_PROFILES or v.startswith("human:")
+
+
+def verified_profile_author(name: str) -> str:
+    """``name`` (an env-derived profile identity), unless it claims an operator
+    identity from inside a dispatched worker: then that worker's own profile.
+
+    Only operator-trusted names are checked (``RULING_AUTHORS`` and
+    ``OPERATOR_PROFILES``), so a worker's ordinary identity costs nothing.
+    """
+    if not is_operator_label(name):
+        return name
+    worker = worker_ancestor_profile()
+    return worker if worker and worker != name else name
+
+
 def safe_comment_provenance(
     task_id: str,
     *,

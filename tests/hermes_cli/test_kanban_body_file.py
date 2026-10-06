@@ -105,36 +105,38 @@ def _bodies(tid):
         return [(c.author, c.body) for c in kb.list_comments(conn, tid)]
 
 
+# ``bot-x``: a NON-operator label. These tests pin argv parsing; an operator label
+# (``apollo``) needs the operator token since #1791 (test_kanban_comment_author_gate).
 @pytest.mark.parametrize(
     "argv_tail",
     [
-        ["--author", "apollo", "before text"],
-        ["before text", "--author", "apollo"],
-        ["--author", "apollo", "before", "text"],
-        ["before", "--author", "apollo", "text"],
+        ["--author", "bot-x", "before text"],
+        ["before text", "--author", "bot-x"],
+        ["--author", "bot-x", "before", "text"],
+        ["before", "--author", "bot-x", "text"],
     ],
 )
 def test_comment_author_either_side_of_text(kanban_home, argv_tail):
     tid = json.loads(kc.run_slash("create 't' --assignee alice --json"))["id"]
     assert _cli(["comment", tid, *argv_tail]) == 0
-    assert _bodies(tid) == [("apollo", "before text")]
+    assert _bodies(tid) == [("bot-x", "before text")]
 
 
 def test_comment_author_before_text_via_slash(kanban_home):
     tid = json.loads(kc.run_slash("create 't' --assignee alice --json"))["id"]
-    out = kc.run_slash(f"comment {tid} --author apollo 'hello world'")
+    out = kc.run_slash(f"comment {tid} --author bot-x 'hello world'")
     assert "unrecognized" not in out
-    assert _bodies(tid) == [("apollo", "hello world")]
+    assert _bodies(tid) == [("bot-x", "hello world")]
 
 
 def test_comment_body_file_alone_and_missing_body_rc(kanban_home, tmp_path, capsys):
     tid = json.loads(kc.run_slash("create 't' --assignee alice --json"))["id"]
     f = tmp_path / "c.md"
     f.write_text("from file", encoding="utf-8")
-    assert _cli(["comment", tid, "--author", "apollo", "--body-file", str(f)]) == 0
-    assert _bodies(tid) == [("apollo", "from file")]
+    assert _cli(["comment", tid, "--author", "bot-x", "--body-file", str(f)]) == 0
+    assert _bodies(tid) == [("bot-x", "from file")]
     capsys.readouterr()
-    assert _cli(["comment", tid, "--author", "apollo"]) == 2
+    assert _cli(["comment", tid, "--author", "bot-x"]) == 2
     assert "comment body required (TEXT or --body-file)" in capsys.readouterr().err
     assert len(_bodies(tid)) == 1
 

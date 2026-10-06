@@ -84,12 +84,12 @@ def test_child_log_verb_reaches_handler(board):
 
 def test_child_comment_appends_with_subagent_marker(board):
     home, tid = board
-    res = _run(home, "comment", tid, "note from a child", "--author", "apollo", child=True)
+    res = _run(home, "comment", tid, "note from a child", "--author", "bot-x", child=True)
     assert res.returncode == 0, res.stderr
     comments = _task(home, tid)["comments"]
     mine = [c for c in comments if c["body"] == "note from a child"]
     assert len(mine) == 1
-    assert mine[0]["author"] == "apollo (subagent)"
+    assert mine[0]["author"] == "bot-x (subagent)"
 
 
 @pytest.mark.parametrize(

@@ -119,8 +119,9 @@ def _title_body(parsed: dict) -> tuple[Optional[str], Optional[str]]:
 def _profile_author(default: str = "specifier") -> str:
     """Same identity contract as ``hermes_cli.kanban._profile_author``; ``$USER`` as the last
     resort for a human running the CLI outside any profile."""
+    from hermes_cli.kanban_identity import verified_profile_author
     from hermes_cli.profiles import current_profile_name
-    return current_profile_name() or os.environ.get("USER") or default
+    return verified_profile_author(current_profile_name() or os.environ.get("USER") or default)
 
 
 def _load_triage_task(task_id: str) -> tuple[Optional[kb.Task], str]:
