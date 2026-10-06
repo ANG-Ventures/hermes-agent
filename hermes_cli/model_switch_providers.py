@@ -1230,6 +1230,8 @@ def list_authenticated_providers(
     provider_seam.refresh("picker")
     # Then pin ONE generation for every registry surface this listing reads (v0.2 contract: one
     # snapshot per picker call, bound HERE; pinned by hermes-home test_hot_registration_prewarm).
+    # The owning modules bind their facades at import, so import them before the snapshot.
+    import hermes_cli.auth, hermes_cli.models, hermes_cli.providers  # noqa: F401,E401
     g = provider_seam.snapshot()
 
     non_blocking_catalogs = bool(non_blocking_catalogs)
