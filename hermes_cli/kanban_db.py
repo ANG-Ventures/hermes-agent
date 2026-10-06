@@ -5865,7 +5865,7 @@ def create_task(
                     add_comment(
                         conn,
                         task_id,
-                        created_by or "operator",
+                        flagship_override_author or created_by or "operator",
                         sub_pin_comment(provider_override, pin_sub_reason,
                                         fallback=bool(pin_sub_fallback)),
                     )

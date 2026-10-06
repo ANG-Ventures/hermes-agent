@@ -114,6 +114,86 @@ def resolve_comment_provenance(
     return run_id, derive_session_ref(session_id)
 
 
+def worker_ancestor_profile() -> Optional[str]:
+    """Profile of the dispatcher-spawned worker this process runs under, or None.
+
+    Read from process ANCESTRY, not the environment: a worker shell can
+    ``env -u HERMES_KANBAN_TASK HERMES_PROFILE=default`` and every env-derived
+    identity then reads ``default`` (Prism 41fd439722e6, hermes-agent#1782).
+    The parent chain cannot be rewritten that way. A run counts only when its
+    recorded ``worker_pid`` is this process or an ancestor AND the pid's
+    spawn fingerprint still matches (a recycled pid is never a worker; legacy
+    and ``unverified`` rows are skipped). Every board on disk is read, plus the
+    board the caller would write to. Unreadable psutil/board -> None, the
+    pre-gate behaviour.
+    """
+    try:
+        import psutil
+
+        me = psutil.Process()
+        chain = [me.pid] + [p.pid for p in me.parents()]
+    except Exception:
+        return None
+    chain = [pid for pid in chain if pid > 1]
+    if not chain:
+        return None
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+
+        paths = {str(b.get("db_path") or "") for b in kb.list_boards()}
+        try:
+            paths.add(str(kb.kanban_db_path()))
+        except Exception:
+            pass
+    except Exception:
+        return None
+    import sqlite3
+    from pathlib import Path
+
+    found: dict[int, list[tuple[str, str]]] = {}
+    marks = ",".join("?" * len(chain))
+    for raw in sorted(p for p in paths if p):
+        path = Path(raw)
+        if not path.is_file():
+            continue
+        try:
+            conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
+            try:
+                rows = conn.execute(
+                    f"SELECT worker_pid, profile, worker_started_at FROM task_runs "
+                    f"WHERE worker_pid IN ({marks}) ORDER BY id DESC", tuple(chain),
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            continue
+        for pid, profile, started in rows:
+            if profile and isinstance(started, str) and "|" in started:
+                found.setdefault(int(pid), []).append((str(profile), started))
+    for pid in chain:  # nearest worker ancestor wins
+        for profile, started in found.get(pid, ()):
+            if _process_fingerprint(pid) == started:
+                return profile
+    return None
+
+
+def verified_profile_author(name: str) -> str:
+    """``name`` (an env-derived profile identity), unless it claims an operator
+    identity from inside a dispatched worker: then that worker's own profile.
+
+    Only operator-trusted names are checked (``RULING_AUTHORS`` and
+    ``OPERATOR_PROFILES``), so a worker's ordinary identity costs nothing.
+    """
+    from hermes_cli.kanban_db import OPERATOR_PROFILES
+    from hermes_cli.kanban_worker_policy import RULING_AUTHORS
+
+    if (name or "").strip().lower() not in (RULING_AUTHORS | OPERATOR_PROFILES):
+        return name
+    worker = worker_ancestor_profile()
+    return worker if worker and worker != name else name
+
+
 def safe_comment_provenance(
     task_id: str,
     *,

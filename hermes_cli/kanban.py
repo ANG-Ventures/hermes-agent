@@ -509,9 +509,15 @@ def _home_label(session_id: Optional[str], *, unhomed: bool = False) -> str:
 
 
 def _profile_author() -> str:
-    """Best-effort author name for an interactive CLI call."""
+    """Best-effort author name for an interactive CLI call.
+
+    The name is env-derived, so inside a dispatched worker an operator name
+    (``HERMES_PROFILE=default``) is checked against the worker's process
+    ancestry and replaced by that worker's own profile (Prism 41fd439722e6).
+    """
+    from hermes_cli.kanban_identity import verified_profile_author
     from hermes_cli.profiles import current_profile_name
-    return current_profile_name("user") or "user"
+    return verified_profile_author(current_profile_name("user") or "user")
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
@@ -838,7 +844,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 pin_sub_reason=getattr(args, "pin_sub", None),
                 pin_sub_fallback=bool(getattr(args, "pin_sub_fallback", False)),
                 flagship_override_reason=getattr(args, "allow_flagship", None),
-                flagship_override_author=args.created_by or _profile_author(),
+                flagship_override_author=_comment_author(args.created_by)[0],
                 reasoning_effort=getattr(args, "reasoning_effort", None),
                 brain=getattr(args, "brain", None),
                 goal_mode=bool(getattr(args, "goal_mode", False)),
@@ -937,7 +943,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
         created = ks.create_swarm(
             conn, goal=args.goal, workers=workers, verifier_assignee=args.verifier,
             synthesizer_assignee=args.synthesizer, tenant=args.tenant,
-            created_by=args.created_by or _profile_author(), priority=args.priority,
+            created_by=_comment_author(args.created_by)[0], priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
         )
     if getattr(args, "json", False):
@@ -4505,7 +4511,11 @@ def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_ke
     """Shared driver for ``specify`` / ``decompose``: validate ids (one task id XOR ``--all``), run
     ``run_one(tid, author=...)`` per id, print JSON or human lines, exit code."""
     all_flag = bool(getattr(args, "all_triage", False))
-    author = getattr(args, "author", None) or _profile_author()
+    author, claimed = _comment_author(getattr(args, "author", None))
+    if claimed is not None:
+        print(f"kanban: --author {claimed!r} needs the operator token "
+              f"({kb.OPERATOR_TOKEN_ENV}); the audit comment is written as {author!r}",
+              file=sys.stderr)
     want_json = bool(getattr(args, "json", False))
     tenant = getattr(args, "tenant", None)
     if args.task_id and all_flag:
