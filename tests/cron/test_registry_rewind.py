@@ -94,3 +94,31 @@ def test_retention_keeps_each_jobs_newest_completed_occurrence(tmp_path, monkeyp
             jobs.datetime.fromisoformat(newest).astimezone(jobs.timezone.utc).isoformat()]
         # The cap still bounds the ledger: past it, only per-job newest completions survive.
         assert len(executions.list_executions(limit=100)) == 6
+
+
+def test_rewound_slot_still_catches_up_an_occurrence_missed_after_the_watermark(tmp_path, monkeypatch):
+    """Rewound behind a completion, then a real miss after it: resume after the watermark, fire once.
+
+    Prism #1795 2c48c2277a95: a daily job completed Monday, the snapshot points at Sunday, the
+    scheduler was down for Tuesday's slot. Skipping straight to now would lose Tuesday."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with jobs.use_cron_store(tmp_path / "cron"):
+        now = jobs._hermes_now()
+        job = _job("hourly")
+        ran = (now - timedelta(hours=5)).replace(microsecond=0).isoformat()
+        _complete(job["id"], ran)
+        _rewind(job["id"], (now - timedelta(hours=8)).replace(microsecond=0).isoformat())
+
+        assert [j["id"] for j in jobs.get_due_jobs()] == [job["id"]]
+
+
+def test_prematurely_completed_later_slot_is_not_rewind_proof(tmp_path, monkeypatch):
+    """A completion recorded long before the slot it claims is poison, not proof (Prism abe5a49483e9)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with jobs.use_cron_store(tmp_path / "cron"):
+        now = jobs._hermes_now()
+        job = _job("hourly")
+        _complete(job["id"], (now + timedelta(hours=2)).replace(microsecond=0).isoformat())
+        _rewind(job["id"], (now - timedelta(hours=3)).replace(microsecond=0).isoformat())
+
+        assert [j["id"] for j in jobs.get_due_jobs()] == [job["id"]]

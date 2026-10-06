@@ -19,9 +19,9 @@ def scheduled_instant(value):
 
 
 def completed_occurrence(job, instant):
-    """True when *instant* already ran: completed itself, or a LATER occurrence completed (the store
-    was rewound past it). Unknown/failed/pruned attempts cannot prove completion: keep them
-    eligible."""
+    """True when *instant* itself completed. Unknown/failed/pruned attempts cannot prove completion:
+    keep them eligible. A store rewound past a completed LATER occurrence is
+    ``rewound_watermark``'s job, not this one's."""
     from cron.constants import FIRE_CLAIM_SKEW_SECONDS
     from cron.executions import _transaction
 
@@ -37,12 +37,6 @@ def completed_occurrence(job, instant):
                 "WHERE job_id=? AND scheduled_instant=? "
                 "AND status='completed'", (str(job['id']), instant)
             ).fetchall()
-            later = conn.execute(
-                "SELECT id, scheduled_instant FROM executions "
-                "WHERE job_id=? AND status='completed' AND scheduled_instant IS NOT NULL "
-                "AND julianday(scheduled_instant) > julianday(?) "
-                "ORDER BY julianday(scheduled_instant) DESC LIMIT 1", (str(job['id']), instant)
-            ).fetchone()
         for row in rows:
             completed_at = scheduled_instant(row["finished_at"] or row["claimed_at"])
             # Legacy or malformed timestamps remain proof; only positively identified poison
@@ -56,22 +50,56 @@ def completed_occurrence(job, instant):
                     job.get("name", job.get("id")), job.get("id"), instant, row["id"],
                     row["finished_at"] or row["claimed_at"])
                 return True
-        if later is not None:
-            # A LATER occurrence already completed, so the store's schedule went backwards:
-            # jobs.json was replaced by an older snapshot (a hand "level" from git, a restore).
-            # Firing it would re-run work that is already done (2026-10-05 22:44: 402
-            # catch-ups, one per daily job that had run that day).
-            logger.warning(
-                "cron.registry_rewound job='%s' id=%s: stored occurrence %s is older than "
-                "occurrence %s, which execution %s already completed; skipping the stale slot "
-                "without a new run (jobs.json was rewound to an older snapshot?)",
-                job.get("name", job.get("id")), job.get("id"), instant,
-                later["scheduled_instant"], later["id"])
-            return True
         return False
     except Exception:
         logger.warning("Cannot check completed occurrence for job %s", job['id'], exc_info=True)
         return False
+
+
+def _proves_slot(completed_at, slot):
+    """A completion proves *slot* ran unless it is positively identified as poison: recorded more
+    than FIRE_CLAIM_SKEW_SECONDS before the slot it claims. Legacy/malformed stamps stay proof."""
+    from cron.constants import FIRE_CLAIM_SKEW_SECONDS
+
+    completed_at = scheduled_instant(completed_at)
+    return completed_at is None or datetime.fromisoformat(completed_at) >= (
+        datetime.fromisoformat(slot) - timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS))
+
+
+def rewound_watermark(job, instant):
+    """Newest validly completed occurrence of *job* LATER than the stored *instant*, or None.
+
+    Non-None means the store's schedule went backwards: jobs.json was replaced by an older snapshot
+    (a hand "level" from git, a restore). 2026-10-05 22:44 that fired 402 catch-ups, one per daily
+    job that had already run that day. The caller resumes the schedule AFTER the watermark rather
+    than skipping to now, so an occurrence genuinely missed after the watermark still catches up."""
+    from cron.executions import _transaction
+
+    instant = scheduled_instant(instant)
+    if instant is None:
+        return None
+    try:
+        with _transaction() as conn:
+            rows = conn.execute(
+                "SELECT id, scheduled_instant, finished_at, claimed_at FROM executions "
+                "WHERE job_id=? AND status='completed' AND scheduled_instant IS NOT NULL "
+                "AND julianday(scheduled_instant) > julianday(?) "
+                "ORDER BY julianday(scheduled_instant) DESC", (str(job['id']), instant)
+            ).fetchall()
+    except Exception:
+        logger.warning("Cannot check rewound schedule for job %s", job['id'], exc_info=True)
+        return None
+    for row in rows:
+        slot = scheduled_instant(row["scheduled_instant"])
+        if slot is None or not _proves_slot(row["finished_at"] or row["claimed_at"], slot):
+            continue
+        logger.warning(
+            "cron.registry_rewound job='%s' id=%s: stored occurrence %s is older than occurrence "
+            "%s, which execution %s already completed; resuming the schedule after it (jobs.json "
+            "was rewound to an older snapshot?)",
+            job.get("name", job.get("id")), job.get("id"), instant, slot, row["id"])
+        return slot
+    return None
 
 
 # --- Pending slot: the occurrence a tick took off the schedule but has not yet claimed ---
