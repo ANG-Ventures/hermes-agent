@@ -37,9 +37,11 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
 
     try:
         thread = spawn_context_thread(run, name=name)
+        # Start BEFORE publishing: other threads join session["_run_thread"], and Thread.join() on an
+        # unstarted thread raises "cannot join thread before it is started" (t_99a9c529).
+        thread.start()
         if session is not None:
             session["_run_thread"] = thread
-        thread.start()
         return thread
     except BaseException:
         retirement.release()

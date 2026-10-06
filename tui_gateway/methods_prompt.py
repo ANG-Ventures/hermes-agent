@@ -729,9 +729,15 @@ def _(rid, params: dict) -> dict:
         target=lambda: _run_after_agent_ready(
             rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author),
         daemon=True)
-    # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
-    session["_run_thread"] = run_thread
+    # Handle lets session.interrupt tell a live turn from a stuck `running` flag. Published only once
+    # started (a concurrent join() of an unstarted thread raises, t_99a9c529), and only if the worker has
+    # not already published its prompt-turn thread — _start_session_work does that under _sessions_lock.
+    with _sessions_lock:
+        prior = session.get("_run_thread")
     run_thread.start()
+    with _sessions_lock:
+        if session.get("_run_thread") is prior:
+            session["_run_thread"] = run_thread
     return _ok(rid, {"status": "streaming", **survivor_fields})
 
 
