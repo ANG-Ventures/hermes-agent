@@ -68,7 +68,7 @@ def _state_lock(cron_dir: Path):
         try:
             if fcntl is not None:
                 try:
-                    fd = open(cron_dir / _LOCK_NAME, "a+")
+                    fd = open(cron_dir / _LOCK_NAME, "a+", encoding="utf-8")
                     fcntl.flock(fd, fcntl.LOCK_EX)
                 except OSError as e:  # in-process lock still held
                     logger.debug("fallback notice gate flock unavailable: %r", e)

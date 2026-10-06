@@ -331,7 +331,7 @@ def test_mark_waits_for_another_process_lock(tmp_path):
 
     cron_dir = tmp_path / "cron"
     cron_dir.mkdir()
-    holder = open(cron_dir / ".fallback_notice_day.lock", "a+")  # another writer (CLI process) holding it
+    holder = open(cron_dir / ".fallback_notice_day.lock", "a+", encoding="utf-8")  # another writer (CLI process) holding it
     fcntl.flock(holder, fcntl.LOCK_EX)
     t = threading.Thread(target=gate.mark_noticed, args=(tmp_path, "md", "a -> b", "2026-10-06"))
     t.start()
