@@ -365,6 +365,17 @@ def _backup_operation_lock(hermes_home: Path, timeout_seconds: float = 0.25):
         handle.close()
 
 
+def _staging_prefix(final_path: Path) -> str:
+    """Name prefix of every hidden ``.partial`` staging file ``_atomic_output_path`` makes for *final_path*."""
+    return f".{final_path.name}."
+
+
+def _is_staging_of(path: Path, final_path: Path) -> bool:
+    """True when *path* is a staging file (open or left by a killed run) of *final_path*."""
+    return (path.name.startswith(_staging_prefix(final_path)) and path.name.endswith(".partial")
+            and path.resolve().parent == final_path.resolve().parent)
+
+
 @contextmanager
 def _atomic_output_path(final_path: Path, publish_path: Optional[Callable[[], Optional[Path]]] = None):
     """Yield a hidden sibling path and publish it only after a clean close.
@@ -373,7 +384,7 @@ def _atomic_output_path(final_path: Path, publish_path: Optional[Callable[[], Op
     can divert an incomplete archive elsewhere without ever touching ``final_path``; returning
     ``None`` discards the partial instead of publishing it.
     """
-    partial_path = final_path.with_name(f".{final_path.name}.{os.getpid()}-{threading.get_ident()}.partial")
+    partial_path = final_path.with_name(f"{_staging_prefix(final_path)}{os.getpid()}-{threading.get_ident()}.partial")
     partial_path.unlink(missing_ok=True)
     try:
         yield partial_path
@@ -531,13 +542,14 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
             rel = rel_dir / fname
             fpath = hermes_root / rel
             # zipfile.write() follows file symlinks, so skip links before any archive write can
-            # copy data from outside HERMES_HOME; never archive the output zip into itself.
+            # copy data from outside HERMES_HOME; never archive the output zip into itself, neither
+            # published nor as its open staging file (a re-scan runs while that file is growing).
             if _should_exclude(rel):
                 continue
             if _is_non_regular_path(fpath):
                 continue
             with suppress(OSError, ValueError):
-                if fpath.resolve() == out_path.resolve():
+                if fpath.resolve() == out_path.resolve() or _is_staging_of(fpath, out_path):
                     continue
             yield fpath, rel
 
