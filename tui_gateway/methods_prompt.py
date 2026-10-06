@@ -725,20 +725,19 @@ def _(rid, params: dict) -> dict:
     # A completed FAILED build must not wedge the session: rebuild, don't replay it.
     if not _restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):
         _start_agent_build(sid, session)
-    published = threading.Event()
-
-    def _run_once_published() -> None:
-        # The worker republishes _run_thread (the prompt-turn thread); it must not race this handle.
-        published.wait()
-        _run_after_agent_ready(
-            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author)
-
-    run_thread = threading.Thread(target=_run_once_published, daemon=True)
+    run_thread = threading.Thread(
+        target=lambda: _run_after_agent_ready(
+            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author),
+        daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag. Published only once
-    # started: a concurrent join() of an unstarted thread raises (t_99a9c529).
+    # started (a concurrent join() of an unstarted thread raises, t_99a9c529), and only if the worker has
+    # not already published its prompt-turn thread — _start_session_work does that under _sessions_lock.
+    with _sessions_lock:
+        prior = session.get("_run_thread")
     run_thread.start()
-    session["_run_thread"] = run_thread
-    published.set()
+    with _sessions_lock:
+        if session.get("_run_thread") is prior:
+            session["_run_thread"] = run_thread
     return _ok(rid, {"status": "streaming", **survivor_fields})
 
 
