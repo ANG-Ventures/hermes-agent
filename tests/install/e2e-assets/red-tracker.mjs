@@ -98,6 +98,12 @@ async function main() {
     if (plan.body) console.log(`\n--- ${plan.title || 'comment'} ---\n${plan.body}`);
     return;
   }
+  // A fork with issues turned off has nowhere to keep the tracker; `gh issue create`
+  // would fail the job and turn the default branch's checks red for no fault in the matrix.
+  if (JSON.parse(gh(['api', `repos/${repo}`])).has_issues === false) {
+    console.log(`${repo} has issues disabled; not keeping a tracker (planned: ${plan.action})`);
+    return;
+  }
   if (plan.action === 'open') {
     gh(['label', 'create', LABEL, '--repo', repo, '--force', '--color', 'B60205',
       '--description', 'The scheduled install/update E2E matrix is red (managed by install-e2e-red.yml)']);
