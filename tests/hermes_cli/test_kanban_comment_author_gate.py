@@ -46,8 +46,8 @@ def operator_gateway(monkeypatch):
     from hermes_cli import kanban_identity as ki
 
     monkeypatch.setattr(
-        ki, "_operator_gateway_pid",
-        lambda name: os.getppid() if name.strip().lower() in ("default", "apollo") else None,
+        ki, "_operator_gateway_pids",
+        lambda name: frozenset({os.getppid()}) if name.strip().lower() in ("default", "apollo") else frozenset(),
     )
     return os.getppid()
 
@@ -177,7 +177,7 @@ def test_unverified_spawn_fails_closed_for_authorship(board, monkeypatch, operat
 
     _seed_worker_run(board, os.getpid(), fingerprint="unverified")
     author, payload = _comment_as(monkeypatch, "default", board, "land-autopilot")
-    assert author == "default-unverified"
+    assert author == "unverified:default"
     assert payload.get("claimed_author") == "land-autopilot"
 
 
@@ -223,7 +223,7 @@ def test_operator_label_needs_token_without_proven_worker(board, monkeypatch):
     proof of operator status, so an operator LABEL needs the token from any
     caller other than the label itself."""
     author, payload = _comment_as(monkeypatch, "default", board, "human:apollo")
-    assert author == "default-unverified"
+    assert author == "unverified:default"
     assert payload.get("claimed_author") == "human:apollo"
     author, payload = _comment_as(monkeypatch, "default", board, "human:apollo", TOKEN)
     assert author == "human:apollo"
@@ -287,7 +287,7 @@ def test_own_operator_name_without_proof_is_not_an_operator_label(board, monkeyp
     from hermes_cli.kanban_identity import is_operator_label
 
     author = _bare_comment(monkeypatch, profile, board)
-    assert author == f"{profile}-unverified"
+    assert author == f"unverified:{profile}"
     assert not is_operator_label(author)
     # ...and --author <own name> takes the same road (no own-name fast path).
     author, payload = _comment_as(monkeypatch, profile, board, profile)
@@ -319,8 +319,8 @@ def test_reparented_helper_outside_the_gateway_tree_is_unverified(board, monkeyp
 
     other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
-        monkeypatch.setattr(ki, "_operator_gateway_pid", lambda name: other.pid)
-        assert _bare_comment(monkeypatch, "apollo", board) == "apollo-unverified"
+        monkeypatch.setattr(ki, "_operator_gateway_pids", lambda name: frozenset({other.pid}))
+        assert _bare_comment(monkeypatch, "apollo", board) == "unverified:apollo"
     finally:
         other.kill()
         other.wait()
@@ -340,7 +340,7 @@ def test_tool_identity_needs_proof_too(board, monkeypatch):
 
     monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV, raising=False)
     monkeypatch.setenv("HERMES_PROFILE", "default")
-    assert kt._persisted_identity() == "default-unverified"
+    assert kt._persisted_identity() == "unverified:default"
     monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, TOKEN)
     assert kt._persisted_identity() == "default"
 
@@ -356,3 +356,53 @@ def test_unverified_comment_is_not_a_ruling(board, monkeypatch):
     _bare_comment(monkeypatch, "apollo", board, TOKEN)
     with kb.connect() as conn:
         assert find_ruled_parent(conn, [board])["why"] == "ruling_comment"
+
+
+# ── Prism round 1 on #1793 ───────────────────────────────────────────────────
+
+
+def test_unproven_human_label_is_not_an_operator_label(board, monkeypatch):
+    """58ee6155c6e1: a suffix kept ``human:apollo-unverified`` inside the
+    ``human:`` namespace that ``is_operator_label`` trusts."""
+    from hermes_cli.kanban_identity import is_operator_label
+
+    author = _bare_comment(monkeypatch, "human:apollo", board)
+    assert author == "unverified:human:apollo"
+    assert not is_operator_label(author)
+
+
+def test_unreadable_board_is_never_proof_of_no_worker(board, monkeypatch, operator_gateway):
+    """c6316b5d4c3b: a board that cannot be read may hold the worker row, so the
+    gateway-tree proof is denied rather than read as "no worker below"."""
+    import sqlite3
+
+    from hermes_cli import kanban_identity as ki
+
+    real = sqlite3.connect
+
+    def locked(database, *a, **kw):
+        if "mode=ro" in str(database):
+            raise sqlite3.OperationalError("database is locked")
+        return real(database, *a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", locked)
+    assert ki._worker_rows([12345]) is None
+    assert ki._runs_under_operator_gateway("apollo") is False
+
+
+def test_multiplexer_serving_the_profile_counts_as_its_gateway(board, monkeypatch):
+    """cfdcb98d4fbe: a served profile owns no gateway.pid; the host multiplexer
+    that serves it is its gateway."""
+    import os
+
+    from gateway import status as gs
+    from hermes_cli import kanban_identity as ki
+
+    (kb.kanban_home() / "profiles" / "aegis").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(gs, "live_gateway_pid_for_home", lambda home: None)
+    monkeypatch.setattr(
+        gs, "multiplexer_liveness_for_profile",
+        lambda home: (os.getppid(), {}) if str(home).endswith("aegis") else None,
+    )
+    assert ki._operator_gateway_pids("aegis") == frozenset({os.getppid()})
+    assert _bare_comment(monkeypatch, "aegis", board) == "aegis"

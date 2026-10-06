@@ -2708,7 +2708,7 @@ def _comment_author(requested: Optional[str]) -> tuple[str, Optional[str]]:
 
     The caller's own name is no fast path for an operator label:
     ``_profile_author`` already turned an unproven one into
-    ``<name>-unverified`` (Prism e8be54683982, t_3b9dbdb1).
+    ``unverified:<name>`` (Prism e8be54683982, t_3b9dbdb1).
 
     Otherwise the caller writes as itself; the requested label survives only
     as ``claimed_author`` on the ``commented`` event, for forensics.

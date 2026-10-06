@@ -138,7 +138,8 @@ def _worker_rows(chain: list[int]) -> Optional[dict[int, list[tuple[str, str]]]]
     ``HERMES_KANBAN_DB`` pin, which would collapse every slug onto one DB
     (Prism 9e1b780a6387); the caller's write-target DB is read too. Rows
     without a profile or fingerprint string are dropped. ``None`` when the
-    board list is unreadable.
+    board list or ANY board is unreadable: an unread board may hold the
+    worker row, so absence is never proven from it (Prism c6316b5d4c3b).
     """
     try:
         from hermes_cli import kanban_db as kb
@@ -173,7 +174,7 @@ def _worker_rows(chain: list[int]) -> Optional[dict[int, list[tuple[str, str]]]]
             finally:
                 conn.close()
         except sqlite3.Error:
-            continue
+            return None
         for pid, profile, started in rows:
             if profile and isinstance(started, str) and started:
                 found.setdefault(int(pid), []).append((str(profile), started))
@@ -219,19 +220,24 @@ def is_operator_label(name: Optional[str]) -> bool:
     return v in RULING_AUTHORS or v in OPERATOR_PROFILES or v.startswith("human:")
 
 
-# Suffix on an operator label the caller could not prove it holds (t_3b9dbdb1).
-# Not an operator label (``is_operator_label`` is False for it), so no
-# operator-trust reader honours the comment, but the board still shows who
-# claimed to write it.
-UNVERIFIED_AUTHOR_SUFFIX = "-unverified"
+# Prefix on an operator label the caller could not prove it holds (t_3b9dbdb1).
+# A PREFIX, so the result can never match an operator label: a suffix left
+# ``human:apollo-unverified`` inside the ``human:`` namespace (Prism
+# 58ee6155c6e1). No operator-trust reader honours the comment, but the board
+# still shows who claimed to write it.
+UNVERIFIED_AUTHOR_PREFIX = "unverified:"
 
 # Operator labels that name the ROOT profile's gateway (Apollo runs as ``default``).
 _ROOT_PROFILE_LABELS = frozenset({"default", "apollo"})
 
 
-def _operator_gateway_pid(name: str) -> Optional[int]:
-    """Verified pid of the live gateway that serves operator profile ``name``,
-    or None (``human:*``, ``ace``/``user`` and unknown profiles have none)."""
+def _operator_gateway_pids(name: str) -> frozenset[int]:
+    """Verified pids of the live gateway(s) that serve operator profile
+    ``name``: the gateway that home owns, and the host multiplexer when it
+    serves that profile (a served profile owns no gateway.pid, and a
+    multiplexer launched from a named profile records its identity there, not
+    at the root; Prism cfdcb98d4fbe). Empty for ``human:*``, ``ace``/``user``
+    and unknown profiles."""
     from pathlib import Path
 
     from hermes_constants import get_default_hermes_root
@@ -244,17 +250,28 @@ def _operator_gateway_pid(name: str) -> Optional[int]:
         from hermes_cli.kanban_db import OPERATOR_PROFILES
 
         if v not in OPERATOR_PROFILES:
-            return None
+            return frozenset()
         home = root / "profiles" / v
         if not home.is_dir():
-            return None
+            return frozenset()
+    pids: set[int] = set()
     try:
         from gateway.status import live_gateway_pid_for_home
 
-        return live_gateway_pid_for_home(home)
+        pid = live_gateway_pid_for_home(home)
+        if pid:
+            pids.add(int(pid))
     except Exception:
         _log.debug("kanban: operator gateway pid lookup failed", exc_info=True)
-        return None
+    try:
+        from gateway.status import multiplexer_liveness_for_profile
+
+        served = multiplexer_liveness_for_profile(home)
+        if served and served[0]:
+            pids.add(int(served[0]))
+    except Exception:
+        _log.debug("kanban: operator multiplexer lookup failed", exc_info=True)
+    return frozenset(pids)
 
 
 def _runs_under_operator_gateway(name: str) -> bool:
@@ -268,8 +285,8 @@ def _runs_under_operator_gateway(name: str) -> bool:
     row counts here even when its fingerprint is ``unverified``: authorship
     fails closed, unlike kill/reap (t_3b9dbdb1).
     """
-    gw = _operator_gateway_pid(name)
-    if gw is None:
+    gws = _operator_gateway_pids(name)
+    if not gws:
         return False
     try:
         import psutil
@@ -278,16 +295,18 @@ def _runs_under_operator_gateway(name: str) -> bool:
         path = [me.pid] + [p.pid for p in me.parents()]
     except Exception:
         return False
-    if gw not in path:
+    at = next((i for i, pid in enumerate(path) if pid in gws), None)
+    if at is None:
         return False
-    below = path[: path.index(gw)]
+    gw = path[at]
+    below = path[:at]
     try:
         below.append(os.getsid(0))
     except (AttributeError, OSError):
         pass
     below = [pid for pid in dict.fromkeys(below) if pid > 1 and pid != gw]
     found = _worker_rows(below)
-    if found is None:
+    if found is None:  # an unreadable board is indeterminate, never "no worker"
         return False
     if not found:
         return True
@@ -322,7 +341,7 @@ def verified_profile_author(name: str) -> str:
 
     * inside a dispatched worker: that worker's own profile (Prism 41fd439722e6);
     * outside one: ``name`` only with :func:`operator_label_proven`, else
-      ``<name>-unverified``. An orphaned, setsid'd helper of a worker has no
+      ``unverified:<name>``. An orphaned, setsid'd helper of a worker has no
       worker in its ancestry and could otherwise write ``apollo`` by setting
       ``HERMES_PROFILE`` (Prism e8be54683982 / 05c79d97284b, t_3b9dbdb1).
     """
@@ -333,7 +352,7 @@ def verified_profile_author(name: str) -> str:
         return worker
     if operator_label_proven(name):
         return name
-    return f"{name.strip()}{UNVERIFIED_AUTHOR_SUFFIX}"
+    return f"{UNVERIFIED_AUTHOR_PREFIX}{name.strip()}"
 
 
 def safe_comment_provenance(
