@@ -24,7 +24,10 @@ import pytest
 
 from hermes_cli import dashboard_procs
 
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics only")
+pytestmark = [
+    pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics only"),
+    pytest.mark.real_posix_descendants,  # real child trees: the descendant sweep is under test
+]
 
 _IGNORING_CHILD = textwrap.dedent(
     """
