@@ -8,8 +8,14 @@ from __future__ import annotations
 import logging
 
 import contextlib
+import threading
 
 from .method_ctx import bind_module
+
+# Guards session["_run_thread"]: start+publish is one critical section and every liveness reader takes it,
+# so a started worker is never hidden behind the previous handle (Prism 22606434c9d8). Reentrant: a
+# synchronous start() (test stubs) re-enters _start_session_work under the prompt.submit publish.
+_run_thread_lock = threading.RLock()
 
 
 @contextlib.contextmanager
@@ -37,15 +43,25 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
 
     try:
         thread = spawn_context_thread(run, name=name)
-        # Start BEFORE publishing: other threads join session["_run_thread"], and Thread.join() on an
-        # unstarted thread raises "cannot join thread before it is started" (t_99a9c529).
-        thread.start()
-        if session is not None:
+        if session is None:
+            thread.start()
+            return thread
+        # Start BEFORE publishing (join() of an unstarted thread raises, t_99a9c529), both under
+        # _run_thread_lock so no liveness reader sees the worker running behind the previous dead handle.
+        with _run_thread_lock:
+            thread.start()
             session["_run_thread"] = thread
         return thread
     except BaseException:
         retirement.release()
         raise
+
+
+def _session_run_thread(session: dict):
+    """The session's published turn thread, read under ``_run_thread_lock`` so a worker that is started but
+    not yet published (see ``_start_session_work``) is never mistaken for a dead or missing turn."""
+    with _run_thread_lock:
+        return session.get("_run_thread")
 
 
 def _notify_session_boundary(event_type: str, session_id: str | None, platform: str | None = None) -> None:
@@ -570,7 +586,7 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
-    run_thread = session.get("_run_thread")
+    run_thread = _session_run_thread(session)
     if end_reason != "tui_shutdown" and run_thread is not None and run_thread is not threading.current_thread():
         try:
             if run_thread.is_alive():
@@ -703,7 +719,7 @@ def _interrupt_session_turn(
         if should_interrupt or session.get("_compute_host_active"):
             _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
     else:
-        run_thread_alive = (rt := session.get("_run_thread")) is not None and rt.is_alive()
+        run_thread_alive = (rt := _session_run_thread(session)) is not None and rt.is_alive()
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
