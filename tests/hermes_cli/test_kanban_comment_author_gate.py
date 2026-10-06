@@ -186,3 +186,46 @@ def test_triage_sweep_author_is_gated(board, monkeypatch):
                               tenant=None, task_id=board)
     kc._run_triage_sweep(args, "specify", _Mod, run_one, "specified", (), lambda o: "ok")
     assert seen["author"] == "daedalus"
+
+
+# ── Prism round 1 on #1791 ──────────────────────────────────────────────────
+
+
+def test_operator_label_needs_token_without_proven_worker(board, monkeypatch):
+    """d11c14fcd7fe: missing worker ancestry (a reparented helper) is never
+    proof of operator status, so an operator LABEL needs the token from any
+    caller other than the label itself."""
+    author, payload = _comment_as(monkeypatch, "default", board, "human:apollo")
+    assert author == "default"
+    assert payload.get("claimed_author") == "human:apollo"
+    author, payload = _comment_as(monkeypatch, "default", board, "human:apollo", TOKEN)
+    assert author == "human:apollo"
+
+
+def test_worker_whose_profile_is_default_loses_the_exemption(board, monkeypatch):
+    """26d8f8ddc376: a dispatched run recorded as ``default`` is still a worker;
+    the service-label exemption is keyed on worker status, not on its label."""
+    import os
+
+    _seed_worker_run(board, os.getpid(), profile="default")
+    author, payload = _comment_as(monkeypatch, "default", board, "land-autopilot")
+    assert author == "default"
+    assert payload.get("claimed_author") == "land-autopilot"
+    author, payload = _comment_as(monkeypatch, "default", board, "human:apollo")
+    assert author == "default"
+    assert payload.get("claimed_author") == "human:apollo"
+
+
+def test_worker_on_another_board_is_found_under_a_repinned_db(board, monkeypatch, tmp_path):
+    """9e1b780a6387: ``HERMES_KANBAN_DB`` repinned to board B must not hide the
+    worker run recorded on board A."""
+    import os
+
+    from hermes_cli.kanban_identity import worker_ancestor_profile
+
+    _seed_worker_run(board, os.getpid())          # board A = default
+    kb.create_board("other")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb._board_db_path_ignoring_pin("other")))
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+    assert worker_ancestor_profile() == "daedalus"

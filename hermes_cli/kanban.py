@@ -2687,25 +2687,36 @@ def _cmd_comment(args: argparse.Namespace) -> int:
 
 
 def _comment_author(requested: Optional[str]) -> tuple[str, Optional[str]]:
-    """``(author, claimed_author)`` for a CLI comment.
+    """``(author, claimed_author)`` for a caller-chosen author label.
 
     ``env -u HERMES_KANBAN_TASK hermes kanban comment --author human:apollo``
     wrote an operator-labelled comment from any worker shell (Prism gate spec
-    §8b). ``--author`` may now never raise a caller above its own identity: it
-    is honoured for an operator-profile caller (``RULING_AUTHORS``, already the
-    label every reader trusts, so a chosen label grants nothing; fleet crons run
-    there and deliberately pick NON-operator labels such as ``land-autopilot``),
-    or with the operator token (the same gate as ``--operator``/``--takeover``).
-    Any other caller writes as itself; the requested label survives only as
-    ``claimed_author`` on the ``commented`` event, for forensics.
+    §8b). ``--author`` may never raise a caller above its own identity:
+
+    * an OPERATOR label (``is_operator_label``: ruling authors, operator
+      profiles, ``human:*``) other than the caller's own name needs the
+      operator token from EVERY caller. The caller's profile is env-derived and
+      its worker ancestry cannot be proven in every topology (a reparented,
+      setsid'd helper), so missing ancestry never grants it (Prism
+      d11c14fcd7fe);
+    * a service label (``land-autopilot``, ``themis``) is honoured for an
+      operator-profile caller that is NOT inside a dispatched worker, whatever
+      that worker's own profile label is (Prism 26d8f8ddc376);
+    * the operator token honours any label.
+
+    Otherwise the caller writes as itself; the requested label survives only
+    as ``claimed_author`` on the ``commented`` event, for forensics.
     """
+    from hermes_cli.kanban_identity import is_operator_label, worker_ancestor_profile
     from hermes_cli.kanban_worker_policy import RULING_AUTHORS
 
     caller = _profile_author()
     want = (requested or "").strip()
-    if (not want or want == caller or caller.strip().lower() in RULING_AUTHORS
-            or kb._operator_token_state() == "ok"):
+    if not want or want == caller or kb._operator_token_state() == "ok":
         return want or caller, None
+    if (caller.strip().lower() in RULING_AUTHORS and not is_operator_label(want)
+            and worker_ancestor_profile() is None):
+        return want, None
     return caller, want
 
 
