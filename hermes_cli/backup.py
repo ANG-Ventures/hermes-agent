@@ -948,6 +948,20 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
             on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
             on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
             on_vanished=lambda rel: vanished.append(str(rel)))
+        late_added = 0
+        if vanished:
+            # A rename looks like a vanish here: the old path is gone and the new one was never
+            # listed. Re-scan once and archive what the first scan did not list, so moved data
+            # still lands and only a true deletion stays a WARN.
+            listed = {str(rel) for _, rel in files_to_add}
+            late = [(a, r) for a, r in _iter_backup_files(hermes_root, out_path) if str(r) not in listed]
+            late_added = len(late)
+            file_count += late_added
+            total_bytes += _write_zip_entries(
+                zf, late, out_path, on_progress=_progress, track_bytes=True,
+                on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
+                on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
+                on_vanished=lambda rel: vanished.append(str(rel)))
         # External memory-provider state never includes ``.db`` files in practice, so no
         # SQLite snapshot is needed; _write_zip_file still drops a failed partial member.
         for abs_path, arcname in external_to_add:
@@ -1015,6 +1029,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
     if vanished:
         _print_capped(f"\n  WARN: {len(vanished)} file(s) were deleted after the scan listed them "
                       "(not archived, not an error):", vanished, "  ")
+        print(f"  Re-scan archived {late_added} file(s) the first scan did not list (renamed or new).")
     if errors:
         _print_capped(f"\n  Archive kept, but {len(errors)} file(s) could not be added:", errors, "  ")
     else:
