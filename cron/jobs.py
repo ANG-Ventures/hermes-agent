@@ -3687,7 +3687,7 @@ def claim_job_for_fire(
         now = _hermes_now()
         if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
             return False  # someone holds a fresh claim
-        from cron.occurrences import completed_occurrence, scheduled_instant
+        from cron.occurrences import completed_occurrence, rewound_watermark, scheduled_instant
 
         # ``manual`` (an off-tick run-now) must NOT stamp an occurrence identity: outside a
         # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
@@ -3715,6 +3715,16 @@ def claim_job_for_fire(
                 if nxt:
                     job["next_run_at"] = nxt
                     save_jobs(jobs)
+            return False
+        recurring = job.get("schedule", {}).get("kind") in {"cron", "interval"}
+        watermark = rewound_watermark(job, instant) if instant and recurring else None
+        if watermark:
+            # Rewound store: re-arm after the completed occurrence and refuse this claim. A slot
+            # genuinely missed after the watermark stays past-due for the due scan's catch-up.
+            nxt = compute_next_run(job["schedule"], watermark)
+            if nxt:
+                job["next_run_at"] = nxt
+                save_jobs(jobs)
             return False
         if force:
             _activate_job_record(job)
@@ -4267,13 +4277,24 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     # into both fields, and any rewrite of next_run_at (edit, re-anchor, fire-claim advance) must
     # invalidate the marker. Do not "fix" this with _ensure_aware normalization.
     manual_run = job.get("manual_run_at") == next_run
-    from cron.occurrences import completed_occurrence, scheduled_instant
+    from cron.occurrences import completed_occurrence, rewound_watermark, scheduled_instant
 
     if not manual_run and completed_occurrence(job, next_run):
         new_next = d.recompute_next() if recurring else None
         if new_next:
             scan.persist(job["id"], next_run_at=new_next)
         return False
+    watermark = rewound_watermark(job, next_run) if recurring and not manual_run else None
+    if watermark:
+        # Resume AFTER the newest completed occurrence, not at now: a slot between it and now
+        # was genuinely missed and still flows through the ordinary catch-up policy below.
+        resumed = compute_next_run(d.schedule, watermark)
+        if not resumed:
+            return False
+        scan.persist(job["id"], next_run_at=resumed)
+        job["next_run_at"] = next_run = d.next_run = resumed
+        d.raw_next_run_dt = datetime.fromisoformat(resumed)
+        d.next_run_dt = _ensure_aware(d.raw_next_run_dt)
     if kind == "cron" and not manual_run and _repair_timezone_shifted_cron(d):
         return False
     if not manual_run:  # a staggered restart re-fire is pending: leave its stamp alone
