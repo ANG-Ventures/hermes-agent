@@ -106,9 +106,12 @@ def test_close_landing_while_turn_claims_lease_leaves_no_lease(turn_env, monkeyp
     server._sessions[SID] = session
     claim = server._ensure_active_session_slot
     at_claim: dict = {}
+    test_thread = threading.current_thread()
 
     def _claim_after_close(sid, claiming):
-        if threading.current_thread() is claiming.get("_run_thread") and not claiming.get("_closing"):
+        # The turn thread is "not the test thread": session["_run_thread"] is published only after start(),
+        # so the worker can reach this claim before its handle is visible.
+        if threading.current_thread() is not test_thread and not claiming.get("_closing"):
             at_claim["closed"] = _rpc("session.close")["result"]["closed"]
             at_claim["leases"] = _registry_session_ids()
         return claim(sid, claiming)
