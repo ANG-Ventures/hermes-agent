@@ -56,12 +56,22 @@ jobs:
             files: tests/e2e/core/windows_update/test_paths_and_acls.py
           - leg: spares
             files: tests/e2e/core/windows_update/test_update_spares_other_installs.py
+            # Two install.ps1 at once on 4 vCPUs: the slowest leg by design. Its test step
+            # over 159 green runs (2026-09-29..10-06): p50 1022 s, p90 1245 s, max 1795 s,
+            # five above 1500 s, so the shared 1800 s file timeout sat at its max and killed a
+            # still-progressing run (37428113550, main 86e289df). ~1.5x the observed max, and
+            # the job wall grows by the same 15 min so the file timeout still fires first; idle
+            # stays above the file timeout (silence is not a hang signal here, see the step env).
+            file_timeout: '2700'
+            idle_timeout: '3000'
+            timeout: 59
     # 2x the measured p90 leg wall: 17 green legs over runs 37168966958, 37169022868,
     # 37170959667 had wall 650-1403 s (p90 1297 s), test step 494-1006 s (p90 812 s) and
     # setup (checkout + setup-pm) 89-565 s (565 s on a cold cache). The per-file timeout
     # (2x the test-step p90, rounded up) plus the cold setup max stays under this wall, so a
     # stuck file is killed and named before the job wall cancels the leg blind.
-    timeout-minutes: 44
+    # spares overrides both budgets (see its matrix row).
+    timeout-minutes: ${{ matrix.timeout || 44 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -99,7 +109,7 @@ jobs:
           # install takes 870-1015 s and the cells pass (run 37102491348: 15/15 across the 4
           # files that finished inside the old job wall).
           HERMES_TEST_WORKERS: '2'
-          HERMES_TEST_FILE_TIMEOUT: '1800'
+          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.file_timeout || '1800' }}
           # Six journeys each run install.ps1 (a cold PM toolchain + venv + Node deps) on a
           # 4-vCPU hosted runner. A journey is one module-scoped fixture (install -> update
           # -> turns) that runs BEFORE its first cell can print, so pytest is silent for the
@@ -108,7 +118,7 @@ jobs:
           # --idle-timeout; upstream has none on this job) killed all six at 269 s (240 s,
           # run 37081194693) and again at 1229 s (1200 s, run 37094436303). Silence is not
           # a hang signal for this suite: let the wall ceiling alone gate it, as upstream does.
-          CI_TEST_IDLE_TIMEOUT: '2400'
+          CI_TEST_IDLE_TIMEOUT: ${{ matrix.idle_timeout || '2400' }}
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''
