@@ -89,11 +89,19 @@ def _route(tmp_path: Path, *, event: str, branch: str, conclusion: str = "failur
 @pytest.mark.parametrize("event,branch", [
     ("push", "main"),
     ("workflow_dispatch", "main"),
-    ("merge_group", "gh-readonly-queue/main/pr-1267-059d3994cfe01c8e455738138163b7fba9ad0174"),
     ("schedule", "main"),
 ])
 def test_actionable_reds_page(tmp_path, event, branch):
     assert _route(tmp_path, event=event, branch=branch)["route"] == "alerts"
+
+
+def test_queue_ejection_goes_to_logs_but_startup_failure_pages(tmp_path):
+    # t_02841e61: 15 per-PR ejection pages on 2026-10-05, 14 for PRs that merged on a later queue run.
+    # mq-ejection-watch / fleet-merge-horizon-watch page the queue faults; the per-PR line is #logs.
+    branch = "gh-readonly-queue/main/pr-1267-059d3994cfe01c8e455738138163b7fba9ad0174"
+    got = _route(tmp_path, event="merge_group", branch=branch)
+    assert got["route"] == "logs" and got["card"] == "mq-ejected"
+    assert _route(tmp_path, event="merge_group", branch=branch, conclusion="startup_failure")["route"] == "alerts"
 
 
 # t_05da39f4: release-tag reds have no PR, so they must page. Shapes taken from
@@ -360,6 +368,15 @@ def _queue_route(tmp_path, api: dict, *, run_id=42, pr="1328", branch="", subjec
     return got
 
 
+def _ejected(got: dict) -> bool:
+    """A queue red that pages nothing else: the per-PR ejection line, routed to #logs (t_02841e61).
+
+    mq-ejection-watch (one test ejecting >=2 batches, queue thrash) and fleet-merge-horizon-watch
+    (a PR still unmerged after the horizon) page the queue faults a human acts on.
+    """
+    return got["route"] == "logs" and got["card"] == "mq-ejected"
+
+
 def _prior(*runs):
     now = "2099-01-01T00:00:00Z"  # always inside the 24h window
     # A run whose ref was deleted comes back with head_branch null (seen live on
@@ -382,7 +399,7 @@ def _api(current_tests, prior_runs=(), prior_tests=None, slice_="6/16"):
 
 def test_first_queue_ejection_pages_naming_pr_and_test(tmp_path):
     got = _queue_route(tmp_path, _api([QTEST]))
-    assert got["route"] == "alerts"
+    assert _ejected(got)
     assert got["pr"] == "1328"
     assert got["summary"] == f"PR #1328 ejected from the merge queue: {QTEST}"
 
@@ -397,13 +414,13 @@ def test_queue_retry_same_pr_same_test_is_silent(tmp_path):
 
 def test_queue_retry_new_failing_test_still_pages(tmp_path):
     got = _queue_route(tmp_path, _api([QTEST], prior_runs=[(30, "1328", "aaa")], prior_tests=["tests/x.py::t"]))
-    assert got["route"] == "alerts"
+    assert _ejected(got)
 
 
 def test_other_pr_same_test_still_pages(tmp_path):
     # A prior failure of a DIFFERENT PR is not this PR's page; the lookup filters by PR.
     got = _queue_route(tmp_path, _api([QTEST], prior_runs=[(30, "1333", "aaa")]))
-    assert got["route"] == "alerts"
+    assert _ejected(got)
 
 
 def test_red_queue_run_of_already_merged_pr_goes_to_logs(tmp_path):
@@ -419,19 +436,19 @@ def test_red_queue_run_of_already_merged_pr_goes_to_logs(tmp_path):
 def test_red_queue_run_of_unmerged_pr_still_pages(tmp_path):
     api = _api([QTEST])
     api["pulls/1328"] = {"merged": False}
-    assert _queue_route(tmp_path, api)["route"] == "alerts"
+    assert _ejected(_queue_route(tmp_path, api))
     del api["pulls/1328"]  # lookup error -> fail loud
-    assert _queue_route(tmp_path, api)["route"] == "alerts"
+    assert _ejected(_queue_route(tmp_path, api))
 
 
 def test_queue_dedupe_api_error_fails_loud(tmp_path):
     api = _api([QTEST], prior_runs=[(30, "1328", "aaa")])
     del api["actions/workflows/7/runs"]
-    assert _queue_route(tmp_path, api)["route"] == "alerts"
+    assert _ejected(_queue_route(tmp_path, api))
     api = _api([QTEST])
     del api["actions/runs/42/jobs"]
     got = _queue_route(tmp_path, api)
-    assert got["route"] == "alerts" and "failing job unknown" in got["summary"]
+    assert _ejected(got) and "failing job unknown" in got["summary"]
 
 
 def test_queue_signature_falls_back_to_job_name_without_slice(tmp_path):
@@ -446,7 +463,7 @@ def test_queue_retry_same_test_plus_new_unannotated_red_job_still_pages(tmp_path
     api["actions/runs/42/jobs"]["jobs"].append({"id": 950, "name": "Lint (ruff + ty) / ruff", "conclusion": "failure"})
     api["check-runs/950/annotations"] = [{"message": "Process completed with exit code 1."}]
     got = _queue_route(tmp_path, api)
-    assert got["route"] == "alerts"
+    assert _ejected(got)
     assert got["summary"] == f"PR #1328 ejected from the merge queue: Lint (ruff + ty) / ruff; {QTEST}"
 
 
@@ -470,12 +487,12 @@ def test_queue_retry_prior_run_with_deleted_ref_is_still_recognized(tmp_path):
 
 def test_deleted_ref_prior_run_of_another_pr_still_pages(tmp_path):
     api = _null_branch_prior(_api([QTEST], prior_runs=[(30, "1333", "aaa")]), 30, "1333")
-    assert _queue_route(tmp_path, api)["route"] == "alerts"
+    assert _ejected(_queue_route(tmp_path, api))
 
 
 def test_current_run_with_deleted_ref_takes_pr_from_commit_subject(tmp_path):
     got = _queue_route(tmp_path, _api([QTEST]), branch=None, subject="fix(y): z (#1328)")
-    assert got["route"] == "alerts"
+    assert _ejected(got)
     assert got["summary"] == f"PR #1328 ejected from the merge queue: {QTEST}"
 
 
@@ -555,10 +572,12 @@ def test_replay_2026_09_28_folds_already_red_tests_to_logs(tmp_path):
     api = _r10_api()
     routes = {int(rid): _replay(tmp_path, int(rid), api) for _ts, rid, _pr in R10["pages"]}
     paged = sorted(rid for rid, g in routes.items() if g["route"] == "alerts")
-    # 15 pages then; 2 now (t_54478fb0 main-red streak for the main pushes):
-    #   36477241100 PR #1453       first red of test_no_new_source_proxy_asserts (queue ejection)
+    # 15 pages then; 1 now (t_54478fb0 main-red streak for the main pushes):
     #   36477804956 main 51e9b286  2nd consecutive "Python tests / Run tests" red (after 36476853851)
-    assert paged == [36477241100, 36477804956]
+    # 36477241100 PR #1453, the first queue ejection on test_no_new_source_proxy_asserts, is the
+    # per-PR #logs line (t_02841e61); mq-ejection-watch pages that test once it ejects >= 2 batches.
+    assert paged == [36477804956]
+    assert _ejected(routes[36477241100])
     # main 553943bd: 2nd red of the kanban test, but 89 min after main 36480232265 (>= BACKSTOP_S):
     # main-red-summary's persistence backstop owns that page
     assert routes[36490159001]["card"] == "main-red-backstop (run 36480232265)"
@@ -587,13 +606,13 @@ def test_fold_needs_every_failing_test_already_red(tmp_path):
             api[key] = [a for a in anns if KANBAN not in a["message"]]
     api["check-runs/" + str(next(j["id"] for j in R10["jobs"]["36496092766"] if "16/16" in j["name"])) + "/annotations"] = (
         [{"message": f"{KANBAN}[guard]: FAILED (not quarantined)"}])
-    assert _replay(tmp_path, 36496092766, api)["route"] == "alerts"
+    assert _ejected(_replay(tmp_path, 36496092766, api))
 
 
 def test_fold_lookup_error_pages(tmp_path):
     api = _r10_api()
     del api[next(k for k in api if k.endswith("runs?status=failure"))]
-    assert _replay(tmp_path, 36490221633, api)["route"] == "alerts"
+    assert _ejected(_replay(tmp_path, 36490221633, api))
 
 
 def test_fold_ignores_the_same_prs_own_earlier_runs(tmp_path):
@@ -602,7 +621,7 @@ def test_fold_ignores_the_same_prs_own_earlier_runs(tmp_path):
     api = _r10_api()
     key = next(k for k in api if k.endswith("runs?status=failure"))
     api[key]["workflow_runs"] = [r for r in api[key]["workflow_runs"] if "/pr-1463-" in (r["head_branch"] or "")]
-    assert _replay(tmp_path, 36494513399, api)["route"] == "alerts"
+    assert _ejected(_replay(tmp_path, 36494513399, api))
 
 
 
@@ -626,7 +645,7 @@ def test_fold_blocked_by_an_extra_unannotated_red_job(tmp_path):
     # FleetReview #1470 b3b3252a79bb: an old test red plus a NEW red job with no
     # FAILED annotation (Windows-only, JS & TS) is a new fault and must page.
     got = _queue_route(tmp_path, _other_pr_queue_api(extra_job="OS-specific tests / Windows-only tests"))
-    assert got["route"] == "alerts", got["_stdout"]
+    assert _ejected(got), got["_stdout"]
     assert "Windows-only tests" in got["summary"]
 
 
@@ -639,7 +658,7 @@ def test_fold_never_covers_a_job_name_even_if_it_failed_before(tmp_path):
                                                 "conclusion": "failure"})
     api["check-runs/951/annotations"] = [{"message": "Process completed with exit code 1."}]
     got = _queue_route(tmp_path, api)
-    assert got["route"] == "alerts", got["_stdout"]
+    assert _ejected(got), got["_stdout"]
 
 def test_fold_matches_deleted_ref_queue_run_by_squash_subject(tmp_path):
     # head_branch null once the queue ref is deleted: PR comes from "(#N)" in the subject.
@@ -1020,7 +1039,7 @@ def test_fold_blocked_by_an_extra_red_job_past_the_first_jobs_page(tmp_path):
     jobs.append({"id": 950, "name": "OS-specific tests / Windows-only tests", "conclusion": "failure"})
     api["check-runs/950/annotations"] = [{"message": "Process completed with exit code 1."}]
     got = _queue_route(tmp_path, api)
-    assert got["route"] == "alerts", got["_stdout"]
+    assert _ejected(got), got["_stdout"]
     assert "Windows-only tests" in got["summary"]
 
 
@@ -1127,7 +1146,7 @@ def test_fold_blocked_by_an_extra_timed_out_job(tmp_path):
     api = _other_pr_queue_api(extra_job="OS-specific tests / Windows-only tests")
     api["actions/runs/42/jobs"]["jobs"][-1]["conclusion"] = "timed_out"
     got = _queue_route(tmp_path, api)
-    assert got["route"] == "alerts", got["_stdout"]
+    assert _ejected(got), got["_stdout"]
     assert "Windows-only tests" in got["summary"]
 
 
@@ -1207,7 +1226,7 @@ def test_fold_blocked_by_a_quarantine_gate_failure_in_tests_complete(tmp_path):
     tc["steps"] = [{"name": QLINT, "conclusion": "failure"},
                    {"name": "Fail on skipped or failed required tests", "conclusion": "failure"}]
     got = _queue_route(tmp_path, api)
-    assert got["route"] == "alerts", got["_stdout"]
+    assert _ejected(got), got["_stdout"]
     assert f"{TC} / {QLINT}" in got["summary"]
 
 
@@ -1251,7 +1270,7 @@ def test_fold_blocked_by_a_tests_complete_timeout(tmp_path):
     tc = next(j for j in api["actions/runs/42/jobs"]["jobs"] if j["name"] == TC)
     tc["conclusion"], tc["steps"] = "timed_out", [{"name": QLINT, "conclusion": "cancelled"}]
     got = _queue_route(tmp_path, api)
-    assert got["route"] == "alerts", got["_stdout"]
+    assert _ejected(got), got["_stdout"]
     assert TC in got["summary"]
 
 
