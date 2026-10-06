@@ -122,3 +122,41 @@ def test_prematurely_completed_later_slot_is_not_rewind_proof(tmp_path, monkeypa
         _rewind(job["id"], (now - timedelta(hours=3)).replace(microsecond=0).isoformat())
 
         assert [j["id"] for j in jobs.get_due_jobs()] == [job["id"]]
+
+
+def test_rewound_oneshot_completed_at_a_later_reschedule_does_not_refire(tmp_path, monkeypatch):
+    """A one-shot rescheduled later and completed, then restored from an older snapshot, is done.
+
+    Prism #1797 792e09957d5e: the restored ``next_run_at`` has no exact completion and the
+    later-completion check was recurring-only, so the one-shot ran its side effects twice."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with jobs.use_cron_store(tmp_path / "cron"):
+        now = jobs._hermes_now()
+        job = jobs.create_job(prompt="once", schedule=(now + timedelta(hours=1)).isoformat(),
+                              model="fixture", deliver="local")
+        _complete(job["id"], (now - timedelta(minutes=10)).replace(microsecond=0).isoformat())
+        restored = (now - timedelta(minutes=30)).replace(microsecond=0).isoformat()
+        _rewind(job["id"], restored)
+
+        assert [j["id"] for j in jobs.get_due_jobs()] == []
+        assert jobs.claim_job_for_fire(job["id"]) is False
+        assert _next_run(job["id"]) == restored  # no recurring successor computed for a one-shot
+
+
+def test_retention_keeps_the_newest_valid_completion_not_a_poisoned_later_one(tmp_path, monkeypatch):
+    """Prism #1797 f84fc879b9dd: a poisoned future-slot completion must not displace the valid
+    watermark from the per-job retention exemption, or a rewind re-runs today's completed slot."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 2)
+    with jobs.use_cron_store(tmp_path / "cron"):
+        now = jobs._hermes_now()
+        job = jobs.create_job(prompt="daily", schedule="every 24h", model="fixture", deliver="local")
+        valid = (now - timedelta(hours=2)).replace(microsecond=0).isoformat()
+        _complete(job["id"], valid)
+        _complete(job["id"], (now + timedelta(hours=20)).replace(microsecond=0).isoformat())  # poison
+        for index in range(5):
+            _complete(f"other-{index}", now.isoformat())
+        _rewind(job["id"], (now - timedelta(hours=5)).replace(microsecond=0).isoformat())
+
+        assert [j["id"] for j in jobs.get_due_jobs()] == []
+        assert jobs._ensure_aware(jobs.datetime.fromisoformat(_next_run(job["id"]))) > now
