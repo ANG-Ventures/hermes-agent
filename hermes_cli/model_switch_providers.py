@@ -269,7 +269,21 @@ def _skip(seen: set, excluded: set, *keys: str) -> bool:
     return any(k in seen for k in lowered) or any(k in excluded for k in lowered)
 
 
-def _iter_builtin_candidates(models_dev_data: dict, excluded: set, seen: set):
+_REGISTRY_OWNERS = {"PROVIDER_REGISTRY": "hermes_cli.auth", "HERMES_OVERLAYS": "hermes_cli.providers",
+                    "CANONICAL_PROVIDERS": "hermes_cli.models", "_PROVIDER_MODELS": "hermes_cli.models"}
+
+
+def _registry(g, name: str):
+    """Registry container *name* from the picker's bound generation ``g`` (one
+    ``provider_seam.snapshot()`` per picker call, so a concurrent hot registration cannot tear a
+    listing across generations); the module global when no generation is bound."""
+    if g is not None:
+        return getattr(g, name)
+    import importlib
+    return getattr(importlib.import_module(_REGISTRY_OWNERS[name]), name)
+
+
+def _iter_builtin_candidates(models_dev_data: dict, excluded: set, seen: set, g=None):
     """Yield ``(hermes_id, mdev_id, pconfig, env_vars)`` for section-1 rows.
 
     Skips vendor names that alias through an aggregator (bare "openai" -> "openrouter" would
@@ -277,8 +291,9 @@ def _iter_builtin_candidates(models_dev_data: dict, excluded: set, seen: set):
     profile ("kimi" -> "kimi-coding"), non-api_key auth types (section 2 handles them) and
     unroutable providers. PROVIDER_REGISTRY env var names win over models.dev's."""
     from agent.models_dev import PROVIDER_TO_MODELS_DEV
-    from hermes_cli.auth import PROVIDER_REGISTRY, is_runtime_provider_routable
+    from hermes_cli.auth import is_runtime_provider_routable
     from hermes_cli.models import _AGGREGATOR_PROVIDERS
+    PROVIDER_REGISTRY = _registry(g, "PROVIDER_REGISTRY")
     from hermes_cli.providers import ALIASES
     for hermes_id, mdev_id in PROVIDER_TO_MODELS_DEV.items():
         alias_target = ALIASES.get(hermes_id)
@@ -338,12 +353,12 @@ def _pool_usable(slug: str) -> bool:
         return False
 
 
-def _overlay_has_env_creds(pid: str, hermes_slug: str, overlay, read_env) -> bool:
+def _overlay_has_env_creds(pid: str, hermes_slug: str, overlay, read_env, g=None) -> bool:
     """Section-2 env/SDK credential check shared by the picker and the prefetch scan.
 
     Vertex authenticates via OAuth2 (service-account JSON / ADC), not an API key, so it gets its
     own probe; otherwise the provider is hidden from the picker even when fully configured."""
-    from hermes_cli.auth import PROVIDER_REGISTRY
+    PROVIDER_REGISTRY = _registry(g, "PROVIDER_REGISTRY")
     has_creds = False
     if overlay.auth_type == "vertex":
         try:
@@ -634,7 +649,7 @@ def _discover_endpoint_models(
 
 
 def _collect_authed_provider_slugs(
-    models_dev_data: dict, curated: dict[str, list[str]], excluded: list[str]) -> list[str]:
+    models_dev_data: dict, curated: dict[str, list[str]], excluded: list[str], g=None) -> list[str]:
     """Quick-scan which providers have credentials, without fetching model lists.
 
     Mirrors the credential checks of sections 1, 2 and 2b of :func:`list_authenticated_providers`
@@ -643,9 +658,9 @@ def _collect_authed_provider_slugs(
     (heavier detection)."""
     from hermes_cli.model_switch import _scoped_key_env
     from agent.models_dev import PROVIDER_TO_MODELS_DEV
-    from hermes_cli.auth import PROVIDER_REGISTRY
-    from hermes_cli.providers import HERMES_OVERLAYS
-    from hermes_cli.models import CANONICAL_PROVIDERS
+    PROVIDER_REGISTRY = _registry(g, "PROVIDER_REGISTRY")
+    HERMES_OVERLAYS = _registry(g, "HERMES_OVERLAYS")
+    CANONICAL_PROVIDERS = _registry(g, "CANONICAL_PROVIDERS")
     excluded_set = {str(p).strip().lower() for p in excluded if p}
     slugs: list[str] = []
     seen: set[str] = set()
@@ -654,7 +669,7 @@ def _collect_authed_provider_slugs(
         slugs.append(slug)
         seen.update(k.lower() for k in keys)
 
-    for hermes_id, _mdev_id, _pconfig, env_vars in _iter_builtin_candidates(models_dev_data, excluded_set, seen):
+    for hermes_id, _mdev_id, _pconfig, env_vars in _iter_builtin_candidates(models_dev_data, excluded_set, seen, g):
         if _any_env(env_vars, _scoped_key_env) or _raw_pool_usable(hermes_id):
             _emit(hermes_id, hermes_id)
 
@@ -664,7 +679,7 @@ def _collect_authed_provider_slugs(
         if _skip(seen, excluded_set, pid, hermes_slug) or overlay.auth_type == "aws_sdk":
             continue
         if (
-            _overlay_has_env_creds(pid, hermes_slug, overlay, _scoped_key_env)
+            _overlay_has_env_creds(pid, hermes_slug, overlay, _scoped_key_env, g)
             or _auth_store_has_provider(pid, hermes_slug) or _pool_usable(hermes_slug)):
             _emit(hermes_slug, pid, hermes_slug)
 
@@ -707,6 +722,9 @@ class _PickerBuild:
     builtin_endpoints: set = field(default_factory=set)
     # (display_name, base_url) pairs from section 3 so section 4 skips overlapping rows.
     section3_pairs: set = field(default_factory=set)
+    # The ONE provider_seam generation list_authenticated_providers bound for this call; every
+    # section reads the registry containers from it (None: module globals, for direct builders).
+    g: Any = None
 
     @property
     def current_provider_norm(self) -> str:
@@ -722,8 +740,7 @@ class _PickerBuild:
     def record_builtin_endpoint(self, slug: str) -> None:
         """Prefer the live env override (e.g. DASHSCOPE_BASE_URL) over the static inference_base_url
         so dedup matches what a user typing that URL into custom_providers would actually hit."""
-        from hermes_cli.auth import PROVIDER_REGISTRY
-        pcfg = PROVIDER_REGISTRY.get(slug)
+        pcfg = _registry(self.g, "PROVIDER_REGISTRY").get(slug)
         if not pcfg:
             return
         url = os.environ.get(pcfg.base_url_env_var, "") if getattr(pcfg, "base_url_env_var", "") else ""
@@ -820,7 +837,7 @@ def _lap_builtin_rows(b: _PickerBuild, data: dict, user_providers: dict) -> None
     """Section 1: models.dev-mapped providers with api_key auth."""
     from hermes_cli.model_switch import _declared_model_ids, _scoped_key_env
     from agent.models_dev import get_provider_info
-    for hermes_id, mdev_id, pconfig, env_vars in _iter_builtin_candidates(data, b.excluded, b.seen_slugs):
+    for hermes_id, mdev_id, pconfig, env_vars in _iter_builtin_candidates(data, b.excluded, b.seen_slugs, b.g):
         # Per-profile scope, never raw os.environ: a secondary profile's picker otherwise listed the
         # LAUNCH profile's env-keyed providers and hid its own .env-keyed ones.
         if not (_any_env(env_vars, _scoped_key_env) or _raw_pool_usable(hermes_id)):
@@ -844,7 +861,7 @@ def _overlay_has_creds(b: _PickerBuild, pid: str, hermes_slug: str, overlay) -> 
         has_creds = _has_aws_sdk_creds_for_listing(hermes_slug, b.current_provider)
     else:
         from hermes_cli.model_switch import _scoped_key_env
-        has_creds = _overlay_has_env_creds(pid, hermes_slug, overlay, _scoped_key_env)
+        has_creds = _overlay_has_env_creds(pid, hermes_slug, overlay, _scoped_key_env, b.g)
     # External-process providers (copilot-acp) hold no key/token/pool entry by design — the
     # spawned ACP subprocess brings its own auth. "Configured" means the executable resolves.
     # "Configured" means the executable resolves, which is exactly what get_auth_status() reports for them;
@@ -894,7 +911,7 @@ def _lap_overlay_rows(b: _PickerBuild, data: dict, user_providers: dict) -> None
     """Section 2: Hermes-only providers (nous, openai-codex, copilot, opencode-go, ...)."""
     from agent.models_dev import PROVIDER_TO_MODELS_DEV
     from hermes_cli.model_switch import _declared_model_ids
-    from hermes_cli.providers import HERMES_OVERLAYS
+    HERMES_OVERLAYS = _registry(b.g, "HERMES_OVERLAYS")
 
     # HERMES_OVERLAYS keys may be models.dev IDs ("github-copilot") while config.yaml uses
     # Hermes IDs ("copilot").
@@ -934,8 +951,8 @@ def _lap_overlay_rows(b: _PickerBuild, data: dict, user_providers: dict) -> None
 
 def _lap_canonical_rows(b: _PickerBuild) -> None:
     """Section 2b: CANONICAL_PROVIDERS missed by sections 1/2."""
-    from hermes_cli.auth import PROVIDER_REGISTRY
-    from hermes_cli.models import CANONICAL_PROVIDERS
+    PROVIDER_REGISTRY = _registry(b.g, "PROVIDER_REGISTRY")
+    CANONICAL_PROVIDERS = _registry(b.g, "CANONICAL_PROVIDERS")
     for cp in CANONICAL_PROVIDERS:
         if _skip(b.seen_slugs, b.excluded, cp.slug):
             continue
@@ -1141,12 +1158,12 @@ def _lap_custom_provider_rows(b: _PickerBuild, custom_providers: list) -> None:
 
 
 def _build_curated_lists(current_provider: str, current_base_url: str, current_model: str,
-                        non_blocking: bool = False) -> dict[str, list[str]]:
+                        non_blocking: bool = False, g=None) -> dict[str, list[str]]:
     """Curated model lists keyed by hermes provider id, plus the dynamic ones (nous manifest,
     Ollama Cloud, LM Studio live probe). ``non_blocking`` (GUI read path) takes cached Ollama Cloud
     ids and warms them in the background rather than waiting on an 8s probe (#114215)."""
-    from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS, get_curated_nous_model_ids
-    curated: dict[str, list[str]] = dict(_PROVIDER_MODELS)
+    from hermes_cli.models import OPENROUTER_MODELS, get_curated_nous_model_ids
+    curated: dict[str, list[str]] = dict(_registry(g, "_PROVIDER_MODELS"))
     curated["openrouter"] = [mid for mid, _ in OPENROUTER_MODELS]
     # Plugin profiles without a static row: their fallback_models are the curated floor, so the
     # non-blocking GUI read (cold catalog cache) lists them instead of an empty provider row.
@@ -1211,6 +1228,11 @@ def list_authenticated_providers(
     # to publish missing names before anything below reads the registries. Pinned by
     # tests/fork_canaries/test_fork_canary_provider_seam.py.
     provider_seam.refresh("picker")
+    # Then pin ONE generation for every registry surface this listing reads (v0.2 contract: one
+    # snapshot per picker call, bound HERE; pinned by hermes-home test_hot_registration_prewarm).
+    # The owning modules bind their facades at import, so import them before the snapshot.
+    import hermes_cli.auth, hermes_cli.models, hermes_cli.providers  # noqa: F401,E401
+    g = provider_seam.snapshot()
 
     non_blocking_catalogs = bool(non_blocking_catalogs)
 
@@ -1240,9 +1262,9 @@ def list_authenticated_providers(
         max_models=max_models, for_picker=for_picker, force_fresh_nous_tier=force_fresh_nous_tier,
         probe_custom_providers=probe_custom_providers, probe_current_custom_provider=probe_current_custom_provider,
         refresh=refresh, excluded={str(p).strip().lower() for p in (excluded_providers or []) if p},
-        non_blocking_catalogs=non_blocking_catalogs,
+        non_blocking_catalogs=non_blocking_catalogs, g=g,
         curated=_build_curated_lists(current_provider, current_base_url, current_model,
-                                     non_blocking=non_blocking_catalogs))
+                                     non_blocking=non_blocking_catalogs, g=g))
 
     # Warm the disk cache in parallel before the serial section loops (otherwise 15-30s of live
     # round-trips on a cold cache). Skipped when refresh=True (serial path force-refreshes) and
@@ -1250,7 +1272,7 @@ def list_authenticated_providers(
     # collects nothing either: every cache-only row read spawns its own deduped background refresh,
     # so no thread pool is joined and no probe can hold up the response.
     prefetch_slugs = ([] if (refresh or non_blocking_catalogs)
-                      else _collect_authed_provider_slugs(data, b.curated, excluded_providers or []))
+                      else _collect_authed_provider_slugs(data, b.curated, excluded_providers or [], g))
     if len(prefetch_slugs) > 3:
         try:
             _prefetch_provider_models_parallel(prefetch_slugs)

@@ -533,7 +533,21 @@ def _inline_provider_matches_exact_id(raw_provider: str, provider_id: str) -> bo
     resolved provider id to match the raw left-hand side exactly.
     """
     left = (raw_provider or "").strip().lower()
-    return bool(left and provider_id and left == provider_id.strip().lower())
+    pid = (provider_id or "").strip().lower()
+    if not (left and pid):
+        return False
+    if left == pid:
+        return True
+    # A registered provider-PROFILE alias (providers._ALIASES / the home layer, e.g. lane-name
+    # aliases like ``claude-api-proxy-f3`` -> ``claude-apx-3``) names that provider explicitly.
+    # Lossy vendor shorthands such as ``openai`` -> openrouter are not profile aliases, so they
+    # still cannot steal ``openai/gpt-5.5`` (t_91575e79).
+    try:
+        from providers import get_provider_profile
+        prof = get_provider_profile(left)
+    except Exception:
+        return False
+    return prof is not None and (prof.name or "").strip().lower() == pid
 
 
 def _parse_inline_provider_model(
