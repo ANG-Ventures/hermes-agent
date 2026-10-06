@@ -610,6 +610,19 @@ jobs:
               echo "::warning::merged lookup for PR #$PR_NUM failed; paging"
             fi
           fi
+          # QUEUE EJECTION -> #logs (t_02841e61). A red merge_group run is a PR the queue dropped,
+          # and the queue heals it: all 15 ejection pages on 2026-10-05 (10 PRs) were for PRs that
+          # merged on a later queue run (the lander / mq-eviction-watch re-enqueue them), and 5 of
+          # the 15 were runs whose jobs never got a runner (cancelled, 0 steps). The act-now cases page from
+          # their own monitors: one test ejecting >=2 batches or queue thrash (mq-ejection-watch, one
+          # mq-episode), a PR still not merged after the horizon (fleet-merge-horizon-watch), trunk red
+          # (the main-red streak below / main-red-summary). So a per-PR ejection is a #logs line
+          # (ci-fail-known, which falls back to #alerts if that POST fails). startup_failure still
+          # pages: the workflow could not start, so no queue run will ever pass.
+          if [ "$ROUTE" = alerts ] && [ "$WF_EVENT" = merge_group ] && [ "$WF_CONCLUSION" = failure ]; then
+            ROUTE=logs; CARD="mq-ejected"
+            echo "queue ejection -> #logs: mq-ejection-watch / fleet-merge-horizon-watch page a queue fault"
+          fi
           # PLACEMENT PROBE (t_c58e7200). ci-placement-probe.yml is dispatched by
           # p4_bench.py inside a bench window, and each wave is graded by
           # p4_gates.py; the nightly bench cron pages #alerts + files a card on a
