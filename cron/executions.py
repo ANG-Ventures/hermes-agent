@@ -172,12 +172,28 @@ def _claim_age_seconds(claimed_at: str) -> float:
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
+    # Each job's newest completed occurrence survives the cap: it is the proof
+    # completed_occurrence() reads when jobs.json is rewound to an older snapshot. The cap is
+    # fleet-wide (~1.5 h of history on a busy host), so without this a daily job's morning run
+    # was gone by evening and a rewound store re-fired it (2026-10-05 22:44, 402 catch-ups).
     conn.execute(
         """DELETE FROM executions WHERE id IN (
-             SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
-             ORDER BY julianday(finished_at) DESC, finished_at DESC,
-                      julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
+             SELECT id FROM (
+               SELECT id FROM executions
+               WHERE status IN ('completed','failed','unknown')
+               ORDER BY julianday(finished_at) DESC, finished_at DESC,
+                        julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
+             )
+             WHERE id NOT IN (
+               SELECT id FROM (
+                 SELECT id, ROW_NUMBER() OVER (
+                          PARTITION BY job_id
+                          ORDER BY julianday(scheduled_instant) DESC, id DESC
+                        ) AS rn
+                 FROM executions
+                 WHERE status='completed' AND scheduled_instant IS NOT NULL
+               ) WHERE rn = 1
+             )
            )""",
         (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
     )
