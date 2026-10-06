@@ -20,6 +20,10 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # The caller stands in for an operator-profile cron (``bot-x`` service
+    # label): proven by the operator gateway's process tree, not the env name.
+    from hermes_cli import kanban_identity as ki
+    monkeypatch.setattr(ki, "_runs_under_operator_gateway", lambda name: True)
     kb.init_db()
     return home
 

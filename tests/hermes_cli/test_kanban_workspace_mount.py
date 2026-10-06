@@ -15,6 +15,10 @@ def home(tmp_path, monkeypatch):
     for key in tuple(__import__('os').environ):
         if key.startswith('HERMES_KANBAN_'):
             monkeypatch.delenv(key)
+    # A caller session leaked from the runner (a worker shell) would make the
+    # home-session guard refuse these unhomed cards: the operator reset here
+    # runs as a sessionless operator script.
+    monkeypatch.delenv('HERMES_SESSION_ID', raising=False)
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)

@@ -114,40 +114,34 @@ def resolve_comment_provenance(
     return run_id, derive_session_ref(session_id)
 
 
-def worker_ancestor_profile() -> Optional[str]:
-    """Profile of the dispatcher-spawned worker this process runs under, or None.
-
-    Read from process identity, not the environment: a worker shell can
-    ``env -u HERMES_KANBAN_TASK HERMES_PROFILE=default`` and every env-derived
-    identity then reads ``default`` (Prism 41fd439722e6, hermes-agent#1782).
-    Candidates are this process, its parent chain, and its SESSION id: workers
-    are spawned with ``start_new_session=True`` (worker pid == sid), so a
-    double-forked helper that init has adopted still carries the worker's sid
-    (Prism d11c14fcd7fe). A run counts only when its recorded ``worker_pid``
-    is a candidate AND that pid's spawn fingerprint still matches (a recycled
-    pid is never a worker; legacy and ``unverified`` rows are skipped). Every
-    board is read at its PHYSICAL path, not through the caller's
-    ``HERMES_KANBAN_DB`` pin, which would collapse every slug onto one DB
-    (Prism 9e1b780a6387); the caller's write-target DB is read too.
-    Unreadable psutil/board -> None.
-    """
+def _ancestry() -> list[int]:
+    """This process, its parent chain, then its session id (pids > 1, deduped)."""
     try:
         import psutil
 
         me = psutil.Process()
         chain = [me.pid] + [p.pid for p in me.parents()]
     except Exception:
-        return None
+        return []
     try:
         chain.append(os.getsid(0))
     except (AttributeError, OSError):
         pass
-    chain = list(dict.fromkeys(pid for pid in chain if pid > 1))
-    if not chain:
-        return None
+    return list(dict.fromkeys(pid for pid in chain if pid > 1))
+
+
+def _worker_rows(chain: list[int]) -> Optional[dict[int, list[tuple[str, str]]]]:
+    """``{pid: [(profile, worker_started_at), ...]}`` for every ``task_runs`` row
+    whose ``worker_pid`` is in ``chain``, on every board (newest first).
+
+    Every board is read at its PHYSICAL path, not through the caller's
+    ``HERMES_KANBAN_DB`` pin, which would collapse every slug onto one DB
+    (Prism 9e1b780a6387); the caller's write-target DB is read too. Rows
+    without a profile or fingerprint string are dropped. ``None`` when the
+    board list is unreadable.
+    """
     try:
         from hermes_cli import kanban_db as kb
-        from hermes_cli.kanban_db_dispatch import _process_fingerprint
 
         with kb.enumerating_boards():
             paths = {str(kb._board_db_path_ignoring_pin(b["slug"]))
@@ -162,6 +156,8 @@ def worker_ancestor_profile() -> Optional[str]:
     from pathlib import Path
 
     found: dict[int, list[tuple[str, str]]] = {}
+    if not chain:
+        return found
     marks = ",".join("?" * len(chain))
     for raw in sorted(p for p in paths if p):
         path = Path(raw)
@@ -179,11 +175,36 @@ def worker_ancestor_profile() -> Optional[str]:
         except sqlite3.Error:
             continue
         for pid, profile, started in rows:
-            if profile and isinstance(started, str) and "|" in started:
+            if profile and isinstance(started, str) and started:
                 found.setdefault(int(pid), []).append((str(profile), started))
+    return found
+
+
+def worker_ancestor_profile() -> Optional[str]:
+    """Profile of the dispatcher-spawned worker this process runs under, or None.
+
+    Read from process identity, not the environment: a worker shell can
+    ``env -u HERMES_KANBAN_TASK HERMES_PROFILE=default`` and every env-derived
+    identity then reads ``default`` (Prism 41fd439722e6, hermes-agent#1782).
+    Candidates are this process, its parent chain, and its SESSION id: workers
+    are spawned with ``start_new_session=True`` (worker pid == sid), so a
+    double-forked helper that init has adopted still carries the worker's sid
+    (Prism d11c14fcd7fe). A run counts only when its recorded ``worker_pid``
+    is a candidate AND that pid's spawn fingerprint still matches (a recycled
+    pid is never a worker; legacy and ``unverified`` rows are skipped).
+    Unreadable psutil/board -> None.
+    """
+    chain = _ancestry()
+    if not chain:
+        return None
+    found = _worker_rows(chain)
+    if not found:
+        return None
+    from hermes_cli.kanban_db_dispatch import _process_fingerprint
+
     for pid in chain:  # nearest worker ancestor wins; the session id is last
         for profile, started in found.get(pid, ()):
-            if _process_fingerprint(pid) == started:
+            if "|" in started and _process_fingerprint(pid) == started:
                 return profile
     return None
 
@@ -198,17 +219,121 @@ def is_operator_label(name: Optional[str]) -> bool:
     return v in RULING_AUTHORS or v in OPERATOR_PROFILES or v.startswith("human:")
 
 
-def verified_profile_author(name: str) -> str:
-    """``name`` (an env-derived profile identity), unless it claims an operator
-    identity from inside a dispatched worker: then that worker's own profile.
+# Suffix on an operator label the caller could not prove it holds (t_3b9dbdb1).
+# Not an operator label (``is_operator_label`` is False for it), so no
+# operator-trust reader honours the comment, but the board still shows who
+# claimed to write it.
+UNVERIFIED_AUTHOR_SUFFIX = "-unverified"
 
-    Only operator-trusted names are checked (``RULING_AUTHORS`` and
-    ``OPERATOR_PROFILES``), so a worker's ordinary identity costs nothing.
+# Operator labels that name the ROOT profile's gateway (Apollo runs as ``default``).
+_ROOT_PROFILE_LABELS = frozenset({"default", "apollo"})
+
+
+def _operator_gateway_pid(name: str) -> Optional[int]:
+    """Verified pid of the live gateway that serves operator profile ``name``,
+    or None (``human:*``, ``ace``/``user`` and unknown profiles have none)."""
+    from pathlib import Path
+
+    from hermes_constants import get_default_hermes_root
+
+    v = (name or "").strip().lower()
+    root = Path(get_default_hermes_root())
+    if v in _ROOT_PROFILE_LABELS:
+        home = root
+    else:
+        from hermes_cli.kanban_db import OPERATOR_PROFILES
+
+        if v not in OPERATOR_PROFILES:
+            return None
+        home = root / "profiles" / v
+        if not home.is_dir():
+            return None
+    try:
+        from gateway.status import live_gateway_pid_for_home
+
+        return live_gateway_pid_for_home(home)
+    except Exception:
+        _log.debug("kanban: operator gateway pid lookup failed", exc_info=True)
+        return None
+
+
+def _runs_under_operator_gateway(name: str) -> bool:
+    """True when this process IS, or descends from, the live gateway of
+    operator profile ``name`` with no dispatched worker in between.
+
+    The gateway's in-process ``/kanban`` and tool calls, its cron scripts and
+    the terminal shells of its own sessions all sit under it. A worker's
+    helper either still sits under its worker (a worker row on the path) or
+    was reparented to init (the gateway is no longer an ancestor). A worker
+    row counts here even when its fingerprint is ``unverified``: authorship
+    fails closed, unlike kill/reap (t_3b9dbdb1).
+    """
+    gw = _operator_gateway_pid(name)
+    if gw is None:
+        return False
+    try:
+        import psutil
+
+        me = psutil.Process()
+        path = [me.pid] + [p.pid for p in me.parents()]
+    except Exception:
+        return False
+    if gw not in path:
+        return False
+    below = path[: path.index(gw)]
+    try:
+        below.append(os.getsid(0))
+    except (AttributeError, OSError):
+        pass
+    below = [pid for pid in dict.fromkeys(below) if pid > 1 and pid != gw]
+    found = _worker_rows(below)
+    if found is None:
+        return False
+    if not found:
+        return True
+    from hermes_cli.kanban_db_dispatch import (
+        UNVERIFIED_WORKER_FINGERPRINT,
+        _process_fingerprint,
+    )
+
+    for pid, rows in found.items():
+        for _profile, started in rows:
+            if started == UNVERIFIED_WORKER_FINGERPRINT or _process_fingerprint(pid) == started:
+                return False
+    return True
+
+
+def operator_label_proven(name: str) -> bool:
+    """The caller may PERSIST operator label ``name`` as itself: it presents the
+    operator token, or it runs under that operator profile's live gateway with
+    no dispatched worker in between. The env name alone proves nothing."""
+    from hermes_cli import kanban_db as kb
+
+    if kb._operator_token_state() == "ok":
+        return True
+    return _runs_under_operator_gateway(name)
+
+
+def verified_profile_author(name: str) -> str:
+    """The author label to persist for env-derived profile identity ``name``.
+
+    Only operator labels (``is_operator_label``) are checked, so a worker's
+    ordinary identity costs nothing:
+
+    * inside a dispatched worker: that worker's own profile (Prism 41fd439722e6);
+    * outside one: ``name`` only with :func:`operator_label_proven`, else
+      ``<name>-unverified``. An orphaned, setsid'd helper of a worker has no
+      worker in its ancestry and could otherwise write ``apollo`` by setting
+      ``HERMES_PROFILE`` (Prism e8be54683982 / 05c79d97284b, t_3b9dbdb1).
     """
     if not is_operator_label(name):
         return name
     worker = worker_ancestor_profile()
-    return worker if worker and worker != name else name
+    if worker:
+        return worker
+    if operator_label_proven(name):
+        return name
+    return f"{name.strip()}{UNVERIFIED_AUTHOR_SUFFIX}"
 
 
 def safe_comment_provenance(

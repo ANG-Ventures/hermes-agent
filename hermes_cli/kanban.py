@@ -2699,10 +2699,16 @@ def _comment_author(requested: Optional[str]) -> tuple[str, Optional[str]]:
       its worker ancestry cannot be proven in every topology (a reparented,
       setsid'd helper), so missing ancestry never grants it (Prism
       d11c14fcd7fe);
-    * a service label (``land-autopilot``, ``themis``) is honoured for an
-      operator-profile caller that is NOT inside a dispatched worker, whatever
-      that worker's own profile label is (Prism 26d8f8ddc376);
+    * a service label (``land-autopilot``, ``themis``) is honoured for a
+      caller whose operator profile is PROVEN (``_profile_author`` kept the
+      ruling-author name: token, or the operator gateway's own process tree
+      with no worker in between) that is NOT inside a dispatched worker,
+      whatever that worker's own profile label is (Prism 26d8f8ddc376);
     * the operator token honours any label.
+
+    The caller's own name is no fast path for an operator label:
+    ``_profile_author`` already turned an unproven one into
+    ``<name>-unverified`` (Prism e8be54683982, t_3b9dbdb1).
 
     Otherwise the caller writes as itself; the requested label survives only
     as ``claimed_author`` on the ``commented`` event, for forensics.
