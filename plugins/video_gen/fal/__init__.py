@@ -295,10 +295,11 @@ def _submit_fal_video_request(endpoint: str, arguments: Dict[str, Any]):
     headers = {"x-idempotency-key": str(uuid.uuid4())}
     managed_gateway = _resolve_managed_fal_video_gateway()
     if managed_gateway is None:
-        from tools.fal_common import call_direct_fal_with_retry
-        # One key for every attempt: a 5xx after FAL accepted the job must not bill a second generation.
+        from tools.fal_common import call_direct_fal_with_retry, is_safe_direct_fal_submit_retry
+        # Resend only when FAL never accepted the job (429 / connect-phase); the key is kept as a belt-and-braces.
         return _RetryingHandle(call_direct_fal_with_retry(
-            lambda: client.submit(endpoint, arguments=arguments, headers=headers), what=f"submit {endpoint}"), endpoint)
+            lambda: client.submit(endpoint, arguments=arguments, headers=headers), what=f"submit {endpoint}",
+            retryable=is_safe_direct_fal_submit_retry), endpoint)
     from tools.fal_common import (
         _extract_http_status, _managed_fal_billing_error, submit_managed_fal_with_rate_limit_retry,
     )

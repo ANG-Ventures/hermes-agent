@@ -706,15 +706,37 @@ class TestDirectFalRetry:
         assert len(direct["headers"]) == 2
         assert len({h["x-idempotency-key"] for h in direct["headers"]}) == 1
 
-    def test_503_three_times_then_success_four_sends_one_key(self, direct):
+    def test_429_three_times_then_success_four_sends_one_key(self, direct):
         from plugins.video_gen import fal as fal_plugin
 
-        direct["outcomes"] = [_HTTPError(503)] * 3
+        direct["outcomes"] = [_HTTPError(429)] * 3
         fal_plugin._submit_fal_video_request("e", {"prompt": "x"})
         assert len(direct["headers"]) == 4
         assert len({h["x-idempotency-key"] for h in direct["headers"]}) == 1
         # exponential base 0.5s with the jitter factor pinned to 1.0: 0.5 + 1 + 2
         assert sum(direct["sleeps"]) == pytest.approx(3.5)
+
+    def test_connect_error_is_retried_on_submit(self, direct):
+        import httpx
+
+        from plugins.video_gen import fal as fal_plugin
+
+        direct["outcomes"] = [httpx.ConnectError("refused")]
+        fal_plugin._submit_fal_video_request("e", {"prompt": "x"})
+        assert len(direct["headers"]) == 2
+
+    @pytest.mark.parametrize("make_exc", [lambda: _HTTPError(503), lambda: _HTTPError(504),
+                                          lambda: __import__("httpx").ReadTimeout("read")])
+    def test_submit_not_resent_when_fal_may_have_accepted_the_job(self, direct, make_exc):
+        """FAL does not document x-idempotency-key; a 5xx/read timeout after the body was sent
+        may already be a billed job, so the submit must not be resent."""
+        from plugins.video_gen import fal as fal_plugin
+
+        exc = make_exc()
+        direct["outcomes"] = [exc]
+        with pytest.raises(type(exc)):
+            fal_plugin._submit_fal_video_request("e", {"prompt": "x"})
+        assert len(direct["headers"]) == 1 and direct["sleeps"] == []
 
     def test_400_is_not_retried(self, direct):
         from plugins.video_gen import fal as fal_plugin
@@ -745,8 +767,10 @@ class TestDirectFalRetry:
 
             def get(self):
                 calls.append(1)
-                if len(calls) < 3:
+                if len(calls) == 1:
                     raise ConnectionError("reset")
+                if len(calls) == 2:
+                    raise _HTTPError(503)
                 return {"video": {"url": "u"}}
 
         assert fal_plugin._RetryingHandle(Flaky(), "e").get() == {"video": {"url": "u"}}

@@ -189,15 +189,29 @@ def _is_retryable_direct_fal_error(exc: BaseException) -> bool:
     return isinstance(exc, httpx.TransportError)
 
 
+def is_safe_direct_fal_submit_retry(exc: BaseException) -> bool:
+    """A submit is resent only when FAL provably never accepted it: 429, or a connect-phase failure.
+    FAL's documented platform headers do not include ``x-idempotency-key``, so a 5xx or read timeout
+    after the body was sent may already be a queued, billed job; resending could bill a second one."""
+    if _extract_http_status(exc) is not None:
+        return _extract_http_status(exc) == 429
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover — fal_client depends on httpx
+        return False
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+
+
 def call_direct_fal_with_retry(
     call: Callable[[], Any], *, what: str, max_attempts: int = 4, base_delay: float = 0.5,
     max_delay: float = 60.0, sleep: Optional[Callable[[float], Any]] = None,
     rand: Optional[Callable[[float, float], float]] = None,
+    retryable: Callable[[BaseException], bool] = _is_retryable_direct_fal_error,
 ):
-    """Run ``call()`` and retry 429/502/503/504 and connection errors with capped exponential
-    backoff (50-100% jitter) or the server's ``Retry-After``. ``call`` must be safe to repeat:
-    a submit closes over ONE ``x-idempotency-key`` so a 5xx after FAL accepted the job cannot
-    bill a second generation. The wait is interrupt-aware; an interrupt raises InterruptedError."""
+    """Run ``call()`` and retry errors ``retryable`` accepts (default 429/502/503/504 + connection
+    errors) with capped exponential backoff (50-100% jitter) or the server's ``Retry-After``.
+    ``call`` must be safe to repeat for every error ``retryable`` accepts. The wait is
+    interrupt-aware; an interrupt raises InterruptedError."""
     from tools.interrupt import is_interrupted
     sleep = sleep or time.sleep
     rand = rand or random.uniform
@@ -205,7 +219,7 @@ def call_direct_fal_with_retry(
         try:
             return call()
         except Exception as exc:
-            if attempt == max_attempts or not _is_retryable_direct_fal_error(exc):
+            if attempt == max_attempts or not retryable(exc):
                 raise
             retry_after = _retry_after_header_seconds(exc)
             delay = min(max_delay, retry_after if retry_after is not None
