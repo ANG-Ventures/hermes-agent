@@ -866,3 +866,20 @@ def test_red_wake_text_names_the_judged_check_run_url(monkeypatch):
     assert ow.pr_is_red_or_dirty(health) == f"red: e2e <{url_new}>"
     # an older health dict without urls still renders names only
     assert ow.pr_is_red_or_dirty({"state": "open", "failing": ["e2e"]}) == "red: e2e"
+
+
+def test_f_scheduled_wake_on_nonspawnable_card_wakes_owner_once(env):
+    tid = _card(env, title="scheduled apollo card")
+    _event(tid, "schedule_elapsed")
+    _event(tid, "unblocked")
+    _event(tid, "skipped_nonspawnable", {"assignee": "apollo"})
+    text = _one_turn(env, _tick(env))
+    assert tid in text and "scheduled wake elapsed; card is assigned to apollo and cannot auto-spawn" in text
+    env["adapter"].handled.clear()
+    assert _tick(env) == [], "the second tick must not re-wake"
+
+
+def test_f_plain_nonspawnable_skip_does_not_wake(env):
+    tid = _card(env)
+    _event(tid, "skipped_nonspawnable", {"assignee": "apollo"})
+    assert _tick(env) == []
