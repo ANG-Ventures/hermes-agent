@@ -201,6 +201,16 @@ def _build_payload(family: Dict[str, Any], *, prompt: str, image_url: Optional[s
     return payload
 
 
+def _coerced_params(payload: Dict[str, Any], *, duration: Optional[int], aspect_ratio: str, resolution: str) -> Dict[str, Dict[str, Any]]:
+    """``{param: {"requested", "applied"}}`` for each requested value ``_build_payload`` changed (alias/snap/clamp) or
+    dropped (``applied`` None, endpoint default applies). Read-only view of the payload; nothing sent changes."""
+    sent_duration = payload.get("duration")
+    applied = {"aspect_ratio": payload.get("aspect_ratio"), "resolution": payload.get("resolution"),
+               "duration": int("".join(c for c in str(sent_duration) if c.isdigit())) if sent_duration is not None else None}
+    requested = {"aspect_ratio": aspect_ratio or None, "resolution": resolution or None, "duration": duration}
+    return {k: {"requested": v, "applied": applied[k]} for k, v in requested.items() if v is not None and applied[k] != v}
+
+
 def _video_url_from_result(result: Any) -> Tuple[Any, Optional[str]]:
     """Return ``(video_field, url)`` from a FAL result dict (url None if absent)."""
     video = result.get("video") if isinstance(result, dict) else None
@@ -273,6 +283,8 @@ def _submit_fal_video_request(endpoint: str, arguments: Dict[str, Any]):
     headers = {"x-idempotency-key": str(uuid.uuid4())}
     managed_gateway = _resolve_managed_fal_video_gateway()
     if managed_gateway is None:
+        # fal_client already retries submit (and handle.get) up to 10x internally; FAL does not document submit-side
+        # dedup on x-idempotency-key, so do not add an outer retry here (it multiplies POSTs -> double billing).
         return client.submit(endpoint, arguments=arguments, headers=headers)
     from tools.fal_common import (
         _extract_http_status, _managed_fal_billing_error, submit_managed_fal_with_rate_limit_retry,
@@ -401,6 +413,9 @@ class FALVideoGenProvider(VideoGenProvider):
             return _fal_error("prompt is required.", "missing_prompt", prompt, model=family_id)
         payload = _build_payload(family, prompt=prompt, image_url=image_url_norm, duration=duration, aspect_ratio=aspect_ratio,
                                  resolution=resolution, negative_prompt=negative_prompt, audio=audio, seed=seed)
+        coerced = _coerced_params(payload, duration=duration, aspect_ratio=aspect_ratio, resolution=resolution)
+        if coerced:
+            logger.info("FAL %s coerced params for %s: %s", family_id, endpoint, coerced)
         try:
             handle = _submit_fal_video_request(endpoint, payload)
             source_request_id = getattr(handle, "request_id", None)
@@ -416,7 +431,8 @@ class FALVideoGenProvider(VideoGenProvider):
         if upscale and not upscaled:
             logger.warning("Video upscale pass failed — returning native-resolution video")
         url = upscaled_url or url
-        extra: Dict[str, Any] = {"endpoint": endpoint, "upscaled": upscaled, **({"upscale_factor": UPSCALER_FACTOR} if upscaled else {})}
+        extra: Dict[str, Any] = {"endpoint": endpoint, "upscaled": upscaled, **({"upscale_factor": UPSCALER_FACTOR} if upscaled else {}),
+                                 **({"coerced": coerced} if coerced else {})}
         if isinstance(video, dict):  # native-resolution file_size no longer applies after an upscale
             extra.update({k: video[k] for k in (("content_type",) if upscaled else ("file_size", "content_type")) if video.get(k)})
         return success_response(
