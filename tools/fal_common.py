@@ -183,36 +183,41 @@ def _retry_after_header_seconds(exc: BaseException) -> Optional[float]:
         return None
 
 
-def _is_direct_fal_retryable(exc: BaseException) -> bool:
+def _is_direct_fal_retryable(exc: BaseException, *, idempotent: bool) -> bool:
     status = _extract_http_status(exc)
     if status is not None:
         return status in DIRECT_FAL_RETRYABLE_STATUSES
-    if isinstance(exc, ConnectionError):
+    if isinstance(exc, ConnectionRefusedError):
         return True
     try:
         import httpx
-    except ImportError:  # fal_client depends on httpx; without it only builtin connection errors qualify
+    except ImportError:  # fal_client depends on httpx; without it only a refused connection qualifies
         return False
-    return isinstance(exc, httpx.TransportError)  # connect/read errors and timeouts
+    # A non-idempotent submit retries only failures that happened before the request left (connect / pool
+    # wait): FAL does not document submit-side dedup on x-idempotency-key, so a read timeout may mean the job
+    # was accepted and a resend would bill twice. An idempotent GET retries any transport error.
+    if idempotent:
+        return isinstance(exc, (httpx.TransportError, ConnectionError))
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
 
 
 def call_direct_fal_with_retry(
-    call: Callable[[], Any], *, what: str,
+    call: Callable[[], Any], *, what: str, idempotent: bool,
     sleep: Callable[[float], None] = time.sleep, rand: Callable[[float, float], float] = random.uniform,
 ):
     """Run ``call()`` up to 4 times on 429/502/503/504 or a connection error.
 
     Waits the server's Retry-After (capped at 60s) when given, else exponential backoff
     (base 0.5s, cap 60s, 50-100% jitter); the wait is interrupt-aware. ``call`` must reuse the
-    same request headers on every attempt so a submit keeps one ``x-idempotency-key`` — a 5xx
-    after FAL accepted the job then dedupes server-side instead of billing a second generation.
+    same request headers on every attempt so a submit keeps one ``x-idempotency-key``.
+    ``idempotent=False`` (submit) skips transport errors that may follow a delivered request.
     """
     from tools.interrupt import is_interrupted
     for attempt in range(1, DIRECT_FAL_RETRY_ATTEMPTS + 1):
         try:
             return call()
         except Exception as exc:
-            if attempt == DIRECT_FAL_RETRY_ATTEMPTS or not _is_direct_fal_retryable(exc):
+            if attempt == DIRECT_FAL_RETRY_ATTEMPTS or not _is_direct_fal_retryable(exc, idempotent=idempotent):
                 raise
             retry_after = _retry_after_header_seconds(exc)
             delay = (min(retry_after, DIRECT_FAL_RETRY_CAP_SECONDS) if retry_after is not None else

@@ -221,7 +221,7 @@ class _RetryingDirectHandle:
 
     def get(self) -> Any:
         from tools.fal_common import call_direct_fal_with_retry
-        return call_direct_fal_with_retry(self._handle.get, what=f"result {self._endpoint}")
+        return call_direct_fal_with_retry(self._handle.get, what=f"result {self._endpoint}", idempotent=True)
 
 
 def _video_url_from_result(result: Any) -> Tuple[Any, Optional[str]]:
@@ -295,10 +295,10 @@ def _submit_fal_video_request(endpoint: str, arguments: Dict[str, Any]):
     client = _load_fal_client()
     headers = {"x-idempotency-key": str(uuid.uuid4())}
     managed_gateway = _resolve_managed_fal_video_gateway()
-    if managed_gateway is None:  # one key across every retry so a 5xx after FAL accepted the job cannot bill twice
+    if managed_gateway is None:  # one key across every retry; submit retries only failures FAL never accepted
         from tools.fal_common import call_direct_fal_with_retry
         handle = call_direct_fal_with_retry(lambda: client.submit(endpoint, arguments=arguments, headers=headers),
-                                            what=f"submit {endpoint}")
+                                            what=f"submit {endpoint}", idempotent=False)
         return _RetryingDirectHandle(handle, endpoint)
     from tools.fal_common import (
         _extract_http_status, _managed_fal_billing_error, submit_managed_fal_with_rate_limit_retry,

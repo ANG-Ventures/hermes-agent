@@ -61,6 +61,18 @@ class TestDirectRetry:
             fal_plugin._submit_fal_video_request("fal-ai/x", {"prompt": "p"})
         assert len(sent) == 1 and sleeps == []
 
+    def test_submit_read_timeout_is_not_resent_but_connect_error_is(self, direct):
+        import httpx
+        fal_plugin, sent, sleeps, outcomes = direct
+        outcomes[:] = [httpx.ReadTimeout("read"), "ok"]  # request may have been accepted -> resend could double-bill
+        with pytest.raises(httpx.ReadTimeout):
+            fal_plugin._submit_fal_video_request("fal-ai/x", {"prompt": "p"})
+        assert len(sent) == 1
+        sent.clear()
+        outcomes[:] = [httpx.ConnectError("refused"), "ok"]  # never reached FAL -> safe to resend
+        fal_plugin._submit_fal_video_request("fal-ai/x", {"prompt": "p"})
+        assert len(sent) == 2
+
     def test_interrupt_stops_the_wait(self, direct, monkeypatch):
         fal_plugin, sent, sleeps, outcomes = direct
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: True)
