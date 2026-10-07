@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from agent.video_gen_provider import VideoGenProvider, error_response, success_response
 
@@ -201,12 +201,25 @@ def _build_payload(family: Dict[str, Any], *, prompt: str, image_url: Optional[s
     return payload
 
 
+def _sent_duration_seconds(value: Any) -> Optional[Union[int, float]]:
+    """Seconds encoded by a payload ``duration`` (``8``, ``"8"``, ``"8s"``, ``5.5``); None if absent or unparseable.
+    Only the unit suffix is stripped: dropping every non-digit turned ``5.0`` into 50 and ``"5.5s"`` into 55."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip().removesuffix("s")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(seconds) if seconds.is_integer() else seconds
+
+
 def _coerced_params(payload: Dict[str, Any], *, duration: Optional[int], aspect_ratio: str, resolution: str) -> Dict[str, Dict[str, Any]]:
     """``{param: {"requested", "applied"}}`` for each requested value ``_build_payload`` changed (alias/snap/clamp) or
     dropped (``applied`` None, endpoint default applies). Read-only view of the payload; nothing sent changes."""
-    sent_duration = payload.get("duration")
     applied = {"aspect_ratio": payload.get("aspect_ratio"), "resolution": payload.get("resolution"),
-               "duration": int("".join(c for c in str(sent_duration) if c.isdigit())) if sent_duration is not None else None}
+               "duration": _sent_duration_seconds(payload.get("duration"))}
     requested = {"aspect_ratio": aspect_ratio or None, "resolution": resolution or None, "duration": duration}
     return {k: {"requested": v, "applied": applied[k]} for k, v in requested.items() if v is not None and applied[k] != v}
 
@@ -438,7 +451,7 @@ class FALVideoGenProvider(VideoGenProvider):
         return success_response(
             video=url, model=family_id, prompt=prompt, modality=modality_used, provider="fal", extra=extra,
             aspect_ratio=aspect_ratio if "aspect_ratio" in payload else "",
-            duration=int("".join(c for c in str(payload["duration"]) if c.isdigit()) or "0") if "duration" in payload else 0,
+            duration=_sent_duration_seconds(payload.get("duration")) or 0,
         )
 
 
