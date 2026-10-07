@@ -983,7 +983,6 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
-_SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
 # `bash -n script` / `sh -n script` parses the script and exits WITHOUT executing it (POSIX sh(1)
 # "-n: Read commands but do not execute them"), so the script's lifecycle commands never run; it
 # is a syntax check, the same class as `shellcheck script` and `cat script`, which already pass.
@@ -991,7 +990,23 @@ _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
 # contains `systemctl restart <gateway>` (papercut, 2026-10-06, Apollo). Fail-CLOSED edges kept:
 # `-n` combined with `-c` still breaks out below (the -c payload is scanned by the sh -c path),
 # and `bash -n script; bash script` is two segments — the second is still walked.
-_SHELL_NOEXEC_FLAGS = frozenset({"-n", "--noexec"})
+# bash long options that consume the NEXT argument: `bash --rcfile -n script` executes script.
+_SHELL_LONG_OPTIONS_WITH_VALUES = frozenset({"--rcfile", "--init-file"})
+
+
+def _shell_option_noexec(name: str, enable: bool, noexec: bool) -> bool:
+    """Apply one `-o NAME` / `+o NAME` / zsh `--NAME` to the noexec state, failing closed.
+
+    zsh folds case and `_` and reads the `exec` name as the inverse of noexec, so `-o exec`,
+    `+o NO_EXEC` and `--exec` all clear it. Only the exact `noexec` spelling SETS it: a variant
+    that bash rejects must never be the reason the guard skips a script.
+    """
+    folded = name.lower().replace("_", "")
+    if folded == "noexec":
+        return True if enable and name == "noexec" else (noexec if enable else False)
+    if folded == "exec":
+        return False if enable else noexec
+    return noexec
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
@@ -1997,26 +2012,38 @@ def _references_at(
     if executable_name in _SHELL_EXECUTABLES:
         arguments = segment[index + 1 :]
         arg_index = 0
+        # Track the EFFECTIVE noexec state: the shell applies options left to right, so
+        # `-n +o noexec`, `-n +n` and `-o noexec +o noexec` re-enable execution. In a short
+        # cluster (`-xo`, `+eo`) `-` sets and `+` clears each letter, and every `o`/`O`
+        # letter consumes the next argument as its value (`-xo errexit script`). zsh also
+        # takes `--name` for `-o name` and the inverted `exec` name (`-n -o exec`).
         noexec = False
         while arg_index < len(arguments):
             argument = arguments[arg_index]
-            if argument == "--":
+            if argument in {"--", "-", "+"}:
                 arg_index += 1
                 break
-            if argument in {"-c", "--command"}:
+            if argument == "--command":
                 break
-            if argument in _SHELL_OPTIONS_WITH_VALUES:
-                arg_index += 2
+            if argument.startswith("--"):
+                noexec = _shell_option_noexec(argument[2:], True, noexec)
+                arg_index += 2 if argument in _SHELL_LONG_OPTIONS_WITH_VALUES else 1
                 continue
-            if argument in _SHELL_NOEXEC_FLAGS or (
-                argument.startswith("-") and not argument.startswith("--")
-                and len(argument) > 2 and "n" in argument[1:] and "c" not in argument[1:]
-            ):
-                noexec = True   # `-n`, `-ne`, `-xn`: parse-only; the operand never executes
-            if argument.startswith("-"):
-                arg_index += 1
-                continue
-            break
+            if len(argument) < 2 or argument[0] not in "-+":
+                break
+            letters = argument[1:]
+            if argument[0] == "-" and "c" in letters:
+                break   # the -c payload is scanned by the sh -c path; fail closed here
+            enable = argument[0] == "-"
+            arg_index += 1
+            for letter in letters:
+                if letter == "n":
+                    noexec = enable
+                elif letter in "oO":
+                    value = arguments[arg_index] if arg_index < len(arguments) else ""
+                    arg_index += 1
+                    if letter == "o":
+                        noexec = _shell_option_noexec(value, enable, noexec)
         if noexec:
             return
         if arg_index < len(arguments) and arguments[arg_index] not in {
