@@ -61,6 +61,24 @@ class TestDirectRetry:
             fal_plugin._submit_fal_video_request("fal-ai/x", {"prompt": "p"})
         assert len(sent) == 1 and sleeps == []
 
+    def test_submit_502_504_not_resent_but_result_get_retries_them(self, direct):
+        fal_plugin, sent, sleeps, outcomes = direct
+        for status in (502, 504):  # gateway errors that can follow an accepted job -> resend could double-bill
+            sent.clear()
+            outcomes[:] = [_HTTPError(status), "ok"]
+            with pytest.raises(_HTTPError):
+                fal_plugin._submit_fal_video_request("fal-ai/x", {"prompt": "p"})
+            assert len(sent) == 1, status
+        from tools.fal_common import call_direct_fal_with_retry
+        gets = [_HTTPError(504), _HTTPError(502), {"ok": 1}]
+
+        def get():
+            outcome = gets.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        assert call_direct_fal_with_retry(get, what="result", idempotent=True) == {"ok": 1}
+
     def test_submit_read_timeout_is_not_resent_but_connect_error_is(self, direct):
         import httpx
         fal_plugin, sent, sleeps, outcomes = direct

@@ -167,6 +167,9 @@ DIRECT_FAL_RETRY_ATTEMPTS = 4
 DIRECT_FAL_RETRY_BASE_SECONDS = 0.5
 DIRECT_FAL_RETRY_CAP_SECONDS = 60.0
 DIRECT_FAL_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+# A submit (POST) is resent only on statuses meaning "not accepted"; a 502/504 from a gateway can follow an
+# accepted job, and FAL documents no submit-side dedup on x-idempotency-key.
+DIRECT_FAL_SUBMIT_RETRYABLE_STATUSES = frozenset({429, 503})
 
 
 def _retry_after_header_seconds(exc: BaseException) -> Optional[float]:
@@ -186,7 +189,7 @@ def _retry_after_header_seconds(exc: BaseException) -> Optional[float]:
 def _is_direct_fal_retryable(exc: BaseException, *, idempotent: bool) -> bool:
     status = _extract_http_status(exc)
     if status is not None:
-        return status in DIRECT_FAL_RETRYABLE_STATUSES
+        return status in (DIRECT_FAL_RETRYABLE_STATUSES if idempotent else DIRECT_FAL_SUBMIT_RETRYABLE_STATUSES)
     if isinstance(exc, ConnectionRefusedError):
         return True
     try:
@@ -210,7 +213,8 @@ def call_direct_fal_with_retry(
     Waits the server's Retry-After (capped at 60s) when given, else exponential backoff
     (base 0.5s, cap 60s, 50-100% jitter); the wait is interrupt-aware. ``call`` must reuse the
     same request headers on every attempt so a submit keeps one ``x-idempotency-key``.
-    ``idempotent=False`` (submit) skips transport errors that may follow a delivered request.
+    ``idempotent=False`` (submit) resends only on 429/503 and pre-send connect errors — never on a
+    502/504 or read timeout that may follow an accepted job.
     """
     from tools.interrupt import is_interrupted
     for attempt in range(1, DIRECT_FAL_RETRY_ATTEMPTS + 1):
