@@ -201,6 +201,16 @@ def _build_payload(family: Dict[str, Any], *, prompt: str, image_url: Optional[s
     return payload
 
 
+def _coerced_params(payload: Dict[str, Any], *, aspect_ratio: Optional[str], resolution: Optional[str],
+                    duration: Optional[int]) -> Dict[str, Dict[str, Any]]:
+    """``{param: {"requested", "applied"}}`` for each requested value the payload changed or dropped (applied None)."""
+    sent_duration = payload.get("duration")
+    applied = {"aspect_ratio": payload.get("aspect_ratio"), "resolution": payload.get("resolution"),
+               "duration": int("".join(c for c in str(sent_duration) if c.isdigit())) if sent_duration is not None else None}
+    requested = {"aspect_ratio": aspect_ratio, "resolution": resolution, "duration": duration}
+    return {k: {"requested": v, "applied": applied[k]} for k, v in requested.items() if v not in (None, "") and v != applied[k]}
+
+
 def _video_url_from_result(result: Any) -> Tuple[Any, Optional[str]]:
     """Return ``(video_field, url)`` from a FAL result dict (url None if absent)."""
     video = result.get("video") if isinstance(result, dict) else None
@@ -267,13 +277,28 @@ def _get_managed_fal_video_client(managed_gateway):
         return _managed_fal_video_client
 
 
+class _RetryingHandle:
+    """Direct-path request handle whose blocking ``get()`` retries transient FAL errors (polling is idempotent)."""
+
+    def __init__(self, handle: Any, endpoint: str):
+        self._handle, self._endpoint = handle, endpoint
+        self.request_id = getattr(handle, "request_id", None)
+
+    def get(self) -> Any:
+        from tools.fal_common import call_direct_fal_with_retry
+        return call_direct_fal_with_retry(self._handle.get, what=f"result {self._endpoint}")
+
+
 def _submit_fal_video_request(endpoint: str, arguments: Dict[str, Any]):
     """Submit via direct credentials or the managed queue gateway; ``.get()`` blocks."""
     client = _load_fal_client()
     headers = {"x-idempotency-key": str(uuid.uuid4())}
     managed_gateway = _resolve_managed_fal_video_gateway()
     if managed_gateway is None:
-        return client.submit(endpoint, arguments=arguments, headers=headers)
+        from tools.fal_common import call_direct_fal_with_retry
+        # One key for every attempt: a 5xx after FAL accepted the job must not bill a second generation.
+        return _RetryingHandle(call_direct_fal_with_retry(
+            lambda: client.submit(endpoint, arguments=arguments, headers=headers), what=f"submit {endpoint}"), endpoint)
     from tools.fal_common import (
         _extract_http_status, _managed_fal_billing_error, submit_managed_fal_with_rate_limit_retry,
     )
@@ -401,6 +426,9 @@ class FALVideoGenProvider(VideoGenProvider):
             return _fal_error("prompt is required.", "missing_prompt", prompt, model=family_id)
         payload = _build_payload(family, prompt=prompt, image_url=image_url_norm, duration=duration, aspect_ratio=aspect_ratio,
                                  resolution=resolution, negative_prompt=negative_prompt, audio=audio, seed=seed)
+        coerced = _coerced_params(payload, aspect_ratio=aspect_ratio, resolution=resolution, duration=duration)
+        if coerced:
+            logger.info("FAL family %s coerced params: %s", family_id, coerced)
         try:
             handle = _submit_fal_video_request(endpoint, payload)
             source_request_id = getattr(handle, "request_id", None)
@@ -416,7 +444,8 @@ class FALVideoGenProvider(VideoGenProvider):
         if upscale and not upscaled:
             logger.warning("Video upscale pass failed — returning native-resolution video")
         url = upscaled_url or url
-        extra: Dict[str, Any] = {"endpoint": endpoint, "upscaled": upscaled, **({"upscale_factor": UPSCALER_FACTOR} if upscaled else {})}
+        extra: Dict[str, Any] = {"endpoint": endpoint, "upscaled": upscaled, **({"upscale_factor": UPSCALER_FACTOR} if upscaled else {}),
+                                 **({"coerced": coerced} if coerced else {})}
         if isinstance(video, dict):  # native-resolution file_size no longer applies after an upscale
             extra.update({k: video[k] for k in (("content_type",) if upscaled else ("file_size", "content_type")) if video.get(k)})
         return success_response(

@@ -650,3 +650,149 @@ class TestUpscalePass:
 
         assert fal_plugin._upscale_video("https://fake/native.mp4") is None
         submit.assert_not_called()
+
+
+class _HTTPError(Exception):
+    """fal_client.FalClientHTTPError shape: ``status_code`` + ``response.headers``."""
+
+    def __init__(self, status, retry_after=None):
+        super().__init__(f"HTTP {status}")
+        self.status_code = status
+        self.response = Mock(status_code=status, headers={"Retry-After": str(retry_after)} if retry_after is not None else {})
+
+
+class TestDirectFalRetry:
+    """Direct (FAL_KEY) path: transient errors retry under ONE idempotency key."""
+
+    @pytest.fixture
+    def direct(self, monkeypatch):
+        import sys
+        import types
+
+        from plugins.video_gen import fal as fal_plugin
+        from tools import fal_common
+
+        sent = {"headers": [], "outcomes": [], "sleeps": []}
+
+        class FakeHandle:
+            request_id = "req-1"
+
+            def get(self):
+                return {"video": {"url": "https://fake/out.mp4"}}
+
+        def _submit(endpoint, arguments=None, headers=None):
+            sent["headers"].append(dict(headers or {}))
+            outcome = sent["outcomes"].pop(0) if sent["outcomes"] else None
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return FakeHandle()
+
+        fake = types.ModuleType("fal_client")
+        fake.submit = _submit  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "fal_client", fake)
+        monkeypatch.setattr(fal_plugin, "_fal_client", None)
+        monkeypatch.setattr(fal_plugin, "_resolve_managed_fal_video_gateway", lambda: None)
+        monkeypatch.setattr(fal_common.time, "sleep", lambda s: sent["sleeps"].append(s))
+        monkeypatch.setattr(fal_common.random, "uniform", lambda lo, hi: 1.0)
+        return sent
+
+    def test_429_honors_retry_after_and_reuses_key(self, direct):
+        from plugins.video_gen import fal as fal_plugin
+
+        direct["outcomes"] = [_HTTPError(429, retry_after=3)]
+        handle = fal_plugin._submit_fal_video_request("fal-ai/pixverse/v6/text-to-video", {"prompt": "x"})
+        assert handle.request_id == "req-1"
+        assert sum(direct["sleeps"]) == pytest.approx(3.0)
+        assert len(direct["headers"]) == 2
+        assert len({h["x-idempotency-key"] for h in direct["headers"]}) == 1
+
+    def test_503_three_times_then_success_four_sends_one_key(self, direct):
+        from plugins.video_gen import fal as fal_plugin
+
+        direct["outcomes"] = [_HTTPError(503)] * 3
+        fal_plugin._submit_fal_video_request("e", {"prompt": "x"})
+        assert len(direct["headers"]) == 4
+        assert len({h["x-idempotency-key"] for h in direct["headers"]}) == 1
+        # exponential base 0.5s with the jitter factor pinned to 1.0: 0.5 + 1 + 2
+        assert sum(direct["sleeps"]) == pytest.approx(3.5)
+
+    def test_400_is_not_retried(self, direct):
+        from plugins.video_gen import fal as fal_plugin
+
+        direct["outcomes"] = [_HTTPError(400)]
+        with pytest.raises(_HTTPError):
+            fal_plugin._submit_fal_video_request("e", {"prompt": "x"})
+        assert len(direct["headers"]) == 1 and direct["sleeps"] == []
+
+    def test_interrupt_during_backoff_raises_promptly(self, direct, monkeypatch):
+        from plugins.video_gen import fal as fal_plugin
+
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: True)
+        direct["outcomes"] = [_HTTPError(429, retry_after=30)]
+        with pytest.raises(InterruptedError):
+            fal_plugin._submit_fal_video_request("e", {"prompt": "x"})
+        assert len(direct["headers"]) == 1 and direct["sleeps"] == []
+
+    def test_result_get_retries_transient_errors(self, monkeypatch):
+        from plugins.video_gen import fal as fal_plugin
+        from tools import fal_common
+
+        monkeypatch.setattr(fal_common.time, "sleep", lambda s: None)
+        calls = []
+
+        class Flaky:
+            request_id = "r"
+
+            def get(self):
+                calls.append(1)
+                if len(calls) < 3:
+                    raise ConnectionError("reset")
+                return {"video": {"url": "u"}}
+
+        assert fal_plugin._RetryingHandle(Flaky(), "e").get() == {"video": {"url": "u"}}
+        assert len(calls) == 3
+
+
+class TestCoercedParams:
+    """Dropped/snapped params are reported in the success extra; the payload is unchanged."""
+
+    @pytest.fixture
+    def captured(self, monkeypatch):
+        from plugins.video_gen import fal as fal_plugin
+
+        sent = {}
+
+        class FakeHandle:
+            request_id = "r"
+
+            def get(self):
+                return {"video": {"url": "https://fake/out.mp4"}}
+
+        monkeypatch.setattr(fal_plugin, "_fal_video_available", lambda: True)
+        monkeypatch.setattr(fal_plugin, "_load_fal_client", lambda: object())
+        monkeypatch.setattr(fal_plugin, "_submit_fal_video_request",
+                            lambda endpoint, arguments: sent.update(arguments) or FakeHandle())
+        return sent
+
+    def test_pixverse_4k_reported_as_dropped(self, captured):
+        from plugins.video_gen.fal import FALVideoGenProvider
+
+        result = FALVideoGenProvider().generate("a dog", model="pixverse-v6", resolution="4k")
+        assert result["success"] is True
+        assert "resolution" not in captured
+        assert result["coerced"]["resolution"] == {"requested": "4k", "applied": None}
+
+    def test_veo_duration_snapped_to_enum(self, captured):
+        from plugins.video_gen.fal import FAL_FAMILIES, FALVideoGenProvider
+
+        result = FALVideoGenProvider().generate("a dog", model="veo3.1", duration=5)
+        applied = result["coerced"]["duration"]["applied"]
+        assert applied in FAL_FAMILIES["veo3.1"]["duration_enum"] and applied != 5
+        assert captured["duration"] == f"{applied}s"
+        assert result["coerced"]["duration"]["requested"] == 5
+
+    def test_supported_params_report_nothing(self, captured):
+        from plugins.video_gen.fal import FALVideoGenProvider
+
+        result = FALVideoGenProvider().generate("a dog", model="veo3.1", aspect_ratio="16:9", resolution="720p", duration=6)
+        assert "coerced" not in result

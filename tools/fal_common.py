@@ -26,10 +26,14 @@ issue #26241 for details.
 
 from __future__ import annotations
 
+import logging
+import random
 import time
 import uuid
 from typing import Any, Callable, Dict, Optional, Union
 from urllib.parse import urlencode
+
+logger = logging.getLogger(__name__)
 
 # A 429 whose Retry-After is longer than this is reported, not waited out inside a tool call.
 MANAGED_FAL_RATE_LIMIT_RETRY_CAP_SECONDS = 30.0
@@ -157,6 +161,65 @@ def submit_managed_fal_with_rate_limit_retry(
                 if is_interrupted():
                     raise ValueError(_managed_fal_rate_limit_message(what, name, retry_after)) from exc
                 time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+
+DIRECT_FAL_RETRY_STATUSES = frozenset({429, 502, 503, 504})
+
+
+def _retry_after_header_seconds(exc: BaseException) -> Optional[float]:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) if response is not None else None
+    raw = headers.get("Retry-After") if headers is not None and hasattr(headers, "get") else None
+    try:
+        return max(0.0, float(raw)) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_retryable_direct_fal_error(exc: BaseException) -> bool:
+    status = _extract_http_status(exc)
+    if status is not None:
+        return status in DIRECT_FAL_RETRY_STATUSES
+    if isinstance(exc, ConnectionError):
+        return True
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover — fal_client depends on httpx
+        return False
+    return isinstance(exc, httpx.TransportError)
+
+
+def call_direct_fal_with_retry(
+    call: Callable[[], Any], *, what: str, max_attempts: int = 4, base_delay: float = 0.5,
+    max_delay: float = 60.0, sleep: Optional[Callable[[float], Any]] = None,
+    rand: Optional[Callable[[float, float], float]] = None,
+):
+    """Run ``call()`` and retry 429/502/503/504 and connection errors with capped exponential
+    backoff (50-100% jitter) or the server's ``Retry-After``. ``call`` must be safe to repeat:
+    a submit closes over ONE ``x-idempotency-key`` so a 5xx after FAL accepted the job cannot
+    bill a second generation. The wait is interrupt-aware; an interrupt raises InterruptedError."""
+    from tools.interrupt import is_interrupted
+    sleep = sleep or time.sleep
+    rand = rand or random.uniform
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return call()
+        except Exception as exc:
+            if attempt == max_attempts or not _is_retryable_direct_fal_error(exc):
+                raise
+            retry_after = _retry_after_header_seconds(exc)
+            delay = min(max_delay, retry_after if retry_after is not None
+                        else base_delay * (2 ** (attempt - 1)) * rand(0.5, 1.0))
+            logger.info("FAL %s failed (%s); retry %d/%d in %.2fs", what, exc, attempt, max_attempts - 1, delay)
+            remaining = delay
+            while True:
+                if is_interrupted():
+                    raise InterruptedError(f"FAL {what} retry interrupted") from exc
+                if remaining <= 0:
+                    break
+                step = min(0.5, remaining)
+                sleep(step)
+                remaining -= step
 
 
 def _require(value: Any, what: str) -> Any:
