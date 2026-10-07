@@ -984,6 +984,14 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
 _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
+# `bash -n script` / `sh -n script` parses the script and exits WITHOUT executing it (POSIX sh(1)
+# "-n: Read commands but do not execute them"), so the script's lifecycle commands never run; it
+# is a syntax check, the same class as `shellcheck script` and `cat script`, which already pass.
+# Scanning the operand here refused `bash -n` on every script written FOR a remote host that
+# contains `systemctl restart <gateway>` (papercut, 2026-10-06, Apollo). Fail-CLOSED edges kept:
+# `-n` combined with `-c` still breaks out below (the -c payload is scanned by the sh -c path),
+# and `bash -n script; bash script` is two segments — the second is still walked.
+_SHELL_NOEXEC_FLAGS = frozenset({"-n", "--noexec"})
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
@@ -1989,6 +1997,7 @@ def _references_at(
     if executable_name in _SHELL_EXECUTABLES:
         arguments = segment[index + 1 :]
         arg_index = 0
+        noexec = False
         while arg_index < len(arguments):
             argument = arguments[arg_index]
             if argument == "--":
@@ -1999,10 +2008,17 @@ def _references_at(
             if argument in _SHELL_OPTIONS_WITH_VALUES:
                 arg_index += 2
                 continue
+            if argument in _SHELL_NOEXEC_FLAGS or (
+                argument.startswith("-") and not argument.startswith("--")
+                and len(argument) > 2 and "n" in argument[1:] and "c" not in argument[1:]
+            ):
+                noexec = True   # `-n`, `-ne`, `-xn`: parse-only; the operand never executes
             if argument.startswith("-"):
                 arg_index += 1
                 continue
             break
+        if noexec:
+            return
         if arg_index < len(arguments) and arguments[arg_index] not in {
             "-c",
             "--command",
