@@ -26,14 +26,10 @@ issue #26241 for details.
 
 from __future__ import annotations
 
-import logging
-import random
 import time
 import uuid
 from typing import Any, Callable, Dict, Optional, Union
 from urllib.parse import urlencode
-
-logger = logging.getLogger(__name__)
 
 # A 429 whose Retry-After is longer than this is reported, not waited out inside a tool call.
 MANAGED_FAL_RATE_LIMIT_RETRY_CAP_SECONDS = 30.0
@@ -161,82 +157,6 @@ def submit_managed_fal_with_rate_limit_retry(
                 if is_interrupted():
                     raise ValueError(_managed_fal_rate_limit_message(what, name, retry_after)) from exc
                 time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
-
-
-DIRECT_FAL_RETRY_ATTEMPTS = 4
-DIRECT_FAL_RETRY_BASE_SECONDS = 0.5
-DIRECT_FAL_RETRY_CAP_SECONDS = 60.0
-DIRECT_FAL_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
-# A submit (POST) is resent only on statuses meaning "not accepted"; a 502/504 from a gateway can follow an
-# accepted job, and FAL documents no submit-side dedup on x-idempotency-key.
-DIRECT_FAL_SUBMIT_RETRYABLE_STATUSES = frozenset({429, 503})
-
-
-def _retry_after_header_seconds(exc: BaseException) -> Optional[float]:
-    """Numeric ``Retry-After`` from an httpx/fal_client HTTP error, else None (HTTP-date form is ignored)."""
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None)
-    raw = headers.get("Retry-After") if headers is not None and hasattr(headers, "get") else None
-    if raw is None:
-        fallback = getattr(exc, "response_headers", None)  # fal_client.FalClientHTTPError stores a lowercased dict
-        raw = fallback.get("retry-after") if isinstance(fallback, dict) else None
-    try:
-        return max(0.0, float(raw)) if raw is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _is_direct_fal_retryable(exc: BaseException, *, idempotent: bool) -> bool:
-    status = _extract_http_status(exc)
-    if status is not None:
-        return status in (DIRECT_FAL_RETRYABLE_STATUSES if idempotent else DIRECT_FAL_SUBMIT_RETRYABLE_STATUSES)
-    if isinstance(exc, ConnectionRefusedError):
-        return True
-    try:
-        import httpx
-    except ImportError:  # fal_client depends on httpx; without it only a refused connection qualifies
-        return False
-    # A non-idempotent submit retries only failures that happened before the request left (connect / pool
-    # wait): FAL does not document submit-side dedup on x-idempotency-key, so a read timeout may mean the job
-    # was accepted and a resend would bill twice. An idempotent GET retries any transport error.
-    if idempotent:
-        return isinstance(exc, (httpx.TransportError, ConnectionError))
-    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
-
-
-def call_direct_fal_with_retry(
-    call: Callable[[], Any], *, what: str, idempotent: bool,
-    sleep: Callable[[float], None] = time.sleep, rand: Callable[[float, float], float] = random.uniform,
-):
-    """Run ``call()`` up to 4 times on 429/502/503/504 or a connection error.
-
-    Waits the server's Retry-After (capped at 60s) when given, else exponential backoff
-    (base 0.5s, cap 60s, 50-100% jitter); the wait is interrupt-aware. ``call`` must reuse the
-    same request headers on every attempt so a submit keeps one ``x-idempotency-key``.
-    ``idempotent=False`` (submit) resends only on 429/503 and pre-send connect errors — never on a
-    502/504 or read timeout that may follow an accepted job.
-    """
-    from tools.interrupt import is_interrupted
-    for attempt in range(1, DIRECT_FAL_RETRY_ATTEMPTS + 1):
-        try:
-            return call()
-        except Exception as exc:
-            if attempt == DIRECT_FAL_RETRY_ATTEMPTS or not _is_direct_fal_retryable(exc, idempotent=idempotent):
-                raise
-            retry_after = _retry_after_header_seconds(exc)
-            delay = (min(retry_after, DIRECT_FAL_RETRY_CAP_SECONDS) if retry_after is not None else
-                     min(DIRECT_FAL_RETRY_CAP_SECONDS, DIRECT_FAL_RETRY_BASE_SECONDS * 2 ** (attempt - 1)) * rand(0.5, 1.0))
-            logger.info("FAL %s failed (%s, HTTP %s); retry %d/%d in %.1fs", what, type(exc).__name__,
-                        _extract_http_status(exc), attempt, DIRECT_FAL_RETRY_ATTEMPTS - 1, delay)
-            remaining = delay
-            while True:
-                if is_interrupted():
-                    raise RuntimeError(f"FAL {what} retry interrupted") from exc
-                if remaining <= 0:
-                    break
-                step = min(0.5, remaining)
-                sleep(step)
-                remaining -= step
 
 
 def _require(value: Any, what: str) -> Any:

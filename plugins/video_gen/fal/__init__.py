@@ -211,19 +211,6 @@ def _coerced_params(payload: Dict[str, Any], *, duration: Optional[int], aspect_
     return {k: {"requested": v, "applied": applied[k]} for k, v in requested.items() if v is not None and applied[k] != v}
 
 
-class _RetryingDirectHandle:
-    """Direct-FAL request handle whose blocking ``get()`` retries transient failures (the GET is idempotent)."""
-
-    def __init__(self, handle: Any, endpoint: str):
-        self._handle = handle
-        self._endpoint = endpoint
-        self.request_id = getattr(handle, "request_id", None)
-
-    def get(self) -> Any:
-        from tools.fal_common import call_direct_fal_with_retry
-        return call_direct_fal_with_retry(self._handle.get, what=f"result {self._endpoint}", idempotent=True)
-
-
 def _video_url_from_result(result: Any) -> Tuple[Any, Optional[str]]:
     """Return ``(video_field, url)`` from a FAL result dict (url None if absent)."""
     video = result.get("video") if isinstance(result, dict) else None
@@ -295,11 +282,10 @@ def _submit_fal_video_request(endpoint: str, arguments: Dict[str, Any]):
     client = _load_fal_client()
     headers = {"x-idempotency-key": str(uuid.uuid4())}
     managed_gateway = _resolve_managed_fal_video_gateway()
-    if managed_gateway is None:  # one key across every retry; submit retries only failures FAL never accepted
-        from tools.fal_common import call_direct_fal_with_retry
-        handle = call_direct_fal_with_retry(lambda: client.submit(endpoint, arguments=arguments, headers=headers),
-                                            what=f"submit {endpoint}", idempotent=False)
-        return _RetryingDirectHandle(handle, endpoint)
+    if managed_gateway is None:
+        # fal_client already retries submit (and handle.get) up to 10x internally; FAL does not document submit-side
+        # dedup on x-idempotency-key, so do not add an outer retry here (it multiplies POSTs -> double billing).
+        return client.submit(endpoint, arguments=arguments, headers=headers)
     from tools.fal_common import (
         _extract_http_status, _managed_fal_billing_error, submit_managed_fal_with_rate_limit_retry,
     )
