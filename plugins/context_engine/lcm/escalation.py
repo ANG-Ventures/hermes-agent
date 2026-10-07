@@ -392,6 +392,14 @@ def _summary_route_is_gemini_bridge(model: str | None) -> bool:
     return is_gemini_bridge(parse_lcm_model_override(alias).provider)
 
 
+def _is_gemini_bridge_provider(provider: str | None) -> bool:
+    try:
+        from agent.fork_ext.gemini_bridge_claims import is_gemini_bridge
+    except Exception:  # host without the fork's bridge registry
+        return False
+    return is_gemini_bridge(provider)
+
+
 _SUMMARY_REFUSALS = SummaryRefusalLatch()
 
 
@@ -520,8 +528,13 @@ def _summary_refusal_reason(response, max_tokens: int) -> Optional[str]:
 
 
 def _call_llm_for_summary(prompt: str, max_tokens: int,
-                           model: str = "", timeout: float | None = None) -> Optional[str]:
-    """Call the Hermes auxiliary LLM for summarization."""
+                           model: str = "", timeout: float | None = None,
+                           route: dict | None = None) -> Optional[str]:
+    """Call the Hermes auxiliary LLM for summarization.
+
+    ``route`` pins ``call_llm`` kwargs (provider/model/base_url/...) from an
+    ``auxiliary.compression.fallback_chain`` entry instead of ``model``.
+    """
     try:
         from agent.auxiliary_client import call_llm
         call_kwargs = {
@@ -535,7 +548,10 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
                 "refusal" if _summary_refusal_reason(r, max_tokens) else None
             ),
         }
-        apply_lcm_model_route(call_kwargs, model)
+        if route:
+            call_kwargs.update(route)
+        else:
+            apply_lcm_model_route(call_kwargs, model)
         if timeout is not None:
             call_kwargs["timeout"] = timeout
         response = call_llm(**call_kwargs)
@@ -561,8 +577,11 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
         return None
 
 
-def _invoke_summary_llm(prompt: str, max_tokens: int, model: str = "", timeout: float | None = None) -> Optional[str]:
+def _invoke_summary_llm(prompt: str, max_tokens: int, model: str = "", timeout: float | None = None,
+                        route: dict | None = None) -> Optional[str]:
     kwargs = {"model": model} if model else {}
+    if route:
+        kwargs["route"] = route
     if timeout is not None:
         try:
             sig = inspect.signature(_call_llm_for_summary)
@@ -666,6 +685,54 @@ def _summary_model_chain(primary_model: str = "", fallback_models: list[str] | t
     return chain
 
 
+# Fields of an ``auxiliary.compression.fallback_chain`` entry that pin the
+# route ``call_llm`` sends to (same set the core compressor pins).
+_REFUSAL_HOP_ROUTE_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "timeout")
+
+
+def _refusal_fallback_routes() -> list[dict]:
+    """``auxiliary.compression.fallback_chain`` entries as ``call_llm`` kwargs.
+
+    The refusal hop (t_04979f65): mirrors the core compressor's
+    ``_compression_refusal_fallback_routes``. ``auto`` resolves to the live
+    main runtime and is dropped when it is the compression primary.
+    """
+    try:
+        from agent.auxiliary_client import resolve_task_fallback_chain
+
+        chain = [entry for _i, entry in resolve_task_fallback_chain("compression")]
+    except Exception:
+        logger.debug("LCM refusal hop: compression fallback_chain unreadable", exc_info=True)
+        return []
+    routes: list[dict] = []
+    for entry in chain:
+        if not isinstance(entry, dict) or not entry.get("provider") or not entry.get("model"):
+            continue
+        routes.append({
+            name: entry[name]
+            for name in _REFUSAL_HOP_ROUTE_FIELDS
+            if entry.get(name) not in (None, "")
+        })
+    return routes
+
+
+def _refusal_route_label(route: dict) -> str:
+    return f"{route.get('provider', '')}/{route.get('model', '')}"
+
+
+def _refusal_route_key(route: dict) -> str:
+    """Latch / breaker identity of a pinned fallback_chain route."""
+    base_url = str(route.get("base_url") or "").rstrip("/").lower()
+    return f"fallback_chain=>{str(route.get('provider') or '').lower()}|{route.get('model')}|{base_url}"
+
+
+def _configured_route_identity(model: str) -> tuple[str, str] | None:
+    resolved = _resolve_summary_route((model or "").strip())
+    if resolved is None:
+        return None
+    return (resolved[1] or "").lower(), (resolved[2] or "").lower()
+
+
 def _invoke_summary_llm_chain(
     prompt: str,
     max_tokens: int,
@@ -680,26 +747,63 @@ def _invoke_summary_llm_chain(
     refused_routes: list[str] | None = None,
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
+    # (configured model alias, pinned fallback_chain route or None)
+    candidates: list[tuple[str, dict | None]] = [(m, None) for m in chain]
     skipped = 0
     drained: SummaryRelayDrainingError | None = None
-    for candidate_model in chain:
+    refused_here = False
+    hopped = False
+    index = 0
+    while True:
+        if index >= len(candidates):
+            # t_04979f65: every configured route refused (or is latched for)
+            # this segment. Hop once through auxiliary.compression.fallback_chain
+            # (the declared non-Claude summary routes) before giving up, the
+            # same place the core compressor re-sends a refused segment.
+            if hopped or not refused_here:
+                break
+            hopped = True
+            tried = {_configured_route_identity(m) for m in chain}
+            extra = [
+                ("", route)
+                for route in _refusal_fallback_routes()
+                if (str(route["provider"]).lower(), str(route["model"]).lower()) not in tried
+            ]
+            if not extra:
+                break
+            logger.warning(
+                "LCM summary refused on every configured route; hopping to "
+                "auxiliary.compression.fallback_chain: %s",
+                ", ".join(_refusal_route_label(r) for _m, r in extra),
+            )
+            candidates.extend(extra)
+        candidate_model, route = candidates[index]
+        index += 1
+        label = _refusal_route_label(route) if route else (candidate_model or _DEFAULT_ROUTE_KEY)
+        breaker_key = _refusal_route_key(route) if route else candidate_model
         # t_5e0ae3b8: gemini-bridge currently drops the tail of prompts over
         # ~200k chars. Never accept a partial-transcript "summary" from that
         # route; try luna/another configured route, then deterministic fallback.
-        if len(prompt) > _GEMINI_BRIDGE_MAX_PROMPT_CHARS and _summary_route_is_gemini_bridge(
-            candidate_model
+        if len(prompt) > _GEMINI_BRIDGE_MAX_PROMPT_CHARS and (
+            _is_gemini_bridge_provider(route.get("provider"))
+            if route
+            else _summary_route_is_gemini_bridge(candidate_model)
         ):
             logger.warning(
                 "LCM summary skipping %s for >200k-char prompt: gemini-bridge "
                 "may truncate its tail (t_5e0ae3b8)",
-                candidate_model or _DEFAULT_ROUTE_KEY,
+                label,
             )
             continue
-        route_key = _summary_route_key(candidate_model) if segment_key else ""
+        if segment_key:
+            route_key = _refusal_route_key(route) if route else _summary_route_key(candidate_model)
+        else:
+            route_key = ""
         latched_for = _SUMMARY_REFUSALS.remaining(route_key, segment_key) if segment_key else 0.0
         if latched_for > 0.0:
+            refused_here = True
             if refused_routes is not None:
-                refused_routes.append(candidate_model or _DEFAULT_ROUTE_KEY)
+                refused_routes.append(label)
             logger.warning(
                 "LCM summary route %s skipped: it refused this segment; latch "
                 "expires in %.0fs",
@@ -707,11 +811,12 @@ def _invoke_summary_llm_chain(
                 latched_for,
             )
             continue
-        if circuit_breaker is not None and not circuit_breaker.allows(candidate_model):
-            skipped += 1
+        if circuit_breaker is not None and not circuit_breaker.allows(breaker_key):
+            if route is None:
+                skipped += 1
             logger.warning(
                 "LCM summary route skipped by open circuit: %s",
-                candidate_model or _DEFAULT_ROUTE_KEY,
+                label,
             )
             continue
         # Check the spend guard per-route so a mid-chain trip stops the
@@ -728,6 +833,7 @@ def _invoke_summary_llm_chain(
                 max_tokens,
                 model=candidate_model,
                 timeout=timeout,
+                route=route,
             )
         except SummaryRefusedError as exc:
             # About the content, not the route: latch the pair instead of
@@ -735,11 +841,12 @@ def _invoke_summary_llm_chain(
             logger.warning(
                 "LCM summary outcome=refusal provider_route=%s model=%s; "
                 "skipping this segment on that route: %s",
-                route_key, candidate_model or "<default>",
+                route_key, label if route else (candidate_model or "<default>"),
                 exc,
             )
+            refused_here = True
             if refused_routes is not None:
-                refused_routes.append(candidate_model or _DEFAULT_ROUTE_KEY)
+                refused_routes.append(label)
             if segment_key:
                 _SUMMARY_REFUSALS.record(route_key, segment_key)
             continue
@@ -749,7 +856,7 @@ def _invoke_summary_llm_chain(
             logger.warning(
                 "LCM summary route %s: relay draining for deploy; not counted "
                 "toward the circuit: %s",
-                candidate_model or _DEFAULT_ROUTE_KEY,
+                label,
                 exc,
             )
             drained = exc
@@ -759,10 +866,10 @@ def _invoke_summary_llm_chain(
             result = None
         if result and (accepts_result is None or accepts_result(result)):
             if circuit_breaker is not None:
-                circuit_breaker.record_success(candidate_model)
+                circuit_breaker.record_success(breaker_key)
             return result
         if circuit_breaker is not None:
-            circuit_breaker.record_failure(candidate_model)
+            circuit_breaker.record_failure(breaker_key)
     if skipped == len(chain):
         logger.warning("LCM summary fallback chain exhausted: all routes are temporarily open")
     if drained is not None:

@@ -661,3 +661,124 @@ def test_third_person_safeguard_report_is_a_summary(reply):
 )
 def test_own_voice_safeguard_reply_is_a_refusal(reply):
     assert escalation._is_meta_refusal_reply(reply, 24000)
+
+
+# --- t_04979f65: refusal hop through auxiliary.compression.fallback_chain ---
+
+LUNA = {"provider": "cpa", "model": "gpt-6-luna", "timeout": 300}
+
+
+def _pin_compression_chain(monkeypatch, chain: list[dict]) -> None:
+    import agent.auxiliary_client as aux
+
+    monkeypatch.setattr(
+        aux, "resolve_task_fallback_chain",
+        lambda task, main_runtime=None: list(enumerate(chain)) if task == "compression" else [],
+    )
+    monkeypatch.setattr(
+        aux, "_resolve_task_provider_model",
+        lambda task=None, provider=None, model=None, **_: (
+            provider or "claude-alr", model or "claude-sonnet-5-5", "", None, None),
+    )
+
+
+def _content_filter():
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=""),
+                                 finish_reason="content_filter")]
+    )
+
+
+def test_refused_primary_hops_to_compression_fallback_chain_without_paging(monkeypatch):
+    """Live 10-07 14:22 shape: no LCM fallback models, Sonnet content_filter,
+    luna declared only in auxiliary.compression.fallback_chain."""
+    _pin_compression_chain(monkeypatch, [LUNA])
+    pages: list[str] = []
+    monkeypatch.setattr(escalation, "_send_summary_unavailable_page", pages.append)
+    seen: list[tuple] = []
+
+    def route(**kw):
+        seen.append((kw.get("provider"), kw.get("model")))
+        if kw.get("provider") == "cpa":
+            return _ok("luna summary of the segment")
+        return _content_filter()
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    summary, level = _run(session_id="s-hop")
+    assert (summary, level) == ("luna summary of the segment", 1)
+    assert seen == [(None, None), ("cpa", "gpt-6-luna")]
+    assert pages == []
+
+    # Next pass on the same segment: primary is latched, luna is sent directly.
+    seen.clear()
+    assert _run(session_id="s-hop") == ("luna summary of the segment", 1)
+    assert seen == [("cpa", "gpt-6-luna")]
+
+
+def test_hop_is_one_hop_then_summary_unavailable(monkeypatch):
+    _pin_compression_chain(monkeypatch, [LUNA])
+    pages: list[str] = []
+    monkeypatch.setattr(escalation, "_send_summary_unavailable_page", pages.append)
+    escalation._PAGED_SUMMARY_UNAVAILABLE.discard("s-both")
+    seen: list[tuple] = []
+
+    def refuse(**kw):
+        seen.append((kw.get("provider"), kw.get("model")))
+        raise _bpx_safeguard_400()
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", refuse)
+    summary, level = _run(session_id="s-both")
+    assert level == 3
+    assert summary.startswith(escalation.SUMMARY_UNAVAILABLE_MARKER)
+    # Each route sent once: L2 skips both latched routes.
+    assert seen == [(None, None), ("cpa", "gpt-6-luna")]
+    assert len(pages) == 1 and "cpa/gpt-6-luna" in pages[0]
+
+
+def test_no_hop_without_a_refusal(monkeypatch):
+    _pin_compression_chain(monkeypatch, [LUNA])
+    seen: list[tuple] = []
+
+    def flaky(**kw):
+        seen.append((kw.get("provider"), kw.get("model")))
+        raise RuntimeError("Error code: 500 - upstream down")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", flaky)
+    _, level = _run()
+    assert level == 3
+    assert ("cpa", "gpt-6-luna") not in seen
+
+
+def test_hop_skips_chain_entry_equal_to_a_configured_route(monkeypatch):
+    _pin_compression_chain(monkeypatch, [{"provider": "claude-alr", "model": "claude-sonnet-5-5"}])
+    calls: list[int] = []
+
+    def refuse(**kw):
+        calls.append(1)
+        return _content_filter()
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", refuse)
+    _, level = _run()
+    assert level == 3
+    assert len(calls) == 1
+
+
+def test_hop_respects_gemini_bridge_prompt_guard(monkeypatch):
+    _pin_compression_chain(monkeypatch, [{"provider": "gemini-bridge", "model": "gemini-3-pro"}, LUNA])
+    monkeypatch.setattr(escalation, "_is_gemini_bridge_provider", lambda p: p == "gemini-bridge")
+    monkeypatch.setattr(escalation, "_summary_route_is_gemini_bridge", lambda m: False)
+    seen: list[tuple] = []
+
+    def route(**kw):
+        seen.append((kw.get("provider"), kw.get("model")))
+        if kw.get("provider") == "cpa":
+            return _ok("luna summary")
+        return _content_filter()
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", route)
+    big = "user: x\nassistant: " + ("z " * 110_000)
+    summary, level = summarize_with_escalation(
+        text=big, source_tokens=200_000, token_budget=600, l3_truncate_tokens=64,
+    )
+    assert (summary, level) == ("luna summary", 1)
+    assert ("gemini-bridge", "gemini-3-pro") not in seen
