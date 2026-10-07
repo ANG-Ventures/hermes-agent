@@ -340,3 +340,49 @@ def test_mark_waits_for_another_process_lock(tmp_path):
     holder.close()
     t.join(5)
     assert gate.already_noticed(tmp_path, "md", "a -> b", "2026-10-06")
+
+
+# --- bounded lock waits (Prism P1 on #1809, t_7b44bcdd) -----------------------
+# mark_noticed runs in run_job's finally, before the job result is saved and delivered. A wedged
+# writer holding either lock must cost a bounded wait and a skipped update, never the delivery.
+
+@pytest.mark.platforms("posix")
+def test_mark_gives_up_on_a_wedged_process_lock(tmp_path, monkeypatch):
+    import fcntl
+    import threading
+    from cron.fork_ext import fallback_notice_gate as gate
+
+    monkeypatch.setattr(gate, "_LOCK_TIMEOUT_SECONDS", 0.3, raising=False)
+    cron_dir = tmp_path / "cron"
+    cron_dir.mkdir()
+    holder = open(cron_dir / ".fallback_notice_day.lock", "a+", encoding="utf-8")  # wedged CLI writer
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        t = threading.Thread(target=gate.mark_noticed, args=(tmp_path, "md", "a -> b", "2026-10-06"),
+                             daemon=True)
+        t.start()
+        t.join(3)
+        assert not t.is_alive(), "mark_noticed blocked on a held flock"
+        assert not (cron_dir / gate._STATE_NAME).exists()  # skipped, no unlocked write
+        assert not gate._thread_lock.locked()  # the in-process lock was released for other jobs
+    finally:
+        holder.close()
+        t.join(5)
+
+
+def test_mark_gives_up_on_a_busy_thread_lock(tmp_path, monkeypatch):
+    import threading
+    from cron.fork_ext import fallback_notice_gate as gate
+
+    monkeypatch.setattr(gate, "_LOCK_TIMEOUT_SECONDS", 0.3, raising=False)
+    gate._thread_lock.acquire()  # another tick thread wedged inside the critical section
+    try:
+        t = threading.Thread(target=gate.mark_noticed, args=(tmp_path, "md", "a -> b", "2026-10-06"),
+                             daemon=True)
+        t.start()
+        t.join(3)
+        assert not t.is_alive(), "mark_noticed blocked on the in-process lock"
+        assert not (tmp_path / "cron" / gate._STATE_NAME).exists()
+    finally:
+        gate._thread_lock.release()
+        t.join(5)
