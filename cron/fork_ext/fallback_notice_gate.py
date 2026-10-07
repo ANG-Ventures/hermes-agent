@@ -20,6 +20,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -34,6 +35,9 @@ logger = logging.getLogger(__name__)
 _STATE_NAME = "fallback_notice_day.json"
 _LOCK_NAME = ".fallback_notice_day.lock"
 _thread_lock = threading.Lock()
+# mark_noticed runs in run_job's finally, before the job result is saved and delivered: a wedged
+# writer must cost at most this long (both locks share the one deadline), never the delivery.
+_LOCK_TIMEOUT_SECONDS = 2.0
 
 
 def _today() -> str:
@@ -62,20 +66,43 @@ def already_noticed(home: Path, job_id: str, pair: str, day: Optional[str] = Non
 def _state_lock(cron_dir: Path):
     """Serialize the read-modify-replace: parallel tick threads share one process
     (``cron.max_parallel_jobs``) and a CLI ``cron run`` is another process. Each writer
-    otherwise loads the same snapshot and the last replace drops the others' records."""
-    with _thread_lock:
-        fd = None
-        try:
-            if fcntl is not None:
-                try:
-                    fd = open(cron_dir / _LOCK_NAME, "a+", encoding="utf-8")
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                except OSError as e:  # in-process lock still held
-                    logger.debug("fallback notice gate flock unavailable: %r", e)
-            yield
-        finally:
+    otherwise loads the same snapshot and the last replace drops the others' records.
+
+    Yields True when held, False when either lock was not acquired within
+    ``_LOCK_TIMEOUT_SECONDS``: the caller then skips the update (no unlocked write)."""
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    if not _thread_lock.acquire(timeout=_LOCK_TIMEOUT_SECONDS):
+        logger.warning("fallback notice gate: in-process lock busy for %.1fs; skipping state update",
+                       _LOCK_TIMEOUT_SECONDS)
+        yield False
+        return
+    fd = None
+    try:
+        held = True
+        if fcntl is not None:
+            try:
+                fd = open(cron_dir / _LOCK_NAME, "a+", encoding="utf-8")
+            except OSError as e:  # no lock file possible: in-process lock still held
+                logger.debug("fallback notice gate flock unavailable: %r", e)
             if fd is not None:
-                fd.close()  # releases the flock
+                held = False
+                while True:  # poll LOCK_NB against the deadline, never a blocking LOCK_EX
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        held = True
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.05)
+                if not held:
+                    logger.warning("fallback notice gate: %s held by another writer for %.1fs; "
+                                   "skipping state update", cron_dir / _LOCK_NAME, _LOCK_TIMEOUT_SECONDS)
+        yield held
+    finally:
+        if fd is not None:
+            fd.close()  # releases the flock
+        _thread_lock.release()
 
 
 def mark_noticed(home: Path, job_id: str, pair: str, day: Optional[str] = None) -> None:
@@ -83,7 +110,9 @@ def mark_noticed(home: Path, job_id: str, pair: str, day: Optional[str] = None) 
     try:
         path = Path(home) / "cron" / _STATE_NAME
         path.parent.mkdir(parents=True, exist_ok=True)
-        with _state_lock(path.parent):
+        with _state_lock(path.parent) as held:
+            if not held:  # best effort: the notice may repost once; the job result must not wait
+                return
             data = _load(path)
             data[str(job_id)] = {"day": day or _today(), "pair": pair}
             fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
