@@ -26,7 +26,7 @@ LINE = f"systemctl --user {R} {UNIT}\n"
 @pytest.fixture
 def script(tmp_path: Path) -> Path:
     p = tmp_path / "remote-sync.sh"
-    p.write_text("#!/bin/bash\n# runs ON another host\n" + LINE)
+    p.write_text("#!/usr/bin/env bash\n# runs ON another host\n" + LINE)
     p.chmod(0o755)
     return p
 
