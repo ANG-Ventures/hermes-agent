@@ -18,7 +18,11 @@ default/aegis), these events enqueue one handoff turn into it:
     with a stale heartbeat;
 (d) ``completed`` of a card that was the LAST ``blocks`` parent of one or more
     open children;
-(e) ``review_requested`` whose fleet PR is red (a failed check-run) or dirty.
+(e) ``review_requested`` whose fleet PR is red (a failed check-run) or dirty;
+(f) ``skipped_nonspawnable`` right after a ``schedule_elapsed`` (t_affb1951): the
+    scheduled wake fired on a card whose assignee the dispatcher never spawns
+    (apollo / human:*). The dispatcher writes that event once per wake, so this is
+    one turn per wake, not per tick.
 
 Not on: heartbeats, a review handback whose PR is green or pending (the merge
 pass owns it), a ``completed`` with no gated children (the digest covers it),
@@ -69,7 +73,7 @@ STATE_FILENAME = "kanban_owner_wake.json"
 
 SCAN_KINDS = (
     "blocked", "stalled", "crashed", "gave_up", "timed_out", "reclaimed",
-    "completed", "review_requested",
+    "completed", "review_requested", "skipped_nonspawnable",
 )
 STUCK_KINDS = frozenset({"stalled", "crashed", "gave_up", "timed_out"})
 # Kinds the per-subscription notify+wake path already turns into a wake. A
@@ -82,6 +86,7 @@ TRIGGER_PRECONDITION = "blocked_precondition"
 TRIGGER_STUCK = "stuck"
 TRIGGER_LAST_BLOCKER = "last_blocker_done"
 TRIGGER_RED_HANDBACK = "red_handback"
+TRIGGER_WOKE_NONSPAWNABLE = "woke_nonspawnable"
 
 _WAKE_OFF_RE = re.compile(r"^\s*wake\s*:\s*off\s*$", re.I | re.M)
 # A block reason that names WHEN or ON WHAT the card can move again.
@@ -224,6 +229,9 @@ def describe(item: dict) -> str:
         kids = ", ".join(f"{c['id']} [{c['status']}]" for c in item.get("children") or [])
         out = (f"done, and it was the last blocker of {kids}; those children are now "
                "unblocked: arm or dispatch them")
+    elif trig == TRIGGER_WOKE_NONSPAWNABLE:
+        return (f"scheduled wake elapsed; card is assigned to {item.get('assignee') or '?'} and cannot "
+                "auto-spawn — decide: reassign to a worker or do it")
     elif trig == TRIGGER_RED_HANDBACK:
         out = f"handed back for review but the PR cannot land ({item.get('pr_state')})"
     else:
@@ -669,6 +677,14 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
         if not kids:
             return None
         item.update(trigger=TRIGGER_LAST_BLOCKER, children=kids)
+    elif kind == "skipped_nonspawnable":
+        prev = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? AND id < ? AND kind IN "
+            "('schedule_elapsed', 'skipped_nonspawnable', 'claimed') ORDER BY id DESC LIMIT 1",
+            (r["task_id"], r["id"])).fetchone()
+        if prev is None or prev["kind"] != "schedule_elapsed":
+            return None   # a plain ready card on a human assignee, not a scheduled wake
+        item.update(trigger=TRIGGER_WOKE_NONSPAWNABLE, assignee=str((payload or {}).get("assignee") or ""))
     elif kind == "review_requested":
         bad = handback_pr_state(kb, conn, {"result": r["result"]}, payload, r["run_id"],
                                 pr_health, memo)
