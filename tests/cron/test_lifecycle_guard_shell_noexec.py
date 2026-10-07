@@ -60,6 +60,33 @@ def test_noexec_syntax_check_does_not_walk_the_operand(command, script):
     "bash -n remote-sync.sh && bash remote-sync.sh",
     "sh -nc 'systemctl --user re" "start hermes-gateway.service'",  # -c payload is scanned regardless of -n
     "bash -c 'systemctl --user re" "start hermes-gateway.service'",
+    # t_26790b89 (Prism P1 on #1812): options apply left to right, so a later option that
+    # clears noexec re-enables execution. Each shape below EXECUTED the script on bash 3.2,
+    # /bin/sh and zsh (observed 2026-10-07); the walker must track the effective state.
+    "bash -n +o noexec remote-sync.sh",
+    "sh -n +o noexec remote-sync.sh",
+    "bash -n +n remote-sync.sh",
+    "bash -n +xn remote-sync.sh",
+    "bash -nx +n remote-sync.sh",
+    "bash -o noexec +o noexec remote-sync.sh",
+    "bash -n +eo noexec remote-sync.sh",       # `o` inside a + cluster takes the next argument
+    "bash --rcfile -n remote-sync.sh",         # `-n` is --rcfile's VALUE, not an option
+    "zsh -n -o exec remote-sync.sh",           # zsh: `exec` is the inverse of noexec
+    "zsh -n +o NO_EXEC remote-sync.sh",        # zsh folds case and `_`
+    "zsh -n --exec remote-sync.sh",            # zsh: `--name` is `-o name`
 ])
 def test_every_executing_shape_still_blocks(command, script):
     assert _scan(command, script.parent) is True
+
+
+@pytest.mark.parametrize("command", [
+    "bash -n -o noexec remote-sync.sh",
+    "bash -no errexit remote-sync.sh",         # `o` consumes errexit; -n still in force
+    "bash -n -O extglob remote-sync.sh",
+    "bash -n +o errexit remote-sync.sh",       # clearing an unrelated option keeps noexec
+    "bash -n - remote-sync.sh",                # bare `-` ends options
+    "bash -o noexec remote-sync.sh",
+    "bash --norc -n remote-sync.sh",
+])
+def test_noexec_still_in_effect_after_later_options(command, script):
+    assert _scan(command, script.parent) is False
