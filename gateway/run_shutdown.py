@@ -148,6 +148,14 @@ def _notice_target_key(platform_value: str, chat_id, thread_id) -> tuple:
     return (platform_value, str(chat_id), str(thread_id) if thread_id else None)
 
 
+def _messaging_platform(target: dict) -> Optional[Platform]:
+    """The messaging ``Platform`` of a resolved target, or None (bot-chat pseudo-targets, unknown)."""
+    try:
+        return Platform(str(target.get("platform", "")).lower())
+    except ValueError:
+        return None
+
+
 def _delivery_target_key(platform_value: str, chat_id, thread_id, *, profile: Optional[str] = None) -> tuple:
     """Dedupe key for one DELIVERED chat: profile-independent, except Telegram private chats.
 
@@ -993,9 +1001,10 @@ class GatewayShutdownMixin:
                 # See #43014. A recurring job re-runs on schedule, so cron.interrupt_deliver (when set)
                 # takes the notice instead, leaving the job's real failures on deliver/failure_deliver.
                 lane = _interrupt_deliver_lane(job)
-                if lane:
-                    targets = _resolve_delivery_targets(dict(job, deliver=lane))
-                else:
+                targets = _resolve_delivery_targets(dict(job, deliver=lane)) if lane else []
+                # This loop sends only through messaging adapters. An override with no such
+                # target (bot-chat, typo) must not swallow the notice: keep the failure lane.
+                if not any(_messaging_platform(tg) for tg in targets):
                     targets = _resolve_delivery_targets(job, for_failure=True)
             except Exception as e:
                 logger.debug("Cron interrupt targets unresolved for %s: %s", job_id, e)

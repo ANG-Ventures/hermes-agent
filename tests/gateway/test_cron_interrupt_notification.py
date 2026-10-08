@@ -258,6 +258,14 @@ class TestInterruptDeliverKnob:
         assert chats == [self.ALERTS]
 
     @pytest.mark.asyncio
+    async def test_non_messaging_interrupt_lane_keeps_failure_lane(self, monkeypatch):
+        """bot-chat (or any lane with no messaging target) can't be sent from this loop: never drop the notice."""
+        self._cfg(monkeypatch, "bot-chat")
+        sent, chats = await self._notify(self._recurring_job())
+        assert sent == 1
+        assert chats == [self.ALERTS]
+
+    @pytest.mark.asyncio
     async def test_failure_deliver_local_opt_out_survives_knob(self, monkeypatch):
         self._cfg(monkeypatch, f"telegram:{self.LOGS}")
         sent, chats = await self._notify(self._recurring_job(failure_deliver="local"))
