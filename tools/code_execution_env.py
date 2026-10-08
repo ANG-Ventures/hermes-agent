@@ -192,6 +192,13 @@ def _inject_session_context(scrubbed, source_env):
     return bridge_session_env(scrubbed)
 
 
+def _session_identity_env(source_env=None) -> Dict[str, str]:
+    """The non-empty ``HERMES_SESSION_*`` set a sandbox child gets, as a standalone dict, for the
+    remote per-call path that ships an env file instead of a scrubbed process env."""
+    identity = _inject_session_context({}, os.environ if source_env is None else source_env)
+    return {k: v for k, v in identity.items() if v}
+
+
 def _inject_session_id(scrubbed, source_env):
     """Fork (#636/C3): bridge the live ``HERMES_SESSION_ID`` into the sandbox child's env.
 

@@ -84,3 +84,14 @@ def test_cleared_context_does_not_leak_the_process_global(monkeypatch):
     env = _kernel_env()
     assert not env.get("HERMES_SESSION_PLATFORM")
     assert not env.get("HERMES_SESSION_CHAT_ID")
+
+
+def test_remote_per_call_identity_matches_the_local_kernel():
+    """The remote per-call twin ships an env file; it carries the same identity as the kernel."""
+    from tools.code_execution_env import _session_identity_env
+    kernel = _kernel_env()
+    remote = _session_identity_env()
+    assert remote["HERMES_SESSION_PLATFORM"] == "discord"
+    assert remote["HERMES_SESSION_CHAT_ID"] == "1554668201428918292"
+    assert remote == {k: kernel[k] for k in _session_names(kernel)
+                      if kernel[k] and k != "HERMES_SESSION_SCRATCH"}

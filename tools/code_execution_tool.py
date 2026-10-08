@@ -703,7 +703,11 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         # comment provenance from its own env. Resolved contextvar-first so a
         # concurrent gateway session cannot attribute this sandbox to itself;
         # absent when unresolvable (fail-open → NULL provenance, never a guess).
-        _session_env = {}
+        # The rest of the HERMES_SESSION_* identity rides along through the same bridge the
+        # local path uses, so a remote `hermes kanban create` can subscribe its chat (t_be44b437).
+        from tools.code_execution_env import _session_identity_env
+        _session_env = _session_identity_env()
+        _session_env.pop("HERMES_SESSION_ID", None)
         _session_id = _resolved_session_id()
         if _session_id:
             _session_env["HERMES_SESSION_ID"] = _session_id
