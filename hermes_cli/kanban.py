@@ -761,6 +761,34 @@ def _maybe_cli_auto_subscribe(conn, task_id: str) -> bool:
         return False
 
 
+_SILENT_CREATE_WARNING = (
+    "create: no gateway identity in env — this card will finish SILENTLY "
+    "(set HERMES_SESSION_PLATFORM/CHAT_ID or run notify-subscribe)"
+)
+
+
+def _warn_if_silent_create(auto_subscribed: bool) -> None:
+    """One stderr line when a create from inside a session cannot subscribe its chat.
+
+    ``HERMES_SESSION_ID`` set but no ``HERMES_SESSION_PLATFORM``/``CHAT_ID`` is the shape of a
+    gateway turn whose identity was lost on the way into a child (t_be44b437: execute_code
+    creates finished silently; the dispatcher's later "no notify subscription" line was
+    swallowed). It is also a cron/script create, which stays unsubscribed by design (#19718);
+    the line only says so. Dispatcher-owned workers are skipped: their cards report through
+    the parent lineage, not a chat.
+    """
+    if auto_subscribed:
+        return
+    from agent.delegation_context import owned_kanban_task
+    from gateway.session_context import get_session_env, resolve_current_session_id
+
+    if not resolve_current_session_id() or owned_kanban_task():
+        return
+    if get_session_env("HERMES_SESSION_PLATFORM", "") and get_session_env("HERMES_SESSION_CHAT_ID", ""):
+        return
+    print(_SILENT_CREATE_WARNING, file=sys.stderr)
+
+
 def _read_body_file(path: str) -> str:
     """Read a card/comment body from ``path`` (``-`` = stdin).
 
@@ -883,6 +911,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    if not getattr(args, "json", False):
+        # Not with --json: ``run_slash`` merges stderr into its output (same rule as below).
+        _warn_if_silent_create(auto_subscribed)
     if (task.unhomed and getattr(args, "session", None) is None
             and not getattr(args, "json", False)):
         # D-O2 (t_6281f908): a hand-typed create with no session is allowed

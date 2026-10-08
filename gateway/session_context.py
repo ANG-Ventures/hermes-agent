@@ -267,6 +267,23 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def bridge_session_env(env: dict) -> dict:
+    """Write the ``HERMES_SESSION_*`` set into a child-process *env*, in place.
+
+    THE one bridge for every spawn surface (terminal, execute_code), so the set a child sees
+    cannot drift between them (t_be44b437). Cross-session leak guard: the ``os.environ`` mirror
+    is last-writer-wins on a concurrent multi-session host, so once the session context is
+    engaged ContextVars are authoritative: a bound value (incl. ``""``) wins and an ``_UNSET``
+    var is STRIPPED, not inherited. An unengaged CLI keeps whatever *env* already carries."""
+    for var_name, var in _VAR_MAP.items():
+        value = var.get()
+        if value is not _UNSET:
+            env[var_name] = "" if value is None else str(value)
+        elif _session_context_engaged:
+            env.pop(var_name, None)
+    return env
+
+
 def resolve_current_session_id() -> str | None:
     """Resolve the active session id contextvar-first, os.environ fallback.
 

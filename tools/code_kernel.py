@@ -54,6 +54,13 @@ def _clip(text):
 
 def run_cell(request, execution_count):
     """Exec one cell; returns (response payload, FULL stdout text)."""
+    # Per-turn session identity (t_be44b437): a kernel outlives the turn that spawned it, so the
+    # host sends the CURRENT turn's HERMES_SESSION_* with every cell; "" means unbound -> unset.
+    for _name, _value in (request.get("env") or {}).items():
+        if _value:
+            os.environ[_name] = _value
+        else:
+            os.environ.pop(_name, None)
     out, err = io.StringIO(), io.StringIO()
     status, trace = "ok", ""
     try:
@@ -891,7 +898,9 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
             kernel.cell_log_start = len(kernel.tool_call_log)
             kernel.raw.drain(), kernel.stderr.drain()  # raw output leaked between cells belongs to no cell
             kernel.cell_authority = authority
-            kernel.proc.stdin.write((json.dumps({"id": uuid.uuid4().hex, "code": code}) + "\n").encode("utf-8"))
+            from tools.code_execution_env import _session_identity_env
+            request = {"id": uuid.uuid4().hex, "code": code, "env": _session_identity_env()}
+            kernel.proc.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
             kernel.proc.stdin.flush()
             status, payload = _await_cell(kernel, timeout, is_interrupted)
             result = _cell_result(
