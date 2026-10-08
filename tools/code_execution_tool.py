@@ -705,12 +705,9 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         # absent when unresolvable (fail-open → NULL provenance, never a guess).
         # The rest of the HERMES_SESSION_* identity rides along through the same bridge the
         # local path uses, so a remote `hermes kanban create` can subscribe its chat (t_be44b437).
+        # Unbound names ship as "" so nothing from an earlier session survives in the remote env.
         from tools.code_execution_env import _session_identity_env
         _session_env = _session_identity_env()
-        _session_env.pop("HERMES_SESSION_ID", None)
-        _session_id = _resolved_session_id()
-        if _session_id:
-            _session_env["HERMES_SESSION_ID"] = _session_id
         launch_cmd = _ship_env_file_and_launch(
             env, sandbox_dir, "sandbox.env", "exec python3 script.py",
             rpc_dir=f"{sandbox_dir}/rpc", rpc_token=rpc_token, **_session_env)

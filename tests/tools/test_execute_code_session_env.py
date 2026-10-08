@@ -87,11 +87,37 @@ def test_cleared_context_does_not_leak_the_process_global(monkeypatch):
 
 
 def test_remote_per_call_identity_matches_the_local_kernel():
-    """The remote per-call twin ships an env file; it carries the same identity as the kernel."""
+    """The remote per-call twin ships an env file; it carries the same identity as the kernel,
+    and every other session name as "" so an earlier session's value is overwritten."""
     from tools.code_execution_env import _session_identity_env
     kernel = _kernel_env()
     remote = _session_identity_env()
+    assert set(remote) == set(_VAR_MAP)
     assert remote["HERMES_SESSION_PLATFORM"] == "discord"
     assert remote["HERMES_SESSION_CHAT_ID"] == "1554668201428918292"
-    assert remote == {k: kernel[k] for k in _session_names(kernel)
-                      if kernel[k] and k != "HERMES_SESSION_SCRATCH"}
+    assert {k: v for k, v in remote.items() if v} == {
+        k: kernel[k] for k in _session_names(kernel) if kernel[k] and k != "HERMES_SESSION_SCRATCH"}
+
+
+def test_kernel_cell_applies_the_current_turns_identity(monkeypatch):
+    """A kernel outlives its first turn: each cell carries the CURRENT identity and the runner
+    applies it before exec (Prism r1 on #1818). Drives the real runner cell source."""
+    import contextlib, io, json, os, traceback  # noqa: E401 — the runner source's own imports
+    from tools.code_execution_env import _session_identity_env
+    from tools.code_kernel import RUNNER_CELL_SOURCE
+    ns = {"_CAPTURE_LIMIT": 100_000, "os": os, "io": io, "contextlib": contextlib,
+          "traceback": traceback, "json": json}
+    exec(RUNNER_CELL_SOURCE, ns)
+    probe = "import os; print(os.environ.get('HERMES_SESSION_USER_ID', '<unset>'))"
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "first-turn-user")  # what the kernel spawned with
+
+    payload, _ = ns["run_cell"]({"id": "1", "code": probe, "env": _session_identity_env()}, 1)
+    assert payload["stdout"].strip() == "u1"
+
+    tokens = set_session_vars(platform="discord", chat_id="1554668201428918292",
+                              session_id="next-turn", cron_session="")
+    try:
+        payload, _ = ns["run_cell"]({"id": "2", "code": probe, "env": _session_identity_env()}, 2)
+    finally:
+        clear_session_vars(tokens)
+    assert payload["stdout"].strip() == "<unset>"

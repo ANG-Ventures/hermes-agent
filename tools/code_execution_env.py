@@ -193,10 +193,17 @@ def _inject_session_context(scrubbed, source_env):
 
 
 def _session_identity_env(source_env=None) -> Dict[str, str]:
-    """The non-empty ``HERMES_SESSION_*`` set a sandbox child gets, as a standalone dict, for the
-    remote per-call path that ships an env file instead of a scrubbed process env."""
-    identity = _inject_session_context({}, os.environ if source_env is None else source_env)
-    return {k: v for k, v in identity.items() if v}
+    """EVERY ``HERMES_SESSION_*`` name for the current turn, ``""`` where unbound/cleared.
+
+    For children that outlive or never saw the spawn-time env: the session kernel (local and
+    remote) applies it at each cell boundary (``RUNNER_CELL_SOURCE`` sets non-empty values and
+    pops empty ones), and the remote per-call env file ships it as-is. Absent names are sent as
+    ``""`` rather than omitted so a prior turn's identity is cleared, not inherited. Same
+    bridge + session-id resolver as ``_scrub_child_env``."""
+    from gateway.session_context import _VAR_MAP
+    src = os.environ if source_env is None else source_env
+    identity = _inject_session_id(_inject_session_context({}, src), src)
+    return {name: identity.get(name) or "" for name in _VAR_MAP}
 
 
 def _inject_session_id(scrubbed, source_env):

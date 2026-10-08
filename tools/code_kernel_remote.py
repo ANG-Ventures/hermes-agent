@@ -304,12 +304,15 @@ def _acquire_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
 def _run_remote_cell(kernel: RemoteKernel, code: str, timeout: int) -> Tuple[str, Dict[str, Any]]:
     """Ship one cell request and poll for its result: (cell status, payload)."""
     from tools.code_execution_tool import _ship_file_to_remote
+    from tools.code_execution_env import _session_identity_env
     kernel.cell_seq += 1
     seq = f"{kernel.cell_seq:06d}"
     q_cells, q_res = shlex.quote(f"{kernel.kernel_dir}/cells"), shlex.quote(f"cell_res_{seq}.json")
-    # One round-trip: tmp write + rename publishes the request atomically.
+    # One round-trip: tmp write + rename publishes the request atomically. The request carries
+    # this turn's session identity; the runner applies it before exec (t_be44b437).
     _ship_file_to_remote(kernel.env, f"{kernel.kernel_dir}/cells/cell_req_{seq}.json",
-                         json.dumps({"id": seq, "code": code}, ensure_ascii=False), atomic=True)
+                         json.dumps({"id": seq, "code": code, "env": _session_identity_env()},
+                                    ensure_ascii=False), atomic=True)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
