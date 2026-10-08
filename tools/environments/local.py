@@ -221,22 +221,13 @@ def _apply_profile_home(env: dict) -> None:
 
 
 def _inject_session_context_env(env: dict) -> None:
-    """Bridge gateway session ContextVars (HERMES_SESSION_*) into a child env.
-    Cross-session leak guard: the vars' last-writer-wins ``os.environ`` mirror may
-    belong to another turn on a concurrent multi-session host, so once the session
-    context is engaged ContextVars are authoritative — a bound value (incl. "") wins
-    and an _UNSET var is STRIPPED, not inherited. An unengaged CLI keeps the mirror."""
+    """Bridge gateway session ContextVars (HERMES_SESSION_*) into a child env through the
+    shared ``gateway.session_context.bridge_session_env`` (execute_code uses the same one)."""
     try:
-        from gateway.session_context import _UNSET, _VAR_MAP, session_context_engaged
+        from gateway.session_context import bridge_session_env
     except Exception:
         return
-    _engaged = session_context_engaged()
-    for var_name, var in _VAR_MAP.items():
-        value = var.get()
-        if value is not _UNSET:
-            env[var_name] = "" if value is None else str(value)
-        elif _engaged:
-            env.pop(var_name, None)
+    bridge_session_env(env)
 
 
 def _filter_secret_env(

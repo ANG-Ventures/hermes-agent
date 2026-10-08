@@ -170,8 +170,26 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             if key in scoped:
                 scrubbed[key] = scoped[key]
     scrubbed = delegated_child_subprocess_env(scrubbed)
+    _inject_session_context(scrubbed, source_env)
     _inject_session_id(scrubbed, source_env)
     return scrubbed
+
+
+def _inject_session_context(scrubbed, source_env):
+    """Give the sandbox child the same ``HERMES_SESSION_*`` set the terminal tool exports.
+
+    The scrub above drops every one of them (``HERMES_SESSION_KEY`` even trips the ``KEY``
+    secret substring), so a ``hermes kanban create`` run from execute_code had no
+    ``HERMES_SESSION_PLATFORM``/``CHAT_ID`` and could not subscribe the gateway chat: the card
+    finished silently (t_be44b437). Seed the names from *source_env* exactly as the terminal's
+    ``os.environ`` base does, then apply the terminal's own bridge, so ContextVars win and an
+    unbound var is stripped once a session context is engaged (cross-session leak guard).
+    ``_inject_session_id`` runs after this and keeps the final say on ``HERMES_SESSION_ID``."""
+    from gateway.session_context import _VAR_MAP, bridge_session_env
+    for name in _VAR_MAP:
+        if name in source_env:
+            scrubbed[name] = source_env[name]
+    return bridge_session_env(scrubbed)
 
 
 def _inject_session_id(scrubbed, source_env):
@@ -225,6 +243,9 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
     if _home_override:
         child_env["HERMES_HOME"] = _home_override
         apply_scratch_tmp_env(child_env)  # TMPDIR follows the routed home, like HOME does
+    # Per-session scratch dir, keyed on the bridged session id — same export as the terminal.
+    from hermes_constants import apply_session_scratch_env
+    apply_session_scratch_env(child_env)
     # PYTHONPATH: the staging dir (hermes_tools.py) must always be importable even when project
     # mode changes CWD. Hermes's root is added ONLY when the child runs in Hermes's Python env —
     # exposing Hermes's site-packages to an external interpreter can mix incompatible compiled
