@@ -4,7 +4,8 @@ Unlock: ``op signin --raw`` with the master password on stdin (desktop-app
 integration or account-level auth) mints an ``OP_SESSION_<account>`` token.
 A configured service-account token skips the prompt entirely (headless).
 List: ``op item list --categories Login --format json`` → title, urls,
-username. Resolve: ``op item get <id> --fields label=password --reveal``.
+username, owning vault. Resolve: ``op item get <id> --vault <vault id> --fields
+label=password --reveal`` (service accounts require the vault).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -25,6 +27,7 @@ from agent.vault_store import VaultItemMeta, normalize_origin
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 30.0
+_OP_ID = re.compile(r"^[A-Za-z0-9]+$")  # op item/vault ids; nothing starting "-" reaches argv
 
 
 class OnePasswordLoginBackend(LoginBackend):
@@ -101,9 +104,8 @@ class OnePasswordLoginBackend(LoginBackend):
     def list_items(self) -> List[VaultItemMeta]:
         if not self.is_unlocked():
             return []
-        raw = json.loads(self._run("item", "list", "--categories", "Login", "--format", "json") or "[]")
         out: List[VaultItemMeta] = []
-        for item in raw if isinstance(raw, list) else []:
+        for item in self._list_raw():
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origins = _all_origins(urls)
             if not origins:
@@ -119,14 +121,36 @@ class OnePasswordLoginBackend(LoginBackend):
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
         return next((m for m in self.list_items() if m.id == handle), None)
 
+    def _list_raw(self) -> List[Dict]:
+        raw = json.loads(self._run("item", "list", "--categories", "Login", "--format", "json") or "[]")
+        return [i for i in raw if isinstance(i, dict)] if isinstance(raw, list) else []
+
+    def _scoped_item(self, handle: str) -> List[str]:
+        """``<id> --vault <vault id>`` for a listed Login item.
+
+        Service-account auth refuses an unscoped item read ("a vault query must be provided"),
+        so every read names the vault the listing says owns the item. Only an id listed exactly
+        once is resolved: a missing or ambiguous id fails closed, which also keeps a
+        caller-supplied handle from reaching op's argv unvetted.
+        """
+        item_id = handle[len(self.prefix):] if handle.startswith(self.prefix) else ""
+        matches = [i for i in self._list_raw() if item_id and str(i.get("id") or "") == item_id]
+        if len(matches) != 1:
+            raise RuntimeError(f"1Password item {handle!r} is {'not listed' if not matches else 'ambiguous'}")
+        vault = matches[0].get("vault")
+        vault_id = str(vault.get("id") or "") if isinstance(vault, dict) else ""
+        if not _OP_ID.match(item_id) or not _OP_ID.match(vault_id):
+            raise RuntimeError(f"1Password item {handle!r} has no resolvable vault")
+        return [item_id, "--vault", vault_id]
+
     def resolve_password(self, handle: str) -> str:
-        item_id = handle[len(self.prefix):]
-        return self._run("item", "get", item_id, "--fields", "label=password", "--reveal").rstrip("\r\n")
+        return self._run("item", "get", *self._scoped_item(handle), "--fields", "label=password",
+                         "--reveal").rstrip("\r\n")
 
     def resolve_otp(self, handle: str) -> Optional[str]:
         # `--otp` mints the current TOTP from the item's one-time-password field; items without one error out.
         try:
-            code = self._run("item", "get", handle[len(self.prefix):], "--otp").strip()
+            code = self._run("item", "get", *self._scoped_item(handle), "--otp").strip()
         except Exception:
             return None
         return code if code.isdigit() else None
