@@ -99,6 +99,9 @@ _POOL_HEADER_NAMES = (
     "x-pool-empty-content-retried",
     # t_6eddafcd: the seats the relay's empty-content ladder tried, in order.
     "x-pool-empty-content-attempts",
+    # t_9783560a: the ladder rung of each attempt (none / drop_fgts /
+    # drop_fgts+rotate), same order as the attempts header. Optional.
+    "x-pool-empty-content-perturbations",
 )
 
 

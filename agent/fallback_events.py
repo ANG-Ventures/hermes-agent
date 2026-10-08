@@ -641,6 +641,16 @@ def _attempt_seats(raw: Any) -> Optional[list]:
     return seats or None
 
 
+def _perturbations(raw: Any) -> Optional[list]:
+    """``x-pool-empty-content-perturbations: none,drop_fgts,drop_fgts+rotate``
+    -> the ladder rung of each attempt (at most 8 short tokens), else None."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    rungs = [t.strip() for t in raw.split(",") if t.strip()]
+    rungs = [t for t in rungs if re.fullmatch(r"[A-Za-z0-9_+.-]{1,32}", t)][:8]
+    return rungs or None
+
+
 def _request_ids(raw: Any) -> Optional[list]:
     """``x-pool-empty-content-request-ids: req_a,req_b,req_c`` -> the upstream
     request ids of each billed empty attempt (at most 8), else None."""
@@ -698,6 +708,7 @@ def stash_response_failure(agent: Any, site: str, response: Any = None, *,
             # #193): "gave_up" / "1" and, when sent, the seats it tried in order.
             "relay_retry": (ph.get("x-pool-empty-content-retried") or "").strip().lower() or None,
             "relay_attempts": _attempt_seats(ph.get("x-pool-empty-content-attempts")),
+            "relay_perturbations": _perturbations(ph.get("x-pool-empty-content-perturbations")),
             # t_c706fd1e: each billed empty attempt's upstream request id
             # (claude-pool x-pool-empty-content-request-ids) and the prompt size.
             "relay_request_ids": _request_ids(ph.get("x-pool-empty-content-request-ids")),

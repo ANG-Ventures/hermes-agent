@@ -1116,28 +1116,87 @@ def _prompt_size(tokens: Any) -> str:
     return f" prompt {round(tokens / 1000)}k tok" if tokens >= 1000 else f" prompt {tokens} tok"
 
 
+RELAY_EMPTY_CHAIN_MAX = 240
+_RUNG_NAMES = {"none": "as-is", "drop_fgts": "−fgts beta"}
+_ROTATE_RUNGS = {"rotate": "", "drop_fgts+rotate": " −fgts"}
+
+
+def _empty_reply_head(fl: Mapping[str, Any]) -> str:
+    """``empty tool-call reply`` for a stop_reason=tool_use empty, else ``empty reply``."""
+    return "empty tool-call reply" if fl.get("stop_reason") == "tool_use" else "empty reply"
+
+
+def _empty_shape(fl: Mapping[str, Any]) -> str:
+    """`` (stop_reason=tool_use, 0 content blocks, ~240 out)`` from the floor."""
+    parts = []
+    if fl.get("stop_reason"):
+        parts.append(f"stop_reason={fl['stop_reason']}")
+    blocks = fl.get("content_blocks")
+    if isinstance(blocks, int):
+        parts.append(f"{blocks} content block{'' if blocks == 1 else 's'}")
+    out = fl.get("output_tokens")
+    if isinstance(out, int) and not isinstance(out, bool):
+        parts.append(f"~{int(round(out, -1))} out")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def _rung(kind: str, seat: Optional[str], prev: Optional[str], seat_names: bool) -> str:
+    """One ladder rung: ``as-is`` / ``−fgts beta`` / ``rotate→sub-vps-9 −fgts``;
+    an unknown kind prints verbatim."""
+    if kind in _ROTATE_RUNGS or (seat and prev and seat != prev):
+        tail = _ROTATE_RUNGS.get(kind, f" {_RUNG_NAMES.get(kind, kind)}")
+        to = (seat if seat_names else "a sub") if seat else "?"
+        return f"rotate→{to}{tail}"
+    return _RUNG_NAMES.get(kind, kind)
+
+
 def _relay_empty_chain(row: Mapping[str, Any], seat_names: bool) -> Optional[str]:
-    """``empty reply from Anthropic ×3 (sub-vps-18, sub-vps-18, sub-vps-23) —
-    relay retried, gave up`` when the pooled relay already ran its own
-    empty-content ladder (``x-pool-empty-content-retried: gave_up``,
-    claude-pool #193) and gave up. None otherwise (t_6eddafcd)."""
+    """``empty tool-call reply ×3 from sub-vps-22 (stop_reason=tool_use, 0
+    content blocks, ~240 out): as-is, −fgts beta, rotate→sub-vps-9 −fgts; req_…;
+    prompt 203k tok — relay ladder exhausted, falling to next lane`` when the
+    pooled relay already ran its own empty-content ladder
+    (``x-pool-empty-content-retried: gave_up``, claude-pool #193) and gave up.
+    The relay seat is the subject, never "from Anthropic" (t_9783560a).
+    None otherwise (t_6eddafcd)."""
     fl = row.get("floor") if isinstance(row.get("floor"), Mapping) else {}
     if fl.get("relay_retry") != "gave_up":
         return None
     seats = [str(x) for x in (fl.get("relay_attempts") or ()) if x]
+    rungs = [str(x) for x in (fl.get("relay_perturbations") or ()) if x]
     rids = [str(x) for x in (fl.get("relay_request_ids") or ()) if x]
     prompt = _prompt_size(fl.get("prompt_tokens"))
-    if seats:
-        names = ", ".join(seats) if seat_names else ", ".join("a sub" for _ in seats)
-        if rids:
-            # t_c706fd1e: one short id per billed attempt, greppable in the
-            # relay log and the subs ledger (upstream_request_id).
-            names += "; " + ", ".join(f"req_…{r[-6:]}" for r in rids)
-        return (f"empty reply from Anthropic ×{len(seats)} ({names}){prompt}"
-                " — relay retried, gave up")
-    seat = row.get("seat") or fl.get("served_by")
-    where = f" (last on {seat if seat_names else 'a sub'})" if seat and seat != "unknown" else ""
-    return f"empty reply from Anthropic{where} — relay retried, gave up"
+    head = _empty_reply_head(fl)
+    shape = _empty_shape(fl)
+
+    def name(seat: str) -> str:
+        return seat if seat_names else "a sub"
+
+    if not seats:
+        seat = row.get("seat") or fl.get("served_by")
+        where = f" from {name(str(seat))}" if seat and seat != "unknown" else ""
+        return f"{head}{where}{shape} — relay retried, gave up"
+    lead = f"{head} ×{len(seats)} from {name(seats[0])}{shape}"
+    if rungs:
+        steps, prev = [], None
+        for i, kind in enumerate(rungs):
+            seat = seats[i] if i < len(seats) else None
+            steps.append(_rung(kind, seat, prev, seat_names))
+            prev = seat or prev
+        lead += ": " + ", ".join(steps)
+        tail = " — relay ladder exhausted, falling to next lane"
+    else:
+        distinct = list(dict.fromkeys(seats))
+        tail = (f" — relay retried same seat ×{len(seats)}, gave up" if len(distinct) == 1
+                else f" — relay retried ×{len(seats)} across "
+                     f"{', '.join(name(s) for s in distinct)}, gave up")
+    # t_c706fd1e: one short id per billed attempt, greppable in the relay log
+    # and the subs ledger (upstream_request_id). Dropped first when too long.
+    ids = "; " + ", ".join(f"req_…{r[-6:]}" for r in rids) if rids else ""
+    prompt = f";{prompt}" if prompt else ""
+    line = f"{lead}{ids}{prompt}{tail}"
+    if len(line) > RELAY_EMPTY_CHAIN_MAX:
+        line = f"{lead}{prompt}{tail}"
+    return line
 
 
 def invalid_response_chat_cause(row: Mapping[str, Any]) -> str:
@@ -1631,7 +1690,8 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
         if fl.get("content_blocks") == 0:
             if fl.get("relay_retry") == "gave_up":
                 n = len(fl.get("relay_attempts") or ())
-                return f"empty reply, retried ×{n}" if n else "empty reply, relay retried"
+                head = _empty_reply_head(fl)
+                return f"{head} ×{n}" if n else f"{head}, relay retried"
             return "empty reply"
         return None
     if cls == "conn" and _cause_phrase(row) == SEAT_TIMEOUT_CAUSE:

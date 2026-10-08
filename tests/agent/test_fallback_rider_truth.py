@@ -45,25 +45,29 @@ def test_empty_reply_relay_gave_up_names_the_attempt_chain():
     row = _empty_row(relay_retry="gave_up",
                      relay_attempts=["sub-vps-18", "sub-vps-18", "sub-vps-23"])
     assert fp.format_cause_rider(row, tz=UTC) == (
-        "empty reply from Anthropic ×3 (sub-vps-18, sub-vps-18, sub-vps-23)"
-        " — relay retried, gave up, 04:25:28")
-    assert fp.head_label_override(row) == "empty reply, retried ×3"
+        "empty tool-call reply ×3 from sub-vps-18 (stop_reason=tool_use, 0 content blocks,"
+        " ~130 out) — relay retried ×3 across sub-vps-18, sub-vps-23, gave up, 04:25:28")
+    assert fp.head_label_override(row) == "empty tool-call reply ×3"
 
 
 def test_empty_reply_relay_gave_up_without_seat_list_names_last_seat():
     row = _empty_row(relay_retry="gave_up")
     assert fp.format_cause_rider(row, tz=UTC) == (
-        "empty reply from Anthropic (last on sub-vps-23) — relay retried, gave up, 04:25:28")
-    assert fp.head_label_override(row) == "empty reply, relay retried"
+        "empty tool-call reply from sub-vps-23 (stop_reason=tool_use, 0 content blocks,"
+        " ~130 out) — relay retried, gave up, 04:25:28")
+    assert fp.head_label_override(row) == "empty tool-call reply, relay retried"
 
 
 def test_empty_reply_chat_line_drops_raw_stop_reason():
-    """The raw stop_reason/blocks/out stays in the log row, never the chat."""
+    """Without a relay give-up the raw stop_reason/blocks/out stays in the log
+    row, never the chat. A relay give-up names the reply shape (t_9783560a)."""
+    text = fp.format_cause_rider(_empty_row(), tz=UTC)
+    assert "stop_reason=" not in text and "content block" not in text, text
     for row in (_empty_row(), _empty_row(relay_retry="gave_up"),
                 _empty_row(relay_retry="gave_up", relay_attempts=["sub-vps-2"])):
         text = fp.format_cause_rider(row, tz=UTC)
-        assert "stop_reason=" not in text and "content block" not in text, text
         assert "hop unknown" not in text and "sub unknown" not in text, text
+        assert "from Anthropic" not in text, text
     # The ledger/log cause still carries the raw evidence.
     assert fp.invalid_response_cause(_empty_row()) == (
         "empty response (stop_reason=tool_use, 0 content blocks, 128 out)")
@@ -73,6 +77,96 @@ def test_empty_reply_without_relay_retry_keeps_hop_and_seat():
     assert fp.format_cause_rider(_empty_row(), tz=UTC) == (
         "empty reply · hop=relay-200 · sub=sub-vps-23, 04:25:28")
     assert fp.head_label_override(_empty_row()) == "empty reply"
+
+
+_LADDER_RIDS = ["req_011CfjmrBqPSu3XP0Aeizj", "req_011CfjmsQRi8ScuyUPEnTq",
+                "req_011CfjmtY76qe92qjndaQa"]
+CARD_SAMPLE = (
+    "empty tool-call reply ×3 from sub-vps-22 (stop_reason=tool_use, 0 content blocks,"
+    " ~240 out): as-is, −fgts beta, rotate→sub-vps-9 −fgts; req_…Aeizj, req_…UPEnTq,"
+    " req_…jndaQa; prompt 203k tok — relay ladder exhausted, falling to next lane")
+
+
+def _ladder_row(**floor):
+    """The 2026-10-08 01:25 give-up: three billed empties, 243 out, ~203k prompt."""
+    kw = dict(relay_retry="gave_up", served_by="sub-vps-22", output_tokens=243,
+              relay_attempts=["sub-vps-22", "sub-vps-22", "sub-vps-22"],
+              relay_request_ids=list(_LADDER_RIDS), prompt_tokens=203_400)
+    kw.update(floor)
+    return _empty_row(**kw)
+
+
+def test_ladder_with_perturbations_renders_the_card_line():
+    row = _ladder_row(relay_attempts=["sub-vps-22", "sub-vps-22", "sub-vps-9"],
+                      relay_perturbations=["none", "drop_fgts", "drop_fgts+rotate"])
+    assert fp.format_cause_rider(row, tz=UTC) == CARD_SAMPLE.replace(
+        "req_…Aeizj", "req_…0Aeizj") + ", 04:25:28"
+    assert fp.head_label_override(row) == "empty tool-call reply ×3"
+
+
+def test_same_seat_ladder_collapses_to_one_seat():
+    row = _ladder_row(relay_perturbations=["none", "drop_fgts", "drop_fgts"])
+    text = fp.format_cause_rider(row, tz=UTC)
+    assert text == (
+        "empty tool-call reply ×3 from sub-vps-22 (stop_reason=tool_use, 0 content blocks,"
+        " ~240 out): as-is, −fgts beta, −fgts beta; req_…0Aeizj, req_…UPEnTq, req_…jndaQa;"
+        " prompt 203k tok — relay ladder exhausted, falling to next lane, 04:25:28"), text
+    assert "sub-vps-22," not in text and "from Anthropic" not in text
+
+
+def test_rotate_rung_names_the_new_seat_inline():
+    row = _ladder_row(relay_attempts=["sub-vps-22", "sub-vps-22", "sub-vps-9"],
+                      relay_perturbations=["none", "drop_fgts", "drop_fgts+rotate"])
+    text = fp.format_cause_rider(row, tz=UTC)
+    assert text.startswith("empty tool-call reply ×3 from sub-vps-22 ("), text
+    assert ": as-is, −fgts beta, rotate→sub-vps-9 −fgts; req_…" in text, text
+
+
+def test_rung_names_map_and_unknown_kinds_print_verbatim():
+    row = _ladder_row(relay_attempts=["sub-vps-22", "sub-vps-22", "sub-vps-7"],
+                      relay_perturbations=["none", "new_thing", "rotate"],
+                      relay_request_ids=None, prompt_tokens=None)
+    text = fp.format_cause_rider(row, tz=UTC)
+    assert ": as-is, new_thing, rotate→sub-vps-7 — relay ladder exhausted" in text, text
+
+
+def test_without_perturbation_header_same_seat_says_same_seat():
+    text = fp.format_cause_rider(_ladder_row(), tz=UTC)
+    assert text == (
+        "empty tool-call reply ×3 from sub-vps-22 (stop_reason=tool_use, 0 content blocks,"
+        " ~240 out); req_…0Aeizj, req_…UPEnTq, req_…jndaQa; prompt 203k tok"
+        " — relay retried same seat ×3, gave up, 04:25:28"), text
+
+
+def test_end_turn_empty_is_a_plain_empty_reply():
+    row = _ladder_row(stop_reason="end_turn")
+    assert fp.head_label_override(row) == "empty reply ×3"
+    text = fp.format_cause_rider(row, tz=UTC)
+    assert text.startswith("empty reply ×3 from sub-vps-22 (stop_reason=end_turn, "), text
+    assert "tool-call" not in text
+
+
+def test_group_chat_line_names_no_seat():
+    for row in (_ladder_row(relay_perturbations=["none", "drop_fgts", "drop_fgts+rotate"],
+                            relay_attempts=["sub-vps-22", "sub-vps-22", "sub-vps-9"]),
+                _ladder_row(), _ladder_row(relay_attempts=["sub-vps-22", "sub-vps-9"]),
+                _ladder_row(relay_attempts=None)):
+        text = fp.format_cause_rider(row, tz=UTC, seat_names=False)
+        assert "sub-vps" not in text, text
+        assert "a sub" in text, text
+
+
+def test_length_cap_drops_request_ids_first():
+    long_rids = [f"req_{i:02d}" + "x" * 30 for i in range(8)]
+    row = _ladder_row(relay_attempts=["sub-vps-22", "sub-vps-22", "sub-vps-9"],
+                      relay_perturbations=["none", "drop_fgts", "drop_fgts+rotate"],
+                      relay_request_ids=long_rids)
+    text = fp.format_cause_rider(row, tz=UTC)
+    assert "req_…" not in text, text
+    assert "rotate→sub-vps-9 −fgts; prompt 203k tok — relay ladder exhausted" in text, text
+    assert len(text[:-len(", 04:25:28")]) <= fp.RELAY_EMPTY_CHAIN_MAX, (len(text), text)
+    # The card's own three-id line fits and keeps its ids.
+    assert "req_…" in fp.format_cause_rider(_ladder_row(), tz=UTC)
 
 
 def test_non_empty_invalid_response_keeps_its_cause():
@@ -240,11 +334,11 @@ def test_live_2118_empty_reply_line(_home, monkeypatch):
     fbe.stash_response_failure(a, "invalid_response", resp, elapsed_s=25.28, repeat=True)
     assert try_activate_fallback(a) is True
     text = _rows(_home)[0]["notice_text"]
-    assert text.startswith("🔄 Model fallback (empty reply, retried ×3): "
+    assert text.startswith("🔄 Model fallback (empty tool-call reply ×3): "
                            "claude-alr/claude-fable-5-1 → claude-btpr/claude-fable-5-1"), text
-    assert (" — empty reply from Anthropic ×3 (sub-vps-18, sub-vps-18, sub-vps-23)"
-            " — relay retried, gave up, ") in text, text
-    for banned in ("stop_reason=", "content block", "hop=relay-200", "hop unknown", "unclassified"):
+    assert (" — empty tool-call reply ×3 from sub-vps-18 (stop_reason=tool_use, 0 content blocks,"
+            " ~130 out) — relay retried ×3 across sub-vps-18, sub-vps-23, gave up, ") in text, text
+    for banned in ("from Anthropic", "hop=relay-200", "hop unknown", "unclassified"):
         assert banned not in text, (banned, text)
 
 
@@ -274,14 +368,55 @@ def test_gave_up_line_and_row_carry_request_ids_and_prompt(_home, monkeypatch):
     assert try_activate_fallback(a) is True
     row = _rows(_home)[0]
     text = row["notice_text"]
-    assert " — empty reply from Anthropic ×3 (sub-vps-8, sub-vps-8, sub-vps-15; req_…" in text, text
+    assert (" — empty tool-call reply ×3 from sub-vps-8 (stop_reason=tool_use, 0 content blocks,"
+            " ~240 out); req_…") in text, text
     for rid in rids.split(","):
         assert f"req_…{rid[-6:]}" in text, (rid, text)
-    assert " prompt 342k tok — relay retried, gave up" in text, text
+    assert " prompt 342k tok — relay retried ×3 across sub-vps-8, sub-vps-15, gave up" in text, text
     assert row["request_ids"] == rids
     assert row["prompt_tokens"] == 2 + 16008 + 326348
     assert row["elapsed_s"] == 47.4
     assert row["trigger_class"] == "provider_invalid_response"
+
+
+def test_perturbation_header_is_captured_and_rendered(_home, monkeypatch):
+    """t_9783560a: x-pool-empty-content-perturbations survives the response
+    header snapshot, lands in floor.relay_perturbations, and names the rungs."""
+    from agent.chat_completion_helpers import _snapshot_pool_headers, try_activate_fallback
+    from tests.agent.test_fallback_dead_letter_cause import _alr_agent
+    from tests.agent.test_fallback_events_ledger import _patch_resolver
+
+    wire = {"x-pool-served-by": "sub-vps-9",
+            "x-pool-empty-content-retried": "gave_up",
+            "x-pool-empty-content-attempts": "sub-vps-22,sub-vps-22,sub-vps-9",
+            "x-pool-empty-content-perturbations": "none,drop_fgts,drop_fgts+rotate,bad token!"}
+    http = type("H", (), {"headers": wire})()
+    pool_headers = _snapshot_pool_headers(http)
+    assert pool_headers["x-pool-empty-content-perturbations"] == wire[
+        "x-pool-empty-content-perturbations"]
+
+    _patch_resolver(monkeypatch)
+    a = _alr_agent()
+    usage = type("U", (), {"output_tokens": 243})()
+    resp = type("R", (), {"content": [], "stop_reason": "tool_use", "usage": usage,
+                          "pool_headers": pool_headers})()
+    fbe.stash_response_failure(a, "invalid_response", resp, elapsed_s=30.0, repeat=True)
+    assert a._pending_fallback_error["floor"]["relay_perturbations"] == [
+        "none", "drop_fgts", "drop_fgts+rotate"]
+    assert try_activate_fallback(a) is True
+    text = _rows(_home)[0]["notice_text"]
+    assert text.startswith("🔄 Model fallback (empty tool-call reply ×3): "), text
+    assert (" — empty tool-call reply ×3 from sub-vps-22 (stop_reason=tool_use, 0 content blocks,"
+            " ~240 out): as-is, −fgts beta, rotate→sub-vps-9 −fgts — relay ladder exhausted,"
+            " falling to next lane, ") in text, text
+
+
+def test_perturbation_parse_bounds():
+    assert fbe._perturbations(None) is None
+    assert fbe._perturbations("  ") is None
+    assert fbe._perturbations(" none , drop_fgts ") == ["none", "drop_fgts"]
+    assert fbe._perturbations(",".join(["none"] * 12)) == ["none"] * 8
+    assert fbe._perturbations("x" * 33 + ",rotate") == ["rotate"]
 
 
 def test_live_2125_seat_timeout_line(_home, monkeypatch):
