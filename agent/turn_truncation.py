@@ -733,6 +733,13 @@ def handle_content_policy_refusal(
 
     if agent._has_pending_fallback():
         agent._buffer_diagnostic_status("⚠️ Model declined to respond (safety refusal) — trying fallback...")
+    # t_5d79bfea: the 200 named its seat (x-pool-served-by) and Anthropic its category;
+    # stash both so the failover rider and the route-changes log say so.
+    from agent import fallback_events as _fbe_ref
+
+    _fbe_ref.stash_refusal(agent, response, stop_details=_stop_details)
+    _fbe_ref.record_refusal(
+        agent, (getattr(agent, "_pending_fallback_error", None) or {}).get("floor"))
     if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
         active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
         return RefusalVerdict("break", None, active_system_prompt)

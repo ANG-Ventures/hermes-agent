@@ -62,6 +62,11 @@ class FailoverReason(enum.Enum):
     # Retry-After for <=30 s, provider-wide and self-clearing. Wait it out on the SAME model;
     # never fall back to another model on the same provider.
     relay_draining = "relay_draining"
+    # The claude-bpx bridge answered 409 ``tui_busy``: THIS session's previous turn is still in
+    # flight on the bridge (typically a client-side interrupt the bridge has not finished). The
+    # request is fine and the route frees when that turn ends: one short wait + same-route retry,
+    # then fail over. Never a bad request (t_5d79bfea).
+    session_busy = "session_busy"
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
     server_error = "server_error"        # 500/502 — internal server error, retry
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
@@ -614,6 +619,7 @@ _V_BODY_TOO_LARGE = _v(_R.body_too_large, should_compress=False)
 _V_POOL_EXHAUSTED = _v(_R.pool_exhausted, should_rotate_credential=False, should_fallback=True)
 _V_POOL_STALLED = _v(_R.pool_stalled, retryable=False, should_rotate_credential=False, should_fallback=True)
 _V_RELAY_DRAINING = _v(_R.relay_draining, should_rotate_credential=False, should_fallback=True)
+_V_SESSION_BUSY = _v(_R.session_busy, should_rotate_credential=False, should_fallback=True)
 _V_ACCOUNT_BLOCKED = _v(_R.account_blocked, retryable=False, should_rotate_credential=False, should_fallback=True)
 _V_EXTRA_USAGE_ONLY = _v(_R.extra_usage_only, retryable=False, should_rotate_credential=False, should_fallback=True)
 # ``auth_permanent``: is_auth escalates to the fallback chain and, unlike ``auth``, skips the
@@ -1094,6 +1100,10 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     _lane_code = _lane_incapable_code(c)
     if _lane_code:
         return _v(_R.lane_incapable, **_ABORT_FALLBACK, error_context={"error_code": _lane_code})
+    # The bridge's 409 ``tui_busy`` (by machine code, never text): this session's previous turn is
+    # still running there. Before status so the generic 4xx bucket never calls it format_error.
+    if c.code == "tui_busy" and c.status_code in (None, 409):
+        return _V_SESSION_BUSY
     # Safety refusal before status classification so a 400 block isn't downgraded
     # to format_error and a status-less block isn't left retryable (#18028).
     if any(p in msg for p in _CONTENT_POLICY_BLOCKED_PATTERNS):

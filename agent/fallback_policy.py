@@ -1168,13 +1168,72 @@ def _invalid_response_body(row: Mapping[str, Any], seat_names: bool) -> str:
     return f"{invalid_response_chat_cause(row)} · hop={hop} · sub={sub}"
 
 
+def _refusal_floor(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The HTTP-200 refusal floor (``stash_refusal``) on a refusal row, else {}."""
+    fl = row.get("floor")
+    if not isinstance(fl, Mapping) or row.get("trigger_class") != "refusal":
+        return {}
+    return fl if fl.get("site") == "content_filter" else {}
+
+
+def _refusal_body(row: Mapping[str, Any], seat_names: bool) -> str:
+    """``content policy refusal (category=cyber) · hop=relay-200 · sub=sub-vps-11``
+    plus `` · "<explanation>"`` when Anthropic gave one (t_5d79bfea). The relay
+    answered 200 and named the seat: never ``(hop unknown, sub unknown)``."""
+    fl = _refusal_floor(row)
+    prov = str(row.get("from_provider") or "").strip().lower()
+    if prov.startswith("custom:"):
+        prov = prov[len("custom:"):]
+    relayed = prov in RELAY_PROVIDERS or bool(fl.get("served_by") or fl.get("route_id"))
+    hop = "relay-200" if relayed else "200"
+    seat = row.get("seat") or fl.get("served_by")
+    sub = (str(seat) if seat_names else "a sub") if seat and seat != "unknown" else "unknown"
+    cat = f" (category={fl['category']})" if fl.get("category") else ""
+    expl = f' · "{fl["explanation"]}"' if fl.get("explanation") else ""
+    return f"content policy refusal{cat} · hop={hop} · sub={sub}{expl}"
+
+
+def _bridge_code(row: Mapping[str, Any]) -> Optional[str]:
+    from agent.fallback_capability import BRIDGE_ERROR_CODES
+
+    code = str(row.get("bridge_code") or "").strip().lower()
+    return code if code in BRIDGE_ERROR_CODES else None
+
+
+def _bridge_code_body(row: Mapping[str, Any], seat: str, cause: str) -> str:
+    """``interactive session busy — 409 tui_busy at the bridge (ours, not
+    Anthropic) on sub-vps-23; this session's previous turn is still running``
+    (t_5d79bfea). The body's machine code says the bridge wrote it, whatever
+    hop the relay stamped."""
+    from agent.fallback_capability import BRIDGE_ERROR_CODES
+
+    code = _bridge_code(row) or ""
+    entry = BRIDGE_ERROR_CODES[code]
+    st = row.get("http_status") or "error"
+    where = "at the relay" if code == "mode_not_allowed" else "at the bridge"
+    seat_seg = f" on {seat}" if seat != SUB_UNKNOWN else f" ({SUB_UNKNOWN})"
+    detail = f"; {entry.detail}" if entry.detail else ""
+    origin = LANE_INCAPABLE_NOT_ANTHROPIC if entry.ours else "reported by the bridge"
+    return (f"{cause} — {st} {code} {where} ({origin})"
+            f"{seat_seg}{detail}{_pool_context(row)}")
+
+
 def _cause_phrase(row: Mapping[str, Any]) -> str:
     cls = row.get("trigger_class") or "unclassified"
     if cls == INVALID_RESPONSE_CLASS:
         return invalid_response_cause(row)
-    if cls == LANE_INCAPABLE_CLASS:
+    if cls == LANE_INCAPABLE_CLASS and not _bridge_code(row):
         return _lane_incapable_cause(row)
     t = str(row.get("err_head") or row.get("err_text") or "").lower()
+    bcode = _bridge_code(row)
+    if bcode:
+        from agent.fallback_capability import BRIDGE_ERROR_CODES
+
+        stated = BRIDGE_ERROR_CODES[bcode].cause
+        if stated:
+            return stated
+        if cls == LANE_INCAPABLE_CLASS:
+            return LANE_INCAPABLE_CAUSE
     if cls == "conn":
         if "reset" in t:
             return "connection reset"
@@ -1331,6 +1390,9 @@ def _cause_body(row: Mapping[str, Any], seat_names: bool,
         # A pool seat answered the rejected 200 (x-pool-served-by): name it,
         # whatever the provider label (t_d35beb85).
         return f"{prefix}{_invalid_response_body(row, seat_names)}, {window}", ()
+    if _refusal_floor(row) and (_refusal_floor(row).get("served_by") or not _plain_provider(row)):
+        # A pool seat answered the refusal 200 (x-pool-served-by): name it (t_5d79bfea).
+        return f"{prefix}{_refusal_body(row, seat_names)}, {window}", ()
     if _plain_provider(row):
         # The banner ends after the vendor's words when there are any (Ace,
         # 2026-09-27: no relay legs, no seats, nothing after the cause).
@@ -1341,10 +1403,15 @@ def _cause_body(row: Mapping[str, Any], seat_names: bool,
     if relay_conn_without_evidence(row):
         return f"{prefix}{_relay_conn_cause(row, tz)}, {window}", ()
     seat = _seat_token(row, seat_names)
-    if row.get("trigger_class") == LANE_INCAPABLE_CLASS:
+    if row.get("trigger_class") == LANE_INCAPABLE_CLASS and row.get("lane_code"):
         # The relay's hop header says bridge->upstream for a bridge 400 it
         # passed through; the body code says the bridge/relay itself refused
         # the shape. Name our hop, never "(Anthropic 400)" (t_1ed37625).
+        return f"{prefix}{_lane_incapable_body(row, seat)}, {window}", ()
+    if _bridge_code(row):
+        # Any other bridge machine code: ours, not Anthropic (t_5d79bfea).
+        return f"{prefix}{_bridge_code_body(row, seat, _cause_phrase(row))}, {window}", ()
+    if row.get("trigger_class") == LANE_INCAPABLE_CLASS:
         return f"{prefix}{_lane_incapable_body(row, seat)}, {window}", ()
     hop = normalize_hop(row.get("hop"))
     cause = _cause_phrase(row)
@@ -1549,6 +1616,15 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
     cls = row.get("trigger_class")
     relay_sourced = (row.get("class_source") in ("relay_header", "relay_stream")
                      or bool(row.get("relay_synthetic")))
+    bcode = _bridge_code(row)
+    if bcode:
+        # The bridge's machine code names what happened; the status-derived
+        # label (a 409 -> "bad request") does not (t_5d79bfea).
+        from agent.fallback_capability import BRIDGE_ERROR_CODES
+
+        head = BRIDGE_ERROR_CODES[bcode].head
+        if head:
+            return head
     if cls == INVALID_RESPONSE_CLASS:
         # t_6eddafcd: say what came back, and that the relay already retried.
         fl = row.get("floor") if isinstance(row.get("floor"), Mapping) else {}
