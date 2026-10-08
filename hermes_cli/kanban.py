@@ -911,7 +911,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    _warn_if_silent_create(auto_subscribed)
+    if not getattr(args, "json", False):
+        # Not with --json: ``run_slash`` merges stderr into its output (same rule as below).
+        _warn_if_silent_create(auto_subscribed)
     if (task.unhomed and getattr(args, "session", None) is None
             and not getattr(args, "json", False)):
         # D-O2 (t_6281f908): a hand-typed create with no session is allowed
