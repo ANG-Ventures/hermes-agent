@@ -309,6 +309,14 @@ def kanban_command(args: argparse.Namespace) -> int:
                   "Run 'hermes kanban --help' for the full list of actions.", file=sys.stderr)
         return 0
 
+    # `--board` may come before or after the verb; both positions must agree (never let one lose).
+    verb_board = getattr(args, "verb_board", None)
+    if verb_board is not None:
+        top_board = getattr(args, "board", None)
+        if top_board and str(top_board).strip().lower() != str(verb_board).strip().lower():
+            return _err(f"kanban: --board given twice: {top_board!r} vs {verb_board!r}", 2)
+        args.board = verb_board
+
     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
     # import DB mutators directly.
     if _is_delegated_child_cli_mutation(args):
