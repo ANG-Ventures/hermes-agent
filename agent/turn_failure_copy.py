@@ -175,6 +175,7 @@ _EXHAUSTED_LEADS: Dict[str, str] = {
     FailoverReason.overloaded.value: "{label} reported it was overloaded on all {attempts} attempts",
     FailoverReason.server_error.value: "{label} returned a server error on all {attempts} attempts",
     FailoverReason.timeout.value: "{label} didn't respond in time on any of {attempts} attempts",
+    FailoverReason.session_busy.value: "{label}'s bridge was still running this session's previous turn",
 }
 _EXHAUSTED_DEFAULT_LEAD = "{label} didn't answer after {attempts} attempts"
 

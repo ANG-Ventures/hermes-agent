@@ -60,6 +60,7 @@ class TestFailoverReason:
             "auth", "auth_permanent", "account_blocked", "extra_usage_only",
             "billing", "rate_limit",
             "upstream_rate_limit", "pool_exhausted", "pool_stalled", "relay_draining",
+            "session_busy",  # t_5d79bfea: bridge 409 tui_busy (this session's turn still running)
             "overloaded", "server_error", "timeout", "stream_parse",
             "ssl_cert_verification",
             "decode_error",

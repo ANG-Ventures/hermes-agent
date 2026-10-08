@@ -1773,6 +1773,11 @@ _RATE_LIMIT_REASONS = frozenset({
 _TRANSPORT_FAILURE_REASONS = frozenset({
     FailoverReason.timeout, FailoverReason.overloaded, FailoverReason.stream_parse,
 })
+# One wait on a bridge 409 tui_busy before the same-route retry (t_5d79bfea). The
+# measured case (2026-10-07 21:52) hit the busy 14 s after a client-side interrupt,
+# so the abandoned turn was already well along; 12 s gives it a real chance to end
+# without parking the turn longer than a failover's cold cache would cost.
+SESSION_BUSY_WAIT_S = 12.0
 
 
 _LONG_CONTEXT_TIER_CAP = 200000
@@ -2108,6 +2113,35 @@ def route_classified_error(
             "relay drain outlived the %.0fs wait (waited %.0fs) → fallback %s",
             _drain_max, _drain_waited, agent._client_log_context(),
         )
+        retry_count = max_retries
+
+    # ── Bridge 409 tui_busy: one short wait, then the SAME route once (t_5d79bfea) ──
+    # This session's previous turn is still running on the bridge (a client-side interrupt
+    # the bridge has not finished; 2026-10-07 21:52 the gap was 14 s). The bridge says
+    # "retry after it completes". Wait SESSION_BUSY_WAIT_S once, without consuming an
+    # attempt; a second busy goes to the "max retries -> fallback" branch.
+    if classified.reason == FailoverReason.session_busy:
+        if not _retry.session_busy_waited:
+            _retry.session_busy_waited = True
+            agent._touch_activity("waiting for the bridge to finish this session's previous turn")
+            logger.warning(
+                "bridge session busy (409 tui_busy): retry %s in %.0fs %s",
+                model, SESSION_BUSY_WAIT_S, agent._client_log_context(),
+            )
+            _busy_end = time.monotonic() + SESSION_BUSY_WAIT_S
+            while time.monotonic() < _busy_end and not agent._interrupt_requested:
+                time.sleep(min(0.2, max(_busy_end - time.monotonic(), 0.0)))
+            retry_count = max(retry_count - 1, 0)
+            return _verdict("continue")
+        logger.warning("bridge session still busy after %.0fs → fallback %s",
+                       SESSION_BUSY_WAIT_S, agent._client_log_context())
+        if agent._fallback_index < len(agent._fallback_chain):
+            agent._buffer_diagnostic_status("⚠️ Bridge session still busy — switching to fallback...")
+            if agent._try_activate_fallback(
+                reason=classified.reason, display_reason=classified.display_reason,
+                error_context=error_context,
+            ):
+                return _fallback_break()
         retry_count = max_retries
 
     # ── Loopback relay restarting: wait, retry the SAME model (fork, 2026-09-28) ──

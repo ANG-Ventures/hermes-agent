@@ -51,6 +51,10 @@ LANE_INCAPABLE_CLASS = "lane_incapable"
 # A billed response the loop rejected (empty content / invalid shape), named
 # from the floor evidence ``stash_response_failure`` stashed (t_d35beb85).
 INVALID_RESPONSE_CLASS = "provider_invalid_response"
+# Floor site of a billed HTTP-200 refusal (stop_reason=refusal / content_filter),
+# stashed by :func:`stash_refusal` so the rider names the seat (t_5d79bfea).
+REFUSAL_FLOOR_SITE = "content_filter"
+REFUSAL_EXPLANATION_MAX = 80
 # Relay-stated classes (spec D2). `upstream_passthrough` defers to the text
 # table; anything else unknown is `unclassified`.
 _RELAY_CLASSES = frozenset(
@@ -251,12 +255,23 @@ def classify_trigger(*, text: Optional[str] = None,
     # A bridge machine code in the body is the lane refusing the request shape:
     # it beats the text table, whose rows describe upstream/relay capacity
     # (t_1ed37625: "tools[] must be empty (52 tools)" rendered "unclassified").
-    from agent.fallback_capability import body_lane_incapable_code
+    from agent.fallback_capability import (BRIDGE_ERROR_CODES, body_lane_incapable_code,
+                                           bridge_error_code)
 
     if body_lane_incapable_code(body, text) or reason == LANE_INCAPABLE_CLASS:
         return LANE_INCAPABLE_CLASS, "relay_code"
+    # Any other bridge machine code names its class from ONE table
+    # (fallback_capability.BRIDGE_ERROR_CODES): a 409 tui_busy rendered
+    # "unclassified error (Anthropic 409)" (t_5d79bfea).
+    bridge_code = bridge_error_code(body)
+    if bridge_code:
+        return BRIDGE_ERROR_CODES[bridge_code].trigger_class, "relay_code"
     cls = classify_text(text, http_status=http_status, exc_name=exc_name,
                         reason=reason)
+    if (cls == "unclassified" and isinstance(floor, dict)
+            and floor.get("site") == REFUSAL_FLOOR_SITE):
+        # A billed HTTP-200 refusal (stop_reason=refusal / content_filter).
+        return "refusal", "floor"
     if (cls == "unclassified" and isinstance(floor, dict) and floor.get("site")
             and not text and http_status is None and not exc_name):
         return INVALID_RESPONSE_CLASS, "floor"
@@ -274,11 +289,15 @@ def floor_err_hash(floor: Any) -> Optional[str]:
 
 
 def pending_err_hash(pending: Any) -> Optional[str]:
-    """err_hash of a stashed failing call: the text hash, else the floor hash."""
+    """err_hash of a stashed failing call: the text hash, else the floor hash.
+    A refusal floor is evidence for the rider only: its repeat policy stays the
+    refusal cooldown, so it yields no hash here (t_5d79bfea)."""
     if not isinstance(pending, dict):
         return None
     if pending.get("text"):
         return err_hash(pending.get("text"))
+    if (pending.get("floor") or {}).get("site") == REFUSAL_FLOOR_SITE:
+        return None
     return floor_err_hash(pending.get("floor"))
 
 
@@ -775,6 +794,102 @@ def _round_s(v: Any) -> Optional[float]:
     return round(float(v), 2) if isinstance(v, (int, float)) and v >= 0 else None
 
 
+def stash_refusal(agent: Any, response: Any, *, stop_details: Any = None,
+                  finish_reason: str = "content_filter") -> None:
+    """Evidence for the failover off a billed HTTP-200 refusal (t_5d79bfea).
+
+    ``handle_content_policy_refusal`` used to fail over with an empty pending
+    slot, so the rider read ``content policy refusal (hop unknown, sub
+    unknown)`` although the relay had answered 200 and named the seat in
+    ``x-pool-served-by``. The floor (site ``content_filter``) carries that seat,
+    the route id, ``stop_reason``, Anthropic's ``stop_details`` category and
+    explanation, and the billed output tokens. Never raises."""
+    try:
+        ph = _lower_headers(getattr(response, "pool_headers", None))
+        usage = getattr(response, "usage", None)
+        out = None
+        if usage is not None:
+            out = getattr(usage, "output_tokens", None)
+            if not isinstance(out, int):
+                out = getattr(usage, "completion_tokens", None)
+        sd = stop_details if isinstance(stop_details, dict) else {}
+        expl = str(sd.get("explanation") or "").strip()
+        if expl:
+            expl = " ".join(_scrub_dead_letter(expl).split())
+            if len(expl) > REFUSAL_EXPLANATION_MAX:
+                expl = expl[:REFUSAL_EXPLANATION_MAX - 1].rstrip() + "…"
+        floor = {
+            "site": REFUSAL_FLOOR_SITE,
+            "stop_reason": (getattr(response, "stop_reason", None) or finish_reason)
+            if response is not None else finish_reason,
+            "category": str(sd["category"]).strip() or None if sd.get("category") else None,
+            "explanation": expl or None,
+            "output_tokens": out if isinstance(out, int) else None,
+            "route_id": ph.get("x-pool-route-id"),
+            "served_by": served_by_seat(ph),
+            "http_status": 200,
+        }
+        agent._pending_fallback_error = {
+            "at": time.monotonic(),
+            "status": None,
+            "text": None,
+            "headers": {},
+            "body": None,
+            "exc": None,
+            "endpoint": None,
+            "elapsed_s": None,
+            "floor": {k: v for k, v in floor.items() if v is not None},
+            "dl_headers": {},
+            "dl_body": None,
+        }
+    except Exception:  # noqa: BLE001
+        logger.debug("fallback ledger: refusal stash failed", exc_info=True)
+
+
+def record_refusal(agent: Any, floor: Any, *, path: Any = None) -> bool:
+    """One ``refusal`` line per HTTP-200 refusal in
+    ``$HERMES_HOME/state/model-route-changes.log`` (t_5d79bfea), same
+    ``key=value`` shape as :func:`record_invalid_response`::
+
+        2026-10-07T21:52:26 refusal class=refusal provider=claude-alr
+            model=claude-opus-5-5 served_by=sub-vps-11 route_id=1ed4...
+            category=cyber stop_reason=refusal output_tokens=0 session=...
+
+    Never raises; True when a line was written."""
+    try:
+        import os
+
+        fl = floor if isinstance(floor, dict) else {}
+        fields = [
+            ("class", "refusal"),
+            ("provider", getattr(agent, "provider", None)),
+            ("model", getattr(agent, "model", None)),
+            ("served_by", fl.get("served_by")),
+            ("route_id", fl.get("route_id")),
+            ("category", fl.get("category")),
+            ("stop_reason", fl.get("stop_reason")),
+            ("output_tokens", fl.get("output_tokens")),
+            ("session", getattr(agent, "session_id", None)),
+        ]
+
+        def _tok(v: Any) -> str:
+            return re.sub(r"\s+", "_", str(v)) if v not in (None, "") else "-"
+
+        line = (time.strftime("%Y-%m-%dT%H:%M:%S") + " refusal "
+                + " ".join(f"{k}={_tok(v)}" for k, v in fields))
+        if path is None:
+            from hermes_constants import get_hermes_home
+
+            path = os.path.join(str(get_hermes_home()), "state", "model-route-changes.log")
+        os.makedirs(os.path.dirname(str(path)), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("refusal count row failed", exc_info=True)
+        return False
+
+
 def dead_letter_cause(rec: Dict[str, Any]) -> str:
     """The NAME a dead-letter row files under: the socket cause, else the
     floor site, else the relay-stated / text class, else ``http_<status>``,
@@ -1177,17 +1292,26 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
             r_seat = served_by_seat(headers)
         if r_seat and (not row.get("seat") or row.get("seat") == "unknown"):
             row["seat"] = r_seat
-        if trigger_class == LANE_INCAPABLE_CLASS:
+        from agent.fallback_capability import (bridge_code_hop, bridge_error_code,
+                                               body_lane_incapable_code)
+
+        code = (body_lane_incapable_code(body, text)
+                if trigger_class == LANE_INCAPABLE_CLASS else None)
+        if code:
             # The body's machine code is the evidence the banner renders from, and
             # the hop is OURS: the relay stamps bridge->upstream on a bridge 400 it
             # passed through, but the bridge (tui_*) or the relay (mode_not_allowed)
             # refused the shape itself (t_1ed37625).
-            from agent.fallback_capability import body_lane_incapable_code
-
-            code = body_lane_incapable_code(body, text)
-            if code:
-                row["lane_code"] = code
-                row["hop"] = "relay" if code == "mode_not_allowed" else "relay→bridge"
+            row["lane_code"] = code
+            row["hop"] = "relay" if code == "mode_not_allowed" else "relay→bridge"
+        else:
+            # Every other bridge machine code (fallback_capability.BRIDGE_ERROR_CODES):
+            # the bridge wrote the body, so the relay's bridge->upstream hop is wrong
+            # (t_5d79bfea: a 409 tui_busy rendered "(Anthropic 409)").
+            bcode = bridge_error_code(body)
+            if bcode:
+                row["bridge_code"] = bcode
+                row["hop"] = bridge_code_hop(bcode)
         # §4.8: a direct pin's seat and hop are knowable locally (no relay
         # headers by design, #1260). Pooled rows are left as they are.
         try:
@@ -1211,6 +1335,18 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
                 row["request_ids"] = ",".join(fl["relay_request_ids"])
             if isinstance(fl.get("prompt_tokens"), int):
                 row.setdefault("prompt_tokens", fl["prompt_tokens"])
+        # t_5d79bfea: an HTTP-200 refusal names its seat, route and hop from the
+        # floor stash_refusal left (x-pool-served-by / x-pool-route-id on the 200).
+        _fl = (pending or {}).get("floor") or {}
+        if trigger_class == "refusal" and _fl.get("site") == REFUSAL_FLOOR_SITE:
+            fl = dict(_fl)
+            row["floor"] = fl
+            if fl.get("served_by") and (not row.get("seat") or row.get("seat") == "unknown"):
+                row["seat"] = fl["served_by"]
+            if fl.get("route_id") and not row.get("route_id"):
+                row["route_id"] = fl["route_id"]
+            if row.get("http_status") is None:
+                row["http_status"] = 200
         # t_b2e9ef12: name what a no-status / rejected-response call died of.
         if pending:
             row.setdefault("exc_name", pending.get("exc"))

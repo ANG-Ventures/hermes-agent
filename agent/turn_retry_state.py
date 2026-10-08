@@ -70,6 +70,11 @@ class TurnRetryState:
     # bounded by ``fallback.relay_drain_wait_s``.
     relay_drain_started_at: float | None = None
 
+    # ── Bridge 409 tui_busy wait (``FailoverReason.session_busy``) ───────
+    # True once this attempt block spent its one same-route wait; a second
+    # busy fails over (t_5d79bfea).
+    session_busy_waited: bool = False
+
     # ── Same-route retry of an empty tool_use 200 (t_d35beb85) ───────────
     # The floor evidence of the rejected response while its one same-route
     # retry is in flight; None otherwise. ``..._done`` caps it at one retry.

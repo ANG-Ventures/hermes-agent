@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, FrozenSet, Iterable, Mapping, Optional
+from typing import Any, FrozenSet, Iterable, Mapping, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,102 @@ LANE_INCAPABLE_CODES: Mapping[str, Optional[str]] = {
 # The aliaser's error family in message text (``contentalias:<reason>``); only
 # history_tool is a lane-shape refusal, the rest stay with their status class.
 _CONTENTALIAS_RE = re.compile(r"contentalias:([a-z_]+)")
+
+
+class BridgeCode(NamedTuple):
+    """How a fallback row names one claude-bpx bridge machine code (t_5d79bfea).
+
+    ``trigger_class``: the fallback_events §4.1 class. ``head``: the announce
+    head label, replacing the status-derived one (a 409 ``tui_busy`` read
+    ``(bad request)``); None keeps the reason label. ``cause``: the rider cause;
+    None derives it from the error text (``fallback_policy._cause_phrase``).
+    ``detail``: a clause after the seat. ``ours``: False when the bridge only
+    REPORTS an upstream answer (a usage cap, a safeguard flag, an upstream error
+    row); the rider then says ``(reported by the bridge)`` instead of ``(ours,
+    not Anthropic)``."""
+
+    trigger_class: str
+    head: Optional[str]
+    cause: Optional[str]
+    detail: Optional[str] = None
+    ours: bool = True
+
+
+# Every machine code the bridge answers with (claude-bpx bridge/src/tuiRunner.js
+# ``TUI_ERRORS``, 3b7ab72). The relay passes a bridge body through with
+# ``x-relay-error-hop: bridge->upstream``, which is wrong for these: the bridge
+# (or, for ``mode_not_allowed``, the relay) wrote the body, never Anthropic.
+# ONE table: the class, head label, rider cause and hop of a bridge-coded
+# failover all come from here (tests/agent/test_fallback_bridge_codes.py pins it
+# against the bridge's list).
+_LANE = "lane_incapable"
+_POOL = "pool_pressure"
+BRIDGE_ERROR_CODES: Mapping[str, BridgeCode] = {
+    # The lane refuses this request shape (deterministic for the lane).
+    "mode_not_allowed": BridgeCode(_LANE, "lane cannot serve this request", None),
+    "tui_tools_unsupported": BridgeCode(_LANE, "lane cannot serve this request", None),
+    "tui_images_unsupported": BridgeCode(_LANE, "lane cannot serve this request", None),
+    "tui_no_session_key": BridgeCode(_LANE, "lane cannot serve this request",
+                                     "interactive session needs a session key"),
+    "tui_last_not_user": BridgeCode(_LANE, "lane cannot serve this request",
+                                    "interactive session needs a user turn last"),
+    "tui_turn_too_large": BridgeCode(_LANE, "lane cannot serve this request",
+                                     "turn too large for the interactive input"),
+    "tui_tools_invalid": BridgeCode(_LANE, "lane cannot serve this request",
+                                    "tools the interactive session cannot offer"),
+    "tui_tool_result_too_large": BridgeCode(_LANE, "lane cannot serve this request",
+                                            "tool result too large for the interactive session"),
+    "context_length_exceeded": BridgeCode(_LANE, "lane cannot serve this request",
+                                          "interactive session hit the context limit"),
+    "tui_config": BridgeCode(_LANE, "bridge refused the turn",
+                             "interactive session config invalid on the box"),
+    # The bridge refused this turn's tool protocol / output.
+    "tui_tool_unknown": BridgeCode(_LANE, "bridge refused the turn",
+                                   "tool result names an unknown tool call"),
+    "tui_tool_duplicate": BridgeCode(_LANE, "bridge refused the turn",
+                                     "tool call answered or issued twice"),
+    "tui_ambiguous_parallel": BridgeCode(_LANE, None, "ambiguous parallel tool calls"),
+    "tui_tool_not_host": BridgeCode(_LANE, None, "tool call outside the host namespace"),
+    "tui_tool_mismatch": BridgeCode(_LANE, None, "tool call did not match its tool use"),
+    "tui_tool_uncorrelated": BridgeCode(_LANE, None, "tool call not tied to its message"),
+    "entrypoint_mismatch": BridgeCode(_LANE, None, "non-interactive entrypoint on the wire"),
+    "tui_upstream_error": BridgeCode(_LANE, None, "interactive session reported an upstream error row",
+                                     ours=False),
+    # This session / this box cannot take the turn right now.
+    "tui_busy": BridgeCode(_POOL, "session busy", "interactive session busy",
+                           "this session's previous turn is still running"),
+    "tui_history_diverged": BridgeCode(_POOL, "session demoted", None),
+    "tui_cancelled": BridgeCode(_POOL, "session demoted",
+                                "interactive session demoted (turn cancelled after the client left)"),
+    "tui_capacity": BridgeCode(_POOL, None, "relay box at session capacity"),
+    "seat_capacity": BridgeCode(_POOL, None, "no account seat for a new interactive session"),
+    "tui_state_unwritable": BridgeCode(_POOL, None, "interactive session state unwritable on the box"),
+    "tui_startup": BridgeCode(_POOL, None, "relay session startup timed out"),
+    "tui_mcp_not_ready": BridgeCode(_POOL, None, "host tool server not ready"),
+    "tui_turn_timeout": BridgeCode("conn", None, "interactive turn timed out at the bridge"),
+    "tui_rate_limited": BridgeCode("quota_seat", None, None, ours=False),
+    "safeguard_refusal": BridgeCode("refusal", None, None, ours=False),
+}
+
+
+def bridge_error_code(body: Any) -> Optional[str]:
+    """The bridge machine code of an error body (one of :data:`BRIDGE_ERROR_CODES`),
+    else None. Same body shapes as :func:`body_lane_incapable_code`."""
+    if not isinstance(body, dict):
+        return None
+    for obj in (body, body.get("error")):
+        if isinstance(obj, dict):
+            for key in ("code", "error_code"):
+                c = str(obj.get(key) or "").strip().lower()
+                if c in BRIDGE_ERROR_CODES:
+                    return c
+    return None
+
+
+def bridge_code_hop(code: str) -> str:
+    """The hop that wrote a bridge-coded body: the relay for ``mode_not_allowed``,
+    else the bridge (``relay→bridge``)."""
+    return "relay" if code == "mode_not_allowed" else "relay→bridge"
 
 _IMAGE_PART_TYPES = frozenset(("image_url", "input_image", "image"))
 

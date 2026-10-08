@@ -76,6 +76,8 @@ _THREAD_ANCHORS = {
     "client_error_should_fallback": "Non-retryable error (HTTP",
     "retry_exhaustion_floor": "Max retries ({max_retries}) exhausted",
     "safety_refusal": "(safety refusal) — trying fallback",
+    # t_5d79bfea: a bridge 409 tui_busy that outlived its one same-route wait.
+    "session_busy": "Bridge session still busy — switching to fallback",
 }
 
 
@@ -139,11 +141,12 @@ class TestFloorSitesStayReasonless:
 
 
 class TestSiteCountReconciles:
-    """There are exactly 12 fallback call sites across the extracted loop family (RC3
+    """There are exactly 13 fallback call sites across the extracted loop family (RC3
     reconciliation; re-reconciled 2026-10-01: the fork's 10 + upstream's incomplete_response
-    continuation site and the refusal site that the extraction split out of the shared branch)."""
+    continuation site and the refusal site that the extraction split out of the shared branch;
+    2026-10-07 t_5d79bfea: + the session_busy site, which threads its reason)."""
 
-    _EXPECTED = 12
+    _EXPECTED = 13
 
     def test_ten_sites(self):
         found = sorted(f"{p.name}:{ln}" for (p, ln) in _fallback_calls())
