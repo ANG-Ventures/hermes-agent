@@ -1116,6 +1116,26 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
         pricing_version="anthropic-pricing-2026-05",
     ),
+    # Claude Haiku 5.5: prompt-size tiered. <=100K prompt tokens: $0.10/$0.50 in/out, cache read
+    # $0.01, 5m cache write $0.125; >100K: $0.50/$2.50/$0.05/$0.625 for the whole request.
+    # Source: https://docs.claude.com/en/docs/models/haiku-5-5/overview
+    (
+        "anthropic",
+        "claude-haiku-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.10"),
+        output_cost_per_million=Decimal("0.50"),
+        cache_read_cost_per_million=Decimal("0.01"),
+        cache_write_cost_per_million=Decimal("0.125"),
+        source="official_docs_snapshot",
+        source_url="https://docs.claude.com/en/docs/models/haiku-5-5/overview",
+        pricing_version="anthropic-pricing-2026-10",
+        tier_threshold_tokens=100_000,
+        input_cost_per_million_above=Decimal("0.50"),
+        output_cost_per_million_above=Decimal("2.50"),
+        cache_read_cost_per_million_above=Decimal("0.05"),
+        cache_write_cost_per_million_above=Decimal("0.625"),
+    ),
     (
         "anthropic",
         "claude-haiku-4-5",
@@ -1618,6 +1638,23 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://aws.amazon.com/bedrock/pricing/",
         pricing_version="bedrock-pricing-2026-04",
+    ),
+    (
+        "bedrock",
+        "anthropic.claude-haiku-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.10"),
+        output_cost_per_million=Decimal("0.50"),
+        cache_read_cost_per_million=Decimal("0.01"),
+        cache_write_cost_per_million=Decimal("0.125"),
+        source="official_docs_snapshot",
+        source_url="https://docs.claude.com/en/docs/models/haiku-5-5/overview",
+        pricing_version="anthropic-pricing-2026-10",
+        tier_threshold_tokens=100_000,
+        input_cost_per_million_above=Decimal("0.50"),
+        output_cost_per_million_above=Decimal("2.50"),
+        cache_read_cost_per_million_above=Decimal("0.05"),
+        cache_write_cost_per_million_above=Decimal("0.625"),
     ),
     (
         "bedrock",

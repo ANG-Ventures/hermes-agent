@@ -2079,3 +2079,43 @@ def test_anthropic_fast_response_without_a_fast_rate_is_unknown():
     result = estimate_usage_cost("claude-sonnet-4-6", _anthropic_usage("fast"), provider="anthropic")
     assert result.amount_usd is None
     assert result.status == "unknown"
+
+
+# ── Anthropic Claude Haiku 5.5 ───────────────────────────────────────────────
+# Behaviour contracts from docs.claude.com/en/docs/models/haiku-5-5/overview: 1M
+# context, prompt-size tiered pricing (whole request re-priced above 100K prompt
+# tokens). claude-haiku-4-5 keeps its 200K window and its price (ADD-KEEP).
+
+def test_haiku_5_5_has_1m_context_and_haiku_4_5_keeps_200k():
+    from agent.model_metadata import get_model_context_length
+
+    assert get_model_context_length("claude-haiku-5-5") == 1_000_000
+    assert get_model_context_length("claude-haiku-4-5") == 200_000
+
+
+def test_haiku_5_5_whole_request_tier_above_100k_prompt_tokens():
+    entry = _OFFICIAL_DOCS_PRICING[("anthropic", "claude-haiku-5-5")]
+    below_usage = CanonicalUsage(
+        input_tokens=50_000, output_tokens=10_000, cache_read_tokens=40_000, cache_write_tokens=10_000
+    )  # prompt = 100_000, not above the threshold
+    above_usage = CanonicalUsage(
+        input_tokens=50_000, output_tokens=10_000, cache_read_tokens=40_000, cache_write_tokens=10_001
+    )
+    below = estimate_usage_cost("claude-haiku-5-5", below_usage, provider="anthropic")
+    above = estimate_usage_cost("claude-haiku-5-5", above_usage, provider="anthropic")
+
+    assert below.amount_usd == (
+        Decimal(50_000) * entry.input_cost_per_million
+        + Decimal(10_000) * entry.output_cost_per_million
+        + Decimal(40_000) * entry.cache_read_cost_per_million
+        + Decimal(10_000) * entry.cache_write_cost_per_million
+    ) / Decimal(1_000_000)
+    assert above.amount_usd == (
+        Decimal(50_000) * entry.input_cost_per_million_above
+        + Decimal(10_000) * entry.output_cost_per_million_above
+        + Decimal(40_000) * entry.cache_read_cost_per_million_above
+        + Decimal(10_001) * entry.cache_write_cost_per_million_above
+    ) / Decimal(1_000_000)
+    assert below.amount_usd < above.amount_usd
+    old = estimate_usage_cost("claude-haiku-4-5", below_usage, provider="anthropic")
+    assert old.amount_usd is not None and old.amount_usd > 0
