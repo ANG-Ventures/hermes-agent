@@ -2169,7 +2169,7 @@ DEFAULT_CONFIG = {
         # Deliver target (deliver grammar, e.g. "discord:<logs channel id>") for the "run was cut
         # short by a gateway restart" notice of a RECURRING job, which simply re-runs on schedule.
         # "" = the job's failure lane (failure_deliver, else deliver). Real failures are never
-        # rerouted; one-shots and deliver/failure_deliver=local jobs keep their own lane.
+        # rerouted; one-shots, finite repeat.times jobs and failure-lane=local jobs keep their own lane.
         "interrupt_deliver": "",
         "media_send_timeout_seconds": 300,
         # Managed systemd gateway with no user session (containers, no linger): false runs

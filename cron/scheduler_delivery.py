@@ -1082,9 +1082,10 @@ def _interrupt_deliver_lane(job: dict, cfg: Optional[dict] = None) -> Optional[s
 
     ``cron.interrupt_deliver`` reroutes the notice for a RECURRING job only: it re-runs on its
     own schedule, so the interruption is status, not a failure page (a one-shot's only run died,
-    so it keeps the failure lane). Real failures never read this knob; they stay on
-    ``deliver``/``failure_deliver``. Unset (default) = byte-identical to the failure lane."""
-    if (job.get("schedule") or {}).get("kind") not in {"cron", "interval"}:
+    so it keeps the failure lane; so does a finite ``repeat.times`` job, whose interrupted run may be
+    its last). Real failures never read this knob; they stay on ``deliver``/``failure_deliver``.
+    Unset (default) = byte-identical to the failure lane."""
+    if not _sched._job_is_recurring(job):
         return None
     # deliver=local / failure_deliver=local is an opt-out of failure-category pings; keep it.
     if _normalize_deliver_value(_delivery_lane_value(job, for_failure=True)) == "local":

@@ -249,6 +249,15 @@ class TestInterruptDeliverKnob:
         assert chats == [self.ALERTS]
 
     @pytest.mark.asyncio
+    async def test_finite_repeat_job_keeps_failure_lane(self, monkeypatch):
+        """An interval job on its last bounded run is retired by the interrupt: no re-run comes."""
+        self._cfg(monkeypatch, f"telegram:{self.LOGS}")
+        job = self._recurring_job(repeat={"times": 1, "completed": 0})
+        sent, chats = await self._notify(job)
+        assert sent == 1
+        assert chats == [self.ALERTS]
+
+    @pytest.mark.asyncio
     async def test_failure_deliver_local_opt_out_survives_knob(self, monkeypatch):
         self._cfg(monkeypatch, f"telegram:{self.LOGS}")
         sent, chats = await self._notify(self._recurring_job(failure_deliver="local"))

@@ -447,7 +447,7 @@ cron:
   interrupt_deliver: "discord:<logs channel id>"  # default: "" (failure lane)
 ```
 
-One-shot jobs, and jobs whose failure lane is `local`, are not rerouted.
+One-shot jobs, jobs with a finite `repeat` count (the interrupted run may be their last), and jobs whose failure lane is `local` are not rerouted.
 
 ### Automatic re-runs when the model was unreachable
 
