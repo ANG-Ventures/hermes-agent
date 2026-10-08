@@ -643,12 +643,15 @@ def _attempt_seats(raw: Any) -> Optional[list]:
 
 def _perturbations(raw: Any) -> Optional[list]:
     """``x-pool-empty-content-perturbations: none,drop_fgts,drop_fgts+rotate``
-    -> the ladder rung of each attempt (at most 8 short tokens), else None."""
+    -> the ladder rung of each attempt (at most 8 short tokens), else None.
+    Positional with the attempts header, so one malformed token rejects the
+    whole list: dropping it would pin later rungs on the wrong attempt."""
     if not isinstance(raw, str) or not raw.strip():
         return None
-    rungs = [t.strip() for t in raw.split(",") if t.strip()]
-    rungs = [t for t in rungs if re.fullmatch(r"[A-Za-z0-9_+.-]{1,32}", t)][:8]
-    return rungs or None
+    rungs = [t.strip() for t in raw.split(",")]
+    if not all(re.fullmatch(r"[A-Za-z0-9_+.-]{1,32}", t) for t in rungs):
+        return None
+    return rungs[:8]
 
 
 def _request_ids(raw: Any) -> Optional[list]:

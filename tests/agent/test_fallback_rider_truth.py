@@ -389,7 +389,7 @@ def test_perturbation_header_is_captured_and_rendered(_home, monkeypatch):
     wire = {"x-pool-served-by": "sub-vps-9",
             "x-pool-empty-content-retried": "gave_up",
             "x-pool-empty-content-attempts": "sub-vps-22,sub-vps-22,sub-vps-9",
-            "x-pool-empty-content-perturbations": "none,drop_fgts,drop_fgts+rotate,bad token!"}
+            "x-pool-empty-content-perturbations": "none,drop_fgts,drop_fgts+rotate"}
     http = type("H", (), {"headers": wire})()
     pool_headers = _snapshot_pool_headers(http)
     assert pool_headers["x-pool-empty-content-perturbations"] == wire[
@@ -416,7 +416,11 @@ def test_perturbation_parse_bounds():
     assert fbe._perturbations("  ") is None
     assert fbe._perturbations(" none , drop_fgts ") == ["none", "drop_fgts"]
     assert fbe._perturbations(",".join(["none"] * 12)) == ["none"] * 8
-    assert fbe._perturbations("x" * 33 + ",rotate") == ["rotate"]
+    # One bad token rejects the whole list: dropping it would shift every later
+    # rung onto the wrong attempt (Prism P1, PR #1821).
+    assert fbe._perturbations("x" * 33 + ",rotate") is None
+    assert fbe._perturbations("none,bad token!,drop_fgts+rotate") is None
+    assert fbe._perturbations("none,,drop_fgts") is None
 
 
 def test_live_2125_seat_timeout_line(_home, monkeypatch):
