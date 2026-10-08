@@ -1077,6 +1077,28 @@ def _delivery_lane_value(job: dict, *, for_failure: bool = False):
     return job.get("deliver", "local")
 
 
+def _interrupt_deliver_lane(job: dict, cfg: Optional[dict] = None) -> Optional[str]:
+    """Deliver lane for a gateway-restart "run was cut short" notice, or None = the failure lane.
+
+    ``cron.interrupt_deliver`` reroutes the notice for a RECURRING job only: it re-runs on its
+    own schedule, so the interruption is status, not a failure page (a one-shot's only run died,
+    so it keeps the failure lane). Real failures never read this knob; they stay on
+    ``deliver``/``failure_deliver``. Unset (default) = byte-identical to the failure lane."""
+    if (job.get("schedule") or {}).get("kind") not in {"cron", "interval"}:
+        return None
+    # deliver=local / failure_deliver=local is an opt-out of failure-category pings; keep it.
+    if _normalize_deliver_value(_delivery_lane_value(job, for_failure=True)) == "local":
+        return None
+    try:
+        if cfg is None:
+            cfg = _sched.load_config() or {}
+        lane = ((cfg.get("cron") or {}) if isinstance(cfg, dict) else {}).get("interrupt_deliver")
+    except Exception:
+        return None
+    lane = _normalize_deliver_value(lane)
+    return None if lane == "local" else lane
+
+
 def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> List[dict]:
     """Resolve auto-delivery targets from comma-separated ``deliver``; ``all`` expands to every
     platform with a home channel and combines with explicit targets. Dedup by (platform, chat_id,

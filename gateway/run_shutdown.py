@@ -977,6 +977,7 @@ class GatewayShutdownMixin:
         try:
             from cron.jobs import get_job
             from cron.scheduler import _resolve_delivery_targets
+            from cron.scheduler_delivery import _interrupt_deliver_lane
         except Exception as e:
             logger.debug("Cron interrupt notification unavailable: %s", e)
             return 0
@@ -989,8 +990,13 @@ class GatewayShutdownMixin:
                     continue
                 # deliver=local / unresolvable-origin jobs resolve to zero targets and stay silent (no home-
                 # channel fallback). Interrupted notices are failure-category status: honor failure_deliver.
-                # See #43014.
-                targets = _resolve_delivery_targets(job, for_failure=True)
+                # See #43014. A recurring job re-runs on schedule, so cron.interrupt_deliver (when set)
+                # takes the notice instead, leaving the job's real failures on deliver/failure_deliver.
+                lane = _interrupt_deliver_lane(job)
+                if lane:
+                    targets = _resolve_delivery_targets(dict(job, deliver=lane))
+                else:
+                    targets = _resolve_delivery_targets(job, for_failure=True)
             except Exception as e:
                 logger.debug("Cron interrupt targets unresolved for %s: %s", job_id, e)
                 continue

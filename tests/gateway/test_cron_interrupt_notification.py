@@ -192,6 +192,70 @@ class TestNotifyInterruptedCronJobs:
         assert sent == 1
         assert len(adapter.sent) == 1
 
+class TestInterruptDeliverKnob:
+    """``cron.interrupt_deliver`` moves the restart-interrupt notice of a RECURRING job (it re-runs
+    on schedule) to a quieter lane; the job's real failures keep deliver/failure_deliver. Real target
+    resolution, config patched at the scheduler's ``load_config`` seam."""
+
+    ALERTS, LOGS = "111", "999"
+
+    def _recurring_job(self, **extra):
+        job = dict(_telegram_job(chat_id=self.ALERTS), no_agent=True,
+                   schedule={"kind": "interval", "minutes": 30}, **extra)
+        return job
+
+    def _cfg(self, monkeypatch, lane):
+        import cron.scheduler as sched
+        cron_cfg = {} if lane is None else {"interrupt_deliver": lane}
+        monkeypatch.setattr(sched, "load_config", lambda: {"cron": cron_cfg})
+
+    async def _notify(self, job):
+        runner, adapter = make_restart_runner()
+        _bind_notifier(runner)
+        with patch("cron.jobs.get_job", return_value=job):
+            sent = await runner._notify_interrupted_cron_jobs([job["id"]])
+        return sent, [c[0] for c in adapter.sent_calls]
+
+    @pytest.mark.asyncio
+    async def test_recurring_job_interrupt_notice_goes_to_interrupt_lane(self, monkeypatch):
+        self._cfg(monkeypatch, f"telegram:{self.LOGS}")
+        sent, chats = await self._notify(self._recurring_job())
+        assert sent == 1
+        assert chats == [self.LOGS]
+
+    def test_real_failures_stay_on_deliver_with_knob_set(self, monkeypatch):
+        """The other direction: the knob never touches the failure lane itself."""
+        from cron.scheduler import _resolve_delivery_targets
+        self._cfg(monkeypatch, f"telegram:{self.LOGS}")
+        job = self._recurring_job()
+        assert [t["chat_id"] for t in _resolve_delivery_targets(job, for_failure=True)] == [self.ALERTS]
+        job = self._recurring_job(failure_deliver="telegram:555")
+        assert [t["chat_id"] for t in _resolve_delivery_targets(job, for_failure=True)] == ["555"]
+
+    @pytest.mark.asyncio
+    async def test_knob_unset_keeps_failure_lane(self, monkeypatch):
+        self._cfg(monkeypatch, None)
+        sent, chats = await self._notify(self._recurring_job())
+        assert sent == 1
+        assert chats == [self.ALERTS]
+
+    @pytest.mark.asyncio
+    async def test_one_shot_keeps_failure_lane(self, monkeypatch):
+        """A one-shot's only run died: that is a failure, not schedule noise."""
+        self._cfg(monkeypatch, f"telegram:{self.LOGS}")
+        job = dict(self._recurring_job(), schedule={"kind": "once", "run_at": "2026-10-08T07:00:00+00:00"})
+        sent, chats = await self._notify(job)
+        assert sent == 1
+        assert chats == [self.ALERTS]
+
+    @pytest.mark.asyncio
+    async def test_failure_deliver_local_opt_out_survives_knob(self, monkeypatch):
+        self._cfg(monkeypatch, f"telegram:{self.LOGS}")
+        sent, chats = await self._notify(self._recurring_job(failure_deliver="local"))
+        assert sent == 0
+        assert chats == []
+
+
 class TestShutdownDeliversNoticeBeforeDisconnect:
     @pytest.mark.asyncio
     async def test_notice_is_sent_while_the_adapter_is_still_connected(self, monkeypatch):

@@ -2166,6 +2166,11 @@ DEFAULT_CONFIG = {
         # (their only signal is that one delivery). Set false to restore the old
         # page-on-every-transient-failure behavior.
         "suppress_transient_failure_page": True,
+        # Deliver target (deliver grammar, e.g. "discord:<logs channel id>") for the "run was cut
+        # short by a gateway restart" notice of a RECURRING job, which simply re-runs on schedule.
+        # "" = the job's failure lane (failure_deliver, else deliver). Real failures are never
+        # rerouted; one-shots and deliver/failure_deliver=local jobs keep their own lane.
+        "interrupt_deliver": "",
         "media_send_timeout_seconds": 300,
         # Managed systemd gateway with no user session (containers, no linger): false runs
         # cron jobs as a direct external subprocess (warns once; no cgroup isolation), true
