@@ -2135,6 +2135,13 @@ def route_classified_error(
             return _verdict("continue")
         logger.warning("bridge session still busy after %.0fs → fallback %s",
                        SESSION_BUSY_WAIT_S, agent._client_log_context())
+        if agent._fallback_index < len(agent._fallback_chain):
+            agent._buffer_diagnostic_status("⚠️ Bridge session still busy — switching to fallback...")
+            if agent._try_activate_fallback(
+                reason=classified.reason, display_reason=classified.display_reason,
+                error_context=error_context,
+            ):
+                return _fallback_break()
         retry_count = max_retries
 
     # ── Loopback relay restarting: wait, retry the SAME model (fork, 2026-09-28) ──
