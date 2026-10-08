@@ -173,6 +173,12 @@ def _patch_launchd_env(
     monkeypatch.setattr(
         gateway_cli, "launchd_gateway_labels_for_install", lambda: [LABEL]
     )
+    # The updater-inside-the-gateway early return (#100179) walks the REAL
+    # process tree: a fake pid (4242) or the host's live gateway pid that
+    # happens to be an ancestor of pytest would skip verification entirely.
+    monkeypatch.setattr(
+        gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: False
+    )
 
     calls = {"restart": 0, "verify": 0, "label": None}
 
