@@ -429,10 +429,11 @@ _BEDROCK_PROBE_FAILURE_CACHE: Dict[tuple, float] = {}
 DEFAULT_CONTEXT_LENGTHS = {
     # Anthropic — bare ids only (prefixed ids resolve via OpenRouter/models.dev
     # and would collide: "anthropic/claude-sonnet-4" ⊂ "anthropic/claude-sonnet-4.6").
-    # Generation-5 ids are listed explicitly (fable-5-1, opus-5-5, sonnet-5-5, mythos-5) so the
+    # Generation-5 ids are listed explicitly (fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5, mythos-5) so the
     # longest-key-first lookup resolves the exact id and never falls to the 200K catch-all.
     "claude-fable-5-1": 1000000, "claude-fable-5": 1000000, "claude-fable": 1000000, "claude-mythos-5": 1000000,
     "claude-opus-5-5": 1000000, "claude-opus-5": 1000000, "claude-sonnet-5-5": 1000000, "claude-sonnet-5": 1000000,
+    "claude-haiku-5-5": 1000000,  # 1M; haiku-4-5 stays on the 200K "claude" catch-all
     "claude-opus-4-8": 1000000, "claude-opus-4.8": 1000000, "claude-opus-4-7": 1000000, "claude-opus-4.7": 1000000,
     "claude-opus-4-6": 1000000, "claude-sonnet-4-6": 1000000, "claude-opus-4.6": 1000000, "claude-sonnet-4.6": 1000000,
     "claude": 200000,  # catch-all for older Claude models

@@ -195,7 +195,7 @@ def _model_matches(model: str, substrings) -> bool:
 # ``claude-fable`` = Mythos-class named models (1M context); ``minimax`` is a third-party
 # Anthropic-compatible endpoint; DashScope enforces ``qwen3`` max_tokens in [1, 65536].
 _ANTHROPIC_OUTPUT_LIMITS = {
-    "claude-fable": 128_000, "claude-sonnet-5": 128_000, "claude-opus-4-8": 128_000,
+    "claude-fable": 128_000, "claude-sonnet-5": 128_000, "claude-haiku-5-5": 128_000, "claude-opus-4-8": 128_000,
     "claude-opus-4-7": 128_000, "claude-opus-4-6": 128_000, "claude-sonnet-4-6": 64_000,
     "claude-opus-4-5": 64_000, "claude-sonnet-4-5": 64_000, "claude-haiku-4-5": 64_000,
     "claude-opus-4": 32_000, "claude-sonnet-4": 64_000, "claude-3-7-sonnet": 128_000,
