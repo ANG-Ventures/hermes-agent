@@ -9996,6 +9996,9 @@ def complete_task(
             )
         elif survivor['kind'] == 'none':
             survivor_note = f"survivor=none follow-up={survivor['follow_up_card']}"
+        elif survivor['kind'] == 'artifact':
+            survivor_note = "survivor=artifact " + " ".join(
+                f"{a['path']} {a['sha256']}" for a in survivor["artifacts"])
         else:
             survivor_note = "survivor=ref " + " ".join(
                 f"{ref.get('repository_path') or ref['remote']}/{ref['branch']}@{ref['sha']}"

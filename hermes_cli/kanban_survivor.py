@@ -2698,6 +2698,38 @@ def _record(conn, task_id, survivor, previous):
     return survivor
 
 
+_NO_PR_RE = re.compile(r"\bno[- ]pr\b", re.IGNORECASE)
+
+
+def _artifact_survivor(conn, task, metadata, workspace, bases, previous):
+    """A no-PR dir/scratch card's attached artifact is its survivor (t_c061a2a7).
+
+    A/B matrix cells are no-PR by design and forbid git; their result is an
+    attachment. Only when the card declares no-PR (body or ``metadata.no_pr``),
+    the workspace holds no repository and none was recorded at dispatch, and a
+    worker-uploaded attachment exists. A repo workspace keeps the git refusal.
+    """
+    if task.workspace_kind not in ("dir", "scratch") or bases:
+        return None
+    if not ((metadata or {}).get("no_pr") or _NO_PR_RE.search(task.body or "")):
+        return None
+    if previous and previous.get("kind") not in (None, "artifact"):
+        return None
+    if _repos(workspace):
+        return None
+    artifacts = []
+    for att in kb.list_attachments(conn, task.id):
+        if att.uploaded_by == "harness":
+            continue
+        path = Path(att.stored_path)
+        if not path.is_file():
+            continue
+        artifacts.append({"path": str(path), "filename": att.filename,
+                          "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                          "bytes": path.stat().st_size})
+    return {"kind": "artifact", "artifacts": artifacts} if artifacts else None
+
+
 def _hold(conn, task_id, reason):
     with kb.write_txn(conn):
         conn.execute(
@@ -2798,6 +2830,10 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 f"its dispatch commit and ignores files no survivor captures ({detail}); "
                 "commit them to the replacement or remove them, then complete again"
             )
+        artifact = None if cleanup or explicit else _artifact_survivor(
+            conn, task, metadata, workspace, bases, previous)
+        if artifact:
+            return _record(conn, task_id, artifact, previous)
         landed = (metadata or {}).get("landed")
         if cleanup and not landed and previous and previous.get("kind") == "landed":
             # Revalidate the recorded live commits before removing the workspace.
