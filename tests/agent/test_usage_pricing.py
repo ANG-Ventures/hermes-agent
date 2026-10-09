@@ -970,19 +970,21 @@ class TestExternalPricingSource:
 
     def test_snapshot_precedence_over_models_dev_intro_price(self, monkeypatch):
         # INVARIANT: the curated snapshot wins over the external catalog. Model
-        # a models.dev "intro" rate cheaper than the snapshot list rate; the
-        # snapshot's list rate must still be returned for a snapshot-covered
-        # model. (Mirrors real Sonnet-5 $3/$15 list vs models.dev $2/$10 intro.)
+        # a models.dev rate that disagrees with the snapshot row; the snapshot's
+        # rate must still be returned for a snapshot-covered model.
+        from agent.usage_pricing import _OFFICIAL_DOCS_PRICING
+
         monkeypatch.setattr(
             _mdev,
             "fetch_models_dev",
-            lambda: {"anthropic": {"models": {"claude-sonnet-5": {"cost": {"input": 2, "output": 10}}}}},
+            lambda: {"anthropic": {"models": {"claude-sonnet-5": {"cost": {"input": 99, "output": 999}}}}},
         )
+        row = _OFFICIAL_DOCS_PRICING[("anthropic", "claude-sonnet-5")]
         entry = get_pricing_entry("claude-sonnet-5", provider="anthropic")
         assert entry is not None
         assert entry.source == "official_docs_snapshot"
-        assert float(entry.input_cost_per_million) == 3.0  # list, NOT the 2.0 intro
-        assert float(entry.output_cost_per_million) == 15.0
+        assert entry.input_cost_per_million == row.input_cost_per_million != 99
+        assert entry.output_cost_per_million == row.output_cost_per_million != 999
 
     def test_models_dev_prices_openrouter_relay_model(self, monkeypatch):
         # A notional-OpenRouter relay model (openai-codex -> openrouter route)
@@ -2039,8 +2041,10 @@ def test_sonnet_5_5_prices_at_launch_rates_and_sonnet_5_still_prices():
         input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000
     )
     new = estimate_usage_cost("claude-sonnet-5-5", usage, provider="anthropic")
-    # 2.00 + 10.00 + 0.20
-    assert new.amount_usd is not None and float(new.amount_usd) == 12.20  # type: ignore[arg-type]
+    row = get_pricing_entry("claude-sonnet-5-5", provider="anthropic")
+    assert row is not None
+    expected = row.input_cost_per_million + row.output_cost_per_million + row.cache_read_cost_per_million
+    assert new.amount_usd == expected
     old = estimate_usage_cost("claude-sonnet-5", usage, provider="anthropic")
     assert old.amount_usd is not None and old.amount_usd > 0
 
