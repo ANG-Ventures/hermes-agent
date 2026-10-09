@@ -16,7 +16,7 @@ def board(tmp_path, monkeypatch):
         yield conn
 
 
-def _card(board, tmp_path, body, attach=True):
+def _card(board, tmp_path, body, attach=True, by="worker"):
     ws = tmp_path / "ws"
     ws.mkdir()
     tid = kb.create_task(board, title="ab cell", body=body, workspace_kind="dir",
@@ -27,7 +27,7 @@ def _card(board, tmp_path, body, attach=True):
         art.write_text('{"ok": 1}')
         kb.add_attachment(board, tid, filename="result.json", stored_path=str(art),
                           content_type="application/json", size=art.stat().st_size,
-                          uploaded_by="worker")
+                          uploaded_by=by)
     return tid, ws
 
 
@@ -60,3 +60,15 @@ def test_repo_workspace_no_pr_never_records_artifact(board, tmp_path):
     except survivor.SurvivorUnavailable:
         return
     assert kb.latest_run(board, tid).metadata["survivor"]["kind"] != "artifact"
+
+
+@pytest.mark.parametrize("by", ["dashboard", "harness", "kanban_complete", None])
+def test_non_worker_input_attachment_is_not_a_survivor(board, tmp_path, by):
+    tid, _ = _card(board, tmp_path, "No-PR by design.", by=by)
+    with pytest.raises(survivor.SurvivorUnavailable):
+        kb.complete_task(board, tid, metadata={"changed_files": ["result.json"]})
+
+
+def test_agent_tagged_upload_is_a_survivor(board, tmp_path):
+    tid, _ = _card(board, tmp_path, "No-PR by design.", by="agent")
+    assert kb.complete_task(board, tid, metadata={"changed_files": ["result.json"]})
