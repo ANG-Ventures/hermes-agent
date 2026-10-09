@@ -2123,3 +2123,32 @@ def test_haiku_5_5_whole_request_tier_above_100k_prompt_tokens():
     assert below.amount_usd < above.amount_usd
     old = estimate_usage_cost("claude-haiku-4-5", below_usage, provider="anthropic")
     assert old.amount_usd is not None and old.amount_usd > 0
+
+
+# t_22b11caa: models.dev-repriced rows. 1k in / 1k out / 10k cache_read turn, exact Decimal.
+_REPRICED_TURN = CanonicalUsage(input_tokens=1_000, output_tokens=1_000, cache_read_tokens=10_000)
+
+
+@pytest.mark.parametrize(("provider", "model", "expected"), [
+    ("anthropic", "claude-sonnet-5", Decimal("0.014")),
+    ("anthropic", "claude-sonnet-5-5", Decimal("0.013")),
+    ("google", "gemini-2.5-flash", Decimal("0.0031")),
+    ("google", "gemini-3.6-flash", Decimal("0.00525")),
+    ("openai", "gpt-5.6-luna", Decimal("0.0016")),
+    ("openai", "gpt-5.6-sol", Decimal("0.028")),
+    ("openai", "gpt-5.6-terra", Decimal("0.016")),
+    ("openai", "o3", Decimal("0.015")),
+])
+def test_repriced_rows_price_turn_at_models_dev_rates(provider, model, expected):
+    assert estimate_usage_cost(model, _REPRICED_TURN, provider=provider).amount_usd == expected
+
+
+def test_gpt_5_6_sol_272k_tier_crossing():
+    below = estimate_usage_cost(
+        "gpt-5.6-sol", CanonicalUsage(input_tokens=100_000, output_tokens=1_000), provider="openai"
+    )
+    above = estimate_usage_cost(
+        "gpt-5.6-sol", CanonicalUsage(input_tokens=300_000, output_tokens=1_000), provider="openai"
+    )
+    assert below.amount_usd == Decimal("0.42")  # 100k*$4 + 1k*$20 per M
+    assert above.amount_usd == Decimal("2.43")  # 300k*$8 + 1k*$30 per M (whole-request tier)
