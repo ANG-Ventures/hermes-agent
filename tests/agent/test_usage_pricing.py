@@ -2079,3 +2079,14 @@ def test_anthropic_fast_response_without_a_fast_rate_is_unknown():
     result = estimate_usage_cost("claude-sonnet-4-6", _anthropic_usage("fast"), provider="anthropic")
     assert result.amount_usd is None
     assert result.status == "unknown"
+
+
+def test_haiku_5_5_prices_and_tiers_whole_request_above_100k():
+    big = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
+    r = estimate_usage_cost("claude-haiku-5-5", big, provider="anthropic")
+    assert r.status == "estimated"
+    # prompt > 100k -> whole-request above rates: 0.50 + 2.50 + 0.05
+    assert float(r.amount_usd) == pytest.approx(3.05)
+    small = CanonicalUsage(input_tokens=10_000, output_tokens=1_000)
+    s = estimate_usage_cost("claude-haiku-5-5", small, provider="anthropic")
+    assert float(s.amount_usd) == pytest.approx(0.0010 + 0.0005)

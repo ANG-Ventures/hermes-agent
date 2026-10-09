@@ -1037,6 +1037,26 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # as Sonnet 5's announced rate: $2/$10 per MTok in/out, cache read $0.20; cache
     # write $2.50 (1.25x input, 5-minute TTL).
     # Source: https://www.anthropic.com/claude-sonnet-5-5
+    # Claude Haiku 5.5 (released 2026-10-07): $0.10/$0.50 in/out, cache read $0.01,
+    # 5m cache write $0.125 for prompts <=100k; whole-request $0.50/$2.50/$0.05/$0.625
+    # above 100k. Source: https://platform.claude.com/docs/en/models/haiku-5-5/overview
+    (
+        "anthropic",
+        "claude-haiku-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.10"),
+        output_cost_per_million=Decimal("0.50"),
+        cache_read_cost_per_million=Decimal("0.01"),
+        cache_write_cost_per_million=Decimal("0.125"),
+        source="official_docs_snapshot",
+        source_url="https://platform.claude.com/docs/en/models/haiku-5-5/overview",
+        pricing_version="anthropic-haiku-5-5-2026-10",
+        tier_threshold_tokens=100_000,
+        input_cost_per_million_above=Decimal("0.50"),
+        output_cost_per_million_above=Decimal("2.50"),
+        cache_read_cost_per_million_above=Decimal("0.05"),
+        cache_write_cost_per_million_above=Decimal("0.625"),
+    ),
     (
         "anthropic",
         "claude-sonnet-5-5",
@@ -1570,6 +1590,23 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://aws.amazon.com/bedrock/pricing/",
         pricing_version="anthropic-list-2026-07",
+    ),
+    (
+        "bedrock",
+        "anthropic.claude-haiku-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.10"),
+        output_cost_per_million=Decimal("0.50"),
+        cache_read_cost_per_million=Decimal("0.01"),
+        cache_write_cost_per_million=Decimal("0.125"),
+        source="official_docs_snapshot",
+        source_url="https://platform.claude.com/docs/en/models/haiku-5-5/overview",
+        pricing_version="anthropic-haiku-5-5-2026-10",
+        tier_threshold_tokens=100_000,
+        input_cost_per_million_above=Decimal("0.50"),
+        output_cost_per_million_above=Decimal("2.50"),
+        cache_read_cost_per_million_above=Decimal("0.05"),
+        cache_write_cost_per_million_above=Decimal("0.625"),
     ),
     (
         "bedrock",
