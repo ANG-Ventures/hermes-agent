@@ -437,6 +437,18 @@ cron:
     "discord:<alerts channel id>": "discord:<logs channel id>"
 ```
 
+A gateway restart that cuts a run short sends a "was cut short" notice to the
+job's failure lane (`failure_deliver`, else `deliver`). A recurring job just
+runs again at its next slot, so you can send those notices somewhere quieter
+without touching where the job's real failures go:
+
+```yaml
+cron:
+  interrupt_deliver: "discord:<logs channel id>"  # default: "" (failure lane)
+```
+
+One-shot jobs, jobs with a finite `repeat` count (the interrupted run may be their last), and jobs whose failure lane is `local` are not rerouted.
+
 ### Automatic re-runs when the model was unreachable
 
 A recurring job whose run fails with a transient network or DNS error before
