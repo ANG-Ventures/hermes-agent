@@ -139,3 +139,67 @@ def test_card_never_routed_is_ungated(board, monkeypatch):
     kb.claim_task(conn, tid)
     assert kb.complete_task(conn, tid, summary="landed", survivor_pr=OTHER, survivor_unbound=True)
     assert _status(conn, tid) == "done"
+
+
+# --------------------------------------------------------------------------- Prism round 2 (t_571d174a)
+
+def test_repository_qualifier_is_not_parsed_as_a_named_pr():
+    # Prism 59942060bd14: `pull/3421=` is the qualifier `preserve` strips; only #3328 is claimed.
+    claim = f"pull/3421={OTHER}"
+    refs = op.extract_pr_refs(survivor_pr=[claim])
+    assert [(r.repo, r.number) for r in refs] == [("ANG-Ventures/home", 3328)]
+    assert op.routed_prs_still_open([ROUTED], survivor_pr=[claim],
+                                    query_fn=lambda r, n: {"state": "OPEN"}) == ([ROUTED], [])
+
+
+def test_qualified_claim_naming_another_pr_is_refused(board, monkeypatch):
+    tid = _routed_card(board, monkeypatch)
+    calls = _stub_preserve(monkeypatch)
+    _oracle(monkeypatch, {3421: "OPEN", 3328: "MERGED"})
+    with pytest.raises(op.RoutedPrOpenError):
+        kb.complete_task(board, tid, summary="landed", survivor_pr=f"pull/3421={OTHER}",
+                         survivor_unbound=True)
+    assert _status(board, tid) == "review" and calls == []
+
+
+def test_qualified_claim_naming_the_routed_pr_passes():
+    assert op.routed_prs_still_open([ROUTED], survivor_pr=[f"repo={ROUTED}"],
+                                    query_fn=lambda r, n: {"state": "OPEN"}) == ([], [])
+
+
+def test_prose_only_reroute_keeps_earlier_owned_pr(board, monkeypatch):
+    # Prism b2d45aef4595: a second route whose handoff only MENTIONS the PR records own_prs=[];
+    # the first route's ownership must survive it.
+    tid = _routed_card(board, monkeypatch)
+    _stub_preserve(monkeypatch)
+    from tests.kanban_review_helpers import covered_request_changes
+    assert kb.claim_review_task(board, tid) is not None
+    ok, detail = covered_request_changes(board, tid, reason="rework please",
+                                         expected_run_id=kb.get_task(board, tid).current_run_id)
+    assert ok, detail
+    kb.claim_task(board, tid)
+    _oracle(monkeypatch, {3421: "OPEN"})
+    assert kb.complete_task(board, tid, summary=f"rework pushed to {ROUTED}")
+    assert _status(board, tid) == "review"
+    newest = kb.list_runs(board, tid)[-1].metadata
+    assert newest.get("own_prs") == [] and "auto_routed_open_prs" in newest
+    _oracle(monkeypatch, {3421: "OPEN", 3328: "MERGED"})
+    with pytest.raises(op.RoutedPrOpenError):
+        kb.complete_task(board, tid, summary="landed", survivor_pr=OTHER, survivor_unbound=True)
+    assert _status(board, tid) == "review"
+
+
+def test_abandon_audit_not_written_when_completion_fails(board, monkeypatch):
+    # Prism d3eaf84a36bd: the override is recorded with `done`, not before survivor verification.
+    from hermes_cli import kanban_survivor
+    tid = _routed_card(board, monkeypatch)
+    _oracle(monkeypatch, {3421: "OPEN", 3328: "MERGED"})
+
+    def refuse(*a, **k):
+        raise kanban_survivor.SurvivorUnavailable("survivor_unavailable: test")
+    monkeypatch.setattr(kanban_survivor, "preserve", refuse)
+    with pytest.raises(kanban_survivor.SurvivorUnavailable):
+        kb.complete_task(board, tid, summary="landed", survivor_pr=OTHER, survivor_unbound=True,
+                         abandon_routed_pr="re-carried on #3328")
+    assert _status(board, tid) == "review"
+    assert _events(board, tid, "routed_pr_abandoned") == []

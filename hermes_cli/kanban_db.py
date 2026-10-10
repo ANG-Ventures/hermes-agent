@@ -9584,42 +9584,47 @@ def _enforce_branch_base(
 
 
 def _routed_own_prs(conn: sqlite3.Connection, task_id: str) -> list:
-    """The own PRs of the card's newest open-PR-routed run (``own_prs``; legacy: ``auto_routed_open_prs``)."""
-    for run in reversed(list_runs(conn, task_id)):
+    """The own PRs of EVERY open-PR-routed run (``own_prs``; legacy: ``auto_routed_open_prs``), deduped.
+
+    A later prose-only route records ``own_prs=[]``; that must not erase a PR an earlier route owned.
+    """
+    out: list = []
+    for run in list_runs(conn, task_id):
         md = run.metadata if isinstance(run.metadata, dict) else {}
         if "auto_routed_open_prs" in md:
-            return list(md.get("own_prs") if "own_prs" in md else md.get("auto_routed_open_prs") or [])
-    return []
+            for pr in (md.get("own_prs") if "own_prs" in md else md.get("auto_routed_open_prs")) or []:
+                if pr not in out:
+                    out.append(pr)
+    return out
 
 
 def _enforce_routed_pr_survivor(
     conn: sqlite3.Connection, task_id: str, *, survivor_pr, survivor_ref,
     abandon_routed_pr: Optional[str], query_fn,
-) -> None:
+) -> Optional[dict]:
     """Refuse ``done`` on a survivor claim that skips the card's still-OPEN routed PR (t_829fce95).
 
     t_cee802d5 was routed to review on its own open PR, then closed with an
     unbound ``--survivor-pr`` naming an unrelated merged PR. Gated only when a
     survivor claim is given; a claim naming the routed PR passes. A non-empty
-    ``abandon_routed_pr`` lets it through with a ``routed_pr_abandoned`` event.
+    ``abandon_routed_pr`` lets it through: the returned ``routed_pr_abandoned``
+    payload is recorded by the caller in the SAME transaction as ``done``, so a
+    completion that later fails (e.g. survivor verification) leaves no audit.
     Raises :class:`kanban_open_pr.RoutedPrOpenError` before any mutation.
     """
     from hermes_cli import kanban_open_pr as _open_pr
     if not (survivor_pr or survivor_ref):
-        return
+        return None
     routed = _routed_own_prs(conn, task_id)
     if not routed:
-        return
+        return None
     opened, unverified = _open_pr.routed_prs_still_open(
         routed, survivor_pr=survivor_pr, query_fn=query_fn)
     if not (opened or unverified):
-        return
+        return None
     reason = str(abandon_routed_pr).strip() if abandon_routed_pr is not None else None
     if reason and not _overlong(reason):
-        with write_txn(conn):
-            _append_event(conn, task_id, "routed_pr_abandoned",
-                          {"prs": opened + unverified, "reason": reason})
-        return
+        return {"prs": opened + unverified, "reason": reason}
     blank = abandon_routed_pr is not None
     with write_txn(conn):
         _append_event(conn, task_id, "completion_blocked_routed_pr_open",
@@ -10040,7 +10045,7 @@ def complete_task(
                 {"prs": closed_err.closed, "unverified": closed_err.unverified},
             )
         raise
-    _enforce_routed_pr_survivor(
+    routed_abandon = _enforce_routed_pr_survivor(
         conn, task_id, survivor_pr=survivor_pr, survivor_ref=survivor_ref,
         abandon_routed_pr=abandon_routed_pr, query_fn=_pr_query or _open_pr.memo_query(),
     )
@@ -10154,6 +10159,8 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if routed_abandon:
+            _append_event(conn, task_id, "routed_pr_abandoned", routed_abandon)
         if approve_head_sha:
             add_comment(
                 conn, task_id, candidate.assignee or "reviewer",

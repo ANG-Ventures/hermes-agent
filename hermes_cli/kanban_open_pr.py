@@ -147,12 +147,18 @@ def extract_pr_refs(
     metadata: Optional[dict] = None,
     survivor_pr=None,
 ) -> list:
-    """Qualified PR refs (URL or ``owner/repo#N``), first-seen order, deduped."""
+    """Qualified PR refs (URL or ``owner/repo#N``), first-seen order, deduped.
+
+    A ``survivor_pr`` claim may carry a ``<repository>=`` qualifier; only the value after it names a PR
+    (the grammar ``preserve`` verifies with), so ``pull/3421=o/r#3328`` is #3328 alone, never #3421 too.
+    """
+    from hermes_cli.kanban_survivor import _split_qualifier
+
     sources = [t for t in texts if isinstance(t, str) and t.strip()]
     if isinstance(metadata, dict):
         for key in ("pr_url", "pr_urls", "pr"):
             sources.extend(_iter_strings(metadata.get(key)))
-    sources.extend(_iter_strings(survivor_pr))
+    sources.extend(_split_qualifier(claim)[1] for claim in _iter_strings(survivor_pr))
     out = []
     seen = set()
     for text in sources:
