@@ -1552,17 +1552,20 @@ from plugins.platforms.discord.adapter_media import DiscordMediaMixin
 # Discord renders a backticked span as inline code, which makes the URL unclickable; the bare
 # <url> form is the one that suppresses the embed while staying a link. Models slip into the
 # double-wrapped form (measured 2026-10-09: Ace asked why links stopped rendering), so the
-# formatter unwraps exactly that case. Real inline code (`curl https://…`, `<div>`,
-# ``fetch(`https://…`)``) is untouched: spans are matched by delimiter length (CommonMark), so a
-# backtick pair inside a longer span or a fence is content, and only a span whose whole content
-# is the URL is rewritten. Module-level (not a method): format_message is invoked unbound
-# (self=None) by scripts/generate_conformance_vectors.py.
+# formatter unwraps exactly that case: a SINGLE-backtick span whose whole content is the URL.
+# Everything else is code and stays byte-identical: fenced blocks (CommonMark: a line opening
+# with >=3 backticks or tildes, closed by a same-char run at least as long, or unclosed to the
+# end) are skipped whole, and inline spans are paired by delimiter length so a backtick pair
+# inside ``fetch(`https://…`)`` is content. Module-level (not a method): format_message is
+# invoked unbound (self=None) by scripts/generate_conformance_vectors.py.
 _BACKTICK_RUN_RE = re.compile(r"`+")
 _SPAN_URL_RE = re.compile(r"<?(https?://[^\s`<>]+)>?")
+_FENCE_OPEN_RE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
+_FENCE_CLOSE_RE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*")
 
 
-def _unwrap_backticked_urls(content: str) -> str:
-    runs = list(_BACKTICK_RUN_RE.finditer(content))
+def _unwrap_inline_url_spans(text: str) -> str:
+    runs = list(_BACKTICK_RUN_RE.finditer(text))
     out, pos, i = [], 0, 0
     while i < len(runs):
         opener = runs[i]
@@ -1572,13 +1575,34 @@ def _unwrap_backticked_urls(content: str) -> str:
             i += 1
             continue
         closer = runs[j]
-        url = _SPAN_URL_RE.fullmatch(content[opener.end():closer.start()])
+        url = _SPAN_URL_RE.fullmatch(text[opener.end():closer.start()]) if width == 1 else None
         if url:
-            out.append(content[pos:opener.start()])
+            out.append(text[pos:opener.start()])
             out.append(f"<{url.group(1)}>")
             pos = closer.end()
         i = j + 1
-    out.append(content[pos:])
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _unwrap_backticked_urls(content: str) -> str:
+    out, prose, fence = [], [], None
+    for line in content.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        if fence is None:
+            m = _FENCE_OPEN_RE.fullmatch(body)
+            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                out.append(_unwrap_inline_url_spans("".join(prose)))
+                prose, fence = [], m.group(1)
+                out.append(line)
+            else:
+                prose.append(line)
+            continue
+        out.append(line)
+        m = _FENCE_CLOSE_RE.fullmatch(body)
+        if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
+            fence = None
+    out.append(_unwrap_inline_url_spans("".join(prose)))
     return "".join(out)
 
 
