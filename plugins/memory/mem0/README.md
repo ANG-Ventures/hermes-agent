@@ -219,8 +219,11 @@ curl http://localhost:11434/api/tags
 host-wide `<hermes root>/state/` (shared by every profile) and carry
 `{"started_at", "expires_at", "reason"}`; an expired flag is ignored.
 
-- `mem0-window.flag`: `mem0_conclude` returns `{"error": "mem0 maintenance window, re-issue after <expires_at>"}`
-  and appends the fact to `mem0-window-journal.jsonl` (mode 600).
+- `mem0-window.flag`: `mem0_conclude` appends the fact to `mem0-window-journal.jsonl` (mode 600) and
+  returns a `result` telling the agent NOT to re-issue it (replay at close is the sole writeback). Only
+  a failed journal write returns `{"error": "... re-issue after <expires_at> ..."}`. The flag check +
+  append, flag removal in `close`, and journal rotation in `replay` all hold the host-wide
+  `mem0-window-journal.lock`, so no fact is written into a drained journal or after close finished.
 - `mem0-capture-drain.pause`: the capture drain makes no attempts; rows stay `pending`.
 
 ```bash
