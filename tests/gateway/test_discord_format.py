@@ -1,7 +1,9 @@
 """Discord format_message: tables converted to bullet groups."""
 
-import types
 import sys
+import types
+
+import pytest
 
 
 def _make_discord_adapter():
@@ -152,3 +154,43 @@ class TestBacktickedAngleLinks:
         adapter = _make_discord_adapter()
         text = "```\n`<https://example.com>`\n```"
         assert adapter.format_message(text) == text
+
+    def test_url_template_literal_inside_double_backtick_span_preserved(self):
+        adapter = _make_discord_adapter()
+        text = "use ``fetch(`https://example.com`)`` here"
+        assert adapter.format_message(text) == text
+
+    def test_only_single_backtick_spans_are_unwrapped(self):
+        adapter = _make_discord_adapter()
+        text = "see ``https://example.com/x`` ok"
+        assert adapter.format_message(text) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "```https://a.b```",
+            "```\nhttps://a.b\n```",
+            "```text\nhttps://a.b\n```",
+            "```\n`https://a.b`\n````",  # closing fence longer than the opener
+            "```\n`https://a.b`\n",  # unclosed fence runs to the end
+            "~~~\n`https://a.b`\n~~~",
+            "````\n```\n`https://a.b`\n````",  # shorter run inside is content
+        ],
+    )
+    def test_fenced_url_content_untouched(self, text):
+        adapter = _make_discord_adapter()
+        assert adapter.format_message(text) == text
+
+    def test_inline_span_after_closed_fence_still_unwrapped(self):
+        adapter = _make_discord_adapter()
+        text = "```\n`https://a.b`\n```\nsee `https://a.b`"
+        assert adapter.format_message(text) == "```\n`https://a.b`\n```\nsee <https://a.b>"
+
+    def test_single_backtick_url_span_still_unwrapped(self):
+        adapter = _make_discord_adapter()
+        assert adapter.format_message("see `https://a.b`") == "see <https://a.b>"
+
+    def test_unbound_call_is_self_free(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        assert DiscordAdapter.format_message(None, "a `https://e.com` b") == "a <https://e.com> b"
