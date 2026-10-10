@@ -157,3 +157,30 @@ def test_relay_absorbed_header_keeps_same_route_retry(agent):
     assert result.get("final_response") == "ok", result
     fo.assert_not_called()
     assert [r["retry_outcome"] for r in _count_rows()] == ["retry_ok"]
+
+
+def _run_gave_up_no_usable_fallback(agent, chain):
+    agent._fallback_chain = chain
+    agent._fallback_index = 0
+    result = _run(agent, [_empty_tool_use(relay_retried="gave_up")]
+                  + [_empty_tool_use(out=1, relay_retried="gave_up")] * 5)
+    return result
+
+
+def test_relay_gave_up_with_empty_chain_stops_after_one_call(agent):
+    """t_3f07418e: gave_up and nothing to fail over to ends the turn at once;
+    another same-route call would only re-run the relay's ladder."""
+    result = _run_gave_up_no_usable_fallback(agent, [])
+    assert result.get("failed") is True
+    assert agent.client.chat.completions.create.call_count == 1
+    assert [r["retry_outcome"] for r in _count_rows()] == ["relay_gave_up"]
+
+
+def test_relay_gave_up_with_only_same_provider_chain_stops_after_one_call(agent):
+    """A chain holding only this provider is skipped by the repeat mark, so it is
+    no usable fallback either: still one relay call and one row."""
+    result = _run_gave_up_no_usable_fallback(
+        agent, [{"provider": agent.provider, "model": "claude-other"}])
+    assert result.get("failed") is True
+    assert agent.client.chat.completions.create.call_count == 1
+    assert [r["retry_outcome"] for r in _count_rows()] == ["relay_gave_up"]
