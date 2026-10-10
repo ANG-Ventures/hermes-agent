@@ -5077,6 +5077,22 @@ def _ruled_since_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return False
 
 
+def _block_was_rekinded_no_open_parent(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the latest block was a ``dependency`` ask re-kinded to
+    ``needs_input`` because no open parent existed: a time/external wait, not
+    a decision, so it must not page."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, *_BLOCK_REASON_EVENTS),
+    ).fetchone()
+    try:
+        payload = json.loads(row["payload"]) if row and row["payload"] else {}
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("rekind_reason") == "no_open_parent"
+
+
 def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
     row = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
@@ -5129,7 +5145,10 @@ def needs_input_page_candidates(
             continue
         if not needs_input_page_enabled(conn, row["id"]):
             continue
-        if row["block_kind"] == "needs_input" and _ruled_since_block(conn, row["id"]):
+        if row["block_kind"] == "needs_input" and (
+            _ruled_since_block(conn, row["id"])
+            or _block_was_rekinded_no_open_parent(conn, row["id"])
+        ):
             continue
         if row["block_kind"] == "dependency":
             parents = [
