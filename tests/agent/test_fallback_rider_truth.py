@@ -421,6 +421,34 @@ def test_perturbation_header_is_captured_and_rendered(_home, monkeypatch):
             " falling to next lane, ") in text, text
 
 
+def test_request_ids_header_survives_snapshot_into_floor(_home, monkeypatch):
+    """t_a782a840: x-pool-empty-content-request-ids survives the response
+    header snapshot, so the floor (and ledger request_ids) carries it."""
+    from agent.chat_completion_helpers import _snapshot_pool_headers, try_activate_fallback
+    from tests.agent.test_fallback_dead_letter_cause import _alr_agent
+    from tests.agent.test_fallback_events_ledger import _patch_resolver
+
+    wire = {"x-pool-served-by": "f2",
+            "x-pool-route-id": "e36ad39d0000000000000000000000aa",
+            "x-pool-empty-content-retried": "gave_up",
+            "x-pool-empty-content-attempts": "f1,f1,f2",
+            "x-pool-empty-content-perturbations": "none,perturb_prompt,perturb_prompt+rotate",
+            "x-pool-empty-content-request-ids": "req_1,req_2,req_3"}
+    http = type("H", (), {"headers": wire})()
+    pool_headers = _snapshot_pool_headers(http)
+    assert {k: pool_headers.get(k) for k in wire} == wire
+
+    _patch_resolver(monkeypatch)
+    a = _alr_agent()
+    usage = type("U", (), {"output_tokens": 0})()
+    resp = type("R", (), {"content": [], "stop_reason": "end_turn", "usage": usage,
+                          "pool_headers": pool_headers})()
+    fbe.stash_response_failure(a, "invalid_response", resp, elapsed_s=5.0, repeat=True)
+    assert a._pending_fallback_error["floor"]["relay_request_ids"] == ["req_1", "req_2", "req_3"]
+    assert try_activate_fallback(a) is True
+    assert _rows(_home)[0]["request_ids"] == "req_1,req_2,req_3"
+
+
 def test_perturbation_parse_bounds():
     assert fbe._perturbations(None) is None
     assert fbe._perturbations("  ") is None

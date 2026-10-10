@@ -312,7 +312,25 @@ def empty_tool_use_floor(response: Any) -> bool:
             return False
         content = getattr(response, "content", None)
         return (getattr(response, "stop_reason", None) == "tool_use"
-                and isinstance(content, list) and len(content) == 0)
+                and isinstance(content, list) and len(content) == 0) or thinking_only_tool_use(response)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_THINKING_BLOCK_TYPES = frozenset(("thinking", "redacted_thinking"))
+
+
+def thinking_only_tool_use(response: Any) -> bool:
+    """``stop_reason=tool_use`` whose content is ONLY thinking blocks (t_a31296b2, shape S11):
+    the empty tool_use body above with a thinking block in front, 10x in the wild 10-08..10.
+    The stop names a tool call that never arrived, so it is a provider invalid response, not a
+    model that thought too long. Never raises."""
+    try:
+        content = getattr(response, "content", None)
+        if getattr(response, "stop_reason", None) != "tool_use" or not isinstance(content, list) or not content:
+            return False
+        return all((b.get("type") if isinstance(b, dict) else getattr(b, "type", None)) in _THINKING_BLOCK_TYPES
+                   for b in content)
     except Exception:  # noqa: BLE001
         return False
 
