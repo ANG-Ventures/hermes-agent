@@ -454,25 +454,43 @@ jobs:
                    | . + {created: ($r.created_at // ""), updated: ($r.updated_at // ""), concl: ($r.conclusion // "")}] as $all
                 | def same($n; $o): ($n.nodes - $o.nodes) == [];
                   def epoch: if . == "" then null else fromdateiso8601 end;
-                  def streak($self; $v):   # the item'"'"'s red streak in one notifier'"'"'s view, or null (a first red)
+                  # the item'"'"'s red streak in one notifier'"'"'s view, null (a first red), or "?" when a
+                  # job/step name that repeats decides it. Only an entry a view CONSUMES can be "?": an
+                  # ambiguous run behind the green that ends the streak decides nothing (Prism P1 814ce172a760).
+                  def streak($self; $v):
                     ([range(0; ([$v | length, 10] | min)) | select($v[.].st != "unknown")] | first) as $k
-                    | if $k == null or $v[$k].st != "red" or (same($self; $v[$k]) | not) then null
+                    | if $k == null then null
+                      elif $v[$k].st == "ambiguous" then "?"
+                      elif $v[$k].st != "red" or (same($self; $v[$k]) | not) then null
                       else reduce $v[$k:$k + 11][] as $r ({out: [], done: false};
                         if .done then .
+                        elif $r.st == "ambiguous" then .done = true | .out = "?"
                         elif $r.st == "red" and (.out == [] or same(.out[-1]; $r)) then .out += [$r]
                         elif $r.st == "unknown" then . else .done = true end) | .out end;
+                  # how a streak was covered by the runs in it: "page" > "late" > "?" (cannot tell) > false
+                  def covered($memo; $s): [$s[] | $memo[.id | tostring] // false] as $c
+                    | if any($c[]; . == "page") then "page" elif any($c[]; . == "late") then "late"
+                      elif any($c[]; . == "?") then "?" else false end;
+                # $memo[y] = how the streak was COVERED once y finished: inherited from a covered red of
+                # its streak, else y'"'"'s own notifier routed it as the 2nd red (page / late). Coverage, not
+                # "y paged", so a streak longer than the 11-run window keeps it (Prism P2 7a67c2ae780e;
+                # hermes-home#3529 dd7a7696e7).
                 (reduce ($all | sort_by(.created))[] as $y ({};
                    . as $memo
                    | streak($y; $all | map(select(.created < $y.created and .updated <= $y.updated))) as $s
                    | .[$y.id | tostring] = (
-                       if $y.concl == "failure" and $y.st == "red" and $s != null
-                         and ([$s[] | $memo[.id | tostring] // false] | any | not)
-                       then (($y.created | epoch) as $a | ($s[0].created | epoch) as $b
+                       if $y.st != "red" or $s == null then false
+                       elif $s == "?" then "?"
+                       else covered($memo; $s) as $in
+                         | if $in != false then $in
+                           elif $y.concl == "failure" then (($y.created | epoch) as $a | ($s[0].created | epoch) as $b
                              | if $a != null and $b != null and $a - $b >= $bs then "late" else "page" end)
-                       else false end))) as $memo
+                           else false end end))) as $memo
                 # this run vs R was already compared (tests included) by the walk above
-                | [(streak({nodes: []}; $all) // [])[] | $memo[.id | tostring] // false] as $by
-                | if any($by[]; . == "page") then "old" elif any($by[]; . == "late") then "late" else "second" end'
+                | streak({nodes: []}; $all) as $cur
+                | (if $cur == "?" then "?" else covered($memo; $cur // []) end) as $by
+                | if $by == "page" then "old" elif $by == "late" then "late"
+                  elif $by == "?" then error("an ambiguous job or step name decides the streak") else "second" end'
               classify() {  # run id, items JSON -> one state per item; rc!=0 on an API error
                 run_jobs "$1" | jq -c --argjson items "$2" "$AGG_JQ"'
                   . as $r | [$items[] as [$j, $s]
@@ -562,8 +580,8 @@ jobs:
                 tests_item "$IT" && TJ="$(jq -r '.[0]' <<< "$IT")"
                 for z in $PREVS; do
                   [ "$past" = 1 ] || [ "$z" = "$R" ] || continue; past=1
+                  # an ambiguous run is recorded, not fatal: STREAK_JQ fails only if a view consumes it
                   S1="$(classify "$z" "[$IT]" | jq -r '.[0]')" || { BAD="cannot read run $z"; break; }
-                  [ "$S1" = ambiguous ] && { BAD="a failed job or step name is not unique in run $z"; break; }
                   ZN='[]'
                   if [ -n "$TJ" ] && [ "$S1" = red ]; then
                     ZN="$(sig_of "$z" nodes "$TJ" | jq -Rsc 'split("\n") | map(select(. != ""))')" \

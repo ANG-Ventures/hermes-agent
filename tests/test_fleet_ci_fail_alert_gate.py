@@ -1529,6 +1529,40 @@ def test_main_red_streak_left_to_the_backstop_through_out_of_order_finishes_stay
     assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
 
 
+def _ambiguous_e2e():
+    return _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), (E2E, "success", {E2E_STEP: "success"}))
+
+
+def test_main_red_ambiguous_run_behind_the_bounding_green_still_pages(tmp_path):
+    # Prism P1 814ce172a760: a run older than the green that ends the streak decides nothing; a
+    # repeated job name there must not turn this valid 2nd red into error handling.
+    api = _timed_api([(41, "2026-10-04T04:00:00Z", "2026-10-04T04:10:00Z", "failure", _red_e2e()),
+                      (40, "2026-10-04T03:00:00Z", "2026-10-04T03:10:00Z", "success", _E2E_GREEN),
+                      (39, "2026-10-04T02:00:00Z", "2026-10-04T02:10:00Z", "failure", _ambiguous_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
+    assert "not unique" not in got["_stdout"] and "ambiguous" not in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_ambiguous_run_inside_the_streak_still_fails_loud(tmp_path):
+    # control: the same ambiguous run INSIDE the streak decides whether it was paged: page (fail loud)
+    api = _timed_api([(41, "2026-10-04T04:00:00Z", "2026-10-04T04:10:00Z", "failure", _red_e2e()),
+                      (40, "2026-10-04T03:00:00Z", "2026-10-04T03:10:00Z", "failure", _ambiguous_e2e()),
+                      (39, "2026-10-04T02:00:00Z", "2026-10-04T02:10:00Z", "success", _E2E_GREEN)])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "main-red streak: cannot replay" in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_streak_longer_than_the_window_does_not_page_again(tmp_path):
+    # Prism P2 7a67c2ae780e: 13 earlier reds; only the 2nd of them paged. The paging run falls out of
+    # the 11-run window, but every later red inherited the coverage, so the 14th red is a 3rd+ red.
+    reds = [(100 + i, f"2026-10-04T{i:02d}:00:00Z", f"2026-10-04T{i:02d}:10:00Z", "failure", _red_e2e())
+            for i in range(1, 14)]
+    green = (100, "2026-10-04T00:00:00Z", "2026-10-04T00:10:00Z", "success", _E2E_GREEN)
+    got = _main_route(tmp_path, _timed_api(list(reversed(reds)) + [green]), env_extra=_run_at("2026-10-04T14:00:00Z"))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 113)", got["_stdout"]
+
+
 # c171f8cb6512: a re-run can promote a logged red of the same run to #alerts. The receiver dedupes
 # X-GitHub-Delivery across routes for an hour, so the two routes need distinct ids.
 _FAKE_CURL_DELIVERY = r"""#!/usr/bin/env bash
