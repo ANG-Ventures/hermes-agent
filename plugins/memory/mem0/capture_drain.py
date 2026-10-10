@@ -123,6 +123,9 @@ class CaptureDrainWorker:
         breaker_open_fn: Optional[Callable[[], bool]] = None,
         alert_fn: Optional[Callable[[str], None]] = None,
         router: Optional[Any] = None,
+        conclude_add_fn: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        conclude_exists_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        turn_rows_allowed: Any = True,           # bool, or a zero-arg callable read per lease
     ):
         self._q = queue
         self._queue_key = os.path.realpath(os.path.abspath(queue.db_path))
@@ -145,6 +148,14 @@ class CaptureDrainWorker:
         # two dedicated extraction passes -> deterministic class router -> world/event facts staged
         # to disk. It NEVER touches mem0 and is fully fail-soft (a router error never fails a turn).
         self._router = router
+        # Foreground mem0_conclude rows that hit a store outage. Without both fns this worker never
+        # leases a conclude row (they stay pending for a worker that has them).
+        self._conclude_add = conclude_add_fn
+        self._conclude_exists = conclude_exists_fn
+        self._turn_rows_allowed = turn_rows_allowed
+        # A down store should land the fact within minutes of coming back, so a conclude row's
+        # backoff caps far below the scrub cap.
+        self._conclude_backoff_cap_s = 300.0
         # Scrub failures never dead-letter (a secret must not be abandoned): requeue indefinitely
         # with a capped backoff, and escalate once at this attempt threshold.
         self._scrub_backoff_cap_s = 3600.0
@@ -155,6 +166,30 @@ class CaptureDrainWorker:
         self._stop = threading.Event()
         # observability counters (read by the digest). scrub_dead = a secret MAY be live in the store.
         self.stats = {"drained": 0, "dead": 0, "retried": 0, "reaped": 0, "scrubbed": 0, "scrub_dead": 0}
+
+    def _leasable_kinds(self) -> Optional[tuple]:
+        """Row kinds this worker may claim now (None = every kind)."""
+        allowed = self._turn_rows_allowed
+        try:
+            turns = bool(allowed()) if callable(allowed) else bool(allowed)
+        except Exception:
+            turns = False
+        conclude = self._conclude_add is not None and self._conclude_exists is not None
+        if turns and conclude:
+            return None
+        if conclude:
+            return ("conclude",)
+        if turns:
+            return ("turn",)
+        return ()
+
+    def _outstanding(self) -> int:
+        """pending+inflight rows this worker could act on; 0 lets the loop retire."""
+        kinds = self._leasable_kinds()
+        if kinds == ():
+            return 0
+        counts = self._q.counts(kinds=kinds)
+        return counts.get("pending", 0) + counts.get("inflight", 0)
 
     # ---- lifecycle ---------------------------------------------------------
     def _members(self) -> "weakref.WeakSet":
@@ -219,11 +254,10 @@ class CaptureDrainWorker:
         design) has to pick the thread up without waiting for an unrelated later enqueue.
         """
         try:
-            counts = self._q.counts()
+            if self._outstanding() == 0:
+                return
         except Exception as e:
             logger.debug("capture successor check failed: %s", e)
-            return
-        if counts.get("pending", 0) == 0 and counts.get("inflight", 0) == 0:
             return
         with _ACTIVE_DRAIN_LOCK:
             owner = _ACTIVE_DRAINS.get(self._queue_key)
@@ -261,11 +295,7 @@ class CaptureDrainWorker:
                 try:
                     with _ACTIVE_DRAIN_LOCK:
                         with self._thread_lock:
-                            counts = self._q.counts()
-                            if (
-                                counts.get("pending", 0) == 0
-                                and counts.get("inflight", 0) == 0
-                            ):
+                            if self._outstanding() == 0:
                                 self._accepting_work = False
                                 if _ACTIVE_DRAINS.get(self._queue_key) is self:
                                     _ACTIVE_DRAINS.pop(self._queue_key, None)
@@ -278,9 +308,14 @@ class CaptureDrainWorker:
         """Process at most one due row. Returns True if a row was handled."""
         if self._breaker_open():
             return False
-        row = self._q.lease_one(lease_s=self._lease_s)
+        kinds = self._leasable_kinds()
+        if kinds == ():
+            return False
+        row = self._q.lease_one(lease_s=self._lease_s, kinds=kinds)
         if row is None:
             return False
+        if row.get("kind") == "conclude":
+            return self._drain_conclude(row)
         key = row["idem_key"]
         payload = row["payload"]
         messages = [
@@ -419,6 +454,44 @@ class CaptureDrainWorker:
         # failure must NEVER requeue or fail the turn: the mem0 write is already durable and complete.
         self._maybe_route(key, payload, messages)
 
+        self._q.mark_done(key)
+        self.stats["drained"] += 1
+        return True
+
+    def _drain_conclude(self, row) -> bool:
+        """Land one queued foreground mem0_conclude verbatim (infer=false, no gate, no extraction).
+
+        The row exists because the store was unreachable, so nothing about the fact is in doubt:
+        it never dead-letters on a connection/5xx/timeout failure (that would recreate the loss
+        this queue fixes). Only an explicit 4xx, which can never succeed, dead-letters. Before every
+        write the dedup_hash lookup checks whether the fact is already live (a 5xx that committed,
+        or a crash after the write but before mark_done), so a retry never writes it twice. No
+        model verdict is recorded, so the reaper treats an orphaned lease as environmental and
+        never burns the budget.
+        """
+        key = row["idem_key"]
+        payload = row["payload"]
+        attempts = int(row.get("attempts", 0)) + 1
+        stage = "dedup-check"
+        try:
+            if not self._conclude_exists(payload):
+                stage = "add"
+                self._conclude_add(payload)
+        except Exception as e:
+            if stage == "add" and _classify_add_error(e) == "deterministic_client_error":
+                self._q.mark_retry(key, backoff_s=0.0, max_attempts=1,
+                                   error=f"deterministic-reject: {str(e)[:270]}")
+                self.stats["dead"] += 1
+                self._alert(f"queued mem0_conclude {key[:12]} rejected by the store (4xx); "
+                            f"the fact was NOT stored: {e}")
+                return True
+            backoff = min(self._backoff * (2 ** min(attempts - 1, 12)), self._conclude_backoff_cap_s)
+            self._q.mark_scrub_retry(key, backoff_s=backoff, error=f"conclude-{stage}: {str(e)[:260]}")
+            self.stats["retried"] += 1
+            if attempts == self._scrub_alert_after:
+                self._alert(f"queued mem0_conclude {key[:12]} still not landed after {attempts} "
+                            f"attempts (store unreachable?); auto-retry continues: {e}")
+            return True
         self._q.mark_done(key)
         self.stats["drained"] += 1
         return True

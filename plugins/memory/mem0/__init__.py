@@ -1284,8 +1284,11 @@ class Mem0MemoryProvider(MemoryProvider):
         # Degrade-safe (INV-3): _get_capture_pipeline() already swallows all construction/start
         # errors internally (returns None), so this guard exists ONLY to keep a raise from
         # capture_is_on() (a cheap flag read) from ever breaking session initialization.
+        # Queued foreground concludes drain even with capture off, so a capture-off profile also
+        # warms the pipeline when a queue file exists (it may hold concludes from a prior outage).
         try:
-            if capture_is_on(self._capture):
+            from .capture_pipeline import default_queue_path
+            if capture_is_on(self._capture) or os.path.exists(default_queue_path()):
                 self._get_capture_pipeline()
         except Exception as e:
             logger.debug("mem0 capture: startup pipeline warm-up skipped (non-fatal): %s", e)
@@ -1467,6 +1470,58 @@ class Mem0MemoryProvider(MemoryProvider):
         self._bgr_ledger({"fact": fact, "verdict": out["verdict"], "supersedes": supersedes or None,
                           "matched": out.get("matched"), "score": out.get("score")})
         return out
+
+    # -- Durable queue for foreground mem0_conclude (store unreachable) ----------------------------
+
+    def _queue_conclude(self, conclusion: str, reason: str) -> Optional[str]:
+        """Queue a conclude the store could not take. Returns the tool reply, or None when the
+        fact could not be queued (the caller then returns the original error)."""
+        pipe = self._get_capture_pipeline()
+        if pipe is None:
+            return None
+        from .capture_queue import conclude_idem_key
+        filters = self._write_filters(write_kind="deliberate")
+        metadata = dict(filters["metadata"])
+        metadata["dedup_hash"] = self._bgr_norm_hash(conclusion)
+        payload = {"text": conclusion, "user_id": filters["user_id"],
+                   "agent_id": filters["agent_id"], "metadata": metadata, "host": self._host,
+                   "queued_at": time.time()}
+        key = conclude_idem_key(filters["user_id"], filters["agent_id"], conclusion)
+        try:
+            pipe.enqueue_conclude(key, payload)
+        except Exception as e:
+            logger.warning("mem0_conclude could not be queued (fact NOT stored): %s", e)
+            return None
+        logger.warning("mem0_conclude queued for retry (store unreachable: %s)", reason[:200])
+        return json.dumps({"result": "queued (store unreachable); will land when mem0 is back",
+                           "queued": True})
+
+    def _check_queued_host(self, payload: Dict[str, Any]) -> None:
+        # The queue file is per host, shared by every profile on it. A row queued against a
+        # different mem0 must not land in this one; raising keeps it pending (never dropped).
+        host = payload.get("host")
+        if host and host != self._host:
+            raise RuntimeError(f"queued conclude targets another mem0 host ({host})")
+
+    def _queued_conclude_landed(self, payload: Dict[str, Any]) -> bool:
+        """True if the queued fact is already live (same dedup_hash, not forgotten). Raises on a
+        lookup failure so the drain retries instead of writing a possible duplicate."""
+        self._check_queued_host(payload)
+        dedup_hash = (payload.get("metadata") or {}).get("dedup_hash")
+        if not dedup_hash:
+            return False
+        hits = self._unwrap_results(self._get_client().search_meta_filtered(
+            payload.get("text", ""), {"dedup_hash": dedup_hash}, top_k=1))
+        return bool(self._drop_forgotten(hits))
+
+    def _land_queued_conclude(self, payload: Dict[str, Any]) -> None:
+        """The direct verbatim POST for a queued conclude: infer=false, no gate, no model."""
+        self._check_queued_host(payload)
+        self._get_client().add(
+            [{"role": "user", "content": payload["text"]}],
+            user_id=payload.get("user_id"), agent_id=payload.get("agent_id"),
+            metadata=dict(payload.get("metadata") or {}), infer=False)
+        self._record_success()
 
     @staticmethod
     def _unwrap_results(response: Any) -> list:
@@ -1930,6 +1985,8 @@ class Mem0MemoryProvider(MemoryProvider):
                 # Arm-B two-pass capture router (Phase 2.5), flag-gated via mem0.json
                 # `mem0_capture_router.enabled` (default OFF). None => byte-identical to today.
                 router=self._build_capture_router(),
+                conclude_add_fn=self._land_queued_conclude,
+                conclude_exists_fn=self._queued_conclude_landed,
             )
             self._capture_pipeline = pipe
             return pipe
@@ -2000,6 +2057,10 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if self._is_breaker_open():
+            if tool_name == "mem0_conclude" and args.get("conclusion"):
+                queued = self._queue_conclude(args["conclusion"], "circuit breaker open")
+                if queued is not None:
+                    return queued
             return json.dumps({
                 "error": "Mem0 API temporarily unavailable (multiple consecutive failures). Will retry automatically."
             })
@@ -2090,15 +2151,21 @@ class Mem0MemoryProvider(MemoryProvider):
             if not conclusion:
                 return tool_error("Missing required parameter: conclusion")
             try:
-                client.add(
-                    [{"role": "user", "content": conclusion}],
-                    **self._write_filters(write_kind="deliberate"),
-                    infer=False,
-                )
+                filters = self._write_filters(write_kind="deliberate")
+                filters["metadata"]["dedup_hash"] = self._bgr_norm_hash(conclusion)
+                client.add([{"role": "user", "content": conclusion}], **filters, infer=False)
                 self._record_success()
                 return json.dumps({"result": "Fact stored."})
             except Exception as e:
                 self._record_failure()
+                # Connection-level failure (refused/timeout/5xx): the store is unreachable, not
+                # refusing this fact. Queue it durably instead of losing it. A 4xx is a
+                # deterministic rejection and still errors (a retry can never succeed).
+                from .capture_drain import _classify_add_error
+                if _classify_add_error(e) != "deterministic_client_error":
+                    queued = self._queue_conclude(conclusion, str(e))
+                    if queued is not None:
+                        return queued
                 return tool_error(f"Failed to store: {e}")
 
         elif tool_name in ("mem0_forget", "mem0_delete"):
