@@ -120,3 +120,35 @@ class TestDiscordToolPreviewFormatting:
         out = adapter.format_tool_preview(ToolPreview(visible, truncated=True))
 
         assert out == visible
+
+
+class TestBacktickedAngleLinks:
+    """2026-10-09: Apollo sent `<https://…>` (backticks AND angle brackets). Discord renders a backticked
+    span as inline code, which kills the link; the bare <url> form is what suppresses the embed while
+    staying clickable. The formatter unwraps that exact slip so a model-side habit cannot un-link a URL."""
+
+    def test_backticked_angle_url_is_unwrapped(self):
+        adapter = _make_discord_adapter()
+        out = adapter.format_message("Found it: `<https://www.reddit.com/r/x/comments/1hwzk5f/>` — dead listing")
+        assert "`" not in out
+        assert "<https://www.reddit.com/r/x/comments/1hwzk5f/>" in out
+
+    def test_bare_angle_url_untouched(self):
+        adapter = _make_discord_adapter()
+        text = "see <https://example.com/a?b=1> and <https://example.org>"
+        assert adapter.format_message(text) == text
+
+    def test_backticked_url_without_angles_is_unwrapped_and_angled(self):
+        adapter = _make_discord_adapter()
+        out = adapter.format_message("link: `https://example.com/path` ok")
+        assert out == "link: <https://example.com/path> ok"
+
+    def test_real_inline_code_is_preserved(self):
+        adapter = _make_discord_adapter()
+        text = "run `curl https://example.com/api` then `ls -la` and `<div>`"
+        assert adapter.format_message(text) == text
+
+    def test_fenced_code_blocks_untouched(self):
+        adapter = _make_discord_adapter()
+        text = "```\n`<https://example.com>`\n```"
+        assert adapter.format_message(text) == text

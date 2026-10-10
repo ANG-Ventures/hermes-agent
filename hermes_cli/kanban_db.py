@@ -5080,7 +5080,8 @@ def _ruled_since_block(conn: sqlite3.Connection, task_id: str) -> bool:
 def _block_was_rekinded_no_open_parent(conn: sqlite3.Connection, task_id: str) -> bool:
     """True when the latest block was a ``dependency`` ask re-kinded to
     ``needs_input`` because no open parent existed: a time/external wait, not
-    a decision, so it must not page."""
+    a decision, so it must not page while ``blocked`` (a ``triage`` escalation
+    still pages)."""
     row = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
         "ORDER BY id DESC LIMIT 1",
@@ -5145,9 +5146,11 @@ def needs_input_page_candidates(
             continue
         if not needs_input_page_enabled(conn, row["id"]):
             continue
+        # A re-kinded dependency is a time/external wait only while it sits in
+        # ``blocked``; once it recurs into ``triage`` it needs a human decision.
         if row["block_kind"] == "needs_input" and (
             _ruled_since_block(conn, row["id"])
-            or _block_was_rekinded_no_open_parent(conn, row["id"])
+            or (row["status"] == "blocked" and _block_was_rekinded_no_open_parent(conn, row["id"]))
         ):
             continue
         if row["block_kind"] == "dependency":
