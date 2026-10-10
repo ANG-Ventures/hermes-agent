@@ -170,6 +170,9 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_SESSION_KEY",
     "HERMES_GATEWAY_SESSION",
     "HERMES_CRON_SESSION",
+    # Set by `hermes -z` / `chat -q`; a suite launched from a kanban worker inherits it and
+    # gets the unattended tool-loop hard stops (and one-shot tool pruning) on platform="cli".
+    "HERMES_SINGLE_QUERY_SESSION",
     "_HERMES_GATEWAY",
     "HERMES_PLATFORM",
     "HERMES_MODEL",
