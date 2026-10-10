@@ -1,0 +1,10 @@
+# Gate integrity (Prism P1 ac6c31b59f61, t_8c9a779a). On pull_request and merge_group GitHub reads the
+# workflow YAML from the PR/candidate commit, so a PR can rewrite a required job itself; checking gate
+# scripts out of the base ref (ci.yaml detect + all-checks-pass) cannot stop that. These paths decide
+# whether a PR passes, so a change to them needs an owner's review.
+# INERT until the main ruleset turns on "Require review from Code Owners" (admin; not set as of 2026-10-10).
+/.github/                       @Kyzcreig
+/scripts/ci/                    @Kyzcreig
+/scripts/run_tests.sh           @Kyzcreig
+/scripts/run_tests_parallel.py  @Kyzcreig
+/.gitleaks.toml                 @Kyzcreig
