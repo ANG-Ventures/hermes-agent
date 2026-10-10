@@ -1999,6 +1999,14 @@ class Mem0MemoryProvider(MemoryProvider):
         return schemas
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        if tool_name == "mem0_conclude" and args.get("conclusion"):
+            # Maintenance window (PRD-studio-cutover I2b): refuse + journal for replay. Checked
+            # before the breaker and the client so a down store never drops the fact.
+            from . import window
+            refused = window.refuse_conclude(self._user_id, self._agent_id, args["conclusion"])
+            if refused is not None:
+                return refused
+
         if self._is_breaker_open():
             return json.dumps({
                 "error": "Mem0 API temporarily unavailable (multiple consecutive failures). Will retry automatically."

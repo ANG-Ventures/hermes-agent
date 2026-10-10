@@ -198,3 +198,21 @@ curl http://localhost:11434/api/tags
 - `mem0_add` stores verbatim (no extraction). Use `sync_turn` for LLM extraction.
 - Search uses semantic matching — try broader queries.
 - Check `user_id` matches between sessions (`$HERMES_HOME/mem0.json`).
+
+## Maintenance window (self-hosted cutover)
+
+`window.py` freezes writes for a store migration without losing them. Both flags live in the
+host-wide `<hermes root>/state/` (shared by every profile) and carry
+`{"started_at", "expires_at", "reason"}`; an expired flag is ignored.
+
+- `mem0-window.flag`: `mem0_conclude` returns `{"error": "mem0 maintenance window, re-issue after <expires_at>"}`
+  and appends the fact to `mem0-window-journal.jsonl` (mode 600).
+- `mem0-capture-drain.pause`: the capture drain makes no attempts; rows stay `pending`.
+
+```bash
+python3 -m plugins.memory.mem0.window open --minutes 90   # both flags; re-run to refresh expiry
+python3 -m plugins.memory.mem0.window status [--check]     # --check: exit 2 on stale flag, unreplayed journal,
+                                                           # or a pending row >30 min old while paused
+python3 -m plugins.memory.mem0.window replay               # direct POST /memories {infer:false}; journaled=N replayed=M
+python3 -m plugins.memory.mem0.window close                # remove flags, replay, sweep once more; exit 1 if M != N
+```
