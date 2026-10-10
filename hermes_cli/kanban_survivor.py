@@ -2701,6 +2701,11 @@ def _record(conn, task_id, survivor, previous):
 _NO_PR_RE = re.compile(r"\bno[- ]pr\b", re.IGNORECASE)
 
 
+# Only a worker's own upload is a delivered result: ``kanban_attach`` tags
+# "agent"; dashboard/user inputs, "harness" and completion artifacts do not count.
+_WORKER_UPLOADERS = frozenset({"worker", "agent"})
+
+
 def _artifact_survivor(conn, task, metadata, workspace, bases, previous):
     """A no-PR dir/scratch card's attached artifact is its survivor (t_c061a2a7).
 
@@ -2719,7 +2724,7 @@ def _artifact_survivor(conn, task, metadata, workspace, bases, previous):
         return None
     artifacts = []
     for att in kb.list_attachments(conn, task.id):
-        if att.uploaded_by == "harness":
+        if att.uploaded_by not in _WORKER_UPLOADERS:
             continue
         path = Path(att.stored_path)
         if not path.is_file():
