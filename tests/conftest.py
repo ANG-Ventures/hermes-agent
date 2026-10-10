@@ -703,6 +703,18 @@ def _isolate_session_contextvars():
 
 
 @pytest.fixture(autouse=True)
+def _restore_version_info_cache():
+    """Put back the process-global version cache a test refreshed (``get_code_identity(refresh=True)``
+    re-resolves under the test's sandbox home). Modules that bake it at import, like the Perplexity
+    provider's User-Agent, otherwise disagree with later ``get_version_info()`` reads."""
+    vi = sys.modules.get("hermes_cli.version_info")
+    saved = vi._cached_version_info if vi is not None else None
+    yield
+    if saved is not None:
+        vi._cached_version_info = saved
+
+
+@pytest.fixture(autouse=True)
 def _reset_foreground_exit_fence():
     """A test that drives a hard-exit path raises the one-way foreground-spawn fence; lower it after."""
     yield
