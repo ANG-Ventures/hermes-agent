@@ -7,6 +7,7 @@ the adapter the wake hands it to. PR health is the one stub (no GitHub).
 """
 from __future__ import annotations
 
+import json
 import asyncio
 import sqlite3
 from pathlib import Path
@@ -323,6 +324,66 @@ def test_pr_red_or_dirty_pure():
     assert ow.pr_is_red_or_dirty({"state": "merged", "failing": ["x"]}) is None
     assert ow.pr_is_red_or_dirty(None) is None
     assert ow.pr_is_red_or_dirty({"state": "open", "failing": ["lint"]}) == "red: lint"
+
+
+def _main_red(now, **pr):
+    v = {"head": "h1", "done": True, "inherited": [".github/workflows/ci.yml|lints-fast|chrome lint"], "own": [],
+         "red_ids": [5]}
+    v.update(pr)
+    return {"repo": "ANG-Ventures/hermes-home", "open": True, "as_of": now, "episode": {"sha": "b" * 40},
+            "prs": {"7": v}}
+
+
+def test_main_red_inherited_predicate():
+    """t_85639cbc: the 'PR cannot land' wake names an inherited-from-main red; a PR's own red never is."""
+    now, repo = 1_791_600_000.0, "ANG-Ventures/hermes-home"
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast"], now, [5]) == "b" * 40
+    # Prism P1 89c1c91ca7f6: a re-run on the same head (a check-run id the snapshot never judged) or no ids
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast"], now, [6]) is None
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast"], now) is None
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast"], now, [None]) is None
+    # MUTANT: the PR has a red step of its own (main passes it) -> never inherited, even in a shared job
+    own = _main_red(now, own=[".github/workflows/ci.yml|lints-fast|its own lint"])
+    assert ow.main_red_inherited(own, repo, 7, "h1", ["lints-fast"], now, [5]) is None
+    # a failing check main does not fail, a different head, a stale or closed state, another repo: not inherited
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast", "sast"], now, [5, 9]) is None
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h2", ["lints-fast"], now, [5]) is None
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast"], now + 1801, [5]) is None
+    assert ow.main_red_inherited(dict(_main_red(now), open=False), repo, 7, "h1", ["lints-fast"], now, [5]) is None
+    assert ow.main_red_inherited(_main_red(now), "o/other", 7, "h1", ["lints-fast"], now, [5]) is None
+    assert ow.main_red_inherited(_main_red(now, done=False), repo, 7, "h1", ["lints-fast"], now, [5]) is None
+    assert ow.main_red_inherited(None, repo, 7, "h1", ["lints-fast"], now) is None
+
+
+def test_red_handback_wake_carries_inherited_from_main():
+    health = {"state": "open", "mergeable_state": "blocked", "failing": ["lints-fast"],
+              "inherited_from_main": "b" * 40}
+    got = ow.pr_is_red_or_dirty(health)
+    assert got.startswith("red (inherited-from-main bbbbbbbbb: fix main, not this PR") and got.endswith("lints-fast")
+    assert "inherited-from-main" not in ow.pr_is_red_or_dirty(dict(health, inherited_from_main=None))
+
+
+def test_query_pr_health_reads_the_main_red_state(monkeypatch, tmp_path):
+    """The real reader path: query_pr_health -> state/main-red-inherited.json under the fleet root."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "state").mkdir()
+    st = _main_red(ow.time.time())
+    (tmp_path / "state" / ow.MAIN_RED_STATE).write_text(json.dumps(st))
+    pr = {"state": "open", "mergeable_state": "blocked", "head": {"sha": "h1"}, "labels": []}
+    runs = [{"id": 5, "name": "lints-fast", "status": "completed", "conclusion": "failure", "check_suite": {"id": 1},
+             "html_url": "https://x/5"}]
+    monkeypatch.setattr(ow, "_gh_json", lambda path: pr)
+    monkeypatch.setattr(ow, "_gh_pages", lambda path, key, max_pages=10: runs)
+    out = ow.query_pr_health("ANG-Ventures/hermes-home", 7)
+    assert out["inherited_from_main"] == "b" * 40
+    assert "inherited-from-main" in ow.pr_is_red_or_dirty(out)
+    st["prs"]["7"]["own"] = [".github/workflows/ci.yml|lints-fast|own"]
+    (tmp_path / "state" / ow.MAIN_RED_STATE).write_text(json.dumps(st))
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 7)["inherited_from_main"] is None
+    st["prs"]["7"]["own"] = []
+    runs[0]["id"] = 6                                   # re-run on the same head after the snapshot
+    (tmp_path / "state" / ow.MAIN_RED_STATE).write_text(json.dumps(st))
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 7)["inherited_from_main"] is None
 
 
 _GATE, _ROLLUP = "Review label gate / Review label gate", "All required checks pass"
