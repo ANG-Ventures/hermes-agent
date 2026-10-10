@@ -327,7 +327,8 @@ def test_pr_red_or_dirty_pure():
 
 
 def _main_red(now, **pr):
-    v = {"head": "h1", "done": True, "inherited": [".github/workflows/ci.yml|lints-fast|chrome lint"], "own": []}
+    v = {"head": "h1", "done": True, "inherited": [".github/workflows/ci.yml|lints-fast|chrome lint"], "own": [],
+         "red_ids": [5]}
     v.update(pr)
     return {"repo": "ANG-Ventures/hermes-home", "open": True, "as_of": now, "episode": {"sha": "b" * 40},
             "prs": {"7": v}}
@@ -336,17 +337,21 @@ def _main_red(now, **pr):
 def test_main_red_inherited_predicate():
     """t_85639cbc: the 'PR cannot land' wake names an inherited-from-main red; a PR's own red never is."""
     now, repo = 1_791_600_000.0, "ANG-Ventures/hermes-home"
-    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast"], now) == "b" * 40
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast"], now, [5]) == "b" * 40
+    # Prism P1 89c1c91ca7f6: a re-run on the same head (a check-run id the snapshot never judged) or no ids
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast"], now, [6]) is None
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast"], now) is None
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast"], now, [None]) is None
     # MUTANT: the PR has a red step of its own (main passes it) -> never inherited, even in a shared job
     own = _main_red(now, own=[".github/workflows/ci.yml|lints-fast|its own lint"])
-    assert ow.main_red_inherited(own, repo, 7, "h1", ["lints-fast"], now) is None
+    assert ow.main_red_inherited(own, repo, 7, "h1", ["lints-fast"], now, [5]) is None
     # a failing check main does not fail, a different head, a stale or closed state, another repo: not inherited
-    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast", "sast"], now) is None
-    assert ow.main_red_inherited(_main_red(now), repo, 7, "h2", ["lints-fast"], now) is None
-    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast"], now + 1801) is None
-    assert ow.main_red_inherited(dict(_main_red(now), open=False), repo, 7, "h1", ["lints-fast"], now) is None
-    assert ow.main_red_inherited(_main_red(now), "o/other", 7, "h1", ["lints-fast"], now) is None
-    assert ow.main_red_inherited(_main_red(now, done=False), repo, 7, "h1", ["lints-fast"], now) is None
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast", "sast"], now, [5, 9]) is None
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h2", ["lints-fast"], now, [5]) is None
+    assert ow.main_red_inherited(_main_red(now), repo, 7, "h1", ["lints-fast"], now + 1801, [5]) is None
+    assert ow.main_red_inherited(dict(_main_red(now), open=False), repo, 7, "h1", ["lints-fast"], now, [5]) is None
+    assert ow.main_red_inherited(_main_red(now), "o/other", 7, "h1", ["lints-fast"], now, [5]) is None
+    assert ow.main_red_inherited(_main_red(now, done=False), repo, 7, "h1", ["lints-fast"], now, [5]) is None
     assert ow.main_red_inherited(None, repo, 7, "h1", ["lints-fast"], now) is None
 
 
@@ -373,6 +378,10 @@ def test_query_pr_health_reads_the_main_red_state(monkeypatch, tmp_path):
     assert out["inherited_from_main"] == "b" * 40
     assert "inherited-from-main" in ow.pr_is_red_or_dirty(out)
     st["prs"]["7"]["own"] = [".github/workflows/ci.yml|lints-fast|own"]
+    (tmp_path / "state" / ow.MAIN_RED_STATE).write_text(json.dumps(st))
+    assert ow.query_pr_health("ANG-Ventures/hermes-home", 7)["inherited_from_main"] is None
+    st["prs"]["7"]["own"] = []
+    runs[0]["id"] = 6                                   # re-run on the same head after the snapshot
     (tmp_path / "state" / ow.MAIN_RED_STATE).write_text(json.dumps(st))
     assert ow.query_pr_health("ANG-Ventures/hermes-home", 7)["inherited_from_main"] is None
 

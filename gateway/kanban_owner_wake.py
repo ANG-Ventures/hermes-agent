@@ -205,10 +205,11 @@ MAIN_RED_FRESH_S = 1800
 
 
 def main_red_inherited(state: Optional[dict], repo: str, number: int, head: str, failing: list,
-                       now: Optional[float] = None) -> Optional[str]:
+                       now: Optional[float] = None, failing_ids: Optional[list] = None) -> Optional[str]:
     """The base-branch sha this PR's red is inherited from, or None. Inherited only when the watcher's state is
-    fresh, names this exact head, the PR has NO red step of its own, and every failing check is a job main fails:
-    a PR-specific red is never labelled inherited."""
+    fresh, names this exact head, the PR has NO red step of its own, every failing check is a job main fails, AND
+    every failing check-run id is one the watcher judged (``red_ids``): a check re-run on the same head after the
+    snapshot can fail a PR-specific step under the same job name, and is never labelled inherited."""
     now = time.time() if now is None else now
     if not isinstance(state, dict) or not state.get("open") or str(state.get("repo") or "").lower() != repo.lower():
         return None
@@ -222,6 +223,13 @@ def main_red_inherited(state: Optional[dict], repo: str, number: int, head: str,
         return None
     jobs = {str(k).split("|")[1] for k in v.get("inherited") or [] if str(k).count("|") >= 2}
     if not jobs or not failing or not set(failing) <= jobs:
+        return None
+    try:
+        judged = {int(i) for i in v.get("red_ids") or []}
+        ids = [int(i) for i in failing_ids or []]
+    except (TypeError, ValueError):
+        return None
+    if not ids or len(ids) != len(failing) or not set(ids) <= judged:
         return None
     return str((state.get("episode") or {}).get("sha") or "") or None
 
@@ -464,7 +472,8 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
         # the run each verdict came from, so the wake is verifiable in one click (t_121bd42e)
         out["failing_urls"] = [str(r.get("html_url") or "") for r in red]
         if red:
-            out["inherited_from_main"] = main_red_inherited(_read_main_red_state(), repo, number, sha, out["failing"])
+            out["inherited_from_main"] = main_red_inherited(_read_main_red_state(), repo, number, sha, out["failing"],
+                                                            failing_ids=[r.get("id") for r in red])
         if red and REVIEW_LABEL not in [x.strip().lower() for x in out["labels"]] and any(_LABEL_GATE_RE.match(n) for n in out["failing"]) \
                 and all(_LABEL_GATE_RE.match(n) or _REQUIRED_ROLLUP_RE.match(n) for n in out["failing"]):
             # only when label_pending could hold: verify EVERY failing run's own annotations (unreadable -> False)
