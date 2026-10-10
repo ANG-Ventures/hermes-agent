@@ -40,7 +40,7 @@ from hermes_cli.kanban_ops import (
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
-from hermes_cli.kanban_open_pr import ClosedUnmergedPrError
+from hermes_cli.kanban_open_pr import ClosedUnmergedPrError, RoutedPrOpenError
 from hermes_cli.kanban_receipt import EXIT_NO_RECEIPT, ReceiptRequiredError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_cli.kanban_held_repo import fmt_held_repo, held_repo
@@ -3002,6 +3002,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     draft_ok = getattr(args, "draft_ok", None)
     external = getattr(args, "external", None)
     watcher = getattr(args, "watcher", None)
+    abandon_routed_pr = getattr(args, "abandon_routed_pr", None)
     raw_meta = getattr(args, "metadata", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
@@ -3013,7 +3014,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     survivor_reason = getattr(args, "reason", None)
     if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr
                          or survivor_unbound or survivor_none or survivor_reason or superseded_by
-                         or draft_ok is not None or external is not None or watcher is not None):
+                         or draft_ok is not None or external is not None or watcher is not None
+                         or abandon_routed_pr is not None):
         return _err(
             "kanban: --summary / --metadata / --superseded-by / --draft-ok / --external / "
             "--watcher / --survivor-ref / "
@@ -3073,6 +3075,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     draft_ok=draft_ok,
                     external=external,
                     watcher=watcher,
+                    abandon_routed_pr=abandon_routed_pr,
                 )
             except kb.LiveClaimError:
                 failed.append(tid)
@@ -3095,7 +3098,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
-            except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
+            except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, RoutedPrOpenError) as draft_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
