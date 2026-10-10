@@ -15,6 +15,9 @@ on:
       # this event; their parent "CI" does. Measured 2026-09-20: 100/100 alert runs
       # skipped, and a red main (c93bfcc1, 07:18Z) paged nobody.
       - "CI"
+      # ci-local.yaml: the fallback orchestrator that replaces "CI" while ci.yaml is
+      # disabled. Keep both names so the swap and the swap back both stay paged.
+      - "CI (local fallback)"
       - "Fleet SAST (semgrep)"
       - "Fleet Secret Scan (gitleaks)"
       - "OSV-Scanner"
