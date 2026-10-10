@@ -15,6 +15,7 @@ import json
 import socket
 import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -284,3 +285,95 @@ def test_existing_queue_db_gains_kind_column_with_turn_default(tmp_path):
     conn.close()
     CaptureQueue(str(path))
     assert _rows(path)[0]["kind"] == "turn"
+
+
+# ---------------------------------------------------------------- shared queue, several mem0 hosts
+# The queue file is per machine; profiles on one machine can point at different mem0 hosts.
+def test_same_fact_from_two_hosts_queues_two_rows(env, monkeypatch):
+    """Host collision: the conclude key must include the target host, or the second profile's
+    fact is a silent no-op behind a "queued": true reply."""
+    provider_a, _store, _server, qpath = env
+    monkeypatch.setenv("MEM0_HOST", f"http://127.0.0.1:{_free_port()}")
+    provider_b = Mem0MemoryProvider()
+    provider_b.initialize("test-session-b")
+    assert provider_a._host != provider_b._host
+    assert _conclude(provider_a, "Ace's NAS is at 192.168.1.50.")["queued"] is True
+    assert _conclude(provider_b, "Ace's NAS is at 192.168.1.50.")["queued"] is True
+    hosts = sorted(json.loads(r["payload"])["host"] for r in _rows(qpath))
+    assert hosts == sorted([provider_a._host, provider_b._host])
+
+
+def _host_worker(q, host, landed, *, fail=False, **kw):
+    def add(payload):
+        if fail:
+            raise RuntimeError("Mem0 self-host REST POST /memories failed: [Errno 61] Connection refused")
+        assert payload["host"] == host
+        landed.append(payload["text"])
+    return CaptureDrainWorker(
+        q, add_fn=lambda m, k: 1, recall_idem_fn=lambda key: 0, scrub_fn=filter_facts,
+        conclude_add_fn=add, conclude_exists_fn=lambda p: False, turn_rows_allowed=False,
+        target=host, **kw)
+
+
+def _enqueue_for(q, host, text):
+    q.enqueue(conclude_idem_key("ace", "daedalus", text, host),
+              {"text": text, "user_id": "ace", "agent_id": "daedalus", "metadata": {}, "host": host},
+              kind="conclude", target=host)
+
+
+def test_worker_neither_leases_nor_counts_another_hosts_rows(tmp_path):
+    """Drain starvation: a row for host B is not A's to lease, and must not keep A's loop alive."""
+    q = CaptureQueue(str(tmp_path / "q.db"))
+    _enqueue_for(q, "http://b", "fact for b")
+    landed_a, landed_b = [], []
+    worker_a = _host_worker(q, "http://a", landed_a)
+    worker_b = _host_worker(q, "http://b", landed_b)
+    assert worker_a._outstanding() == 0
+    assert worker_a.drain_once() is False
+    assert _rows(tmp_path / "q.db")[0]["attempts"] == 0     # never leased by A
+    assert worker_b._outstanding() == 1
+    assert worker_b.drain_once() is True
+    assert landed_b == ["fact for b"] and landed_a == []
+
+
+def test_stuck_host_owner_does_not_block_another_hosts_standby(tmp_path):
+    """Replay starvation: A's mem0 is down so A's owner never retires; B's healthy rows must
+    still land, so drain ownership cannot be shared across hosts."""
+    q = CaptureQueue(str(tmp_path / "q.db"))
+    _enqueue_for(q, "http://a", "fact for a")
+    _enqueue_for(q, "http://b", "fact for b")
+    landed_a, landed_b = [], []
+    worker_a = _host_worker(q, "http://a", landed_a, fail=True, backoff_base_s=0.0,
+                            poll_interval_s=0.01)
+    worker_b = _host_worker(q, "http://b", landed_b, backoff_base_s=0.0, poll_interval_s=0.01)
+    worker_a.start()
+    try:
+        worker_b.start()
+        deadline = time.time() + 5
+        while not landed_b and time.time() < deadline:
+            time.sleep(0.02)
+        assert landed_b == ["fact for b"]
+        status = {json.loads(r["payload"])["host"]: r["status"] for r in _rows(tmp_path / "q.db")}
+        assert status["http://b"] == "done" and status["http://a"] != "done"
+    finally:
+        worker_b.stop()
+        worker_a.stop()
+
+
+def test_existing_conclude_rows_gain_their_target_host_on_migration(tmp_path):
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        "CREATE TABLE capture_queue (idem_key TEXT PRIMARY KEY, payload TEXT NOT NULL,"
+        " status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,"
+        " next_attempt_at REAL NOT NULL DEFAULT 0, leased_until REAL, model_verdict TEXT,"
+        " add_committed INTEGER NOT NULL DEFAULT 0, last_error TEXT,"
+        " kind TEXT NOT NULL DEFAULT 'turn', created_at REAL NOT NULL, updated_at REAL NOT NULL);"
+        "INSERT INTO capture_queue (idem_key,payload,kind,created_at,updated_at)"
+        " VALUES ('c','{\"text\":\"f\",\"host\":\"http://b\"}','conclude',0,0),"
+        "        ('t','{}','turn',0,0);")
+    conn.close()
+    q = CaptureQueue(str(path))
+    assert {r["idem_key"]: r["target"] for r in _rows(path)} == {"c": "http://b", "t": ""}
+    assert _host_worker(q, "http://a", [])._outstanding() == 0
+    assert _host_worker(q, "http://b", [])._outstanding() == 1
