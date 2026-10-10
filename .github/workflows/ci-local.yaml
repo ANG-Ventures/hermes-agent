@@ -1,0 +1,656 @@
+# ci-local.yaml — FALLBACK ORCHESTRATOR (2026-10-08, Apollo; Ace 'prep it so it's one click').
+# Byte-for-byte copy of ci.yaml under a NEW workflow id. ci.yaml was set disabled_manually by
+# `github-staff` three times on 10-08 (GitHub Support #4838502); a disabled workflow never
+# triggers, so no PR on this repo gets CI. This file is NOT active by default: it ships with
+# its triggers commented out. To arm (one click, operator only, and ONLY if Support has not
+# answered): (1) set repo var CI_RUNNER_LABELS to ["self-hosted","ace-ai"] so the copy runs on
+# our iron, not hosted minutes (the likely trigger); (2) uncomment the `on:` block below;
+# (3) merge. The gate job keeps the name `all-checks-pass`, which is what branch protection and
+# the merge queue require, so no ruleset change is needed. Disarm = delete this file.
+#
+name: CI (local fallback)
+
+# Orchestrator workflow. Runs ``detect-changes`` once, then conditionally
+# calls the sub-workflows that a PR can actually affect. A final
+# ``all-checks-pass`` gate job aggregates results so branch protection only
+# needs to require a single check.
+#
+# Sub-workflows are triggered via ``workflow_call`` and keep their own job
+# definitions, matrices, and concurrency settings. They no longer have
+# ``push:`` / ``pull_request:`` triggers of their own — everything flows
+# through this file.
+#
+# SECURITY: this workflow runs PR-controlled actions, workflows, and code.
+# Do not add ``secrets: inherit`` or GitHub App credentials here. Trusted
+# main-only automation uses protected environments in its own workflows.
+#
+# RUNNERS (fork, 2026-09-16). Heavy portable jobs use
+# ``vars.CI_RUNNER_LABELS`` for self-hosted/hosted evacuation; cheap required
+# gates (sast, secret_scan, review-label, supply-chain pattern scan, lint)
+# use literal ``ubuntu-latest`` so a pool outage cannot strand those checks. The pool runs
+# ephemeral containers with ``--security-opt no-new-privileges`` and no docker
+# socket, which is why a handful of jobs are pinned to ``ubuntu-latest``
+# instead and carry a comment naming the reason at their ``runs-on``:
+#
+#   nix.yml         nix install needs root (cachix/install-nix-action uses sudo)
+#   rust-tests.yml  sudo apt-get for webkit2gtk; the pool image ships none
+#   e2e-desktop.yml sudo apt-get for gtk/nss/xvfb
+#   docker-lint.yml hadolint is a Docker container action; no socket on the pool
+#   js-tests.yml    mid-flight vitest death, not root-caused; see js-tests.yml
+#
+# ``installer-tests`` and the ``tests-os`` matrix use a
+# literal ``runs-on`` and are hosted by design. Further hosted pins are listed
+# below. Any PR touching ``.github/workflows/**`` also needs the ``ci-reviewed``
+# label or the Review label gate hard-blocks it.
+#
+# OVERFLOW (2026-09-20). The pool has 17 slots (ace-ai 8 + ace-media 8 +
+# studio 1) and a PR/merge_group run wanted 26 of them — 16 test slices plus
+# 10 non-test jobs — so jobs queued 4.6 min on average (max 14.4) to run for
+# 3.3. GitHub cannot spill a full self-hosted pool onto hosted runners by
+# itself, so two things changed:
+#
+#   * tests.yml stamps a PER-SLICE ``runs_on`` in its ``generate`` job:
+#     slices 1..``vars.CI_SELF_HOSTED_SLOTS`` take ``CI_RUNNER_LABELS``, the
+#     rest take ``ubuntu-latest``. Unset slot count = no cap = every slice
+#     self-hosted, so the variable is a no-op until it is set.
+#   * the short non-test jobs that gate nothing on the LAN — lint (x3),
+#     uv-lockfile-check, contributor-check, docs-site-checks — moved to a
+#     literal ``ubuntu-latest``, freeing 6 pool slots per run for test slices.
+#   * gate/plumbing jobs (detect, generate, all-checks-pass, ci-timings,
+#     save-durations, OSV emit-status) are also pinned hosted. The required
+#     aggregator queued 17+ minutes behind test slices after they finished;
+#     these GitHub API/artifact and local Python jobs need no LAN resources.
+#
+# ``CI_RUNNER_LABELS`` rollback still sends the heavy variable-routed jobs,
+# including the matrix slices, to ubuntu-latest. Literal hosted gates stay hosted.
+#
+# PR LANE GATES (fork, Ace 2026-10-03, t_bf20260d). Two heavy lane sets are off
+# on a pull request unless the diff calls for them; both come from the `detect`
+# classifier (scripts/ci/classify_changes.py), not a second paths filter:
+#
+#   * desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip
+#     CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the
+#     desktop app is in use. Desktop core E2E, Desktop update E2E, the UI test
+#     shards and the apps/desktop check units run only when apps/desktop/**
+#     changed AND vars.CI_DESKTOP_JOBS == 'on'. A release run forces them on.
+#   * install/update: e2e-upgrade, Windows install + update E2E and Bootstrap
+#     installer run on a PR only when the diff touches _INSTALL_PATHS.
+#     merge_group forces them on and push:main runs everything, so a PR run is
+#     never the only gate (t_e8c5045e).
+
+on:   # ARMED 2026-10-09 20:06 PT by Apollo on Ace's word ("let's arm it"); Support #4838502 still open on ci.yaml
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Stable-release candidate run: force every applicability lane and make the aggregate gate strict (skipped required lanes fail).'
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      release:
+        description: 'Stable-release candidate run: force every applicability lane and make the aggregate gate strict (skipped required lanes fail).'
+        required: false
+        type: boolean
+        default: false
+  pull_request:
+  push:
+    branches: [main]
+  # merge_group: the merge queue creates a temporary batched branch and fires
+  # this event; the required checks must run on it or the queue wedges forever.
+  # The detect-changes classifier resolves a REAL diff here, three-dot from the
+  # TARGET BRANCH (github.event.merge_group.base_ref) to the candidate head —
+  # deliberately NOT merge_group.base_sha, which is the previous chained queue
+  # candidate and yields only the topmost entry's delta. The three-dot diff is
+  # the union of the batch's member PRs, so lane selection over it cannot
+  # under-test any member (the full argument, with the measurement, lives in
+  # .github/actions/detect-changes/action.yml).
+  # A malformed/absent payload still fails open to the full matrix, and every
+  # other non-PR event (push to main, release, dispatch) is untouched: no base
+  # resolved, empty diff, every lane true.
+  merge_group:
+
+permissions:
+  contents: read
+  pull-requests: write # needed by lint (PR comment) + supply-chain review_status
+  # fork: tests.yml's tests-complete job (quarantine evidence gate) needs
+  # ``actions: read``; a reusable workflow can only hold what its caller
+  # grants, and GitHub fails the WHOLE graph at validation (startup_failure,
+  # 0 jobs) when a nested job asks for more. osv-scanner SARIF upload also
+  # needs these two. Dropped by the 2026-10-01 parity merge; restored.
+  actions: read
+  security-events: write
+
+# cancel-in-progress only ever applies to PR events. A push, a dispatch, and
+# above all a stable-release workflow_call run are never cancelled by a later
+# commit or a rerun of the same branch — the caller's own concurrency uses
+# github.run_id, so even a parent rerun cannot kill this child mid-flight.
+# Release (workflow_call with inputs.release) never cancels and never gets
+# cancelled: its group is github.run_id. PRs collapse per-PR; pushes use the
+# ref as before.
+concurrency:
+  group: ci-${{ inputs.release == true && github.run_id || (github.event_name == 'pull_request' && github.event.pull_request.number || github.ref) }}
+  # Cancel superseded runs on BOTH pull_request and merge_group.
+  #
+  # merge_group was previously excluded, which stranded a full 44-job run every
+  # time the queue reshuffled: GitHub creates a NEW gh-readonly-queue/... branch
+  # per batch candidate, the old batch's run stays queued forever, and those
+  # orphans keep competing for the self-hosted ACE-AI pool. Measured 2026-09-19:
+  # 17 orphaned merge_group runs across PRs 711/712/715/716 (already evicted from
+  # the queue) starved a seconds-long `all-checks-pass` rollup job for 3.5 hours,
+  # blocking PR #713 behind head-of-line contention on a pool that was otherwise
+  # healthy and cycling normally.
+  #
+  # Safe because `group` is keyed on github.ref: each queue batch has its own
+  # unique gh-readonly-queue ref, so cancelling only ever kills a run whose ref
+  # is being superseded — never a live sibling batch. push-to-main keeps its
+  # no-cancel behaviour (main's history must be fully verified).
+  #
+  # Release (workflow_call/dispatch with inputs.release) is keyed on run_id
+  # and never cancelled.
+  cancel-in-progress: ${{ inputs.release != true && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # detect: run the classifier once. Every downstream job reads its outputs
+  # to decide whether to run. On push/dispatch the classifier fails open
+  # (all lanes true) so post-merge validation is never weakened.
+  #
+  # A release run (inputs.release) additionally forces every lane true via
+  # the `release-forced-*` outputs: a stable candidate must run the FULL
+  # pipeline, not the lanes its diff would touch — the diff of a release
+  # tag is not a meaningful applicability signal.
+  # ─────────────────────────────────────────────────────────────────────
+  detect:
+    name: Detect affected areas
+    # Unblock all lanes without waiting for a self-hosted test slot.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      python: ${{ steps.gate-lanes.outputs.python }}
+      python_prod: ${{ steps.gate-lanes.outputs.python_prod }}
+      frontend: ${{ steps.gate-lanes.outputs.frontend }}
+      site: ${{ steps.gate-lanes.outputs.site }}
+      scan: ${{ steps.gate-lanes.outputs.scan }}
+      deps: ${{ steps.gate-lanes.outputs.deps }}
+      uv_lock: ${{ steps.gate-lanes.outputs.uv_lock }}
+      npm_lock: ${{ steps.gate-lanes.outputs.npm_lock }}
+      bootstrap: ${{ steps.gate-lanes.outputs.bootstrap }}
+      desktop_updater: ${{ steps.gate-lanes.outputs.desktop_updater }}
+      rust: ${{ steps.gate-lanes.outputs.rust }}
+      docker_meta: ${{ steps.gate-lanes.outputs.docker_meta }}
+      mcp_catalog: ${{ steps.gate-lanes.outputs.mcp_catalog }}
+      e2e: ${{ steps.gate-lanes.outputs.e2e }}
+      e2e_upgrade: ${{ steps.gate-lanes.outputs.e2e_upgrade }}
+      e2e_desktop_core: ${{ steps.gate-lanes.outputs.e2e_desktop_core }}
+      e2e_desktop_update: ${{ steps.gate-lanes.outputs.e2e_desktop_update }}
+      desktop: ${{ steps.gate-lanes.outputs.desktop }}
+      # Not lane booleans: raw classifier values, never release-forced.
+      test_scope: ${{ steps.classify.outputs.test_scope }}
+      changed_files: ${{ steps.classify.outputs.changed_files }}
+      ci_review: ${{ steps.classify.outputs.ci_review }}
+      ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
+      event_name: ${{ github.event_name }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - name: Detect affected areas
+        id: classify
+        uses: ./.github/actions/detect-changes
+        with:
+          github-token: ${{ github.token }}
+      - name: Force all lanes on release
+        # Overwrite the classifier outputs with 'true' when inputs.release.
+        # ci_review stays raw: it only ever feeds the PR review-label gate.
+        #
+        # desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the desktop app is in use
+        # `desktop` (apps/desktop/** changed) is ANDed with the repo var here, so
+        # every Electron-app job reads one output. A release run forces it on.
+        #
+        # The install/update lanes (e2e_upgrade -> e2e-upgrade shards + the
+        # Windows install + update E2E legs; bootstrap -> Bootstrap installer)
+        # are path-gated on pull_request only. merge_group forces them on, and
+        # push has an empty diff (every lane on): a PR run is never the only
+        # gate (t_e8c5045e).
+        id: gate-lanes
+        env:
+          RELEASE: ${{ inputs.release }}
+          EVENT_NAME: ${{ github.event_name }}
+          DESKTOP_JOBS: ${{ vars.CI_DESKTOP_JOBS }}
+          CLASSIFIED: ${{ toJSON(steps.classify.outputs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          values = json.loads(os.environ['CLASSIFIED'])
+          release = os.environ['RELEASE'] == 'true'
+          if os.environ['EVENT_NAME'] == 'merge_group':
+              values.update(e2e_upgrade='true', bootstrap='true')
+          if not release and os.environ['DESKTOP_JOBS'] != 'on':
+              values['desktop'] = 'false'
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              for lane, value in values.items():
+                  if release and value in ('true', 'false'):
+                      value = 'true'
+                  if '\n' in value or '\r' in value:
+                      continue
+                  output.write(f'{lane}={value}\n')
+          PY
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Lane-gated sub-workflows. Each runs in parallel after detect finishes.
+  # Skipped workflows (if condition is false) don't spin up runners.
+  #
+  # The E2E suites (e2e, e2e-upgrade, both Desktop suites, and the two
+  # Windows journeys in tests-os) take most of the larger-runner minutes.
+  # On a pull request each runs only when the diff touches that suite or the
+  # code it guards, or the PR carries the `run-e2e` label
+  # (scripts/ci/classify_changes.py::_E2E_LANES). Every push to main runs
+  # all of them, so a regression the path lists miss turns main red after
+  # the merge.
+  # ─────────────────────────────────────────────────────────────────────
+  tests:
+    name: Python tests
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/tests.yml
+    with:
+      # 2026-09-09: 12 -> 16. On the fork's hosted 4-vCPU runners every exit-143
+      # "runner received a shutdown signal" death this week (9 jobs, 09-08..09-09)
+      # hit a slice that had already run 412-784 s; the passing distribution is
+      # 4-6 min. Shorter slices keep each job out of that window. Three PRs
+      # (#651 x2, #660) were blocked by it with no test actually failing.
+      #
+      # 2026-09-24 (t_41004cb2): merge_group runs 8, pull_request keeps 16.
+      # The queue run is the only gate (the ruleset has no PR status checks),
+      # and all CI jobs share the 60-concurrent hosted cap: 13 in-flight
+      # runs at ~20 jobs held the queue at 0 merges in 40 min. Halving the
+      # gate's matrix halves its share of that cap.
+      #
+      # 2026-09-25 (t_f447539b, dynamic CI slots): merge_group follows the LIVE
+      # self-hosted slot total, which ci-placement writes to
+      # vars.CI_MERGE_GROUP_SLICES through scripts/ci_routing_ledger.py (the only
+      # sanctioned writer). A 16-slice matrix onto 5 live slots just queues.
+      # Clamped 4..16 here AND in ci-overflow-controller `slice_counts`.
+      #
+      # 2026-09-26 (t_21d0a6cf): unset default 8 -> 16. CI is GitHub-hosted
+      # only now (CI_RUNNER_LABELS=ubuntu-latest, 120 concurrent); 8 was the
+      # self-hosted sizing. merge_group 36217656078 at 8 slices: 341-621 s
+      # per slice; push 36222117773 at 16: 106-322 s. Dynamic slots are
+      # disarmed, so ci-placement never writes the variable and this default
+      # is what merge_group runs. Rollback: set CI_MERGE_GROUP_SLICES=8.
+      slice_count: ${{ github.event_name == 'merge_group' && (vars.CI_MERGE_GROUP_SLICES == '' && 16 || (fromJSON(vars.CI_MERGE_GROUP_SLICES) < 4 && 4 || (fromJSON(vars.CI_MERGE_GROUP_SLICES) > 16 && 16 || fromJSON(vars.CI_MERGE_GROUP_SLICES)))) || 16 }}
+      test_scope: ${{ needs.detect.outputs.test_scope }}
+      # pull_request is a pre-filter: test-impact-selected files only. The
+      # merge_group run is the only required gate and always runs full, so a
+      # PR run is never the only gate (t_e8c5045e).
+      changed_files: ${{ needs.detect.outputs.event_name == 'pull_request' && needs.detect.outputs.changed_files || '[]' }}
+      e2e: ${{ needs.detect.outputs.e2e == 'true' }}
+      e2e_upgrade: ${{ needs.detect.outputs.e2e_upgrade == 'true' }}
+
+  # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
+  # the OS-marked tests it collects are skipped there by design (see the
+  # `_OS_MARKS` comment in tests/conftest.py) — this is where they run.
+  # Same `python` lane gate: if no Python changed, neither runs.
+  tests-os:
+    name: OS-specific tests
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/tests-os.yml
+    with:
+      # The Windows lane spawns the real desktop-update hand-off script
+      # (tests/test_desktop_update_windows_*.py) only when that surface
+      # changed; unit-level platforms("windows") tests always run.
+      desktop_updater: ${{ needs.detect.outputs.desktop_updater == 'true' }}
+      e2e: ${{ needs.detect.outputs.e2e == 'true' }}
+      e2e_upgrade: ${{ needs.detect.outputs.e2e_upgrade == 'true' }}
+
+  lint:
+    name: Python lints
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/lint.yml
+    with:
+      event_name: ${{ needs.detect.outputs.event_name }}
+
+  js-tests:
+    name: JS & TS checks
+    needs: detect
+    if: needs.detect.outputs.frontend == 'true'
+    uses: ./.github/workflows/js-tests.yml
+    with:
+      # desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the desktop app is in use
+      # Off: the UI test shards skip and the apps/desktop check units are left out.
+      desktop: ${{ needs.detect.outputs.desktop == 'true' }}
+
+  rust-tests:
+    name: Rust tests
+    needs: detect
+    # Only for PRs that touch a Rust crate. `.rs` is under apps/, so these
+    # changes used to run the TypeScript matrix and nothing that compiles them.
+    if: needs.detect.outputs.rust == 'true'
+    uses: ./.github/workflows/rust-tests.yml
+
+  bootstrap-installer:
+    name: Bootstrap installer
+    needs: detect
+    # The bootstrap-installer path: install.sh, the pin fragments it embeds,
+    # and the version stamp it ships. The PowerShell installer's native tests
+    # are platforms("windows") pytest files and run in tests-os.
+    if: needs.detect.outputs.bootstrap == 'true'
+    uses: ./.github/workflows/bootstrap-installer.yml
+
+  e2e-desktop:
+    name: Desktop E2E
+    needs: detect
+    # python_prod (not python): the Playwright suite exercises the built app
+    # + `hermes serve` backend, which never import anything under tests/.
+    #
+    # ⛔ DISABLED — upstream's guard (their #76627: after the Aug 1 engines/npm
+    # churn the mock-backend Electron window never gets a title, so boot/chat/
+    # setup specs all fail identically regardless of the diff).
+    #
+    # fork-parity note: I briefly restored the fork's condition here because
+    # `Desktop E2E` concludes SUCCESS on fork/main (runs 31280614721 /
+    # 31278775668) — which looked like proof upstream's premise was false here.
+    # It was the wrong inference. fork/main still carries the FORK's desktop
+    # tree (17 specs); this branch retires that fork and takes upstream's
+    # apps/desktop verbatim (19 specs, byte-identical to upstream/main), so it
+    # inherits upstream's BROKEN suite too. Re-enabling reproduced their exact
+    # symptom and blew the 20-minute cap at 20m20s:
+    #   ✘ e2e/boot.spec.ts › window opens with Hermes title
+    #   ✘ e2e/boot.spec.ts › renderer mounts and shows DOM content
+    #   ✘ e2e/chat.spec.ts › send a message and receive a response
+    # Green on fork/main measured the fork's suite, not this one.
+    #
+    # This job is intentionally SKIPPED, and scripts/ci/evaluate_needs.py has a
+    # matching exemption so the skip is declared rather than silent (the #476
+    # rule is 'no required job vanishes unnoticed', not 'never skip').
+    # Re-enable together with upstream's #76627 fix.
+    # t_bc0052b9: bare `if: false`, as upstream NousResearch did. The constant-folded
+    # `${{ false && (...) }}` form on this reusable-workflow job is upstream's documented
+    # cause of GitHub startup_failure ("An unexpected error has occurred", 0 jobs). Here it
+    # hit ~1 in 12 `--failed` re-runs (35898441649, 36070097433, 36145913460, 36170775010).
+    # To re-enable, restore:
+    #   if: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
+    if: false
+    uses: ./.github/workflows/e2e-desktop.yml
+
+  e2e-desktop-core:
+    name: Desktop core E2E
+    needs: detect
+    # The deterministic core suite (apps/desktop/e2e/core): transcript
+    # integrity, boot/respawn/orphans, clarify+approval. Required; retries 0.
+    # desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the desktop app is in use
+    if: needs.detect.outputs.desktop == 'true' && needs.detect.outputs.e2e_desktop_core == 'true'
+    uses: ./.github/workflows/e2e-desktop-core.yml
+
+  e2e-desktop-update:
+    name: Desktop update E2E
+    needs: detect
+    # apps/desktop/e2e/update: a real install.sh install + packaged Desktop,
+    # first run, "Update now" hand-off/relaunch, concurrent-update refusal.
+    # Advisory until it has proven stable on CI: its shards run with continue-on-error, so a
+    # red shard shows on the PR but does not fail all-checks-pass.
+    # desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the desktop app is in use
+    if: needs.detect.outputs.desktop == 'true' && needs.detect.outputs.e2e_desktop_update == 'true'
+    uses: ./.github/workflows/e2e-desktop-update.yml
+
+  docs-site:
+    name: Docs Site
+    needs: detect
+    if: needs.detect.outputs.site == 'true'
+    uses: ./.github/workflows/docs-site-checks.yml
+
+  history-check:
+    name: Deny unrelated histories
+    needs: detect
+    if: needs.detect.outputs.event_name == 'pull_request'
+    uses: ./.github/workflows/history-check.yml
+
+  contributor-check:
+    name: Check contributors
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/contributor-check.yml
+
+  uv-lockfile:
+    name: Check uv.lock
+    needs: detect
+    # Gated: `uv lock --check` re-resolves the whole dependency graph against
+    # PyPI, so on every PR it spent a network round-trip — and, on a registry
+    # blip, a blocking red X — for diffs that cannot desync the lockfile
+    # (docs, frontend, prose). Only pyproject.toml / uv.lock can. A
+    # `.github/` change still forces it on via the classifier's fail-open.
+    if: needs.detect.outputs.uv_lock == 'true'
+    uses: ./.github/workflows/uv-lockfile-check.yml
+
+  infographic-check:
+    name: Check no committed infographics
+    needs: detect
+    uses: ./.github/workflows/infographic-check.yml
+
+  profile-artifact-check:
+    name: Profile artifact check
+    needs: detect
+    uses: ./.github/workflows/profile-artifact-check.yml
+
+  icons-freshness-check:
+    name: Icon assets freshness
+    needs: detect
+    uses: ./.github/workflows/icons-freshness-check.yml
+
+  case-collision-check:
+    name: Check no case-colliding filenames
+    needs: detect
+    uses: ./.github/workflows/case-collision-check.yml
+
+  lazy-deps-guard:
+    name: No production imports of the tools.lazy_deps stub
+    needs: detect
+    uses: ./.github/workflows/lazy-deps-guard.yml
+
+  lockfile-diff:
+    name: package-lock.json diff
+    needs: detect
+    if: needs.detect.outputs.event_name == 'pull_request' && needs.detect.outputs.npm_lock == 'true'
+    uses: ./.github/workflows/lockfile-diff.yml
+
+  docker-lint:
+    name: Lint Docker scripts
+    needs: detect
+    if: needs.detect.outputs.docker_meta == 'true'
+    uses: ./.github/workflows/docker-lint.yml
+
+  supply-chain:
+    name: Supply-chain scan
+    needs: detect
+    if: needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps == 'true')
+    uses: ./.github/workflows/supply-chain-audit.yml
+    with:
+      event_name: ${{ needs.detect.outputs.event_name }}
+      scan: ${{ needs.detect.outputs.scan == 'true' }}
+      deps: ${{ needs.detect.outputs.deps == 'true' }}
+
+  review-labels:
+    name: Review label gate
+    needs: [detect, supply-chain]
+    if: always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
+    uses: ./.github/workflows/review-labels.yml
+    with:
+      ci_review: ${{ needs.detect.outputs.ci_review == 'true' }}
+      ci_review_files: ${{ needs.detect.outputs.ci_review_files }}
+      mcp_catalog: ${{ needs.detect.outputs.mcp_catalog == 'true' }}
+      supply_chain: ${{ needs.supply-chain.outputs.critical_findings == 'true' }}
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Gate: runs after everything. ``if: always()`` ensures it reports a
+  # status even when some deps were skipped. Only ``success`` and a
+  # classifier-consistent ``skipped`` result pass the gate.
+  #
+  #   Release (inputs.release): additionally strict — every required job must
+  #   be `success`. A skipped required lane fails the gate; only the PR-only
+  #   jobs (history-check, lockfile-diff, supply-chain, review-labels) and
+  #   the deferred Desktop E2E (e2e-desktop) may skip. The OSV scan's
+  #   findings are advisory, but its execution is required.
+  #
+  # Branch protection should require ONLY this check.
+  #
+  # Outputs ``needs-json`` — a compact ``{job_name: result}`` dict — so
+  # the live comment poller can list failed jobs in the PR comment.
+  # ─────────────────────────────────────────────────────────────────────
+  all-checks-pass:
+    name: All required checks pass
+    needs:
+      - detect
+      - tests
+      - tests-os
+      - lint
+      - js-tests
+      - rust-tests
+      - bootstrap-installer
+      - e2e-desktop
+      - e2e-desktop-core
+      - e2e-desktop-update
+      - docs-site
+      - history-check
+      - contributor-check
+      - uv-lockfile
+      - infographic-check
+      - case-collision-check
+      - lazy-deps-guard
+      - lockfile-diff
+      - docker-lint
+      - profile-artifact-check
+      - icons-freshness-check
+      - supply-chain
+      - review-labels
+      # OSV runs weekly against main (osv-scanner.yml schedule), not per PR:
+      # every PR was reporting the same repo-wide baseline of pinned-dep CVEs
+      # in its review comment, and the SARIF upload tripped GitHub's
+      # per-installation API rate limit during merge trains.
+      # The image build runs in its own workflow (docker.yml) and reports
+      # its own check. It was never required here, because it is too slow
+      # to block a merge. A separate run also stops it from holding this
+      # run open. That is what blocked ``gh run rerun``.
+    if: always()
+    # A completed matrix must not wait for the pool to report its verdict.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      needs-json: ${{ steps.evaluate.outputs.needs-json }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Evaluate job results
+        id: evaluate
+        # Shared with the stable orchestrator (scripts/ci/required_results.py
+        # is imported there). NEEDS is the toJSON(needs) context; RELEASE
+        # switches the gate into strict mode for release runs.
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          RELEASE: ${{ inputs.release }}
+        run: |
+          echo "$NEEDS" | python3 scripts/ci/evaluate_needs.py
+          if [ "$RELEASE" = true ]; then
+            printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py --release
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────
+  # CI timing report: collect per-job/step durations from the GitHub API,
+  # cache them on main (as a baseline), and on PRs generate an HTML diff
+  # report with a gantt chart + per-step breakdown. The report is uploaded
+  # as an artifact and a markdown summary is written to $GITHUB_STEP_SUMMARY.
+  #
+  # The live comment poller dynamically fetches all review-status-* artifacts
+  # across the orchestrator and sub-workflow runs every cycle, so its link
+  # points straight at that report.
+  # ─────────────────────────────────────────────────────────────────────
+  ci-timings:
+    name: CI timing report
+    needs: [all-checks-pass]
+    if: always()
+    # GitHub API/cache/artifacts only; reserve pool slots for tests.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+
+      - name: Restore baseline cache (PR only)
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ci-timings-baseline.json
+          # Prefix-match: exact key will never hit (run_id differs), so
+          # restore-keys finds the most recent baseline from main.
+          key: ci-timings-baseline-never-exact-${{ github.run_id }}
+          restore-keys: |
+            ci-timings-baseline-
+
+      - name: Collect timings and generate report
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci/timings_report.py \
+            --baseline ci-timings-baseline.json \
+            --output ci-timings-report.html \
+            --json-out ci-timings.json \
+            --summary-out ci-timings-summary.md
+
+      - name: Upload HTML report
+        # Advisory report — artifact-service blips must not fail the job.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        id: ci-timings-html
+        with:
+          name: ci-timings-report
+          path: ci-timings-report.html
+          retention-days: 14
+
+      - name: Build linked review status
+        if: hashFiles('ci-timings.json') != ''
+        env:
+          CI_TIMINGS_REPORT_URL: ${{ steps.ci-timings-html.outputs.artifact-url }}
+        run: |
+          python3 scripts/ci/timings_report.py \
+            --from-json ci-timings.json \
+            --baseline ci-timings-baseline.json \
+            --review-status-out review-status.json \
+            --review-status-only
+
+      - name: Upload review status
+        if: hashFiles('review-status.json') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: review-status-ci-timings
+          path: review-status.json
+          retention-days: 14
+
+      - name: Output summary
+        env:
+          REPORT_URL: ${{ steps.ci-timings-html.outputs.artifact-url}}
+        run: |
+          {
+            echo "# CI Timing report"
+            echo "[View the full interactive report]($REPORT_URL)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat ci-timings-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save baseline cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          # Degraded runs (API rate-limited) produce no ci-timings.json —
+          # skip rather than fail, and never cache an empty baseline.
+          if [ -f ci-timings.json ]; then
+            cp ci-timings.json ci-timings-baseline.json
+          else
+            echo "No timings JSON this run — skipping baseline update"
+          fi
+
+      - name: Upload baseline to cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('ci-timings-baseline.json') != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ci-timings-baseline.json
+          key: ci-timings-baseline-${{ github.run_id }}
