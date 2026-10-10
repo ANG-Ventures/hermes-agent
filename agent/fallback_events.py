@@ -730,6 +730,8 @@ def stash_response_failure(agent: Any, site: str, response: Any = None, *,
             "dl_headers": {},
             "dl_body": None,
         }
+        if repeat:  # the same response was already logged by the first stash
+            return
         logger.warning(
             "provider response rejected by the loop: site=%s stop_reason=%s "
             "content_blocks=%s output_tokens=%s route_id=%s served_by=%s elapsed_s=%s",
@@ -784,6 +786,16 @@ def record_invalid_response(agent: Any, floor: Any, outcome: str, *,
         cr = getattr(usage, "cache_read_input_tokens", None) if usage is not None else None
         if isinstance(cr, int):
             fields.append(("cache_read", cr))
+        # t_3afed4f8: the relay's own ladder, so the row reconciles with the
+        # rider built from the same floor (served_by is only the LAST seat).
+        seats = [str(x) for x in (fl.get("relay_attempts") or ()) if x]
+        if seats:
+            fields += [("relay_attempts", len(seats)), ("relay_seats", ",".join(seats))]
+        for key, src in (("relay_ladder", "relay_perturbations"),
+                         ("relay_request_ids", "relay_request_ids")):
+            vals = [str(x) for x in (fl.get(src) or ()) if x]
+            if vals:
+                fields.append((key, ",".join(vals)))
 
         def _tok(v: Any) -> str:
             return re.sub(r"\s+", "_", str(v)) if v not in (None, "") else "-"

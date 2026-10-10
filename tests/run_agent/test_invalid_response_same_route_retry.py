@@ -201,3 +201,17 @@ def test_row_without_relay_headers_has_no_relay_tokens(agent):
     row = _count_rows()[0]
     assert row["retry_outcome"] == "relay_gave_up"
     assert not {"relay_attempts", "relay_seats", "relay_ladder", "relay_request_ids"} & set(row)
+
+
+def test_relay_gave_up_response_is_logged_rejected_once(agent, caplog):
+    """The repeat-mark re-stash of the same response must not log it twice."""
+    import logging
+
+    agent._fallback_chain = [{"provider": "claude-btpr", "model": "claude-fable-5-1"}]
+    caplog.set_level(logging.WARNING, logger="agent.fallback_events")
+    with patch.object(agent, "_try_activate_fallback", return_value=False):
+        _run(agent, [_empty_tool_use(out=277, relay_retried="gave_up")]
+             + [_empty_tool_use(out=1)] * 5)
+    hits = [r for r in caplog.records
+            if "rejected by the loop" in r.getMessage() and "output_tokens=277" in r.getMessage()]
+    assert len(hits) == 1, [r.getMessage() for r in hits]
