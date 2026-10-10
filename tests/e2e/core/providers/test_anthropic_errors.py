@@ -148,3 +148,25 @@ def test_stream_drop_then_next_turn_replays_only_the_completed_signature(rig_fac
     assert len(prior) == 1 and thinking_of(prior[0]) == [("Completed reasoning.", "EqCompleted+/Sig==")], dump(last)
     assert "FRAGMENT" not in json.dumps(last["messages"])
     assert not rig.srv.schema_errors(), rig.srv.schema_errors()
+
+
+THOUGHT = "S11-PRIVATE-THOUGHT about the request."
+
+
+@pytest.mark.parametrize("blocks", [[], [Thinking(THOUGHT, "EqS11Sig+/==")]], ids=["S0_no_content", "S11_thinking_only"])
+def test_tool_use_stop_without_a_tool_block_is_a_provider_invalid_response(rig_factory, blocks) -> None:
+    """stop_reason=tool_use with no tool_use block (t_a31296b2). S0 (content=[]) is a provider invalid
+    response; S11 is the same fault with a thinking block in front (10x in the wild 10-08..10). Both
+    get one same-route retry and an ``invalid_response`` ledger row. The user is never told the model
+    spent its budget thinking, and the thinking is never delivered as the answer."""
+    rig = rig_factory(lambda _r: Reply(list(blocks), stop_reason="tool_use", output_tokens=300))
+    proc = rig.run("-z", "hello")
+    surfaced = proc.stdout + proc.stderr
+    mains = rig.srv.main_requests()
+    assert len(mains) == 2, f"expected the one same-route retry, saw {len(mains)} calls: {surfaced[-800:]!r}"
+    assert THOUGHT not in proc.stdout, f"thinking delivered as the answer: {proc.stdout[-800:]!r}"
+    assert "output budget thinking" not in surfaced and "/reasoning" not in surfaced, surfaced[-800:]
+    ledger = rig.hermes_home / "state" / "model-route-changes.log"
+    rows = ledger.read_text(encoding="utf-8").splitlines() if ledger.exists() else []
+    assert any("class=provider_invalid_response" in r and "stop_reason=tool_use" in r
+               and "retry_outcome=retry_same" in r for r in rows), (rows, rig.log_tail(pattern="invalid"))

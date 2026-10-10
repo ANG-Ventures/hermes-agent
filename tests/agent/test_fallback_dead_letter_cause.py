@@ -418,3 +418,18 @@ def test_non_repeat_floor_keeps_same_provider_entries(_home, monkeypatch):
     fbe.stash_response_failure(a, "invalid_response", _live_resp(462, "sub-vps-2", None))
     assert try_activate_fallback(a) is True
     assert (a.provider, a.model) == ("claude-alr", "claude-opus-5-5")
+
+
+def test_thinking_only_tool_use_is_the_empty_tool_use_floor():
+    # t_a31296b2 S11: stop_reason=tool_use with only thinking in content is the same fault as content=[].
+    R = lambda **k: type("R", (), k)()
+    B = lambda t: type("B", (), {"type": t})()
+    from agent.transports.anthropic import AnthropicTransport
+    s11 = R(stop_reason="tool_use", content=[B("thinking")])
+    assert fbe.thinking_only_tool_use(s11) and fbe.empty_tool_use_floor(s11)
+    assert fbe.thinking_only_tool_use(R(stop_reason="tool_use", content=[{"type": "redacted_thinking"}]))
+    assert not AnthropicTransport().validate_response(s11)
+    with_tool = R(stop_reason="tool_use", content=[B("thinking"), B("tool_use")])
+    assert not fbe.thinking_only_tool_use(with_tool) and AnthropicTransport().validate_response(with_tool)
+    end_turn = R(stop_reason="end_turn", content=[B("thinking")])
+    assert not fbe.thinking_only_tool_use(end_turn) and AnthropicTransport().validate_response(end_turn)
