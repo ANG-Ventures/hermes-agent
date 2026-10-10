@@ -1364,9 +1364,12 @@ def _apply_display_config(agent, _agent_cfg, platform):
     agent._stream_5xx_probe_ts = None  # monotonic time of the last streaming-5xx unmask probe
 
     try:
+        from agent.oneshot_footprint import is_single_query_session
+
         agent._tool_guardrails = ToolCallGuardrailController(
             ToolCallGuardrailConfig.from_mapping(
                 _agent_cfg.get("tool_loop_guardrails", {}), platform=platform,
+                unattended=is_single_query_session(),
             )
         )
     except Exception as _tlg_err:

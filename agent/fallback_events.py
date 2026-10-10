@@ -312,7 +312,25 @@ def empty_tool_use_floor(response: Any) -> bool:
             return False
         content = getattr(response, "content", None)
         return (getattr(response, "stop_reason", None) == "tool_use"
-                and isinstance(content, list) and len(content) == 0)
+                and isinstance(content, list) and len(content) == 0) or thinking_only_tool_use(response)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_THINKING_BLOCK_TYPES = frozenset(("thinking", "redacted_thinking"))
+
+
+def thinking_only_tool_use(response: Any) -> bool:
+    """``stop_reason=tool_use`` whose content is ONLY thinking blocks (t_a31296b2, shape S11):
+    the empty tool_use body above with a thinking block in front, 10x in the wild 10-08..10.
+    The stop names a tool call that never arrived, so it is a provider invalid response, not a
+    model that thought too long. Never raises."""
+    try:
+        content = getattr(response, "content", None)
+        if getattr(response, "stop_reason", None) != "tool_use" or not isinstance(content, list) or not content:
+            return False
+        return all((b.get("type") if isinstance(b, dict) else getattr(b, "type", None)) in _THINKING_BLOCK_TYPES
+                   for b in content)
     except Exception:  # noqa: BLE001
         return False
 
@@ -654,14 +672,29 @@ def _perturbations(raw: Any) -> Optional[list]:
     return rungs[:8]
 
 
+# claude-pool #229 (claude_pool_relay.EC_REQUEST_ID_MISSING): the relay's slot
+# for an attempt that got no upstream request id. Never a real id.
+RELAY_REQUEST_ID_MISSING = "-"
+
+
 def _request_ids(raw: Any) -> Optional[list]:
-    """``x-pool-empty-content-request-ids: req_a,req_b,req_c`` -> the upstream
-    request ids of each billed empty attempt (at most 8), else None."""
+    """``x-pool-empty-content-request-ids: req_a,-,req_c`` -> the upstream
+    request id of each billed empty attempt (at most 8), positional with the
+    attempts header: a ``-`` placeholder, empty or malformed slot is None, so
+    later ids stay on their attempt. None when no slot holds a real id."""
     if not isinstance(raw, str) or not raw.strip():
         return None
-    ids = [t.strip() for t in raw.split(",") if t.strip()]
-    ids = [t for t in ids if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", t)][:8]
-    return ids or None
+    ids = [t.strip() for t in raw.split(",")][:8]
+    ids = [t if t != RELAY_REQUEST_ID_MISSING
+           and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", t) else None for t in ids]
+    return ids if any(ids) else None
+
+
+def _positional_ids(ids: Any) -> str:
+    """Ledger/log form of a floor's ``relay_request_ids``: comma-joined, one
+    slot per attempt, ``-`` where the attempt had no id (the relay's own
+    placeholder). Readers joining to upstream ids skip ``-``."""
+    return ",".join(str(x) if x else RELAY_REQUEST_ID_MISSING for x in ids)
 
 
 def _prompt_tokens(usage: Any) -> Optional[int]:
@@ -791,11 +824,11 @@ def record_invalid_response(agent: Any, floor: Any, outcome: str, *,
         seats = [str(x) for x in (fl.get("relay_attempts") or ()) if x]
         if seats:
             fields += [("relay_attempts", len(seats)), ("relay_seats", ",".join(seats))]
-        for key, src in (("relay_ladder", "relay_perturbations"),
-                         ("relay_request_ids", "relay_request_ids")):
-            vals = [str(x) for x in (fl.get(src) or ()) if x]
-            if vals:
-                fields.append((key, ",".join(vals)))
+        rungs = [str(x) for x in (fl.get("relay_perturbations") or ()) if x]
+        if rungs:
+            fields.append(("relay_ladder", ",".join(rungs)))
+        if any(fl.get("relay_request_ids") or ()):
+            fields.append(("relay_request_ids", _positional_ids(fl["relay_request_ids"])))
 
         def _tok(v: Any) -> str:
             return re.sub(r"\s+", "_", str(v)) if v not in (None, "") else "-"
@@ -1358,7 +1391,7 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
                 row["route_id"] = fl["route_id"]
             # t_c706fd1e: ledger columns, so the billed ladder is queryable.
             if fl.get("relay_request_ids") and not row.get("request_ids"):
-                row["request_ids"] = ",".join(fl["relay_request_ids"])
+                row["request_ids"] = _positional_ids(fl["relay_request_ids"])
             if isinstance(fl.get("prompt_tokens"), int):
                 row.setdefault("prompt_tokens", fl["prompt_tokens"])
         # t_5d79bfea: an HTTP-200 refusal names its seat, route and hop from the
