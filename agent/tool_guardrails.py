@@ -133,14 +133,16 @@ class ToolCallGuardrailConfig:
 
     @classmethod
     def from_mapping(
-        cls, data: Mapping[str, Any] | None, *, platform: str | None = None,
+        cls, data: Mapping[str, Any] | None, *, platform: str | None = None, unattended: bool = False,
     ) -> "ToolCallGuardrailConfig":
-        """Build config from `tool_loop_guardrails`; nested ``warn_after`` / ``hard_stop_after`` win over flat legacy keys."""
+        """Build config from `tool_loop_guardrails`; nested ``warn_after`` / ``hard_stop_after`` win over flat legacy keys.
+        ``unattended`` marks a finite one-shot turn (``-z`` / ``-q``, kanban workers) on an attended platform
+        label: nobody can /stop it, so it gets the non-interactive hard-stop default."""
         if not isinstance(data, Mapping):
             data = {}
         d = cls()
         flags = {name: _as_bool(data.get(name), getattr(d, name)) for name in _BOOL_FIELDS}
-        if flags["non_interactive_hard_stop_enabled"] and _is_non_interactive_platform(platform):
+        if flags["non_interactive_hard_stop_enabled"] and (unattended or _is_non_interactive_platform(platform)):
             flags["hard_stop_enabled"] = True
 
         def threshold(name: str, section_name: str, key: str) -> int:

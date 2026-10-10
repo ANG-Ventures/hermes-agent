@@ -480,3 +480,39 @@ def test_live_2125_seat_timeout_line(_home, monkeypatch):
             " · pool had no other seat, ") in text, text
     for banned in ("read timeout", "hop unknown", "stalled mid-turn"):
         assert banned not in text, (banned, text)
+
+
+def test_missing_request_id_placeholder_is_not_an_id(_home, monkeypatch):
+    """t_2cb85183 / claude-pool #229: an attempt with no upstream id comes in
+    as the relay's ``-`` placeholder. The floor holds None in that slot (the
+    list stays positional), the banner names only real ids, and the ledger
+    row keeps ``-`` purely as the positional placeholder."""
+    from agent.chat_completion_helpers import try_activate_fallback
+    from tests.agent.test_fallback_dead_letter_cause import _alr_agent
+    from tests.agent.test_fallback_events_ledger import _patch_resolver
+
+    _patch_resolver(monkeypatch)
+    a = _alr_agent()
+    resp = type("R", (), {"content": [], "stop_reason": "tool_use", "usage": None,
+                          "pool_headers": {
+                              "x-pool-served-by": "sub-vps-2",
+                              "x-pool-empty-content-retried": "gave_up",
+                              "x-pool-empty-content-attempts": "sub-vps-1,sub-vps-1,sub-vps-2",
+                              "x-pool-empty-content-request-ids": "req_1,-,req_3",
+                          }})()
+    fbe.stash_response_failure(a, "invalid_response", resp, repeat=True)
+    floor = a._pending_fallback_error["floor"]
+    assert floor["relay_request_ids"] == ["req_1", None, "req_3"]
+    assert try_activate_fallback(a) is True
+    row = _rows(_home)[0]
+    assert row["request_ids"] == "req_1,-,req_3"
+    real = [r for r in row["request_ids"].split(",") if r != fbe.RELAY_REQUEST_ID_MISSING]
+    assert real == ["req_1", "req_3"]
+    text = row["notice_text"]
+    assert "req_…req_1" in text and "req_…req_3" in text, text
+    assert "req_…-" not in text, text
+
+
+def test_request_ids_all_placeholders_is_none():
+    assert fbe._request_ids("-,-") is None
+    assert fbe._request_ids("req_a,bad id!,-") == ["req_a", None, None]
