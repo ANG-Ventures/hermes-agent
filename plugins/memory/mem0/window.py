@@ -21,6 +21,7 @@ CLI (run from the hermes-agent checkout):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ WINDOW_FLAG_NAME = "mem0-window.flag"
 PAUSE_FLAG_NAME = "mem0-capture-drain.pause"
 JOURNAL_NAME = "mem0-window-journal.jsonl"
 REPLAYING_SUFFIX = ".replaying"
+LOCK_NAME = "mem0-window-journal.lock"
 DEFAULT_QUEUE_PATH = "~/.hermes/state/mem0-capture/capture_queue.db"  # = capture_pipeline default
 PENDING_MAX_AGE_S = 30 * 60
 
@@ -59,6 +61,33 @@ def pause_flag_path() -> Path:
 
 def journal_path() -> Path:
     return state_dir() / JOURNAL_NAME
+
+
+@contextlib.contextmanager
+def _journal_lock(path: Optional[Path] = None) -> Iterator[None]:
+    """Host-wide exclusive lock serializing (flag check + journal append), flag removal and
+    journal rotation, so no conclude can write into a journal being drained or land after
+    ``close()`` finished. A separate file: the journal itself is renamed away."""
+    path = path or state_dir() / LOCK_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b") as f:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 # ---- flags ----------------------------------------------------------------------------------
@@ -129,19 +158,34 @@ def write_flag(path: Path, *, minutes: float, reason: str, now: Optional[float] 
 
 # ---- conclude gate (called by the provider) -------------------------------------------------
 def refuse_conclude(user_id: str, agent_id: str, text: str) -> Optional[str]:
-    """If the window flag is active: journal the fact and return the tool error JSON; else None."""
+    """If the window flag is active: journal the fact and return the tool JSON (result when journaled, error when not); else None.
+
+    The flag read and the append happen under the journal lock, so ``close()`` (which removes
+    the flags under the same lock) cannot finish while a refused fact is still unwritten."""
+    try:
+        with _journal_lock():
+            return _refuse_locked(user_id, agent_id, text)
+    except OSError as e:  # lock unusable (state dir broken): keep the pre-lock behaviour
+        logger.error("mem0 window: journal lock unavailable, proceeding unlocked: %s", e)
+        return _refuse_locked(user_id, agent_id, text)
+
+
+def _refuse_locked(user_id: str, agent_id: str, text: str) -> Optional[str]:
     active, data = flag_active(window_flag_path())
     if not active:
         return None
     until = (data or {}).get("expires_at", "the window closes")
-    msg = f"mem0 maintenance window, re-issue after {until}"
     try:
         _append_journal(journal_path(), {"user_id": user_id, "agent_id": agent_id,
                                          "text": text, "ts": _iso(time.time())})
     except Exception as e:
         logger.error("mem0 window: journal append FAILED, fact not kept: %s", e)
-        msg += f" (journal write failed: {e}; the fact was NOT kept)"
-    return json.dumps({"error": msg})
+        return json.dumps({"error": f"mem0 maintenance window, re-issue after {until} "
+                                    f"(journal write failed: {e}; the fact was NOT kept)"})
+    # Journaled: replay at close is the sole writeback, so the agent must NOT re-issue it
+    # (a re-issue after the window would store every maintenance-time fact twice).
+    return json.dumps({"result": f"mem0 maintenance window until {until}: fact journaled, it is "
+                                 f"stored automatically when the window closes. Do not re-issue it."})
 
 
 def _append_journal(path: Path, entry: Dict[str, Any]) -> None:
@@ -185,10 +229,13 @@ def replay(add_fn: AddFn, *, path: Optional[Path] = None) -> Tuple[int, int]:
     replaying = path.with_name(path.name + REPLAYING_SUFFIX)
     leftover = replaying.exists()
     if not leftover:
-        try:
-            os.rename(path, replaying)
-        except FileNotFoundError:
-            return 0, 0
+        # Under the lock no conclude holds an fd on the live journal (appends open+write+close
+        # inside it), so nothing can be written into the renamed file after we read it.
+        with _journal_lock(path.with_name(LOCK_NAME)):
+            try:
+                os.rename(path, replaying)
+            except FileNotFoundError:
+                return 0, 0
     lines = [ln for ln in replaying.read_text(encoding="utf-8").splitlines() if ln.strip()]
     failed: List[str] = []
     replayed = 0
@@ -217,13 +264,16 @@ def replay(add_fn: AddFn, *, path: Optional[Path] = None) -> Tuple[int, int]:
 
 
 def close(add_fn: AddFn) -> Tuple[int, int]:
-    """Remove both flags, replay the journal, then one post-removal sweep for facts journaled
-    by concludes that read the flag before it was removed."""
-    for p in (window_flag_path(), pause_flag_path()):
-        try:
-            p.unlink()
-        except FileNotFoundError:
-            pass
+    """Remove both flags, replay the journal, then one post-removal sweep.
+
+    The flags are removed under the journal lock: every conclude that read the flag as active
+    has already appended, and every later one sees it absent and stores directly."""
+    with _journal_lock():
+        for p in (window_flag_path(), pause_flag_path()):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
     j1, r1 = replay(add_fn)
     if r1 != j1:
         return j1, r1  # leftover stays in .replaying; a sweep now would recount it

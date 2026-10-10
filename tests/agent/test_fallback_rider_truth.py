@@ -130,6 +130,16 @@ def test_rung_names_map_and_unknown_kinds_print_verbatim():
     assert ": as-is, new_thing, rotate→sub-vps-7 — relay ladder exhausted" in text, text
 
 
+def test_perturb_prompt_rungs_map_to_labels_not_raw_tokens():
+    """claude-pool#223 tokens render as labels, never raw (t_0256b47c)."""
+    row = _ladder_row(relay_attempts=["local", "local", "sub-vps-11"],
+                      relay_perturbations=["none", "perturb_prompt", "perturb_prompt+rotate"],
+                      relay_request_ids=None, prompt_tokens=300_148)
+    text = fp.format_cause_rider(row, tz=UTC)
+    assert ": as-is, +\\n prompt, rotate→sub-vps-11 +\\n prompt; prompt 300k tok" in text, text
+    assert "perturb_prompt" not in text and text.count("rotate") == 1, text
+
+
 def test_without_perturbation_header_same_seat_says_same_seat():
     text = fp.format_cause_rider(_ladder_row(), tz=UTC)
     assert text == (
