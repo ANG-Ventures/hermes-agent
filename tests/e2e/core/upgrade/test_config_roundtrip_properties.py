@@ -370,8 +370,16 @@ def home(monkeypatch):
     with contextlib.suppress(Exception):
         from tui_gateway import server
         monkeypatch.setattr(server, "_hermes_home", hh)
+    saved_env = environ_snapshot()
     yield hh
     _reset_config_caches()
+    # save_env_value publishes to os.environ outside monkeypatch (migrate's v12->13 step sets
+    # LLM_MODEL=""), and a leaked "" makes a later test's get_env_value skip that clear.
+    for key in set(environ_snapshot()) - set(saved_env):
+        os.environ.pop(key, None)
+    for key, value in saved_env.items():
+        if os.environ.get(key) != value:
+            os.environ[key] = value
 
 
 def _install(case: Case, monkeypatch) -> Path:

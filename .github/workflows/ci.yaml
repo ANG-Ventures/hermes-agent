@@ -182,7 +182,14 @@ jobs:
       ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
       event_name: ${{ github.event_name }}
     steps:
+      # TRUSTED REF, never the PR tree (Prism P1 ac6c31b59f61): the classifier
+      # decides which required lanes run, so a PR must not ship its own. This
+      # job reads the diff through the API and needs no PR bytes. merge_group
+      # takes base_REF (main), not base_sha: base_sha is the previous queue
+      # candidate, i.e. unmerged PRs. tests/ci/test_trusted_gate_ref.py.
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ github.event.merge_group.base_ref || github.event.pull_request.base.sha || github.sha }}
       - name: Detect affected areas
         id: classify
         uses: ./.github/actions/detect-changes
@@ -528,9 +535,12 @@ jobs:
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
     steps:
+      # TRUSTED REF (see detect): the evaluator below IS the required verdict;
+      # a PR that rewrites scripts/ci/evaluate_needs.py to exit 0 must not
+      # run it here. needs-json comes from the expression context, not the tree.
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.merge_group.base_ref || github.event.pull_request.base.sha || github.sha }}
       - name: Evaluate job results
         id: evaluate
         # Shared with the stable orchestrator (scripts/ci/required_results.py
