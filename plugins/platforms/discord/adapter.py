@@ -1548,6 +1548,40 @@ def _read_discord_prompt_timeout() -> int:
 from plugins.platforms.discord.adapter_media import DiscordMediaMixin
 
 
+# A backticked URL span: `<https://…>` or `https://…` with nothing else inside the backticks.
+# Discord renders a backticked span as inline code, which makes the URL unclickable; the bare
+# <url> form is the one that suppresses the embed while staying a link. Models slip into the
+# double-wrapped form (measured 2026-10-09: Ace asked why links stopped rendering), so the
+# formatter unwraps exactly that case. Real inline code (`curl https://…`, `<div>`,
+# ``fetch(`https://…`)``) is untouched: spans are matched by delimiter length (CommonMark), so a
+# backtick pair inside a longer span or a fence is content, and only a span whose whole content
+# is the URL is rewritten. Module-level (not a method): format_message is invoked unbound
+# (self=None) by scripts/generate_conformance_vectors.py.
+_BACKTICK_RUN_RE = re.compile(r"`+")
+_SPAN_URL_RE = re.compile(r"<?(https?://[^\s`<>]+)>?")
+
+
+def _unwrap_backticked_urls(content: str) -> str:
+    runs = list(_BACKTICK_RUN_RE.finditer(content))
+    out, pos, i = [], 0, 0
+    while i < len(runs):
+        opener = runs[i]
+        width = len(opener.group())
+        j = next((k for k in range(i + 1, len(runs)) if len(runs[k].group()) == width), None)
+        if j is None:  # unmatched run is literal text
+            i += 1
+            continue
+        closer = runs[j]
+        url = _SPAN_URL_RE.fullmatch(content[opener.end():closer.start()])
+        if url:
+            out.append(content[pos:opener.start()])
+            out.append(f"<{url.group(1)}>")
+            pos = closer.end()
+        i = j + 1
+    out.append(content[pos:])
+    return "".join(out)
+
+
 class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
@@ -5542,28 +5576,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if resolved_count:
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
 
-    # A backticked URL span: `<https://…>` or `https://…` with nothing else inside the backticks.
-    # Discord renders a backticked span as inline code, which makes the URL unclickable; the bare
-    # <url> form is the one that suppresses the embed while staying a link. Models slip into the
-    # double-wrapped form (measured 2026-10-09: Ace asked why links stopped rendering), so the
-    # formatter unwraps exactly that case. Real inline code (`curl https://…`, `<div>`) is untouched
-    # because the span must contain ONLY the URL.
-    _BACKTICKED_URL_RE = re.compile(r"`<?(https?://[^\s`<>]+)>?`")
-
-    @classmethod
-    def _unwrap_backticked_urls(cls, content: str) -> str:
-        # Skip fenced blocks: split on ``` and only rewrite the even (outside) segments.
-        parts = content.split("```")
-        for i in range(0, len(parts), 2):
-            parts[i] = cls._BACKTICKED_URL_RE.sub(lambda m: f"<{m.group(1)}>", parts[i])
-        return "```".join(parts)
-
     def format_message(self, content: str) -> str:
         """Format for Discord: GFM tables become bullet lists (Discord doesn't render pipe tables);
         a URL wrapped in backticks (`<url>` / `url`) becomes a plain <url> so it stays clickable."""
         if not content:
             return content
-        return self._unwrap_backticked_urls(convert_table_to_bullets(content))
+        return _unwrap_backticked_urls(convert_table_to_bullets(content))
 
     async def _defer_unless_expired(self, interaction: discord.Interaction, warn_fmt: str, *warn_args) -> bool:
         """Ephemeral defer(); False (after a warning) when the interaction token already expired

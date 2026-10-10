@@ -152,3 +152,17 @@ class TestBacktickedAngleLinks:
         adapter = _make_discord_adapter()
         text = "```\n`<https://example.com>`\n```"
         assert adapter.format_message(text) == text
+
+    def test_url_template_literal_inside_double_backtick_span_preserved(self):
+        adapter = _make_discord_adapter()
+        text = "use ``fetch(`https://example.com`)`` here"
+        assert adapter.format_message(text) == text
+
+    def test_double_backtick_span_holding_only_url_is_unwrapped(self):
+        adapter = _make_discord_adapter()
+        assert adapter.format_message("see ``https://example.com/x`` ok") == "see <https://example.com/x> ok"
+
+    def test_unbound_call_is_self_free(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        assert DiscordAdapter.format_message(None, "a `https://e.com` b") == "a <https://e.com> b"
