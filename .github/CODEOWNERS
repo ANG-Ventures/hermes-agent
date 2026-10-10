@@ -1,8 +1,11 @@
-# Gate integrity (Prism P1 ac6c31b59f61, t_8c9a779a). On pull_request and merge_group GitHub reads the
-# workflow YAML from the PR/candidate commit, so a PR can rewrite a required job itself; checking gate
-# scripts out of the base ref (ci.yaml detect + all-checks-pass) cannot stop that. These paths decide
-# whether a PR passes, so a change to them needs an owner's review.
-# INERT until the main ruleset turns on "Require review from Code Owners" (admin; not set as of 2026-10-10).
+# CODEOWNERS — ownership RECORD only. NOT enforced.
+# Ace ruling 2026-10-10 06:04 (Discord #apollo 1558465153106841713): "Require review from Code Owners" on
+# ruleset 19798098 is deliberately OFF; only fleet kanban workers open PRs here and every landing is ledgered
+# by the merge-attribution gate. The required gate's SCRIPTS are trusted (checked out from the base ref,
+# #1853); the workflow YAML itself is readable from a PR by GitHub design and that residual is accepted.
+# Re-raise only if an external contributor lane or a non-fleet account gains push. Doctrine: hermes-home
+# skills-shared/devops/github-actions-ci-ops SKILL.md section 1.8.
+
 /.github/                       @Kyzcreig
 /scripts/ci/                    @Kyzcreig
 /scripts/run_tests.sh           @Kyzcreig
