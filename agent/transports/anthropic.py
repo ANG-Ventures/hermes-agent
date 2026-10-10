@@ -117,10 +117,12 @@ class AnthropicTransport(ProviderTransport):
     def validate_response(self, response: Any) -> bool:
         """Structural check; empty content is legitimate for ``end_turn``/``refusal`` (retrying
         either would loop forever)."""
+        from agent.fallback_events import thinking_only_tool_use
+
         content_blocks = getattr(response, "content", None)
         return isinstance(content_blocks, list) and (
             bool(content_blocks) or getattr(response, "stop_reason", None) in {"end_turn", "refusal"}
-        )
+        ) and not thinking_only_tool_use(response)
 
     def extract_cache_stats(self, response: Any) -> Optional[Dict[str, int]]:
         """Anthropic cache_read / cache_creation token counts."""

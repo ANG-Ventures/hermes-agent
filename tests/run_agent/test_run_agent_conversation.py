@@ -2325,9 +2325,10 @@ class TestDeadRetryCode:
         from agent.turn_response_check import retry_invalid_response
 
         for fn in (settle_unrecovered_error, retry_invalid_response):
-            occurrences = inspect.getsource(fn).count("if retry_count >= max_retries:")
+            # Prefix match: the invalid-response guard also ends a relay gave_up turn (t_3f07418e).
+            occurrences = inspect.getsource(fn).count("if retry_count >= max_retries")
             assert occurrences == 1, (
-                f"{fn.__name__}: expected 1 occurrence of 'if retry_count >= max_retries:' "
+                f"{fn.__name__}: expected 1 occurrence of 'if retry_count >= max_retries' "
                 f"but found {occurrences}"
             )
         assert inspect.getsource(_run_api_retry_loop).count("if retry_count >= max_retries:") == 0
