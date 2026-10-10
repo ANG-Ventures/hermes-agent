@@ -89,7 +89,10 @@ def test_profile_home_shares_the_host_flag(home, monkeypatch):
 def test_conclude_refused_and_journaled_under_flag(home, posts):
     data = window.write_flag(window.window_flag_path(), minutes=30, reason="cutover")
     out = json.loads(_provider().handle_tool_call("mem0_conclude", {"conclusion": "Ace likes tea"}))
-    assert out == {"error": f"mem0 maintenance window, re-issue after {data['expires_at']}"}
+    # journaled = kept; replay is the sole writeback, so the agent is told NOT to re-issue
+    assert set(out) == {"result"}
+    assert data["expires_at"] in out["result"] and "Do not re-issue" in out["result"]
+    assert "re-issue after" not in out["result"]
     assert posts == []  # nothing reached the store
     rows = _journal_rows()
     assert len(rows) == 1
@@ -306,3 +309,82 @@ def test_check_exits_2_on_old_pending_while_paused(home, tmp_path, capsys):
     window.write_flag(window.pause_flag_path(), minutes=60, reason="t")
     assert window.main(["status", "--check", "--queue", qp]) == 2
     assert "pending_older_than_30m_while_paused" in capsys.readouterr().out
+
+
+# ---- journal lock: appends, rotation and flag removal are serialized (Prism #1837 P1 x2) ----
+def _slow_append(monkeypatch, entered, go):
+    """Patch _append_journal so it parks after opening the journal fd until `go` is set."""
+    import os as _os
+
+    def append(path, entry):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_APPEND, 0o600)
+        try:
+            entered.set()
+            assert go.wait(5)
+            _os.write(fd, (json.dumps(entry) + "\n").encode())
+        finally:
+            _os.close(fd)
+
+    monkeypatch.setattr(window, "_append_journal", append)
+
+
+def test_replay_waits_for_an_append_holding_the_journal_open(home, monkeypatch):
+    import threading
+    window.write_flag(window.window_flag_path(), minutes=30, reason="t")
+    entered, go = threading.Event(), threading.Event()
+    _slow_append(monkeypatch, entered, go)
+    a = threading.Thread(target=window.refuse_conclude, args=("ace", "a", "in-flight"))
+    a.start()
+    assert entered.wait(5)  # the conclude holds an fd on the live journal
+    landed, out = [], {}
+    b = threading.Thread(target=lambda: out.update(r=window.replay(lambda e: landed.append(e["text"]))))
+    b.start()
+    b.join(0.3)
+    go.set()
+    a.join(5)
+    b.join(5)
+    # the fact must reach the store, never be written into a renamed-and-unlinked file
+    assert landed == ["in-flight"] and out["r"] == (1, 1)
+    assert not window.journal_path().exists()
+
+
+def test_close_cannot_finish_ahead_of_an_already_refused_conclude(home, monkeypatch):
+    import threading
+    window.write_flag(window.window_flag_path(), minutes=30, reason="t")
+    window.write_flag(window.pause_flag_path(), minutes=30, reason="t")
+    entered, go = threading.Event(), threading.Event()
+    _slow_append(monkeypatch, entered, go)
+    a = threading.Thread(target=window.refuse_conclude, args=("ace", "a", "late"))
+    a.start()
+    assert entered.wait(5)  # flag read as active; append not done yet
+    landed, out = [], {}
+    b = threading.Thread(target=lambda: out.update(r=window.close(lambda e: landed.append(e["text"]))))
+    b.start()
+    b.join(0.3)
+    go.set()
+    a.join(5)
+    b.join(5)
+    assert landed == ["late"] and out["r"] == (1, 1)
+    assert not window.journal_path().exists()
+    assert not window.window_flag_path().exists()
+
+
+def test_conclude_after_close_stores_directly_without_journal(home, posts):
+    window.write_flag(window.window_flag_path(), minutes=30, reason="t")
+    window.close(lambda e: None)
+    out = json.loads(_provider().handle_tool_call("mem0_conclude", {"conclusion": "after"}))
+    assert out == {"result": "Fact stored."}
+    assert len(posts) == 1 and not window.journal_path().exists()
+
+
+def test_journal_write_failure_tells_agent_to_reissue(home, monkeypatch):
+    data = window.write_flag(window.window_flag_path(), minutes=30, reason="t")
+
+    def boom(path, entry):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(window, "_append_journal", boom)
+    out = json.loads(window.refuse_conclude("ace", "a", "lost"))
+    assert set(out) == {"error"}
+    assert f"re-issue after {data['expires_at']}" in out["error"] and "NOT kept" in out["error"]
