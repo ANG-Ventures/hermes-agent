@@ -20,10 +20,15 @@ from hermes_cli import kanban_parser
 
 
 def _cli(home: Path, *args: str) -> subprocess.CompletedProcess:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_KANBAN")}
+    # Hermetic: no ambient kanban/session/cron identity and no tty, so the run is the same
+    # in an agent shell, CI and off-box. Creates pass --unhomed (the home guard's explicit
+    # opt-out) because the board under test, not the home session, is what is asserted.
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("HERMES_KANBAN", "HERMES_SESSION", "HERMES_CRON"))}
     env.update(HERMES_HOME=str(home), PYTHONPATH=str(_WORKTREE))
     return subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", *args],
-                          env=env, capture_output=True, text=True, cwd=str(_WORKTREE), timeout=60)
+                          env=env, capture_output=True, text=True, cwd=str(_WORKTREE),
+                          stdin=subprocess.DEVNULL, timeout=60)
 
 
 def _titles(db: Path) -> set[str]:
@@ -38,8 +43,8 @@ def home(tmp_path):
 
 
 def test_verb_and_top_level_positions_hit_the_same_board(home):
-    after = _cli(home, "create", "after-verb", "--board", "beta")
-    before = _cli(home, "--board", "beta", "create", "before-verb")
+    after = _cli(home, "create", "after-verb", "--board", "beta", "--unhomed")
+    before = _cli(home, "--board", "beta", "create", "before-verb", "--unhomed")
     assert after.returncode == 0, after.stderr
     assert before.returncode == 0, before.stderr
     beta_db = home / "kanban" / "boards" / "beta" / "kanban.db"
@@ -58,7 +63,7 @@ def test_conflicting_positions_refused_equal_positions_accepted(home):
     clash = _cli(home, "--board", "default", "create", "T", "--board", "beta")
     assert clash.returncode != 0
     assert "--board given twice" in clash.stderr
-    same = _cli(home, "--board", "beta", "create", "same", "--board", "BETA")
+    same = _cli(home, "--board", "beta", "create", "same", "--board", "BETA", "--unhomed")
     assert same.returncode == 0, same.stderr
     assert "same" in _titles(home / "kanban" / "boards" / "beta" / "kanban.db")
 
