@@ -706,11 +706,15 @@ def _isolate_session_contextvars():
 def _restore_version_info_cache():
     """Put back the process-global version cache a test refreshed (``get_code_identity(refresh=True)``
     re-resolves under the test's sandbox home). Modules that bake it at import, like the Perplexity
-    provider's User-Agent, otherwise disagree with later ``get_version_info()`` reads."""
+    provider's User-Agent, otherwise disagree with later ``get_version_info()`` reads.
+
+    Restore unconditionally: a ``None`` pre-test cache (or a module the test imported) must come
+    back as ``None``, else the identity resolved under this test's sandbox home outlives it."""
     vi = sys.modules.get("hermes_cli.version_info")
     saved = vi._cached_version_info if vi is not None else None
     yield
-    if saved is not None:
+    vi = sys.modules.get("hermes_cli.version_info")
+    if vi is not None:
         vi._cached_version_info = saved
 
 
