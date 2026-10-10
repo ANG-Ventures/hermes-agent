@@ -1463,6 +1463,106 @@ def test_main_red_pair_left_to_the_backstop_is_not_treated_as_paged(tmp_path):
     assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
 
 
+# --- one streak, one page (t_e4208718, port of ANG-Ventures/hermes-home#3529 / t_6c8d8622) ----------------
+# hermes-home 2026-10-10: ace-media-preflight paged at 08:42Z (run 38037719217, the real 2nd red) and AGAIN at
+# 09:01Z (run 38038845374): the latest earlier red 38038409908 finished BEFORE its predecessor 38038359677, so
+# "did R's notifier pair R with the run before it" said no, though 38037719217 had paged the streak.
+# Real created/finished times, shifted -3h13m so this run (38038845374) is 42 at 05:30:00Z.
+def _timed_api(history, *, current=None):
+    """history: newest first, (run_id, created_at, updated_at, conclusion, jobs)."""
+    api = _main_api([(rid, c, cc, j) for rid, c, _u, cc, j in history], current=current)
+    for row, (_rid, _c, u, _cc, _j) in zip(api["runs?branch=main&event=push"]["workflow_runs"], history):
+        row["updated_at"] = u
+    return api
+
+
+def _run_at(created):
+    return {"RUN_JSON": json.dumps({"name": "CI", "workflow_id": 7, "id": 42, "head_sha": "abc", "conclusion": "failure",
+                                    "head_branch": "main", "event": "push", "created_at": created,
+                                    "html_url": "https://x/42", "actor": {"login": "Kyzcreig"}})}
+
+
+_E2E_GREEN = _main_jobs((E2E, "success", {E2E_STEP: "success"}))
+_INCIDENT = [  # 38038409908, 38038359677, 38037719217, 38037651833, 38037644502, 38037513472
+    (8409, "2026-10-04T05:22:29Z", "2026-10-04T05:40:40Z", "failure", _red_e2e()),
+    (8359, "2026-10-04T05:21:40Z", "2026-10-04T05:40:58Z", "failure", _red_e2e()),
+    (7719, "2026-10-04T05:10:41Z", "2026-10-04T05:29:11Z", "failure", _red_e2e()),
+    (7651, "2026-10-04T05:09:30Z", "2026-10-04T05:27:23Z", "failure", _red_e2e()),
+    (7644, "2026-10-04T05:09:23Z", "2026-10-04T05:28:15Z", "failure", _red_e2e()),
+    (7513, "2026-10-04T05:07:08Z", "2026-10-04T05:25:30Z", "success", _E2E_GREEN),
+]
+
+
+def test_main_red_streak_already_paged_through_out_of_order_finishes_goes_to_logs(tmp_path):
+    got = _main_route(tmp_path, _timed_api(_INCIDENT), env_extra=_run_at("2026-10-04T05:30:00Z"))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 8409)", got["_stdout"]
+
+
+def test_main_red_the_real_second_red_of_that_streak_still_pages(tmp_path):
+    # 38037719217's own notifier: 7651 and 7644 were first reds as their own notifiers saw them
+    got = _main_route(tmp_path, _timed_api(_INCIDENT[3:]), env_extra=_run_at("2026-10-04T05:10:41Z"))
+    assert got["route"] == "alerts" and "(also run 7651)" in got["summary"], got["_stdout"]
+
+
+def test_main_red_unnoticed_streak_still_pages_when_the_pair_finished_out_of_order(tmp_path):
+    # the old rule's own case: R finished before its predecessor, so R's notifier never saw that red and
+    # never paged. Nothing in the streak was noticed: this red pages.
+    api = _timed_api([(41, "2026-10-04T04:20:00Z", "2026-10-04T04:25:00Z", "failure", _red_e2e()),
+                      (40, "2026-10-04T04:10:00Z", "2026-10-04T04:28:00Z", "failure", _red_e2e()),
+                      (39, "2026-10-04T04:00:00Z", "2026-10-04T04:05:00Z", "success", _E2E_GREEN)])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
+
+
+def test_main_red_streak_left_to_the_backstop_through_out_of_order_finishes_stays_late(tmp_path):
+    # the agent side's `late` case: 40 was created >= BACKSTOP_S after 39, so 40's notifier left the
+    # streak to the backstop. R=41 finished before 40 (never saw it); this run is < BACKSTOP_S after
+    # R. The old rule paged here; the streak was noticed (as the backstop's), so this red is late.
+    api = _timed_api([(41, "2026-10-04T04:20:00Z", "2026-10-04T04:25:00Z", "failure", _red_e2e()),
+                      (40, "2026-10-04T04:10:00Z", "2026-10-04T04:28:00Z", "failure", _red_e2e()),
+                      (39, "2026-10-04T03:00:00Z", "2026-10-04T03:05:00Z", "failure", _red_e2e())])
+    got = _main_route(tmp_path, api, env_extra=HOUR)
+    assert got["route"] == "logs" and got["card"] == "main-red-backstop (run 41)", got["_stdout"]
+    # control: 40 inside the window of 39 paged the streak, so this one is a 3rd+ red
+    api["runs?branch=main&event=push"]["workflow_runs"][2]["created_at"] = "2026-10-04T03:20:00Z"
+    got = _main_route(tmp_path, api, env_extra=HOUR)
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 41)", got["_stdout"]
+
+
+def _ambiguous_e2e():
+    return _main_jobs((E2E, "failure", {E2E_STEP: "failure"}), (E2E, "success", {E2E_STEP: "success"}))
+
+
+def test_main_red_ambiguous_run_behind_the_bounding_green_still_pages(tmp_path):
+    # Prism P1 814ce172a760: a run older than the green that ends the streak decides nothing; a
+    # repeated job name there must not turn this valid 2nd red into error handling.
+    api = _timed_api([(41, "2026-10-04T04:00:00Z", "2026-10-04T04:10:00Z", "failure", _red_e2e()),
+                      (40, "2026-10-04T03:00:00Z", "2026-10-04T03:10:00Z", "success", _E2E_GREEN),
+                      (39, "2026-10-04T02:00:00Z", "2026-10-04T02:10:00Z", "failure", _ambiguous_e2e())])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "(also run 41)" in got["summary"], got["_stdout"]
+    assert "not unique" not in got["_stdout"] and "ambiguous" not in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_ambiguous_run_inside_the_streak_still_fails_loud(tmp_path):
+    # control: the same ambiguous run INSIDE the streak decides whether it was paged: page (fail loud)
+    api = _timed_api([(41, "2026-10-04T04:00:00Z", "2026-10-04T04:10:00Z", "failure", _red_e2e()),
+                      (40, "2026-10-04T03:00:00Z", "2026-10-04T03:10:00Z", "failure", _ambiguous_e2e()),
+                      (39, "2026-10-04T02:00:00Z", "2026-10-04T02:10:00Z", "success", _E2E_GREEN)])
+    got = _main_route(tmp_path, api)
+    assert got["route"] == "alerts" and "main-red streak: cannot replay" in got["_stdout"], got["_stdout"]
+
+
+def test_main_red_streak_longer_than_the_window_does_not_page_again(tmp_path):
+    # Prism P2 7a67c2ae780e: 13 earlier reds; only the 2nd of them paged. The paging run falls out of
+    # the 11-run window, but every later red inherited the coverage, so the 14th red is a 3rd+ red.
+    reds = [(100 + i, f"2026-10-04T{i:02d}:00:00Z", f"2026-10-04T{i:02d}:10:00Z", "failure", _red_e2e())
+            for i in range(1, 14)]
+    green = (100, "2026-10-04T00:00:00Z", "2026-10-04T00:10:00Z", "success", _E2E_GREEN)
+    got = _main_route(tmp_path, _timed_api(list(reversed(reds)) + [green]), env_extra=_run_at("2026-10-04T14:00:00Z"))
+    assert got["route"] == "logs" and got["card"] == "main-still-red (run 113)", got["_stdout"]
+
+
 # c171f8cb6512: a re-run can promote a logged red of the same run to #alerts. The receiver dedupes
 # X-GitHub-Delivery across routes for an hour, so the two routes need distinct ids.
 _FAKE_CURL_DELIVERY = r"""#!/usr/bin/env bash
