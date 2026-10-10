@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS capture_queue (
     model_verdict   TEXT,
     add_committed   INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
+    kind            TEXT NOT NULL DEFAULT 'turn',
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
 );
@@ -51,6 +52,12 @@ CREATE INDEX IF NOT EXISTS idx_cq_lease ON capture_queue(status, leased_until);
 """
 
 _VALID_STATUS = ("pending", "inflight", "done", "dead")
+
+# Row kinds. 'turn' = a per-turn auto-capture (server-side extraction behind the certified gate).
+# 'conclude' = a foreground mem0_conclude whose POST failed at the connection level; it lands
+# verbatim (infer=false), never through extraction.
+KIND_TURN = "turn"
+KIND_CONCLUDE = "conclude"
 
 
 def normalize_turn(user: str, assistant: str) -> str:
@@ -68,6 +75,19 @@ def idem_key(session_id: str, turn_ordinal: int, user: str, assistant: str) -> s
     h.update(str(int(turn_ordinal)).encode("utf-8"))
     h.update(b"\x1f")
     h.update(normalize_turn(user, assistant).encode("utf-8"))
+    return h.hexdigest()
+
+
+def conclude_idem_key(user_id: str, agent_id: str, text: str) -> str:
+    """Key for a queued mem0_conclude: the same fact re-issued while the store is down maps to one
+    row. Whitespace-collapsed, case kept (paths/hostnames are case-sensitive)."""
+    h = hashlib.sha256()
+    h.update(b"conclude\x1f")
+    h.update(str(user_id or "").encode("utf-8"))
+    h.update(b"\x1f")
+    h.update(str(agent_id or "").encode("utf-8"))
+    h.update(b"\x1f")
+    h.update(" ".join((text or "").split()).encode("utf-8"))
     return h.hexdigest()
 
 
@@ -97,39 +117,65 @@ class CaptureQueue:
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(capture_queue)")}
             if "add_committed" not in cols:
                 conn.execute("ALTER TABLE capture_queue ADD COLUMN add_committed INTEGER NOT NULL DEFAULT 0")
+            if "kind" not in cols:
+                conn.execute("ALTER TABLE capture_queue ADD COLUMN kind TEXT NOT NULL DEFAULT 'turn'")
         finally:
             conn.close()
 
     # ---- enqueue (the durability boundary, INV-1) --------------------------
-    def enqueue(self, key: str, payload: Dict[str, Any], *, now: Optional[float] = None) -> bool:
+    def enqueue(self, key: str, payload: Dict[str, Any], *, kind: str = KIND_TURN,
+                delay_s: float = 0.0, now: Optional[float] = None) -> bool:
         """Insert a pending row. Duplicate idem_key -> no-op (returns False). INV-5.
-        Returns True if a new row was inserted."""
+        Returns True if a new row was inserted.
+
+        kind='conclude': a duplicate of a row still pending/inflight stays a no-op (no double
+        write), but a done/dead row with the same key is revived. Done rows are not purged, so
+        without this a fact concluded, later forgotten, then re-concluded during an outage would
+        be silently dropped while the caller was told it was queued. The drain's dedup_hash check
+        still skips it if the fact is live in the store."""
         now = time.time() if now is None else now
+        due = now + max(0.0, float(delay_s))
         conn = self._connect()
         try:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO capture_queue "
-                "(idem_key,payload,status,attempts,next_attempt_at,created_at,updated_at) "
-                "VALUES (?,?,'pending',0,?,?,?)",
-                (key, json.dumps(payload), now, now, now),
-            )
+            if kind == KIND_CONCLUDE:
+                cur = conn.execute(
+                    "INSERT INTO capture_queue "
+                    "(idem_key,payload,status,attempts,next_attempt_at,kind,created_at,updated_at) "
+                    "VALUES (?,?,'pending',0,?,?,?,?) "
+                    "ON CONFLICT(idem_key) DO UPDATE SET status='pending', attempts=0, "
+                    "next_attempt_at=excluded.next_attempt_at, payload=excluded.payload, "
+                    "leased_until=NULL, model_verdict=NULL, last_error=NULL, "
+                    "updated_at=excluded.updated_at "
+                    "WHERE capture_queue.status IN ('done','dead')",
+                    (key, json.dumps(payload), due, kind, now, now),
+                )
+            else:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO capture_queue "
+                    "(idem_key,payload,status,attempts,next_attempt_at,kind,created_at,updated_at) "
+                    "VALUES (?,?,'pending',0,?,?,?,?)",
+                    (key, json.dumps(payload), due, kind, now, now),
+                )
             return cur.rowcount > 0
         finally:
             conn.close()
 
     # ---- lease (drain worker claims due rows, D-10) ------------------------
-    def lease_one(self, *, lease_s: float = 120.0, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    def lease_one(self, *, lease_s: float = 120.0, now: Optional[float] = None,
+                  kinds: Optional[tuple] = None) -> Optional[Dict[str, Any]]:
         """Atomically claim ONE due pending row -> inflight with a lease. Returns the row dict
         or None. Uses BEGIN IMMEDIATE so two concurrent drainers never claim the same row
-        (the SQLite equivalent of FOR UPDATE SKIP LOCKED for a single-writer-at-a-time claim)."""
+        (the SQLite equivalent of FOR UPDATE SKIP LOCKED for a single-writer-at-a-time claim).
+        kinds: restrict the claim to these row kinds (None = any)."""
         now = time.time() if now is None else now
+        kind_sql, kind_args = self._kind_clause(kinds)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT * FROM capture_queue WHERE status='pending' AND next_attempt_at<=? "
-                "ORDER BY next_attempt_at ASC LIMIT 1",
-                (now,),
+                "SELECT * FROM capture_queue WHERE status='pending' AND next_attempt_at<=?"
+                f"{kind_sql} ORDER BY next_attempt_at ASC LIMIT 1",
+                (now, *kind_args),
             ).fetchone()
             if row is None:
                 conn.execute("COMMIT")
@@ -311,12 +357,21 @@ class CaptureQueue:
         finally:
             conn.close()
 
+    @staticmethod
+    def _kind_clause(kinds: Optional[tuple]):
+        if not kinds:
+            return "", ()
+        return f" AND kind IN ({','.join('?' * len(kinds))})", tuple(kinds)
+
     # ---- observability -----------------------------------------------------
-    def counts(self) -> Dict[str, int]:
+    def counts(self, *, kinds: Optional[tuple] = None) -> Dict[str, int]:
+        kind_sql, kind_args = self._kind_clause(kinds)
+        where = f" WHERE 1=1{kind_sql}" if kind_sql else ""
         conn = self._connect()
         try:
             out = {s: 0 for s in _VALID_STATUS}
-            for r in conn.execute("SELECT status, COUNT(*) c FROM capture_queue GROUP BY status"):
+            for r in conn.execute(
+                    f"SELECT status, COUNT(*) c FROM capture_queue{where} GROUP BY status", kind_args):
                 out[r["status"]] = r["c"]
             return out
         finally:

@@ -169,6 +169,20 @@ Circuit breaker tripped after 5 consecutive failures. Resets after 2 minutes.
 - **Platform mode**: Check API key and internet connectivity.
 - **OSS mode**: Check that your vector store (qdrant/pgvector) is running.
 
+### `mem0_conclude` returned `"queued": true`
+
+Self-hosted mode: the store was unreachable (connection refused, timeout, 5xx, or the
+circuit breaker was open), so the fact went into the durable capture queue
+(`<home>/state/mem0-capture/capture_queue.db`, row `kind='conclude'`) and the tool returned
+`{"result": "queued (store unreachable); will land when mem0 is back", "queued": true}`.
+The drain worker lands it with a verbatim `infer=false` POST once the store answers again.
+Extraction never runs on these rows, and they drain even when `capture` is off. Before each
+write it looks the fact up by `dedup_hash`, so a retried or re-issued conclude is written once.
+Connection failures never dead-letter a queued conclude. A 4xx reply is a rejection: the
+tool returns an error and nothing is queued.
+
+Inspect: `sqlite3 <queue.db> "SELECT status,attempts,last_error FROM capture_queue WHERE kind='conclude'"`.
+
 ### OSS: Qdrant connection refused
 
 ```bash
