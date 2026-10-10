@@ -364,3 +364,18 @@ def test_worker_run_on_the_card_cannot_answer_with_an_operator_label(kanban_home
         conn.commit()
         kb.add_comment(conn, tid, "default", "APOLLO 09:00 ANSWERED: option B.", run_id=run_id)
         assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [tid]
+
+
+def test_dependency_downgraded_to_needs_input_does_not_page(kanban_home):
+    """A ``--kind dependency`` block with no open parent is re-kinded to
+    needs_input (a time/external wait, not a decision): it must not page."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="park", body=ORIGIN, priority=150, assignee="w")
+        assert kb.claim_task(conn, tid, claimer="w") is not None
+        assert kb.block_task(conn, tid, reason="DEFERRED 24h wall clock", kind="dependency")
+        task = kb.get_task(conn, tid)
+        assert (task.status, task.block_kind) == ("blocked", "needs_input")
+        assert kb.needs_input_page_candidates(conn) == []
+        # control: an explicit needs_input block still pages
+        other = _card(conn)
+        assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [other]

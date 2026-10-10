@@ -32,6 +32,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    from .window import drain_paused as _drain_paused
+except ImportError:  # flat import (test_capture_drain.py runs with PYTHONPATH=<dir>)
+    from window import drain_paused as _drain_paused
+
 # A gateway caches many provider instances, but they all drain the same durable
 # queue. Exactly one process-local owner per queue avoids N cached agents
 # polling and contending on the same SQLite file.
@@ -276,7 +281,7 @@ class CaptureDrainWorker:
 
     def drain_once(self) -> bool:
         """Process at most one due row. Returns True if a row was handled."""
-        if self._breaker_open():
+        if self._breaker_open() or _drain_paused():
             return False
         row = self._q.lease_one(lease_s=self._lease_s)
         if row is None:

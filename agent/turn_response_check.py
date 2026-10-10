@@ -368,7 +368,8 @@ def retry_invalid_response(
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
         _fbe_floor.stash_response_failure(
             agent, "invalid_response_exhausted", response,
-            detail=", ".join(error_details), elapsed_s=api_duration)
+            detail=", ".join(error_details), elapsed_s=api_duration,
+            repeat=_ir_relay_gave_up)  # gave_up: this same response was logged above
         if not _ir_relay_gave_up and agent._try_activate_fallback():
             active_system_prompt = _arm_fallback_restart(
                 agent, api_messages, active_system_prompt, _retry)
