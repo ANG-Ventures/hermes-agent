@@ -157,3 +157,47 @@ def test_relay_absorbed_header_keeps_same_route_retry(agent):
     assert result.get("final_response") == "ok", result
     fo.assert_not_called()
     assert [r["retry_outcome"] for r in _count_rows()] == ["retry_ok"]
+
+
+def test_relay_gave_up_row_carries_the_relay_ladder(agent):
+    """t_3afed4f8: the 2026-10-09 19:30:54 give-up. The banner said ``×4 from
+    local ... rotate→sub-vps-11`` while the row only had served_by=sub-vps-11.
+    The row carries the attempt count, every billed seat in order, the ladder
+    and the request ids, consistent with the rider built from the same floor."""
+    from agent import fallback_policy as fp
+
+    agent._fallback_chain = [{"provider": "claude-btpr", "model": "claude-fable-5-1"}]
+    gave_up = _empty_tool_use(out=277, seat="sub-vps-11", relay_retried="gave_up")
+    gave_up.pool_headers.update({
+        "x-pool-empty-content-attempts": "local,local,local,sub-vps-11",
+        "x-pool-empty-content-perturbations": "none,none,drop_fgts,drop_fgts+rotate",
+        "x-pool-empty-content-request-ids": "req_a1,req_b2,req_c3,req_d4",
+    })
+    floors = []
+
+    def _fo(*a, **k):
+        floors.append(dict((getattr(agent, "_pending_fallback_error", None) or {}).get("floor") or {}))
+        return False
+
+    with patch.object(agent, "_try_activate_fallback", side_effect=_fo):
+        _run(agent, [gave_up] + [_empty_tool_use(out=1)] * 5)
+    row = [r for r in _count_rows() if r["retry_outcome"] == "relay_gave_up"][0]
+    assert row["served_by"] == "sub-vps-11"  # the seat that answered last
+    assert row["relay_attempts"] == "4"
+    assert row["relay_seats"] == "local,local,local,sub-vps-11"
+    assert row["relay_ladder"] == "none,none,drop_fgts,drop_fgts+rotate"
+    assert row["relay_request_ids"] == "req_a1,req_b2,req_c3,req_d4"
+    # Same floor -> the rider says the same count and the same first seat.
+    rider = fp.format_cause_rider({"trigger_class": fp.INVALID_RESPONSE_CLASS,
+                                   "from_provider": "claude-alr", "floor": floors[0]})
+    assert f"×{row['relay_attempts']} from {row['relay_seats'].split(',')[0]} " in rider, rider
+    assert "rotate→sub-vps-11 −fgts" in rider, rider
+
+
+def test_row_without_relay_headers_has_no_relay_tokens(agent):
+    agent._fallback_chain = [{"provider": "claude-btpr", "model": "claude-fable-5-1"}]
+    with patch.object(agent, "_try_activate_fallback", return_value=False):
+        _run(agent, [_empty_tool_use(relay_retried="gave_up")] + [_empty_tool_use(out=1)] * 5)
+    row = _count_rows()[0]
+    assert row["retry_outcome"] == "relay_gave_up"
+    assert not {"relay_attempts", "relay_seats", "relay_ladder", "relay_request_ids"} & set(row)
