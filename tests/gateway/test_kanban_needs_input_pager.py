@@ -379,3 +379,18 @@ def test_dependency_downgraded_to_needs_input_does_not_page(kanban_home):
         # control: an explicit needs_input block still pages
         other = _card(conn)
         assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [other]
+
+
+def test_loop_escalated_rekinded_dependency_still_pages(kanban_home):
+    """A re-kinded dependency block that recurs escalates to ``triage``: that
+    needs a human decision, so the no_open_parent suppression must not hide it
+    (Prism aefe736f033c on #1835)."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="park", body=ORIGIN, priority=150, assignee="w")
+        assert kb.block_task(conn, tid, reason="DEFERRED 24h wall clock", kind="dependency")
+        assert kb.needs_input_page_candidates(conn) == []
+        assert kb.unblock_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="DEFERRED 24h wall clock", kind="dependency")
+        task = kb.get_task(conn, tid)
+        assert (task.status, task.block_kind) == ("triage", "needs_input")
+        assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [tid]
