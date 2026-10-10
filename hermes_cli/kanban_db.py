@@ -9583,6 +9583,51 @@ def _enforce_branch_base(
             _append_event(conn, task.id, "base_guard_overridden", checked)
 
 
+def _routed_own_prs(conn: sqlite3.Connection, task_id: str) -> list:
+    """The own PRs of the card's newest open-PR-routed run (``own_prs``; legacy: ``auto_routed_open_prs``)."""
+    for run in reversed(list_runs(conn, task_id)):
+        md = run.metadata if isinstance(run.metadata, dict) else {}
+        if "auto_routed_open_prs" in md:
+            return list(md.get("own_prs") if "own_prs" in md else md.get("auto_routed_open_prs") or [])
+    return []
+
+
+def _enforce_routed_pr_survivor(
+    conn: sqlite3.Connection, task_id: str, *, survivor_pr, survivor_ref,
+    abandon_routed_pr: Optional[str], query_fn,
+) -> None:
+    """Refuse ``done`` on a survivor claim that skips the card's still-OPEN routed PR (t_829fce95).
+
+    t_cee802d5 was routed to review on its own open PR, then closed with an
+    unbound ``--survivor-pr`` naming an unrelated merged PR. Gated only when a
+    survivor claim is given; a claim naming the routed PR passes. A non-empty
+    ``abandon_routed_pr`` lets it through with a ``routed_pr_abandoned`` event.
+    Raises :class:`kanban_open_pr.RoutedPrOpenError` before any mutation.
+    """
+    from hermes_cli import kanban_open_pr as _open_pr
+    if not (survivor_pr or survivor_ref):
+        return
+    routed = _routed_own_prs(conn, task_id)
+    if not routed:
+        return
+    opened, unverified = _open_pr.routed_prs_still_open(
+        routed, survivor_pr=survivor_pr, query_fn=query_fn)
+    if not (opened or unverified):
+        return
+    reason = str(abandon_routed_pr).strip() if abandon_routed_pr is not None else None
+    if reason and not _overlong(reason):
+        with write_txn(conn):
+            _append_event(conn, task_id, "routed_pr_abandoned",
+                          {"prs": opened + unverified, "reason": reason})
+        return
+    blank = abandon_routed_pr is not None
+    with write_txn(conn):
+        _append_event(conn, task_id, "completion_blocked_routed_pr_open",
+                      {"prs": opened, "unverified": unverified,
+                       **({"reason": "empty_or_overlong_abandon_reason"} if blank else {})})
+    raise _open_pr.RoutedPrOpenError(task_id, opened, unverified, blank_reason=blank)
+
+
 @_home_session_guarded("complete")
 def complete_task(
     conn: sqlite3.Connection,
@@ -9604,8 +9649,13 @@ def complete_task(
     draft_ok: Optional[str] = None,
     external: Optional[str] = None,
     watcher: Optional[str] = None,
+    abandon_routed_pr: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    ``abandon_routed_pr`` (t_829fce95) is the audited override for
+    :func:`_enforce_routed_pr_survivor`: a survivor claim naming a different PR
+    while the card's routed own PR is still OPEN is refused without it.
 
     ``external`` + ``watcher`` (t_768c9e91) close a card whose remaining step
     is an outside party's (an upstream maintainer merge): the closing run's
@@ -9990,6 +10040,10 @@ def complete_task(
                 {"prs": closed_err.closed, "unverified": closed_err.unverified},
             )
         raise
+    _enforce_routed_pr_survivor(
+        conn, task_id, survivor_pr=survivor_pr, survivor_ref=survivor_ref,
+        abandon_routed_pr=abandon_routed_pr, query_fn=_pr_query or _open_pr.memo_query(),
+    )
     from hermes_cli.kanban_survivor import preserve
     survivor = preserve(
         conn, task_id, metadata,
