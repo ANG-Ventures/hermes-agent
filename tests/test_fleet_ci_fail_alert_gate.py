@@ -162,6 +162,21 @@ def test_non_failure_conclusion_is_silent(tmp_path):
     assert _route(tmp_path, event="push", branch="main", conclusion="success")["route"] == "none"
 
 
+def test_every_ci_orchestrator_is_subscribed():
+    """A workflow that owns the required `all-checks-pass` gate is a top-level CI
+    orchestrator (ci.yaml, or its ci-local.yaml fallback); its children are
+    workflow_call reusables that never emit workflow_run, so the orchestrator's
+    own name must be on the notifier allowlist or its reds page nobody."""
+    subscribed = set(_workflow()["on"]["workflow_run"]["workflows"])
+    orchestrators = set()
+    for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
+        wf = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if "all-checks-pass" in (wf.get("jobs") or {}):
+            orchestrators.add(wf["name"])
+    assert orchestrators, "no all-checks-pass orchestrator found"
+    assert orchestrators <= subscribed, orchestrators - subscribed
+
+
 def test_post_step_is_gated_on_route():
     steps = _workflow()["jobs"]["notify-on-failure"]["steps"]
     post = next(s for s in steps if s.get("name", "").startswith("Sign and POST"))
