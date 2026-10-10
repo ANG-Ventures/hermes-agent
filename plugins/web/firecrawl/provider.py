@@ -22,6 +22,9 @@ from tools.website_policy import check_website_access
 logger = logging.getLogger(__name__)
 
 _FIRECRAWL_CLOUD_API_URL = "https://api.firecrawl.dev"
+# Firecrawl bills search at 2 credits per 10 results; anything above 10 is a second (or third)
+# 2-credit tranche. Hard cap here so no caller (model, cache bucket, cron) can double the price.
+FIRECRAWL_SEARCH_MAX_LIMIT = 10
 
 # The SDK costs ~200ms of imports on a cold CLI; defer to first use (tests patch ``Firecrawl`` here).
 _FIRECRAWL_CLS_CACHE: Optional[type] = None
@@ -295,10 +298,19 @@ class FirecrawlWebSearchProvider(BaseWebSearchProvider):
 
     def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Pre-flight errors (ValueError / ImportError) propagate so the dispatcher emits
-        the legacy ``tool_error`` envelope; in-flight errors become failure dicts."""
+        the legacy ``tool_error`` envelope; in-flight errors become failure dicts.
+
+        Cost contract (Firecrawl pricing, verified 2026-10-09): a search bills 2 credits per 10
+        results, so ``limit`` above 10 doubles the price; adding ``scrapeOptions`` bills a scrape
+        for EVERY result (5 scraped hits = 7 credits instead of 2). This provider therefore caps
+        ``limit`` at 10 and never sends ``scrapeOptions`` — page content is web_extract's job.
+        That combination is what drained the fleet's pool in Sept 2026."""
         from tools.interrupt import is_interrupted
         if is_interrupted():
             return search_fail("Interrupted")
+        if limit > FIRECRAWL_SEARCH_MAX_LIMIT:
+            logger.info("Firecrawl search: limit %d capped to %d (2 credits/10 results)", limit, FIRECRAWL_SEARCH_MAX_LIMIT)
+            limit = FIRECRAWL_SEARCH_MAX_LIMIT
         if _use_keyless_ring():
             return keyless_search("Firecrawl", "firecrawl", query, limit, logger)
         logger.info("Firecrawl search: '%s' (limit=%d)", query, limit)

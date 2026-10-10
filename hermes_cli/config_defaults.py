@@ -489,6 +489,10 @@ DEFAULT_CONFIG = {
         # over on rate limits. Never pre-empts a configured/keyed backend. false = disable.
         "search_fallbacks": [],  # keyed providers tried in order before keyless rescue
         "extract_fallbacks": [], # keyed providers tried in order before keyless rescue
+        # Max PAID web_search calls per UTC day across the whole install (firecrawl/tavily/exa/...);
+        # past the cap the primary is refused and the fallback chain serves. Protects a monthly
+        # credit pool from one runaway day (2026-09-08: ~3,190 calls in 32 min). 0 = off.
+        "search_daily_budget": 300,
         # PDFs (.pdf path or HEAD Content-Type: application/pdf) are downloaded
         # and read locally (pymupdf, else pdftotext) instead of sent to a paid
         # extract vendor that bills per page. false restores vendor dispatch.
