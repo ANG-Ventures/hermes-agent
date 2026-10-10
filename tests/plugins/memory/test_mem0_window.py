@@ -196,6 +196,59 @@ def test_close_sweep_catches_fact_journaled_during_replay(home, capsys):
     assert not window.journal_path().exists()
 
 
+def _slow_append(monkeypatch, opened, go):
+    """A journal writer that opens the journal fd, then stalls before writing: the window in
+    which a rotation used to strand its row in an already-replayed inode (Prism 5df08c92362d)."""
+    import os as _os
+
+    def slow(path, entry):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_APPEND, 0o600)
+        try:
+            opened.set()
+            go.wait(5)
+            _os.write(fd, (json.dumps(entry) + "\n").encode())
+        finally:
+            _os.close(fd)
+
+    monkeypatch.setattr(window, "_append_journal", slow)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("verb", ["close", "replay"])
+def test_rotation_waits_for_in_flight_journal_append(home, monkeypatch, verb):
+    import threading
+    window.write_flag(window.window_flag_path(), minutes=30, reason="t")
+    opened, go = threading.Event(), threading.Event()
+    _slow_append(monkeypatch, opened, go)
+    landed = []
+    writer = threading.Thread(target=window.refuse_conclude, args=("ace", "a", "in-flight"))
+    writer.start()
+    assert opened.wait(5)
+    fn = window.close if verb == "close" else window.replay
+    rot = threading.Thread(target=lambda: fn(lambda e: landed.append(e["text"])))
+    rot.start()
+    rot.join(0.5)  # base: the rotation finishes here, before the append; fixed: blocked on the lock
+    go.set()
+    writer.join(5)
+    rot.join(5)
+    if verb == "replay":
+        window.replay(lambda e: landed.append(e["text"]))  # whatever the first pass left
+    assert landed == ["in-flight"], "the in-flight fact must be replayed exactly once, never lost"
+    left = [f.name for f in window.journal_path().parent.glob("mem0-window-journal.jsonl*")
+            if not f.name.endswith(".lock")]
+    assert left == []
+
+
+def test_refusal_after_close_barrier_writes_through_not_to_journal(home, posts):
+    window.write_flag(window.window_flag_path(), minutes=30, reason="t")
+    p = _provider()
+    assert window.close(lambda e: None) == (0, 0)
+    p.handle_tool_call("mem0_conclude", {"conclusion": "after"})
+    assert [c["messages"][0]["content"] for c in posts] == ["after"]
+    assert not window.journal_path().exists()
+
+
 def test_close_with_failing_store_reports_true_count(home, capsys):
     window.write_flag(window.window_flag_path(), minutes=30, reason="t")
     window.refuse_conclude("ace", "a", "only")

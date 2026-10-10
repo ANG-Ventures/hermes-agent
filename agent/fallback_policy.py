@@ -1117,8 +1117,8 @@ def _prompt_size(tokens: Any) -> str:
 
 
 RELAY_EMPTY_CHAIN_MAX = 240
-_RUNG_NAMES = {"none": "as-is", "drop_fgts": "−fgts beta", "perturb_prompt": "+\\n prompt"}
-_ROTATE_RUNGS = {"rotate": "", "drop_fgts+rotate": " −fgts", "perturb_prompt+rotate": " +\\n prompt"}
+_RUNG_NAMES = {"none": "as-is", "drop_fgts": "−fgts beta"}
+_ROTATE_RUNGS = {"rotate": "", "drop_fgts+rotate": " −fgts"}
 
 
 def _empty_reply_head(fl: Mapping[str, Any]) -> str:

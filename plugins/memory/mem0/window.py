@@ -29,13 +29,20 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+
+try:
+    import fcntl
+except ImportError:  # Windows: no flock; the window CLI only runs on the POSIX fleet hosts
+    fcntl = None
 
 logger = logging.getLogger(__name__)
 
 WINDOW_FLAG_NAME = "mem0-window.flag"
 PAUSE_FLAG_NAME = "mem0-capture-drain.pause"
 JOURNAL_NAME = "mem0-window-journal.jsonl"
+JOURNAL_LOCK_SUFFIX = ".lock"
 REPLAYING_SUFFIX = ".replaying"
 DEFAULT_QUEUE_PATH = "~/.hermes/state/mem0-capture/capture_queue.db"  # = capture_pipeline default
 PENDING_MAX_AGE_S = 30 * 60
@@ -127,17 +134,48 @@ def write_flag(path: Path, *, minutes: float, reason: str, now: Optional[float] 
     return data
 
 
+# ---- journal lock ---------------------------------------------------------------------------
+# Writers (refuse_conclude) hold it SHARED from the flag check through the append; rotation
+# (replay's rename) and close's barrier hold it EXCLUSIVE. So no writer can hold an fd to the
+# journal inode across the rename (its row would land in a .replaying already read and deleted),
+# and once close has removed the flag and taken the lock once, no refusal is still in flight.
+@contextmanager
+def _journal_lock(path: Path, mode: str) -> Iterator[None]:
+    if fcntl is None:
+        yield
+        return
+    lock = path.with_name(path.name + JOURNAL_LOCK_SUFFIX)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH if mode == "shared" else fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the fd releases the flock
+
+
 # ---- conclude gate (called by the provider) -------------------------------------------------
 def refuse_conclude(user_id: str, agent_id: str, text: str) -> Optional[str]:
     """If the window flag is active: journal the fact and return the tool error JSON; else None."""
-    active, data = flag_active(window_flag_path())
-    if not active:
-        return None
+    if not flag_active(window_flag_path())[0]:
+        return None  # fast path: no lock taken outside a window
+    jp = journal_path()
+    with _journal_lock(jp, "shared"):
+        # Re-read under the lock: close() removes the flag BEFORE its exclusive barrier, so a
+        # caller that gets here after the barrier sees the flag gone and writes to the store.
+        active, data = flag_active(window_flag_path())
+        if not active:
+            return None
+        return _refuse_locked(jp, user_id, agent_id, text, data)
+
+
+def _refuse_locked(jp: Path, user_id: str, agent_id: str, text: str,
+                   data: Optional[Dict[str, Any]]) -> str:
     until = (data or {}).get("expires_at", "the window closes")
     msg = f"mem0 maintenance window, re-issue after {until}"
     try:
-        _append_journal(journal_path(), {"user_id": user_id, "agent_id": agent_id,
-                                         "text": text, "ts": _iso(time.time())})
+        _append_journal(jp, {"user_id": user_id, "agent_id": agent_id,
+                             "text": text, "ts": _iso(time.time())})
     except Exception as e:
         logger.error("mem0 window: journal append FAILED, fact not kept: %s", e)
         msg += f" (journal write failed: {e}; the fact was NOT kept)"
@@ -185,10 +223,11 @@ def replay(add_fn: AddFn, *, path: Optional[Path] = None) -> Tuple[int, int]:
     replaying = path.with_name(path.name + REPLAYING_SUFFIX)
     leftover = replaying.exists()
     if not leftover:
-        try:
-            os.rename(path, replaying)
-        except FileNotFoundError:
-            return 0, 0
+        with _journal_lock(path, "exclusive"):  # no writer holds the inode across the rename
+            try:
+                os.rename(path, replaying)
+            except FileNotFoundError:
+                return 0, 0
     lines = [ln for ln in replaying.read_text(encoding="utf-8").splitlines() if ln.strip()]
     failed: List[str] = []
     replayed = 0
@@ -224,6 +263,11 @@ def close(add_fn: AddFn) -> Tuple[int, int]:
             p.unlink()
         except FileNotFoundError:
             pass
+    # Barrier: wait for every refusal that read the flag before the unlink to finish its append.
+    # After this, refuse_conclude re-reads the flag under the lock and finds it gone, so the
+    # sweep below is the last write the journal can ever receive for this window.
+    with _journal_lock(journal_path(), "exclusive"):
+        pass
     j1, r1 = replay(add_fn)
     if r1 != j1:
         return j1, r1  # leftover stays in .replaying; a sweep now would recount it
