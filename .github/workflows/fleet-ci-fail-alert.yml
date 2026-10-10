@@ -432,27 +432,47 @@ jobs:
               # red (the step failed in one), green (it passed in all), differs (failed for a
               # different reason), unknown (did not run, or did not finish everywhere: look
               # further back), ambiguous (a job or step name repeats: cannot be matched).
-              # R (the latest earlier red) only PAGED the pair R + older when its notifier ran
-              # (R concluded failure; a cancelled run never notifies) and saw the older red (it had
-              # completed before R did: overlapping runs and later re-runs of an older commit are not
-              # seen; Prism P1 31122e0a54bf / 358db3d855b2 / 805a46df2012). Otherwise this red is the
-              # 2nd that pages.
-              # R created >= BACKSTOP_S after the older red: R's notifier logged the pair as the
-              # backstop's (LATE below), so it never paged it; the backstop owns the streak and this
-              # red is LATE too, never a fresh page (Prism P1 f9a5572f1892).
-              paired() {  # R, older -> rc 0 R's notifier paged the R+older pair, 1 it did not, 3 it left it to the backstop
-                [ "$(meta "$1" conclusion)" = failure ] || return 1
-                local ru ou; ru="$(meta "$1" updated_at)"; ou="$(meta "$2" updated_at)"
-                ! [[ "$ou" > "$ru" ]] || return 1
-                late "$1" "$2" && return 3
-                return 0
-              }
-              late() {  # newer run, older run -> rc 0 when newer was created >= BACKSTOP_S after older
-                local t1 t0
-                t1="$(jq -rn --arg c "$(meta "$1" created_at)" '$c | fromdateiso8601')" || return 1
-                t0="$(jq -rn --arg c "$(meta "$2" created_at)" '$c | fromdateiso8601')" || return 1
-                [ $((t1 - t0)) -ge "$BACKSTOP_S" ]
-              }
+              # Was this red streak already NOTICED (an earlier notifier routed it as its 2nd red:
+              # paged it, or left it to the backstop as LATE below)? Replays every notifier of the
+              # streak over what it could see: a run Y notifies only if it concluded failure (a
+              # cancelled run never notifies), and it saw only runs created before it that had
+              # completed by the time it finished (overlapping runs and later re-runs of an older
+              # commit are not seen; Prism P1 31122e0a54bf / 358db3d855b2 / 805a46df2012). Y left the
+              # streak to the backstop when Y was created >= BACKSTOP_S after the latest red it saw
+              # (Prism P1 f9a5572f1892): this red is then LATE too, never a fresh page. A slice item
+              # links two reds only when every test the newer one failed also failed in the older
+              # (Prism P1 21a041362289). Asking only "did R's notifier pair R with the run before it"
+              # paged one streak twice on hermes-home (2026-10-10 08:42 + 09:01Z, ace-media-preflight):
+              # R finished before its predecessor, yet an earlier notifier had paged the streak
+              # (ANG-Ventures/hermes-home#3529, t_6c8d8622, t_e4208718).
+              # stdin: RUNS_RAW. $st: [{id, st, nodes}] newest first, from R back. $bs: BACKSTOP_S.
+              # -> "old" (paged before) | "late" (left to the backstop) | "second" (never noticed).
+              # shellcheck disable=SC2016 # a jq program, not shell
+              STREAK_JQ='
+                (.workflow_runs | map({key: (.id | tostring), value: .}) | from_entries) as $m
+                | [$st[] | ($m[.id | tostring] // {}) as $r
+                   | . + {created: ($r.created_at // ""), updated: ($r.updated_at // ""), concl: ($r.conclusion // "")}] as $all
+                | def same($n; $o): ($n.nodes - $o.nodes) == [];
+                  def epoch: if . == "" then null else fromdateiso8601 end;
+                  def streak($self; $v):   # the item'"'"'s red streak in one notifier'"'"'s view, or null (a first red)
+                    ([range(0; ([$v | length, 10] | min)) | select($v[.].st != "unknown")] | first) as $k
+                    | if $k == null or $v[$k].st != "red" or (same($self; $v[$k]) | not) then null
+                      else reduce $v[$k:$k + 11][] as $r ({out: [], done: false};
+                        if .done then .
+                        elif $r.st == "red" and (.out == [] or same(.out[-1]; $r)) then .out += [$r]
+                        elif $r.st == "unknown" then . else .done = true end) | .out end;
+                (reduce ($all | sort_by(.created))[] as $y ({};
+                   . as $memo
+                   | streak($y; $all | map(select(.created < $y.created and .updated <= $y.updated))) as $s
+                   | .[$y.id | tostring] = (
+                       if $y.concl == "failure" and $y.st == "red" and $s != null
+                         and ([$s[] | $memo[.id | tostring] // false] | any | not)
+                       then (($y.created | epoch) as $a | ($s[0].created | epoch) as $b
+                             | if $a != null and $b != null and $a - $b >= $bs then "late" else "page" end)
+                       else false end))) as $memo
+                # this run vs R was already compared (tests included) by the walk above
+                | [(streak({nodes: []}; $all) // [])[] | $memo[.id | tostring] // false] as $by
+                | if any($by[]; . == "page") then "old" elif any($by[]; . == "late") then "late" else "second" end'
               classify() {  # run id, items JSON -> one state per item; rc!=0 on an API error
                 run_jobs "$1" | jq -c --argjson items "$2" "$AGG_JQ"'
                   . as $r | [$items[] as [$j, $s]
@@ -538,28 +558,22 @@ jobs:
               n="$(jq length <<< "$REDAT")"; k=0
               while [ -z "$BAD" ] && [ "$k" -lt "$n" ]; do
                 IT="$(jq -c ".[$k].item" <<< "$REDAT")"; R="$(jq -r ".[$k].run" <<< "$REDAT")"; k=$((k + 1))
-                KIND=second; past=0; w=0
-                for older in $PREVS; do
-                  [ "$past" = 1 ] || { [ "$older" = "$R" ] && past=1; continue; }
-                  [ "$w" -lt 10 ] || break; w=$((w + 1))
-                  S1="$(classify "$older" "[$IT]" | jq -r '.[0]')" || { BAD="cannot read run $older"; break; }
-                  case "$S1" in
-                    red)
-                      if paired "$R" "$older"; then KIND=old; else [ "$?" = 3 ] && KIND=late; fi
-                      if [ "$KIND" != second ] && tests_item "$IT"; then
-                        # R's own tests vs older: R paged only if ITS failures repeated older's
-                        # (Prism P1 21a041362289), not this run's
-                        if same_tests "$older" "$(jq -r '.[0]' <<< "$IT")" "$R"; then rc=0; else rc=$?; fi
-                        [ "$rc" = 2 ] && { BAD="cannot read the tests of run $older"; break; }
-                        [ "$rc" = 1 ] && KIND=second
-                      fi
-                      break ;;
-                    unknown) ;;
-                    ambiguous) BAD="a failed job or step name is not unique in run $older"; break ;;
-                    *) break ;;
-                  esac
+                STS='[]'; past=0; TJ=""
+                tests_item "$IT" && TJ="$(jq -r '.[0]' <<< "$IT")"
+                for z in $PREVS; do
+                  [ "$past" = 1 ] || [ "$z" = "$R" ] || continue; past=1
+                  S1="$(classify "$z" "[$IT]" | jq -r '.[0]')" || { BAD="cannot read run $z"; break; }
+                  [ "$S1" = ambiguous ] && { BAD="a failed job or step name is not unique in run $z"; break; }
+                  ZN='[]'
+                  if [ -n "$TJ" ] && [ "$S1" = red ]; then
+                    ZN="$(sig_of "$z" nodes "$TJ" | jq -Rsc 'split("\n") | map(select(. != ""))')" \
+                      || { BAD="cannot read the tests of run $z"; break; }
+                  fi
+                  STS="$(jq -c --argjson id "$z" --arg st "$S1" --argjson n "$ZN" '. + [{id: $id, st: $st, nodes: $n}]' <<< "$STS")"
                 done
                 [ -n "$BAD" ] && break
+                KIND="$(jq -r --argjson st "$STS" --argjson bs "$BACKSTOP_S" "$STREAK_JQ" <<< "$RUNS_RAW")" \
+                  || { BAD="cannot replay the streak of $IT"; break; }
                 if [ "$KIND" = old ]; then
                   OLD="$(jq -c --argjson i "$IT" '. + [$i]' <<< "$OLD")"; continue
                 fi
