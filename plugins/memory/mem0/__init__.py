@@ -1486,7 +1486,7 @@ class Mem0MemoryProvider(MemoryProvider):
         payload = {"text": conclusion, "user_id": filters["user_id"],
                    "agent_id": filters["agent_id"], "metadata": metadata, "host": self._host,
                    "queued_at": time.time()}
-        key = conclude_idem_key(filters["user_id"], filters["agent_id"], conclusion)
+        key = conclude_idem_key(filters["user_id"], filters["agent_id"], conclusion, self._host)
         try:
             pipe.enqueue_conclude(key, payload)
         except Exception as e:
@@ -1497,8 +1497,9 @@ class Mem0MemoryProvider(MemoryProvider):
                            "queued": True})
 
     def _check_queued_host(self, payload: Dict[str, Any]) -> None:
-        # The queue file is per host, shared by every profile on it. A row queued against a
-        # different mem0 must not land in this one; raising keeps it pending (never dropped).
+        # The queue file is per machine, shared by every profile on it. Leasing is scoped to this
+        # host, so this only trips on a row whose target column disagrees with its payload; it
+        # stays as the last guard: a row for another mem0 never lands here (raise = stays pending).
         host = payload.get("host")
         if host and host != self._host:
             raise RuntimeError(f"queued conclude targets another mem0 host ({host})")
@@ -1987,6 +1988,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 router=self._build_capture_router(),
                 conclude_add_fn=self._land_queued_conclude,
                 conclude_exists_fn=self._queued_conclude_landed,
+                target=self._host,
             )
             self._capture_pipeline = pipe
             return pipe

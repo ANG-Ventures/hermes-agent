@@ -96,6 +96,7 @@ class CapturePipeline:
         router: Optional[Any] = None,   # Arm-B capture router (Phase 2.5); None => flag OFF (no-op)
         conclude_add_fn: Optional[Callable[[Dict[str, Any]], Any]] = None,
         conclude_exists_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        target: str = "",   # the mem0 host this provider writes to; scopes the shared queue file
     ):
         try:
             from .capture_queue import CaptureQueue
@@ -124,6 +125,7 @@ class CapturePipeline:
         self._model = model
         qp = os.path.expanduser(queue_path) if queue_path else default_queue_path()
         self._queue = CaptureQueue(qp)
+        self._target = target or ""
         self._worker = CaptureDrainWorker(
             self._queue,
             add_fn=add_fn,
@@ -142,6 +144,7 @@ class CapturePipeline:
             # Turn rows are auto-capture writes: only while capture is active (on + certified).
             # Conclude rows are deliberate writes the agent already made; they drain regardless.
             turn_rows_allowed=lambda: self.active,
+            target=self._target,
         )
         self._concludes = conclude_add_fn is not None and conclude_exists_fn is not None
         self._started = False
@@ -158,7 +161,7 @@ class CapturePipeline:
             kinds = None if self.active else (("conclude",) if self._concludes else ())
             if kinds == ():
                 return
-            counts = self._queue.counts(kinds=kinds)
+            counts = self._queue.counts(kinds=kinds, target=self._target)
             if (counts.get("pending", 0) + counts.get("inflight", 0)) > 0:
                 self.start()
         except Exception as e:
@@ -199,12 +202,14 @@ class CapturePipeline:
             except ImportError:
                 from capture_queue import idem_key
                 from capture_router import active_profile_name
-            key = idem_key(session_id, turn_ordinal, user_content, assistant_content)
+            key = idem_key(session_id, turn_ordinal, user_content, assistant_content,
+                           host=self._target)
             # Stamp the originating profile HERE, on the turn thread: the drain thread does not
             # inherit the per-request home ContextVar, so it cannot resolve it later.
             enq = self._queue.enqueue(key, {"user": user_content, "assistant": assistant_content,
                                             "session_id": session_id,
-                                            "profile": active_profile_name()})
+                                            "profile": active_profile_name()},
+                                       target=self._target)
             # Start/restart the worker after every active enqueue. The worker
             # retires itself when the durable queue becomes empty; start() is
             # idempotent while it is still accepting work.
@@ -225,7 +230,7 @@ class CapturePipeline:
         except ImportError:
             from capture_queue import KIND_CONCLUDE
         enq = self._queue.enqueue(key, payload, kind=KIND_CONCLUDE,
-                                  delay_s=_CONCLUDE_FIRST_DRAIN_DELAY_S)
+                                  delay_s=_CONCLUDE_FIRST_DRAIN_DELAY_S, target=self._target)
         self.start()
         return enq
 

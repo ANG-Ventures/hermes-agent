@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS capture_queue (
     add_committed   INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
     kind            TEXT NOT NULL DEFAULT 'turn',
+    target          TEXT NOT NULL DEFAULT '',
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
 );
@@ -67,9 +68,14 @@ def normalize_turn(user: str, assistant: str) -> str:
     return re.sub(r"\s+", " ", j).strip().lower()
 
 
-def idem_key(session_id: str, turn_ordinal: int, user: str, assistant: str) -> str:
-    """sha256(session_id + turn_ordinal + normalized(user+assistant)) — spec D-8."""
+def idem_key(session_id: str, turn_ordinal: int, user: str, assistant: str, host: str = "") -> str:
+    """sha256([host +] session_id + turn_ordinal + normalized(user+assistant)) — spec D-8. The
+    target host is mixed in when given: profiles on different mem0 hosts share the queue file."""
     h = hashlib.sha256()
+    if host:
+        h.update(b"host\x1f")
+        h.update(str(host).encode("utf-8"))
+        h.update(b"\x1f")
     h.update(str(session_id or "").encode("utf-8"))
     h.update(b"\x1f")
     h.update(str(int(turn_ordinal)).encode("utf-8"))
@@ -78,11 +84,16 @@ def idem_key(session_id: str, turn_ordinal: int, user: str, assistant: str) -> s
     return h.hexdigest()
 
 
-def conclude_idem_key(user_id: str, agent_id: str, text: str) -> str:
+def conclude_idem_key(user_id: str, agent_id: str, text: str, host: str = "") -> str:
     """Key for a queued mem0_conclude: the same fact re-issued while the store is down maps to one
-    row. Whitespace-collapsed, case kept (paths/hostnames are case-sensitive)."""
+    row. Whitespace-collapsed, case kept (paths/hostnames are case-sensitive). The target host is
+    part of the key: the queue file is shared by every profile on the machine, and two profiles
+    pointed at different mem0 hosts concluding the same fact are two writes, not one."""
     h = hashlib.sha256()
     h.update(b"conclude\x1f")
+    if host:
+        h.update(str(host).encode("utf-8"))
+        h.update(b"\x1f")
     h.update(str(user_id or "").encode("utf-8"))
     h.update(b"\x1f")
     h.update(str(agent_id or "").encode("utf-8"))
@@ -119,12 +130,18 @@ class CaptureQueue:
                 conn.execute("ALTER TABLE capture_queue ADD COLUMN add_committed INTEGER NOT NULL DEFAULT 0")
             if "kind" not in cols:
                 conn.execute("ALTER TABLE capture_queue ADD COLUMN kind TEXT NOT NULL DEFAULT 'turn'")
+            if "target" not in cols:
+                conn.execute("ALTER TABLE capture_queue ADD COLUMN target TEXT NOT NULL DEFAULT ''")
+                # Conclude rows queued before the column existed carry their host in the payload.
+                conn.execute(
+                    "UPDATE capture_queue SET target=COALESCE(json_extract(payload,'$.host'),'') "
+                    "WHERE kind='conclude' AND json_valid(payload)")
         finally:
             conn.close()
 
     # ---- enqueue (the durability boundary, INV-1) --------------------------
     def enqueue(self, key: str, payload: Dict[str, Any], *, kind: str = KIND_TURN,
-                delay_s: float = 0.0, now: Optional[float] = None) -> bool:
+                delay_s: float = 0.0, now: Optional[float] = None, target: str = "") -> bool:
         """Insert a pending row. Duplicate idem_key -> no-op (returns False). INV-5.
         Returns True if a new row was inserted.
 
@@ -132,7 +149,10 @@ class CaptureQueue:
         write), but a done/dead row with the same key is revived. Done rows are not purged, so
         without this a fact concluded, later forgotten, then re-concluded during an outage would
         be silently dropped while the caller was told it was queued. The drain's dedup_hash check
-        still skips it if the fact is live in the store."""
+        still skips it if the fact is live in the store.
+
+        target: the mem0 host the row must land in ('' = any). Only a worker for that host leases
+        or counts the row (see _scope_clause)."""
         now = time.time() if now is None else now
         due = now + max(0.0, float(delay_s))
         conn = self._connect()
@@ -140,21 +160,21 @@ class CaptureQueue:
             if kind == KIND_CONCLUDE:
                 cur = conn.execute(
                     "INSERT INTO capture_queue "
-                    "(idem_key,payload,status,attempts,next_attempt_at,kind,created_at,updated_at) "
-                    "VALUES (?,?,'pending',0,?,?,?,?) "
+                    "(idem_key,payload,status,attempts,next_attempt_at,kind,target,created_at,"
+                    "updated_at) VALUES (?,?,'pending',0,?,?,?,?,?) "
                     "ON CONFLICT(idem_key) DO UPDATE SET status='pending', attempts=0, "
                     "next_attempt_at=excluded.next_attempt_at, payload=excluded.payload, "
                     "leased_until=NULL, model_verdict=NULL, last_error=NULL, "
                     "updated_at=excluded.updated_at "
                     "WHERE capture_queue.status IN ('done','dead')",
-                    (key, json.dumps(payload), due, kind, now, now),
+                    (key, json.dumps(payload), due, kind, target or "", now, now),
                 )
             else:
                 cur = conn.execute(
                     "INSERT OR IGNORE INTO capture_queue "
-                    "(idem_key,payload,status,attempts,next_attempt_at,kind,created_at,updated_at) "
-                    "VALUES (?,?,'pending',0,?,?,?,?)",
-                    (key, json.dumps(payload), due, kind, now, now),
+                    "(idem_key,payload,status,attempts,next_attempt_at,kind,target,created_at,"
+                    "updated_at) VALUES (?,?,'pending',0,?,?,?,?,?)",
+                    (key, json.dumps(payload), due, kind, target or "", now, now),
                 )
             return cur.rowcount > 0
         finally:
@@ -162,13 +182,15 @@ class CaptureQueue:
 
     # ---- lease (drain worker claims due rows, D-10) ------------------------
     def lease_one(self, *, lease_s: float = 120.0, now: Optional[float] = None,
-                  kinds: Optional[tuple] = None) -> Optional[Dict[str, Any]]:
+                  kinds: Optional[tuple] = None,
+                  target: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Atomically claim ONE due pending row -> inflight with a lease. Returns the row dict
         or None. Uses BEGIN IMMEDIATE so two concurrent drainers never claim the same row
         (the SQLite equivalent of FOR UPDATE SKIP LOCKED for a single-writer-at-a-time claim).
-        kinds: restrict the claim to these row kinds (None = any)."""
+        kinds: restrict the claim to these row kinds (None = any).
+        target: restrict the claim to rows for this mem0 host (None = any host)."""
         now = time.time() if now is None else now
-        kind_sql, kind_args = self._kind_clause(kinds)
+        kind_sql, kind_args = self._scope_clause(kinds, target)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -358,14 +380,23 @@ class CaptureQueue:
             conn.close()
 
     @staticmethod
-    def _kind_clause(kinds: Optional[tuple]):
-        if not kinds:
-            return "", ()
-        return f" AND kind IN ({','.join('?' * len(kinds))})", tuple(kinds)
+    def _scope_clause(kinds: Optional[tuple], target: Optional[str] = None):
+        """SQL restricting rows to the given kinds and to one target mem0 host. The queue file is
+        shared by every profile on the machine, and a worker can only land a row in its own host.
+        A row with no target (queued before targets were recorded) is any host's."""
+        sql, args = "", ()
+        if kinds:
+            sql += f" AND kind IN ({','.join('?' * len(kinds))})"
+            args += tuple(kinds)
+        if target is not None:
+            sql += " AND (target='' OR target=?)"
+            args += (target,)
+        return sql, args
 
     # ---- observability -----------------------------------------------------
-    def counts(self, *, kinds: Optional[tuple] = None) -> Dict[str, int]:
-        kind_sql, kind_args = self._kind_clause(kinds)
+    def counts(self, *, kinds: Optional[tuple] = None,
+               target: Optional[str] = None) -> Dict[str, int]:
+        kind_sql, kind_args = self._scope_clause(kinds, target)
         where = f" WHERE 1=1{kind_sql}" if kind_sql else ""
         conn = self._connect()
         try:

@@ -41,13 +41,13 @@ except ImportError:  # flat import (test_capture_drain.py runs with PYTHONPATH=<
 # queue. Exactly one process-local owner per queue avoids N cached agents
 # polling and contending on the same SQLite file.
 _ACTIVE_DRAIN_LOCK = threading.Lock()
-_ACTIVE_DRAINS: Dict[str, "CaptureDrainWorker"] = {}
+_ACTIVE_DRAINS: Dict[tuple, "CaptureDrainWorker"] = {}
 # Every worker that has been start()ed and not yet stop()ed, keyed by queue. Exactly one of them
 # owns the drain thread; the others are standbys. Ownership must SURVIVE the shutdown of any one
 # cached provider: without a handoff, stopping the owner leaves the siblings started-but-threadless
 # and strands already-pending rows until an unrelated later enqueue or a process restart.
 # WeakSet so a provider that is garbage-collected without stop() does not pin its worker.
-_DRAIN_MEMBERS: Dict[str, "weakref.WeakSet"] = {}
+_DRAIN_MEMBERS: Dict[tuple, "weakref.WeakSet"] = {}
 
 # HTTP status appearing in an add() error string. Two anchored shapes, so a stray 3-digit number in
 # the body (a memory id fragment, a byte count) can't be misread as a status:
@@ -131,9 +131,15 @@ class CaptureDrainWorker:
         conclude_add_fn: Optional[Callable[[Dict[str, Any]], Any]] = None,
         conclude_exists_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
         turn_rows_allowed: Any = True,           # bool, or a zero-arg callable read per lease
+        target: Optional[str] = None,            # mem0 host this worker writes to (None = any)
     ):
         self._q = queue
-        self._queue_key = os.path.realpath(os.path.abspath(queue.db_path))
+        # Every profile on the machine shares one queue file, but a worker can only land rows in
+        # its own mem0 host. So leasing, the outstanding count and drain ownership are all scoped
+        # to (queue file, target host): a worker never holds another host's rows, and one host's
+        # owner never keeps another host's standby from taking its rows.
+        self._target = target
+        self._queue_key = (os.path.realpath(os.path.abspath(queue.db_path)), target or "")
         self._add = add_fn
         self._recall_idem = recall_idem_fn
         self._scrub = scrub_fn
@@ -193,7 +199,7 @@ class CaptureDrainWorker:
         kinds = self._leasable_kinds()
         if kinds == ():
             return 0
-        counts = self._q.counts(kinds=kinds)
+        counts = self._q.counts(kinds=kinds, target=self._target)
         return counts.get("pending", 0) + counts.get("inflight", 0)
 
     # ---- lifecycle ---------------------------------------------------------
@@ -316,7 +322,7 @@ class CaptureDrainWorker:
         kinds = self._leasable_kinds()
         if kinds == ():
             return False
-        row = self._q.lease_one(lease_s=self._lease_s, kinds=kinds)
+        row = self._q.lease_one(lease_s=self._lease_s, kinds=kinds, target=self._target)
         if row is None:
             return False
         if row.get("kind") == "conclude":
