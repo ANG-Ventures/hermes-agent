@@ -170,3 +170,66 @@ def test_non_401_error_never_touches_the_file(monkeypatch, tmp_path):
     assert "error" in result and "500" in result["error"]
     assert sent == ["key-A"]
     assert reads == []
+
+
+def test_401_with_changed_host_never_sends_the_other_servers_key(monkeypatch, tmp_path):
+    provider = _provider_with_file_key(monkeypatch, tmp_path, "key-A")
+    sent = _install_key_gated_server(monkeypatch, accepted_key="key-B")
+    cfg_path = tmp_path / "mem0.json"
+    before = cfg_path.stat().st_mtime
+    cfg_path.write_text(json.dumps({"host": "http://other.test", "admin_api_key": "key-B"}))
+    os.utime(cfg_path, (before + 5, before + 5))
+
+    result = _search(provider)
+
+    assert "error" in result and "401" in result["error"]
+    assert sent == ["key-A"]                   # key-B belongs to other.test: never sent to mem0.test
+    assert provider._admin_api_key == "key-A"
+
+
+def test_rotation_between_init_stat_and_read_is_still_picked_up(monkeypatch, tmp_path):
+    """The mtime snapshot is taken BEFORE the config read, so a rotation racing initialize()
+    is never marked as already-loaded while the old key was the one read."""
+    import plugins.memory.mem0 as mem0_mod
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for var in ("MEM0_HOST", "MEM0_ADMIN_API_KEY", "MEM0_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("MEM0_USER_ID", "ace")
+    monkeypatch.setenv("MEM0_DESTRUCTIVE_TOOLS", "false")
+    cfg_path = tmp_path / "mem0.json"
+    cfg_path.write_text(json.dumps({"host": HOST, "admin_api_key": "key-A"}))
+    real_load = mem0_mod._load_config
+
+    def load_then_rotate():
+        cfg = real_load()                      # returns key-A ...
+        _rotate_file(tmp_path, "key-B")        # ... and the rotation lands right after the read
+        return cfg
+
+    monkeypatch.setattr(mem0_mod, "_load_config", load_then_rotate)
+    provider = Mem0MemoryProvider()
+    provider.initialize("test-session")
+    assert provider._admin_api_key == "key-A"
+    sent = _install_key_gated_server(monkeypatch, accepted_key="key-B")
+
+    result = _search(provider)
+
+    assert result["count"] == 1
+    assert sent == ["key-A", "key-B"]
+
+
+def test_refresh_reads_the_profile_file_pinned_at_init_not_the_current_home(monkeypatch, tmp_path):
+    """A background thread (capture drain) may run with a different HERMES_HOME resolved; the
+    401 re-read must come from the owning profile's mem0.json, never another profile's."""
+    provider = _provider_with_file_key(monkeypatch, tmp_path, "key-A")
+    other_home = tmp_path / "other-profile"
+    other_home.mkdir()
+    (other_home / "mem0.json").write_text(json.dumps({"host": HOST, "admin_api_key": "key-OTHER"}))
+    monkeypatch.setenv("HERMES_HOME", str(other_home))
+    sent = _install_key_gated_server(monkeypatch, accepted_key="key-B")
+    _rotate_file(tmp_path, "key-B")
+
+    result = _search(provider)
+
+    assert result["count"] == 1
+    assert sent == ["key-A", "key-B"]          # the owning profile's rotated key, not key-OTHER
+    assert "key-OTHER" not in sent

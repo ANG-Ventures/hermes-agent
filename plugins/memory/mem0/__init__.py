@@ -582,6 +582,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._host = ""
         self._admin_api_key = ""
         self._admin_key_mtime = 0.0
+        self._admin_key_path = None
         self._ca_bundle = ""
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
@@ -708,9 +709,10 @@ class Mem0MemoryProvider(MemoryProvider):
         same call with it) or None (the 401 surfaces as-is). The host is constant by design, so the
         key is the one cached value a rotation changes. A rotation rewrites every file on disk but a
         live gateway kept the init-time key until restart (measured 2026-10-11, t_b8e2170c)."""
+        cfg_path = self._admin_key_path
+        if cfg_path is None:
+            return None
         try:
-            from hermes_constants import get_hermes_home
-            cfg_path = get_hermes_home() / "mem0.json"
             mtime = cfg_path.stat().st_mtime
             if mtime == self._admin_key_mtime:
                 # Unchanged file: no re-read. Hand back the provider's current key so a thread that
@@ -718,10 +720,18 @@ class Mem0MemoryProvider(MemoryProvider):
                 # skips the retry when it equals the key it just sent).
                 return self._admin_api_key or None
             self._admin_key_mtime = mtime
-            new_key = str(json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("admin_api_key") or "").strip()
+            file_cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+            new_key = str(file_cfg.get("admin_api_key") or "").strip()
+            file_host = str(file_cfg.get("host") or "").strip().rstrip("/")
         except Exception:
             return None
         if not new_key or new_key == self._admin_api_key:
+            return None
+        if file_host != self._host:
+            # The file now names a different server: its key belongs to THAT host. Never send
+            # it to the endpoint this provider is still bound to; the 401 surfaces as-is.
+            logger.warning("mem0: mem0.json host changed (%s -> %s); not re-reading the admin key "
+                           "for the live endpoint, restart to switch hosts", self._host, file_host)
             return None
         self._admin_api_key = new_key
         from agent.redact import register_credential_redaction_value
@@ -729,11 +739,10 @@ class Mem0MemoryProvider(MemoryProvider):
         return new_key
 
     def _admin_key_file_mtime(self) -> float:
-        """mtime of mem0.json at the moment the admin key was loaded (0.0 = no file)."""
+        """mtime of the pinned mem0.json at the moment the admin key was loaded (0.0 = no file)."""
         try:
-            from hermes_constants import get_hermes_home
-            return (get_hermes_home() / "mem0.json").stat().st_mtime
-        except OSError:
+            return self._admin_key_path.stat().st_mtime
+        except (OSError, AttributeError):
             return 0.0
 
     def _is_breaker_open(self) -> bool:
@@ -1208,11 +1217,18 @@ class Mem0MemoryProvider(MemoryProvider):
         return "unknown"
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        # Pin the file the key is loaded from, under the caller-bound profile scope of THIS
+        # initialize(): a 401 re-read must come from the same profile's mem0.json, never from
+        # whatever home a later call (prefetch thread, another profile's turn) resolves to.
+        # Stat BEFORE the read: a rotation landing between the two would otherwise be
+        # snapshotted as already-seen and the 401 re-read would skip it.
+        from hermes_constants import get_hermes_home
+        self._admin_key_path = get_hermes_home() / "mem0.json"
+        self._admin_key_mtime = self._admin_key_file_mtime()
         self._config = _load_config()
         self._api_key = self._config.get("api_key", "")
         self._host = str(self._config.get("host", "") or "").strip().rstrip("/")
         self._admin_api_key = str(self._config.get("admin_api_key", "") or "").strip()
-        self._admin_key_mtime = self._admin_key_file_mtime()
         if self._admin_api_key:
             # The admin key has no vendor prefix, so the shape-based redactor misses it in a
             # ``cat mem0.json`` / ``docker inspect`` / read_file result and it lands verbatim in
