@@ -168,16 +168,40 @@ def _is_sandbox_key(node: ast.expr | None) -> bool:
     return isinstance(node, ast.Constant) and node.value == SANDBOX_ENV
 
 
+def _is_falsy_constant(val: ast.expr | None) -> bool:
+    return isinstance(val, ast.Constant) and str(val.value).strip().lower() in _FALSY
+
+
 def _disarms_sandbox(call: ast.Call) -> bool:
-    """``delenv``/``pop``/falsy ``setenv``/``unsetenv`` of the sandbox flag."""
+    """``delenv``/``pop``/``delitem``/falsy ``setenv``/``setitem``/``unsetenv`` of the flag."""
     name = _func_name(call.func)
     first = call.args[0] if call.args else None
     if name in ("delenv", "pop", "unsetenv") and _is_sandbox_key(first):
         return True
-    if name in ("setenv", "putenv") and _is_sandbox_key(first) and len(call.args) > 1:
-        val = call.args[1]
-        return isinstance(val, ast.Constant) and str(val.value).strip().lower() in _FALSY
+    if name in ("setenv", "putenv", "setdefault") and _is_sandbox_key(first) and len(call.args) > 1:
+        return _is_falsy_constant(call.args[1])
+    # monkeypatch.setitem(os.environ, KEY, "0") / monkeypatch.delitem(os.environ, KEY)
+    second = call.args[1] if len(call.args) > 1 else None
+    if name == "delitem" and _is_sandbox_key(second):
+        return True
+    if name == "setitem" and _is_sandbox_key(second) and len(call.args) > 2:
+        return _is_falsy_constant(call.args[2])
+    # os.environ.update({KEY: "0"})
+    if name == "update" and isinstance(first, ast.Dict):
+        return any(_is_sandbox_key(k) and _is_falsy_constant(v) for k, v in zip(first.keys, first.values))
     return False
+
+
+def _assign_disarms_sandbox(node: ast.AST) -> bool:
+    """``os.environ[KEY] = "0"`` (plain or annotated assignment)."""
+    if isinstance(node, ast.Assign):
+        targets, value = node.targets, node.value
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        targets, value = [node.target], node.value
+    else:
+        return False
+    return _is_falsy_constant(value) and any(
+        isinstance(t, ast.Subscript) and _is_sandbox_key(t.slice) for t in targets)
 
 
 def check_sandbox_disarm(src: str, filename: str = "<src>") -> list[str]:
@@ -190,7 +214,7 @@ def check_sandbox_disarm(src: str, filename: str = "<src>") -> list[str]:
     lines = src.splitlines()
     problems: list[str] = []
     for node in ast.walk(tree):
-        disarm = isinstance(node, ast.Call) and _disarms_sandbox(node)
+        disarm = (isinstance(node, ast.Call) and _disarms_sandbox(node)) or _assign_disarms_sandbox(node)
         if isinstance(node, ast.Delete):
             disarm = any(isinstance(t, ast.Subscript) and _is_sandbox_key(t.slice) for t in node.targets)
         if not disarm:

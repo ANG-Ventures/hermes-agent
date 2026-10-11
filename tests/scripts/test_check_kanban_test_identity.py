@@ -79,12 +79,19 @@ def test_disarming_the_sandbox_needs_a_stated_reason():
     assert lint.check_sandbox_disarm(bare, "t.py")
     for shape in ('monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "0")',
                   'os.environ.pop("HERMES_KANBAN_SANDBOX", None)',
-                  'del os.environ["HERMES_KANBAN_SANDBOX"]'):
+                  'del os.environ["HERMES_KANBAN_SANDBOX"]',
+                  'os.environ["HERMES_KANBAN_SANDBOX"] = "0"',
+                  'monkeypatch.setitem(os.environ, "HERMES_KANBAN_SANDBOX", "0")',
+                  'monkeypatch.delitem(os.environ, "HERMES_KANBAN_SANDBOX")',
+                  'os.environ.update({"HERMES_KANBAN_SANDBOX": ""})'):
         assert lint.check_sandbox_disarm(f"import os\ndef test_x(monkeypatch):\n    {shape}\n", "t.py"), shape
     stated = bare.rstrip("\n") + "  # kanban-sandbox: off — tests pin precedence\n"
     assert lint.check_sandbox_disarm(stated, "t.py") == []
     armed = 'def test_x(monkeypatch):\n    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")\n'
     assert lint.check_sandbox_disarm(armed, "t.py") == []
+    for armed in ('os.environ["HERMES_KANBAN_SANDBOX"] = "1"',
+                  'monkeypatch.setitem(os.environ, "HERMES_KANBAN_SANDBOX", "1")'):
+        assert lint.check_sandbox_disarm(f"import os\ndef test_x(monkeypatch):\n    {armed}\n", "t.py") == [], armed
 
 
 def test_conftest_must_arm_the_sandbox_in_an_autouse_fixture(tmp_path):

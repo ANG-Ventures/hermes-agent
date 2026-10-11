@@ -122,3 +122,61 @@ def test_production_homes_still_share_the_root(live_root, monkeypatch, home):
         monkeypatch.delenv("HERMES_HOME", raising=False)
     assert kb.kanban_home() == live_root
     assert kb.kanban_db_path() == live_root / "kanban.db"
+
+
+# --- Prism round 1 on #1873 ------------------------------------------------
+
+
+def test_sandbox_refuses_a_home_that_is_a_live_named_board(live_root, monkeypatch):
+    """HERMES_HOME=<live>/kanban/boards/proj would make the live proj DB the sandbox board."""
+    board = live_root / "kanban" / "boards" / "proj"
+    board.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(board))
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    with pytest.raises(kb.KanbanLiveBoardRefusedError, match="live board state"):
+        kb.kanban_db_path()
+
+
+def test_pin_inside_one_task_workspace_is_not_the_live_board(live_root, monkeypatch):
+    """A scratch DB inside <live>/kanban/workspaces/<task>/ stays usable in isolation."""
+    scratch = live_root / "kanban" / "workspaces" / "t_2f909ab6" / "kanban.db"
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — exercises the pin path itself
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(scratch))
+    assert kb.kanban_db_path() == scratch
+    for live_pin in (live_root / "kanban" / "boards" / "proj" / "kanban.db", live_root / "kanban" / "workspaces"):
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(live_pin))
+        with pytest.raises(kb.KanbanLiveBoardRefusedError):
+            kb.kanban_db_path()
+
+
+def test_deployed_root_is_a_live_root_for_isolation(tmp_path, monkeypatch):
+    """Container shape: HERMES_HOME == account home (/opt/data); a drill must refuse it."""
+    import hermes_state
+
+    deployed = tmp_path / "opt-data"
+    deployed.mkdir()
+    monkeypatch.setattr(kb, "_LIVE_KANBAN_ROOT_MEMO", ((tmp_path / "native" / ".hermes").resolve(),))
+    monkeypatch.setattr(hermes_state, "_deployed_hermes_home_root", lambda: deployed.resolve())
+    monkeypatch.setenv("HERMES_HOME", str(deployed))
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    with pytest.raises(kb.KanbanLiveBoardRefusedError, match="no isolated board"):
+        kb.kanban_home()
+
+
+def test_explicit_db_path_is_refused_for_a_drill(tmp_path, monkeypatch):
+    """kb.connect(db_path=<live>/kanban.db) bypasses kanban_db_path(); the write guard refuses."""
+    import hermes_state
+    import hermes_test_context
+
+    live = (tmp_path / "prodhome" / ".hermes")
+    live.mkdir(parents=True)
+    monkeypatch.setattr(hermes_state, "_STATE_DB_GUARD_EXTRA_DENY_ROOTS", (live.resolve(),))
+    monkeypatch.setattr(hermes_test_context, "_in_test_context", lambda: False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_DRILL", "t_65791cd2")
+    with pytest.raises(kb.LiveBoardWriteRefused, match="HERMES_KANBAN_DRILL"):
+        kb.connect(db_path=live / "kanban.db")
+    assert not (live / "kanban.db").exists()

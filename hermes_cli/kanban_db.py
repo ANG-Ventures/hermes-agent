@@ -1210,39 +1210,71 @@ def _live_kanban_root() -> Optional[Path]:
 _LIVE_KANBAN_ROOT_MEMO: Optional[tuple] = None
 
 
-def _is_live_kanban_root(root: Path) -> bool:
-    live = _live_kanban_root()
-    if live is None:
-        return False
+def _live_kanban_roots() -> tuple:
+    """Every live root: the passwd-anchored native root plus a deployed root.
+
+    The deployed root is the official container shape (``HERMES_HOME`` = the
+    account home, e.g. ``/opt/data``), where the native ``<account>/.hermes``
+    is not where the board lives (``hermes_state._deployed_hermes_home_root``).
+    """
+    from hermes_state import _deployed_hermes_home_root
+    roots = [r for r in (_live_kanban_root(), _deployed_hermes_home_root()) if r is not None]
+    return tuple(dict.fromkeys(roots))
+
+
+def _matching_live_root(path: Path) -> Optional[Path]:
+    """The live root *path* is exactly, else None."""
     try:
-        return root.expanduser().resolve(strict=False) == live
+        resolved = path.expanduser().resolve(strict=False)
     except OSError:
-        return False
+        return None
+    for live in _live_kanban_roots():
+        if resolved == live:
+            return live
+    return None
+
+
+def _is_live_kanban_root(root: Path) -> bool:
+    return _matching_live_root(root) is not None
+
+
+def _is_live_board_pin_target(target: Path, live: Path) -> bool:
+    """True when a path pin names live board state of *live*.
+
+    The root itself, a board DB, the board set (``kanban/boards/...``,
+    ``current``, aliases) and the shared ``kanban``/``workspaces``/``attachments``
+    roots. A path INSIDE one task's workspace is a scratch location, not the
+    board (same narrow rule as :func:`_is_production_board_db`).
+    """
+    if target == live or _is_production_board_db(target, live) or _is_live_board_tree_path(target, live):
+        return True
+    kanban = live / "kanban"
+    return target in (kanban, kanban / "workspaces", kanban / "attachments")
 
 
 def _refuse_live_kanban_pin_in_isolation(path: Path, name: str) -> None:
-    """Refuse a path pin that names a live board DB/tree in an isolated process.
+    """Refuse a path pin that names live board state in an isolated process.
 
-    The live board files are ``<root>/kanban.db`` and everything under
-    ``<root>/kanban/``. A pin elsewhere under the root (a sandbox in a profile's
-    cache/scratch) is not a live board and is left alone.
+    Live board state is the root, a board DB, the board set and the shared
+    kanban/workspaces/attachments roots (:func:`_is_live_board_pin_target`), for
+    every live root including a deployed one. A pin elsewhere under the root (a
+    sandbox in a profile's cache/scratch, a DB inside one task's workspace) is
+    not the live board and is left alone.
     """
     marker = _kanban_isolation_context()
     if marker is None and not kanban_sandbox_enabled():
-        return
-    live = _live_kanban_root()
-    if live is None:
         return
     try:
         target = path.expanduser().resolve(strict=False)
     except OSError:
         return
-    if target == live / "kanban.db" or target == live or live / "kanban" in (target, *target.parents):
-        why = f"{marker} is set" if marker else "HERMES_KANBAN_SANDBOX is set"
-        raise KanbanLiveBoardRefusedError(
-            f"{name}={target} is a LIVE board path under {live} while {why}. Refusing: "
-            f"a test, drill or sandbox must not read or write the live board."
-        )
+    for live in _live_kanban_roots():
+        if _is_live_board_pin_target(target, live):
+            why = f"{marker} is set" if marker else "HERMES_KANBAN_SANDBOX is set"
+            raise KanbanLiveBoardRefusedError(
+                f"{name}={target} is a LIVE board path under {live} while {why}. Refusing: "
+                f"a test, drill or sandbox must not read or write the live board."
+            )
 
 
 def _sandbox_kanban_home(root: Path) -> Path:
@@ -1252,9 +1284,12 @@ def _sandbox_kanban_home(root: Path) -> Path:
     for a real profile ``~/.hermes/profiles/<p>``, and for ANY deeper path
     such as ``~/.hermes/profiles/<p>/cache/scratch/x``. A sandbox asked for the
     last one; give it that directory. A sandbox whose ``HERMES_HOME`` is the
-    live root itself, or unset, has nowhere isolated to go: refuse.
+    live root itself, or unset, has nowhere isolated to go: refuse. So does a
+    home that is itself live board state: ``<live>/kanban/boards/<slug>`` as a
+    home would make that live board's DB the sandbox's default board.
     """
-    if not _is_live_kanban_root(root):
+    live = _matching_live_root(root)
+    if live is None:
         return root
     raw = os.environ.get("HERMES_HOME", "").strip()
     home = Path(os.path.expanduser(os.path.expandvars(raw))) if raw else None
@@ -1263,6 +1298,16 @@ def _sandbox_kanban_home(root: Path) -> Path:
             f"HERMES_KANBAN_SANDBOX is set but HERMES_HOME={raw or '<unset>'} is the "
             f"live Hermes root {root}; there is no isolated board to resolve. Point "
             f"HERMES_HOME at a throwaway directory."
+        )
+    try:
+        inside_board = _is_live_board_pin_target(home.resolve(strict=False), live)
+    except OSError:
+        inside_board = True
+    if inside_board:
+        raise KanbanLiveBoardRefusedError(
+            f"HERMES_KANBAN_SANDBOX is set but HERMES_HOME={home} is live board state "
+            f"under {live} (e.g. a named board's directory); a sandbox there would open "
+            f"that live board. Point HERMES_HOME at a throwaway directory."
         )
     return home
 
@@ -1278,14 +1323,15 @@ def _refuse_nested_non_profile_home(root: Path) -> None:
     Measured 2026-10-10: every launchd job and running process sets the root
     or a profile dir, never a deeper path, so this refuses only the drill shape.
     """
-    if not _is_live_kanban_root(root):
+    live = _matching_live_root(root)
+    if live is None:
         return
     raw = os.environ.get("HERMES_HOME", "").strip()
     if not raw:
         return
     try:
         home = Path(os.path.expanduser(os.path.expandvars(raw))).resolve(strict=False)
-        rel = home.relative_to(_live_kanban_root())
+        rel = home.relative_to(live)
     except (OSError, ValueError, TypeError):
         return
     parts = rel.parts
@@ -3138,10 +3184,20 @@ def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> Non
     """Shared R1/R2 decision for :func:`_assert_live_board_write_allowed` and
     :func:`_assert_live_board_tree_write_allowed`; raises or returns."""
     reason: Optional[str] = None
+    drill = os.environ.get("HERMES_KANBAN_DRILL", "").strip()
     if _in_test_context():
         reason = (
             f"this process is a TEST context and {target} is the LIVE board "
             f"(under real Hermes root {live_root})"
+        )
+    elif drill:
+        # An explicit db_path never passes through kanban_db_path(), so the
+        # drill declaration has to be honoured at the write boundary too
+        # (Prism #1873). Test contexts are R1's; the sandbox flag only
+        # re-roots resolved paths and never vetoes an explicit one.
+        reason = (
+            f"HERMES_KANBAN_DRILL={drill} declares a drill and {target} is the "
+            f"LIVE board (under real Hermes root {live_root})"
         )
     else:
         declared = os.environ.get("HERMES_HOME", "").strip()
