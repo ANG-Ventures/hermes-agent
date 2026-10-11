@@ -675,27 +675,42 @@ class Mem0MemoryProvider(MemoryProvider):
                 raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
 
     def _is_breaker_open(self) -> bool:
-        """Return True if the circuit breaker is tripped (too many failures)."""
+        """Return True if the circuit breaker is tripped (too many failures).
+
+        After the cooldown the breaker is HALF-OPEN: calls go through, and the failure count stays
+        at the threshold, so ONE more failure re-opens it for a full cooldown. Only a success closes
+        it. (It used to reset the count to 0 here, so a still-dead store took THRESHOLD more real
+        requests -- 5 x up to 30 s of a blocked tool call each -- before it re-opened.)"""
         if self._consecutive_failures < _BREAKER_THRESHOLD:
             return False
-        if time.monotonic() >= self._breaker_open_until:
-            # Cooldown expired — reset and allow a retry
-            self._consecutive_failures = 0
-            return False
-        return True
+        return time.monotonic() < self._breaker_open_until
 
     def _record_success(self):
+        if self._consecutive_failures >= _BREAKER_THRESHOLD:
+            logger.warning("Mem0 circuit breaker closed: the store answered again.")
         self._consecutive_failures = 0
+
+    def _read_failure_text(self, what: str, exc: Exception) -> str:
+        """Tool error for a failed READ. A store the client cannot reach (refused, timeout, DNS,
+        5xx) is said to be DOWN in so many words, so the model tells the user memory is unavailable
+        instead of answering as if nothing was stored. A 4xx is a request problem, not an outage."""
+        from .capture_drain import _classify_add_error
+        if _classify_add_error(exc) == "deterministic_client_error":
+            return f"{what}: {exc}"
+        return (f"{what}: mem0 memory store is DOWN or unreachable ({exc}). This is NOT an empty "
+                f"result: tell the user memory is unavailable right now.")
 
     def _record_failure(self):
         self._consecutive_failures += 1
         if self._consecutive_failures >= _BREAKER_THRESHOLD:
+            was_open = time.monotonic() < self._breaker_open_until
             self._breaker_open_until = time.monotonic() + _BREAKER_COOLDOWN_SECS
-            logger.warning(
-                "Mem0 circuit breaker tripped after %d consecutive failures. "
-                "Pausing API calls for %ds.",
-                self._consecutive_failures, _BREAKER_COOLDOWN_SECS,
-            )
+            if not was_open:
+                logger.warning(
+                    "Mem0 circuit breaker tripped after %d consecutive failures. "
+                    "Pausing API calls for %ds.",
+                    self._consecutive_failures, _BREAKER_COOLDOWN_SECS,
+                )
 
     @staticmethod
     def _truthy(value: Any) -> bool:
@@ -1640,13 +1655,21 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         future = self._prefetch_future
-        if future and not future.done():
+        # Breaker open: queue_prefetch submitted nothing new, so the only in-flight future is the
+        # one already stuck on the dead store. Joining it again would charge every turn the full
+        # budget for a result that cannot arrive.
+        if future and not future.done() and not self._is_breaker_open():
             try:
                 future.result(timeout=self._prefetch_join_timeout_s)
             except FutureTimeoutError:
                 with self._prefetch_submit_lock:
                     if self._prefetch_future is future:
                         self._prefetch_timed_out = True
+                # A store that accepts the connection and never answers (wedged, or packets
+                # dropped after SYN) used to cost EVERY turn the full join budget and never trip
+                # the breaker: the worker was still inside its 30 s urlopen when the next turn
+                # rotated it away. A join timeout is a failure for the breaker's purposes.
+                self._record_failure()
             except Exception as e:
                 logger.debug("Mem0 prefetch worker failed: %s", e)
         with self._prefetch_lock:
@@ -1679,7 +1702,9 @@ class Mem0MemoryProvider(MemoryProvider):
                     with self._prefetch_lock:
                         if epoch == self._prefetch_epoch:
                             self._prefetch_result = ""   # inject nothing (D-4)
-                    self._record_success()
+                    # No request was made, so this is NOT evidence the store is up: never touch
+                    # the breaker here (an ack turn used to reset the failure count, and in the
+                    # half-open state it would have closed the breaker without a probe).
                 else:
                     client = self._get_client()
                     # INV-8(ii) PREFETCH profile (the every-turn hot path). Ace's call
@@ -2071,9 +2096,12 @@ class Mem0MemoryProvider(MemoryProvider):
                 queued = self._queue_conclude(args["conclusion"], "circuit breaker open")
                 if queued is not None:
                     return queued
-            return json.dumps({
-                "error": "Mem0 API temporarily unavailable (multiple consecutive failures). Will retry automatically."
-            })
+            left = max(0, int(self._breaker_open_until - time.monotonic()))
+            return tool_error(
+                f"mem0 memory store is DOWN ({self._host or 'mem0 cloud'}: {self._consecutive_failures} "
+                f"consecutive failures; not retried for {left}s). This is NOT an empty result: "
+                f"memories exist but cannot be read now. Tell the user memory is unavailable; "
+                f"do not answer as if nothing was stored.")
 
         try:
             client = self._get_client()
@@ -2091,7 +2119,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 return json.dumps({"result": "\n".join(lines), "count": len(lines)})
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Failed to fetch profile: {e}")
+                return tool_error(self._read_failure_text("Failed to fetch profile", e))
 
         elif tool_name == "mem0_search":
             query = args.get("query", "")
@@ -2154,7 +2182,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 return json.dumps(out)
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Search failed: {e}")
+                return tool_error(self._read_failure_text("Search failed", e))
 
         elif tool_name == "mem0_conclude":
             conclusion = args.get("conclusion", "")

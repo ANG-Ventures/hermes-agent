@@ -210,11 +210,30 @@ def default_add_fn() -> AddFn:
         raise RuntimeError("mem0 window replay: no self-hosted host configured (MEM0_HOST / mem0.json)")
     client = _DirectRestMem0Client(host=cfg["host"], admin_api_key=cfg.get("admin_api_key", ""),
                                    agent_id=cfg.get("agent_id", ""), ca_bundle=cfg.get("ca_bundle", ""))
+    readers: Dict[str, Any] = {}   # dedup lookups are user-scoped (search_meta_filtered sends user_id)
+
+    def _reader(user_id: str):
+        if user_id not in readers:
+            readers[user_id] = _DirectRestMem0Client(
+                host=cfg["host"], admin_api_key=cfg.get("admin_api_key", ""), agent_id="",
+                user_id=user_id, ca_bundle=cfg.get("ca_bundle", ""))
+        return readers[user_id]
 
     def _add(entry: Dict[str, Any]) -> Any:
+        # Same contract as the durable conclude queue: stamp the dedup_hash (the key every later
+        # conclude/queue/background-review dedup looks up) and skip a fact that is already live
+        # (a replay re-run, or the same fact journaled on another host and replayed there first).
+        # Without the stamp a replayed row was invisible to every later dedup lookup.
+        from plugins.memory.mem0 import Mem0MemoryProvider
+        dedup_hash = Mem0MemoryProvider._bgr_norm_hash(entry["text"])
+        hits = _reader(str(entry.get("user_id") or "")).search_meta_filtered(
+            entry["text"], {"dedup_hash": dedup_hash}, top_k=1)
+        live = Mem0MemoryProvider._drop_forgotten(Mem0MemoryProvider._unwrap_results(hits))
+        if live:
+            return {"skipped": "already stored"}
         return client.add([{"role": "user", "content": entry["text"]}],
                           user_id=entry.get("user_id"), agent_id=entry.get("agent_id"),
-                          infer=False, metadata={"write_kind": "deliberate"})
+                          infer=False, metadata={"write_kind": "deliberate", "dedup_hash": dedup_hash})
     return _add
 
 
