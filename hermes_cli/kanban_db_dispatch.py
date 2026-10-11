@@ -3706,7 +3706,8 @@ _LINK_CHUNK = 250
 def _linked_ids(conn, ids, mode: Optional[str] = None) -> dict:
     """``{id: (kind, other_id)}`` for ids among ``ids`` whose links hold them
     local: ONE query per tick (bounded by the ready set), not one per row.
-    ``other_id`` is the far end of the first such link.
+    ``other_id`` is the far end of its lowest (parent_id, child_id) such
+    link, whatever the order or chunking of ``ids``.
 
     ``mode`` is ``kanban.placement.lineage_pins`` (None = read it): ``kinds``
     skips provenance-only kinds (``derived-from``); ``legacy`` counts every
@@ -3717,6 +3718,7 @@ def _linked_ids(conn, ids, mode: Optional[str] = None) -> dict:
         mode = _lineage_pins_mode()
     ids = list(ids)
     out: dict = {}
+    best: dict = {}
     # Each id is bound twice (parent + child): 250 ids = 500 variables, under
     # SQLite's historical 999 limit (SQLITE_MAX_VARIABLE_NUMBER < 3.32).
     for i in range(0, len(ids), _LINK_CHUNK):
@@ -3733,8 +3735,15 @@ def _linked_ids(conn, ids, mode: Optional[str] = None) -> dict:
                 kind = str(r[2])
             if mode != _pr.LINEAGE_PINS_LEGACY and kind in _pr.PROVENANCE_LINK_KINDS:
                 continue
-            out.setdefault(r[0], (kind, r[1]))
-            out.setdefault(r[1], (kind, r[0]))
+            # Keep the lowest (parent_id, child_id) edge across ALL chunks, not
+            # the first one seen: chunk membership follows ready-row order, and
+            # a reason that flips with it resets placement_wait ``since``
+            # (Prism 9457394f1922).
+            edge = (r[0], r[1])
+            for me, other in ((r[0], r[1]), (r[1], r[0])):
+                if me not in best or edge < best[me]:
+                    best[me] = edge
+                    out[me] = (kind, other)
     return out
 
 
