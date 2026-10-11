@@ -100,6 +100,7 @@ class TestPathResolution:
         assert p == fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
 
 
+    @pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
     def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
         """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
         forced = tmp_path / "custom.db"

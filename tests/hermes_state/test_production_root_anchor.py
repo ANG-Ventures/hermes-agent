@@ -131,7 +131,7 @@ def test_live_board_under_the_real_root_is_still_refused_from_a_test(
     from hermes_cli import kanban_db as kb
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     real_board = (_account_home() / ".hermes" / "kanban.db").resolve()
 
     with pytest.raises(kb.LiveBoardWriteRefused):

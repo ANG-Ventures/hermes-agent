@@ -676,6 +676,7 @@ def _goal_cases():
     ]
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
 @pytest.mark.parametrize("driver", DRIVERS)
 @pytest.mark.parametrize(("case_id", "setup", "script", "code", "entries"), _goal_cases())
 def test_goal_mode_does_not_continue(

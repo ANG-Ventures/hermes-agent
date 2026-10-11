@@ -44,3 +44,14 @@ def kanban_identity(monkeypatch) -> KanbanIdentity:
         session_id=KANBAN_TEST_SESSION_ID,
         env=dict(os.environ),
     )
+
+
+@pytest.fixture
+def kanban_pins(monkeypatch) -> None:
+    """Opt out of the autouse kanban sandbox for a test of ``HERMES_KANBAN_*`` pin behaviour.
+
+    ``tests/conftest.py`` sets ``HERMES_KANBAN_SANDBOX=1`` for every test (t_65791cd2), which
+    ignores every path pin. A test that pins a DB on purpose requests this fixture; the
+    live-root refusal (``PYTEST_CURRENT_TEST``) still stops any pin that reaches the real board.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — the opt-out fixture itself

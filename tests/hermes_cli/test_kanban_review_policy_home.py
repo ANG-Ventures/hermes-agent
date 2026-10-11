@@ -30,7 +30,7 @@ def homes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         d.mkdir(parents=True)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.setenv("HERMES_HOME", str(prof_w))
     return root, prof_w, prof_v
 

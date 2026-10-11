@@ -716,7 +716,10 @@ def _kanban_path_override(name: str) -> str:
     """
     if kanban_sandbox_enabled():
         return ""
-    return os.environ.get(name, "").strip()
+    value = os.environ.get(name, "").strip()
+    if value:
+        _refuse_live_kanban_pin_in_isolation(Path(value), name)
+    return value
 
 # The ``HERMES_KANBAN_DB`` pin and ``HERMES_HOME`` as they were when this
 # module was first imported. Load-bearing for telling the INCIDENT shape apart
@@ -1135,12 +1138,255 @@ def kanban_home() -> Path:
     module docstring). Resolving the kanban paths through the active
     profile's ``HERMES_HOME`` would silently fork the board per profile,
     which breaks the dispatcher / worker handoff.
+
+    ``HERMES_REAL_HOME`` plays no part here. It is the OS account home that
+    the subprocess HOME contract (``hermes_constants.get_real_home``) uses so a
+    child with ``HOME={HERMES_HOME}/home`` still finds ``~``-based credentials.
+    The live-board leak blamed on it (t_db9ca661) was step 2: a HERMES_HOME
+    anywhere under the native root resolves to the native root.
+
+    With ``HERMES_KANBAN_SANDBOX`` set, step 2 never climbs from a home
+    nested under the live root to the live root (see
+    :func:`_sandbox_kanban_home`). In a test or drill context
+    (:func:`_kanban_isolation_context`) a root that is the live Hermes root
+    raises :class:`KanbanLiveBoardRefusedError`.
     """
     override = _kanban_path_override("HERMES_KANBAN_HOME")
     if override:
-        return Path(override).expanduser()
-    from hermes_constants import get_default_hermes_root
-    return get_default_hermes_root()
+        root = Path(override).expanduser()
+    else:
+        from hermes_constants import get_default_hermes_root
+        root = get_default_hermes_root()
+        if kanban_sandbox_enabled():
+            root = _sandbox_kanban_home(root)
+        else:
+            _refuse_nested_non_profile_home(root)
+    _refuse_live_kanban_root_in_isolation(root, "kanban_home()")
+    return root
+
+
+class KanbanLiveBoardRefusedError(RuntimeError):
+    """A test, drill or declared sandbox resolved a kanban path on the LIVE board.
+
+    2026-10-10: two drills (t_db9ca661, t_7a6f4611) pointed ``HERMES_HOME`` at a
+    scratch dir under ``~/.hermes/profiles/<p>/cache/scratch`` (the fleet's
+    default ``TMPDIR``). ``get_default_hermes_root()`` maps every home under
+    the native root to the native root, so 8 fixture cards landed on the live
+    default board, the second time with ``HERMES_KANBAN_SANDBOX=1`` set and
+    every pin unset. The dispatcher then spawned real workers on 4 of them.
+    """
+
+
+# Env markers that declare "this process must never touch the live board".
+# PYTEST_CURRENT_TEST is pytest's own; HERMES_TEST_ISOLATION is exported by
+# tests/conftest.py and inherits into children that strip PYTEST_*;
+# HERMES_KANBAN_DRILL=<card> marks a hand-run drill.
+_KANBAN_ISOLATION_ENV_VARS = ("PYTEST_CURRENT_TEST", "HERMES_TEST_ISOLATION", "HERMES_KANBAN_DRILL")
+
+
+def _kanban_isolation_context() -> Optional[str]:
+    """Name of the first isolation marker set in the environment, else None."""
+    for name in _KANBAN_ISOLATION_ENV_VARS:
+        if os.environ.get(name, "").strip():
+            return name
+    return None
+
+
+def _live_kanban_root() -> Optional[Path]:
+    """The live Hermes root, anchored on the OS account (passwd), not ``$HOME``.
+
+    Tests monkeypatch ``Path.home`` and the platform default; the passwd entry
+    is the one anchor they cannot move, so this keeps naming production.
+    Only consulted when an isolation marker or the sandbox flag is set, so a
+    production process never pays for it.
+    """
+    global _LIVE_KANBAN_ROOT_MEMO
+    if _LIVE_KANBAN_ROOT_MEMO is None:
+        from hermes_state_guard import _real_platform_state_root
+        _LIVE_KANBAN_ROOT_MEMO = (_real_platform_state_root(),)
+    return _LIVE_KANBAN_ROOT_MEMO[0]
+
+
+_LIVE_KANBAN_ROOT_MEMO: Optional[tuple] = None
+
+
+def _account_home_board_root() -> Optional[Path]:
+    """The passwd account home when a board lives there, regardless of HERMES_HOME.
+
+    The official container keeps its live board at ``<account>/kanban.db``
+    (``/opt/data``). ``hermes_state._deployed_hermes_home_root`` only sees that
+    while ``HERMES_HOME`` still names the account home, so a drill that
+    redirects its home first lost the deployed root (Prism round 2, #1873). The
+    board files on disk are the identity; nothing a process sets can move them.
+    Inert on fleet hosts: no ``~/kanban.db`` exists there (checked Studio and
+    ace-ai 2026-10-10).
+    """
+    from hermes_state import _os_account_home
+    account = _os_account_home()
+    if account is None:
+        return None
+    try:
+        account = account.resolve()
+    except OSError:
+        return None
+    if (account / "kanban.db").exists() or (account / "kanban" / "boards").is_dir():
+        return account
+    return None
+
+
+def _live_kanban_roots() -> tuple:
+    """Every live root: the passwd-anchored native root plus a deployed root.
+
+    The deployed root is the official container shape (``HERMES_HOME`` = the
+    account home, e.g. ``/opt/data``), where the native ``<account>/.hermes``
+    is not where the board lives (``hermes_state._deployed_hermes_home_root``,
+    plus :func:`_account_home_board_root` for a process that redirected its home).
+    """
+    from hermes_state import _deployed_hermes_home_root
+    roots = [r for r in (_live_kanban_root(), _deployed_hermes_home_root(), _account_home_board_root())
+             if r is not None]
+    return tuple(dict.fromkeys(roots))
+
+
+def _matching_live_root(path: Path) -> Optional[Path]:
+    """The live root *path* is exactly, else None."""
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    for live in _live_kanban_roots():
+        if resolved == live:
+            return live
+    return None
+
+
+def _is_live_kanban_root(root: Path) -> bool:
+    return _matching_live_root(root) is not None
+
+
+def _is_live_board_pin_target(target: Path, live: Path) -> bool:
+    """True when a path pin names live board state of *live*.
+
+    The root itself, a board DB, the board set (``kanban/boards/...``,
+    ``current``, aliases) and the shared ``kanban``/``workspaces``/``attachments``
+    roots. A path INSIDE one task's workspace is a scratch location, not the
+    board (same narrow rule as :func:`_is_production_board_db`).
+    """
+    if target == live or _is_production_board_db(target, live) or _is_live_board_tree_path(target, live):
+        return True
+    kanban = live / "kanban"
+    return target in (kanban, kanban / "workspaces", kanban / "attachments")
+
+
+def _refuse_live_kanban_pin_in_isolation(path: Path, name: str) -> None:
+    """Refuse a path pin that names live board state in an isolated process.
+
+    Live board state is the root, a board DB, the board set and the shared
+    kanban/workspaces/attachments roots (:func:`_is_live_board_pin_target`), for
+    every live root including a deployed one. A pin elsewhere under the root (a
+    sandbox in a profile's cache/scratch, a DB inside one task's workspace) is
+    not the live board and is left alone.
+    """
+    marker = _kanban_isolation_context()
+    if marker is None and not kanban_sandbox_enabled():
+        return
+    try:
+        target = path.expanduser().resolve(strict=False)
+    except OSError:
+        return
+    for live in _live_kanban_roots():
+        if _is_live_board_pin_target(target, live):
+            why = f"{marker} is set" if marker else "HERMES_KANBAN_SANDBOX is set"
+            raise KanbanLiveBoardRefusedError(
+                f"{name}={target} is a LIVE board path under {live} while {why}. Refusing: "
+                f"a test, drill or sandbox must not read or write the live board."
+            )
+
+
+def _sandbox_kanban_home(root: Path) -> Path:
+    """Under SANDBOX, keep a home nested in the live root from resolving to it.
+
+    ``get_default_hermes_root()`` returns the live root for ``~/.hermes`` itself,
+    for a real profile ``~/.hermes/profiles/<p>``, and for ANY deeper path
+    such as ``~/.hermes/profiles/<p>/cache/scratch/x``. A sandbox asked for the
+    last one; give it that directory. A sandbox whose ``HERMES_HOME`` is the
+    live root itself, or unset, has nowhere isolated to go: refuse. So does a
+    home that is itself live board state: ``<live>/kanban/boards/<slug>`` as a
+    home would make that live board's DB the sandbox's default board.
+    """
+    live = _matching_live_root(root)
+    if live is None:
+        return root
+    raw = os.environ.get("HERMES_HOME", "").strip()
+    home = Path(os.path.expanduser(os.path.expandvars(raw))) if raw else None
+    if home is None or _is_live_kanban_root(home):
+        raise KanbanLiveBoardRefusedError(
+            f"HERMES_KANBAN_SANDBOX is set but HERMES_HOME={raw or '<unset>'} is the "
+            f"live Hermes root {root}; there is no isolated board to resolve. Point "
+            f"HERMES_HOME at a throwaway directory."
+        )
+    try:
+        inside_board = _is_live_board_pin_target(home.resolve(strict=False), live)
+    except OSError:
+        inside_board = True
+    if inside_board:
+        raise KanbanLiveBoardRefusedError(
+            f"HERMES_KANBAN_SANDBOX is set but HERMES_HOME={home} is live board state "
+            f"under {live} (e.g. a named board's directory); a sandbox there would open "
+            f"that live board. Point HERMES_HOME at a throwaway directory."
+        )
+    return home
+
+
+def _refuse_nested_non_profile_home(root: Path) -> None:
+    """Refuse a HERMES_HOME nested under the live root that is not a profile.
+
+    ``get_default_hermes_root()`` maps the root itself and ``<root>/profiles/<p>``
+    to the shared root, which is the board-sharing design. It ALSO maps every
+    other path under the root (``<root>/profiles/<p>/cache/scratch/x``, the
+    fleet's default ``TMPDIR``) to the live root; a caller that set such a home
+    asked for isolation and silently got the live board (t_db9ca661 drill).
+    Measured 2026-10-10: every launchd job and running process sets the root
+    or a profile dir, never a deeper path, so this refuses only the drill shape.
+    """
+    live = _matching_live_root(root)
+    if live is None:
+        return
+    raw = os.environ.get("HERMES_HOME", "").strip()
+    if not raw:
+        return
+    try:
+        home = Path(os.path.expanduser(os.path.expandvars(raw))).resolve(strict=False)
+        rel = home.relative_to(live)
+    except (OSError, ValueError, TypeError):
+        return
+    parts = rel.parts
+    if not parts or (len(parts) == 2 and parts[0] == "profiles"):
+        return
+    raise KanbanLiveBoardRefusedError(
+        f"HERMES_HOME={home} is inside the live Hermes root {root} but is neither the "
+        f"root nor a profile home, so kanban would resolve the LIVE board for a "
+        f"process that pointed its home somewhere else. Refusing. To isolate, set "
+        f"HERMES_KANBAN_SANDBOX=1 (the board then lives in {home}); to use the live "
+        f"board, set HERMES_HOME to the root or a profile home."
+    )
+
+
+def _refuse_live_kanban_root_in_isolation(root: Path, what: str) -> None:
+    """Refuse a live-root kanban path for a sandboxed, test or drill process."""
+    marker = _kanban_isolation_context()
+    if marker is None and not kanban_sandbox_enabled():
+        return
+    if not _is_live_kanban_root(root):
+        return
+    why = f"{marker} is set" if marker else "HERMES_KANBAN_SANDBOX is set"
+    raise KanbanLiveBoardRefusedError(
+        f"{what} resolved to the LIVE Hermes root {root} while {why}. Refusing: a "
+        f"test, drill or sandbox must not read or write the live board. Set "
+        f"HERMES_KANBAN_SANDBOX=1 and point HERMES_HOME at a throwaway directory "
+        f"(any path, including one under ~/.hermes, resolves to itself under the "
+        f"sandbox)."
+    )
 
 
 def boards_root() -> Path:
@@ -2856,7 +3102,13 @@ def _production_kanban_roots() -> list[Path]:
     kept leaking.
     """
     from hermes_state import _production_state_roots
-    return list(_production_state_roots())
+    roots = list(_production_state_roots())
+    # A container drill that redirected HERMES_HOME still must see /opt/data
+    # as live (Prism round 2, #1873); identity comes from the board on disk.
+    account_board = _account_home_board_root()
+    if account_board is not None and account_board not in roots:
+        roots.append(account_board)
+    return roots
 
 
 def _in_test_context() -> bool:
@@ -2964,10 +3216,20 @@ def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> Non
     """Shared R1/R2 decision for :func:`_assert_live_board_write_allowed` and
     :func:`_assert_live_board_tree_write_allowed`; raises or returns."""
     reason: Optional[str] = None
+    drill = os.environ.get("HERMES_KANBAN_DRILL", "").strip()
     if _in_test_context():
         reason = (
             f"this process is a TEST context and {target} is the LIVE board "
             f"(under real Hermes root {live_root})"
+        )
+    elif drill:
+        # An explicit db_path never passes through kanban_db_path(), so the
+        # drill declaration has to be honoured at the write boundary too
+        # (Prism #1873). Test contexts are R1's; the sandbox flag only
+        # re-roots resolved paths and never vetoes an explicit one.
+        reason = (
+            f"HERMES_KANBAN_DRILL={drill} declares a drill and {target} is the "
+            f"LIVE board (under real Hermes root {live_root})"
         )
     else:
         declared = os.environ.get("HERMES_HOME", "").strip()

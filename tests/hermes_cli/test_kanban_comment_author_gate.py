@@ -243,6 +243,7 @@ def test_worker_whose_profile_is_default_loses_the_exemption(board, monkeypatch)
     assert payload.get("claimed_author") == "human:apollo"
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
 def test_worker_on_another_board_is_found_under_a_repinned_db(board, monkeypatch, tmp_path):
     """9e1b780a6387: ``HERMES_KANBAN_DB`` repinned to board B must not hide the
     worker run recorded on board A."""
