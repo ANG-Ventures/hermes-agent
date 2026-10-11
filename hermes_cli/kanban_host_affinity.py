@@ -21,6 +21,7 @@ rarely. Everything fails OPEN (no binding): the pool sidecar's
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -128,6 +129,65 @@ def manifest_affinity(skills: Iterable[str], assignee: Optional[str], *,
         if why:
             out[name] = why
     return out
+
+
+def manifest_affinity_safe(skills, assignee) -> Dict[str, str]:
+    """:func:`manifest_affinity` that can never raise into the dispatch tick."""
+    try:
+        return manifest_affinity(skills, assignee)
+    except Exception:
+        _log.debug("kanban host affinity: manifest lookup failed open", exc_info=True)
+        return {}
+
+
+def studio_affinity_unplanned(rows, default_assignee: Optional[str], result) -> None:
+    """Dry-run view with no pool plan: which ready cards ARE Studio-bound, so
+    ``kanban dispatch --dry-run`` shows the binding before a spill ever happens."""
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_worker_pool as _kwp
+    try:
+        cfg = _kwp.read_pool(_kb.kanban_home() / "fleet")
+    except Exception:
+        cfg = _kwp.PoolConfig()
+    for r in rows:
+        if _kwp.card_pin(r["body"]) is not None:
+            continue  # an explicit pin is the operator's call
+        try:
+            skills = tuple(s for s in (json.loads(r["skills"] or "[]") or []) if isinstance(s, str))
+        except (TypeError, ValueError):
+            skills = ()
+        assignee = r["assignee"] or default_assignee
+        manifest = manifest_affinity_safe(skills, assignee) if skills and assignee else {}
+        hit = _kwp.studio_affinity(r["body"], skills, cfg, manifest=manifest)
+        if hit is not None:
+            result.placement_affinity[r["id"]] = {
+                "host": _kwp.STUDIO_HOST, "rule": hit[0], "matched_by": hit[1]}
+
+
+def _last_payload(conn, task_id: str, kind: str):
+    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+                       "ORDER BY id DESC LIMIT 1", (task_id, kind)).fetchone()
+    return None if row is None else json.loads(row[0] or "{}")
+
+
+def record_affinity_events(conn, result) -> None:
+    """``placement_affinity`` on each change of binding and ``placement_wait`` on
+    each change of wait reason, per bound card. Best-effort: never breaks a tick."""
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_connect as _kbc
+    try:
+        with _kbc.write_txn(conn):
+            for tid, aff in result.placement_affinity.items():
+                if _last_payload(conn, tid, "placement_affinity") != aff:
+                    _kb._append_event(conn, tid, "placement_affinity", dict(aff))
+                reason = (result.placement_waits or {}).get(tid)
+                if reason is None:
+                    continue
+                payload = {"host": aff["host"], "reason": reason, "matched_by": aff["matched_by"]}
+                if _last_payload(conn, tid, "placement_wait") != payload:
+                    _kb._append_event(conn, tid, "placement_wait", payload)
+    except Exception:
+        _log.warning("kanban dispatch: could not record placement affinity events", exc_info=True)
 
 
 def clear_cache() -> None:

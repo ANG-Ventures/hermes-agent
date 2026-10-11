@@ -3799,63 +3799,8 @@ _STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "st
 
 
 def _manifest_affinity(skills, assignee) -> dict:
-    """``{skill: why}`` from the skills' own manifests; fails open to ``{}``."""
-    try:
-        from hermes_cli.kanban_host_affinity import manifest_affinity
-        return manifest_affinity(skills, assignee)
-    except Exception:
-        _kb._log.debug("kanban host affinity: manifest lookup failed open", exc_info=True)
-        return {}
-
-
-def _studio_affinity_unplanned(conn, rows, default_assignee, result) -> None:
-    """Dry-run view with no pool plan: which ready cards ARE Studio-bound, so
-    ``kanban dispatch --dry-run`` shows the binding before a spill ever happens."""
-    from hermes_cli import kanban_worker_pool as _kwp
-    try:
-        cfg = _kwp.read_pool(_kb.kanban_home() / "fleet")
-    except Exception:
-        cfg = _kwp.PoolConfig()
-    for r in rows:
-        try:
-            skills = tuple(s for s in (json.loads(r["skills"] or "[]") or []) if isinstance(s, str))
-        except (TypeError, ValueError):
-            skills = ()
-        if _kwp.card_pin(r["body"]) is not None:
-            continue
-        assignee = r["assignee"] or default_assignee
-        manifest = _manifest_affinity(skills, assignee) if skills and assignee else {}
-        hit = _kwp.studio_affinity(r["body"], skills, cfg, manifest=manifest)
-        if hit is not None:
-            result.placement_affinity[r["id"]] = {
-                "host": _kwp.STUDIO_HOST, "rule": hit[0], "matched_by": hit[1]}
-
-
-def _record_affinity_events(conn, result, dry_run: bool) -> None:
-    """``placement_affinity`` once per binding and ``placement_wait`` on each
-    change of wait reason, per bound card (t_3e6c9b2b). Never in a dry run."""
-    if dry_run or not result.placement_affinity:
-        return
-    try:
-        with _kbc.write_txn(conn):
-            for tid, aff in result.placement_affinity.items():
-                last = conn.execute(
-                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
-                    "ORDER BY id DESC LIMIT 1", (tid, "placement_affinity")).fetchone()
-                if last is None or json.loads(last[0] or "{}") != aff:
-                    _kb._append_event(conn, tid, "placement_affinity", dict(aff))
-                reason = result.placement_waits.get(tid)
-                if reason is None:
-                    continue
-                payload = {"host": aff["host"], "reason": reason, "matched_by": aff["matched_by"]}
-                last = conn.execute(
-                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
-                    "ORDER BY id DESC LIMIT 1", (tid, "placement_wait")).fetchone()
-                if last is None or json.loads(last[0] or "{}") != payload:
-                    _kb._append_event(conn, tid, "placement_wait", payload)
-    except Exception:
-        _kb._log.warning("kanban dispatch: could not record placement affinity events",
-                         exc_info=True)
+    from hermes_cli.kanban_host_affinity import manifest_affinity_safe
+    return manifest_affinity_safe(skills, assignee)
 
 
 def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optional[str]:
@@ -4393,8 +4338,9 @@ def _dispatch_once_locked(
             if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
                 row_route[r["id"]] = ("wait", "pool_unavailable")
         if dry_run:
-            _studio_affinity_unplanned(
-                conn, ready_rows, (default_assignee or "").strip() or None, result)
+            from hermes_cli.kanban_host_affinity import studio_affinity_unplanned
+            studio_affinity_unplanned(
+                ready_rows, (default_assignee or "").strip() or None, result)
         _unplanned = sum(1 for v in row_route.values() if v == ("wait", "pool_unavailable"))
         if _unplanned:
             # The pool is planned by the GATEWAY tick only (KWLB v0.1); the
@@ -5327,7 +5273,9 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
 
     pr_state_resolver.finish_tick(scan_complete=ready_scan_complete)
-    _record_affinity_events(conn, result, dry_run)
+    if result.placement_affinity and not dry_run:
+        from hermes_cli.kanban_host_affinity import record_affinity_events
+        record_affinity_events(conn, result)
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
