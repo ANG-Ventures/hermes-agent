@@ -278,6 +278,36 @@ def test_parking_a_claimed_review_wakes_back_into_review(kanban_home: Path, park
         assert kb.get_task(conn, tid).status == "review"
 
 
+@pytest.mark.parametrize("park", ["deferred_block", "schedule"])
+def test_parking_an_unclaimed_review_wakes_back_into_review(kanban_home: Path, park) -> None:
+    """A card waiting in ``review`` with no reviewer yet can be parked on
+    time ("park this review until Monday") and wakes into review, not into
+    implementation (Prism 7a203f4ecebc / 8b2a837af2a6)."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="r", assignee="builder")
+        worker = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, reviewer="argus", expected_run_id=worker.current_run_id)
+        assert kb.get_task(conn, tid).status == "review"
+        if park == "deferred_block":
+            assert kb.block_task(conn, tid, reason="monday", kind="deferred", until=2_000_000_000)
+        else:
+            assert kb.schedule_task(conn, tid, reason="monday")
+            ok, _ = kb.set_schedule_wake(conn, tid, wake_at=2_000_000_000, actor="t")
+            assert ok
+        assert kb.get_task(conn, tid).status == "scheduled"
+        parked = [e for e in kb.list_events(conn, tid) if e.kind == "scheduled"][-1].payload
+        assert parked["source_status"] == "review"
+        assert kb.wake_due_scheduled(conn, now=2_000_000_000) == [tid]
+        assert kb.get_task(conn, tid).status == "review"
+
+
+def test_resume_phase_for_park_keeps_review(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="r", assignee="builder")
+        assert kb._resume_phase_for_park(conn, tid, "review") == "review"
+        assert kb._resume_phase_for_park(conn, tid, "ready") == "ready"
+
+
 def test_blocked_review_converted_to_deferred_wakes_back_into_review(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         tid = _claimed_review(conn)

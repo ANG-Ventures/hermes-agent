@@ -8219,6 +8219,8 @@ def _resume_phase_for_park(conn: sqlite3.Connection, task_id: str, status: str) 
         return _retry_status_for_run(conn, task_id)
     if status == "blocked":
         return _resume_status_from_events(conn, task_id)
+    if status == "review":
+        return "review"
     return "ready"
 
 
@@ -12022,7 +12024,7 @@ def block_task(
             sql = (
                 "UPDATE tasks SET status = 'scheduled', claim_lock = NULL, claim_expires = NULL, "
                 "worker_pid = NULL, block_kind = 'deferred', next_eligible_at = ? "
-                "WHERE id = ? AND status IN ('todo', 'ready', 'running', 'blocked')"
+                "WHERE id = ? AND status IN ('todo', 'ready', 'running', 'blocked', 'review')"
             )
             params: list[Any] = [int(until), task_id]
             if expected_run_id is not None:
@@ -15323,7 +15325,7 @@ def schedule_task(
                    -- to wake_due_scheduled; set_schedule_wake stamps a real one.
                    next_eligible_at = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'review')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
