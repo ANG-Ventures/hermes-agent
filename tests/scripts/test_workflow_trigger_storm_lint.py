@@ -74,3 +74,13 @@ def test_selftest_and_this_repo_are_green():
         proc = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=60)
         assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_scalar_workflows_is_one_upstream():  # Prism P1 b731e7859a9b
+    text = "on:\n  workflow_run:\n    workflows: Build\n    types: [completed]\njobs:\n  j:\n    if: github.event.workflow_run.conclusion == 'failure'\n"
+    assert not L.lint_text("w", text)
+
+
+def test_missing_repo_exits_2(tmp_path):  # Prism P1 1ec058f04ff8
+    proc = subprocess.run([sys.executable, str(SCRIPT), "--repo", str(tmp_path / "nope")], capture_output=True, text=True)
+    assert proc.returncode == 2, proc.stdout + proc.stderr

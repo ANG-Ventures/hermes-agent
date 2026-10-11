@@ -1663,6 +1663,7 @@ def _sweep(tmp_path, reds, *, sweeps=(), sweep_jobs=None, listener=None, event="
     (bindir / "curl").chmod(0o755)
     api = {f"actions/runs/{SWEEP_SELF}": {"workflow_id": 77},
            "actions/workflows/77/runs?event=schedule": {"workflow_runs": list(sweeps)},
+           "actions/workflows/77/runs?event=schedule&status=success": {"workflow_runs": [w for w in sweeps if w.get("conclusion") == "success"]},
            "actions/workflows/77/runs?event=workflow_run": {"workflow_runs": [listener] if listener else []},
            "repos/o/r": {"default_branch": "main"}}
     for st in ("failure", "timed_out", "startup_failure"):  # the run list filters by status AND event, as GitHub does
@@ -1704,7 +1705,7 @@ def test_sweep_emits_each_unnotified_red_once(tmp_path):
     reds = [_red_run(11), _red_run(12, name="Nix flake check", event="schedule"),
             _red_run(13, name="CI", event="merge_group", concl="startup_failure"),
             _red_run(14, event="pull_request"), _red_run(15, name="unwatched"),
-            _red_run(16, branch="ci-overflow-ledger"), _red_run(17, age=4 * 3600),
+            _red_run(16, branch="ci-overflow-ledger"), _red_run(17, age=28 * 3600),
             _red_run(18, concl="timed_out")]  # the listener never paged timed_out here either
     proc, runs, got = _sweep(tmp_path, reds)
     assert proc.returncode == 0, proc.stderr
@@ -1780,7 +1781,7 @@ def test_rerun_of_a_run_created_days_ago_is_still_swept(tmp_path):
     assert [r["key"] for r in runs] == ["21#2"], runs
     log = (tmp_path / "curl.log").read_text(encoding="utf-8")
     window = int(_sweep_step()["env"]["RERUN_WINDOW_S"])
-    assert window >= 30 * 86400 and f"created=%3E%3D{_iso(SWEEP_NOW - window)}" in log
+    assert window >= 30 * 86400 and f"created={_iso(SWEEP_NOW - window)}..{_iso(SWEEP_NOW)}" in log
 
 
 def test_sweep_events_cover_every_non_pr_trigger_of_the_watched_workflows():
@@ -1867,3 +1868,58 @@ def test_dedupe_ignores_non_notify_jobs_and_empty_lists(tmp_path):
     proc, runs, _ = _sweep(tmp_path, [_red_run(11, age=200)], sweeps=[prior],
                            sweep_jobs={801: [("sweep", "success"), ("backlog", "success")]})
     assert proc.returncode == 0 and [r["key"] for r in runs] == ["11#1"], (proc.stderr, runs)
+
+
+# --- Prism round 2 on the sweep (P1 8aa862751a5e, cef8815b85e0, 81de6de0f429) ------------------------
+def test_checkpoint_older_than_a_day_still_bounds_the_window(tmp_path):
+    # last green sweep 30 h ago (an outage): a red that completed 29 h ago was never delivered
+    import json as _j
+    prior = {"id": 801, "conclusion": "success", "created_at": _iso(SWEEP_NOW - 30 * 3600)}
+    _sweep(tmp_path, [_red_run(11, age=29 * 3600)], sweeps=[prior], sweep_jobs={801: []})
+    api = _j.loads((tmp_path / "api.json").read_text())
+    api["actions/workflows/77/runs?event=schedule"] = {"workflow_runs": []}  # a 24 h created window holds no sweep
+    (tmp_path / "api.json").write_text(_j.dumps(api))
+    step = _sweep_step()
+    out = tmp_path / "out3"
+    out.write_text("")
+    env = {"PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
+           "FAKE_CURL_LOG": str(tmp_path / "curl.log"), "FAKE_API": str(tmp_path / "api.json"), "GH_TOKEN": "x",
+           "REPO": "o/r", "EVENT_NAME": "schedule", "REPLAY_RUN_ID": "", "GITHUB_RUN_ID": str(SWEEP_SELF),
+           "SWEEP_NOW": str(SWEEP_NOW), **{k: v for k, v in step["env"].items() if k.isupper() and not str(v).startswith("${")}}
+    proc = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60)
+    got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+    assert proc.returncode == 0, proc.stderr
+    assert [r["key"] for r in json.loads(got["runs"])] == ["11#1"], got
+
+
+def test_saturated_list_window_is_split_not_fatal(tmp_path):
+    # the fake serves exactly 100 runs per page, forever: 10 pages = the API's 1,000 cap on every window
+    import json as _j
+    bindir = tmp_path / "bin"
+    proc, runs, _ = _sweep(tmp_path, [_red_run(11)])
+    assert proc.returncode == 0
+    full = {"workflow_runs": [{"id": 5000 + i, "name": "unwatched", "event": "push", "conclusion": "failure",
+                                "created_at": _iso(SWEEP_NOW - 900), "updated_at": _iso(SWEEP_NOW - 600)} for i in range(100)]}
+    api = _j.loads((tmp_path / "api.json").read_text())
+    for k in [k for k in api if k.startswith("actions/runs?") and "push" in k and "status=failure" in k]:
+        api[k] = full
+    (tmp_path / "api.json").write_text(_j.dumps(api))
+    step = _sweep_step()
+    env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(tmp_path / "out2"),
+           "FAKE_CURL_LOG": str(tmp_path / "curl.log"), "FAKE_API": str(tmp_path / "api.json"), "GH_TOKEN": "x",
+           "REPO": "o/r", "EVENT_NAME": "schedule", "REPLAY_RUN_ID": "", "GITHUB_RUN_ID": str(SWEEP_SELF),
+           "SWEEP_NOW": str(SWEEP_NOW), **{k: v for k, v in step["env"].items() if k.isupper() and not str(v).startswith("${")}}
+    (tmp_path / "out2").write_text("")
+    (tmp_path / "curl.log").write_text("")
+    import subprocess as _sp
+    p2 = _sp.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=120)
+    # an endless list never fits: the split recurses down to 10-minute windows, then gives up LOUDLY
+    assert p2.returncode != 0
+    created = [l for l in (tmp_path / "curl.log").read_text().splitlines() if "status=failure" in l and "push" in l]
+    assert any(".." in l for l in created) and len({l.split("created=")[1].split("&")[0] for l in created}) > 2
+
+
+def test_find_step_leaves_time_for_the_outage_page():
+    job = _workflow()["jobs"]["sweep"]
+    find = next(s for s in job["steps"] if s.get("id") == "find")
+    assert find["timeout-minutes"] + 3 <= job["timeout-minutes"], (find["timeout-minutes"], job["timeout-minutes"])

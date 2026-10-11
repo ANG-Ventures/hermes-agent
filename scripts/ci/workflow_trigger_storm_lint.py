@@ -62,6 +62,7 @@ def lint_text(path: str, text: str) -> list[str]:
     if "workflow_run" in on and not MARK_STORM.search(_key_line(text, "workflow_run")):
         wr = on.get("workflow_run") or {}
         ups = wr.get("workflows") or [] if isinstance(wr, dict) else []
+        ups = [ups] if isinstance(ups, str) else list(ups)  # `workflows: Build` is one upstream
         types = wr.get("types") or [] if isinstance(wr, dict) else []
         types = [types] if isinstance(types, str) else list(types)
         first = next(iter(jobs.values()), {}) if isinstance(jobs, dict) and jobs else {}
@@ -90,6 +91,8 @@ def lint_text(path: str, text: str) -> list[str]:
 
 def findings(repo: pathlib.Path) -> list[str]:
     wf = repo / ".github" / "workflows"
+    if not wf.is_dir():  # a mistyped --repo must not read as clean (exit 2)
+        raise OSError("no workflows directory: %s" % wf)
     out = []
     for p in sorted(list(wf.glob("*.yml")) + list(wf.glob("*.yaml"))):
         out += lint_text(str(p.relative_to(repo)), p.read_text(encoding="utf-8-sig"))
