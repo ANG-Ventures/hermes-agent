@@ -2,10 +2,10 @@
 
 Acceptance fixture: the 2026-10-11 01:59-02:34 cascade (t_f2ddf6d1). Chain
 alr -> dtlr -> btpr -> bpr (all claude-fable-5-1) -> cpa (gpt). alr failed in
-seconds, dtlr held the turn 420 s with no byte and 504'd, and the walk went on
-to btpr and bpr on the same model: 34 min of dead air. With the budget (180 s
-default) spent when dtlr fails, the walker skips the remaining fable faces and
-lands on the first lane on another model.
+seconds, dtlr and btpr each held the turn 420 s with no byte and 504'd, and the
+walk went on to bpr on the same model: 34 min of dead air. With the DEFAULT budget
+(600 s) spent once btpr fails, the walker skips the remaining fable face and lands
+on the first lane on another model.
 """
 
 from __future__ import annotations
@@ -89,16 +89,27 @@ def _drive(agent, script, fallback_cfg):
 INCIDENT = [
     (2.0, RelayError(504, STALL_504)),     # alr: fails fast (01:59:43)
     (420.0, RelayError(504, STALL_504)),   # dtlr: 420 s silent, relay 504 (02:06:44)
+    (420.0, RelayError(504, STALL_504)),   # btpr: another 420 s silent seat; 842 s spent
     (3.0, _response("served")),           # whichever lane comes next answers
 ]
 
 
-def test_incident_timeline_skips_remaining_fable_lanes_once_budget_is_spent():
+def test_incident_timeline_skips_remaining_fable_lanes_once_default_budget_is_spent():
     agent = _agent([])
-    result, called = _drive(agent, INCIDENT, {"no_first_byte_budget_seconds": 180})
+    result, called = _drive(agent, INCIDENT, {})  # pins the shipped default, not a test value
     assert result["final_response"] == "served"
-    # dtlr burned the budget; btpr/bpr are faces of the same stalled model: go straight to cpa.
-    assert called == ["claude-alr", "claude-dtlr", "cpa"]
+    # dtlr+btpr burned the budget; bpr is another face of the same stalled model: go to cpa.
+    assert called == ["claude-alr", "claude-dtlr", "claude-btpr", "cpa"]
+
+
+def test_healthy_slow_lane_inside_default_budget_is_not_skipped():
+    """A 500 s silent dtlr then a healthy btpr: the default budget is not spent, so the
+    chain order holds and the turn stays on fable (no mid-conversation model change)."""
+    agent = _agent([])
+    script = [(2.0, RelayError(504, STALL_504)), (500.0, RelayError(504, STALL_504)), (3.0, _response("served"))]
+    result, called = _drive(agent, script, {})
+    assert result["final_response"] == "served"
+    assert called == ["claude-alr", "claude-dtlr", "claude-btpr"]
 
 
 def test_budget_not_spent_keeps_the_chain_order():
@@ -114,7 +125,28 @@ def test_zero_disables_the_budget():
     agent = _agent([])
     result, called = _drive(agent, INCIDENT, {"no_first_byte_budget_seconds": 0})
     assert result["final_response"] == "served"
-    assert called == ["claude-alr", "claude-dtlr", "claude-btpr"]
+    assert called == ["claude-alr", "claude-dtlr", "claude-btpr", "claude-bpr"]
+
+
+def test_unusable_other_model_lane_does_not_strand_the_turn():
+    """Prism a54a5cb796b0: the only other-model lane is unusable, so the spent budget must
+    not skip the remaining fable face into an exhausted chain."""
+    agent = _agent([])
+    agent._unavailable_fallback_keys = {("cpa", "gpt-6.1-sol", "")}  # e.g. a 401 earlier this session
+    result, called = _drive(agent, INCIDENT, {})
+    assert result["final_response"] == "served"
+    assert called == ["claude-alr", "claude-dtlr", "claude-btpr", "claude-bpr"]
+
+
+def test_walker_revisits_budget_skipped_lanes_when_the_other_model_is_refused_late():
+    """A filter the budget cannot see ahead of time (a card pin refusing cpa): the walk
+    comes back to the skipped fable face instead of ending the turn with no reply."""
+    agent = _agent([])
+    with patch("hermes_cli.kanban_worker_route.refuse_runtime_failover",
+               side_effect=lambda _a, prov, _m, _r=None: prov == "cpa"):
+        result, called = _drive(agent, INCIDENT, {})
+    assert result["final_response"] == "served"
+    assert called == ["claude-alr", "claude-dtlr", "claude-btpr", "claude-bpr"]
 
 
 # ── unit: clock, skip rule, notices ─────────────────────────────────────────
@@ -138,6 +170,21 @@ def test_skip_lane_only_for_the_stalled_model_and_only_with_another_model_ahead(
         only_fable = _bare(chain=CHAIN[:3])
         wb.arm(only_fable, now=0.0)
         assert not wb.skip_lane(only_fable, FABLE, now=500.0)
+        # The only other-model lane is unusable: same answer.
+        blocked = _bare()
+        blocked._quota_gate_skipped_providers = {"cpa"}
+        wb.arm(blocked, now=0.0)
+        assert not wb.skip_lane(blocked, FABLE, now=500.0)
+        assert not wb.should_cut_attempt(blocked, now=500.0)
+
+
+def test_default_budget_does_not_cut_a_healthy_slow_attempt():
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly", return_value={}):
+        a = _bare()
+        wb.arm(a, now=0.0)
+        assert not wb.should_cut_attempt(a, now=500.0)
+        assert wb.should_cut_attempt(a, now=wb.DEFAULT_BUDGET_S + 1)
 
 
 def test_first_real_byte_disarms():
@@ -158,6 +205,8 @@ def test_still_waiting_notice_once_per_interval_names_lanes():
         wb.note_lane_switch(a)
         text = wb.notice_due(a, now=121.0)
         assert text and "121s" in text and "2 lanes tried" in text and "claude-dtlr" in text
+        # It names what is left: the fable faces ahead and the other model behind them.
+        assert "ahead: claude-btpr, claude-bpr [claude-fable-5-1] + cpa [gpt-6.1-sol]" in text
         assert wb.notice_due(a, now=200.0) is None
         assert wb.notice_due(a, now=241.0) is not None
 

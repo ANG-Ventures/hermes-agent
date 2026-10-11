@@ -11,12 +11,18 @@ starts waiting and disarmed by the first real stream event (a keepalive ping doe
 not count) or a completed response. While armed:
 
 * every ``fallback.still_waiting_notice_seconds`` (120) the chat gets a
-  "still waiting" line naming how many lanes were tried;
-* once ``fallback.no_first_byte_budget_seconds`` (180) is spent, the current
+  "still waiting" line naming how many lanes were tried and what is left ahead;
+* once ``fallback.no_first_byte_budget_seconds`` (600) is spent, the current
   attempt is cut (only when a lane on a DIFFERENT model is still ahead in the
   chain), and the chain walker skips the remaining lanes that serve the same
   model as the stalled one: they are other faces of the same pool, which is
-  what just failed to answer.
+  what just failed to answer. If the walk then finds no usable lane on another
+  model, it goes back and tries the skipped same-model lanes after all.
+
+The 600 s default sits above every lane's healthy p99 (alr 100 s, dtlr TUI
+p90 168 s / max 275 s on 2026-10-11): it ends dead air, not slow turns, and its
+destination is usually a different model, which is a last resort (Apollo ruling
+2026-10-11).
 
 ``0`` disables either knob. State lives on the agent as ``_wall_budget``.
 """
@@ -29,7 +35,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BUDGET_S = 180.0
+DEFAULT_BUDGET_S = 600.0
 DEFAULT_NOTICE_S = 120.0
 
 
@@ -119,10 +125,35 @@ def _remaining_entries(agent: Any) -> list:
     return [fb for fb in chain[idx:] if isinstance(fb, dict)]
 
 
+def _viable(agent: Any, fb: dict) -> bool:
+    """The walker's side-effect-free filters: an entry it would skip anyway is no
+    reason to skip or cut the stalled model (Prism a54a5cb796b0)."""
+    provider = str(fb.get("provider") or "").strip().lower()
+    model = str(fb.get("model") or "").strip()
+    if not provider or not model:
+        return False
+    key = (provider, model, str(fb.get("base_url") or "").strip().rstrip("/"))
+    if key in (getattr(agent, "_unavailable_fallback_keys", None) or ()):
+        return False
+    if provider in (getattr(agent, "_quota_gate_skipped_providers", None) or ()):
+        return False
+    try:
+        from agent.fallback_cooldown import _is_entitlement_rejected
+        if _is_entitlement_rejected(agent, provider, model):
+            return False
+        from agent.fallback_capability import lane_incapable_shape, stamped_request_shape
+        if lane_incapable_shape(provider, stamped_request_shape(agent)):
+            return False
+    except Exception:
+        logger.debug("wall budget: viability probe failed for %s/%s", provider, model, exc_info=True)
+    return True
+
+
 def has_other_model_ahead(agent: Any, model: Any = None) -> bool:
-    """A lane on a model other than ``model`` (default: the current one) is still ahead."""
+    """A usable lane on a model other than ``model`` (default: the current one) is still ahead."""
     current = _norm(getattr(agent, "model", "") if model is None else model)
-    return any(_norm(fb.get("model")) not in ("", current) for fb in _remaining_entries(agent))
+    return any(_norm(fb.get("model")) not in ("", current) and _viable(agent, fb)
+               for fb in _remaining_entries(agent))
 
 
 def should_cut_attempt(agent: Any, now: Optional[float] = None) -> bool:
@@ -163,4 +194,20 @@ def notice_due(agent: Any, now: Optional[float] = None) -> Optional[str]:
     lanes = st["lanes"]
     route = f"{getattr(agent, 'provider', '') or '?'}/{getattr(agent, 'model', '') or '?'}"
     return (f"⏳ still waiting for a first reply: {int(waited)}s, "
-            f"{lanes} lane{'s' if lanes != 1 else ''} tried (now on {route})")
+            f"{lanes} lane{'s' if lanes != 1 else ''} tried (now on {route}); {_ahead_text(agent)}")
+
+
+def _ahead_text(agent: Any) -> str:
+    """The rest of the chain, consecutive lanes grouped by model:
+    ``ahead: claude-btpr, claude-bpr [claude-fable-5-1] + cpa [gpt-6.1-sol]``."""
+    groups: list[tuple[str, list[str]]] = []
+    for fb in _remaining_entries(agent):
+        model = str(fb.get("model") or "?").strip() or "?"
+        provider = str(fb.get("provider") or "?").strip() or "?"
+        if groups and groups[-1][0] == model:
+            groups[-1][1].append(provider)
+        else:
+            groups.append((model, [provider]))
+    if not groups:
+        return "nothing left in the fallback chain"
+    return "ahead: " + " + ".join(f"{', '.join(p)} [{m}]" for m, p in groups)

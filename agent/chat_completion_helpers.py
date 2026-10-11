@@ -3713,9 +3713,15 @@ def try_activate_fallback(
                 "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
                 backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
             )
+    budget_skipped: list[int] = []  # same-model lanes passed over by the wall budget (t_452c6ead)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
-            return _fallback_chain_exhausted(agent, reason)
+            if not budget_skipped:
+                return _fallback_chain_exhausted(agent, reason)
+            # No other-model lane was usable after all: the skipped faces are better than no reply.
+            logger.info("Fallback: no usable lane on another model; revisiting %d budget-skipped lane(s)",
+                        len(budget_skipped))
+            agent._fallback_index, budget_skipped = budget_skipped[0], None
         fb = agent._fallback_chain[agent._fallback_index]
         agent._fallback_index += 1
         fb_key = _fallback_entry_key(fb)
@@ -3729,7 +3735,8 @@ def try_activate_fallback(
         # The turn's no-first-byte budget is spent: another face of the model that just
         # stalled is the same pool, so walk on to a different model (t_452c6ead).
         from agent import fallback_wall_budget as _wb
-        if _wb.skip_lane(agent, fb_model):
+        if budget_skipped is not None and _wb.skip_lane(agent, fb_model):
+            budget_skipped.append(agent._fallback_index - 1)
             continue
         quota_skipped = getattr(agent, "_quota_gate_skipped_providers", set()) or set()
         if fb_provider in quota_skipped:

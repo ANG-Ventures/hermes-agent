@@ -42,10 +42,11 @@ DEFAULT_CONFIG = {
     # of switching the turn to a fallback model.
     # no_first_byte_budget_seconds: per-turn wall budget across the fallback chain while no byte
     # has arrived. Once spent, the attempt is cut and the walker skips the remaining lanes on the
-    # stalled model for the first lane on another model (t_452c6ead). 0 = off.
-    # still_waiting_notice_seconds: post "still waiting, N lanes tried" to the chat this often
-    # during that wait. 0 = off.
-    "fallback": {"min_switch_reset_seconds": 0, "no_first_byte_budget_seconds": 180,
+    # stalled model for the first lane on another model (t_452c6ead). 600 s sits above every
+    # lane's healthy p99, so it ends dead air, not slow turns (Apollo ruling 2026-10-11). 0 = off.
+    # still_waiting_notice_seconds: post "still waiting, N lanes tried; ahead: ..." to the chat
+    # this often during that wait. 0 = off.
+    "fallback": {"min_switch_reset_seconds": 0, "no_first_byte_budget_seconds": 600,
                  "still_waiting_notice_seconds": 120},
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
