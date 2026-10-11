@@ -497,6 +497,33 @@ def test_placement_wait_event_written_once_then_deduplicated(kanban_home, monkey
     assert len(evs) == 2 and evs[1]["since"] == ev["since"]
 
 
+def test_placement_wait_new_episode_after_run_is_not_deduplicated(kanban_home, monkeypatch):
+    """Prism 331b10c66fe9: hold -> card runs -> back to ready with the same
+    reason is a NEW wait episode: a fresh event (even inside 900 s) whose
+    ``since`` is the new hold's start, never the first episode's."""
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1, assignee="beta")
+        (child,) = _make(conn, 1, body="host:ace-ai", parents=[parent])
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        (first,) = _placement_waits(conn, child)
+        # Backdate the first episode by 300 s (still inside the 900 s window).
+        conn.execute("UPDATE task_events SET created_at = created_at - 300, payload = "
+                     "json_set(payload, '$.since', json_extract(payload, '$.since') - 300) "
+                     "WHERE task_id=? AND kind='placement_wait'", (child,))
+        with kb.write_txn(conn):
+            kb._append_event(conn, child, "claimed", {"run_id": 1})
+            kb._append_event(conn, child, "requeued", {"reason": "test"})
+        conn.commit()
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        evs = _placement_waits(conn, child)
+    assert len(evs) == 2
+    assert evs[1]["reason"] == first["reason"]
+    assert evs[1]["since"] >= first["since"]  # first["since"] read before the backdate
+    assert evs[1]["since"] - evs[0]["since"] >= 300
+
+
 def test_lineage_pins_legacy_is_todays_routing(kanban_home, monkeypatch):
     """Spec t_1cca39e1 (c): ``legacy`` routes exactly as before t_ae87edff on
     real card shapes (this card's own pinned body, an umbrella's derived-from

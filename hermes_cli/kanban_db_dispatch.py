@@ -3752,8 +3752,9 @@ def _lineage_pins_mode() -> str:
 def _record_placement_waits(conn, result, row_route: dict, dry_run: bool) -> None:
     """One ``placement_wait`` task_event per held ready card {reason, route,
     host, since}; written only when the reason differs from the card's latest
-    one or that one is older than PLACEMENT_WAIT_REFRESH_SECONDS. Never on a
-    dry run. Best-effort: bookkeeping never fails a tick."""
+    one or that one is older than PLACEMENT_WAIT_REFRESH_SECONDS. A lifecycle
+    event after the latest one (PLACEMENT_WAIT_EPISODE_END_KINDS) starts a new
+    episode: written now, ``since`` = now. Never on a dry run. Best-effort: bookkeeping never fails a tick."""
     from hermes_cli import kanban_placement_reasons as _pr
     waits = result.placement_waits or {}
     if dry_run or not waits:
@@ -3763,10 +3764,18 @@ def _record_placement_waits(conn, result, row_route: dict, dry_run: bool) -> Non
         with _kb.write_txn(conn):
             for tid, reason in waits.items():
                 last = conn.execute(
-                    "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
+                    "SELECT payload, created_at, id FROM task_events WHERE task_id = ? AND kind = ? "
                     "ORDER BY id DESC LIMIT 1", (tid, _pr.PLACEMENT_WAIT_EVENT),
                 ).fetchone()
                 since = now
+                if last is not None and conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN (%s) LIMIT 1"
+                    % ",".join("?" * len(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)),
+                    (tid, last[2], *sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)),
+                ).fetchone() is not None:
+                    # The card ran / was blocked / requeued since that wait:
+                    # this is a new episode, never a continuation (Prism 331b10c66fe9).
+                    last = None
                 if last is not None:
                     try:
                         prev = json.loads(last[0] or "{}")
@@ -3832,6 +3841,12 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         return ("pin", pin) if route_class == "pin" else ("portable", None)
     if rule == _pr.LINKED and link is not None and lineage_mode != _pr.LINEAGE_PINS_LEGACY:
         rule = _pr.linked(*link)  # name the edge that holds it (t_ae87edff)
+    if rule == _pr.HOST_REACH:
+        # A host-bound card (ssh skill / fleet alias in the body) with no
+        # worker host proven to reach its target: local, never spilled.
+        _kb._log.info("kanban dispatch: %s classified local (host_reach): host-bound card, "
+                      "no pool host with a proven ssh route (reach matrix %s)",
+                      row["id"], getattr(plan.config, "reach_status", "absent"))
     if pin is not None and pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
         return "wait", _pr.not_portable(rule)
     # host:any that fails hard_ok may still run locally; with no local slot
@@ -5072,7 +5087,22 @@ def _dispatch_once_locked(
         placed_host = None
         if route == "pin" or (route == "portable" and not local_free):
             # A refused take() NEVER falls through to a local spawn (I-11).
-            placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
+            # A host-bound portable card only lands on a host the reach
+            # matrix proves (t_1e9ea7e9); None = any pool host.
+            _only = None
+            if route == "portable":
+                from hermes_cli import kanban_worker_pool as _kwp_take
+                try:
+                    _skills = json.loads(row["skills"] or "[]") or []
+                except (TypeError, ValueError, IndexError, KeyError):
+                    _skills = []
+                _only = _kwp_take.reach_allowed_hosts(
+                    body=row["body"], skills=tuple(s for s in _skills if isinstance(s, str)),
+                    pool=spillover.config)
+            if _only is None:
+                placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
+            else:
+                placed_host = spillover.take(row_assignee, only=_only)
             if placed_host is None:
                 result.placement_waits[row["id"]] = spillover.refusal or "pool_full"
                 continue

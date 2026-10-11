@@ -20,11 +20,20 @@ PROFILE = "profile"
 NATIVE_COMMAND = "native_command"
 HOST_STUDIO = "host_studio"
 STUDIO_BOUND_SKILL = "studio_bound_skill"
+HOST_REACH = "host_reach"  # host-bound card, no pool host with a proven ssh route (t_1e9ea7e9)
 
 # The task_event that records why a ready card was held this tick.
 PLACEMENT_WAIT_EVENT = "placement_wait"
 # A repeated identical reason is re-written only after this many seconds.
 PLACEMENT_WAIT_REFRESH_SECONDS = 900
+# A task_event of one of these kinds after the latest placement_wait ends that
+# wait episode: the next hold is a new episode (new event, ``since`` = now),
+# never deduplicated against or timed from the old one.
+PLACEMENT_WAIT_EPISODE_END_KINDS = frozenset({
+    "claimed", "spawned", "blocked", "unblocked", "requeued", "reopened",
+    "promoted", "reclaimed", "completed", "review_requested", "scheduled",
+    "deferred", "archived",
+})
 
 # kanban.placement.lineage_pins (read per tick). ``kinds`` (default): only a
 # link kind that can share a workspace holds a card local; ``legacy``: any
