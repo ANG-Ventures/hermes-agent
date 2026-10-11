@@ -920,6 +920,8 @@ def test_manifest_affinity_reads_host_affinity_and_linux_less_platforms(tmp_path
     got = kha.manifest_affinity(["cdp-login", "mac-app", "anywhere", "no-platforms",
                                  "missing", "ns:plugin"], "alpha")
     assert got == {"cdp-login": "manifest:host_affinity", "mac-app": "manifest:platforms=macos"}
+    # Literal match only: a glob-shaped name never borrows another skill's manifest.
+    assert kha.manifest_affinity(["cdp-logi?", "mac-*", "general/mac-app"], "alpha") == {}
     kha.clear_cache()
 
 
@@ -974,3 +976,14 @@ def test_dry_run_shows_affinity_without_a_pool_plan_or_events(kanban_home):
         assert res.placement_affinity[cdp] == {"host": "mac-studio", "rule": "studio_body",
                                                "matched_by": "body:signed-in browser"}
         assert _events(conn, cdp, "placement_affinity") == []
+
+
+def test_dry_run_prose_host_line_is_not_a_pin(kanban_home):
+    """A ``host: example.com`` header is prose, not a pin: affinity still shows."""
+    with kb.connect_closing() as conn:
+        (cdp,) = _make(conn, 1, body="host: example.com\nattach CDP :9222")
+        (pinned,) = _make(conn, 1, body="host:any\nattach CDP :9222")
+        res = kbd.dispatch_once(conn, dry_run=True, max_spawn=8, spillover=None,
+                                reconcile_orphans=False)
+    assert res.placement_affinity[cdp]["rule"] == "studio_body"
+    assert pinned not in res.placement_affinity

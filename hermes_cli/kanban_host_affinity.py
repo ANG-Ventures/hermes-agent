@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional, Tuple
@@ -38,8 +39,17 @@ _dirs_cache: Dict[str, Tuple[float, Tuple[Path, ...]]] = {}
 _skill_cache: Dict[Tuple[Tuple[Path, ...], str], Tuple[float, Optional[str]]] = {}
 
 
+_SKILL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+
+
 def _find_skill_md(name: str, dirs: Iterable[Path]) -> Optional[Path]:
-    """``<dir>/<name>/SKILL.md`` or one level deeper (category layout)."""
+    """``<dir>/<name>/SKILL.md`` or one level deeper (category layout).
+
+    The name is matched LITERALLY (never a glob): a card skill like
+    ``browser-acces?`` must not borrow another skill's manifest.
+    """
+    if not _SKILL_NAME_RE.fullmatch(name or ""):
+        return None
     dirs = list(dirs)
     for d in dirs:
         direct = d / name / "SKILL.md"
@@ -47,11 +57,13 @@ def _find_skill_md(name: str, dirs: Iterable[Path]) -> Optional[Path]:
             return direct
     for d in dirs:
         try:
-            for hit in d.glob(f"*/{name}/SKILL.md"):
-                if not any(part.startswith(".") for part in hit.relative_to(d).parts):
-                    return hit
+            cats = sorted(c for c in d.iterdir() if c.is_dir() and not c.name.startswith("."))
         except OSError:
             continue
+        for c in cats:
+            hit = c / name / "SKILL.md"
+            if hit.is_file():
+                return hit
     return None
 
 
@@ -149,9 +161,13 @@ def studio_affinity_unplanned(rows, default_assignee: Optional[str], result) -> 
         cfg = _kwp.read_pool(_kb.kanban_home() / "fleet")
     except Exception:
         cfg = _kwp.PoolConfig()
+    known = tuple(cfg.hosts or ()) or _kwp.known_host_ids(_kb.kanban_home() / "fleet")
     for r in rows:
-        if _kwp.card_pin(r["body"]) is not None:
-            continue  # an explicit pin is the operator's call
+        # Same pin rule as the planned path: only a REAL pin (any/studio/a known
+        # host) is the operator's call; a prose ``host: example.com`` line is not.
+        pin, _ignored = _kwp.resolve_pin(r["body"], known)
+        if pin is not None:
+            continue
         try:
             skills = tuple(s for s in (json.loads(r["skills"] or "[]") or []) if isinstance(s, str))
         except (TypeError, ValueError):
