@@ -9919,6 +9919,15 @@ def complete_task(
                      if isinstance(metadata, dict) else []},
                 )
             raise _receipt.ReceiptRequiredError(task_id)
+    if (
+        expected_run_id is not None
+        and candidate.status == 'running' and not review_claimed
+        and not approve_head_sha and not superseded_by and not external
+    ):
+        _enforce_handback_head(
+            conn, task_id, summary=summary, result=result, metadata=metadata,
+            survivor_pr=survivor_pr,
+        )
     negative_trigger: Optional[str] = None
     if (
         candidate.status == 'running' and not review_claimed
@@ -12580,6 +12589,8 @@ def request_review(
     _bb_task = get_task(conn, task_id) if not force else None
     if _bb_task is not None and _bb_task.status == "running":
         _enforce_branch_base(conn, _bb_task, metadata)
+        if expected_run_id is not None:
+            _enforce_handback_head(conn, task_id, summary=summary, metadata=metadata)
 
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
@@ -12610,6 +12621,27 @@ def request_review(
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
         raise
+
+
+def _enforce_handback_head(conn, task_id, *, summary, metadata, result=None, survivor_pr=None):
+    """Refuse a worker handoff that cites an older commit of its open PR (t_e52337cb).
+
+    Raises :class:`kanban_handback_head.StaleHandbackHeadError` (nothing else
+    mutated) after a ``completion_blocked_stale_head`` event. An unreadable PR
+    is fail-open: ``head_check_unavailable`` is logged and the handoff proceeds.
+    """
+    from hermes_cli import kanban_handback_head as _hh
+
+    try:
+        report = _hh.check(task_id=task_id, summary=summary, result=result,
+                           metadata=metadata, survivor_pr=survivor_pr)
+    except _hh.StaleHandbackHeadError as err:
+        with write_txn(conn):
+            _append_event(conn, task_id, "completion_blocked_stale_head", {"stale": err.stale})
+        raise
+    if report["unavailable"]:
+        with write_txn(conn):
+            _append_event(conn, task_id, "head_check_unavailable", {"prs": report["unavailable"]})
 
 
 def _request_review_txn(
