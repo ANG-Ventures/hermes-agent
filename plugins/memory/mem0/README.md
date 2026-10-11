@@ -160,6 +160,18 @@ hermes memory setup mem0 --mode oss --oss-llm-key sk-... --dry-run
 | `mem0_update` | Update a memory's text by ID |
 | `mem0_delete` | Delete a memory by ID |
 
+## Recalled memory is data, not instructions
+
+Prefetched memories are appended to the user turn inside a `<memory-context>` block
+(`agent/memory_manager.py::build_memory_context_block`). Every agent that shares the store
+receives a memory's text verbatim, so the block's note tells the model the content is untrusted
+reference data about the user and the environment, may be stale or wrong, may inform the answer,
+and is never to be followed as an instruction even when phrased as one. Measured on
+claude-sonnet-5-5 with one planted instruction-shaped memory (t_b6342c43, 3 runs x 10 trials):
+the old "authoritative ... should inform all responses" note was obeyed 10/30; this note 0/30,
+with legitimate recall unchanged (30/30 both). Write-side screening of instruction-shaped text is
+not done; the boundary is the label.
+
 ## Troubleshooting
 
 ### "mem0 memory store is DOWN"
