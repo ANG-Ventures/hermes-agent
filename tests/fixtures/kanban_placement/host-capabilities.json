@@ -1,0 +1,87 @@
+{
+  "_doc": "Host -> capability map for Fleet Work Placement Phase 1 (card t_8c474c2e; spec Obsidian 'AI/Infrastructure/Fleet Work Placement -- Host Affinity and Continuation (spec, 2026-10-11).md' v2 s1.2, s1.3, s2.3). Hand-written for Phase 1; Phase 2 (fleet-host capabilities --sync/--set) takes ownership. Every body-sniff term lives here (F13), none in code. A pool host with no row has no capability. Absent file = feature off. Malformed = every capability warn for the tick, pool never refused (F11). Modes: kanban.placement.capabilities off|warn|enforce + capabilities_enforce (default browser-session, screen) in the ROOT config.yaml.",
+  "schema": 1,
+  "capabilities": {
+    "browser-session": {
+      "what": "Ace's signed-in browser profiles over CDP on the Studio (:9222 shared Brave, :9223, :9224 shopping), with his cookies",
+      "act": [
+        "act:browser"
+      ],
+      "sniff": [
+        "(?<![\\w.-])(?:localhost|127\\.0\\.0\\.1)?:922[2-4]\\b",
+        "\\bsigned-in (?:Brave|browser|Chrome|session)\\b",
+        "\\bAce's (?:real|logged-in|signed-in) browser\\b",
+        "\\badd (?:it|items|them|these) to (?:the|his|Ace's) cart\\b",
+        "\\bcart only\\b",
+        "\\b(?:amazon|etsy|ebay|instacart)-cart\\b"
+      ]
+    },
+    "screen": {
+      "what": "an unlocked GUI session to click, type and screenshot (peekaboo, cua-driver, macOS Accessibility)",
+      "act": [
+        "act:computer-use"
+      ],
+      "sniff": [
+        "\\bpeekaboo\\b",
+        "\\bcomputer[_-]use\\b"
+      ]
+    },
+    "imessage": {
+      "what": "Messages.app / chat.db / imsg, incl. reading 2FA codes",
+      "sniff": [
+        "\\bimsg\\b",
+        "\\bchat\\.db\\b",
+        "\\bMessages\\.app\\b",
+        "\\b2FA code from (?:iMessage|SMS|Messages)\\b"
+      ]
+    },
+    "keychain": {
+      "what": "the login keychain (security find-generic-password)"
+    },
+    "op-desktop": {
+      "what": "1Password desktop app integration (biometric unlock, personal vault); not the service-account op CLI every host has"
+    },
+    "apple-apps": {
+      "what": "Notes, Reminders, FindMy, AppleScript into Ace's apps"
+    },
+    "obsidian-vault": {
+      "what": "the live vault at ~/Obsidian/Ace Place"
+    },
+    "control-plane": {
+      "what": "the live runtime tree, gateway launchd jobs, ~/.hermes/config.yaml (the six studio_bound_skills harness skills)"
+    },
+    "acoustic-bench": {
+      "what": "the Mac-side voice acceptance rig (acceptance.sh from the Mac, afplay, bench satellite)",
+      "sniff": [
+        "\\bafplay\\b",
+        "\\bacceptance\\.sh\\b",
+        "\\bsay the wake\\b",
+        "\\bbench satellite\\b"
+      ]
+    }
+  },
+  "hosts": {
+    "studio": {
+      "capabilities": [
+        "browser-session",
+        "screen",
+        "imessage",
+        "keychain",
+        "op-desktop",
+        "apple-apps",
+        "obsidian-vault",
+        "control-plane",
+        "acoustic-bench"
+      ]
+    },
+    "ace-ai": {
+      "capabilities": []
+    },
+    "ace-media": {
+      "capabilities": []
+    },
+    "ci-box": {
+      "capabilities": []
+    }
+  }
+}
