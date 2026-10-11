@@ -299,6 +299,7 @@ def test_bare_approval_event_carries_routed_artifacts(conn, armed):
     assert len(kb.list_attachments(conn, tid)) == 1
 
 
+@pytest.mark.allow_dangling_staged_refs  # deletes the staged copy on purpose (simulated race)
 def test_vanished_copy_after_route_does_not_fail_the_route(conn, armed, monkeypatch):
     tid, ws, artifact = _scratch_task(conn)
     real = kb.request_review
