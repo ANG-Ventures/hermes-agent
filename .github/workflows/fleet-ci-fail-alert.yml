@@ -8,46 +8,13 @@
 name: Fleet CI-fail alert
 
 on:
-  workflow_run:
-    workflows:
-      # workflow_run only fires for TOP-LEVEL workflows. "Tests" and "Lint (ruff + ty)"
-      # became workflow_call-only reusables on 2026-06-23 (05c896cf52) and never emit
-      # this event; their parent "CI" does. Measured 2026-09-20: 100/100 alert runs
-      # skipped, and a red main (c93bfcc1, 07:18Z) paged nobody.
-      - "CI"
-      # ci-local.yaml: the fallback orchestrator that replaces "CI" while ci.yaml is
-      # disabled. Keep both names so the swap and the swap back both stay paged.
-      - "CI (local fallback)"
-      - "Fleet SAST (semgrep)"
-      - "Fleet Secret Scan (gitleaks)"
-      - "OSV-Scanner"
-      - "Supply Chain Audit"
-      # Non-gating detector (spec L6): PR runs are paths-scoped, so a flake
-      # break from a source-only change first shows on push:main. Page it.
-      - "Nix flake check"
-      # Weekly flake digest (t_162ffd04): red = a flake qualifies for
-      # quarantine but has no fix card + owner yet.
-      - "Flake quarantine digest"
-      # Scheduled / dispatch workflows: a red run otherwise pages nobody
-      # (ci-speed-lint R5). The three NousResearch-guarded ones are skipped on
-      # the fork, so they only notify if that guard is ever lifted.
-      - "Install & Update E2E"
-      - "auto-fix lint issues & formatting"
-      - "Deploy Site"
-      - "Build Skills Index"
-      - "Skills Index Freshness Check"
-      # Synthetic P4 bench probe (t_c58e7200). Bench waves stay silent here;
-      # see the PLACEMENT PROBE gate in the route step.
-      - "CI placement probe"
-    types:
-      - completed
-    # A ci-overflow-ledger data commit must start zero workflows (spec §5.3).
-    # Which branches PAGE is decided by the single gate in the `route` step
-    # below (t_957f5398), not here: it is an allowlist (default branch, merge
-    # queue, schedule), so *THROWAWAY* / *repro* branches (t_2afda99d) and every
-    # other worker branch are already excluded there.
-    branches-ignore:
-      - ci-overflow-ledger
+  # SWEEP, not a workflow_run listener (t_8ca8c919, ci-redundancy-audit class I). A listener is one run
+  # of this workflow per upstream run: 2026-10-04 it was 1,039 runs, 967 skipped at the job `if:`, 38 %
+  # of the 2,762 runs GitHub counted the day before it disabled this repo's Actions (its abuse
+  # heuristics count runs). Every 15 minutes the sweep job lists the CFA_WATCHED workflows' red runs
+  # and runs the unchanged route + POST steps once per red (`notify <run id>#<attempt>` matrix legs).
+  schedule:
+    - cron: '*/15 * * * *'
   # Proof path (t_957f5398): replay an EXISTING upstream run through the same
   # gate + POST code. The run is fetched from the API and fed to the identical
   # route step, so a replayed red merge_group run pages exactly as it would
@@ -61,19 +28,159 @@ on:
 
 permissions:
   contents: read
-  actions: read # route step reads the failed workflow's previous run
+  actions: read # the sweep lists runs + jobs; the route step reads the failed workflow's previous run
+
+# One sweep at a time: a sweep reads its predecessors' `notify` legs, so two in flight could both
+# notify one red. A replay is its own group.
+concurrency:
+  group: fleet-ci-fail-alert-${{ github.event_name == 'schedule' && 'sweep' || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
-  notify-on-failure:
-    name: notify-on-failure
+  sweep:
+    name: sweep
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    # Only on a genuine failure of the upstream workflow. Success/cancelled/skipped → no-op.
+    timeout-minutes: 8
+    outputs:
+      runs: ${{ steps.find.outputs.runs }}
+      default_branch: ${{ steps.find.outputs.default_branch }}
+    steps:
+      - name: Find the watched workflows' unnotified red runs
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPLAY_RUN_ID: ${{ inputs.run_id }}
+          # A red is a candidate when it COMPLETED (updated_at) within LOOKBACK_S before the last green
+          # sweep started (now, if none in 24 h), so a late or failed sweep is covered by the next one.
+          # Runs CREATED in the last 24 h are listed: a re-run keeps its run's created_at.
+          LOOKBACK_S: "10800"
+          # The workflows whose reds reach the page gate. One name per line (hermes-home
+          # scripts/main-red-summary.py and scripts/ci_speed_lint.py read this list). workflow_run only
+          # fired for TOP-LEVEL workflows; a sweep sees every run, but a workflow_call child's red is
+          # still its parent's run, so list the parent.
+          # workflow_run only fires for TOP-LEVEL workflows. "Tests" and "Lint (ruff + ty)"
+          # became workflow_call-only reusables on 2026-06-23 (05c896cf52) and never emit
+          # this event; their parent "CI" does. Measured 2026-09-20: 100/100 alert runs
+          # skipped, and a red main (c93bfcc1, 07:18Z) paged nobody.
+          # ci-local.yaml: the fallback orchestrator that replaces "CI" while ci.yaml is
+          # disabled. Keep both names so the swap and the swap back both stay paged.
+          # Non-gating detector (spec L6): PR runs are paths-scoped, so a flake
+          # break from a source-only change first shows on push:main. Page it.
+          # Weekly flake digest (t_162ffd04): red = a flake qualifies for
+          # quarantine but has no fix card + owner yet.
+          # Scheduled / dispatch workflows: a red run otherwise pages nobody
+          # (ci-speed-lint R5). The three NousResearch-guarded ones are skipped on
+          # the fork, so they only notify if that guard is ever lifted.
+          # Synthetic P4 bench probe (t_c58e7200). Bench waves stay silent here;
+          # see the PLACEMENT PROBE gate in the route step.
+          CFA_WATCHED: |
+            CI
+            CI (local fallback)
+            Fleet SAST (semgrep)
+            Fleet Secret Scan (gitleaks)
+            OSV-Scanner
+            Supply Chain Audit
+            Nix flake check
+            Flake quarantine digest
+            Install & Update E2E
+            auto-fix lint issues & formatting
+            Deploy Site
+            Build Skills Index
+            Skills Index Freshness Check
+            CI placement probe
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            [[ "$REPLAY_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a run id"; exit 1; }
+            echo "runs=[{\"id\":$REPLAY_RUN_ID,\"key\":\"replay\"}]" | tee -a "$GITHUB_OUTPUT"
+            echo "default_branch=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO" | jq -er .default_branch)" | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          api() { timeout "${API_CALL_S:-75}" curl -fsS --retry 2 --retry-max-time 40 --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
+          pages() {  # list path -> one JSON array of every .workflow_runs item; rc!=0 on an API error or > 1000 runs
+            local p=1 acc='[]' resp n
+            while :; do
+              resp="$(api "$1&per_page=100&page=$p")" || return 1
+              n="$(jq -e '.workflow_runs | length' <<< "$resp")" || return 1
+              acc="$(printf '%s\n%s' "$acc" "$resp" | jq -cs '.[0] + .[1].workflow_runs')" || return 1
+              [ "$n" -lt 100 ] && break
+              [ "$p" -lt 10 ] || return 1
+              p=$((p + 1))
+            done
+            printf '%s\n' "$acc"
+          }
+          iso() { jq -nr --argjson t "$1" '$t | todate'; }
+          epoch() { jq -nr --arg d "$1" '$d | fromdate'; }
+          NOW="${SWEEP_NOW:-$(date -u +%s)}"
+          SELF="$(api "actions/runs/$GITHUB_RUN_ID" | jq -er .workflow_id)"
+          SWEEPS="$(pages "actions/workflows/$SELF/runs?event=schedule&created=%3E%3D$(iso $((NOW - 86400)))")"
+          LAST_OK="$(jq -r --argjson me "$GITHUB_RUN_ID" '[.[] | select(.id != $me and .conclusion == "success") | .created_at] | max // ""' <<< "$SWEEPS")"
+          SINCE=$((NOW - LOOKBACK_S))
+          [ -n "$LAST_OK" ] && SINCE=$(( $(epoch "$LAST_OK") - LOOKBACK_S ))
+          # A red that completed before the last run of the retired workflow_run listener was that listener's.
+          LISTENER="$(api "actions/workflows/$SELF/runs?event=workflow_run&per_page=1" | jq -r '.workflow_runs[0].created_at // ""')"
+          REDS='[]'
+          for st in failure startup_failure; do
+            got="$(pages "actions/runs?status=$st&created=%3E%3D$(iso $((NOW - 86400)))")"
+            REDS="$(printf '%s\n%s' "$REDS" "$got" | jq -cs '.[0] + .[1]')"
+          done
+          CANDS="$(jq -c --arg watched "$CFA_WATCHED" --arg listener "$LISTENER" --arg since "$(iso "$SINCE")" '
+            ($watched | split("\n") | map(select(. != ""))) as $w
+            | [.[] | select(.name as $n | $w | index($n)) | select(.updated_at >= $since)
+               | select(.event != "pull_request" and .event != "pull_request_target")
+               | select(.head_branch != "ci-overflow-ledger")
+               | select($listener == "" or .updated_at > $listener)
+               | {id, key: "\(.id)#\(.run_attempt // 1)", created_at, updated_at}]
+            | unique_by(.key) | sort_by(.created_at)' <<< "$REDS")"
+          DONE='[]'
+          if [ "$CANDS" != "[]" ]; then
+            OLDEST="$(jq -r 'map(.updated_at) | min' <<< "$CANDS")"
+            for sid in $(jq -r --argjson me "$GITHUB_RUN_ID" --arg o "$OLDEST" '.[] | select(.id != $me and .created_at >= $o) | .id' <<< "$SWEEPS"); do
+              got="$(api "actions/runs/$sid/jobs?per_page=100" | jq -c '[.jobs[] | select(.conclusion == "success") | .name | capture("^notify (?<k>[0-9]+#[0-9]+)$").k]')"
+              DONE="$(jq -c --argjson g "$got" '. + $g' <<< "$DONE")"
+            done
+          fi
+          RUNS="$(jq -c --argjson seen "$DONE" '[.[] | select(.key as $k | $seen | index($k) | not) | {id, key}][:20]' <<< "$CANDS")"
+          echo "sweep since $(iso "$SINCE"): $(jq length <<< "$CANDS") red run(s) of the watched workflows, $(jq length <<< "$DONE") already notified"
+          echo "runs=$RUNS" | tee -a "$GITHUB_OUTPUT"
+          echo "default_branch=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO" | jq -er .default_branch)" | tee -a "$GITHUB_OUTPUT"
+
+      # The sweep itself going red pages nobody else: page once, on the green -> red transition.
+      - name: Page when the sweep breaks (green -> red only)
+        if: ${{ failure() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CI_FAIL_WEBHOOK_SECRET: ${{ secrets.CI_FAIL_WEBHOOK_SECRET }}
+          WEBHOOK_URL: https://hooks.angventures.io/webhooks/ci-fail
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          PREV="$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/actions/workflows/fleet-ci-fail-alert.yml/runs?event=schedule&status=completed&per_page=1" | jq -r '.workflow_runs[0].conclusion // "none"')" || PREV=error
+          [ "$PREV" = failure ] && { echo "previous sweep was red too: already paged"; exit 0; }
+          body="$(jq -nc --arg repo "$REPO" --arg url "$RUN_URL" --arg sha "$GITHUB_SHA" '{event_type:"ci_failure", card:"", signature:"", repo:$repo, workflow:"Fleet CI-fail alert sweep is red: reds of the watched workflows are not being paged", branch:"main", sha:$sha, run_url:$url, actor:"cron", trigger:"schedule"}')"
+          sig="$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$CI_FAIL_WEBHOOK_SECRET" | sed 's/^.* //')"
+          curl -fsS -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -H "X-GitHub-Event: ci_failure" \
+            -H "X-GitHub-Delivery: ci-fail-sweep-$GITHUB_RUN_ID" -H "X-Webhook-Signature: $sig" --data "$body"
+
+  notify-on-failure:
+    needs: sweep
+    # Only on a genuine failure of the upstream workflow: the sweep lists failure + startup_failure.
     # startup_failure counts (t_bc0052b9): a run that dies at startup has 0 jobs and no
     # red check, so without this nobody is told, and a re-run that dies this way leaves the
     # PR with no required check at all.
     # A workflow_dispatch replay always starts; the route step re-checks the
     # replayed run's conclusion with the same rule.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'startup_failure' }}
+    if: ${{ needs.sweep.outputs.runs != '' && needs.sweep.outputs.runs != '[]' }}
+    # The leg name is the sweep's dedupe record: keep `notify <run id>#<attempt>`.
+    name: notify ${{ matrix.run.key }}
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJSON(needs.sweep.outputs.runs) }}
     # 2x measured p90 (4 s over 30 runs), floored at 10.
     timeout-minutes: 10
     steps:
@@ -105,16 +212,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          REPLAY_RUN_ID: ${{ inputs.run_id }}
-          # Live: the workflow_run payload. Replay: fetched below from the API,
-          # which returns the same run object schema.
-          RUN_JSON: ${{ github.event_name == 'workflow_run' && toJSON(github.event.workflow_run) || '' }}
+          DEFAULT_BRANCH: ${{ needs.sweep.outputs.default_branch }}
+          # The sweep's red (or the replayed run): fetched below from the API, which returns
+          # the same run object schema the workflow_run payload had.
+          REPLAY_RUN_ID: ${{ matrix.run.id }}
+          RUN_JSON: ""
           KNOWN_RED: |
             Install & Update E2E|t_bab6df79
         run: |
           set -uo pipefail
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          if [ -z "${RUN_JSON:-}" ]; then
             RUN_JSON="$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/$REPO/actions/runs/$REPLAY_RUN_ID")" || {
