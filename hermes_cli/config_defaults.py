@@ -40,7 +40,13 @@ DEFAULT_CONFIG = {
     # min_switch_reset_seconds: opt-in (0 = off). When a rate-limited primary declares a reset
     # sooner than this many seconds, stay on it (the retry backoff rides out the window) instead
     # of switching the turn to a fallback model.
-    "fallback": {"min_switch_reset_seconds": 0},
+    # no_first_byte_budget_seconds: per-turn wall budget across the fallback chain while no byte
+    # has arrived. Once spent, the attempt is cut and the walker skips the remaining lanes on the
+    # stalled model for the first lane on another model (t_452c6ead). 0 = off.
+    # still_waiting_notice_seconds: post "still waiting, N lanes tried" to the chat this often
+    # during that wait. 0 = off.
+    "fallback": {"min_switch_reset_seconds": 0, "no_first_byte_budget_seconds": 180,
+                 "still_waiting_notice_seconds": 120},
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # journal_mode: SQLite journal mode for every Hermes DB. "wal" default; use "delete" on
