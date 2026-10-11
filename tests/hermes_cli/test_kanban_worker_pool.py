@@ -881,3 +881,96 @@ def test_r8_prose_host_line_above_a_real_pin_does_not_hide_the_pin():
     assert kwp.resolve_pin(body, ("ace-ai",)) == ("ace-ai", "example.com")
     assert kwp.resolve_pin("host: example.com\nhost:any\n", ()) == ("any", "example.com")
     assert kwp.resolve_pin("host: example.com\n", ("ace-ai",)) == (None, "example.com")
+
+
+# -- Studio host affinity (card t_3e6c9b2b, incident t_79436ebf) -----------
+
+def test_studio_affinity_sources_and_pin_override():
+    assert _portable(body="Use CDP on the signed-in browser :9224 on the Studio") == (
+        False, "studio_body", None)
+    assert _portable(body="drive it with peekaboo") == (False, "studio_body", None)
+    assert _portable(skills=("browser-access",),
+                     manifest={"browser-access": "manifest:host_affinity"}) == (
+        False, "studio_manifest", None)
+    # Prose that only mentions a port family, not a loopback CDP port, stays portable.
+    assert _portable(body="port 9200 is elasticsearch") == (True, None, "policy")
+    # An explicit pin is the operator's call and wins over every affinity signal.
+    assert _portable(body="host:ace-ai\nCDP :9222") == (True, None, "pin")
+    assert _portable(body="host:any\nCDP :9222")[0] is True
+    hit = kwp.studio_affinity("plain", ("mac-only", "x"), _POOL)
+    assert hit == ("studio_bound_skill", "skill:mac-only")
+
+
+def _skill(root, name, frontmatter):
+    d = root / "general" / name
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(f"---\nname: {name}\n{frontmatter}---\n\nbody\n", encoding="utf-8")
+
+
+def test_manifest_affinity_reads_host_affinity_and_linux_less_platforms(tmp_path, monkeypatch):
+    from hermes_cli import kanban_host_affinity as kha
+    root = tmp_path / "skills"
+    _skill(root, "cdp-login", "platforms: [macos, linux]\nmetadata:\n  hermes:\n"
+                              "    host_affinity: studio\n")
+    _skill(root, "mac-app", "platforms: [macos]\n")
+    _skill(root, "anywhere", "platforms: [macos, linux]\n")
+    _skill(root, "no-platforms", "description: x\n")
+    kha.clear_cache()
+    monkeypatch.setattr(kha, "_profile_dirs", lambda assignee, now: (root,))
+    got = kha.manifest_affinity(["cdp-login", "mac-app", "anywhere", "no-platforms",
+                                 "missing", "ns:plugin"], "alpha")
+    assert got == {"cdp-login": "manifest:host_affinity", "mac-app": "manifest:platforms=macos"}
+    kha.clear_cache()
+
+
+def _events(conn, tid, kind):
+    return [json.loads(r[0]) for r in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id", (tid, kind))]
+
+
+def test_browser_card_under_spilling_studio_waits_never_spills(kanban_home, monkeypatch):
+    """The t_79436ebf shape: a browser-access card while the Studio spills."""
+    from hermes_cli import kanban_host_affinity as kha
+    monkeypatch.setattr(kha, "manifest_affinity",
+                        lambda skills, assignee, now=None: {
+                            s: "manifest:host_affinity" for s in skills if s == "browser-access"})
+    with kb.connect_closing() as conn:
+        (browser,) = _make(conn, 1, priority=9, skills=["browser-access"])
+        (coding,) = _make(conn, 1, priority=1)
+        plan = _plan(free=2, band="spilling")
+        res, spawned = _tick(conn, spillover=plan, spawn_limit=0, spawn_paused="spilling")
+        assert spawned == [(coding, "ace-ai")]          # the plain coding card still spills
+        assert browser not in [t for t, _ in spawned]   # never ace-ai / ace-media
+        assert res.placement_waits[browser] == "studio_affinity:studio_manifest"
+        assert res.placement_affinity[browser]["host"] == "mac-studio"
+        status = conn.execute("SELECT status FROM tasks WHERE id=?", (browser,)).fetchone()[0]
+        assert status == "ready"
+        aff = _events(conn, browser, "placement_affinity")
+        waits = _events(conn, browser, "placement_wait")
+        assert aff == [{"host": "mac-studio", "rule": "studio_manifest",
+                        "matched_by": "skill:browser-access (manifest:host_affinity)"}]
+        assert waits == [{"host": "mac-studio", "reason": "studio_affinity:studio_manifest",
+                          "matched_by": "skill:browser-access (manifest:host_affinity)"}]
+        # A second identical tick writes no duplicate events.
+        _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
+              spawn_paused="spilling")
+        assert len(_events(conn, browser, "placement_affinity")) == 1
+        assert len(_events(conn, browser, "placement_wait")) == 1
+
+
+def test_body_bound_card_runs_locally_when_the_studio_has_room(kanban_home):
+    with kb.connect_closing() as conn:
+        (cdp,) = _make(conn, 1, body="attach CDP to :9222 on the Studio")
+        res, spawned = _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=1)
+    assert spawned == [(cdp, None)] and res.placed == []
+    assert res.placement_affinity[cdp]["matched_by"] == "body:CDP"
+
+
+def test_dry_run_shows_affinity_without_a_pool_plan_or_events(kanban_home):
+    with kb.connect_closing() as conn:
+        (cdp,) = _make(conn, 1, body="signed-in browser task")
+        res = kbd.dispatch_once(conn, dry_run=True, max_spawn=8, spillover=None,
+                                reconcile_orphans=False)
+        assert res.placement_affinity[cdp] == {"host": "mac-studio", "rule": "studio_body",
+                                               "matched_by": "body:signed-in browser"}
+        assert _events(conn, cdp, "placement_affinity") == []
