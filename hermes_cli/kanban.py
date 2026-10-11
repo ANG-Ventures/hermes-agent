@@ -3359,10 +3359,10 @@ def _parse_wake_at(value: str) -> int:
     (a naive timestamp is local time, like every other human-typed time)."""
     value = (value or "").strip()
     if value.isdigit():
-        return int(value)
+        return kb.validate_wake_at(int(value))
     from datetime import datetime
 
-    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    return kb.validate_wake_at(int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()))
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
