@@ -4304,6 +4304,11 @@ def _dispatch_once_locked(
     # budget), then portable ones; the ORDER BY holds inside each class.
     # Without a plan every row is local and the order is unchanged.
     row_route: dict = {}
+    # Ready cards whose Studio binding was evaluated this tick (a pool plan
+    # ran the classifier on every one of them) and, of those, the ones the
+    # spawn loop reached: the affinity event log reconciles against both.
+    _affinity_evaluated: list = []
+    _affinity_reached: set = set()
     if spillover is not None:
         if dry_run:
             # Dry run reserves on its own ledger: the shared plan is untouched.
@@ -4315,6 +4320,7 @@ def _dispatch_once_locked(
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
                                          result.placement_affinity)
                      for r in ready_rows}
+        _affinity_evaluated = [r["id"] for r in ready_rows]
         _rank = {"pin": 0, "wait": 1, "local": 1, "portable": 2}
         ready_rows = sorted(ready_rows, key=lambda r: _rank[row_route[r["id"]][0]])
     else:
@@ -4893,6 +4899,8 @@ def _dispatch_once_locked(
         if wait is not None:
             result.placement_waits[row["id"]] = wait
             continue
+        if row["id"] in result.placement_affinity:
+            _affinity_reached.add(row["id"])
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -5273,9 +5281,9 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
 
     pr_state_resolver.finish_tick(scan_complete=ready_scan_complete)
-    if result.placement_affinity and not dry_run:
+    if _affinity_evaluated and not dry_run:
         from hermes_cli.kanban_host_affinity import record_affinity_events
-        record_affinity_events(conn, result)
+        record_affinity_events(conn, result, _affinity_evaluated, _affinity_reached)
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after

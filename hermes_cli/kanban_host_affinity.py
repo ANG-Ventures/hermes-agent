@@ -36,35 +36,68 @@ CACHE_TTL_SECONDS = 600.0
 _POOL_PLATFORMS = ("linux",)
 
 _dirs_cache: Dict[str, Tuple[float, Tuple[Path, ...]]] = {}
+_index_cache: Dict[Tuple[Path, ...], Tuple[float, Dict[str, Tuple[Path, ...]]]] = {}
 _skill_cache: Dict[Tuple[Tuple[Path, ...], str], Tuple[float, Optional[str]]] = {}
 
 
 _SKILL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 
 
-def _find_skill_md(name: str, dirs: Iterable[Path]) -> Optional[Path]:
-    """``<dir>/<name>/SKILL.md`` or one level deeper (category layout).
+def _build_index(dirs: Iterable[Path]) -> Dict[str, Tuple[Path, ...]]:
+    """``{skill name: every SKILL.md that resolves it}`` across ``dirs``, the
+    way the worker resolves (``kanban_skill_resolve.skill_resolves``): by
+    directory name at any depth and by frontmatter ``name:``.
 
-    The name is matched LITERALLY (never a glob): a card skill like
-    ``browser-acces?`` must not borrow another skill's manifest.
+    One walk per skill-dir set, cached for ``CACHE_TTL_SECONDS``. All roots
+    contribute: a binding declared by ANY resolvable copy must count,
+    whichever root the worker would load first (Prism e16f8f5c on #1877).
     """
-    if not _SKILL_NAME_RE.fullmatch(name or ""):
+    from agent.skill_utils import iter_skill_index_files, parse_frontmatter
+
+    index: Dict[str, list] = {}
+    for d in dirs:
+        for skill_md in iter_skill_index_files(d, "SKILL.md"):
+            names = {skill_md.parent.name}
+            try:
+                fm, _ = parse_frontmatter(skill_md.read_text(encoding="utf-8-sig", errors="replace"))
+            except OSError:
+                fm = {}
+            fm_name = fm.get("name") if isinstance(fm, Mapping) else None
+            if isinstance(fm_name, str) and fm_name:
+                names.add(fm_name)
+            for n in names:
+                lst = index.setdefault(n, [])
+                if skill_md not in lst:
+                    lst.append(skill_md)
+    return {k: tuple(v) for k, v in index.items()}
+
+
+def _index_for(dirs: Tuple[Path, ...], now: float) -> Optional[Dict[str, Tuple[Path, ...]]]:
+    hit = _index_cache.get(dirs)
+    if hit is not None and now - hit[0] < CACHE_TTL_SECONDS:
+        return hit[1]
+    try:
+        index = _build_index(dirs)
+    except Exception:
+        # Fail open for THIS call only: a failed walk is never cached as
+        # "no skills", or a bound skill could spill for a whole TTL
+        # (Prism 7cfa01ca / 94f5d2a0 on #1877).
+        _log.debug("kanban host affinity: skill index failed open", exc_info=True)
         return None
-    dirs = list(dirs)
-    for d in dirs:
-        direct = d / name / "SKILL.md"
-        if direct.is_file():
-            return direct
-    for d in dirs:
-        try:
-            cats = sorted(c for c in d.iterdir() if c.is_dir() and not c.name.startswith("."))
-        except OSError:
-            continue
-        for c in cats:
-            hit = c / name / "SKILL.md"
-            if hit.is_file():
-                return hit
-    return None
+    _index_cache[dirs] = (now, index)
+    return index
+
+
+def _find_skill_mds(name: str, dirs: Tuple[Path, ...], now: float) -> Optional[Tuple[Path, ...]]:
+    """Every ``SKILL.md`` resolving ``name``; ``None`` when the index could not
+    be built. The name is matched LITERALLY (never a glob): a card skill
+    like ``browser-acces?`` must not borrow another skill's manifest."""
+    if not _SKILL_NAME_RE.fullmatch(name or ""):
+        return ()
+    index = _index_for(dirs, now)
+    if index is None:
+        return None
+    return index.get(name, ())
 
 
 def manifest_reason(frontmatter: Mapping) -> Optional[str]:
@@ -87,39 +120,48 @@ def manifest_reason(frontmatter: Mapping) -> Optional[str]:
 
 
 def _skill_reason(name: str, dirs: Tuple[Path, ...], now: float) -> Optional[str]:
+    """Why ``name`` binds to the Studio, or None. Only a COMPLETED lookup is
+    cached: on any exception the call fails open and the cache is left
+    alone, so the next tick re-reads (Prism 7cfa01ca / 94f5d2a0 on #1877)."""
     key = (dirs, name)
     hit = _skill_cache.get(key)
     if hit is not None and now - hit[0] < CACHE_TTL_SECONDS:
         return hit[1]
-    reason: Optional[str] = None
     try:
-        md = _find_skill_md(name, dirs)
-        if md is not None:
-            from agent.skill_utils import parse_frontmatter
+        mds = _find_skill_mds(name, dirs, now)
+        if mds is None:
+            return None
+        from agent.skill_utils import parse_frontmatter
 
+        reason: Optional[str] = None
+        for md in mds:
             fm, _ = parse_frontmatter(md.read_text(encoding="utf-8-sig", errors="replace"))
             reason = manifest_reason(fm)
+            if reason:
+                break
     except Exception:
-        _log.debug("kanban host affinity: %s failed open", name, exc_info=True)
-        reason = None
+        _log.debug("kanban host affinity: %s failed open (not cached)", name, exc_info=True)
+        return None
     _skill_cache[key] = (now, reason)
     return reason
 
 
-def _profile_dirs(assignee: str, now: float) -> Tuple[Path, ...]:
+def _profile_dirs(assignee: str, now: float) -> Optional[Tuple[Path, ...]]:
+    """The assignee profile's skill roots; ``None`` when they could not be
+    read this call (never cached, same rule as :func:`_skill_reason`)."""
     hit = _dirs_cache.get(assignee)
     if hit is not None and now - hit[0] < CACHE_TTL_SECONDS:
         return hit[1]
-    dirs: Tuple[Path, ...] = ()
     try:
         from hermes_cli.kanban_skill_resolve import profile_skill_dirs
         from hermes_cli.profiles import get_profile_dir
 
         home = Path(get_profile_dir(assignee))
-        if home.is_dir():
-            dirs = tuple(profile_skill_dirs(home))
+        dirs: Tuple[Path, ...] = tuple(profile_skill_dirs(home)) if home.is_dir() else ()
     except Exception:
-        _log.debug("kanban host affinity: dirs for %s failed open", assignee, exc_info=True)
+        _log.debug("kanban host affinity: dirs for %s failed open (not cached)", assignee,
+                   exc_info=True)
+        return None
     _dirs_cache[assignee] = (now, dirs)
     return dirs
 
@@ -180,35 +222,73 @@ def studio_affinity_unplanned(rows, default_assignee: Optional[str], result) -> 
                 "host": _kwp.STUDIO_HOST, "rule": hit[0], "matched_by": hit[1]}
 
 
-def _last_payload(conn, task_id: str, kind: str):
-    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
-                       "ORDER BY id DESC LIMIT 1", (task_id, kind)).fetchone()
-    return None if row is None else json.loads(row[0] or "{}")
+def _last_payloads(conn, task_ids, kind: str) -> Dict[str, dict]:
+    """``{task_id: latest payload}`` of ``kind`` for the given cards, one query."""
+    ids = [t for t in dict.fromkeys(task_ids) if t]
+    out: Dict[str, dict] = {}
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        marks = ",".join("?" * len(chunk))
+        for tid, payload in conn.execute(
+                f"SELECT task_id, payload FROM task_events e WHERE kind = ? AND task_id IN ({marks}) "
+                "AND id = (SELECT MAX(id) FROM task_events WHERE task_id = e.task_id AND kind = ?)",
+                [kind, *chunk, kind]):
+            out[tid] = json.loads(payload or "{}")
+    return out
 
 
-def record_affinity_events(conn, result) -> None:
-    """``placement_affinity`` on each change of binding and ``placement_wait`` on
-    each change of wait reason, per bound card. Best-effort: never breaks a tick."""
+CLEARED = {"cleared": True}
+
+
+def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
+                           wait_cleared_ids: Iterable[str] = ()) -> None:
+    """Persist the placement history of every ready card evaluated this tick.
+
+    ``placement_affinity`` is written on each CHANGE of binding, including
+    the change to no binding: a card whose last recorded binding is live but
+    which is no longer bound gets ``{"cleared": true}``, so re-binding later
+    is a new transition (Prism d3ef126d on #1877). ``placement_wait`` is
+    written on each change of wait reason; a bound card that was evaluated
+    with no wait this tick (``wait_cleared_ids``: it spawned, or capacity
+    was there and something else deferred it) gets ``{"cleared": true}``,
+    so the next identical wait is a new episode (Prism 1ccf2233 / 5a51e524).
+    A ``claimed`` event after the last wait also ends it. Best-effort: never
+    breaks a tick.
+    """
     from hermes_cli import kanban_db as _kb
     from hermes_cli import kanban_db_connect as _kbc
+    affinity = result.placement_affinity or {}
+    waits = result.placement_waits or {}
+    evaluated = list(dict.fromkeys([*evaluated_ids, *affinity.keys()]))
+    if not evaluated:
+        return
     try:
         with _kbc.write_txn(conn):
-            for tid, aff in result.placement_affinity.items():
-                if _last_payload(conn, tid, "placement_affinity") != aff:
-                    _kb._append_event(conn, tid, "placement_affinity", dict(aff))
-                reason = (result.placement_waits or {}).get(tid)
-                if reason is None:
-                    continue
-                payload = {"host": aff["host"], "reason": reason, "matched_by": aff["matched_by"]}
+            last_aff = _last_payloads(conn, evaluated, "placement_affinity")
+            for tid in evaluated:
+                aff = affinity.get(tid)
+                last = last_aff.get(tid)
+                if aff is not None:
+                    if last != aff:
+                        _kb._append_event(conn, tid, "placement_affinity", dict(aff))
+                elif last is not None and not last.get("cleared"):
+                    _kb._append_event(conn, tid, "placement_affinity", dict(CLEARED))
+            cleared = set(wait_cleared_ids)
+            for tid, aff in affinity.items():
+                reason = waits.get(tid)
                 last = conn.execute(
                     "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? "
                     "ORDER BY id DESC LIMIT 1", (tid, "placement_wait")).fetchone()
-                # A claim after the last wait ends that wait: the next wait is a new
-                # transition even with the same reason (Prism r2 on #1877).
+                last_payload = None if last is None else json.loads(last[1] or "{}")
+                if reason is None:
+                    if tid in cleared and last_payload is not None and not last_payload.get("cleared"):
+                        _kb._append_event(conn, tid, "placement_wait", dict(CLEARED))
+                    continue
+                payload = {"host": aff["host"], "reason": reason, "matched_by": aff["matched_by"]}
                 claimed_since = last is not None and conn.execute(
                     "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' AND id > ? "
                     "LIMIT 1", (tid, last[0])).fetchone() is not None
-                if last is None or claimed_since or json.loads(last[1] or "{}") != payload:
+                if last is None or claimed_since or last_payload != payload:
                     _kb._append_event(conn, tid, "placement_wait", payload)
     except Exception:
         _log.warning("kanban dispatch: could not record placement affinity events", exc_info=True)
@@ -216,4 +296,5 @@ def record_affinity_events(conn, result) -> None:
 
 def clear_cache() -> None:
     _dirs_cache.clear()
+    _index_cache.clear()
     _skill_cache.clear()

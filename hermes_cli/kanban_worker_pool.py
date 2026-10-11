@@ -86,8 +86,15 @@ STUDIO_HOST = "mac-studio"
 
 # Card-body signals that the work needs the Studio's signed-in browser or GUI
 # session (card t_3e6c9b2b; incident t_79436ebf placed a ":9222/:9224 on the
-# Studio" card on ace-media). Loopback CDP ports, the word CDP, peekaboo.
-STUDIO_BODY_RE = re.compile(r":922\d\b|\bCDP\b|signed-in browser|\bpeekaboo\b", re.IGNORECASE)
+# Studio" card on ace-media). The NARROW list from the placement spec
+# (Obsidian "Fleet Work Placement -- Host Affinity and Continuation" s2.3):
+# a bare or loopback CDP port (``:9222``, ``localhost:9223``, never
+# ``http://ace-ai:9222``, a remote browser is not Studio state), "signed-in
+# browser", "add to cart", peekaboo. A bare ``CDP`` matched 460 of 5,350
+# card bodies in 14 days, mostly infra, and is deliberately NOT a signal.
+STUDIO_BODY_RE = re.compile(
+    r"(?<![\w.-])(?:localhost|127\.0\.0\.1)?:922\d\b|signed-in browser|add to cart|\bpeekaboo\b",
+    re.IGNORECASE)
 IGNORED_PIN_WARN_SECONDS = 300
 
 _log = logging.getLogger(__name__)
