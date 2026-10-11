@@ -1363,3 +1363,97 @@ def test_dry_run_prose_host_line_is_not_a_pin(kanban_home):
                                 reconcile_orphans=False)
     assert res.placement_affinity[cdp]["rule"] == "studio_body"
     assert pinned not in res.placement_affinity
+
+
+# -- Remote-target affinity from skill manifests (card t_9eeb9c40) ----------
+# ``host_affinity: <fleet host>`` means the work TARGETS that host over ssh
+# (ACE-AI GPUs / Bambuddy). It feeds the reach matrix, never a pin: kanbanw on
+# ace-ai cannot see the GPUs (I-4), the Studio reaches ace-ai (rc 0).
+
+def _reach_cfg(rows, hosts=("ace-ai", "ace-media")):
+    reach = {h: dict(r) for h, r in rows.items()}
+    return kwp.PoolConfig(hosts=hosts, profiles=("alpha",), reach=reach,
+                          reach_aliases=("ace-ai", "ace-media", "mac-studio-m3u"),
+                          reach_status="ok")
+
+
+def test_manifest_targets_reads_host_affinity_naming_a_fleet_host(tmp_path, monkeypatch):
+    from hermes_cli import kanban_host_affinity as kha
+    root = tmp_path / "skills"
+    _skill(root, "vllm-gpu", "metadata:\n  hermes:\n    host_affinity: ACE-AI\n")
+    _skill(root, "cdp-login", "metadata:\n  hermes:\n    host_affinity: studio\n")
+    _skill(root, "plain", "description: x\n")
+    kha.clear_cache()
+    monkeypatch.setattr(kha, "_profile_dirs", lambda assignee, now: (root,))
+    names = ["vllm-gpu", "cdp-login", "plain"]
+    assert kha.manifest_targets(names, "alpha") == {"vllm-gpu": "ace-ai"}
+    # ``studio`` stays the Studio-state binding, a remote target never is one.
+    assert kha.manifest_affinity(names, "alpha") == {"cdp-login": "manifest:host_affinity"}
+    kha.clear_cache()
+
+
+def test_manifest_target_refused_on_non_reaching_pool_host_allowed_once_reached():
+    targets = {"vllm-gpu": "ace-ai"}
+    no_route = _reach_cfg({"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 255}})
+    # (1) every pool host is rc 255 to ace-ai: not portable, stays on the Studio.
+    assert kwp.reach_allowed_hosts(body=None, skills=("vllm-gpu",), pool=no_route,
+                                   targets=targets) == ()
+    assert _portable(skills=("vllm-gpu",), pool=no_route, targets=targets) == (
+        False, "host_reach", None)
+    # The live matrix also carries the Studio's own row (rc 0 to ace-ai): the
+    # allowed set is then the Studio only, which take() never matches.
+    with_studio = _reach_cfg({"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 255},
+                              "mac-studio-m3u": {"ace-ai": 0}})
+    assert kwp.reach_allowed_hosts(body=None, skills=("vllm-gpu",), pool=with_studio,
+                                   targets=targets) == ("mac-studio-m3u",)
+    # (2) a fixture row gives ace-media rc 0: portable, and take() is held to it.
+    routed = _reach_cfg({"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 0}})
+    assert _portable(skills=("vllm-gpu",), pool=routed, targets=targets) == (True, None, "policy")
+    assert kwp.reach_allowed_hosts(body=None, skills=("vllm-gpu",), pool=routed,
+                                   targets=targets) == ("ace-media",)
+    # Never a pin: the target host's own worker is not preferred for it.
+    assert _portable(skills=("vllm-gpu",), pool=routed, targets=targets)[2] != "pin"
+    # A target nobody probed fails closed; no target = unchanged (not host-bound).
+    assert _portable(skills=("x",), pool=routed, targets={"x": "nas-9"}) == (
+        False, "host_reach", None)
+    assert kwp.reach_allowed_hosts(body=None, skills=("x",), pool=routed, targets={}) is None
+    # (3) a studio binding is unaffected by the reach path.
+    assert _portable(skills=("browser-access",), pool=routed,
+                     manifest={"browser-access": "manifest:host_affinity"}) == (
+        False, "studio_manifest", None)
+
+
+def test_gpu_card_never_spills_to_a_pool_host_without_a_route(kanban_home, monkeypatch):
+    """Dispatcher end to end: a ``host_affinity: ace-ai`` card under a spilling
+    Studio is not placed on ace-ai/ace-media (rc 255); it runs on the Studio
+    when a local slot is free, and spills to a pool host once its row is rc 0."""
+    from hermes_cli import kanban_host_affinity as kha
+    monkeypatch.setattr(kha, "manifest_targets", lambda skills, assignee, now=None: {
+        s: "ace-ai" for s in skills if s == "vllm-gpu"})
+    monkeypatch.setattr(kb, "_card_skills_refused", lambda *a, **kw: False)
+    hosts = [_host("ace-ai", slots=2, priority=0), _host("ace-media", slots=2, priority=1)]
+
+    def plan_for(rows):
+        p = kwp.plan(hosts, {}, probe=lambda h: (1.0, 16), config=_reach_cfg(rows))
+        p.band, p.spill_reason = "spilling", "load"
+        return p
+
+    no_route = {"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 255},
+                "mac-studio-m3u": {"ace-ai": 0}}       # the live matrix shape
+    with kb.connect_closing() as conn:
+        (gpu,) = _make(conn, 1, priority=9, skills=["vllm-gpu"])
+        (coding,) = _make(conn, 1, priority=1)
+        res, spawned = _tick(conn, spillover=plan_for(no_route), spawn_limit=0,
+                             spawn_paused="spilling")
+        assert spawned == [(coding, "ace-ai")]
+        assert gpu not in [t for t, _ in spawned]
+        assert res.placement_waits[gpu] == "host_reach"
+    with kb.connect_closing() as conn:
+        res, spawned = _tick(conn, spillover=plan_for(no_route), spawn_limit=4)
+        assert (gpu, None) in spawned                      # local: the Studio reaches ace-ai
+    with kb.connect_closing() as conn:
+        (gpu2,) = _make(conn, 1, priority=9, skills=["vllm-gpu"])
+        routed = {"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 0}}
+        res, spawned = _tick(conn, spillover=plan_for(routed), spawn_limit=0,
+                             spawn_paused="spilling")
+        assert (gpu2, "ace-media") in spawned

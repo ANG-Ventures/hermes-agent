@@ -3836,13 +3836,14 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     scan = (row["workspace_kind"] or "scratch") == "scratch" and not linked and allowlisted
     skills = tuple(s for s in skills if isinstance(s, str))
     manifest = _manifest_affinity(skills, assignee) if allowlisted and skills else {}
+    targets = _manifest_targets(skills, assignee) if allowlisted and skills else {}
     ok, rule, route_class = _kwp.portable(
         workspace_kind=row["workspace_kind"], has_links=linked,
         workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
                                if scan else False),
         assignee=assignee, body=row["body"],
         skills=skills, pool=plan.config,
-        native_command=native, manifest=manifest,
+        native_command=native, manifest=manifest, targets=targets,
     )
     pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or ())
     if ignored is not None:
@@ -3879,6 +3880,11 @@ _STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "st
 def _manifest_affinity(skills, assignee) -> dict:
     from hermes_cli.kanban_host_affinity import manifest_affinity_safe
     return manifest_affinity_safe(skills, assignee)
+
+
+def _manifest_targets(skills, assignee) -> dict:
+    from hermes_cli.kanban_host_affinity import manifest_targets_safe
+    return manifest_targets_safe(skills, assignee)
 
 
 def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optional[str]:
@@ -5140,9 +5146,10 @@ def _dispatch_once_locked(
                     _skills = json.loads(row["skills"] or "[]") or []
                 except (TypeError, ValueError, IndexError, KeyError):
                     _skills = []
+                _skills = tuple(s for s in _skills if isinstance(s, str))
                 _only = _kwp_take.reach_allowed_hosts(
-                    body=row["body"], skills=tuple(s for s in _skills if isinstance(s, str)),
-                    pool=spillover.config)
+                    body=row["body"], skills=_skills, pool=spillover.config,
+                    targets=_manifest_targets(_skills, row_assignee) if _skills else {})
             if _only is None:
                 placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
             else:
