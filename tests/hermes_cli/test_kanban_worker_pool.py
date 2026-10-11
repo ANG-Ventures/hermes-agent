@@ -1068,7 +1068,12 @@ def test_lost_binding_is_recorded_and_rebinding_is_a_new_transition(kanban_home)
     restoring it records the binding again (Prism d3ef126d on #1877)."""
     with kb.connect_closing() as conn:
         (card,) = _make(conn, 1, skills=["mac-only"])
-        spill = lambda: _plan(free=2, band="spilling")  # noqa: E731
+        # One pool slot, always taken by a higher-priority portable filler
+        # (a fresh one per tick): an UNBOUND card then waits pool_full and
+        # stays ready across the ticks below instead of spilling.
+        def spill():
+            _make(conn, 1, priority=9, assignee="alpha")
+            return _plan(free=1, band="spilling")
         plan = spill()
         plan.config = kwp.PoolConfig(hosts=plan.config.hosts, profiles=plan.config.profiles,
                                      studio_bound_skills=("mac-only",), pool_hosts=plan.config.pool_hosts)
@@ -1083,6 +1088,8 @@ def test_lost_binding_is_recorded_and_rebinding_is_a_new_transition(kanban_home)
         res, _ = _tick(conn, spillover=plan2, spawn_limit=0, spawn_paused="spilling")
         assert card not in res.placement_affinity
         assert _events(conn, card, "placement_affinity")[-1] == {"cleared": True}
+        # The binding's wait ends with it (Prism 0f21fb8c).
+        assert _events(conn, card, "placement_wait")[-1] == {"cleared": True}
         # Idempotent: an unbound card with a cleared history writes nothing.
         plan3 = spill()
         plan3.config = plan.config
@@ -1097,6 +1104,9 @@ def test_lost_binding_is_recorded_and_rebinding_is_a_new_transition(kanban_home)
         aff = _events(conn, card, "placement_affinity")
         assert [a.get("rule", "cleared") for a in aff] == [
             "studio_bound_skill", "cleared", "studio_bound_skill"]
+        # ...and the same wait after the re-bind is a new episode, not a duplicate.
+        assert [w.get("reason", "cleared") for w in _events(conn, card, "placement_wait")] == [
+            "studio_affinity:studio_bound_skill", "cleared", "studio_affinity:studio_bound_skill"]
         # A card that was never bound never gets a cleared event.
         (plain,) = _make(conn, 1)
         plan5 = spill()
@@ -1112,7 +1122,7 @@ def test_route_row_affinity_branch_is_reached_on_a_live_tick(kanban_home):
     f3a0c70c "unreachable affinity" on #1877)."""
     with kb.connect_closing() as conn:
         (cdp,) = _make(conn, 1, body="signed-in browser work")
-        (pinned,) = _make(conn, 1, body="host: ace-media\nsigned-in browser work",
+        (pinned,) = _make(conn, 1, body="host: ace-ai\nsigned-in browser work",
                           workspace_kind="worktree")
         rows = {r["id"]: r for r in conn.execute(
             "SELECT id, assignee, body, skills, workspace_kind, workspace_path, no_worker FROM tasks")}

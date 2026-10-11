@@ -265,6 +265,7 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
     try:
         with _kbc.write_txn(conn):
             last_aff = _last_payloads(conn, evaluated, "placement_affinity")
+            cleared_wait: set = set()
             for tid in evaluated:
                 aff = affinity.get(tid)
                 last = last_aff.get(tid)
@@ -273,7 +274,14 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
                         _kb._append_event(conn, tid, "placement_affinity", dict(aff))
                 elif last is not None and not last.get("cleared"):
                     _kb._append_event(conn, tid, "placement_affinity", dict(CLEARED))
+                    # The binding's wait ends with it, or the same wait after a
+                    # re-bind would read as a duplicate (Prism 0f21fb8c).
+                    cleared_wait.add(tid)
             cleared = set(wait_cleared_ids)
+            for tid in cleared_wait:
+                lw = _last_payloads(conn, [tid], "placement_wait").get(tid)
+                if lw is not None and not lw.get("cleared"):
+                    _kb._append_event(conn, tid, "placement_wait", dict(CLEARED))
             for tid, aff in affinity.items():
                 reason = waits.get(tid)
                 last = conn.execute(
