@@ -627,10 +627,16 @@ _SPECS = [
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
-                  "parents finish, no human); 'needs_input'/'capability' go to "
+                  "parents finish, no human; refused when no parent is open); "
+                  "'deferred' parks in scheduled until --until, then wakes to ready "
+                  "and pages nobody; 'needs_input'/'capability' go to "
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--until", metavar="TS",
+             help="Wake time for --kind deferred: +<N>[smhd] (e.g. +6h), epoch seconds, "
+                  "or ISO-8601 (naive = local time). The dispatcher returns the card "
+                  "to ready on its first tick at/after TS."),
     ], help="Mark one or more tasks blocked"),
     _cmd("budget", [
         _arg("--board", dest="budget_board", help="Report a single board instead of every board."),

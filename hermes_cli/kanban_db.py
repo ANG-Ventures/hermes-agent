@@ -129,13 +129,54 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 #   * ``capability``   — hit a hard wall (no access, missing creds, an action no
 #                        AI agent can perform). Genuinely human-only.
 #   * ``transient``    — a flaky/temporary failure that may clear on retry.
+#   * ``deferred``     — waiting on wall-clock time (``until``). Parks in
+#                        ``scheduled`` with a timed wake; the dispatcher's
+#                        ``wake_due_scheduled`` returns it to ``ready`` at that
+#                        time. Not a human question, so it never pages.
 #
 # ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "deferred"}
+
+# A ``dependency`` block with no open parent has nothing to wait on. It used to
+# be re-kinded to ``needs_input`` silently, which paged the origin channel every
+# 2 h for what was usually a time wait (closeout 10-09 lesson 5). It is refused
+# instead, naming the two kinds that mean what the caller wanted.
+DEPENDENCY_NO_PARENT_REFUSAL = (
+    "kind 'dependency' waits on an open parent task, and this card has none. "
+    "Pick one: --kind deferred --until <ISO|+6h> for a time wait (parks in "
+    "scheduled, wakes to ready at that time, pages nobody), or --kind "
+    "needs_input for a human ruling (stays blocked and pages the origin channel)."
+)
+
+
+class BlockRefused(ValueError):
+    """``block_task`` refused the requested kind; the message says what to use instead."""
+
+
+def parse_wake_at(value: str, *, now: Optional[int] = None) -> int:
+    """Wake time -> epoch seconds: epoch digits, ``+<N>[smhd]`` relative to
+    *now*, or ISO-8601 (a naive timestamp is local time). Raises ValueError."""
+    value = (value or "").strip()
+    if value.isdigit():
+        return int(value)
+    rel = re.fullmatch(r"\+(\d+)([smhd])", value)
+    if rel:
+        base = int(time.time()) if now is None else int(now)
+        return base + int(rel.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[rel.group(2)]
+    from datetime import datetime
+
+    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+
+
+def format_deferred_until(until: Optional[int]) -> str:
+    """``⏸ deferred until <local time>``: the one rendering of a deferred park."""
+    when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(int(until))) if until else "?"
+    return f"⏸ deferred until {when}"
+
 
 # Run outcomes that mean "this attempt ENDED the card successfully".
 # ``superseded`` is the honest close for a card whose premise was already
@@ -11589,6 +11630,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    until: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -11600,9 +11642,17 @@ def block_task(
       sit in ``blocked`` (where a cron would keep "unblocking" it); it goes to
       ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
       promotes it automatically once its parents finish. No human, no cron, no
-      retry storm. This is Dale's "Type 2 — dependency blocked". If no open
-      blocking parent exists, it instead uses the sticky ``blocked`` bucket
-      and loop counter below: the graph cannot auto-resolve an external wait.
+      retry storm. This is Dale's "Type 2 — dependency blocked". With no open
+      blocking parent it is refused with :class:`BlockRefused`
+      (:data:`DEPENDENCY_NO_PARENT_REFUSAL`), never silently re-kinded.
+
+    * ``deferred`` — waiting on wall-clock time. Requires ``until`` (epoch
+      seconds). Parks in ``scheduled`` with ``next_eligible_at = until``, so
+      the dispatcher's :func:`wake_due_scheduled` returns it to ``ready``
+      (``todo`` while parents are open) at that time. Never ``blocked``, so
+      the needs-input pager and lifecycle block lines never see it. Accepted
+      from ``todo``/``ready``/``running``/``blocked`` (an existing human park
+      can be converted), like :func:`schedule_task`.
 
     * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
@@ -11636,6 +11686,10 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if until is not None and kind != "deferred":
+        raise BlockRefused("until only applies to kind 'deferred'")
+    if kind == "deferred" and until is None:
+        raise BlockRefused("kind 'deferred' needs until (--until <ISO|+6h>): the wake time")
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -11644,6 +11698,33 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        if kind == "dependency" and _parents_satisfied(conn, task_id):
+            raise BlockRefused(DEPENDENCY_NO_PARENT_REFUSAL)
+        if kind == "deferred":
+            # Same transition as schedule_task + set_schedule_wake in one step, so
+            # the dispatcher's wake_due_scheduled owns the wake. No ``blocked``
+            # event and no ``kanban_task_blocked`` hook: a time park is not a
+            # human question, and every pager keys on those.
+            sql = (
+                "UPDATE tasks SET status = 'scheduled', claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, block_kind = 'deferred', next_eligible_at = ? "
+                "WHERE id = ? AND status IN ('todo', 'ready', 'running', 'blocked')"
+            )
+            params: list[Any] = [int(until), task_id]
+            if expected_run_id is not None:
+                sql += " AND current_run_id = ?"
+                params.append(int(expected_run_id))
+            if conn.execute(sql, params).rowcount != 1:
+                return False
+            run_id = _end_or_synthesize_run(
+                conn, task_id, outcome="scheduled", status="scheduled", summary=reason,
+                synthesize=bool(reason),
+            )
+            _append_event(conn, task_id, "scheduled", {
+                "reason": reason, "kind": "deferred", "until": int(until),
+                "source_status": cur_row["status"],
+            }, run_id=run_id)
+            return True
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
         # ``block_kind`` and no ``blocked`` event -- the policy is the
         # supervisor's, not the kernel's -- but the transition guard below only
@@ -11671,15 +11752,6 @@ def block_task(
             if cur_row["status"] == "running"
             else ("review" if cur_row["status"] == "review" else "ready")
         )
-        requested_kind = kind
-        rekind_reason = None
-        # ``dependency`` only waits on incomplete parents. A worker filing that
-        # kind with none open would park in ``todo`` and ``recompute_ready``
-        # would promote+respawn it context-free on the next tick. Re-kind to
-        # ``needs_input`` so it is sticky until a human unblocks.
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
-            kind = "needs_input"
-            rekind_reason = "no_open_parent"
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -11786,7 +11858,6 @@ def block_task(
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
-                    **({"requested_kind": requested_kind, "rekind_reason": rekind_reason} if rekind_reason else {}),
                 },
                 run_id=run_id,
             )
@@ -11875,7 +11946,6 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "source_status": source_status,
-                    **({"requested_kind": requested_kind, "rekind_reason": rekind_reason} if rekind_reason else {}),
                 },
                 run_id=run_id,
             )

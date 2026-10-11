@@ -547,15 +547,37 @@ def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
         conn.close()
 
 
-def test_block_dependency_without_open_parent_is_rekinded(worker_env):
-    """kind=dependency with no incomplete parent must not park in todo; the
-    tool reports the landed kind and tells the worker why."""
+def test_block_dependency_without_open_parent_is_refused(worker_env):
+    """kind=dependency with no incomplete parent is refused with both options
+    and the card stays running (t_1e0609f4: no silent needs_input re-kind)."""
     from tools import kanban_tools as kt
 
     d = json.loads(kt._handle_block({"reason": "upstream input is missing", "kind": "dependency"}))
-    assert (d["ok"], d["status"], d["block_kind"]) == (True, "blocked", "needs_input")
-    assert d["requested_kind"] == "dependency"
-    assert "no parent is open" in d["note"]
+    assert "error" in d
+    assert "--kind deferred --until" in d["error"] and "--kind needs_input" in d["error"]
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_deferred_parks_scheduled_with_wake(worker_env):
+    from tools import kanban_tools as kt
+
+    d = json.loads(kt._handle_block({"reason": "24h wall clock", "kind": "deferred", "until": "+6h"}))
+    assert (d["ok"], d["status"], d["block_kind"]) == (True, "scheduled", "deferred")
+    assert d["note"].startswith("⏸ deferred until ")
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.next_eligible_at == d["until"]
+    finally:
+        conn.close()
 
 
 def test_heartbeat_extends_claim_expires(worker_env):

@@ -877,7 +877,7 @@ def test_pr_merged_before_the_block_is_history_not_a_gate(
     with kb.connect() as conn:
         tid = _blocked_card(
             conn,
-            kind="dependency",
+            kind="needs_input",
             reason=(
                 "Waiting on t_082e7650 (per-tick pool spawn budget fix). The "
                 "deployed o/r#953 lets whole bursts through, so resume once "
@@ -2318,7 +2318,7 @@ _T213_BLOCKS = (
      "09-24 21:40; 0 outcome files carry turn_stop. The 05:53 "
      "TRIAGE-RESOLVE→todo sweep re-dispatched this card before the deploy "
      "gate was met. Unblock only after #401 is deployed and there are 30+ "
-     "real answered turns.", "dependency"),
+     "real answered turns.", "needs_input"),   # filed as dependency (no parent); the kernel then stored needs_input
 )
 _PCV = "Kyzcreig/pipecat-house-voice"
 

@@ -366,31 +366,76 @@ def test_worker_run_on_the_card_cannot_answer_with_an_operator_label(kanban_home
         assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [tid]
 
 
-def test_dependency_downgraded_to_needs_input_does_not_page(kanban_home):
-    """A ``--kind dependency`` block with no open parent is re-kinded to
-    needs_input (a time/external wait, not a decision): it must not page."""
+def _legacy_rekinded_block(conn, tid):
+    """A block event as the pre-t_1e0609f4 kernel wrote it for a parentless
+    ``dependency`` ask (re-kinded to needs_input). Live boards still hold
+    these rows; the pager must keep treating them as time waits."""
+    assert kb.block_task(conn, tid, reason="DEFERRED 24h wall clock", kind="needs_input")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_events SET payload = json_set(payload, '$.requested_kind', 'dependency', "
+            "'$.rekind_reason', 'no_open_parent') WHERE id = (SELECT MAX(id) FROM task_events "
+            "WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected'))", (tid,))
+
+
+def test_legacy_rekinded_dependency_does_not_page(kanban_home):
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="park", body=ORIGIN, priority=150, assignee="w")
-        assert kb.claim_task(conn, tid, claimer="w") is not None
-        assert kb.block_task(conn, tid, reason="DEFERRED 24h wall clock", kind="dependency")
-        task = kb.get_task(conn, tid)
-        assert (task.status, task.block_kind) == ("blocked", "needs_input")
+        _legacy_rekinded_block(conn, tid)
         assert kb.needs_input_page_candidates(conn) == []
         # control: an explicit needs_input block still pages
         other = _card(conn)
         assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [other]
 
 
-def test_loop_escalated_rekinded_dependency_still_pages(kanban_home):
-    """A re-kinded dependency block that recurs escalates to ``triage``: that
-    needs a human decision, so the no_open_parent suppression must not hide it
-    (Prism aefe736f033c on #1835)."""
+def test_legacy_rekinded_dependency_pages_once_escalated_to_triage(kanban_home):
+    """Prism aefe736f033c on #1835: a recurrence into ``triage`` needs a ruling."""
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="park", body=ORIGIN, priority=150, assignee="w")
-        assert kb.block_task(conn, tid, reason="DEFERRED 24h wall clock", kind="dependency")
-        assert kb.needs_input_page_candidates(conn) == []
+        _legacy_rekinded_block(conn, tid)
         assert kb.unblock_task(conn, tid)
-        assert kb.block_task(conn, tid, reason="DEFERRED 24h wall clock", kind="dependency")
-        task = kb.get_task(conn, tid)
-        assert (task.status, task.block_kind) == ("triage", "needs_input")
+        assert kb.block_task(conn, tid, reason="DEFERRED 24h wall clock", kind="needs_input")
+        assert kb.get_task(conn, tid).status == "triage"
         assert [c["task_id"] for c in kb.needs_input_page_candidates(conn)] == [tid]
+
+
+def test_deferred_block_wakes_to_ready_with_zero_pages(kanban_home):
+    """Card acceptance (t_1e0609f4): `block --kind deferred --until +1m` on a
+    priority-150 card with an origin channel parks, wakes to ready at the
+    wake time, and the needs-input pager sends NOTHING across park and wake
+    (dependency paging on, the widest setting)."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="park", body=ORIGIN, priority=150, assignee="w")
+        assert kb.claim_task(conn, tid, claimer="w") is not None
+    assert _run("block", tid, "DEFERRED", "24h", "wall", "clock", "--kind", "deferred", "--until", "+1m") == 0
+    sent = []
+    pager = kw._NeedsInputPager()
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert (task.status, task.block_kind) == ("scheduled", "deferred")
+        wake = int(task.next_eligible_at)
+    for now in (1000.0, 1000.0 + 2 * 3600, 1000.0 + 5 * 3600):
+        _tick(pager, now, sent, include_dependency=True)
+    with kb.connect_closing() as conn:
+        assert kb.wake_due_scheduled(conn, now=wake - 1) == []
+        assert kb.wake_due_scheduled(conn, now=wake) == [tid]
+        assert kb.get_task(conn, tid).status == "ready"
+    _tick(pager, 1000.0 + 7 * 3600, sent, include_dependency=True)
+    assert sent == []
+
+
+def test_bare_dependency_block_is_refused_and_never_pages(kanban_home, capsys):
+    """Card acceptance (t_1e0609f4): `block --kind dependency` with no parent
+    and no --until is refused with the message naming both options; nothing
+    lands, so nothing pages."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="park", body=ORIGIN, priority=150, assignee="w")
+        assert kb.claim_task(conn, tid, claimer="w") is not None
+    assert _run("block", tid, "waiting", "--kind", "dependency") == 1
+    err = capsys.readouterr().err
+    assert "--kind deferred --until" in err and "--kind needs_input" in err
+    sent = []
+    _tick(kw._NeedsInputPager(), 1000.0, sent, include_dependency=True)
+    assert sent == []
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "running"
