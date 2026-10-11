@@ -518,7 +518,8 @@ def known_host_ids(fleet_dir: Path) -> Tuple[str, ...]:
 def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_content: bool,
              assignee: Optional[str], body: Optional[str], skills: Iterable[str] = (),
              pool, native_command: bool = False,
-             manifest: Optional[Mapping[str, str]] = None) -> Tuple[bool, Optional[str], Optional[str]]:
+             manifest: Optional[Mapping[str, str]] = None,
+             targets: Optional[Mapping[str, str]] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
 
@@ -529,6 +530,8 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     ``studio_bound_skills`` and ``hosts`` (known host ids). An unpinned card
     whose work is bound to the Studio (:func:`studio_affinity`) is not
     portable; ``manifest`` carries the skill-manifest half of that check.
+    ``targets`` (``{skill: host}``, manifest ``host_affinity: <host>``) makes
+    the card host-bound to those hosts (:func:`reach_allowed_hosts`).
     """
     if (workspace_kind or "scratch") != "scratch":
         return False, _reasons.WORKSPACE_KIND, None
@@ -549,7 +552,7 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     # worker host with a PROVEN route (fresh reach matrix row, rc 0 to every
     # target) may take it. No such host, or no fresh matrix: it stays local
     # (a remote pin to a non-reaching host waits, never runs locally, I-11).
-    allowed = reach_allowed_hosts(body=body, skills=skills, pool=pool)
+    allowed = reach_allowed_hosts(body=body, skills=skills, pool=pool, targets=targets)
     if allowed is not None:
         if pin is not None and pin != PIN_ANY and pin not in allowed:
             return False, _reasons.HOST_REACH, None
@@ -567,7 +570,8 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     return True, None, "policy"
 
 
-def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool) -> Optional[Tuple[str, ...]]:
+def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
+                        targets: Optional[Mapping[str, str]] = None) -> Optional[Tuple[str, ...]]:
     """None when the card is not host-bound (any pool host may take it);
     else the worker hosts the reach matrix proves can ssh to every target
     the card names (``()`` = none: stays local). FAIL CLOSED: the target
@@ -575,14 +579,25 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool) -> 
     pool host (so recognition never depends on a fresh sample, Prism
     13bf80849c6b), while the proof is fresh rows only: an absent or stale
     matrix recognises the target and proves nothing, so the card gets
-    ``()``. ``pool`` needs ``reach``, ``reach_aliases`` and ``hosts``."""
+    ``()``. ``pool`` needs ``reach``, ``reach_aliases`` and ``hosts``.
+
+    ``targets`` (``{skill: host}``) are the hosts a skill manifest says the
+    work targets (``host_affinity: ace-ai``, card t_9eeb9c40): they bind the
+    card and join the named targets. A target the matrix never probed has no
+    rc 0 anywhere, so it fails closed (stays local). A skill-bound card with
+    no named alias still needs a host that reaches EVERYTHING."""
     pool_hosts = tuple(getattr(pool, "hosts", ()) or ())
     aliases = tuple(dict.fromkeys([*(getattr(pool, "reach_aliases", ()) or ()),
                                    *(h.lower() for h in pool_hosts)]))
-    bound, targets = host_bound_targets(body, skills, aliases, pin_hosts=pool_hosts)
-    if not bound:
+    bound, named = host_bound_targets(body, skills, aliases, pin_hosts=pool_hosts)
+    wanted = tuple(dict.fromkeys(h.lower() for h in (targets or {}).values() if h))
+    if not bound and not wanted:
         return None
-    return reaching_hosts(getattr(pool, "reach", {}) or {}, targets, aliases)
+    # Unnamed host-bound skill: reach EVERY alias, plus the manifest targets
+    # (an unprobed target must still fail closed, Prism bf503f94e81a).
+    base = named if (named or not bound) else aliases
+    named = tuple(dict.fromkeys([*base, *wanted]))
+    return reaching_hosts(getattr(pool, "reach", {}) or {}, named, aliases)
 
 
 def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,

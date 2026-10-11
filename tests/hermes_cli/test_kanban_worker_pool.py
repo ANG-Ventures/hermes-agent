@@ -1137,7 +1137,10 @@ def test_manifest_affinity_reads_host_affinity_and_linux_less_platforms(tmp_path
     assert got == {"cdp-login": "manifest:host_affinity", "mac-app": "manifest:platforms=macos",
                    "deep-login": "manifest:platforms=macos", "by-fm-name": "manifest:platforms=macos"}
     # Literal match only: a glob-shaped name never borrows another skill's manifest.
-    assert kha.manifest_affinity(["cdp-logi?", "mac-*", "general/mac-app"], "alpha") == {}
+    assert kha.manifest_affinity(["cdp-logi?", "mac-*", "general/mac-?pp"], "alpha") == {}
+    # A path-qualified id the worker loads keeps its binding (Prism fbf21aa8cc13).
+    assert kha.manifest_affinity(["general/mac-app"], "alpha") == {
+        "general/mac-app": "manifest:platforms=macos"}
     kha.clear_cache()
 
 
@@ -1363,3 +1366,161 @@ def test_dry_run_prose_host_line_is_not_a_pin(kanban_home):
                                 reconcile_orphans=False)
     assert res.placement_affinity[cdp]["rule"] == "studio_body"
     assert pinned not in res.placement_affinity
+
+
+# -- Remote-target affinity from skill manifests (card t_9eeb9c40) ----------
+# ``host_affinity: <fleet host>`` means the work TARGETS that host over ssh
+# (ACE-AI GPUs / Bambuddy). It feeds the reach matrix, never a pin: kanbanw on
+# ace-ai cannot see the GPUs (I-4), the Studio reaches ace-ai (rc 0).
+
+def _reach_cfg(rows, hosts=("ace-ai", "ace-media")):
+    reach = {h: dict(r) for h, r in rows.items()}
+    return kwp.PoolConfig(hosts=hosts, profiles=("alpha",), reach=reach,
+                          reach_aliases=("ace-ai", "ace-media", "mac-studio-m3u"),
+                          reach_status="ok")
+
+
+def test_manifest_targets_reads_host_affinity_naming_a_fleet_host(tmp_path, monkeypatch):
+    from hermes_cli import kanban_host_affinity as kha
+    root = tmp_path / "skills"
+    _skill(root, "vllm-gpu", "metadata:\n  hermes:\n    host_affinity: ACE-AI\n")
+    _skill(root, "cdp-login", "metadata:\n  hermes:\n    host_affinity: studio\n")
+    _skill(root, "plain", "description: x\n")
+    kha.clear_cache()
+    monkeypatch.setattr(kha, "_profile_dirs", lambda assignee, now: (root,))
+    names = ["vllm-gpu", "cdp-login", "plain"]
+    assert kha.manifest_targets(names, "alpha") == {"vllm-gpu": "ace-ai"}
+    # ``studio`` stays the Studio-state binding, a remote target never is one.
+    assert kha.manifest_affinity(names, "alpha") == {"cdp-login": "manifest:host_affinity"}
+    kha.clear_cache()
+
+
+def test_manifest_target_refused_on_non_reaching_pool_host_allowed_once_reached():
+    targets = {"vllm-gpu": "ace-ai"}
+    no_route = _reach_cfg({"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 255}})
+    # (1) every pool host is rc 255 to ace-ai: not portable, stays on the Studio.
+    assert kwp.reach_allowed_hosts(body=None, skills=("vllm-gpu",), pool=no_route,
+                                   targets=targets) == ()
+    assert _portable(skills=("vllm-gpu",), pool=no_route, targets=targets) == (
+        False, "host_reach", None)
+    # The live matrix also carries the Studio's own row (rc 0 to ace-ai): the
+    # allowed set is then the Studio only, which take() never matches.
+    with_studio = _reach_cfg({"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 255},
+                              "mac-studio-m3u": {"ace-ai": 0}})
+    assert kwp.reach_allowed_hosts(body=None, skills=("vllm-gpu",), pool=with_studio,
+                                   targets=targets) == ("mac-studio-m3u",)
+    # (2) a fixture row gives ace-media rc 0: portable, and take() is held to it.
+    routed = _reach_cfg({"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 0}})
+    assert _portable(skills=("vllm-gpu",), pool=routed, targets=targets) == (True, None, "policy")
+    assert kwp.reach_allowed_hosts(body=None, skills=("vllm-gpu",), pool=routed,
+                                   targets=targets) == ("ace-media",)
+    # Never a pin: the target host's own worker is not preferred for it.
+    assert _portable(skills=("vllm-gpu",), pool=routed, targets=targets)[2] != "pin"
+    # A target nobody probed fails closed; no target = unchanged (not host-bound).
+    assert _portable(skills=("x",), pool=routed, targets={"x": "nas-9"}) == (
+        False, "host_reach", None)
+    assert kwp.reach_allowed_hosts(body=None, skills=("x",), pool=routed, targets={}) is None
+    # (3) a studio binding is unaffected by the reach path.
+    assert _portable(skills=("browser-access",), pool=routed,
+                     manifest={"browser-access": "manifest:host_affinity"}) == (
+        False, "studio_manifest", None)
+
+
+def test_gpu_card_never_spills_to_a_pool_host_without_a_route(kanban_home, monkeypatch):
+    """Dispatcher end to end: a ``host_affinity: ace-ai`` card under a spilling
+    Studio is not placed on ace-ai/ace-media (rc 255); it runs on the Studio
+    when a local slot is free, and spills to a pool host once its row is rc 0."""
+    from hermes_cli import kanban_host_affinity as kha
+    monkeypatch.setattr(kha, "manifest_targets", lambda skills, assignee, now=None: {
+        s: "ace-ai" for s in skills if s == "vllm-gpu"})
+    monkeypatch.setattr(kb, "_card_skills_refused", lambda *a, **kw: False)
+    hosts = [_host("ace-ai", slots=2, priority=0), _host("ace-media", slots=2, priority=1)]
+
+    def plan_for(rows):
+        p = kwp.plan(hosts, {}, probe=lambda h: (1.0, 16), config=_reach_cfg(rows))
+        p.band, p.spill_reason = "spilling", "load"
+        return p
+
+    no_route = {"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 255},
+                "mac-studio-m3u": {"ace-ai": 0}}       # the live matrix shape
+    with kb.connect_closing() as conn:
+        (gpu,) = _make(conn, 1, priority=9, skills=["vllm-gpu"])
+        (coding,) = _make(conn, 1, priority=1)
+        res, spawned = _tick(conn, spillover=plan_for(no_route), spawn_limit=0,
+                             spawn_paused="spilling")
+        assert spawned == [(coding, "ace-ai")]
+        assert gpu not in [t for t, _ in spawned]
+        assert res.placement_waits[gpu] == "host_reach"
+    with kb.connect_closing() as conn:
+        res, spawned = _tick(conn, spillover=plan_for(no_route), spawn_limit=4)
+        assert (gpu, None) in spawned                      # local: the Studio reaches ace-ai
+    with kb.connect_closing() as conn:
+        (gpu2,) = _make(conn, 1, priority=9, skills=["vllm-gpu"])
+        routed = {"ace-ai": {"ace-ai": 255}, "ace-media": {"ace-ai": 0}}
+        res, spawned = _tick(conn, spillover=plan_for(routed), spawn_limit=0,
+                             spawn_paused="spilling")
+        assert (gpu2, "ace-media") in spawned
+
+
+def test_unnamed_host_bound_card_still_requires_its_manifest_target():
+    """Prism bf503f94e81a: a HOST_BOUND skill with no alias in the body takes
+    the 'reach every alias' fallback; a manifest target must join that set,
+    so a worker that reaches every alias but not the target is refused."""
+    targets = {"vllm-gpu": "ace-ai"}
+    skills = ("ssh-machines", "vllm-gpu")
+    aliases_ok = {"ace-media": 0, "mac-studio-m3u": 0}
+    no_route = _reach_cfg({"ace-ai": {**aliases_ok, "ace-ai": 255},
+                           "ace-media": {**aliases_ok, "ace-ai": 255}})
+    assert kwp.reach_allowed_hosts(body="fix it", skills=skills, pool=no_route,
+                                   targets=targets) == ()
+    assert _portable(body="fix it", skills=skills, pool=no_route, targets=targets) == (
+        False, "host_reach", None)
+    routed = _reach_cfg({"ace-ai": {**aliases_ok, "ace-ai": 255},
+                         "ace-media": {**aliases_ok, "ace-ai": 0}})
+    assert kwp.reach_allowed_hosts(body="fix it", skills=skills, pool=routed,
+                                   targets=targets) == ("ace-media",)
+    # An unprobed target (no column anywhere) fails closed in the fallback too.
+    assert kwp.reach_allowed_hosts(body="fix it", skills=("ssh-machines", "x"), pool=routed,
+                                   targets={"x": "nas-9"}) == ()
+
+
+def test_manifest_binding_survives_a_later_unreadable_copy(tmp_path, monkeypatch):
+    """Prism 883b1cd1ac29: a Studio binding found in one SKILL.md copy is kept
+    when a later copy cannot be read; the incomplete lookup is not cached."""
+    from hermes_cli import kanban_host_affinity as kha
+    a, b = tmp_path / "a", tmp_path / "b"
+    _skill(a, "cdp-login", "metadata:\n  hermes:\n    host_affinity: studio\n")
+    _skill(b, "cdp-login", "description: x\n")
+    kha.clear_cache()
+    monkeypatch.setattr(kha, "_profile_dirs", lambda assignee, now: (a, b))
+    bad = b / "general" / "cdp-login" / "SKILL.md"
+    real_read = type(bad).read_text
+
+    def flaky(self, *args, **kw):
+        if self == bad:
+            raise OSError("EIO")
+        return real_read(self, *args, **kw)
+    kha.manifest_affinity(["cdp-login"], "alpha", now=1.0)   # build the index first
+    kha._skill_cache.clear()                                  # keep the index, re-read the copies
+    monkeypatch.setattr(type(bad), "read_text", flaky)
+    assert kha.manifest_affinity(["cdp-login"], "alpha", now=2.0) == {
+        "cdp-login": "manifest:host_affinity"}
+    assert not kha._skill_cache                                # incomplete lookup: not cached
+    kha.clear_cache()
+
+
+def test_manifest_target_honours_path_qualified_card_skill(tmp_path, monkeypatch):
+    """Prism fbf21aa8cc13: ``mlops/vllm-gpu`` (a categorized id skill_view
+    accepts) keeps its manifest target, keyed by the card's own identifier."""
+    from hermes_cli import kanban_host_affinity as kha
+    root = tmp_path / "skills"
+    _skill(root, "vllm-gpu", "metadata:\n  hermes:\n    host_affinity: ace-ai\n", category="mlops")
+    _skill(root, "cdp-login", "metadata:\n  hermes:\n    host_affinity: studio\n")
+    kha.clear_cache()
+    monkeypatch.setattr(kha, "_profile_dirs", lambda assignee, now: (root,))
+    assert kha.manifest_targets(["mlops/vllm-gpu"], "alpha") == {"mlops/vllm-gpu": "ace-ai"}
+    assert kha.manifest_affinity(["general/cdp-login"], "alpha") == {
+        "general/cdp-login": "manifest:host_affinity"}
+    # Traversal / wrong category never resolve.
+    assert kha.manifest_targets(["../skills/mlops/vllm-gpu", "general/vllm-gpu"], "alpha") == {}
+    kha.clear_cache()
