@@ -6026,7 +6026,7 @@ class _StreamingCall(StreamingWaitMonitor):
         ``run`` raise ``FallbackWallBudgetExceeded`` so the loop fails over (t_452c6ead)."""
         logger.warning("No first byte from %s/%s within the fallback wall budget (%.0fs); cutting the attempt.",
                        self.agent.provider, self.api_kwargs.get("model", "unknown"),
-                       getattr(self.agent, "_wall_budget", {}).get("budget_s", 0.0))
+                       (getattr(self.agent, "_wall_budget", None) or {}).get("budget_s", 0.0))
         self._request_cancelled["value"] = True
         _killed_response = self._attempt_stream_response
         with contextlib.suppress(Exception):
