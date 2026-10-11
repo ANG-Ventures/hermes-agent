@@ -907,8 +907,6 @@ _SPECS = [
              help="Reclassify recorded quota crashes without counting task failures"),
         _arg("--dry-run", action="store_true",
              help="Report quota repairs without writes or schema migration"),
-        _arg("--board", default=argparse.SUPPRESS,
-             help="Board to repair (also accepted before the repair verb)"),
     ], help="Check kanban.db integrity and auto-repair index-only corruption",
        description=(
            "Runs PRAGMA integrity_check on the board's DB and reports the result. When the "
@@ -1008,6 +1006,41 @@ def _intermix_optional_positionals(parser: argparse.ArgumentParser) -> None:
     parser.__class__ = _Intermixed
 
 
+_BOARD_HELP = ("Board slug to operate on. Defaults to the current board (set "
+               "via `hermes kanban boards switch <slug>` or the "
+               "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
+               "list` to see all boards.")
+
+# Verbs that take no verb-position ``--board``: ``clone`` is a git operation with no board state,
+# ``budget`` owns ``--board`` as a report filter. ``boards …`` accepts it for parity and its
+# dispatch ignores it, exactly like the top-level position.
+VERB_BOARD_EXCLUDED = frozenset({"clone", "budget"})
+
+
+def _add_verb_board_flag(sub: argparse._SubParsersAction) -> None:
+    """``--board`` after the verb (``create "T" --board X``) on every board-scoped leaf parser.
+
+    It lands in ``verb_board`` (a subparser namespace overwrites the parent's keys, so sharing
+    ``board`` would let one position silently win); ``kanban_command`` reconciles the two.
+    """
+    seen: set[int] = set()
+
+    def walk(action: argparse._SubParsersAction) -> None:
+        for name, p in action.choices.items():
+            if id(p) in seen or (action is sub and name in VERB_BOARD_EXCLUDED):
+                continue
+            seen.add(id(p))
+            children = [a for a in p._actions if isinstance(a, argparse._SubParsersAction)]
+            if children:
+                for child in children:
+                    walk(child)
+            else:
+                p.add_argument("--board", dest="verb_board", default=argparse.SUPPRESS,
+                               metavar="<slug>", help=_BOARD_HELP)
+
+    walk(sub)
+
+
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree; returns the ``kanban`` parser."""
     kanban_parser = parent_subparsers.add_parser(
@@ -1021,14 +1054,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --board scopes every subcommand to one board's DB; when omitted the
     # resolution is HERMES_KANBAN_BOARD, then the persisted current-board
     # file, then "default" (kanban_db.get_current_board()).
-    kanban_parser.add_argument("--board", default=None, metavar="<slug>",
-                               help="Board slug to operate on. Defaults to the current board (set "
-                                    "via `hermes kanban boards switch <slug>` or the "
-                                    "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
-                                    "list` to see all boards.")
+    kanban_parser.add_argument("--board", default=None, metavar="<slug>", help=_BOARD_HELP)
     sub = kanban_parser.add_subparsers(dest="kanban_action")
     _add_commands(sub, _SPECS)
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     _add_home_guard_flags(sub)
+    _add_verb_board_flag(sub)
     _intermix_optional_positionals(kanban_parser)
     return kanban_parser

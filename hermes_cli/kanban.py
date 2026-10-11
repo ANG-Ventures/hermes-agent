@@ -42,6 +42,7 @@ from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError, RoutedPrOpenError
 from hermes_cli.kanban_receipt import EXIT_NO_RECEIPT, ReceiptRequiredError
+from hermes_cli.kanban_handback_head import StaleHandbackHeadError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_cli.kanban_held_repo import fmt_held_repo, held_repo
 from hermes_constants import get_default_hermes_root
@@ -308,6 +309,14 @@ def kanban_command(args: argparse.Namespace) -> int:
             print("usage: hermes kanban <action> [options]\n"
                   "Run 'hermes kanban --help' for the full list of actions.", file=sys.stderr)
         return 0
+
+    # `--board` may come before or after the verb; both positions must agree (never let one lose).
+    verb_board = getattr(args, "verb_board", None)
+    if verb_board is not None:
+        top_board = getattr(args, "board", None)
+        if top_board and str(top_board).strip().lower() != str(verb_board).strip().lower():
+            return _err(f"kanban: --board given twice: {top_board!r} vs {verb_board!r}", 2)
+        args.board = verb_board
 
     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
     # import DB mutators directly.
@@ -3102,7 +3111,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
-            except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, RoutedPrOpenError) as draft_err:
+            except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, RoutedPrOpenError,
+                    StaleHandbackHeadError) as draft_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
@@ -3576,7 +3586,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
         except ReceiptRequiredError as receipt_err:
             print(f"cannot request review for {tid}: {receipt_err}", file=sys.stderr)
             return EXIT_NO_RECEIPT
-        except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
+        except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, StaleHandbackHeadError) as draft_err:
             return _err(f"cannot request review for {tid}: {draft_err}")
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
