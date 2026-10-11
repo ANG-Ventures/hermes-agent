@@ -54,8 +54,14 @@ jobs:
           REPLAY_RUN_ID: ${{ inputs.run_id }}
           # A red is a candidate when it COMPLETED (updated_at) within LOOKBACK_S before the last green
           # sweep started (now, if none in 24 h), so a late or failed sweep is covered by the next one.
-          # Runs CREATED in the last 24 h are listed: a re-run keeps its run's created_at.
+          # A re-run keeps its run's created_at, and GitHub allows a re-run up to 30 days after the run
+          # was created (Prism P1 09960417aff6), so reds are listed back to 30 days by CREATION and kept by
+          # COMPLETION. Listed per non-PR event to stay inside the 1,000-result list cap (agent, 30 d:
+          # ~600 non-PR reds vs ~2,000 with PR reds). CFA_EVENTS must cover every non-PR trigger of
+          # every CFA_WATCHED workflow (tests/test_fleet_ci_fail_alert_gate.py checks it).
           LOOKBACK_S: "10800"
+          RERUN_WINDOW_S: "2592000"
+          CFA_EVENTS: push merge_group schedule workflow_dispatch release
           # The workflows whose reds reach the page gate. One name per line (hermes-home
           # scripts/main-red-summary.py and scripts/ci_speed_lint.py read this list). workflow_run only
           # fired for TOP-LEVEL workflows; a sweep sees every run, but a workflow_call child's red is
@@ -123,8 +129,10 @@ jobs:
           LISTENER="$(api "actions/workflows/$SELF/runs?event=workflow_run&per_page=1" | jq -r '.workflow_runs[0].created_at // ""')"
           REDS='[]'
           for st in failure startup_failure; do
-            got="$(pages "actions/runs?status=$st&created=%3E%3D$(iso $((NOW - 86400)))")"
-            REDS="$(printf '%s\n%s' "$REDS" "$got" | jq -cs '.[0] + .[1]')"
+            for ev in $CFA_EVENTS; do
+              got="$(pages "actions/runs?status=$st&event=$ev&created=%3E%3D$(iso $((NOW - RERUN_WINDOW_S)))")"
+              REDS="$(printf '%s\n%s' "$REDS" "$got" | jq -cs '.[0] + .[1]')"
+            done
           done
           CANDS="$(jq -c --arg watched "$CFA_WATCHED" --arg listener "$LISTENER" --arg since "$(iso "$SINCE")" '
             ($watched | split("\n") | map(select(. != ""))) as $w
@@ -147,7 +155,10 @@ jobs:
           echo "runs=$RUNS" | tee -a "$GITHUB_OUTPUT"
           echo "default_branch=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO" | jq -er .default_branch)" | tee -a "$GITHUB_OUTPUT"
 
-      # The sweep itself going red pages nobody else: page once, on the green -> red transition.
+      # The sweep itself going red pages nobody else: page once per outage. "Already paged" = this
+      # step SUCCEEDED in the previous completed sweep (it exits 0 on both a page and a skip, so it
+      # stays success through a streak). Not the previous run's conclusion: a failed notify leg or a
+      # rejected POST also leave it red, and that must not silence the next outage (Prism P1 9091d8429c50).
       - name: Page when the sweep breaks (green -> red only)
         if: ${{ failure() && github.event_name == 'schedule' }}
         env:
@@ -156,10 +167,15 @@ jobs:
           CI_FAIL_WEBHOOK_SECRET: ${{ secrets.CI_FAIL_WEBHOOK_SECRET }}
           WEBHOOK_URL: https://hooks.angventures.io/webhooks/ci-fail
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PAGE_STEP: Page when the sweep breaks (green -> red only)  # this step's own name
         run: |
           set -uo pipefail
-          PREV="$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/actions/workflows/fleet-ci-fail-alert.yml/runs?event=schedule&status=completed&per_page=1" | jq -r '.workflow_runs[0].conclusion // "none"')" || PREV=error
-          [ "$PREV" = failure ] && { echo "previous sweep was red too: already paged"; exit 0; }
+          gh_api() { curl -fsS --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
+          PREV="$(gh_api "actions/workflows/fleet-ci-fail-alert.yml/runs?event=schedule&status=completed&per_page=1" | jq -er '.workflow_runs[0].id // "none"')" || PREV=error
+          if [ "$PREV" != none ] && [ "$PREV" != error ]; then
+            PREV="$(gh_api "actions/runs/$PREV/jobs?per_page=100" | jq -er --arg s "$PAGE_STEP" '[.jobs[] | select(.name == "sweep") | .steps[]? | select(.name == $s) | .conclusion] | first // "none"')" || PREV=error
+          fi
+          [ "$PREV" = success ] && { echo "the previous sweep already paged this outage"; exit 0; }
           body="$(jq -nc --arg repo "$REPO" --arg url "$RUN_URL" --arg sha "$GITHUB_SHA" '{event_type:"ci_failure", card:"", signature:"", repo:$repo, workflow:"Fleet CI-fail alert sweep is red: reds of the watched workflows are not being paged", branch:"main", sha:$sha, run_url:$url, actor:"cron", trigger:"schedule"}')"
           sig="$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$CI_FAIL_WEBHOOK_SECRET" | sed 's/^.* //')"
           curl -fsS -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -H "X-GitHub-Event: ci_failure" \

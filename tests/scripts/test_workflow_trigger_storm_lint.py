@@ -25,6 +25,42 @@ def test_listener_shapes():
     assert L.lint_text("w", LISTENER.format(mark="  # trigger-storm-ok:", ups="A", cond="true"))
 
 
+def test_listener_types_must_be_exactly_completed():
+    """Prism P1 2565a2e94fdd: `requested`/`in_progress` each create a run before any conclusion exists."""
+    for types in ("[completed, requested, in_progress]", "[completed, requested]", "[requested]", "completed"):
+        text = LISTENER.format(mark="", ups="A", cond=GOOD_IF).replace("[completed]", types)
+        assert bool(L.lint_text("w", text)) is (types != "completed"), types
+    assert L.lint_text("w", "on:\n  workflow_run:\n    workflows: [A]\njobs:\n  j:\n    if: %s\n" % GOOD_IF)
+
+
+def test_default_repo_is_the_repo_root(tmp_path):
+    """Prism P1 3ab412ae0825: with no --repo the lint scanned scripts/.github/workflows and passed vacuously."""
+    import shutil
+    clone = tmp_path / "r"
+    (clone / "scripts" / "ci").mkdir(parents=True)
+    shutil.copy(SCRIPT, clone / "scripts" / "ci" / SCRIPT.name)
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "bare.yml").write_text("on:\n  pull_request:\njobs: {}\n", encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(clone / "scripts" / "ci" / SCRIPT.name)], capture_output=True,
+                          text=True, encoding="utf-8", errors="replace", timeout=60)
+    assert proc.returncode == 1 and "bare.yml" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_bom_prefixed_workflow_is_read(tmp_path):
+    """Windows tooling BOMs files; the lint reads utf-8-sig (Prism P0 26fe00113f79, footguns policy)."""
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "bom.yml").write_bytes(b"\xef\xbb\xbfon:\n  pull_request:\njobs: {}\n")
+    assert L.findings(tmp_path) == L.lint_text(".github/workflows/bom.yml", "on:\n  pull_request:\njobs: {}\n")
+
+
+def test_lint_passes_the_windows_footguns_check():
+    """Prism P0 26fe00113f79: the blocking footguns lint scans scripts/, so this script must pass it."""
+    proc = subprocess.run([sys.executable, str(ROOT / "scripts" / "check-windows-footguns.py"), str(SCRIPT)],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_pull_request_shapes():
     assert L.lint_text("w", "on:\n  pull_request:\njobs: {}\n")
     assert L.lint_text("w", "on: [pull_request]\njobs: {}\n")
@@ -35,5 +71,6 @@ def test_pull_request_shapes():
 
 def test_selftest_and_this_repo_are_green():
     for args in (["--selftest"], ["--repo", str(ROOT)]):
-        proc = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, timeout=60)
+        proc = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=60)
         assert proc.returncode == 0, proc.stdout + proc.stderr

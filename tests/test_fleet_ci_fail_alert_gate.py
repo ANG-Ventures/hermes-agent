@@ -1665,8 +1665,11 @@ def _sweep(tmp_path, reds, *, sweeps=(), sweep_jobs=None, listener=None, event="
            "actions/workflows/77/runs?event=schedule": {"workflow_runs": list(sweeps)},
            "actions/workflows/77/runs?event=workflow_run": {"workflow_runs": [listener] if listener else []},
            "repos/o/r": {"default_branch": "main"}}
-    for st in ("failure", "timed_out", "startup_failure"):
-        api[f"actions/runs?status={st}"] = {"workflow_runs": [r for r in reds if r["conclusion"] == st]}
+    for st in ("failure", "timed_out", "startup_failure"):  # the run list filters by status AND event, as GitHub does
+        for ev in {r["event"] for r in reds}:
+            api[f"actions/runs?status={st}&event={ev}&"] = {
+                "workflow_runs": [r for r in reds if r["conclusion"] == st and r["event"] == ev]}
+        api[f"actions/runs?status={st}"] = {"workflow_runs": []}
     for sid, names in (sweep_jobs or {}).items():
         api[f"actions/runs/{sid}/jobs"] = {"jobs": [{"name": n, "conclusion": c} for n, c in names]}
     (tmp_path / "api.json").write_text(json.dumps(api))
@@ -1676,9 +1679,11 @@ def _sweep(tmp_path, reds, *, sweeps=(), sweep_jobs=None, listener=None, event="
     env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GITHUB_OUTPUT": str(out),
            "FAKE_CURL_LOG": str(tmp_path / "curl.log"), "FAKE_API": str(tmp_path / "api.json"), "GH_TOKEN": "x",
            "REPO": "o/r", "EVENT_NAME": event, "REPLAY_RUN_ID": replay, "GITHUB_RUN_ID": str(SWEEP_SELF),
-           "SWEEP_NOW": str(SWEEP_NOW), "LOOKBACK_S": step["env"]["LOOKBACK_S"], "CFA_WATCHED": step["env"]["CFA_WATCHED"]}
-    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=60)
-    got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+           "SWEEP_NOW": str(SWEEP_NOW), "LOOKBACK_S": step["env"]["LOOKBACK_S"], "CFA_WATCHED": step["env"]["CFA_WATCHED"],
+           "RERUN_WINDOW_S": step["env"]["RERUN_WINDOW_S"], "CFA_EVENTS": step["env"]["CFA_EVENTS"]}
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=60)
+    got = dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines() if "=" in line)
     return proc, (json.loads(got["runs"]) if "runs" in got else None), got
 
 
@@ -1759,7 +1764,81 @@ def test_route_fetches_the_run_when_fed_by_the_sweep(tmp_path):
            "FAKE_CURL_LOG": str(tmp_path / "curl.log"), "FAKE_API": str(tmp_path / "api.json"), "GH_TOKEN": "x",
            "REPO": "o/r", "EVENT_NAME": "schedule", "DEFAULT_BRANCH": "main", "REPLAY_RUN_ID": "42",
            "RUN_JSON": "", "KNOWN_RED": step["env"]["KNOWN_RED"]}
-    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=30)
     assert proc.returncode == 0, proc.stderr
-    got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+    got = dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines() if "=" in line)
     assert got["wf_run_id"] == "42" and got["route"] == "none", got  # a branch red stays silent
+
+
+def test_rerun_of_a_run_created_days_ago_is_still_swept(tmp_path):
+    """Prism P1 09960417aff6: a re-run keeps the run's created_at, so listing by created>=24h dropped it."""
+    rerun = _red_run(21, age=300, attempt=2)
+    rerun["created_at"] = _iso(SWEEP_NOW - 5 * 86400)
+    proc, runs, _ = _sweep(tmp_path, [rerun])
+    assert proc.returncode == 0, proc.stderr
+    assert [r["key"] for r in runs] == ["21#2"], runs
+    log = (tmp_path / "curl.log").read_text(encoding="utf-8")
+    window = int(_sweep_step()["env"]["RERUN_WINDOW_S"])
+    assert window >= 30 * 86400 and f"created=%3E%3D{_iso(SWEEP_NOW - window)}" in log
+
+
+def test_sweep_events_cover_every_non_pr_trigger_of_the_watched_workflows():
+    """The sweep lists reds per event: a watched workflow's non-PR trigger missing from CFA_EVENTS pages nobody."""
+    events = set(_sweep_step()["env"]["CFA_EVENTS"].split())
+    by_name = {}
+    for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8-sig"))
+        on = doc.get("on", doc.get(True))
+        on = [on] if isinstance(on, str) else list(on or [])
+        by_name[doc.get("name")] = set(on)
+    for name in _watched():
+        assert name in by_name, name
+        missing = by_name[name] - {"pull_request", "pull_request_target", "workflow_call"} - events
+        assert not missing, (name, missing)
+
+
+def _page_step() -> dict:
+    return next(s for s in _workflow()["jobs"]["sweep"]["steps"] if s.get("name", "").startswith("Page when the sweep"))
+
+
+def _outage_page(tmp_path, prev_jobs):
+    """Run the sweep-outage page step against a fake API whose latest completed sweep has `prev_jobs`."""
+    step = _page_step()
+    assert step["env"]["PAGE_STEP"] == step["name"]
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "curl").write_text(_FAKE_API_CURL, encoding="utf-8")
+    (bindir / "curl").chmod(0o755)
+    api = {"actions/workflows/fleet-ci-fail-alert.yml/runs": {"workflow_runs": [{"id": 801, "conclusion": "failure"}]},
+           "actions/runs/801/jobs": {"jobs": prev_jobs},
+           "hooks.angventures.io": {"ok": True}}
+    (tmp_path / "api.json").write_text(json.dumps(api), encoding="utf-8")
+    (tmp_path / "curl.log").write_text("", encoding="utf-8")
+    env = {"PATH": f"{bindir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GH_TOKEN": "x", "REPO": "o/r",
+           "FAKE_CURL_LOG": str(tmp_path / "curl.log"), "FAKE_API": str(tmp_path / "api.json"),
+           "CI_FAIL_WEBHOOK_SECRET": "s", "WEBHOOK_URL": "https://hooks.angventures.io/webhooks/ci-fail",
+           "RUN_URL": "https://x/1", "GITHUB_RUN_ID": "900", "GITHUB_SHA": "abc", "PAGE_STEP": step["env"]["PAGE_STEP"]}
+    proc = subprocess.run(["bash", _script(tmp_path, step["run"])], env=env, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=30)
+    posted = "hooks.angventures.io" in (tmp_path / "curl.log").read_text(encoding="utf-8")
+    return proc, posted
+
+
+@pytest.mark.skipif(not shutil.which("openssl"), reason="needs openssl")
+@pytest.mark.parametrize("prev_page, pages", [
+    ("success", False),   # the previous sweep already paged (or skipped as already paged) this outage
+    ("skipped", True),    # previous sweep was green, or red only through a failed notify leg
+    ("failure", True),    # the previous page POST was rejected: retry, never stay silent
+    (None, True),         # previous sweep never reached the step
+])
+def test_sweep_outage_page_keys_on_the_previous_page_step_not_the_run_conclusion(tmp_path, prev_page, pages):
+    """Prism P1 9091d8429c50: a red previous run (failed notify leg or rejected POST) silenced every later outage."""
+    steps = [{"name": "Find the watched workflows' unnotified red runs", "conclusion": "failure"}]
+    if prev_page:
+        steps.append({"name": _page_step()["name"], "conclusion": prev_page})
+    jobs = [{"name": "notify 11#1", "conclusion": "failure", "steps": []},
+            {"name": "sweep", "conclusion": "failure", "steps": steps}]
+    proc, posted = _outage_page(tmp_path, jobs)
+    assert proc.returncode == 0, proc.stderr
+    assert posted is pages, proc.stdout

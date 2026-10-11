@@ -8,7 +8,8 @@ nothing to do. Each of those is a run GitHub counts. Measured 2026-10-04 on ANG-
 disable (Support #4838502). hermes-home 2026-10-09: 780 `CI-fail alert` runs, 772 skipped.
 
 RULES (one line per finding; exit 1 on any, 0 clean, 2 unreadable):
-  1. A `workflow_run` listener needs ALL of: `types: [completed]`, at most 3 upstream workflows, and a
+  1. A `workflow_run` listener needs ALL of: `types: [completed]` and nothing else (`requested` /
+     `in_progress` each create a run before any conclusion exists), at most 3 upstream workflows, and a
      first job whose `if:` tests `workflow_run.conclusion`. Or the `workflow_run:` line carries
      `# trigger-storm-ok: <why>`.
   2. A `pull_request` workflow needs a `paths:`/`paths-ignore:` filter or a workflow-level
@@ -62,11 +63,12 @@ def lint_text(path: str, text: str) -> list[str]:
         wr = on.get("workflow_run") or {}
         ups = wr.get("workflows") or [] if isinstance(wr, dict) else []
         types = wr.get("types") or [] if isinstance(wr, dict) else []
+        types = [types] if isinstance(types, str) else list(types)
         first = next(iter(jobs.values()), {}) if isinstance(jobs, dict) and jobs else {}
         cond = str((first or {}).get("if") or "")
         why = []
-        if "completed" not in types:
-            why.append("no `types: [completed]`")
+        if types != ["completed"]:
+            why.append("`types:` is %s, not exactly `[completed]`" % (types or "unset (every activity type)"))
         if len(ups) > MAX_UPSTREAM:
             why.append("listens to %d upstream workflows (max %d): one run per upstream run" % (len(ups), MAX_UPSTREAM))
         if "workflow_run.conclusion" not in cond:
@@ -90,7 +92,7 @@ def findings(repo: pathlib.Path) -> list[str]:
     wf = repo / ".github" / "workflows"
     out = []
     for p in sorted(list(wf.glob("*.yml")) + list(wf.glob("*.yaml"))):
-        out += lint_text(str(p.relative_to(repo)), p.read_text(encoding="utf-8"))
+        out += lint_text(str(p.relative_to(repo)), p.read_text(encoding="utf-8-sig"))
     return out
 
 
@@ -98,6 +100,8 @@ SELFTEST = {  # name -> (workflow text, expect a finding)
     "storm.yml": ("on:\n  workflow_run:\n    workflows: [A, B, C, D]\n    types: [completed]\n"
                   "jobs:\n  j:\n    if: github.event.workflow_run.conclusion == 'failure'\n", True),
     "no-cond.yml": ("on:\n  workflow_run:\n    workflows: [A]\n    types: [completed]\njobs:\n  j:\n    if: true\n", True),
+    "extra-types.yml": ("on:\n  workflow_run:\n    workflows: [A]\n    types: [completed, requested, in_progress]\n"
+                        "jobs:\n  j:\n    if: github.event.workflow_run.conclusion == 'failure'\n", True),
     "lean.yml": ("on:\n  workflow_run:\n    workflows: [A]\n    types: [completed]\n"
                  "jobs:\n  j:\n    if: github.event.workflow_run.conclusion == 'failure'\n", False),
     "marked.yml": ("on:\n  workflow_run:  # trigger-storm-ok: tracks green runs too\n    workflows: [A, B, C, D]\n"
@@ -115,7 +119,7 @@ def selftest() -> int:
         wf = pathlib.Path(d) / ".github" / "workflows"
         wf.mkdir(parents=True)
         for name, (text, _bad) in SELFTEST.items():
-            (wf / name).write_text(text)
+            (wf / name).write_text(text, encoding="utf-8")
         got = findings(pathlib.Path(d))
     bad = []
     for name, (_text, want) in SELFTEST.items():
@@ -128,7 +132,7 @@ def selftest() -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", type=pathlib.Path, default=pathlib.Path(__file__).resolve().parents[1])
+    ap.add_argument("--repo", type=pathlib.Path, default=pathlib.Path(__file__).resolve().parents[2])  # scripts/ci/<this> -> repo root
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
