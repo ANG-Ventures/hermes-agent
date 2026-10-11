@@ -83,6 +83,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 # Shipped page outside those packages, exercised by the desktop Electron suite.
@@ -328,6 +329,53 @@ def _is_install_path(p: str) -> bool:
     return p.startswith(_INSTALL_PATHS) or p in _INSTALL_FILES or p.endswith(".ps1")
 
 
+# The macOS + Windows unit lanes (tests-os.yml os-tests, t_04d4944a). On a pull
+# request they cost 21.4 of 81.2 job-minutes per run (26%, 30 runs 10-06..10-08)
+# and ran on 29 of 30 PRs. The merge_group run (the only required gate) and
+# push:main always run them; ci.yaml forces this lane on for every non-PR event,
+# and vars.CI_PR_OS_TESTS=on restores it on every PR. Of 200 failed PR runs
+# (09-27..10-06) an OS lane failed in 10 and was the only failing job family in 1.
+# On a PR the lane runs when the diff touches the host-OS surface or the lane's
+# own machinery: path prefixes below, any file whose name says which OS it is
+# about, or a Windows script.
+_OS_TESTS_PATHS = (
+    *_PY_TEST_HARNESS,
+    "hermes_platform/",
+    "scripts/desktop-update/",
+    "scripts/ci/list_os_marked_tests.py",
+    "scripts/install",
+    "pm/",
+    "pyproject.toml",
+    "uv.lock",
+)
+_OS_TESTS_NAME_HINTS = ("windows", "win32", "_win", "macos", "darwin", "launchd", "powershell", "conpty")
+_OS_TESTS_EXTS = (".ps1", ".psm1", ".bat", ".cmd")
+
+
+def _is_os_tests_path(p: str) -> bool:
+    base = p.rsplit("/", 1)[-1].lower()
+    return (
+        p.startswith(_OS_TESTS_PATHS)
+        or base.endswith(_OS_TESTS_EXTS)
+        or any(hint in base for hint in _OS_TESTS_NAME_HINTS)
+    )
+
+
+def _is_os_marked_test(p: str, root: Path | None) -> bool:
+    """A test file (as it is in the checked-out base tree) that an OS lane runs.
+
+    detect checks out the BASE ref, so a brand-new marked file is not seen here;
+    merge_group still runs it.
+    """
+    if root is None or not p.startswith("tests/") or not p.endswith(".py"):
+        return False
+    try:
+        text = (root / p).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return False
+    return "mark.platforms(" in text
+
+
 # A pull request with this label runs every slow lane, whatever it touches.
 RUN_E2E_LABEL = "run-e2e"
 
@@ -419,11 +467,12 @@ def _slow_lanes(files: list[str]) -> dict[str, bool]:
     return lanes
 
 
-def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
+def classify(files: list[str], run_e2e: bool = False, root: Path | None = None) -> dict[str, bool]:
     """Map changed paths to ``{lane: should_run}``.
 
     ``run_e2e`` is the pull request's ``run-e2e`` label: it turns every slow
-    lane on.
+    lane on. ``root`` is the checked-out tree; with it, a changed test file that
+    carries a ``platforms(...)`` marker starts ``os_tests``.
     """
     files = [f.strip() for f in files if f.strip()]
     python = any(not _py_irrelevant(f) for f in files)
@@ -453,6 +502,7 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
             for f in files
         ),
         "desktop_updater": any(_is_desktop_updater(f) for f in files),
+        "os_tests": run_e2e or any(_is_os_tests_path(f) or _is_os_marked_test(f, root) for f in files),
         "rust": any(_is_rust(f) for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
@@ -479,6 +529,7 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
         ret["npm_lock"] = True
         ret["bootstrap"] = True
         ret["desktop_updater"] = True
+        ret["os_tests"] = True
         ret["rust"] = True
         ret["ci_review"] = True
         ret["desktop"] = True
@@ -576,7 +627,11 @@ def main() -> int:
                 file=sys.stderr,
             )
             files = recovered
-    lanes = classify(files, run_e2e=RUN_E2E_LABEL in pull_request_labels())
+    lanes = classify(
+        files,
+        run_e2e=RUN_E2E_LABEL in pull_request_labels(),
+        root=Path(__file__).resolve().parents[2],
+    )
     out = "\n".join([
         *(f"{key}={str(value).lower()}" for key, value in lanes.items()),
         f"ci_review_files={json.dumps(ci_review_files(files))}",

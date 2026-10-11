@@ -41,6 +41,15 @@ on:
         type: boolean
         required: false
         default: true
+      os_tests:
+        description: >-
+          Run the unit-level macOS-only / Windows-only jobs (os-tests). The
+          caller passes the classifier's os_tests lane: path-gated on a pull
+          request, always true on merge_group and push. A caller that passes
+          nothing gets them.
+        type: boolean
+        required: false
+        default: true
       e2e:
         description: >-
           Run the Windows E2E job (tests/e2e/core/windows). A slow lane
@@ -66,6 +75,7 @@ concurrency:
 jobs:
   os-tests:
     name: ${{ matrix.name }}
+    if: inputs.os_tests
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout || 30 }}
     strategy:

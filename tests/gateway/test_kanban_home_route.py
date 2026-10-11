@@ -202,7 +202,7 @@ def test_no_home_falls_back_to_logs_tagged(tmp_path, monkeypatch, session):
 def test_home_send_failure_falls_back_to_logs_with_reason(tmp_path, monkeypatch):
     def make(conn):
         tid = _card(conn, S_APOLLO)
-        kb.block_task(conn, tid, reason="waiting", kind="dependency")
+        kb.block_task(conn, tid, reason="waiting", kind="needs_input")
         return tid
 
     tid, ad, runner = _run(tmp_path, monkeypatch, make, discord=Adapter(fail_chats={APOLLO}))

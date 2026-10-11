@@ -170,6 +170,8 @@ def _fmt_task_line(t: kb.Task, refusal: Optional[dict] = None) -> str:
         flag = f"  [{_fmt_refusal(refusal)}]"
     pin = _pin_badge(t)
     pin = f"  {pin}" if pin else ""
+    if t.status == "scheduled" and getattr(t, "block_kind", None) == "deferred":
+        flag += f"  [{kb.format_deferred_until(t.next_eligible_at)}]"
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{pin}{flag}"
 
 
@@ -1308,7 +1310,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  {label + ':':<11}{value}")
 
     print(f"Task {task.id}: {task.title}")
-    field("status", task.status + (f"  [{_fmt_refusal(refusal)}]" if refusal else ""))
+    field("status", task.status + (f"  [{_fmt_refusal(refusal)}]" if refusal else "")
+          + (f"  [{kb.format_deferred_until(task.next_eligible_at)}]"
+             if task.status == "scheduled" and task.block_kind == "deferred" else ""))
     guard_line = _fmt_current_respawn_guard(task.status, events)
     if guard_line:
         field("guard", guard_line)
@@ -3285,6 +3289,12 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
+    until: Optional[int] = None
+    if getattr(args, "until", None):
+        try:
+            until = kb.parse_wake_at(args.until)
+        except ValueError:
+            return _err(f"invalid --until {args.until!r} (+<N>[smhd], epoch seconds or ISO-8601)")
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
@@ -3293,13 +3303,20 @@ def _cmd_block(args: argparse.Namespace) -> int:
         for tid in ids:
             # Provenance before the transition: blocking ends the run.
             _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id_for(tid),
+                    until=until,
+                )
+            except kb.BlockRefused as exc:
+                failed.append(tid)
+                print(f"cannot block {tid}: {exc}", file=sys.stderr)
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
@@ -3316,8 +3333,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 where = landed.status if landed else "blocked"
                 if where == "todo":
                     print(f"{tid} → todo (dependency wait){suffix}")
-                elif kind == "dependency" and where == "blocked":
-                    print(f"Blocked {tid} as needs_input (no open parent to wait on){suffix}")
+                elif where == "scheduled":
+                    print(f"{tid} → {kb.format_deferred_until(until)}{suffix}")
                 elif where == "triage":
                     # Only a typed owner-input block carries a question for a human.
                     verdict = ("needs a human decision"
