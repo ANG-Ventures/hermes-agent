@@ -37,18 +37,22 @@ def _vault_scope() -> str:
     return str(get_hermes_home())
 
 
+def _redaction_forms(value: str) -> tuple:
+    """The value plus the form a text input normalizes it to (CR/LF stripped): that is what the page or a
+    flattened tool result holds, so both must be scrubbed."""
+    return (value, value.replace("\r", "").replace("\n", ""))
+
+
 def register_vault_redaction_value(value) -> None:
     """Register an exact vault secret value for model-facing redaction.
 
     Called by the vault fill path BEFORE the injection happens, so no later browser tool result
-    can echo the value back into model context. Also registers the form a text input normalizes
-    it to (CR/LF stripped), since that is what the page holds.
+    can echo the value back into model context. Also registers the normalized form.
     """
     if not isinstance(value, str) or not value:
         return
-    normalized = value.replace("\r", "").replace("\n", "")
     with _VAULT_REDACTION_LOCK:
-        _vault_bucket_add_locked(_vault_scope(), (value, normalized))
+        _vault_bucket_add_locked(_vault_scope(), _redaction_forms(value))
 
 
 def _vault_bucket_add_locked(scope: str, values) -> None:
@@ -86,7 +90,7 @@ def register_credential_redaction_value(name: str, value) -> None:
         displaced = slots.get(name)
         slots[name] = value
         if displaced and displaced != value:
-            _vault_bucket_add_locked(scope, (displaced,))
+            _vault_bucket_add_locked(scope, _redaction_forms(displaced))
 
 
 def redact_registered_vault_values(text: str) -> str:
@@ -95,7 +99,9 @@ def redact_registered_vault_values(text: str) -> str:
         return text
     with _VAULT_REDACTION_LOCK:
         scope = _vault_scope()
-        values = {*(_VAULT_REDACTION_VALUES.get(scope) or ()), *(_CREDENTIAL_REDACTION_VALUES.get(scope) or {}).values()}
+        values = {*(_VAULT_REDACTION_VALUES.get(scope) or ())}
+        for current in (_CREDENTIAL_REDACTION_VALUES.get(scope) or {}).values():
+            values.update(_redaction_forms(current))
         values = sorted(values, key=len, reverse=True)  # longest first: a substring never shadows its superstring
     for value in values:
         if value in text:

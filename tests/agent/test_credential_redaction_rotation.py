@@ -31,6 +31,33 @@ def test_rotated_out_value_stays_redacted():
     assert NEW not in out
 
 
+def test_rotated_out_multiline_value_stays_redacted_when_flattened():
+    # A displaced credential must carry the same CR/LF-stripped form a vault fill registers (Prism 9dd9c5c14589):
+    # the model usually sees the old value only after a tool flattened it.
+    old = "old-admin-\r\n" + "5c1e" * 10 + "\n"
+    old_flat = "old-admin-" + "5c1e" * 10
+    redact.register_credential_redaction_value("mem0.admin_api_key", old)
+    redact.register_credential_redaction_value("mem0.admin_api_key", NEW)
+
+    out = redact.redact_registered_vault_values(f"current={NEW} backup={old_flat} raw={old}")
+
+    assert old_flat not in out
+    assert old not in out
+    assert NEW not in out
+
+
+def test_current_multiline_credential_is_redacted_when_flattened():
+    # Same class on the non-evictable slot: the current credential's flattened form must scrub too.
+    cur = "cur-admin-\r\n" + "7d2a" * 10 + "\n"
+    cur_flat = "cur-admin-" + "7d2a" * 10
+    redact.register_credential_redaction_value("mem0.admin_api_key", cur)
+
+    out = redact.redact_registered_vault_values(f"flat={cur_flat} raw={cur}")
+
+    assert cur_flat not in out
+    assert cur not in out
+
+
 def test_current_value_survives_vault_eviction_after_rotation():
     redact.register_credential_redaction_value("mcp:x.token", OLD)
     redact.register_credential_redaction_value("mcp:x.token", NEW)
