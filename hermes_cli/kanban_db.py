@@ -3351,16 +3351,15 @@ def _assert_live_board_tree_write_allowed(path: Path) -> None:
     ``set_current_board()`` / ``remove_board()`` never touch the DB at all.
     That is how ten fixture boards (alpha, curr, spawntest, slug-immutable, …)
     landed in the live ``kanban/boards/`` on 2026-09-22 (card t_216b74e0).
-    Same production-root list and R1/R2 predicate as the DB guard.
+    Same production-root list and R1/R2 predicate as the DB guard, and the same
+    spellings (:func:`_path_spellings`, so a symlinked ``<live>/kanban`` counts).
     """
-    try:
-        target = path.expanduser().resolve(strict=False)
-    except OSError:  # pragma: no cover - resolution failure is not a leak
-        return
-    for root in _production_kanban_roots():
-        if _is_live_board_tree_path(target, root):
-            _refuse_live_kanban_write(target, root, f"write live board state {target}")
-            return
+    roots = _production_kanban_roots()
+    for target in _path_spellings(path):
+        for root in roots:
+            if _is_live_board_tree_path(target, root):
+                _refuse_live_kanban_write(target, root, f"write live board state {target}")
+                return
 
 
 def connect_readonly(
