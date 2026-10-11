@@ -145,13 +145,14 @@ def test_workflow_binds_variable_event_and_same_repo():
 
 def test_blacksmith_is_reachable_only_through_tests_yml():
     """The host controller and spend monitor (hermes-home scripts/ci-placement.py
-    BS_WORKFLOWS) scan only ci.yaml runs for Blacksmith minutes, because tests.yml
-    (called from ci.yaml) is the one place a blacksmith label can come from. A new use
-    site must add its caller workflow to BS_WORKFLOWS, or spend goes uncounted."""
+    BS_WORKFLOWS) scan only the runs of tests.yml's callers for Blacksmith minutes,
+    because tests.yml is the one place a blacksmith label can come from. A new use site
+    or caller must be added to BS_WORKFLOWS, or spend goes uncounted. ci-local.yaml is
+    the ci.yaml fallback copy (#1828); deleting it to disarm stays green."""
     wf = ROOT / ".github/workflows"
     users = sorted(p.name for p in wf.glob("*.y*ml")
                    if "blacksmith" in p.read_text(encoding="utf-8").lower())
     assert users == ["tests.yml"]
     callers = sorted(p.name for p in wf.glob("*.y*ml")
                      if "./.github/workflows/tests.yml" in p.read_text(encoding="utf-8"))
-    assert callers == ["ci.yaml"]
+    assert callers and set(callers) <= {"ci.yaml", "ci-local.yaml"}, callers
