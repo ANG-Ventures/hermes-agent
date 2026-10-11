@@ -7,6 +7,7 @@ saying their close gate was NOT met / not proven; Apollo reopened all three.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -121,3 +122,51 @@ def test_milestone_card_negative_keeps_its_named_reviewer(kanban_home, monkeypat
         task = kb.get_task(conn, tid)
         assert task.status == "review" and task.assignee == "argus"
         assert _events(conn, tid, "review_negative_result") == []
+
+
+def test_failed_negative_result_event_rolls_back_with_the_transition(kanban_home, monkeypatch):
+    """The review_negative_result event rides the review transition's txn.
+    A failure writing it (lock timeout, disk full) must roll the whole
+    handoff back with its staged copies, never leave a committed review whose
+    referenced artifact copies were discarded (Prism P1 83af2fcef278 on #1859)."""
+    from hermes_cli import kanban_db_workspace as kbw
+
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "milestone_only")
+    real_append = kb._append_event
+    fail = {"on": True}
+
+    def _append(conn, task_id, kind, *a, **k):
+        if kind == "review_negative_result" and fail["on"]:
+            raise sqlite3.OperationalError("database is locked")
+        return real_append(conn, task_id, kind, *a, **k)
+
+    monkeypatch.setattr(kb, "_append_event", _append)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="slice: close-on soak", assignee="builder")
+        ws = kbw.resolve_workspace(kb.get_task(conn, tid))
+        kbw.set_workspace_path(conn, tid, ws)
+        artifact = ws / "evidence.json"
+        artifact.write_bytes(b'{"ok": false}')
+        claimed = kb.claim_task(conn, tid)
+        kwargs = dict(
+            summary="Close-on read: NOT met.", metadata={"artifacts": [str(artifact)]},
+            expected_run_id=claimed.current_run_id,
+        )
+        with pytest.raises(sqlite3.OperationalError):
+            kb.request_review(conn, tid, **kwargs)
+        attachment_dir = kb.task_attachments_dir(tid)
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.list_attachments(conn, tid) == []
+        assert _events(conn, tid, "review_requested") == []
+        assert not attachment_dir.exists() or not any(attachment_dir.iterdir())
+
+        fail["on"] = False
+        assert kb.request_review(conn, tid, **kwargs) is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "review" and kb.is_human_reviewer(task.assignee)
+        attachments = kb.list_attachments(conn, tid)
+        assert [e["match"] for e in _events(conn, tid, "review_negative_result")] == ["NOT met"]
+    assert [a.filename for a in attachments] == ["evidence.json"]
+    stored = Path(attachments[0].stored_path)
+    assert stored.read_bytes() == b'{"ok": false}'
+    assert sorted(p.name for p in attachment_dir.iterdir()) == ["evidence.json"]

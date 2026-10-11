@@ -42,6 +42,7 @@ from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError, RoutedPrOpenError
 from hermes_cli.kanban_receipt import EXIT_NO_RECEIPT, ReceiptRequiredError
+from hermes_cli.kanban_handback_head import StaleHandbackHeadError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_cli.kanban_held_repo import fmt_held_repo, held_repo
 from hermes_constants import get_default_hermes_root
@@ -3110,7 +3111,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
-            except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, RoutedPrOpenError) as draft_err:
+            except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, RoutedPrOpenError,
+                    StaleHandbackHeadError) as draft_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
@@ -3584,7 +3586,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
         except ReceiptRequiredError as receipt_err:
             print(f"cannot request review for {tid}: {receipt_err}", file=sys.stderr)
             return EXIT_NO_RECEIPT
-        except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
+        except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, StaleHandbackHeadError) as draft_err:
             return _err(f"cannot request review for {tid}: {draft_err}")
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
