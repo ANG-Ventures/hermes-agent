@@ -58,6 +58,13 @@ def test_current_multiline_credential_is_redacted_when_flattened():
     assert cur not in out
 
 
+def test_crlf_only_credential_does_not_corrupt_unrelated_output():
+    # A CR/LF-only value normalizes to "", which matches every text (Prism 5d5afe2c8d8e).
+    redact.register_credential_redaction_value("mem0.admin_api_key", "\r\n")
+
+    assert redact.redact_registered_vault_values("hello world") == "hello world"
+
+
 def test_current_value_survives_vault_eviction_after_rotation():
     redact.register_credential_redaction_value("mcp:x.token", OLD)
     redact.register_credential_redaction_value("mcp:x.token", NEW)

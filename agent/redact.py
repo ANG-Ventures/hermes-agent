@@ -40,7 +40,8 @@ def _vault_scope() -> str:
 def _redaction_forms(value: str) -> tuple:
     """The value plus the form a text input normalizes it to (CR/LF stripped): that is what the page or a
     flattened tool result holds, so both must be scrubbed."""
-    return (value, value.replace("\r", "").replace("\n", ""))
+    # Empty forms are dropped: an empty string matches every text (a CR/LF-only value, Prism 5d5afe2c8d8e).
+    return tuple(v for v in (value, value.replace("\r", "").replace("\n", "")) if v)
 
 
 def register_vault_redaction_value(value) -> None:
