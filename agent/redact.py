@@ -48,13 +48,18 @@ def register_vault_redaction_value(value) -> None:
         return
     normalized = value.replace("\r", "").replace("\n", "")
     with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
-        for v in (value, normalized):
-            if v:
-                bucket.pop(v, None)  # re-registering refreshes recency
-                bucket[v] = None
-        while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
-            del bucket[next(iter(bucket))]
+        _vault_bucket_add_locked(_vault_scope(), (value, normalized))
+
+
+def _vault_bucket_add_locked(scope: str, values) -> None:
+    """Add ``values`` to the profile's bounded vault bucket. Caller holds ``_VAULT_REDACTION_LOCK``."""
+    bucket = _VAULT_REDACTION_VALUES.setdefault(scope, {})
+    for v in values:
+        if v:
+            bucket.pop(v, None)  # re-registering refreshes recency
+            bucket[v] = None
+    while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
+        del bucket[next(iter(bucket))]
 
 
 def clear_vault_redaction_values() -> None:
@@ -65,7 +70,9 @@ def clear_vault_redaction_values() -> None:
 
 # Long-lived configured credentials (mem0 admin key, MCP live-endpoint token) live outside the bounded
 # vault bucket: transient fills must never evict them, and nothing re-registers them after init.
-# One slot per credential name, so a rotated value replaces its predecessor instead of accumulating.
+# One slot per credential name, so slots never accumulate. A rotated value takes the slot and the
+# displaced one moves to the bounded vault bucket: during a rotation both may still be valid, so the old
+# value stays redacted until ordinary vault eviction instead of leaking the moment the new one registers.
 _CREDENTIAL_REDACTION_VALUES: dict = {}  # profile home → {name: value}
 
 
@@ -74,7 +81,12 @@ def register_credential_redaction_value(name: str, value) -> None:
     if not isinstance(value, str) or not value:
         return
     with _VAULT_REDACTION_LOCK:
-        _CREDENTIAL_REDACTION_VALUES.setdefault(_vault_scope(), {})[name] = value
+        scope = _vault_scope()
+        slots = _CREDENTIAL_REDACTION_VALUES.setdefault(scope, {})
+        displaced = slots.get(name)
+        slots[name] = value
+        if displaced and displaced != value:
+            _vault_bucket_add_locked(scope, (displaced,))
 
 
 def redact_registered_vault_values(text: str) -> str:
