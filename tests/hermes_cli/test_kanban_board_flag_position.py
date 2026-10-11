@@ -68,6 +68,21 @@ def test_conflicting_positions_refused_equal_positions_accepted(home):
     assert "same" in _titles(home / "kanban" / "boards" / "beta" / "kanban.db")
 
 
+@pytest.mark.parametrize("argv", [
+    ("--board", "", "create", "T", "--board", "beta", "--unhomed"),  # empty top vs real verb
+    ("--board", "beta", "create", "T", "--board", "", "--unhomed"),  # real top vs empty verb
+    ("--board", "", "create", "T", "--unhomed"),                     # empty top alone
+    ("create", "T", "--board", "", "--unhomed"),                     # empty verb alone
+])
+def test_empty_board_selector_is_refused_before_any_write(home, argv):
+    # An empty $BOARD in a script must not route a mutation to some other board (Prism P1 2853ced0ea9a).
+    r = _cli(home, *argv)
+    assert r.returncode != 0, r.stdout
+    assert "T" not in _titles(home / "kanban" / "boards" / "beta" / "kanban.db")
+    default_db = home / "kanban.db"
+    assert not default_db.exists() or "T" not in _titles(default_db)
+
+
 def test_boards_show_ignores_verb_position_override(home):
     r = _cli(home, "boards", "show", "--board", "beta")
     assert r.returncode == 0, r.stderr
