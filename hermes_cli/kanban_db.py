@@ -12465,12 +12465,23 @@ def request_review(
     # reviewer="argus" on every card — that IS the mechanism being removed).
     # Only the explicit ``human`` sentinel or force=True (operator) bypasses it.
     _policy = configured_review_policy()
+    _neg_result = None
     if (
         _policy in ("milestone_only", "none")
         and not force
         and not is_human_reviewer(reviewer)
     ):
-        if _policy == "none" or not is_milestone_card(conn, task_id):
+        _skip_review = _policy == "none" or not is_milestone_card(conn, task_id)
+        if _skip_review:
+            # A handoff that itself says its close gate is NOT met / not
+            # proven / FAIL is never completed in place (t_db9ca661): it goes
+            # to the human review lane, where the orchestrator decides.
+            from hermes_cli.kanban_negative_result import negative_result_match
+
+            _neg_result = negative_result_match(summary, metadata)
+            if _neg_result is not None:
+                reviewer = HUMAN_REVIEWER_SENTINEL
+        if _skip_review and _neg_result is None:
             skip_meta = dict(metadata or {})
             skip_meta["review_skipped"] = "policy_none" if _policy == "none" else "non_milestone"
             done = complete_task(
@@ -12516,11 +12527,18 @@ def request_review(
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
     staged_copies: list[Path] = []
     try:
-        return _request_review_txn(
+        result = _request_review_txn(
             conn, task_id, summary=summary, metadata=metadata, reviewer=reviewer,
             expected_run_id=expected_run_id, force=force, allow_same_actor=allow_same_actor,
             now=now, staged_copies=staged_copies, _ret=_ret,
         )
+        if _neg_result is not None and (result[0] if isinstance(result, tuple) else result):
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "review_negative_result",
+                    {"policy": _policy, "match": _neg_result, "reviewer": reviewer},
+                )
+        return result
     except Exception:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
