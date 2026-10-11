@@ -177,6 +177,7 @@ jobs:
       npm_lock: ${{ steps.gate-lanes.outputs.npm_lock }}
       bootstrap: ${{ steps.gate-lanes.outputs.bootstrap }}
       desktop_updater: ${{ steps.gate-lanes.outputs.desktop_updater }}
+      os_tests: ${{ steps.gate-lanes.outputs.os_tests }}
       rust: ${{ steps.gate-lanes.outputs.rust }}
       docker_meta: ${{ steps.gate-lanes.outputs.docker_meta }}
       mcp_catalog: ${{ steps.gate-lanes.outputs.mcp_catalog }}
@@ -218,11 +219,16 @@ jobs:
         # are path-gated on pull_request only. merge_group forces them on, and
         # push has an empty diff (every lane on): a PR run is never the only
         # gate (t_e8c5045e).
+        #
+        # os_tests (the macOS + Windows unit lanes in tests-os.yml) is the same
+        # shape: path-gated on pull_request, forced on for every other event
+        # (t_04d4944a). vars.CI_PR_OS_TESTS=on forces it on PRs too.
         id: gate-lanes
         env:
           RELEASE: ${{ inputs.release }}
           EVENT_NAME: ${{ github.event_name }}
           DESKTOP_JOBS: ${{ vars.CI_DESKTOP_JOBS }}
+          PR_OS_TESTS: ${{ vars.CI_PR_OS_TESTS }}
           CLASSIFIED: ${{ toJSON(steps.classify.outputs) }}
         run: |
           python3 - <<'PY'
@@ -233,6 +239,11 @@ jobs:
               values.update(e2e_upgrade='true', bootstrap='true')
           if not release and os.environ['DESKTOP_JOBS'] != 'on':
               values['desktop'] = 'false'
+          # macOS + Windows unit lanes: path-gated on pull_request only
+          # (t_04d4944a). merge_group and push always run them; rollback:
+          # vars.CI_PR_OS_TESTS=on runs them on every PR again.
+          if os.environ['EVENT_NAME'] != 'pull_request' or os.environ['PR_OS_TESTS'] == 'on':
+              values['os_tests'] = 'true'
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               for lane, value in values.items():
                   if release and value in ('true', 'false'):
@@ -305,8 +316,12 @@ jobs:
     with:
       # The Windows lane spawns the real desktop-update hand-off script
       # (tests/test_desktop_update_windows_*.py) only when that surface
-      # changed; unit-level platforms("windows") tests always run.
+      # changed; unit-level platforms("windows") tests run whenever os_tests is on.
       desktop_updater: ${{ needs.detect.outputs.desktop_updater == 'true' }}
+      # The unit-level macOS/Windows jobs. Off on a PR whose diff does not
+      # touch the host-OS surface (scripts/ci/classify_changes.py::_is_os_tests_path);
+      # always on for merge_group and push.
+      os_tests: ${{ needs.detect.outputs.os_tests == 'true' }}
       e2e: ${{ needs.detect.outputs.e2e == 'true' }}
       e2e_upgrade: ${{ needs.detect.outputs.e2e_upgrade == 'true' }}
 
