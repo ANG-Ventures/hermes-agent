@@ -9,6 +9,7 @@ host it runs on. Tests pass their own ``spawn_fn``.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -680,9 +681,17 @@ def test_count_running_by_placement_reads_one_snapshot(kanban_home, monkeypatch)
     real = kwp.running_by_host
 
     def finish_then_read(conn):
+        # WAL: the write lands but the open read snapshot does not see it.
+        # DELETE journal (a SQLite with the WAL-reset bug, e.g. 3.46 on
+        # ace-media): the snapshot's shared lock refuses the write. Both are
+        # one snapshot; only waiting out the busy timeout would not be.
         with kb.connect_closing() as other:
-            other.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
-            other.commit()
+            other.execute("PRAGMA busy_timeout=50")
+            try:
+                other.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+                other.commit()
+            except sqlite3.OperationalError as exc:
+                assert "locked" in str(exc)
         return real(conn)
 
     monkeypatch.setattr(kwp, "running_by_host", finish_then_read)
