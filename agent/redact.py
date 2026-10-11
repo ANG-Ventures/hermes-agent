@@ -63,13 +63,28 @@ def clear_vault_redaction_values() -> None:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
 
 
+# Long-lived configured credentials (mem0 admin key, MCP live-endpoint token) live outside the bounded
+# vault bucket: transient fills must never evict them, and nothing re-registers them after init.
+# One slot per credential name, so a rotated value replaces its predecessor instead of accumulating.
+_CREDENTIAL_REDACTION_VALUES: dict = {}  # profile home → {name: value}
+
+
+def register_credential_redaction_value(name: str, value) -> None:
+    """Register a long-lived configured credential for model-facing redaction (never evicted by vault fills)."""
+    if not isinstance(value, str) or not value:
+        return
+    with _VAULT_REDACTION_LOCK:
+        _CREDENTIAL_REDACTION_VALUES.setdefault(_vault_scope(), {})[name] = value
+
+
 def redact_registered_vault_values(text: str) -> str:
-    """Exact-substring scrub of every vault secret value registered for the current profile."""
+    """Exact-substring scrub of every vault secret / configured credential registered for the current profile."""
     if not isinstance(text, str) or not text:
         return text
     with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.get(_vault_scope())
-        values = sorted(bucket, key=len, reverse=True) if bucket else ()  # longest first: a substring never shadows its superstring
+        scope = _vault_scope()
+        values = {*(_VAULT_REDACTION_VALUES.get(scope) or ()), *(_CREDENTIAL_REDACTION_VALUES.get(scope) or {}).values()}
+        values = sorted(values, key=len, reverse=True)  # longest first: a substring never shadows its superstring
     for value in values:
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")
