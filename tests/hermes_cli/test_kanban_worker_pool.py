@@ -379,7 +379,7 @@ def test_rc1_linked_card_with_host_any_is_not_placed(kanban_home):
         conn.commit()
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
     assert res.placed == [] and all(tid != child for tid, _ in spawned)
-    assert res.placement_waits[child] == f"not_portable:linked(blocks -> {parent})"
+    assert res.placement_waits[child] == f"not_portable:linked(blocks->{parent})"
 
 
 # -- t_ae87edff: only workspace-sharing link kinds hold a card local ---------
@@ -418,7 +418,7 @@ def test_blocks_child_is_not_portable_and_names_the_link(kanban_home):
         conn.commit()
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (child,)).fetchone()
         assert kbd._route_row(conn, row, _plan(free=2)) == (
-            "local", f"not_portable:linked(blocks -> {parent})")
+            "local", f"not_portable:linked(blocks->{parent})")
 
 
 def test_legacy_null_kind_link_still_holds_local(kanban_home):
@@ -457,7 +457,83 @@ def test_dry_run_prints_the_placement_wait_reason(kanban_home, capsys, monkeypat
                                                max_running=None, failure_limit=2))
     out = capsys.readouterr().out
     assert rc == 0
-    assert f"Held ({child}): not_portable:linked(blocks -> {parent})" in out
+    assert f"Held ({child}): not_portable:linked(blocks->{parent})" in out
+
+
+def _lineage(monkeypatch, mode):
+    from hermes_cli import config as _config
+    monkeypatch.setattr(_config, "load_config_readonly",
+                        lambda: {"kanban": {"placement": {"lineage_pins": mode}}})
+
+
+def _placement_waits(conn, tid):
+    return [json.loads(r[0]) for r in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='placement_wait' ORDER BY id",
+        (tid,))]
+
+
+def test_placement_wait_event_written_once_then_deduplicated(kanban_home, monkeypatch):
+    """Spec t_1cca39e1 (b): {reason, route, host, since}; a repeat within 900 s
+    writes nothing, a dry run writes nothing, an aged repeat keeps ``since``."""
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1, assignee="beta")
+        (child,) = _make(conn, 1, body="host:ace-ai", parents=[parent])
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+        kbd.dispatch_once(conn, dry_run=True, spawn_fn=lambda *a, **k: 1, max_spawn=64,
+                          spawn_limit=0, spawn_paused="t", spillover=_plan(free=2),
+                          reconcile_orphans=False)
+        assert _placement_waits(conn, child) == []
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        (ev,) = _placement_waits(conn, child)
+        assert ev["reason"] == f"not_portable:linked(blocks->{parent})"
+        assert ev["route"] == "wait" and ev["host"] is None and isinstance(ev["since"], int)
+        conn.execute("UPDATE task_events SET created_at = created_at - 901 "
+                     "WHERE task_id=? AND kind='placement_wait'", (child,))
+        conn.commit()
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        evs = _placement_waits(conn, child)
+    assert len(evs) == 2 and evs[1]["since"] == ev["since"]
+
+
+def test_lineage_pins_legacy_is_todays_routing(kanban_home, monkeypatch):
+    """Spec t_1cca39e1 (c): ``legacy`` routes exactly as before t_ae87edff on
+    real card shapes (this card's own pinned body, an umbrella's derived-from
+    children, a blocks chain). Passes on the pre-fix base unchanged."""
+    _lineage(monkeypatch, "legacy")
+    umbrella_body = "origin: discord #ci-runner-box\nFix (hermes-agent, worktree off gh/main, PR)"
+    with kb.connect_closing() as conn:
+        (umb,) = _make(conn, 1, body=umbrella_body)
+        (der_any,) = _make(conn, 1, body="host: any\nproof card", parents=[umb],
+                           parents_kind="derived-from")
+        (der_pin,) = _make(conn, 1, body="host: ace-ai\nbuild", parents=[umb],
+                           parents_kind="derived-from")
+        (der_plain,) = _make(conn, 1, body="no host line", parents=[umb],
+                             parents_kind="derived-from")
+        (blk,) = _make(conn, 1, body="host:ace-ai", parents=[umb])
+        (lone,) = _make(conn, 1, body="host: ace-ai\norigin: no links")
+        conn.execute("UPDATE tasks SET status='ready'")
+        conn.commit()
+        rows = {r["id"]: r for r in conn.execute("SELECT * FROM tasks")}
+        plan = _plan(free=2)
+        got = {t: kbd._route_row(conn, rows[t], plan) for t in rows}
+    assert got == {
+        umb: ("local", None),
+        der_any: ("local", "not_portable:linked"),
+        der_pin: ("wait", "not_portable:linked"),
+        der_plain: ("local", None),
+        blk: ("wait", "not_portable:linked"),
+        lone: ("pin", "ace-ai"),
+    }
+
+
+def test_lineage_pins_default_is_kinds(kanban_home, monkeypatch):
+    _lineage(monkeypatch, "typo")  # unrecognised -> default, never re-pins everything
+    with kb.connect_closing() as conn:
+        _parent, child = _derived(conn, child_body="host: any")
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (child,)).fetchone()
+        assert kbd._route_row(conn, row, _plan(free=2)) == ("portable", None)
 
 
 def test_review_rows_spawn_locally_only(kanban_home, monkeypatch):

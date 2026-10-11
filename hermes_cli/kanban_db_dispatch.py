@@ -3703,19 +3703,18 @@ def _native_command_profile(assignee: str, cache: dict) -> bool:
 _LINK_CHUNK = 250
 
 
-# Link kinds that never imply a shared workspace (t_ae87edff). ``derived-from``
-# is provenance only: it never gates, so the child never waits on, or builds
-# on, the parent's output. ``blocks`` (and NULL, which reads as ``blocks``)
-# gates the child on the parent's handoff, which may sit in the parent's
-# retained local workspace, so both ends stay local. An unknown kind is
-# treated as sharing (fail closed). Literal: ``_kb`` binds at module end.
-_PROVENANCE_LINK_KINDS = frozenset({"derived-from"})  # == kanban_db.LINK_KIND_DERIVED_FROM
+def _linked_ids(conn, ids, mode: Optional[str] = None) -> dict:
+    """``{id: (kind, other_id)}`` for ids among ``ids`` whose links hold them
+    local: ONE query per tick (bounded by the ready set), not one per row.
+    ``other_id`` is the far end of the first such link.
 
-
-def _linked_ids(conn, ids) -> dict:
-    """``{id: (kind, other_id)}`` for ids among ``ids`` with a link whose kind
-    may share a workspace: ONE query per tick (bounded by the ready set), not
-    one per row. ``other_id`` is the far end of the first such link."""
+    ``mode`` is ``kanban.placement.lineage_pins`` (None = read it): ``kinds``
+    skips provenance-only kinds (``derived-from``); ``legacy`` counts every
+    link, as before t_ae87edff. NULL reads as ``blocks``; an unknown kind
+    holds the card (fail closed)."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    if mode is None:
+        mode = _lineage_pins_mode()
     ids = list(ids)
     out: dict = {}
     # Each id is bound twice (parent + child): 250 ids = 500 variables, under
@@ -3732,16 +3731,64 @@ def _linked_ids(conn, ids) -> dict:
                 kind = _kb.normalize_link_kind(r[2])
             except ValueError:
                 kind = str(r[2])
-            if kind in _PROVENANCE_LINK_KINDS:
+            if mode != _pr.LINEAGE_PINS_LEGACY and kind in _pr.PROVENANCE_LINK_KINDS:
                 continue
             out.setdefault(r[0], (kind, r[1]))
             out.setdefault(r[1], (kind, r[0]))
     return out
 
 
+def _lineage_pins_mode() -> str:
+    """``kanban.placement.lineage_pins``, read per tick (default ``kinds``)."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    try:
+        from hermes_cli.config import load_config_readonly
+        kcfg = (load_config_readonly() or {}).get("kanban")
+    except Exception:
+        kcfg = None
+    return _pr.lineage_pins(kcfg)
+
+
+def _record_placement_waits(conn, result, row_route: dict, dry_run: bool) -> None:
+    """One ``placement_wait`` task_event per held ready card {reason, route,
+    host, since}; written only when the reason differs from the card's latest
+    one or that one is older than PLACEMENT_WAIT_REFRESH_SECONDS. Never on a
+    dry run. Best-effort: bookkeeping never fails a tick."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    waits = result.placement_waits or {}
+    if dry_run or not waits:
+        return
+    now = int(time.time())
+    try:
+        with _kb.write_txn(conn):
+            for tid, reason in waits.items():
+                last = conn.execute(
+                    "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
+                    "ORDER BY id DESC LIMIT 1", (tid, _pr.PLACEMENT_WAIT_EVENT),
+                ).fetchone()
+                since = now
+                if last is not None:
+                    try:
+                        prev = json.loads(last[0] or "{}")
+                    except (TypeError, ValueError):
+                        prev = {}
+                    if prev.get("reason") == reason:
+                        if now - int(last[1] or 0) < _pr.PLACEMENT_WAIT_REFRESH_SECONDS:
+                            continue
+                        since = int(prev.get("since") or last[1] or now)
+                route, arg = row_route.get(tid, ("local", None))
+                _kb._append_event(conn, tid, _pr.PLACEMENT_WAIT_EVENT, {
+                    "reason": reason, "route": route,
+                    "host": arg if route == "pin" else None, "since": since,
+                })
+    except Exception:
+        _kb._log.exception("kanban dispatch: could not record placement_wait events")
+
+
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
-               linked_ids: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+               linked_ids: Optional[dict] = None,
+               lineage_mode: Optional[str] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
 
@@ -3754,7 +3801,12 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         skills = json.loads(row["skills"] or "[]") or []
     except (TypeError, ValueError, IndexError, KeyError):
         skills = []
-    link = (linked_ids if linked_ids is not None else _linked_ids(conn, [row["id"]])).get(row["id"])
+    from hermes_cli import kanban_placement_reasons as _pr
+    if lineage_mode is None:
+        lineage_mode = _lineage_pins_mode()
+    if linked_ids is None:
+        linked_ids = _linked_ids(conn, [row["id"]], lineage_mode)
+    link = linked_ids.get(row["id"])
     linked = link is not None
     # An unassigned card is routed as the assignee the loop will give it.
     assignee = row["assignee"] or default_assignee
@@ -3778,13 +3830,13 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         _kwp.note_ignored_pin(row["id"], ignored)
     if ok:
         return ("pin", pin) if route_class == "pin" else ("portable", None)
-    if rule == "linked" and link is not None:
-        rule = f"linked({link[0]} -> {link[1]})"  # name the edge that holds it
+    if rule == _pr.LINKED and link is not None and lineage_mode != _pr.LINEAGE_PINS_LEGACY:
+        rule = _pr.linked(*link)  # name the edge that holds it (t_ae87edff)
     if pin is not None and pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
-        return "wait", f"not_portable:{rule}"
+        return "wait", _pr.not_portable(rule)
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
-    return "local", (f"not_portable:{rule}" if pin == _kwp.PIN_ANY else None)
+    return "local", (_pr.not_portable(rule) if pin == _kwp.PIN_ANY else None)
 
 
 def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optional[str]:
@@ -4295,8 +4347,10 @@ def _dispatch_once_locked(
             spillover = _dc.replace(spillover, slots=dict(spillover.slots))
         _eff_default = (default_assignee or "").strip() or None
         _native: dict = {}
-        _linked = _linked_ids(conn, [r["id"] for r in ready_rows])
-        row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked)
+        _lineage = _lineage_pins_mode()  # kanban.placement.lineage_pins, per tick
+        _linked = _linked_ids(conn, [r["id"] for r in ready_rows], _lineage)
+        row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
+                                         _lineage)
                      for r in ready_rows}
         _rank = {"pin": 0, "wait": 1, "local": 1, "portable": 2}
         ready_rows = sorted(ready_rows, key=lambda r: _rank[row_route[r["id"]][0]])
@@ -5232,6 +5286,7 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
 
     pr_state_resolver.finish_tick(scan_complete=ready_scan_complete)
+    _record_placement_waits(conn, result, row_route, dry_run)
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
