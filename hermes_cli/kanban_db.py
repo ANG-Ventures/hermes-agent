@@ -12601,13 +12601,10 @@ def request_review(
             conn, task_id, summary=summary, metadata=metadata, reviewer=reviewer,
             expected_run_id=expected_run_id, force=force, allow_same_actor=allow_same_actor,
             now=now, staged_copies=staged_copies, _ret=_ret,
+            negative_result=(
+                {"policy": _policy, "match": _neg_result} if _neg_result is not None else None
+            ),
         )
-        if _neg_result is not None and (result[0] if isinstance(result, tuple) else result):
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "review_negative_result",
-                    {"policy": _policy, "match": _neg_result, "reviewer": reviewer},
-                )
         return result
     except Exception:
         if staged_copies:
@@ -12617,10 +12614,12 @@ def request_review(
 
 def _request_review_txn(
     conn: sqlite3.Connection, task_id: str, *, summary, metadata, reviewer, expected_run_id,
-    force, allow_same_actor, now, staged_copies, _ret,
+    force, allow_same_actor, now, staged_copies, _ret, negative_result=None,
 ):
     """The transactional half of :func:`request_review` (artifact staging rides
-    inside the txn; the caller discards staged copies on rollback)."""
+    inside the txn; the caller discards staged copies on rollback).
+    ``negative_result`` ({policy, match}) is recorded in the same txn so a
+    failed audit write rolls the transition back instead of orphaning it."""
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -12771,6 +12770,11 @@ def _request_review_txn(
         if staged:
             payload["artifacts"] = staged
         _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
+        if negative_result is not None:
+            _append_event(
+                conn, task_id, "review_negative_result",
+                {**negative_result, "reviewer": reviewer},
+            )
     return _ret(True)
 
 
