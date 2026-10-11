@@ -204,6 +204,91 @@ def test_deferred_block_parks_scheduled_and_wakes_at_until(kanban_home: Path) ->
         assert kb.claim_task(conn, child, claimer="worker") is not None
 
 
+@pytest.mark.parametrize("status", ["done", "archived", "scheduled", "todo"])
+def test_parentless_dependency_on_unblockable_card_returns_false(kanban_home: Path, status) -> None:
+    """The refusal only fires where a block could land; elsewhere block_task
+    keeps its ``False`` contract instead of raising (Prism 4f545435d98e)."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        assert kb.block_task(conn, tid, reason="x", kind="dependency") is False
+        assert kb.get_task(conn, tid).status == status
+
+
+# Nanosecond epoch: fits SQLite's integer range, overflows time.localtime().
+_UNRENDERABLE_WAKE = 1_781_100_000_000_000_000
+
+
+def test_deferred_block_refuses_unrenderable_wake_before_persisting(kanban_home: Path) -> None:
+    """A wake ``time.localtime`` cannot render is refused before the park,
+    so the card stays running and list/show never meet it (Prism 106d60b244a4)."""
+    with kb.connect_closing() as conn:
+        child = _running_task(conn)
+        with pytest.raises(ValueError):
+            kb.parse_wake_at(str(_UNRENDERABLE_WAKE))
+        with pytest.raises(kb.BlockRefused):
+            kb.block_task(conn, child, reason="x", kind="deferred", until=_UNRENDERABLE_WAKE)
+        task = kb.get_task(conn, child)
+        assert (task.status, task.next_eligible_at) == ("running", None)
+        assert "scheduled" not in [e.kind for e in kb.list_events(conn, child)]
+
+
+def test_schedule_wake_refuses_unrenderable_wake(kanban_home: Path) -> None:
+    """Same class on the ``schedule --at`` writer."""
+    with kb.connect_closing() as conn:
+        child = _running_task(conn)
+        assert kb.schedule_task(conn, child, reason="gate")
+        ok, err = kb.set_schedule_wake(conn, child, wake_at=_UNRENDERABLE_WAKE, actor="t")
+        assert not ok and "representable" in err
+        assert kb.get_task(conn, child).next_eligible_at is None
+
+
+def test_format_deferred_until_survives_a_stored_unrenderable_wake() -> None:
+    """A row written before validation still renders instead of raising."""
+    assert str(_UNRENDERABLE_WAKE) in kb.format_deferred_until(_UNRENDERABLE_WAKE)
+
+
+def _claimed_review(conn) -> str:
+    tid = kb.create_task(conn, title="r", assignee="builder")
+    worker = kb.claim_task(conn, tid)
+    assert worker is not None
+    assert kb.request_review(conn, tid, reviewer="argus", expected_run_id=worker.current_run_id)
+    assert kb.claim_review_task(conn, tid) is not None
+    return tid
+
+
+@pytest.mark.parametrize("park", ["deferred_block", "schedule"])
+def test_parking_a_claimed_review_wakes_back_into_review(kanban_home: Path, park) -> None:
+    """A reviewer that parks on time resumes REVIEW at the wake, never an
+    implementation run under the reviewer (Prism 2eb3a143f7f5)."""
+    with kb.connect_closing() as conn:
+        tid = _claimed_review(conn)
+        run_id = kb.get_task(conn, tid).current_run_id
+        if park == "deferred_block":
+            assert kb.block_task(conn, tid, reason="wait", kind="deferred",
+                                 until=2_000_000_000, expected_run_id=run_id)
+        else:
+            assert kb.schedule_task(conn, tid, reason="wait", expected_run_id=run_id)
+            ok, _ = kb.set_schedule_wake(conn, tid, wake_at=2_000_000_000, actor="t")
+            assert ok
+        parked = [e for e in kb.list_events(conn, tid) if e.kind == "scheduled"][-1].payload
+        assert parked["source_status"] == "review"
+        assert kb.wake_due_scheduled(conn, now=2_000_000_000) == [tid]
+        assert kb.get_task(conn, tid).status == "review"
+
+
+def test_blocked_review_converted_to_deferred_wakes_back_into_review(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _claimed_review(conn)
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert kb.block_task(conn, tid, reason="human", kind="needs_input", expected_run_id=run_id)
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.block_task(conn, tid, reason="time", kind="deferred", until=2_000_000_000)
+        assert kb.wake_due_scheduled(conn, now=2_000_000_000) == [tid]
+        assert kb.get_task(conn, tid).status == "review"
+
+
 def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
     kanban_home: Path, all_assignees_spawnable,
 ) -> None:

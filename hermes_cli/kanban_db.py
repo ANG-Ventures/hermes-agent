@@ -153,28 +153,50 @@ DEPENDENCY_NO_PARENT_REFUSAL = (
 )
 
 
+# Statuses block_task can act on for a dependency kind (the transition guard's
+# running/ready/review, plus blocked for in-place classification).
+_DEPENDENCY_REFUSAL_STATUSES = ("running", "ready", "review", "blocked")
+
+
 class BlockRefused(ValueError):
     """``block_task`` refused the requested kind; the message says what to use instead."""
 
 
+def validate_wake_at(value: int) -> int:
+    """*value* if it renders as a local time, else ValueError. A wake that
+    fits SQLite but not ``time.localtime`` (a nanosecond epoch) would be
+    persisted and then break every list/show of the card."""
+    try:
+        time.localtime(int(value))
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError(f"wake time {value!r} is not a representable epoch-seconds time") from exc
+    return int(value)
+
+
 def parse_wake_at(value: str, *, now: Optional[int] = None) -> int:
     """Wake time -> epoch seconds: epoch digits, ``+<N>[smhd]`` relative to
-    *now*, or ISO-8601 (a naive timestamp is local time). Raises ValueError."""
+    *now*, or ISO-8601 (a naive timestamp is local time). Raises ValueError,
+    including for a time :func:`validate_wake_at` cannot render."""
     value = (value or "").strip()
     if value.isdigit():
-        return int(value)
+        return validate_wake_at(int(value))
     rel = re.fullmatch(r"\+(\d+)([smhd])", value)
     if rel:
         base = int(time.time()) if now is None else int(now)
-        return base + int(rel.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[rel.group(2)]
+        return validate_wake_at(
+            base + int(rel.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[rel.group(2)])
     from datetime import datetime
 
-    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    return validate_wake_at(int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()))
 
 
 def format_deferred_until(until: Optional[int]) -> str:
-    """``⏸ deferred until <local time>``: the one rendering of a deferred park."""
-    when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(int(until))) if until else "?"
+    """``⏸ deferred until <local time>``: the one rendering of a deferred park.
+    A stored wake that cannot render (written before validation) shows raw."""
+    try:
+        when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(int(until))) if until else "?"
+    except (OverflowError, OSError, ValueError):
+        when = f"epoch {until}"
     return f"⏸ deferred until {when}"
 
 
@@ -7917,7 +7939,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         # 'review_reopened' is historical (verb retired); legacy rows still count.
         "'review_reopened', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', "
-        "'infra_unavailable'"
+        "'infra_unavailable', 'scheduled'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -7925,6 +7947,16 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     for key in ("resume_status", "retry_status", "source_status"):
         if payload.get(key) == "review":
             return "review"
+    return "ready"
+
+
+def _resume_phase_for_park(conn: sqlite3.Connection, task_id: str, status: str) -> str:
+    """``review`` or ``ready``: the phase a card parked from *status* resumes in.
+    A running card answers from its claim, a blocked one from its block event."""
+    if status == "running":
+        return _retry_status_for_run(conn, task_id)
+    if status == "blocked":
+        return _resume_status_from_events(conn, task_id)
     return "ready"
 
 
@@ -11699,6 +11731,11 @@ def block_task(
         raise BlockRefused("until only applies to kind 'deferred'")
     if kind == "deferred" and until is None:
         raise BlockRefused("kind 'deferred' needs until (--until <ISO|+6h>): the wake time")
+    if until is not None:
+        try:
+            until = validate_wake_at(until)
+        except ValueError as exc:
+            raise BlockRefused(str(exc)) from None
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -11707,13 +11744,19 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
+        # Refuse only where a block could have landed; a done/archived/
+        # scheduled/todo card keeps the plain ``False`` every caller handles.
+        if (kind == "dependency" and cur_row["status"] in _DEPENDENCY_REFUSAL_STATUSES
+                and _parents_satisfied(conn, task_id)):
             raise BlockRefused(DEPENDENCY_NO_PARENT_REFUSAL)
         if kind == "deferred":
             # Same transition as schedule_task + set_schedule_wake in one step, so
             # the dispatcher's wake_due_scheduled owns the wake. No ``blocked``
             # event and no ``kanban_task_blocked`` hook: a time park is not a
-            # human question, and every pager keys on those.
+            # human question, and every pager keys on those. The phase to
+            # resume is read before the run ends: a claimed reviewer or a
+            # blocked review card must wake back into review.
+            parked_from = _resume_phase_for_park(conn, task_id, cur_row["status"])
             sql = (
                 "UPDATE tasks SET status = 'scheduled', claim_lock = NULL, claim_expires = NULL, "
                 "worker_pid = NULL, block_kind = 'deferred', next_eligible_at = ? "
@@ -11731,7 +11774,7 @@ def block_task(
             )
             _append_event(conn, task_id, "scheduled", {
                 "reason": reason, "kind": "deferred", "until": int(until),
-                "source_status": cur_row["status"],
+                "source_status": parked_from,
             }, run_id=run_id)
             return True
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
@@ -13606,7 +13649,7 @@ def unblock_task(
     with write_txn(conn):
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
+            if _task_status(conn, task_id) in ("blocked", "scheduled")
             else "ready"
         )
         _reclaim_dangling_run(
@@ -15005,6 +15048,8 @@ def schedule_task(
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
     with write_txn(conn):
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        parked_from = _resume_phase_for_park(conn, task_id, row["status"]) if row else "ready"
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -15026,7 +15071,8 @@ def schedule_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        _append_event(conn, task_id, "scheduled",
+                      {"reason": reason, "source_status": parked_from}, run_id=run_id)
         return True
 
 # Scheduled cards with no timed wake (``next_eligible_at IS NULL``) wait on a
@@ -15066,6 +15112,10 @@ def set_schedule_wake(
                 f"task {task_id} is {row['status']!r}; a wake time only "
                 f"applies to 'scheduled' tasks"
             )
+        try:
+            wake_at = validate_wake_at(wake_at)
+        except ValueError as exc:
+            return False, str(exc)
         cur = conn.execute(
             "UPDATE tasks SET next_eligible_at = ? "
             "WHERE id = ? AND status = 'scheduled'",

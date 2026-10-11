@@ -336,7 +336,13 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert kb.claim_task(conn, t) is None
 
         events = kb.list_events(conn, t)
-        assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
+        # source_status is the phase unblock_task resumes into (t_7e2b7beb):
+        # a plain park of a ready card resumes as an implementation run.
+        assert any(
+            e.kind == "scheduled"
+            and e.payload == {"reason": "run next week", "source_status": "ready"}
+            for e in events
+        )
 
 
 def test_stale_claim_reclaim_event_records_diagnostic_payload(
