@@ -28,7 +28,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from agent.secret_scope import UnscopedSecretError, get_secret
@@ -220,11 +220,14 @@ class _DirectRestMem0Client:
     """Small stdlib client for the self-hosted OSS Mem0 server."""
 
     def __init__(self, host: str, admin_api_key: str, agent_id: str, user_id: str = "",
-                 ca_bundle: str = ""):
+                 ca_bundle: str = "", key_refresh: Optional[Callable[[], Optional[str]]] = None):
         self._host = (host or "").strip().rstrip("/")
         self._admin_api_key = (admin_api_key or "").strip()
         self._agent_id = (agent_id or "").strip()
         self._user_id = (user_id or "").strip()
+        # Called on an HTTP 401. Returns a NEW admin key when the owner re-read one from a
+        # rotated mem0.json (the request is retried once with it), or None (401 surfaces as-is).
+        self._key_refresh = key_refresh
         # Optional CA bundle for verifying a self-hosted HTTPS endpoint signed by a
         # private CA (e.g. the LAN "Ace Local Root CA" in front of mem0.ace). urllib
         # uses the system trust store by default, which fleet hosts don't carry the
@@ -263,6 +266,38 @@ class _DirectRestMem0Client:
 
     def _request(self, method: str, path: str, *, body: Optional[dict] = None,
                  params: Optional[dict] = None) -> Any:
+        sent_key = self._admin_api_key
+        try:
+            return self._request_once(method, path, body=body, params=params)
+        except urllib.error.HTTPError as e:
+            if e.code != 401 or self._key_refresh is None:
+                raise self._http_error(method, path, e) from e
+            # A rotated key: the owner re-reads mem0.json ONLY if the file changed since the
+            # key was loaded. Exactly one retry; a second 401 surfaces as today (no loop).
+            new_key = self._key_refresh()
+            if not new_key or new_key == sent_key:
+                raise self._http_error(method, path, e) from e
+            logger.warning("mem0: HTTP 401 and mem0.json changed since init; retrying once with the re-read admin key")
+            self._admin_api_key = new_key
+            try:
+                return self._request_once(method, path, body=body, params=params)
+            except urllib.error.HTTPError as e2:
+                raise self._http_error(method, path, e2) from e2
+
+    @staticmethod
+    def _http_error(method: str, path: str, e: urllib.error.HTTPError) -> RuntimeError:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        suffix = f": {detail}" if detail else ""
+        return RuntimeError(
+            f"Mem0 self-host REST {method} {path} failed: HTTP {e.code} {e.reason}{suffix}"
+        )
+
+    def _request_once(self, method: str, path: str, *, body: Optional[dict] = None,
+                      params: Optional[dict] = None) -> Any:
         clean_params = {k: v for k, v in (params or {}).items()
                         if v is not None and v != ""}
         query = urllib.parse.urlencode(clean_params)
@@ -283,17 +318,9 @@ class _DirectRestMem0Client:
         try:
             with urllib.request.urlopen(req, timeout=30, context=self._ssl_context) as resp:
                 raw = resp.read()
-        except urllib.error.HTTPError as e:
-            detail = ""
-            try:
-                detail = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            suffix = f": {detail}" if detail else ""
-            raise RuntimeError(
-                f"Mem0 self-host REST {method} {path} failed: HTTP {e.code} {e.reason}{suffix}"
-            ) from e
         except urllib.error.URLError as e:
+            if isinstance(e, urllib.error.HTTPError):
+                raise
             raise RuntimeError(
                 f"Mem0 self-host REST {method} {path} failed: {e.reason}"
             ) from e
@@ -554,6 +581,8 @@ class Mem0MemoryProvider(MemoryProvider):
         self._api_key = ""
         self._host = ""
         self._admin_api_key = ""
+        self._admin_key_mtime = 0.0
+        self._admin_key_path = None
         self._ca_bundle = ""
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
@@ -641,7 +670,7 @@ class Mem0MemoryProvider(MemoryProvider):
             if self._host:
                 self._client = _DirectRestMem0Client(
                     self._host, self._admin_api_key, self._agent_id, self._user_id,
-                    ca_bundle=self._ca_bundle,
+                    ca_bundle=self._ca_bundle, key_refresh=self._reread_admin_key_if_rotated,
                 )
                 return self._client
             try:
@@ -673,6 +702,48 @@ class Mem0MemoryProvider(MemoryProvider):
                 return self._client
             except ImportError:
                 raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
+
+    def _reread_admin_key_if_rotated(self) -> Optional[str]:
+        """401 hook for the self-host client: re-stat mem0.json and, ONLY if its mtime moved since
+        the admin key was loaded, re-read the key once. Returns the new key (the client retries the
+        same call with it) or None (the 401 surfaces as-is). The host is constant by design, so the
+        key is the one cached value a rotation changes. A rotation rewrites every file on disk but a
+        live gateway kept the init-time key until restart (measured 2026-10-11, t_b8e2170c)."""
+        cfg_path = self._admin_key_path
+        if cfg_path is None:
+            return None
+        try:
+            mtime = cfg_path.stat().st_mtime
+            if mtime == self._admin_key_mtime:
+                # Unchanged file: no re-read. Hand back the provider's current key so a thread that
+                # raced a sibling's successful re-read still picks up the rotated key (the client
+                # skips the retry when it equals the key it just sent).
+                return self._admin_api_key or None
+            self._admin_key_mtime = mtime
+            file_cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+            new_key = str(file_cfg.get("admin_api_key") or "").strip()
+            file_host = str(file_cfg.get("host") or "").strip().rstrip("/")
+        except Exception:
+            return None
+        if not new_key or new_key == self._admin_api_key:
+            return None
+        if file_host != self._host:
+            # The file now names a different server: its key belongs to THAT host. Never send
+            # it to the endpoint this provider is still bound to; the 401 surfaces as-is.
+            logger.warning("mem0: mem0.json host changed (%s -> %s); not re-reading the admin key "
+                           "for the live endpoint, restart to switch hosts", self._host, file_host)
+            return None
+        self._admin_api_key = new_key
+        from agent.redact import register_credential_redaction_value
+        register_credential_redaction_value("mem0.admin_api_key", new_key)
+        return new_key
+
+    def _admin_key_file_mtime(self) -> float:
+        """mtime of the pinned mem0.json at the moment the admin key was loaded (0.0 = no file)."""
+        try:
+            return self._admin_key_path.stat().st_mtime
+        except (OSError, AttributeError):
+            return 0.0
 
     def _is_breaker_open(self) -> bool:
         """Return True if the circuit breaker is tripped (too many failures).
@@ -1146,6 +1217,14 @@ class Mem0MemoryProvider(MemoryProvider):
         return "unknown"
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        # Pin the file the key is loaded from, under the caller-bound profile scope of THIS
+        # initialize(): a 401 re-read must come from the same profile's mem0.json, never from
+        # whatever home a later call (prefetch thread, another profile's turn) resolves to.
+        # Stat BEFORE the read: a rotation landing between the two would otherwise be
+        # snapshotted as already-seen and the 401 re-read would skip it.
+        from hermes_constants import get_hermes_home
+        self._admin_key_path = get_hermes_home() / "mem0.json"
+        self._admin_key_mtime = self._admin_key_file_mtime()
         self._config = _load_config()
         self._api_key = self._config.get("api_key", "")
         self._host = str(self._config.get("host", "") or "").strip().rstrip("/")
