@@ -92,7 +92,7 @@ class LiveEndpointUnavailable(ConnectionError):
 
 
 def _live_endpoint(server_name: str) -> Optional[tuple[str, dict]]:
-    from agent.redact import register_vault_redaction_value
+    from agent.redact import register_credential_redaction_value
     from hermes_platform import declaration
     from hermes_platform.host import facts
     from hermes_platform.resolver.app import AppResolver
@@ -107,7 +107,7 @@ def _live_endpoint(server_name: str) -> Optional[tuple[str, dict]]:
     if endpoint is None:
         raise LiveEndpointUnavailable(f"MCP server '{server_name}' has no usable live endpoint")
     if endpoint.token:
-        register_vault_redaction_value(endpoint.token)
+        register_credential_redaction_value(f"mcp:{server_name}.token", endpoint.token)
     headers = {"Authorization": f"Bearer {endpoint.token}"} if endpoint.token else {}
     return endpoint.url, headers
 

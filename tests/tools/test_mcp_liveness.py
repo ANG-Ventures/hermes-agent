@@ -62,7 +62,7 @@ def test_live_endpoint_reloads_file_and_registers_token_before_use(tmp_path, mon
     }
     monkeypatch.setattr(agent_plugins, "liveness_for", lambda name: raw, raising=False)
     calls = []
-    monkeypatch.setattr(redact, "register_vault_redaction_value", calls.append)
+    monkeypatch.setattr(redact, "register_credential_redaction_value", lambda name, value: calls.append(value))
     caplog.set_level(logging.DEBUG)
     try:
         runtime.write_text(json.dumps({"http": "http://127.0.0.1:1111", "token": "first-secret", "pid": os.getpid()}))
@@ -89,7 +89,7 @@ def test_runtime_file_without_token_connects_without_authorization(tmp_path, mon
         "fields": {"url": "http", "token": "token", "pid": "pid"},
     }, raising=False)
     calls = []
-    monkeypatch.setattr(redact, "register_vault_redaction_value", calls.append)
+    monkeypatch.setattr(redact, "register_credential_redaction_value", lambda name, value: calls.append(value))
     try:
         runtime.write_text(json.dumps({"http": "http://127.0.0.1:3333", "pid": os.getpid()}))
         result = _live_endpoint("example-server")
