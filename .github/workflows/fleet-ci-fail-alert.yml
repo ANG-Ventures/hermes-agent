@@ -43,6 +43,7 @@ jobs:
     timeout-minutes: 8
     outputs:
       runs: ${{ steps.find.outputs.runs }}
+      backlog: ${{ steps.find.outputs.backlog }}
       default_branch: ${{ steps.find.outputs.default_branch }}
     steps:
       - name: Find the watched workflows' unnotified red runs
@@ -109,7 +110,7 @@ jobs:
             local p=1 acc='[]' resp n
             while :; do
               resp="$(api "$1&per_page=100&page=$p")" || return 1
-              n="$(jq -e '.workflow_runs | length' <<< "$resp")" || return 1
+              n="$(jq '.workflow_runs | length' <<< "$resp")" && [[ "$n" =~ ^[0-9]+$ ]] || return 1
               acc="$(printf '%s\n%s' "$acc" "$resp" | jq -cs '.[0] + .[1].workflow_runs')" || return 1
               [ "$n" -lt 100 ] && break
               [ "$p" -lt 10 ] || return 1
@@ -140,17 +141,21 @@ jobs:
                | select(.event != "pull_request" and .event != "pull_request_target")
                | select(.head_branch != "ci-overflow-ledger")
                | select($listener == "" or .updated_at > $listener)
-               | {id, key: "\(.id)#\(.run_attempt // 1)", created_at, updated_at}]
+               | {id, attempt: (.run_attempt // 1), key: "\(.id)#\(.run_attempt // 1)", created_at, updated_at}]
             | unique_by(.key) | sort_by(.created_at)' <<< "$REDS")"
           DONE='[]'
           if [ "$CANDS" != "[]" ]; then
             OLDEST="$(jq -r 'map(.updated_at) | min' <<< "$CANDS")"
             for sid in $(jq -r --argjson me "$GITHUB_RUN_ID" --arg o "$OLDEST" '.[] | select(.id != $me and .created_at >= $o) | .id' <<< "$SWEEPS"); do
-              got="$(api "actions/runs/$sid/jobs?per_page=100" | jq -c '[.jobs[] | select(.conclusion == "success") | .name | capture("^notify (?<k>[0-9]+#[0-9]+)$").k]')"
+              got="$(api "actions/runs/$sid/jobs?per_page=100" | jq -c '[.jobs[] | select(.conclusion == "success") | .name | select(test("^notify [0-9]+#[0-9]+$")) | capture("^notify (?<k>[0-9]+#[0-9]+)$").k]')"
               DONE="$(jq -c --argjson g "$got" '. + $g' <<< "$DONE")"
             done
           fi
-          RUNS="$(jq -c --argjson seen "$DONE" '[.[] | select(.key as $k | $seen | index($k) | not) | {id, key}][:20]' <<< "$CANDS")"
+          PENDING="$(jq -c --argjson seen "$DONE" '[.[] | select(.key as $k | $seen | index($k) | not) | {id, attempt, key}]' <<< "$CANDS")"
+          # A matrix holds 256 legs. Past 200 the rest wait for the next sweep, and the `backlog` job fails
+          # this run so it is not a checkpoint (LAST_OK) until the backlog drains (Prism P1 c19edca1c071).
+          RUNS="$(jq -c '.[:200]' <<< "$PENDING")"
+          echo "backlog=$(( $(jq length <<< "$PENDING") - $(jq length <<< "$RUNS") ))" | tee -a "$GITHUB_OUTPUT"
           echo "sweep since $(iso "$SINCE"): $(jq length <<< "$CANDS") red run(s) of the watched workflows, $(jq length <<< "$DONE") already notified"
           echo "runs=$RUNS" | tee -a "$GITHUB_OUTPUT"
           echo "default_branch=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO" | jq -er .default_branch)" | tee -a "$GITHUB_OUTPUT"
@@ -180,6 +185,17 @@ jobs:
           sig="$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$CI_FAIL_WEBHOOK_SECRET" | sed 's/^.* //')"
           curl -fsS -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -H "X-GitHub-Event: ci_failure" \
             -H "X-GitHub-Delivery: ci-fail-sweep-$GITHUB_RUN_ID" -H "X-Webhook-Signature: $sig" --data "$body"
+
+  backlog:
+    needs: sweep
+    if: ${{ needs.sweep.outputs.backlog != '' && needs.sweep.outputs.backlog != '0' }}
+    name: backlog
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "::error::${{ needs.sweep.outputs.backlog }} red run(s) wait for the next sweep; this run is not a checkpoint"
+          exit 1
 
   notify-on-failure:
     needs: sweep
@@ -232,6 +248,9 @@ jobs:
           # The sweep's red (or the replayed run): fetched below from the API, which returns
           # the same run object schema the workflow_run payload had.
           REPLAY_RUN_ID: ${{ matrix.run.id }}
+          # The attempt the sweep selected (Prism P1 5cef09601c08): a re-run started since must not
+          # replace it. Empty for a replay = the latest attempt.
+          REPLAY_ATTEMPT: ${{ matrix.run.attempt }}
           RUN_JSON: ""
           KNOWN_RED: |
             Install & Update E2E|t_bab6df79
@@ -240,11 +259,11 @@ jobs:
           if [ -z "${RUN_JSON:-}" ]; then
             RUN_JSON="$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/actions/runs/$REPLAY_RUN_ID")" || {
+              "https://api.github.com/repos/$REPO/actions/runs/$REPLAY_RUN_ID${REPLAY_ATTEMPT:+/attempts/$REPLAY_ATTEMPT}")" || {
               echo "::error::cannot fetch run $REPLAY_RUN_ID for replay" >&2; exit 1; }
           fi
           f() { jq -r "$1 // \"\"" <<< "$RUN_JSON"; }
-          WF_NAME="$(f .name)"; WF_ID="$(f .workflow_id)"; WF_RUN_ID="$(f .id)"
+          WF_NAME="$(f .name)"; WF_ID="$(f .workflow_id)"; WF_RUN_ID="$(f .id)"; WF_ATTEMPT="$(f .run_attempt)"
           WF_BRANCH="$(f .head_branch)"; WF_SHA="$(f .head_sha)"
           WF_CONCLUSION="$(f .conclusion)"; WF_URL="$(f .html_url)"
           WF_ACTOR="$(f .actor.login)"; WF_EVENT="$(f .event)"
@@ -353,9 +372,12 @@ jobs:
             [ -n "${JOBS_CACHE:-}" ] && [ -s "$JOBS_CACHE/$1" ] && { cat "$JOBS_CACHE/$1"; return 0; }
             # A run can carry > 100 jobs. One page would drop a failed job (missed page) or a job
             # that passed (main looks still red): Prism P1 30c28a402d93 / 8adcbc19fb8b, 2026-10-04.
-            local page=1 resp total acc='[]'
+            local page=1 resp total acc='[]' jpath
             while :; do
-              resp="$(api "actions/runs/$1/jobs?filter=latest&per_page=100&page=$page")" || return 1
+              # This run: the jobs of the attempt the run object names, not the latest (Prism P1 5cef09601c08).
+              if [ "$1" = "$WF_RUN_ID" ] && [ -n "${WF_ATTEMPT:-}" ]; then jpath="actions/runs/$1/attempts/$WF_ATTEMPT/jobs?per_page=100&page=$page"
+              else jpath="actions/runs/$1/jobs?filter=latest&per_page=100&page=$page"; fi
+              resp="$(api "$jpath")" || return 1
               total="$(jq -er '.total_count | numbers' <<< "$resp")" || return 1
               # Accumulator on stdin, not argv: one 100-job page is ~240 KB, over Linux's 128 KiB
               # per-argument limit (Prism P2, run 37243401496 measured 244 KB).

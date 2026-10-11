@@ -1842,3 +1842,28 @@ def test_sweep_outage_page_keys_on_the_previous_page_step_not_the_run_conclusion
     proc, posted = _outage_page(tmp_path, jobs)
     assert proc.returncode == 0, proc.stderr
     assert posted is pages, proc.stdout
+
+
+# --- Prism round 1, second batch (P1 c19edca1c071, 5cef09601c08, 1b495ac027fb, 9ee78fb842f6) ----------
+def test_backlog_past_the_matrix_cap_holds_the_checkpoint(tmp_path):
+    evs = ["push"] * 99 + ["schedule"] * 99 + ["workflow_dispatch"] * 7  # fake list does not paginate past 100
+    reds = [_red_run(1000 + i, event=ev, age=600 + i) for i, ev in enumerate(evs)]
+    proc, runs, got = _sweep(tmp_path, reds)
+    assert proc.returncode == 0, proc.stderr
+    assert len(runs) == 200 and got["backlog"] == "5", (len(runs), got.get("backlog"))
+    backlog = _workflow()["jobs"]["backlog"]
+    assert backlog["needs"] == "sweep" and "exit 1" in backlog["steps"][0]["run"]
+
+
+def test_sweep_legs_carry_the_selected_attempt(tmp_path):
+    _, runs, got = _sweep(tmp_path, [_red_run(11, age=200, attempt=3)])
+    assert runs == [{"id": 11, "attempt": 3, "key": "11#3"}] and got["backlog"] == "0", runs
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "REPLAY_ATTEMPT: ${{ matrix.run.attempt }}" in text and "/attempts/$WF_ATTEMPT/jobs" in text
+
+
+def test_dedupe_ignores_non_notify_jobs_and_empty_lists(tmp_path):
+    prior = {"id": 801, "conclusion": "success", "created_at": _iso(SWEEP_NOW - 120)}
+    proc, runs, _ = _sweep(tmp_path, [_red_run(11, age=200)], sweeps=[prior],
+                           sweep_jobs={801: [("sweep", "success"), ("backlog", "success")]})
+    assert proc.returncode == 0 and [r["key"] for r in runs] == ["11#1"], (proc.stderr, runs)
