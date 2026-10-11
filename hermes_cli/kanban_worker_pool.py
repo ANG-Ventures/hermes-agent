@@ -82,6 +82,12 @@ HOST_PIN_RE = re.compile(r"^[ \t]*host:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*\
                          re.IGNORECASE | re.MULTILINE)
 PIN_ANY = "any"
 PIN_STUDIO = "studio"
+STUDIO_HOST = "mac-studio"
+
+# Card-body signals that the work needs the Studio's signed-in browser or GUI
+# session (card t_3e6c9b2b; incident t_79436ebf placed a ":9222/:9224 on the
+# Studio" card on ace-media). Loopback CDP ports, the word CDP, peekaboo.
+STUDIO_BODY_RE = re.compile(r":922\d\b|\bCDP\b|signed-in browser|\bpeekaboo\b", re.IGNORECASE)
 IGNORED_PIN_WARN_SECONDS = 300
 
 _log = logging.getLogger(__name__)
@@ -479,7 +485,8 @@ def known_host_ids(fleet_dir: Path) -> Tuple[str, ...]:
 
 def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_content: bool,
              assignee: Optional[str], body: Optional[str], skills: Iterable[str] = (),
-             pool, native_command: bool = False) -> Tuple[bool, Optional[str], Optional[str]]:
+             pool, native_command: bool = False,
+             manifest: Optional[Mapping[str, str]] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
 
@@ -487,7 +494,9 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     assignee whose profile is not a native-command lane) is required for every
     remote placement; a pin only picks the
     route and never overrides it (RC-1). ``pool`` needs ``profiles``,
-    ``studio_bound_skills`` and ``hosts`` (known host ids).
+    ``studio_bound_skills`` and ``hosts`` (known host ids). An unpinned card
+    whose work is bound to the Studio (:func:`studio_affinity`) is not
+    portable; ``manifest`` carries the skill-manifest half of that check.
     """
     if (workspace_kind or "scratch") != "scratch":
         return False, "workspace_kind", None
@@ -520,9 +529,9 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
         # A KNOWN pool host: a remote pin. A disabled one waits at take()
         # and never falls back to a local spawn. An unknown word is no pin.
         return True, None, "pin"
-    bound = set(pool.studio_bound_skills or ())
-    if any(s in bound for s in (skills or ())):
-        return False, "studio_bound_skill", None
+    affinity = studio_affinity(body, skills, pool, manifest=manifest)
+    if affinity is not None:
+        return False, affinity[0], None
     return True, None, "policy"
 
 
@@ -542,6 +551,32 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool) -> 
     if not bound:
         return None
     return reaching_hosts(getattr(pool, "reach", {}) or {}, targets, aliases)
+
+
+def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
+                    manifest: Optional[Mapping[str, str]] = None) -> Optional[Tuple[str, str]]:
+    """``(rule, matched_by)`` when the card's WORK is bound to the Studio's state
+    (signed-in browsers, Messages.app, a macOS GUI session), else None.
+
+    Three sources, first hit wins: the pool sidecar's ``studio_bound_skills``
+    (rule ``studio_bound_skill``), a skill manifest that declares the binding
+    (``manifest``: ``{skill: why}`` from :mod:`kanban_host_affinity`; rule
+    ``studio_manifest``), and the card body (rule ``studio_body``). An explicit
+    ``host:`` pin is decided before this and wins.
+    """
+    names = [s for s in (skills or ()) if isinstance(s, str)]
+    bound = set(pool.studio_bound_skills or ())
+    for s in names:
+        if s in bound:
+            return "studio_bound_skill", f"skill:{s}"
+    for s in names:
+        why = (manifest or {}).get(s)
+        if why:
+            return "studio_manifest", f"skill:{s} ({why})"
+    m = STUDIO_BODY_RE.search(body or "")
+    if m:
+        return "studio_body", f"body:{m.group(0)}"
+    return None
 
 
 # -- probe + plan -----------------------------------------------------------

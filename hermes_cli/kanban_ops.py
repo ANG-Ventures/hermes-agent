@@ -327,6 +327,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (lane, route) in res.expired_lane_models or []
             ],
             "spawned_unwatched": spawned_unwatched,
+            "placement_affinity": getattr(res, "placement_affinity", None) or {},
+            "placement_waits": getattr(res, "placement_waits", None) or {},
             "skipped_unassigned": res.skipped_unassigned,
             "flagship_refused": res.flagship_refused,
             "skipped_nonspawnable": res.skipped_nonspawnable,
@@ -479,6 +481,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
     for tid, who, current in res.skipped_per_profile_capped:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
+    for tid, aff in (getattr(res, "placement_affinity", None) or {}).items():
+        wait = (res.placement_waits or {}).get(tid)
+        print(
+            f"Placement affinity: {tid} -> {aff.get('host')} ({aff.get('matched_by')})"
+            + (f"; waits {wait}, never spills" if wait else "")
+        )
     for tid, reason in res.respawn_guarded:
         print(
             f"Deferred (respawn guard {reason}): {tid}"

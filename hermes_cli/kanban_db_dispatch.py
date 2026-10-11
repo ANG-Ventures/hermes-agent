@@ -294,7 +294,11 @@ class DispatchResult:
     books local spawns as ``len(spawned) - len(placed)``."""
     placement_waits: dict = field(default_factory=dict)
     """task id -> why a ready card was not spawned anywhere this tick
-    (``local_full``, ``pool_full``, ``pin_*``, ``not_portable:<rule>``)."""
+    (``local_full``, ``pool_full``, ``pin_*``, ``not_portable:<rule>``,
+    ``studio_affinity:<rule>``)."""
+    placement_affinity: dict = field(default_factory=dict)
+    """task id -> ``{host, rule, matched_by}`` for ready cards whose work is
+    bound to one host's state (t_3e6c9b2b): they run there or wait, never spill."""
     spawn_paused: Optional[str] = None
     """Non-None when this tick RECLAIMED but deliberately spawned nothing —
     the gateway's load gate (``kanban.dispatch_load_gate``) held the host was
@@ -3724,7 +3728,8 @@ def _linked_ids(conn, ids) -> set:
 
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
-               linked_ids: Optional[set] = None) -> "tuple[str, Optional[str]]":
+               linked_ids: Optional[set] = None,
+               affinity_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
 
@@ -3753,13 +3758,15 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     # rule would admit pays for it (non-scratch, linked or non-allowlisted
     # rows can never place; a non-allowlisted one reports ``profile``).
     scan = (row["workspace_kind"] or "scratch") == "scratch" and not linked and allowlisted
+    skills = tuple(s for s in skills if isinstance(s, str))
+    manifest = _manifest_affinity(skills, assignee) if allowlisted and skills else {}
     ok, rule, route_class = _kwp.portable(
         workspace_kind=row["workspace_kind"], has_links=linked,
         workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
                                if scan else False),
         assignee=assignee, body=row["body"],
-        skills=tuple(s for s in skills if isinstance(s, str)), pool=plan.config,
-        native_command=native,
+        skills=skills, pool=plan.config,
+        native_command=native, manifest=manifest,
     )
     pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or ())
     if ignored is not None:
@@ -3774,9 +3781,81 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                       row["id"], getattr(plan.config, "reach_status", "absent"))
     if pin is not None and pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
         return "wait", f"not_portable:{rule}"
+    if rule in _STUDIO_AFFINITY_RULES:
+        # Work bound to the Studio's state (t_3e6c9b2b): runs here or waits,
+        # named, never spills. ``portable()`` only reaches these rules when
+        # no explicit pin decided the route.
+        hit = _kwp.studio_affinity(row["body"], skills, plan.config, manifest=manifest)
+        if affinity_out is not None:
+            affinity_out[row["id"]] = {"host": _kwp.STUDIO_HOST, "rule": rule,
+                                       "matched_by": hit[1] if hit else rule}
+        return "local", f"studio_affinity:{rule}"
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
     return "local", (f"not_portable:{rule}" if pin == _kwp.PIN_ANY else None)
+
+
+_STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body"})
+
+
+def _manifest_affinity(skills, assignee) -> dict:
+    """``{skill: why}`` from the skills' own manifests; fails open to ``{}``."""
+    try:
+        from hermes_cli.kanban_host_affinity import manifest_affinity
+        return manifest_affinity(skills, assignee)
+    except Exception:
+        _kb._log.debug("kanban host affinity: manifest lookup failed open", exc_info=True)
+        return {}
+
+
+def _studio_affinity_unplanned(conn, rows, default_assignee, result) -> None:
+    """Dry-run view with no pool plan: which ready cards ARE Studio-bound, so
+    ``kanban dispatch --dry-run`` shows the binding before a spill ever happens."""
+    from hermes_cli import kanban_worker_pool as _kwp
+    try:
+        cfg = _kwp.read_pool(_kb.kanban_home() / "fleet")
+    except Exception:
+        cfg = _kwp.PoolConfig()
+    for r in rows:
+        try:
+            skills = tuple(s for s in (json.loads(r["skills"] or "[]") or []) if isinstance(s, str))
+        except (TypeError, ValueError):
+            skills = ()
+        if _kwp.card_pin(r["body"]) is not None:
+            continue
+        assignee = r["assignee"] or default_assignee
+        manifest = _manifest_affinity(skills, assignee) if skills and assignee else {}
+        hit = _kwp.studio_affinity(r["body"], skills, cfg, manifest=manifest)
+        if hit is not None:
+            result.placement_affinity[r["id"]] = {
+                "host": _kwp.STUDIO_HOST, "rule": hit[0], "matched_by": hit[1]}
+
+
+def _record_affinity_events(conn, result, dry_run: bool) -> None:
+    """``placement_affinity`` once per binding and ``placement_wait`` on each
+    change of wait reason, per bound card (t_3e6c9b2b). Never in a dry run."""
+    if dry_run or not result.placement_affinity:
+        return
+    try:
+        with _kbc.write_txn(conn):
+            for tid, aff in result.placement_affinity.items():
+                last = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+                    "ORDER BY id DESC LIMIT 1", (tid, "placement_affinity")).fetchone()
+                if last is None or json.loads(last[0] or "{}") != aff:
+                    _kb._append_event(conn, tid, "placement_affinity", dict(aff))
+                reason = result.placement_waits.get(tid)
+                if reason is None:
+                    continue
+                payload = {"host": aff["host"], "reason": reason, "matched_by": aff["matched_by"]}
+                last = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+                    "ORDER BY id DESC LIMIT 1", (tid, "placement_wait")).fetchone()
+                if last is None or json.loads(last[0] or "{}") != payload:
+                    _kb._append_event(conn, tid, "placement_wait", payload)
+    except Exception:
+        _kb._log.warning("kanban dispatch: could not record placement affinity events",
+                         exc_info=True)
 
 
 def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optional[str]:
@@ -4288,7 +4367,8 @@ def _dispatch_once_locked(
         _eff_default = (default_assignee or "").strip() or None
         _native: dict = {}
         _linked = _linked_ids(conn, [r["id"] for r in ready_rows])
-        row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked)
+        row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
+                                         result.placement_affinity)
                      for r in ready_rows}
         _rank = {"pin": 0, "wait": 1, "local": 1, "portable": 2}
         ready_rows = sorted(ready_rows, key=lambda r: _rank[row_route[r["id"]][0]])
@@ -4312,6 +4392,9 @@ def _dispatch_once_locked(
             # BOTH, and the pin must still wait (Prism 56085b64).
             if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
                 row_route[r["id"]] = ("wait", "pool_unavailable")
+        if dry_run:
+            _studio_affinity_unplanned(
+                conn, ready_rows, (default_assignee or "").strip() or None, result)
         _unplanned = sum(1 for v in row_route.values() if v == ("wait", "pool_unavailable"))
         if _unplanned:
             # The pool is planned by the GATEWAY tick only (KWLB v0.1); the
@@ -4838,7 +4921,7 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     ready_scan_complete = bool(ready_rows)
-    for row in ready_rows:
+    for row_index, row in enumerate(ready_rows):
         if ready_budget is not None and spawned >= ready_budget:
             ready_scan_complete = False
             break
@@ -4853,6 +4936,11 @@ def _dispatch_once_locked(
                     _route_wait(route, route_arg, False, spillover)
                     or ("pin_host_full" if route == "pin" else spillover.full_reason())
                 )
+                # Host-bound cards behind the wall still say why (t_3e6c9b2b).
+                for rest in ready_rows[row_index + 1:]:
+                    r_route, r_arg = row_route.get(rest["id"], ("local", None))
+                    if rest["id"] in result.placement_affinity and r_route == "local":
+                        result.placement_waits[rest["id"]] = r_arg or "local_full"
             ready_scan_complete = False
             break
         wait = _route_wait(route, route_arg, local_free, spillover)
@@ -5239,6 +5327,7 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
 
     pr_state_resolver.finish_tick(scan_complete=ready_scan_complete)
+    _record_affinity_events(conn, result, dry_run)
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
