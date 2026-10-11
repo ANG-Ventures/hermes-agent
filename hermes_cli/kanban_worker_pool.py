@@ -376,7 +376,7 @@ def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iter
             if HOST_PIN_RE.match(line):
                 continue
             for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]*", line):
-                w = word.lower()
+                w = word.lower().rstrip("._-")
                 if w in alias_set and w not in found:
                     found.append(w)
     return (bound or bool(found)), tuple(found)
