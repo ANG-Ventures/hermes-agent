@@ -180,3 +180,29 @@ def test_explicit_db_path_is_refused_for_a_drill(tmp_path, monkeypatch):
     with pytest.raises(kb.LiveBoardWriteRefused, match="HERMES_KANBAN_DRILL"):
         kb.connect(db_path=live / "kanban.db")
     assert not (live / "kanban.db").exists()
+
+
+def test_container_board_stays_live_after_the_drill_redirects_its_home(tmp_path, monkeypatch):
+    """Prism round 2: /opt/data with HERMES_HOME=/tmp/drill must still be live (pin + write)."""
+    import hermes_state
+    import hermes_test_context
+
+    account = tmp_path / "opt-data"
+    account.mkdir()
+    (account / "kanban.db").touch()
+    monkeypatch.setattr(hermes_state, "_os_account_home", lambda: account)
+    monkeypatch.setattr(kb, "_LIVE_KANBAN_ROOT_MEMO", ((account / ".hermes").resolve(),))
+    monkeypatch.setattr(hermes_test_context, "_in_test_context", lambda: False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "drill"))
+    monkeypatch.setenv("HERMES_KANBAN_DRILL", "t_65791cd2")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — the drill marker alone must refuse
+    assert hermes_state._deployed_hermes_home_root() is None  # the redirect hid it before
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(account / "kanban.db"))
+    with pytest.raises(kb.KanbanLiveBoardRefusedError, match="HERMES_KANBAN_DB"):
+        kb.kanban_db_path()
+    monkeypatch.delenv("HERMES_KANBAN_DB")
+    with pytest.raises(kb.LiveBoardWriteRefused, match="HERMES_KANBAN_DRILL"):
+        kb.connect(db_path=account / "kanban.db")
+    assert (account / "kanban.db").stat().st_size == 0

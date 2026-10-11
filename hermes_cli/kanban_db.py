@@ -1210,15 +1210,41 @@ def _live_kanban_root() -> Optional[Path]:
 _LIVE_KANBAN_ROOT_MEMO: Optional[tuple] = None
 
 
+def _account_home_board_root() -> Optional[Path]:
+    """The passwd account home when a board lives there, regardless of HERMES_HOME.
+
+    The official container keeps its live board at ``<account>/kanban.db``
+    (``/opt/data``). ``hermes_state._deployed_hermes_home_root`` only sees that
+    while ``HERMES_HOME`` still names the account home, so a drill that
+    redirects its home first lost the deployed root (Prism round 2, #1873). The
+    board files on disk are the identity; nothing a process sets can move them.
+    Inert on fleet hosts: no ``~/kanban.db`` exists there (checked Studio and
+    ace-ai 2026-10-10).
+    """
+    from hermes_state import _os_account_home
+    account = _os_account_home()
+    if account is None:
+        return None
+    try:
+        account = account.resolve()
+    except OSError:
+        return None
+    if (account / "kanban.db").exists() or (account / "kanban" / "boards").is_dir():
+        return account
+    return None
+
+
 def _live_kanban_roots() -> tuple:
     """Every live root: the passwd-anchored native root plus a deployed root.
 
     The deployed root is the official container shape (``HERMES_HOME`` = the
     account home, e.g. ``/opt/data``), where the native ``<account>/.hermes``
-    is not where the board lives (``hermes_state._deployed_hermes_home_root``).
+    is not where the board lives (``hermes_state._deployed_hermes_home_root``,
+    plus :func:`_account_home_board_root` for a process that redirected its home).
     """
     from hermes_state import _deployed_hermes_home_root
-    roots = [r for r in (_live_kanban_root(), _deployed_hermes_home_root()) if r is not None]
+    roots = [r for r in (_live_kanban_root(), _deployed_hermes_home_root(), _account_home_board_root())
+             if r is not None]
     return tuple(dict.fromkeys(roots))
 
 
@@ -3076,7 +3102,13 @@ def _production_kanban_roots() -> list[Path]:
     kept leaking.
     """
     from hermes_state import _production_state_roots
-    return list(_production_state_roots())
+    roots = list(_production_state_roots())
+    # A container drill that redirected HERMES_HOME still must see /opt/data
+    # as live (Prism round 2, #1873); identity comes from the board on disk.
+    account_board = _account_home_board_root()
+    if account_board is not None and account_board not in roots:
+        roots.append(account_board)
+    return roots
 
 
 def _in_test_context() -> bool:
