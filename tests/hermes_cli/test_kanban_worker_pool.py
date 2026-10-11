@@ -1137,7 +1137,10 @@ def test_manifest_affinity_reads_host_affinity_and_linux_less_platforms(tmp_path
     assert got == {"cdp-login": "manifest:host_affinity", "mac-app": "manifest:platforms=macos",
                    "deep-login": "manifest:platforms=macos", "by-fm-name": "manifest:platforms=macos"}
     # Literal match only: a glob-shaped name never borrows another skill's manifest.
-    assert kha.manifest_affinity(["cdp-logi?", "mac-*", "general/mac-app"], "alpha") == {}
+    assert kha.manifest_affinity(["cdp-logi?", "mac-*", "general/mac-?pp"], "alpha") == {}
+    # A path-qualified id the worker loads keeps its binding (Prism fbf21aa8cc13).
+    assert kha.manifest_affinity(["general/mac-app"], "alpha") == {
+        "general/mac-app": "manifest:platforms=macos"}
     kha.clear_cache()
 
 
@@ -1479,3 +1482,45 @@ def test_unnamed_host_bound_card_still_requires_its_manifest_target():
     # An unprobed target (no column anywhere) fails closed in the fallback too.
     assert kwp.reach_allowed_hosts(body="fix it", skills=("ssh-machines", "x"), pool=routed,
                                    targets={"x": "nas-9"}) == ()
+
+
+def test_manifest_binding_survives_a_later_unreadable_copy(tmp_path, monkeypatch):
+    """Prism 883b1cd1ac29: a Studio binding found in one SKILL.md copy is kept
+    when a later copy cannot be read; the incomplete lookup is not cached."""
+    from hermes_cli import kanban_host_affinity as kha
+    a, b = tmp_path / "a", tmp_path / "b"
+    _skill(a, "cdp-login", "metadata:\n  hermes:\n    host_affinity: studio\n")
+    _skill(b, "cdp-login", "description: x\n")
+    kha.clear_cache()
+    monkeypatch.setattr(kha, "_profile_dirs", lambda assignee, now: (a, b))
+    bad = b / "general" / "cdp-login" / "SKILL.md"
+    real_read = type(bad).read_text
+
+    def flaky(self, *args, **kw):
+        if self == bad:
+            raise OSError("EIO")
+        return real_read(self, *args, **kw)
+    kha.manifest_affinity(["cdp-login"], "alpha", now=1.0)   # build the index first
+    kha._skill_cache.clear()                                  # keep the index, re-read the copies
+    monkeypatch.setattr(type(bad), "read_text", flaky)
+    assert kha.manifest_affinity(["cdp-login"], "alpha", now=2.0) == {
+        "cdp-login": "manifest:host_affinity"}
+    assert not kha._skill_cache                                # incomplete lookup: not cached
+    kha.clear_cache()
+
+
+def test_manifest_target_honours_path_qualified_card_skill(tmp_path, monkeypatch):
+    """Prism fbf21aa8cc13: ``mlops/vllm-gpu`` (a categorized id skill_view
+    accepts) keeps its manifest target, keyed by the card's own identifier."""
+    from hermes_cli import kanban_host_affinity as kha
+    root = tmp_path / "skills"
+    _skill(root, "vllm-gpu", "metadata:\n  hermes:\n    host_affinity: ace-ai\n", category="mlops")
+    _skill(root, "cdp-login", "metadata:\n  hermes:\n    host_affinity: studio\n")
+    kha.clear_cache()
+    monkeypatch.setattr(kha, "_profile_dirs", lambda assignee, now: (root,))
+    assert kha.manifest_targets(["mlops/vllm-gpu"], "alpha") == {"mlops/vllm-gpu": "ace-ai"}
+    assert kha.manifest_affinity(["general/cdp-login"], "alpha") == {
+        "general/cdp-login": "manifest:host_affinity"}
+    # Traversal / wrong category never resolve.
+    assert kha.manifest_targets(["../skills/mlops/vllm-gpu", "general/vllm-gpu"], "alpha") == {}
+    kha.clear_cache()

@@ -99,13 +99,24 @@ def _index_for(dirs: Tuple[Path, ...], now: float) -> Optional[Dict[str, Tuple[P
 def _find_skill_mds(name: str, dirs: Tuple[Path, ...], now: float) -> Optional[Tuple[Path, ...]]:
     """Every ``SKILL.md`` resolving ``name``; ``None`` when the index could not
     be built. The name is matched LITERALLY (never a glob): a card skill
-    like ``browser-acces?`` must not borrow another skill's manifest."""
-    if not _SKILL_NAME_RE.fullmatch(name or ""):
+    like ``browser-acces?`` must not borrow another skill's manifest.
+
+    A path-qualified id (``mlops/vllm``, which ``skill_view`` accepts and the
+    worker passes on unchanged) resolves to the indexed copies whose path
+    under a skill root ends with those segments (Prism fbf21aa8cc13)."""
+    parts = (name or "").split("/")
+    if not all(_SKILL_NAME_RE.fullmatch(p) for p in parts):
         return ()
     index = _index_for(dirs, now)
     if index is None:
         return None
-    return index.get(name, ())
+    hits = index.get(parts[-1], ())
+    if len(parts) == 1:
+        return hits
+    want = tuple(parts)
+    return tuple(md for md in hits
+                 if any(md.parent.is_relative_to(d)
+                        and md.parent.relative_to(d).parts[-len(want):] == want for d in dirs))
 
 
 def _affinity_value(frontmatter: Mapping) -> Optional[str]:
@@ -157,17 +168,26 @@ def _skill_binding(name: str, dirs: Tuple[Path, ...],
         if mds is None:
             return None, None
         from agent.skill_utils import parse_frontmatter
-
-        reason: Optional[str] = None
-        target: Optional[str] = None
-        for md in mds:
-            fm, _ = parse_frontmatter(md.read_text(encoding="utf-8-sig", errors="replace"))
-            reason = reason or manifest_reason(fm)
-            target = target or manifest_target(fm)
     except Exception:
         _log.debug("kanban host affinity: %s failed open (not cached)", name, exc_info=True)
         return None, None
-    _skill_cache[key] = (now, (reason, target))
+    reason: Optional[str] = None
+    target: Optional[str] = None
+    complete = True
+    for md in mds:
+        try:
+            fm, _ = parse_frontmatter(md.read_text(encoding="utf-8-sig", errors="replace"))
+        except Exception:
+            # Keep what earlier copies already bound (Prism 883b1cd1ac29); the
+            # lookup is incomplete, so it is not cached and the next tick re-reads.
+            _log.debug("kanban host affinity: %s copy %s unreadable (not cached)", name, md,
+                       exc_info=True)
+            complete = False
+            continue
+        reason = reason or manifest_reason(fm)
+        target = target or manifest_target(fm)
+    if complete:
+        _skill_cache[key] = (now, (reason, target))
     return reason, target
 
 
@@ -193,8 +213,7 @@ def _profile_dirs(assignee: str, now: float) -> Optional[Tuple[Path, ...]]:
 
 def _bindings(skills: Iterable[str], assignee: Optional[str],
               now: Optional[float]) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
-    names = [s for s in dict.fromkeys(skills or ()) if isinstance(s, str) and s and ":" not in s
-             and "/" not in s]
+    names = [s for s in dict.fromkeys(skills or ()) if isinstance(s, str) and s and ":" not in s]
     if not names or not assignee:
         return {}
     now = time.monotonic() if now is None else now
