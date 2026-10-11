@@ -208,6 +208,17 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+    # Caller identity the kanban home/author guards read (t_f4c584e2). An agent or worker
+    # shell carries all of these; CI and the off-box lane carry none. Ambient, they homed
+    # fixture cards to the worker's session (requeue/edit/set-model then refused the
+    # UNHOMED card as foreign) and relabelled comment authors -- 11 tests passed or failed
+    # by shell. Tests that need an identity request the ``kanban_identity`` fixture.
+    "HERMES_SESSION_ID",
+    "HERMES_SESSION_PROFILE",
+    "HERMES_PROFILE",
+    "HERMES_PROFILE_NAME",
+    "HERMES_CRON_JOB_ID",
+    "HERMES_CRON_SCRIPT",
     # Pytest is routinely launched from a delegated worker.  The worker
     # lineage marker must not make parent-state tests run as delegated
     # children; tests that exercise child behavior set it explicitly.

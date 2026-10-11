@@ -51,10 +51,10 @@ def _run(home: Path, *args: str, extra: dict | None = None) -> subprocess.Comple
 
 
 def _running_card(home: Path) -> tuple[str, int]:
-    created = _run(home, "create", "non-owner complete probe", "--json")
+    created = _run(home, "create", "non-owner complete probe", "--json", "--unhomed")
     assert created.returncode == 0, created.stderr
     task_id = json.loads(created.stdout)["id"]
-    claimed = _run(home, "claim", task_id)
+    claimed = _run(home, "claim", task_id)  # kanban-identity: ok — claims the --unhomed card above
     assert claimed.returncode == 0, claimed.stderr
     status, run_id = _state(home, task_id)
     assert status == "running" and run_id is not None
