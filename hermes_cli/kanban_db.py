@@ -1257,7 +1257,48 @@ def _rel_to_live(path: Path, live: Path) -> Optional[tuple]:
     case); a spelling fold only decides whether the identity walk runs, and
     the walk compares ``(st_dev, st_ino)``, so a case-sensitive volume where
     ``.HERMES`` is a different directory never matches.
+
+    Sub-root parts keep the caller's spelling too (``~/.Hermes/KANBAN/boards/x``,
+    Prism #1873 round 3, 8e093c37e43a), so a part is canonicalized to lowercase
+    when the kernel says both spellings are the same directory entry; callers
+    compare parts against lowercase layout names (``kanban``, ``boards``).
     """
+    parts = _rel_to_dir(path, live)
+    if not parts:
+        return parts
+    canonical: list[str] = []
+    current = live
+    for part in parts:
+        lower = part.lower()
+        if lower != part:
+            ident = _path_identity(current / part)
+            if ident is not None and ident == _path_identity(current / lower):
+                part = lower
+        canonical.append(part)
+        current = current / part
+    return tuple(canonical)
+
+
+def _path_spellings(path: Path) -> tuple:
+    """*path* resolved, plus its lexical absolute form when that differs.
+
+    A structural dir symlinked off the root (``<live>/kanban -> /mnt/k``, a
+    layout the noncanonical-board-path tests support) makes the resolved form
+    of ``<live>/kanban/boards/proj`` leave the root, so every live-relative
+    compare missed it (Prism #1873 round 3, member F on 1317). The caller's own
+    spelling still names the live layout, and checking it costs no I/O.
+    """
+    expanded = path.expanduser()
+    lexical = Path(os.path.normpath(os.path.abspath(expanded)))
+    try:
+        resolved = expanded.resolve(strict=False)
+    except OSError:
+        return (lexical,)
+    return (resolved,) if resolved == lexical else (resolved, lexical)
+
+
+def _rel_to_dir(path: Path, live: Path) -> Optional[tuple]:
+    """:func:`_rel_to_live` for one directory: lexical, then the identity walk."""
     try:
         return path.relative_to(live).parts
     except ValueError:
@@ -1323,12 +1364,10 @@ def _refuse_live_kanban_pin_in_isolation(path: Path, name: str) -> None:
     marker = _kanban_isolation_context()
     if marker is None and not kanban_sandbox_enabled():
         return
-    try:
-        target = path.expanduser().resolve(strict=False)
-    except OSError:
-        return
-    for live in _live_kanban_roots():
-        if _is_live_board_pin_target(target, live):
+    for target in _path_spellings(path):
+        for live in _live_kanban_roots():
+            if not _is_live_board_pin_target(target, live):
+                continue
             why = f"{marker} is set" if marker else "HERMES_KANBAN_SANDBOX is set"
             raise KanbanLiveBoardRefusedError(
                 f"{name}={target} is a LIVE board path under {live} while {why}. Refusing: "
@@ -1358,10 +1397,7 @@ def _sandbox_kanban_home(root: Path) -> Path:
             f"live Hermes root {root}; there is no isolated board to resolve. Point "
             f"HERMES_HOME at a throwaway directory."
         )
-    try:
-        inside_board = _is_live_board_pin_target(home.resolve(strict=False), live)
-    except OSError:
-        inside_board = True
+    inside_board = any(_is_live_board_pin_target(spelled, live) for spelled in _path_spellings(home))
     if inside_board:
         raise KanbanLiveBoardRefusedError(
             f"HERMES_KANBAN_SANDBOX is set but HERMES_HOME={home} is live board state "
@@ -1414,11 +1450,8 @@ def _refuse_live_kanban_root_in_isolation(root: Path, what: str) -> None:
     # The root itself OR board state under ANY live root: a container home of
     # /opt/data/kanban/boards/proj resolves to itself, and its kanban.db is the
     # live proj board (Prism #1873).
-    try:
-        resolved = root.expanduser().resolve(strict=False)
-    except OSError:
-        return
-    live = next((r for r in _live_kanban_roots() if _is_live_board_pin_target(resolved, r)), None)
+    live = next((r for spelled in _path_spellings(root) for r in _live_kanban_roots()
+                 if _is_live_board_pin_target(spelled, r)), None)
     if live is None:
         return
     why = f"{marker} is set" if marker else "HERMES_KANBAN_SANDBOX is set"
@@ -3237,14 +3270,11 @@ def _assert_live_board_write_allowed(path: Path) -> None:
     A deliberate operator pin to a board outside every production root — the
     documented ``HERMES_KANBAN_DB`` use — is untouched.
     """
-    try:
-        target = path.expanduser().resolve(strict=False)
-    except OSError:  # pragma: no cover - resolution failure is not a leak
-        return
     live_root: Optional[Path] = None
-    for root in _production_kanban_roots():
-        if _is_production_board_db(target, root):
-            live_root = root
+    roots = _production_kanban_roots()
+    for target in _path_spellings(path):
+        live_root = next((r for r in roots if _is_production_board_db(target, r)), None)
+        if live_root is not None:
             break
     if live_root is None:
         return  # not a live board — nothing this guard is about.
