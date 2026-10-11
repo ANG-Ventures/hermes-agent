@@ -153,28 +153,50 @@ DEPENDENCY_NO_PARENT_REFUSAL = (
 )
 
 
+# Statuses block_task can act on for a dependency kind (the transition guard's
+# running/ready/review, plus blocked for in-place classification).
+_DEPENDENCY_REFUSAL_STATUSES = ("running", "ready", "review", "blocked")
+
+
 class BlockRefused(ValueError):
     """``block_task`` refused the requested kind; the message says what to use instead."""
 
 
+def validate_wake_at(value: int) -> int:
+    """*value* if it renders as a local time, else ValueError. A wake that
+    fits SQLite but not ``time.localtime`` (a nanosecond epoch) would be
+    persisted and then break every list/show of the card."""
+    try:
+        time.localtime(int(value))
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError(f"wake time {value!r} is not a representable epoch-seconds time") from exc
+    return int(value)
+
+
 def parse_wake_at(value: str, *, now: Optional[int] = None) -> int:
     """Wake time -> epoch seconds: epoch digits, ``+<N>[smhd]`` relative to
-    *now*, or ISO-8601 (a naive timestamp is local time). Raises ValueError."""
+    *now*, or ISO-8601 (a naive timestamp is local time). Raises ValueError,
+    including for a time :func:`validate_wake_at` cannot render."""
     value = (value or "").strip()
     if value.isdigit():
-        return int(value)
+        return validate_wake_at(int(value))
     rel = re.fullmatch(r"\+(\d+)([smhd])", value)
     if rel:
         base = int(time.time()) if now is None else int(now)
-        return base + int(rel.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[rel.group(2)]
+        return validate_wake_at(
+            base + int(rel.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[rel.group(2)])
     from datetime import datetime
 
-    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    return validate_wake_at(int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()))
 
 
 def format_deferred_until(until: Optional[int]) -> str:
-    """``⏸ deferred until <local time>``: the one rendering of a deferred park."""
-    when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(int(until))) if until else "?"
+    """``⏸ deferred until <local time>``: the one rendering of a deferred park.
+    A stored wake that cannot render (written before validation) shows raw."""
+    try:
+        when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(int(until))) if until else "?"
+    except (OverflowError, OSError, ValueError):
+        when = f"epoch {until}"
     return f"⏸ deferred until {when}"
 
 
@@ -1248,14 +1270,86 @@ def _live_kanban_roots() -> tuple:
     return tuple(dict.fromkeys(roots))
 
 
+def _rel_to_live(path: Path, live: Path) -> Optional[tuple]:
+    """Parts of resolved *path* below *live*, by spelling OR filesystem identity.
+
+    ``Path.resolve()`` keeps the caller's casing on a case-insensitive volume,
+    so ``~/.HERMES`` is the live root on macOS while comparing unequal to
+    ``~/.hermes`` (Prism #1873). Lexical match first (free, the production
+    case); a spelling fold only decides whether the identity walk runs, and
+    the walk compares ``(st_dev, st_ino)``, so a case-sensitive volume where
+    ``.HERMES`` is a different directory never matches.
+
+    Sub-root parts keep the caller's spelling too (``~/.Hermes/KANBAN/boards/x``,
+    Prism #1873 round 3, 8e093c37e43a), so a part is canonicalized to lowercase
+    when the kernel says both spellings are the same directory entry; callers
+    compare parts against lowercase layout names (``kanban``, ``boards``).
+    """
+    parts = _rel_to_dir(path, live)
+    if not parts:
+        return parts
+    canonical: list[str] = []
+    current = live
+    for part in parts:
+        lower = part.lower()
+        if lower != part:
+            ident = _path_identity(current / part)
+            if ident is not None and ident == _path_identity(current / lower):
+                part = lower
+        canonical.append(part)
+        current = current / part
+    return tuple(canonical)
+
+
+def _path_spellings(path: Path) -> tuple:
+    """*path* resolved, plus its lexical absolute form when that differs.
+
+    A structural dir symlinked off the root (``<live>/kanban -> /mnt/k``, a
+    layout the noncanonical-board-path tests support) makes the resolved form
+    of ``<live>/kanban/boards/proj`` leave the root, so every live-relative
+    compare missed it (Prism #1873 round 3, member F on 1317). The caller's own
+    spelling still names the live layout, and checking it costs no I/O.
+    """
+    expanded = path.expanduser()
+    lexical = Path(os.path.normpath(os.path.abspath(expanded)))
+    try:
+        resolved = expanded.resolve(strict=False)
+    except OSError:
+        return (lexical,)
+    return (resolved,) if resolved == lexical else (resolved, lexical)
+
+
+def _rel_to_dir(path: Path, live: Path) -> Optional[tuple]:
+    """:func:`_rel_to_live` for one directory: lexical, then the identity walk."""
+    try:
+        return path.relative_to(live).parts
+    except ValueError:
+        pass
+    folded, folded_live = _spelling_fold(path), _spelling_fold(live)
+    if folded != folded_live and not folded.startswith(folded_live.rstrip("/") + "/"):
+        return None
+    target = _path_identity(live)
+    if target is None:
+        return None
+    tail: list[str] = []
+    current = path
+    while True:
+        if _path_identity(current) == target:
+            return tuple(reversed(tail))
+        if current.parent == current:
+            return None
+        tail.append(current.name)
+        current = current.parent
+
+
 def _matching_live_root(path: Path) -> Optional[Path]:
-    """The live root *path* is exactly, else None."""
+    """The live root *path* is (same directory, any spelling), else None."""
     try:
         resolved = path.expanduser().resolve(strict=False)
     except OSError:
         return None
     for live in _live_kanban_roots():
-        if resolved == live:
+        if _rel_to_live(resolved, live) == ():
             return live
     return None
 
@@ -1272,10 +1366,12 @@ def _is_live_board_pin_target(target: Path, live: Path) -> bool:
     roots. A path INSIDE one task's workspace is a scratch location, not the
     board (same narrow rule as :func:`_is_production_board_db`).
     """
-    if target == live or _is_production_board_db(target, live) or _is_live_board_tree_path(target, live):
+    parts = _rel_to_live(target, live)
+    if parts is None:
+        return False
+    if not parts or _is_production_board_db(target, live) or _is_live_board_tree_path(target, live):
         return True
-    kanban = live / "kanban"
-    return target in (kanban, kanban / "workspaces", kanban / "attachments")
+    return parts in (("kanban",), ("kanban", "workspaces"), ("kanban", "attachments"))
 
 
 def _refuse_live_kanban_pin_in_isolation(path: Path, name: str) -> None:
@@ -1290,12 +1386,10 @@ def _refuse_live_kanban_pin_in_isolation(path: Path, name: str) -> None:
     marker = _kanban_isolation_context()
     if marker is None and not kanban_sandbox_enabled():
         return
-    try:
-        target = path.expanduser().resolve(strict=False)
-    except OSError:
-        return
-    for live in _live_kanban_roots():
-        if _is_live_board_pin_target(target, live):
+    for target in _path_spellings(path):
+        for live in _live_kanban_roots():
+            if not _is_live_board_pin_target(target, live):
+                continue
             why = f"{marker} is set" if marker else "HERMES_KANBAN_SANDBOX is set"
             raise KanbanLiveBoardRefusedError(
                 f"{name}={target} is a LIVE board path under {live} while {why}. Refusing: "
@@ -1325,10 +1419,7 @@ def _sandbox_kanban_home(root: Path) -> Path:
             f"live Hermes root {root}; there is no isolated board to resolve. Point "
             f"HERMES_HOME at a throwaway directory."
         )
-    try:
-        inside_board = _is_live_board_pin_target(home.resolve(strict=False), live)
-    except OSError:
-        inside_board = True
+    inside_board = any(_is_live_board_pin_target(spelled, live) for spelled in _path_spellings(home))
     if inside_board:
         raise KanbanLiveBoardRefusedError(
             f"HERMES_KANBAN_SANDBOX is set but HERMES_HOME={home} is live board state "
@@ -1357,10 +1448,11 @@ def _refuse_nested_non_profile_home(root: Path) -> None:
         return
     try:
         home = Path(os.path.expanduser(os.path.expandvars(raw))).resolve(strict=False)
-        rel = home.relative_to(live)
     except (OSError, ValueError, TypeError):
         return
-    parts = rel.parts
+    parts = _rel_to_live(home, live)
+    if parts is None:
+        return
     if not parts or (len(parts) == 2 and parts[0] == "profiles"):
         return
     raise KanbanLiveBoardRefusedError(
@@ -1377,11 +1469,17 @@ def _refuse_live_kanban_root_in_isolation(root: Path, what: str) -> None:
     marker = _kanban_isolation_context()
     if marker is None and not kanban_sandbox_enabled():
         return
-    if not _is_live_kanban_root(root):
+    # The root itself OR board state under ANY live root: a container home of
+    # /opt/data/kanban/boards/proj resolves to itself, and its kanban.db is the
+    # live proj board (Prism #1873).
+    live = next((r for spelled in _path_spellings(root) for r in _live_kanban_roots()
+                 if _is_live_board_pin_target(spelled, r)), None)
+    if live is None:
         return
     why = f"{marker} is set" if marker else "HERMES_KANBAN_SANDBOX is set"
     raise KanbanLiveBoardRefusedError(
-        f"{what} resolved to the LIVE Hermes root {root} while {why}. Refusing: a "
+        f"{what} resolved to {root}, the LIVE Hermes root {live} or board state under it, "
+        f"while {why}. Refusing: a "
         f"test, drill or sandbox must not read or write the live board. Set "
         f"HERMES_KANBAN_SANDBOX=1 and point HERMES_HOME at a throwaway directory "
         f"(any path, including one under ~/.hermes, resolves to itself under the "
@@ -3139,14 +3237,10 @@ def _is_production_board_db(resolved: Path, root: Path) -> bool:
     tests and workers legitimately create throwaway DBs. A containment-only
     check (``is_relative_to(root)``) would refuse all of those.
     """
-    if resolved == root / "kanban.db":
-        return True
-    try:
-        rel = resolved.relative_to(root)
-    except ValueError:
+    parts = _rel_to_live(resolved, root)
+    if parts is None:
         return False
-    parts = rel.parts
-    return (
+    return parts == ("kanban.db",) or (
         len(parts) == 4
         and parts[0] == "kanban"
         and parts[1] == "boards"
@@ -3198,14 +3292,11 @@ def _assert_live_board_write_allowed(path: Path) -> None:
     A deliberate operator pin to a board outside every production root — the
     documented ``HERMES_KANBAN_DB`` use — is untouched.
     """
-    try:
-        target = path.expanduser().resolve(strict=False)
-    except OSError:  # pragma: no cover - resolution failure is not a leak
-        return
     live_root: Optional[Path] = None
-    for root in _production_kanban_roots():
-        if _is_production_board_db(target, root):
-            live_root = root
+    roots = _production_kanban_roots()
+    for target in _path_spellings(path):
+        live_root = next((r for r in roots if _is_production_board_db(target, r)), None)
+        if live_root is not None:
             break
     if live_root is None:
         return  # not a live board — nothing this guard is about.
@@ -3238,9 +3329,7 @@ def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> Non
                 declared_root = kanban_home().expanduser().resolve(strict=False)
             except OSError:  # pragma: no cover - diagnostic only
                 declared_root = live_root
-            if declared_root not in {
-                r for r in _production_kanban_roots()
-            }:
+            if not any(_rel_to_live(declared_root, r) == () for r in _production_kanban_roots()):
                 reason = (
                     f"HERMES_HOME={declared} declares the kanban root "
                     f"{declared_root}, but a HERMES_KANBAN_* path pin "
@@ -3269,12 +3358,8 @@ def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> Non
 def _is_live_board_tree_path(resolved: Path, root: Path) -> bool:
     """True for board-set state of *root* that is not a DB: the ``current``
     pointer, ``board-aliases.json`` and anything under ``kanban/boards/``."""
-    try:
-        rel = resolved.relative_to(root)
-    except ValueError:
-        return False
-    parts = rel.parts
-    if len(parts) < 2 or parts[0] != "kanban":
+    parts = _rel_to_live(resolved, root)
+    if parts is None or len(parts) < 2 or parts[0] != "kanban":
         return False
     return parts[1] == "boards" or (len(parts) == 2 and parts[1] in ("current", "board-aliases.json"))
 
@@ -3288,16 +3373,15 @@ def _assert_live_board_tree_write_allowed(path: Path) -> None:
     ``set_current_board()`` / ``remove_board()`` never touch the DB at all.
     That is how ten fixture boards (alpha, curr, spawntest, slug-immutable, …)
     landed in the live ``kanban/boards/`` on 2026-09-22 (card t_216b74e0).
-    Same production-root list and R1/R2 predicate as the DB guard.
+    Same production-root list and R1/R2 predicate as the DB guard, and the same
+    spellings (:func:`_path_spellings`, so a symlinked ``<live>/kanban`` counts).
     """
-    try:
-        target = path.expanduser().resolve(strict=False)
-    except OSError:  # pragma: no cover - resolution failure is not a leak
-        return
-    for root in _production_kanban_roots():
-        if _is_live_board_tree_path(target, root):
-            _refuse_live_kanban_write(target, root, f"write live board state {target}")
-            return
+    roots = _production_kanban_roots()
+    for target in _path_spellings(path):
+        for root in roots:
+            if _is_live_board_tree_path(target, root):
+                _refuse_live_kanban_write(target, root, f"write live board state {target}")
+                return
 
 
 def connect_readonly(
@@ -8179,7 +8263,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         # 'review_reopened' is historical (verb retired); legacy rows still count.
         "'review_reopened', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', "
-        "'infra_unavailable'"
+        "'infra_unavailable', 'scheduled'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -8187,6 +8271,18 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     for key in ("resume_status", "retry_status", "source_status"):
         if payload.get(key) == "review":
             return "review"
+    return "ready"
+
+
+def _resume_phase_for_park(conn: sqlite3.Connection, task_id: str, status: str) -> str:
+    """``review`` or ``ready``: the phase a card parked from *status* resumes in.
+    A running card answers from its claim, a blocked one from its block event."""
+    if status == "running":
+        return _retry_status_for_run(conn, task_id)
+    if status == "blocked":
+        return _resume_status_from_events(conn, task_id)
+    if status == "review":
+        return "review"
     return "ready"
 
 
@@ -11961,6 +12057,11 @@ def block_task(
         raise BlockRefused("until only applies to kind 'deferred'")
     if kind == "deferred" and until is None:
         raise BlockRefused("kind 'deferred' needs until (--until <ISO|+6h>): the wake time")
+    if until is not None:
+        try:
+            until = validate_wake_at(until)
+        except ValueError as exc:
+            raise BlockRefused(str(exc)) from None
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -11969,17 +12070,23 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
+        # Refuse only where a block could have landed; a done/archived/
+        # scheduled/todo card keeps the plain ``False`` every caller handles.
+        if (kind == "dependency" and cur_row["status"] in _DEPENDENCY_REFUSAL_STATUSES
+                and _parents_satisfied(conn, task_id)):
             raise BlockRefused(DEPENDENCY_NO_PARENT_REFUSAL)
         if kind == "deferred":
             # Same transition as schedule_task + set_schedule_wake in one step, so
             # the dispatcher's wake_due_scheduled owns the wake. No ``blocked``
             # event and no ``kanban_task_blocked`` hook: a time park is not a
-            # human question, and every pager keys on those.
+            # human question, and every pager keys on those. The phase to
+            # resume is read before the run ends: a claimed reviewer or a
+            # blocked review card must wake back into review.
+            parked_from = _resume_phase_for_park(conn, task_id, cur_row["status"])
             sql = (
                 "UPDATE tasks SET status = 'scheduled', claim_lock = NULL, claim_expires = NULL, "
                 "worker_pid = NULL, block_kind = 'deferred', next_eligible_at = ? "
-                "WHERE id = ? AND status IN ('todo', 'ready', 'running', 'blocked')"
+                "WHERE id = ? AND status IN ('todo', 'ready', 'running', 'blocked', 'review')"
             )
             params: list[Any] = [int(until), task_id]
             if expected_run_id is not None:
@@ -11993,7 +12100,7 @@ def block_task(
             )
             _append_event(conn, task_id, "scheduled", {
                 "reason": reason, "kind": "deferred", "until": int(until),
-                "source_status": cur_row["status"],
+                "source_status": parked_from,
             }, run_id=run_id)
             return True
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
@@ -13868,7 +13975,7 @@ def unblock_task(
     with write_txn(conn):
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
+            if _task_status(conn, task_id) in ("blocked", "scheduled")
             else "ready"
         )
         _reclaim_dangling_run(
@@ -15267,6 +15374,8 @@ def schedule_task(
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
     with write_txn(conn):
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        parked_from = _resume_phase_for_park(conn, task_id, row["status"]) if row else "ready"
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -15278,7 +15387,7 @@ def schedule_task(
                    -- to wake_due_scheduled; set_schedule_wake stamps a real one.
                    next_eligible_at = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'review')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -15288,7 +15397,8 @@ def schedule_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        _append_event(conn, task_id, "scheduled",
+                      {"reason": reason, "source_status": parked_from}, run_id=run_id)
         return True
 
 # Scheduled cards with no timed wake (``next_eligible_at IS NULL``) wait on a
@@ -15328,6 +15438,10 @@ def set_schedule_wake(
                 f"task {task_id} is {row['status']!r}; a wake time only "
                 f"applies to 'scheduled' tasks"
             )
+        try:
+            wake_at = validate_wake_at(wake_at)
+        except ValueError as exc:
+            return False, str(exc)
         cur = conn.execute(
             "UPDATE tasks SET next_eligible_at = ? "
             "WHERE id = ? AND status = 'scheduled'",
