@@ -73,7 +73,7 @@ def test_container_shape_live_board_is_refused_from_a_test(monkeypatch):
     account = _account_home()
     monkeypatch.setenv("HERMES_HOME", str(account))
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
 
     board = (account / "kanban.db").resolve()
     assert kb.kanban_home().resolve() == account  # the resolver picks it

@@ -86,7 +86,7 @@ def test_test_context_refused_on_live_board(live_root, monkeypatch):
     """The 16:05 shape: probe under pytest, pin inherited from the worker env."""
     monkeypatch.setenv("HERMES_HOME", str(live_root))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(_live_db(live_root)))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
 
     with pytest.raises(kb.LiveBoardWriteRefused) as excinfo:
         kb.connect()
@@ -103,7 +103,7 @@ def test_named_board_of_the_live_root_is_refused_too(live_root, monkeypatch):
     """
     board_db = live_root / "kanban" / "boards" / "proj" / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(board_db))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
 
     with pytest.raises(kb.LiveBoardWriteRefused):
         kb.connect()
@@ -115,7 +115,7 @@ def test_named_board_of_the_live_root_is_refused_too(live_root, monkeypatch):
 def test_explicit_db_path_argument_is_also_refused(live_root, monkeypatch):
     """Handing connect() the live path directly is the same leak, other door."""
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
 
     with pytest.raises(kb.LiveBoardWriteRefused):
         kb.connect(db_path=_live_db(live_root))
@@ -123,7 +123,7 @@ def test_explicit_db_path_argument_is_also_refused(live_root, monkeypatch):
 
 def test_init_db_is_covered_by_the_same_gate(live_root, monkeypatch):
     """``init_db`` routes through connect(), so it must refuse too."""
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
 
     with pytest.raises(kb.LiveBoardWriteRefused):
         kb.init_db(db_path=_live_db(live_root))
@@ -160,7 +160,7 @@ def test_guard_is_not_fooled_by_a_rebuilt_child_environment(
     """
     for var in ("PYTEST_CURRENT_TEST", "HERMES_IN_PYTEST", "HERMES_HOME"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
 
     assert hermes_test_context._in_test_context() is True
     with pytest.raises(kb.LiveBoardWriteRefused):
@@ -182,7 +182,7 @@ def test_redirected_hermes_home_overridden_by_pin_is_refused(
     """
     probe_home = tmp_path / "probe-partial-i9lt7ab5"
     probe_home.mkdir()
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.setenv("HERMES_HOME", str(probe_home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(_live_db(live_root)))
 
@@ -228,7 +228,7 @@ def test_production_env_shapes_are_never_refused(
     these would break the dispatcher outright — strictly worse than the leak it
     is closing.
     """
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     if home_mode == "unset":
         monkeypatch.delenv("HERMES_HOME", raising=False)
     elif home_mode == "root":
@@ -249,7 +249,7 @@ def test_hermetic_tmp_board_is_untouched(tmp_path, live_root, monkeypatch):
     This is also what the whole rest of the suite does, so a regression here
     would take the suite down with it.
     """
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     elsewhere = tmp_path / "elsewhere" / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(elsewhere))
 
@@ -268,7 +268,7 @@ def test_scratch_paths_under_the_live_root_are_not_boards(
     the live board and refusing it would break legitimate work.
     """
     scratch = live_root / "kanban" / "workspaces" / "t_2f909ab6" / "kanban.db"
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.setenv("HERMES_KANBAN_DB", str(scratch))
 
     with kb.connect_closing() as conn:
@@ -322,7 +322,7 @@ def test_repair_db_refuses_the_pin_resolved_live_board(live_root, monkeypatch):
     """The CLI shape: no ``db_path=``, resolved via ``kanban_db_path()``."""
     monkeypatch.setenv("HERMES_HOME", str(live_root))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(_live_db(live_root)))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
 
     with pytest.raises(kb.LiveBoardWriteRefused):
         kbc.repair_db()
@@ -338,7 +338,7 @@ def test_repair_db_refusal_creates_no_files(live_root, monkeypatch):
     live = _live_db(live_root)
     monkeypatch.setenv("HERMES_HOME", str(live_root))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
 
     before = sorted(p.name for p in live_root.iterdir())
     with pytest.raises(kb.LiveBoardWriteRefused):

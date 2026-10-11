@@ -155,12 +155,87 @@ def check_source(src: str, filename: str = "<src>") -> list[str]:
     return problems
 
 
+# ── Kanban sandbox (t_65791cd2) ─────────────────────────────────────────────
+# Every test runs with HERMES_KANBAN_SANDBOX=1, set by an autouse fixture in
+# tests/conftest.py: kanban paths resolve from the per-test HERMES_HOME and no
+# HERMES_KANBAN_* pin or home nested under ~/.hermes can reach the live board.
+SANDBOX_ENV = "HERMES_KANBAN_SANDBOX"
+SANDBOX_SUPPRESS = "# kanban-sandbox: off"
+_FALSY = frozenset({"", "0", "false", "no", "off"})
+
+
+def _is_sandbox_key(node: ast.expr | None) -> bool:
+    return isinstance(node, ast.Constant) and node.value == SANDBOX_ENV
+
+
+def _disarms_sandbox(call: ast.Call) -> bool:
+    """``delenv``/``pop``/falsy ``setenv``/``unsetenv`` of the sandbox flag."""
+    name = _func_name(call.func)
+    first = call.args[0] if call.args else None
+    if name in ("delenv", "pop", "unsetenv") and _is_sandbox_key(first):
+        return True
+    if name in ("setenv", "putenv") and _is_sandbox_key(first) and len(call.args) > 1:
+        val = call.args[1]
+        return isinstance(val, ast.Constant) and str(val.value).strip().lower() in _FALSY
+    return False
+
+
+def check_sandbox_disarm(src: str, filename: str = "<src>") -> list[str]:
+    """A test that turns the kanban sandbox off must say why on that line."""
+    if SANDBOX_ENV not in src:
+        return []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        tree = ast.parse(src, filename=filename)
+    lines = src.splitlines()
+    problems: list[str] = []
+    for node in ast.walk(tree):
+        disarm = isinstance(node, ast.Call) and _disarms_sandbox(node)
+        if isinstance(node, ast.Delete):
+            disarm = any(isinstance(t, ast.Subscript) and _is_sandbox_key(t.slice) for t in node.targets)
+        if not disarm:
+            continue
+        line = lines[node.lineno - 1] if node.lineno <= len(lines) else ""
+        if SANDBOX_SUPPRESS not in line:
+            problems.append(
+                f"{filename}:{node.lineno}: turns off {SANDBOX_ENV} (the conftest autouse sandbox) "
+                f"with no reason: add `{SANDBOX_SUPPRESS} — <why>` on the line, and keep the "
+                f"test's HERMES_HOME off the live root")
+    return problems
+
+
+def check_conftest_sandbox(conftest: Path) -> list[str]:
+    """tests/conftest.py must set the sandbox flag inside an autouse fixture."""
+    try:
+        tree = ast.parse(conftest.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError) as exc:
+        return [f"{conftest}: unreadable: {exc}"]
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        autouse = any(
+            isinstance(d, ast.Call) and any(
+                k.arg == "autouse" and isinstance(k.value, ast.Constant) and k.value.value is True
+                for k in d.keywords)
+            for d in fn.decorator_list)
+        if not autouse:
+            continue
+        for call in (n for n in ast.walk(fn) if isinstance(n, ast.Call)):
+            if (_func_name(call.func) == "setenv" and len(call.args) > 1 and _is_sandbox_key(call.args[0])
+                    and not _disarms_sandbox(call)):
+                return []
+    return [f"tests/conftest.py: no autouse fixture sets {SANDBOX_ENV}=1; every test must run "
+            f"kanban-sandboxed (t_65791cd2)"]
+
+
 def main(argv: list[str]) -> int:
     targets = [Path(p) for p in argv] or [ROOT / "tests"]
     files: list[Path] = []
     for t in targets:
         files.extend(sorted(t.rglob("*.py")) if t.is_dir() else [t])
     problems: list[str] = []
+    if not argv:
+        problems.extend(check_conftest_sandbox(ROOT / "tests" / "conftest.py"))
     for f in files:
         try:
             src = f.read_text(encoding="utf-8")
@@ -172,12 +247,14 @@ def main(argv: list[str]) -> int:
             rel = str(f)
         try:
             problems.extend(check_source(src, rel))
+            problems.extend(check_sandbox_disarm(src, rel))
         except SyntaxError as exc:
             problems.append(f"{rel}: unparsable: {exc}")
     for p in problems:
         print(p)
     if problems:
-        print(f"\n{len(problems)} kanban spawn(s) without a stated identity (t_f4c584e2).", file=sys.stderr)
+        print(f"\n{len(problems)} kanban test identity/sandbox problem(s) (t_f4c584e2, t_65791cd2).",
+              file=sys.stderr)
         return 1
     return 0
 

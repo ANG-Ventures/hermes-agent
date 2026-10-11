@@ -1527,6 +1527,7 @@ def test_prefetch_repo_context_is_not_reused_when_the_card_changes(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
 def test_explicit_hermes_home_with_ambient_pin_is_not_treated_as_sandboxed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1567,6 +1568,7 @@ def test_explicit_hermes_home_with_ambient_pin_is_not_treated_as_sandboxed(
     assert prg._db_is_sandboxed() is True
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
 def test_stubbed_oracle_against_a_non_sandbox_db_raises_instead_of_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1593,6 +1595,7 @@ def test_stubbed_oracle_against_a_non_sandbox_db_raises_instead_of_writing(
     assert not live.exists()
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
 def test_monkeypatching_the_module_attribute_does_not_vouch_for_the_stub(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1948,6 +1951,7 @@ def test_a_board_inside_the_declared_hermes_home_is_still_not_sandboxed(
     assert observed["real_allowed"] is True
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
 def test_dispatch_once_propagates_a_sandbox_escape_instead_of_absorbing_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2274,7 +2278,7 @@ def test_stubbed_deploy_oracle_against_a_live_board_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A fabricated "it is live" is fabricated unblock evidence too."""
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     with pytest.raises(prg.SandboxEscape):
         prg.assert_write_allowed(None, deploy_fn=lambda tree, sha: True)
     prg.assert_write_allowed(None, deploy_fn=prg._REAL_IS_DEPLOYED)

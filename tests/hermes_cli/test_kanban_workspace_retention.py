@@ -630,6 +630,7 @@ def test_gc_never_deletes_distinct_case_sensitive_directory(case_sensitive_volum
     assert not kb._is_managed_scratch_path(candidate)
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
 def test_gc_reaps_managed_directory_on_case_sensitive_mount(case_sensitive_volume, monkeypatch):
     home = case_sensitive_volume / "control-home"
     home.mkdir()
@@ -740,7 +741,7 @@ def _pin_env(monkeypatch, tmp_path, *, home: Path, pin: Path) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.setattr(kb, "_PIN_AT_IMPORT", "")
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
     monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())

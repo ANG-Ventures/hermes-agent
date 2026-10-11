@@ -70,3 +70,29 @@ def test_the_1825_helper_shape_is_red_bare_and_green_with_an_identity():
 
 def test_the_live_tests_tree_is_clean():
     assert lint.main([str(ROOT / "tests")]) == 0
+
+
+# --- kanban sandbox (t_65791cd2) --------------------------------------------
+
+def test_disarming_the_sandbox_needs_a_stated_reason():
+    bare = 'def test_x(monkeypatch):\n    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)\n'
+    assert lint.check_sandbox_disarm(bare, "t.py")
+    for shape in ('monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "0")',
+                  'os.environ.pop("HERMES_KANBAN_SANDBOX", None)',
+                  'del os.environ["HERMES_KANBAN_SANDBOX"]'):
+        assert lint.check_sandbox_disarm(f"import os\ndef test_x(monkeypatch):\n    {shape}\n", "t.py"), shape
+    stated = bare.rstrip("\n") + "  # kanban-sandbox: off — tests pin precedence\n"
+    assert lint.check_sandbox_disarm(stated, "t.py") == []
+    armed = 'def test_x(monkeypatch):\n    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")\n'
+    assert lint.check_sandbox_disarm(armed, "t.py") == []
+
+
+def test_conftest_must_arm_the_sandbox_in_an_autouse_fixture(tmp_path):
+    good = tmp_path / "good.py"
+    good.write_text('import pytest\n@pytest.fixture(autouse=True)\ndef _env(monkeypatch):\n'
+                    '    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")\n')
+    assert lint.check_conftest_sandbox(good) == []
+    not_autouse = tmp_path / "plain.py"
+    not_autouse.write_text(good.read_text().replace("(autouse=True)", ""))
+    assert lint.check_conftest_sandbox(not_autouse)
+    assert lint.check_conftest_sandbox(ROOT / "tests" / "conftest.py") == []
