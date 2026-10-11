@@ -1248,14 +1248,45 @@ def _live_kanban_roots() -> tuple:
     return tuple(dict.fromkeys(roots))
 
 
+def _rel_to_live(path: Path, live: Path) -> Optional[tuple]:
+    """Parts of resolved *path* below *live*, by spelling OR filesystem identity.
+
+    ``Path.resolve()`` keeps the caller's casing on a case-insensitive volume,
+    so ``~/.HERMES`` is the live root on macOS while comparing unequal to
+    ``~/.hermes`` (Prism #1873). Lexical match first (free, the production
+    case); a spelling fold only decides whether the identity walk runs, and
+    the walk compares ``(st_dev, st_ino)``, so a case-sensitive volume where
+    ``.HERMES`` is a different directory never matches.
+    """
+    try:
+        return path.relative_to(live).parts
+    except ValueError:
+        pass
+    folded, folded_live = _spelling_fold(path), _spelling_fold(live)
+    if folded != folded_live and not folded.startswith(folded_live.rstrip("/") + "/"):
+        return None
+    target = _path_identity(live)
+    if target is None:
+        return None
+    tail: list[str] = []
+    current = path
+    while True:
+        if _path_identity(current) == target:
+            return tuple(reversed(tail))
+        if current.parent == current:
+            return None
+        tail.append(current.name)
+        current = current.parent
+
+
 def _matching_live_root(path: Path) -> Optional[Path]:
-    """The live root *path* is exactly, else None."""
+    """The live root *path* is (same directory, any spelling), else None."""
     try:
         resolved = path.expanduser().resolve(strict=False)
     except OSError:
         return None
     for live in _live_kanban_roots():
-        if resolved == live:
+        if _rel_to_live(resolved, live) == ():
             return live
     return None
 
@@ -1272,10 +1303,12 @@ def _is_live_board_pin_target(target: Path, live: Path) -> bool:
     roots. A path INSIDE one task's workspace is a scratch location, not the
     board (same narrow rule as :func:`_is_production_board_db`).
     """
-    if target == live or _is_production_board_db(target, live) or _is_live_board_tree_path(target, live):
+    parts = _rel_to_live(target, live)
+    if parts is None:
+        return False
+    if not parts or _is_production_board_db(target, live) or _is_live_board_tree_path(target, live):
         return True
-    kanban = live / "kanban"
-    return target in (kanban, kanban / "workspaces", kanban / "attachments")
+    return parts in (("kanban",), ("kanban", "workspaces"), ("kanban", "attachments"))
 
 
 def _refuse_live_kanban_pin_in_isolation(path: Path, name: str) -> None:
@@ -1357,10 +1390,11 @@ def _refuse_nested_non_profile_home(root: Path) -> None:
         return
     try:
         home = Path(os.path.expanduser(os.path.expandvars(raw))).resolve(strict=False)
-        rel = home.relative_to(live)
     except (OSError, ValueError, TypeError):
         return
-    parts = rel.parts
+    parts = _rel_to_live(home, live)
+    if parts is None:
+        return
     if not parts or (len(parts) == 2 and parts[0] == "profiles"):
         return
     raise KanbanLiveBoardRefusedError(
@@ -1377,11 +1411,20 @@ def _refuse_live_kanban_root_in_isolation(root: Path, what: str) -> None:
     marker = _kanban_isolation_context()
     if marker is None and not kanban_sandbox_enabled():
         return
-    if not _is_live_kanban_root(root):
+    # The root itself OR board state under ANY live root: a container home of
+    # /opt/data/kanban/boards/proj resolves to itself, and its kanban.db is the
+    # live proj board (Prism #1873).
+    try:
+        resolved = root.expanduser().resolve(strict=False)
+    except OSError:
+        return
+    live = next((r for r in _live_kanban_roots() if _is_live_board_pin_target(resolved, r)), None)
+    if live is None:
         return
     why = f"{marker} is set" if marker else "HERMES_KANBAN_SANDBOX is set"
     raise KanbanLiveBoardRefusedError(
-        f"{what} resolved to the LIVE Hermes root {root} while {why}. Refusing: a "
+        f"{what} resolved to {root}, the LIVE Hermes root {live} or board state under it, "
+        f"while {why}. Refusing: a "
         f"test, drill or sandbox must not read or write the live board. Set "
         f"HERMES_KANBAN_SANDBOX=1 and point HERMES_HOME at a throwaway directory "
         f"(any path, including one under ~/.hermes, resolves to itself under the "
@@ -3139,14 +3182,10 @@ def _is_production_board_db(resolved: Path, root: Path) -> bool:
     tests and workers legitimately create throwaway DBs. A containment-only
     check (``is_relative_to(root)``) would refuse all of those.
     """
-    if resolved == root / "kanban.db":
-        return True
-    try:
-        rel = resolved.relative_to(root)
-    except ValueError:
+    parts = _rel_to_live(resolved, root)
+    if parts is None:
         return False
-    parts = rel.parts
-    return (
+    return parts == ("kanban.db",) or (
         len(parts) == 4
         and parts[0] == "kanban"
         and parts[1] == "boards"
@@ -3238,9 +3277,7 @@ def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> Non
                 declared_root = kanban_home().expanduser().resolve(strict=False)
             except OSError:  # pragma: no cover - diagnostic only
                 declared_root = live_root
-            if declared_root not in {
-                r for r in _production_kanban_roots()
-            }:
+            if not any(_rel_to_live(declared_root, r) == () for r in _production_kanban_roots()):
                 reason = (
                     f"HERMES_HOME={declared} declares the kanban root "
                     f"{declared_root}, but a HERMES_KANBAN_* path pin "
@@ -3269,12 +3306,8 @@ def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> Non
 def _is_live_board_tree_path(resolved: Path, root: Path) -> bool:
     """True for board-set state of *root* that is not a DB: the ``current``
     pointer, ``board-aliases.json`` and anything under ``kanban/boards/``."""
-    try:
-        rel = resolved.relative_to(root)
-    except ValueError:
-        return False
-    parts = rel.parts
-    if len(parts) < 2 or parts[0] != "kanban":
+    parts = _rel_to_live(resolved, root)
+    if parts is None or len(parts) < 2 or parts[0] != "kanban":
         return False
     return parts[1] == "boards" or (len(parts) == 2 and parts[1] in ("current", "board-aliases.json"))
 

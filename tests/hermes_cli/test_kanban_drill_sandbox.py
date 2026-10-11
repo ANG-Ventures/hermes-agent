@@ -206,3 +206,63 @@ def test_container_board_stays_live_after_the_drill_redirects_its_home(tmp_path,
     with pytest.raises(kb.LiveBoardWriteRefused, match="HERMES_KANBAN_DRILL"):
         kb.connect(db_path=account / "kanban.db")
     assert (account / "kanban.db").stat().st_size == 0
+
+
+# --- Prism round 3 on #1873 ------------------------------------------------
+
+
+def _case_insensitive(path: Path) -> bool:
+    flipped = path.parent / path.name.swapcase()
+    return flipped != path and flipped.exists()
+
+
+def test_case_alias_of_the_live_root_is_the_live_root(live_root, monkeypatch, tmp_path):
+    """``HERMES_HOME=~/.HERMES`` on a case-insensitive volume is the live root (fc44b60a3e3b).
+
+    ``Path.resolve()`` keeps the caller's casing, so a lexical compare let the
+    sandbox, the drill marker and the write guard all miss it.
+    """
+    alias = live_root.parent / live_root.name.swapcase()
+    if not _case_insensitive(live_root):
+        alias.mkdir()  # case-sensitive volume: a DIFFERENT directory, must not match
+        assert kb._matching_live_root(alias) is None
+        assert not kb._is_production_board_db((alias / "kanban.db").resolve(), live_root.resolve())
+        return
+    assert kb._matching_live_root(alias) == live_root.resolve()
+    monkeypatch.setenv("HERMES_HOME", str(alias))
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    with pytest.raises(kb.KanbanLiveBoardRefusedError, match="no isolated board"):
+        kb.kanban_home()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(alias / "kanban.db"))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — the pin path itself
+    with pytest.raises(kb.KanbanLiveBoardRefusedError, match="HERMES_KANBAN_DB"):
+        kb.kanban_db_path()
+    assert kb._is_production_board_db((alias / "kanban.db").resolve(), live_root.resolve())
+    assert kb._is_live_board_tree_path((alias / "kanban" / "current").resolve(), live_root.resolve())
+
+
+def test_container_named_board_home_is_refused_under_the_sandbox(tmp_path, monkeypatch):
+    """/opt/data shape: HERMES_HOME=<account>/kanban/boards/proj resolves to itself (feda0ec469c6).
+
+    get_default_hermes_root() returns that directory, not the account root, so
+    the sandbox early return accepted it and kanban_db_path() named the live
+    proj board.
+    """
+    import hermes_constants
+    import hermes_state
+
+    account = tmp_path / "opt-data"
+    board = account / "kanban" / "boards" / "proj"
+    board.mkdir(parents=True)
+    (account / "kanban.db").touch()
+    (board / "kanban.db").touch()
+    monkeypatch.setattr(hermes_state, "_os_account_home", lambda: account)
+    monkeypatch.setattr(kb, "_LIVE_KANBAN_ROOT_MEMO", ((account / ".hermes").resolve(),))
+    monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+    for name in kb._KANBAN_PATH_PIN_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(board))
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    with pytest.raises(kb.KanbanLiveBoardRefusedError, match="board state"):
+        kb.kanban_db_path()
+    assert (board / "kanban.db").stat().st_size == 0
