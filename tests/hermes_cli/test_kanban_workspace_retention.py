@@ -28,6 +28,30 @@ from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
 
 
+@pytest.fixture(autouse=True)
+def _scan_ignores_real_home_cwds(monkeypatch):
+    """Drop other processes' cwds under the REAL Hermes root from the cwd scan.
+
+    The scan is machine-wide by design, so on a fleet host it lists live gateway
+    and worker cwds under ``~/.hermes``; ``_process_cwds`` then stats each one and
+    the home-IO guard fails the test (rc=1 on ace-ai at base 9c6148e79f and head
+    alike, depending only on which processes were running). No candidate here
+    lives under the real root, so those entries cannot change any verdict.
+    """
+    from tests import conftest
+
+    real = conftest._REAL_HERMES_ROOT_CANDIDATES
+    original = kb._scan_process_cwds
+
+    def scan():
+        cwds = original()
+        if cwds is None:
+            return None
+        kept = frozenset(c for c in cwds if not any(c == r or r in c.parents for r in real))
+        return kept or None
+
+    monkeypatch.setattr(kb, "_scan_process_cwds", scan)
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -630,6 +654,7 @@ def test_gc_never_deletes_distinct_case_sensitive_directory(case_sensitive_volum
     assert not kb._is_managed_scratch_path(candidate)
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
 def test_gc_reaps_managed_directory_on_case_sensitive_mount(case_sensitive_volume, monkeypatch):
     home = case_sensitive_volume / "control-home"
     home.mkdir()
@@ -740,7 +765,7 @@ def _pin_env(monkeypatch, tmp_path, *, home: Path, pin: Path) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pin))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.setattr(kb, "_PIN_AT_IMPORT", "")
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
     monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())

@@ -411,6 +411,7 @@ def test_terminal_run_for_another_task_does_not_suppress_nudge(worker_run):
     assert build_kanban_stop_nudge(task_id="t_other", messages=[]) is not None
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
 def test_unreadable_board_does_not_accept_tool_history(worker_run, monkeypatch, tmp_path, caplog):
     missing_db = tmp_path / "missing.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(missing_db))

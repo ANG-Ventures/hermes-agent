@@ -337,7 +337,7 @@ if not HOST_LOCK_DIR_AT_CONFTEST_IMPORT:
 # non-root conftest carrying ``pytest_plugins`` after startup (e.g. ``pytest .``).
 # Fixtures imported here register exactly as if they were defined here.
 from tests._fixtures.env_filter import _HERMES_BEHAVIORAL_VARS, _looks_like_credential
-from tests._fixtures.kanban_identity import kanban_identity  # noqa: F401 — fixture registers here
+from tests._fixtures.kanban_identity import kanban_identity, kanban_pins  # noqa: F401 — fixtures register here
 from tests._fixtures.live_system_guard import (  # noqa: F401 — _live_system_guard registers here
     _GATEWAY_LOOKALIKE_MARK,
     _LIVE_SYSTEM_GUARD_BYPASS_MARK,
@@ -362,6 +362,12 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # 2. Blank behavioral HERMES_* vars that could change test semantics.
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
+
+    # 2a. Kanban sandbox (t_65791cd2): every kanban path resolves from this
+    #     test's HERMES_HOME and ignores HERMES_KANBAN_* pins, so no test can
+    #     reach the live board through a pin or through a home nested under
+    #     ~/.hermes. Tests of pin precedence opt out with ``kanban_pins``.
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
 
     # Honcho's fallback host/config resolution legitimately reads the user's
     # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend

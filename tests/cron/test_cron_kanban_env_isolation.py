@@ -353,6 +353,7 @@ class TestRunJobKanbanIsolation:
 
 
 @pytest.mark.platforms("linux")
+@pytest.mark.usefixtures("kanban_pins")  # seeds tmp board.db and pins it for the spawned worker (t_65791cd2)
 def test_dispatcher_grants_only_the_assigned_worker_scope(tmp_path, monkeypatch):
     import json
     from pathlib import Path
