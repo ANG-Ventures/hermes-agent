@@ -87,6 +87,50 @@ def worker_exit_class(failure_reason: str | None, error: str = "") -> str | None
 SAFEGUARD_REFUSAL_MARK = "safeguard_refusal"
 
 
+def _park_needs_input(reason: str) -> bool:
+    """Block THIS worker's running card ``needs_input`` with ``reason``, fenced to this run.
+
+    Only the owning worker of a running card acts; anything else is a no-op.
+    block_task's run CAS is off when expected_run_id is None, so a missing or
+    malformed run id must not mutate the card (a stale worker could otherwise
+    park a newer run). Raises on DB errors; callers own the logging.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    from agent.delegation_context import owns_kanban_worker_authority
+    if not task_id or not owns_kanban_worker_authority():
+        return False
+    try:
+        run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID") or "")
+    except ValueError:
+        return False
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        return bool(kb.block_task(conn, task_id, reason=reason, kind="needs_input",
+                                  expected_run_id=run_id))
+    finally:
+        conn.close()
+
+
+def block_on_rail_absent(message: str) -> bool:
+    """Park the card ``needs_input`` with a ``*_RAIL_ABSENT:`` tool error verbatim.
+
+    t_db491366: a worker that needs the operator's browser/screen but runs where
+    neither exists must not retry; the fix is re-pinning the card, which the
+    message names. Never raises.
+    """
+    try:
+        if "_RAIL_ABSENT:" not in str(message or ""):
+            return False
+        from agent.delegation_context import owned_kanban_task
+        if not owned_kanban_task():  # in-process cron / delegate child: never park the worker's card
+            return False
+        return _park_needs_input(str(message))
+    except Exception:
+        logging.getLogger(__name__).warning("rail-absent block failed", exc_info=True)
+        return False
+
+
 def block_on_safeguard_refusal(result) -> bool:
     """Park this worker's card as ``needs_input`` when its turn was refused.
 

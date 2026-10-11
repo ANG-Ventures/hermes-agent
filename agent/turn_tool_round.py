@@ -186,6 +186,19 @@ def run_tool_round(
                     agent.stream_delta_callback(None)
         return _verdict("break")
 
+    # t_db491366: a tool reported that the operator's browser/screen rail does not exist on this
+    # host. Retrying cannot help (the card must be re-pinned), so a kanban worker parks the card
+    # needs_input with the message verbatim and ends the turn instead of handing it to the model.
+    from tools.rail_preflight import take_rail_absent
+    rail_message = take_rail_absent()
+    if rail_message:
+        from hermes_cli.kanban_worker_exit import block_on_rail_absent
+        if block_on_rail_absent(rail_message):
+            _turn_exit_reason = "rail_absent"
+            final_response = rail_message
+            append_message(messages, {"role": "assistant", "content": final_response})
+            return _verdict("break")
+
     # Reset per-turn retry counters so one truncation can't poison the turn.
     truncated_tool_call_retries = 0
     # Defer the paragraph break: _fire_stream_delta() prepends one "\n\n" when real

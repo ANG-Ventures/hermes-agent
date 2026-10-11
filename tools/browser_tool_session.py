@@ -684,6 +684,11 @@ def _browser_command_preflight() -> Dict[str, Any]:
     try:
         where = _bd_runtime.tool_placement()  # starts the sandbox screen on demand; raises for refused / down
     except RuntimeError as e:
+        # t_db491366: on a placed kanban worker the pool host's sandbox was the only place left
+        # for the agent's own browser; the operator's lives on the Studio, so name that fix.
+        from tools.rail_preflight import placed_browser_rail_error
+        if rail := placed_browser_rail_error():
+            return {"success": False, "error": rail}
         return {"success": False, "error": f"The browser cannot run here: {e}"}
     if where == placement.TERMINAL:
         from tools.interrupt import is_interrupted
