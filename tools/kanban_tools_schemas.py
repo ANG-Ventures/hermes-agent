@@ -172,7 +172,9 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "Stop work on this task and route it according to WHY you're stuck. "
         "Set ``kind`` to say which: 'dependency' (waiting on another task — "
         "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
+        "needed; refused if no parent task is open), 'deferred' (waiting on "
+        "time — set ``until``; parks until then, wakes to ready, pages "
+        "nobody), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "
@@ -189,14 +191,19 @@ KANBAN_BLOCK_SCHEMA = _schema(
         )),
         "kind": {
             "type": "string",
-            "enum": ["dependency", "needs_input", "capability", "transient"],
+            "enum": ["dependency", "deferred", "needs_input", "capability", "transient"],
             "description": (
                 "Why you're blocked. 'dependency' waits in todo and "
                 "resumes automatically when an incomplete parent finishes; "
-                "if no parent is open it is recorded as needs_input instead. "
+                "with no open parent it is refused. 'deferred' waits on "
+                "time (requires ``until``). "
                 "The others surface to a human. Omit only if none apply."
             ),
         },
+        "until": _prop("string", (
+            "Wake time for kind='deferred': '+<N>[smhd]' (e.g. '+6h'), "
+            "epoch seconds, or ISO-8601."
+        )),
     },
     ["reason"],
 )

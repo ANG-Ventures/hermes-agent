@@ -978,9 +978,16 @@ def _handle_block(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
+    until_raw = args.get("until")
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
+        until = None
+        if until_raw not in (None, ""):
+            try:
+                until = kb.parse_wake_at(str(until_raw))
+            except ValueError:
+                raise _Reject(f"invalid until {until_raw!r} (+<N>[smhd], epoch seconds or ISO-8601)")
         # The goal loop treats ANY blocked status as terminal, so kanban_block
         # would be an escape hatch around the completion judge: goal_mode tasks
         # may only block on genuine external blockers.
@@ -997,18 +1004,17 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
+        try:
+            ok = kb.block_task(conn, tid, reason=reason, kind=kind,
+                               expected_run_id=_worker_run_id(tid), until=until)
+        except kb.BlockRefused as exc:
+            raise _Reject(str(exc))
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
-        landed_kind = kb.get_task(conn, tid).block_kind
-        extra: dict = {"block_kind": landed_kind}
-        if kind == "dependency" and landed_kind != kind:
-            # block_task re-kinds a dependency wait that no open parent can satisfy.
-            extra["requested_kind"] = kind
-            extra["note"] = (
-                "kind='dependency' only waits on an incomplete parent; no parent is open, "
-                "so this was recorded as needs_input (sticky until a human unblocks) "
-                "instead of parking in todo where the dispatcher would respawn it."
-            )
+        landed = kb.get_task(conn, tid)
+        extra: dict = {"block_kind": landed.block_kind}
+        if landed.status == "scheduled":
+            extra["until"] = landed.next_eligible_at
+            extra["note"] = kb.format_deferred_until(landed.next_eligible_at)
         return _ok_landed(kb, conn, tid, "blocked", **extra)
 
 

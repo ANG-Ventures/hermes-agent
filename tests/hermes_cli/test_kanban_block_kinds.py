@@ -120,10 +120,12 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 
 
 @pytest.mark.parametrize("parent_state", ["done", "archived", "absent", "derived-from"])
-def test_dependency_without_open_blocking_parent_stays_blocked(
+def test_dependency_without_open_blocking_parent_is_refused(
     kanban_home: Path, parent_state: str,
 ) -> None:
-    """An external wait must not re-spawn on every dispatcher tick."""
+    """A ``dependency`` block no open ``blocks`` parent can satisfy is refused
+    with the two-option message and leaves the card untouched (it used to be
+    re-kinded to needs_input silently and paged every 2 h, t_1e0609f4)."""
     with kb.connect_closing() as conn:
         # Build the edge BEFORE the child runs: a running child cannot be gated retroactively
         # (link_tasks rejects it without the owning run id, upstream b95513df7c4).
@@ -134,83 +136,72 @@ def test_dependency_without_open_blocking_parent_stays_blocked(
                 assert kb.complete_task(conn, parent, result="done")
                 if parent_state == "archived":
                     assert kb.archive_task(conn, parent)
-        child_id = kb.create_task(conn, title="waiting on external PR", assignee="worker")
+        child = kb.create_task(conn, title="waiting on external PR", assignee="worker")
         if parent is not None:
             kb.link_tasks(
-                conn, parent_id=parent, child_id=child_id,
+                conn, parent_id=parent, child_id=child,
                 kind="derived-from" if parent_state == "derived-from" else "blocks",
             )
-        _make_running_again(conn, child_id)
-        child = child_id
+        _make_running_again(conn, child)
         before = [e.kind for e in kb.list_events(conn, child)]
-        for _ in range(10):
+        with pytest.raises(kb.BlockRefused) as exc:
             kb.block_task(conn, child, reason="PR not merged", kind="dependency")
-            kb.recompute_ready(conn)
-            # Exercise the real claim gate, without launching a worker process.
-            assert kb.claim_task(conn, child, claimer="worker") is None
+        assert str(exc.value) == kb.DEPENDENCY_NO_PARENT_REFUSAL
+        assert "--kind deferred --until" in str(exc.value) and "--kind needs_input" in str(exc.value)
         task = kb.get_task(conn, child)
-        assert task.status == "blocked"
-        # A dependency block with no open blocking parent is re-kinded to the sticky needs_input
-        # (upstream 42a778ab4bc; same verdict as test_dependency_block_with_terminal_parents_parks_then_escalates).
-        assert task.block_kind == "needs_input"
-        assert task.block_recurrences == 1
-        after = [e.kind for e in kb.list_events(conn, child)]
-        assert after.count("promoted") == before.count("promoted")
-        assert after.count("claimed") == before.count("claimed")
-        assert after.count("blocked") == 1
+        assert (task.status, task.block_kind) == ("running", None)
+        assert [e.kind for e in kb.list_events(conn, child)] == before
 
 
-def test_dependency_without_parent_escalates_after_manual_unblocks(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
-        child = _running_task(conn)
-        for attempt in range(1, kb.BLOCK_RECURRENCE_LIMIT + 1):
-            assert kb.block_task(conn, child, reason="external wait", kind="dependency")
-            task = kb.get_task(conn, child)
-            assert task.block_recurrences == attempt
-            if attempt < kb.BLOCK_RECURRENCE_LIMIT:
-                assert task.status == "blocked"
-                assert kb.unblock_task(conn, child)
-                _make_running_again(conn, child)
-        assert task.status == "triage"
-        kb.recompute_ready(conn)
-        assert kb.claim_task(conn, child, claimer="worker") is None
-
-
-def test_dependency_block_with_terminal_parents_parks_then_escalates(
+def test_cli_dependency_without_parent_is_refused_with_both_options(
     kanban_home: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A ``dependency`` block whose parents are all terminal can never be
-    satisfied by ``recompute_ready``: it must park in ``blocked`` as
-    ``needs_input`` (no ``dependency_wait``, no re-promotion), say so on the
-    CLI, and count toward the loop breaker so a re-block after an unblock
-    reaches ``triage``."""
+    """`hermes kanban block <id> --kind dependency` with no parent exits 1,
+    names both options on stderr, and writes no BLOCKED comment."""
     with kbc.connect_closing() as conn:
-        parent = kb.create_task(conn, title="already-done-parent", assignee="worker")
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
-        # The edge exists before the run: link_tasks refuses to gate a running child retroactively.
-        child = _running_task(conn, title="child-of-done", parents=(parent,))
+        child = _running_task(conn, title="no-parent")
+        args = argparse.Namespace(task_id=child, ids=None, reason=["waiting", "on", "upstream"],
+                                  kind="dependency", until=None)
+        assert kanban_cli._cmd_block(args) == 1
+        err = capsys.readouterr().err
+        assert kb.DEPENDENCY_NO_PARENT_REFUSAL in err
+        assert kb.get_task(conn, child).status == "running"
+        assert not [c for c in kb.list_comments(conn, child) if c.body.startswith("BLOCKED:")]
 
-        # `hermes kanban block <child> --kind dependency waiting on upstream`
-        args = argparse.Namespace(task_id=child, ids=None, reason=["waiting", "on", "upstream"], kind="dependency")
-        assert kanban_cli._cmd_block(args) == 0
-        assert "needs_input" in capsys.readouterr().out
-        parked = kb.get_task(conn, child)
-        assert (parked.status, parked.block_kind, parked.block_recurrences) == ("blocked", "needs_input", 1)
-        events = kb.list_events(conn, child)
-        assert not [e for e in events if e.kind == "dependency_wait"]
-        blocked = [e for e in events if e.kind == "blocked"][-1].payload
-        assert (blocked["requested_kind"], blocked["rekind_reason"]) == ("dependency", "no_open_parent")
-        assert kb.recompute_ready(conn) == 0
-        assert kb.get_task(conn, child).status == "blocked"
 
-        # A cron/human unblocks; the worker re-declares the same impossible wait.
-        assert kb.unblock_task(conn, child)
+@pytest.mark.parametrize(("kind", "until"), [("deferred", None), ("needs_input", 2_000_000_000)])
+def test_deferred_and_until_must_come_together(kanban_home: Path, kind, until) -> None:
+    with kb.connect_closing() as conn:
+        child = _running_task(conn)
+        with pytest.raises(kb.BlockRefused):
+            kb.block_task(conn, child, reason="x", kind=kind, until=until)
+        assert kb.get_task(conn, child).status == "running"
+
+
+def test_deferred_block_parks_scheduled_and_wakes_at_until(kanban_home: Path) -> None:
+    """``--kind deferred --until T`` parks in ``scheduled`` (never ``blocked``),
+    stamps the wake, and the dispatcher's timed-wake pass returns it to
+    ``ready`` at T, not before."""
+    with kb.connect_closing() as conn:
+        child = _running_task(conn, title="deferred")
+        now = 1_800_000_000
+        until = kb.parse_wake_at("+1m", now=now)
+        assert until == now + 60
+        assert kb.block_task(conn, child, reason="DEFERRED until the 24h window",
+                             kind="deferred", until=until)
+        task = kb.get_task(conn, child)
+        assert (task.status, task.block_kind, task.next_eligible_at) == ("scheduled", "deferred", until)
+        assert task.current_run_id is None
+        kinds = [e.kind for e in kb.list_events(conn, child)]
+        assert "blocked" not in kinds and "dependency_wait" not in kinds
+        parked = [e for e in kb.list_events(conn, child) if e.kind == "scheduled"][-1].payload
+        assert (parked["kind"], parked["until"]) == ("deferred", until)
+        assert kb.wake_due_scheduled(conn, now=until - 1) == []
+        assert kb.get_task(conn, child).status == "scheduled"
+        assert kb.wake_due_scheduled(conn, now=until) == [child]
+        woke = kb.get_task(conn, child)
+        assert (woke.status, woke.next_eligible_at) == ("ready", None)
         assert kb.claim_task(conn, child, claimer="worker") is not None
-        assert kb.block_task(conn, child, reason="still waiting", kind="dependency")
-        assert kb.get_task(conn, child).status == "triage"
-        loop = [e for e in kb.list_events(conn, child) if e.kind == "block_loop_detected"][-1].payload
-        assert loop["recurrences"] == kb.BLOCK_RECURRENCE_LIMIT
 
 
 def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
