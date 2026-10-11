@@ -198,6 +198,16 @@ jobs:
       - name: Require portable Bash shebangs
         run: python scripts/check_bash_shebangs.py
 
+      # Class I (t_8ca8c919): GitHub's abuse heuristics count RUNS. A workflow_run listener on many
+      # upstreams (1,039 runs/day here, 967 skipped) or a pull_request workflow with no paths: and no
+      # concurrency: inflates the count without doing work. Markers: `# trigger-storm-ok: <why>`,
+      # `# no-paths-ok: <why>`. Same script as hermes-home scripts/workflow-trigger-storm-lint.py.
+      - name: Refuse workflow trigger storms
+        run: |
+          # PyYAML is a TEST-env pin only (pyproject), so bring it here; same version uv.lock resolves.
+          uv run --no-project --python 3.11 --with pyyaml==6.0.3 python scripts/ci/workflow_trigger_storm_lint.py --selftest
+          uv run --no-project --python 3.11 --with pyyaml==6.0.3 python scripts/ci/workflow_trigger_storm_lint.py --repo .
+
       # /tmp is not portable (Termux has none, native Windows has none, macOS aliases it to
       # /private/tmp, Linux mounts it as a small tmpfs). Production code resolves scratch space
       # through the scratch-dir helper; skills, docs and prompts must not teach the model a
