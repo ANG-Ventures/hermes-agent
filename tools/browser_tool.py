@@ -1317,8 +1317,7 @@ def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple =
         # t_db491366: refuse before any session/CDP discovery when the operator's browser
         # cannot exist here (placed kanban worker, or a dead loopback endpoint).
         from tools.rail_preflight import browser_rail_error
-        rail = browser_rail_error(_cdp._get_cdp_override_raw(),
-                                  local_browser=_cloud._is_local_mode() and not _is_camofox_mode())
+        rail = browser_rail_error(_cdp._get_cdp_override_raw())
         if rail:
             return _dumps(_err(rail))
         params = {a: args.get(a, d) for a, d in arg_defaults.items()}

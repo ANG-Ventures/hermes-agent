@@ -122,6 +122,9 @@ def block_on_rail_absent(message: str) -> bool:
     try:
         if "_RAIL_ABSENT:" not in str(message or ""):
             return False
+        from agent.delegation_context import owned_kanban_task
+        if not owned_kanban_task():  # in-process cron / delegate child: never park the worker's card
+            return False
         return _park_needs_input(str(message))
     except Exception:
         logging.getLogger(__name__).warning("rail-absent block failed", exc_info=True)

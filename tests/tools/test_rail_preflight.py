@@ -95,7 +95,7 @@ def test_studio_worker_with_reachable_endpoint_passes_through(monkeypatch):
     _worker(monkeypatch)
     monkeypatch.setattr(socket, "gethostname", lambda: "mac-studio-m3u")
     _cdp_requests(monkeypatch, answers=True)
-    assert rp.browser_rail_error("http://127.0.0.1:9222", local_browser=False) is None
+    assert rp.browser_rail_error("http://127.0.0.1:9222") is None
     assert rp.take_rail_absent() is None
 
 
@@ -103,26 +103,63 @@ def test_non_worker_session_is_never_refused(monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     _placed(monkeypatch)
     _cdp_requests(monkeypatch, answers=False)
-    assert rp.browser_rail_error("http://127.0.0.1:9222", local_browser=False) is None
+    assert rp.browser_rail_error("http://127.0.0.1:9222") is None
 
 
-def test_remote_cdp_or_cloud_is_not_a_rail(monkeypatch):
+def test_remote_cdp_or_no_override_is_not_a_rail(monkeypatch):
+    # A remote endpoint, a cloud provider, or the agent's own Chromium (no override) is not Ace's browser.
     _worker(monkeypatch)
     _placed(monkeypatch)
-    assert rp.browser_rail_error("ws://10.0.0.5:9222", local_browser=False) is None
-    assert rp.browser_rail_error("", local_browser=False) is None  # cloud provider
+    assert rp.browser_rail_error("ws://10.0.0.5:9222") is None
+    assert rp.browser_rail_error("") is None
 
 
-def test_placed_worker_local_chromium_is_refused(monkeypatch):
+def test_placed_worker_sandbox_browser_failure_reports_rail(monkeypatch):
+    # Own-Chromium path: placement onto the pool host's sandbox failed -> name the Studio fix.
     _worker(monkeypatch)
     _placed(monkeypatch, "ace-media")
-    assert rp.browser_rail_error("", local_browser=True) == EXPECTED_BROWSER.format(host="ace-media")
+    from tools import browser_tool_session as bts
+    from tools.bot_desktop import runtime as bd
+
+    def refused():
+        raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+    monkeypatch.setattr(bd, "tool_placement", refused)
+    assert bts._browser_command_preflight() == {"success": False, "error": EXPECTED_BROWSER.format(host="ace-media")}
 
 
-def test_computer_use_on_linux_gets_screen_message(monkeypatch):
+def test_unplaced_sandbox_failure_keeps_generic_error(monkeypatch):
+    _worker(monkeypatch)
+    from tools import browser_tool_session as bts
+    from tools.bot_desktop import runtime as bd
+
+    def refused():
+        raise RuntimeError("no screen")
+    monkeypatch.setattr(bd, "tool_placement", refused)
+    assert bts._browser_command_preflight()["error"] == "The browser cannot run here: no screen"
+
+
+@pytest.mark.parametrize("url,expect", [
+    ("http://127.0.0.1:9222", ("http", "http://127.0.0.1:9222/json/version")),
+    ("http://127.0.0.1:9222/session", ("http", "http://127.0.0.1:9222/session/json/version")),
+    ("ws://127.0.0.1:9222", ("http", "http://127.0.0.1:9222/json/version")),
+    ("ws://127.0.0.1:9222/devtools/browser/abc", ("tcp", ("127.0.0.1", 9222))),
+    ("ws://127.0.0.1:3000/cdp-proxy", ("tcp", ("127.0.0.1", 3000))),
+])
+def test_probe_follows_resolver_discovery_semantics(url, expect):
+    assert rp._probe_target(url) == expect
+
+
+def test_unplaced_linux_worker_keeps_its_own_screen(monkeypatch):
+    # Bot Desktop / native Linux/Windows screens are supported: only a placed worker lacks the rail.
     _worker(monkeypatch)
     monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(socket, "gethostname", lambda: "ace-ai")
+    assert rp.screen_rail_error() is None
+
+
+def test_computer_use_placed_worker_gets_screen_message(monkeypatch):
+    _worker(monkeypatch)
+    monkeypatch.setattr(sys, "platform", "linux")
+    _placed(monkeypatch, "ace-ai")
     from tools.computer_use.tool import handle_computer_use
     out = json.loads(handle_computer_use({"action": "capture"}))
     assert out["error"] == (
@@ -137,6 +174,26 @@ def test_computer_use_placed_worker_on_macos_still_refused(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
     _placed(monkeypatch, "ci-box")
     assert rp.screen_rail_error().startswith("SCREEN_RAIL_ABSENT: no screen session on ci-box.")
+
+
+def test_pending_rail_is_drained_only_by_its_owning_worker(monkeypatch):
+    _worker(monkeypatch, "t_owner001")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    _placed(monkeypatch, "ace-ai")
+    message = rp.browser_rail_error("http://127.0.0.1:9222")
+    parked = []
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda *a, **k: parked.append(1) or (_ for _ in ()).throw(AssertionError("parked")))
+    from agent.delegation_context import non_dispatcher_owned_context
+    with non_dispatcher_owned_context():  # in-process cron / delegate turn in the same process
+        assert rp.take_rail_absent() is None
+        from hermes_cli import kanban_worker_exit as kwe
+        assert kwe.block_on_rail_absent(message) is False
+    assert parked == [], "an in-process cron/delegate turn must never touch the worker's card"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_other002")
+    assert rp.take_rail_absent() is None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_owner001")
+    assert rp.take_rail_absent() == message
+    assert rp.take_rail_absent() is None
 
 
 def test_rail_absent_parks_card_needs_input_verbatim(tmp_path, monkeypatch):
@@ -181,7 +238,7 @@ def test_tool_round_breaks_on_rail_absent_instead_of_retrying(monkeypatch):
                         lambda agent, **k: ({"role": "assistant", "content": "", "tool_calls": []}, False))
 
     def execute(assistant_message, messages, task_id, n):
-        rp.browser_rail_error("http://127.0.0.1:9222", local_browser=False)
+        rp.browser_rail_error("http://127.0.0.1:9222")
         messages.append({"role": "tool", "content": "x", "tool_call_id": "c1"})
 
     agent = SimpleNamespace(
