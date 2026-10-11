@@ -68,6 +68,9 @@ outputs:
   desktop_updater:
     description: Run the Windows desktop-update hand-off (windows.ps1) integration tests.
     value: ${{ steps.classify.outputs.desktop_updater }}
+  os_tests:
+    description: Run the macOS + Windows unit lanes (tests-os.yml os-tests) on a pull request.
+    value: ${{ steps.classify.outputs.os_tests }}
   rust:
     description: Run `cargo test` for the Tauri bootstrap installer.
     value: ${{ steps.classify.outputs.rust }}

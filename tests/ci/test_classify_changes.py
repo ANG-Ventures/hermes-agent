@@ -10,9 +10,11 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -47,6 +49,7 @@ DEFAULT = {
     "npm_lock": True,
     "bootstrap": True,
     "desktop_updater": True,
+    "os_tests": True,
     "rust": True,
     "mcp_catalog": False,
     "ci_review": True,
@@ -56,7 +59,7 @@ DEFAULT = {
 SLOW_LANES = {"docker", "nix", "e2e", "e2e_upgrade", "e2e_desktop_core", "e2e_desktop_update"}
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, bootstrap=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=False, docker=None, e2e=False, e2e_upgrade=False, e2e_desktop_core=False, e2e_desktop_update=False, desktop=False) -> dict[str, bool]:
+def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, bootstrap=False, desktop_updater=False, rust=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None, nix=False, docker=None, e2e=False, e2e_upgrade=False, e2e_desktop_core=False, e2e_desktop_update=False, desktop=False, os_tests=False) -> dict[str, bool]:
     # python_prod tracks python except for tests-only diffs; default it to
     # python so the majority of cases don't need to spell it out.
     #
@@ -83,6 +86,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
         "npm_lock": npm_lock,
         "bootstrap": bootstrap,
         "desktop_updater": desktop_updater,
+        "os_tests": os_tests,
         "rust": rust,
         "mcp_catalog": mcp_catalog,
         "ci_review": ci_review,
@@ -101,9 +105,9 @@ CASES = {
     # install, so they start those slow lanes on the PR itself.
     "dep manifest → python": (
         ["pyproject.toml"],
-        _lanes(python=True, scan=True, deps=True, uv_lock=True, desktop_updater=True, docker=True, nix=True, e2e_upgrade=True, bootstrap=True),
+        _lanes(os_tests=True, python=True, scan=True, deps=True, uv_lock=True, desktop_updater=True, docker=True, nix=True, e2e_upgrade=True, bootstrap=True),
     ),
-    "uv.lock → python": (["uv.lock"], _lanes(python=True, uv_lock=True, docker=True, nix=True, e2e_upgrade=True, bootstrap=True)),
+    "uv.lock → python": (["uv.lock"], _lanes(os_tests=True, python=True, uv_lock=True, docker=True, nix=True, e2e_upgrade=True, bootstrap=True)),
     "ts package → frontend": (["apps/desktop/src/app.tsx"], _lanes(frontend=True, desktop=True)),
     "ui-tui → frontend": (["ui-tui/src/entry.ts"], _lanes(frontend=True)),
     # Lockfile bump shifts every TS package's tree, but not the Python suite.
@@ -215,26 +219,26 @@ CASES = {
     "docs-only → no nix": (["README.md"], _lanes()),
     # install.ps1 and its PowerShell suites are exercised by platforms("windows")
     # pytest files, so they must turn on python (which gates tests-os).
-    "install.ps1 → python + e2e_upgrade": (["scripts/install.ps1"], _lanes(python=True, e2e_upgrade=True, bootstrap=True)),
+    "install.ps1 → python + e2e_upgrade": (["scripts/install.ps1"], _lanes(os_tests=True, python=True, e2e_upgrade=True, bootstrap=True)),
     # Every .ps1 is on the install/update path (Ace 2026-10-03, t_bf20260d).
-    "installer suite → python + install lanes": (["scripts/tests/test-install-ps1-longpath.ps1"], _lanes(python=True, e2e_upgrade=True, bootstrap=True)),
+    "installer suite → python + install lanes": (["scripts/tests/test-install-ps1-longpath.ps1"], _lanes(os_tests=True, python=True, e2e_upgrade=True, bootstrap=True)),
     # The Windows desktop-update hand-off is a PowerShell integration surface:
     # its tests spawn the real script and poll its loopback server. They run
     # when the script, the Electron side that launches it, or their own test
     # files change — not on every hermes_state.py PR.
     "windows.ps1 → desktop_updater": (
         ["scripts/desktop-update/windows.ps1"],
-        _lanes(python=True, desktop_updater=True, e2e_desktop_update=True, e2e_upgrade=True, bootstrap=True, desktop=True),
+        _lanes(os_tests=True, python=True, desktop_updater=True, e2e_desktop_update=True, e2e_upgrade=True, bootstrap=True, desktop=True),
     ),
     # The shipped updater page is exercised by the desktop Electron suite;
     # a page-only change must run that suite as well as the server tests.
     "updater ui.html → frontend + desktop_updater": (
         ["scripts/desktop-update/ui.html"],
-        _lanes(python=True, frontend=True, desktop_updater=True, e2e_desktop_update=True, desktop=True),
+        _lanes(os_tests=True, python=True, frontend=True, desktop_updater=True, e2e_desktop_update=True, desktop=True),
     ),
     "desktop-update test → desktop_updater": (
         ["tests/scripts/desktop_update/test_desktop_update_windows_progress.py"],
-        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True),
+        _lanes(os_tests=True, python=True, python_prod=False, scan=True, desktop_updater=True),
     ),
     "updater-process.ts → desktop_updater": (
         ["apps/desktop/electron/updater-process.ts"],
@@ -246,7 +250,7 @@ CASES = {
     # the ONLY lane a Rust change ran, and the crate's tests never executed.
     "rust source → rust": (
         ["apps/bootstrap-installer/src-tauri/src/powershell.rs"],
-        _lanes(frontend=True, bootstrap=True, rust=True),
+        _lanes(os_tests=True, frontend=True, bootstrap=True, rust=True),
     ),
     "cargo lockfile → rust": (
         ["apps/bootstrap-installer/src-tauri/Cargo.lock"],
@@ -276,11 +280,11 @@ CASES = {
     # The shared harness can break every Python E2E suite.
     "conftest → python + desktop_updater + python e2e": (
         ["tests/conftest.py"],
-        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, e2e=True, e2e_upgrade=True),
+        _lanes(os_tests=True, python=True, python_prod=False, scan=True, desktop_updater=True, e2e=True, e2e_upgrade=True),
     ),
     "conftest fixture module → python + desktop_updater + python e2e": (
         ["tests/_fixtures/platform_gating.py"],
-        _lanes(python=True, python_prod=False, scan=True, desktop_updater=True, e2e=True, e2e_upgrade=True),
+        _lanes(os_tests=True, python=True, python_prod=False, scan=True, desktop_updater=True, e2e=True, e2e_upgrade=True),
     ),
     "tests + prod source → both lanes": (
         ["tests/agent/test_foo.py", "agent/x.py"],
@@ -292,7 +296,7 @@ CASES = {
     # .py/.pth payloads are what it scans for).
     "test runner script → python_prod stays on": (
         ["scripts/run_tests_parallel.py"],
-        _lanes(python=True, scan=True, e2e=True, e2e_upgrade=True),
+        _lanes(os_tests=True, python=True, scan=True, e2e=True, e2e_upgrade=True),
     ),
     # Supply-chain lanes
     ".pth file → scan": (["evil.pth"], _lanes(python=True, scan=True)),
@@ -342,7 +346,7 @@ CASES = {
     # and the Tauri app's non-Rust sources.
     "install.sh → bootstrap lane": (
         ["scripts/install.sh"],
-        _lanes(python=True, bootstrap=True, python_prod=True, e2e_upgrade=True, e2e_desktop_update=True, desktop=True),
+        _lanes(os_tests=True, python=True, bootstrap=True, python_prod=True, e2e_upgrade=True, e2e_desktop_update=True, desktop=True),
     ),
     "setup-hermes.sh → bootstrap lane": (
         ["setup-hermes.sh"],
@@ -378,7 +382,7 @@ CASES = {
         ["hermes_cli/update_cmd_git.py"],
         _lanes(python=True, scan=True, e2e_upgrade=True, e2e_desktop_update=True, bootstrap=True, desktop=True),
     ),
-    "PM → e2e_upgrade + docker": (["pm/environments.py"], _lanes(python=True, scan=True, e2e_upgrade=True, docker=True, bootstrap=True)),
+    "PM → e2e_upgrade + docker": (["pm/environments.py"], _lanes(os_tests=True, python=True, scan=True, e2e_upgrade=True, docker=True, bootstrap=True)),
     "desktop backend spawn → desktop core": (
         ["apps/desktop/electron/backend-child.ts"],
         _lanes(frontend=True, e2e_desktop_core=True, desktop=True),
@@ -428,8 +432,9 @@ def test_run_e2e_label_turns_every_slow_lane_on_and_nothing_else(files):
     assert {lane for lane in SLOW_LANES if labelled[lane]} == SLOW_LANES
     unlabelled = classify(files)
     # `desktop` follows the desktop E2E lanes, so the label turns it on too.
-    derived = SLOW_LANES | {"desktop"}
+    derived = SLOW_LANES | {"desktop", "os_tests"}
     assert labelled["desktop"]
+    assert labelled["os_tests"]
     assert {k: v for k, v in labelled.items() if k not in derived} == \
         {k: v for k, v in unlabelled.items() if k not in derived}
 
@@ -461,6 +466,7 @@ def test_every_slow_lane_path_matches_a_tracked_file():
         "docker": _mod._DOCKER_PATHS,
         "nix": _mod._NIX_LANE_PATHS,
         "install": _mod._INSTALL_PATHS,
+        "os_tests": _mod._OS_TESTS_PATHS,
     }
     dead = {
         (lane, prefix)
@@ -642,3 +648,83 @@ def test_pull_request_labels_prefers_the_live_labels_over_the_replayed_event(tmp
     monkeypatch.setattr(_mod.subprocess, "run", lambda *a, **k: failed)
     event.write_text(json.dumps({"pull_request": {"number": 7, "labels": [{"name": "run-e2e"}]}}), encoding="utf-8")
     assert pull_request_labels() == ["run-e2e"]
+
+
+# ── os_tests: the macOS + Windows unit lanes (t_04d4944a) ──────────────────
+
+
+def test_os_marked_test_file_starts_os_tests(tmp_path):
+    """A changed test that carries a platforms() marker is what the OS lanes run."""
+    (tmp_path / "tests" / "tools").mkdir(parents=True)
+    (tmp_path / "tests/tools/test_marked.py").write_text(
+        'import pytest\n\n@pytest.mark.platforms("windows")\ndef test_x():\n    pass\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "tests/tools/test_plain.py").write_text("def test_y():\n    pass\n", encoding="utf-8")
+    assert classify(["tests/tools/test_marked.py"], root=tmp_path)["os_tests"]
+    assert not classify(["tests/tools/test_plain.py"], root=tmp_path)["os_tests"]
+    # Without a tree the content check cannot run; the path rules still apply.
+    assert not classify(["tests/tools/test_marked.py"])["os_tests"]
+    # A file missing from the base tree (new in the PR) does not crash.
+    assert not classify(["tests/tools/test_new.py"], root=tmp_path)["os_tests"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["hermes_cli/windows_console.py", "tools/environments/macos_sandbox.py", "gateway/launchd_unit.py",
+     "scripts/foo.bat", "hermes_platform/host/__init__.py", "scripts/ci/list_os_marked_tests.py"],
+)
+def test_host_os_surface_starts_os_tests(path):
+    assert classify([path])["os_tests"]
+
+
+def _gate_lanes_script(rel: str) -> str:
+    step = next(
+        s for s in _yaml(rel)["jobs"]["detect"]["steps"] if s.get("id") == "gate-lanes"
+    )
+    body = step["run"]
+    start = body.index("<<'PY'\n") + len("<<'PY'\n")
+    return textwrap.dedent(body[start : body.rindex("PY")])
+
+
+@pytest.mark.parametrize("orchestrator", [".github/workflows/ci.yaml", ".github/workflows/ci-local.yaml"])
+@pytest.mark.parametrize(
+    "event,toggle,classified,expected",
+    [
+        ("pull_request", "", "false", "false"),
+        ("pull_request", "", "true", "true"),
+        ("pull_request", "on", "false", "true"),
+        ("merge_group", "", "false", "true"),
+        ("push", "", "false", "true"),
+        ("workflow_dispatch", "", "false", "true"),
+    ],
+)
+def test_gate_lanes_never_skips_os_tests_outside_a_pull_request(
+    orchestrator, event, toggle, classified, expected, tmp_path
+):
+    """merge_group (the only required gate) and push:main always run the OS
+    lanes; a PR runs them when the classifier says so or CI_PR_OS_TESTS=on."""
+    out = tmp_path / "out"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "RELEASE": "false",
+        "EVENT_NAME": event,
+        "DESKTOP_JOBS": "",
+        "PR_OS_TESTS": toggle,
+        "CLASSIFIED": json.dumps({"python": "true", "os_tests": classified}),
+        "GITHUB_OUTPUT": str(out),
+    }
+    subprocess.run([sys.executable, "-c", _gate_lanes_script(orchestrator)], env=env, check=True)
+    lanes = dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines())
+    assert lanes["os_tests"] == expected
+
+
+def test_os_tests_lane_reaches_the_os_unit_jobs():
+    """detect.os_tests must be what tests-os.yml's os-tests job gates on, in both orchestrators."""
+    tests_os = _yaml(".github/workflows/tests-os.yml")
+    assert tests_os["jobs"]["os-tests"]["if"] == "inputs.os_tests"
+    assert "os_tests" in (tests_os.get("on") or tests_os.get(True))["workflow_call"]["inputs"]
+    for rel in (".github/workflows/ci.yaml", ".github/workflows/ci-local.yaml"):
+        ci = _yaml(rel)
+        assert "os_tests" in ci["jobs"]["detect"]["outputs"]
+        assert "needs.detect.outputs.os_tests" in ci["jobs"]["tests-os"]["with"]["os_tests"]
