@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
+from hermes_cli import kanban_placement_reasons as _reasons
 from hermes_cli import placement_ledger as _ledger
 from hermes_cli import placement_policy as _policy
 
@@ -379,21 +380,26 @@ def read_reach(fleet_dir: Path, *, now: Optional[float] = None,
 
 
 def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iterable[str],
-                       ) -> Tuple[bool, Tuple[str, ...]]:
+                       *, pin_hosts: Iterable[str] = ()) -> Tuple[bool, Tuple[str, ...]]:
     """``(host_bound, targets)``: is this card host-bound (a HOST_BOUND_SKILLS
     skill, or a body line naming a probed ssh alias), and which aliases it
     names. A skill-bound card with no named alias has targets ``()``: it
     needs a host that reaches EVERYTHING the matrix probed.
 
     Body lines are matched as whole words (``ssh ace-ai``, ``on ci-box:``),
-    never substrings, and the ``host:<pin>`` line is not a target.
+    never substrings. A ``host:<pin>`` line is not a target only when it IS a
+    pin (``any``, ``studio`` or one of ``pin_hosts``); ``host: unifi`` with
+    no such pool host is prose and is scanned (Prism c63ba2e150ec). Skill ids
+    compare on their basename (``operations/ssh-machines``, Prism e5e1f41acb09).
     """
-    bound = any(s in HOST_BOUND_SKILLS for s in (skills or ()))
+    bound = any(s.rsplit("/", 1)[-1] in HOST_BOUND_SKILLS for s in (skills or ()))
     alias_set = {a for a in (aliases or ()) if a}
+    pins = {PIN_ANY, PIN_STUDIO, *(h.lower() for h in (pin_hosts or ()))}
     found: List[str] = []
     if alias_set and body:
         for line in body.splitlines():
-            if HOST_PIN_RE.match(line):
+            m = HOST_PIN_RE.match(line)
+            if m and m.group(1).lower() in pins:
                 continue
             for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]*", line):
                 w = word.lower().rstrip("._-")
@@ -434,7 +440,7 @@ def resolve_pin(body: Optional[str], known_hosts: Iterable[str]) -> Tuple[Option
     pool registry knows; any other ``host: <word>`` line (an HTTP header, a
     config snippet) is prose: ``pin`` None, the word returned as ``ignored``.
     So a card never waits on a host that does not exist."""
-    known = set(known_hosts or ())
+    known = {h.lower() for h in (known_hosts or ())}
     ignored: Optional[str] = None
     # Every line-anchored host: line, in order: prose lines (an HTTP header
     # pasted above the real pin) are skipped, the first REAL pin wins
@@ -501,20 +507,20 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     portable; ``manifest`` carries the skill-manifest half of that check.
     """
     if (workspace_kind or "scratch") != "scratch":
-        return False, "workspace_kind", None
+        return False, _reasons.WORKSPACE_KIND, None
     if has_links:
-        return False, "linked", None
+        return False, _reasons.LINKED, None
     if workspace_has_content:
-        return False, "local_files", None
+        return False, _reasons.LOCAL_FILES, None
     if not assignee or assignee not in tuple(pool.profiles or ()):
-        return False, "profile", None
+        return False, _reasons.PROFILE, None
     if native_command:
         # foreign_lane.worker_command runs the lane with a LOCAL Popen; the
         # ssh terminal backend never sees it, so placement would be a lie.
-        return False, "native_command", None
+        return False, _reasons.NATIVE_COMMAND, None
     pin, _ignored = resolve_pin(body, pool.hosts or ())
     if pin == PIN_STUDIO:
-        return False, "host_studio", None
+        return False, _reasons.HOST_STUDIO, None
     # Host-bound card (t_1e9ea7e9): it drives a fleet host over ssh, so only a
     # worker host with a PROVEN route (fresh reach matrix row, rc 0 to every
     # target) may take it. No such host, or no fresh matrix: it stays local
@@ -522,9 +528,9 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     allowed = reach_allowed_hosts(body=body, skills=skills, pool=pool)
     if allowed is not None:
         if pin is not None and pin != PIN_ANY and pin not in allowed:
-            return False, "host_reach", None
+            return False, _reasons.HOST_REACH, None
         if pin in (None, PIN_ANY) and not allowed:
-            return False, "host_reach", None
+            return False, _reasons.HOST_REACH, None
     if pin == PIN_ANY:
         return True, None, "any"
     if pin is not None:
@@ -546,9 +552,10 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool) -> 
     13bf80849c6b), while the proof is fresh rows only: an absent or stale
     matrix recognises the target and proves nothing, so the card gets
     ``()``. ``pool`` needs ``reach``, ``reach_aliases`` and ``hosts``."""
+    pool_hosts = tuple(getattr(pool, "hosts", ()) or ())
     aliases = tuple(dict.fromkeys([*(getattr(pool, "reach_aliases", ()) or ()),
-                                   *(h.lower() for h in (getattr(pool, "hosts", ()) or ()))]))
-    bound, targets = host_bound_targets(body, skills, aliases)
+                                   *(h.lower() for h in pool_hosts)]))
+    bound, targets = host_bound_targets(body, skills, aliases, pin_hosts=pool_hosts)
     if not bound:
         return None
     return reaching_hosts(getattr(pool, "reach", {}) or {}, targets, aliases)
@@ -831,11 +838,17 @@ class SpilloverPlan:
         card, t_1e9ea7e9) restricts the unpinned pick to those hosts; an empty
         ``only`` takes nothing (``host_reach``). None sets ``refusal``."""
         self.refusal = None
+        # Pins and reach rows are lower-cased; host keys are compared case-
+        # folded so a mixed-case pool id still matches (Prism d4be9ccd2c7f).
+        fold = {n.lower(): n for n in self.hosts}
         if pin is not None:
+            pin = fold.get(pin.lower(), pin)
             host = self.hosts.get(pin)
             if host is None:
-                self.refusal = ("pin_host_disabled" if pin in self.disabled
-                                else "pin_host_dropped" if pin in (self.config.hosts or ())
+                low = pin.lower()
+                self.refusal = ("pin_host_disabled" if low in {d.lower() for d in self.disabled}
+                                else "pin_host_dropped"
+                                if low in {h.lower() for h in (self.config.hosts or ())}
                                 else "pin_unknown_host")
                 return None
             if assignee not in host.profiles:
@@ -853,7 +866,7 @@ class SpilloverPlan:
             self.taken[pin] = self.taken.get(pin, 0) + 1
             return host
         if only is not None:
-            allowed = set(only)
+            allowed = {fold.get(n.lower(), n) for n in only}
             if not any(n in allowed for n in self.hosts):
                 self.refusal = "host_reach"
                 return None

@@ -142,11 +142,11 @@ def test_body_alias_match_is_whole_word_and_skips_the_pin_line(tmp_path):
     _matrix(fleet, {"ci-box": _row()})
     pool = _pool(fleet)
     bound, targets = kwp.host_bound_targets("host: ci-box\nrestart sshd on ace-ai, then unifi.",
-                                            (), pool.reach_aliases)
+                                            (), pool.reach_aliases, pin_hosts=pool.hosts)
     assert (bound, targets) == (True, ("ace-ai", "unifi"))
     # Substrings are not aliases; the pin line is not a target.
-    assert kwp.host_bound_targets("host: ci-box\nthe ace-ai-lan box", (), pool.reach_aliases) \
-        == (False, ())
+    assert kwp.host_bound_targets("host: ci-box\nthe ace-ai-lan box", (), pool.reach_aliases,
+                                  pin_hosts=pool.hosts) == (False, ())
 
 
 def test_host_bound_card_portable_only_to_a_reaching_host(tmp_path):
@@ -166,6 +166,48 @@ def test_host_bound_card_portable_only_to_a_reaching_host(tmp_path):
     assert _portable(pool, body="host: ace-ai\nssh ace-ai", ) == (False, "host_reach", None)
     assert _portable(pool, body="host: ci-box\nssh ace-ai") == (True, None, "pin")
     assert _portable(pool, body="host:any\nssh ace-ai") == (True, None, "any")
+
+
+def test_prose_host_line_naming_a_non_pool_alias_is_scanned(tmp_path):
+    """Prism c63ba2e150ec: ``host: unifi`` is not a pin (unifi is no pool host),
+    so the line is prose and its alias makes the card host-bound. A real pin
+    line (a pool host) is still skipped."""
+    fleet = tmp_path / "fleet"
+    _matrix(fleet, {"ci-box": _row()})
+    pool = _pool(fleet)
+    assert kwp.host_bound_targets("host: unifi\nrestart the controller", (), pool.reach_aliases,
+                                  pin_hosts=pool.hosts) == (True, ("unifi",))
+    assert kwp.host_bound_targets("host: ci-box\nwrite a doc", (), pool.reach_aliases,
+                                  pin_hosts=pool.hosts) == (False, ())
+    # Nobody reaches unifi: the card stays local instead of spilling on policy.
+    assert _portable(pool, body="host: unifi\nrestart the controller") == (False, "host_reach", None)
+
+
+def test_path_qualified_skill_id_is_host_bound(tmp_path):
+    """Prism e5e1f41acb09: ``operations/ssh-machines`` is the ssh-machines skill."""
+    pool = _pool(tmp_path / "fleet")
+    assert kwp.host_bound_targets(None, ("operations/ssh-machines",), ()) == (True, ())
+    assert _portable(pool, skills=("operations/ssh-machines",)) == (False, "host_reach", None)
+    assert _portable(pool, skills=("operations/not-a-host-skill",)) == (True, None, "policy")
+
+
+def test_reach_rows_and_pool_hosts_compare_case_folded(tmp_path):
+    """Prism d4be9ccd2c7f: reach rows are lower-cased, pool keys and pins are
+    not; a mixed-case pool host that the matrix proves must still be allowed."""
+    fleet = tmp_path / "fleet"
+    _matrix(fleet, {"CI-Box": _row(ace_ai=0)})
+    reach, aliases, status = kwp.read_reach(fleet, now=NOW)
+    cfg = kwp.PoolConfig(hosts=("CI-Box",), profiles=("alpha",), reach=reach,
+                         reach_aliases=aliases, reach_status=status)
+    assert _portable(cfg, body="host: CI-Box\nssh ace-ai") == (True, None, "pin")
+    host = kwp.PoolHost(name="CI-Box", ssh_host="CI-Box", ssh_user=kwp.SSH_USER, slots=2,
+                        capacity_pct=0.8, absence="required", profiles=("alpha",),
+                        state="active", enabled=True, priority=0)
+    p = kwp.plan([host], {}, probe=lambda h: (1.0, 16), config=cfg)
+    only = kwp.reach_allowed_hosts(body="ssh ace-ai", skills=(), pool=cfg)
+    assert only == ("ci-box",)
+    assert p.take("alpha", only=only).name == "CI-Box"
+    assert p.take("alpha", pin="ci-box").name == "CI-Box"
 
 
 def test_take_honours_the_reaching_set():

@@ -371,6 +371,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "load_gate": gate["info"],
             "limit_notes": limit_notes,
             "memory_pressure": res.memory_pressure,
+            "placement_waits": dict(res.placement_waits or {}),
         }, ascii=True)
         return 0
     if res.skipped_locked:
@@ -492,6 +493,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Deferred (respawn guard {reason}): {tid}"
             + _fmt_respawn_guard_detail(res.respawn_guard_details.get(tid))
         )
+    # Why a ready card was not spawned anywhere this tick (pool routing); a
+    # held card used to be invisible without reading the source (t_ae87edff).
+    for tid, reason in (res.placement_waits or {}).items():
+        print(f"Held ({tid}): {reason}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — HUMAN review required): "
