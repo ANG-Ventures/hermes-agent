@@ -12,7 +12,6 @@ is NOT portable (fail closed). Every dispatcher test runs under the AC-5 seam.
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -97,6 +96,35 @@ def test_malformed_matrix_is_unreadable_never_reachable(tmp_path, text):
     (fleet / kwp.REACH_FILE).write_text(text)
     reach, aliases, status = kwp.read_reach(fleet, now=NOW)
     assert (reach, aliases, status) == ({}, (), "unreadable")
+
+
+def test_stale_rows_keep_their_aliases_in_the_vocabulary(tmp_path):
+    """A target named only by a STALE row is still a target (Prism da8af4dbc8be):
+    the fresh ci-box row proves ace-ai, the stale row is the only one naming
+    mac-studio-m3u, and a card needing both must not spill on ace-ai alone."""
+    fleet = tmp_path / "fleet"
+    _matrix(fleet, {"ci-box": {"at": NOW, "reach": {"ace-ai": 0}},
+                    "ace-media": {"at": NOW - 40 * 3600, "reach": {"ace-ai": 0, "mac-studio-m3u": 0}}})
+    pool = _pool(fleet)
+    assert pool.reach_status == "ok" and set(pool.reach) == {"ci-box"}
+    assert set(pool.reach_aliases) == {"ace-ai", "mac-studio-m3u"}
+    assert kwp.reach_allowed_hosts(body="ssh ace-ai", skills=(), pool=pool) == ("ci-box",)
+    assert kwp.reach_allowed_hosts(body="ssh ace-ai then mac-studio-m3u", skills=(), pool=pool) == ()
+
+
+def test_body_only_card_is_recognised_without_a_fresh_sample(tmp_path):
+    """Prism 13bf80849c6b: a card whose body names a fleet host is host-bound
+    even when the matrix is absent (pool hosts are always vocabulary) or
+    wholly stale (the file's aliases survive); it then stays local."""
+    fleet = tmp_path / "fleet"
+    pool = _pool(fleet)
+    assert pool.reach_status == "absent"
+    assert _portable(pool, body="check nvidia-smi on ace-ai") == (False, "host_reach", None)
+    _matrix(fleet, {"ci-box": _row(at=NOW - 40 * 3600, ace_ai=0, unifi=0, mac_studio_m3u=0)})
+    pool = _pool(fleet)
+    assert pool.reach_status == "stale" and pool.reach == {} and "unifi" in pool.reach_aliases
+    assert _portable(pool, body="restart the controller on unifi") == (False, "host_reach", None)
+    assert _portable(pool, body="write a doc") == (True, None, "policy")
 
 
 def test_fresh_row_kept_stale_row_dropped(tmp_path):
@@ -197,7 +225,7 @@ def test_fleet_host_diagnosis_card_is_never_spilled_without_a_matrix(kanban_home
 def test_host_bound_card_spills_only_to_the_reaching_host(kanban_home):
     fleet = kanban_home / "fleet"
     _matrix(fleet, {"ci-box": _row(), "ace-media": _row(ace_ai=0)})
-    reach, aliases, status = kwp.read_reach(fleet, now=time.time())
+    reach, aliases, status = kwp.read_reach(fleet, now=NOW)
     cfg = kwp.PoolConfig(hosts=("ci-box", "ace-media"), profiles=("alpha",),
                          reach=reach, reach_aliases=aliases, reach_status=status)
     plan = kwp.plan([_fleet_host("ci-box", 0), _fleet_host("ace-media", 1)], {},

@@ -124,9 +124,12 @@ class PoolConfig:
     warnings: Tuple[str, ...] = ()
     refused: Optional[str] = None   # why the whole pool was refused (load_gate.json)
     # Reach matrix (t_1e9ea7e9): ``reach[host][alias] = rc``, only rows whose
-    # sample is fresh. ``reach_aliases`` = every alias ANY fresh row probed (the
-    # body scan vocabulary). An absent/stale/unreadable matrix is {} / ():
-    # nothing is reachable from anywhere, so every host-bound card stays local.
+    # sample is fresh. ``reach_aliases`` = every alias the file names at ALL
+    # (top-level list + every row, stale rows included): the body-scan
+    # vocabulary must not shrink when samples age, or a target silently
+    # stops being a target (Prism da8af4dbc8be). An absent/stale/unreadable
+    # matrix has reach {}: nothing is reachable from anywhere, so every
+    # host-bound card stays local.
     reach: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
     reach_aliases: Tuple[str, ...] = ()
     reach_status: str = "absent"   # ok | absent | stale | unreadable
@@ -299,9 +302,9 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     # The classifier allowlist is every profile SOME enabled host serves
     # (global list + per-host overrides); take() still checks the host.
     served = tuple(dict.fromkeys([*gprofiles, *(p for h in hosts for p in h.profiles)]))
+    # Not a pool-drift warning: a missing matrix is the normal pre-cron state
+    # and the classifier is fail-closed without it (reach_status carries it).
     reach, aliases, reach_status = read_reach(fleet_dir)
-    if reach_status != "ok":
-        warnings.append(f"kanban pool: {REACH_FILE} {reach_status}: host-bound cards stay local")
     # ``hosts`` is every host the pool files KNOW, placement-eligible or not:
     # a pin on a dropped host (role but no row, row not in priority) must
     # still resolve as a pin and wait at take(), never fall back (Prism 4271004b).
@@ -322,8 +325,10 @@ def read_reach(fleet_dir: Path, *, now: Optional[float] = None,
     Schema 1: ``{"schema": 1, "hosts": {"<worker host>": {"at": <epoch>,
     "reach": {"<alias>": <rc>}}}}``. FAIL CLOSED (t_1e9ea7e9): an absent,
     unreadable or malformed file, or a row older than ``stale_after_s``, is
-    DROPPED, never read as reachable. ``aliases`` is the union of every
-    alias a fresh row probed, in file order.
+    DROPPED, never read as reachable. ``aliases`` is the union of the
+    top-level ``aliases`` list and every alias ANY row probed, fresh or
+    stale, in file order: the target vocabulary does not depend on
+    freshness, only the proof does.
     """
     now = time.time() if now is None else now
     try:
@@ -335,7 +340,8 @@ def read_reach(fleet_dir: Path, *, now: Optional[float] = None,
     if not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("hosts"), dict):
         return {}, (), "unreadable"
     reach: Dict[str, Dict[str, int]] = {}
-    aliases: List[str] = []
+    aliases: List[str] = [a.lower() for a in (doc.get("aliases") or ())
+                          if isinstance(a, str) and a] if isinstance(doc.get("aliases"), list) else []
     stale = 0
     for hid, row in doc["hosts"].items():
         if not isinstance(hid, str) or not isinstance(row, dict):
@@ -344,18 +350,19 @@ def read_reach(fleet_dir: Path, *, now: Optional[float] = None,
         table = row.get("reach")
         if isinstance(at, bool) or not isinstance(at, (int, float)) or not isinstance(table, dict):
             continue
-        if now - float(at) > stale_after_s or at > now + 3600:
-            stale += 1
-            continue
         clean: Dict[str, int] = {}
         for alias, rc in table.items():
             if isinstance(alias, str) and alias and not isinstance(rc, bool) and isinstance(rc, int):
                 clean[alias.lower()] = rc
                 aliases.append(alias.lower())
+        if now - float(at) > stale_after_s or at > now + 3600:
+            stale += 1
+            continue
         reach[hid.lower()] = clean
+    vocab = tuple(dict.fromkeys(aliases))
     if not reach:
-        return {}, (), "stale" if stale else "unreadable"
-    return reach, tuple(dict.fromkeys(aliases)), "ok"
+        return {}, vocab, "stale" if stale else "unreadable"
+    return reach, vocab, "ok"
 
 
 def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iterable[str],
@@ -517,10 +524,14 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
 def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool) -> Optional[Tuple[str, ...]]:
     """None when the card is not host-bound (any pool host may take it);
     else the worker hosts the reach matrix proves can ssh to every target
-    the card names (``()`` = none: stays local). FAIL CLOSED: an absent or
-    stale matrix knows no alias, so only a skill-bound card is detected, and
-    it gets ``()``. ``pool`` needs ``reach`` and ``reach_aliases``."""
-    aliases = tuple(getattr(pool, "reach_aliases", ()) or ())
+    the card names (``()`` = none: stays local). FAIL CLOSED: the target
+    vocabulary is every alias the matrix file ever named PLUS every known
+    pool host (so recognition never depends on a fresh sample, Prism
+    13bf80849c6b), while the proof is fresh rows only: an absent or stale
+    matrix recognises the target and proves nothing, so the card gets
+    ``()``. ``pool`` needs ``reach``, ``reach_aliases`` and ``hosts``."""
+    aliases = tuple(dict.fromkeys([*(getattr(pool, "reach_aliases", ()) or ()),
+                                   *(h.lower() for h in (getattr(pool, "hosts", ()) or ()))]))
     bound, targets = host_bound_targets(body, skills, aliases)
     if not bound:
         return None
