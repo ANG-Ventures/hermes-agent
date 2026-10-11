@@ -16,7 +16,11 @@ RULES (one line per finding; exit 1 on any, 0 clean, 2 unreadable):
      `concurrency:` group (else every push of every PR runs it and nothing cancels the stale run).
      Or the `pull_request:` line carries `# no-paths-ok: <why>`.
 
-  workflow_trigger_storm_lint.py [--repo DIR] [--json] [--selftest]   (vendored from hermes-home scripts/workflow-trigger-storm-lint.py)
+  workflow-trigger-storm-lint [--repo DIR] [--json] [--selftest]
+
+ONE FILE, TWO REPOS: hermes-home scripts/workflow-trigger-storm-lint.py and hermes-agent
+scripts/ci/workflow_trigger_storm_lint.py are byte-identical; each repo's test pins this file's sha256
+(LINT_SHA256). Change both in the same pair of PRs.
 """
 from __future__ import annotations
 
@@ -48,7 +52,25 @@ def _on(doc) -> dict:
 
 
 def _key_line(text: str, key: str) -> str:
-    return next((ln for ln in text.splitlines() if re.match(r"^\s*%s:" % re.escape(key), ln)), "")
+    """The source line of the `key` event INSIDE the top-level `on:` (its mapping key, or its item in the
+    list / scalar form), so a marker elsewhere (e.g. in a `run: |` script) never exempts the trigger."""
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError:
+        return ""
+    if not isinstance(root, yaml.MappingNode):
+        return ""
+    on = next((v for k, v in root.value if isinstance(k, yaml.ScalarNode) and k.value in ("on", "true", "True")), None)
+    if isinstance(on, yaml.MappingNode):
+        nodes = [k for k, _v in on.value if isinstance(k, yaml.ScalarNode) and k.value == key]
+    elif isinstance(on, yaml.SequenceNode):
+        nodes = [x for x in on.value if isinstance(x, yaml.ScalarNode) and x.value == key]
+    elif isinstance(on, yaml.ScalarNode) and on.value == key:
+        nodes = [on]
+    else:
+        nodes = []
+    lines = text.splitlines()
+    return lines[nodes[0].start_mark.line] if nodes and nodes[0].start_mark.line < len(lines) else ""
 
 
 def lint_text(path: str, text: str) -> list[str]:
@@ -113,6 +135,8 @@ SELFTEST = {  # name -> (workflow text, expect a finding)
     "pr-paths.yml": ("on:\n  pull_request:\n    paths: ['x/**']\njobs: {}\n", False),
     "pr-conc.yml": ("on: [pull_request]\nconcurrency:\n  group: g\n  cancel-in-progress: true\njobs: {}\n", False),
     "pr-marked.yml": ("on:\n  pull_request:  # no-paths-ok: reads the PR body\n    types: [edited]\njobs: {}\n", False),
+    "marker-in-script.yml": ("on: [pull_request]\njobs:\n  j:\n    steps:\n      - run: |\n"
+                             "          pull_request: # no-paths-ok: example\n", True),
     "sweep.yml": ("on:\n  schedule:\n    - cron: '*/15 * * * *'\njobs: {}\n", False),
 }
 
@@ -133,9 +157,15 @@ def selftest() -> int:
     return 1 if bad else 0
 
 
+def _repo_root() -> pathlib.Path:
+    """The nearest ancestor of this file that holds .github/ (scripts/ in one repo, scripts/ci/ in the other)."""
+    here = pathlib.Path(__file__).resolve().parent
+    return next((d for d in (here, *here.parents) if (d / ".github").is_dir()), here)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", type=pathlib.Path, default=pathlib.Path(__file__).resolve().parents[2])  # scripts/ci/<this> -> repo root
+    ap.add_argument("--repo", type=pathlib.Path, default=_repo_root())
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)

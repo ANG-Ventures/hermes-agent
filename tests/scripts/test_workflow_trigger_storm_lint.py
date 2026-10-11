@@ -84,3 +84,30 @@ def test_scalar_workflows_is_one_upstream():  # Prism P1 b731e7859a9b
 def test_missing_repo_exits_2(tmp_path):  # Prism P1 1ec058f04ff8
     proc = subprocess.run([sys.executable, str(SCRIPT), "--repo", str(tmp_path / "nope")], capture_output=True, text=True)
     assert proc.returncode == 2, proc.stdout + proc.stderr
+
+
+# --- Apollo send-back on hermes-home#3576: marker scope (Prism 95a4fac5d32d) + one file in two repos ----
+SCRIPT_MARKER = "jobs:\n  j:\n    steps:\n      - run: |\n          pull_request: # no-paths-ok: example\n"
+
+
+def test_marker_inside_a_run_script_does_not_exempt_the_trigger():
+    assert L.lint_text("w", "on: [pull_request]\n" + SCRIPT_MARKER)
+    assert L.lint_text("w", "on:\n  pull_request:\n" + SCRIPT_MARKER)
+    assert L.lint_text("w", "on:\n  workflow_run:\n    workflows: [A, B, C, D]\n    types: [completed]\n"
+                            "jobs:\n  j:\n    if: true\n    steps:\n      - run: |\n          workflow_run: # trigger-storm-ok: x\n")
+
+
+def test_marker_on_the_trigger_itself_exempts():
+    assert not L.lint_text("w", "on:\n  pull_request:  # no-paths-ok: reads the PR body\n" + SCRIPT_MARKER)
+    assert not L.lint_text("w", "on: [pull_request]  # no-paths-ok: reads the PR body\njobs: {}\n")
+    assert not L.lint_text("w", "on: pull_request  # no-paths-ok: reads the PR body\njobs: {}\n")
+
+
+# hermes-home scripts/workflow-trigger-storm-lint.py pins the same digest (scripts/tests/
+# test_workflow_trigger_storm_lint.py there): a change to one copy fails until both repos carry the same bytes.
+LINT_SHA256 = "b687922e4606a5b4f37c0c70b5c9c17e0d7bb98f134f533c912e112cb114d9e3"
+
+
+def test_lint_bytes_match_the_hermes_home_copy():
+    import hashlib
+    assert hashlib.sha256(SCRIPT.read_bytes()).hexdigest() == LINT_SHA256

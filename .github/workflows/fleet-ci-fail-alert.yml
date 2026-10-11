@@ -65,6 +65,11 @@ jobs:
           # every CFA_WATCHED workflow (tests/test_fleet_ci_fail_alert_gate.py checks it).
           LOOKBACK_S: "10800"
           RERUN_WINDOW_S: "2592000"
+          # The re-run scan's creation window (Prism P1 5c2e2b7a1114): a hosted job runs at most 6 h. A re-run
+          # of an OLDER run is seen while its newest attempt is queued or running, so a red attempt k of a run
+          # created > RUN_MAX_S before SINCE is missed only if attempts k and k+1 both start and finish between
+          # two sweeps.
+          RUN_MAX_S: "21600"
           CFA_EVENTS: push merge_group schedule workflow_dispatch release
           # The workflows whose reds reach the page gate. One name per line (hermes-home
           # scripts/main-red-summary.py and scripts/ci_speed_lint.py read this list). workflow_run only
@@ -104,8 +109,10 @@ jobs:
           set -euo pipefail
           if [ "$EVENT_NAME" = workflow_dispatch ]; then
             [[ "$REPLAY_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::run_id must be a run id"; exit 1; }
+            # a standalone assignment: inside `echo "...$(...)"` a failed lookup is masked (Prism P1 0624b7746292)
+            DEF="$(curl -fsS --retry 2 --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO" | jq -er '.default_branch | select(length > 0)')"
             echo "runs=[{\"id\":$REPLAY_RUN_ID,\"key\":\"replay\"}]" | tee -a "$GITHUB_OUTPUT"
-            echo "default_branch=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO" | jq -er .default_branch)" | tee -a "$GITHUB_OUTPUT"
+            echo "default_branch=$DEF" | tee -a "$GITHUB_OUTPUT"
             exit 0
           fi
           api() { timeout "${API_CALL_S:-75}" curl -fsS --retry 2 --retry-max-time 40 --connect-timeout 10 --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/$1"; }
@@ -155,9 +162,33 @@ jobs:
               REDS="$(printf '%s\n%s' "$REDS" "$got" | jq -cs '.[0] + .[1]')"
             done
           done
+          # The run list shows a run's LATEST attempt only, so a red attempt that was re-run before a sweep
+          # listed it hides behind its re-run (Prism P1 5c2e2b7a1114 / a29846216f52). Read the earlier
+          # attempts of every re-run watched run that is in flight (any age), or that completed since SINCE
+          # among the runs created since SINCE - RUN_MAX_S.
+          MULTI='[]'
+          for ev in $CFA_EVENTS; do
+            for st in completed queued in_progress; do
+              from=$((NOW - RERUN_WINDOW_S)); [ "$st" = completed ] && from=$((SINCE - RUN_MAX_S))
+              got="$(win_pages "actions/runs?status=$st&event=$ev" "$from" "$NOW")"
+              MULTI="$(printf '%s\n%s' "$MULTI" "$got" | jq -cs '.[0] + .[1]')"
+            done
+          done
+          for ra in $(jq -r --arg watched "$CFA_WATCHED" --arg since "$(iso "$SINCE")" '
+              ($watched | split("\n") | map(select(. != ""))) as $w
+              | [.[] | select(.name as $n | $w | index($n)) | select((.run_attempt // 1) > 1)
+                 | select(.event != "pull_request" and .event != "pull_request_target")
+                 | select(.status != "completed" or .updated_at >= $since)]
+              | unique_by(.id) | .[] | "\(.id):\(.run_attempt)"' <<< "$MULTI"); do
+            for n in $(seq 1 $((${ra#*:} - 1))); do
+              got="$(api "actions/runs/${ra%%:*}/attempts/$n" | jq -c '{id, name, event, conclusion, run_attempt, head_branch, created_at, updated_at}')"
+              REDS="$(printf '%s\n%s' "$REDS" "$got" | jq -cs '.[0] + [.[1]]')"
+            done
+          done
           CANDS="$(jq -c --arg watched "$CFA_WATCHED" --arg listener "$LISTENER" --arg since "$(iso "$SINCE")" '
             ($watched | split("\n") | map(select(. != ""))) as $w
-            | [.[] | select(.name as $n | $w | index($n)) | select(.updated_at >= $since)
+            | [.[] | select(.conclusion as $c | ["failure", "startup_failure"] | index($c))
+               | select(.name as $n | $w | index($n)) | select(.updated_at >= $since)
                | select(.event != "pull_request" and .event != "pull_request_target")
                | select(.head_branch != "ci-overflow-ledger")
                | select($listener == "" or .updated_at > $listener)
@@ -177,8 +208,10 @@ jobs:
           RUNS="$(jq -c '.[:200]' <<< "$PENDING")"
           echo "backlog=$(( $(jq length <<< "$PENDING") - $(jq length <<< "$RUNS") ))" | tee -a "$GITHUB_OUTPUT"
           echo "sweep since $(iso "$SINCE"): $(jq length <<< "$CANDS") red run(s) of the watched workflows, $(jq length <<< "$DONE") already notified"
+          # standalone assignment: a failed lookup fails the sweep (Prism P1 0624b7746292)
+          DEF="$(timeout "${API_CALL_S:-75}" curl -fsS --retry 2 --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO" | jq -er '.default_branch | select(length > 0)')"
           echo "runs=$RUNS" | tee -a "$GITHUB_OUTPUT"
-          echo "default_branch=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO" | jq -er .default_branch)" | tee -a "$GITHUB_OUTPUT"
+          echo "default_branch=$DEF" | tee -a "$GITHUB_OUTPUT"
 
       # The sweep itself going red pages nobody else: page once per outage. "Already paged" = this
       # step SUCCEEDED in the previous completed sweep (it exits 0 on both a page and a skip, so it
@@ -203,8 +236,12 @@ jobs:
           [ "$PREV" = success ] && { echo "the previous sweep already paged this outage"; exit 0; }
           body="$(jq -nc --arg repo "$REPO" --arg url "$RUN_URL" --arg sha "$GITHUB_SHA" '{event_type:"ci_failure", card:"", signature:"", repo:$repo, workflow:"Fleet CI-fail alert sweep is red: reds of the watched workflows are not being paged", branch:"main", sha:$sha, run_url:$url, actor:"cron", trigger:"schedule"}')"
           sig="$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$CI_FAIL_WEBHOOK_SECRET" | sed 's/^.* //')"
-          curl -fsS -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -H "X-GitHub-Event: ci_failure" \
-            -H "X-GitHub-Delivery: ci-fail-sweep-$GITHUB_RUN_ID" -H "X-Webhook-Signature: $sig" --data "$body"
+          # 2xx or the step fails: curl -f calls a 3xx a success, and a "successful" page step suppresses the
+          # next sweep's page, so a redirecting webhook would silence the whole outage (Prism P1 a178f3651a54).
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -H "X-GitHub-Event: ci_failure" \
+            -H "X-GitHub-Delivery: ci-fail-sweep-$GITHUB_RUN_ID" -H "X-Webhook-Signature: $sig" --data "$body")" || code=000
+          echo "outage page: receiver HTTP $code"
+          case "$code" in 2??) ;; *) echo "::error::outage page POST returned HTTP $code"; exit 1 ;; esac
 
   backlog:
     needs: sweep
@@ -556,6 +593,7 @@ jobs:
           # pages none of the reds this workflow watches except as that backstop.
           STILL_SIG=""; STREAK_SUMMARY=""
           WF_CREATED="$(f .created_at)"
+          WF_UPDATED="$(f .updated_at)"
           if [ "$ROUTE" = alerts ] && [ "$WF_EVENT" = push ] && [ "$WF_CONCLUSION" = failure ] \
              && [ -n "$WF_ID" ] && [ -n "$DEFAULT_BRANCH" ] && [ "$WF_BRANCH" = "$DEFAULT_BRANCH" ]; then
             # Items = [job, step] of each failed step ([job, ""] if no step failed, e.g. a job
@@ -577,13 +615,17 @@ jobs:
                   then error("ambiguous step name: \($jn) / \($sn)") else . end] | unique')" || ITEMS=error
             BR_Q="$(jq -rn --arg b "$DEFAULT_BRANCH" '$b | @uri')"
             RUNS_RAW="$(api "actions/workflows/$WF_ID/runs?branch=$BR_Q&event=push&status=completed&per_page=50${WF_CREATED:+&created=%3C%3D$WF_CREATED}")" || RUNS_RAW=""
-            PREVS="$([ -n "$RUNS_RAW" ] || exit 1; jq -r --argjson id "$WF_RUN_ID" --arg created "$WF_CREATED" '
+            PREVS="$([ -n "$RUNS_RAW" ] || exit 1; jq -r --argjson id "$WF_RUN_ID" --arg created "$WF_CREATED" --arg updated "$WF_UPDATED" '
                 # created_at has 1 s precision: another run created in the same second cannot be
                 # ordered against this one, so page instead of dropping it (Prism P1 569d6f572e69).
                 if $created != "" and any(.workflow_runs[]; .id != $id and .created_at == $created)
                 then error("a main run shares created_at \($created)") else . end
                 | [.workflow_runs[] | select(.id != $id)
-                  | select($created == "" or .created_at < $created)]
+                  | select($created == "" or .created_at < $created)
+                  # only the runs that had completed when THIS run did: what a listener saw at completion,
+                  # and what STREAK_JQ assumes each notifier saw. A sweep leg runs up to 15 min later
+                  # (Prism P1 80accbb94ab6: a later-finishing run changed the live view, not the replay).
+                  | select($updated == "" or .updated_at <= $updated)]
                 # two earlier runs created in the same second cannot be ordered either: an older
                 # red could be walked before a newer green (Prism P1 d12fe5a4bf6d)
                 | if (group_by(.created_at) | any(length > 1)) then error("two main runs share a created_at") else . end
@@ -898,11 +940,25 @@ jobs:
           REPO: ${{ github.repository }}
           WF_EVENT: ${{ steps.route.outputs.wf_event }}
           EVENT_NAME: ${{ github.event_name }}
+          # The sweep's identity of this red, for when the route step could not read the run object.
+          MATRIX_RUN_ID: ${{ matrix.run.id }}
+          RUNS_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs
         run: |
           set -euo pipefail
           if [ -z "${CI_FAIL_WEBHOOK_SECRET:-}" ]; then
             echo "::error::CI_FAIL_WEBHOOK_SECRET is not set; cannot sign the alert." >&2
             exit 1
+          fi
+          # The route step (continue-on-error) could not read the upstream run: page with the sweep's run id,
+          # never an empty identity (one shared delivery id `ci-fail-` that the receiver dedupes), and fail
+          # this leg after the POST so the next sweep retries it (Prism P1 cc39469af539 / 4b0d2dad0a6c).
+          LOOKUP_FAILED=0
+          if [ -z "${WF_RUN_ID:-}" ]; then
+            [[ "${MATRIX_RUN_ID:-}" =~ ^[0-9]+$ ]] || { echo "::error::no upstream run id" >&2; exit 1; }
+            LOOKUP_FAILED=1; ROUTE=alerts; CARD=""; SUMMARY=""; WF_RUN_ID="$MATRIX_RUN_ID"
+            WF_URL="$RUNS_URL/$MATRIX_RUN_ID"; WF_NAME="run $MATRIX_RUN_ID (run lookup failed; open the link)"
+            WF_BRANCH="${WF_BRANCH:-}"; WF_SHA="${WF_SHA:-}"; WF_ACTOR="${WF_ACTOR:-}"; WF_EVENT="${WF_EVENT:-unknown}"
+            echo "::warning::route step did not read run $MATRIX_RUN_ID; paging it by id"
           fi
           # A replay is labelled and gets its own delivery id, so the receiver's
           # idempotency does not drop it when the original run already paged.
@@ -988,3 +1044,7 @@ jobs:
                 echo "::error::CI-fail alert POST returned HTTP $CODE" >&2; exit 1
               fi ;;
           esac
+          if [ "$LOOKUP_FAILED" = 1 ]; then
+            echo "::error::paged run $WF_RUN_ID by id only; failing this leg so the next sweep retries the lookup" >&2
+            exit 1
+          fi
