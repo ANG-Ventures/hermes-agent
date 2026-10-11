@@ -674,28 +674,39 @@ def test_cli_dispatch_places_a_pin_through_the_gateway_plan(kanban_home, monkeyp
 
 def test_count_running_by_placement_reads_one_snapshot(kanban_home, monkeypatch):
     """A placed run that ends between the two queries must not be read as a
-    LOCAL worker (total counted it, the remote map did not)."""
+    LOCAL worker (total counted it, the remote map did not).
+
+    The interleaved write needs WAL: under a rollback journal the reader's
+    SHARED lock blocks it for the whole busy_timeout (120 s), and the swallowed
+    'database is locked' reads as an UNKNOWN board. Connect leaves new boards in
+    DELETE on WAL-reset-vulnerable SQLite (3.46.1 on the Linux venues), so put
+    this tmp board in WAL here; connect keeps an on-disk WAL file as WAL.
+    """
     with kb.connect_closing() as conn:
         (tid,) = _make(conn, 1)
         _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test")
+    raw = sqlite3.connect(str(kb.kanban_db_path("default")))
+    try:
+        assert raw.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+    finally:
+        raw.close()
     real = kwp.running_by_host
+    wrote = []
 
     def finish_then_read(conn):
         # WAL: the write lands but the open read snapshot does not see it.
-        # DELETE journal (a SQLite with the WAL-reset bug, e.g. 3.46 on
-        # ace-media): the snapshot's shared lock refuses the write. Both are
-        # one snapshot; only waiting out the busy timeout would not be.
         with kb.connect_closing() as other:
-            other.execute("PRAGMA busy_timeout=50")
-            try:
-                other.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
-                other.commit()
-            except sqlite3.OperationalError as exc:
-                assert "locked" in str(exc)
+            other.execute("PRAGMA busy_timeout=2000")  # a lock wait fails fast, not at 120 s
+            other.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+            other.commit()
+        wrote.append(tid)
         return real(conn)
 
     monkeypatch.setattr(kwp, "running_by_host", finish_then_read)
     assert kb.count_running_by_placement([{"slug": "default"}]) == {"default": (1, {"ace-ai": 1})}
+    assert wrote == [tid]  # the write really landed between the two reads
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "done"
 
 
 def test_aborted_placement_is_not_reported_placed(kanban_home, monkeypatch):
