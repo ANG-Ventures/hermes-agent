@@ -1082,3 +1082,284 @@ def test_r8_prose_host_line_above_a_real_pin_does_not_hide_the_pin():
     assert kwp.resolve_pin(body, ("ace-ai",)) == ("ace-ai", "example.com")
     assert kwp.resolve_pin("host: example.com\nhost:any\n", ()) == ("any", "example.com")
     assert kwp.resolve_pin("host: example.com\n", ("ace-ai",)) == (None, "example.com")
+
+
+# -- Studio host affinity (card t_3e6c9b2b, incident t_79436ebf) -----------
+
+def test_studio_affinity_sources_and_pin_override():
+    assert _portable(body="Use CDP on the signed-in browser :9224 on the Studio") == (
+        False, "studio_body", None)
+    assert _portable(body="drive it with peekaboo") == (False, "studio_body", None)
+    assert _portable(skills=("browser-access",),
+                     manifest={"browser-access": "manifest:host_affinity"}) == (
+        False, "studio_manifest", None)
+    # Prose that only mentions a port family, not a loopback CDP port, stays portable.
+    assert _portable(body="port 9200 is elasticsearch") == (True, None, "policy")
+    # The NARROW body list (spec s2.3): a REMOTE browser endpoint and the bare
+    # word CDP are not Studio state (Prism f66cf7e1 / 115dad86).
+    # A URL naming a pool host is not an ssh-shaped mention (t_696a9a06), so
+    # it binds neither host_reach nor studio affinity.
+    assert _portable(body="Connect via CDP to http://ace-ai:9222") == (True, None, "policy")
+    assert _portable(body="connect to http://browser.example:9222") == (True, None, "policy")
+    assert _portable(body="use CDP generally") == (True, None, "policy")
+    assert _portable(body="add items to Ace's Amazon cart on localhost:9222") == (
+        False, "studio_body", None)
+    assert _portable(body="Add to cart the printer filament") == (False, "studio_body", None)
+    # An explicit pin is the operator's call and wins over every affinity signal.
+    assert _portable(body="host:ace-ai\nCDP :9222") == (True, None, "pin")
+    assert _portable(body="host:any\nCDP :9222")[0] is True
+    hit = kwp.studio_affinity("plain", ("mac-only", "x"), _POOL)
+    assert hit == ("studio_bound_skill", "skill:mac-only")
+
+
+def _skill(root, name, frontmatter, *, category="general", dir_name=None):
+    d = root / category / (dir_name or name)
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(f"---\nname: {name}\n{frontmatter}---\n\nbody\n", encoding="utf-8")
+
+
+def test_manifest_affinity_reads_host_affinity_and_linux_less_platforms(tmp_path, monkeypatch):
+    from hermes_cli import kanban_host_affinity as kha
+    root = tmp_path / "skills"
+    _skill(root, "cdp-login", "platforms: [macos, linux]\nmetadata:\n  hermes:\n"
+                              "    host_affinity: studio\n")
+    _skill(root, "mac-app", "platforms: [macos]\n")
+    _skill(root, "anywhere", "platforms: [macos, linux]\n")
+    _skill(root, "no-platforms", "description: x\n")
+    # Nested two levels down (category/subcategory) and found by frontmatter
+    # name, the way the worker resolves (Prism e16f8f5c: recursive lookup).
+    _skill(root, "deep-login", "platforms: [macos]\n", category="general/logins")
+    _skill(root, "by-fm-name", "platforms: [macos]\n", dir_name="some-dir")
+    kha.clear_cache()
+    monkeypatch.setattr(kha, "_profile_dirs", lambda assignee, now: (root,))
+    got = kha.manifest_affinity(["cdp-login", "mac-app", "anywhere", "no-platforms",
+                                 "missing", "ns:plugin", "deep-login", "by-fm-name"], "alpha")
+    assert got == {"cdp-login": "manifest:host_affinity", "mac-app": "manifest:platforms=macos",
+                   "deep-login": "manifest:platforms=macos", "by-fm-name": "manifest:platforms=macos"}
+    # Literal match only: a glob-shaped name never borrows another skill's manifest.
+    assert kha.manifest_affinity(["cdp-logi?", "mac-*", "general/mac-app"], "alpha") == {}
+    kha.clear_cache()
+
+
+def test_manifest_affinity_unions_every_root_and_never_caches_a_failure(tmp_path, monkeypatch):
+    """A binding declared by ANY resolvable copy counts, whichever root is
+    searched first (Prism e16f8f5c); a failed read is not cached as "no
+    binding" for the TTL (Prism 7cfa01ca / 94f5d2a0)."""
+    from hermes_cli import kanban_host_affinity as kha
+    real_profile_dirs = kha._profile_dirs
+    first, second = tmp_path / "local", tmp_path / "shared"
+    _skill(first, "browser-login", "description: unbound copy\n")
+    _skill(second, "browser-login", "platforms: [macos]\n")
+    kha.clear_cache()
+    monkeypatch.setattr(kha, "_profile_dirs", lambda assignee, now: (first, second))
+    assert kha.manifest_affinity(["browser-login"], "alpha") == {
+        "browser-login": "manifest:platforms=macos"}
+    # A throwing index build fails open for THIS call and leaves no cache entry.
+    kha.clear_cache()
+    calls = {"n": 0}
+    real = kha._build_index
+
+    def flaky(dirs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient")
+        return real(dirs)
+    monkeypatch.setattr(kha, "_build_index", flaky)
+    assert kha.manifest_affinity(["browser-login"], "alpha") == {}
+    assert kha.manifest_affinity(["browser-login"], "alpha") == {
+        "browser-login": "manifest:platforms=macos"}
+    assert calls["n"] == 2
+    # Same for the profile-dir lookup: a throwing read returns None and is
+    # not cached as (), so the next tick asks again.
+    kha.clear_cache()
+    import hermes_cli.profiles as profiles
+
+    def boom(_assignee):
+        raise RuntimeError("profile store busy")
+    monkeypatch.setattr(profiles, "get_profile_dir", boom)
+    monkeypatch.setattr(kha, "_profile_dirs", real_profile_dirs)
+    assert kha._profile_dirs("alpha", 0.0) is None
+    assert "alpha" not in kha._dirs_cache
+    assert kha.manifest_affinity(["browser-login"], "alpha") == {}
+    kha.clear_cache()
+
+
+def _events(conn, tid, kind):
+    return [json.loads(r[0]) for r in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id", (tid, kind))]
+
+
+def test_browser_card_under_spilling_studio_waits_never_spills(kanban_home, monkeypatch):
+    """The t_79436ebf shape: a browser-access card while the Studio spills."""
+    from hermes_cli import kanban_host_affinity as kha
+    monkeypatch.setattr(kha, "manifest_affinity",
+                        lambda skills, assignee, now=None: {
+                            s: "manifest:host_affinity" for s in skills if s == "browser-access"})
+    with kb.connect_closing() as conn:
+        (browser,) = _make(conn, 1, priority=9, skills=["browser-access"])
+        (coding,) = _make(conn, 1, priority=1)
+        plan = _plan(free=2, band="spilling")
+        res, spawned = _tick(conn, spillover=plan, spawn_limit=0, spawn_paused="spilling")
+        assert spawned == [(coding, "ace-ai")]          # the plain coding card still spills
+        assert browser not in [t for t, _ in spawned]   # never ace-ai / ace-media
+        assert res.placement_waits[browser] == "studio_affinity:studio_manifest"
+        assert res.placement_affinity[browser]["host"] == "mac-studio"
+        status = conn.execute("SELECT status FROM tasks WHERE id=?", (browser,)).fetchone()[0]
+        assert status == "ready"
+        aff = _events(conn, browser, "placement_affinity")
+        waits = _events(conn, browser, "placement_wait")
+        assert aff == [{"host": "mac-studio", "rule": "studio_manifest",
+                        "matched_by": "skill:browser-access (manifest:host_affinity)"}]
+        assert waits == [{"host": "mac-studio", "reason": "studio_affinity:studio_manifest",
+                          "matched_by": "skill:browser-access (manifest:host_affinity)"}]
+        # A second identical tick writes no duplicate events.
+        _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
+              spawn_paused="spilling")
+        assert len(_events(conn, browser, "placement_affinity")) == 1
+        assert len(_events(conn, browser, "placement_wait")) == 1
+        # Spawned in between (a claim), then waiting again for the same reason:
+        # that is a NEW wait and is recorded.
+        kb._append_event(conn, browser, "claimed", {"lock": "test"})
+        conn.commit()
+        _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
+              spawn_paused="spilling")
+        assert len(_events(conn, browser, "placement_wait")) == 2
+
+
+def test_body_bound_card_runs_locally_when_the_studio_has_room(kanban_home):
+    with kb.connect_closing() as conn:
+        (cdp,) = _make(conn, 1, body="attach CDP to :9222 on the Studio")
+        res, spawned = _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=1)
+    assert spawned == [(cdp, None)] and res.placed == []
+    assert res.placement_affinity[cdp]["matched_by"] == "body::9222"
+
+
+def test_wait_cleared_without_a_claim_makes_the_next_wait_a_new_episode(kanban_home):
+    """A bound card waits, then a tick evaluates it with no wait but it does
+    not spawn (per-profile cap), then it waits again for the same reason:
+    three episodes, three events (Prism 1ccf2233 / 5a51e524 on #1877)."""
+    with kb.connect_closing() as conn:
+        (cdp,) = _make(conn, 1, body="signed-in browser work")
+        spill = lambda: _plan(free=2, band="spilling")  # noqa: E731
+        _tick(conn, spillover=spill(), spawn_limit=0, spawn_paused="spilling")
+        assert [e["reason"] for e in _events(conn, cdp, "placement_wait")] == [
+            "studio_affinity:studio_body"]
+        # Room on the Studio, but the assignee is at its per-profile cap: the
+        # card is evaluated with NO wait reason and still not claimed.
+        (busy,) = _make(conn, 1)
+        conn.execute("UPDATE tasks SET status='running', claim_lock='x' WHERE id=?", (busy,))
+        conn.commit()
+        res, spawned = _tick(conn, spillover=spill(), spawn_limit=4,
+                             max_in_progress_per_profile={"default": 8, "alpha": 1})
+        assert spawned == [] and cdp not in res.placement_waits
+        assert cdp in [t for t, _who, _n in res.skipped_per_profile_capped]
+        waits = _events(conn, cdp, "placement_wait")
+        assert waits[-1] == {"cleared": True}
+        conn.execute("UPDATE tasks SET status='done', claim_lock=NULL WHERE id=?", (busy,))
+        conn.commit()
+        _tick(conn, spillover=spill(), spawn_limit=0, spawn_paused="spilling")
+        waits = _events(conn, cdp, "placement_wait")
+        assert [w.get("reason", "cleared") for w in waits] == [
+            "studio_affinity:studio_body", "cleared", "studio_affinity:studio_body"]
+        # Repeating the same wait writes nothing new.
+        _tick(conn, spillover=spill(), spawn_limit=0, spawn_paused="spilling")
+        assert len(_events(conn, cdp, "placement_wait")) == 3
+
+
+def test_lost_binding_is_recorded_and_rebinding_is_a_new_transition(kanban_home):
+    """Removing a card's bound skill clears the binding in the event log;
+    restoring it records the binding again (Prism d3ef126d on #1877)."""
+    with kb.connect_closing() as conn:
+        (card,) = _make(conn, 1, skills=["mac-only"])
+        # One pool slot, always taken by a higher-priority portable filler
+        # (a fresh one per tick): an UNBOUND card then waits pool_full and
+        # stays ready across the ticks below instead of spilling.
+        def spill():
+            _make(conn, 1, priority=9, assignee="alpha")
+            return _plan(free=1, band="spilling")
+        plan = spill()
+        plan.config = kwp.PoolConfig(hosts=plan.config.hosts, profiles=plan.config.profiles,
+                                     studio_bound_skills=("mac-only",), pool_hosts=plan.config.pool_hosts)
+        _tick(conn, spillover=plan, spawn_limit=0, spawn_paused="spilling")
+        assert _events(conn, card, "placement_affinity") == [
+            {"host": "mac-studio", "rule": "studio_bound_skill", "matched_by": "skill:mac-only"}]
+        # The operator edits the card: the bound skill is gone.
+        conn.execute("UPDATE tasks SET skills = ? WHERE id = ?", (json.dumps([]), card))
+        conn.commit()
+        plan2 = spill()
+        plan2.config = plan.config
+        res, _ = _tick(conn, spillover=plan2, spawn_limit=0, spawn_paused="spilling")
+        assert card not in res.placement_affinity
+        assert _events(conn, card, "placement_affinity")[-1] == {"cleared": True}
+        # The binding's wait ends with it (Prism 0f21fb8c); the card's own
+        # pool wait is then a new placement_wait (main's per-card writer).
+        assert [w.get("reason", "cleared") for w in _events(conn, card, "placement_wait")] == [
+            "studio_affinity:studio_bound_skill", "cleared", "pool_full"]
+        # Idempotent: an unbound card with a cleared history writes nothing.
+        plan3 = spill()
+        plan3.config = plan.config
+        _tick(conn, spillover=plan3, spawn_limit=0, spawn_paused="spilling")
+        assert len(_events(conn, card, "placement_affinity")) == 2
+        # Restored: a new binding event, not a suppressed duplicate.
+        conn.execute("UPDATE tasks SET skills = ? WHERE id = ?", (json.dumps(["mac-only"]), card))
+        conn.commit()
+        plan4 = spill()
+        plan4.config = plan.config
+        _tick(conn, spillover=plan4, spawn_limit=0, spawn_paused="spilling")
+        aff = _events(conn, card, "placement_affinity")
+        assert [a.get("rule", "cleared") for a in aff] == [
+            "studio_bound_skill", "cleared", "studio_bound_skill"]
+        # ...and the same wait after the re-bind is a new episode, not a duplicate.
+        assert [w.get("reason", "cleared") for w in _events(conn, card, "placement_wait")] == [
+            "studio_affinity:studio_bound_skill", "cleared", "pool_full",
+            "studio_affinity:studio_bound_skill"]
+        # A card that was never bound never gets a cleared event.
+        (plain,) = _make(conn, 1)
+        plan5 = spill()
+        plan5.config = plan.config
+        _tick(conn, spillover=plan5, spawn_limit=0, spawn_paused="spilling")
+        assert _events(conn, plain, "placement_affinity") == []
+
+
+def test_route_row_affinity_branch_is_reached_on_a_live_tick(kanban_home):
+    """The studio-affinity branch in ``_route_row`` sits AFTER the remote-pin
+    return and is reached for an unpinned bound card: the route carries
+    ``studio_affinity:<rule>`` and the affinity map is filled (refutes Prism
+    f3a0c70c "unreachable affinity" on #1877)."""
+    with kb.connect_closing() as conn:
+        (cdp,) = _make(conn, 1, body="signed-in browser work")
+        (pinned,) = _make(conn, 1, body="host: ace-ai\nsigned-in browser work",
+                          workspace_kind="worktree")
+        rows = {r["id"]: r for r in conn.execute(
+            "SELECT id, assignee, body, skills, workspace_kind, workspace_path, no_worker FROM tasks")}
+        plan = _plan(free=2, band="spilling")
+        out: dict = {}
+        assert kbd._route_row(conn, rows[cdp], plan, None, {}, {}, affinity_out=out) == (
+            "local", "studio_affinity:studio_body")
+        assert out[cdp] == {"host": "mac-studio", "rule": "studio_body",
+                            "matched_by": "body:signed-in browser"}
+        # A REMOTE pin on a non-portable card returns before the branch.
+        assert kbd._route_row(conn, rows[pinned], plan, None, {}, {}, affinity_out=out) == (
+            "wait", "not_portable:workspace_kind")
+        assert pinned not in out
+
+
+def test_dry_run_shows_affinity_without_a_pool_plan_or_events(kanban_home):
+    with kb.connect_closing() as conn:
+        (cdp,) = _make(conn, 1, body="signed-in browser task")
+        res = kbd.dispatch_once(conn, dry_run=True, max_spawn=8, spillover=None,
+                                reconcile_orphans=False)
+        assert res.placement_affinity[cdp] == {"host": "mac-studio", "rule": "studio_body",
+                                               "matched_by": "body:signed-in browser"}
+        assert _events(conn, cdp, "placement_affinity") == []
+
+
+def test_dry_run_prose_host_line_is_not_a_pin(kanban_home):
+    """A ``host: example.com`` header is prose, not a pin: affinity still shows."""
+    with kb.connect_closing() as conn:
+        (cdp,) = _make(conn, 1, body="host: example.com\nattach CDP :9222")
+        (pinned,) = _make(conn, 1, body="host:any\nattach CDP :9222")
+        res = kbd.dispatch_once(conn, dry_run=True, max_spawn=8, spillover=None,
+                                reconcile_orphans=False)
+    assert res.placement_affinity[cdp]["rule"] == "studio_body"
+    assert pinned not in res.placement_affinity

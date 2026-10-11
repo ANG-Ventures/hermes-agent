@@ -294,7 +294,11 @@ class DispatchResult:
     books local spawns as ``len(spawned) - len(placed)``."""
     placement_waits: dict = field(default_factory=dict)
     """task id -> why a ready card was not spawned anywhere this tick
-    (``local_full``, ``pool_full``, ``pin_*``, ``not_portable:<rule>``)."""
+    (``local_full``, ``pool_full``, ``pin_*``, ``not_portable:<rule>``,
+    ``studio_affinity:<rule>``)."""
+    placement_affinity: dict = field(default_factory=dict)
+    """task id -> ``{host, rule, matched_by}`` for ready cards whose work is
+    bound to one host's state (t_3e6c9b2b): they run there or wait, never spill."""
     spawn_paused: Optional[str] = None
     """Non-None when this tick RECLAIMED but deliberately spawned nothing —
     the gateway's load gate (``kanban.dispatch_load_gate``) held the host was
@@ -3756,7 +3760,10 @@ def _record_placement_waits(conn, result, row_route: dict, dry_run: bool) -> Non
     event after the latest one (PLACEMENT_WAIT_EPISODE_END_KINDS) starts a new
     episode: written now, ``since`` = now. Never on a dry run. Best-effort: bookkeeping never fails a tick."""
     from hermes_cli import kanban_placement_reasons as _pr
-    waits = result.placement_waits or {}
+    # Studio-affinity cards have their own placement_wait writer
+    # (kanban_host_affinity.record_affinity_events); one writer per card.
+    bound = result.placement_affinity or {}
+    waits = {t: r for t, r in (result.placement_waits or {}).items() if t not in bound}
     if dry_run or not waits:
         return
     now = int(time.time())
@@ -3797,7 +3804,8 @@ def _record_placement_waits(conn, result, row_route: dict, dry_run: bool) -> Non
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
                linked_ids: Optional[dict] = None,
-               lineage_mode: Optional[str] = None) -> "tuple[str, Optional[str]]":
+               lineage_mode: Optional[str] = None,
+               affinity_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
 
@@ -3826,13 +3834,15 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     # rule would admit pays for it (non-scratch, linked or non-allowlisted
     # rows can never place; a non-allowlisted one reports ``profile``).
     scan = (row["workspace_kind"] or "scratch") == "scratch" and not linked and allowlisted
+    skills = tuple(s for s in skills if isinstance(s, str))
+    manifest = _manifest_affinity(skills, assignee) if allowlisted and skills else {}
     ok, rule, route_class = _kwp.portable(
         workspace_kind=row["workspace_kind"], has_links=linked,
         workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
                                if scan else False),
         assignee=assignee, body=row["body"],
-        skills=tuple(s for s in skills if isinstance(s, str)), pool=plan.config,
-        native_command=native,
+        skills=skills, pool=plan.config,
+        native_command=native, manifest=manifest,
     )
     pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or ())
     if ignored is not None:
@@ -3849,9 +3859,26 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                       row["id"], getattr(plan.config, "reach_status", "absent"))
     if pin is not None and pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
         return "wait", _pr.not_portable(rule)
+    if rule in _STUDIO_AFFINITY_RULES:
+        # Work bound to the Studio's state (t_3e6c9b2b): runs here or waits,
+        # named, never spills. ``portable()`` only reaches these rules when
+        # no explicit pin decided the route.
+        hit = _kwp.studio_affinity(row["body"], skills, plan.config, manifest=manifest)
+        if affinity_out is not None:
+            affinity_out[row["id"]] = {"host": _kwp.STUDIO_HOST, "rule": rule,
+                                       "matched_by": hit[1] if hit else rule}
+        return "local", f"studio_affinity:{rule}"
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
     return "local", (_pr.not_portable(rule) if pin == _kwp.PIN_ANY else None)
+
+
+_STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body"})
+
+
+def _manifest_affinity(skills, assignee) -> dict:
+    from hermes_cli.kanban_host_affinity import manifest_affinity_safe
+    return manifest_affinity_safe(skills, assignee)
 
 
 def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optional[str]:
@@ -4355,6 +4382,11 @@ def _dispatch_once_locked(
     # budget), then portable ones; the ORDER BY holds inside each class.
     # Without a plan every row is local and the order is unchanged.
     row_route: dict = {}
+    # Ready cards whose Studio binding was evaluated this tick (a pool plan
+    # ran the classifier on every one of them) and, of those, the ones the
+    # spawn loop reached: the affinity event log reconciles against both.
+    _affinity_evaluated: list = []
+    _affinity_reached: set = set()
     if spillover is not None:
         if dry_run:
             # Dry run reserves on its own ledger: the shared plan is untouched.
@@ -4365,8 +4397,9 @@ def _dispatch_once_locked(
         _lineage = _lineage_pins_mode()  # kanban.placement.lineage_pins, per tick
         _linked = _linked_ids(conn, [r["id"] for r in ready_rows], _lineage)
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
-                                         _lineage)
+                                         _lineage, result.placement_affinity)
                      for r in ready_rows}
+        _affinity_evaluated = [r["id"] for r in ready_rows]
         _rank = {"pin": 0, "wait": 1, "local": 1, "portable": 2}
         ready_rows = sorted(ready_rows, key=lambda r: _rank[row_route[r["id"]][0]])
     else:
@@ -4389,6 +4422,10 @@ def _dispatch_once_locked(
             # BOTH, and the pin must still wait (Prism 56085b64).
             if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
                 row_route[r["id"]] = ("wait", "pool_unavailable")
+        if dry_run:
+            from hermes_cli.kanban_host_affinity import studio_affinity_unplanned
+            studio_affinity_unplanned(
+                ready_rows, (default_assignee or "").strip() or None, result)
         _unplanned = sum(1 for v in row_route.values() if v == ("wait", "pool_unavailable"))
         if _unplanned:
             # The pool is planned by the GATEWAY tick only (KWLB v0.1); the
@@ -4915,7 +4952,7 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     ready_scan_complete = bool(ready_rows)
-    for row in ready_rows:
+    for row_index, row in enumerate(ready_rows):
         if ready_budget is not None and spawned >= ready_budget:
             ready_scan_complete = False
             break
@@ -4930,12 +4967,19 @@ def _dispatch_once_locked(
                     _route_wait(route, route_arg, False, spillover)
                     or ("pin_host_full" if route == "pin" else spillover.full_reason())
                 )
+                # Host-bound cards behind the wall still say why (t_3e6c9b2b).
+                for rest in ready_rows[row_index + 1:]:
+                    r_route, r_arg = row_route.get(rest["id"], ("local", None))
+                    if rest["id"] in result.placement_affinity and r_route == "local":
+                        result.placement_waits[rest["id"]] = r_arg or "local_full"
             ready_scan_complete = False
             break
         wait = _route_wait(route, route_arg, local_free, spillover)
         if wait is not None:
             result.placement_waits[row["id"]] = wait
             continue
+        if row["id"] in result.placement_affinity:
+            _affinity_reached.add(row["id"])
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -5316,6 +5360,9 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
 
     pr_state_resolver.finish_tick(scan_complete=ready_scan_complete)
+    if _affinity_evaluated and not dry_run:
+        from hermes_cli.kanban_host_affinity import record_affinity_events
+        record_affinity_events(conn, result, _affinity_evaluated, _affinity_reached)
     _record_placement_waits(conn, result, row_route, dry_run)
 
     # ---- review column dispatch ----
