@@ -54,13 +54,13 @@ def test_verb_and_top_level_positions_hit_the_same_board(home):
 
 
 def test_verb_position_unknown_board_hits_existence_guard(home):
-    r = _cli(home, "create", "T", "--board", "nonexistent")
+    r = _cli(home, "create", "T", "--board", "nonexistent", "--unhomed")
     assert r.returncode != 0
     assert "does not exist. Create it with" in r.stderr
 
 
 def test_conflicting_positions_refused_equal_positions_accepted(home):
-    clash = _cli(home, "--board", "default", "create", "T", "--board", "beta")
+    clash = _cli(home, "--board", "default", "create", "T", "--board", "beta", "--unhomed")
     assert clash.returncode != 0
     assert "--board given twice" in clash.stderr
     same = _cli(home, "--board", "beta", "create", "same", "--board", "BETA", "--unhomed")
