@@ -314,7 +314,7 @@ def kanban_command(args: argparse.Namespace) -> int:
     verb_board = getattr(args, "verb_board", None)
     if verb_board is not None:
         top_board = getattr(args, "board", None)
-        if top_board and str(top_board).strip().lower() != str(verb_board).strip().lower():
+        if top_board is not None and str(top_board).strip().lower() != str(verb_board).strip().lower():
             return _err(f"kanban: --board given twice: {top_board!r} vs {verb_board!r}", 2)
         args.board = verb_board
 
@@ -339,7 +339,9 @@ def kanban_command(args: argparse.Namespace) -> int:
     # exact resolution the dispatcher uses for workers.
     board_override = getattr(args, "board", None)
     board_scope = contextlib.nullcontext()
-    if board_override:
+    # `is not None`: an explicit empty selector (empty $BOARD in a script) is refused below,
+    # never treated as "no selector" and routed to the current board.
+    if board_override is not None:
         try:
             normed = kb._normalize_board_slug(board_override)
         except ValueError as exc:
