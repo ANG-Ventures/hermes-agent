@@ -519,9 +519,19 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
              assignee: Optional[str], body: Optional[str], skills: Iterable[str] = (),
              pool, native_command: bool = False,
              manifest: Optional[Mapping[str, str]] = None,
-             targets: Optional[Mapping[str, str]] = None) -> Tuple[bool, Optional[str], Optional[str]]:
+             targets: Optional[Mapping[str, str]] = None,
+             requires: Optional[Tuple[Optional[str], Optional[str]]] = None,
+             body_signals: bool = True) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
+
+    ``requires`` is ``(hard_rule, soft_rule)`` from
+    :mod:`kanban_host_capabilities` (t_8c474c2e): the ``requires:<cap>``
+    rule of an enforced capability no candidate pool host has, or None.
+    The HARD one is checked before pin resolution, so ``host: any`` never
+    spills it; the SOFT one after it, so ``host: any`` overrides it (spec
+    s2.2 rule order, F3). ``body_signals`` False drops the in-code body list
+    (the capability map owns the terms while it enforces, F13).
 
     ``hard_ok`` (scratch, unlinked, empty local workspace, allowlisted
     assignee whose profile is not a native-command lane) is required for every
@@ -545,6 +555,9 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
         # foreign_lane.worker_command runs the lane with a LOCAL Popen; the
         # ssh terminal backend never sees it, so placement would be a lie.
         return False, _reasons.NATIVE_COMMAND, None
+    hard_rule, soft_rule = requires or (None, None)
+    if hard_rule:
+        return False, hard_rule, None
     pin, _ignored = resolve_pin(body, pool.hosts or ())
     if pin == PIN_STUDIO:
         return False, _reasons.HOST_STUDIO, None
@@ -564,7 +577,9 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
         # A KNOWN pool host: a remote pin. A disabled one waits at take()
         # and never falls back to a local spawn. An unknown word is no pin.
         return True, None, "pin"
-    affinity = studio_affinity(body, skills, pool, manifest=manifest)
+    if soft_rule:
+        return False, soft_rule, None
+    affinity = studio_affinity(body, skills, pool, manifest=manifest, body_signals=body_signals)
     if affinity is not None:
         return False, affinity[0], None
     return True, None, "policy"
@@ -601,7 +616,8 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
 
 
 def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
-                    manifest: Optional[Mapping[str, str]] = None) -> Optional[Tuple[str, str]]:
+                    manifest: Optional[Mapping[str, str]] = None,
+                    body_signals: bool = True) -> Optional[Tuple[str, str]]:
     """``(rule, matched_by)`` when the card's WORK is bound to the Studio's state
     (signed-in browsers, Messages.app, a macOS GUI session), else None.
 
@@ -620,7 +636,7 @@ def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
         why = (manifest or {}).get(s)
         if why:
             return "studio_manifest", f"skill:{s} ({why})"
-    m = STUDIO_BODY_RE.search(body or "")
+    m = STUDIO_BODY_RE.search(body or "") if body_signals else None
     if m:
         return "studio_body", f"body:{m.group(0)}"
     return None

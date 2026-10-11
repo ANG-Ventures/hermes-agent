@@ -299,6 +299,11 @@ class DispatchResult:
     placement_affinity: dict = field(default_factory=dict)
     """task id -> ``{host, rule, matched_by}`` for ready cards whose work is
     bound to one host's state (t_3e6c9b2b): they run there or wait, never spill."""
+    placement_caps: dict = field(default_factory=dict)
+    """task id -> what the capability layer (t_8c474c2e) saw on a ready card
+    without changing its route: ``{"warn": <payload>}`` (warn mode),
+    ``{"unknown": <word>}``, ``{"action": "needs_input"}`` (a pool pin that
+    lacks a hard requirement), and ``"_map_error"`` -> the map problem."""
     spawn_paused: Optional[str] = None
     """Non-None when this tick RECLAIMED but deliberately spawned nothing —
     the gateway's load gate (``kanban.dispatch_load_gate``) held the host was
@@ -3805,12 +3810,19 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
                linked_ids: Optional[dict] = None,
                lineage_mode: Optional[str] = None,
-               affinity_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+               affinity_out: Optional[dict] = None,
+               caps=None, caps_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
 
     ``portable()`` is THE classifier; a remote pin on a card that fails
     ``hard_ok`` waits ``not_portable:<rule>`` and is never spawned locally.
+
+    ``caps`` is this tick's :class:`kanban_host_capabilities.CapabilityTick`
+    (None = layer off or map absent: routes as before it existed). A card
+    pinned by an enforced capability lands in ``affinity_out``; a warn-mode
+    observation, a remote pin that lacks a hard requirement (F3) and an
+    unknown ``requires:`` word land in ``caps_out``.
     """
     from hermes_cli import kanban_worker_pool as _kwp
 
@@ -3837,6 +3849,13 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     skills = tuple(s for s in skills if isinstance(s, str))
     manifest = _manifest_affinity(skills, assignee) if allowlisted and skills else {}
     targets = _manifest_targets(skills, assignee) if allowlisted and skills else {}
+    pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or ())
+    verdict = None
+    if caps is not None:
+        from hermes_cli import kanban_host_capabilities as _khc
+        verdict = _khc.evaluate(
+            row["body"], skills, caps,
+            pin_host=pin if pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) else None)
     ok, rule, route_class = _kwp.portable(
         workspace_kind=row["workspace_kind"], has_links=linked,
         workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
@@ -3844,10 +3863,16 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         assignee=assignee, body=row["body"],
         skills=skills, pool=plan.config,
         native_command=native, manifest=manifest, targets=targets,
+        requires=verdict.for_portable() if verdict is not None else None,
+        body_signals=caps is None or caps.legacy_body,
     )
-    pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or ())
     if ignored is not None:
         _kwp.note_ignored_pin(row["id"], ignored)
+    if verdict is not None and caps_out is not None:
+        _note_capability_verdict(row["id"], verdict, caps, rule, pin, caps_out)
+        if caps.error and (verdict.observed is not None or skills):
+            # A card the bad map/index demoted (F11): it carries the event.
+            caps_out.setdefault("touched", []).append(row["id"])
     if ok:
         return ("pin", pin) if route_class == "pin" else ("portable", None)
     if rule == _pr.LINKED and link is not None and lineage_mode != _pr.LINEAGE_PINS_LEGACY:
@@ -3860,6 +3885,13 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                       row["id"], getattr(plan.config, "reach_status", "absent"))
     if pin is not None and pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
         return "wait", _pr.not_portable(rule)
+    if verdict is not None and verdict.pin is not None and rule == verdict.pin.rule:
+        # An enforced capability no pool host has (t_8c474c2e): runs here
+        # or waits, named, never spills.
+        if affinity_out is not None:
+            from hermes_cli import kanban_host_capabilities as _khc
+            affinity_out[row["id"]] = _khc.affinity_payload(verdict.pin, verdict, _khc.ENFORCE)
+        return "local", f"studio_affinity:{rule}"
     if rule in _STUDIO_AFFINITY_RULES:
         # Work bound to the Studio's state (t_3e6c9b2b): runs here or waits,
         # named, never spills. ``portable()`` only reaches these rules when
@@ -3875,6 +3907,98 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
 
 
 _STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body"})
+
+
+def _note_capability_verdict(tid, verdict, caps, rule, pin, caps_out: dict) -> None:
+    """Record what the capability layer saw on one card this tick:
+    ``pin_lacks`` (a ``host:<pool-id>`` pin missing a HARD requirement, F3:
+    parked needs_input after the loop), ``unknown`` (a word the map does not
+    define, F4) and ``observed`` (a warn-mode requirement: event only)."""
+    from hermes_cli import kanban_host_capabilities as _khc
+    from hermes_cli import kanban_worker_pool as _kwp
+    if (verdict.pin is not None and verdict.pin.strength == _khc.HARD and rule == verdict.pin.rule
+            and pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO)):
+        caps_out.setdefault("pin_lacks", {})[tid] = (pin, verdict.pin)
+    for req in verdict.enforced:
+        if req.unknown:
+            caps_out.setdefault("unknown", {})[tid] = req
+            break
+    if verdict.observed is not None and verdict.pin is None:
+        caps_out.setdefault("observed", {})[tid] = _khc.affinity_payload(
+            verdict.observed, verdict, _khc.WARN)
+
+
+def _root_kanban_cfg() -> dict:
+    """The ``kanban`` section of the ROOT ``config.yaml`` (F5: never a
+    profile's), ``{}`` when unreadable. Same presence-sensitive read as the
+    board-home knobs: only what the file writes."""
+    try:
+        return _kb._board_home_kanban_cfg()
+    except Exception:
+        _kb._log.debug("kanban dispatch: root kanban config unreadable", exc_info=True)
+        return {}
+
+
+def _capability_tick(pool_config):
+    """This tick's capability context, or None (layer off / map absent):
+    read once per tick, from the root config and the fleet dir. The
+    candidate hosts are every host the pool files name (disabled ones too:
+    Phase 1 asks all of them, the conservative direction)."""
+    try:
+        from hermes_cli import kanban_host_capabilities as _khc
+        hosts = tuple(getattr(pool_config, "hosts", ()) or ())
+        return _khc.tick(_kb.kanban_home() / "fleet", _root_kanban_cfg(), hosts)
+    except Exception:
+        _kb._log.warning("kanban dispatch: capability map unreadable, layer off this tick",
+                         exc_info=True)
+        return None
+
+
+def _caps_into_result(result, caps, caps_out: dict) -> None:
+    """Surface the capability layer's non-route observations on the result
+    (the dry-run column reads them)."""
+    if caps is None:
+        return
+    if caps.error:
+        result.placement_caps["_map_error"] = caps.error
+    for tid, payload in (caps_out.get("observed") or {}).items():
+        result.placement_caps.setdefault(tid, {})["warn"] = payload
+    for tid, req in (caps_out.get("unknown") or {}).items():
+        result.placement_caps.setdefault(tid, {})["unknown"] = req.cap.split(":", 1)[-1]
+    for tid, (host, req) in (caps_out.get("pin_lacks") or {}).items():
+        result.placement_caps.setdefault(tid, {})["pin_lacks"] = f"host:{host} lacks {req.cap}"
+
+
+def _capabilities_unplanned(rows, result) -> None:
+    """Dry-run view with no pool plan: the capability verdict of each ready
+    card against the pool files, so ``--dry-run`` shows a pin before a spill."""
+    try:
+        from hermes_cli import kanban_host_capabilities as _khc
+        from hermes_cli import kanban_worker_pool as _kwp
+        cfg = _kwp.read_pool(_kb.kanban_home() / "fleet")
+        caps = _capability_tick(cfg)
+        if caps is None:
+            return
+        known = tuple(cfg.hosts or ()) or _kwp.known_host_ids(_kb.kanban_home() / "fleet")
+        out: dict = {}
+        for r in rows:
+            pin, _ignored = _kwp.resolve_pin(r["body"], known)
+            try:
+                skills = tuple(s for s in (json.loads(r["skills"] or "[]") or []) if isinstance(s, str))
+            except (TypeError, ValueError):
+                skills = ()
+            v = _khc.evaluate(r["body"], skills, caps,
+                              pin_host=pin if pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) else None)
+            rule = v.hard_rule or (v.soft_rule if pin != _kwp.PIN_ANY else None)
+            if v.pin is not None and rule == v.pin.rule and pin != _kwp.PIN_STUDIO:
+                result.placement_affinity[r["id"]] = _khc.affinity_payload(v.pin, v, _khc.ENFORCE)
+                if pin not in (None, _kwp.PIN_ANY) and v.pin.strength == _khc.HARD:
+                    out.setdefault("pin_lacks", {})[r["id"]] = (pin, v.pin)
+            elif v.observed is not None:
+                out.setdefault("observed", {})[r["id"]] = _khc.affinity_payload(v.observed, v, _khc.WARN)
+        _caps_into_result(result, caps, out)
+    except Exception:
+        _kb._log.debug("kanban dispatch: dry-run capability view failed", exc_info=True)
 
 
 def _manifest_affinity(skills, assignee) -> dict:
@@ -4393,6 +4517,8 @@ def _dispatch_once_locked(
     # spawn loop reached: the affinity event log reconciles against both.
     _affinity_evaluated: list = []
     _affinity_reached: set = set()
+    _caps = None
+    _caps_out: dict = {}
     if spillover is not None:
         if dry_run:
             # Dry run reserves on its own ledger: the shared plan is untouched.
@@ -4402,9 +4528,12 @@ def _dispatch_once_locked(
         _native: dict = {}
         _lineage = _lineage_pins_mode()  # kanban.placement.lineage_pins, per tick
         _linked = _linked_ids(conn, [r["id"] for r in ready_rows], _lineage)
+        _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
-                                         _lineage, result.placement_affinity)
+                                         _lineage, result.placement_affinity,
+                                         caps=_caps, caps_out=_caps_out)
                      for r in ready_rows}
+        _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
         _rank = {"pin": 0, "wait": 1, "local": 1, "portable": 2}
         ready_rows = sorted(ready_rows, key=lambda r: _rank[row_route[r["id"]][0]])
@@ -4432,6 +4561,7 @@ def _dispatch_once_locked(
             from hermes_cli.kanban_host_affinity import studio_affinity_unplanned
             studio_affinity_unplanned(
                 ready_rows, (default_assignee or "").strip() or None, result)
+            _capabilities_unplanned(ready_rows, result)
         _unplanned = sum(1 for v in row_route.values() if v == ("wait", "pool_unavailable"))
         if _unplanned:
             # The pool is planned by the GATEWAY tick only (KWLB v0.1); the
@@ -5369,7 +5499,11 @@ def _dispatch_once_locked(
     pr_state_resolver.finish_tick(scan_complete=ready_scan_complete)
     if _affinity_evaluated and not dry_run:
         from hermes_cli.kanban_host_affinity import record_affinity_events
+        from hermes_cli import kanban_host_capabilities as _khc
+        _cap_comments = _khc.pending_comments(conn, result, _caps, _caps_out)
         record_affinity_events(conn, result, _affinity_evaluated, _affinity_reached)
+        _khc.record_capability_events(conn, result, _caps, _caps_out, _affinity_evaluated,
+                                      _cap_comments)
     _record_placement_waits(conn, result, row_route, dry_run)
 
     # ---- review column dispatch ----
@@ -6252,6 +6386,13 @@ def _default_spawn(
     # Worker-pool placement (kanban_worker_pool): same process, same grant,
     # tools on the worker host. Never inherit a placement from our own env.
     env.pop(_kb._kwh.PLACEMENT_ENV, None)
+    # The capability modes the worker's rail gates honour (t_8c474c2e, F5):
+    # workers never read config.yaml for this, the dispatcher decides.
+    from hermes_cli import kanban_host_capabilities as _khc
+    try:
+        env[_khc.CAPS_ENV] = _khc.spawn_env(_kb.kanban_home() / "fleet", _root_kanban_cfg())
+    except Exception:
+        env[_khc.CAPS_ENV] = _khc.env_value(_khc.WARN, ())
     if placement is not None:
         _kb._kwh.prepare_remote_workspace(placement, workspace)
         _kb._kwh.apply_placement(env, placement, workspace)

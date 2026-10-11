@@ -2357,6 +2357,12 @@ DEFAULT_CONFIG = {
         # <root>/var/kanban-target-state.json), warm hosts are picked last by
         # projected load, and kanban's placements are written to
         # <root>/var/placement/host-reservations.kanban.json. false = KWLB v0.1.
+        # kanban.placement.capabilities (t_8c474c2e, Fleet Work Placement
+        # Phase 1): off | warn | enforce, read per tick from the ROOT
+        # config.yaml only, never merged from here (absent = enforce, with
+        # capabilities_enforce [browser-session, screen]; the rest warn). The
+        # layer needs <root>/fleet/host-capabilities.json: absent file = off.
+        # See hermes_cli/kanban_host_capabilities.py.
         "placement": {"read_signal": True},
         "dispatch_load_gate": {
             "enabled": True,
