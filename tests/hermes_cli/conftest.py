@@ -20,6 +20,32 @@ def _isolate_kanban_process_registry(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_dangling_staged_refs(request, monkeypatch):
+    """Post-condition on every request_review / complete_task / block_task:
+    no committed row names a staged attachment copy that is gone (t_f577ddd5).
+    Checked whether the call returned or raised. Tests that delete a staged
+    copy on purpose opt out with ``@pytest.mark.allow_dangling_staged_refs``."""
+    if request.node.get_closest_marker("allow_dangling_staged_refs"):
+        return
+    from hermes_cli import kanban_db
+    from tests.hermes_cli._kanban_ref_integrity import assert_no_dangling_staged_refs
+
+    def _checked(name):
+        real = getattr(kanban_db, name)
+
+        def wrapper(conn, task_id, *args, **kwargs):
+            try:
+                return real(conn, task_id, *args, **kwargs)
+            finally:
+                assert_no_dangling_staged_refs(conn, task_id, after=name)
+
+        return wrapper
+
+    for name in ("request_review", "complete_task", "block_task"):
+        monkeypatch.setattr(kanban_db, name, _checked(name))
+
+
+@pytest.fixture(autouse=True)
 def _quiet_host_loadavg(monkeypatch):
     """Pin host load to idle: `kanban dispatch` consults the real load gate
     (t_689b81b7), so an unpinned test would pause on a busy CI runner.
