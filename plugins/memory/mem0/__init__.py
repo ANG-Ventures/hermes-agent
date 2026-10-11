@@ -1135,6 +1135,12 @@ class Mem0MemoryProvider(MemoryProvider):
         self._api_key = self._config.get("api_key", "")
         self._host = str(self._config.get("host", "") or "").strip().rstrip("/")
         self._admin_api_key = str(self._config.get("admin_api_key", "") or "").strip()
+        if self._admin_api_key:
+            # The admin key has no vendor prefix, so the shape-based redactor misses it in a
+            # ``cat mem0.json`` / ``docker inspect`` / read_file result and it lands verbatim in
+            # state.db and blackbox (t_9627c5fd). Register the exact value for this profile.
+            from agent.redact import register_vault_redaction_value
+            register_vault_redaction_value(self._admin_api_key)
         self._ca_bundle = str(self._config.get("ca_bundle", "") or "").strip()
         self._pin_user_id = self._truthy(self._config.get("pin_user_id", False))
         try:

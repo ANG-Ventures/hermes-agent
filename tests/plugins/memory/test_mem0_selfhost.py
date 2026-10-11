@@ -987,3 +987,32 @@ def test_temporal_parse_failure_is_non_fatal(monkeypatch, tmp_path):
     payload = json.loads(out)
     assert payload["count"] == 3                      # recall still works
     assert client.searches[-1]["top_k"] == 3         # fell back to plain fetch (no window)
+
+
+def test_admin_api_key_is_scrubbed_from_tool_output_after_initialize(monkeypatch, tmp_path):
+    """The admin key has no vendor prefix, so only exact-value registration masks it in a
+    ``cat mem0.json`` result before state.db / blackbox persist it (t_9627c5fd)."""
+    from agent import redact
+
+    nonce = "e2e" + "9f1c" * 15 + "z"
+    home_a, home_b = tmp_path / "a", tmp_path / "b"
+    home_a.mkdir()
+    home_b.mkdir()
+    cat_output = json.dumps({"host": "http://mem0.test", "admin_api_key": nonce}, indent=2)
+    (home_a / "mem0.json").write_text(cat_output)
+    monkeypatch.delenv("MEM0_ADMIN_API_KEY", raising=False)
+    try:
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        assert nonce in redact.redact_sensitive_text(cat_output, force=True)  # shape passes miss it
+
+        Mem0MemoryProvider().initialize("test-session")
+
+        for text in (cat_output, f"ADMIN_API_KEY={nonce}", f"X-API-Key: {nonce}"):
+            assert nonce not in redact.redact_sensitive_text(text)
+            assert nonce not in redact.redact_terminal_output(text, "cat mem0.json")
+        # Another profile's output is not scrubbed with this profile's key.
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        assert nonce in redact.redact_sensitive_text(cat_output, force=True)
+    finally:
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        redact.clear_vault_redaction_values()
