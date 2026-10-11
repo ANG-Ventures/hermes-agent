@@ -896,7 +896,9 @@ def test_studio_affinity_sources_and_pin_override():
     assert _portable(body="port 9200 is elasticsearch") == (True, None, "policy")
     # The NARROW body list (spec s2.3): a REMOTE browser endpoint and the bare
     # word CDP are not Studio state (Prism f66cf7e1 / 115dad86).
-    assert _portable(body="Connect via CDP to http://ace-ai:9222") == (True, None, "policy")
+    # Naming a pool host makes it host-bound (reach rule, t_1e9ea7e9): with no
+    # reach matrix it stays local on host_reach, never on studio affinity.
+    assert _portable(body="Connect via CDP to http://ace-ai:9222") == (False, "host_reach", None)
     assert _portable(body="connect to http://browser.example:9222") == (True, None, "policy")
     assert _portable(body="use CDP generally") == (True, None, "policy")
     assert _portable(body="add items to Ace's Amazon cart on localhost:9222") == (
