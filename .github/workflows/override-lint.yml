@@ -15,7 +15,7 @@ name: override-lint
 # itself (README "Caller path filters"), so an unfiltered run on a docs-only PR finds no hits and passes.
 # Not a required check.
 on:
-  pull_request:
+  pull_request:  # no-paths-ok: reads the PR BODY (`edited`); no concurrency on purpose (callee t_69ee9353)
     types: [opened, edited, synchronize, reopened]
 
 permissions:
