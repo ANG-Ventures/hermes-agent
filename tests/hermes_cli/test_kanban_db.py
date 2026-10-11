@@ -1028,7 +1028,7 @@ def test_kanban_db_override_outranks_hermes_home_without_sandbox(tmp_path, monke
     live = tmp_path / "live" / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
     _simulate_inherited_pin(monkeypatch, live, started_at=tmp_path / "live")
     with pytest.raises(kb.KanbanPinDivergenceError):
@@ -1110,7 +1110,7 @@ def test_override_escaping_hermes_home_REFUSES(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
     _simulate_inherited_pin(monkeypatch, live, started_at=tmp_path / "live")
@@ -1141,7 +1141,7 @@ def test_diverged_pin_cannot_create_a_task_or_append_an_event(tmp_path, monkeypa
     monkeypatch.setenv("HERMES_HOME", str(live_root))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
     with kb.connect() as conn:
@@ -1193,7 +1193,7 @@ def test_no_refusal_when_override_lives_inside_hermes_home(tmp_path, monkeypatch
     """The dispatcher's normal pin (inside the root) must resolve untouched."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     inside = kb.kanban_home() / "kanban" / "boards" / "b" / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(inside))
@@ -1212,7 +1212,7 @@ def test_pin_without_hermes_home_still_resolves(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_HOME", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(live))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
 
@@ -1243,7 +1243,7 @@ def _pin_contradiction_env(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
     monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
@@ -1265,7 +1265,7 @@ def test_a_self_chosen_pin_outside_hermes_home_is_left_alone(tmp_path, monkeypat
     chosen = tmp_path / "my-own" / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
     monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
@@ -1292,7 +1292,7 @@ def test_a_pin_reaching_the_machines_real_hermes_home_always_refuses(
 
     live = _get_platform_default_hermes_home() / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "scratch"))
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(kb, "_CHECKED_OVERRIDE_ESCAPES", set())
     monkeypatch.setattr(kb, "_CHECKED_PIN_BOARD_CONTRADICTIONS", set())
@@ -1367,6 +1367,7 @@ def test_identical_pin_under_uncreated_home_does_not_refuse(tmp_path, monkeypatc
         kb._CHECKED_OVERRIDE_ESCAPES.clear()
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
 def test_missing_pin_agreement_is_shared_by_both_guards(tmp_path, monkeypatch):
     """An uncreated home and an uncreated DB use the same exact-tail rule."""
     home = tmp_path / "missing" / ".hermes"

@@ -6,6 +6,8 @@ import shlex
 import subprocess
 import sys
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
 from tools import kanban_tools
@@ -32,6 +34,7 @@ def _worker_board(tmp_path, monkeypatch):
     return conn, own, foreign
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a tmp board for real child processes (t_65791cd2)
 def test_terminal_descendants_cannot_mutate_even_after_task_is_removed(tmp_path, monkeypatch):
     conn, own, foreign = _worker_board(tmp_path, monkeypatch)
     script = tmp_path / "descendant.py"
@@ -88,6 +91,7 @@ def test_terminal_descendants_cannot_mutate_even_after_task_is_removed(tmp_path,
     conn.close()
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a tmp board for real child processes (t_65791cd2)
 def test_worker_cli_cannot_use_foreign_task_to_drop_run_scope(tmp_path, monkeypatch):
     conn, own, foreign = _worker_board(tmp_path, monkeypatch)
     assert "error" in json.loads(kanban_tools._handle_complete({"task_id": foreign, "summary": "no"}))

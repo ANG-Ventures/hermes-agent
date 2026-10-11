@@ -198,6 +198,7 @@ class _ConnProxy:
         return getattr(self._conn, name)
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
 def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
     """First tick checkpoints; ticks inside the interval don't; after the
     interval elapses the next tick checkpoints again."""

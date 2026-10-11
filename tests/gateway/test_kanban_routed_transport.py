@@ -2,6 +2,8 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from gateway.config import GatewayConfig, Platform
 from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
 from gateway.profile_routing import parse_profile_routes
@@ -121,6 +123,7 @@ def test_user_routed_subscription_uses_only_its_authorized_profile(tmp_path, mon
     assert not collect(runner)
 
 
+@pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
 def test_route_denials_leave_events_retryable_at_claim_and_send(tmp_path, monkeypatch):
     runner = setup_runner(tmp_path, monkeypatch)
     primary = runner.adapters[Platform.DISCORD]
