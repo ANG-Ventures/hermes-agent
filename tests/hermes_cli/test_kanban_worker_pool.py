@@ -385,7 +385,7 @@ def test_rc1_linked_card_with_host_any_is_not_placed(kanban_home):
 # -- t_ae87edff: only workspace-sharing link kinds hold a card local ---------
 
 def _derived(conn, *, child_body=None):
-    (parent,) = _make(conn, 1, assignee="beta")
+    (parent,) = _make(conn, 1)  # alpha: the pool allowlist, so only links can hold it
     (child,) = _make(conn, 1, body=child_body, parents=[parent], parents_kind="derived-from")
     return parent, child
 
@@ -431,7 +431,7 @@ def test_legacy_null_kind_link_still_holds_local(kanban_home):
         conn.execute("CREATE TABLE task_links (parent_id TEXT, child_id TEXT, kind TEXT)")
         conn.execute("INSERT INTO task_links VALUES (?, ?, NULL)", (parent, child))
         conn.commit()
-        assert kbd._linked_ids(conn, [child]) == {child: ("blocks", parent)}
+        assert kbd._linked_ids(conn, [child])[child] == ("blocks", parent)
 
 
 def test_parent_of_derived_from_child_is_portable(kanban_home):

@@ -3703,28 +3703,45 @@ def _native_command_profile(assignee: str, cache: dict) -> bool:
 _LINK_CHUNK = 250
 
 
-def _linked_ids(conn, ids) -> set:
-    """Ids among ``ids`` with any task link: ONE query per tick (bounded by
-    the ready set), not one per row."""
+# Link kinds that never imply a shared workspace (t_ae87edff). ``derived-from``
+# is provenance only: it never gates, so the child never waits on, or builds
+# on, the parent's output. ``blocks`` (and NULL, which reads as ``blocks``)
+# gates the child on the parent's handoff, which may sit in the parent's
+# retained local workspace, so both ends stay local. An unknown kind is
+# treated as sharing (fail closed). Literal: ``_kb`` binds at module end.
+_PROVENANCE_LINK_KINDS = frozenset({"derived-from"})  # == kanban_db.LINK_KIND_DERIVED_FROM
+
+
+def _linked_ids(conn, ids) -> dict:
+    """``{id: (kind, other_id)}`` for ids among ``ids`` with a link whose kind
+    may share a workspace: ONE query per tick (bounded by the ready set), not
+    one per row. ``other_id`` is the far end of the first such link."""
     ids = list(ids)
-    out: set = set()
+    out: dict = {}
     # Each id is bound twice (parent + child): 250 ids = 500 variables, under
     # SQLite's historical 999 limit (SQLITE_MAX_VARIABLE_NUMBER < 3.32).
     for i in range(0, len(ids), _LINK_CHUNK):
         chunk = ids[i:i + _LINK_CHUNK]
         marks = ",".join("?" * len(chunk))
         for r in conn.execute(
-            f"SELECT parent_id, child_id FROM task_links "
-            f"WHERE parent_id IN ({marks}) OR child_id IN ({marks})", chunk + chunk,
+            f"SELECT parent_id, child_id, kind FROM task_links "
+            f"WHERE parent_id IN ({marks}) OR child_id IN ({marks}) "
+            f"ORDER BY parent_id, child_id", chunk + chunk,
         ):
-            out.add(r[0])
-            out.add(r[1])
+            try:
+                kind = _kb.normalize_link_kind(r[2])
+            except ValueError:
+                kind = str(r[2])
+            if kind in _PROVENANCE_LINK_KINDS:
+                continue
+            out.setdefault(r[0], (kind, r[1]))
+            out.setdefault(r[1], (kind, r[0]))
     return out
 
 
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
-               linked_ids: Optional[set] = None) -> "tuple[str, Optional[str]]":
+               linked_ids: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
 
@@ -3737,13 +3754,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         skills = json.loads(row["skills"] or "[]") or []
     except (TypeError, ValueError, IndexError, KeyError):
         skills = []
-    if linked_ids is not None:
-        linked = row["id"] in linked_ids
-    else:
-        linked = conn.execute(
-            "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ? LIMIT 1",
-            (row["id"], row["id"]),
-        ).fetchone() is not None
+    link = (linked_ids if linked_ids is not None else _linked_ids(conn, [row["id"]])).get(row["id"])
+    linked = link is not None
     # An unassigned card is routed as the assignee the loop will give it.
     assignee = row["assignee"] or default_assignee
     allowlisted = bool(assignee) and assignee in tuple(plan.config.profiles or ())
@@ -3766,6 +3778,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         _kwp.note_ignored_pin(row["id"], ignored)
     if ok:
         return ("pin", pin) if route_class == "pin" else ("portable", None)
+    if rule == "linked" and link is not None:
+        rule = f"linked({link[0]} -> {link[1]})"  # name the edge that holds it
     if pin is not None and pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
         return "wait", f"not_portable:{rule}"
     # host:any that fails hard_ok may still run locally; with no local slot
