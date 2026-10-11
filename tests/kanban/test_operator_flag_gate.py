@@ -94,10 +94,10 @@ def _db(home: Path) -> Path:
 
 
 def _running_card(home: Path, title: str = "operator gate probe") -> tuple[str, int]:
-    created = _run(home, "create", title, "--json")
+    created = _run(home, "create", title, "--json", "--unhomed")
     assert created.returncode == 0, created.stderr
     task_id = json.loads(created.stdout)["id"]
-    claimed = _run(home, "claim", task_id)
+    claimed = _run(home, "claim", task_id)  # kanban-identity: ok — claims the --unhomed card above
     assert claimed.returncode == 0, claimed.stderr
     status, run_id = _state(home, task_id)
     assert status == "running" and run_id is not None
@@ -213,7 +213,7 @@ def test_takeover_with_operator_token_completes(home):
 
 def test_takeover_without_active_run_is_not_gated(home):
     """Scope control: the gate bites only while a run is active."""
-    created = _run(home, "create", "idle card", "--json")
+    created = _run(home, "create", "idle card", "--json", "--unhomed")
     task_id = json.loads(created.stdout)["id"]
     _write_token(home)
 
@@ -351,7 +351,7 @@ def test_a6_6_token_read_by_same_uid_process_passes_known_limit(home):
 def test_unblock_reset_failures_already_happens_q16_branch_a(home):
     """Spec 9.9 step 5: ``unblock`` already zeroes ``consecutive_failures``, so
     no ``--reset-failures`` flag is added."""
-    created = _run(home, "create", "breaker card", "--json")
+    created = _run(home, "create", "breaker card", "--json", "--unhomed")
     task_id = json.loads(created.stdout)["id"]
     blocked = _run(home, "block", task_id, "quota: no eligible sub")
     assert blocked.returncode == 0, blocked.stderr
