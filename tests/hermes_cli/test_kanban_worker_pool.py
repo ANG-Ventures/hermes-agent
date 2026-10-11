@@ -380,7 +380,188 @@ def test_rc1_linked_card_with_host_any_is_not_placed(kanban_home):
         conn.commit()
         res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
     assert res.placed == [] and all(tid != child for tid, _ in spawned)
-    assert res.placement_waits[child] == "not_portable:linked"
+    assert res.placement_waits[child] == f"not_portable:linked(blocks->{parent})"
+
+
+# -- t_ae87edff: only workspace-sharing link kinds hold a card local ---------
+
+def _derived(conn, *, child_body=None):
+    (parent,) = _make(conn, 1)  # alpha: the pool allowlist, so only links can hold it
+    (child,) = _make(conn, 1, body=child_body, parents=[parent], parents_kind="derived-from")
+    return parent, child
+
+
+def test_derived_from_child_is_portable_on_policy(kanban_home):
+    """(a) A provenance-only child (scratch, otherwise unlinked) spills."""
+    with kb.connect_closing() as conn:
+        _parent, child = _derived(conn)
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (child,)).fetchone()[0] == "ready"
+        assert kbd._route_row(conn, conn.execute("SELECT * FROM tasks WHERE id=?", (child,)).fetchone(),
+                              _plan(free=2)) == ("portable", None)
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+    assert (child, "ace-ai") in spawned and child not in res.placement_waits
+
+
+def test_derived_from_child_with_host_any_places_on_pool(kanban_home):
+    with kb.connect_closing() as conn:
+        _parent, child = _derived(conn, child_body="host: any")
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+    assert (child, "ace-ai") in res.placed
+
+
+def test_blocks_child_is_not_portable_and_names_the_link(kanban_home):
+    """(b) A gating child may read its parent's retained local workspace."""
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1, assignee="beta")
+        (child,) = _make(conn, 1, body="host:any")
+        kb.link_tasks(conn, parent, child, kind="blocks")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (child,)).fetchone()
+        assert kbd._route_row(conn, row, _plan(free=2)) == (
+            "local", f"not_portable:linked(blocks->{parent})")
+
+
+def test_legacy_null_kind_link_still_holds_local(kanban_home):
+    """A NULL kind reads as ``blocks`` (normalize_link_kind), never un-holds."""
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1, assignee="beta")
+        (child,) = _make(conn, 1)
+        conn.execute("PRAGMA ignore_check_constraints=1")
+        conn.execute("DROP TABLE task_links")
+        conn.execute("CREATE TABLE task_links (parent_id TEXT, child_id TEXT, kind TEXT)")
+        conn.execute("INSERT INTO task_links VALUES (?, ?, NULL)", (parent, child))
+        conn.commit()
+        assert kbd._linked_ids(conn, [child])[child] == ("blocks", parent)
+
+
+def test_parent_of_derived_from_child_is_portable(kanban_home):
+    """(c) The provenance edge does not hold the PARENT local either."""
+    with kb.connect_closing() as conn:
+        parent, _child = _derived(conn)
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (parent,)).fetchone()
+        assert kbd._route_row(conn, row, _plan(free=2)) == ("portable", None)
+        assert kbd._linked_ids(conn, [parent, _child]) == {}
+
+
+def test_dry_run_prints_the_placement_wait_reason(kanban_home, capsys, monkeypatch):
+    """(d) `kanban dispatch --dry-run` says WHY a ready card was held."""
+    from hermes_cli import kanban_ops as kops
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1, assignee="beta")
+        (child,) = _make(conn, 1, body="host:ace-ai", parents=[parent])
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+    monkeypatch.setattr(kops, "_one_shot_pool_plan", lambda *a, **k: _plan(free=2))
+    import argparse
+    rc = kops._cmd_dispatch(argparse.Namespace(dry_run=True, json=False, max=None,
+                                               max_running=None, failure_limit=2))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"Held ({child}): not_portable:linked(blocks->{parent})" in out
+
+
+def _lineage(monkeypatch, mode):
+    from hermes_cli import config as _config
+    monkeypatch.setattr(_config, "load_config_readonly",
+                        lambda: {"kanban": {"placement": {"lineage_pins": mode}}})
+
+
+def _placement_waits(conn, tid):
+    return [json.loads(r[0]) for r in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='placement_wait' ORDER BY id",
+        (tid,))]
+
+
+def test_placement_wait_event_written_once_then_deduplicated(kanban_home, monkeypatch):
+    """Spec t_1cca39e1 (b): {reason, route, host, since}; a repeat within 900 s
+    writes nothing, a dry run writes nothing, an aged repeat keeps ``since``."""
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1, assignee="beta")
+        (child,) = _make(conn, 1, body="host:ace-ai", parents=[parent])
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+        kbd.dispatch_once(conn, dry_run=True, spawn_fn=lambda *a, **k: 1, max_spawn=64,
+                          spawn_limit=0, spawn_paused="t", spillover=_plan(free=2),
+                          reconcile_orphans=False)
+        assert _placement_waits(conn, child) == []
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        (ev,) = _placement_waits(conn, child)
+        assert ev["reason"] == f"not_portable:linked(blocks->{parent})"
+        assert ev["route"] == "wait" and ev["host"] is None and isinstance(ev["since"], int)
+        conn.execute("UPDATE task_events SET created_at = created_at - 901 "
+                     "WHERE task_id=? AND kind='placement_wait'", (child,))
+        conn.commit()
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        evs = _placement_waits(conn, child)
+    assert len(evs) == 2 and evs[1]["since"] == ev["since"]
+
+
+def test_placement_wait_new_episode_after_run_is_not_deduplicated(kanban_home, monkeypatch):
+    """Prism 331b10c66fe9: hold -> card runs -> back to ready with the same
+    reason is a NEW wait episode: a fresh event (even inside 900 s) whose
+    ``since`` is the new hold's start, never the first episode's."""
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1, assignee="beta")
+        (child,) = _make(conn, 1, body="host:ace-ai", parents=[parent])
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        (first,) = _placement_waits(conn, child)
+        # Backdate the first episode by 300 s (still inside the 900 s window).
+        conn.execute("UPDATE task_events SET created_at = created_at - 300, payload = "
+                     "json_set(payload, '$.since', json_extract(payload, '$.since') - 300) "
+                     "WHERE task_id=? AND kind='placement_wait'", (child,))
+        with kb.write_txn(conn):
+            kb._append_event(conn, child, "claimed", {"run_id": 1})
+            kb._append_event(conn, child, "requeued", {"reason": "test"})
+        conn.commit()
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        evs = _placement_waits(conn, child)
+    assert len(evs) == 2
+    assert evs[1]["reason"] == first["reason"]
+    assert evs[1]["since"] >= first["since"]  # first["since"] read before the backdate
+    assert evs[1]["since"] - evs[0]["since"] >= 300
+
+
+def test_lineage_pins_legacy_is_todays_routing(kanban_home, monkeypatch):
+    """Spec t_1cca39e1 (c): ``legacy`` routes exactly as before t_ae87edff on
+    real card shapes (this card's own pinned body, an umbrella's derived-from
+    children, a blocks chain). Passes on the pre-fix base unchanged."""
+    _lineage(monkeypatch, "legacy")
+    umbrella_body = "origin: discord #ci-runner-box\nFix (hermes-agent, worktree off gh/main, PR)"
+    with kb.connect_closing() as conn:
+        (umb,) = _make(conn, 1, body=umbrella_body)
+        (der_any,) = _make(conn, 1, body="host: any\nproof card", parents=[umb],
+                           parents_kind="derived-from")
+        (der_pin,) = _make(conn, 1, body="host: ace-ai\nbuild", parents=[umb],
+                           parents_kind="derived-from")
+        (der_plain,) = _make(conn, 1, body="no host line", parents=[umb],
+                             parents_kind="derived-from")
+        (blk,) = _make(conn, 1, body="host:ace-ai", parents=[umb])
+        (lone,) = _make(conn, 1, body="host: ace-ai\norigin: no links")
+        conn.execute("UPDATE tasks SET status='ready'")
+        conn.commit()
+        rows = {r["id"]: r for r in conn.execute("SELECT * FROM tasks")}
+        plan = _plan(free=2)
+        got = {t: kbd._route_row(conn, rows[t], plan) for t in rows}
+    assert got == {
+        umb: ("local", None),
+        der_any: ("local", "not_portable:linked"),
+        der_pin: ("wait", "not_portable:linked"),
+        der_plain: ("local", None),
+        blk: ("wait", "not_portable:linked"),
+        lone: ("pin", "ace-ai"),
+    }
+
+
+def test_lineage_pins_default_is_kinds(kanban_home, monkeypatch):
+    _lineage(monkeypatch, "typo")  # unrecognised -> default, never re-pins everything
+    with kb.connect_closing() as conn:
+        _parent, child = _derived(conn, child_body="host: any")
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (child,)).fetchone()
+        assert kbd._route_row(conn, row, _plan(free=2)) == ("portable", None)
 
 
 def test_review_rows_spawn_locally_only(kanban_home, monkeypatch):
@@ -868,7 +1049,7 @@ def test_link_scan_binds_under_the_sqlite_variable_limit(kanban_home):
         kb.link_tasks(conn, a, b)
         conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
         ids = [f"t_fake{i:05d}" for i in range(1198)] + [a, b]
-        assert kbd._linked_ids(conn, ids) == {a, b}
+        assert kbd._linked_ids(conn, ids) == {a: ("blocks", b), b: ("blocks", a)}
 
 
 # -- Apollo review r5 (PR #1730) -------------------------------------------

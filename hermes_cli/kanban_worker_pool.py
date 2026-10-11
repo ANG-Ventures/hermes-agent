@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
+from hermes_cli import kanban_placement_reasons as _reasons
 from hermes_cli import placement_ledger as _ledger
 from hermes_cli import placement_policy as _policy
 
@@ -490,20 +491,20 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     ``studio_bound_skills`` and ``hosts`` (known host ids).
     """
     if (workspace_kind or "scratch") != "scratch":
-        return False, "workspace_kind", None
+        return False, _reasons.WORKSPACE_KIND, None
     if has_links:
-        return False, "linked", None
+        return False, _reasons.LINKED, None
     if workspace_has_content:
-        return False, "local_files", None
+        return False, _reasons.LOCAL_FILES, None
     if not assignee or assignee not in tuple(pool.profiles or ()):
-        return False, "profile", None
+        return False, _reasons.PROFILE, None
     if native_command:
         # foreign_lane.worker_command runs the lane with a LOCAL Popen; the
         # ssh terminal backend never sees it, so placement would be a lie.
-        return False, "native_command", None
+        return False, _reasons.NATIVE_COMMAND, None
     pin, _ignored = resolve_pin(body, pool.hosts or ())
     if pin == PIN_STUDIO:
-        return False, "host_studio", None
+        return False, _reasons.HOST_STUDIO, None
     # Host-bound card (t_1e9ea7e9): it drives a fleet host over ssh, so only a
     # worker host with a PROVEN route (fresh reach matrix row, rc 0 to every
     # target) may take it. No such host, or no fresh matrix: it stays local
@@ -511,9 +512,9 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     allowed = reach_allowed_hosts(body=body, skills=skills, pool=pool)
     if allowed is not None:
         if pin is not None and pin != PIN_ANY and pin not in allowed:
-            return False, "host_reach", None
+            return False, _reasons.HOST_REACH, None
         if pin in (None, PIN_ANY) and not allowed:
-            return False, "host_reach", None
+            return False, _reasons.HOST_REACH, None
     if pin == PIN_ANY:
         return True, None, "any"
     if pin is not None:
@@ -522,7 +523,7 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
         return True, None, "pin"
     bound = set(pool.studio_bound_skills or ())
     if any(s in bound for s in (skills or ())):
-        return False, "studio_bound_skill", None
+        return False, _reasons.STUDIO_BOUND_SKILL, None
     return True, None, "policy"
 
 
