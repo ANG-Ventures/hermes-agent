@@ -675,27 +675,42 @@ class Mem0MemoryProvider(MemoryProvider):
                 raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
 
     def _is_breaker_open(self) -> bool:
-        """Return True if the circuit breaker is tripped (too many failures)."""
+        """Return True if the circuit breaker is tripped (too many failures).
+
+        After the cooldown the breaker is HALF-OPEN: calls go through, and the failure count stays
+        at the threshold, so ONE more failure re-opens it for a full cooldown. Only a success closes
+        it. (It used to reset the count to 0 here, so a still-dead store took THRESHOLD more real
+        requests -- 5 x up to 30 s of a blocked tool call each -- before it re-opened.)"""
         if self._consecutive_failures < _BREAKER_THRESHOLD:
             return False
-        if time.monotonic() >= self._breaker_open_until:
-            # Cooldown expired — reset and allow a retry
-            self._consecutive_failures = 0
-            return False
-        return True
+        return time.monotonic() < self._breaker_open_until
 
     def _record_success(self):
+        if self._consecutive_failures >= _BREAKER_THRESHOLD:
+            logger.warning("Mem0 circuit breaker closed: the store answered again.")
         self._consecutive_failures = 0
+
+    def _read_failure_text(self, what: str, exc: Exception) -> str:
+        """Tool error for a failed READ. A store the client cannot reach (refused, timeout, DNS,
+        5xx) is said to be DOWN in so many words, so the model tells the user memory is unavailable
+        instead of answering as if nothing was stored. A 4xx is a request problem, not an outage."""
+        from .capture_drain import _classify_add_error
+        if _classify_add_error(exc) == "deterministic_client_error":
+            return f"{what}: {exc}"
+        return (f"{what}: mem0 memory store is DOWN or unreachable ({exc}). This is NOT an empty "
+                f"result: tell the user memory is unavailable right now.")
 
     def _record_failure(self):
         self._consecutive_failures += 1
         if self._consecutive_failures >= _BREAKER_THRESHOLD:
+            was_open = time.monotonic() < self._breaker_open_until
             self._breaker_open_until = time.monotonic() + _BREAKER_COOLDOWN_SECS
-            logger.warning(
-                "Mem0 circuit breaker tripped after %d consecutive failures. "
-                "Pausing API calls for %ds.",
-                self._consecutive_failures, _BREAKER_COOLDOWN_SECS,
-            )
+            if not was_open:
+                logger.warning(
+                    "Mem0 circuit breaker tripped after %d consecutive failures. "
+                    "Pausing API calls for %ds.",
+                    self._consecutive_failures, _BREAKER_COOLDOWN_SECS,
+                )
 
     @staticmethod
     def _truthy(value: Any) -> bool:
@@ -1135,6 +1150,12 @@ class Mem0MemoryProvider(MemoryProvider):
         self._api_key = self._config.get("api_key", "")
         self._host = str(self._config.get("host", "") or "").strip().rstrip("/")
         self._admin_api_key = str(self._config.get("admin_api_key", "") or "").strip()
+        if self._admin_api_key:
+            # The admin key has no vendor prefix, so the shape-based redactor misses it in a
+            # ``cat mem0.json`` / ``docker inspect`` / read_file result and it lands verbatim in
+            # state.db and blackbox (t_9627c5fd). Register the exact value for this profile.
+            from agent.redact import register_vault_redaction_value
+            register_vault_redaction_value(self._admin_api_key)
         self._ca_bundle = str(self._config.get("ca_bundle", "") or "").strip()
         self._pin_user_id = self._truthy(self._config.get("pin_user_id", False))
         try:
@@ -1284,8 +1305,11 @@ class Mem0MemoryProvider(MemoryProvider):
         # Degrade-safe (INV-3): _get_capture_pipeline() already swallows all construction/start
         # errors internally (returns None), so this guard exists ONLY to keep a raise from
         # capture_is_on() (a cheap flag read) from ever breaking session initialization.
+        # Queued foreground concludes drain even with capture off, so a capture-off profile also
+        # warms the pipeline when a queue file exists (it may hold concludes from a prior outage).
         try:
-            if capture_is_on(self._capture):
+            from .capture_pipeline import default_queue_path
+            if capture_is_on(self._capture) or os.path.exists(default_queue_path()):
                 self._get_capture_pipeline()
         except Exception as e:
             logger.debug("mem0 capture: startup pipeline warm-up skipped (non-fatal): %s", e)
@@ -1468,6 +1492,59 @@ class Mem0MemoryProvider(MemoryProvider):
                           "matched": out.get("matched"), "score": out.get("score")})
         return out
 
+    # -- Durable queue for foreground mem0_conclude (store unreachable) ----------------------------
+
+    def _queue_conclude(self, conclusion: str, reason: str) -> Optional[str]:
+        """Queue a conclude the store could not take. Returns the tool reply, or None when the
+        fact could not be queued (the caller then returns the original error)."""
+        pipe = self._get_capture_pipeline()
+        if pipe is None:
+            return None
+        from .capture_queue import conclude_idem_key
+        filters = self._write_filters(write_kind="deliberate")
+        metadata = dict(filters["metadata"])
+        metadata["dedup_hash"] = self._bgr_norm_hash(conclusion)
+        payload = {"text": conclusion, "user_id": filters["user_id"],
+                   "agent_id": filters["agent_id"], "metadata": metadata, "host": self._host,
+                   "queued_at": time.time()}
+        key = conclude_idem_key(filters["user_id"], filters["agent_id"], conclusion, self._host)
+        try:
+            pipe.enqueue_conclude(key, payload)
+        except Exception as e:
+            logger.warning("mem0_conclude could not be queued (fact NOT stored): %s", e)
+            return None
+        logger.warning("mem0_conclude queued for retry (store unreachable: %s)", reason[:200])
+        return json.dumps({"result": "queued (store unreachable); will land when mem0 is back",
+                           "queued": True})
+
+    def _check_queued_host(self, payload: Dict[str, Any]) -> None:
+        # The queue file is per machine, shared by every profile on it. Leasing is scoped to this
+        # host, so this only trips on a row whose target column disagrees with its payload; it
+        # stays as the last guard: a row for another mem0 never lands here (raise = stays pending).
+        host = payload.get("host")
+        if host and host != self._host:
+            raise RuntimeError(f"queued conclude targets another mem0 host ({host})")
+
+    def _queued_conclude_landed(self, payload: Dict[str, Any]) -> bool:
+        """True if the queued fact is already live (same dedup_hash, not forgotten). Raises on a
+        lookup failure so the drain retries instead of writing a possible duplicate."""
+        self._check_queued_host(payload)
+        dedup_hash = (payload.get("metadata") or {}).get("dedup_hash")
+        if not dedup_hash:
+            return False
+        hits = self._unwrap_results(self._get_client().search_meta_filtered(
+            payload.get("text", ""), {"dedup_hash": dedup_hash}, top_k=1))
+        return bool(self._drop_forgotten(hits))
+
+    def _land_queued_conclude(self, payload: Dict[str, Any]) -> None:
+        """The direct verbatim POST for a queued conclude: infer=false, no gate, no model."""
+        self._check_queued_host(payload)
+        self._get_client().add(
+            [{"role": "user", "content": payload["text"]}],
+            user_id=payload.get("user_id"), agent_id=payload.get("agent_id"),
+            metadata=dict(payload.get("metadata") or {}), infer=False)
+        self._record_success()
+
     @staticmethod
     def _unwrap_results(response: Any) -> list:
         """Normalize Mem0 API response — v2 wraps results in {"results": [...]}."""
@@ -1584,13 +1661,21 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         future = self._prefetch_future
-        if future and not future.done():
+        # Breaker open: queue_prefetch submitted nothing new, so the only in-flight future is the
+        # one already stuck on the dead store. Joining it again would charge every turn the full
+        # budget for a result that cannot arrive.
+        if future and not future.done() and not self._is_breaker_open():
             try:
                 future.result(timeout=self._prefetch_join_timeout_s)
             except FutureTimeoutError:
                 with self._prefetch_submit_lock:
                     if self._prefetch_future is future:
                         self._prefetch_timed_out = True
+                # A store that accepts the connection and never answers (wedged, or packets
+                # dropped after SYN) used to cost EVERY turn the full join budget and never trip
+                # the breaker: the worker was still inside its 30 s urlopen when the next turn
+                # rotated it away. A join timeout is a failure for the breaker's purposes.
+                self._record_failure()
             except Exception as e:
                 logger.debug("Mem0 prefetch worker failed: %s", e)
         with self._prefetch_lock:
@@ -1623,7 +1708,9 @@ class Mem0MemoryProvider(MemoryProvider):
                     with self._prefetch_lock:
                         if epoch == self._prefetch_epoch:
                             self._prefetch_result = ""   # inject nothing (D-4)
-                    self._record_success()
+                    # No request was made, so this is NOT evidence the store is up: never touch
+                    # the breaker here (an ack turn used to reset the failure count, and in the
+                    # half-open state it would have closed the breaker without a probe).
                 else:
                     client = self._get_client()
                     # INV-8(ii) PREFETCH profile (the every-turn hot path). Ace's call
@@ -1930,6 +2017,9 @@ class Mem0MemoryProvider(MemoryProvider):
                 # Arm-B two-pass capture router (Phase 2.5), flag-gated via mem0.json
                 # `mem0_capture_router.enabled` (default OFF). None => byte-identical to today.
                 router=self._build_capture_router(),
+                conclude_add_fn=self._land_queued_conclude,
+                conclude_exists_fn=self._queued_conclude_landed,
+                target=self._host,
             )
             self._capture_pipeline = pipe
             return pipe
@@ -1999,10 +2089,25 @@ class Mem0MemoryProvider(MemoryProvider):
         return schemas
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        if tool_name == "mem0_conclude" and args.get("conclusion"):
+            # Maintenance window (PRD-studio-cutover I2b): refuse + journal for replay. Checked
+            # before the breaker and the client so a down store never drops the fact.
+            from . import window
+            refused = window.refuse_conclude(self._user_id, self._agent_id, args["conclusion"])
+            if refused is not None:
+                return refused
+
         if self._is_breaker_open():
-            return json.dumps({
-                "error": "Mem0 API temporarily unavailable (multiple consecutive failures). Will retry automatically."
-            })
+            if tool_name == "mem0_conclude" and args.get("conclusion"):
+                queued = self._queue_conclude(args["conclusion"], "circuit breaker open")
+                if queued is not None:
+                    return queued
+            left = max(0, int(self._breaker_open_until - time.monotonic()))
+            return tool_error(
+                f"mem0 memory store is DOWN ({self._host or 'mem0 cloud'}: {self._consecutive_failures} "
+                f"consecutive failures; not retried for {left}s). This is NOT an empty result: "
+                f"memories exist but cannot be read now. Tell the user memory is unavailable; "
+                f"do not answer as if nothing was stored.")
 
         try:
             client = self._get_client()
@@ -2020,7 +2125,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 return json.dumps({"result": "\n".join(lines), "count": len(lines)})
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Failed to fetch profile: {e}")
+                return tool_error(self._read_failure_text("Failed to fetch profile", e))
 
         elif tool_name == "mem0_search":
             query = args.get("query", "")
@@ -2083,22 +2188,28 @@ class Mem0MemoryProvider(MemoryProvider):
                 return json.dumps(out)
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Search failed: {e}")
+                return tool_error(self._read_failure_text("Search failed", e))
 
         elif tool_name == "mem0_conclude":
             conclusion = args.get("conclusion", "")
             if not conclusion:
                 return tool_error("Missing required parameter: conclusion")
             try:
-                client.add(
-                    [{"role": "user", "content": conclusion}],
-                    **self._write_filters(write_kind="deliberate"),
-                    infer=False,
-                )
+                filters = self._write_filters(write_kind="deliberate")
+                filters["metadata"]["dedup_hash"] = self._bgr_norm_hash(conclusion)
+                client.add([{"role": "user", "content": conclusion}], **filters, infer=False)
                 self._record_success()
                 return json.dumps({"result": "Fact stored."})
             except Exception as e:
                 self._record_failure()
+                # Connection-level failure (refused/timeout/5xx): the store is unreachable, not
+                # refusing this fact. Queue it durably instead of losing it. A 4xx is a
+                # deterministic rejection and still errors (a retry can never succeed).
+                from .capture_drain import _classify_add_error
+                if _classify_add_error(e) != "deterministic_client_error":
+                    queued = self._queue_conclude(conclusion, str(e))
+                    if queued is not None:
+                        return queued
                 return tool_error(f"Failed to store: {e}")
 
         elif tool_name in ("mem0_forget", "mem0_delete"):

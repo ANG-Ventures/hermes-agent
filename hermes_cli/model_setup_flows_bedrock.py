@@ -109,7 +109,8 @@ _BEDROCK_PROFILE_PREFIXES = BEDROCK_GEO_PREFIXES + ("global.",)
 # Recommended models, matched geo-agnostically so an EU (eu.*) or APAC (apac.*)
 # picker pins its own region's profile rather than a us.* one.
 _BEDROCK_RECOMMENDED_BASES = (
-    "anthropic.claude-sonnet-4-6", "anthropic.claude-opus-4-6", "anthropic.claude-haiku-4-5", "amazon.nova-pro",
+    "anthropic.claude-sonnet-4-6", "anthropic.claude-opus-4-6", "anthropic.claude-haiku-5-5", "anthropic.claude-haiku-4-5",
+    "amazon.nova-pro",
     "amazon.nova-lite", "amazon.nova-micro", "deepseek.v3", "meta.llama4-maverick", "meta.llama4-scout")
 
 

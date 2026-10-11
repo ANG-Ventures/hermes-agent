@@ -333,10 +333,16 @@ def _breaker_search(provider, query: str, limit: int) -> dict:
     paying a doomed round-trip.
     """
     from tools import web_backend_breaker as _bb
+    from tools import web_search_budget as _budget
 
     until = _bb.open_until(provider.name)
     if until:
         return {"success": False, "error": _bb.skip_error(provider.name, until)}
+    refusal = _budget.budget_exceeded(provider.name)
+    if refusal:
+        logger.warning(refusal)
+        return {"success": False, "error": refusal}
+    _budget.record_call(provider.name)
     try:
         resp = provider.search(query, limit)
     except Exception as exc:

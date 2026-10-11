@@ -361,13 +361,16 @@ def retry_invalid_response(
     agent._buffer_vprint(f"   📝 Provider message: {agent._clean_error_message(error_msg)}")
     agent._buffer_vprint(f"   ⏱️  {_failure_hint}")
 
-    if retry_count >= max_retries:
-        if agent._has_pending_fallback():
+    # t_3f07418e: after a relay gave_up with no usable fallback, a same-route retry would
+    # only re-run the relay's ladder, so the turn ends here. The failover was just tried.
+    if retry_count >= max_retries or _ir_relay_gave_up:
+        if not _ir_relay_gave_up and agent._has_pending_fallback():
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
         _fbe_floor.stash_response_failure(
             agent, "invalid_response_exhausted", response,
-            detail=", ".join(error_details), elapsed_s=api_duration)
-        if agent._try_activate_fallback():
+            detail=", ".join(error_details), elapsed_s=api_duration,
+            repeat=_ir_relay_gave_up)  # gave_up: this same response was logged above
+        if not _ir_relay_gave_up and agent._try_activate_fallback():
             active_system_prompt = _arm_fallback_restart(
                 agent, api_messages, active_system_prompt, _retry)
             retry_count = 0
@@ -375,8 +378,9 @@ def retry_invalid_response(
             return _verdict("break")
         # Terminal — flush buffered retry trace so user sees what happened.
         agent._flush_status_buffer()
-        agent._emit_diagnostic_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
-        logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
+        _attempts = retry_count if _ir_relay_gave_up else max_retries
+        agent._emit_diagnostic_status(f"❌ Max retries ({_attempts}) exceeded for invalid responses. Giving up.")
+        logger.error("%sInvalid API response after %d retries.", agent.log_prefix, _attempts)
         agent._persist_session(messages, conversation_history)
         # "model=<id>" is describe_invalid_response's OpenRouter fallback, not a provider name.
         _label = (
@@ -385,14 +389,14 @@ def retry_invalid_response(
             else provider_name
         )
         _final_response = site_copy(
-            "invalid_response", label=_label, attempts=max_retries, detail=_failure_hint,
+            "invalid_response", label=_label, attempts=_attempts, detail=_failure_hint,
         )
         return _verdict("return", stamp_failure({
             "final_response": _final_response,
             "messages": messages,
             "completed": False,
             "api_calls": api_call_count,
-            "error": f"Invalid API response after {max_retries} retries: {_failure_hint}",
+            "error": f"Invalid API response after {_attempts} retries: {_failure_hint}",
             "failed": True,
         }, invalid_response_failure_reason(response), True))
 

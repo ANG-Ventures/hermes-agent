@@ -147,12 +147,18 @@ def extract_pr_refs(
     metadata: Optional[dict] = None,
     survivor_pr=None,
 ) -> list:
-    """Qualified PR refs (URL or ``owner/repo#N``), first-seen order, deduped."""
+    """Qualified PR refs (URL or ``owner/repo#N``), first-seen order, deduped.
+
+    A ``survivor_pr`` claim may carry a ``<repository>=`` qualifier; only the value after it names a PR
+    (the grammar ``preserve`` verifies with), so ``pull/3421=o/r#3328`` is #3328 alone, never #3421 too.
+    """
+    from hermes_cli.kanban_survivor import _split_qualifier
+
     sources = [t for t in texts if isinstance(t, str) and t.strip()]
     if isinstance(metadata, dict):
         for key in ("pr_url", "pr_urls", "pr"):
             sources.extend(_iter_strings(metadata.get(key)))
-    sources.extend(_iter_strings(survivor_pr))
+    sources.extend(_split_qualifier(claim)[1] for claim in _iter_strings(survivor_pr))
     out = []
     seen = set()
     for text in sources:
@@ -641,6 +647,54 @@ def enforce_not_closed_unmerged(task_id: str, *texts: Optional[str], metadata: O
             return closed
     raise ClosedUnmergedPrError(task_id, [f"{r.repo}#{r.number}" for r in closed], verb=verb,
                                 untokened=untokened, survivors=[f"{r.repo}#{r.number}" for r in survivors])
+
+
+# --------------------------------------------------------------------------- routed-PR survivor gate
+# t_829fce95 (2026-10-10): t_cee802d5 was routed to review on its own OPEN PR hermes-home#3421, then an
+# operator closed it ``done`` with ``--survivor-pr hermes-home#3328 --survivor-unbound`` (an unrelated,
+# merged PR). The review-status card skips the open-PR route and the closed-unmerged gate only looks for
+# CLOSED, so done went through with #3421 open. A survivor claim that does not name the routed PR while
+# that PR is still OPEN (or unreadable) is now refused; ``--abandon-routed-pr <reason>`` is the override.
+
+
+class RoutedPrOpenError(ValueError):
+    """The card's routed own PR is still OPEN/unreadable and the survivor claim names a different one."""
+
+    def __init__(self, task_id: str, prs: list, unverified: Optional[list] = None, blank_reason: bool = False):
+        self.task_id = task_id
+        self.open = list(prs)
+        self.unverified = list(unverified or [])
+        self.prs = self.open + self.unverified
+        if blank_reason:
+            msg = (f"done refused: --abandon-routed-pr needs a non-empty reason (it is the audit record). "
+                   f"{task_id} is still in-flight (no state change).")
+        else:
+            parts = ["done refused:"]
+            if self.open:
+                parts.append(
+                    f"the card was routed to review on its own PR {', '.join(self.open)}, which is still OPEN, "
+                    f"and the survivor claim names a different PR/ref. Land {', '.join(self.open)} (the card "
+                    f"closes on merged=true), name it with --survivor-pr, or pass --abandon-routed-pr "
+                    f"'<reason>' if that PR is really abandoned.")
+            if self.unverified:
+                parts.append(f"GitHub could not be read for routed PR {', '.join(self.unverified)}; retry when "
+                             f"`gh api repos/<owner>/<repo>/pulls/<n>` works.")
+            parts.append(f"{task_id} is still in-flight (no state change).")
+            msg = " ".join(parts)
+        super().__init__(msg)
+
+
+def routed_prs_still_open(routed, *, survivor_pr=None, query_fn: Optional[QueryFn] = None) -> tuple:
+    """``(open, unverified)`` among the fleet PR strings ``routed`` that ``survivor_pr`` does not name.
+
+    Every routed ref is looked up (they are the card's own PRs, bounded by the card). No oracle (pytest
+    without a stub) checks nothing."""
+    named = {(r.repo.lower(), r.number) for r in extract_pr_refs(survivor_pr=survivor_pr)}
+    refs = [r for r in split_fleet(extract_pr_refs(*routed))[0] if (r.repo.lower(), r.number) not in named]
+    if not refs:
+        return [], []
+    opened, unverified = unmerged_refs(refs, query_fn=query_fn, primary=refs)
+    return [f"{r.repo}#{r.number}" for r in opened], [f"{r.repo}#{r.number}" for r in unverified]
 
 
 ROUTE_COMMENT = "survivor PR open; card closes on merged=true"

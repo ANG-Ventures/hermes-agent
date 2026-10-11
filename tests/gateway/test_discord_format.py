@@ -1,7 +1,9 @@
 """Discord format_message: tables converted to bullet groups."""
 
-import types
 import sys
+import types
+
+import pytest
 
 
 def _make_discord_adapter():
@@ -120,3 +122,75 @@ class TestDiscordToolPreviewFormatting:
         out = adapter.format_tool_preview(ToolPreview(visible, truncated=True))
 
         assert out == visible
+
+
+class TestBacktickedAngleLinks:
+    """2026-10-09: Apollo sent `<https://…>` (backticks AND angle brackets). Discord renders a backticked
+    span as inline code, which kills the link; the bare <url> form is what suppresses the embed while
+    staying clickable. The formatter unwraps that exact slip so a model-side habit cannot un-link a URL."""
+
+    def test_backticked_angle_url_is_unwrapped(self):
+        adapter = _make_discord_adapter()
+        out = adapter.format_message("Found it: `<https://www.reddit.com/r/x/comments/1hwzk5f/>` — dead listing")
+        assert "`" not in out
+        assert "<https://www.reddit.com/r/x/comments/1hwzk5f/>" in out
+
+    def test_bare_angle_url_untouched(self):
+        adapter = _make_discord_adapter()
+        text = "see <https://example.com/a?b=1> and <https://example.org>"
+        assert adapter.format_message(text) == text
+
+    def test_backticked_url_without_angles_is_unwrapped_and_angled(self):
+        adapter = _make_discord_adapter()
+        out = adapter.format_message("link: `https://example.com/path` ok")
+        assert out == "link: <https://example.com/path> ok"
+
+    def test_real_inline_code_is_preserved(self):
+        adapter = _make_discord_adapter()
+        text = "run `curl https://example.com/api` then `ls -la` and `<div>`"
+        assert adapter.format_message(text) == text
+
+    def test_fenced_code_blocks_untouched(self):
+        adapter = _make_discord_adapter()
+        text = "```\n`<https://example.com>`\n```"
+        assert adapter.format_message(text) == text
+
+    def test_url_template_literal_inside_double_backtick_span_preserved(self):
+        adapter = _make_discord_adapter()
+        text = "use ``fetch(`https://example.com`)`` here"
+        assert adapter.format_message(text) == text
+
+    def test_only_single_backtick_spans_are_unwrapped(self):
+        adapter = _make_discord_adapter()
+        text = "see ``https://example.com/x`` ok"
+        assert adapter.format_message(text) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "```https://a.b```",
+            "```\nhttps://a.b\n```",
+            "```text\nhttps://a.b\n```",
+            "```\n`https://a.b`\n````",  # closing fence longer than the opener
+            "```\n`https://a.b`\n",  # unclosed fence runs to the end
+            "~~~\n`https://a.b`\n~~~",
+            "````\n```\n`https://a.b`\n````",  # shorter run inside is content
+        ],
+    )
+    def test_fenced_url_content_untouched(self, text):
+        adapter = _make_discord_adapter()
+        assert adapter.format_message(text) == text
+
+    def test_inline_span_after_closed_fence_still_unwrapped(self):
+        adapter = _make_discord_adapter()
+        text = "```\n`https://a.b`\n```\nsee `https://a.b`"
+        assert adapter.format_message(text) == "```\n`https://a.b`\n```\nsee <https://a.b>"
+
+    def test_single_backtick_url_span_still_unwrapped(self):
+        adapter = _make_discord_adapter()
+        assert adapter.format_message("see `https://a.b`") == "see <https://a.b>"
+
+    def test_unbound_call_is_self_free(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        assert DiscordAdapter.format_message(None, "a `https://e.com` b") == "a <https://e.com> b"

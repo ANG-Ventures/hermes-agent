@@ -129,13 +129,54 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 #   * ``capability``   — hit a hard wall (no access, missing creds, an action no
 #                        AI agent can perform). Genuinely human-only.
 #   * ``transient``    — a flaky/temporary failure that may clear on retry.
+#   * ``deferred``     — waiting on wall-clock time (``until``). Parks in
+#                        ``scheduled`` with a timed wake; the dispatcher's
+#                        ``wake_due_scheduled`` returns it to ``ready`` at that
+#                        time. Not a human question, so it never pages.
 #
 # ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "deferred"}
+
+# A ``dependency`` block with no open parent has nothing to wait on. It used to
+# be re-kinded to ``needs_input`` silently, which paged the origin channel every
+# 2 h for what was usually a time wait (closeout 10-09 lesson 5). It is refused
+# instead, naming the two kinds that mean what the caller wanted.
+DEPENDENCY_NO_PARENT_REFUSAL = (
+    "kind 'dependency' waits on an open parent task, and this card has none. "
+    "Pick one: --kind deferred --until <ISO|+6h> for a time wait (parks in "
+    "scheduled, wakes to ready at that time, pages nobody), or --kind "
+    "needs_input for a human ruling (stays blocked and pages the origin channel)."
+)
+
+
+class BlockRefused(ValueError):
+    """``block_task`` refused the requested kind; the message says what to use instead."""
+
+
+def parse_wake_at(value: str, *, now: Optional[int] = None) -> int:
+    """Wake time -> epoch seconds: epoch digits, ``+<N>[smhd]`` relative to
+    *now*, or ISO-8601 (a naive timestamp is local time). Raises ValueError."""
+    value = (value or "").strip()
+    if value.isdigit():
+        return int(value)
+    rel = re.fullmatch(r"\+(\d+)([smhd])", value)
+    if rel:
+        base = int(time.time()) if now is None else int(now)
+        return base + int(rel.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[rel.group(2)]
+    from datetime import datetime
+
+    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+
+
+def format_deferred_until(until: Optional[int]) -> str:
+    """``⏸ deferred until <local time>``: the one rendering of a deferred park."""
+    when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(int(until))) if until else "?"
+    return f"⏸ deferred until {when}"
+
 
 # Run outcomes that mean "this attempt ENDED the card successfully".
 # ``superseded`` is the honest close for a card whose premise was already
@@ -5077,6 +5118,23 @@ def _ruled_since_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return False
 
 
+def _block_was_rekinded_no_open_parent(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the latest block was a ``dependency`` ask re-kinded to
+    ``needs_input`` because no open parent existed: a time/external wait, not
+    a decision, so it must not page while ``blocked`` (a ``triage`` escalation
+    still pages)."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, *_BLOCK_REASON_EVENTS),
+    ).fetchone()
+    try:
+        payload = json.loads(row["payload"]) if row and row["payload"] else {}
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("rekind_reason") == "no_open_parent"
+
+
 def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
     row = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
@@ -5129,7 +5187,12 @@ def needs_input_page_candidates(
             continue
         if not needs_input_page_enabled(conn, row["id"]):
             continue
-        if row["block_kind"] == "needs_input" and _ruled_since_block(conn, row["id"]):
+        # A re-kinded dependency is a time/external wait only while it sits in
+        # ``blocked``; once it recurs into ``triage`` it needs a human decision.
+        if row["block_kind"] == "needs_input" and (
+            _ruled_since_block(conn, row["id"])
+            or (row["status"] == "blocked" and _block_was_rekinded_no_open_parent(conn, row["id"]))
+        ):
             continue
         if row["block_kind"] == "dependency":
             parents = [
@@ -9561,6 +9624,56 @@ def _enforce_branch_base(
             _append_event(conn, task.id, "base_guard_overridden", checked)
 
 
+def _routed_own_prs(conn: sqlite3.Connection, task_id: str) -> list:
+    """The own PRs of EVERY open-PR-routed run (``own_prs``; legacy: ``auto_routed_open_prs``), deduped.
+
+    A later prose-only route records ``own_prs=[]``; that must not erase a PR an earlier route owned.
+    """
+    out: list = []
+    for run in list_runs(conn, task_id):
+        md = run.metadata if isinstance(run.metadata, dict) else {}
+        if "auto_routed_open_prs" in md:
+            for pr in (md.get("own_prs") if "own_prs" in md else md.get("auto_routed_open_prs")) or []:
+                if pr not in out:
+                    out.append(pr)
+    return out
+
+
+def _enforce_routed_pr_survivor(
+    conn: sqlite3.Connection, task_id: str, *, survivor_pr, survivor_ref,
+    abandon_routed_pr: Optional[str], query_fn,
+) -> Optional[dict]:
+    """Refuse ``done`` on a survivor claim that skips the card's still-OPEN routed PR (t_829fce95).
+
+    t_cee802d5 was routed to review on its own open PR, then closed with an
+    unbound ``--survivor-pr`` naming an unrelated merged PR. Gated only when a
+    survivor claim is given; a claim naming the routed PR passes. A non-empty
+    ``abandon_routed_pr`` lets it through: the returned ``routed_pr_abandoned``
+    payload is recorded by the caller in the SAME transaction as ``done``, so a
+    completion that later fails (e.g. survivor verification) leaves no audit.
+    Raises :class:`kanban_open_pr.RoutedPrOpenError` before any mutation.
+    """
+    from hermes_cli import kanban_open_pr as _open_pr
+    if not (survivor_pr or survivor_ref):
+        return None
+    routed = _routed_own_prs(conn, task_id)
+    if not routed:
+        return None
+    opened, unverified = _open_pr.routed_prs_still_open(
+        routed, survivor_pr=survivor_pr, query_fn=query_fn)
+    if not (opened or unverified):
+        return None
+    reason = str(abandon_routed_pr).strip() if abandon_routed_pr is not None else None
+    if reason and not _overlong(reason):
+        return {"prs": opened + unverified, "reason": reason}
+    blank = abandon_routed_pr is not None
+    with write_txn(conn):
+        _append_event(conn, task_id, "completion_blocked_routed_pr_open",
+                      {"prs": opened, "unverified": unverified,
+                       **({"reason": "empty_or_overlong_abandon_reason"} if blank else {})})
+    raise _open_pr.RoutedPrOpenError(task_id, opened, unverified, blank_reason=blank)
+
+
 @_home_session_guarded("complete")
 def complete_task(
     conn: sqlite3.Connection,
@@ -9582,8 +9695,13 @@ def complete_task(
     draft_ok: Optional[str] = None,
     external: Optional[str] = None,
     watcher: Optional[str] = None,
+    abandon_routed_pr: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    ``abandon_routed_pr`` (t_829fce95) is the audited override for
+    :func:`_enforce_routed_pr_survivor`: a survivor claim naming a different PR
+    while the card's routed own PR is still OPEN is refused without it.
 
     ``external`` + ``watcher`` (t_768c9e91) close a card whose remaining step
     is an outside party's (an upstream maintainer merge): the closing run's
@@ -9801,6 +9919,15 @@ def complete_task(
                      if isinstance(metadata, dict) else []},
                 )
             raise _receipt.ReceiptRequiredError(task_id)
+    if (
+        expected_run_id is not None
+        and candidate.status == 'running' and not review_claimed
+        and not approve_head_sha and not superseded_by and not external
+    ):
+        _enforce_handback_head(
+            conn, task_id, summary=summary, result=result, metadata=metadata,
+            survivor_pr=survivor_pr,
+        )
     negative_trigger: Optional[str] = None
     if (
         candidate.status == 'running' and not review_claimed
@@ -9968,6 +10095,10 @@ def complete_task(
                 {"prs": closed_err.closed, "unverified": closed_err.unverified},
             )
         raise
+    routed_abandon = _enforce_routed_pr_survivor(
+        conn, task_id, survivor_pr=survivor_pr, survivor_ref=survivor_ref,
+        abandon_routed_pr=abandon_routed_pr, query_fn=_pr_query or _open_pr.memo_query(),
+    )
     from hermes_cli.kanban_survivor import preserve
     survivor = preserve(
         conn, task_id, metadata,
@@ -9996,6 +10127,9 @@ def complete_task(
             )
         elif survivor['kind'] == 'none':
             survivor_note = f"survivor=none follow-up={survivor['follow_up_card']}"
+        elif survivor['kind'] == 'artifact':
+            survivor_note = "survivor=artifact " + " ".join(
+                f"{a['path']} {a['sha256']}" for a in survivor["artifacts"])
         else:
             survivor_note = "survivor=ref " + " ".join(
                 f"{ref.get('repository_path') or ref['remote']}/{ref['branch']}@{ref['sha']}"
@@ -10075,6 +10209,8 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if routed_abandon:
+            _append_event(conn, task_id, "routed_pr_abandoned", routed_abandon)
         if approve_head_sha:
             add_comment(
                 conn, task_id, candidate.assignee or "reviewer",
@@ -11503,6 +11639,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    until: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -11514,9 +11651,17 @@ def block_task(
       sit in ``blocked`` (where a cron would keep "unblocking" it); it goes to
       ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
       promotes it automatically once its parents finish. No human, no cron, no
-      retry storm. This is Dale's "Type 2 — dependency blocked". If no open
-      blocking parent exists, it instead uses the sticky ``blocked`` bucket
-      and loop counter below: the graph cannot auto-resolve an external wait.
+      retry storm. This is Dale's "Type 2 — dependency blocked". With no open
+      blocking parent it is refused with :class:`BlockRefused`
+      (:data:`DEPENDENCY_NO_PARENT_REFUSAL`), never silently re-kinded.
+
+    * ``deferred`` — waiting on wall-clock time. Requires ``until`` (epoch
+      seconds). Parks in ``scheduled`` with ``next_eligible_at = until``, so
+      the dispatcher's :func:`wake_due_scheduled` returns it to ``ready``
+      (``todo`` while parents are open) at that time. Never ``blocked``, so
+      the needs-input pager and lifecycle block lines never see it. Accepted
+      from ``todo``/``ready``/``running``/``blocked`` (an existing human park
+      can be converted), like :func:`schedule_task`.
 
     * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
@@ -11550,6 +11695,10 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if until is not None and kind != "deferred":
+        raise BlockRefused("until only applies to kind 'deferred'")
+    if kind == "deferred" and until is None:
+        raise BlockRefused("kind 'deferred' needs until (--until <ISO|+6h>): the wake time")
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -11558,6 +11707,33 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        if kind == "dependency" and _parents_satisfied(conn, task_id):
+            raise BlockRefused(DEPENDENCY_NO_PARENT_REFUSAL)
+        if kind == "deferred":
+            # Same transition as schedule_task + set_schedule_wake in one step, so
+            # the dispatcher's wake_due_scheduled owns the wake. No ``blocked``
+            # event and no ``kanban_task_blocked`` hook: a time park is not a
+            # human question, and every pager keys on those.
+            sql = (
+                "UPDATE tasks SET status = 'scheduled', claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, block_kind = 'deferred', next_eligible_at = ? "
+                "WHERE id = ? AND status IN ('todo', 'ready', 'running', 'blocked')"
+            )
+            params: list[Any] = [int(until), task_id]
+            if expected_run_id is not None:
+                sql += " AND current_run_id = ?"
+                params.append(int(expected_run_id))
+            if conn.execute(sql, params).rowcount != 1:
+                return False
+            run_id = _end_or_synthesize_run(
+                conn, task_id, outcome="scheduled", status="scheduled", summary=reason,
+                synthesize=bool(reason),
+            )
+            _append_event(conn, task_id, "scheduled", {
+                "reason": reason, "kind": "deferred", "until": int(until),
+                "source_status": cur_row["status"],
+            }, run_id=run_id)
+            return True
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
         # ``block_kind`` and no ``blocked`` event -- the policy is the
         # supervisor's, not the kernel's -- but the transition guard below only
@@ -11585,15 +11761,6 @@ def block_task(
             if cur_row["status"] == "running"
             else ("review" if cur_row["status"] == "review" else "ready")
         )
-        requested_kind = kind
-        rekind_reason = None
-        # ``dependency`` only waits on incomplete parents. A worker filing that
-        # kind with none open would park in ``todo`` and ``recompute_ready``
-        # would promote+respawn it context-free on the next tick. Re-kind to
-        # ``needs_input`` so it is sticky until a human unblocks.
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
-            kind = "needs_input"
-            rekind_reason = "no_open_parent"
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -11700,7 +11867,6 @@ def block_task(
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
-                    **({"requested_kind": requested_kind, "rekind_reason": rekind_reason} if rekind_reason else {}),
                 },
                 run_id=run_id,
             )
@@ -11789,7 +11955,6 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "source_status": source_status,
-                    **({"requested_kind": requested_kind, "rekind_reason": rekind_reason} if rekind_reason else {}),
                 },
                 run_id=run_id,
             )
@@ -12379,12 +12544,23 @@ def request_review(
     # reviewer="argus" on every card — that IS the mechanism being removed).
     # Only the explicit ``human`` sentinel or force=True (operator) bypasses it.
     _policy = configured_review_policy()
+    _neg_result = None
     if (
         _policy in ("milestone_only", "none")
         and not force
         and not is_human_reviewer(reviewer)
     ):
-        if _policy == "none" or not is_milestone_card(conn, task_id):
+        _skip_review = _policy == "none" or not is_milestone_card(conn, task_id)
+        if _skip_review:
+            # A handoff that itself says its close gate is NOT met / not
+            # proven / FAIL is never completed in place (t_db9ca661): it goes
+            # to the human review lane, where the orchestrator decides.
+            from hermes_cli.kanban_negative_result import negative_result_match
+
+            _neg_result = negative_result_match(summary, metadata)
+            if _neg_result is not None:
+                reviewer = HUMAN_REVIEWER_SENTINEL
+        if _skip_review and _neg_result is None:
             skip_meta = dict(metadata or {})
             skip_meta["review_skipped"] = "policy_none" if _policy == "none" else "non_milestone"
             done = complete_task(
@@ -12413,6 +12589,8 @@ def request_review(
     _bb_task = get_task(conn, task_id) if not force else None
     if _bb_task is not None and _bb_task.status == "running":
         _enforce_branch_base(conn, _bb_task, metadata)
+        if expected_run_id is not None:
+            _enforce_handback_head(conn, task_id, summary=summary, metadata=metadata)
 
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
@@ -12430,23 +12608,50 @@ def request_review(
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
     staged_copies: list[Path] = []
     try:
-        return _request_review_txn(
+        result = _request_review_txn(
             conn, task_id, summary=summary, metadata=metadata, reviewer=reviewer,
             expected_run_id=expected_run_id, force=force, allow_same_actor=allow_same_actor,
             now=now, staged_copies=staged_copies, _ret=_ret,
+            negative_result=(
+                {"policy": _policy, "match": _neg_result} if _neg_result is not None else None
+            ),
         )
+        return result
     except Exception:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
         raise
 
 
+def _enforce_handback_head(conn, task_id, *, summary, metadata, result=None, survivor_pr=None):
+    """Refuse a worker handoff that cites an older commit of its open PR (t_e52337cb).
+
+    Raises :class:`kanban_handback_head.StaleHandbackHeadError` (nothing else
+    mutated) after a ``completion_blocked_stale_head`` event. An unreadable PR
+    is fail-open: ``head_check_unavailable`` is logged and the handoff proceeds.
+    """
+    from hermes_cli import kanban_handback_head as _hh
+
+    try:
+        report = _hh.check(task_id=task_id, summary=summary, result=result,
+                           metadata=metadata, survivor_pr=survivor_pr)
+    except _hh.StaleHandbackHeadError as err:
+        with write_txn(conn):
+            _append_event(conn, task_id, "completion_blocked_stale_head", {"stale": err.stale})
+        raise
+    if report["unavailable"]:
+        with write_txn(conn):
+            _append_event(conn, task_id, "head_check_unavailable", {"prs": report["unavailable"]})
+
+
 def _request_review_txn(
     conn: sqlite3.Connection, task_id: str, *, summary, metadata, reviewer, expected_run_id,
-    force, allow_same_actor, now, staged_copies, _ret,
+    force, allow_same_actor, now, staged_copies, _ret, negative_result=None,
 ):
     """The transactional half of :func:`request_review` (artifact staging rides
-    inside the txn; the caller discards staged copies on rollback)."""
+    inside the txn; the caller discards staged copies on rollback).
+    ``negative_result`` ({policy, match}) is recorded in the same txn so a
+    failed audit write rolls the transition back instead of orphaning it."""
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -12597,6 +12802,11 @@ def _request_review_txn(
         if staged:
             payload["artifacts"] = staged
         _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
+        if negative_result is not None:
+            _append_event(
+                conn, task_id, "review_negative_result",
+                {**negative_result, "reviewer": reviewer},
+            )
     return _ret(True)
 
 

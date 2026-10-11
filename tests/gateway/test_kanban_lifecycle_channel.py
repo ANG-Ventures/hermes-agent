@@ -103,7 +103,7 @@ def test_review_and_plain_block_are_routed(tmp_path, monkeypatch):
         a = _card(conn)
         kb.request_review(conn, a, summary="PR ready", force=True)
         b = _card(conn)
-        kb.block_task(conn, b, reason="waiting on parent", kind="dependency")
+        kb.block_task(conn, b, reason="waiting on parent", kind="needs_input")
         return a, b
 
     (a, b), adapter = _run(tmp_path, monkeypatch, f"telegram:{LOG}", make)
@@ -171,7 +171,7 @@ def _three(conn):
     b = _card(conn)
     kb.request_review(conn, b, summary="two", force=True)
     c = _card(conn)
-    kb.block_task(conn, c, reason="three", kind="dependency")
+    kb.block_task(conn, c, reason="three", kind="needs_input")
     return a, b, c
 
 

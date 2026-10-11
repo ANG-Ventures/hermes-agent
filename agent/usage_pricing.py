@@ -614,10 +614,11 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         pricing_version="xai-grok-3-mini-fast-launch-2025",
     ),
     # ── OpenAI GPT-5.6 series (Sol/Terra/Luna) ───────────────────────────
-    # Announced in limited preview 2026-06-26; GA 2026-07-09 at the same
-    # rates (Sol $5/$30, Terra $2.50/$15, Luna $1/$6 per 1M in/out). Cache
-    # writes are billed at 1.25x the uncached input rate; cache reads get the
-    # standard 90% discount (0.10x input, confirmed: Sol $0.50/M cached).
+    # Repriced (read 2026-10-08 from the per-model docs pages and models.dev):
+    # Sol $4/$20 (promotional, "at least through November 21, 2026"), Terra
+    # $2/$12, Luna $0.20/$1.20 per 1M in/out. Cache read 0.1x input, cache
+    # write 1.25x input. "Prompts with >272K input tokens are priced at 2x
+    # input and 1.5x output for the full request."
     # Note: "Sol Fast mode" ($12.5/$75, up to 750 tok/s via Cerebras) is a
     # separate serving tier, not covered by these entries. The "-pro"
     # variants (high-effort modes, GA alongside base tiers) bill at the
@@ -629,37 +630,52 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         "openai",
         "gpt-5.6-sol",
     ): PricingEntry(
-        input_cost_per_million=Decimal("5.00"),
-        output_cost_per_million=Decimal("30.00"),
-        cache_read_cost_per_million=Decimal("0.50"),
-        cache_write_cost_per_million=Decimal("6.25"),
+        input_cost_per_million=Decimal("4.00"),
+        output_cost_per_million=Decimal("20.00"),
+        cache_read_cost_per_million=Decimal("0.40"),
+        cache_write_cost_per_million=Decimal("5.00"),
         source="official_docs_snapshot",
-        source_url="https://openai.com/index/previewing-gpt-5-6-sol/",
-        pricing_version="openai-gpt-5.6-2026-07",
+        source_url="https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+        pricing_version="openai-gpt-5.6-2026-10",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("8.00"),
+        output_cost_per_million_above=Decimal("30.00"),
+        cache_read_cost_per_million_above=Decimal("0.80"),
+        cache_write_cost_per_million_above=Decimal("10.00"),
     ),
     (
         "openai",
         "gpt-5.6-terra",
     ): PricingEntry(
-        input_cost_per_million=Decimal("2.50"),
-        output_cost_per_million=Decimal("15.00"),
-        cache_read_cost_per_million=Decimal("0.25"),
-        cache_write_cost_per_million=Decimal("3.125"),
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("12.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("2.50"),
         source="official_docs_snapshot",
-        source_url="https://openai.com/index/previewing-gpt-5-6-sol/",
-        pricing_version="openai-gpt-5.6-2026-07",
+        source_url="https://developers.openai.com/api/docs/models/gpt-5.6-terra",
+        pricing_version="openai-gpt-5.6-2026-10",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("4.00"),
+        output_cost_per_million_above=Decimal("18.00"),
+        cache_read_cost_per_million_above=Decimal("0.40"),
+        cache_write_cost_per_million_above=Decimal("5.00"),
     ),
     (
         "openai",
         "gpt-5.6-luna",
     ): PricingEntry(
-        input_cost_per_million=Decimal("1.00"),
-        output_cost_per_million=Decimal("6.00"),
-        cache_read_cost_per_million=Decimal("0.10"),
-        cache_write_cost_per_million=Decimal("1.25"),
+        input_cost_per_million=Decimal("0.20"),
+        output_cost_per_million=Decimal("1.20"),
+        cache_read_cost_per_million=Decimal("0.02"),
+        cache_write_cost_per_million=Decimal("0.25"),
         source="official_docs_snapshot",
-        source_url="https://openai.com/index/previewing-gpt-5-6-sol/",
-        pricing_version="openai-gpt-5.6-2026-07",
+        source_url="https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+        pricing_version="openai-gpt-5.6-2026-10",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("0.40"),
+        output_cost_per_million_above=Decimal("1.80"),
+        cache_read_cost_per_million_above=Decimal("0.04"),
+        cache_write_cost_per_million_above=Decimal("0.50"),
     ),
     # ── OpenAI GPT-6 Astra ───────────────────────────────────────────────
     # GA 2026-09-04. OpenAI's flagship; replaces gpt-5.6-sol as the codex
@@ -1033,39 +1049,37 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
         pricing_version="anthropic-pricing-2026-05",
     ),
-    # Claude Sonnet 5.5 (launched 2026-09-28). Sonnet 5.5 launch 2026-09-28, same list
-    # as Sonnet 5's announced rate: $2/$10 per MTok in/out, cache read $0.20; cache
-    # write $2.50 (1.25x input, 5-minute TTL).
-    # Source: https://www.anthropic.com/claude-sonnet-5-5
+    # Claude Sonnet 5.5 (launched 2026-09-28): $2/$10 per MTok in/out, cache read
+    # $0.10, cache write $2.50 (5-minute TTL). Read 2026-10-08 from the pricing page.
+    # Source: https://platform.claude.com/docs/en/about-claude/pricing
     (
         "anthropic",
         "claude-sonnet-5-5",
     ): PricingEntry(
         input_cost_per_million=Decimal("2.00"),
         output_cost_per_million=Decimal("10.00"),
-        cache_read_cost_per_million=Decimal("0.20"),
+        cache_read_cost_per_million=Decimal("0.10"),
         cache_write_cost_per_million=Decimal("2.50"),
         source="official_docs_snapshot",
-        source_url="https://www.anthropic.com/claude-sonnet-5-5",
-        pricing_version="anthropic-sonnet-5-5-2026-09",
+        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-10",
     ),
-    # Claude Sonnet 5 (released 2026-06-30). List price $3/$15; cache read $0.30 (0.1x input).
-    # Intro pricing $2/$10 in/out runs through 2026-08-31 — the cost-book uses the
-    # standing LIST rate (as the rest of this table does), so it does not under-count
-    # once intro ends. Subscription relays (claude-apr/-bpr/-api-proxy/-bridge) price
-    # NOTIONAL via is_notional_anthropic_provider(); this entry only prices the bare
-    # "anthropic" provider (direct key / Bedrock / Vertex).
+    # Claude Sonnet 5 (released 2026-06-30). The pricing page still lists $2/$10 in/out,
+    # cache read $0.20, cache write $2.50 (read 2026-10-08); the announced revert to
+    # $3/$15 after 2026-08-31 did not happen. Subscription relays (claude-apr/-bpr/
+    # -api-proxy/-bridge) price NOTIONAL via is_notional_anthropic_provider(); this
+    # entry only prices the bare "anthropic" provider (direct key / Bedrock / Vertex).
     (
         "anthropic",
         "claude-sonnet-5",
     ): PricingEntry(
-        input_cost_per_million=Decimal("3.00"),
-        output_cost_per_million=Decimal("15.00"),
-        cache_read_cost_per_million=Decimal("0.30"),
-        cache_write_cost_per_million=Decimal("3.75"),
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("10.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("2.50"),
         source="official_docs_snapshot",
         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
-        pricing_version="anthropic-pricing-2026-06",
+        pricing_version="anthropic-pricing-2026-10",
     ),
     (
         "anthropic",
@@ -1115,6 +1129,26 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://platform.claude.com/docs/en/about-claude/pricing",
         pricing_version="anthropic-pricing-2026-05",
+    ),
+    # Claude Haiku 5.5: prompt-size tiered. <=100K prompt tokens: $0.10/$0.50 in/out, cache read
+    # $0.01, 5m cache write $0.125; >100K: $0.50/$2.50/$0.05/$0.625 for the whole request.
+    # Source: https://docs.claude.com/en/docs/models/haiku-5-5/overview
+    (
+        "anthropic",
+        "claude-haiku-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.10"),
+        output_cost_per_million=Decimal("0.50"),
+        cache_read_cost_per_million=Decimal("0.01"),
+        cache_write_cost_per_million=Decimal("0.125"),
+        source="official_docs_snapshot",
+        source_url="https://docs.claude.com/en/docs/models/haiku-5-5/overview",
+        pricing_version="anthropic-pricing-2026-10",
+        tier_threshold_tokens=100_000,
+        input_cost_per_million_above=Decimal("0.50"),
+        output_cost_per_million_above=Decimal("2.50"),
+        cache_read_cost_per_million_above=Decimal("0.05"),
+        cache_write_cost_per_million_above=Decimal("0.625"),
     ),
     (
         "anthropic",
@@ -1213,12 +1247,12 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         "openai",
         "o3",
     ): PricingEntry(
-        input_cost_per_million=Decimal("10.00"),
-        output_cost_per_million=Decimal("40.00"),
-        cache_read_cost_per_million=Decimal("2.50"),
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("8.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
         source="official_docs_snapshot",
-        source_url="https://openai.com/api/pricing/",
-        pricing_version="openai-pricing-2026-03-16",
+        source_url="https://developers.openai.com/api/docs/models/o3",
+        pricing_version="openai-pricing-2026-10",
     ),
     (
         "openai",
@@ -1412,12 +1446,21 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         "google",
         "gemini-3.6-flash",
     ): PricingEntry(
-        input_cost_per_million=Decimal("1.50"),
-        output_cost_per_million=Decimal("7.50"),
-        cache_read_cost_per_million=Decimal("0.15"),
+        input_cost_per_million=Decimal("0.75"),
+        output_cost_per_million=Decimal("3.75"),
+        cache_read_cost_per_million=Decimal("0.075"),
         source="official_docs_snapshot",
         source_url="https://ai.google.dev/gemini-api/docs/pricing",
-        pricing_version="google-pricing-2026-07-28",
+        pricing_version="google-pricing-2026-10-08",
+        superseded_at=datetime(2027, 1, 1, tzinfo=timezone.utc),
+        superseded_by=PricingEntry(
+            input_cost_per_million=Decimal("1.50"),
+            output_cost_per_million=Decimal("7.50"),
+            cache_read_cost_per_million=Decimal("0.15"),
+            source="official_docs_snapshot",
+            source_url="https://ai.google.dev/gemini-api/docs/pricing",
+            pricing_version="google-pricing-2027-01-01",
+        ),
     ),
     (
         "google",
@@ -1507,12 +1550,12 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         "google",
         "gemini-2.5-flash",
     ): PricingEntry(
-        input_cost_per_million=Decimal("0.15"),
-        output_cost_per_million=Decimal("0.60"),
-        cache_read_cost_per_million=Decimal("0.015"),
+        input_cost_per_million=Decimal("0.30"),
+        output_cost_per_million=Decimal("2.50"),
+        cache_read_cost_per_million=Decimal("0.03"),
         source="official_docs_snapshot",
-        source_url="https://ai.google.dev/pricing",
-        pricing_version="google-pricing-2026-07-07",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-pricing-2026-10-08",
     ),
     (
         "google",
@@ -1618,6 +1661,23 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://aws.amazon.com/bedrock/pricing/",
         pricing_version="bedrock-pricing-2026-04",
+    ),
+    (
+        "bedrock",
+        "anthropic.claude-haiku-5-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.10"),
+        output_cost_per_million=Decimal("0.50"),
+        cache_read_cost_per_million=Decimal("0.01"),
+        cache_write_cost_per_million=Decimal("0.125"),
+        source="official_docs_snapshot",
+        source_url="https://docs.claude.com/en/docs/models/haiku-5-5/overview",
+        pricing_version="anthropic-pricing-2026-10",
+        tier_threshold_tokens=100_000,
+        input_cost_per_million_above=Decimal("0.50"),
+        output_cost_per_million_above=Decimal("2.50"),
+        cache_read_cost_per_million_above=Decimal("0.05"),
+        cache_write_cost_per_million_above=Decimal("0.625"),
     ),
     (
         "bedrock",

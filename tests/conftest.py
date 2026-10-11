@@ -337,6 +337,7 @@ if not HOST_LOCK_DIR_AT_CONFTEST_IMPORT:
 # non-root conftest carrying ``pytest_plugins`` after startup (e.g. ``pytest .``).
 # Fixtures imported here register exactly as if they were defined here.
 from tests._fixtures.env_filter import _HERMES_BEHAVIORAL_VARS, _looks_like_credential
+from tests._fixtures.kanban_identity import kanban_identity  # noqa: F401 — fixture registers here
 from tests._fixtures.live_system_guard import (  # noqa: F401 — _live_system_guard registers here
     _GATEWAY_LOOKALIKE_MARK,
     _LIVE_SYSTEM_GUARD_BYPASS_MARK,
@@ -700,6 +701,22 @@ def _isolate_session_contextvars():
     tokens = sc.reset_session_vars()
     yield
     sc.restore_session_vars(tokens)
+
+
+@pytest.fixture(autouse=True)
+def _restore_version_info_cache():
+    """Put back the process-global version cache a test refreshed (``get_code_identity(refresh=True)``
+    re-resolves under the test's sandbox home). Modules that bake it at import, like the Perplexity
+    provider's User-Agent, otherwise disagree with later ``get_version_info()`` reads.
+
+    Restore unconditionally: a ``None`` pre-test cache (or a module the test imported) must come
+    back as ``None``, else the identity resolved under this test's sandbox home outlives it."""
+    vi = sys.modules.get("hermes_cli.version_info")
+    saved = vi._cached_version_info if vi is not None else None
+    yield
+    vi = sys.modules.get("hermes_cli.version_info")
+    if vi is not None:
+        vi._cached_version_info = saved
 
 
 @pytest.fixture(autouse=True)

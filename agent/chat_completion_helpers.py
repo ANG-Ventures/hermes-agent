@@ -102,6 +102,9 @@ _POOL_HEADER_NAMES = (
     # t_9783560a: the ladder rung of each attempt (none / drop_fgts /
     # drop_fgts+rotate), same order as the attempts header. Optional.
     "x-pool-empty-content-perturbations",
+    # t_c706fd1e / t_a782a840: upstream request id of each billed empty
+    # attempt; feeds fallback_events.request_ids. Optional.
+    "x-pool-empty-content-request-ids",
 )
 
 

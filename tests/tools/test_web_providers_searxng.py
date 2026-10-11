@@ -105,6 +105,71 @@ class TestSearXNGSearchProviderSearch:
 
         assert calls[0] == "http://localhost:8080/search", f"Got: {calls[0]}"
 
+    def test_empty_results_with_unresponsive_engines_is_a_failure(self, monkeypatch):
+        """0 rows + every engine CAPTCHA'd/403'd must NOT be reported as success, or the
+        keyed search_fallbacks chain never fires (live fleet regression, 2026-10-09)."""
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({
+            "results": [],
+            "unresponsive_engines": [["google", "access denied"], ["duckduckgo", "CAPTCHA"]],
+        })
+
+        with patch("httpx.get", return_value=mock_resp):
+            result = SearXNGWebSearchProvider().search("query", limit=5)
+
+        assert result["success"] is False
+        assert "unresponsive" in result["error"]
+        assert "google: access denied" in result["error"]
+
+    def test_empty_results_with_healthy_engines_is_an_honest_miss(self, monkeypatch):
+        """No hits but no engine complaints = a real empty answer, still success."""
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": [], "unresponsive_engines": []})
+
+        with patch("httpx.get", return_value=mock_resp):
+            result = SearXNGWebSearchProvider().search("zxqv-nonsense-query", limit=5)
+
+        assert result["success"] is True
+        assert result["data"]["web"] == []
+
+    def test_degraded_results_ignoring_the_query_are_a_failure(self, monkeypatch):
+        """A soft-blocked engine (Bing, 2026-10-09) answers with generic pages for the first
+        word of the query. Fewer than half the query terms present → failure → fallback chain."""
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({
+            "results": [
+                {"title": "32 (number) - Wikipedia", "url": "https://en.wikipedia.org/wiki/32", "content": "natural number", "score": 1},
+                {"title": "thirtytwo | Snowboard Boots", "url": "https://thirtytwo.com/", "content": "snowboard gear", "score": 0.9},
+            ],
+            "unresponsive_engines": [["google", "access denied"]],
+        })
+
+        with patch("httpx.get", return_value=mock_resp):
+            result = SearXNGWebSearchProvider().search("32 inch 4K 240Hz OLED monitor DisplayPort inputs", limit=5)
+
+        assert result["success"] is False
+        assert "degraded" in result["error"]
+
+    def test_relevant_results_pass_the_coverage_guard(self, monkeypatch):
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({
+            "results": [
+                {"title": "AORUS FO32U2P 4K OLED monitor review", "url": "https://x.example/a",
+                 "content": "240Hz QD-OLED with DisplayPort 2.1 and mini DisplayPort inputs", "score": 1},
+            ],
+            "unresponsive_engines": [["google", "access denied"]],
+        })
+
+        with patch("httpx.get", return_value=mock_resp):
+            result = SearXNGWebSearchProvider().search("AORUS FO32U2P OLED monitor DisplayPort inputs", limit=5)
+
+        assert result["success"] is True
+        assert len(result["data"]["web"]) == 1
+
 
 # ---------------------------------------------------------------------------
 # Integration: _is_backend_available recognizes "searxng"

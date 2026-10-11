@@ -160,14 +160,56 @@ hermes memory setup mem0 --mode oss --oss-llm-key sk-... --dry-run
 | `mem0_update` | Update a memory's text by ID |
 | `mem0_delete` | Delete a memory by ID |
 
+## Recalled memory is data, not instructions
+
+Prefetched memories are appended to the user turn inside a `<memory-context>` block
+(`agent/memory_manager.py::build_memory_context_block`). Every agent that shares the store
+receives a memory's text verbatim, so the block's note tells the model the content is untrusted
+reference data about the user and the environment, may be stale or wrong, may inform the answer,
+and is never to be followed as an instruction even when phrased as one. Measured on
+claude-sonnet-5-5 with one planted instruction-shaped memory (t_b6342c43, 3 runs x 10 trials):
+the old "authoritative ... should inform all responses" note was obeyed 10/30; this note 0/30,
+with legitimate recall unchanged (30/30 both). Write-side screening of instruction-shaped text is
+not done; the boundary is the label.
+
 ## Troubleshooting
 
-### "Mem0 temporarily unavailable"
+### "mem0 memory store is DOWN"
 
-Circuit breaker tripped after 5 consecutive failures. Resets after 2 minutes.
+The tool reply says DOWN when the store cannot be reached (connection refused, timeout, DNS,
+5xx) or the circuit breaker is open. It is never an empty result, and the model is told to say
+memory is unavailable. A 4xx reply is reported as a request error, not an outage.
+
+Circuit breaker: 5 consecutive failures open it for 2 minutes. A prefetch that hits its join
+budget (`prefetch_join_timeout_s`) counts as a failure, so a store that accepts connections and
+never answers also trips it. While it is open, turns skip the prefetch join entirely (no
+per-turn wait). After the cooldown it is half-open: the next call is a probe, and one failure
+re-opens it for another 2 minutes. Only a success closes it.
 
 - **Platform mode**: Check API key and internet connectivity.
 - **OSS mode**: Check that your vector store (qdrant/pgvector) is running.
+
+### Validate every mem0.json
+
+`python3 -m plugins.memory.mem0.config_schema --home ~/.hermes` checks the root file and every
+`profiles/*/mem0.json` against one schema: unknown or typo'd keys, wrong types, a host with no
+admin key, `pin_user_id` with no user_id (file or `MEM0_USER_ID` in the profile `.env`), and
+unknown capture modes. Exit 1 on any error. It prints key names only, never values. On a host
+whose agent tree predates the module: `ssh host 'python3 - --home ~/.hermes' < plugins/memory/mem0/config_schema.py`.
+
+### `mem0_conclude` returned `"queued": true`
+
+Self-hosted mode: the store was unreachable (connection refused, timeout, 5xx, or the
+circuit breaker was open), so the fact went into the durable capture queue
+(`<home>/state/mem0-capture/capture_queue.db`, row `kind='conclude'`) and the tool returned
+`{"result": "queued (store unreachable); will land when mem0 is back", "queued": true}`.
+The drain worker lands it with a verbatim `infer=false` POST once the store answers again.
+Extraction never runs on these rows, and they drain even when `capture` is off. Before each
+write it looks the fact up by `dedup_hash`, so a retried or re-issued conclude is written once.
+Connection failures never dead-letter a queued conclude. A 4xx reply is a rejection: the
+tool returns an error and nothing is queued.
+
+Inspect: `sqlite3 <queue.db> "SELECT status,attempts,last_error FROM capture_queue WHERE kind='conclude'"`.
 
 ### OSS: Qdrant connection refused
 
@@ -198,3 +240,25 @@ curl http://localhost:11434/api/tags
 - `mem0_add` stores verbatim (no extraction). Use `sync_turn` for LLM extraction.
 - Search uses semantic matching — try broader queries.
 - Check `user_id` matches between sessions (`$HERMES_HOME/mem0.json`).
+
+## Maintenance window (self-hosted cutover)
+
+`window.py` freezes writes for a store migration without losing them. Both flags live in the
+host-wide `<hermes root>/state/` (shared by every profile) and carry
+`{"started_at", "expires_at", "reason"}`; an expired flag is ignored.
+
+- `mem0-window.flag`: `mem0_conclude` appends the fact to `mem0-window-journal.jsonl` (mode 600) and
+  returns a `result` telling the agent NOT to re-issue it (replay at close is the sole writeback). Only
+  a failed journal write returns `{"error": "... re-issue after <expires_at> ..."}`. The flag check +
+  append, flag removal in `close`, and journal rotation in `replay` all hold the host-wide
+  `mem0-window-journal.lock`, so no fact is written into a drained journal or after close finished.
+- `mem0-capture-drain.pause`: the capture drain makes no attempts; rows stay `pending`.
+
+```bash
+python3 -m plugins.memory.mem0.window open --minutes 90   # both flags; re-run to refresh expiry
+python3 -m plugins.memory.mem0.window status [--check]     # --check: exit 2 on stale flag, unreplayed journal,
+                                                           # or a pending row >30 min old while paused
+python3 -m plugins.memory.mem0.window replay               # direct POST /memories {infer:false}; journaled=N replayed=M
+                                                           # stamps dedup_hash; a fact already live is skipped
+python3 -m plugins.memory.mem0.window close                # remove flags, replay, sweep once more; exit 1 if M != N
+```

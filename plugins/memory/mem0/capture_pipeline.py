@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 
 _ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets")
 _DEFAULT_QUEUE_PATH = "~/.hermes/state/mem0-capture/capture_queue.db"
+# A queued conclude exists because the store just refused/timed out; the first drain waits this
+# long instead of hammering a store that is down right now.
+_CONCLUDE_FIRST_DRAIN_DELAY_S = 15.0
+
+
+def default_queue_path() -> str:
+    return os.path.expanduser(_DEFAULT_QUEUE_PATH)
 
 # The gate version that was actually CERTIFIED by the A0 eval (gpt-5.4-mini, P=0.97 LB 0.92, n=90).
 # This is PINNED IN CODE on purpose (Greptile P1): the D-11 guard must compare the shipped asset
@@ -87,6 +94,9 @@ class CapturePipeline:
         queue_path: Optional[str] = None,
         expected_gate_version: Optional[str] = None,  # None => the code-pinned PINNED_GATE_VERSION
         router: Optional[Any] = None,   # Arm-B capture router (Phase 2.5); None => flag OFF (no-op)
+        conclude_add_fn: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        conclude_exists_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        target: str = "",   # the mem0 host this provider writes to; scopes the shared queue file
     ):
         try:
             from .capture_queue import CaptureQueue
@@ -113,8 +123,9 @@ class CapturePipeline:
                 f"mem0 auto-capture DISABLED: gate version mismatch/absent "
                 f"(live={self._gate_version!r} expected={self._expected_version!r})")
         self._model = model
-        qp = os.path.expanduser(queue_path or _DEFAULT_QUEUE_PATH)
+        qp = os.path.expanduser(queue_path) if queue_path else default_queue_path()
         self._queue = CaptureQueue(qp)
+        self._target = target or ""
         self._worker = CaptureDrainWorker(
             self._queue,
             add_fn=add_fn,
@@ -128,7 +139,14 @@ class CapturePipeline:
             breaker_open_fn=breaker_open_fn,
             alert_fn=self._alert,
             router=router,
+            conclude_add_fn=conclude_add_fn,
+            conclude_exists_fn=conclude_exists_fn,
+            # Turn rows are auto-capture writes: only while capture is active (on + certified).
+            # Conclude rows are deliberate writes the agent already made; they drain regardless.
+            turn_rows_allowed=lambda: self.active,
+            target=self._target,
         )
+        self._concludes = conclude_add_fn is not None and conclude_exists_fn is not None
         self._started = False
         self._lock = threading.Lock()
         # Startup drain path (Greptile P1): if this process inherited pending/expired rows from a
@@ -140,9 +158,10 @@ class CapturePipeline:
         """Start the drain+reaper worker if capture is active and there is un-drained work already in
         the durable queue. Safe to call any time; no-op if already started, inactive, or empty."""
         try:
-            if not self.active:
+            kinds = None if self.active else (("conclude",) if self._concludes else ())
+            if kinds == ():
                 return
-            counts = self._queue.counts()
+            counts = self._queue.counts(kinds=kinds, target=self._target)
             if (counts.get("pending", 0) + counts.get("inflight", 0)) > 0:
                 self.start()
         except Exception as e:
@@ -155,7 +174,7 @@ class CapturePipeline:
 
     def start(self) -> None:
         with self._lock:
-            if not self._certified:
+            if not (self._certified or self._concludes):
                 return
             self._worker.start()
             first_start = not self._started
@@ -183,12 +202,14 @@ class CapturePipeline:
             except ImportError:
                 from capture_queue import idem_key
                 from capture_router import active_profile_name
-            key = idem_key(session_id, turn_ordinal, user_content, assistant_content)
+            key = idem_key(session_id, turn_ordinal, user_content, assistant_content,
+                           host=self._target)
             # Stamp the originating profile HERE, on the turn thread: the drain thread does not
             # inherit the per-request home ContextVar, so it cannot resolve it later.
             enq = self._queue.enqueue(key, {"user": user_content, "assistant": assistant_content,
                                             "session_id": session_id,
-                                            "profile": active_profile_name()})
+                                            "profile": active_profile_name()},
+                                       target=self._target)
             # Start/restart the worker after every active enqueue. The worker
             # retires itself when the durable queue becomes empty; start() is
             # idempotent while it is still accepting work.
@@ -197,6 +218,21 @@ class CapturePipeline:
         except Exception as e:
             logger.warning("mem0 capture enqueue failed (turn not captured, not broken): %s", e)
             return False
+
+    def enqueue_conclude(self, key: str, payload: Dict[str, Any]) -> bool:
+        """Durably queue a foreground mem0_conclude the store could not take. Unlike enqueue_turn
+        this RAISES on failure: the caller must report the original error rather than claim the
+        fact was queued. Returns True if a new row was written (False = already queued)."""
+        if not self._concludes:
+            raise RuntimeError("conclude queue not wired")
+        try:
+            from .capture_queue import KIND_CONCLUDE
+        except ImportError:
+            from capture_queue import KIND_CONCLUDE
+        enq = self._queue.enqueue(key, payload, kind=KIND_CONCLUDE,
+                                  delay_s=_CONCLUDE_FIRST_DRAIN_DELAY_S, target=self._target)
+        self.start()
+        return enq
 
     def stats(self) -> Dict[str, Any]:
         out = {"certified": self._certified, "gate_version": self._gate_version,

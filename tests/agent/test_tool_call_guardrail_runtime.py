@@ -502,3 +502,38 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+@pytest.mark.parametrize("single_query", ["1", ""])
+def test_one_shot_cli_turn_halts_a_replayed_failing_call_at_the_exact_failure_threshold(monkeypatch, single_query):
+    """t_6ff00b49: ``hermes -z`` / ``chat -q`` (kanban workers) run with platform="cli" but nobody can
+    /stop them. A model replaying the same invalid tool call (``terminal`` with ``{}``) ran 830 upstream
+    calls in 240 s and was killed with no reply. The finite-session marker must get the unattended
+    hard-stop default; a plain interactive CLI keeps warn-only."""
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", single_query)
+    agent = _make_agent("terminal", max_iterations=12)
+    agent._disable_streaming = True
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls",
+                       tool_calls=[_mock_tool_call("terminal", "{}", f"c{i}")])
+        for i in range(1, 30)
+    ]
+    invalid = json.dumps({"error": "Invalid command: expected string, got NoneType"})
+
+    with (
+        patch("model_tools.handle_function_call", return_value=invalid) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("Run ls in the current directory")
+
+    if not single_query:
+        assert result["turn_exit_reason"] != "guardrail_halt"
+        assert dispatch.call_count > 5
+        return
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert dispatch.call_count == 5
+    assert result["guardrail"]["count"] == 5
+    assert result["final_response"] and "terminal" in result["final_response"]
+    assert agent.client.chat.completions.create.call_count <= 6

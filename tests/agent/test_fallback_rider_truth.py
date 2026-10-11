@@ -130,6 +130,16 @@ def test_rung_names_map_and_unknown_kinds_print_verbatim():
     assert ": as-is, new_thing, rotate→sub-vps-7 — relay ladder exhausted" in text, text
 
 
+def test_perturb_prompt_rungs_map_to_labels_not_raw_tokens():
+    """claude-pool#223 tokens render as labels, never raw (t_0256b47c)."""
+    row = _ladder_row(relay_attempts=["local", "local", "sub-vps-11"],
+                      relay_perturbations=["none", "perturb_prompt", "perturb_prompt+rotate"],
+                      relay_request_ids=None, prompt_tokens=300_148)
+    text = fp.format_cause_rider(row, tz=UTC)
+    assert ": as-is, +\\n prompt, rotate→sub-vps-11 +\\n prompt; prompt 300k tok" in text, text
+    assert "perturb_prompt" not in text and text.count("rotate") == 1, text
+
+
 def test_without_perturbation_header_same_seat_says_same_seat():
     text = fp.format_cause_rider(_ladder_row(), tz=UTC)
     assert text == (
@@ -411,6 +421,34 @@ def test_perturbation_header_is_captured_and_rendered(_home, monkeypatch):
             " falling to next lane, ") in text, text
 
 
+def test_request_ids_header_survives_snapshot_into_floor(_home, monkeypatch):
+    """t_a782a840: x-pool-empty-content-request-ids survives the response
+    header snapshot, so the floor (and ledger request_ids) carries it."""
+    from agent.chat_completion_helpers import _snapshot_pool_headers, try_activate_fallback
+    from tests.agent.test_fallback_dead_letter_cause import _alr_agent
+    from tests.agent.test_fallback_events_ledger import _patch_resolver
+
+    wire = {"x-pool-served-by": "f2",
+            "x-pool-route-id": "e36ad39d0000000000000000000000aa",
+            "x-pool-empty-content-retried": "gave_up",
+            "x-pool-empty-content-attempts": "f1,f1,f2",
+            "x-pool-empty-content-perturbations": "none,perturb_prompt,perturb_prompt+rotate",
+            "x-pool-empty-content-request-ids": "req_1,req_2,req_3"}
+    http = type("H", (), {"headers": wire})()
+    pool_headers = _snapshot_pool_headers(http)
+    assert {k: pool_headers.get(k) for k in wire} == wire
+
+    _patch_resolver(monkeypatch)
+    a = _alr_agent()
+    usage = type("U", (), {"output_tokens": 0})()
+    resp = type("R", (), {"content": [], "stop_reason": "end_turn", "usage": usage,
+                          "pool_headers": pool_headers})()
+    fbe.stash_response_failure(a, "invalid_response", resp, elapsed_s=5.0, repeat=True)
+    assert a._pending_fallback_error["floor"]["relay_request_ids"] == ["req_1", "req_2", "req_3"]
+    assert try_activate_fallback(a) is True
+    assert _rows(_home)[0]["request_ids"] == "req_1,req_2,req_3"
+
+
 def test_perturbation_parse_bounds():
     assert fbe._perturbations(None) is None
     assert fbe._perturbations("  ") is None
@@ -442,3 +480,39 @@ def test_live_2125_seat_timeout_line(_home, monkeypatch):
             " · pool had no other seat, ") in text, text
     for banned in ("read timeout", "hop unknown", "stalled mid-turn"):
         assert banned not in text, (banned, text)
+
+
+def test_missing_request_id_placeholder_is_not_an_id(_home, monkeypatch):
+    """t_2cb85183 / claude-pool #229: an attempt with no upstream id comes in
+    as the relay's ``-`` placeholder. The floor holds None in that slot (the
+    list stays positional), the banner names only real ids, and the ledger
+    row keeps ``-`` purely as the positional placeholder."""
+    from agent.chat_completion_helpers import try_activate_fallback
+    from tests.agent.test_fallback_dead_letter_cause import _alr_agent
+    from tests.agent.test_fallback_events_ledger import _patch_resolver
+
+    _patch_resolver(monkeypatch)
+    a = _alr_agent()
+    resp = type("R", (), {"content": [], "stop_reason": "tool_use", "usage": None,
+                          "pool_headers": {
+                              "x-pool-served-by": "sub-vps-2",
+                              "x-pool-empty-content-retried": "gave_up",
+                              "x-pool-empty-content-attempts": "sub-vps-1,sub-vps-1,sub-vps-2",
+                              "x-pool-empty-content-request-ids": "req_1,-,req_3",
+                          }})()
+    fbe.stash_response_failure(a, "invalid_response", resp, repeat=True)
+    floor = a._pending_fallback_error["floor"]
+    assert floor["relay_request_ids"] == ["req_1", None, "req_3"]
+    assert try_activate_fallback(a) is True
+    row = _rows(_home)[0]
+    assert row["request_ids"] == "req_1,-,req_3"
+    real = [r for r in row["request_ids"].split(",") if r != fbe.RELAY_REQUEST_ID_MISSING]
+    assert real == ["req_1", "req_3"]
+    text = row["notice_text"]
+    assert "req_…req_1" in text and "req_…req_3" in text, text
+    assert "req_…-" not in text, text
+
+
+def test_request_ids_all_placeholders_is_none():
+    assert fbe._request_ids("-,-") is None
+    assert fbe._request_ids("req_a,bad id!,-") == ["req_a", None, None]

@@ -489,6 +489,10 @@ DEFAULT_CONFIG = {
         # over on rate limits. Never pre-empts a configured/keyed backend. false = disable.
         "search_fallbacks": [],  # keyed providers tried in order before keyless rescue
         "extract_fallbacks": [], # keyed providers tried in order before keyless rescue
+        # Max PAID web_search calls per UTC day across the whole install (firecrawl/tavily/exa/...);
+        # past the cap the primary is refused and the fallback chain serves. Protects a monthly
+        # credit pool from one runaway day (2026-09-08: ~3,190 calls in 32 min). 0 = off.
+        "search_daily_budget": 300,
         # PDFs (.pdf path or HEAD Content-Type: application/pdf) are downloaded
         # and read locally (pymupdf, else pdftotext) instead of sent to a paid
         # extract vendor that bills per page. false restores vendor dispatch.
@@ -2166,6 +2170,11 @@ DEFAULT_CONFIG = {
         # (their only signal is that one delivery). Set false to restore the old
         # page-on-every-transient-failure behavior.
         "suppress_transient_failure_page": True,
+        # Deliver target (deliver grammar, e.g. "discord:<logs channel id>") for the "run was cut
+        # short by a gateway restart" notice of a RECURRING job, which simply re-runs on schedule.
+        # "" = the job's failure lane (failure_deliver, else deliver). Real failures are never
+        # rerouted; one-shots, finite repeat.times jobs and failure-lane=local jobs keep their own lane.
+        "interrupt_deliver": "",
         "media_send_timeout_seconds": 300,
         # Managed systemd gateway with no user session (containers, no linger): false runs
         # cron jobs as a direct external subprocess (warns once; no cgroup isolation), true

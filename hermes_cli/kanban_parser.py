@@ -541,6 +541,11 @@ _SPECS = [
                   "draft PR that is intentionally left open (e.g. a CI vehicle for an upstream "  # windows-footgun: ok (string literal, not a call)
                   "PR). The draft is not routed to review; a completion_draft_override event "
                   "records the PRs and REASON. An empty REASON is refused."),
+        _arg("--abandon-routed-pr", metavar="REASON",
+             help="Audited override: the card was routed to review on its own PR, that PR is still "
+                  "OPEN, and the --survivor-pr/--survivor-ref claim names something else. Without "
+                  "this flag such a completion is refused (t_829fce95); with it a "
+                  "routed_pr_abandoned event records the PRs and REASON. An empty REASON is refused."),
         _arg("--survivor-ref", action="append", metavar="[REPO=]URL#SHA",
              help="Name an external survivor when the implementation lives on a remote, not in "
                   "the workspace. Verified with git ls-remote AND required to name this task: "
@@ -622,10 +627,16 @@ _SPECS = [
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
-                  "parents finish, no human); 'needs_input'/'capability' go to "
+                  "parents finish, no human; refused when no parent is open); "
+                  "'deferred' parks in scheduled until --until, then wakes to ready "
+                  "and pages nobody; 'needs_input'/'capability' go to "
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--until", metavar="TS",
+             help="Wake time for --kind deferred: +<N>[smhd] (e.g. +6h), epoch seconds, "
+                  "or ISO-8601 (naive = local time). The dispatcher returns the card "
+                  "to ready on its first tick at/after TS."),
     ], help="Mark one or more tasks blocked"),
     _cmd("budget", [
         _arg("--board", dest="budget_board", help="Report a single board instead of every board."),
@@ -896,8 +907,6 @@ _SPECS = [
              help="Reclassify recorded quota crashes without counting task failures"),
         _arg("--dry-run", action="store_true",
              help="Report quota repairs without writes or schema migration"),
-        _arg("--board", default=argparse.SUPPRESS,
-             help="Board to repair (also accepted before the repair verb)"),
     ], help="Check kanban.db integrity and auto-repair index-only corruption",
        description=(
            "Runs PRAGMA integrity_check on the board's DB and reports the result. When the "
@@ -997,6 +1006,41 @@ def _intermix_optional_positionals(parser: argparse.ArgumentParser) -> None:
     parser.__class__ = _Intermixed
 
 
+_BOARD_HELP = ("Board slug to operate on. Defaults to the current board (set "
+               "via `hermes kanban boards switch <slug>` or the "
+               "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
+               "list` to see all boards.")
+
+# Verbs that take no verb-position ``--board``: ``clone`` is a git operation with no board state,
+# ``budget`` owns ``--board`` as a report filter. ``boards …`` accepts it for parity and its
+# dispatch ignores it, exactly like the top-level position.
+VERB_BOARD_EXCLUDED = frozenset({"clone", "budget"})
+
+
+def _add_verb_board_flag(sub: argparse._SubParsersAction) -> None:
+    """``--board`` after the verb (``create "T" --board X``) on every board-scoped leaf parser.
+
+    It lands in ``verb_board`` (a subparser namespace overwrites the parent's keys, so sharing
+    ``board`` would let one position silently win); ``kanban_command`` reconciles the two.
+    """
+    seen: set[int] = set()
+
+    def walk(action: argparse._SubParsersAction) -> None:
+        for name, p in action.choices.items():
+            if id(p) in seen or (action is sub and name in VERB_BOARD_EXCLUDED):
+                continue
+            seen.add(id(p))
+            children = [a for a in p._actions if isinstance(a, argparse._SubParsersAction)]
+            if children:
+                for child in children:
+                    walk(child)
+            else:
+                p.add_argument("--board", dest="verb_board", default=argparse.SUPPRESS,
+                               metavar="<slug>", help=_BOARD_HELP)
+
+    walk(sub)
+
+
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree; returns the ``kanban`` parser."""
     kanban_parser = parent_subparsers.add_parser(
@@ -1010,14 +1054,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --board scopes every subcommand to one board's DB; when omitted the
     # resolution is HERMES_KANBAN_BOARD, then the persisted current-board
     # file, then "default" (kanban_db.get_current_board()).
-    kanban_parser.add_argument("--board", default=None, metavar="<slug>",
-                               help="Board slug to operate on. Defaults to the current board (set "
-                                    "via `hermes kanban boards switch <slug>` or the "
-                                    "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
-                                    "list` to see all boards.")
+    kanban_parser.add_argument("--board", default=None, metavar="<slug>", help=_BOARD_HELP)
     sub = kanban_parser.add_subparsers(dest="kanban_action")
     _add_commands(sub, _SPECS)
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     _add_home_guard_flags(sub)
+    _add_verb_board_flag(sub)
     _intermix_optional_positionals(kanban_parser)
     return kanban_parser

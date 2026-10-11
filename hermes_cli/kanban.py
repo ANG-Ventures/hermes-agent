@@ -40,8 +40,9 @@ from hermes_cli.kanban_ops import (
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
-from hermes_cli.kanban_open_pr import ClosedUnmergedPrError
+from hermes_cli.kanban_open_pr import ClosedUnmergedPrError, RoutedPrOpenError
 from hermes_cli.kanban_receipt import EXIT_NO_RECEIPT, ReceiptRequiredError
+from hermes_cli.kanban_handback_head import StaleHandbackHeadError
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_cli.kanban_held_repo import fmt_held_repo, held_repo
 from hermes_constants import get_default_hermes_root
@@ -170,6 +171,8 @@ def _fmt_task_line(t: kb.Task, refusal: Optional[dict] = None) -> str:
         flag = f"  [{_fmt_refusal(refusal)}]"
     pin = _pin_badge(t)
     pin = f"  {pin}" if pin else ""
+    if t.status == "scheduled" and getattr(t, "block_kind", None) == "deferred":
+        flag += f"  [{kb.format_deferred_until(t.next_eligible_at)}]"
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{pin}{flag}"
 
 
@@ -306,6 +309,14 @@ def kanban_command(args: argparse.Namespace) -> int:
             print("usage: hermes kanban <action> [options]\n"
                   "Run 'hermes kanban --help' for the full list of actions.", file=sys.stderr)
         return 0
+
+    # `--board` may come before or after the verb; both positions must agree (never let one lose).
+    verb_board = getattr(args, "verb_board", None)
+    if verb_board is not None:
+        top_board = getattr(args, "board", None)
+        if top_board and str(top_board).strip().lower() != str(verb_board).strip().lower():
+            return _err(f"kanban: --board given twice: {top_board!r} vs {verb_board!r}", 2)
+        args.board = verb_board
 
     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
     # import DB mutators directly.
@@ -1308,7 +1319,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  {label + ':':<11}{value}")
 
     print(f"Task {task.id}: {task.title}")
-    field("status", task.status + (f"  [{_fmt_refusal(refusal)}]" if refusal else ""))
+    field("status", task.status + (f"  [{_fmt_refusal(refusal)}]" if refusal else "")
+          + (f"  [{kb.format_deferred_until(task.next_eligible_at)}]"
+             if task.status == "scheduled" and task.block_kind == "deferred" else ""))
     guard_line = _fmt_current_respawn_guard(task.status, events)
     if guard_line:
         field("guard", guard_line)
@@ -3002,6 +3015,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     draft_ok = getattr(args, "draft_ok", None)
     external = getattr(args, "external", None)
     watcher = getattr(args, "watcher", None)
+    abandon_routed_pr = getattr(args, "abandon_routed_pr", None)
     raw_meta = getattr(args, "metadata", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
@@ -3013,7 +3027,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     survivor_reason = getattr(args, "reason", None)
     if len(ids) > 1 and (summary or raw_meta or survivor_ref or survivor_pr
                          or survivor_unbound or survivor_none or survivor_reason or superseded_by
-                         or draft_ok is not None or external is not None or watcher is not None):
+                         or draft_ok is not None or external is not None or watcher is not None
+                         or abandon_routed_pr is not None):
         return _err(
             "kanban: --summary / --metadata / --superseded-by / --draft-ok / --external / "
             "--watcher / --survivor-ref / "
@@ -3073,6 +3088,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     draft_ok=draft_ok,
                     external=external,
                     watcher=watcher,
+                    abandon_routed_pr=abandon_routed_pr,
                 )
             except kb.LiveClaimError:
                 failed.append(tid)
@@ -3095,7 +3111,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
-            except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
+            except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, RoutedPrOpenError,
+                    StaleHandbackHeadError) as draft_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
@@ -3282,6 +3299,12 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
+    until: Optional[int] = None
+    if getattr(args, "until", None):
+        try:
+            until = kb.parse_wake_at(args.until)
+        except ValueError:
+            return _err(f"invalid --until {args.until!r} (+<N>[smhd], epoch seconds or ISO-8601)")
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
@@ -3290,13 +3313,20 @@ def _cmd_block(args: argparse.Namespace) -> int:
         for tid in ids:
             # Provenance before the transition: blocking ends the run.
             _run_id, _sess_ref = safe_comment_provenance(tid) if reason else (None, None)
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id_for(tid),
+                    until=until,
+                )
+            except kb.BlockRefused as exc:
+                failed.append(tid)
+                print(f"cannot block {tid}: {exc}", file=sys.stderr)
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
@@ -3313,8 +3343,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 where = landed.status if landed else "blocked"
                 if where == "todo":
                     print(f"{tid} → todo (dependency wait){suffix}")
-                elif kind == "dependency" and where == "blocked":
-                    print(f"Blocked {tid} as needs_input (no open parent to wait on){suffix}")
+                elif where == "scheduled":
+                    print(f"{tid} → {kb.format_deferred_until(until)}{suffix}")
                 elif where == "triage":
                     # Only a typed owner-input block carries a question for a human.
                     verdict = ("needs a human decision"
@@ -3556,7 +3586,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
         except ReceiptRequiredError as receipt_err:
             print(f"cannot request review for {tid}: {receipt_err}", file=sys.stderr)
             return EXIT_NO_RECEIPT
-        except (DraftPrError, StaleBaseError, ClosedUnmergedPrError) as draft_err:
+        except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, StaleHandbackHeadError) as draft_err:
             return _err(f"cannot request review for {tid}: {draft_err}")
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")

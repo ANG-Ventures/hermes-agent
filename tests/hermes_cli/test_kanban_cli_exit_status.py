@@ -38,10 +38,9 @@ def _run_hermes(home: Path, *args: str, marker: bool = False) -> subprocess.Comp
     )
 
 
-def test_delegated_child_kanban_cli_refusal_returns_nonzero_exit_status(tmp_path):
+def test_delegated_child_kanban_cli_refusal_returns_nonzero_exit_status(kanban_identity):
     """A printed Kanban mutation refusal must not look like CLI success."""
-    home = tmp_path / "hermes"
-    home.mkdir()
+    home = kanban_identity.home
 
     created = _run_hermes(home, "kanban", "create", "exit status probe", "--json")
     assert created.returncode == 0, created.stderr
