@@ -3766,6 +3766,12 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         _kwp.note_ignored_pin(row["id"], ignored)
     if ok:
         return ("pin", pin) if route_class == "pin" else ("portable", None)
+    if rule == "host_reach":
+        # A host-bound card (ssh skill / fleet alias in the body) with no
+        # worker host proven to reach its target: local, never spilled.
+        _kb._log.info("kanban dispatch: %s classified local (host_reach): host-bound card, "
+                      "no pool host with a proven ssh route (reach matrix %s)",
+                      row["id"], getattr(plan.config, "reach_status", "absent"))
     if pin is not None and pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
         return "wait", f"not_portable:{rule}"
     # host:any that fails hard_ok may still run locally; with no local slot
@@ -5004,7 +5010,22 @@ def _dispatch_once_locked(
         placed_host = None
         if route == "pin" or (route == "portable" and not local_free):
             # A refused take() NEVER falls through to a local spawn (I-11).
-            placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
+            # A host-bound portable card only lands on a host the reach
+            # matrix proves (t_1e9ea7e9); None = any pool host.
+            _only = None
+            if route == "portable":
+                from hermes_cli import kanban_worker_pool as _kwp_take
+                try:
+                    _skills = json.loads(row["skills"] or "[]") or []
+                except (TypeError, ValueError, IndexError, KeyError):
+                    _skills = []
+                _only = _kwp_take.reach_allowed_hosts(
+                    body=row["body"], skills=tuple(s for s in _skills if isinstance(s, str)),
+                    pool=spillover.config)
+            if _only is None:
+                placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
+            else:
+                placed_host = spillover.take(row_assignee, only=_only)
             if placed_host is None:
                 result.placement_waits[row["id"]] = spillover.refusal or "pool_full"
                 continue

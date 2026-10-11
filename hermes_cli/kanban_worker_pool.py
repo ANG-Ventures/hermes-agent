@@ -53,6 +53,14 @@ ROLE = "kanban-worker"
 SSH_USER = "kanbanw"
 ROLES_FILE = "fleet-roles.json"
 SIDECAR_FILE = "kanban-pool.json"
+# Per-worker-host SSH reach matrix (card t_1e9ea7e9): written daily by the
+# hermes-home no_agent cron ``kanban-reach-matrix`` (``ssh -o BatchMode=yes
+# <alias> true`` from EVERY worker host, rc recorded), read here fail-closed.
+REACH_FILE = "kanban-reach-matrix.json"
+REACH_STALE_SECONDS = 36 * 3600
+# Skills whose card drives a fleet HOST over ssh: the card is host-bound.
+HOST_BOUND_SKILLS = ("fleet-host-diagnosis", "ssh-machines", "unifi", "local-dns",
+                     "media-homelab-servarr")
 DEFAULT_CAPACITY = 0.80
 PLACED_EVENT = "worker_placed"
 PROBE_TIMEOUT_SECONDS = 8
@@ -115,6 +123,16 @@ class PoolConfig:
     disabled: Tuple[str, ...] = ()
     warnings: Tuple[str, ...] = ()
     refused: Optional[str] = None   # why the whole pool was refused (load_gate.json)
+    # Reach matrix (t_1e9ea7e9): ``reach[host][alias] = rc``, only rows whose
+    # sample is fresh. ``reach_aliases`` = every alias the file names at ALL
+    # (top-level list + every row, stale rows included): the body-scan
+    # vocabulary must not shrink when samples age, or a target silently
+    # stops being a target (Prism da8af4dbc8be). An absent/stale/unreadable
+    # matrix has reach {}: nothing is reachable from anywhere, so every
+    # host-bound card stays local.
+    reach: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
+    reach_aliases: Tuple[str, ...] = ()
+    reach_status: str = "absent"   # ok | absent | stale | unreadable
 
 
 # -- registry ---------------------------------------------------------------
@@ -284,6 +302,9 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     # The classifier allowlist is every profile SOME enabled host serves
     # (global list + per-host overrides); take() still checks the host.
     served = tuple(dict.fromkeys([*gprofiles, *(p for h in hosts for p in h.profiles)]))
+    # Not a pool-drift warning: a missing matrix is the normal pre-cron state
+    # and the classifier is fail-closed without it (reach_status carries it).
+    reach, aliases, reach_status = read_reach(fleet_dir)
     # ``hosts`` is every host the pool files KNOW, placement-eligible or not:
     # a pin on a dropped host (role but no row, row not in priority) must
     # still resolve as a pin and wait at take(), never fall back (Prism 4271004b).
@@ -292,7 +313,92 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         profiles=served,
         studio_bound_skills=tuple(sidecar.get("studio_bound_skills") or ()),
         pool_hosts=tuple(hosts), disabled=tuple(disabled), warnings=tuple(warnings),
+        reach=reach, reach_aliases=aliases, reach_status=reach_status,
     )
+
+
+def read_reach(fleet_dir: Path, *, now: Optional[float] = None,
+               stale_after_s: float = REACH_STALE_SECONDS,
+               ) -> Tuple[Dict[str, Dict[str, int]], Tuple[str, ...], str]:
+    """``(reach, aliases, status)`` from ``<fleet_dir>/kanban-reach-matrix.json``.
+
+    Schema 1: ``{"schema": 1, "hosts": {"<worker host>": {"at": <epoch>,
+    "reach": {"<alias>": <rc>}}}}``. FAIL CLOSED (t_1e9ea7e9): an absent,
+    unreadable or malformed file, or a row older than ``stale_after_s``, is
+    DROPPED, never read as reachable. ``aliases`` is the union of the
+    top-level ``aliases`` list and every alias ANY row probed, fresh or
+    stale, in file order: the target vocabulary does not depend on
+    freshness, only the proof does.
+    """
+    now = time.time() if now is None else now
+    try:
+        doc = _read_json(Path(fleet_dir) / REACH_FILE)
+    except (OSError, ValueError):
+        return {}, (), "unreadable"
+    if doc is None:
+        return {}, (), "absent"
+    if not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("hosts"), dict):
+        return {}, (), "unreadable"
+    reach: Dict[str, Dict[str, int]] = {}
+    aliases: List[str] = [a.lower() for a in (doc.get("aliases") or ())
+                          if isinstance(a, str) and a] if isinstance(doc.get("aliases"), list) else []
+    stale = 0
+    for hid, row in doc["hosts"].items():
+        if not isinstance(hid, str) or not isinstance(row, dict):
+            continue
+        at = row.get("at")
+        table = row.get("reach")
+        if isinstance(at, bool) or not isinstance(at, (int, float)) or not isinstance(table, dict):
+            continue
+        clean: Dict[str, int] = {}
+        for alias, rc in table.items():
+            if isinstance(alias, str) and alias and not isinstance(rc, bool) and isinstance(rc, int):
+                clean[alias.lower()] = rc
+                aliases.append(alias.lower())
+        if now - float(at) > stale_after_s or at > now + 3600:
+            stale += 1
+            continue
+        reach[hid.lower()] = clean
+    vocab = tuple(dict.fromkeys(aliases))
+    if not reach:
+        return {}, vocab, "stale" if stale else "unreadable"
+    return reach, vocab, "ok"
+
+
+def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iterable[str],
+                       ) -> Tuple[bool, Tuple[str, ...]]:
+    """``(host_bound, targets)``: is this card host-bound (a HOST_BOUND_SKILLS
+    skill, or a body line naming a probed ssh alias), and which aliases it
+    names. A skill-bound card with no named alias has targets ``()``: it
+    needs a host that reaches EVERYTHING the matrix probed.
+
+    Body lines are matched as whole words (``ssh ace-ai``, ``on ci-box:``),
+    never substrings, and the ``host:<pin>`` line is not a target.
+    """
+    bound = any(s in HOST_BOUND_SKILLS for s in (skills or ()))
+    alias_set = {a for a in (aliases or ()) if a}
+    found: List[str] = []
+    if alias_set and body:
+        for line in body.splitlines():
+            if HOST_PIN_RE.match(line):
+                continue
+            for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]*", line):
+                w = word.lower().rstrip("._-")
+                if w in alias_set and w not in found:
+                    found.append(w)
+    return (bound or bool(found)), tuple(found)
+
+
+def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str],
+                   aliases: Iterable[str]) -> Tuple[str, ...]:
+    """Worker hosts whose fresh row shows ``rc == 0`` for EVERY target (or,
+    with no named target, for every alias the matrix knows). Empty when the
+    matrix is empty: fail closed.
+    """
+    want = tuple(targets) or tuple(aliases)
+    if not want:
+        return ()
+    return tuple(h for h, row in reach.items() if all(row.get(a) == 0 for a in want))
 
 
 def load_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> Tuple[List[PoolHost], List[str]]:
@@ -393,6 +499,16 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     pin, _ignored = resolve_pin(body, pool.hosts or ())
     if pin == PIN_STUDIO:
         return False, "host_studio", None
+    # Host-bound card (t_1e9ea7e9): it drives a fleet host over ssh, so only a
+    # worker host with a PROVEN route (fresh reach matrix row, rc 0 to every
+    # target) may take it. No such host, or no fresh matrix: it stays local
+    # (a remote pin to a non-reaching host waits, never runs locally, I-11).
+    allowed = reach_allowed_hosts(body=body, skills=skills, pool=pool)
+    if allowed is not None:
+        if pin is not None and pin != PIN_ANY and pin not in allowed:
+            return False, "host_reach", None
+        if pin in (None, PIN_ANY) and not allowed:
+            return False, "host_reach", None
     if pin == PIN_ANY:
         return True, None, "any"
     if pin is not None:
@@ -403,6 +519,23 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     if any(s in bound for s in (skills or ())):
         return False, "studio_bound_skill", None
     return True, None, "policy"
+
+
+def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool) -> Optional[Tuple[str, ...]]:
+    """None when the card is not host-bound (any pool host may take it);
+    else the worker hosts the reach matrix proves can ssh to every target
+    the card names (``()`` = none: stays local). FAIL CLOSED: the target
+    vocabulary is every alias the matrix file ever named PLUS every known
+    pool host (so recognition never depends on a fresh sample, Prism
+    13bf80849c6b), while the proof is fresh rows only: an absent or stale
+    matrix recognises the target and proves nothing, so the card gets
+    ``()``. ``pool`` needs ``reach``, ``reach_aliases`` and ``hosts``."""
+    aliases = tuple(dict.fromkeys([*(getattr(pool, "reach_aliases", ()) or ()),
+                                   *(h.lower() for h in (getattr(pool, "hosts", ()) or ()))]))
+    bound, targets = host_bound_targets(body, skills, aliases)
+    if not bound:
+        return None
+    return reaching_hosts(getattr(pool, "reach", {}) or {}, targets, aliases)
 
 
 # -- probe + plan -----------------------------------------------------------
@@ -649,9 +782,12 @@ class SpilloverPlan:
             return None
         return {"load1": d.get("load1"), "ncpu": d.get("ncpu")}
 
-    def take(self, assignee: Optional[str], pin: Optional[str] = None) -> Optional[PoolHost]:
+    def take(self, assignee: Optional[str], pin: Optional[str] = None,
+             only: Optional[Collection[str]] = None) -> Optional[PoolHost]:
         """Reserve one slot: on ``pin`` only, else the first host in priority
-        order with a free slot that serves ``assignee``. None sets ``refusal``."""
+        order with a free slot that serves ``assignee``. ``only`` (a host-bound
+        card, t_1e9ea7e9) restricts the unpinned pick to those hosts; an empty
+        ``only`` takes nothing (``host_reach``). None sets ``refusal``."""
         self.refusal = None
         if pin is not None:
             host = self.hosts.get(pin)
@@ -674,9 +810,16 @@ class SpilloverPlan:
             self.slots[pin] -= 1
             self.taken[pin] = self.taken.get(pin, 0) + 1
             return host
+        if only is not None:
+            allowed = set(only)
+            if not any(n in allowed for n in self.hosts):
+                self.refusal = "host_reach"
+                return None
+        else:
+            allowed = set(self.hosts)
         if self.signal is not None:
             free = [n for n, h in self.hosts.items()
-                    if self.slots.get(n, 0) > 0 and assignee in h.profiles]
+                    if n in allowed and self.slots.get(n, 0) > 0 and assignee in h.profiles]
             if free:
                 # Only an OK rung is cool. Warm rungs, then hot-but-not-yet-
                 # streaked rungs, are picked by projected load (RC7).
@@ -690,7 +833,7 @@ class SpilloverPlan:
             self.refusal = self.full_reason()
             return None
         for name, host in self.hosts.items():
-            if self.slots.get(name, 0) > 0 and assignee in host.profiles:
+            if name in allowed and self.slots.get(name, 0) > 0 and assignee in host.profiles:
                 self.slots[name] -= 1
                 return host
         self.refusal = "pool_full"
