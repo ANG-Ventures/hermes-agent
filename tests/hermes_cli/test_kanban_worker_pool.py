@@ -958,6 +958,13 @@ def test_browser_card_under_spilling_studio_waits_never_spills(kanban_home, monk
               spawn_paused="spilling")
         assert len(_events(conn, browser, "placement_affinity")) == 1
         assert len(_events(conn, browser, "placement_wait")) == 1
+        # Spawned in between (a claim), then waiting again for the same reason:
+        # that is a NEW wait and is recorded.
+        kb._append_event(conn, browser, "claimed", {"lock": "test"})
+        conn.commit()
+        _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
+              spawn_paused="spilling")
+        assert len(_events(conn, browser, "placement_wait")) == 2
 
 
 def test_body_bound_card_runs_locally_when_the_studio_has_room(kanban_home):

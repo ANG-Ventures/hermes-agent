@@ -200,7 +200,15 @@ def record_affinity_events(conn, result) -> None:
                 if reason is None:
                     continue
                 payload = {"host": aff["host"], "reason": reason, "matched_by": aff["matched_by"]}
-                if _last_payload(conn, tid, "placement_wait") != payload:
+                last = conn.execute(
+                    "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? "
+                    "ORDER BY id DESC LIMIT 1", (tid, "placement_wait")).fetchone()
+                # A claim after the last wait ends that wait: the next wait is a new
+                # transition even with the same reason (Prism r2 on #1877).
+                claimed_since = last is not None and conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' AND id > ? "
+                    "LIMIT 1", (tid, last[0])).fetchone() is not None
+                if last is None or claimed_since or json.loads(last[1] or "{}") != payload:
                     _kb._append_event(conn, tid, "placement_wait", payload)
     except Exception:
         _log.warning("kanban dispatch: could not record placement affinity events", exc_info=True)
