@@ -379,18 +379,42 @@ def read_reach(fleet_dir: Path, *, now: Optional[float] = None,
     return reach, vocab, "ok"
 
 
+_HOST_TOKEN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+# The three ssh-shaped ways a body drives a host (t_696a9a06). A bare word is
+# prose: "ci-box burst 2/6" or "the ci-box build sheet" drive nothing.
+#   ssh/scp/sftp/rsync/mosh ... [user@]<alias>   (alias after the verb, same line)
+#   [user@]<alias>:<path>                        (scp/rsync remote form)
+#   -H <alias>                                   (docker -H, pdsh -H ...)
+_SSH_VERB_RE = re.compile(r"(?<![\w-])(?:ssh|scp|sftp|rsync|mosh)(?![\w-])(.*)", re.IGNORECASE)
+_AFTER_VERB_RE = re.compile(rf"(?:^|[\s@'\"=/])({_HOST_TOKEN})")
+_SCP_RE = re.compile(rf"(?:^|[\s@'\"])({_HOST_TOKEN}):(?=[~/.$A-Za-z_])")
+_DASH_H_RE = re.compile(rf"(?:^|\s)-H[ \t]*[\"']?(?:[\w.-]+@)?({_HOST_TOKEN})")
+
+
+def _ssh_shaped_hosts(line: str) -> List[str]:
+    """Host tokens the line addresses in an ssh shape, in order."""
+    out: List[str] = []
+    m = _SSH_VERB_RE.search(line)
+    if m:
+        out += _AFTER_VERB_RE.findall(m.group(1))
+    out += _SCP_RE.findall(line)
+    out += _DASH_H_RE.findall(line)
+    return out
+
+
 def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iterable[str],
                        *, pin_hosts: Iterable[str] = ()) -> Tuple[bool, Tuple[str, ...]]:
     """``(host_bound, targets)``: is this card host-bound (a HOST_BOUND_SKILLS
-    skill, or a body line naming a probed ssh alias), and which aliases it
-    names. A skill-bound card with no named alias has targets ``()``: it
-    needs a host that reaches EVERYTHING the matrix probed.
+    skill, or a body line that addresses a probed ssh alias in an ssh shape),
+    and which aliases it names. A skill-bound card with no named alias has
+    targets ``()``: it needs a host that reaches EVERYTHING the matrix probed.
 
-    Body lines are matched as whole words (``ssh ace-ai``, ``on ci-box:``),
-    never substrings. A ``host:<pin>`` line is not a target only when it IS a
-    pin (``any``, ``studio`` or one of ``pin_hosts``); ``host: unifi`` with
-    no such pool host is prose and is scanned (Prism c63ba2e150ec). Skill ids
-    compare on their basename (``operations/ssh-machines``, Prism e5e1f41acb09).
+    Only ssh-shaped mentions count (``ssh [opts] [user@]ace-ai``,
+    ``ace-ai:/path``, ``-H ace-ai``), never a bare word: "ci-box burst 2/6"
+    or "the ci-box build sheet" is prose (t_696a9a06). Aliases compare whole,
+    never as substrings. A ``host:<pin>`` line is not a target when it IS a
+    pin (``any``, ``studio`` or one of ``pin_hosts``). Skill ids compare on
+    their basename (``operations/ssh-machines``, Prism e5e1f41acb09).
     """
     bound = any(s.rsplit("/", 1)[-1] in HOST_BOUND_SKILLS for s in (skills or ()))
     alias_set = {a for a in (aliases or ()) if a}
@@ -401,7 +425,7 @@ def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iter
             m = HOST_PIN_RE.match(line)
             if m and m.group(1).lower() in pins:
                 continue
-            for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]*", line):
+            for word in _ssh_shaped_hosts(line):
                 w = word.lower().rstrip("._-")
                 if w in alias_set and w not in found:
                     found.append(w)
