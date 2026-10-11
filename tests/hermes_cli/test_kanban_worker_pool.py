@@ -1457,3 +1457,25 @@ def test_gpu_card_never_spills_to_a_pool_host_without_a_route(kanban_home, monke
         res, spawned = _tick(conn, spillover=plan_for(routed), spawn_limit=0,
                              spawn_paused="spilling")
         assert (gpu2, "ace-media") in spawned
+
+
+def test_unnamed_host_bound_card_still_requires_its_manifest_target():
+    """Prism bf503f94e81a: a HOST_BOUND skill with no alias in the body takes
+    the 'reach every alias' fallback; a manifest target must join that set,
+    so a worker that reaches every alias but not the target is refused."""
+    targets = {"vllm-gpu": "ace-ai"}
+    skills = ("ssh-machines", "vllm-gpu")
+    aliases_ok = {"ace-media": 0, "mac-studio-m3u": 0}
+    no_route = _reach_cfg({"ace-ai": {**aliases_ok, "ace-ai": 255},
+                           "ace-media": {**aliases_ok, "ace-ai": 255}})
+    assert kwp.reach_allowed_hosts(body="fix it", skills=skills, pool=no_route,
+                                   targets=targets) == ()
+    assert _portable(body="fix it", skills=skills, pool=no_route, targets=targets) == (
+        False, "host_reach", None)
+    routed = _reach_cfg({"ace-ai": {**aliases_ok, "ace-ai": 255},
+                         "ace-media": {**aliases_ok, "ace-ai": 0}})
+    assert kwp.reach_allowed_hosts(body="fix it", skills=skills, pool=routed,
+                                   targets=targets) == ("ace-media",)
+    # An unprobed target (no column anywhere) fails closed in the fallback too.
+    assert kwp.reach_allowed_hosts(body="fix it", skills=("ssh-machines", "x"), pool=routed,
+                                   targets={"x": "nas-9"}) == ()

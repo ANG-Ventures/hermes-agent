@@ -593,8 +593,10 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     wanted = tuple(dict.fromkeys(h.lower() for h in (targets or {}).values() if h))
     if not bound and not wanted:
         return None
-    if named or not bound:
-        named = tuple(dict.fromkeys([*named, *wanted]))
+    # Unnamed host-bound skill: reach EVERY alias, plus the manifest targets
+    # (an unprobed target must still fail closed, Prism bf503f94e81a).
+    base = named if (named or not bound) else aliases
+    named = tuple(dict.fromkeys([*base, *wanted]))
     return reaching_hosts(getattr(pool, "reach", {}) or {}, named, aliases)
 
 
