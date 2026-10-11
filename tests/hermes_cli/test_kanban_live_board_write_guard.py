@@ -488,3 +488,29 @@ def test_board_lifecycle_under_a_hermetic_home_is_untouched(
     kb.set_current_board("alpha")
     kb.remove_board("alpha")
     assert _files_under(live_root) == []
+
+
+def test_board_tree_guard_sees_a_symlinked_live_kanban_dir(live_root, tmp_path, monkeypatch):
+    """``<live>/kanban -> /mnt/k``: resolved paths leave the root (Prism #1881 73c944bd05e2).
+
+    create_board/set_current_board/remove_board reach only the board-tree guard,
+    which compared the resolved spelling alone and let all three through.
+    """
+    external = tmp_path / "mnt-kanban"
+    board = external / "boards" / "real-board"
+    board.mkdir(parents=True)
+    (board / "board.json").write_text("{}", encoding="utf-8")
+    (live_root / "kanban").symlink_to(external, target_is_directory=True)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(live_root))
+    monkeypatch.setenv("HERMES_HOME", str(live_root))
+    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(var, raising=False)
+    before = _files_under(external)
+    with pytest.raises(kb.LiveBoardWriteRefused):
+        kb.create_board("spawntest")
+    with pytest.raises(kb.LiveBoardWriteRefused):
+        kb.set_current_board("real-board")
+    for archive in (True, False):
+        with pytest.raises(kb.LiveBoardWriteRefused):
+            kb.remove_board("real-board", archive=archive)
+    assert _files_under(external) == before
