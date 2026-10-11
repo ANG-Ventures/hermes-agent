@@ -14,7 +14,7 @@ name: Install & Update E2E red tracker
 # Dispatch it by hand to preview (dry-run, the default) or replay a run.
 
 on:
-  workflow_run:
+  workflow_run:  # trigger-storm-ok: one upstream; a GREEN scheduled run must close the issue, so it reads every conclusion (~4 runs/day, t_8ca8c919)
     workflows: ['Install & Update E2E']
     types: [completed]
     # A ci-overflow-ledger data commit must start zero workflows (spec §5.3).
