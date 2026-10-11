@@ -3760,7 +3760,10 @@ def _record_placement_waits(conn, result, row_route: dict, dry_run: bool) -> Non
     event after the latest one (PLACEMENT_WAIT_EPISODE_END_KINDS) starts a new
     episode: written now, ``since`` = now. Never on a dry run. Best-effort: bookkeeping never fails a tick."""
     from hermes_cli import kanban_placement_reasons as _pr
-    waits = result.placement_waits or {}
+    # Studio-affinity cards have their own placement_wait writer
+    # (kanban_host_affinity.record_affinity_events); one writer per card.
+    bound = result.placement_affinity or {}
+    waits = {t: r for t, r in (result.placement_waits or {}).items() if t not in bound}
     if dry_run or not waits:
         return
     now = int(time.time())
