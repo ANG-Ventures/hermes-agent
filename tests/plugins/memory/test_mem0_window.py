@@ -50,6 +50,13 @@ def posts(monkeypatch):
         if request.get_method() == "POST" and p.path == "/memories":
             calls.append(json.loads(request.data.decode()))
             return _Resp({"results": [{"id": "m1", "memory": "x"}]})
+        if request.get_method() == "POST" and p.path == "/search":
+            # metadata-equality lookup over what was posted (the replay's dedup check)
+            f = json.loads(request.data.decode()).get("filters") or {}
+            hits = [{"id": f"m{i}", "memory": c["messages"][0]["content"], "metadata": c.get("metadata") or {}}
+                    for i, c in enumerate(calls)
+                    if f and all((c.get("metadata") or {}).get(k) == v for k, v in f.items())]
+            return _Resp({"results": hits})
         raise AssertionError(f"unexpected HTTP call {request.get_method()} {p.path}")
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)

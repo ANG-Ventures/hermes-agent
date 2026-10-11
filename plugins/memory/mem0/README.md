@@ -162,12 +162,28 @@ hermes memory setup mem0 --mode oss --oss-llm-key sk-... --dry-run
 
 ## Troubleshooting
 
-### "Mem0 temporarily unavailable"
+### "mem0 memory store is DOWN"
 
-Circuit breaker tripped after 5 consecutive failures. Resets after 2 minutes.
+The tool reply says DOWN when the store cannot be reached (connection refused, timeout, DNS,
+5xx) or the circuit breaker is open. It is never an empty result, and the model is told to say
+memory is unavailable. A 4xx reply is reported as a request error, not an outage.
+
+Circuit breaker: 5 consecutive failures open it for 2 minutes. A prefetch that hits its join
+budget (`prefetch_join_timeout_s`) counts as a failure, so a store that accepts connections and
+never answers also trips it. While it is open, turns skip the prefetch join entirely (no
+per-turn wait). After the cooldown it is half-open: the next call is a probe, and one failure
+re-opens it for another 2 minutes. Only a success closes it.
 
 - **Platform mode**: Check API key and internet connectivity.
 - **OSS mode**: Check that your vector store (qdrant/pgvector) is running.
+
+### Validate every mem0.json
+
+`python3 -m plugins.memory.mem0.config_schema --home ~/.hermes` checks the root file and every
+`profiles/*/mem0.json` against one schema: unknown or typo'd keys, wrong types, a host with no
+admin key, `pin_user_id` with no user_id (file or `MEM0_USER_ID` in the profile `.env`), and
+unknown capture modes. Exit 1 on any error. It prints key names only, never values. On a host
+whose agent tree predates the module: `ssh host 'python3 - --home ~/.hermes' < plugins/memory/mem0/config_schema.py`.
 
 ### `mem0_conclude` returned `"queued": true`
 
@@ -231,5 +247,6 @@ python3 -m plugins.memory.mem0.window open --minutes 90   # both flags; re-run t
 python3 -m plugins.memory.mem0.window status [--check]     # --check: exit 2 on stale flag, unreplayed journal,
                                                            # or a pending row >30 min old while paused
 python3 -m plugins.memory.mem0.window replay               # direct POST /memories {infer:false}; journaled=N replayed=M
+                                                           # stamps dedup_hash; a fact already live is skipped
 python3 -m plugins.memory.mem0.window close                # remove flags, replay, sweep once more; exit 1 if M != N
 ```
