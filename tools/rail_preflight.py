@@ -16,7 +16,7 @@ the dispatcher process itself) only gets the liveness probe. The agent's own Chr
 computer_use desktop are not operator rails: a placed worker keeps both wherever the pool host can
 host them, and only when that placement fails is the failure reported as this rail
 (``placed_browser_rail_error`` / ``screen_rail_error``). Only a rail error returned by an active
-model tool call (``active_tool_call``) is recorded (background cleanup never is), under the owning task, so that worker's
+model tool call is recorded (background cleanup, ``background_cleanup``, never is), under the owning task, so that worker's
 turn loop, and only it, parks the card ``needs_input`` with the message verbatim
 (``take_rail_absent``).
 """
@@ -38,18 +38,20 @@ _PROBE_OK_TTL_S = 30.0
 _lock = threading.Lock()
 _emitted: Dict[str, str] = {}  # owning task id -> first unconsumed rail message
 _probe_ok: Dict[str, float] = {}
-_in_tool_call: ContextVar[bool] = ContextVar("rail_preflight_in_tool_call", default=False)
+_in_cleanup: ContextVar[bool] = ContextVar("rail_preflight_in_cleanup", default=False)
 
 
 @contextmanager
-def active_tool_call() -> Iterator[None]:
-    """Mark a model-invoked browser tool call; a rail failure inside it is recorded however the
-    tool's adapter reformats or drops the error. Background cleanup runs outside it."""
-    token = _in_tool_call.set(True)
+def background_cleanup() -> Iterator[None]:
+    """Mark browser session teardown (janitor / ``close``): a rail failure inside it is returned to
+    the caller but never recorded, so it cannot park the card. Every other browser command runs on
+    behalf of a model tool call (browser_*, vault, browser-use) and records its rail failure however
+    that tool's adapter reformats or drops the error."""
+    token = _in_cleanup.set(True)
     try:
         yield
     finally:
-        _in_tool_call.reset(token)
+        _in_cleanup.reset(token)
 
 
 def rail_absent_message(rail: str, host: str) -> str:
@@ -142,14 +144,14 @@ def browser_rail_error(cdp_url: str, *, host_side: bool = False) -> Optional[str
 def placed_browser_rail_error() -> Optional[str]:
     """The agent's own browser could not be placed on this worker's pool host (no desktop stack
     in its sandbox): report it as the browser rail, since the only browser left is the Studio's.
-    None for anything but a placed, dispatcher-owned worker. Recorded for parking only inside an
-    active model tool call (``active_tool_call``), never from a background cleanup ``close``."""
+    None for anything but a placed, dispatcher-owned worker. Never recorded for parking from a
+    background cleanup ``close`` (``background_cleanup``)."""
     task = _owned_task()
     placed = _placed_host() if task else None
     if not placed:
         return None
     message = rail_absent_message("browser", placed)
-    return _emit(task, message) if _in_tool_call.get() else message
+    return message if _in_cleanup.get() else _emit(task, message)
 
 
 def screen_rail_error() -> Optional[str]:

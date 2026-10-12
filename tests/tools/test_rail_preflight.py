@@ -246,9 +246,29 @@ def test_background_cleanup_failure_never_queues_a_rail(monkeypatch):
     def refused():
         raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
     monkeypatch.setattr(bd, "tool_placement", refused)
-    res = bts._run_browser_command("rail", "close", [], timeout=10)
-    assert res["error"] == EXPECTED_BROWSER.format(host="ace-media")
+    from tools import browser_tool as bt
+    from tools.browser_tool_lifecycle import _cleanup_single_browser_session
+    closed = []
+    real = bts._run_browser_command
+    monkeypatch.setattr(bts, "_run_browser_command", lambda *a, **k: closed.append(real(*a, **k)) or closed[-1])
+    monkeypatch.setitem(bt._active_sessions, "rail-janitor", {"session_name": "rail-janitor", "features": {}})
+    _cleanup_single_browser_session("rail-janitor")
+    assert closed and closed[0]["error"] == EXPECTED_BROWSER.format(host="ace-media")
     assert rp.take_rail_absent() is None
+
+
+def test_vault_tool_direct_browser_command_queues_rail(monkeypatch):
+    # browser_vault calls _run_browser_command directly (no _fallback_call): its rail must still park.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-media")
+    from tools import browser_tool_session as bts
+    from tools.bot_desktop import runtime as bd
+
+    def refused():
+        raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+    monkeypatch.setattr(bd, "tool_placement", refused)
+    bts._run_browser_command("rail", "eval", ["1"])
+    assert rp.take_rail_absent() == EXPECTED_BROWSER.format(host="ace-media")
 
 
 def test_active_browser_tool_call_with_sandbox_failure_queues_rail(monkeypatch):
