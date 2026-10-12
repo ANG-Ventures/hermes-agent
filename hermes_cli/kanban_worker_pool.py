@@ -870,13 +870,14 @@ class SpilloverPlan:
             return None
         return {"load1": d.get("load1"), "ncpu": d.get("ncpu")}
 
-    def pin_refusal(self, pin: str, assignee: Optional[str] = None) -> Optional[str]:
-        """Why a card pinned to ``pin`` cannot take a slot now, or None.
+    def pin_host_refusal(self, pin: str) -> Optional[str]:
+        """Why the HOST behind ``pin`` cannot give a slot now, or None.
 
-        A host that is not ``active`` in fleet-roles.json (``draining``) reads
-        ``pin_host_<state>``, never ``pin_host_full``: full means wait, a
-        drained member means re-pin or wait for re-admit (t_e10add5a).
-        ``assignee`` None skips the profile check (the no-slot wall)."""
+        Host state only: no profile check and no reservation, so the no-slot
+        wall can name the state too. ``take()`` checks the assignee before
+        this. A host that is not ``active`` in fleet-roles.json (``draining``)
+        reads ``pin_host_<state>``, never ``pin_host_full``: full means wait,
+        a drained member means re-pin or wait for re-admit (t_e10add5a)."""
         pin = {n.lower(): n for n in self.hosts}.get(pin.lower(), pin)
         host = self.hosts.get(pin)
         if host is None:
@@ -885,8 +886,6 @@ class SpilloverPlan:
                     else "pin_host_dropped"
                     if low in {h.lower() for h in (self.config.hosts or ())}
                     else "pin_unknown_host")
-        if assignee is not None and assignee not in host.profiles:
-            return "pin_profile"  # the pinned host does not serve this assignee
         if self.slots.get(pin, 0) > 0:
             return None
         if host.state != "active":
@@ -908,10 +907,13 @@ class SpilloverPlan:
         fold = {n.lower(): n for n in self.hosts}
         if pin is not None:
             pin = fold.get(pin.lower(), pin)
-            self.refusal = self.pin_refusal(pin, assignee)
+            host = self.hosts.get(pin)
+            if host is not None and assignee not in host.profiles:
+                self.refusal = "pin_profile"  # the pinned host does not serve this assignee
+                return None
+            self.refusal = self.pin_host_refusal(pin)
             if self.refusal is not None:
                 return None
-            host = self.hosts[pin]
             self.slots[pin] -= 1
             self.taken[pin] = self.taken.get(pin, 0) + 1
             return host

@@ -45,6 +45,28 @@ def drained_pin_waits(conn, waits: Mapping[str, str], now: int) -> list[dict]:
     return hits
 
 
+def _episode_since(conn, task_id: str) -> Optional[int]:
+    """``since`` of the card's open drained-pin wait episode, else None."""
+    from hermes_cli import kanban_placement_reasons as _pr
+
+    status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if status is None or status[0] != "ready":
+        return None
+    row = conn.execute(
+        "SELECT payload, id FROM task_events WHERE task_id = ? AND kind = 'placement_wait' "
+        "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    if row is None or conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN (%s) LIMIT 1"
+            % ",".join("?" * len(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)),
+            (task_id, row[1], *sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS))).fetchone():
+        return None
+    try:
+        last = json.loads(row[0] or "{}")
+    except (TypeError, ValueError):
+        return None
+    return last.get("since") if last.get("reason") in DRAINED_PIN_REASONS else None
+
+
 def notify_drained_pins(conn, board: Optional[str], waits: Mapping[str, str], now: int) -> list[dict]:
     """Post the #logs line for each new hit; returns the hits posted."""
     from hermes_cli import kanban_budget as _kbudget
@@ -59,7 +81,12 @@ def notify_drained_pins(conn, board: Optional[str], waits: Mapping[str, str], no
     if not isinstance(seen, dict):
         seen = {}
     current = {h["task_id"]: h["since"] for h in hits}
-    latched = {k: v for k, v in seen.items() if current.get(k) == v}
+    # Prune by board state, never by this tick's view: a held card can be
+    # missing from ``waits`` for a tick (the ready scan stopped at the no-slot
+    # wall, a gateway restart's first ticks) and must not re-post when it
+    # reappears (Prism a54ce82ab27c).
+    latched = {k: v for k, v in seen.items()
+               if current.get(k, _episode_since(conn, k)) == v}
     changed = latched != seen
     script = _kbudget._notify_script_path()
     posted = []

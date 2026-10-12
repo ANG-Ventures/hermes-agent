@@ -4980,7 +4980,7 @@ def _dispatch_once_locked(
             if spillover is not None:
                 result.placement_waits[row["id"]] = (
                     _route_wait(route, route_arg, False, spillover)
-                    or ((spillover.pin_refusal(route_arg) or "pin_host_full")
+                    or ((spillover.pin_host_refusal(route_arg) or "pin_host_full")
                         if route == "pin" else spillover.full_reason())
                 )
                 # Host-bound cards behind the wall still say why (t_3e6c9b2b).

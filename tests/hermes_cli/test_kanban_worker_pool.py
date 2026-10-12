@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -1606,3 +1607,37 @@ def test_drained_pin_wait_posts_one_logs_line_after_15_min(kanban_home, monkeypa
     body = sent[0][-1]
     assert tid in body and "ci-box" in body and "draining" in body and "16 min" in body
     assert sent[0][sent[0].index("--target") + 1] == kbud.RECOVERY_TARGET
+
+
+def test_unassigned_pin_is_refused_pin_profile_and_takes_no_slot():
+    """Prism 6884d3dc366b: an unassigned card pinned to a member is refused
+    ``pin_profile`` (base semantics) and reserves nothing."""
+    p = _plan(hosts=[_host("ace-ai", slots=1)])
+    assert p.take(None, pin="ace-ai") is None and p.refusal == "pin_profile"
+    assert p.slots["ace-ai"] == 1 and p.taken.get("ace-ai", 0) == 0 and p.budget == 1
+    p = _drained_plan()
+    before = dict(p.slots)
+    assert p.take(None, pin="ci-box") is None and p.refusal == "pin_profile"
+    assert p.slots == before
+
+
+def test_drained_pin_latch_survives_a_tick_the_card_is_missing_from(kanban_home, monkeypatch):
+    """Prism a54ce82ab27c: a card absent from one tick's waits (no-slot wall,
+    the first ticks after a restart) keeps its latch and is not re-posted."""
+    from hermes_cli import kanban_budget as kbud
+    from hermes_cli import kanban_drained_pin as kdp
+    sent = []
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: "/x/notify.py")
+    monkeypatch.setattr(kbud, "_run_notify", lambda argv: sent.append(argv) or True)
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host: ci-box")
+        _tick(conn, spillover=_drained_plan(), spawn_limit=4)
+        conn.execute("UPDATE task_events SET payload = json_set(payload, '$.since', "
+                     "json_extract(payload, '$.since') - 16*60) WHERE task_id=? "
+                     "AND kind='placement_wait'", (tid,))
+        conn.commit()
+        now = int(time.time())
+        assert len(kdp.notify_drained_pins(conn, None, {tid: "pin_host_draining"}, now)) == 1
+        kdp.notify_drained_pins(conn, None, {}, now + 60)  # card not evaluated this tick
+        assert kdp.notify_drained_pins(conn, None, {tid: "pin_host_draining"}, now + 120) == []
+    assert len(sent) == 1
