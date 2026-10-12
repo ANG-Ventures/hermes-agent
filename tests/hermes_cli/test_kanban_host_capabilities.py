@@ -232,7 +232,8 @@ def test_plain_coding_card_still_spills(home, fleet, monkeypatch):
 
 def test_absent_map_is_byte_identical(home, monkeypatch):
     """No fleet/host-capabilities.json: the route table of 50 real card bodies
-    equals the one the BASE commit (e10ab66274) produced."""
+    equals the one the BASE commit produced (regenerated against main
+    fdff5531ac after #1927 card_needs, t_0d07a53a)."""
     _mode(monkeypatch)
     sys.path.insert(0, str(FIXTURES))
     try:
