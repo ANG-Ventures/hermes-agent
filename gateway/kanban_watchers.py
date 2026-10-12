@@ -3421,6 +3421,9 @@ class GatewayKanbanWatchersMixin:
         # KWLB v0.1: ONE GateTick per tick (band, LOCAL allowance, ONE shared
         # pool plan). The gate's slope sees LOCAL workers only (PRD 5.2.4).
         from gateway.kanban_gate_tick import GateTickBuilder, format_tick_line
+        from gateway import kanban_gate_series as _gate_series
+        from hermes_cli import kanban_db_connect as _kbc_tick
+        _series_tick: dict = {}
 
         def _kanban_cfg_now() -> dict:
             try:
@@ -3622,6 +3625,16 @@ class GatewayKanbanWatchersMixin:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            # Tick-series cost (spec v0.3 §3.6 / I-7): the WHOLE tick, build()
+            # through the end of the board loop, on this thread's CPU clock.
+            _t_cpu0, _t_wall0 = time.thread_time(), time.perf_counter()
+            with _kbc_tick.count_statements() as _queries:
+                out = _tick_body(boards)
+            _write_gate_series(boards, out, time.thread_time() - _t_cpu0,
+                               time.perf_counter() - _t_wall0, _queries[0])
+            return out
+
+        def _tick_body(boards) -> "list[tuple[str, Optional[object]]]":
             out: list[tuple[str, "Optional[object]"]] = []
             # One budget cache per TICK, shared across boards: the per-profile
             # turn ledgers are the same files for every board, so without this
@@ -3634,6 +3647,7 @@ class GatewayKanbanWatchersMixin:
             # (t_f78d1938: consumed in fixed board order, default first, the
             # subs-ace board got 0 spawns for 93 min with 7 ready P1 cards).
             _tick = _gate_ticks.build(boards)
+            _series_tick["tick"] = _tick
             _allowance, _spawn_paused = _tick.local_allowance, _tick.spawn_paused
             _placed: list = []
             # Host-exhaustion transient blocks clear when the host does
@@ -3757,7 +3771,33 @@ class GatewayKanbanWatchersMixin:
                 logger.info("%s", format_tick_line(load_gate, _tick, _tick_spawned, _placed))
             _gate_ticks.record_placements(_placed)
             _finish_gate_tick(_tick_spawned)
+            _series_tick.update(allowance=_allowance, paused=_spawn_paused,
+                                local=_tick_spawned)
             return out
+
+        def _write_gate_series(boards, results, cpu_s: float, wall_s: float,
+                               queries: int) -> None:
+            """Append this gateway tick's ONE line to var/gate-ticks.jsonl.
+            Here, never in GateTickBuilder.build(): build() also serves the
+            standalone daemon and one-shot dry-runs (AC-12). Best-effort."""
+            tick = _series_tick.pop("tick", None)
+            if tick is None:
+                return
+            try:
+                rec = _gate_series.tick_record(
+                    ts=time.time(), gate=load_gate, tick=tick, builder=_gate_ticks,
+                    allowance=_series_tick.get("allowance"),
+                    spawn_paused=_series_tick.get("paused"),
+                    local_spawned=int(_series_tick.get("local") or 0),
+                    results=results, tick_ms_cpu=cpu_s * 1000.0,
+                    tick_ms_wall=wall_s * 1000.0, boards=len(boards or ()),
+                    queries=queries,
+                )
+                _gate_series.append(_gate_series.series_path(_kb.kanban_home()), rec)
+            except Exception as exc:
+                logger.debug("kanban gate series: append failed: %s", exc)
+            finally:
+                _series_tick.clear()
 
         def _ready_nonempty() -> bool:
             """Cheap probe: is there at least one ready+assigned+unclaimed
