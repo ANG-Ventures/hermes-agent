@@ -292,12 +292,18 @@ def is_redundant(event: Any, card: Optional[dict], subscription: Optional[dict],
         # own (second miss, t_fb95da9b 2026-10-12 14:10: the PR landed under the
         # lander before the attended read, so no APPROVE existed, and the echo
         # was delivered).
+        #
+        # The shortcut has no window and no APPROVE, so it trusts ONLY a STAMPED
+        # ``actor_profile`` that is EXACTLY a configured closer: never the
+        # summary-prose guess, never the prefix match (Prism #1933 r1: an
+        # unstamped "(merge-pass follow-up) ..." summary would otherwise silence
+        # the owner). Prose/prefix identities keep the APPROVE-gated path below.
         home_sid = _s(card.get("session_id"))
         owned = bool(home_sid) and (
             home_sid in {_s(x) for x in (sub.get("session_ids") or ())}
             or sub.get("is_home") is True   # the notifier's explicit "this subscription IS the home chat"
         )
-        if owned:
+        if owned and actor_profile.lower() in {_s(c).lower() for c in cfg.closers}:
             return True, "closer-on-owned-card"
         approve = card.get("latest_approve") or None
         if not approve or not same_operator(approve.get("by"), operator):

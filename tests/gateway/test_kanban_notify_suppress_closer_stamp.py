@@ -85,6 +85,25 @@ def test_trusted_closer_on_foreign_card_still_needs_approve():
     assert ns.is_redundant(ev, card, {"session_ids": {HOME_SID}}, cfg) == (True, "closer-after-operator-approve")
 
 
+def test_owned_card_shortcut_requires_a_stamped_exact_closer():
+    """Prism #1933 r1: the owned shortcut has no APPROVE and no window, so it trusts only a
+    STAMPED actor_profile that is EXACTLY a configured closer. An unstamped summary whose first
+    tag is a closer name, or a stamped prefix variant ("merge-pass follow-up"), keeps the
+    APPROVE-gated path and is delivered without one."""
+    cfg = ns.parse_config({})
+    owned = {"session_id": HOME_SID, "operator_profile": "default", "latest_approve": None}
+    sub = {"session_ids": {HOME_SID}}
+    prose = _ev(id=4, task_id="t_fb95da9b", created_at=1791839400, actor_profile=None,
+                payload={"summary": "(merge-pass follow-up) tidied the card"})
+    assert ns.closer_identity(prose) == "merge-pass follow-up"
+    assert ns.is_closer("merge-pass follow-up", cfg.closers)   # prefix match, by design for the APPROVE path
+    assert ns.is_redundant(prose, owned, sub, cfg) == (False, "closer-without-operator-approve")
+    prefix = _ev(id=5, task_id="t_fb95da9b", created_at=1791839400, actor_profile="merge-pass follow-up", payload={})
+    assert ns.is_redundant(prefix, owned, sub, cfg) == (False, "closer-without-operator-approve")
+    exact = _ev(id=6, task_id="t_fb95da9b", created_at=1791839400, actor_profile="Merge-Pass", payload={})
+    assert ns.is_redundant(exact, owned, sub, cfg) == (True, "closer-on-owned-card")
+
+
 def test_ownership_alone_never_suppresses_a_non_closer():
     cfg = ns.parse_config({})
     ev = _ev(id=3, task_id="t_fb95da9b", created_at=1791839400, actor_profile="daedalus-opus", payload={})

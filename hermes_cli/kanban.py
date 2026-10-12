@@ -421,6 +421,14 @@ def kanban_command(args: argparse.Namespace) -> int:
             if is_operator_label(closer):
                 return _err(f"kanban: --actor {closer!r} is an operator label; an automated closer "
                             "stamps its own name (kanban-review-merge-pass, review-card closer, ...)")
+            # The stamp silences the owner's wake (notify-suppress closer-on-owned-card), so
+            # it is accepted only from a scheduled job: the real closers are cron scripts
+            # (kanban-review-merge-pass, mq-review-card-closer) and carry HERMES_CRON_JOB_ID.
+            # A hand-typed or ad-hoc script `--actor <closer>` is refused (Prism #1933 r1).
+            origin = kb.classify_create_origin()
+            if origin != kb.CREATE_ORIGIN_CRON:
+                return _err(f"kanban: --actor {closer!r} is accepted only from a cron script job "
+                            f"(this process is {origin}); an interactive closer is its own session")
             event_actor_scope = kb.event_actor(closer)
         try:
             # The preflight above ran on its own connection; the scope re-runs

@@ -24,8 +24,9 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     for var in ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID", "HERMES_PROFILE", "HERMES_PROFILE_NAME"):
         monkeypatch.delenv(var, raising=False)
-    # a cron closer: no chat-session identity
+    # a cron closer: no chat-session identity, a scheduled-job child (cron/scheduler_script.py)
     monkeypatch.setattr(kc, "_caller_session_id", lambda: None)
+    monkeypatch.setenv("HERMES_CRON_JOB_ID", "c6c86efd0ac8")
     kb.init_db()
     return home
 
@@ -71,6 +72,18 @@ def test_actor_refuses_operator_labels(kanban_home, capsys):
     rc = kc.kanban_command(_parse(["complete", tid, "--summary", "x", "--actor", "apollo"]))
     assert rc != 0
     assert "operator label" in capsys.readouterr().err
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "done"
+
+
+def test_actor_refused_outside_a_cron_job(kanban_home, monkeypatch, capsys):
+    """Prism #1933 r1: a session-less hand/script caller cannot stamp a closer and silence the owner."""
+    monkeypatch.delenv("HERMES_CRON_JOB_ID")
+    with kb.connect_closing() as conn:
+        tid = _card(conn)
+    rc = kc.kanban_command(_parse(["complete", tid, "--summary", "x", "--actor", "kanban-review-merge-pass"]))
+    assert rc != 0
+    assert "only from a cron script job" in capsys.readouterr().err
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).status != "done"
 
