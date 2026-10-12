@@ -524,6 +524,10 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "the profile's provider and will fail if it belongs "
                 "to a different one. Requires 'model'."
         )),
+        "force_model": _prop("string", (
+                "Reason to pin a 'model' id the provider's live model list does not "
+                "know. Without it an unknown id is refused with the valid list."
+        )),
     },
     ["title", "assignee"],
 )

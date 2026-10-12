@@ -179,7 +179,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             cli_invocation_id TEXT,
             served_subs_json TEXT,
             attribution TEXT,
-            terminal_error TEXT
+            terminal_error TEXT,
+            reasoning_effort TEXT
         );
 
         CREATE TABLE IF NOT EXISTS turn_tool_calls (
@@ -543,7 +544,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # `terminal_error` (t_6c09f0c2): NULL for a turn that ended normally; the
     # turn_exit_reason for one that ended failed (fallback chain exhausted,
     # raised, ...). Lets turn-level surfaces count failed turns.
-    for _col in ("served_subs_json", "attribution", "terminal_error"):
+    # `reasoning_effort` (t_09a1e42a): the resolved effort label the turn ran
+    # at (`xhigh`, `none`, ...), distinct from the `reasoning` TOKEN count.
+    # NULL on rows written before the column existed.
+    for _col in ("served_subs_json", "attribution", "terminal_error", "reasoning_effort"):
         if _col not in _existing:
             try:
                 conn.execute(f"ALTER TABLE turns ADD COLUMN {_col} TEXT")
@@ -911,6 +915,7 @@ _INSERT_TURN_COLUMNS = (
     "cache_write_tokens_unknown", "usage_unknown",
     "terminal_error",
     "lane_family", "vendor", "served_provider",
+    "reasoning_effort",
 )
 
 _INSERT_TURN_SQL = (
@@ -1127,6 +1132,9 @@ def insert_turn(
                     if record.terminal_error
                     else None,
                     *_route_columns(record.provider, record.model),
+                    (str(record.reasoning_effort).strip() or None)
+                    if record.reasoning_effort is not None
+                    else None,
                 ),
             )
             if provisional and cur.rowcount == 0:

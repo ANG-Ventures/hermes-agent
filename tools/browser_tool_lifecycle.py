@@ -704,7 +704,9 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         _bt.logger.debug("Skipping agent-browser close for expired session %s", task_id)
     else:
         try:
-            _session._run_browser_command(task_id, "close", [], timeout=10)
+            from tools.rail_preflight import background_cleanup
+            with background_cleanup():  # teardown must never park the worker's card (t_db491366)
+                _session._run_browser_command(task_id, "close", [], timeout=10)
             _bt.logger.debug("agent-browser close command completed for task %s", task_id)
         except Exception as e:
             _bt.logger.warning("agent-browser close failed for task %s: %s", task_id, e)

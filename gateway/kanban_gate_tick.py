@@ -82,15 +82,16 @@ def read_signal_enabled(kanban_cfg) -> bool:
     return not (isinstance(pl, dict) and pl.get("read_signal", True) is False)
 
 
-def any_remote_pin(boards, connect, known_hosts=()) -> bool:
-    """A ready card on any board pins a KNOWN pool host (``host:<id>``)."""
+def any_remote_pin(boards, connect, known_hosts=(), aliases=None) -> bool:
+    """A ready card on any board pins a KNOWN pool host (``host:<id>`` or a
+    registry alias of one, t_cb2b888d)."""
     for b in boards:
         slug = (b.get("slug") if isinstance(b, dict) else None) or "default"
         conn = None
         try:
             conn = connect(board=slug)
             for (body,) in conn.execute(_REMOTE_PIN_SQL).fetchall():
-                pin, _ignored = kwp.resolve_pin(body, known_hosts)
+                pin, _ignored = kwp.resolve_pin(body, known_hosts, aliases)
                 if pin is not None and pin not in (kwp.PIN_ANY, kwp.PIN_STUDIO):
                     return True
         except Exception:
@@ -167,7 +168,8 @@ class GateTickBuilder:
             return None
         pins_only = gate.band not in ("spilling", "paused")
         if pins_only and not any_remote_pin(boards, self._connect,
-                                            kwp.known_host_ids(self._fleet_dir())):
+                                            kwp.known_host_ids(self._fleet_dir()),
+                                            kwp.pin_aliases(self._fleet_dir())):
             gate.pool = {"planned": False, "reason": "not_needed"}
             return None
         pool = kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg)

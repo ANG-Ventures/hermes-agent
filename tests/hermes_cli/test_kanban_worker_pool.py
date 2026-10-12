@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -1008,11 +1009,15 @@ def test_prose_host_line_with_no_pool_spawns_locally(kanban_home):
     assert spawned == [(tid, None)] and tid not in res.placement_waits
 
 
-def test_prose_host_line_with_a_pool_routes_by_policy(kanban_home):
+def test_prose_host_line_with_a_pool_stays_local(kanban_home):
+    """t_cb2b888d reverses the old 'prose routes by policy': a host: line
+    that names no host may be a typo, so it never widens to the pool. It runs
+    locally (local slot free) and is never placed."""
     with kb.connect_closing() as conn:
         (tid,) = _make(conn, 1, body="Host: example.com")
         res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test")
-    assert spawned == [(tid, "ace-ai")] and res.placed == [(tid, "ace-ai")]
+    assert spawned == [] and res.placed == []
+    assert res.placement_waits[tid].startswith("pin_unknown_host:example.com")
 
 
 def test_known_pool_host_still_pins(kanban_home):
@@ -1050,6 +1055,26 @@ def test_link_scan_binds_under_the_sqlite_variable_limit(kanban_home):
         conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
         ids = [f"t_fake{i:05d}" for i in range(1198)] + [a, b]
         assert kbd._linked_ids(conn, ids) == {a: ("blocks", b), b: ("blocks", a)}
+
+
+def test_link_reason_is_stable_across_ready_order_and_chunks(kanban_home):
+    """Prism 9457394f1922: a card with two pinning links names the SAME edge
+    whatever the ready-row order, even when the other endpoint lands in an
+    earlier 250-id chunk than the card itself."""
+    import itertools
+    with kb.connect_closing() as conn:
+        p_lo, p_hi = sorted(_make(conn, 2, assignee="beta"))
+        (card,) = _make(conn, 1)
+        kb.link_tasks(conn, p_lo, card)
+        kb.link_tasks(conn, p_hi, card)
+        want = ("blocks", p_lo)  # the single-chunk answer (ORDER BY parent_id, child_id)
+        assert kbd._linked_ids(conn, [card])[card] == want
+        pad = [f"t_fake{i:05d}" for i in range(kbd._LINK_CHUNK - 1)]
+        # p_hi alone fills chunk 1 with the padding; card arrives in chunk 2.
+        assert kbd._linked_ids(conn, [p_hi, *pad, card, p_lo])[card] == want
+        for order in itertools.permutations([card, p_lo, p_hi]):
+            got = kbd._linked_ids(conn, [order[0], *pad, *order[1:]])
+            assert got[card] == want, order
 
 
 # -- Apollo review r5 (PR #1730) -------------------------------------------
@@ -1524,3 +1549,214 @@ def test_manifest_target_honours_path_qualified_card_skill(tmp_path, monkeypatch
     # Traversal / wrong category never resolve.
     assert kha.manifest_targets(["../skills/mlops/vllm-gpu", "general/vllm-gpu"], "alpha") == {}
     kha.clear_cache()
+
+
+# -- t_e10add5a: a pin to a DRAINED member is not a full one ----------------
+
+def _drained_plan():
+    p = _plan(hosts=[_host("ace-ai", slots=1), _host("ci-box", slots=2, priority=1, state="draining")])
+    p.disabled = ("old-box",)
+    return p
+
+
+def test_pin_to_a_draining_host_reads_pin_host_draining():
+    """2026-10-11: t_d69f0790 pinned host:ci-box while ci-box drained read
+    ``pin_host_full`` for 25 min. Draining (re-pin) is not full (wait)."""
+    p = _drained_plan()
+    assert p.take("alpha", pin="ci-box") is None and p.refusal == "pin_host_draining"
+    assert p.take("alpha", pin="old-box") is None and p.refusal == "pin_host_disabled"
+    assert p.take("alpha", pin="ace-ai").name == "ace-ai"
+    assert p.take("alpha", pin="ace-ai") is None and p.refusal == "pin_host_full"
+
+
+def test_drained_pin_reason_reaches_placement_wait_and_dry_run(kanban_home, capsys, monkeypatch):
+    from hermes_cli import kanban_ops as kops
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host: ci-box")
+        _tick(conn, spillover=_drained_plan(), spawn_limit=4)
+        assert [e["reason"] for e in _placement_waits(conn, tid)] == ["pin_host_draining"]
+        assert _placement_waits(conn, tid)[0]["host"] == "ci-box"
+    monkeypatch.setattr(kops, "_one_shot_pool_plan", lambda *a, **k: _drained_plan())
+    import argparse
+    rc = kops._cmd_dispatch(argparse.Namespace(dry_run=True, json=False, max=None,
+                                               max_running=None, failure_limit=2))
+    assert rc == 0 and f"Held ({tid}): pin_host_draining" in capsys.readouterr().out
+
+
+def test_drained_pin_behind_the_no_slot_wall_still_names_the_state(kanban_home):
+    """No local slot and no pool slot: the row that hits the wall keeps its state."""
+    p = _plan(hosts=[_host("ci-box", slots=2, state="draining")])
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host: ci-box")
+        res, spawned = _tick(conn, spillover=p, spawn_limit=0)
+    assert spawned == [] and res.placement_waits.get(tid) == "pin_host_draining"
+
+
+def test_drained_pin_wait_posts_one_logs_line_after_15_min(kanban_home, monkeypatch):
+    from hermes_cli import kanban_budget as kbud
+    sent = []
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: "/x/notify.py")
+    monkeypatch.setattr(kbud, "_run_notify", lambda argv: sent.append(argv) or True)
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host: ci-box")
+        _tick(conn, spillover=_drained_plan(), spawn_limit=4)
+        assert sent == []  # a fresh wait is not news
+        conn.execute("UPDATE task_events SET payload = json_set(payload, '$.since', "
+                     "json_extract(payload, '$.since') - 16*60) WHERE task_id=? "
+                     "AND kind='placement_wait'", (tid,))
+        conn.commit()
+        _tick(conn, spillover=_drained_plan(), spawn_limit=4)
+        _tick(conn, spillover=_drained_plan(), spawn_limit=4)
+    assert len(sent) == 1
+    body = sent[0][-1]
+    assert tid in body and "ci-box" in body and "draining" in body and "16 min" in body
+    assert sent[0][sent[0].index("--target") + 1] == kbud.RECOVERY_TARGET
+
+
+def test_unassigned_pin_is_refused_pin_profile_and_takes_no_slot():
+    """Prism 6884d3dc366b: an unassigned card pinned to a member is refused
+    ``pin_profile`` (base semantics) and reserves nothing."""
+    p = _plan(hosts=[_host("ace-ai", slots=1)])
+    assert p.take(None, pin="ace-ai") is None and p.refusal == "pin_profile"
+    assert p.slots["ace-ai"] == 1 and p.taken.get("ace-ai", 0) == 0 and p.budget == 1
+    p = _drained_plan()
+    before = dict(p.slots)
+    assert p.take(None, pin="ci-box") is None and p.refusal == "pin_profile"
+    assert p.slots == before
+
+
+def test_drained_pin_latch_survives_a_tick_the_card_is_missing_from(kanban_home, monkeypatch):
+    """Prism a54ce82ab27c: a card absent from one tick's waits (no-slot wall,
+    the first ticks after a restart) keeps its latch and is not re-posted."""
+    from hermes_cli import kanban_budget as kbud
+    from hermes_cli import kanban_drained_pin as kdp
+    sent = []
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: "/x/notify.py")
+    monkeypatch.setattr(kbud, "_run_notify", lambda argv: sent.append(argv) or True)
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host: ci-box")
+        _tick(conn, spillover=_drained_plan(), spawn_limit=4)
+        conn.execute("UPDATE task_events SET payload = json_set(payload, '$.since', "
+                     "json_extract(payload, '$.since') - 16*60) WHERE task_id=? "
+                     "AND kind='placement_wait'", (tid,))
+        conn.commit()
+        now = int(time.time())
+        assert len(kdp.notify_drained_pins(conn, None, {tid: "pin_host_draining"}, now)) == 1
+        kdp.notify_drained_pins(conn, None, {}, now + 60)  # card not evaluated this tick
+        assert kdp.notify_drained_pins(conn, None, {tid: "pin_host_draining"}, now + 120) == []
+    assert len(sent) == 1
+
+
+def test_drained_pin_corrupt_marker_posts_nothing_and_is_rewritten(kanban_home, monkeypatch):
+    """Prism ac5ce939aace: a torn/unreadable latch marker is latched-unknown,
+    not empty: no #logs storm this tick, and the marker is rewritten valid."""
+    from hermes_cli import kanban_budget as kbud
+    from hermes_cli import kanban_drained_pin as kdp
+    sent = []
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: "/x/notify.py")
+    monkeypatch.setattr(kbud, "_run_notify", lambda argv: sent.append(argv) or True)
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host: ci-box")
+        _tick(conn, spillover=_drained_plan(), spawn_limit=4)
+        conn.execute("UPDATE task_events SET payload = json_set(payload, '$.since', "
+                     "json_extract(payload, '$.since') - 16*60) WHERE task_id=? "
+                     "AND kind='placement_wait'", (tid,))
+        conn.commit()
+        marker = kb.board_state_dir(None) / kdp._MARKER
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{"t_', encoding="utf-8")  # torn write
+        now = int(time.time())
+        assert kdp.notify_drained_pins(conn, None, {tid: "pin_host_draining"}, now) == []
+        latched = json.loads(marker.read_text(encoding="utf-8"))
+        assert isinstance(latched.get(tid), int)
+        assert kdp.notify_drained_pins(conn, None, {tid: "pin_host_draining"}, now + 60) == []
+    assert sent == []
+    assert not list(marker.parent.glob(kdp._MARKER + ".*"))  # no tmp left behind
+
+
+# -- host: pins by hostname/alias; unknown pins are loud (t_cb2b888d) ------
+
+def _write_ci_hosts(fleet: Path):
+    (fleet / kwp.CI_HOSTS_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        "ace-ai": {"ssh_alias": "ace-ai", "transport": "ssh", "host_label": "ace-ai"},
+        "studio": {"ssh_alias": None, "transport": "local", "host_label": "studio"},
+        "ci-box": {"ssh_alias": "ci.ace", "transport": "ssh", "host_label": "ci-box"},
+        "unrelated": {"ssh_alias": "elsewhere", "transport": "ssh", "host_label": "x"},
+    }}), encoding="utf-8")
+
+
+@pytest.fixture
+def fleet_aliases(kanban_home, monkeypatch):
+    import socket
+    monkeypatch.setattr(socket, "gethostname", lambda: "mac-studio-m3u.local")
+    fleet = kanban_home / "fleet"
+    _write_pool(fleet)
+    _write_ci_hosts(fleet)
+    return kwp.known_host_ids(fleet), kwp.pin_aliases(fleet)
+
+
+@pytest.mark.parametrize("body,pin", [
+    ("host:mac-studio-m3u", "studio"),   # the Studio's hostname -s (incident t_cccdee67)
+    ("host:MAC-STUDIO", "studio"),
+    ("host:local", "studio"),
+    ("host:ci.ace", "ci-box"),           # ssh alias from ci-hosts.json
+    ("host:ci", "ci-box"),               # its short DNS label
+    ("host:ACE-AI", "ace-ai"),           # hostname -s on ace-ai is upper case
+    ("Repro:\nHost: example.com\n\nhost:ci.ace\n", "ci-box"),  # Prism r8 preserved
+])
+def test_pin_resolves_hostname_and_registry_aliases_to_the_canonical_pin(fleet_aliases, body, pin):
+    known, aliases = fleet_aliases
+    assert kwp.resolve_pin(body, known, aliases)[0] == pin
+
+
+def test_pin_aliases_come_only_from_the_registry(fleet_aliases):
+    _known, aliases = fleet_aliases
+    assert "elsewhere" not in aliases and "unrelated" not in aliases  # not a pool host
+    assert aliases["ci.ace"] == "ci-box" and aliases["studio"] == "studio"
+
+
+def test_typo_pin_is_not_portable_and_names_suggestions(fleet_aliases):
+    known, aliases = fleet_aliases
+    assert kwp.resolve_pin("host:mac-studio-m3", known, aliases) == (None, "mac-studio-m3")
+    pool = kwp.PoolConfig(hosts=known, profiles=("alpha",), pin_aliases=aliases)
+    assert _portable(body="host:mac-studio-m3", pool=pool) == (False, "pin_unknown_host", None)
+    assert "mac-studio-m3u->studio" in kwp.pin_suggestions("mac-studio-m3", known, aliases)
+
+
+def test_alias_pin_routes_to_the_canonical_pool_host(fleet_aliases):
+    known, aliases = fleet_aliases
+    pool = kwp.PoolConfig(hosts=known, profiles=("alpha",), pin_aliases=aliases)
+    assert _portable(body="host:ACE-AI", pool=pool) == (True, None, "pin")
+    assert _portable(body="host:mac-studio-m3u", pool=pool) == (False, "host_studio", None)
+
+
+def test_typo_pin_is_held_local_with_one_latched_comment(fleet_aliases):
+    """host:mac-studio-m3 (typo): never spilled, placement_wait names the word
+    and suggestions, exactly one comment across ticks; a new word comments again."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="Do it.\nhost:mac-studio-m3\n")
+        for _ in range(3):
+            res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+            assert spawned == [] and res.placed == []
+        reason = res.placement_waits[tid]
+        assert reason.startswith("pin_unknown_host:mac-studio-m3 (did you mean: ")
+        assert "mac-studio-m3u->studio" in reason
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = "
+                          "'placement_wait' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+        assert json.loads(ev[0])["reason"] == reason
+        comments = [c.body for c in kb.list_comments(conn, tid)]
+        assert len(comments) == 1 and "host:mac-studio-m3 is no pin" in comments[0]
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", ("host:ace-ia", tid))
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        assert len(kb.list_comments(conn, tid)) == 2
+
+
+def test_hostname_pin_runs_local_never_spills(fleet_aliases):
+    """The incident: host:mac-studio-m3u under a spilling band went to ace-ai."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host:mac-studio-m3u")
+        res, spawned = _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
+                             spawn_paused="test")
+        assert kb.list_comments(conn, tid) == []
+    assert spawned == [] and res.placed == []
+    assert not res.placement_waits[tid].startswith("pin_unknown_host")

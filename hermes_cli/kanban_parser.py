@@ -135,6 +135,11 @@ _PIN_SUB_FALLBACK = _arg(
     help="With --pin-sub: when the pinned sub is capped/cooling, ride its family pool "
          "(bpx-N -> claude-bpr, apx-N -> claude-apr) instead of waiting.",
 )
+_FORCE_MODEL = _arg(
+    "--force-model", dest="force_model", metavar="REASON",
+    help="Pin a model id the lane's live model list does not know (normally refused with the "
+         "valid list; incident t_d564a8dd). Requires a non-empty reason, recorded as a comment.",
+)
 _ALLOW_FLAGSHIP = _arg(
     "--allow-flagship", "--firepower", dest="allow_flagship", metavar="REASON",
     help="Allow an orchestrator-only flagship model for this task. Requires a non-empty "
@@ -306,6 +311,7 @@ _SPECS = [
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
         _ALLOW_FLAGSHIP,
+        _FORCE_MODEL,
         _PIN_SUB,
         _PIN_SUB_FALLBACK,
         _arg("--reasoning", "--effort", dest="reasoning_effort", metavar="LEVEL",
@@ -420,6 +426,7 @@ _SPECS = [
         _arg("--allow-flagship", "--firepower", dest="allow_flagship", metavar="REASON",
              help="Allow an orchestrator-only flagship model. Requires a non-empty "
                   "reason, recorded as a task comment. --firepower is an alias."),
+        _FORCE_MODEL,
         _PIN_SUB,
         _PIN_SUB_FALLBACK,
         _group(
@@ -469,8 +476,19 @@ _SPECS = [
         _arg("--placement", action="store_true",
              help="Read-only pool placement view: band, streak and projected() per host, "
                   "and the rung take() would pick now (no probe, no streak advance)"),
+        _arg("--fleet", action="store_true",
+             help="With --placement: the fleet view (alias of `kanban placement --fleet`)"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
     ], aliases=["diag"], help="List active diagnostics on the current board"),
+    _cmd("placement", [
+        _arg("task_id", nargs="?", help="One card: its Placement block only"),
+        _arg("--fleet", action="store_true",
+             help="Per host in ladder order: running/slots/band/pressure and the cards there, "
+                  "then held cards by reason code (every board, read-only)"),
+        _arg("--gate", metavar="PATH",
+             help="Read this load_gate.json instead of <root>/load_gate.json"),
+        _json_flag(help="Emit the dict the text is printed from"),
+    ], help="Where cards run and why they wait (read-only; no probe)"),
     # rehome (t_808bc8e6)
     _cmd("rehome", [
         _arg("task_id"),
@@ -597,6 +615,7 @@ _SPECS = [
         _arg("--clear-model", action="store_true", dest="clear_model",
              help="Clear the per-task model override (revert to the assignee profile default). "
                   "Mutually exclusive with --model."),
+        _FORCE_MODEL,
         _arg("--session", metavar="SESSION_ID",
              help="(Re)stamp the card's home session ('none' = unstamped)."),
         _group(

@@ -32,9 +32,10 @@ _PROBE_TIMEOUT_SECONDS = 8
 _log = logging.getLogger(__name__)
 
 
-def placement_env(host: PoolHost, workspace: str) -> Dict[str, str]:
+def placement_env(host: PoolHost, workspace: str, *, run_id: Optional[int] = None,
+                  log_file: Optional[str] = None) -> Dict[str, str]:
     """The ``TERMINAL_*`` values a spilled worker's tools must run under."""
-    return {
+    values = {
         "TERMINAL_ENV": "ssh",
         "TERMINAL_SSH_HOST": host.ssh_host,
         "TERMINAL_SSH_USER": host.ssh_user,
@@ -45,10 +46,20 @@ def placement_env(host: PoolHost, workspace: str) -> Dict[str, str]:
         # profile from a tree another profile wrote.
         "TERMINAL_SSH_SYNC_FILES": "false",
     }
+    # N workers placed on one host in one tick shared one ControlMaster socket
+    # and raced to create it; the loser printed "ControlSocket ... already
+    # exists" into its tool output (t_3d487402). One socket per run.
+    if run_id is not None:
+        values["TERMINAL_SSH_CONTROL_SCOPE"] = f"run{int(run_id)}"
+    # ssh's own diagnostics go to the worker's run log, never a tool result.
+    if log_file:
+        values["TERMINAL_SSH_LOG_FILE"] = str(log_file)
+    return values
 
 
-def apply_placement(env: Dict[str, str], host: PoolHost, workspace: str) -> Dict[str, str]:
-    values = placement_env(host, workspace)
+def apply_placement(env: Dict[str, str], host: PoolHost, workspace: str, *,
+                    run_id: Optional[int] = None, log_file: Optional[str] = None) -> Dict[str, str]:
+    values = placement_env(host, workspace, run_id=run_id, log_file=log_file)
     env.update(values)
     env[PLACEMENT_ENV] = json.dumps({"host": host.name, "env": values}, sort_keys=True)
     return values

@@ -416,6 +416,12 @@ def render_last_turn_record(rec: Dict[str, Any], compressions: "int | None" = No
     _prov = (rec.get("provider") or "").strip()
     _model_disp = f"{_prov}/{_model}" if _prov and _model != "—" else _model
     lines.append(f"• Model: {_model_disp}")
+    # Reasoning EFFORT the turn ran at (not the token count): the resolved
+    # label the ledger writer recorded (t_09a1e42a). The slot is always
+    # rendered — a NULL (pre-column row, or a turn that carried no reasoning
+    # config) shows "—" so a missing value is visible, never silently absent.
+    _effort = str(rec.get("reasoning_effort") or "").strip()
+    lines.append(f"• Reasoning: {_effort or '—'}")
     # Proxy lanes (cpa) front several vendors behind one provider name; name the
     # vendor and upstream provider the served model came from (t_d59c7936).
     from agent.usage_pricing import VENDOR_ATTRIBUTION, attribute_route, proxy_lane

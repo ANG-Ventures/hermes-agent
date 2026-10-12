@@ -279,3 +279,65 @@ def test_raw_restamp_moves_home_at_next_commit(home):
     conn.close()
     assert _ids() == set()
     assert {t for _, t, _ in _ids((OTHER,))} == {tid}
+
+
+# A write_txn that writes nothing (the notifier's per-subscription claim, ~300
+# per tick on the live board) must not re-fingerprint every stamped card, and
+# the skip must never hide a write made by another connection (t_4a8f441c).
+def _ident_scans(conn):
+    hits = []
+    conn.set_trace_callback(lambda sql: hits.append(sql) if sql.startswith(hi._IDENT_SQL) else None)
+    return hits
+
+
+def test_noop_write_txn_skips_the_identity_scan(home):
+    hi.resync()
+    conn = _conn(home)
+    kb.create_task(conn, title="x", session_id=SID)
+    hits = _ident_scans(conn)
+    for _ in range(5):
+        with kb.write_txn(conn):
+            conn.execute("SELECT 1").fetchone()
+    conn.close()
+    assert hits == []
+
+
+def test_noop_write_txn_still_converges_another_connections_eventless_write(home):
+    hi.resync()
+    conn = _conn(home)
+    tid = kb.create_task(conn, title="x", session_id=SID)
+    with kb.write_txn(conn):
+        pass
+    raw = sqlite3.connect(home / "kanban.db")
+    raw.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+    raw.commit(); raw.close()
+    with kb.write_txn(conn):
+        pass
+    conn.close()
+    assert _ids() == {("default", tid, "blocked")}
+
+
+def test_own_eventless_write_converges_after_a_noop_memo(home):
+    hi.resync()
+    conn = _conn(home)
+    tid = kb.create_task(conn, title="old", session_id=SID)
+    with kb.write_txn(conn):
+        pass
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET title = 'new' WHERE id = ?", (tid,))
+    got = hi.open_cards([SID])
+    conn.close()
+    assert [(c["id"], c["title"]) for c in got] == [(tid, "new")]
+
+
+def test_uninstalled_index_never_fingerprints_the_board(home):
+    """No index file (the live Studio state on 2026-10-11): every commit used to
+    scan every stamped card only to return at the install check."""
+    conn = _conn(home)
+    kb.create_task(conn, title="x", session_id=SID)
+    hits = _ident_scans(conn)
+    kb.create_task(conn, title="y", session_id=SID)
+    with kb.write_txn(conn):
+        pass
+    conn.close()
+    assert hits == [] and not hi.index_path().is_file()

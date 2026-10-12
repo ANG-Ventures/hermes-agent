@@ -229,6 +229,13 @@ def _apply_rows(idx: sqlite3.Connection, slug: str, rows: Iterable[Sequence[Any]
     return n
 
 
+def _remember_seen(conn: sqlite3.Connection, seen: tuple[int, int]) -> None:
+    try:
+        conn._hermes_home_index_seen = seen  # type: ignore[attr-defined]
+    except AttributeError:
+        pass  # a bare sqlite3.Connection takes no attributes: no memo, full check
+
+
 def sync_after_commit(conn: sqlite3.Connection) -> int:
     """Mirror every card written since the board's watermark into the index.
 
@@ -239,16 +246,25 @@ def sync_after_commit(conn: sqlite3.Connection) -> int:
         slug = _board_slug_for(conn)
         if slug is None:
             return 0
+        # No board write since this connection last confirmed the index: skip
+        # the identity fingerprint (a full tasks scan, 43 ms at 7.5k stamped
+        # cards). data_version moves on any OTHER connection's commit,
+        # total_changes on this one's (t_4a8f441c: notifier claims that write
+        # nothing ran it ~300x per tick and pinned a gateway core).
+        seen = (conn.execute("PRAGMA data_version").fetchone()[0], conn.total_changes)
+        if getattr(conn, "_hermes_home_index_seen", None) == seen:
+            return 0
+        path = index_path()
+        if not path.is_file():
+            return 0  # not installed: the backfill creates it; nothing to fingerprint for
         file = conn.execute("PRAGMA database_list").fetchone()[2]
         top = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
         ident = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(_IDENT_SQL)}
         mark = (int(top), hash(frozenset(ident.items())))
         with _FLUSH_LOCK:
             if _FLUSHED.get(file) == mark:
+                _remember_seen(conn, seen)
                 return 0
-        path = index_path()
-        if not path.is_file():
-            return 0  # not installed: the backfill creates it
         idx = _open_rw(path)
         try:
             if not _is_backfilled(idx):
@@ -294,6 +310,7 @@ def sync_after_commit(conn: sqlite3.Connection) -> int:
             idx.close()
         with _FLUSH_LOCK:
             _FLUSHED[file] = mark
+        _remember_seen(conn, seen)
         return n
     except Exception as exc:  # the index is a mirror, never a gate
         logger.debug("kanban home index: sync skipped: %s", exc)

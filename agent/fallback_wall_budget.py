@@ -101,6 +101,28 @@ def note_lane_switch(agent: Any) -> None:
         st["lanes"] += 1
 
 
+def note_excused_wait(agent: Any, seconds: float) -> None:
+    """Credit the clock for a wait the upstream ASKED for, so it is not read as silence.
+
+    2026-10-11 16:37 PT: a relay deploy drain refused every request for 126 s with
+    ``503 draining-for-deploy`` + ``Retry-After``; the harness waited in place as
+    designed and this clock then posted "still waiting for a first reply: 124s" into a
+    healthy session. A drain (or any explicit retry-after hold) is the relay telling us
+    to wait, not the provider failing to answer. Moves ``started`` forward by the slept
+    seconds so ``elapsed``/``spent``/``notice_due`` all see only genuine silence.
+    No-op when nothing is armed."""
+    st = _state(agent)
+    if st is None:
+        return
+    try:
+        credit = float(seconds)
+    except (TypeError, ValueError):
+        return
+    if credit > 0:
+        st["started"] += credit
+        st["excused_s"] = st.get("excused_s", 0.0) + credit
+
+
 def elapsed(agent: Any, now: Optional[float] = None) -> Optional[float]:
     st = _state(agent)
     if st is None:

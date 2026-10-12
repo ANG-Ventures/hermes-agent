@@ -57,7 +57,8 @@ _BUILTIN_BACKENDS = "local, docker, singularity, modal, daytona, vercel_sandbox,
 # (key, default) literal is intentionally greppable; tools/terminal_tool.py keeps its own for the AST test.
 _SSH_KEYS = (("host", "ssh_host", ""), ("user", "ssh_user", ""), ("port", "ssh_port", 22),
              ("key", "ssh_key", ""), ("persistent", "ssh_persistent", False),
-             ("sync_files", "ssh_sync_files", True))
+             ("sync_files", "ssh_sync_files", True), ("control_scope", "ssh_control_scope", ""),
+             ("log_file", "ssh_log_file", ""))
 _RESOURCE_KEYS = (("cpu", "container_cpu", 1), ("memory", "container_memory", 5120),
                   ("disk", "container_disk", 51200), ("persistent_filesystem", "container_persistent", True))
 _CONTAINER_KEYS = (
@@ -207,7 +208,9 @@ def _build_ssh_env(*, cwd, timeout, ssh_config, probe_only=False, **_):
         raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
     return _SSHEnvironment(host=ssh_config["host"], user=ssh_config["user"], port=ssh_config.get("port", 22),
                            key_path=ssh_config.get("key", ""), cwd=cwd, timeout=timeout, probe_only=probe_only,
-                           sync_files=ssh_config.get("sync_files", True) is not False)
+                           sync_files=ssh_config.get("sync_files", True) is not False,
+                           control_scope=ssh_config.get("control_scope") or "",
+                           log_file=ssh_config.get("log_file") or "")
 
 
 def _build_plugin_env(*, env_type, image, cwd, timeout, cc, task_id, **_):

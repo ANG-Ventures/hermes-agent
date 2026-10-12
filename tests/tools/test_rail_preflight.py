@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import socket
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -144,9 +145,26 @@ def test_unplaced_sandbox_failure_keeps_generic_error(monkeypatch):
     ("ws://127.0.0.1:9222", ("http", "http://127.0.0.1:9222/json/version")),
     ("ws://127.0.0.1:9222/devtools/browser/abc", ("tcp", ("127.0.0.1", 9222))),
     ("ws://127.0.0.1:3000/cdp-proxy", ("tcp", ("127.0.0.1", 3000))),
+    ("ws://127.0.0.1:3000/", ("tcp", ("127.0.0.1", 3000))),  # resolver passes a root-path WS URL through
+    ("127.0.0.1:9222", ("http", "http://127.0.0.1:9222/json/version")),
 ])
 def test_probe_follows_resolver_discovery_semantics(url, expect):
     assert rp._probe_target(url) == expect
+
+
+@pytest.mark.parametrize("url", ["ws://127.0.0.1:3000/", "ws://127.0.0.1:9222", "http://127.0.0.1:9222/session",
+                                 "ws://127.0.0.1:9222/devtools/browser/abc", "wss://127.0.0.1:443/x"])
+def test_probe_discovers_exactly_when_the_resolver_does(url, monkeypatch):
+    # Contract between the two: the probe hits HTTP discovery iff _resolve_cdp_override would.
+    import requests
+    from tools import browser_tool_cdp as cdp
+    seen = []
+    monkeypatch.setattr(requests, "get", lambda u, **kw: seen.append(u) or (_ for _ in ()).throw(requests.ConnectionError()))
+    cdp._resolve_cdp_override(url)
+    kind, target = rp._probe_target(url)
+    assert (kind == "http") == bool(seen)
+    if seen:
+        assert target == seen[0]
 
 
 def test_unplaced_linux_worker_keeps_its_own_screen(monkeypatch):
@@ -156,24 +174,160 @@ def test_unplaced_linux_worker_keeps_its_own_screen(monkeypatch):
     assert rp.screen_rail_error() is None
 
 
-def test_computer_use_placed_worker_gets_screen_message(monkeypatch):
+EXPECTED_SCREEN = (
+    "SCREEN_RAIL_ABSENT: no screen session on {host}. This card needs Ace's logged-in screen session, "
+    "which lives only on the Mac Studio. Add the line `host: studio` to the card body (or "
+    "`requires: browser-session` once the affinity spec lands) and re-run; do not retry here."
+)
+
+
+def _computer_use(monkeypatch, *, backend_error=None, screen_up=None, backend_exc=None):
+    """handle_computer_use with the lease/screen start stubbed and the backend either failing or working."""
+    import contextlib
+    from tools.bot_desktop import lease, runtime as bd
+    from tools.computer_use import tool as cu
+    monkeypatch.setattr(lease, "assert_agent_may_act", lambda: SimpleNamespace(epoch=0))
+    monkeypatch.setattr(lease, "get", lambda: SimpleNamespace(epoch=0))
+    monkeypatch.setattr(bd, "ensure_started_for_tool", lambda: None)
+    if screen_up is None:
+        screen_up = backend_error is None
+
+    def placement():
+        if not screen_up:
+            raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+        return "terminal"
+    monkeypatch.setattr(bd, "tool_placement", placement)
+    calls = []
+
+    class _Backend:
+        def __getattr__(self, name):
+            def op(*a, **k):
+                calls.append(name)
+                return {"ok": True}
+            return op
+
+    @contextlib.contextmanager
+    def backend_for_call(session_id=""):
+        if backend_exc is not None:
+            raise backend_exc
+        if backend_error:
+            raise RuntimeError(backend_error)
+        yield _Backend()
+    monkeypatch.setattr(cu, "_backend_for_call", backend_for_call)
+    out = cu.handle_computer_use({"action": "list_apps"})
+    return (json.loads(out) if isinstance(out, str) else out), calls
+
+
+def test_computer_use_placed_worker_with_own_desktop_keeps_working(monkeypatch):
+    # ace-ai's Bot Desktop inside the ssh sandbox is the worker's own screen: never a rail refusal.
     _worker(monkeypatch)
     monkeypatch.setattr(sys, "platform", "linux")
     _placed(monkeypatch, "ace-ai")
-    from tools.computer_use.tool import handle_computer_use
-    out = json.loads(handle_computer_use({"action": "capture"}))
-    assert out["error"] == (
-        "SCREEN_RAIL_ABSENT: no screen session on ace-ai. This card needs Ace's logged-in screen session, "
-        "which lives only on the Mac Studio. Add the line `host: studio` to the card body (or "
-        "`requires: browser-session` once the affinity spec lands) and re-run; do not retry here."
-    )
+    out, calls = _computer_use(monkeypatch)
+    assert "RAIL_ABSENT" not in json.dumps(out)
+    assert calls, "the backend was reached"
+    assert rp.take_rail_absent() is None
 
 
-def test_computer_use_placed_worker_on_macos_still_refused(monkeypatch):
+def test_computer_use_placed_worker_without_desktop_gets_screen_message(monkeypatch):
     _worker(monkeypatch)
-    monkeypatch.setattr(sys, "platform", "darwin")
-    _placed(monkeypatch, "ci-box")
-    assert rp.screen_rail_error().startswith("SCREEN_RAIL_ABSENT: no screen session on ci-box.")
+    monkeypatch.setattr(sys, "platform", "linux")
+    _placed(monkeypatch, "ace-ai")
+    out, _ = _computer_use(monkeypatch, backend_error="Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+    assert out["error"] == EXPECTED_SCREEN.format(host="ace-ai")
+    assert "Xvnc" in out["detail"]
+    assert rp.take_rail_absent() == EXPECTED_SCREEN.format(host="ace-ai")
+
+
+def test_computer_use_placed_worker_non_screen_failure_keeps_its_own_error(monkeypatch):
+    # The pool-host desktop is up; a missing cua-driver is not a missing screen.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-ai")
+    out, _ = _computer_use(monkeypatch, backend_error="cua-driver missing", screen_up=True)
+    assert out["error"] == "computer_use backend unavailable: cua-driver missing"
+    assert rp.take_rail_absent() is None
+
+
+def test_computer_use_unplaced_backend_failure_keeps_generic_error(monkeypatch):
+    _worker(monkeypatch)
+    out, _ = _computer_use(monkeypatch, backend_error="cua-driver missing")
+    assert out["error"] == "computer_use backend unavailable: cua-driver missing"
+    assert rp.take_rail_absent() is None
+
+
+def test_background_cleanup_failure_never_queues_a_rail(monkeypatch):
+    # The inactivity janitor's ``close`` hits the same preflight; only an active tool call may park.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-media")
+    from tools import browser_tool_session as bts
+    from tools.bot_desktop import runtime as bd
+
+    def refused():
+        raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+    monkeypatch.setattr(bd, "tool_placement", refused)
+    from tools import browser_tool as bt
+    from tools.browser_tool_lifecycle import _cleanup_single_browser_session
+    closed = []
+    real = bts._run_browser_command
+    monkeypatch.setattr(bts, "_run_browser_command", lambda *a, **k: closed.append(real(*a, **k)) or closed[-1])
+    monkeypatch.setitem(bt._active_sessions, "rail-janitor", {"session_name": "rail-janitor", "features": {}})
+    _cleanup_single_browser_session("rail-janitor")
+    assert closed and closed[0]["error"] == EXPECTED_BROWSER.format(host="ace-media")
+    assert rp.take_rail_absent() is None
+
+
+def test_vault_tool_direct_browser_command_queues_rail(monkeypatch):
+    # browser_vault calls _run_browser_command directly (no _fallback_call): its rail must still park.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-media")
+    from tools import browser_tool_session as bts
+    from tools.bot_desktop import runtime as bd
+
+    def refused():
+        raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+    monkeypatch.setattr(bd, "tool_placement", refused)
+    bts._run_browser_command("rail", "eval", ["1"])
+    assert rp.take_rail_absent() == EXPECTED_BROWSER.format(host="ace-media")
+
+
+def test_active_browser_tool_call_with_sandbox_failure_queues_rail(monkeypatch):
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-media")
+    from tools.bot_desktop import runtime as bd
+
+    def refused():
+        raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+    monkeypatch.setattr(bd, "tool_placement", refused)
+    out = _navigate(monkeypatch, "")
+    assert out["error"] == EXPECTED_BROWSER.format(host="ace-media")
+    assert rp.take_rail_absent() == EXPECTED_BROWSER.format(host="ace-media")
+
+
+def test_adapter_that_drops_the_error_still_queues_rail(monkeypatch):
+    # browser_console swallows per-command failures; the rail must still park the card.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-media")
+    from tools.bot_desktop import runtime as bd
+    from tools.registry import registry
+    import model_tools  # noqa: F401
+
+    def refused():
+        raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+    monkeypatch.setattr(bd, "tool_placement", refused)
+    registry.dispatch("browser_console", {}, task_id="rail")
+    assert rp.take_rail_absent() == EXPECTED_BROWSER.format(host="ace-media")
+
+
+def test_browser_cdp_on_placed_worker_uses_dispatcher_side_liveness(monkeypatch):
+    # browser_cdp connects from the dispatcher process: a placed worker's loopback CDP IS the Studio's.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-ai")
+    _cdp_requests(monkeypatch, answers=True)
+    assert rp.browser_rail_error("http://127.0.0.1:9222", host_side=True) is None
+    _cdp_requests(monkeypatch, answers=False)
+    rp._probe_ok.clear()
+    monkeypatch.setattr(socket, "gethostname", lambda: "mac-studio-m3u")
+    assert rp.browser_rail_error("http://127.0.0.1:9222", host_side=True) == EXPECTED_BROWSER.format(host="mac-studio-m3u")
 
 
 def test_pending_rail_is_drained_only_by_its_owning_worker(monkeypatch):
@@ -262,3 +416,66 @@ def test_tool_round_breaks_on_rail_absent_instead_of_retrying(monkeypatch):
     assert v._turn_exit_reason == "rail_absent"
     assert parked == [EXPECTED_BROWSER.format(host="ace-ai")]
     assert v.final_response == parked[0]
+
+
+# ── t_08423f24: the private (bounded/unrestricted) cua-driver daemon is a host process ──────────────
+def _private_daemon_start(monkeypatch, tmp_path, mode, *, placed):
+    """CuaDriverBackend(mode).start() through the REAL placement resolution (KANBAN_WORKER_PLACEMENT ->
+    TERMINAL_ENV=ssh, as on a pool host), recording any local daemon spawn instead of running it."""
+    from unittest.mock import Mock
+    import pm
+    from tools.computer_use import cua_backend, cua_backend_daemon
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"version": 2}', encoding="utf-8")
+    monkeypatch.setattr(cua_backend, "_computer_use_cfg",
+                        lambda: {"permission_mode": "bounded", "capability_manifest": str(manifest)})
+    monkeypatch.setenv("TERMINAL_ENV", "ssh" if placed else "local")
+    if placed:
+        _placed(monkeypatch, "ace-ai")
+        # The pool host's screen is up, so the MCP proxy itself would already go over ssh.
+        monkeypatch.setattr(cua_backend, "sandbox_mcp_invocation",
+                            lambda: (("ssh", ["kanbanw@ace-ai", "cua-driver", "mcp"]), {"PATH": ""}))
+    else:
+        monkeypatch.setattr(cua_backend, "sandbox_mcp_invocation", lambda: None)
+        monkeypatch.setattr(cua_backend, "cua_driver_runtime_contract_status", lambda: {"ready": True})
+        monkeypatch.setenv("HERMES_CUA_DRIVER_CMD", "/opt/cua-driver")
+    monkeypatch.setattr(sys, "platform", "linux")  # plain `serve` argv, no CuaDriver.app codesign probe
+    monkeypatch.setattr(pm, "ensure_import", lambda *a, **k: None)
+    monkeypatch.setattr(cua_backend, "_cua_no_overlay", lambda: False)
+    monkeypatch.setattr(cua_backend_daemon._driver, "resolve_cua_driver_cmd", lambda: "/opt/cua-driver")
+    monkeypatch.setattr(cua_backend_daemon._driver, "_resolve_mcp_invocation", lambda c: (c, ["mcp"]))
+    popen = Mock(side_effect=OSError("recorded: private daemon spawn on this host"))
+    monkeypatch.setattr(cua_backend_daemon.subprocess, "Popen", popen)
+    backend = cua_backend.CuaDriverBackend(permission_mode=mode)
+    monkeypatch.setattr(backend._session, "start", lambda: None)
+    with pytest.raises(Exception) as exc:
+        backend.start()
+    return popen, exc.value
+
+
+@pytest.mark.parametrize("mode", ["bounded", "unrestricted"])
+def test_placed_worker_never_starts_the_private_daemon_on_the_dispatcher(monkeypatch, tmp_path, mode):
+    # Red on base: `serve --embedded` (macOS: `open -a CuaDriver.app --args serve ...`) ran on the
+    # dispatcher, so a placed worker's computer_use drove the operator's screen, not ace-ai's.
+    _worker(monkeypatch)
+    from tools.computer_use.cua_backend_daemon import PrivateDaemonOffScreen
+    popen, exc = _private_daemon_start(monkeypatch, tmp_path, mode, placed=True)
+    assert popen.call_count == 0, f"private daemon spawned on the dispatcher: {popen.call_args}"
+    assert isinstance(exc, PrivateDaemonOffScreen)
+
+
+def test_unplaced_bounded_worker_still_starts_its_private_daemon(monkeypatch, tmp_path):
+    _worker(monkeypatch)
+    popen, _ = _private_daemon_start(monkeypatch, tmp_path, "bounded", placed=False)
+    assert popen.call_count == 1 and popen.call_args.args[0][:2] == ["/opt/cua-driver", "serve"]
+
+
+def test_computer_use_placed_private_daemon_refusal_is_the_screen_rail(monkeypatch):
+    # The pool host's desktop is up, yet the private daemon cannot live there: park SCREEN_RAIL_ABSENT.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-ai")
+    from tools.computer_use.cua_backend_daemon import PrivateDaemonOffScreen
+    out, _ = _computer_use(monkeypatch, screen_up=True, backend_exc=PrivateDaemonOffScreen("off-screen host"))
+    assert out["error"] == EXPECTED_SCREEN.format(host="ace-ai")
+    assert out["detail"] == "off-screen host"
+    assert rp.take_rail_absent() == EXPECTED_SCREEN.format(host="ace-ai")

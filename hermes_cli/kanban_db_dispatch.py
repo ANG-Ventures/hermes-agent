@@ -304,6 +304,9 @@ class DispatchResult:
     without changing its route: ``{"warn": <payload>}`` (warn mode),
     ``{"unknown": <word>}``, ``{"action": "needs_input"}`` (a pool pin that
     lacks a hard requirement), and ``"_map_error"`` -> the map problem."""
+    unknown_pins: dict = field(default_factory=dict)
+    """task id -> the ``host:`` word that names no host (t_cb2b888d): the card
+    is held local-only and gets one latched comment per (task, word)."""
     spawn_paused: Optional[str] = None
     """Non-None when this tick RECLAIMED but deliberately spawned nothing —
     the gateway's load gate (``kanban.dispatch_load_gate``) held the host was
@@ -1459,6 +1462,12 @@ def _error_fingerprint(error_text: str) -> str:
 # nor extend it. Per-task ``max_retries`` overrides it.
 _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 
+# Provider REJECTIONS (HTTP 4xx from the model provider) count as failures and
+# block the card after this many in a row (t_d564a8dd). Separate from
+# ``failure_limit`` so an operator's dispatcher setting of 1 or 5 does not
+# change how many identical 404s a dead pin is allowed.
+_PROVIDER_REJECTED_FAILURE_LIMIT = 3
+
 # Closed runs to walk when counting the streak; it trips at a handful anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
@@ -1940,12 +1949,26 @@ def detect_crashed_workers(
             rate_limited_exit = False
             cohort_death = row["id"] in cohort_ids
             stderr_exit_class = None
+            provider_rejected_line = None
             if kind == "nonzero_exit" and not cohort_death:
                 stderr_exit_class = _kb._stderr_cooldown_class(
                     _kb._worker_log_run_segment(row["id"], board=board)
                 )
                 if stderr_exit_class is not None:
                     kind = "rate_limited"
+            if kind == "rate_limited" and not cohort_death:
+                # The worker said "wall", but its own last lines carry the provider's
+                # verdict. A 400/401/403/404 is a REJECTION (dead model id, bad
+                # credential): the same answer on every retry, so it is a failure
+                # that counts, never a requeue-without-a-strike (t_d564a8dd: 24 such
+                # exits booked ``rate_limited`` for 8 h). 429/503/529 stay a wall.
+                from hermes_cli.kanban_worker_exit import provider_rejected_status
+
+                provider_rejected_line = provider_rejected_status(
+                    _kb._worker_log_run_segment(row["id"], board=board)
+                )
+                if provider_rejected_line:
+                    kind = "provider_rejected"
             if cohort_death:
                 protocol_violation = False
                 error_text = (
@@ -2094,6 +2117,21 @@ def detect_crashed_workers(
                 stderr_tail = _kb._worker_log_stderr_tail(row["id"], board=board)
                 if stderr_tail:
                     event_payload["stderr_tail"] = stderr_tail
+            elif kind == "provider_rejected":
+                protocol_violation = False
+                error_text = (
+                    f"pid {pid} exited on a provider rejection — {provider_rejected_line}; "
+                    f"counts as a failure (a 4xx answers the same way on every retry)"
+                )
+                event_kind = "provider_rejected"
+                event_payload = {
+                    "pid": pid, "claimer": row["claim_lock"], "exit_kind": kind,
+                    "exit_code": code, "provider_status": provider_rejected_line,
+                    "provider_rejected": True,
+                }
+                stderr_tail = _kb._worker_log_stderr_tail(row["id"], board=board)
+                if stderr_tail:
+                    event_payload["stderr_tail"] = stderr_tail
             elif kind == "terminal_provider":
                 # EX_CONFIG (upstream 2b94b0d40f): the provider rejected this
                 # profile's credential or model — retrying cannot help, so the
@@ -2155,6 +2193,8 @@ def detect_crashed_workers(
                     _run_outcome = "cohort_death"
                 elif kind == "infra_unavailable":
                     _run_outcome = "infra_unavailable"
+                elif kind == "provider_rejected":
+                    _run_outcome = "provider_rejected"
                 elif rate_limited_exit:
                     _run_outcome = "rate_limited"
                 else:
@@ -2316,6 +2356,26 @@ def detect_crashed_workers(
                     release_claim=False,
                     end_run=False,
                     event_payload_extra=violation_extra,
+                )
+                if tripped:
+                    auto_blocked.append(tid)
+                continue
+            if "exited on a provider rejection" in error_text:
+                # Three identical rejections → blocked with a typed ``capability`` block
+                # (sticky; fires ``kanban_task_blocked`` → owner wake). Below that, a
+                # counted failure the respawn guard spaces like any crash.
+                _rej_streak = _kb._provider_rejected_streak(conn, tid)
+                tripped = _record_task_failure(
+                    conn, tid,
+                    error=error_text,
+                    outcome="provider_rejected",
+                    failure_limit=_PROVIDER_REJECTED_FAILURE_LIMIT,
+                    force_trip=_rej_streak >= _PROVIDER_REJECTED_FAILURE_LIMIT,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={"pid": pid, "claimer": claimer, "provider_rejected": True,
+                                         "provider_rejected_streak": _rej_streak},
+                    block_kind="capability" if _rej_streak >= _PROVIDER_REJECTED_FAILURE_LIMIT else None,
                 )
                 if tripped:
                     auto_blocked.append(tid)
@@ -2533,14 +2593,17 @@ def _record_task_failure(
                 )
             else:
                 # Timeout/crash path: source phase already restored with claim
-                # cleared; just flip to blocked + update
-                # counter fields. No current timeout/crash caller supplies a
-                # typed ``block_kind``; typed auto-blocking is a spawn path.
+                # cleared; just flip to blocked + update counter fields. A typed
+                # ``block_kind`` (provider rejection streak) lands here too.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "UPDATE tasks SET status = ?, "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = COALESCE(?, block_kind), "
+                    "block_recurrences = CASE WHEN ? IS NULL "
+                    "THEN block_recurrences ELSE ? END "
                     "WHERE id = ? AND status IN ('ready', 'review', 'running')",
-                    (failures, error[:500], task_id),
+                    (_typed_status if _bk else "blocked",
+                     failures, error[:500], _bk, _bk, _recurrences, task_id),
                 )
             run_id = None
             if end_run:
@@ -3715,7 +3778,8 @@ _LINK_CHUNK = 250
 def _linked_ids(conn, ids, mode: Optional[str] = None) -> dict:
     """``{id: (kind, other_id)}`` for ids among ``ids`` whose links hold them
     local: ONE query per tick (bounded by the ready set), not one per row.
-    ``other_id`` is the far end of the first such link.
+    ``other_id`` is the far end of its lowest (parent_id, child_id) such
+    link, whatever the order or chunking of ``ids``.
 
     ``mode`` is ``kanban.placement.lineage_pins`` (None = read it): ``kinds``
     skips provenance-only kinds (``derived-from``); ``legacy`` counts every
@@ -3726,6 +3790,7 @@ def _linked_ids(conn, ids, mode: Optional[str] = None) -> dict:
         mode = _lineage_pins_mode()
     ids = list(ids)
     out: dict = {}
+    best: dict = {}
     # Each id is bound twice (parent + child): 250 ids = 500 variables, under
     # SQLite's historical 999 limit (SQLITE_MAX_VARIABLE_NUMBER < 3.32).
     for i in range(0, len(ids), _LINK_CHUNK):
@@ -3742,8 +3807,15 @@ def _linked_ids(conn, ids, mode: Optional[str] = None) -> dict:
                 kind = str(r[2])
             if mode != _pr.LINEAGE_PINS_LEGACY and kind in _pr.PROVENANCE_LINK_KINDS:
                 continue
-            out.setdefault(r[0], (kind, r[1]))
-            out.setdefault(r[1], (kind, r[0]))
+            # Keep the lowest (parent_id, child_id) edge across ALL chunks, not
+            # the first one seen: chunk membership follows ready-row order, and
+            # a reason that flips with it resets placement_wait ``since``
+            # (Prism 9457394f1922).
+            edge = (r[0], r[1])
+            for me, other in ((r[0], r[1]), (r[1], r[0])):
+                if me not in best or edge < best[me]:
+                    best[me] = edge
+                    out[me] = (kind, other)
     return out
 
 
@@ -3811,6 +3883,7 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                linked_ids: Optional[dict] = None,
                lineage_mode: Optional[str] = None,
                affinity_out: Optional[dict] = None,
+               unknown_out: Optional[dict] = None,
                caps=None, caps_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
@@ -3849,7 +3922,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     skills = tuple(s for s in skills if isinstance(s, str))
     manifest = _manifest_affinity(skills, assignee) if allowlisted and skills else {}
     targets = _manifest_targets(skills, assignee) if allowlisted and skills else {}
-    pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or ())
+    pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or (),
+                                    getattr(plan.config, "pin_aliases", None))
     verdict = None
     if caps is not None:
         from hermes_cli import kanban_host_capabilities as _khc
@@ -3907,6 +3981,12 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                 affinity_out[row["id"]] = _khc.affinity_payload(
                     verdict.pin, verdict, _khc.ENFORCE, host="|".join(verdict.only))
         return ("pin", pin) if route_class == "pin" else ("portable", None)
+    if rule == _pr.PIN_UNKNOWN_HOST:
+        # A host: line naming no host: local only, named, never spilled (t_cb2b888d).
+        if unknown_out is not None:
+            unknown_out[row["id"]] = ignored
+        return "local", _pr.pin_unknown_host(ignored, _kwp.pin_suggestions(
+            ignored, plan.config.hosts or (), getattr(plan.config, "pin_aliases", None)))
     if rule == _pr.LINKED and link is not None and lineage_mode != _pr.LINEAGE_PINS_LEGACY:
         rule = _pr.linked(*link)  # name the edge that holds it (t_ae87edff)
     if rule == _pr.HOST_REACH:
@@ -4039,7 +4119,7 @@ def _identity_only_unplanned(rows) -> dict:
         known = tuple(cfg.hosts or ()) or _kwp.known_host_ids(_kb.kanban_home() / "fleet")
         out = {}
         for r in rows:
-            pin, _ignored = _kwp.resolve_pin(r["body"], known)
+            pin, _ignored = _kwp.resolve_pin(r["body"], known, getattr(cfg, "pin_aliases", None))
             if pin == _kwp.PIN_STUDIO:
                 continue
             try:
@@ -4072,7 +4152,7 @@ def _capabilities_unplanned(rows, result) -> None:
         known = tuple(cfg.hosts or ()) or _kwp.known_host_ids(_kb.kanban_home() / "fleet")
         out: dict = {}
         for r in rows:
-            pin, _ignored = _kwp.resolve_pin(r["body"], known)
+            pin, _ignored = _kwp.resolve_pin(r["body"], known, getattr(cfg, "pin_aliases", None))
             try:
                 skills = tuple(s for s in (json.loads(r["skills"] or "[]") or []) if isinstance(s, str))
             except (TypeError, ValueError):
@@ -4621,6 +4701,7 @@ def _dispatch_once_locked(
         _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
                                          _lineage, result.placement_affinity,
+                                         result.unknown_pins,
                                          caps=_caps, caps_out=_caps_out)
                      for r in ready_rows}
         _caps_into_result(result, _caps, _caps_out)
@@ -4635,14 +4716,19 @@ def _dispatch_once_locked(
         # a ``host: <word>`` line is prose and the card runs locally.
         from hermes_cli import kanban_worker_pool as _kwp
         _known = None
+        _aliases = None
         for r in ready_rows:
             if _kwp.card_pin(r["body"]) is None:
                 continue
             if _known is None:
                 _known = _kwp.known_host_ids(_kb.kanban_home() / "fleet")
-            _pin, _ignored = _kwp.resolve_pin(r["body"], _known)
+                _aliases = _kwp.pin_aliases(_kb.kanban_home() / "fleet")
+            _pin, _ignored = _kwp.resolve_pin(r["body"], _known, _aliases)
             if _ignored is not None:
                 _kwp.note_ignored_pin(r["id"], _ignored)
+                if _pin is None:
+                    # No plan: it runs locally anyway, but still says so (t_cb2b888d).
+                    result.unknown_pins[r["id"]] = _ignored
             # Not ``elif``: a prose ``Host:`` line above a real pin returns
             # BOTH, and the pin must still wait (Prism 56085b64).
             if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
@@ -5163,6 +5249,46 @@ def _dispatch_once_locked(
             )
         return True
 
+    def invalid_pin_refused(task_id: str) -> bool:
+        """Park a card whose stored ``model_override`` names an id its lane does not serve.
+
+        The writers refuse such a pin at mint; this catches a row written by hand, or
+        before the writers validated (t_d564a8dd: ``claude-sonnet-4-8`` on claude-alr,
+        8 h of 404s booked as ``rate_limited``). A ``capability`` block fires the
+        ``kanban_task_blocked`` hook, so the owner is woken like any handback.
+        """
+        task = _kb.get_task(conn, task_id)
+        if task is None or not task.model_override:
+            return False
+        from hermes_cli.kanban_provider_health import model_override
+        from hermes_cli.model_registry import invalid_pin_reason
+
+        model, provider = model_override(task)
+        reason = invalid_pin_reason(provider, model)
+        if reason is None:
+            return False
+        # Prism 68402070f7c9 (hermes-agent#1903): a pin written with ``--force-model`` carries a
+        # ``model force: <provider>/<model> ...`` audit comment; honour it for THAT exact pair only,
+        # so a later re-pin to a different unknown id is still caught here.
+        if _kb.model_force_comment_present(conn, task_id, provider, model):
+            _kb._log.info("PHASE=kanban_model_override_forced task=%s provider=%s model=%s",
+                          task_id, provider, model)
+            return False
+        result.auto_blocked.append(task_id)
+        if dry_run:
+            return True
+        valid = ", ".join(_kb._model_registry_valid_ids(provider)) or "(unreadable)"
+        body = (
+            f"{reason}; the lane serves [{valid}]. Re-pin with "
+            f"`hermes kanban set-model {task_id} <model> --provider {provider}` "
+            f"(or --force-model <reason>), then unblock."
+        )
+        _kb._log.warning("PHASE=kanban_model_override_invalid task=%s provider=%s model=%s",
+                         task_id, provider, model)
+        if _kb.block_task(conn, task_id, reason=reason, kind="capability"):
+            _kb.add_comment(conn, task_id, "dispatcher", body)
+        return True
+
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -5196,7 +5322,8 @@ def _dispatch_once_locked(
             if spillover is not None:
                 result.placement_waits[row["id"]] = (
                     _route_wait(route, route_arg, False, spillover)
-                    or ("pin_host_full" if route == "pin" else spillover.full_reason())
+                    or ((spillover.pin_host_refusal(route_arg) or "pin_host_full")
+                        if route == "pin" else spillover.full_reason())
                 )
                 # Host-bound cards behind the wall still say why (t_3e6c9b2b).
                 for rest in ready_rows[row_index + 1:]:
@@ -5291,6 +5418,8 @@ def _dispatch_once_locked(
                 )
                 continue
         if flagship_refused(row["id"], row_assignee):
+            continue
+        if invalid_pin_refused(row["id"]):
             continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
@@ -5606,6 +5735,18 @@ def _dispatch_once_locked(
         _khc.record_capability_events(conn, result, _caps, _caps_out, _affinity_evaluated,
                                       _cap_comments)
     _record_placement_waits(conn, result, row_route, dry_run)
+    if not dry_run and result.placement_waits:
+        try:
+            from hermes_cli.kanban_drained_pin import notify_drained_pins
+            notify_drained_pins(conn, board, result.placement_waits, int(time.time()))
+        except Exception as exc:  # never break a dispatcher tick
+            _kb._log.warning("kanban drained-pin notify failed: %s", exc)
+    if not dry_run and result.unknown_pins:
+        try:
+            from hermes_cli.kanban_unknown_pin import comment_unknown_pins
+            comment_unknown_pins(conn, result.unknown_pins)
+        except Exception as exc:  # never break a dispatcher tick
+            _kb._log.warning("kanban unknown-pin comment failed: %s", exc)
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
@@ -5651,6 +5792,8 @@ def _dispatch_once_locked(
                 )
                 continue
         if flagship_refused(row["id"], row["assignee"]):
+            continue
+        if invalid_pin_refused(row["id"]):
             continue
         guard_detail = {}
         guard_reason = check_respawn_guard(
@@ -6496,7 +6639,9 @@ def _default_spawn(
         env[_khc.CAPS_ENV] = _khc.env_value(_khc.WARN, ())
     if placement is not None:
         _kb._kwh.prepare_remote_workspace(placement, workspace)
-        _kb._kwh.apply_placement(env, placement, workspace)
+        _kb._kwh.apply_placement(
+            env, placement, workspace, run_id=task.current_run_id,
+            log_file=str(_kb.worker_log_path(task.id, board=board)))
 
     cmd = [
         *_resolve_hermes_argv(),
