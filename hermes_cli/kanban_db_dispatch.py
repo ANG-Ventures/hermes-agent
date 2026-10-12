@@ -596,13 +596,18 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
     CURRENT run's segment counts: the log is append-mode across re-runs, and a
     previous run's ``rc=0`` trailer read for a live-but-misjudged worker booked
     13 still-running workers as clean-exit protocol violations on 2026-10-12
-    12:11 (t_5c37ab9d). No segment = no evidence.
+    12:11 (t_5c37ab9d). A log with no boundary (never stamped) keeps the
+    whole-tail read; an empty current segment is no evidence.
     """
     try:
-        raw = _kb._worker_log_run_segment(task_id, board=board)
+        raw = _kb.read_worker_log(task_id, tail_bytes=_kb._WORKER_LOG_SEGMENT_BYTES, board=board)
     except Exception:
         return None
-    matches = _EXIT_TRAILER_RE.findall(raw or "")
+    raw = raw or ""
+    boundary = raw.rfind(_kb._RUN_BOUNDARY_PREFIX)
+    if boundary >= 0:
+        raw = raw[boundary:]
+    matches = _EXIT_TRAILER_RE.findall(raw)
     return int(matches[-1]) if matches else None
 
 
