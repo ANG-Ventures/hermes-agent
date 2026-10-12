@@ -21,6 +21,14 @@ NATIVE_COMMAND = "native_command"
 HOST_STUDIO = "host_studio"
 STUDIO_BOUND_SKILL = "studio_bound_skill"
 HOST_REACH = "host_reach"  # host-bound card, no pool host with a proven ssh route (t_1e9ea7e9)
+# A host: line that resolves to no host (t_cb2b888d): held local, never spilled.
+PIN_UNKNOWN_HOST = "pin_unknown_host"
+
+
+def pin_unknown_host(word: str, suggestions=()) -> str:
+    """``pin_unknown_host:<word>`` plus `` (did you mean: a, b)``."""
+    tail = f" (did you mean: {', '.join(suggestions)})" if suggestions else ""
+    return f"{PIN_UNKNOWN_HOST}:{word}{tail}"
 
 # The task_event that records why a ready card was held this tick.
 PLACEMENT_WAIT_EVENT = "placement_wait"

@@ -299,6 +299,9 @@ class DispatchResult:
     placement_affinity: dict = field(default_factory=dict)
     """task id -> ``{host, rule, matched_by}`` for ready cards whose work is
     bound to one host's state (t_3e6c9b2b): they run there or wait, never spill."""
+    unknown_pins: dict = field(default_factory=dict)
+    """task id -> the ``host:`` word that names no host (t_cb2b888d): the card
+    is held local-only and gets one latched comment per (task, word)."""
     spawn_paused: Optional[str] = None
     """Non-None when this tick RECLAIMED but deliberately spawned nothing —
     the gateway's load gate (``kanban.dispatch_load_gate``) held the host was
@@ -3814,7 +3817,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                native_cache: Optional[dict] = None,
                linked_ids: Optional[dict] = None,
                lineage_mode: Optional[str] = None,
-               affinity_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+               affinity_out: Optional[dict] = None,
+               unknown_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
 
@@ -3854,11 +3858,18 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         skills=skills, pool=plan.config,
         native_command=native, manifest=manifest, targets=targets,
     )
-    pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or ())
+    pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or (),
+                                    getattr(plan.config, "pin_aliases", None))
     if ignored is not None:
         _kwp.note_ignored_pin(row["id"], ignored)
     if ok:
         return ("pin", pin) if route_class == "pin" else ("portable", None)
+    if rule == _pr.PIN_UNKNOWN_HOST:
+        # A host: line naming no host: local only, named, never spilled (t_cb2b888d).
+        if unknown_out is not None:
+            unknown_out[row["id"]] = ignored
+        return "local", _pr.pin_unknown_host(ignored, _kwp.pin_suggestions(
+            ignored, plan.config.hosts or (), getattr(plan.config, "pin_aliases", None)))
     if rule == _pr.LINKED and link is not None and lineage_mode != _pr.LINEAGE_PINS_LEGACY:
         rule = _pr.linked(*link)  # name the edge that holds it (t_ae87edff)
     if rule == _pr.HOST_REACH:
@@ -4412,7 +4423,8 @@ def _dispatch_once_locked(
         _lineage = _lineage_pins_mode()  # kanban.placement.lineage_pins, per tick
         _linked = _linked_ids(conn, [r["id"] for r in ready_rows], _lineage)
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
-                                         _lineage, result.placement_affinity)
+                                         _lineage, result.placement_affinity,
+                                         result.unknown_pins)
                      for r in ready_rows}
         _affinity_evaluated = [r["id"] for r in ready_rows]
         _rank = {"pin": 0, "wait": 1, "local": 1, "portable": 2}
@@ -4425,14 +4437,19 @@ def _dispatch_once_locked(
         # a ``host: <word>`` line is prose and the card runs locally.
         from hermes_cli import kanban_worker_pool as _kwp
         _known = None
+        _aliases = None
         for r in ready_rows:
             if _kwp.card_pin(r["body"]) is None:
                 continue
             if _known is None:
                 _known = _kwp.known_host_ids(_kb.kanban_home() / "fleet")
-            _pin, _ignored = _kwp.resolve_pin(r["body"], _known)
+                _aliases = _kwp.pin_aliases(_kb.kanban_home() / "fleet")
+            _pin, _ignored = _kwp.resolve_pin(r["body"], _known, _aliases)
             if _ignored is not None:
                 _kwp.note_ignored_pin(r["id"], _ignored)
+                if _pin is None:
+                    # No plan: it runs locally anyway, but still says so (t_cb2b888d).
+                    result.unknown_pins[r["id"]] = _ignored
             # Not ``elif``: a prose ``Host:`` line above a real pin returns
             # BOTH, and the pin must still wait (Prism 56085b64).
             if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
@@ -5387,6 +5404,12 @@ def _dispatch_once_locked(
             notify_drained_pins(conn, board, result.placement_waits, int(time.time()))
         except Exception as exc:  # never break a dispatcher tick
             _kb._log.warning("kanban drained-pin notify failed: %s", exc)
+    if not dry_run and result.unknown_pins:
+        try:
+            from hermes_cli.kanban_unknown_pin import comment_unknown_pins
+            comment_unknown_pins(conn, result.unknown_pins)
+        except Exception as exc:  # never break a dispatcher tick
+            _kb._log.warning("kanban unknown-pin comment failed: %s", exc)
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after

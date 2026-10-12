@@ -84,6 +84,12 @@ HOST_PIN_RE = re.compile(r"^[ \t]*host:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*\
 PIN_ANY = "any"
 PIN_STUDIO = "studio"
 STUDIO_HOST = "mac-studio"
+# Words that name the dispatcher's own machine (resolve to PIN_STUDIO); the
+# live ``socket.gethostname()`` short form joins them at call time.
+_STUDIO_PIN_WORDS = frozenset({PIN_STUDIO, STUDIO_HOST, "local"})
+# Per-host alias source (t_cb2b888d): ``hosts.<id>.{ssh_alias, host_label,
+# transport}``; ``transport: local`` is the dispatcher's own machine.
+CI_HOSTS_FILE = "ci-hosts.json"
 
 # Card-body signals that the work needs the Studio's signed-in browser or GUI
 # session (card t_3e6c9b2b; incident t_79436ebf placed a ":9222/:9224 on the
@@ -151,6 +157,8 @@ class PoolConfig:
     # a word-shaped alias (ci, ai, media) binds a card only if listed here.
     # None = unknown (unread / unreadable): fail closed, the check is skipped.
     ssh_hosts: Optional[frozenset] = None
+    # ``{alias: canonical pin}`` from :func:`pin_aliases` (t_cb2b888d).
+    pin_aliases: Mapping[str, str] = field(default_factory=dict)
 
 
 # -- registry ---------------------------------------------------------------
@@ -333,6 +341,7 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         pool_hosts=tuple(hosts), disabled=tuple(disabled), warnings=tuple(warnings),
         reach=reach, reach_aliases=aliases, reach_status=reach_status,
         ssh_hosts=known_ssh_hosts(fleet_dir),
+        pin_aliases=pin_aliases(fleet_dir),
     )
 
 
@@ -636,23 +645,97 @@ def card_pin(body: Optional[str]) -> Optional[str]:
     return m.group(1).lower() if m else None
 
 
-def resolve_pin(body: Optional[str], known_hosts: Iterable[str]) -> Tuple[Optional[str], Optional[str]]:
-    """``(pin, ignored)``. A pin is ONLY ``any``, ``studio`` or a host id the
-    pool registry knows; any other ``host: <word>`` line (an HTTP header, a
-    config snippet) is prose: ``pin`` None, the word returned as ``ignored``.
-    So a card never waits on a host that does not exist."""
+def resolve_pin(body: Optional[str], known_hosts: Iterable[str],
+                aliases: Optional[Mapping[str, str]] = None) -> Tuple[Optional[str], Optional[str]]:
+    """``(pin, ignored)``. A pin is ``any``, the Studio (``studio``,
+    ``mac-studio``, ``local``, this machine's short hostname) or a host the
+    pool registry knows, by id or by an alias in ``aliases`` (``{word:
+    canonical}``, :func:`pin_aliases`); the CANONICAL pin is returned. Any
+    other ``host: <word>`` line is not a pin: ``pin`` None, the word
+    returned as ``ignored``. A caller treats ``(None, word)`` as an UNKNOWN
+    pin (t_cb2b888d): held local, never portable."""
     known = {h.lower() for h in (known_hosts or ())}
+    alias_map = {k.lower(): v for k, v in (aliases or {}).items()}
+    studio = _studio_words()
     ignored: Optional[str] = None
     # Every line-anchored host: line, in order: prose lines (an HTTP header
     # pasted above the real pin) are skipped, the first REAL pin wins
     # (Prism r8 "skip prose host lines before choosing the effective pin").
     for m in HOST_PIN_RE.finditer(body or ""):
         raw = m.group(1).lower()
-        if raw in (PIN_ANY, PIN_STUDIO) or raw in known:
+        if raw == PIN_ANY or raw in known:
             return raw, ignored
+        if raw in studio:
+            return PIN_STUDIO, ignored
+        if raw in alias_map:
+            return alias_map[raw], ignored
         if ignored is None:
             ignored = raw
     return None, ignored
+
+
+def _studio_words() -> frozenset:
+    """Words for the dispatcher's own machine: the constants plus the live
+    ``socket.gethostname()`` short form, lower-cased."""
+    import socket
+    try:
+        short = socket.gethostname().split(".", 1)[0].strip().lower()
+    except OSError:
+        short = ""
+    return _STUDIO_PIN_WORDS | ({short} if short else set())
+
+
+def pin_aliases(fleet_dir: Path) -> Dict[str, str]:
+    """``{alias: canonical pin}`` from the registry (t_cb2b888d), the ONE
+    alias source. For every host the pool files know (:func:`known_host_ids`)
+    and every ``ci-hosts.json`` row: the id, its ``ssh_alias`` and
+    ``host_label``, and the first DNS label of each (``ci.ace`` -> ``ci``).
+    A row with ``transport: local`` is the Studio (``studio``). A row that is
+    neither a known pool host nor local adds nothing. An alias two hosts
+    claim is dropped (ambiguous: it stays unknown, never guesses). Matching
+    is case-insensitive. Unreadable files add nothing."""
+    known = set(known_host_ids(fleet_dir))
+    try:
+        ci = _read_json(Path(fleet_dir) / CI_HOSTS_FILE)
+    except (OSError, ValueError):
+        ci = None
+    claims: Dict[str, set] = {}
+
+    def claim(word, canon):
+        if isinstance(word, str) and word.strip():
+            w = word.strip().lower()
+            for v in dict.fromkeys((w, w.split(".", 1)[0])):
+                if v:
+                    claims.setdefault(v, set()).add(canon)
+
+    for hid in known:
+        claim(hid, hid)
+    rows = ci.get("hosts") if isinstance(ci, dict) else None
+    for hid, row in (rows.items() if isinstance(rows, dict) else ()):
+        if not isinstance(hid, str) or not isinstance(row, dict):
+            continue
+        canon = (PIN_STUDIO if row.get("transport") == "local"
+                 else hid.lower() if hid.lower() in known else None)
+        if canon is None:
+            continue
+        for word in (hid, row.get("ssh_alias"), row.get("host_label")):
+            claim(word, canon)
+    return {w: next(iter(c)) for w, c in sorted(claims.items()) if len(c) == 1}
+
+
+def pin_suggestions(word: str, known_hosts: Iterable[str],
+                    aliases: Optional[Mapping[str, str]] = None, n: int = 3) -> List[str]:
+    """Closest real pins to an unknown ``host:`` word, as ``alias->canonical``
+    (or the canonical alone); never empty: falls back to every canonical pin."""
+    import difflib
+    table: Dict[str, str] = {w: PIN_STUDIO for w in _studio_words()}
+    table[PIN_ANY] = PIN_ANY
+    table.update({h.lower(): h.lower() for h in (known_hosts or ())})
+    table.update({k.lower(): v for k, v in (aliases or {}).items()})
+    close = difflib.get_close_matches((word or "").lower(), list(table), n=n, cutoff=0.6)
+    if not close:
+        return sorted(set(table.values()))
+    return [w if table[w] == w else f"{w}->{table[w]}" for w in close]
 
 
 def note_ignored_pin(card_id: str, word: str) -> None:
@@ -722,9 +805,13 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
         # foreign_lane.worker_command runs the lane with a LOCAL Popen; the
         # ssh terminal backend never sees it, so placement would be a lie.
         return False, _reasons.NATIVE_COMMAND, None
-    pin, _ignored = resolve_pin(body, pool.hosts or ())
+    pin, ignored = resolve_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None))
     if pin == PIN_STUDIO:
         return False, _reasons.HOST_STUDIO, None
+    if pin is None and ignored is not None:
+        # A host: line that names no host (typo, unregistered name): never
+        # portable, a typo must not widen the blast radius (t_cb2b888d).
+        return False, _reasons.PIN_UNKNOWN_HOST, None
     # Host-bound card (t_1e9ea7e9): it drives a fleet host over ssh, so only a
     # worker host with a PROVEN route (fresh reach matrix row, rc 0 to every
     # target) may take it. No such host, or no fresh matrix: it stays local

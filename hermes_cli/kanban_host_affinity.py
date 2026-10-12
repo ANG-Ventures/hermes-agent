@@ -264,10 +264,11 @@ def studio_affinity_unplanned(rows, default_assignee: Optional[str], result) -> 
     except Exception:
         cfg = _kwp.PoolConfig()
     known = tuple(cfg.hosts or ()) or _kwp.known_host_ids(_kb.kanban_home() / "fleet")
+    aliases = cfg.pin_aliases or _kwp.pin_aliases(_kb.kanban_home() / "fleet")
     for r in rows:
         # Same pin rule as the planned path: only a REAL pin (any/studio/a known
         # host) is the operator's call; a prose ``host: example.com`` line is not.
-        pin, _ignored = _kwp.resolve_pin(r["body"], known)
+        pin, _ignored = _kwp.resolve_pin(r["body"], known, aliases)
         if pin is not None:
             continue
         try:
