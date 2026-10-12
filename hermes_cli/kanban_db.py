@@ -10388,10 +10388,20 @@ def complete_task(
                 f"{r.repo}#{r.number}" for r in foreign
             ])
         _pr_query = _open_pr.memo_query()
+        unowned_prs: list = []
         still_open = _open_pr.open_pr_refs(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
-            query_fn=_pr_query,
+            query_fn=_pr_query, task_id=task_id, unowned=unowned_prs,
         )
+        if unowned_prs:
+            # Prose is not provenance (t_60b39483): the handoff named open PRs whose head branch
+            # belongs to another card. Keep the information, never gate on it.
+            mentioned = [f"{r.repo}#{r.number}" for r in unowned_prs]
+            metadata = dict(metadata or {}, mentioned_unowned_prs=mentioned)
+            _log.warning("kanban %s: handoff mentions PRs not owned by this card: %s",
+                         task_id, ", ".join(mentioned))
+            with write_txn(conn):
+                _append_event(conn, task_id, "completion_unowned_pr_mentions", {"prs": mentioned})
         if still_open:
             # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
             # DraftPrError, nothing mutated), update a stale head, arm a green
