@@ -200,3 +200,38 @@ def test_rotation_renames_once_per_utc_day_and_keeps_14(tmp_path):
     assert all(len(r.read_text().splitlines()) == 1 for r in rotated)
     # Same UTC day: no rename.
     assert series.rotate(p, t0 + 16 * day + 60) is None
+
+
+def test_rotation_never_overwrites_an_existing_archive(tmp_path):
+    """Prism 9376e97343ca: a clock step back after a rotation must not let the
+    next rotation replace the day's archive."""
+    p = tmp_path / "var" / series.SERIES_FILE
+    t0 = 1_791_000_000.0
+    series.append(p, {"n": 1}, now=t0)
+    os.utime(p, (t0, t0))
+    series.append(p, {"n": 2}, now=t0 + 86400)       # rotates day0 -> archive
+    os.utime(p, (t0, t0))                             # clock stepped back: live file dated day0 again
+    series.rotate(p, t0 + 86400)
+    (arch,) = p.parent.glob("gate-ticks.????-??-??.jsonl")
+    assert [json.loads(l)["n"] for l in arch.read_text().splitlines()] == [1, 2]
+
+
+def test_failed_append_rolls_back_the_partial_line(tmp_path, monkeypatch):
+    """Prism 12af5c33fcb9: a short write is completed, a failed one truncated."""
+    p = tmp_path / "var" / series.SERIES_FILE
+    series.append(p, {"n": 1})
+    real = os.write
+    calls = {"n": 0}
+
+    def short_then_fail(fd, data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real(fd, data[:5])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(series.os, "write", short_then_fail)
+    with pytest.raises(OSError):
+        series.append(p, {"n": 2})
+    monkeypatch.setattr(series.os, "write", real)
+    series.append(p, {"n": 3})
+    assert [json.loads(l)["n"] for l in p.read_text().splitlines()] == [1, 3]

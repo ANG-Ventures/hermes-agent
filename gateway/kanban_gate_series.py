@@ -60,7 +60,14 @@ def rotate(path: Path, now: float, keep: int = KEEP_DAYS) -> Optional[Path]:
         return None
     stem = path.name[: -len(".jsonl")]
     dest = path.with_name(f"{stem}.{day}.jsonl")
-    os.replace(path, dest)
+    if dest.exists():
+        # A clock step back across midnight can give the live file a day that
+        # already has an archive: merge into it, never overwrite it.
+        with open(dest, "ab") as out, open(path, "rb") as src:
+            out.write(src.read())
+        path.unlink()
+    else:
+        os.replace(path, dest)
     rotated = sorted(p for p in path.parent.glob(f"{stem}.????-??-??.jsonl"))
     for old in rotated[: max(0, len(rotated) - keep)]:
         old.unlink(missing_ok=True)
@@ -74,9 +81,21 @@ def append(path: Path, record: Mapping[str, Any], now: Optional[float] = None) -
     path.parent.mkdir(parents=True, exist_ok=True)
     rotate(path, now)
     line = json.dumps(dict(record), separators=(",", ":"), sort_keys=False) + "\n"
+    data = line.encode("utf-8")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
-        os.write(fd, line.encode("utf-8"))
+        start = os.fstat(fd).st_size
+        done = 0
+        try:
+            while done < len(data):
+                n = os.write(fd, data[done:])
+                if n <= 0:
+                    raise OSError("short write")
+                done += n
+        except OSError:
+            # Roll back a partial line so the next append starts on a JSONL boundary.
+            os.ftruncate(fd, start)
+            raise
     finally:
         os.close(fd)
 
