@@ -3836,6 +3836,27 @@ def _model_force_comment(provider: Optional[str], model: Optional[str], reason: 
     return f"{MODEL_FORCE_COMMENT_PREFIX} {provider or '?'}/{model} not on the lane list; reason={reason.strip()}"
 
 
+def model_force_comment_present(
+    conn: sqlite3.Connection, task_id: str, provider: Optional[str], model: Optional[str],
+) -> bool:
+    """True when the card carries the ``model force:`` audit comment for exactly this pair.
+
+    The dispatcher's pre-spawn pin check (``invalid_pin_refused``) consults this so a pin
+    the operator deliberately forced through ``--force-model`` runs instead of being
+    capability-blocked on every tick (Prism 68402070f7c9 on hermes-agent#1903). The match is
+    on the ``provider/model`` token the writer recorded, so re-pinning to a different unknown
+    id does not inherit the exemption.
+    """
+    if not model:
+        return False
+    token = f"{MODEL_FORCE_COMMENT_PREFIX} {provider or '?'}/{model} "
+    row = conn.execute(
+        "SELECT 1 FROM task_comments WHERE task_id=? AND body LIKE ? LIMIT 1",
+        (task_id, token.replace("%", r"\%").replace("_", r"\_") + "%"),
+    ).fetchone()
+    return row is not None
+
+
 # ---------------------------------------------------------------------------
 # Home-session card ownership (foreign-session mutation guard)
 # ---------------------------------------------------------------------------
