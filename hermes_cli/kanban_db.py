@@ -12172,8 +12172,14 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     until: Optional[int] = None,
+    require_unclaimed_ready: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+
+    ``require_unclaimed_ready`` fences a caller acting on a stale snapshot
+    (the dispatcher's post-loop parking, t_8c474c2e): the block happens only
+    if the task is still ``ready`` with no claim, read in the same write
+    transaction, so it never ends a run claimed in the meantime.
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -12239,10 +12245,12 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, claim_lock FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
+            return False
+        if require_unclaimed_ready and (cur_row["status"] != "ready" or cur_row["claim_lock"] is not None):
             return False
         # Refuse only where a block could have landed; a done/archived/
         # scheduled/todo card keeps the plain ``False`` every caller handles.

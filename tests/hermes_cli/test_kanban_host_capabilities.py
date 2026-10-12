@@ -245,7 +245,9 @@ def test_plain_coding_card_still_spills(home, fleet, monkeypatch):
 
 def test_absent_map_is_byte_identical(home, monkeypatch):
     """No fleet/host-capabilities.json: the route table of 50 real card bodies
-    equals the one the BASE commit (e10ab66274) produced."""
+    equals the one the BASE commit produced (golden regenerated on main
+    7bf7b6f3f0, which added studio_needs routes; this branch with no map
+    produces the same bytes as that main)."""
     _mode(monkeypatch)
     sys.path.insert(0, str(FIXTURES))
     try:
@@ -268,8 +270,9 @@ def test_kill_switch_warn(home, fleet, monkeypatch):
         assert spawned == [(tid, "ace-ai")]                      # route unchanged: it spills
         assert tid not in res.placement_affinity
         assert res.placement_caps[tid]["warn"]["rule"] == "requires:browser-session"
-        aff = _events(conn, tid, "placement_affinity")
+        aff = _events(conn, tid, khc.WARN_EVENT)
         assert aff and aff[-1]["mode"] == "warn" and aff[-1]["matched_by"] == "skill"
+        assert _events(conn, tid, "placement_affinity") == []   # a warn is not a binding
         assert _comments(conn, tid) == []                        # no comment in warn
         task = kb.get_task(conn, tid)
     # The spawn env carries the mode (F5): the real _default_spawn, Popen faked.
@@ -380,3 +383,66 @@ def test_verified_index_round_trip(fleet):
     assert doc["generated_by"] == khc.INDEX_GENERATOR
     assert doc["source_hash"] == khc.index_hash(doc["skills"])
     assert khc.load_map(fleet).index_unverified is None
+
+
+# -- r3 (t_8c474c2e review 24676) -------------------------------------------------
+
+def test_pin_lacks_park_skips_a_card_claimed_since_the_snapshot(home, fleet, monkeypatch):
+    # Prism 55912e00bffe: the park decision comes from the pre-loop snapshot;
+    # a claim landing before the post-loop park must keep its live run.
+    _mode(monkeypatch)
+    real = khc.record_capability_events
+    claimed = {}
+
+    def claim_first(conn, result, caps, caps_out, evaluated, comments):
+        for tid in (caps_out.get("pin_lacks") or {}):
+            claimed[tid] = kb.claim_task(conn, tid, claimer="manual-cli")
+        return real(conn, result, caps, caps_out, evaluated, comments)
+    monkeypatch.setattr(khc, "record_capability_events", claim_first)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="host: ace-ai\nrestock", skills=[WAVE])
+        res, _ = _tick(conn)
+        assert claimed.get(tid) is not None
+        row = conn.execute("SELECT status, claim_lock, current_run_id FROM tasks WHERE id=?",
+                           (tid,)).fetchone()
+        assert row["status"] == "running" and row["claim_lock"] == "manual-cli"
+        assert row["current_run_id"] is not None
+        assert _comments(conn, tid, prefix="pin host:ace-ai") == []
+        assert res.placement_caps[tid].get("action") is None
+
+
+def test_attached_skill_lookup_is_case_insensitive(home, fleet, monkeypatch):
+    # Prism b7a3c37db15e: index keys and attached names fold to lower case.
+    doc = _index(fleet)
+    doc["skills"]["GUI-Check"] = ["screen"]
+    doc["source_hash"] = khc.index_hash(doc["skills"])
+    (fleet / khc.INDEX_FILE).write_text(json.dumps(doc), encoding="utf-8")
+    _mode(monkeypatch)
+    with kb.connect_closing() as conn:
+        for skills in (["gui-check"], ["GUI-CHECK"], ["Amazon-Cart-Ops-Local"]):
+            tid = _card(conn, body="do it", skills=skills)
+            (route, out) = _route(conn, tid)
+            assert route[0] == "local" and route[1].startswith("studio_affinity:requires:"), skills
+            assert out[tid]["matched_by"] == "skill" and out[tid]["strength"] == "hard", skills
+
+
+def test_warn_observation_never_shadows_a_binding_and_clears_when_off(home, fleet, monkeypatch):
+    # Prism 415306946489 + 08dfcc4dc097: bind -> warn -> latest affinity is the
+    # binding; layer off -> the warn observation is cleared.
+    _mode(monkeypatch, "warn")
+    with kb.connect_closing() as conn:
+        # Legacy #1877 body rule binds it; the attached wave skill is warn-only.
+        tid = _card(conn, body="attach to the signed-in browser", skills=[WAVE])
+        res, _ = _tick(conn)
+        assert res.placement_affinity[tid]["rule"] == "studio_body"
+        assert res.placement_caps[tid]["warn"]["rule"] == "requires:browser-session"
+        _tick(conn)
+        aff = _events(conn, tid, "placement_affinity")
+        assert len(aff) == 1 and aff[-1]["rule"] == "studio_body"          # binding is latest, once
+        warn = _events(conn, tid, khc.WARN_EVENT)
+        assert len(warn) == 1 and warn[0]["mode"] == "warn"
+        _mode(monkeypatch, "off")
+        _tick(conn)
+        _tick(conn)
+        assert _events(conn, tid, khc.WARN_EVENT)[1:] == [{"cleared": True}]
+        assert _events(conn, tid, "placement_affinity")[-1]["rule"] == "studio_body"

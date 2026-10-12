@@ -333,9 +333,7 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
                 if aff is not None:
                     if last != aff:
                         _kb._append_event(conn, tid, "placement_affinity", dict(aff))
-                elif last is not None and not last.get("cleared") and last.get("mode") != "warn":
-                    # A warn-mode observation (t_8c474c2e) is not a binding:
-                    # kanban_host_capabilities owns its lifecycle.
+                elif last is not None and not last.get("cleared"):
                     _kb._append_event(conn, tid, "placement_affinity", dict(CLEARED))
                     # The binding's wait ends with it, or the same wait after a
                     # re-bind would read as a duplicate (Prism 0f21fb8c).

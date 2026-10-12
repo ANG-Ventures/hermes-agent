@@ -67,6 +67,9 @@ RULE_PREFIX = "requires:"
 UNKNOWN_PREFIX = "unknown:"
 COMMENT_PREFIX = "auto-pinned:"
 MAP_INVALID_EVENT = "placement_map_invalid"
+# A warn-mode observation is NOT a binding: it has its own event kind so it
+# never shadows the card's ``placement_affinity`` (Prism 415306946489).
+WARN_EVENT = "placement_affinity_warn"
 STUDIO_HOST = "mac-studio"
 
 REQUIRES_RE = re.compile(r"^[ \t]*requires:[ \t]*(.*?)[ \t]*\r?$", re.IGNORECASE | re.MULTILINE)
@@ -263,7 +266,10 @@ def _parse_index(doc) -> Dict[str, Tuple[str, ...]]:
         if not isinstance(name, str) or not name or not isinstance(caps, list) \
                 or not all(isinstance(c, str) and c for c in caps):
             raise ValueError(f"skills.{name!r} must be a list of capability names")
-        out[name] = tuple(c.strip().lower() for c in caps)
+        # Skill names are case-insensitive fleet-wide (Prism b7a3c37db15e):
+        # keys fold to lower case; a case-only duplicate unions its caps.
+        key = name.strip().lower()
+        out[key] = tuple(dict.fromkeys([*out.get(key, ()), *(c.strip().lower() for c in caps)]))
     return out
 
 
@@ -383,16 +389,17 @@ def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
         if w != NONE_WORD:
             reqs.append(Requirement(cap_of(w), HARD, DECLARED, w))
     attached = [s for s in dict.fromkeys(skills or ()) if isinstance(s, str)]
+    attached_keys = {s.rsplit("/", 1)[-1].strip().lower() for s in attached}
     if cmap.index_error is None:
         for s in attached:
-            for c in cmap.index.get(s.rsplit("/", 1)[-1], ()):
+            for c in cmap.index.get(s.rsplit("/", 1)[-1].strip().lower(), ()):
                 reqs.append(Requirement(cap_of(c), HARD, SKILL, s))
         # Skill names are case-insensitive everywhere in the fleet: the cheap
         # prefilter must not drop "use the Browser-Access skill" (Prism eac2f2e68fe7).
         text = body or ""
         folded = text.lower()
         for name, caps in cmap.index.items():
-            if name in attached or not caps or name.lower() not in folded:
+            if name in attached_keys or not caps or name not in folded:
                 continue
             if _named_skill_re(name).search(text):
                 for c in caps:
@@ -550,6 +557,39 @@ def pending_comments(conn, result, caps: Optional[CapabilityTick], caps_out: Map
     return out
 
 
+def _reconcile_warn_events(conn, task_ids: Iterable[str], observed: Mapping[str, Any]) -> None:
+    """Inside the caller's txn: write each card's warn observation on change,
+    and ``{"cleared": true}`` once for a card whose last one no longer holds."""
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli.kanban_host_affinity import _last_payloads
+    ids = list(dict.fromkeys(task_ids))
+    last_by = _last_payloads(conn, ids, WARN_EVENT)
+    for tid in ids:
+        last = last_by.get(tid)
+        want = observed.get(tid)
+        if want is not None and last != want:
+            _kb._append_event(conn, tid, WARN_EVENT, dict(want))
+        elif want is None and last is not None and not last.get("cleared"):
+            _kb._append_event(conn, tid, WARN_EVENT, {"cleared": True})
+
+
+def _clear_warn_events(conn, evaluated_ids: Iterable[str]) -> None:
+    """Layer off or map absent: no observation holds (Prism 08dfcc4dc097).
+    Reads first, so a board that never had one pays one SELECT, no write."""
+    import logging
+    from hermes_cli import kanban_db_connect as _kbc
+    from hermes_cli.kanban_host_affinity import _last_payloads
+    ids = list(dict.fromkeys(evaluated_ids))
+    if not ids or not any(not p.get("cleared") for p in _last_payloads(conn, ids, WARN_EVENT).values()):
+        return
+    try:
+        with _kbc.write_txn(conn):
+            _reconcile_warn_events(conn, ids, {})
+    except Exception:
+        logging.getLogger(__name__).warning("kanban dispatch: could not clear capability warn events",
+                                            exc_info=True)
+
+
 def record_capability_events(conn, result, caps: Optional[CapabilityTick], caps_out: Mapping,
                              evaluated_ids: Iterable[str], comments: List[Tuple[str, str]]) -> None:
     """Post the pin comments, park ``host:<pool-id>`` cards that lack a hard
@@ -561,6 +601,7 @@ def record_capability_events(conn, result, caps: Optional[CapabilityTick], caps_
     from hermes_cli import kanban_db_connect as _kbc
     log = logging.getLogger(__name__)
     if caps is None:
+        _clear_warn_events(conn, evaluated_ids)
         return
     try:
         with _kbc.write_txn(conn):
@@ -569,17 +610,7 @@ def record_capability_events(conn, result, caps: Optional[CapabilityTick], caps_
                                 (tid, body)).fetchone() is None:
                     _kb.add_comment(conn, tid, "dispatcher", body)
             observed = caps_out.get("observed") or {}
-            for tid in dict.fromkeys([*evaluated_ids, *observed]):
-                last = conn.execute(
-                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'placement_affinity' "
-                    "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
-                last = json.loads(last[0] or "{}") if last is not None else None
-                want = observed.get(tid)
-                if want is not None and last != want:
-                    _kb._append_event(conn, tid, "placement_affinity", dict(want))
-                elif want is None and last is not None and last.get("mode") == WARN \
-                        and tid not in (result.placement_affinity or {}):
-                    _kb._append_event(conn, tid, "placement_affinity", {"cleared": True})
+            _reconcile_warn_events(conn, [*evaluated_ids, *observed], observed)
             error = caps.error
             if error:
                 # On the cards the bad file demoted (a warn-mode requirement,
@@ -599,10 +630,15 @@ def record_capability_events(conn, result, caps: Optional[CapabilityTick], caps_
     for tid, (host, req) in (caps_out.get("pin_lacks") or {}).items():
         try:
             reason = pin_lacks_comment(host, req)
-            if _kb.block_task(conn, tid, reason=reason, kind="needs_input"):
+            # Fenced (Prism 55912e00bffe): the decision was made on the
+            # pre-loop snapshot; a card claimed since is left alone.
+            if _kb.block_task(conn, tid, reason=reason, kind="needs_input",
+                              require_unclaimed_ready=True):
                 _kb.add_comment(conn, tid, "dispatcher", reason)
                 (result.placement_waits or {}).pop(tid, None)
                 result.placement_caps.setdefault(tid, {})["action"] = "needs_input"
+            else:
+                log.info("kanban dispatch: %s no longer ready+unclaimed; pin-lacks park skipped", tid)
         except Exception:
             log.warning("kanban dispatch: could not park %s needs_input (pin lacks %s)",
                         tid, req.cap, exc_info=True)
