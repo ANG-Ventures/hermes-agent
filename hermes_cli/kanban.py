@@ -413,6 +413,15 @@ def kanban_command(args: argparse.Namespace) -> int:
                 operator=getattr(args, "operator", None),
                 home=getattr(args, "takeover_home", None),
             )
+        event_actor_scope = contextlib.nullcontext()
+        closer = (getattr(args, "event_actor", None) or "").strip()
+        if closer:
+            from hermes_cli.kanban_identity import is_operator_label
+
+            if is_operator_label(closer):
+                return _err(f"kanban: --actor {closer!r} is an operator label; an automated closer "
+                            "stamps its own name (kanban-review-merge-pass, review-card closer, ...)")
+            event_actor_scope = kb.event_actor(closer)
         try:
             # The preflight above ran on its own connection; the scope re-runs
             # the same gate inside every write transaction the handler opens,
@@ -420,7 +429,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             # override (t_920c6b4a).
             with kb.operator_flag_gate_scope(
                 _lifecycle_target_ids(args), action, flags=gated_flags,
-            ), actor_scope:
+            ), actor_scope, event_actor_scope:
                 return int(handler(args) or 0)
         except (ValueError, RuntimeError, PermissionError) as exc:
             # A survivor refusal carries its operator-only hint on the
