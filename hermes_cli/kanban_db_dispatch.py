@@ -307,6 +307,11 @@ class DispatchResult:
     without changing its route: ``{"warn": <payload>}`` (warn mode),
     ``{"unknown": <word>}``, ``{"action": "needs_input"}`` (a pool pin that
     lacks a hard requirement), and ``"_map_error"`` -> the map problem."""
+    routes: list = field(default_factory=list)
+    """One dict per ready row this tick, in loop order (spec §4.3,
+    t_7133e03d): ``{task_id, route, rule, host, outcome, code, detail}``.
+    ``route`` is ``local | remote-pin | remote-policy | hold`` (None when a
+    total-budget gate held the row before routing)."""
     spawn_paused: Optional[str] = None
     """Non-None when this tick RECLAIMED but deliberately spawned nothing —
     the gateway's load gate (``kanban.dispatch_load_gate``) held the host was
@@ -2839,8 +2844,13 @@ def _set_worker_pid(
     *,
     run_id: Optional[int] = None,
     pool: Optional[str] = None,
+    placement: Optional[dict] = None,
 ) -> bool:
     """Record the spawned child's pid + emit a ``spawned`` event.
+
+    ``placement`` (spec §4.1, t_7133e03d) is written as a ``placement``
+    event in the same transaction as ``spawned``, when the run still holds
+    the card.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
@@ -2906,6 +2916,9 @@ def _set_worker_pid(
                 (int(pid), started_at, run_id),
             )
         _kb._append_event(conn, task_id, "spawned", spawn_payload, run_id=run_id)
+        if placement is not None:
+            from hermes_cli.kanban_placement_reasons import PLACEMENT_EVENT
+            _kb._append_event(conn, task_id, PLACEMENT_EVENT, placement, run_id=run_id)
     return True
 
 
@@ -3635,6 +3648,7 @@ def dispatch_once(
     spillover_fn=None,
     spillover=None,
     max_new: Optional[int] = None,
+    entry: str = "gateway",
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -3678,6 +3692,7 @@ def dispatch_once(
             spillover_fn=spillover_fn,
             spillover=spillover,
             max_new=max_new,
+            entry=entry,
         )
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -3708,6 +3723,7 @@ def dispatch_once(
                 spillover_fn=spillover_fn,
                 spillover=spillover,
                 max_new=max_new,
+                entry=entry,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -4005,52 +4021,241 @@ def _lineage_pins_mode() -> str:
     return _pr.lineage_pins(kcfg)
 
 
-def _record_placement_waits(conn, result, row_route: dict, dry_run: bool) -> None:
-    """One ``placement_wait`` task_event per held ready card {reason, route,
-    host, since}; written only when the reason differs from the card's latest
-    one or that one is older than PLACEMENT_WAIT_REFRESH_SECONDS. A lifecycle
-    event after the latest one (PLACEMENT_WAIT_EPISODE_END_KINDS) starts a new
-    episode: written now, ``since`` = now. Never on a dry run. Best-effort: bookkeeping never fails a tick."""
+def _wait_key(payload: dict) -> tuple:
+    """``(code, route, host)`` of a placement_wait payload: the dedup key
+    (I-S6 + Momus R-B). ``detail`` is never compared; a payload from before
+    Phase 2a has no ``code`` and is split from its ``reason``."""
     from hermes_cli import kanban_placement_reasons as _pr
-    # Studio-affinity cards have their own placement_wait writer
-    # (kanban_host_affinity.record_affinity_events); one writer per card.
+    code = payload.get("code")
+    if code is None:
+        code = _pr.split_reason(payload.get("reason"))[0]
+    return (code, payload.get("route"), payload.get("host"))
+
+
+def _wait_history(conn, tids: list, since_ts: int) -> "tuple[dict, dict]":
+    """One batched read per tick for the held cards: ``({tid: [(id,
+    created_at, payload)] newest first}, {tid: last episode-end event id})``.
+    The history holds each card's latest placement_wait plus every one inside
+    the refresh window (the flap check needs those, nothing older).
+    One SELECT per 400 cards over ``idx_events_task``; payloads are decoded
+    only for the rows kept."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    hist: dict = {}
+    ends: dict = {}
+    kinds = [_pr.PLACEMENT_WAIT_EVENT, *sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)]
+    for i in range(0, len(tids), 400):
+        chunk = tids[i:i + 400]
+        for tid, eid, created, kind, payload in conn.execute(
+            f"SELECT task_id, id, created_at, kind, "
+            f"CASE WHEN kind = ? THEN payload END FROM task_events "
+            f"WHERE task_id IN ({','.join('?' * len(chunk))}) "
+            f"AND kind IN ({','.join('?' * len(kinds))}) ORDER BY id DESC",
+            [_pr.PLACEMENT_WAIT_EVENT, *chunk, *kinds],
+        ):
+            if kind != _pr.PLACEMENT_WAIT_EVENT:
+                ends.setdefault(tid, eid)
+                continue
+            if tid in hist and int(created or 0) < since_ts:
+                continue
+            try:
+                pl = json.loads(payload or "{}")
+            except (TypeError, ValueError):
+                pl = {}
+            hist.setdefault(tid, []).append((eid, int(created or 0), pl if isinstance(pl, dict) else {}))
+    return hist, ends
+
+
+def _record_placement_waits(conn, result, row_route: dict, dry_run: bool) -> None:
+    """One ``placement_wait`` task_event per held ready card
+    ``{code, detail, reason, route, host, since}`` (spec §4.2).
+
+    Written only when the card's dedup key ``(code, route, host)`` differs
+    from its latest one in the current episode, or that one is older than
+    PLACEMENT_WAIT_REFRESH_SECONDS. ``detail`` (the volatile part) is never
+    compared (I-S6); ``host`` is the pin host, or for a plan-wide refusal the
+    host(s) the reason names, so a refusal moving between hosts is a new row
+    (Momus R-B). A key already seen in this episode inside the refresh window
+    (A->B->A) writes ONE ``flapping`` row and then nothing until the window
+    passes. A lifecycle event after the latest wait
+    (PLACEMENT_WAIT_EPISODE_END_KINDS) starts a new episode: written now,
+    ``since`` = now. ``reason`` = code + detail, kept one release for readers
+    of the #1880 shape.
+
+    Cost (Momus R-G): one batched SELECT per tick (per 400 held cards),
+    outside any transaction; the write transaction opens only when there is
+    something to write. Never on a dry run. Best-effort.
+
+    The other writer of this event kind is
+    ``kanban_host_affinity.record_affinity_events``: it owns Studio-affinity
+    cards (``{host, reason, matched_by}`` / ``{cleared: true}``) and this
+    writer skips them, so each card has one writer."""
+    from hermes_cli import kanban_placement_reasons as _pr
     bound = result.placement_affinity or {}
     waits = {t: r for t, r in (result.placement_waits or {}).items() if t not in bound}
     if dry_run or not waits:
         return
     now = int(time.time())
+    window = _pr.PLACEMENT_WAIT_REFRESH_SECONDS
     try:
-        with _kb.write_txn(conn):
-            for tid, reason in waits.items():
-                last = conn.execute(
-                    "SELECT payload, created_at, id FROM task_events WHERE task_id = ? AND kind = ? "
-                    "ORDER BY id DESC LIMIT 1", (tid, _pr.PLACEMENT_WAIT_EVENT),
-                ).fetchone()
-                since = now
-                if last is not None and conn.execute(
-                    "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN (%s) LIMIT 1"
-                    % ",".join("?" * len(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)),
-                    (tid, last[2], *sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)),
-                ).fetchone() is not None:
-                    # The card ran / was blocked / requeued since that wait:
-                    # this is a new episode, never a continuation (Prism 331b10c66fe9).
-                    last = None
-                if last is not None:
-                    try:
-                        prev = json.loads(last[0] or "{}")
-                    except (TypeError, ValueError):
-                        prev = {}
-                    if prev.get("reason") == reason:
-                        if now - int(last[1] or 0) < _pr.PLACEMENT_WAIT_REFRESH_SECONDS:
+        hist, ends = _wait_history(conn, list(waits), now - window)
+        writes: list = []
+        for tid, reason in waits.items():
+            code, detail = _pr.split_reason(reason)
+            route, arg = row_route.get(tid, ("local", None))
+            host = arg if route == "pin" else _pr.named_hosts(code, detail)
+            key = (code, route, host)
+            episode = [h for h in hist.get(tid, ()) if h[0] > ends.get(tid, 0)]
+            since = now
+            if episode:
+                last_id, last_at, last = episode[0]
+                fresh = now - last_at < window
+                if _wait_key(last) == key:
+                    if fresh:
+                        continue
+                    since = int(last.get("since") or last_at or now)
+                elif fresh:
+                    recent = [_wait_key(p) for _i, at, p in episode if now - at < window]
+                    if key in recent[1:]:
+                        # A->B->A inside the window: one ``flapping`` row,
+                        # then quiet until the window passes.
+                        if last.get("code") == _pr.FLAPPING:
                             continue
-                        since = int(prev.get("since") or last[1] or now)
-                route, arg = row_route.get(tid, ("local", None))
-                _kb._append_event(conn, tid, _pr.PLACEMENT_WAIT_EVENT, {
-                    "reason": reason, "route": route,
-                    "host": arg if route == "pin" else None, "since": since,
-                })
+                        seen = list(dict.fromkeys(k[0] for k in recent if k[0] != _pr.FLAPPING))
+                        code, detail, host = _pr.FLAPPING, "|".join(seen), None
+                        reason = f"{code} ({detail})"
+            writes.append((tid, {
+                "code": code, "detail": detail, "reason": reason, "route": route,
+                "host": host, "since": since,
+            }))
+        if not writes:
+            return
+        with _kb.write_txn(conn):
+            for tid, payload in writes:
+                _kb._append_event(conn, tid, _pr.PLACEMENT_WAIT_EVENT, payload)
     except Exception:
         _kb._log.exception("kanban dispatch: could not record placement_wait events")
+
+
+def _record_total_hold(conn, result, gate: str, dry_run: bool) -> None:
+    """A total-budget gate (spec §3.1 step 1) spawns nothing this tick: every
+    ready row still gets a ``placement_wait {code: total:<gate>}`` (deduped
+    like any other), and the dry run sees the same rows in ``routes``."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    reason = _pr.total(gate)
+    try:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
+            "AND COALESCE(no_worker, 0) = 0 ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+    except Exception:
+        _kb._log.exception("kanban dispatch: could not enumerate ready rows for %s", reason)
+        return
+    for r in rows:
+        result.placement_waits[r[0]] = reason
+        result.routes.append({"task_id": r[0], "route": None, "rule": None, "host": None,
+                              "outcome": "held", "code": reason, "detail": None})
+    _record_placement_waits(conn, result, {r[0]: (None, None) for r in rows}, dry_run)
+
+
+def _route_first_enabled() -> bool:
+    """``kanban.placement.route_first`` from the ROOT config, read per tick."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    try:
+        from hermes_cli.config import load_config_readonly
+        kcfg = (load_config_readonly() or {}).get("kanban")
+    except Exception:
+        kcfg = None
+    return _pr.route_first(kcfg)
+
+
+# ``placement.route`` values (spec §4.1).
+_ROUTE_LOCAL = "local"
+_ROUTE_REMOTE_PIN = "remote-pin"
+_ROUTE_REMOTE_POLICY = "remote-policy"
+_ROUTE_HOLD = "hold"
+
+
+def _spec_route(route: Optional[str], placed: bool, spawned_local: bool) -> Optional[str]:
+    """The spec §4.1 route name for an internal ``_route_row`` route."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    if route == "pin":
+        return _ROUTE_REMOTE_PIN
+    if route == "portable":
+        return _ROUTE_LOCAL if spawned_local else _ROUTE_REMOTE_POLICY
+    if route == "wait":
+        return _ROUTE_HOLD
+    if route is None and not placed and not spawned_local:
+        return None
+    return _ROUTE_LOCAL
+
+
+def _placement_rule(route: str, arg: Optional[str], rule: Optional[str], placed: bool,
+                    planned: bool) -> str:
+    """``placement.rule`` (spec §4.1): the ``_route_row`` rule; ``default``
+    for a portable card the Studio took locally; ``unplanned`` when no pool
+    plan ran this tick."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    if not planned:
+        return _pr.RULE_UNPLANNED
+    if route == "portable" and not placed:
+        return _pr.RULE_DEFAULT
+    return rule or (_pr.RULE_PIN if route == "pin" else _pr.RULE_DEFAULT)
+
+
+def _placement_payload(*, run_id, route: str, arg: Optional[str], rule: Optional[str],
+                       placed_host, plan, entry: str, gate: dict) -> dict:
+    """The ``placement`` event payload, every key present (spec §4.1)."""
+    placed = placed_host is not None
+    considered = []
+    if plan is not None:
+        for name in plan.hosts:
+            d = plan.detail.get(name) or {}
+            considered.append({
+                "host": name, "band": d.get("band"), "free_slots": plan.slots.get(name, 0),
+                "pressure": d.get("pressure"), "load1": d.get("load1"),
+                "ncpu": d.get("ncpu"), "reachable": d.get("reachable"),
+            })
+    return {
+        "run_id": run_id,
+        "route": _spec_route(route, placed, not placed),
+        "rule": _placement_rule(route, arg, rule, placed, plan is not None),
+        "host": placed_host.name if placed else _kb._claimer_id().split(":", 1)[0],
+        "considered": considered,
+        "gate": gate,
+        "plan_at": getattr(plan, "planned_at", None) if plan is not None else None,
+        "entry": entry,
+    }
+
+
+def _tick_routes(result, ready_rows, row_route: dict, row_rules: dict, planned: bool,
+                 dry_run: bool) -> None:
+    """``result.routes``: one dict per ready row in loop order (spec §4.3)."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    placed = dict(result.placed or [])
+    spawned = {t for t, _w, _s in result.spawned}
+    local_host = _kb._claimer_id().split(":", 1)[0]
+    for row in ready_rows:
+        tid = row["id"]
+        route, arg = row_route.get(tid, ("local", None))
+        host = placed.get(tid) or (arg if route == "pin" else None)
+        # ``default`` names a portable card the Studio TOOK; a held one keeps
+        # the rule it was routed by.
+        rule = _placement_rule(route, arg, row_rules.get(tid), tid in placed, planned) \
+            if tid in spawned else (row_rules.get(tid) or arg)
+        entry = {"task_id": tid,
+                 "route": _spec_route(route, tid in placed, tid in spawned and tid not in placed),
+                 "rule": rule, "host": host, "outcome": None, "code": None, "detail": None}
+        if tid in spawned:
+            entry["outcome"] = "would_place" if dry_run else "spawned"
+            entry["host"] = placed.get(tid) or local_host
+        elif tid in (result.placement_waits or {}):
+            entry["outcome"] = "held"
+            entry["code"], entry["detail"] = _pr.split_reason(result.placement_waits[tid])
+        else:
+            entry["outcome"] = "skipped"
+        if entry["route"] is None:
+            entry["route"] = _ROUTE_LOCAL
+        result.routes.append(entry)
 
 
 def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
@@ -4059,9 +4264,12 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                lineage_mode: Optional[str] = None,
                affinity_out: Optional[dict] = None,
                unknown_out: Optional[dict] = None,
-               caps=None, caps_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+               caps=None, caps_out: Optional[dict] = None,
+               rules_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
+    ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
+    portable) for the ``placement`` record (spec §4.1).
 
     ``portable()`` is THE classifier; a remote pin on a card that fails
     ``hard_ok`` waits ``not_portable:<rule>`` and is never spawned locally.
@@ -4155,15 +4363,21 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                 from hermes_cli import kanban_host_capabilities as _khc
                 affinity_out[row["id"]] = _khc.affinity_payload(
                     verdict.pin, verdict, _khc.ENFORCE, host="|".join(verdict.only))
+        if rules_out is not None:
+            rules_out[row["id"]] = _pr.RULE_PIN if route_class == "pin" else _pr.RULE_POLICY
         return ("pin", pin) if route_class == "pin" else ("portable", None)
     if rule == _pr.PIN_UNKNOWN_HOST:
         # A host: line naming no host: local only, named, never spilled (t_cb2b888d).
         if unknown_out is not None:
             unknown_out[row["id"]] = ignored
+        if rules_out is not None:
+            rules_out[row["id"]] = rule
         return "local", _pr.pin_unknown_host(ignored, _kwp.pin_suggestions(
             ignored, plan.config.hosts or (), getattr(plan.config, "pin_aliases", None)))
     if rule == _pr.LINKED and link is not None and lineage_mode != _pr.LINEAGE_PINS_LEGACY:
         rule = _pr.linked(*link)  # name the edge that holds it (t_ae87edff)
+    if rules_out is not None:
+        rules_out[row["id"]] = rule
     if rule == _pr.HOST_REACH:
         # A host-bound card (ssh skill / fleet alias in the body) with no
         # worker host proven to reach its target: local, never spilled.
@@ -4388,6 +4602,16 @@ def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optio
     return None
 
 
+def _wall_reason(route: str, arg: Optional[str], plan) -> str:
+    """Why a row waits once no slot is left anywhere (record-only mode)."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    if plan is None:
+        return arg if route == "wait" and arg else (arg or _pr.LOCAL_FULL)
+    return (_route_wait(route, arg, False, plan)
+            or ((plan.pin_host_refusal(arg) or "pin_host_full")
+                if route == "pin" else plan.full_reason()))
+
+
 def _tick_spawn_budget(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -4529,6 +4753,7 @@ def _dispatch_once_locked(
     spillover_fn=None,
     spillover=None,
     max_new: Optional[int] = None,
+    entry: str = "gateway",
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -4729,6 +4954,12 @@ def _dispatch_once_locked(
     # Skipped entirely under ``dry_run``: the documented SAFE probe must not
     # write a pause marker or fire a real page about a tick it only observes.
     # (Same rule the review-stale detector follows.)
+    #
+    # kanban.placement.route_first (t_7133e03d, read per tick): every total-
+    # budget gate below records a ``total:<gate>`` hold on each ready row
+    # before it returns, and a paused tick with no plan still routes.
+    from hermes_cli import kanban_placement_reasons as _pr
+    route_first = _route_first_enabled()
     if not dry_run:
         try:
             from hermes_cli import kanban_budget as _kbudget
@@ -4743,6 +4974,8 @@ def _dispatch_once_locked(
                 cache=budget_cache,
             ):
                 result.budget_paused = True
+                if route_first:
+                    _record_total_hold(conn, result, _pr.TOTAL_BUDGET_PAUSED, dry_run)
                 return result
         except Exception as exc:
             _kb._log.warning(
@@ -4776,7 +5009,7 @@ def _dispatch_once_locked(
     if spawn_paused:
         result.spawn_paused = str(spawn_paused)
         local_budget = 0
-        if spillover is None or spillover.budget <= 0:
+        if (spillover is None or spillover.budget <= 0) and not route_first:
             return result
 
     running_count = 0
@@ -4792,6 +5025,8 @@ def _dispatch_once_locked(
             result.spawn_capped = (
                 f"max_spawn={max_spawn} reached: {running_count} running on this board"
             )
+            if route_first:
+                _record_total_hold(conn, result, _pr.TOTAL_MAX_SPAWN, dry_run)
             return result
         spawn_budget = max_spawn - running_count
 
@@ -4812,6 +5047,8 @@ def _dispatch_once_locked(
                 f"max_in_progress={max_in_progress} reached: {total_running} "
                 f"running host-wide ({running_count} on this board)"
             )
+            if route_first:
+                _record_total_hold(conn, result, _pr.TOTAL_MAX_IN_PROGRESS, dry_run)
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -4839,6 +5076,8 @@ def _dispatch_once_locked(
             "kanban dispatch: system memory pressure is critical; "
             "spawning no new workers this tick (deferred, not dropped)"
         )
+        if route_first:
+            _record_total_hold(conn, result, _pr.TOTAL_MEMORY_CRITICAL, dry_run)
         return result
     if pressure == "elevated":
         result.memory_pressure = pressure
@@ -4858,6 +5097,8 @@ def _dispatch_once_locked(
             spawn_budget = _cap
         if _cap == 0:
             result.spawn_capped = "--max=0: no new workers this call"
+            if route_first:
+                _record_total_hold(conn, result, _pr.TOTAL_MAX_NEW, dry_run)
             return result
 
     ready_rows = conn.execute(
@@ -4872,6 +5113,7 @@ def _dispatch_once_locked(
     # budget), then portable ones; the ORDER BY holds inside each class.
     # Without a plan every row is local and the order is unchanged.
     row_route: dict = {}
+    row_rules: dict = {}  # task id -> portable() rule, for the placement record
     # Ready cards whose Studio binding was evaluated this tick (a pool plan
     # ran the classifier on every one of them) and, of those, the ones the
     # spawn loop reached: the affinity event log reconciles against both.
@@ -4891,8 +5133,9 @@ def _dispatch_once_locked(
         _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
                                          _lineage, result.placement_affinity,
-                                         result.unknown_pins,
-                                         caps=_caps, caps_out=_caps_out)
+                                         unknown_out=result.unknown_pins,
+                                         caps=_caps, caps_out=_caps_out,
+                                         rules_out=row_rules)
                      for r in ready_rows}
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
@@ -4935,12 +5178,13 @@ def _dispatch_once_locked(
             _capabilities_unplanned(ready_rows, result)
         _unplanned = sum(1 for v in row_route.values() if v == ("wait", "pool_unavailable"))
         if _unplanned:
-            # The pool is planned by the GATEWAY tick only (KWLB v0.1); the
-            # standalone daemon and one-shot CLI dispatch never place.
+            # No plan this tick: the gateway tick and the one-shot CLI both
+            # plan the pool, so this is a disabled/refused/empty pool,
+            # proc_paused, or the standalone daemon (which never places).
             _kb._log.info(
                 "kanban dispatch: %d remote-pinned card(s) wait pool_unavailable: no pool "
                 "plan this tick (pool disabled/refused/no hosts, proc_paused, or a "
-                "daemon/CLI dispatch, which never places remotely)", _unplanned,
+                "standalone daemon, which never places remotely)", _unplanned,
             )
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all. The
@@ -5499,14 +5743,43 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     ready_scan_complete = bool(ready_rows)
+    # The ``placement.gate`` block (spec §4.1): the same for every spawn this tick.
+    tick_gate = {
+        "band": getattr(spillover, "band", None),
+        "spill_reason": getattr(spillover, "spill_reason", None),
+        "local_allowance": local_budget,
+        "spawn_paused": str(spawn_paused) if spawn_paused else None,
+        "total": {"budget_paused": bool(result.budget_paused), "max_spawn": max_spawn,
+                  "max_in_progress": max_in_progress, "memory_pressure": result.memory_pressure,
+                  "max_new": max_new},
+    }
+    # Record-only mode (spec §3.1 step 3, B2-ii): once a total budget or
+    # every slot is used, the loop keeps walking the remaining rows and
+    # records why each one waits instead of stopping silently.
+    record_only: Optional[str] = None
     for row_index, row in enumerate(ready_rows):
+        route, route_arg = row_route.get(row["id"], ("local", None))
+        if record_only is not None:
+            result.placement_waits[row["id"]] = (
+                record_only if record_only != "wall"
+                else _wall_reason(route, route_arg, spillover))
+            continue
         if ready_budget is not None and spawned >= ready_budget:
             ready_scan_complete = False
+            if route_first:
+                record_only = _pr.total(_pr.TOTAL_READY_BUDGET)
+                result.placement_waits[row["id"]] = record_only
+                continue
             break
         local_free = ready_local is None or local_spawned < ready_local
         pool_free = spillover is not None and spillover.budget > 0
-        route, route_arg = row_route.get(row["id"], ("local", None))
         if not local_free and not pool_free:
+            ready_scan_complete = False
+            if route_first:
+                # No slot anywhere: this row and every one after it say why.
+                record_only = "wall"
+                result.placement_waits[row["id"]] = _wall_reason(route, route_arg, spillover)
+                continue
             # No slot anywhere: same early stop the intersected budget gave.
             # The row that hit the wall still says why it waits.
             if spillover is not None:
@@ -5520,7 +5793,6 @@ def _dispatch_once_locked(
                     r_route, r_arg = row_route.get(rest["id"], ("local", None))
                     if rest["id"] in result.placement_affinity and r_route == "local":
                         result.placement_waits[rest["id"]] = r_arg or "local_full"
-            ready_scan_complete = False
             break
         wait = _route_wait(route, route_arg, local_free, spillover)
         if wait is not None:
@@ -5566,11 +5838,15 @@ def _dispatch_once_locked(
                             _default_assignee, row["id"], exc_info=True,
                         )
                         result.skipped_unassigned.append(row["id"])
+                        if route_first:
+                            result.placement_waits[row["id"]] = _pr.UNASSIGNED
                         continue
                 row_assignee = _default_assignee
                 result.auto_assigned_default.append(row["id"])
             else:
                 result.skipped_unassigned.append(row["id"])
+                if route_first:
+                    result.placement_waits[row["id"]] = _pr.UNASSIGNED
                 continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
@@ -5606,6 +5882,9 @@ def _dispatch_once_locked(
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
+                if route_first:
+                    result.placement_waits[row["id"]] = (
+                        f"{_pr.PER_PROFILE_CAP} ({row_assignee} {current}/{_row_cap})")
                 continue
         if flagship_refused(row["id"], row_assignee):
             continue
@@ -5860,12 +6139,22 @@ def _dispatch_once_locked(
                     claimed.id, claimed.assignee, placed_host.name, pid,
                     band, spill_reason, reason, probe, spawn_paused,
                 )
+            placement_record = _placement_payload(
+                run_id=claimed.current_run_id, route=route, arg=route_arg,
+                rule=row_rules.get(claimed.id), placed_host=placed_host, plan=spillover,
+                entry=entry, gate=tick_gate,
+            )
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
-                pool=admitted_routes.get(claimed.id),
+                pool=admitted_routes.get(claimed.id), placement=placement_record,
             ):
                 _kb._abort_lost_claim_spawn(conn, claimed, int(pid))
                 continue
+            if not pid:
+                # No pid reported (no ``spawned`` event): still one record.
+                with _kbc.write_txn(conn):
+                    _kb._append_event(conn, claimed.id, _pr.PLACEMENT_EVENT, placement_record,
+                                      run_id=claimed.current_run_id)
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -5943,6 +6232,7 @@ def _dispatch_once_locked(
             comment_unknown_pins(conn, result.unknown_pins)
         except Exception as exc:  # never break a dispatcher tick
             _kb._log.warning("kanban unknown-pin comment failed: %s", exc)
+    _tick_routes(result, ready_rows, row_route, row_rules, spillover is not None, dry_run)
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after

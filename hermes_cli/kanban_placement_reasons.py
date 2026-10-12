@@ -61,6 +61,81 @@ LINEAGE_PINS_DEFAULT = LINEAGE_PINS_KINDS
 PROVENANCE_LINK_KINDS = frozenset({"derived-from"})
 
 
+# Phase 2a (t_7133e03d): hold codes written by the dispatcher itself.
+LOCAL_FULL = "local_full"
+POOL_UNAVAILABLE = "pool_unavailable"
+UNASSIGNED = "unassigned"
+PER_PROFILE_CAP = "per_profile_cap"
+# One placement_wait row replaces an A->B->A reason flap inside one refresh
+# window (Momus pass 2 R-B); its ``detail`` names the codes seen.
+FLAPPING = "flapping"
+# Total-budget gates (spec §3.1 step 1): ``total:<gate>`` holds every ready row.
+TOTAL = "total"
+TOTAL_BUDGET_PAUSED = "budget_paused"
+TOTAL_MAX_SPAWN = "max_spawn"
+TOTAL_MAX_IN_PROGRESS = "max_in_progress"
+TOTAL_MEMORY_CRITICAL = "memory_critical"
+TOTAL_MAX_NEW = "max_new"
+TOTAL_READY_BUDGET = "ready_budget"
+
+# The record of every spawn, both routes (spec §4.1); its ``route`` values
+# live in kanban_db_dispatch (``_ROUTE_*``): routes are not hold reasons.
+# ``placement.rule`` values the dispatcher names itself (portable() rules
+# above are the rest): ``default`` = portable by policy, placed locally
+# because the Studio had allowance; ``unplanned`` = no pool plan this tick.
+RULE_PIN = "pin"
+RULE_POLICY = "policy"
+RULE_DEFAULT = "default"
+RULE_UNPLANNED = "unplanned"
+
+# kanban.placement.route_first (read per tick, default true): false restores
+# the pre-Phase-2a early returns and the old one-shot gate line.
+ROUTE_FIRST_DEFAULT = True
+
+
+def total(gate: str) -> str:
+    """``total:<gate>``."""
+    return f"{TOTAL}:{gate}"
+
+
+def split_reason(reason) -> "tuple[str, str | None]":
+    """``(code, detail)`` of a wait reason string (spec §4.2, I-S6).
+
+    The volatile part of a reason lives in ONE trailing parenthesised group
+    (``pool_unavailable (ci-box: stale 12s)``, ``pin_host_unknown (...)``,
+    ``not_portable:linked(blocks->t_x)``, ``per_profile_cap (alpha 4/4)``);
+    the code is everything before it. Dedup compares the code only."""
+    text = str(reason or "").strip()
+    if text.endswith(")") and "(" in text:
+        i = text.index("(")
+        return text[:i].rstrip(), text[i + 1:-1] or None
+    return text, None
+
+
+def named_hosts(code: str, detail) -> "str | None":
+    """The pool host(s) a reason names, for the dedup key (Momus R-B): a
+    host change is a new hold even when the code is the same. Only the
+    plan-wide ``pool_unavailable (<host>: <why>; ...)`` names hosts in its
+    detail; pin reasons carry their host in the payload already."""
+    if code != POOL_UNAVAILABLE or not detail:
+        return None
+    names = sorted({part.split(":", 1)[0].strip() for part in str(detail).split(";")
+                    if ":" in part and part.split(":", 1)[0].strip()})
+    return ",".join(names) or None
+
+
+def route_first(kanban_cfg: Any) -> bool:
+    """``kanban.placement.route_first``; anything but an explicit false reads
+    as the default (true)."""
+    pl = kanban_cfg.get("placement") if isinstance(kanban_cfg, Mapping) else None
+    val = pl.get("route_first") if isinstance(pl, Mapping) else None
+    if val is None:
+        return ROUTE_FIRST_DEFAULT
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() not in ("false", "off", "no", "0")
+
+
 def not_portable(rule: str) -> str:
     """``not_portable:<rule>``."""
     return f"{NOT_PORTABLE}:{rule}"

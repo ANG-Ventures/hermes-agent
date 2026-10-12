@@ -86,7 +86,7 @@ def _one_shot_pool_plan(gate, config, builders=None):
         return None
 
 
-def _one_shot_load_gate(conn, args, config, additive):
+def _one_shot_load_gate(conn, args, config, additive, defer=False):
     """Apply ``kanban.dispatch_load_gate`` to one ``kanban dispatch`` call.
 
     Same gate object, allowance math and pause text as the gateway loop and
@@ -101,6 +101,8 @@ def _one_shot_load_gate(conn, args, config, additive):
     ``override`` payload the caller writes as an event on every spawn.
 
     Returns ``{spawn_paused, spawn_limit, limit_source, override, info}``.
+    ``defer`` (route_first, t_7133e03d) collects the gate line in
+    ``out["lines"]`` so the caller prints it after the pool plan exists.
     """
     from hermes_cli import kanban_load_gate as _klg
 
@@ -110,7 +112,15 @@ def _one_shot_load_gate(conn, args, config, additive):
         "limit_source": "--max" if additive is not None else None,
         "override": None,
         "info": None,
+        "lines": [],
     }
+    stream = sys.stderr if getattr(args, "json", False) else sys.stdout
+
+    def emit(text):
+        if defer:
+            out["lines"].append(text)
+        else:
+            print(text, file=stream, flush=True)
     try:
         gate = _klg.gate_from_config(config if isinstance(config, dict) else None)
     except Exception:
@@ -142,18 +152,16 @@ def _one_shot_load_gate(conn, args, config, additive):
     info = gate.snapshot()
     info.pop("boards", None)
     out["info"] = info
-    stream = sys.stderr if getattr(args, "json", False) else sys.stdout
     if getattr(args, "ignore_load_gate", False):
         try:
             from hermes_cli.profiles import get_active_profile_name
             profile = get_active_profile_name()
         except Exception:
             profile = "unknown"
-        print(
+        emit(
             f"Load gate: load1={load1:.1f} pause_above={gate.pause_above:.1f} "
             f"OVERRIDE by {profile} (--ignore-load-gate; gate state={gate.state}, "
-            f"would have allowed {allowance})",
-            file=stream, flush=True,
+            f"would have allowed {allowance})"
         )
         out["override"] = {
             "source": "cli dispatch --ignore-load-gate",
@@ -169,25 +177,67 @@ def _one_shot_load_gate(conn, args, config, additive):
     if reason:
         label = {"paused": "PAUSED", "proc_paused": "PROC-PAUSED"}.get(
             gate.state, "SATURATED")
-        print(
-            f"Load gate: {label} load1={load1:.1f} (pause_above={gate.pause_above:.1f}) "
-            f"- spawning 0 this call: {reason}",
-            file=stream, flush=True,
+        emit(
+            f"Load gate: {label} load1={load1:.1f} (pause_above={gate.pause_above:.1f}) - "
+            + (f"local allowance 0: {reason}" if defer else f"spawning 0 this call: {reason}")
         )
         out["spawn_paused"] = reason
         out["spawn_limit"] = 0
         out["limit_source"] = "load gate"
         return out
-    print(
+    emit(
         f"Load gate: admitting load1={load1:.1f} pending_ramp={gate.pending_ramp:.1f} "
         f"allowance={allowance} (pause_above={gate.pause_above:.1f}, "
-        f"max_spawn_per_tick={gate.max_spawn_per_tick})",
-        file=stream, flush=True,
+        f"max_spawn_per_tick={gate.max_spawn_per_tick})"
     )
     if allowance is not None and (additive is None or allowance < additive):
         out["spawn_limit"] = allowance
         out["limit_source"] = "load gate allowance"
     return out
+
+
+CLI_PATH_LINE = "path: cli (one-shot plan; the gateway's shared plan is not consulted)"
+
+
+def _remote_part(gate_obj, plan) -> str:
+    """``remote: N slot(s) on <hosts>`` or ``remote: no plan (<reason>)`` (spec §3.1)."""
+    if plan is not None:
+        free = [n for n, k in plan.slots.items() if k > 0]
+        return (f"remote: {plan.budget} slot(s) on {', '.join(free)}" if free
+                else f"remote: 0 slot(s) ({plan.full_reason()})")
+    pool = getattr(gate_obj, "pool", None)
+    why = pool.get("reason") if isinstance(pool, dict) else None
+    return f"remote: no plan ({why or 'pool not planned'})"
+
+
+def _print_gate_lines(gate, plan, stream) -> None:
+    """The route-first header: the ``path:`` line, then the gate line(s)
+    with the remote half, printed after the pool plan exists."""
+    print(CLI_PATH_LINE, file=stream, flush=True)
+    lines = list(gate.get("lines") or [])
+    remote = _remote_part(gate.get("gate"), plan)
+    if lines:
+        lines[-1] = f"{lines[-1]}; {remote}"
+    else:
+        lines = [f"Load gate: off; {remote}"]
+    for line in lines:
+        print(line, file=stream, flush=True)
+
+
+def _route_line(entry: dict, dry_run: bool, reason=None) -> str:
+    """One dry-run/tick line per ready row (spec §4.3); ``reason`` is the
+    held row's reason string as written (code + detail)."""
+    outcome = entry.get("outcome")
+    if outcome in ("spawned", "would_place"):
+        verdict = "would place" if dry_run else "spawned"
+    elif outcome == "held":
+        verdict = f"holds {reason or entry.get('code')}"
+    else:
+        verdict = "skipped (see below)"
+    if entry.get("route") is None:
+        return f"  {entry['task_id']}  -> {verdict}"
+    return (f"  {entry['task_id']}  route={entry['route']} host={entry.get('host') or '-'} "
+            f"rule={entry.get('rule') or '-'}  -> {verdict}")
 
 
 def _dispatch_limit_notes(res, gate, max_spawn_source):
@@ -251,8 +301,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         # gateway loop and `kanban daemon` apply. The one-shot verb used to
         # skip it; `dispatch --max 128` at load1 66 (pause_above 64) spawned
         # 33 workers and took the Studio to load1 243 (t_689b81b7).
-        gate = _one_shot_load_gate(conn, args, _cfg, additive)
+        route_first = kbd._route_first_enabled()
+        gate = _one_shot_load_gate(conn, args, _cfg, additive, defer=route_first)
         _pool_builders: list = []
+        # Route first (spec §3.1): the pool plan exists before the gate line.
+        plan = _one_shot_pool_plan(gate.get("gate"), _cfg, _pool_builders)
+        if route_first:
+            _print_gate_lines(gate, plan,
+                              sys.stderr if getattr(args, "json", False) else sys.stdout)
         res = kbd.dispatch_once(
             conn,
             dry_run=args.dry_run,
@@ -263,9 +319,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_in_progress_per_profile=max_in_progress_per_profile,
             spawn_paused=gate["spawn_paused"],
             spawn_limit=gate["spawn_limit"],
-            spillover=_one_shot_pool_plan(gate.get("gate"), _cfg, _pool_builders),
+            spillover=plan,
             # --max is additive across local AND remote spawns (total budget).
             max_new=additive,
+            entry="cli",
         )
         if not args.dry_run:
             for _b in _pool_builders:  # placement 1b: publish kanban's reservations
@@ -373,6 +430,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "limit_notes": limit_notes,
             "memory_pressure": res.memory_pressure,
             "placement_waits": dict(res.placement_waits or {}),
+            "routes": list(res.routes or []),
         }, ascii=True)
         return 0
     if res.skipped_locked:
@@ -513,8 +571,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     # Why a ready card was not spawned anywhere this tick (pool routing); a
     # held card used to be invisible without reading the source (t_ae87edff).
-    for tid, reason in (res.placement_waits or {}).items():
-        print(f"Held ({tid}): {reason}")
+    if route_first and res.routes:
+        print(f"Routes ({len(res.routes)}):")
+        for entry in res.routes:
+            print(_route_line(entry, args.dry_run,
+                              (res.placement_waits or {}).get(entry["task_id"])))
+    else:
+        for tid, reason in (res.placement_waits or {}).items():
+            print(f"Held ({tid}): {reason}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — HUMAN review required): "
