@@ -2513,6 +2513,41 @@ def _cmd_diagnostics_placement(args: argparse.Namespace, config) -> int:
     return 0
 
 
+def _cmd_placement(args: argparse.Namespace) -> int:
+    """``placement --fleet`` / ``placement <id>``: read-only (spec §4.3, Phase 3)."""
+    from hermes_cli import kanban_load_gate as _klg
+    from hermes_cli import kanban_placement_view as kpv
+    from hermes_cli.config_effective import load_user_config_effective
+
+    task_id = getattr(args, "task_id", None)
+    if task_id:
+        with kb.connect_closing() as conn:
+            blk = kpv.task_block(conn, task_id)
+        if blk is None:
+            return _err(f"placement: no task {task_id}")
+        if getattr(args, "json", False):
+            _print_json(blk)
+        else:
+            print("\n".join(kpv.format_task(blk)))
+        return 0
+    if not getattr(args, "fleet", False):
+        return _err("placement: give a task id or --fleet")
+    root = kb.kanban_home()
+    try:  # the shared root's pool config, never the invoking profile's
+        root_cfg = load_user_config_effective(root / "config.yaml")
+    except Exception as exc:
+        return _err(f"placement --fleet: cannot read {root / 'config.yaml'}: {exc}")
+    kcfg = (root_cfg or {}).get("kanban") if isinstance(root_cfg, dict) else None
+    gate_path = getattr(args, "gate", None)
+    rep = kpv.compute(root, boards=kpv.live_boards(), gate_state=_klg.read_state(gate_path),
+                      kanban_cfg=kcfg if isinstance(kcfg, dict) else {})
+    if getattr(args, "json", False):
+        _print_json(rep)
+    else:
+        print("\n".join(kpv.format_fleet(rep)))
+    return 0 if not rep["errors"] else 1
+
+
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board via the same rule engine the dashboard uses."""
     from hermes_cli import kanban_diagnostics as kd
@@ -2525,6 +2560,9 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
     runtime_config = load_config()
     if getattr(args, "placement", False):
+        if getattr(args, "fleet", False):  # Q5 alias, one release: `kanban placement --fleet`
+            args.task_id, args.gate = None, None
+            return _cmd_placement(args)
         return _cmd_diagnostics_placement(args, runtime_config)
     diag_config = kd.config_from_runtime_config(runtime_config)
 
@@ -4675,7 +4713,7 @@ _HANDLERS = {
     "assign": _cmd_assign, "set-model": _cmd_set_model, "priority": _cmd_priority,
     "lane-model": _cmd_lane_model, "pins": _cmd_pins,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
-    "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
+    "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics, "placement": _cmd_placement,
     "link": _cmd_link, "rehome": _cmd_rehome, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,

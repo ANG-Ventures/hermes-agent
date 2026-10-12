@@ -63,7 +63,7 @@ REACH_STALE_SECONDS = 36 * 3600
 HOST_BOUND_SKILLS = ("fleet-host-diagnosis", "ssh-machines", "unifi", "local-dns",
                      "media-homelab-servarr")
 DEFAULT_CAPACITY = 0.80
-PLACED_EVENT = "worker_placed"
+PLACED_EVENT = _reasons.WORKER_PLACED_EVENT
 PROBE_TIMEOUT_SECONDS = 8
 
 _PLAIN_RE = re.compile(r"[a-z][a-z0-9-]{0,62}")
