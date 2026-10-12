@@ -1,6 +1,8 @@
 {
-  "_doc": "Skill -> capabilities the skill needs (card t_8c474c2e, Phase 1, hand-written). The s5.1 first pin wave (10 skills) plus the six studio_bound_skills harness skills as control-plane. Phase 2 generates this file (fleet-host capabilities --sync) from SKILL.md signals + metadata.hermes.host_requires overrides. Attached skill = HARD requirement; skill named in the body (`name`, 'skill name', 'load name') = SOFT.",
+  "_doc": "Skill -> capabilities the skill needs (card t_8c474c2e, Phase 1, generated in shape (test fixture)). The s5.1 first pin wave (10 skills) plus the six studio_bound_skills harness skills as control-plane. Phase 2 generates this file (fleet-host capabilities --sync) from SKILL.md signals + metadata.hermes.host_requires overrides. Attached skill = HARD requirement; skill named in the body (`name`, 'skill name', 'load name') = SOFT.",
   "schema": 1,
+  "generated_by": "fleet-host capabilities --sync",
+  "source_hash": "5c014872a37f32318d33701dae04c1c11673b2fa4b0dbfc79cc80284f64725cc",
   "skills": {
     "amazon-cart-ops-local": [
       "browser-session",

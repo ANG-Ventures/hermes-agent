@@ -20,9 +20,13 @@ A card's requirements are the union of (s2.2, F12):
   body-sniff hits: SOFT. ``host: any`` or ``requires: none`` overrides them.
 
 Kill switch ``kanban.placement.capabilities: off | warn | enforce`` (root
-config, read per tick, F5) plus ``kanban.placement.capabilities_enforce``
-(default ``[browser-session, screen]``): in ``enforce`` the listed
-capabilities change routes, every other one is ``warn`` (event only).
+config, read per tick, F5; absent = ``warn``) plus
+``kanban.placement.capabilities_enforce`` (default ``[browser-session,
+screen]``): in ``enforce`` the listed capabilities change routes, every other
+one is ``warn`` (event only). ``enforce`` takes effect only while the skill
+index is GENERATED (``generated_by: fleet-host capabilities --sync`` and a
+``source_hash`` that matches its ``skills``); a hand-written or hand-edited
+index keeps the whole layer at ``warn`` and logs why once an hour.
 
 Failure modes (s1.3, F11): an absent map means the layer is OFF and routes
 are byte-identical to before it existed. A malformed map degrades every
@@ -46,7 +50,11 @@ CAPS_ENV = "KANBAN_PLACEMENT_CAPS"
 
 OFF, WARN, ENFORCE = "off", "warn", "enforce"
 MODES = (OFF, WARN, ENFORCE)
-DEFAULT_MODE = ENFORCE
+DEFAULT_MODE = WARN
+# The index header that lets ``enforce`` act (t_8c474c2e review r2). The drift
+# lint (hermes-home ``fleet-host capabilities --check``) re-derives the index
+# from every SKILL.md and compares it against ``source_hash``.
+INDEX_GENERATOR = "fleet-host capabilities --sync"
 DEFAULT_ENFORCE = ("browser-session", "screen")
 NONE_WORD = "none"   # reserved: ``requires: none`` overrides every SOFT requirement (F4/F12)
 
@@ -92,6 +100,7 @@ class CapabilityMap:
     index: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
     error: Optional[str] = None
     index_error: Optional[str] = None
+    index_unverified: Optional[str] = None   # why ``enforce`` is demoted to ``warn``
 
     @property
     def valid(self) -> bool:
@@ -229,6 +238,23 @@ def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[
     return tuple(names), tuple(sniff), out
 
 
+def index_hash(skills: Mapping[str, Iterable[str]]) -> str:
+    """``source_hash`` of a skill index: sha256 of its canonical ``skills``."""
+    import hashlib
+    canon = {k: list(v) for k, v in skills.items()}
+    return hashlib.sha256(json.dumps(canon, sort_keys=True, separators=(",", ":"))
+                          .encode("utf-8")).hexdigest()
+
+
+def _index_unverified(doc) -> Optional[str]:
+    """None when the index is the generator's untouched output, else why not."""
+    if doc.get("generated_by") != INDEX_GENERATOR:
+        return f"{INDEX_FILE} is hand-written (no generated_by: {INDEX_GENERATOR})"
+    if doc.get("source_hash") != index_hash(doc["skills"]):
+        return f"{INDEX_FILE} source_hash does not match its skills (edited after --sync)"
+    return None
+
+
 def _parse_index(doc) -> Dict[str, Tuple[str, ...]]:
     if not isinstance(doc, dict) or doc.get("schema") != 1 or not isinstance(doc.get("skills"), dict):
         raise ValueError("schema must be 1 with a skills object")
@@ -258,15 +284,43 @@ def load_map(fleet_dir: Path) -> Optional[CapabilityMap]:
         names, sniff, hosts, error = (), (), {}, f"{MAP_FILE}: {exc}"
     index: Dict[str, Tuple[str, ...]] = {}
     index_error = None
+    unverified = None
     try:
         idoc = _read(fleet_dir / INDEX_FILE)
         index = _parse_index(idoc) if idoc is not None else {}
         if idoc is None:
             index_error = f"{INDEX_FILE}: absent"
+        else:
+            unverified = _index_unverified(idoc)
     except (OSError, ValueError) as exc:
         index_error = f"{INDEX_FILE}: {exc}"
     return CapabilityMap(capabilities=names, sniff=sniff, hosts=hosts, index=index,
-                         error=error, index_error=index_error)
+                         error=error, index_error=index_error,
+                         index_unverified=unverified if index_error is None else None)
+
+
+def effective_mode(mode: str, cmap: CapabilityMap) -> str:
+    """The configured mode, except ``enforce`` drops to ``warn`` while the
+    skill index is not the generator's verified output (or is absent/bad):
+    a hand list routes nothing on its own (t_8c474c2e review r2)."""
+    if mode == ENFORCE and (cmap.index_error is not None or cmap.index_unverified is not None):
+        return WARN
+    return mode
+
+
+_DEMOTED_LOGGED: Dict[str, float] = {}
+
+
+def _note_demoted(cmap: CapabilityMap, now: float) -> None:
+    import logging
+    why = cmap.index_unverified or cmap.index_error or ""
+    last = _DEMOTED_LOGGED.get(why)
+    if last is not None and now - last < MAP_INVALID_LOG_SECONDS:
+        return
+    _DEMOTED_LOGGED[why] = now
+    logging.getLogger(__name__).warning(
+        "kanban placement: capabilities configured enforce but running warn: %s "
+        "(run `fleet-host capabilities --sync` and land the regenerated index)", why)
 
 
 def tick(fleet_dir: Path, kanban_cfg: Any, pool_hosts: Iterable[str]) -> Optional[CapabilityTick]:
@@ -277,7 +331,11 @@ def tick(fleet_dir: Path, kanban_cfg: Any, pool_hosts: Iterable[str]) -> Optiona
     cmap = load_map(fleet_dir)
     if cmap is None:
         return None
-    return CapabilityTick(cmap=cmap, mode=mode, enforce=enforce,
+    eff = effective_mode(mode, cmap)
+    if eff != mode:
+        import time as _time
+        _note_demoted(cmap, _time.monotonic())
+    return CapabilityTick(cmap=cmap, mode=eff, enforce=enforce,
                           pool_hosts=tuple(h.lower() for h in pool_hosts or ()))
 
 
@@ -296,7 +354,10 @@ def declared_words(body: Optional[str]) -> List[str]:
 
 def _named_skill_re(name: str):
     n = re.escape(name)
-    return re.compile(rf"`{n}`|\bskill[ \t:]+`?{n}(?![\w-])|\bload[ \t]+`?{n}(?![\w-])", re.IGNORECASE)
+    # backticked, "skill X", "load X", and "the X skill" (Apollo r2 repro:
+    # "use the Browser-Access skill"). All SOFT, all case-insensitive.
+    return re.compile(rf"`{n}`|\bskill[ \t:]+`?{n}(?![\w-])|\bload[ \t]+`?{n}(?![\w-])"
+                      rf"|(?<![\w-]){n}`?[ \t]+skill\b", re.IGNORECASE)
 
 
 def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
@@ -326,9 +387,12 @@ def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
         for s in attached:
             for c in cmap.index.get(s.rsplit("/", 1)[-1], ()):
                 reqs.append(Requirement(cap_of(c), HARD, SKILL, s))
+        # Skill names are case-insensitive everywhere in the fleet: the cheap
+        # prefilter must not drop "use the Browser-Access skill" (Prism eac2f2e68fe7).
         text = body or ""
+        folded = text.lower()
         for name, caps in cmap.index.items():
-            if name in attached or not caps or name not in text:
+            if name in attached or not caps or name.lower() not in folded:
                 continue
             if _named_skill_re(name).search(text):
                 for c in caps:
@@ -442,7 +506,7 @@ def spawn_env(fleet_dir: Path, kanban_cfg: Any) -> str:
         return env_value(OFF, ())
     if not cmap.valid:
         return env_value(WARN, ())
-    return env_value(mode, enforce)
+    return env_value(effective_mode(mode, cmap), enforce)
 
 
 _MAP_INVALID_LOGGED: Dict[str, float] = {}

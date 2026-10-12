@@ -149,6 +149,19 @@ def test_requires_named_skill_in_body_stays_local(home, fleet, monkeypatch):
         assert _route(conn, plain)[0] == ("portable", None)
 
 
+def test_named_skill_in_body_is_case_insensitive(home, fleet, monkeypatch):
+    # Prism eac2f2e68fe7 / Apollo r2 repro: a case-sensitive prefilter dropped
+    # these before the (case-insensitive) matcher ran, and the card spilled.
+    _mode(monkeypatch)
+    with kb.connect_closing() as conn:
+        for body in ("use the Browser-Access skill to check the order",
+                     "LOAD BROWSER-ACCESS and read the invoice"):
+            tid = _card(conn, body=body)
+            (route, out) = _route(conn, tid)
+            assert route == ("local", "studio_affinity:requires:browser-session"), body
+            assert out[tid]["matched_by"] == "named_skill", body
+
+
 # -- 3: body sniff, one comment, survives a restart ------------------------------
 
 def test_body_sniff_pins_and_comments(home, fleet, monkeypatch):
@@ -321,3 +334,49 @@ def test_malformed_map_degrades_to_warn(home, fleet, monkeypatch):
         assert len(inv) == 1 and inv[0]["mode"] == "warn"
         assert json.loads(khc.spawn_env(fleet, kbd._root_kanban_cfg())) == {"*": "warn"}
         assert _comments(conn, browser) == []
+
+
+# -- r2: enforce needs a GENERATED index; the absent-config default is warn ------
+
+def _index(fleet):
+    return json.loads((fleet / khc.INDEX_FILE).read_text(encoding="utf-8"))
+
+
+def test_absent_config_defaults_to_warn(home, fleet, monkeypatch):
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: {})
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="restock", skills=[WAVE])
+        res, spawned = _tick(conn)
+        assert spawned == [(tid, "ace-ai")]                      # observed, not pinned
+        assert res.placement_caps[tid]["warn"]["rule"] == "requires:browser-session"
+    assert json.loads(khc.spawn_env(fleet, {})) == {"*": "warn"}
+
+
+@pytest.mark.parametrize("damage", ["hand_written", "edited_after_sync"])
+def test_unverified_index_demotes_enforce_to_warn(home, fleet, monkeypatch, caplog, damage):
+    doc = _index(fleet)
+    if damage == "hand_written":
+        doc.pop("generated_by")
+        doc.pop("source_hash")
+    else:
+        doc["skills"]["some-new-skill"] = ["screen"]          # hash no longer matches
+    (fleet / khc.INDEX_FILE).write_text(json.dumps(doc), encoding="utf-8")
+    khc._DEMOTED_LOGGED.clear()
+    _mode(monkeypatch, "enforce")
+    with kb.connect_closing() as conn, caplog.at_level("WARNING"):
+        tid = _card(conn, body="restock", skills=[WAVE])
+        res, spawned = _tick(conn)
+        assert spawned == [(tid, "ace-ai")]
+        assert tid not in res.placement_affinity
+        assert res.placement_caps[tid]["warn"]["rule"] == "requires:browser-session"
+        _tick(conn)
+    why = [r.getMessage() for r in caplog.records if "running warn" in r.getMessage()]
+    assert len(why) == 1 and khc.INDEX_FILE in why[0]              # one line per hour, says why
+    assert json.loads(khc.spawn_env(fleet, kbd._root_kanban_cfg())) == {"*": "warn"}
+
+
+def test_verified_index_round_trip(fleet):
+    doc = _index(fleet)
+    assert doc["generated_by"] == khc.INDEX_GENERATOR
+    assert doc["source_hash"] == khc.index_hash(doc["skills"])
+    assert khc.load_map(fleet).index_unverified is None
