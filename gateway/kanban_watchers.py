@@ -1793,6 +1793,7 @@ class GatewayKanbanWatchersMixin:
         )
         self._kanban_lifecycle_digest = lifecycle_digest
         from gateway import kanban_home_route as _hr
+        from gateway import kanban_notify_suppress as _ns
 
         home_cache: _hr.HomeCache = getattr(self, "_kanban_home_cache", None) or _hr.HomeCache()
         self._kanban_home_cache = home_cache
@@ -1838,6 +1839,25 @@ class GatewayKanbanWatchersMixin:
                     # t_dcc4ed08: one memoised REST oracle per tick for the
                     # landed-close-gate check on changes_requested events.
                     from gateway import kanban_close_gate as _cg
+
+                    # kanban.notify_suppress (t_4c7da648), re-read per tick, per
+                    # OWNING profile: a multiplexing gateway serves several
+                    # profiles from this one loop and each subscription's owner
+                    # sets its own policy (Prism P1 dc5a880e1f16).
+                    _suppress_cfgs: dict[str, Any] = {}
+
+                    def _suppress_cfg_for(profile: Optional[str]):
+                        name = (profile or notifier_profile or "default").strip() or "default"
+                        if name not in _suppress_cfgs:
+                            home = None
+                            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                                try:
+                                    from hermes_cli.profiles import get_profile_dir
+                                    home = get_profile_dir(name)
+                                except Exception:
+                                    home = None
+                            _suppress_cfgs[name] = _ns.resolve_config(home)
+                        return _suppress_cfgs[name]
                     from hermes_cli import kanban_open_pr as _open_pr
 
                     _cg_query = getattr(self, "_kanban_close_gate_query", None) or _open_pr.memo_query()
@@ -2022,6 +2042,42 @@ class GatewayKanbanWatchersMixin:
                                     _home_sid = getattr(task, "session_id", None) if task else None
                                     _home_row, home_res = home_cache.get(slug, sub["task_id"], _home_sid)
                                     home_line = format_home_line(_home_sid, _home_row)
+                                    _self_ids = self_caused_event_ids(sub, events)
+                                    # t_4c7da648: redundant-notification filter. Decided
+                                    # here (worker thread; it reads task_comments) and
+                                    # applied at the send/wake sites below.
+                                    # Never on a sub whose ONLY delivery is the wake
+                                    # (delivery_mode='wake', or api_server's self-post):
+                                    # there is no chat echo to cut, and a delegated
+                                    # child's completion must still reach its parent
+                                    # (FleetReview d9c37a52d911).
+                                    suppressed: dict[int, str] = {}
+                                    _suppress_cfg = _suppress_cfg_for(owner_profile)
+                                    if _suppress_cfg.enabled and (
+                                        sub.get("delivery_mode") or "notify"
+                                    ) != "wake" and platform != "api_server" and any(
+                                        ev.kind in _suppress_cfg.kinds for ev in events
+                                    ):
+                                        # Home-side evidence (home session, its operator,
+                                        # its APPROVE) applies only when THIS subscription
+                                        # is the home chat (Prism P1 03f8b8156055).
+                                        _home_t = getattr(home_res, "target", None)
+                                        _sub_is_home = bool(_home_t) and (
+                                            _home_t.platform == platform
+                                            and str(_home_t.chat_id) == str(sub.get("chat_id") or "")
+                                            and str(_home_t.thread_id or "") == str(sub.get("thread_id") or "")
+                                        )
+                                        _ctx = _ns.card_context(
+                                            conn, sub["task_id"], _home_sid,
+                                            (_home_row or {}).get("profile_name") or (sub.get("notifier_profile") or notifier_profile),
+                                        )
+                                        for _ev in events:
+                                            _red, _why = _ns.is_redundant(
+                                                _ev, _ctx, {"self_event_ids": _self_ids, "is_home": _sub_is_home},
+                                                _suppress_cfg,
+                                            )
+                                            if _red:
+                                                suppressed[_ev.id] = _why
                                     close_gates: dict = {}
                                     for _ev in events:
                                         if _ev.kind != "changes_requested":
@@ -2048,7 +2104,8 @@ class GatewayKanbanWatchersMixin:
                                         "home": home_line,
                                         "home_res": home_res,
                                         "close_gates": close_gates,
-                                        "self_event_ids": self_caused_event_ids(sub, events),
+                                        "self_event_ids": _self_ids,
+                                        "suppressed": suppressed,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -2421,6 +2478,34 @@ class GatewayKanbanWatchersMixin:
                                 )
                             else:
                                 _routed = None
+                        # t_4c7da648: a redundant event (the receiving side's
+                        # own close) posts nothing to the chat. Its line goes
+                        # to the lifecycle channel tagged [suppressed:<why>]
+                        # (held with the digest when one is configured) and a
+                        # notify_suppressed receipt lands on the card; the
+                        # wake below skips it. No lifecycle channel: receipt only.
+                        _why_suppressed = (d.get("suppressed") or {}).get(ev.id)
+                        if _why_suppressed and not await _to_thread_process_service(
+                            _ns.record_suppressed, board_slug, sub["task_id"], ev,
+                            _why_suppressed, "notifier",
+                        ):
+                            # No receipt persisted (board locked): deliver normally
+                            # rather than lose the audit row (Prism P1 91fac1e92097).
+                            d["suppressed"].pop(ev.id, None)
+                            _why_suppressed = None
+                        if _why_suppressed:
+                            _lc_adapter = (
+                                self._kanban_route_adapter(lifecycle_channel[0], sub_profile)
+                                if lifecycle_channel is not None else None
+                            )
+                            if _lc_adapter is None:
+                                continue
+                            _routed, send_adapter, send_chat_id = lifecycle_channel, _lc_adapter, lifecycle_channel[1]
+                            _route = _hr.Route(lifecycle_channel, "", None, "", False)
+                            _route_window, _fallback, metadata = _digest_window, None, {}
+                            msg = _hr.format_for_platform(
+                                lifecycle_channel[0], _hr.tag_line(msg, f"suppressed:{_why_suppressed}"),
+                            )
                         # Handoff artifacts upload only beside a line posted
                         # NOW to a conversation (subscriber chat or an
                         # immediate home line). A log-channel line or a held
@@ -2683,10 +2768,13 @@ class GatewayKanbanWatchersMixin:
                         # never land in _sent_event_ids, so their wake (the
                         # sole delivery) stays.
                         _self_ids = set(d.get("self_event_ids") or ()) & _sent_event_ids
+                        # t_4c7da648: a suppressed event never wakes, sent or not.
+                        _suppressed_ids = set(d.get("suppressed") or ())
                         _wake_kinds = (
                             {
                                 ev.kind for ev in d["events"]
                                 if ev.kind in _WAKE_KINDS and ev.id not in _self_ids
+                                and ev.id not in _suppressed_ids
                             }
                             if wake_agent
                             else set()
@@ -2709,7 +2797,7 @@ class GatewayKanbanWatchersMixin:
                                     _fresh.log_dropped(sub["task_id"], _k, _ev_ts.get(_k),
                                                        "notifier", _now_status)
                                     _wake_kinds.discard(_k)
-                        if wake_agent and _self_ids and not _wake_kinds:
+                        if wake_agent and (_self_ids or _suppressed_ids) and not _wake_kinds:
                             logger.info(
                                 "kanban notifier: wake skipped for %s on %s/%s: "
                                 "transition made by this chat's own session",

@@ -944,3 +944,34 @@ def test_f_plain_nonspawnable_skip_does_not_wake(env):
     tid = _card(env)
     _event(tid, "skipped_nonspawnable", {"assignee": "apollo"})
     assert _tick(env) == []
+
+
+def test_last_blocker_done_by_the_operator_profile_still_wakes(env):
+    """t_4c7da648: notify_suppress never eats a last-blocker-done wake, even when the
+    operator's own profile closed the parent (the children need arming either way)."""
+    p1 = _card(env, title="only parent")
+    child = _card(env, title="child", parents=[p1])
+    with kb.connect_closing() as conn:
+        kb.complete_task(conn, p1, summary="parent done")
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET actor_profile = 'default' WHERE task_id = ? AND kind = 'completed'",
+                     (p1,))
+    text = _one_turn(env, _tick(env))
+    assert child in text and "arm or dispatch" in text
+    with kb.connect_closing() as conn:
+        assert [e for e in kb.list_events(conn, p1) if e.kind == "notify_suppressed"] == []
+
+
+def test_owner_wake_receipt_failure_keeps_the_item(env, monkeypatch):
+    """Prism 91fac1e92097: an unpersisted notify_suppressed receipt never withholds a wake."""
+    from gateway import kanban_notify_suppress as ns
+    monkeypatch.setattr(ns, "record_suppressed", lambda *a, **k: False)
+    tid = _card(env)
+    _event(tid, "stalled", {"reason": "no heartbeat"})
+    # pretend the stuck event is a self-operator completed-like kind under a widened config
+    monkeypatch.setattr(ns, "resolve_config", lambda *a, **k: ns.parse_config(
+        {"notify_suppress": {"kinds": ["completed", "stalled"]}}))
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE task_events SET actor_profile = 'default' WHERE task_id = ?", (tid,))
+    # stalled is in NEVER_SUPPRESS anyway: protected kinds beat config -> wakes
+    assert "stuck (stalled)" in _one_turn(env, _tick(env))
