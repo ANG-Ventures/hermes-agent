@@ -1794,6 +1794,7 @@ class GatewayKanbanWatchersMixin:
         self._kanban_lifecycle_digest = lifecycle_digest
         from gateway import kanban_home_route as _hr
         from gateway import kanban_notify_suppress as _ns
+        from gateway import kanban_wake_defer as _defer
 
         home_cache: _hr.HomeCache = getattr(self, "_kanban_home_cache", None) or _hr.HomeCache()
         self._kanban_home_cache = home_cache
@@ -2214,18 +2215,28 @@ class GatewayKanbanWatchersMixin:
                     # or a capped waker lane, THIS event's wake is sent as a
                     # notify. The subscription row is not changed.
                     wake_downgrade = None
+                    # t_b7b31563: a human-owned card's wake weighs the lane
+                    # and the dispatcher's proc_paused state, not load1 alone,
+                    # and a downgrade of a handback kind is DEFERRED below.
+                    _defer_owner = _defer.human_owner(task, d["events"])
+                    _defer_pending = False
                     # api_server has no push channel: its wake self-post IS
                     # the delivery, so it is never downgraded.
                     if mode in ("notify+wake", "wake") and sub["platform"] != "api_server":
                         wake_downgrade = await _to_thread_process_service(
                             _wake_downgrade_reason, self,
                             self._wake_gate_profile(plat, sub, sub_profile or None),
+                            bool(_defer_owner),
                         )
                         if wake_downgrade:
+                            _defer_pending = bool(_defer_owner) and _defer.deferrable(
+                                ev.kind for ev in d["events"]
+                            )
                             logger.info(
-                                "kanban notifier: wake for %s on %s/%s sent as notify (%s)",
+                                "kanban notifier: wake for %s on %s/%s sent as notify (%s)%s",
                                 sub["task_id"], sub["platform"], sub["chat_id"],
                                 wake_downgrade,
+                                f"; deferred for {_defer_owner}" if _defer_pending else "",
                             )
                             mode = "notify"
                     wake_agent = mode in ("notify+wake", "wake")
@@ -2776,7 +2787,9 @@ class GatewayKanbanWatchersMixin:
                                 if ev.kind in _WAKE_KINDS and ev.id not in _self_ids
                                 and ev.id not in _suppressed_ids
                             }
-                            if wake_agent
+                            # t_b7b31563: a deferred wake builds its text here
+                            # too; it is parked (not delivered) further down.
+                            if (wake_agent or _defer_pending)
                             else set()
                         )
                         if _wake_kinds:
@@ -2866,6 +2879,27 @@ class GatewayKanbanWatchersMixin:
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
                             )
+
+                        if _defer_pending and _wake_kinds and not wake_agent:
+                            # t_b7b31563: park the downgraded human-owner
+                            # wake; kanban_wake_defer.tick fires it when the
+                            # gate clears or the ceiling passes. The passive
+                            # line above was delivered as usual.
+                            _defer.record(
+                                self, board=board_slug, sub=sub,
+                                sub_profile=sub_profile or None,
+                                cursor=int(d["cursor"]), kinds=_wake_kinds,
+                                text=_synth, reason=str(wake_downgrade),
+                                owner=str(_defer_owner),
+                                home_sid=getattr(task, "session_id", None) if task else None,
+                                session_key=_session_key,
+                                event_ts=max((ev.created_at for ev in d["events"]), default=None),
+                                comment_cursor=await asyncio.to_thread(
+                                    _defer.latest_comment_id, _kb, board_slug, sub["task_id"],
+                                ),
+                            )
+                            await asyncio.to_thread(_defer._state(self).write)  # noqa: SLF001
+                            _wake_kinds = set()
 
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —
@@ -3065,6 +3099,12 @@ class GatewayKanbanWatchersMixin:
                 await _owner_wake.tick(self)
             except Exception as exc:
                 logger.warning("kanban owner-wake tick failed: %s", exc)
+            # t_b7b31563: fire deferred human-owner wakes once the gate clears
+            # or their ceiling passes.
+            try:
+                await _defer.tick(self)
+            except Exception as exc:
+                logger.warning("kanban wake deferred tick failed: %s", exc)
             # Sleep with cancellation checks.
             for _ in range(int(max(1, interval))):
                 if not self._running:

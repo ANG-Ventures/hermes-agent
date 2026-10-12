@@ -2551,6 +2551,11 @@ DEFAULT_CONFIG = {
             "lane_headroom": True,
             "sample_seconds": 15,
         },
+        # t_b7b31563 (Ace 2026-10-12 06:25): a downgraded wake for a HUMAN-owned
+        # card (human:* assignee/reviewer; review_requested / blocked /
+        # block_loop_detected) is deferred, never dropped. It fires when the
+        # gate clears or after this many seconds, whichever comes first.
+        "wake_defer_ceiling_s": 1200,
         "reconcile_orphans": True,
         # Notify subscriptions survive `done` (completion is reversible) and are removed on archive.
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
