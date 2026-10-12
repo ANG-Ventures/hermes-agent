@@ -311,3 +311,27 @@ def test_forced_pin_is_honoured_at_dispatch_for_that_pair_only(kanban_home, lane
         result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 4242)
         assert tid in result.auto_blocked
 
+
+
+def test_plain_nonzero_exit_with_provider_404_is_provider_rejected(kanban_home, monkeypatch):
+    """Prism P2 e1cc1e3f8b27 on #1903: ``apply_pin_refusal_to_result`` now lets a 4xx
+    exit as an ordinary failure (rc=1, no cooldown marker). That exit must reach the
+    same rejection accounting as the rc=75 shape, not generic ``crashed`` accounting."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    text = ("[hermes-kanban-run-boundary deadbeef]\n"
+            f"Provider said: HTTP 404: model: {DEAD_ID}\n\n"
+            "session_id: x\n\n[kanban-worker-exit] rc=1\n")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="a", max_retries=99)
+        _seed_exit(conn, tid, 82000, kanban_home, text, 1)
+        assert tid in kbd.detect_crashed_workers(conn)
+        run = conn.execute(
+            "SELECT outcome, error FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,)).fetchone()
+        assert run["outcome"] == "provider_rejected"
+        assert f"HTTP 404: model: {DEAD_ID}" in run["error"]
+        kinds = [r["kind"] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
+        assert "provider_rejected" in kinds and "crashed" not in kinds
+        assert kb.get_task(conn, tid).consecutive_failures == 1
