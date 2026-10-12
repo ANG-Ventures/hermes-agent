@@ -24,6 +24,10 @@ HOST_REACH = "host_reach"  # host-bound card, no pool host with a proven ssh rou
 
 # The task_event that records why a ready card was held this tick.
 PLACEMENT_WAIT_EVENT = "placement_wait"
+# The task_event on a run that was spawned on a pool host (host, reason, band).
+WORKER_PLACED_EVENT = "worker_placed"
+# The task_event on every spawn, both routes (spec §4.1; written from Phase 2a).
+PLACEMENT_EVENT = "placement"
 # A repeated identical reason is re-written only after this many seconds.
 PLACEMENT_WAIT_REFRESH_SECONDS = 900
 # A task_event of one of these kinds after the latest placement_wait ends that
