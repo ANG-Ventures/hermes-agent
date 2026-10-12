@@ -3849,10 +3849,12 @@ def model_force_comment_present(
     """
     if not model:
         return False
+    # Prism 20f583066d18 (#1912): SQLite LIKE is ASCII-case-insensitive, so `custommodel` would inherit
+    # `CustomModel`'s exemption. Match the exact token bytes: a case-sensitive prefix via substr().
     token = f"{MODEL_FORCE_COMMENT_PREFIX} {provider or '?'}/{model} "
     row = conn.execute(
-        "SELECT 1 FROM task_comments WHERE task_id=? AND body LIKE ? LIMIT 1",
-        (task_id, token.replace("%", r"\%").replace("_", r"\_") + "%"),
+        "SELECT 1 FROM task_comments WHERE task_id=? AND substr(body, 1, ?) = ? LIMIT 1",
+        (task_id, len(token), token),
     ).fetchone()
     return row is not None
 
