@@ -1544,3 +1544,65 @@ def test_manifest_target_honours_path_qualified_card_skill(tmp_path, monkeypatch
     # Traversal / wrong category never resolve.
     assert kha.manifest_targets(["../skills/mlops/vllm-gpu", "general/vllm-gpu"], "alpha") == {}
     kha.clear_cache()
+
+
+# -- t_e10add5a: a pin to a DRAINED member is not a full one ----------------
+
+def _drained_plan():
+    p = _plan(hosts=[_host("ace-ai", slots=1), _host("ci-box", slots=2, priority=1, state="draining")])
+    p.disabled = ("old-box",)
+    return p
+
+
+def test_pin_to_a_draining_host_reads_pin_host_draining():
+    """2026-10-11: t_d69f0790 pinned host:ci-box while ci-box drained read
+    ``pin_host_full`` for 25 min. Draining (re-pin) is not full (wait)."""
+    p = _drained_plan()
+    assert p.take("alpha", pin="ci-box") is None and p.refusal == "pin_host_draining"
+    assert p.take("alpha", pin="old-box") is None and p.refusal == "pin_host_disabled"
+    assert p.take("alpha", pin="ace-ai").name == "ace-ai"
+    assert p.take("alpha", pin="ace-ai") is None and p.refusal == "pin_host_full"
+
+
+def test_drained_pin_reason_reaches_placement_wait_and_dry_run(kanban_home, capsys, monkeypatch):
+    from hermes_cli import kanban_ops as kops
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host: ci-box")
+        _tick(conn, spillover=_drained_plan(), spawn_limit=4)
+        assert [e["reason"] for e in _placement_waits(conn, tid)] == ["pin_host_draining"]
+        assert _placement_waits(conn, tid)[0]["host"] == "ci-box"
+    monkeypatch.setattr(kops, "_one_shot_pool_plan", lambda *a, **k: _drained_plan())
+    import argparse
+    rc = kops._cmd_dispatch(argparse.Namespace(dry_run=True, json=False, max=None,
+                                               max_running=None, failure_limit=2))
+    assert rc == 0 and f"Held ({tid}): pin_host_draining" in capsys.readouterr().out
+
+
+def test_drained_pin_behind_the_no_slot_wall_still_names_the_state(kanban_home):
+    """No local slot and no pool slot: the row that hits the wall keeps its state."""
+    p = _plan(hosts=[_host("ci-box", slots=2, state="draining")])
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host: ci-box")
+        res, spawned = _tick(conn, spillover=p, spawn_limit=0)
+    assert spawned == [] and res.placement_waits.get(tid) == "pin_host_draining"
+
+
+def test_drained_pin_wait_posts_one_logs_line_after_15_min(kanban_home, monkeypatch):
+    from hermes_cli import kanban_budget as kbud
+    sent = []
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: "/x/notify.py")
+    monkeypatch.setattr(kbud, "_run_notify", lambda argv: sent.append(argv) or True)
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host: ci-box")
+        _tick(conn, spillover=_drained_plan(), spawn_limit=4)
+        assert sent == []  # a fresh wait is not news
+        conn.execute("UPDATE task_events SET payload = json_set(payload, '$.since', "
+                     "json_extract(payload, '$.since') - 16*60) WHERE task_id=? "
+                     "AND kind='placement_wait'", (tid,))
+        conn.commit()
+        _tick(conn, spillover=_drained_plan(), spawn_limit=4)
+        _tick(conn, spillover=_drained_plan(), spawn_limit=4)
+    assert len(sent) == 1
+    body = sent[0][-1]
+    assert tid in body and "ci-box" in body and "draining" in body and "16 min" in body
+    assert sent[0][sent[0].index("--target") + 1] == kbud.RECOVERY_TARGET
