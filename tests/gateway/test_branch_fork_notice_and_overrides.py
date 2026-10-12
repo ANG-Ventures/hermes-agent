@@ -230,6 +230,27 @@ async def test_branch_unresolvable_model_is_not_inherited_and_not_claimed(store)
     assert "xhigh" in reply
 
 
+@pytest.mark.asyncio
+async def test_branch_inherits_reasoning_from_the_parent_live_state_when_entry_lags(store):
+    """Live E2E 2026-10-12: ``/reasoning xhigh`` typed as the FIRST message of a fresh chat lands in the
+    live map before the store entry exists, so the entry stays None while the parent runs at xhigh.
+    The fork must inherit what the parent RUNS at, not only what its entry persisted."""
+    source = _channel_source()
+    _seed(store, source)
+    parent_key = build_session_key(source)
+    runner = _runner(store, _ThreadAdapter())
+    runner._session_state(parent_key).conversation.reasoning_override = {"enabled": True, "effort": "xhigh"}
+    assert store.entry_for(parent_key).reasoning_override is None
+    assert runner._resolved_effort_label(session_key=parent_key) == "xhigh"
+
+    reply = await runner._handle_branch_command(MessageEvent(text="/fork idea", source=source))
+
+    child_key = build_session_key(_thread_source())
+    assert store.entry_for(child_key).reasoning_override == {"enabled": True, "effort": "xhigh"}
+    assert runner._resolved_effort_label(session_key=child_key) == "xhigh"
+    assert "xhigh" in reply
+
+
 # ----------------------------------------------------------------------------- (c) --fresh
 
 @pytest.mark.asyncio

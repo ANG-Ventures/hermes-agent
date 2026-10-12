@@ -1122,7 +1122,7 @@ class GatewaySessionCommandsMixin:
                 await asyncio.to_thread(self._branch_drop_route_overrides, dest_key)
         else:
             inherited = await asyncio.to_thread(
-                self._branch_inherit_route_overrides, current_entry, dest_key)
+                self._branch_inherit_route_overrides, current_entry, session_key, dest_key)
         inherit_line = self._branch_inherit_line(inherited)
         # Count = raw transcript rows (matches the /footer "N msgs" tally = sessions.message_count),
         # NOT a user-only subset, so the "inherits N messages" line reconciles with the footer.
@@ -1141,13 +1141,16 @@ class GatewaySessionCommandsMixin:
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id,
                  thread=format_thread_ref(source.platform, dest_source.thread_id)) + inherit_line
 
-    def _branch_inherit_route_overrides(self, parent: "SessionEntry", child_key: str) -> dict:
-        """Copy the parent entry's persisted ``reasoning_override`` + ``model_override_identity`` onto
-        the child's store entry AND the runner's live maps, exactly as the restart rehydrate does
-        (``_rehydrate_session_overrides_from_store``). Returns ``{"reasoning": label, "model": id}``
-        for what actually landed; a model whose credentials no longer resolve is NOT inherited
-        (the child stays on the config route, and the reply does not claim it). Runs off the loop:
-        the credential re-resolution can refresh an OAuth token over the network."""
+    def _branch_inherit_route_overrides(self, parent: "SessionEntry", parent_key: str, child_key: str) -> dict:
+        """Copy the parent's ``reasoning_override`` + ``model_override_identity`` onto the child's store
+        entry AND the runner's live maps, exactly as the restart rehydrate does
+        (``_rehydrate_session_overrides_from_store``). The reasoning override is read from the parent's
+        LIVE session state first (what the parent actually runs at), then its persisted entry: a
+        ``/reasoning`` typed as the first message of a fresh chat lands in the live map before the entry
+        exists, so the entry alone under-reports (measured live 2026-10-12, t_424dcfb5 E2E). Returns
+        ``{"reasoning": label, "model": id}`` for what actually landed; a model whose credentials no
+        longer resolve is NOT inherited (the child stays on the config route, and the reply does not
+        claim it). Runs off the loop: the credential re-resolution can refresh an OAuth token."""
         from hermes_constants import reasoning_label
 
         inherited: dict = {}
@@ -1155,7 +1158,7 @@ class GatewaySessionCommandsMixin:
         child = store.entry_for(child_key) if store is not None else None
         if parent is None or child is None:
             return inherited
-        ro = parent.reasoning_override
+        ro = self._session_state(parent_key).conversation.reasoning_override or parent.reasoning_override
         if isinstance(ro, dict) and ro:
             child.reasoning_override = dict(ro)
             self._session_state(child_key).conversation.reasoning_override = dict(ro)
