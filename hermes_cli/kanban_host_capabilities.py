@@ -569,7 +569,13 @@ def spawn_env(fleet_dir: Path, kanban_cfg: Any) -> str:
         return env_value(OFF, ())
     if not cmap.valid:
         return env_value(WARN, ())
-    return env_value(effective_mode(mode, cmap), enforce)
+    mode = effective_mode(mode, cmap)
+    if mode == ENFORCE and cmap.soft:
+        # The map's per-class hardness wins, exactly as CapabilityTick.mode_of
+        # decides placement (Prism b8ddb038892b on #1902).
+        enforce = tuple(c for c in dict.fromkeys([*enforce, *(k for k, v in cmap.soft.items() if not v)])
+                        if not cmap.soft.get(c, False))
+    return env_value(mode, enforce)
 
 
 _MAP_INVALID_LOGGED: Dict[str, float] = {}
