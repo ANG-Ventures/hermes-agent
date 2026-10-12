@@ -354,9 +354,16 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         backend = call.enter_context(_backend_for_call(session_id))
     except Exception as e:
         # t_db491366: a placed worker whose pool host cannot bring up a desktop has no screen left
-        # but the Studio's; a working pool-host desktop never reaches this branch.
+        # but the Studio's. Only a placement failure is that; any other startup error (missing
+        # cua-driver, bad manifest) keeps its own message.
+        from tools.bot_desktop.runtime import tool_placement as _bd_tool_placement
         from tools.rail_preflight import screen_rail_error
-        if rail := screen_rail_error():
+        try:
+            _bd_tool_placement()
+            screen_down = False
+        except RuntimeError:
+            screen_down = True
+        if screen_down and (rail := screen_rail_error()):
             return json.dumps({"ok": False, "action": action, "error": rail, "detail": str(e)})
         return json.dumps({"error": f"computer_use backend unavailable: {e}",
                            "hint": "If the cua-driver binary is missing, run `hermes computer-use install`. "

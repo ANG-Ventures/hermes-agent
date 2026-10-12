@@ -181,7 +181,7 @@ EXPECTED_SCREEN = (
 )
 
 
-def _computer_use(monkeypatch, *, backend_error=None):
+def _computer_use(monkeypatch, *, backend_error=None, screen_up=None):
     """handle_computer_use with the lease/screen start stubbed and the backend either failing or working."""
     import contextlib
     from tools.bot_desktop import lease, runtime as bd
@@ -189,6 +189,14 @@ def _computer_use(monkeypatch, *, backend_error=None):
     monkeypatch.setattr(lease, "assert_agent_may_act", lambda: SimpleNamespace(epoch=0))
     monkeypatch.setattr(lease, "get", lambda: SimpleNamespace(epoch=0))
     monkeypatch.setattr(bd, "ensure_started_for_tool", lambda: None)
+    if screen_up is None:
+        screen_up = backend_error is None
+
+    def placement():
+        if not screen_up:
+            raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+        return "terminal"
+    monkeypatch.setattr(bd, "tool_placement", placement)
     calls = []
 
     class _Backend:
@@ -227,6 +235,15 @@ def test_computer_use_placed_worker_without_desktop_gets_screen_message(monkeypa
     assert out["error"] == EXPECTED_SCREEN.format(host="ace-ai")
     assert "Xvnc" in out["detail"]
     assert rp.take_rail_absent() == EXPECTED_SCREEN.format(host="ace-ai")
+
+
+def test_computer_use_placed_worker_non_screen_failure_keeps_its_own_error(monkeypatch):
+    # The pool-host desktop is up; a missing cua-driver is not a missing screen.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-ai")
+    out, _ = _computer_use(monkeypatch, backend_error="cua-driver missing", screen_up=True)
+    assert out["error"] == "computer_use backend unavailable: cua-driver missing"
+    assert rp.take_rail_absent() is None
 
 
 def test_computer_use_unplaced_backend_failure_keeps_generic_error(monkeypatch):
