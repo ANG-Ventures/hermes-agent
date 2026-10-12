@@ -2916,7 +2916,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Resources (VM / container / GPU-resident unit) this run started, JSON list of
+    -- {kind, id, host, started_at, state}. The dispatcher stops each one after the card
+    -- is done/archived unless the body carries `keep-alive: <reason>` (kanban_resources).
+    resources           TEXT NOT NULL DEFAULT '[]'
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -17882,11 +17886,16 @@ def _cohort_death_ids(dead: list, *, now: float) -> set:
     return members if len(members) >= _COHORT_DEATH_MIN else set()
 
 
-def _page_cohort_death(conn: sqlite3.Connection, task_ids: list) -> None:
+def _page_cohort_death(conn: sqlite3.Connection, task_ids: list, *, still_alive: Optional[list] = None) -> None:
     """Page #alerts ONCE for a cohort death. Best-effort, never raises.
 
     Once per cohort by construction: the members are released in the same
     tick that detects them, so the next tick cannot see them dead again.
+
+    ``--sev error`` routes the page to #alerts; without it notify.py sends a
+    bare send to the #logs digest, which is where both 2026-10-12 12:11 pages
+    went (t_5c37ab9d). ``still_alive`` are members whose pid still existed:
+    the page then says the dispatcher misjudged them instead of blaming a killer.
     """
     try:
         import importlib
@@ -17897,16 +17906,29 @@ def _page_cohort_death(conn: sqlite3.Connection, task_ids: list) -> None:
         if script is None:
             return
         db_path = next(r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main")
+        if still_alive:
+            cause = (
+                f"{len(still_alive)} of them still had a live pid at detection "
+                f"({', '.join(list(still_alive)[:5])}{' …' if len(still_alive) > 5 else ''}): "
+                "the dispatcher's liveness/identity check misjudged them (clock step? "
+                "`log show --predicate 'process == \"timed\"'`), so live workers may now "
+                "be running beside their own requeued card."
+            )
+        else:
+            cause = (
+                "Something outside the dispatcher killed them (reaper / OOM / signal sweep): "
+                "the cohort_death events carry each member's spawn pgid and who else was in it; "
+                "find the sender with `log show --predicate 'eventMessage CONTAINS \"sent by\"'` "
+                "around the tick."
+            )
         body = (
             f"💀 Kanban cohort death: {len(task_ids)} workers ended externally in ONE "
             f"dispatcher tick while still heartbeating ({os.path.basename(db_path or '')}).\n"
             f"Tasks: {', '.join(task_ids[:20])}{' …' if len(task_ids) > 20 else ''}\n"
-            "Requeued WITHOUT counting a failure. Something outside the dispatcher killed "
-            "them (reaper / OOM / signal sweep) — find the sender: "
-            "`log show --predicate 'eventMessage CONTAINS \"sent by\"'` around the tick."
+            f"Requeued WITHOUT counting a failure. {cause}"
         )
         subprocess.run(
-            [sys.executable, str(script), "--send", body, "--channel", "discord"],
+            [sys.executable, str(script), "--send", body, "--channel", "discord", "--sev", "error"],
             check=False,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

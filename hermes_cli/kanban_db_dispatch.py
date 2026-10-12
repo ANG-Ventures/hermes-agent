@@ -597,14 +597,22 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
 
     The durable twin of ``_recent_worker_exits``: written by the worker itself
     (``hermes_cli.quiet_single_query.exit_single_query``), so it is there whether
-    or not the process running this sweep ever reaped the worker. Last trailer
-    wins — the log is append-mode across re-runs.
+    or not the process running this sweep ever reaped the worker. Only the
+    CURRENT run's segment counts: the log is append-mode across re-runs, and a
+    previous run's ``rc=0`` trailer read for a live-but-misjudged worker booked
+    13 still-running workers as clean-exit protocol violations on 2026-10-12
+    12:11 (t_5c37ab9d). A log with no boundary (never stamped) keeps the
+    whole-tail read; an empty current segment is no evidence.
     """
     try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
+        raw = _kb.read_worker_log(task_id, tail_bytes=_kb._WORKER_LOG_SEGMENT_BYTES, board=board)
     except Exception:
         return None
-    matches = _EXIT_TRAILER_RE.findall(raw or "")
+    raw = raw or ""
+    boundary = raw.rfind(_kb._RUN_BOUNDARY_PREFIX)
+    if boundary >= 0:
+        raw = raw[boundary:]
+    matches = _EXIT_TRAILER_RE.findall(raw)
     return int(matches[-1]) if matches else None
 
 
@@ -694,6 +702,90 @@ def _process_fingerprint(pid: int) -> Optional[str]:
     return f"{current_instantiation_epoch()}|{start}"
 
 
+def _fingerprints_agree(recorded: str, current: Optional[str]) -> bool:
+    """Same process: the boot epochs are equal and the start times agree within
+    ``START_TIME_DRIFT_TOLERANCE`` (2 s).
+
+    Never compare the strings exactly. On macOS the start time is psutil's
+    ``create_time()``, which re-bases every reading by the change in the
+    whole-second ``boot_time()`` once a wall-clock step moves it across a
+    second boundary. 2026-10-12 12:11:25 PT: timed stepped the Studio clock
+    +0.75 s and every fingerprint the gateway read afterwards was +100 cs off
+    the one it recorded at spawn. The exact compare called all 40 live workers
+    recycled, and they were requeued as a "cohort death" while still running
+    (t_5c37ab9d).
+    """
+    from gateway.status import start_time_fingerprints_match
+
+    if current is None:
+        return False
+    rec_epoch, _, rec_start = recorded.rpartition("|")
+    cur_epoch, _, cur_start = current.rpartition("|")
+    if rec_epoch != cur_epoch:
+        return False
+    try:
+        return start_time_fingerprints_match(rec_start, cur_start)
+    except (TypeError, ValueError):
+        return False
+
+
+def _process_group_evidence(pid: int) -> dict[str, Any]:
+    """``{ppid, pgid, sid}`` of a live ``pid``, read without forking.
+
+    Stamped on the ``spawned`` event so a later cohort death can say which
+    process group/session the dead workers lived in. Missing keys = unreadable.
+    """
+    out: dict[str, Any] = {}
+    for key, read in (("pgid", getattr(os, "getpgid", None)), ("sid", getattr(os, "getsid", None))):
+        if read is not None:
+            with contextlib.suppress(OSError):
+                out[key] = read(int(pid))
+    with contextlib.suppress(Exception):
+        import psutil
+
+        out["ppid"] = psutil.Process(int(pid)).ppid()
+    return out
+
+
+def _cohort_member_evidence(pid: int, spawn_group: Optional[int]) -> dict[str, Any]:
+    """Death-time evidence for one cohort member.
+
+    ``pid_alive``: the pid is still a running (non-zombie) process. A cohort
+    whose pids are still running was not killed; the liveness/identity check
+    misjudged it. ``group_members``: other live pids still in the worker's
+    spawn process group (who else shared the pgrp when it died).
+    """
+    evidence: dict[str, Any] = {"pid_alive": bool(_kb._pid_alive(int(pid)))}
+    if spawn_group is None:
+        return evidence
+    with contextlib.suppress(Exception):
+        import psutil
+
+        members = []
+        for proc in psutil.process_iter(["pid"]):
+            with contextlib.suppress(Exception):
+                if proc.pid != int(pid) and os.getpgid(proc.pid) == int(spawn_group):
+                    members.append(proc.pid)
+        evidence["group_members"] = sorted(members)[:20]
+    return evidence
+
+
+def _spawn_group(conn: sqlite3.Connection, task_id: str, run_id: Optional[int], pid: int) -> Optional[int]:
+    """The pgid the run's ``spawned`` event recorded for ``pid``, if any."""
+    if run_id is None:
+        return None
+    for ev in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'spawned' ORDER BY id DESC",
+        (task_id, int(run_id)),
+    ):
+        with contextlib.suppress(TypeError, ValueError, AttributeError):
+            payload = json.loads(ev["payload"] or "{}")
+            if int(payload.get("pid", -1)) == int(pid) and payload.get("pgid") is not None:
+                return int(payload["pgid"])
+    return None
+
+
 def _worker_alive(pid: Optional[int], started_at) -> bool:
     """True when ``pid`` is live AND is still the worker we spawned. ``started_at`` is the fingerprint
     recorded by ``_set_worker_pid``; after a reboot (or any PID recycle) an unrelated process can own
@@ -719,7 +811,7 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
+        return not _fingerprints_agree(started_at, _process_fingerprint(int(pid)))
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:
@@ -1899,6 +1991,9 @@ def detect_crashed_workers(
     # (task_id, pid, claimer, protocol_violation, error_text, stderr_tail)
     dead: list[tuple] = []  # (row, pid, exit_kind, exit_code) for every dead pid
     cohort_dead: list[str] = []
+    # Cohort members whose pid was still in the process table: a misjudged
+    # liveness check, not a kill (t_5c37ab9d). Named in the page.
+    cohort_alive: list[str] = []
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
@@ -2012,6 +2107,11 @@ def detect_crashed_workers(
                     "cohort_size": len(cohort_ids),
                     "cohort": sorted(cohort_ids)[:50],
                 }
+                event_payload.update(_cohort_member_evidence(
+                    pid, _spawn_group(conn, row["id"], row["current_run_id"], pid),
+                ))
+                if event_payload["pid_alive"]:
+                    cohort_alive.append(row["id"])
                 stderr_tail = _kb._worker_log_stderr_tail(row["id"], board=board)
                 if stderr_tail:
                     event_payload["stderr_tail"] = stderr_tail
@@ -2457,7 +2557,7 @@ def detect_crashed_workers(
             "(no failure counted): %s",
             len(cohort_dead), ", ".join(cohort_dead),
         )
-        _kb._page_cohort_death(conn, cohort_dead)
+        _kb._page_cohort_death(conn, cohort_dead, still_alive=cohort_alive)
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -2774,6 +2874,9 @@ def _set_worker_pid(
         boot_id = _kb._boot_id()
         if boot_id:
             spawn_payload["boot_id"] = boot_id
+    # Process group / session / parent at spawn: a cohort death names the
+    # group its members lived in and who else was still in it (t_5c37ab9d).
+    spawn_payload.update(_process_group_evidence(int(pid)))
     if pool is not None:
         # The relay pool this spawn was charged to (t_38be6b10).
         spawn_payload["pool"] = pool
@@ -3610,12 +3713,26 @@ def dispatch_once(
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
             _kbc._maybe_checkpoint_wal(conn, db_path)
+    # Outside the dispatch lock: stop resources (VM/container/unit) whose card finished
+    # (t_2df204e5). Only the tick that held the lock sweeps, so two dispatchers never double-stop.
+    if held and not dry_run:
+        _release_finished_resources(conn, board)
     # The dispatch lock has been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
+
+
+def _release_finished_resources(conn: sqlite3.Connection, board: Optional[str]) -> None:
+    """Best-effort: a failing sweep is logged and retried next tick, never breaks dispatch."""
+    try:
+        from hermes_cli import kanban_resources
+
+        kanban_resources.release_finished(conn, board=board)
+    except Exception as exc:
+        _kb._log.warning("kanban resource release failed (%s: %s)", type(exc).__name__, exc)
 
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:

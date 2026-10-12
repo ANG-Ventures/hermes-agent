@@ -21,6 +21,11 @@ _PATH_NAMES = {
     "target", "cwd", "workspace", "p_abs", "managed_root", "pinned",
     "requested", "override", "native", "artifact", "workspace_root",
 }
+# A string fold is allowed only where it merely PICKS the candidate spelling and
+# filesystem identity makes the decision. _rel_to_live (#1881, t_59aceaac) lowers a
+# part, then keeps it only if _path_identity(current/part) == _path_identity(current/lower);
+# a case-sensitive volume where the two are different dirs never folds (t_1aa8b583).
+_FOLD_ONLY_PICKS_CANDIDATE = {"_unknown_owner_may_claim", "_rel_to_live"}
 
 
 def _called(node):
@@ -44,7 +49,7 @@ def _gc_path_offenders(source: str):
                 or isinstance(n.func, ast.Name) and n.func.id in {"open", "fcntl"}
             ) and fn.name in {"_path_identity", "_same_tree", "_same_path"}:
                 offenders.append((fn.name, n.lineno, "descriptor in identity"))
-            if (fn.name != "_unknown_owner_may_claim" and isinstance(n, ast.Call)
+            if (fn.name not in _FOLD_ONLY_PICKS_CANDIDATE and isinstance(n, ast.Call)
                     and isinstance(n.func, ast.Attribute)
                     and n.func.attr in {"casefold", "lower", "normalize"}):
                 offenders.append((fn.name, n.lineno, "string fold in identity"))

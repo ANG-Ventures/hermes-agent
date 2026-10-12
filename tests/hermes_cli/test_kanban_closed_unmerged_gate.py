@@ -450,7 +450,8 @@ def test_e2e_prose_mentioned_pr_closed_elsewhere_does_not_gate(board, no_survivo
                                 metadata={"pr_url": PR_URL}, expected_run_id=run)
         assert _status(conn, tid) == "review"
         meta = kb.list_runs(conn, tid)[-1].metadata
-        assert "ANG-Ventures/x#12" in meta["auto_routed_open_prs"] and meta["own_prs"] == ["ANG-Ventures/r#5"]
+        assert meta["auto_routed_open_prs"] == ["ANG-Ventures/r#5"] and meta["own_prs"] == ["ANG-Ventures/r#5"]
+        assert meta["mentioned_unowned_prs"] == ["ANG-Ventures/x#12"]  # declared beats prose (t_0ecd6506)
         monkeypatch.setattr(op, "_default_query", lambda: states(n5="MERGED", n12="CLOSED"))
         assert kb.complete_task(conn, tid, summary="approved")
         assert _status(conn, tid) == "done"
