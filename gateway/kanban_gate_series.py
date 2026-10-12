@@ -63,14 +63,39 @@ def rotate(path: Path, now: float, keep: int = KEEP_DAYS) -> Optional[Path]:
     if dest.exists():
         # A clock step back across midnight can give the live file a day that
         # already has an archive: merge into it, never overwrite it.
-        _append_all(dest, path.read_bytes())
-        path.unlink()
+        _merge_into(dest, path)
     else:
         os.replace(path, dest)
     rotated = sorted(p for p in path.parent.glob(f"{stem}.????-??-??.jsonl"))
     for old in rotated[: max(0, len(rotated) - keep)]:
         old.unlink(missing_ok=True)
     return dest
+
+
+def _merge_into(dest: Path, live: Path) -> None:
+    """Merge ``live`` onto the end of ``dest`` and remove ``live``, crash-safe.
+
+    The merged archive is written to a temp file and swapped in with one
+    ``os.replace``, so ``dest`` is always either the old archive or the whole
+    merge. A crash after that swap but before ``live`` is unlinked leaves
+    ``dest`` already ending in ``live``'s bytes; the retry sees that suffix and
+    only unlinks, so no tick record is ever counted twice (the I-0 query sums
+    this series)."""
+    old = dest.read_bytes()
+    data = live.read_bytes()
+    if data and old.endswith(data):
+        live.unlink()
+        return
+    if old and not old.endswith(b"\n"):
+        old += b"\n"
+    tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+    try:
+        tmp.unlink(missing_ok=True)
+        _append_all(tmp, old + data)
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+    live.unlink()
 
 
 def append(path: Path, record: Mapping[str, Any], now: Optional[float] = None) -> None:

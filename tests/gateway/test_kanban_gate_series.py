@@ -258,6 +258,35 @@ def test_failed_rotation_merge_leaves_the_archive_untouched(tmp_path, monkeypatc
     assert [json.loads(l)["n"] for l in arch.read_text().splitlines()] == [1, 2]
 
 
+def test_crash_between_merge_and_unlink_never_duplicates_records(tmp_path, monkeypatch):
+    """Apollo review r1 (t_90887924), Prism 2468447f9fca: a crash after the
+    archive merge but before the live file is unlinked must not re-append the
+    same ticks on the next rotation (the I-0 query sums this series)."""
+    p = tmp_path / "var" / series.SERIES_FILE
+    t0 = 1_791_000_000.0
+    series.append(p, {"n": 1}, now=t0)
+    os.utime(p, (t0, t0))
+    series.append(p, {"n": 2}, now=t0 + 86400)       # day0 archive holds n=1
+    os.utime(p, (t0, t0))                             # clock step back: live dated day0
+    (arch,) = p.parent.glob("gate-ticks.????-??-??.jsonl")
+    real_unlink = Path.unlink
+
+    def crash_on_live(self, *a, **kw):
+        if self == p:
+            raise OSError("simulated crash before unlink")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", crash_on_live)
+    with pytest.raises(OSError):
+        series.rotate(p, t0 + 86400)
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    assert p.exists()
+    series.rotate(p, t0 + 86400)                      # the retry after the crash
+    assert not p.exists()
+    assert [json.loads(l)["n"] for l in arch.read_text().splitlines()] == [1, 2]
+    assert not list(p.parent.glob(".*.tmp"))
+
+
 def test_pool_budget_is_the_plan_budget_before_any_take():
     """Prism 24de3acc1c0b: an unpinned take with the signal off decrements
     slots without counting `taken`; the series must still record the grant."""
