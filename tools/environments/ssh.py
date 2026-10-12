@@ -57,16 +57,20 @@ class SSHEnvironment(BaseEnvironment):
 
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
-                 probe_only: bool = False, sync_files: bool = True):
+                 probe_only: bool = False, sync_files: bool = True,
+                 control_scope: str = "", log_file: str = ""):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host, self.user, self.port, self.key_path = host, user, port, key_path
+        self.log_file = log_file
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
         self.control_dir.mkdir(parents=True, exist_ok=True)
         # Short, deterministic socket name: the path must stay under macOS's 104-byte sun_path
         # limit (raw user@host:port + SSH's 16-byte suffix under a deep $TMPDIR exceeds it), and
         # stability across reconnects keeps ControlMaster reuse working. A probe gets its own
         # per-instance socket so its cleanup() can never close the agent's shared master.
-        socket_key = f"{user}@{host}:{port}"
+        # ``control_scope`` (a kanban run) gives concurrent processes to one target their own
+        # master instead of racing to create the shared one.
+        socket_key = f"{user}@{host}:{port}" + (f":{control_scope}" if control_scope else "")
         if probe_only:
             socket_key = f"{socket_key}:probe:{self._session_id}"
         _socket_id = hashlib.sha256(socket_key.encode()).hexdigest()[:16]
@@ -111,9 +115,14 @@ class SSHEnvironment(BaseEnvironment):
         flags = [port_flag, str(self.port)] if self.port != 22 else []
         return flags + (["-i", self.key_path] if self.key_path else [])
 
-    def _build_ssh_command(self, extra_args: list | None = None, send_env: Iterable[str] = ()) -> list:
+    def _build_ssh_command(self, extra_args: list | None = None, send_env: Iterable[str] = (),
+                           log_to_file: bool = False) -> list:
         send_env = tuple(sorted(send_env))
         cmd = ["ssh"]
+        if log_to_file and self.log_file:
+            # The command path merges stderr into the tool result: ssh's own diagnostics
+            # ("ControlSocket ... already exists") go to the log; the remote command's stderr stays.
+            cmd.extend(["-E", self.log_file])
         if _SSH_MULTIPLEX:
             cmd.extend(["-o", f"ControlPath={self._control_socket_for(send_env)}",
                         "-o", "ControlMaster=auto", "-o", "ControlPersist=300"])
@@ -293,7 +302,7 @@ class SSHEnvironment(BaseEnvironment):
         remote sshd must ``AcceptEnv`` them (#14091). Profile-scoped names missing from the active
         scope are unset remotely so a shared host cannot serve another profile's value."""
         values, unset_names = resolve_passthrough_env(hermes_env_loader=_load_hermes_env_vars)
-        cmd = self._build_ssh_command(send_env=values) + bash_argv(shlex.quote(prepend_unset(cmd_string, unset_names)), login)
+        cmd = self._build_ssh_command(send_env=values, log_to_file=True) + bash_argv(shlex.quote(prepend_unset(cmd_string, unset_names)), login)
         client_env = client_env_with(values)
         return _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
 

@@ -904,6 +904,10 @@ def _get_env_config() -> Dict[str, Any]:
         # Internal bridge: a kanban pool placement turns ~/.hermes file sync
         # off (KWLB: one shared kanbanw login serves every profile).
         "ssh_sync_files": _tenv_bool("TERMINAL_SSH_SYNC_FILES", "true"),
+        # Internal bridge (kanban placement): per-run ControlMaster socket and
+        # the file ssh's own diagnostics go to (``ssh -E``).
+        "ssh_control_scope": _tenv("TERMINAL_SSH_CONTROL_SCOPE", ""),
+        "ssh_log_file": _tenv("TERMINAL_SSH_LOG_FILE", ""),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting; local is always opt-in. Per-backend env vars override.
         "ssh_persistent": _tenv_bool(

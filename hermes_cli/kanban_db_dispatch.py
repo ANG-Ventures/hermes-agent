@@ -6263,7 +6263,9 @@ def _default_spawn(
     env.pop(_kb._kwh.PLACEMENT_ENV, None)
     if placement is not None:
         _kb._kwh.prepare_remote_workspace(placement, workspace)
-        _kb._kwh.apply_placement(env, placement, workspace)
+        _kb._kwh.apply_placement(
+            env, placement, workspace, run_id=task.current_run_id,
+            log_file=str(_kb.worker_log_path(task.id, board=board)))
 
     cmd = [
         *_resolve_hermes_argv(),
