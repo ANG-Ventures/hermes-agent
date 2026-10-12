@@ -2258,17 +2258,16 @@ class GatewayTurnMixin:
         # the system prompt cannot drift turn-over-turn; a miss (thread rename, /sethome) re-renders.
         if event.internal and session_key:
             await self._rehydrate_prompt_pins(session_key, session_entry.session_id)
-        # A /branch thread child keeps its parent's context bytes (warm prefix); its own thread facts
-        # ride this turn's user message instead (t_84dabcc7).
-        _branch_context_note = None if event.internal else self._adopt_inherited_context_pin(
-            context, _redact_pii, session_key)
+        # A /branch thread child keeps its parent's context bytes (warm prefix); the inherited pin
+        # is returned verbatim here and adopted (re-keyed + its thread note staged) only after the
+        # early-outs below, so an aborted first turn leaves it adoptable (t_84dabcc7).
         context_prompt = self._pinned_session_context_prompt(
             context, _redact_pii, session_key, internal=event.internal,
         )
 
         # Per-turn notes ride the user message via the api_content sidecar, NOT context_prompt
         # (appending to the ephemeral system prompt forced a full agent rebuild).
-        turn_sidecar_notes: List[str] = [_branch_context_note] if _branch_context_note else []
+        turn_sidecar_notes: List[str] = []
         if _was_auto_reset:
             await self._hmwa_deliver_auto_reset_notice(session_entry, source, turn_sidecar_notes)
 
@@ -2316,6 +2315,13 @@ class GatewayTurnMixin:
         message_text, persist_user_message, persist_user_timestamp = (
             self._hmwa_apply_message_timestamp(event, message_text)
         )
+
+        # Adopt an inherited /branch pin only now, past every early-out: it re-keys the pin and the
+        # thread's own facts ride this turn's user message (Prism d78579970af8 / b6bd0d66ca29).
+        if not event.internal:
+            _branch_context_note = self._adopt_inherited_context_pin(context, _redact_pii, session_key)
+            if _branch_context_note:
+                turn_sidecar_notes.insert(0, _branch_context_note)
 
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.

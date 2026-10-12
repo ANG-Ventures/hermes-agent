@@ -16,7 +16,8 @@ import pytest
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import (
-    SessionContext, SessionSource, SessionStore, branch_thread_context_note, build_session_context_prompt,
+    BRANCH_INHERITED_PIN_KEY, SessionContext, SessionSource, SessionStore, branch_thread_context_note,
+    build_session_context_prompt,
 )
 from tests.gateway.test_internal_event_pin_wiring import KEY, _capture, _human_source, _make_runner
 from hermes_state import AsyncSessionDB
@@ -99,6 +100,64 @@ async def test_branch_thread_note_is_staged_on_first_child_turn_only(monkeypatch
     notes = [n for batch in staged for n in batch if "[Session context for this branch]" in n]
     assert len(notes) == 1
     assert f"**Thread:** `{THREAD_ID}`" in notes[0] and '"Guild / side quest"' in notes[0]
+
+
+# ------------------------------------------------- aborted first turn keeps the pin adoptable
+# Prism d78579970af8 / b6bd0d66ca29 on #1923: the sentinel was re-keyed BEFORE the two early-outs
+# in ``_hmwa_prepare_turn``, so a child whose first turn aborted kept the parent's bytes with no
+# note ever delivered (Discord tools then target the parent channel).
+
+async def _first_turn_aborts_then_succeeds(runner, abort):
+    staged: list[list[str]] = []
+    orig = runner._set_pending_turn_sidecar_notes
+    runner._set_pending_turn_sidecar_notes = lambda k, notes: (staged.append(list(notes)), orig(k, notes))
+
+    await _turn(runner, _human_source(), KEY)
+    CHILD_KEY = _child_key(runner)
+    runner._inherit_branch_context_pin(KEY, CHILD_KEY)
+    staged.clear()
+    undo = abort(runner)
+    await _turn(runner, _child_thread_source(), CHILD_KEY)
+    assert staged == [], "an aborted turn must stage nothing"
+    pin = runner._peek_session_state(CHILD_KEY).conversation.ephemeral_pin
+    assert pin is not None and pin[0] == BRANCH_INHERITED_PIN_KEY, "aborted turn consumed the inherited pin"
+    undo()
+    await _turn(runner, _child_thread_source(), CHILD_KEY)
+    notes = [n for batch in staged for n in batch if "[Session context for this branch]" in n]
+    assert len(notes) == 1, "retry after an aborted first turn never delivered the branch note"
+
+
+@pytest.mark.asyncio
+async def test_history_unreadable_early_out_keeps_inherited_pin_adoptable(monkeypatch):
+    from gateway.session_transcript import TranscriptReadError
+
+    runner = _make_runner(monkeypatch)
+    _capture(runner, [])
+
+    def abort(r):
+        store = r.session_store
+        prev = store.load_transcript.side_effect
+        store.load_transcript.side_effect = TranscriptReadError("db locked")
+        return lambda: setattr(store.load_transcript, "side_effect", prev)
+
+    await _first_turn_aborts_then_succeeds(runner, abort)
+
+
+@pytest.mark.asyncio
+async def test_rejected_inbound_text_early_out_keeps_inherited_pin_adoptable(monkeypatch):
+    runner = _make_runner(monkeypatch)
+    _capture(runner, [])
+
+    def abort(r):
+        prev = r._prepare_profile_scoped_inbound_message_text
+
+        async def _drop(**kw):
+            return None
+
+        r._prepare_profile_scoped_inbound_message_text = _drop
+        return lambda: setattr(r, "_prepare_profile_scoped_inbound_message_text", prev)
+
+    await _first_turn_aborts_then_succeeds(runner, abort)
 
 
 def test_inherited_pin_never_crosses_privacy_policy(monkeypatch):

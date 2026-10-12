@@ -810,6 +810,10 @@ class GatewayAgentCacheMixin:
             _eph_pin = None
         if internal and _eph_pin is not None:
             return _eph_pin[1]
+        # An inherited /branch pin is a hit on its own: the sentinel is re-keyed only once the turn
+        # commits (``_adopt_inherited_context_pin``), so an early-out leaves it adoptable.
+        if _eph_pin is not None and _eph_pin[0] == BRANCH_INHERITED_PIN_KEY:
+            return _eph_pin[1]
         _eph_key = self._ephemeral_change_key(context, redact_pii)
         if _eph_pin is not None and _eph_pin[0] == _eph_key:
             return _eph_pin[1]
@@ -844,8 +848,10 @@ class GatewayAgentCacheMixin:
     def _adopt_inherited_context_pin(self, context, redact_pii: bool, session_key: Optional[str]) -> Optional[str]:
         """Re-key an inherited ``/branch`` pin to this session's own render key, keeping the parent's
         bytes, and return the per-turn note carrying the thread's own session facts (``None`` when
-        there is nothing to adopt). After this the usual pin rules apply: a later real metadata
-        change (rename, /sethome) re-renders once, as on any session."""
+        there is nothing to adopt). Called from ``_hmwa_prepare_turn`` only once the turn is past its
+        early-outs: until then ``_pinned_session_context_prompt`` serves the sentinel pin verbatim,
+        so an aborted first turn leaves the note still deliverable. After this the usual pin rules
+        apply: a later real metadata change (rename, /sethome) re-renders once, as on any session."""
         state = self._peek_session_state(session_key) if session_key else None
         pin = state.conversation.ephemeral_pin if state else None
         if pin is None or pin[0] != BRANCH_INHERITED_PIN_KEY:
