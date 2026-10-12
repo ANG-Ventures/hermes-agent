@@ -5042,6 +5042,13 @@ def _dispatch_once_locked(
         reason = invalid_pin_reason(provider, model)
         if reason is None:
             return False
+        # Prism 68402070f7c9 (hermes-agent#1903): a pin written with ``--force-model`` carries a
+        # ``model force: <provider>/<model> ...`` audit comment; honour it for THAT exact pair only,
+        # so a later re-pin to a different unknown id is still caught here.
+        if _kb.model_force_comment_present(conn, task_id, provider, model):
+            _kb._log.info("PHASE=kanban_model_override_forced task=%s provider=%s model=%s",
+                          task_id, provider, model)
+            return False
         result.auto_blocked.append(task_id)
         if dry_run:
             return True

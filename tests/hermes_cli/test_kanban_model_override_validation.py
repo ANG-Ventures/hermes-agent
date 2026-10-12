@@ -281,3 +281,26 @@ def test_rate_limit_exit_with_a_real_429_stays_rate_limited(kanban_home, monkeyp
         assert tid in getattr(kbd.detect_crashed_workers, "_last_rate_limited", [])
         task = kb.get_task(conn, tid)
         assert task.status == "ready" and task.consecutive_failures == 0
+
+
+def test_forced_pin_is_honoured_at_dispatch_for_that_pair_only(kanban_home, lane_catalog):
+    """Prism 68402070f7c9: a --force-model pin must run, not be capability-blocked every tick;
+    a later re-pin to a DIFFERENT unknown id gets no exemption."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="w")
+        conn.execute("UPDATE tasks SET model_override=?, provider_override=? WHERE id=?",
+                     (DEAD_ID, LANE, tid))
+        kb.add_comment(conn, tid, "apollo", kb._model_force_comment(LANE, DEAD_ID, "canary lane"))
+        conn.commit()
+        assert kb.model_force_comment_present(conn, tid, LANE, DEAD_ID)
+        spawned = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 4242)
+        assert tid not in result.auto_blocked
+        assert kb.get_task(conn, tid).status != "blocked"
+        # re-pin to another unknown id: the old force comment does not cover it
+        conn.execute("UPDATE tasks SET model_override=? WHERE id=?", (DEAD_ID + "-other", tid))
+        conn.commit()
+        assert not kb.model_force_comment_present(conn, tid, LANE, DEAD_ID + "-other")
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 4242)
+        assert tid in result.auto_blocked
+
