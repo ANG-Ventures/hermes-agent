@@ -147,6 +147,10 @@ class PoolConfig:
     reach: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
     reach_aliases: Tuple[str, ...] = ()
     reach_status: str = "absent"   # ok | absent | stale | unreadable
+    # Literal ``Host`` aliases of the dispatcher's ~/.ssh/config (t_f1b135a8):
+    # a word-shaped alias (ci, ai, media) binds a card only if listed here.
+    # None = unknown (unread / unreadable): fail closed, the check is skipped.
+    ssh_hosts: Optional[frozenset] = None
 
 
 # -- registry ---------------------------------------------------------------
@@ -328,6 +332,7 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         studio_bound_skills=tuple(sidecar.get("studio_bound_skills") or ()),
         pool_hosts=tuple(hosts), disabled=tuple(disabled), warnings=tuple(warnings),
         reach=reach, reach_aliases=aliases, reach_status=reach_status,
+        ssh_hosts=known_ssh_hosts(fleet_dir),
     )
 
 
@@ -380,30 +385,186 @@ def read_reach(fleet_dir: Path, *, now: Optional[float] = None,
 
 
 _HOST_TOKEN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
-# The three ssh-shaped ways a body drives a host (t_696a9a06). A bare word is
-# prose: "ci-box burst 2/6" or "the ci-box build sheet" drive nothing.
-#   ssh/scp/sftp/rsync/mosh ... [user@]<alias>   (alias after the verb, same line)
-#   [user@]<alias>:<path>                        (scp/rsync remote form)
+# The ssh-shaped ways a body drives a host (t_696a9a06, t_f1b135a8). A bare
+# word is prose: "ci-box burst 2/6" or "the ci-box build sheet" drive nothing,
+# and neither does a word that merely FOLLOWS a verb ("ssh in and check the ai
+# lane", "rsync the media library"): only the TARGET position binds.
+#   ssh/sftp/mosh [opts] [user@]<alias> ...      (first non-option operand)
+#   scp/rsync ... [user@]<alias>:<path>          (a remote operand of the verb)
+#   [user@]<alias>:<path>                        (anywhere: separator-bearing aliases only)
 #   -H <alias>                                   (docker -H, pdsh -H ...)
-_SSH_VERB_RE = re.compile(r"(?<![\w-])(?:ssh|scp|sftp|rsync|mosh)(?![\w-])(.*)", re.IGNORECASE)
-_AFTER_VERB_RE = re.compile(rf"(?:^|[\s@'\"=/])({_HOST_TOKEN})")
+# A WORD-SHAPED alias (no '-', '.', '_' or digit: ci, ai, media, unifi) is an
+# ordinary English word too, so it additionally needs a ``Host`` entry in the
+# dispatcher's ~/.ssh/config (:func:`ssh_config_hosts`), never a bare word.
+_SSH_VERB_RE = re.compile(r"(?<![\w-])(ssh|scp|sftp|rsync|mosh)(?=\s)", re.IGNORECASE)
 _SCP_RE = re.compile(rf"(?:^|[\s@'\"])({_HOST_TOKEN}):(?=[~/.$A-Za-z_])")
-_DASH_H_RE = re.compile(rf"(?:^|\s)-H[ \t]*[\"']?(?:[\w.-]+@)?({_HOST_TOKEN})")
+_REMOTE_OPERAND_RE = re.compile(
+    rf"^(?:rsync://)?(?:[^\s@/]+@)?({_HOST_TOKEN})(?:::?(?=[~/.$A-Za-z_]|$)|(?<=\w)/)")
+_DASH_H_RE = re.compile(rf"(?:^|\s)-H[ \t]*[\"']?(?:ssh://)?(?:[\w.-]+@)?({_HOST_TOKEN})")
+# Options that consume the NEXT token (``ssh -o BatchMode=yes host``).
+_SSH_ARG_OPTS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+_CMD_BREAK = frozenset({";", "&&", "||", "|", "&"})
+_WORD_ALIAS_RE = re.compile(r"[a-z]+")
+_ssh_config_cache: Dict[str, Tuple[Tuple[float, ...], Optional[frozenset]]] = {}
+
+
+def _strip_token(tok: str) -> str:
+    return tok.strip("`'\"()[]{}<>,;")
+
+
+def _ssh_target(rest: str) -> Optional[str]:
+    """``[user@]host`` of the first non-option operand of ssh/sftp/mosh."""
+    toks = rest.split()
+    i = 0
+    while i < len(toks):
+        tok = _strip_token(toks[i])
+        i += 1
+        if not tok:
+            continue
+        if tok in _CMD_BREAK:
+            return None
+        if tok == "--":
+            continue
+        if tok.startswith("--"):
+            continue           # mosh/long option; ``--x=y`` carries its value
+        if tok.startswith("-") and len(tok) > 1:
+            flags = tok[1:]
+            for j, ch in enumerate(flags):
+                if ch in _SSH_ARG_OPTS:
+                    if j == len(flags) - 1:
+                        i += 1     # value is the next token
+                    break          # else the value is attached (-p22, -oX=y)
+            continue
+        if tok.lower().startswith("ssh://"):
+            tok = tok[6:]
+        tok = tok.rsplit("@", 1)[-1]
+        m = re.match(_HOST_TOKEN, tok)
+        return m.group(0) if m else None
+    return None
+
+
+def _remote_operands(rest: str) -> List[str]:
+    """Hosts of the ``[user@]host:path`` / ``rsync://host/`` operands of scp/rsync."""
+    out: List[str] = []
+    for raw in rest.split():
+        tok = _strip_token(raw)
+        if tok in _CMD_BREAK:
+            break
+        if tok.startswith("-"):
+            continue
+        m = _REMOTE_OPERAND_RE.match(tok)
+        if m and (":" in tok or tok.lower().startswith("rsync://")):
+            out.append(m.group(1))
+    return out
 
 
 def _ssh_shaped_hosts(line: str) -> List[str]:
-    """Host tokens the line addresses in an ssh shape, in order."""
+    """Host tokens the line addresses in an ssh TARGET position, in order.
+
+    Every verb on the line is parsed on its own (``ssh a ..., then ssh b``)."""
     out: List[str] = []
-    m = _SSH_VERB_RE.search(line)
-    if m:
-        out += _AFTER_VERB_RE.findall(m.group(1))
-    out += _SCP_RE.findall(line)
+    verbs = list(_SSH_VERB_RE.finditer(line))
+    for k, m in enumerate(verbs):
+        rest = line[m.end():verbs[k + 1].start() if k + 1 < len(verbs) else len(line)]
+        verb = m.group(1).lower()
+        if verb in ("scp", "rsync"):
+            out += _remote_operands(rest)
+        else:
+            t = _ssh_target(rest)
+            if t:
+                out.append(t)
+    # A verbless ``ace-ai:/path`` still binds a separator-bearing alias; the
+    # \0 mark tells host_bound_targets it is verbless so a WORD alias never
+    # binds this way (``ci:lint``, ``media:...`` in prose).
+    out += [f"\0{h}" for h in _SCP_RE.findall(line)]
     out += _DASH_H_RE.findall(line)
     return out
 
 
+def word_shaped_alias(alias: str) -> bool:
+    """An alias that is also an ordinary word (ci, ai, media, unifi): no
+    separator and no digit. Such an alias binds only as a known ssh host."""
+    return _WORD_ALIAS_RE.fullmatch(alias.lower()) is not None
+
+
+def _ssh_config_files(path: Path, depth: int = 0) -> List[Path]:
+    files = [path]
+    if depth > 4:
+        return files
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return files
+    for line in text.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "include":
+            for pat in parts[1].split():
+                pat = str(Path(pat).expanduser())
+                if not pat.startswith("/"):
+                    pat = str(path.parent / pat)
+                for inc in sorted(Path("/").glob(pat.lstrip("/"))):
+                    files += _ssh_config_files(inc, depth + 1)
+    return files
+
+
+def ssh_config_hosts(path: Optional[Path] = None) -> Optional[frozenset]:
+    """Every literal ``Host`` alias in ``~/.ssh/config`` (and its Includes),
+    lower-cased; wildcard/negated patterns are skipped. ``None`` when the
+    file is absent or unreadable: the caller then FAILS CLOSED (a word alias
+    in target position still binds, the card stays local). Cached by mtime."""
+    path = Path(path) if path is not None else Path.home() / ".ssh" / "config"
+    try:
+        files = _ssh_config_files(path)
+        stamp = tuple(f.stat().st_mtime for f in files)
+    except OSError:
+        return None
+    key = str(path)
+    hit = _ssh_config_cache.get(key)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    names: List[str] = []
+    try:
+        for f in files:
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2 and parts[0].lower() == "host":
+                    names += [n.lower() for n in parts[1].split()
+                              if not any(c in n for c in "*?!")]
+    except OSError:
+        return None
+    out = frozenset(names)
+    _ssh_config_cache[key] = (stamp, out)
+    return out
+
+
+def known_ssh_hosts(fleet_dir: Path, *, ssh_config: Optional[Path] = None) -> Optional[frozenset]:
+    """The ``PoolConfig.ssh_hosts`` set: literal ``Host`` aliases of the
+    dispatcher's ~/.ssh/config, plus every alias ANY reach-matrix row (fresh
+    or stale) recorded ``rc == 0`` for: ssh resolved and reached it, so it is
+    a real destination even with no Host entry (a DNS name like ``unifi``).
+    Stale rows count because this widens what binds (fail closed); freshness
+    only gates the proof. ``None`` when ~/.ssh/config is unreadable."""
+    cfg = ssh_config_hosts(ssh_config)
+    if cfg is None:
+        return None
+    reached: List[str] = []
+    try:
+        doc = _read_json(Path(fleet_dir) / REACH_FILE)
+    except (OSError, ValueError):
+        doc = None
+    rows = doc.get("hosts") if isinstance(doc, dict) else None
+    for row in (rows.values() if isinstance(rows, dict) else ()):
+        table = row.get("reach") if isinstance(row, dict) else None
+        for alias, rc in (table.items() if isinstance(table, dict) else ()):
+            if isinstance(alias, str) and rc == 0 and not isinstance(rc, bool):
+                reached.append(alias.lower())
+    return cfg | frozenset(reached)
+
+
 def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iterable[str],
-                       *, pin_hosts: Iterable[str] = ()) -> Tuple[bool, Tuple[str, ...]]:
+                       *, pin_hosts: Iterable[str] = (),
+                       ssh_hosts: Optional[Collection[str]] = None,
+                       ) -> Tuple[bool, Tuple[str, ...]]:
     """``(host_bound, targets)``: is this card host-bound (a HOST_BOUND_SKILLS
     skill, or a body line that addresses a probed ssh alias in an ssh shape),
     and which aliases it names. A skill-bound card with no named alias has
@@ -415,20 +576,36 @@ def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iter
     never as substrings. A ``host:<pin>`` line is not a target when it IS a
     pin (``any``, ``studio`` or one of ``pin_hosts``). Skill ids compare on
     their basename (``operations/ssh-machines``, Prism e5e1f41acb09).
+
+    Only the ssh TARGET position binds (t_f1b135a8): ``ssh in and check the
+    ai lane`` names no target. A word-shaped alias (``ci``, ``ai``, ``media``)
+    binds only when it is a literal ``Host`` in ``ssh_hosts`` (read_pool
+    fills it from the dispatcher's ~/.ssh/config). ``ssh_hosts=None`` means
+    unknown (file absent/unreadable): the check is skipped, fail closed
+    (bound, stays local). A verbless ``word:path`` never binds a word alias
+    (``ci:lint``, ``media: notes``).
     """
     bound = any(s.rsplit("/", 1)[-1] in HOST_BOUND_SKILLS for s in (skills or ()))
     alias_set = {a for a in (aliases or ()) if a}
     pins = {PIN_ANY, PIN_STUDIO, *(h.lower() for h in (pin_hosts or ()))}
     found: List[str] = []
+    known = None if ssh_hosts is None else {h.lower() for h in ssh_hosts}
     if alias_set and body:
         for line in body.splitlines():
             m = HOST_PIN_RE.match(line)
             if m and m.group(1).lower() in pins:
                 continue
             for word in _ssh_shaped_hosts(line):
-                w = word.lower().rstrip("._-")
-                if w in alias_set and w not in found:
-                    found.append(w)
+                verbless = word.startswith("\0")
+                w = word.lstrip("\0").lower().rstrip("._-")
+                if w not in alias_set or w in found:
+                    continue
+                if word_shaped_alias(w):
+                    if verbless:
+                        continue
+                    if known is not None and w not in known:
+                        continue
+                found.append(w)
     return (bound or bool(found)), tuple(found)
 
 
@@ -589,7 +766,8 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     pool_hosts = tuple(getattr(pool, "hosts", ()) or ())
     aliases = tuple(dict.fromkeys([*(getattr(pool, "reach_aliases", ()) or ()),
                                    *(h.lower() for h in pool_hosts)]))
-    bound, named = host_bound_targets(body, skills, aliases, pin_hosts=pool_hosts)
+    bound, named = host_bound_targets(body, skills, aliases, pin_hosts=pool_hosts,
+                                      ssh_hosts=getattr(pool, "ssh_hosts", None))
     wanted = tuple(dict.fromkeys(h.lower() for h in (targets or {}).values() if h))
     if not bound and not wanted:
         return None

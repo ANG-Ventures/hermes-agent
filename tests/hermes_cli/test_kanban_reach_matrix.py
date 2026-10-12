@@ -109,7 +109,8 @@ def test_stale_rows_keep_their_aliases_in_the_vocabulary(tmp_path):
     assert pool.reach_status == "ok" and set(pool.reach) == {"ci-box"}
     assert set(pool.reach_aliases) == {"ace-ai", "mac-studio-m3u"}
     assert kwp.reach_allowed_hosts(body="ssh ace-ai", skills=(), pool=pool) == ("ci-box",)
-    assert kwp.reach_allowed_hosts(body="ssh ace-ai then mac-studio-m3u", skills=(), pool=pool) == ()
+    # Both hosts in ssh TARGET position (t_f1b135a8: a word after the target is prose).
+    assert kwp.reach_allowed_hosts(body="ssh ace-ai, then ssh mac-studio-m3u", skills=(), pool=pool) == ()
 
 
 def test_body_only_card_is_recognised_without_a_fresh_sample(tmp_path):
@@ -226,6 +227,92 @@ def test_ssh_shaped_mention_is_host_bound_and_held_on_an_empty_matrix(tmp_path, 
     assert kwp.reach_allowed_hosts(body=body, skills=(), pool=pool) == ()
     ok, rule, _ = _portable(pool, body=body)
     assert (ok, rule) == (False, "host_reach")
+
+
+# -- t_f1b135a8: only the ssh TARGET position binds; word aliases need ~/.ssh/config --
+SHORT = (*ALIASES, "ci", "ai", "media")
+SSH_CFG = frozenset({"ci", "ace-ai", "ace-media", "unifi"})   # ai/media: no Host entry
+
+
+@pytest.mark.parametrize("body", [
+    "ssh in and check the ai lane",
+    "scp media:/srv/x .",                       # media is no ssh Host
+    "rsync the media library to the NAS",
+    "ssh into the box and look at ci logs",
+    "run ci:lint then report",                  # verbless word:path
+    "ssh -o BatchMode=yes in, then grep the ai log",
+    "mosh to it and tail the media log",
+])
+def test_word_alias_in_prose_does_not_bind(body):
+    """RED ON BASE: any token after an ssh/rsync verb, and any ``<word>:``
+    bound the card, so a short alias in prose made it non-portable."""
+    assert kwp.host_bound_targets(body, (), SHORT, ssh_hosts=SSH_CFG) == (False, ())
+
+
+@pytest.mark.parametrize("body,target", [
+    ("ssh ci sudo systemctl restart foo", "ci"),
+    ("scp ci:/path .", "ci"),
+    ("scp report.txt kanbanw@ci:/tmp/", "ci"),
+    ("rsync -az ci:/var/log/ ./logs/", "ci"),
+    ("ssh -p 22 -o BatchMode=yes kanbanw@ci 'uptime'", "ci"),
+    ("ssh -i ~/.ssh/k ci uptime", "ci"),
+    ("ssh ace-ai 'x' && ssh ci 'y'", "ci"),
+    ("sftp ci", "ci"),
+    ("docker -H ssh://ace-ai ps", "ace-ai"),
+    ("see ace-media:/srv/drop for the file", "ace-media"),   # separator alias, verbless
+])
+def test_target_position_binds(body, target):
+    bound, targets = kwp.host_bound_targets(body, (), SHORT, ssh_hosts=SSH_CFG)
+    assert bound and target in targets
+
+
+def test_word_alias_needs_an_ssh_config_host():
+    """Target position alone is not enough for a word alias: ``ssh ai uptime``
+    names a host only if ``ai`` is a Host in ~/.ssh/config. Unknown config
+    (None) fails closed: the word alias binds."""
+    assert kwp.host_bound_targets("ssh ai uptime", (), SHORT, ssh_hosts=SSH_CFG) == (False, ())
+    assert kwp.host_bound_targets("ssh ai uptime", (), SHORT, ssh_hosts=SSH_CFG | {"ai"}) == (True, ("ai",))
+    assert kwp.host_bound_targets("ssh ai uptime", (), SHORT, ssh_hosts=None) == (True, ("ai",))
+    # Separator-bearing aliases never need the config.
+    assert kwp.host_bound_targets("ssh ace-media uptime", (), SHORT, ssh_hosts=frozenset()) \
+        == (True, ("ace-media",))
+
+
+def test_ssh_config_hosts_reads_literal_hosts_and_includes(tmp_path):
+    inc = tmp_path / "conf.d"
+    inc.mkdir()
+    (inc / "fleet").write_text("Host media ace-media\n  HostName 10.0.0.2\n")
+    cfg = tmp_path / "config"
+    cfg.write_text("Include conf.d/*\nHost ci *.lan !bad\n  User x\nhost   ai\n")
+    assert kwp.ssh_config_hosts(cfg) == frozenset({"ci", "ai", "media", "ace-media"})
+    assert kwp.ssh_config_hosts(tmp_path / "missing") is None
+
+
+def test_pool_ssh_hosts_threads_into_reach_allowed_hosts(tmp_path):
+    fleet = tmp_path / "fleet"
+    _matrix(fleet, {"ci-box": {"at": NOW, "reach": {"ci": 0}}})
+    reach, aliases, status = kwp.read_reach(fleet, now=NOW)
+    pool = kwp.PoolConfig(hosts=("ci-box",), profiles=("alpha",), reach=reach,
+                          reach_aliases=aliases, reach_status=status, ssh_hosts=frozenset({"ci"}))
+    assert kwp.reach_allowed_hosts(body="ssh ci sudo reboot", skills=(), pool=pool) == ("ci-box",)
+    assert kwp.reach_allowed_hosts(body="ssh in and run the ci suite", skills=(), pool=pool) is None
+
+
+def test_known_ssh_hosts_adds_every_alias_a_matrix_row_ever_reached(tmp_path):
+    """A word alias with no Host entry (DNS-resolved ``unifi``) is still a real
+    destination if any matrix row, fresh OR stale, reached it (rc 0): a stale
+    matrix must not unbind ``ssh unifi ...`` and let it spill (fail closed)."""
+    fleet = tmp_path / "fleet"
+    _matrix(fleet, {"ci-box": {"at": NOW, "reach": {"media": 255}},
+                    "ace-ai": {"at": NOW - 40 * 3600, "reach": {"unifi": 0}}})
+    cfg = tmp_path / "config"
+    cfg.write_text("Host ci\n")
+    known = kwp.known_ssh_hosts(fleet, ssh_config=cfg)
+    assert known == frozenset({"ci", "unifi"})
+    assert kwp.host_bound_targets("ssh unifi 'unifi-os restart'", (), SHORT, ssh_hosts=known) == (True, ("unifi",))
+    assert kwp.host_bound_targets("ssh media uptime", (), SHORT, ssh_hosts=known) == (False, ())
+    assert kwp.host_bound_targets("ssh in and restart the unifi app", (), SHORT, ssh_hosts=known) == (False, ())
+    assert kwp.known_ssh_hosts(fleet, ssh_config=tmp_path / "missing") is None
 
 
 def test_burst_card_pinned_to_ci_box_places_on_a_members_reach_nothing_matrix(kanban_home):
