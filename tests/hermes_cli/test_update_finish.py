@@ -28,11 +28,40 @@ def _put(root, name, content):
     return path
 
 
+_NO_YAML = "import importlib.util, sys; sys.exit(importlib.util.find_spec('yaml') is not None)"
+
+
+def _dependency_free_python():
+    """The base interpreter, or a uv-managed one of the same minor when the base is not clean.
+
+    A python-build-standalone base (uv-managed, CI's setup-pm) carries no third-party packages.
+    A distro system interpreter does not hold that: Ubuntu's /usr/bin/python3.X ships
+    /usr/lib/python3/dist-packages (python3-yaml is a netplan/cloud-init dependency), and -I
+    drops PYTHONPATH and user site but not dist-packages. A venv built on it (uv picks the system
+    3.14 when no managed one is installed) would leak yaml into the "selected" interpreter, so the
+    test would assert a property of the venue, not of the completion code.
+    """
+    base = Path(sys._base_executable).resolve()
+    if subprocess.run([str(base), "-I", "-c", _NO_YAML], capture_output=True).returncode == 0:
+        return base
+    uv = shutil.which("uv")
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    found = subprocess.run([uv, "python", "find", "--managed-python", "--no-project", version],
+                           capture_output=True, text=True) if uv else None
+    if found is not None and found.returncode == 0:
+        managed = Path(found.stdout.strip()).resolve()
+        if subprocess.run([str(managed), "-I", "-c", _NO_YAML], capture_output=True).returncode == 0:
+            return managed
+    pytest.skip(f"base interpreter {base} imports yaml under -I (distro dist-packages) and no "
+                f"dependency-free uv-managed {version} is installed (`uv python install {version}`)")
+
+
 @pytest.fixture
 def completion(tmp_path, monkeypatch):
     from hermes_cli.config_defaults import DEFAULT_CONFIG
     from pm.environments import install_state_dir, runtime_facts_path, site_packages
 
+    selected_python = _dependency_free_python()  # before HOME moves: uv finds managed Pythons under it
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -55,12 +84,13 @@ def completion(tmp_path, monkeypatch):
                "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
     for command in (["init", "-q"], ["add", "--all"], ["-c", "commit.gpgsign=false", "commit", "-qm", "selected"]):
         subprocess.run(["git", *command], cwd=source, env=git_env, check=True, capture_output=True)
-    # The selected interpreter is dependency-free, not the pytest environment. A symlink, not a
-    # copy: a relocatable build (python-build-standalone) locates its stdlib beside the resolved
-    # executable, so a lone copied binary cannot even import ``encodings``.
+    # The selected interpreter is dependency-free, not the pytest environment; on a distro system
+    # Python the base is not, see _dependency_free_python. A symlink, not a copy: a relocatable
+    # build (python-build-standalone) locates its stdlib beside the resolved executable, so a lone
+    # copied binary cannot even import ``encodings``.
     python = tmp_path / "store/python/bin/python3"
     python.parent.mkdir(parents=True)
-    python.symlink_to(Path(sys._base_executable).resolve())
+    python.symlink_to(selected_python)
     _put(tmp_path / "store", "facts.json", json.dumps({"packages": {"python": {"entry": "python"}}}))
     # A real venv: isolated build children (icon generation, npm lifecycle scripts) run on the
     # selected generation's own interpreter, not on the store Python that hosts the completion.
