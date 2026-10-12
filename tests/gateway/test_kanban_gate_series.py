@@ -149,9 +149,10 @@ async def test_allowance_unused_is_read_after_spare_redistribution(two_boards, m
 
 
 def test_dry_run_and_standalone_daemon_add_no_line(home, monkeypatch):
-    """AC-12 negative: build() is shared with the one-shot CLI and the
-    standalone daemon; neither may append. Mutation: move the append into
-    GateTickBuilder.build() -> 5 dry-runs add 5 lines (RED)."""
+    """AC-12 negative: neither 5 one-shot dry-runs nor one standalone-daemon
+    tick may append. The daemon tick goes through GateTickBuilder.build()
+    (asserted), so moving the append into build() turns this RED. The one-shot
+    CLI calls plan_pool() directly, not build(), on the current tree."""
     from hermes_cli import kanban_ops as kops
     from gateway import kanban_gate_tick as kgt
 
@@ -167,8 +168,8 @@ def test_dry_run_and_standalone_daemon_add_no_line(home, monkeypatch):
     monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (0.1, None))
     monkeypatch.setattr(config, "load_config", lambda: {"kanban": {"dispatch_load_gate": {}}})
     for _ in range(5):
-        kops._cmd_dispatch(argparse.Namespace(dry_run=True, json=False, max=None,
-                                              max_running=None, failure_limit=2))
+        assert kops._cmd_dispatch(argparse.Namespace(dry_run=True, json=False, max=None,
+                                                     max_running=None, failure_limit=2)) == 0
     stop = threading.Event()
     ticks = []
 
