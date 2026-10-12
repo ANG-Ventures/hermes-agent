@@ -1009,11 +1009,15 @@ def test_prose_host_line_with_no_pool_spawns_locally(kanban_home):
     assert spawned == [(tid, None)] and tid not in res.placement_waits
 
 
-def test_prose_host_line_with_a_pool_routes_by_policy(kanban_home):
+def test_prose_host_line_with_a_pool_stays_local(kanban_home):
+    """t_cb2b888d reverses the old 'prose routes by policy': a host: line
+    that names no host may be a typo, so it never widens to the pool. It runs
+    locally (local slot free) and is never placed."""
     with kb.connect_closing() as conn:
         (tid,) = _make(conn, 1, body="Host: example.com")
         res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test")
-    assert spawned == [(tid, "ace-ai")] and res.placed == [(tid, "ace-ai")]
+    assert spawned == [] and res.placed == []
+    assert res.placement_waits[tid].startswith("pin_unknown_host:example.com")
 
 
 def test_known_pool_host_still_pins(kanban_home):
@@ -1668,3 +1672,91 @@ def test_drained_pin_corrupt_marker_posts_nothing_and_is_rewritten(kanban_home, 
         assert kdp.notify_drained_pins(conn, None, {tid: "pin_host_draining"}, now + 60) == []
     assert sent == []
     assert not list(marker.parent.glob(kdp._MARKER + ".*"))  # no tmp left behind
+
+
+# -- host: pins by hostname/alias; unknown pins are loud (t_cb2b888d) ------
+
+def _write_ci_hosts(fleet: Path):
+    (fleet / kwp.CI_HOSTS_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        "ace-ai": {"ssh_alias": "ace-ai", "transport": "ssh", "host_label": "ace-ai"},
+        "studio": {"ssh_alias": None, "transport": "local", "host_label": "studio"},
+        "ci-box": {"ssh_alias": "ci.ace", "transport": "ssh", "host_label": "ci-box"},
+        "unrelated": {"ssh_alias": "elsewhere", "transport": "ssh", "host_label": "x"},
+    }}), encoding="utf-8")
+
+
+@pytest.fixture
+def fleet_aliases(kanban_home, monkeypatch):
+    import socket
+    monkeypatch.setattr(socket, "gethostname", lambda: "mac-studio-m3u.local")
+    fleet = kanban_home / "fleet"
+    _write_pool(fleet)
+    _write_ci_hosts(fleet)
+    return kwp.known_host_ids(fleet), kwp.pin_aliases(fleet)
+
+
+@pytest.mark.parametrize("body,pin", [
+    ("host:mac-studio-m3u", "studio"),   # the Studio's hostname -s (incident t_cccdee67)
+    ("host:MAC-STUDIO", "studio"),
+    ("host:local", "studio"),
+    ("host:ci.ace", "ci-box"),           # ssh alias from ci-hosts.json
+    ("host:ci", "ci-box"),               # its short DNS label
+    ("host:ACE-AI", "ace-ai"),           # hostname -s on ace-ai is upper case
+    ("Repro:\nHost: example.com\n\nhost:ci.ace\n", "ci-box"),  # Prism r8 preserved
+])
+def test_pin_resolves_hostname_and_registry_aliases_to_the_canonical_pin(fleet_aliases, body, pin):
+    known, aliases = fleet_aliases
+    assert kwp.resolve_pin(body, known, aliases)[0] == pin
+
+
+def test_pin_aliases_come_only_from_the_registry(fleet_aliases):
+    _known, aliases = fleet_aliases
+    assert "elsewhere" not in aliases and "unrelated" not in aliases  # not a pool host
+    assert aliases["ci.ace"] == "ci-box" and aliases["studio"] == "studio"
+
+
+def test_typo_pin_is_not_portable_and_names_suggestions(fleet_aliases):
+    known, aliases = fleet_aliases
+    assert kwp.resolve_pin("host:mac-studio-m3", known, aliases) == (None, "mac-studio-m3")
+    pool = kwp.PoolConfig(hosts=known, profiles=("alpha",), pin_aliases=aliases)
+    assert _portable(body="host:mac-studio-m3", pool=pool) == (False, "pin_unknown_host", None)
+    assert "mac-studio-m3u->studio" in kwp.pin_suggestions("mac-studio-m3", known, aliases)
+
+
+def test_alias_pin_routes_to_the_canonical_pool_host(fleet_aliases):
+    known, aliases = fleet_aliases
+    pool = kwp.PoolConfig(hosts=known, profiles=("alpha",), pin_aliases=aliases)
+    assert _portable(body="host:ACE-AI", pool=pool) == (True, None, "pin")
+    assert _portable(body="host:mac-studio-m3u", pool=pool) == (False, "host_studio", None)
+
+
+def test_typo_pin_is_held_local_with_one_latched_comment(fleet_aliases):
+    """host:mac-studio-m3 (typo): never spilled, placement_wait names the word
+    and suggestions, exactly one comment across ticks; a new word comments again."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="Do it.\nhost:mac-studio-m3\n")
+        for _ in range(3):
+            res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+            assert spawned == [] and res.placed == []
+        reason = res.placement_waits[tid]
+        assert reason.startswith("pin_unknown_host:mac-studio-m3 (did you mean: ")
+        assert "mac-studio-m3u->studio" in reason
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = "
+                          "'placement_wait' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+        assert json.loads(ev[0])["reason"] == reason
+        comments = [c.body for c in kb.list_comments(conn, tid)]
+        assert len(comments) == 1 and "host:mac-studio-m3 is no pin" in comments[0]
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", ("host:ace-ia", tid))
+        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        assert len(kb.list_comments(conn, tid)) == 2
+
+
+def test_hostname_pin_runs_local_never_spills(fleet_aliases):
+    """The incident: host:mac-studio-m3u under a spilling band went to ace-ai."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host:mac-studio-m3u")
+        res, spawned = _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
+                             spawn_paused="test")
+        assert kb.list_comments(conn, tid) == []
+    assert spawned == [] and res.placed == []
+    assert not res.placement_waits[tid].startswith("pin_unknown_host")

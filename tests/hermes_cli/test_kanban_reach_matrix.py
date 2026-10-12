@@ -183,7 +183,9 @@ def test_prose_host_line_naming_a_non_pool_alias_is_scanned(tmp_path):
     assert kwp.host_bound_targets("host: ci-box\nwrite a doc", (), pool.reach_aliases,
                                   pin_hosts=pool.hosts) == (False, ())
     # Nobody reaches unifi: the card stays local instead of spilling on policy.
-    assert _portable(pool, body="host: unifi\nssh unifi 'restart'") == (False, "host_reach", None)
+    assert _portable(pool, body="ssh unifi 'restart'") == (False, "host_reach", None)
+    # ``host: unifi`` is no pin a worker host can take: held local, named (t_cb2b888d).
+    assert _portable(pool, body="host: unifi\nssh unifi 'restart'") == (False, "pin_unknown_host", None)
 
 
 BURST = ("origin: ruling \"ci-box carries the bulk\".\n\nhost:ci-box\n"
@@ -410,7 +412,7 @@ def test_fleet_host_diagnosis_card_is_never_spilled_without_a_matrix(kanban_home
     plan.band, plan.spill_reason = "paused", "load"
     with kb.connect_closing() as conn:
         bound = kb.create_task(conn, title="diag", assignee="alpha", skills=["fleet-host-diagnosis"],
-                               body="host: mac-studio-m3u\nread the Studio's OrbStack LNP state")
+                               body="read the Studio's OrbStack LNP state")
         plain = kb.create_task(conn, title="plain", assignee="alpha", body="write a doc")
         with caplog.at_level("INFO", logger=kb._log.name):
             res, spawned = _tick(conn, plan)
