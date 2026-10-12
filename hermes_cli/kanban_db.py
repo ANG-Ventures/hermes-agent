@@ -3846,13 +3846,18 @@ def model_force_comment_present(
     capability-blocked on every tick (Prism 68402070f7c9 on hermes-agent#1903). The match is
     on the ``provider/model`` token the writer recorded, so re-pinning to a different unknown
     id does not inherit the exemption.
+
+    The compare is a case-sensitive literal prefix, never ``LIKE``: ``LIKE`` folds ASCII
+    case (``CustomModel`` would exempt ``custommodel``) and, without an ``ESCAPE`` clause,
+    treats ``\\_`` as two literal characters, so an id containing ``_`` never matched its
+    own comment (Prism 20f583066d18 on hermes-agent#1912).
     """
     if not model:
         return False
     token = f"{MODEL_FORCE_COMMENT_PREFIX} {provider or '?'}/{model} "
     row = conn.execute(
-        "SELECT 1 FROM task_comments WHERE task_id=? AND body LIKE ? LIMIT 1",
-        (task_id, token.replace("%", r"\%").replace("_", r"\_") + "%"),
+        "SELECT 1 FROM task_comments WHERE task_id=? AND substr(body, 1, ?) = ? LIMIT 1",
+        (task_id, len(token), token),
     ).fetchone()
     return row is not None
 

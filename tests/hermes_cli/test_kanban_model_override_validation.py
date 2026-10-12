@@ -311,3 +311,20 @@ def test_forced_pin_is_honoured_at_dispatch_for_that_pair_only(kanban_home, lane
         result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 4242)
         assert tid in result.auto_blocked
 
+
+
+@pytest.mark.parametrize("forced,pinned,expected", [
+    ("CustomModel", "custommodel", False),   # ASCII case alias must not inherit the exemption
+    ("custommodel", "CustomModel", False),
+    ("gpt_5x", "gpt_5x", True),              # an id with '_' matches its own comment
+    ("gpt_5x", "gptA5x", False),             # '_' is a literal, not a LIKE wildcard
+    ("m%", "m-anything", False),             # '%' is a literal, not a LIKE wildcard
+])
+def test_force_comment_match_is_a_case_sensitive_literal(kanban_home, forced, pinned, expected):
+    """Prism 20f583066d18 (hermes-agent#1912): the exact-pair exemption must compare the
+    recorded ``provider/model`` token literally and case-sensitively."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="w")
+        kb.add_comment(conn, tid, "apollo", kb._model_force_comment(LANE, forced, "canary lane"))
+        conn.commit()
+        assert kb.model_force_comment_present(conn, tid, LANE, pinned) is expected
