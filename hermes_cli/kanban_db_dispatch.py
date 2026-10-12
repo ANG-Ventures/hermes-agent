@@ -761,8 +761,15 @@ def _terminate_reclaimed_worker(
     task_id: Optional[str] = None,
     run_id: Optional[int] = None,
     started_at=None,
+    signal_allowed: bool = True,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths.
+
+    ``signal_allowed=False`` makes this a liveness probe with reap: a dead or
+    recycled recorded worker is reported ``terminated`` exactly as before, but
+    a live, verified one is never signalled (``worker_alive_unsignalled``),
+    so the caller's :func:`_worker_survived_termination` check fails closed
+    BEFORE any signal. The pr-owner reclaimer uses it (t_0a9a20ea).
 
     ``run_id`` is the run ``owner_window`` was computed for. The post-death
     reap sweeps only that run's identity; it never re-reads
@@ -894,6 +901,21 @@ def _terminate_reclaimed_worker(
             info["liveness_unprovable"] = True
             info["needs_attention"] = True
             return info
+        if not signal_allowed:
+            # The caller may reclaim a DEAD run but never end a live one
+            # (the pr-owner reclaimer, t_0a9a20ea: it SIGTERM'd a heartbeating
+            # worker and only then recorded the refusal). Report the live,
+            # verified worker and send nothing.
+            info["signal_refused"] = True
+            info["worker_alive_unsignalled"] = True
+            return info
+    elif not signal_allowed:
+        # Already gone: nothing to signal, reap its leftovers as a kill would.
+        info["terminated"] = True
+        _kb._reap_terminated_worker_session(
+            pid, info, signal_fn, owner_window, None, conn, task_id, run_id,
+        )
+        return info
 
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
@@ -1029,6 +1051,7 @@ def _worker_survived_termination(termination: dict) -> bool:
     return bool(
         termination.get("termination_attempted")
         or termination.get("liveness_unprovable")
+        or termination.get("worker_alive_unsignalled")
     )
 
 
@@ -2818,6 +2841,37 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _ledger_pr_owner_stale_skips(
+    conn: sqlite3.Connection, task_id: str, owners: list,
+) -> None:
+    """Record ``pr_owner_stale_skipped`` on each owner a heartbeat kept fresh (t_0a9a20ea).
+
+    Once per owner run: the guard runs every tick, and the event is for the
+    operator reading ``kanban tail`` after the fact, not a heartbeat mirror.
+    """
+    from . import kanban_pr_owner as _kpo
+
+    for owner in owners:
+        if owner.get("stale_skipped") != _kpo.STALE_SKIP_REASON:
+            continue
+        run_id = owner.get("run_id")
+        already = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+            "AND run_id IS ? LIMIT 1",
+            (owner["task_id"], _kpo.STALE_SKIP_EVENT, run_id),
+        ).fetchone()
+        if already is not None:
+            continue
+        with _kbc.write_txn(conn):
+            _kb._append_event(
+                conn, owner["task_id"], _kpo.STALE_SKIP_EVENT,
+                {"reason": _kpo.STALE_SKIP_REASON, "pr": owner["pr"],
+                 "waiting": task_id, "last_progress_at": owner.get("last_heartbeat_at"),
+                 "head_committed_at": owner.get("head_committed_at")},
+                run_id=run_id,
+            )
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2924,13 +2978,14 @@ def check_respawn_guard(
             return "overlap_hold"
 
     # 0b. One running card per PR (t_cb70d390). A fresh owner holds the card;
-    #     a stale one (run and PR head both >2 h old) is left in
+    #     a stale one (run, heartbeat and PR head all >2 h old) is left in
     #     ``detail["pr_owner_stale"]`` for the dispatcher to reclaim.
     if lane == "ready":
         from . import kanban_pr_owner as _kpo
 
         owners = _kpo.spawn_owners(conn, task_id, now=now)
         fresh = [o for o in owners if not o["stale"]]
+        _ledger_pr_owner_stale_skips(conn, task_id, fresh)
         if fresh:
             if detail is not None:
                 detail.update(
