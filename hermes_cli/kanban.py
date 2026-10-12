@@ -865,6 +865,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
             )
             return 2
         args.session = home_flag
+    until = None
+    if getattr(args, "until", None):
+        try:
+            until = kb.parse_wake_at(args.until)
+        except ValueError as exc:
+            print(f"kanban: --until: {exc}", file=sys.stderr)
+            return 2
     try:
         with kb.connect_closing() as conn:
             _event_mark = kb.max_event_id(conn)
@@ -911,6 +918,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 require_home=True,
                 duplicate_guard=True,
                 force_reason=getattr(args, "force_reason", None),
+                until=until,
+                time_gate_guard=True,
+                i_mean_blocks=bool(getattr(args, "i_mean_blocks", False)),
             )
             task = kb.get_task(conn, task_id)
             # Notice only when THIS call created the card and auto-added the
