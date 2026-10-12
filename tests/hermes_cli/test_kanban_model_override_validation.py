@@ -335,3 +335,14 @@ def test_plain_nonzero_exit_with_provider_404_is_provider_rejected(kanban_home, 
             "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
         assert "provider_rejected" in kinds and "crashed" not in kinds
         assert kb.get_task(conn, tid).consecutive_failures == 1
+
+
+def test_force_comment_match_is_case_sensitive(kanban_home, lane_catalog):
+    """Prism 20f583066d18: a force comment for `CustomModel` must not cover a re-pin to `custommodel`."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="w")
+        kb.add_comment(conn, tid, "apollo", kb._model_force_comment(LANE, "CustomModel", "canary"))
+        conn.commit()
+        assert kb.model_force_comment_present(conn, tid, LANE, "CustomModel")
+        assert not kb.model_force_comment_present(conn, tid, LANE, "custommodel")
+        assert not kb.model_force_comment_present(conn, tid, LANE, "CustomModel-2")

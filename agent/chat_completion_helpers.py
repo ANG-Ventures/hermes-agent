@@ -3713,15 +3713,10 @@ def try_activate_fallback(
                 "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
                 backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
             )
-    budget_skipped: list[int] = []  # same-model lanes passed over by the wall budget (t_452c6ead)
+    from agent import fallback_wall_budget as _wb
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
-            if not budget_skipped:
-                return _fallback_chain_exhausted(agent, reason)
-            # No other-model lane was usable after all: the skipped faces are better than no reply.
-            logger.info("Fallback: no usable lane on another model; revisiting %d budget-skipped lane(s)",
-                        len(budget_skipped))
-            agent._fallback_index, budget_skipped = budget_skipped[0], None
+            return _fallback_chain_exhausted(agent, reason)
         fb = agent._fallback_chain[agent._fallback_index]
         agent._fallback_index += 1
         fb_key = _fallback_entry_key(fb)
@@ -3731,12 +3726,6 @@ def try_activate_fallback(
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
-            continue
-        # The turn's no-first-byte budget is spent: another face of the model that just
-        # stalled is the same pool, so walk on to a different model (t_452c6ead).
-        from agent import fallback_wall_budget as _wb
-        if budget_skipped is not None and _wb.skip_lane(agent, fb_model):
-            budget_skipped.append(agent._fallback_index - 1)
             continue
         quota_skipped = getattr(agent, "_quota_gate_skipped_providers", set()) or set()
         if fb_provider in quota_skipped:
@@ -6028,12 +6017,21 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._touch_activity(f"stale stream detected after {int(elapsed)}s, reconnecting")
 
     def _cut_for_wall_budget(self) -> None:
-        """The turn's cross-lane no-first-byte budget is spent and another model is ahead
+        """The turn's cross-lane no-first-byte budget is spent and a lane is still ahead
         in the chain: abort this attempt like an interrupt (no in-place retry), and let
-        ``run`` raise ``FallbackWallBudgetExceeded`` so the loop fails over (t_452c6ead)."""
+        ``run`` raise ``FallbackWallBudgetExceeded`` so the loop fails over to the next
+        lane in chain order, same model or not (t_452c6ead, t_778185f3)."""
         logger.warning("No first byte from %s/%s within the fallback wall budget (%.0fs); cutting the attempt.",
                        self.agent.provider, self.api_kwargs.get("model", "unknown"),
                        (getattr(self.agent, "_wall_budget", None) or {}).get("budget_s", 0.0))
+        # The banner names the lane, the budget clock and (if the relay sent headers
+        # before the cut) the seat: captured before the teardown resets the attempt.
+        from agent.fallback_wall_budget import elapsed as _wb_elapsed
+        self._wall_budget_cut_evidence = {
+            "lane": getattr(self.agent, "provider", None),
+            "elapsed_s": _wb_elapsed(self.agent),
+            "pool_headers": dict(getattr(self, "_attempt_pool_headers", None) or {}),
+        }
         self._request_cancelled["value"] = True
         _killed_response = self._attempt_stream_response
         with contextlib.suppress(Exception):
@@ -6184,7 +6182,8 @@ class _StreamingCall(StreamingWaitMonitor):
             from agent.fallback_wall_budget import FallbackWallBudgetExceeded
             raise FallbackWallBudgetExceeded(
                 f"no first byte from {self.api_kwargs.get('model', 'the provider')} within the turn's "
-                "fallback wall budget (fallback.no_first_byte_budget_seconds); moving to the next model")
+                "fallback wall budget (fallback.no_first_byte_budget_seconds); moving to the next lane",
+                **(getattr(self, "_wall_budget_cut_evidence", None) or {}))
         if self._monitor_interrupted["yes"]:
             raise InterruptedError("Agent interrupted during streaming API call")
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag

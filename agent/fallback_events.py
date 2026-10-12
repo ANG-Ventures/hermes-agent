@@ -42,8 +42,14 @@ logger = logging.getLogger(__name__)
 
 TRIGGER_CLASSES = (
     "conn", "pool_pressure", "quota_model", "quota_seat", "rate_upstream",
-    "refusal", "auth", "provider_invalid_response", "lane_incapable", "unclassified",
+    "refusal", "auth", "provider_invalid_response", "lane_incapable",
+    "no_first_byte_budget", "unclassified",
 )
+# The harness cut the attempt itself: the turn's no-first-byte wall budget
+# (agent/fallback_wall_budget.py) was spent before any byte arrived. Named from
+# the exception, never from text: there is no error response (t_778185f3).
+NO_FIRST_BYTE_BUDGET_CLASS = "no_first_byte_budget"
+_BUDGET_CUT_EXC = "FallbackWallBudgetExceeded"
 # OUR bridge/relay refused the request SHAPE for this lane (400
 # tui_tools_unsupported / tui_images_unsupported, relay mode_not_allowed):
 # named from the body's machine code, never from Anthropic text (t_1ed37625).
@@ -232,7 +238,11 @@ def classify_trigger(*, text: Optional[str] = None,
     ``floor``. ``floor`` is the evidence of a billed response the loop
     rejected (:func:`stash_response_failure`): with no http/exc/text class it
     names the failure ``provider_invalid_response`` instead of ``unclassified``.
+    A wall-budget cut (``exc_name`` ``FallbackWallBudgetExceeded``) is
+    ``no_first_byte_budget`` / ``harness``: the harness, not the relay, ended it.
     """
+    if exc_name == _BUDGET_CUT_EXC:
+        return NO_FIRST_BYTE_BUDGET_CLASS, "harness"
     h = _lower_headers(headers)
     rc = (h.get("x-relay-error-class") or "").strip().lower()
     if rc:
@@ -1025,6 +1035,17 @@ def stash_api_error(agent: Any, api_error: BaseException,
             "dl_headers": _dead_letter_headers(headers),
             "dl_body": _raw_body_text(response, body, msg),
         }
+        if type(api_error).__name__ == _BUDGET_CUT_EXC:
+            # t_778185f3: the lane that was cut, the budget clock, and the relay
+            # attribution headers seen before the cut (``{}``: cut before headers).
+            cut_headers = _lower_headers(getattr(api_error, "pool_headers", None))
+            agent._pending_fallback_error["budget_cut"] = {
+                "lane": getattr(api_error, "lane", None),
+                "elapsed_s": _round_s(getattr(api_error, "elapsed_s", None)),
+                "headers_seen": bool(cut_headers),
+                "seat": served_by_seat(cut_headers),
+                "route_id": cut_headers.get("x-pool-route-id"),
+            }
         pend = agent._pending_fallback_error
         if pend["status"] is None:
             # t_b2e9ef12: a no-status failure used to log nothing parseable.
@@ -1406,6 +1427,15 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
                 row["route_id"] = fl["route_id"]
             if row.get("http_status") is None:
                 row["http_status"] = 200
+        # t_778185f3: a wall-budget cut names the lane, the budget clock and the
+        # seat (x-pool-served-by, when the relay answered headers before the cut).
+        cut = (pending or {}).get("budget_cut")
+        if trigger_class == NO_FIRST_BYTE_BUDGET_CLASS and isinstance(cut, dict):
+            row["budget_cut"] = dict(cut)
+            if cut.get("seat") and (not row.get("seat") or row.get("seat") == "unknown"):
+                row["seat"] = cut["seat"]
+            if cut.get("route_id") and not row.get("route_id"):
+                row["route_id"] = cut["route_id"]
         # t_b2e9ef12: name what a no-status / rejected-response call died of.
         if pending:
             row.setdefault("exc_name", pending.get("exc"))

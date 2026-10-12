@@ -69,8 +69,12 @@ def _make_runner(session_db, adapter=None):
     runner._agent_cache_lock = None
     runner._session_db = AsyncSessionDB(session_db)
 
-    # Real-ish session store backed by a MagicMock we control per-test.
+    # Real-ish session store backed by a MagicMock we control per-test. The /merge delta is sliced
+    # on the unrepaired rows (``load_transcript_rows``); tests seed only ``load_transcript`` and the
+    # row read mirrors it, which is exact for histories with no same-role runs.
     runner.session_store = MagicMock()
+    runner.session_store.load_transcript_rows.side_effect = (
+        lambda sid: runner.session_store.load_transcript.return_value)
 
     # Neutralize side-effect helpers we don't assert on.
     runner._clear_session_boundary_security_state = MagicMock()
