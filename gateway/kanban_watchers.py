@@ -3648,6 +3648,8 @@ class GatewayKanbanWatchersMixin:
             # subs-ace board got 0 spawns for 93 min with 7 ready P1 cards).
             _tick = _gate_ticks.build(boards)
             _series_tick["tick"] = _tick
+            _series_tick["pool_budget"] = (
+                None if _tick.remote_plan is None else _tick.remote_plan.budget)
             _allowance, _spawn_paused = _tick.local_allowance, _tick.spawn_paused
             _placed: list = []
             # Host-exhaustion transient blocks clear when the host does
@@ -3787,6 +3789,7 @@ class GatewayKanbanWatchersMixin:
                 rec = _gate_series.tick_record(
                     ts=time.time(), gate=load_gate, tick=tick, builder=_gate_ticks,
                     allowance=_series_tick.get("allowance"),
+                    pool_budget=_series_tick.get("pool_budget"),
                     spawn_paused=_series_tick.get("paused"),
                     local_spawned=int(_series_tick.get("local") or 0),
                     results=results, tick_ms_cpu=cpu_s * 1000.0,

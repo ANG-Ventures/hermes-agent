@@ -235,3 +235,41 @@ def test_failed_append_rolls_back_the_partial_line(tmp_path, monkeypatch):
     monkeypatch.setattr(series.os, "write", real)
     series.append(p, {"n": 3})
     assert [json.loads(l)["n"] for l in p.read_text().splitlines()] == [1, 3]
+
+
+def test_failed_rotation_merge_leaves_the_archive_untouched(tmp_path, monkeypatch):
+    """Prism 2468447f9fca: a disk-full merge into an existing archive is rolled
+    back, so a retried rotation neither truncates nor duplicates lines."""
+    p = tmp_path / "var" / series.SERIES_FILE
+    t0 = 1_791_000_000.0
+    series.append(p, {"n": 1}, now=t0)
+    os.utime(p, (t0, t0))
+    series.append(p, {"n": 2}, now=t0 + 86400)
+    os.utime(p, (t0, t0))
+    (arch,) = p.parent.glob("gate-ticks.????-??-??.jsonl")
+    before = arch.read_bytes()
+    real = os.write
+    monkeypatch.setattr(series.os, "write", lambda fd, data: real(fd, data[:3]) if len(data) > 3 else (_ for _ in ()).throw(OSError(28, "full")))
+    with pytest.raises(OSError):
+        series.rotate(p, t0 + 86400)
+    monkeypatch.setattr(series.os, "write", real)
+    assert arch.read_bytes() == before and p.exists()
+    series.rotate(p, t0 + 86400)
+    assert [json.loads(l)["n"] for l in arch.read_text().splitlines()] == [1, 2]
+
+
+def test_pool_budget_is_the_plan_budget_before_any_take():
+    """Prism 24de3acc1c0b: an unpinned take with the signal off decrements
+    slots without counting `taken`; the series must still record the grant."""
+    from hermes_cli import kanban_worker_pool as kwp
+    host = kwp.PoolHost(name="ace-ai", ssh_host="ace-ai", ssh_user=kwp.SSH_USER, slots=4,
+                        capacity_pct=0.8, absence="required", profiles=("alpha",),
+                        state="active", enabled=True, priority=0)
+    plan = kwp.SpilloverPlan(hosts={"ace-ai": host}, slots={"ace-ai": 4})
+    budget = plan.budget
+    for _ in range(4):
+        assert plan.take("alpha") is not None
+    rec = series.tick_record(ts=0.0, gate=SimpleNamespace(), tick=SimpleNamespace(remote_plan=plan, band="spilling", spill_reason="load"),
+                             builder=SimpleNamespace(), allowance=0, pool_budget=budget, spawn_paused=None,
+                             local_spawned=0, results=[], tick_ms_cpu=1.0, tick_ms_wall=1.0, boards=1, queries=0)
+    assert rec["pool_budget"] == 4 and rec["pool_free_by_host"] == {"ace-ai": 0}

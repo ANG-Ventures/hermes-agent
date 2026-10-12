@@ -63,8 +63,7 @@ def rotate(path: Path, now: float, keep: int = KEEP_DAYS) -> Optional[Path]:
     if dest.exists():
         # A clock step back across midnight can give the live file a day that
         # already has an archive: merge into it, never overwrite it.
-        with open(dest, "ab") as out, open(path, "rb") as src:
-            out.write(src.read())
+        _append_all(dest, path.read_bytes())
         path.unlink()
     else:
         os.replace(path, dest)
@@ -81,7 +80,13 @@ def append(path: Path, record: Mapping[str, Any], now: Optional[float] = None) -
     path.parent.mkdir(parents=True, exist_ok=True)
     rotate(path, now)
     line = json.dumps(dict(record), separators=(",", ":"), sort_keys=False) + "\n"
-    data = line.encode("utf-8")
+    _append_all(path, line.encode("utf-8"))
+
+
+def _append_all(path: Path, data: bytes) -> None:
+    """Append ``data`` whole or not at all: a short or failed write is
+    truncated back to the pre-append size, so the file keeps its JSONL
+    boundaries and a retried rotation never duplicates records."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
         start = os.fstat(fd).st_size
@@ -93,7 +98,6 @@ def append(path: Path, record: Mapping[str, Any], now: Optional[float] = None) -
                     raise OSError("short write")
                 done += n
         except OSError:
-            # Roll back a partial line so the next append starts on a JSONL boundary.
             os.ftruncate(fd, start)
             raise
     finally:
@@ -101,6 +105,7 @@ def append(path: Path, record: Mapping[str, Any], now: Optional[float] = None) -
 
 
 def tick_record(*, ts: float, gate, tick, builder, allowance: Optional[int],
+                pool_budget: Optional[int],
                 spawn_paused: Optional[str], local_spawned: int, results,
                 tick_ms_cpu: float, tick_ms_wall: float, boards: int,
                 queries: Optional[int]) -> dict:
@@ -113,17 +118,16 @@ def tick_record(*, ts: float, gate, tick, builder, allowance: Optional[int],
     disabled (no allowance exists).
     ``portable_waiting`` = portable rows still in ``placement_waits`` at the
     end of the tick, summed over boards.
+    ``pool_budget`` is the plan's free slots read right after ``build()``,
+    before any board took one (``take()`` does not count every placement in
+    ``taken``), None without a plan.
     ``running_last_resort`` is None until Phase 2 records a ``last-resort``
     spawn reason (there is no such spawn before the flip).
     """
     running_local = getattr(builder, "running_local", None)
     remote = dict(getattr(builder, "_remote_by_host", {}) or {})
     plan = getattr(tick, "remote_plan", None)
-    if plan is not None:
-        free = {n: int(v) for n, v in plan.slots.items()}
-        pool_budget: Optional[int] = sum(free.values()) + sum(int(v) for v in (plan.taken or {}).values())
-    else:
-        free, pool_budget = {}, None
+    free = {n: int(v) for n, v in plan.slots.items()} if plan is not None else {}
     if allowance is None:
         unused: Optional[int] = None
     elif spawn_paused:
