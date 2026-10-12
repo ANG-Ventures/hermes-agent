@@ -1052,6 +1052,26 @@ def test_link_scan_binds_under_the_sqlite_variable_limit(kanban_home):
         assert kbd._linked_ids(conn, ids) == {a: ("blocks", b), b: ("blocks", a)}
 
 
+def test_link_reason_is_stable_across_ready_order_and_chunks(kanban_home):
+    """Prism 9457394f1922: a card with two pinning links names the SAME edge
+    whatever the ready-row order, even when the other endpoint lands in an
+    earlier 250-id chunk than the card itself."""
+    import itertools
+    with kb.connect_closing() as conn:
+        p_lo, p_hi = sorted(_make(conn, 2, assignee="beta"))
+        (card,) = _make(conn, 1)
+        kb.link_tasks(conn, p_lo, card)
+        kb.link_tasks(conn, p_hi, card)
+        want = ("blocks", p_lo)  # the single-chunk answer (ORDER BY parent_id, child_id)
+        assert kbd._linked_ids(conn, [card])[card] == want
+        pad = [f"t_fake{i:05d}" for i in range(kbd._LINK_CHUNK - 1)]
+        # p_hi alone fills chunk 1 with the padding; card arrives in chunk 2.
+        assert kbd._linked_ids(conn, [p_hi, *pad, card, p_lo])[card] == want
+        for order in itertools.permutations([card, p_lo, p_hi]):
+            got = kbd._linked_ids(conn, [order[0], *pad, *order[1:]])
+            assert got[card] == want, order
+
+
 # -- Apollo review r5 (PR #1730) -------------------------------------------
 
 def test_pin_on_a_known_but_dropped_host_waits_and_never_spawns(kanban_home):
