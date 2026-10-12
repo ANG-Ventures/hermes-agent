@@ -75,14 +75,32 @@ def turn_reasoning_effort(agent, turn_calls=None) -> "str | None":
     The same value the runtime footer prints: ``reasoning_label`` over the
     LIVE ``agent.reasoning_config`` (session ``/reasoning`` override, per-model
     override and fallback-entry effort already folded in), never the config
-    default re-read from disk. ``none`` when reasoning is disabled. When the
-    agent carries no config at all (unset ``agent.reasoning_effort``), the
-    label is what actually went on the wire for this turn's calls (the
-    provider default ``_reasoning_config_for_wire`` resolved); None when the
-    turn made no call, so a non-reasoning turn records no fabricated level.
+    default re-read from disk. ``none`` when reasoning is disabled.
+
+    Two cases follow what actually went on the wire instead
+    (``_wire_reasoning_config``, the config of the last request built):
+
+    - reasoning recovery rewrote the request for the session
+      (``_reasoning_disable_rejected``: the route refused the OFF and the floor
+      effort was sent; ``_reasoning_effort_rejected``: the route refused the
+      level and the fields were omitted). The requested config is then not
+      what ran: record the floor, or None (unknown) when the effort was
+      omitted and the route applied its own default.
+    - the agent carries no config at all (unset ``agent.reasoning_effort``):
+      the provider default resolved at request time is the truth.
+
+    None when the turn made no call, so nothing is fabricated. The one-shot
+    ``_ephemeral_reasoning_off`` continuation is NOT read from the wire: it
+    disables thinking for a single follow-up call, not the turn.
     """
     from hermes_constants import reasoning_label
 
+    recovered = bool(
+        getattr(agent, "_reasoning_disable_rejected", False)
+        or getattr(agent, "_reasoning_effort_rejected", False)
+    )
+    if turn_calls and recovered:
+        return reasoning_label(getattr(agent, "_wire_reasoning_config", None)) or None
     label = reasoning_label(getattr(agent, "reasoning_config", None))
     if label:
         return label

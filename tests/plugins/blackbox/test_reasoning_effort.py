@@ -104,6 +104,50 @@ def test_resolved_effort_falls_back_to_the_wire_config_when_unset():
     assert _effort(agent, []) is None
 
 
+def _wire(agent):
+    """Build the request's reasoning config through the REAL wire resolver."""
+    from agent.chat_completion_helpers import _reasoning_config_for_wire
+    return _reasoning_config_for_wire(agent)
+
+
+def test_recovery_floor_records_the_effort_actually_sent_not_the_disable():
+    # Route said "reasoning is mandatory": recovery keeps agent.reasoning_config
+    # as the user's disable but sends the floor effort. The ledger must record
+    # what ran (the floor), never "none" (Prism #1906 r1 3685d9ec2713).
+    from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
+    agent = SimpleNamespace(
+        reasoning_config={"enabled": False}, api_mode="chat_completions",
+        _reasoning_disable_rejected=True, _reasoning_floor_required=True,
+    )
+    sent = _wire(agent)
+    assert sent == {"enabled": True, "effort": REASONING_FLOOR_EFFORT}
+    assert _effort(agent, [{"input_tokens": 1}]) == REASONING_FLOOR_EFFORT
+
+
+def test_recovery_omission_records_unknown_not_the_rejected_level():
+    # Route rejected the configured LEVEL: recovery omits the reasoning fields
+    # (route default applies). The requested level did not run; the effective
+    # effort is unknown, so the row stays NULL and renders "—".
+    agent = SimpleNamespace(
+        reasoning_config={"enabled": True, "effort": "max"}, api_mode="chat_completions",
+        _reasoning_effort_rejected=True,
+    )
+    assert _wire(agent) is None
+    assert _effort(agent, [{"input_tokens": 1}]) is None
+    assert _line_after_model(render_last_turn_record(_rec(reasoning_effort=None))) == "• Reasoning: —"
+
+
+def test_recovery_relay_drop_of_a_disable_records_unknown():
+    # Relay that does not know the field: recovery drops the disable, nothing
+    # is sent, route default applies -> unknown.
+    agent = SimpleNamespace(
+        reasoning_config={"enabled": False}, api_mode="chat_completions",
+        _reasoning_disable_rejected=True, _reasoning_floor_required=False,
+    )
+    assert _wire(agent) is None
+    assert _effort(agent, [{"input_tokens": 1}]) is None
+
+
 def test_on_session_end_persists_reasoning_effort(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import plugins.blackbox as bb
