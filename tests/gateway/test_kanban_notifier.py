@@ -872,9 +872,36 @@ def _origins(monkeypatch, mapping):
     monkeypatch.setattr(kw, "_session_origin", lambda sid: mapping.get(sid))
 
 
-def test_self_caused_completion_posts_line_but_does_not_wake(tmp_path, monkeypatch):
+def test_self_caused_completion_posts_nothing_and_leaves_receipt(tmp_path, monkeypatch):
+    """t_a4890a77 dropped the wake; t_4c7da648 (kanban.notify_suppress, default on)
+    also withholds the passive line: the chat's own close is not news to it. The
+    event is consumed and a ``notify_suppressed`` receipt lands on the card."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "self-echo.db"))
     kb.init_db()
+    _origins(monkeypatch, {"sess-chat-1": {"platform": "telegram", "chat_id": "chat-1", "thread_id": "", "user_id": "u1", "profile": "default"}})
+    tid = _self_caused_completion("sess-chat-1")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], "own-session close posts no line to the same chat"
+    assert adapter.handled == [], "own-session close must not wake the same chat"
+    assert _unseen_terminal_events(tid) == [], "cursor still advances"
+    conn = kbc.connect()
+    try:
+        receipts = [e for e in kb.list_events(conn, tid) if e.kind == "notify_suppressed"]
+    finally:
+        conn.close()
+    assert len(receipts) == 1 and receipts[0].payload["reason"] == "self-session"
+
+
+def test_self_caused_completion_posts_line_when_suppression_is_off(tmp_path, monkeypatch):
+    """kanban.notify_suppress.enabled=false restores the t_a4890a77 shape: line, no wake."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "self-echo-off.db"))
+    kb.init_db()
+    from gateway import kanban_notify_suppress as _ns
+    monkeypatch.setattr(_ns, "resolve_config", lambda *a, **k: _ns.parse_config({"notify_suppress": {"enabled": False}}))
     _origins(monkeypatch, {"sess-chat-1": {"platform": "telegram", "chat_id": "chat-1", "thread_id": "", "user_id": "u1", "profile": "default"}})
     tid = _self_caused_completion("sess-chat-1")
 

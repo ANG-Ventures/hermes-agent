@@ -108,8 +108,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("title", "Set a title for the current session", "Session", args_hint="[name]"),
     CommandDef("handoff", "Hand off this session to a messaging platform (Telegram, Discord, etc.)", "Session",
                args_hint="<platform>", cli_only=True, argument_mode="options"),
-    CommandDef("branch", "Branch the current session (new thread on Discord/Telegram/Slack/Matrix; --here stays here)",
-               "Session", aliases=("fork",), args_hint="[--here] [name]"),
+    CommandDef("branch", "Branch the current session (new thread on Discord/Telegram/Slack/Matrix; --here stays here; "
+               "--fresh drops the /model + /reasoning overrides)",
+               "Session", aliases=("fork",), args_hint="[--here] [--fresh] [name]"),
     CommandDef("merge", "Merge a summary of this session into another session (branched thread, or a named session)", "Session",
                gateway_only=True, args_hint="[name]"),
     CommandDef("boomerang", "Run a task autonomously in an isolated subagent that inherits this "

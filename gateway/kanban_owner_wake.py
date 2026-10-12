@@ -60,6 +60,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+from gateway import kanban_notify_suppress as _ns
 from gateway import kanban_wake_freshness as _fresh
 
 logger = logging.getLogger(__name__)
@@ -665,10 +666,12 @@ def scan(state: WakeState, now: float, pr_health: Optional[PrHealthFn],
             cursor = state.cursors[slug]
             cols = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
             actor = "e.actor_session_id" if "actor_session_id" in cols else "NULL"
+            actor_profile = "e.actor_profile" if "actor_profile" in cols else "NULL"
             marks = ",".join("?" for _ in SCAN_KINDS)
             rows = conn.execute(
                 f"SELECT e.id, e.task_id, e.kind, e.payload, e.run_id, e.created_at, "
-                f"{actor} AS actor_sid, t.session_id AS home_sid, t.title, t.body, "
+                f"{actor} AS actor_sid, {actor_profile} AS actor_profile, "
+                f"t.session_id AS home_sid, t.title, t.body, "
                 f"t.result FROM task_events e JOIN tasks t ON t.id = e.task_id "
                 f"WHERE e.id > ? AND e.kind IN ({marks}) ORDER BY e.id LIMIT ?",
                 (cursor, *SCAN_KINDS, SCAN_LIMIT),
@@ -719,7 +722,8 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
         payload = None
     kind = r["kind"]
     item = {"event_id": int(r["id"]), "kind": kind, "actor_sid": r["actor_sid"] or "",
-            "event_ts": r["created_at"]}
+            "actor_profile": (r["actor_profile"] if "actor_profile" in r.keys() else None) or "",
+            "event_ts": r["created_at"], "payload": payload if isinstance(payload, dict) else None}
     if kind == "blocked":
         trig = classify_block(payload)
         if trig is None:
@@ -844,6 +848,58 @@ def has_wake_sub(kb: Any, board: str, task_id: str, origin: Any, profile: str) -
     return False
 
 
+def _owner_home(runner: Any, entry: Any, owner_profile: str) -> Optional[Path]:
+    """The owner profile's HERMES_HOME under multiplex (its config.yaml holds its
+    policy), else None (= this process's own home)."""
+    if not getattr(getattr(runner, "config", None), "multiplex_profiles", False):
+        return None
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        return get_profile_dir(owner_profile or "default")
+    except Exception:
+        return None
+
+
+def _drop_redundant(kb: Any, card: dict, items: list[dict], own: set, owner_profile: str,
+                    cfg: _ns.SuppressConfig) -> list[dict]:
+    """Items minus the ones :func:`kanban_notify_suppress.is_redundant` calls the
+    owner's own doing; each dropped item gets a ``notify_suppressed`` receipt.
+    Blocking (board read + write); worker thread only."""
+    class _Ev:
+        def __init__(self, i: dict) -> None:
+            self.id = i["event_id"]
+            self.kind = i.get("kind")
+            self.payload = i.get("payload")
+            self.created_at = i.get("event_ts")
+            self.actor_session_id = i.get("actor_sid") or None
+            self.actor_profile = i.get("actor_profile") or None
+
+    ctx = None
+    kept = []
+    for i in items:
+        ev = _Ev(i)
+        if ctx is None:
+            try:
+                conn = kb.connect_readonly(board=card["board"])
+                try:
+                    ctx = _ns.card_context(conn, card["task_id"], card.get("home_sid"), owner_profile)
+                finally:
+                    conn.close()
+            except Exception as exc:
+                logger.debug("kanban owner-wake: suppress context for %s unreadable (%s); not suppressing",
+                             card["task_id"], exc)
+                return items
+        red, why = _ns.is_redundant(ev, ctx, {"session_ids": own}, cfg, trigger=i.get("trigger"))
+        # Withheld only once the receipt is persisted: a failed write (locked
+        # board) keeps the item deliverable rather than losing the audit row
+        # (Prism P1 91fac1e92097).
+        if red and _ns.record_suppressed(card.get("board"), card["task_id"], ev, why, "owner-wake"):
+            continue
+        kept.append(i)
+    return kept
+
+
 async def deliver_turn(runner: Any, entry: Any, text: str,
                        cards: Optional[list[dict]] = None) -> None:
     """Enqueue one handoff turn into ``entry``'s session. Raises on no route."""
@@ -893,6 +949,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     enabled, profiles = resolve_settings()
     if not enabled:
         return 0
+    suppress_cfgs: dict[str, _ns.SuppressConfig] = {}
     try:
         active = runner._active_profile_name()  # noqa: SLF001
     except Exception:
@@ -966,6 +1023,16 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             continue
         own = {str(card.get("home_sid") or ""), str(getattr(entry, "session_id", "") or "")}
         items = [i for i in card["items"] if not (i.get("actor_sid") and i["actor_sid"] in own)]
+        # t_4c7da648: the shared redundancy predicate (operator profile / closer
+        # after the operator's APPROVE). Protected triggers never drop here.
+        if items:
+            # Policy of the OWNER's profile (one multiplexing gateway serves several).
+            if owner_profile not in suppress_cfgs:
+                suppress_cfgs[owner_profile] = await asyncio.to_thread(
+                    _ns.resolve_config, _owner_home(runner, entry, owner_profile))
+            if suppress_cfgs[owner_profile].enabled:
+                items = await asyncio.to_thread(
+                    _drop_redundant, kb, card, items, own, owner_profile, suppress_cfgs[owner_profile])
         if items and await asyncio.to_thread(has_wake_sub, kb, card["board"], card["task_id"],
                                              entry.origin, owner_profile):
             items = [i for i in items if i["kind"] not in SUB_WAKE_KINDS]

@@ -44,9 +44,11 @@ logger = logging.getLogger(__name__)
 # ── §4.1 vocabulary (identical to Phase 1 fallback_events.TRIGGER_CLASSES) ──
 TRIGGER_CLASSES = (
     "conn", "pool_pressure", "quota_model", "quota_seat", "rate_upstream",
-    "refusal", "auth", "provider_invalid_response", "lane_incapable", "unclassified",
+    "refusal", "auth", "provider_invalid_response", "lane_incapable",
+    "no_first_byte_budget", "unclassified",
 )
 LANE_INCAPABLE_CLASS = "lane_incapable"
+NO_FIRST_BYTE_BUDGET_CLASS = "no_first_byte_budget"
 INVALID_RESPONSE_CLASS = "provider_invalid_response"
 # Classes the sticky writer arms (one clock: _sticky.until_epoch).
 STICKY_CLASSES = frozenset({"conn", "pool_pressure", "quota_seat", "quota_model"})
@@ -1277,6 +1279,32 @@ def _bridge_code_body(row: Mapping[str, Any], seat: str, cause: str) -> str:
             f"{seat_seg}{detail}{_pool_context(row)}")
 
 
+BUDGET_CUT_BEFORE_HEADERS = "seat unknown — cut before headers"
+
+
+def _budget_cut_body(row: Mapping[str, Any], seat_names: bool) -> str:
+    """``no first byte in 600 s on claude-alr (sub-vps-5)`` for a wall-budget cut
+    (t_778185f3). The seat is the relay's ``x-pool-served-by`` when it answered
+    headers before the cut; a cut before any header says so. A lane with no seat
+    concept (cpa, openrouter, ...) gets no seat clause."""
+    cut = row.get("budget_cut") if isinstance(row.get("budget_cut"), Mapping) else {}
+    lane = str(cut.get("lane") or row.get("from_provider") or "").strip() or "the lane"
+    try:
+        took = f" in {int(round(float(cut.get('elapsed_s'))))} s"
+    except (TypeError, ValueError):
+        took = " within the turn's budget"
+    seat = row.get("seat") or cut.get("seat")
+    if seat and seat != "unknown":
+        seat_seg = f" ({seat if seat_names else 'a sub'})"
+    elif _plain_provider({"from_provider": lane}):
+        seat_seg = ""
+    elif cut.get("headers_seen"):
+        seat_seg = f" ({SUB_UNKNOWN})"
+    else:
+        seat_seg = f" ({BUDGET_CUT_BEFORE_HEADERS})"
+    return f"no first byte{took} on {lane}{seat_seg}"
+
+
 def _cause_phrase(row: Mapping[str, Any]) -> str:
     cls = row.get("trigger_class") or "unclassified"
     if cls == INVALID_RESPONSE_CLASS:
@@ -1443,6 +1471,8 @@ def cause_rider_with_floors(row: Mapping[str, Any], *, seat_names: bool = True,
 def _cause_body(row: Mapping[str, Any], seat_names: bool,
                 tz: Optional[_dt.tzinfo]) -> Tuple[str, Tuple[str, ...]]:
     prefix, window = _count_window(row, tz)
+    if row.get("trigger_class") == NO_FIRST_BYTE_BUDGET_CLASS:
+        return f"{prefix}{_budget_cut_body(row, seat_names)}, {window}", ()
     _fl = row.get("floor") if isinstance(row.get("floor"), Mapping) else {}
     if row.get("trigger_class") == INVALID_RESPONSE_CLASS and (
             _fl.get("served_by") or not _plain_provider(row)):

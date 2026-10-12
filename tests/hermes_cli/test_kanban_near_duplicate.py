@@ -77,6 +77,9 @@ def test_force_reason_files_and_ledgers(kanban_home):
     assert forced == [{
         "duplicates": [{"id": first, "score": forced[0]["duplicates"][0]["score"],
                         "same_title": True}],
+        # The same card is also an OPEN duplicate (no-window rule, t_6d1df155).
+        "open_duplicates": [{"id": first, "status": "ready", "assignee": "daedalus",
+                             "rule": "title_ratio", "score": 1.0}],
         "reason": "re-filed after scope change",
     }]
     assert forced[0]["duplicates"][0]["score"] >= kb.NEAR_DUP_THRESHOLD
@@ -153,8 +156,9 @@ def test_shard_siblings_warn_but_are_not_refused(kanban_home):
 def test_unrelated_card_and_old_duplicate_pass_clean(kanban_home):
     with kb.connect_closing() as conn:
         old = kb.create_task(conn, title=TITLE, body=BODY_A)
+        # Closed: an OPEN same-title card is refused at any age (t_6d1df155).
         conn.execute(
-            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            "UPDATE tasks SET created_at = ?, status = 'done' WHERE id = ?",
             (int(time.time()) - kb.NEAR_DUP_WINDOW_SECONDS - 60, old),
         )
         conn.commit()

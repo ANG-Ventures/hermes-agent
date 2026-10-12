@@ -1956,12 +1956,15 @@ def detect_crashed_workers(
                 )
                 if stderr_exit_class is not None:
                     kind = "rate_limited"
-            if kind == "rate_limited" and not cohort_death:
-                # The worker said "wall", but its own last lines carry the provider's
-                # verdict. A 400/401/403/404 is a REJECTION (dead model id, bad
-                # credential): the same answer on every retry, so it is a failure
-                # that counts, never a requeue-without-a-strike (t_d564a8dd: 24 such
-                # exits booked ``rate_limited`` for 8 h). 429/503/529 stay a wall.
+            if kind in ("rate_limited", "nonzero_exit") and not cohort_death:
+                # Whatever the worker said ("wall", or a plain nonzero exit), its own
+                # last lines carry the provider's verdict. A 400/401/403/404 is a
+                # REJECTION (dead model id, bad credential): the same answer on every
+                # retry, so it is a failure that counts toward the rejection streak,
+                # never a requeue-without-a-strike (t_d564a8dd: 24 such exits booked
+                # ``rate_limited`` for 8 h) and never generic crash accounting (the
+                # pinned-worker refusal path now exits nonzero on a 4xx on purpose,
+                # ``apply_pin_refusal_to_result``). 429/503/529 stay a wall.
                 from hermes_cli.kanban_worker_exit import provider_rejected_status
 
                 provider_rejected_line = provider_rejected_status(
@@ -4025,13 +4028,17 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         if affinity_out is not None:
             affinity_out[row["id"]] = {"host": _kwp.STUDIO_HOST, "rule": rule,
                                        "matched_by": hit[1] if hit else rule}
+        if rule == _kwp.STUDIO_NEEDS_RULE:
+            # Name what it needs (t_aea826a9): ``studio_affinity:studio_needs(vault,skills_tree)``.
+            return "local", f"studio_affinity:{rule}({','.join(sorted(_kwp.card_needs(row['body'])))})"
         return "local", f"studio_affinity:{rule}"
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
     return "local", (_pr.not_portable(rule) if pin == _kwp.PIN_ANY else None)
 
 
-_STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body"})
+_STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body",
+                                    "studio_needs"})
 
 
 def _identity_only_needed(verdict, caps, any_pin: bool = False) -> bool:
@@ -5513,6 +5520,12 @@ def _dispatch_once_locked(
                     # intersected with the reach proof when both apply.
                     _only = tuple(_cap_only) if _only is None else \
                         tuple(h for h in _only if h in _cap_only)
+                # A body naming Studio-only resources lands only on a host
+                # whose caps cover them (t_aea826a9); never widen ``_only``.
+                _need_hosts = _kwp_take.needs_allowed_hosts(row["body"], spillover.config)
+                if _need_hosts is not None:
+                    _only = _need_hosts if _only is None else tuple(
+                        h for h in _only if h.lower() in {n.lower() for n in _need_hosts})
             if _only is None:
                 placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
             else:
