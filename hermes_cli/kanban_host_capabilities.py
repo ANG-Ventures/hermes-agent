@@ -461,7 +461,7 @@ def _first(reqs: List[Requirement]) -> Optional[Requirement]:
 
 
 def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[CapabilityTick], *,
-             pin_host: Optional[str] = None) -> Verdict:
+             pin_host: Optional[str] = None, any_pin: bool = False) -> Verdict:
     """The card's verdict under this tick's map and modes. ``pin_host`` is a
     resolved ``host:<pool-id>`` pin (never ``any``/``studio``)."""
     if ctx is None:
@@ -479,8 +479,12 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
     warned = [r for r in live if ctx.mode_of(r.cap) == WARN]
     hard = _first([r for r in enforced if r.strength == HARD])
     soft = _first([r for r in enforced if r.strength == SOFT])
-    if enforced and pin_host is None and not any(r.unknown for r in enforced):
-        needed = {r.cap for r in enforced}
+    # `host: any` overrides SOFT requirements (F12): they must not come back
+    # as a host restriction or an identity-only hold (Prism dab1f537f2a0 /
+    # a5b769beaf55 on #1902). HARD ones still apply.
+    binding = [r for r in enforced if r.strength == HARD] if any_pin else enforced
+    if binding and pin_host is None and not any(r.unknown for r in binding):
+        needed = {r.cap for r in binding}
         servers = tuple(h for h in ctx.pool_hosts if needed <= ctx.cmap.hosts.get(h, frozenset()))
         if servers:
             # Some pool host advertises everything the card needs: portable,
