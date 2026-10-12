@@ -25,6 +25,10 @@ def kanban_home(tmp_path, monkeypatch):
     for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
         monkeypatch.delenv(var, raising=False)
     kb.init_db()
+    # The fleet registry the sweep binds hosts to (live shape: kanban-reach-matrix.json aliases).
+    (home / "fleet").mkdir()
+    (home / "fleet" / "kanban-reach-matrix.json").write_text(
+        json.dumps({"schema": 1, "aliases": ["ace-ai", "ace-media"], "hosts": {}}))
     return home
 
 
@@ -81,9 +85,9 @@ def test_finished_card_stops_what_its_run_started(kanban_home):
         assert kb.complete_task(conn, tid, summary="ok")
         acts = kres.release_finished(conn, runner=runner, notify=lambda b, l: lines.append(l))
         assert {a["action"] for a in acts} == {"stopped"}
-        assert runner.calls[0] == ["docker", "compose", "-p", "mem0-rt-s", "stop"]
+        assert runner.calls[0] == ["docker", "compose", "--project-name=mem0-rt-s", "stop"]
         assert runner.calls[1][:4] == ["ssh", "-o", "BatchMode=yes", "-o"]
-        assert runner.calls[1][-2:] == ["ace-ai", "sudo -n virsh shutdown win11-ai"]
+        assert runner.calls[1][-3:] == ["--", "ace-ai", "sudo -n virsh shutdown -- win11-ai"]
         assert len(lines) == 2 and all(tid in line for line in lines)
         assert kres.outstanding(conn, tid) == []
         assert {r["state"] for r in kres.list_resources(conn, tid)} == {"stopped"}
@@ -113,7 +117,7 @@ def test_archive_releases_too_and_failed_stops_stay_open_for_closeout(kanban_hom
         kb.archive_task(conn, tid)
         for _ in range(kres.MAX_STOP_ATTEMPTS):
             kres.release_finished(conn, runner=runner, notify=_quiet)
-        assert "systemctl --user stop zerank-native.service" in runner.calls[0][-1]
+        assert "systemctl --user stop -- zerank-native.service" in runner.calls[0][-1]
         (left,) = kres.outstanding(conn, tid)
         assert left["state"] == "stop_failed" and "rc=1" in left["last_error"]
         kres.release_finished(conn, runner=runner, notify=_quiet)
@@ -132,6 +136,62 @@ def test_registration_refuses_shell_tokens_and_finished_cards(kanban_home, rid):
         kb.complete_task(conn, tid, summary="ok")
         with pytest.raises(ValueError, match="finished card"):
             kres.kanban_run_resource(conn, tid, "container", "ok", "local")
+
+
+@pytest.mark.parametrize("host", ["-v", "-oProxyCommand=id", "ace@ace-ai", "/tmp/x", "evil-box", ""])
+def test_registration_refuses_option_shaped_and_unregistered_hosts(kanban_home, host):
+    with kbc.connect_closing() as conn:
+        tid, _ = _running_card(conn)
+        with pytest.raises(ValueError, match="resource host"):
+            kres.kanban_run_resource(conn, tid, "container", "ok", host)
+        assert kres.kanban_run_resource(conn, tid, "container", "ok", "ACE-AI")["resource"]["host"] == "ace-ai"
+
+
+@pytest.mark.parametrize("rid", ["--help", "-f"])
+def test_registration_refuses_option_shaped_ids(kanban_home, rid):
+    with kbc.connect_closing() as conn:
+        tid, _ = _running_card(conn)
+        with pytest.raises(ValueError, match="resource id"):
+            kres.kanban_run_resource(conn, tid, "container", rid, "local")
+
+
+@pytest.mark.parametrize("kind", sorted(kres.STOP_VERBS))
+def test_an_option_shaped_id_planted_in_the_row_is_never_an_option(kind):
+    """Defence past registration: whatever reaches the argv sits after ``--`` (or inside ``--opt=``)."""
+    for rid in ("--help", "user:--help"):
+        argv = kres._stop_argv({"kind": kind, "id": rid, "host": "local"})
+        idx = argv.index("--") if "--" in argv else None
+        bare = [a for a in argv if a in (rid, rid[len("user:"):])]
+        if idx is None:  # compose: the id is glued to its own option
+            assert bare == [] and f"--project-name={rid}" in argv
+        else:
+            assert bare and all(argv.index(a) > idx for a in bare)
+    remote = kres._stop_argv({"kind": kind, "id": "x", "host": "-v"})
+    assert remote[remote.index("--") + 1] == "-v"  # ssh never parses the host as an option
+
+
+def test_sweep_refuses_a_planted_row_without_running_it(kanban_home):
+    runner = _Runner()
+    with kbc.connect_closing() as conn:
+        tid, run = _running_card(conn)
+        planted = [{"kind": "container", "id": "--help", "host": "local", "started_at": 0, "state": "started"},
+                   {"kind": "vm", "id": "win11-ai", "host": "-v", "started_at": 0, "state": "started"},
+                   {"kind": "vm", "id": "win11-ai", "host": "evil-box", "started_at": 0, "state": "started"}]
+        conn.execute("UPDATE task_runs SET resources = ? WHERE id = ?", (kres._dump(planted), run))
+        conn.commit()
+        kb.complete_task(conn, tid, summary="ok")
+        acts = kres.release_finished(conn, runner=runner, notify=_quiet)
+        assert runner.calls == []
+        assert [a["action"] for a in acts] == ["stop_failed"] * 3
+        assert all(a["error"].startswith("refused: ") for a in acts)
+        assert len(kres.outstanding(conn, tid)) == 3  # left open for the ang-closeout Resources step
+
+
+def test_fleet_hosts_fails_closed(tmp_path):
+    assert kres.fleet_hosts(tmp_path) == frozenset()
+    (tmp_path / "placement-policy.json").write_text("{not json")
+    (tmp_path / "kanban-pool.json").write_text(json.dumps({"hosts": {"ci-box": {}, "-v": {}, "a@b": {}}}))
+    assert kres.fleet_hosts(tmp_path) == {"ci-box"}
 
 
 def test_keep_alive_needs_a_reason():

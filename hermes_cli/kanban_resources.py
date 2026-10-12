@@ -22,19 +22,22 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 _log = logging.getLogger(__name__)
 
 # kind -> argv builder for the stop verb (run on the resource's host). ``stop`` never deletes:
 # a container/compose project keeps its volumes, a VM gets an ACPI shutdown, a unit is stopped.
+# The id comes from a worker-writable row, so it always sits after ``--`` (or inside ``--opt=``):
+# it can never be read as an option, whatever the token check below admits.
 STOP_VERBS: dict[str, Callable[[str], list[str]]] = {
-    "vm": lambda rid: ["sudo", "-n", "virsh", "shutdown", rid],
-    "container": lambda rid: ["docker", "stop", rid],
-    "compose": lambda rid: ["docker", "compose", "-p", rid, "stop"],
+    "vm": lambda rid: ["sudo", "-n", "virsh", "shutdown", "--", rid],
+    "container": lambda rid: ["docker", "stop", "--", rid],
+    "compose": lambda rid: ["docker", "compose", f"--project-name={rid}", "stop"],
     "gpu-resident": lambda rid: (
-        ["systemctl", "--user", "stop", rid[len("user:"):]] if rid.startswith("user:")
-        else ["sudo", "-n", "systemctl", "stop", rid]
+        ["systemctl", "--user", "stop", "--", rid[len("user:"):]] if rid.startswith("user:")
+        else ["sudo", "-n", "systemctl", "stop", "--", rid]
     ),
 }
 KINDS = tuple(STOP_VERBS)
@@ -42,8 +45,12 @@ OPEN_STATES = ("started", "stop_failed")
 TERMINAL_CARD = ("done", "archived")
 MAX_STOP_ATTEMPTS = 3
 STOP_TIMEOUT_S = 90
-# A resource id / host goes through a remote shell (ssh), so only shell-inert characters.
+# A resource id goes through a remote shell (ssh), so only shell-inert characters.
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")
+# A host is a bare fleet name (no user@, no path, no option), and must also be in the fleet registry.
+_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,62}$")
+# Fleet files (under <kanban home>/fleet) whose host names the sweep may ssh to.
+_REGISTRY_FILES = ("kanban-reach-matrix.json", "placement-policy.json", "kanban-pool.json")
 _KEEP_ALIVE_RE = re.compile(r"(?im)^\s*keep-alive:\s*(\S.*)$")
 _LOCAL_HOSTS = {"local", "localhost"}
 # Compact JSON so the sweep's LIKE prefilter can match the state literally.
@@ -76,6 +83,41 @@ def _is_local(host: str) -> bool:
     return host.lower() in _LOCAL_HOSTS or host.split(".")[0].lower() == _this_host()
 
 
+def fleet_hosts(fleet_dir: Optional[Path] = None) -> frozenset[str]:
+    """Host names the sweep may stop a resource on: the ssh aliases and worker hosts of
+    ``kanban-reach-matrix.json`` plus the ``hosts`` of ``placement-policy.json`` and
+    ``kanban-pool.json``. Fail closed: an absent or unreadable file contributes nothing, so with no
+    registry only this box (``local``) is reachable."""
+    if fleet_dir is None:
+        from hermes_cli import kanban_db as kb
+
+        fleet_dir = kb.kanban_home() / "fleet"
+    names: set[str] = set()
+    for fname in _REGISTRY_FILES:
+        try:
+            doc = json.loads((Path(fleet_dir) / fname).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        if isinstance(doc.get("aliases"), list):
+            names.update(a for a in doc["aliases"] if isinstance(a, str))
+        if isinstance(doc.get("hosts"), dict):
+            names.update(h for h in doc["hosts"] if isinstance(h, str))
+    return frozenset(n.lower() for n in names if _HOST_RE.match(n.lower()))
+
+
+def host_refusal(host: Any, registry: Optional[frozenset[str]] = None) -> Optional[str]:
+    """Why ``host`` may not carry a resource, else None."""
+    if not isinstance(host, str) or not _HOST_RE.match(host.lower()):
+        return f"resource host {host!r} is not a bare fleet host name ([a-z0-9.-])"
+    if _is_local(host):
+        return None
+    if host.lower() not in (fleet_hosts() if registry is None else registry):
+        return f"resource host {host!r} is not in the fleet registry (fleet/{', fleet/'.join(_REGISTRY_FILES)})"
+    return None
+
+
 def _resolve_run_id(conn, task_id: str, run_id: Optional[int]) -> int:
     if run_id is not None:
         row = conn.execute("SELECT task_id FROM task_runs WHERE id = ?", (int(run_id),)).fetchone()
@@ -106,9 +148,12 @@ def kanban_run_resource(
 
     if kind not in STOP_VERBS:
         raise ValueError(f"unknown resource kind {kind!r} (one of {', '.join(KINDS)})")
-    for label, val in (("id", rid), ("host", host)):
-        if not _TOKEN_RE.match(val or ""):
-            raise ValueError(f"resource {label} {val!r} is not a plain token ([A-Za-z0-9_.:@/-])")
+    if not _TOKEN_RE.match(rid or ""):
+        raise ValueError(f"resource id {rid!r} is not a plain token ([A-Za-z0-9_.:@/-])")
+    why = host_refusal(host)
+    if why:
+        raise ValueError(why)
+    host = host.lower()
     with kb.write_txn(conn):
         trow = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if trow is None:
@@ -145,7 +190,7 @@ def _stop_argv(res: dict) -> list[str]:
     argv = STOP_VERBS[res["kind"]](res["id"])
     if _is_local(res["host"]):
         return argv
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", res["host"], shlex.join(argv)]
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", res["host"], shlex.join(argv)]
 
 
 def _default_runner(argv: list[str]) -> tuple[int, str]:
@@ -190,6 +235,7 @@ def release_finished(
         "WHERE r.resources LIKE '%\"state\":\"started\"%' AND t.status IN ('done', 'archived')"
     ).fetchall()
     actions: list[dict] = []
+    registry = fleet_hosts() if rows else frozenset()
     for row in rows:
         keep = keep_alive_reason(row["body"])
         items = _load(row["resources"])
@@ -198,11 +244,17 @@ def release_finished(
             if res.get("state") != "started" or res.get("kind") not in STOP_VERBS:
                 continue
             act = {"task_id": row["task_id"], "run_id": int(row["run_id"]), "kind": res["kind"],
-                   "id": res["id"], "host": res["host"]}
+                   "id": res.get("id"), "host": res.get("host")}
             if keep:
                 act.update(action="kept", reason=keep)
                 if not dry_run:
                     res.update(state="kept", kept_reason=keep[:200], released_at=int(time.time()))
+            elif (why := (None if _TOKEN_RE.match(str(res.get("id") or "")) else f"resource id {res.get('id')!r} "
+                          "is not a plain token") or host_refusal(res.get("host"), registry)):
+                # A row planted past registration: never run it, leave it open for closeout.
+                act.update(action="stop_failed", error=f"refused: {why}"[:240])
+                if not dry_run:
+                    res.update(state="stop_failed", last_error=act["error"])
             else:
                 argv = _stop_argv(res)
                 act["argv"] = argv
@@ -266,7 +318,7 @@ def mark(conn, task_id: str, kind: str, rid: str, host: str, state: str, *, reas
             items = _load(row["resources"])
             hit = False
             for r in items:
-                if (r.get("kind"), r.get("id"), r.get("host")) == (kind, rid, host) and r.get("state") != state:
+                if (r.get("kind"), r.get("id"), r.get("host")) == (kind, rid, host.lower()) and r.get("state") != state:
                     r.update(state=state, released_at=int(time.time()), mark_reason=reason.strip()[:200])
                     hit = True
                     n += 1
