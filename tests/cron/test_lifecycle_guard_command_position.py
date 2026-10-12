@@ -165,6 +165,32 @@ def test_quoted_json_values_and_null_redirects_pass(command):
     assert not _blocked(command)
 
 
+# --- Apollo r5 (t_4fded0bd): a quoted ESCAPE operand of a data sink is an executor, never data ---
+# sqlite3 is not a re-parser, so the quoted-argument view masked `".shell <verb>"` as a content
+# argument on 3e1ce485; sqlite3 dot-commands and psql `\!` EXECUTE their argument. The data-sink
+# masker has always refused them (`_DOT_COMMAND_ARGUMENT`); this view refuses them too.
+
+@pytest.mark.parametrize("command", [
+    f'sqlite3 db ".shell {RESTART}"',
+    f'sqlite3 ./db ".shell {RESTART}"',
+    f'sqlite3 ./db ".system {SYSTEMCTL}"',
+    f"sqlite3 ./db '.system {SYSTEMCTL}'",
+    f'psql ./x -c "\\\\! {SYSTEMCTL}"',
+])
+def test_quoted_escape_operand_of_a_data_sink_blocks(command):
+    assert _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
+    # the same sink with a plain SQL/data operand stays a content argument
+    f'sqlite3 ./db "SELECT msg FROM log WHERE msg LIKE \'%{RESTART}%\'"',
+    f"sqlite3 ./stats.db 'SELECT 1 -- never {SYSTEMCTL}'",
+    f"grep -r '{SYSTEMCTL}' .",
+])
+def test_quoted_sql_operand_of_a_data_sink_passes(command):
+    assert not _blocked(command)
+
+
 def test_referenced_script_whose_python_heredoc_prints_json_passes(tmp_path):
     """fp4 (hit while filing the review): a .sh that only prints JSON quoting the incident."""
     script = tmp_path / "sendback.sh"

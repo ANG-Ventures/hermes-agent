@@ -2104,8 +2104,20 @@ def _mask_quoted_argument_data(text: str) -> str:
             inner = text[i + 1:end]
             multi_word = any(c.isspace() for c in inner)
             expands = ch == '"' and ("$(" in inner or "`" in inner)
+            # A quoted operand that is itself an ESCAPE the receiving program executes is never
+            # data: sqlite3 dot-commands (`".shell <verb>"`, `".system …"`) and psql `\!`. The
+            # data-sink masker has always refused these (`_DOT_COMMAND_ARGUMENT`); the quoted-
+            # argument view must refuse them too, or sqlite3 (not a re-parser) hides the verb
+            # (Apollo r5 on t_4fded0bd: 3 cases of test_gateway_restart_loop.py regressed).
+            escape_operand = bool(_DOT_COMMAND_ARGUMENT.match(inner)) or "\\!" in inner
             reparses = _segment_command_reparses(text[seg_start:i]) if multi_word else None
-            if multi_word and not expands and not line_unmaskable and reparses is False:
+            if (
+                multi_word
+                and not expands
+                and not escape_operand
+                and not line_unmaskable
+                and reparses is False
+            ):
                 out.append(ch + "quoted-argument" + ch)
                 changed = True
             else:
