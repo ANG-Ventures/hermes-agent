@@ -134,6 +134,9 @@ gateway:
     thread_branched_one: "⑂ Branched into a new thread → {thread} (**{title}**, {count} message inherited).\nThe parent channel stays on its own session; use `/merge` inside the thread to fold it back."
     thread_parent_fallback: "the parent conversation"
     thread_branched_many: "⑂ Branched into a new thread → {thread} (**{title}**, {count} messages inherited).\nThe parent channel stays on its own session; use `/merge` inside the thread to fold it back."
+    inherits: "Inherits from the original: {items}"
+    inherits_model: "model {model}"
+    inherits_reasoning: "reasoning {effort}"
   commands:
     usage: "使い方: `/commands [page]`"
     skill_header: "⚡ **スキルコマンド**:"

@@ -486,6 +486,25 @@ class SessionTranscriptMixin:
             logger.debug("transcript tail lookup failed for %s", session_id, exc_info=True)
             return None
 
+    def load_transcript_rows(self, session_id: str) -> List[Dict[str, Any]]:
+        """``load_transcript`` WITHOUT the alternation repair: one dict per durable row, on the same
+        route. For readers that index the transcript by ROW (the /merge delta slices at
+        ``_branch_point_len``, a count of copied rows): the repaired replay folds consecutive user
+        rows (a /fork notice after a mid-turn parent, two notices on a re-forked branch) and is
+        shorter than the row count, so an index into it lands past the child's first prompt."""
+        if not self._db_for_session_id(session_id):
+            return []
+        session_id = self._follow_reroutes(session_id)
+        with contextlib.suppress(Exception):
+            db = self._db_for_session_id(session_id)
+            session_id = db.get_compression_tip(session_id) or session_id
+        try:
+            return self._db_for_session_id(session_id).get_messages_as_conversation(
+                session_id, include_timestamp=True, repair_alternation=False)
+        except Exception as e:
+            logger.error("Transcript row read failed for session %s: %s", session_id, e, exc_info=True)
+            raise TranscriptReadError(session_id) from e
+
     def rewrite_transcript(
         self, session_id: str, messages: List[Dict[str, Any]], active_only: bool = False,
         reject_active_turn_lease: bool = False) -> bool:
