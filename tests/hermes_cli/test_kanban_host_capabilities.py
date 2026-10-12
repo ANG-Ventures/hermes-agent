@@ -277,8 +277,10 @@ def test_kill_switch_warn(home, fleet, monkeypatch):
     _mode(monkeypatch, "off")
     assert json.loads(khc.spawn_env(fleet, kbd._root_kanban_cfg())) == {"*": "off"}
     _mode(monkeypatch, "enforce")
+    hard = {c for c, r in json.loads((fleet / khc.MAP_FILE).read_text())["capabilities"].items()
+            if r.get("soft") is False}   # the map's per-class hardness (t_90887924)
     assert json.loads(khc.spawn_env(fleet, kbd._root_kanban_cfg())) == {
-        "*": "warn", "browser-session": "enforce", "screen": "enforce"}
+        "*": "warn", "browser-session": "enforce", "screen": "enforce", **{c: "enforce" for c in hard}}
     (fleet / khc.MAP_FILE).unlink()   # absent map = off for the workers too
     assert json.loads(khc.spawn_env(fleet, kbd._root_kanban_cfg())) == {"*": "off"}
 

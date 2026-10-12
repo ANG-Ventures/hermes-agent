@@ -232,3 +232,45 @@ def test_kanbanw_in_the_docker_group_fails_the_rootless_probe(home):
     for fake, rc in ((rootful, 1), (rootless, 0)):
         cmd = probe.replace("docker info --format '{{.ServerVersion}} {{.SecurityOptions}}'", fake)
         assert subprocess.run(["sh", "-c", cmd]).returncode == rc
+
+
+# -- Prism r1 on #1902 ----------------------------------------------------------------
+
+def test_identity_only_wait_survives_an_earlier_local_rule(home, monkeypatch):
+    """fbd44b39be03 / 3b4b76976536: a docker card that some OTHER rule keeps off
+    the pool (here: a non-scratch workspace) still waits, never runs locally."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn, DOCKER)
+        conn.execute("UPDATE tasks SET workspace_kind='dir', workspace_path='/tmp/x' WHERE id=?", (tid,))
+        conn.commit()
+        (route, aff, _out) = _route(conn, tid)
+        assert route[0] == "wait" and route[1].startswith("requires_unsatisfied:docker")
+        assert aff[tid]["host"] == "none"
+
+
+def test_identity_only_waits_with_no_pool_plan(home):
+    """b83b86d68a65: the admitting band plans no pool; the docker card still
+    waits instead of spawning on the Studio. `host: studio` still runs."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn, DOCKER)
+        pinned = _card(conn, "host: studio\n" + DOCKER)
+        spawned = []
+
+        def spawn(task, workspace, *, board=None, placement=None):
+            spawned.append(task.id)
+            return 4242
+
+        res = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=64, spawn_limit=4,
+                                spillover=None, reconcile_orphans=False)
+        assert spawned == [pinned]
+        assert res.placement_waits[tid] == "requires_unsatisfied:docker"
+
+
+def test_worker_env_honours_the_map_hardness(home):
+    """b8ddb038892b: KANBAN_PLACEMENT_CAPS uses the same per-class modes as placement."""
+    env = json.loads(khc.spawn_env(home / "fleet", {"placement": {"capabilities": "enforce"}}))
+    assert env["docker"] == "enforce" and env["studio-state"] == "enforce"
+    _map(home, lambda d: d["capabilities"]["docker"].update(soft=True))
+    env = json.loads(khc.spawn_env(home / "fleet", {"placement": {"capabilities": "enforce",
+                                                                 "capabilities_enforce": ["docker"]}}))
+    assert env.get("docker", env["*"]) == "warn"
