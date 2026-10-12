@@ -17,8 +17,9 @@ config edit, no restart.
 
 from __future__ import annotations
 
-import getpass
 import logging
+import os
+import pwd
 import re
 from typing import Any, Mapping, Optional
 
@@ -31,59 +32,61 @@ LOCAL_SSH_HOST = "localhost"
 # A POSIX login, the hidden ``_name`` form included. Anything else is refused, not guessed.
 _LOGIN_RE = re.compile(r"_?[a-z][a-z0-9_-]{0,30}")
 _log = logging.getLogger(__name__)
-_warned: set = set()
 
 
-def _warn_once(msg: str) -> None:
-    if msg not in _warned:
-        _warned.add(msg)
-        _log.warning("kanban.%s: %s", KNOB, msg)
+class LocalWorkerUidError(RuntimeError):
+    """The knob is set but unusable: the spawn fails instead of silently running as the dispatcher."""
+
+
+def _my_login() -> str:
+    # The process uid, never LOGNAME/USER (a launcher can set those to anything).
+    return pwd.getpwuid(os.getuid()).pw_name
 
 
 def resolve_user(kanban_cfg: Optional[Mapping[str, Any]], *, me: Optional[str] = None) -> Optional[str]:
     """The login local workers' tools run as, or None for the dispatcher's own uid.
 
-    None for: knob absent/empty, a value naming the dispatcher's own login or uid, or a malformed
-    value (logged once; a typo must never strand every local card).
+    None ONLY for an explicitly unset knob (absent / null / empty) or a value naming the
+    dispatcher's own uid. A set-but-unusable value (malformed, unknown uid/login) raises
+    ``LocalWorkerUidError``: this knob is a privilege boundary, so a typo must fail closed.
     """
     raw = (kanban_cfg or {}).get(KNOB) if isinstance(kanban_cfg, Mapping) else None
-    if raw is None or isinstance(raw, bool):
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
         return None
+    if isinstance(raw, bool):
+        raise LocalWorkerUidError(f"kanban.{KNOB}: {raw!r} is not a login or uid")
     value = str(raw).strip()
-    if not value:
-        return None
     if me is None:
-        try:
-            me = getpass.getuser()
-        except Exception:
-            me = ""
-    if value == me:
-        return None
+        me = _my_login()
     if value.isdigit():
-        import os
         if int(value) == os.getuid():
             return None
         try:
-            import pwd
             value = pwd.getpwuid(int(value)).pw_name
-        except (KeyError, ImportError):
-            _warn_once(f"uid {raw!r} has no passwd entry; local workers keep the dispatcher uid")
-            return None
-        if value == me:
-            return None
-    if not _LOGIN_RE.fullmatch(value):
-        _warn_once(f"{raw!r} is not a login name; local workers keep the dispatcher uid")
+        except KeyError:
+            raise LocalWorkerUidError(f"kanban.{KNOB}: uid {value} has no passwd entry") from None
+    elif value == me:
+        return None
+    elif not _LOGIN_RE.fullmatch(value):
+        raise LocalWorkerUidError(f"kanban.{KNOB}: {raw!r} is not a login name")
+    else:
+        try:
+            pwd.getpwnam(value)
+        except KeyError:
+            raise LocalWorkerUidError(f"kanban.{KNOB}: login {value!r} does not exist") from None
+    if value == me:
         return None
     return value
 
 
 def configured_user() -> Optional[str]:
-    """``resolve_user`` over the live ROOT config (per tick)."""
+    """``resolve_user`` over the live ROOT config (per spawn). A config that cannot be read
+    raises: the knob's state is unknown, and unknown must not mean "dispatcher uid"."""
     try:
         from hermes_cli.config import load_config_readonly
         kcfg = (load_config_readonly() or {}).get("kanban")
-    except Exception:
-        return None
+    except Exception as exc:
+        raise LocalWorkerUidError(f"kanban.{KNOB}: config unreadable: {exc}") from exc
     return resolve_user(kcfg if isinstance(kcfg, Mapping) else None)
 
 

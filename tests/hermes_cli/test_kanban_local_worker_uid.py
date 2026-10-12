@@ -17,7 +17,7 @@ from hermes_cli import kanban_local_worker_uid as klu
 
 
 @pytest.mark.parametrize("cfg", [None, {}, {"local_worker_uid": None}, {"local_worker_uid": ""},
-                                 {"local_worker_uid": "  "}, {"local_worker_uid": False}])
+                                 {"local_worker_uid": "  "}])
 def test_unset_keeps_dispatcher_uid(cfg):
     assert klu.resolve_user(cfg, me="alice") is None
 
@@ -28,18 +28,43 @@ def test_own_login_and_own_uid_keep_dispatcher_uid():
     assert klu.resolve_user({"local_worker_uid": str(os.getuid())}, me="alice") is None
 
 
-def test_dedicated_login_resolves():
+@pytest.fixture()
+def fake_pwd(monkeypatch):
+    import pwd as _pwd
+    real_nam = _pwd.getpwnam
+
+    def getpwnam(name):
+        if name in ("_kanbanw", "kanbanw"):
+            return type("P", (), {"pw_name": name})()
+        return real_nam(name)
+    monkeypatch.setattr(klu.pwd, "getpwnam", getpwnam)
+
+
+def test_dedicated_login_resolves(fake_pwd):
     assert klu.resolve_user({"local_worker_uid": "_kanbanw"}, me="alice") == "_kanbanw"
     assert klu.resolve_user({"local_worker_uid": " kanbanw "}, me="alice") == "kanbanw"
 
 
-@pytest.mark.parametrize("bad", ["root; rm -rf /", "Kanban W", "-oProxyCommand=x", "a" * 40])
-def test_malformed_value_falls_back_never_strands(bad):
-    assert klu.resolve_user({"local_worker_uid": bad}, me="alice") is None
+@pytest.mark.parametrize("bad", ["root; rm -rf /", "Kanban W", "_kanbanW", "-oProxyCommand=x",
+                                 "a" * 40, "4000000000", "no-such-login-xyz", True, False])
+def test_set_but_unusable_value_fails_closed(bad, fake_pwd):
+    with pytest.raises(klu.LocalWorkerUidError):
+        klu.resolve_user({"local_worker_uid": bad}, me="alice")
 
 
-def test_unknown_numeric_uid_falls_back():
-    assert klu.resolve_user({"local_worker_uid": "4000000000"}, me="alice") is None
+def test_identity_is_the_process_uid_not_logname(monkeypatch, fake_pwd):
+    # A launcher env claiming to BE the worker login must not make placement look redundant.
+    monkeypatch.setenv("LOGNAME", "_kanbanw")
+    monkeypatch.setenv("USER", "_kanbanw")
+    assert klu.resolve_user({"local_worker_uid": "_kanbanw"}) == "_kanbanw"
+
+
+def test_unreadable_config_fails_closed(monkeypatch):
+    def boom():
+        raise OSError("disk gone")
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", boom)
+    with pytest.raises(klu.LocalWorkerUidError):
+        klu.configured_user()
 
 
 def test_local_host_targets_localhost_as_the_user():
@@ -58,7 +83,7 @@ def _task(kb):
 
 
 @pytest.fixture()
-def spawn(monkeypatch, tmp_path):
+def spawn(monkeypatch, tmp_path, fake_pwd):
     """Run the REAL ``_default_spawn`` env builder with a config value and a fake Popen."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_dispatch as kbd
@@ -108,6 +133,11 @@ def test_spawn_flag_on_places_tools_as_the_dedicated_uid(spawn):
     assert env["TERMINAL_SSH_SYNC_FILES"] == "false"
     assert json.loads(env["KANBAN_WORKER_PLACEMENT"])["host"] == klu.LOCAL_HOST_NAME
     assert captured["mkdir"] == [("_kanbanw@localhost", ws)]
+
+
+def test_spawn_with_typo_raises_never_runs_as_dispatcher(spawn):
+    with pytest.raises(klu.LocalWorkerUidError):
+        spawn("_kanbanW")
 
 
 def test_rollback_is_one_edit(spawn):
