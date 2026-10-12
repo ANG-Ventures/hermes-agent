@@ -176,8 +176,9 @@ def test_branch_thread_context_note_renders_thread_facts():
         source=_child_thread_source(), connected_platforms=[], home_channels={},
         shared_multi_user_session=True))
     assert "**Session type:** Multi-user thread" in note
-    assert f"**Parent channel:** `{_human_source().chat_id}`" in note
-    assert '`"origin"` → Back to this thread ("Guild / side quest")' in note
+    assert '**Source:** Discord thread "Guild / side quest"' in note
+    assert f"**Thread:** `{THREAD_ID}` (discord tools `channel_id`; `\"origin\"` delivers here)" in note
+    assert note.count(THREAD_ID) == 1, "thread id is the costliest token run; render it once"
 
 
 # ---------------------------------------------------------------- the real /branch handler wiring
