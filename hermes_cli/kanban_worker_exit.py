@@ -37,6 +37,35 @@ _UPSTREAM_CAPACITY_PATTERNS = (
 _UPSTREAM_CAPACITY_STATUS_RE = re.compile(r"\b(?:503|529)\b")
 
 
+# A provider REJECTION is not a wall: HTTP 400/401/403/404 (bad request, bad credential,
+# forbidden, unknown model) answers the same way on every retry. Incident t_d564a8dd: 24
+# consecutive ``HTTP 404: model: claude-sonnet-4-8`` exits were booked ``rate_limited`` for 8 h
+# because the pinned worker's refusal path mapped every retryable "unknown" onto the
+# retry-preserving class. 429 and the relay's capacity 503 keep ``rate_limited``.
+_PROVIDER_REJECTED_RE = re.compile(
+    r"\bHTTP[\s:]*(?:400|401|403|404)\b[^\n]*", re.IGNORECASE,
+)
+_PROVIDER_WALL_RE = re.compile(r"\bHTTP[\s:]*(?:429|503|529)\b", re.IGNORECASE)
+PROVIDER_REJECTED_TAIL_LINES = 8
+
+
+def provider_rejected_status(text: str | None) -> str | None:
+    """The provider's own ``HTTP 4xx ...`` status line from a failure text, else None.
+
+    Reads only the LAST few non-empty lines (the run's verdict), so an earlier, already
+    recovered 404 inside a long log never re-labels a later quota wall. A 429/503/529 in
+    that tail wins: the run was walled, whatever came before.
+    """
+    if not text:
+        return None
+    lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+    tail = "\n".join(lines[-PROVIDER_REJECTED_TAIL_LINES:])
+    if _PROVIDER_WALL_RE.search(tail):
+        return None
+    match = _PROVIDER_REJECTED_RE.search(tail)
+    return match.group(0).strip() if match else None
+
+
 def is_quota_exit(failure_reason: str | None, error: str = "") -> bool:
     """Provider quota wall: rate-limited or billing-exhausted (#655)."""
     return failure_reason in ("rate_limit", "billing")

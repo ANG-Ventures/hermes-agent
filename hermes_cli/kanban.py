@@ -891,6 +891,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 provider_override=getattr(args, "provider_override", None),
                 pin_sub_reason=getattr(args, "pin_sub", None),
                 pin_sub_fallback=bool(getattr(args, "pin_sub_fallback", False)),
+                force_model_reason=getattr(args, "force_model", None),
                 flagship_override_reason=getattr(args, "allow_flagship", None),
                 flagship_override_author=_comment_author(args.created_by)[0],
                 reasoning_effort=getattr(args, "reasoning_effort", None),
@@ -1948,6 +1949,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     write.provider = provider
                     write.pin_sub_reason = getattr(args, "pin_sub", None)
                     write.pin_sub_fallback = bool(getattr(args, "pin_sub_fallback", False))
+                    write.force_model_reason = getattr(args, "force_model", None)
                     if write.pin_sub_reason:
                         write.pin_sub_author = _profile_author()
                     if firepower:
@@ -3307,7 +3309,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             # --clear-model writes NULL; --model X writes X literally. The
             # None sentinel ("--model omitted") never reaches here.
             new_model = None if clear_model else model_override
-            affected = kb.set_task_model(conn, args.task_id, new_model)
+            try:
+                affected = kb.set_task_model(
+                    conn, args.task_id, new_model,
+                    force_model_reason=getattr(args, "force_model", None),
+                    actor=_profile_author(),
+                )
+            except ValueError as exc:
+                return _err(f"kanban: {exc}")
             if affected == 0:
                 return _err(f"cannot set model on {args.task_id} (unknown id)")
             if clear_model:

@@ -3803,6 +3803,39 @@ def _resolve_stored_model_pair(
         _log.debug("kanban model alias resolution failed for %r", model, exc_info=True)
         return model, provider
 
+
+# ``--force-model`` audit comment: a pin the lane's model list did not know, admitted
+# on purpose (t_d564a8dd: an unknown id otherwise 404s on every dispatch for hours).
+MODEL_FORCE_COMMENT_PREFIX = "model force:"
+
+
+def _require_known_model(
+    model: Optional[str], provider: Optional[str], *, force_model_reason: Optional[str] = None,
+):
+    """Refuse a ``(provider, model)`` pair the lane does not serve (``ValueError``).
+
+    The pair must already be alias-resolved. Returns the registry verdict so the
+    caller can leave the ``model force:`` comment when the id was forced through.
+    """
+    from hermes_cli.model_registry import require
+
+    return require(provider, model, force_reason=force_model_reason, flag="--force-model")
+
+
+def _model_registry_valid_ids(provider: Optional[str]) -> tuple[str, ...]:
+    """The lane's model list for a refusal message; empty when unreadable."""
+    try:
+        from hermes_cli.model_registry import catalog_for
+
+        return catalog_for(provider or "")
+    except Exception:
+        return ()
+
+
+def _model_force_comment(provider: Optional[str], model: Optional[str], reason: str) -> str:
+    return f"{MODEL_FORCE_COMMENT_PREFIX} {provider or '?'}/{model} not on the lane list; reason={reason.strip()}"
+
+
 # ---------------------------------------------------------------------------
 # Home-session card ownership (foreign-session mutation guard)
 # ---------------------------------------------------------------------------
@@ -5782,6 +5815,7 @@ def create_task(
     brain: Optional[str] = None,
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
+    force_model_reason: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -5885,6 +5919,9 @@ def create_task(
     flagship_override_reason = validate_worker_model(
         model_override,
         allow_flagship_reason=flagship_override_reason,
+    )
+    _model_verdict = _require_known_model(
+        model_override, provider_override, force_model_reason=force_model_reason,
     )
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -6277,6 +6314,11 @@ def create_task(
                         flagship_override_author or created_by or "operator",
                         sub_pin_comment(provider_override, pin_sub_reason,
                                         fallback=bool(pin_sub_fallback)),
+                    )
+                if _model_verdict.reason == "forced":
+                    add_comment(
+                        conn, task_id, flagship_override_author or created_by or "operator",
+                        _model_force_comment(provider_override, model_override, _model_verdict.force_reason or ""),
                     )
                 if near_dups:
                     forced = force_reason and bool(same)
@@ -6790,6 +6832,7 @@ def set_model_override(
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
     pin_sub_author: Optional[str] = None,
+    force_model_reason: Optional[str] = None,
 ) -> bool:
     """Set (or clear) the per-task model/provider override.
 
@@ -6822,6 +6865,7 @@ def set_model_override(
         audit_comment_body=audit_comment_body,
         pin_sub_reason=pin_sub_reason,
         pin_sub_fallback=pin_sub_fallback,
+        force_model_reason=force_model_reason,
     )
     with write_txn(conn):
         if not _set_model_override_locked(
@@ -6831,6 +6875,7 @@ def set_model_override(
             pin_sub_reason=pin_sub_reason,
             pin_sub_fallback=pin_sub_fallback,
             pin_sub_author=pin_sub_author,
+            force_model_reason=force_model_reason,
         ):
             return False
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
@@ -6864,6 +6909,7 @@ def _validate_model_override_args(
     audit_comment_body: Optional[str] = None,
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
+    force_model_reason: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Normalise + validate a route pair WITHOUT touching the database.
 
@@ -6907,6 +6953,7 @@ def _validate_model_override_args(
         body = (audit_comment_body or "").lstrip().casefold()
         if not body.startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
             raise ValueError(flagship_model_error(str(model)))
+    _require_known_model(model, provider, force_model_reason=force_model_reason)
     return model, provider
 
 
@@ -6948,6 +6995,7 @@ def _set_model_override_locked(
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
     pin_sub_author: Optional[str] = None,
+    force_model_reason: Optional[str] = None,
 ) -> bool:
     """Write one route override. MUST already be inside a ``write_txn``.
 
@@ -6996,6 +7044,14 @@ def _set_model_override_locked(
             conn, task_id, pin_sub_author or audit_comment_author or "operator",
             sub_pin_comment(provider, pin_sub_reason, fallback=pin_sub_fallback),
         )
+    if model and (force_model_reason or "").strip():
+        from hermes_cli.model_registry import resolve
+
+        if resolve(provider, model, force_reason=force_model_reason, resolve_aliases=False).reason == "forced":
+            add_comment(
+                conn, task_id, pin_sub_author or audit_comment_author or "operator",
+                _model_force_comment(provider, model, force_model_reason or ""),
+            )
     return True
 
 
@@ -7099,6 +7155,8 @@ class BatchRouteWrite:
     pin_sub_reason: Optional[str] = None
     pin_sub_fallback: bool = False
     pin_sub_author: Optional[str] = None
+    # ``--force-model <reason>``: admit an id the lane's model list lacks.
+    force_model_reason: Optional[str] = None
     # The selection predicate that chose this card, re-checked under the
     # batch's writer lock. ``None`` means "no constraint on that column".
     require_statuses: Optional[frozenset] = None
@@ -7221,6 +7279,7 @@ def apply_batch_route_writes(
                 audit_comment_body=write.audit_comment_body,
                 pin_sub_reason=write.pin_sub_reason,
                 pin_sub_fallback=write.pin_sub_fallback,
+                force_model_reason=write.force_model_reason,
             )
         effort = normalize_reasoning_effort(write.effort) if write.touch_effort else None
         if write.touch_brain:
@@ -7258,6 +7317,7 @@ def apply_batch_route_writes(
                     pin_sub_reason=write.pin_sub_reason,
                     pin_sub_fallback=write.pin_sub_fallback,
                     pin_sub_author=write.pin_sub_author or write.audit_comment_author,
+                    force_model_reason=write.force_model_reason,
                 ):
                     raise RuntimeError(f"no such task: {write.task_id}")
                 changed += ("model_override", "provider_override")
@@ -8263,7 +8323,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         # 'review_reopened' is historical (verb retired); legacy rows still count.
         "'review_reopened', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', "
-        "'infra_unavailable', 'scheduled'"
+        "'infra_unavailable', 'provider_rejected', 'scheduled'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -15243,7 +15303,8 @@ def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
 
 @_home_session_guarded("set-model")
 def set_task_model(
-    conn: sqlite3.Connection, task_id: str, model: Optional[str]
+    conn: sqlite3.Connection, task_id: str, model: Optional[str],
+    *, force_model_reason: Optional[str] = None, actor: Optional[str] = None,
 ) -> int:
     """Set (or clear) a task's per-task model override.
 
@@ -15272,6 +15333,9 @@ def set_task_model(
     resolved_model, resolved_provider = _resolve_stored_model_pair(model, None)
     validate_route_provider(resolved_model, resolved_provider)
     validate_worker_model(resolved_model)
+    _verdict = _require_known_model(
+        resolved_model, resolved_provider, force_model_reason=force_model_reason,
+    )
     if not resolved_model:
         resolved_provider = None
     with write_txn(conn):
@@ -15280,6 +15344,11 @@ def set_task_model(
             "pin_sub_reason = NULL, pin_sub_fallback = 0 WHERE id = ?",
             (resolved_model, resolved_provider, task_id),
         )
+        if cur.rowcount and _verdict.reason == "forced":
+            add_comment(
+                conn, task_id, actor or "operator",
+                _model_force_comment(resolved_provider, resolved_model, _verdict.force_reason or ""),
+            )
     return int(cur.rowcount or 0)
 
 
@@ -15587,6 +15656,21 @@ def _rate_limit_hold_seconds(streak: int, *, base: int) -> int:
     return max(base, rung)
 
 
+def _provider_rejected_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Trailing count of CLOSED runs whose outcome is ``provider_rejected``."""
+    rows = conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT 50",
+        (task_id,),
+    ).fetchall()
+    streak = 0
+    for r in rows:
+        if r["outcome"] != "provider_rejected":
+            break
+        streak += 1
+    return streak
+
+
 def consecutive_rate_limited_runs(conn: sqlite3.Connection, task_id: str) -> int:
     """Trailing count of CLOSED runs whose outcome is ``rate_limited``."""
     streak = 0
@@ -15878,7 +15962,7 @@ _RESPAWN_GUARD_FAILURE_RESET_KINDS: tuple[str, ...] = (
 # reclaimed / stale ...) supersedes the stamped text: it belongs to history.
 _RESPAWN_GUARD_FAILURE_OUTCOMES: frozenset[str] = frozenset(
     {"crashed", "timed_out", "spawn_failed", "gave_up", "rate_limited",
-     "infra_unavailable"}
+     "infra_unavailable", "provider_rejected"}
 )
 _RESPAWN_GUARD_PR_QUERY_LIMIT = 5
 _RESPAWN_GUARD_PR_QUERY_TIMEOUT_SECONDS = 5

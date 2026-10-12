@@ -1457,6 +1457,12 @@ def _error_fingerprint(error_text: str) -> str:
 # nor extend it. Per-task ``max_retries`` overrides it.
 _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 
+# Provider REJECTIONS (HTTP 4xx from the model provider) count as failures and
+# block the card after this many in a row (t_d564a8dd). Separate from
+# ``failure_limit`` so an operator's dispatcher setting of 1 or 5 does not
+# change how many identical 404s a dead pin is allowed.
+_PROVIDER_REJECTED_FAILURE_LIMIT = 3
+
 # Closed runs to walk when counting the streak; it trips at a handful anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
@@ -1938,12 +1944,26 @@ def detect_crashed_workers(
             rate_limited_exit = False
             cohort_death = row["id"] in cohort_ids
             stderr_exit_class = None
+            provider_rejected_line = None
             if kind == "nonzero_exit" and not cohort_death:
                 stderr_exit_class = _kb._stderr_cooldown_class(
                     _kb._worker_log_run_segment(row["id"], board=board)
                 )
                 if stderr_exit_class is not None:
                     kind = "rate_limited"
+            if kind == "rate_limited" and not cohort_death:
+                # The worker said "wall", but its own last lines carry the provider's
+                # verdict. A 400/401/403/404 is a REJECTION (dead model id, bad
+                # credential): the same answer on every retry, so it is a failure
+                # that counts, never a requeue-without-a-strike (t_d564a8dd: 24 such
+                # exits booked ``rate_limited`` for 8 h). 429/503/529 stay a wall.
+                from hermes_cli.kanban_worker_exit import provider_rejected_status
+
+                provider_rejected_line = provider_rejected_status(
+                    _kb._worker_log_run_segment(row["id"], board=board)
+                )
+                if provider_rejected_line:
+                    kind = "provider_rejected"
             if cohort_death:
                 protocol_violation = False
                 error_text = (
@@ -2092,6 +2112,21 @@ def detect_crashed_workers(
                 stderr_tail = _kb._worker_log_stderr_tail(row["id"], board=board)
                 if stderr_tail:
                     event_payload["stderr_tail"] = stderr_tail
+            elif kind == "provider_rejected":
+                protocol_violation = False
+                error_text = (
+                    f"pid {pid} exited on a provider rejection — {provider_rejected_line}; "
+                    f"counts as a failure (a 4xx answers the same way on every retry)"
+                )
+                event_kind = "provider_rejected"
+                event_payload = {
+                    "pid": pid, "claimer": row["claim_lock"], "exit_kind": kind,
+                    "exit_code": code, "provider_status": provider_rejected_line,
+                    "provider_rejected": True,
+                }
+                stderr_tail = _kb._worker_log_stderr_tail(row["id"], board=board)
+                if stderr_tail:
+                    event_payload["stderr_tail"] = stderr_tail
             elif kind == "terminal_provider":
                 # EX_CONFIG (upstream 2b94b0d40f): the provider rejected this
                 # profile's credential or model — retrying cannot help, so the
@@ -2153,6 +2188,8 @@ def detect_crashed_workers(
                     _run_outcome = "cohort_death"
                 elif kind == "infra_unavailable":
                     _run_outcome = "infra_unavailable"
+                elif kind == "provider_rejected":
+                    _run_outcome = "provider_rejected"
                 elif rate_limited_exit:
                     _run_outcome = "rate_limited"
                 else:
@@ -2314,6 +2351,26 @@ def detect_crashed_workers(
                     release_claim=False,
                     end_run=False,
                     event_payload_extra=violation_extra,
+                )
+                if tripped:
+                    auto_blocked.append(tid)
+                continue
+            if "exited on a provider rejection" in error_text:
+                # Three identical rejections → blocked with a typed ``capability`` block
+                # (sticky; fires ``kanban_task_blocked`` → owner wake). Below that, a
+                # counted failure the respawn guard spaces like any crash.
+                _rej_streak = _kb._provider_rejected_streak(conn, tid)
+                tripped = _record_task_failure(
+                    conn, tid,
+                    error=error_text,
+                    outcome="provider_rejected",
+                    failure_limit=_PROVIDER_REJECTED_FAILURE_LIMIT,
+                    force_trip=_rej_streak >= _PROVIDER_REJECTED_FAILURE_LIMIT,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={"pid": pid, "claimer": claimer, "provider_rejected": True,
+                                         "provider_rejected_streak": _rej_streak},
+                    block_kind="capability" if _rej_streak >= _PROVIDER_REJECTED_FAILURE_LIMIT else None,
                 )
                 if tripped:
                     auto_blocked.append(tid)
@@ -2531,14 +2588,17 @@ def _record_task_failure(
                 )
             else:
                 # Timeout/crash path: source phase already restored with claim
-                # cleared; just flip to blocked + update
-                # counter fields. No current timeout/crash caller supplies a
-                # typed ``block_kind``; typed auto-blocking is a spawn path.
+                # cleared; just flip to blocked + update counter fields. A typed
+                # ``block_kind`` (provider rejection streak) lands here too.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "UPDATE tasks SET status = ?, "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = COALESCE(?, block_kind), "
+                    "block_recurrences = CASE WHEN ? IS NULL "
+                    "THEN block_recurrences ELSE ? END "
                     "WHERE id = ? AND status IN ('ready', 'review', 'running')",
-                    (failures, error[:500], task_id),
+                    (_typed_status if _bk else "blocked",
+                     failures, error[:500], _bk, _bk, _recurrences, task_id),
                 )
             run_id = None
             if end_run:
@@ -4964,6 +5024,39 @@ def _dispatch_once_locked(
             )
         return True
 
+    def invalid_pin_refused(task_id: str) -> bool:
+        """Park a card whose stored ``model_override`` names an id its lane does not serve.
+
+        The writers refuse such a pin at mint; this catches a row written by hand, or
+        before the writers validated (t_d564a8dd: ``claude-sonnet-4-8`` on claude-alr,
+        8 h of 404s booked as ``rate_limited``). A ``capability`` block fires the
+        ``kanban_task_blocked`` hook, so the owner is woken like any handback.
+        """
+        task = _kb.get_task(conn, task_id)
+        if task is None or not task.model_override:
+            return False
+        from hermes_cli.kanban_provider_health import model_override
+        from hermes_cli.model_registry import invalid_pin_reason
+
+        model, provider = model_override(task)
+        reason = invalid_pin_reason(provider, model)
+        if reason is None:
+            return False
+        result.auto_blocked.append(task_id)
+        if dry_run:
+            return True
+        valid = ", ".join(_kb._model_registry_valid_ids(provider)) or "(unreadable)"
+        body = (
+            f"{reason}; the lane serves [{valid}]. Re-pin with "
+            f"`hermes kanban set-model {task_id} <model> --provider {provider}` "
+            f"(or --force-model <reason>), then unblock."
+        )
+        _kb._log.warning("PHASE=kanban_model_override_invalid task=%s provider=%s model=%s",
+                         task_id, provider, model)
+        if _kb.block_task(conn, task_id, reason=reason, kind="capability"):
+            _kb.add_comment(conn, task_id, "dispatcher", body)
+        return True
+
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -5093,6 +5186,8 @@ def _dispatch_once_locked(
                 )
                 continue
         if flagship_refused(row["id"], row_assignee):
+            continue
+        if invalid_pin_refused(row["id"]):
             continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
@@ -5455,6 +5550,8 @@ def _dispatch_once_locked(
                 )
                 continue
         if flagship_refused(row["id"], row["assignee"]):
+            continue
+        if invalid_pin_refused(row["id"]):
             continue
         guard_detail = {}
         guard_reason = check_respawn_guard(

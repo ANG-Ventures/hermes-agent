@@ -316,9 +316,18 @@ def apply_pin_refusal_to_result(agent, result):
         return result
     if not result.get("failure_retryable"):
         return result
-    from hermes_cli.kanban_worker_exit import worker_exit_class
+    from hermes_cli.kanban_worker_exit import provider_rejected_status, worker_exit_class
 
     if worker_exit_class(result.get("failure_reason"), result.get("error", "")) is not None:
+        return result
+    rejected = provider_rejected_status(result.get("error", ""))
+    if rejected:
+        # The pinned provider ANSWERED, with a 4xx: a dead pin, not an outage (t_d564a8dd).
+        # Exit as a real failure so the dispatcher books ``provider_rejected`` and counts it.
+        logger.warning(
+            "PHASE=kanban_worker_pin_provider_rejected task=%s status=%s",
+            os.environ.get("HERMES_KANBAN_TASK"), rejected,
+        )
         return result
     logger.warning(
         "PHASE=kanban_worker_pin_refused_exit task=%s original_failure_reason=%s",
