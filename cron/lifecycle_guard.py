@@ -877,9 +877,16 @@ def describe_gateway_lifecycle_command(text: str) -> Optional[str]:
     # body is documentation, not a command this shell will execute. The
     # stripper fails open on ANY ambiguity (unquoted delimiter, shell
     # consumer, unterminated body), so executable heredocs are still scanned.
+    #
+    # Unless the command WRITES and then RUNS (`cat > x.sh <<'EOF' … EOF; bash x.sh`,
+    # `printf '<verb>' > x.sh && bash x.sh`): the bytes written are what executes, so
+    # neither the heredoc strip nor the quoted-data / text-consumer exemptions below apply
+    # (Apollo r2 on t_4fded0bd: the lifecycle verb's own write-then-run passed).
     from tools.shell_heredoc import strip_inert_heredoc_bodies
 
-    text = strip_inert_heredoc_bodies(text)
+    writes_then_runs = _writes_then_runs(text)
+    if not writes_then_runs:
+        text = strip_inert_heredoc_bodies(text)
     # Collapse POSIX shell line-continuations first (#62891) so a multi-line
     # invocation cannot slip past the `[^\\n]*` branches.
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
@@ -891,7 +898,7 @@ def describe_gateway_lifecycle_command(text: str) -> Optional[str]:
         # is quoted DATA fed to a text-only consumer (echo/grep/printf/…), not
         # an executed command. Interpreter re-exec (bash -c "…") is NOT exempt.
         matched = match.group(0)
-        if matched.lower().startswith("hermes") and _match_is_quoted_data(
+        if matched.lower().startswith("hermes") and not writes_then_runs and _match_is_quoted_data(
             normalized, match.start(), matched
         ):
             continue
@@ -952,9 +959,8 @@ def describe_gateway_lifecycle_command(text: str) -> Optional[str]:
             if stripped != joined:
                 _seg_match = _GATEWAY_LIFECYCLE_PATTERN.search(stripped)
         if _seg_match is not None:
-            if _seg_match.group(0).lower().startswith("hermes") and _TEXT_CONSUMER_RE.match(
-                joined
-            ):
+            if (_seg_match.group(0).lower().startswith("hermes") and not writes_then_runs
+                    and _TEXT_CONSUMER_RE.match(joined)):
                 continue
             if _match_is_sibling_exemptable(
                 _seg_match.group(0)
@@ -1903,9 +1909,93 @@ def _unquoted_view(text: str) -> str:
 # A redirection or `tee` in the command: a quoted value may be written to a file that a later
 # segment executes (`printf '<stop>' > x.sh; bash x.sh`), and `printf -v NAME` / `read` store it in
 # a variable a later `$NAME` runs. The masker cannot follow either, so it does not apply at all.
+# `>`, `>>`, `1>`, `&>`, `>|` are all file writes; `>&2` / `2>&1` / `> /dev/null` are not.
 _WRITES_OR_STORES_RE = re.compile(
-    r"(?<![<>&\d])>(?![(&])(?!\s*/dev/null\b)|\btee\b|\bprintf\s+(?:-\S+\s+)*-v\b|\bread\s"
+    r"(?<![<])(?:(?<![&\d])|(?<=\s[1&])|(?<=^[1&]))>(?![(&])\|?(?!\s*/dev/null\b)|\btee\b|"
+    r"\bprintf\s+(?:-\S+\s+)*-v\b|\bread\s"
 )
+# Command words that only READ or LINT what they are given: a write followed by one of these is
+# not a write-then-run. Anything else at command position after a write (a shell, `source`, an
+# interpreter, a path, a bare name found through PATH) may execute the bytes just written.
+_INERT_AFTER_WRITE = frozenset({
+    "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "wc", "diff", "cmp",
+    "ls", "stat", "file", "echo", "printf", "shellcheck", "chmod", "chown", "touch", "cp", "mv",
+    "rm", "md5", "md5sum", "shasum", "sha256sum", "base64", "xxd", "od", "hexdump", "strings",
+    "sort", "uniq", "cut", "tr", "column", "nl", "true", "false", ":", "test", "[", "sleep", "cd",
+    "mkdir", "ln", "git", "sed", "awk", "jq", "tee",
+})
+
+
+def _drop_heredoc_bodies(text: str) -> str:
+    """*text* without heredoc body lines (every heredoc, inert or not): for the segment scan only."""
+    out: list[str] = []
+    pending: list[str] = []
+    for line in text.split("\n"):
+        if pending:
+            if line.strip() == pending[0]:
+                pending.pop(0)
+            continue
+        out.append(line)
+        view = _unquoted_view(line)
+        for at in (m.start() for m in re.finditer(r"<<(?!<)", view)):
+            raw = _HEREDOC_OPEN_RE.match(line, at)
+            if raw is not None:
+                pending.append(_heredoc_delimiter(raw))
+    return "\n".join(out)
+
+
+def _writes_then_runs(text: str) -> bool:
+    """The command WRITES bytes (a redirect, `tee`, a heredoc to a file, `printf -v`, `read`) and a
+    LATER segment executes something that is not an inert reader: the written content may be what
+    runs, so no data exemption (quoted argument, text consumer, inert heredoc) may hide it. Apollo
+    r2 on t_4fded0bd: `printf '<lifecycle verb>' > x.sh && bash x.sh` passed through every one."""
+    # Drop heredoc bodies BEFORE locating the write: `cat <<EOF > notes.md` opens the heredoc
+    # ahead of the redirect, so slicing at the `>` would keep the body as if it were commands.
+    dropped = _drop_heredoc_bodies(text)
+    match = _WRITES_OR_STORES_RE.search(_unquoted_view(dropped))
+    if match is None:
+        return False
+    tail = dropped[match.start():]
+    for segment in list(_iter_command_segments(tail))[1:]:
+        index = _command_token_index(segment)
+        if index is None:
+            continue
+        name = _executable_name(segment[index]).lower()
+        rest = segment[index + 1:]
+        operands = [t for t in rest if not t.startswith("-")]
+        if rest and not operands and not any(t in ("-c", "-e", "-m", "-x") for t in rest):
+            continue   # `python3 -V`, `bash --version`: options only, nothing to run
+        if name in _INERT_AFTER_WRITE and "/" not in segment[index]:
+            if name == "sed" and any(re.search(r"(?:^|/)e$|^-\w*E?e", t) for t in rest):
+                return True
+            if name == "git" and any(t == "-c" or t.startswith(("!", "--exec")) or t == "-x" for t in rest):
+                return True
+            if name == "awk" and any("system(" in t for t in rest):
+                return True
+            continue
+        if name in _SHELL_EXECUTABLES and _is_noexec_shell_segment(segment[index:]):
+            continue
+        return True
+    return False
+
+
+def _is_noexec_shell_segment(argv: list[str]) -> bool:
+    """`bash -n x.sh`: parses without executing."""
+    noexec = False
+    for w in argv[1:]:
+        if w.startswith("--"):
+            continue
+        if w.startswith("+") and len(w) > 1:
+            if "n" in w[1:]:
+                noexec = False
+            continue
+        if not w.startswith("-"):
+            break
+        if "c" in w[1:]:
+            return False
+        if "n" in w[1:]:
+            noexec = True
+    return noexec
 _PROGRAM_VALUE_OPTION_RE = re.compile(
     r"(?:^|\s)(?:\+!|-c\b|-e\b|-x\b|-o\s|--to-command|--checkpoint-action|--exec\b|-exec\b|-execdir\b|"
     r"--pre\b|--pager\b|--compress-program|-I\s|-O\b|--ext-diff|--textconv|--filter\b|-S\b|--split-string)"
@@ -1959,7 +2049,7 @@ def _mask_quoted_argument_data(text: str) -> str:
         return text
     # The view cannot follow a value into a file or a variable: `printf '<stop>' > x.sh; bash
     # x.sh` was ALLOWED by the first version while base blocked it (regression, Apollo r1 probe).
-    if _WRITES_OR_STORES_RE.search(_unquoted_view(text)):
+    if _writes_then_runs(text):
         return text
     # Any option that hands its value to a program (`vim '+!cmd'`, `git -c alias.x='!cmd'`,
     # `tar --to-command=`, `rsync -e`, `find -exec`): keep the text whole.
@@ -2111,6 +2201,8 @@ def _describe_lifecycle_command_with_data_exemption(text: str) -> Optional[str]:
     """
     if describe_gateway_lifecycle_command(text) is None:
         return None
+    if _writes_then_runs(text):
+        return describe_gateway_lifecycle_command(text)   # the written bytes run: no data view
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
     masked = _mask_data_sink_arguments(
         _mask_heredoc_bodies(_mask_quoted_argument_data(normalized))

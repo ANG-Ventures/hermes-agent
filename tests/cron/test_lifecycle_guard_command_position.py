@@ -178,6 +178,49 @@ def test_referenced_script_whose_python_heredoc_prints_json_passes(tmp_path):
     assert _blocked(f"bash {real}")
 
 
+# --- Apollo r2 (t_4fded0bd): the lifecycle VERB written to a file and run in the same command ----
+# `printf '<restart>' > x.sh && bash x.sh` PASSED on 85b61694 (and on base): printf is a text
+# consumer, so Branch A's quoted-data exemption fired; a `cat > x.sh <<'EOF'` body was stripped as
+# an inert heredoc. When the command WRITES and a later segment RUNS, no data exemption applies.
+
+@pytest.mark.parametrize("command", [
+    f"printf '{RESTART}' > /tmp/zz_t4f.sh && bash /tmp/zz_t4f.sh",
+    f"printf '{RESTART}' > /tmp/zz_t4f.sh\nbash /tmp/zz_t4f.sh",
+    f"echo '{RESTART}' 1> /tmp/zz_t4f.sh; sh /tmp/zz_t4f.sh",
+    f"echo '{RESTART}' &> /tmp/zz_t4f.sh; sh /tmp/zz_t4f.sh",
+    f"echo '{RESTART}' >> /tmp/zz_t4f.sh; zsh /tmp/zz_t4f.sh",
+    f"printf '{RESTART}' > /tmp/zz_t4f.sh && chmod +x /tmp/zz_t4f.sh && /tmp/zz_t4f.sh",
+    f"printf '{RESTART}' > /tmp/zz_t4f.sh && source /tmp/zz_t4f.sh",
+    f"printf '{RESTART}' > /tmp/zz_t4f.sh && . /tmp/zz_t4f.sh",
+    f"printf '{RESTART}' > /tmp/zz_t4f.sh && sudo bash /tmp/zz_t4f.sh",
+    f"printf '{RESTART}' > /tmp/zz_t4f.py && python3 /tmp/zz_t4f.py",
+    f"printf '{RESTART}' | tee /tmp/zz_t4f.sh; bash /tmp/zz_t4f.sh",
+    f"cat > /tmp/zz_t4f.sh <<'EOF'\n{RESTART}\nEOF\nbash /tmp/zz_t4f.sh",
+    f"cat <<'EOF' > /tmp/zz_t4f.sh\n{RESTART}\nEOF\nbash /tmp/zz_t4f.sh",
+    f"tee /tmp/zz_t4f.sh <<'EOF'\n{RESTART}\nEOF\nsh /tmp/zz_t4f.sh",
+    f"cat > /tmp/zz_t4f.sh <<'EOF'\n{BOOTOUT}\nEOF\nbash /tmp/zz_t4f.sh",
+    f"git commit -m '{RESTART}' > /tmp/zz_t4f.sh; bash /tmp/zz_t4f.sh",
+    f"read -r C <<< '{RESTART}'; $C",
+])
+def test_lifecycle_verb_written_then_run_blocks(command):
+    assert _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
+    # written, then only READ / linted / left alone
+    f"echo '{RESTART}' >> ~/.zshrc",
+    f"echo '{RESTART}' > /tmp/notes.md; cat /tmp/notes.md",
+    f"echo '{RESTART}' > /tmp/zz_t4f.sh; echo done",
+    f"echo '{RESTART}' > /tmp/zz_t4f.sh; bash -n /tmp/zz_t4f.sh",
+    f"echo '{RESTART}' > /tmp/zz_t4f.sh; shellcheck /tmp/zz_t4f.sh",
+    f"git commit -m 'run {RESTART} later' > /tmp/log.txt",
+    f"cat > /tmp/notes.md <<'EOF'\nnever {RESTART}\nEOF\ngit add /tmp/notes.md",
+    f"printf '{RESTART}' > /tmp/x; wc -l /tmp/x && grep -c gateway /tmp/x",
+])
+def test_lifecycle_verb_written_then_only_read_passes(command):
+    assert not _blocked(command)
+
+
 # --- verb-family ownership: these shapes PASS here BY DESIGN ------------------------------------
 # This guard owns lifecycle verbs aimed at OUR OWN gateway from inside it; a SIBLING label or a
 # remote host is fleet maintenance and exempt. The raw stop of ANY gateway label/unit is blocked
