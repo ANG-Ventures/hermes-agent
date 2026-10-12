@@ -36,6 +36,23 @@ The profile-flag form (``hermes -p <profile> gateway restart|stop``, #78028)
 is handled profile-aware: it is blocked only when the named profile is the
 profile running the guard. Sibling-profile restarts are legitimate fleet
 operations and stay allowed.
+
+VERB-FAMILY OWNERSHIP (Apollo r1 on card t_4fded0bd, 2026-10-12). This guard
+owns ONE family: lifecycle verbs aimed at the gateway the agent itself runs
+inside -- ``hermes gateway restart|stop|uninstall``, ``launchctl kickstart|
+bootout|...`` / ``systemctl restart|stop|...`` / ``pkill`` of OUR OWN label or
+unit, from inside a supervised gateway (the respawn-loop foot-gun). It exempts
+SIBLING labels and remote hosts BY DESIGN (fleet maintenance), so these shapes
+PASS here and are not misses: a bare bootout of a sibling gateway label; ``bash
+-c "systemctl --user disable --now <sibling unit>"``; a heredoc piped to bash
+carrying a sibling stop; a python heredoc that runs a sibling stop via
+subprocess; ``ssh <host> systemctl restart <unit>``; a ``sudo -s`` wrapper
+around any of those. The RAW STOP of ANY gateway label/unit from ANY process
+(sibling included, worker included) is the hermes-home hook
+``hooks/gateway_stop_policy.py`` (gateway-stop-guard, card t_c892ebee), which
+runs as a pre_tool_call policy on every worker tool call; the tests in
+``tests/cron/test_lifecycle_guard_command_position.py`` pin the expected
+verdict of THIS guard for each of those six shapes with that hand-off named.
 """
 
 from __future__ import annotations
@@ -1840,6 +1857,8 @@ _ARGUMENT_REPARSERS = frozenset({
     "perl", "ruby", "node", "deno", "bun", "php", "osascript", "awk", "gawk", "mawk",
     "nawk", "sed", "tmux", "screen", "expect", "script", "at", "batch", "watch", "entr",
     "find", "fd", "make", "cmd", "cmd.exe", "powershell", "pwsh",
+    # editors run a quoted `+!cmd` / `-c cmd` argument (vim '+!<stop>' +qa!)
+    "vim", "vi", "nvim", "ex", "view", "vimdiff", "emacs",
 })
 _REPARSER_NAME_RE = re.compile(r"^(?:python|pythonw|perl|ruby|node|php)[\d.]*(?:\.exe)?$", re.IGNORECASE)
 # Wrappers that only re-parse with a specific option: `env -S "…"`, `sudo -i|-s "…"`.
@@ -1853,6 +1872,46 @@ _LINE_FEEDS_EXECUTOR_RE = re.compile(
 )
 
 
+def _unquoted_view(text: str) -> str:
+    """*text* with the inside of every quoted span blanked (same length, quotes kept)."""
+    out: list[str] = []
+    q = None
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if q:
+            if c == q:
+                q = None
+                out.append(c)
+            elif c == "\\" and q == '"' and i + 1 < len(text):
+                out.append("  ")
+                i += 1
+            else:
+                out.append(" ")
+        elif c in _OPENING_QUOTES:
+            q = c
+            out.append(c)
+        elif c == "\\" and i + 1 < len(text):
+            out.append("  ")
+            i += 1
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+# A redirection or `tee` in the command: a quoted value may be written to a file that a later
+# segment executes (`printf '<stop>' > x.sh; bash x.sh`), and `printf -v NAME` / `read` store it in
+# a variable a later `$NAME` runs. The masker cannot follow either, so it does not apply at all.
+_WRITES_OR_STORES_RE = re.compile(
+    r"(?<![<>&\d])>(?![(&])(?!\s*/dev/null\b)|\btee\b|\bprintf\s+(?:-\S+\s+)*-v\b|\bread\s"
+)
+_PROGRAM_VALUE_OPTION_RE = re.compile(
+    r"(?:^|\s)(?:\+!|-c\b|-e\b|-x\b|-o\s|--to-command|--checkpoint-action|--exec\b|-exec\b|-execdir\b|"
+    r"--pre\b|--pager\b|--compress-program|-I\s|-O\b|--ext-diff|--textconv|--filter\b|-S\b|--split-string)"
+)
+
+
 def _segment_command_reparses(prefix: str) -> Optional[bool]:
     """Whether the command the quoted argument belongs to re-parses it. ``None`` when the
     quoted span is itself at command position (no command word before it)."""
@@ -1863,9 +1922,16 @@ def _segment_command_reparses(prefix: str) -> Optional[bool]:
     tokens = [t for t in tokens if t and not (set(t) <= _CONTROL_CHARS)]
     if not tokens:
         return None
+    # `C='<stop>'; $C` / `cmd="..."; eval "$cmd"`: the assignment's value is what a later segment
+    # runs, so it is never a content argument (fail closed, same as the hermes-home stop guard).
+    if _ENV_ASSIGNMENT.match(tokens[0]):
+        return True
     # A Python argv list (`subprocess.run(["kill", "…"])`) reaches this scan as shell-shaped text
     # whose "command" is list punctuation; its elements are argv the OS will see, never data.
-    if any("[" in t or t.endswith(",") for t in tokens):
+    # Only UNQUOTED brackets/commas count: a quoted JSON value (`--coverage '{"items": [...]}'`)
+    # is one argument, and must not turn the next quoted value into "argv" (Apollo r1, t_4fded0bd).
+    unquoted = _unquoted_view(prefix)
+    if "[" in unquoted or re.search(r",(?:\s|$)", unquoted):
         return None
     for token in tokens:
         name = _executable_name(token).lower()
@@ -1890,6 +1956,14 @@ def _mask_quoted_argument_data(text: str) -> str:
     else is left exactly as written, so this view can only ever ALLOW.
     """
     if "'" not in text and '"' not in text:
+        return text
+    # The view cannot follow a value into a file or a variable: `printf '<stop>' > x.sh; bash
+    # x.sh` was ALLOWED by the first version while base blocked it (regression, Apollo r1 probe).
+    if _WRITES_OR_STORES_RE.search(_unquoted_view(text)):
+        return text
+    # Any option that hands its value to a program (`vim '+!cmd'`, `git -c alias.x='!cmd'`,
+    # `tar --to-command=`, `rsync -e`, `find -exec`): keep the text whole.
+    if _PROGRAM_VALUE_OPTION_RE.search(_unquoted_view(text)):
         return text
     out: list[str] = []
     i, n = 0, len(text)
@@ -2540,7 +2614,13 @@ _MASK_SAFE_NODE_TYPES = (
     ast.boolop, ast.operator, ast.unaryop, ast.cmpop,
 )
 _MASK_SAFE_MODULES = frozenset({"json", "subprocess"})
-_MASK_SAFE_MODULE_CALLS = frozenset({("json", "loads"), ("json", "dumps"), ("subprocess", "run")})
+_MASK_SAFE_MODULE_CALLS = frozenset({("json", "loads"), ("json", "dumps"), ("json", "dump"), ("subprocess", "run")})
+# `open(<literal>, <mode>)`: reading is data; WRITING is data too (a review's JSON built in a
+# python heredoc and written to a file, Apollo r1 on t_4fded0bd) UNLESS the written path is
+# named again in the surrounding shell text, where a later segment could execute it -- the
+# caller (`_contains_unsafe_gateway_action`) keeps the body visible in that case.
+_MASK_OPEN_READ_MODES = frozenset({"r", "rb", "rt"})
+_MASK_OPEN_WRITE_MODES = frozenset({"w", "wt", "a", "at", "x", "xt"})
 _MASK_SAFE_BUILTINS = frozenset({
     "open", "reversed", "len", "print", "set", "list", "dict", "tuple",
     "sorted", "str", "int", "float", "bool", "min", "max", "sum", "abs",
@@ -2554,7 +2634,7 @@ _MASK_SAFE_METHODS = frozenset({
     "read", "read_text", "read_bytes", "splitlines", "split", "rsplit",
     "strip", "lstrip", "rstrip", "lower", "upper", "startswith", "endswith",
     "replace", "join", "get", "items", "keys", "values", "add", "append",
-    "extend", "count", "find", "encode", "decode", "isdigit",
+    "extend", "count", "find", "encode", "decode", "isdigit", "write",
 })
 _MASK_SUBPROCESS_KEYWORDS = frozenset({"capture_output", "text", "check", "timeout", "encoding", "errors"})
 # Keywords whose value is CALLED by the callee (sorted/min/max key, json hooks,
@@ -2674,7 +2754,8 @@ def _python_body_is_mask_safe(tree: ast.AST) -> bool:
             if func.id == "open" and not (
                 1 <= len(node.args) <= 2
                 and all(
-                    isinstance(arg, ast.Constant) and arg.value in {"r", "rb", "rt"}
+                    isinstance(arg, ast.Constant)
+                    and arg.value in (_MASK_OPEN_READ_MODES | _MASK_OPEN_WRITE_MODES)
                     for arg in node.args[1:]
                 )
                 and all(kw.arg in {"encoding", "errors"} for kw in node.keywords)
@@ -2709,6 +2790,22 @@ def _python_body_is_mask_safe(tree: ast.AST) -> bool:
         if isinstance(root, ast.Name) and root.id in imported:
             return False
     return True
+
+
+def _python_written_paths(body: str) -> set[str]:
+    """Literal paths a (mask-safe) python body opens for WRITING; empty when none or unparsable."""
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return set()
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open"
+                and len(node.args) >= 2 and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str) and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in _MASK_OPEN_WRITE_MODES):
+            out.add(node.args[0].value)
+    return out
 
 
 def _mask_python_data_strings(body: str) -> str:
@@ -2801,6 +2898,9 @@ def _mask_read_only_python_paths(body: str) -> str:
             continue
         if node.func.id == "Path" and not has_path:
             continue
+        if (node.func.id == "open" and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in _MASK_OPEN_WRITE_MODES):
+            continue  # a WRITTEN path stays a mention candidate for the shell walk
         spans.append((offsets[node.lineno - 1] + node.col_offset,
                       offsets[node.end_lineno - 1] + node.end_col_offset))
     for start, end in sorted(spans, reverse=True):
@@ -2851,8 +2951,16 @@ def _contains_unsafe_gateway_action(
     # commands. Scan its lifecycle-shaped calls like a .py file, then exclude
     # its path strings from the shell's referenced-script walk.
     python_bodies = inert_python_heredoc_bodies(command, semicolon_chain=True)
+    shell_only = strip_inert_heredoc_bodies(command, python_semicolon_chain=True)
     for body in python_bodies:
-        hit = _describe_direct_lifecycle_scan(_mask_python_data_strings(body))
+        masked_body = _mask_python_data_strings(body)
+        # a file the body WRITES and the shell text names again may be executed next: the
+        # strings going into it are not data (write-then-run class, R6)
+        if masked_body != body and any(
+            p in shell_only or Path(p).name in shell_only for p in _python_written_paths(body)
+        ):
+            masked_body = body
+        hit = _describe_direct_lifecycle_scan(masked_body)
         if hit is not None:
             budget.hit = budget.hit or hit + " (inside a python heredoc body)"
             return True

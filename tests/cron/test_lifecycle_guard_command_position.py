@@ -122,6 +122,108 @@ def test_real_incident_shapes_still_block(command):
     assert _blocked(command)
 
 
+# --- Apollo r1 (t_4fded0bd): the write-then-run class the first masker opened, pinned ---------
+# base BLOCKED `printf '<stop>' > x.sh; bash x.sh`; the first quoted-argument masker masked the
+# printf operand and ALLOWED it. A quoted value that can reach a file, a variable, or a
+# program-running option is never data.
+
+@pytest.mark.parametrize("command", [
+    f"printf '{BOOTOUT}' > /tmp/zz_t4f.sh; bash /tmp/zz_t4f.sh",
+    f"echo '{BOOTOUT}' > /tmp/zz_t4f.sh && sh /tmp/zz_t4f.sh",
+    f"echo '{BOOTOUT}' | tee /tmp/zz_t4f.sh; bash /tmp/zz_t4f.sh",
+    f"C='{RESTART}'; $C",
+    f'cmd="{RESTART}"; eval "$cmd"',
+    f"printf -v C '{BOOTOUT}'; $C",
+    f"vim '+!{RESTART}' +qa! /dev/null",
+    f"git -c alias.x='!{RESTART}' x",
+    f"tar --to-command='{RESTART}' -xf a.tar",
+    # a python heredoc that WRITES the stop into a file the shell then runs
+    f"python3 - <<'PY'\nopen('/tmp/zz_t4f.sh', 'w').write('{RESTART}')\nPY\nbash /tmp/zz_t4f.sh",
+    f"python3 - <<'PY'\nwith open('/tmp/zz_t4f.sh', 'w') as f:\n    f.write('{BOOTOUT}')\nPY\nbash /tmp/zz_t4f.sh",
+])
+def test_quoted_value_reaching_a_file_or_variable_still_blocks(command):
+    assert _blocked(command)
+
+
+# --- Apollo r1 (t_4fded0bd): a quoted JSON value / stderr redirect is still a content argument ---
+
+@pytest.mark.parametrize("command", [
+    # a --coverage JSON value, then a second quoted value: the `[`/`,` inside the JSON are quoted,
+    # not a Python argv list, so the review text after it is still data
+    'hermes kanban request-changes t_x --coverage \'{"items": ["no ' + RESTART + '"]}\' "also ' + RESTART + ' here"',
+    'hermes kanban request-changes t_x --coverage "{\\"items\\": [\\"no ' + RESTART + '\\"]}"',
+    # redirecting stderr/stdout to /dev/null is not writing a file
+    f'hermes kanban comment t_x --body "see: {RESTART}" >/dev/null 2>&1',
+    f'hermes kanban comment t_x --body "see: {RESTART}" 2>/dev/null',
+    f"echo 'a' && hermes kanban create 'x' --body 'never {BOOTOUT}' 2>&1 | tail -1",
+    # fp5 (hit while filing the review): a python heredoc BUILDING JSON and writing it to a
+    # non-executed file
+    f"python3 - <<'PY'\nimport json\nd = {{'items': ['never {BOOTOUT}', 'no {RESTART}']}}\nopen('/tmp/x.json', 'w').write(json.dumps(d))\nPY",
+    f"python3 - <<'PY'\nimport json\nd = {{'items': ['never {BOOTOUT}']}}\nwith open('/tmp/x.json', 'w') as f:\n    json.dump(d, f)\nPY",
+])
+def test_quoted_json_values_and_null_redirects_pass(command):
+    assert not _blocked(command)
+
+
+def test_referenced_script_whose_python_heredoc_prints_json_passes(tmp_path):
+    """fp4 (hit while filing the review): a .sh that only prints JSON quoting the incident."""
+    script = tmp_path / "sendback.sh"
+    script.write_text(
+        f"#!/bin/bash\npython3 - <<'PY'\nimport json\nprint(json.dumps({{'items': ['never {BOOTOUT}', 'no {RESTART}']}}))\nPY\n",
+        encoding="utf-8",
+    )
+    assert not _blocked(f"bash {script}")
+    real = tmp_path / "real.sh"
+    real.write_text(f"#!/bin/bash\n{BOOTOUT}\n", encoding="utf-8")
+    assert _blocked(f"bash {real}")
+
+
+# --- verb-family ownership: these shapes PASS here BY DESIGN ------------------------------------
+# This guard owns lifecycle verbs aimed at OUR OWN gateway from inside it; a SIBLING label or a
+# remote host is fleet maintenance and exempt. The raw stop of ANY gateway label/unit is blocked
+# by the hermes-home hook hooks/gateway_stop_policy.py (gateway-stop-guard, t_c892ebee), which
+# runs on every worker tool call. Apollo probed these six as misses on r1; they are the hand-off.
+
+SIBLING_LABEL = "ai.hermes." + "gateway-apollo"
+SIBLING_UNIT = "hermes-" + "gateway-clanker"
+SIBLING_BOOTOUT = "launch" + "ctl boot" + "out gui/502/" + SIBLING_LABEL
+SIBLING_DISABLE = "systemctl --user disable --now " + SIBLING_UNIT
+
+
+@pytest.mark.parametrize("command", [
+    SIBLING_BOOTOUT,
+    f'bash -c "{SIBLING_DISABLE}"',
+    f"bash <<EOF\n{SIBLING_DISABLE}\nEOF",
+    f"python3 - <<'PY'\nimport subprocess\nsubprocess.run('{SIBLING_DISABLE}', shell=True)\nPY",
+    f"ssh ace-ai 'systemctl --user restart {SIBLING_UNIT}'",
+    f"sudo -s '{SIBLING_BOOTOUT}'",
+])
+def test_sibling_gateway_stops_are_the_stop_guards_job_not_this_ones(command):
+    # EXPECTED verdict of THIS guard: allowed (sibling exemption). gateway_stop_policy blocks them.
+    assert not _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
+    f"sudo -s '{BOOTOUT}'",
+    f'bash -c "{SYSTEMCTL}"',
+    f"bash <<EOF\n{SYSTEMCTL}\nEOF",
+])
+def test_same_shapes_against_our_own_gateway_block(command):
+    assert _blocked(command)
+
+
+# Same verdict on base (f9e98c15) and on this PR: this guard's systemd verb set is stop|kill|restart
+# of OUR unit; `disable --now` / `mask` of a gateway unit are the hermes-home stop guard's family
+# (hooks/gateway_stop_policy.py, #3822 adds them there). Pinned so the next probe reads them as the
+# hand-off, not as a regression of this PR.
+@pytest.mark.parametrize("command", [
+    f'bash -c "systemctl --user disable --now {UNIT}"',
+    f"systemctl --user mask {UNIT}",
+])
+def test_systemd_disable_and_mask_are_the_stop_guards_family(command):
+    assert not _blocked(command)
+
+
 # --- the refusal names the tripping token ------------------------------------------------
 
 def test_describe_names_token_and_position():
