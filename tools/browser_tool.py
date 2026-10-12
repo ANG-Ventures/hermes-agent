@@ -1316,7 +1316,7 @@ def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple =
     def call(args, kw):
         # t_db491366: refuse before any session/CDP discovery when the operator's browser
         # cannot exist here (placed kanban worker, or a dead loopback endpoint).
-        from tools.rail_preflight import browser_rail_error
+        from tools.rail_preflight import browser_rail_error, note_tool_result
         rail = browser_rail_error(_cdp._get_cdp_override_raw())
         if rail:
             return _dumps(_err(rail))
@@ -1324,7 +1324,7 @@ def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple =
         params["task_id"] = kw.get("task_id")
         for k in extra_kw:
             params[k] = kw.get(k)
-        return globals()[fn_name](**params)
+        return note_tool_result(globals()[fn_name](**params))
     return call
 
 

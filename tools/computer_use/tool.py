@@ -330,9 +330,6 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     if not action:
         return json.dumps({"error": "missing `action`"})
     session_id = str(kwargs.get("session_id") or "")  # approval-state / daemon-mode isolation key
-    from tools.rail_preflight import screen_rail_error
-    if rail := screen_rail_error():
-        return json.dumps({"ok": False, "action": action, "error": rail})
     # Bot Desktop lease: while a human drives the screen every action, capture included, is refused.
     from tools.bot_desktop import lease as _bd_lease
     from tools.bot_desktop.runtime import ensure_started_for_tool as _bd_ensure_started
@@ -356,6 +353,11 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     try:
         backend = call.enter_context(_backend_for_call(session_id))
     except Exception as e:
+        # t_db491366: a placed worker whose pool host cannot bring up a desktop has no screen left
+        # but the Studio's; a working pool-host desktop never reaches this branch.
+        from tools.rail_preflight import screen_rail_error
+        if rail := screen_rail_error():
+            return json.dumps({"ok": False, "action": action, "error": rail})
         return json.dumps({"error": f"computer_use backend unavailable: {e}",
                            "hint": "If the cua-driver binary is missing, run `hermes computer-use install`. "
                                    "If a Python dependency is missing, the error above shows the exact install command."})

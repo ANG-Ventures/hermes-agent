@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import socket
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -144,9 +145,26 @@ def test_unplaced_sandbox_failure_keeps_generic_error(monkeypatch):
     ("ws://127.0.0.1:9222", ("http", "http://127.0.0.1:9222/json/version")),
     ("ws://127.0.0.1:9222/devtools/browser/abc", ("tcp", ("127.0.0.1", 9222))),
     ("ws://127.0.0.1:3000/cdp-proxy", ("tcp", ("127.0.0.1", 3000))),
+    ("ws://127.0.0.1:3000/", ("tcp", ("127.0.0.1", 3000))),  # resolver passes a root-path WS URL through
+    ("127.0.0.1:9222", ("http", "http://127.0.0.1:9222/json/version")),
 ])
 def test_probe_follows_resolver_discovery_semantics(url, expect):
     assert rp._probe_target(url) == expect
+
+
+@pytest.mark.parametrize("url", ["ws://127.0.0.1:3000/", "ws://127.0.0.1:9222", "http://127.0.0.1:9222/session",
+                                 "ws://127.0.0.1:9222/devtools/browser/abc", "wss://127.0.0.1:443/x"])
+def test_probe_discovers_exactly_when_the_resolver_does(url, monkeypatch):
+    # Contract between the two: the probe hits HTTP discovery iff _resolve_cdp_override would.
+    import requests
+    from tools import browser_tool_cdp as cdp
+    seen = []
+    monkeypatch.setattr(requests, "get", lambda u, **kw: seen.append(u) or (_ for _ in ()).throw(requests.ConnectionError()))
+    cdp._resolve_cdp_override(url)
+    kind, target = rp._probe_target(url)
+    assert (kind == "http") == bool(seen)
+    if seen:
+        assert target == seen[0]
 
 
 def test_unplaced_linux_worker_keeps_its_own_screen(monkeypatch):
@@ -156,24 +174,103 @@ def test_unplaced_linux_worker_keeps_its_own_screen(monkeypatch):
     assert rp.screen_rail_error() is None
 
 
-def test_computer_use_placed_worker_gets_screen_message(monkeypatch):
+EXPECTED_SCREEN = (
+    "SCREEN_RAIL_ABSENT: no screen session on {host}. This card needs Ace's logged-in screen session, "
+    "which lives only on the Mac Studio. Add the line `host: studio` to the card body (or "
+    "`requires: browser-session` once the affinity spec lands) and re-run; do not retry here."
+)
+
+
+def _computer_use(monkeypatch, *, backend_error=None):
+    """handle_computer_use with the lease/screen start stubbed and the backend either failing or working."""
+    import contextlib
+    from tools.bot_desktop import lease, runtime as bd
+    from tools.computer_use import tool as cu
+    monkeypatch.setattr(lease, "assert_agent_may_act", lambda: SimpleNamespace(epoch=0))
+    monkeypatch.setattr(lease, "get", lambda: SimpleNamespace(epoch=0))
+    monkeypatch.setattr(bd, "ensure_started_for_tool", lambda: None)
+    calls = []
+
+    class _Backend:
+        def __getattr__(self, name):
+            def op(*a, **k):
+                calls.append(name)
+                return {"ok": True}
+            return op
+
+    @contextlib.contextmanager
+    def backend_for_call(session_id=""):
+        if backend_error:
+            raise RuntimeError(backend_error)
+        yield _Backend()
+    monkeypatch.setattr(cu, "_backend_for_call", backend_for_call)
+    out = cu.handle_computer_use({"action": "list_apps"})
+    return (json.loads(out) if isinstance(out, str) else out), calls
+
+
+def test_computer_use_placed_worker_with_own_desktop_keeps_working(monkeypatch):
+    # ace-ai's Bot Desktop inside the ssh sandbox is the worker's own screen: never a rail refusal.
     _worker(monkeypatch)
     monkeypatch.setattr(sys, "platform", "linux")
     _placed(monkeypatch, "ace-ai")
-    from tools.computer_use.tool import handle_computer_use
-    out = json.loads(handle_computer_use({"action": "capture"}))
-    assert out["error"] == (
-        "SCREEN_RAIL_ABSENT: no screen session on ace-ai. This card needs Ace's logged-in screen session, "
-        "which lives only on the Mac Studio. Add the line `host: studio` to the card body (or "
-        "`requires: browser-session` once the affinity spec lands) and re-run; do not retry here."
-    )
+    out, calls = _computer_use(monkeypatch)
+    assert "RAIL_ABSENT" not in json.dumps(out)
+    assert calls, "the backend was reached"
+    assert rp.take_rail_absent() is None
 
 
-def test_computer_use_placed_worker_on_macos_still_refused(monkeypatch):
+def test_computer_use_placed_worker_without_desktop_gets_screen_message(monkeypatch):
     _worker(monkeypatch)
-    monkeypatch.setattr(sys, "platform", "darwin")
-    _placed(monkeypatch, "ci-box")
-    assert rp.screen_rail_error().startswith("SCREEN_RAIL_ABSENT: no screen session on ci-box.")
+    monkeypatch.setattr(sys, "platform", "linux")
+    _placed(monkeypatch, "ace-ai")
+    out, _ = _computer_use(monkeypatch, backend_error="Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+    assert out["error"] == EXPECTED_SCREEN.format(host="ace-ai")
+    assert rp.take_rail_absent() == EXPECTED_SCREEN.format(host="ace-ai")
+
+
+def test_computer_use_unplaced_backend_failure_keeps_generic_error(monkeypatch):
+    _worker(monkeypatch)
+    out, _ = _computer_use(monkeypatch, backend_error="cua-driver missing")
+    assert out["error"] == "computer_use backend unavailable: cua-driver missing"
+    assert rp.take_rail_absent() is None
+
+
+def test_background_cleanup_failure_never_queues_a_rail(monkeypatch):
+    # The inactivity janitor's ``close`` hits the same preflight; only an active tool call may park.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-media")
+    from tools import browser_tool_session as bts
+    from tools.bot_desktop import runtime as bd
+
+    def refused():
+        raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+    monkeypatch.setattr(bd, "tool_placement", refused)
+    res = bts._run_browser_command("rail", "close", [], timeout=10)
+    assert res["error"] == EXPECTED_BROWSER.format(host="ace-media")
+    assert rp.take_rail_absent() is None
+
+
+def test_active_browser_tool_call_with_sandbox_failure_queues_rail(monkeypatch):
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-media")
+    from tools import browser_tool as bt
+    message = EXPECTED_BROWSER.format(host="ace-media")
+    monkeypatch.setattr(bt, "browser_navigate", lambda **kw: json.dumps({"success": False, "error": message}))
+    out = _navigate(monkeypatch, "")
+    assert out["error"] == message
+    assert rp.take_rail_absent() == message
+
+
+def test_browser_cdp_on_placed_worker_uses_dispatcher_side_liveness(monkeypatch):
+    # browser_cdp connects from the dispatcher process: a placed worker's loopback CDP IS the Studio's.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-ai")
+    _cdp_requests(monkeypatch, answers=True)
+    assert rp.browser_rail_error("http://127.0.0.1:9222", host_side=True) is None
+    _cdp_requests(monkeypatch, answers=False)
+    rp._probe_ok.clear()
+    monkeypatch.setattr(socket, "gethostname", lambda: "mac-studio-m3u")
+    assert rp.browser_rail_error("http://127.0.0.1:9222", host_side=True) == EXPECTED_BROWSER.format(host="mac-studio-m3u")
 
 
 def test_pending_rail_is_drained_only_by_its_owning_worker(monkeypatch):
