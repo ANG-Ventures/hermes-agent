@@ -55,32 +55,39 @@ def parse_branch_args(raw: str) -> tuple[bool, str]:
 
 
 FORK_NOTICE_PREFIX = "[Forked session]"
+# Closing sentinel written WITH the notice. The alternation repair may fold the notice into an
+# adjacent user row (a mid-turn parent's unanswered prompt before it, the child's first prompt or a
+# second notice after it) with a blank-line join that any human text can also contain, so the only
+# honest way to strip the notice back out is a delimiter the notice itself carries. A row without
+# the sentinel is never touched (Apollo review r1; Prism e8e07ff8b118 / 199166e82bdc / b3522bab429c).
+FORK_NOTICE_END = "[/Forked session]"
 _FORK_NOTICE_TEMPLATE = (
     "{prefix} This session was forked from {parent} at row {row} ({where}). The parent session "
     "continues the work that was in progress above; do NOT resume it here. Take new direction "
-    "from the user in this thread."
+    "from the user in this thread. {end}"
 )
-# The COMPLETE notice, anchored at the start of a user row; a human prompt that merely starts
-# with "[Forked session]" does not match and is never stripped (Prism P1 e8e07ff8b118).
-_FORK_NOTICE_RE = re.compile(
-    "^" + re.escape(_FORK_NOTICE_TEMPLATE).replace(
+# One COMPLETE generated notice (template shape, closed by the sentinel), wherever it sits in the
+# row. A human fragment that merely starts with the prefix is not a span start, so it can never
+# swallow text up to a real notice folded after it.
+_FORK_NOTICE_SPAN_RE = re.compile(
+    re.escape(_FORK_NOTICE_TEMPLATE).replace(
         re.escape("{prefix}"), re.escape(FORK_NOTICE_PREFIX)).replace(
         re.escape("{parent}"), r"\S+").replace(
         re.escape("{row}"), r"\d+").replace(
-        re.escape("{where}"), r"[^()\n]*")
-    + r"(?:\n\n|$)"
+        re.escape("{where}"), r"[^()\n]*").replace(
+        re.escape("{end}"), re.escape(FORK_NOTICE_END))
 )
 
 
 def fork_notice_content(*, parent_session_id: str, row_count: int, platform: Optional[Platform],
                         parent_ref: Optional[str]) -> str:
-    """The fork-notice text the child replays after the copied history (single paragraph: the
-    alternation repair joins it to the next human turn with a blank line, which is the seam
-    :func:`merge_delta_rows` splits on)."""
+    """The fork-notice text the child replays after the copied history: one paragraph, opened by
+    :data:`FORK_NOTICE_PREFIX` and closed by :data:`FORK_NOTICE_END` so :func:`merge_delta_rows`
+    can lift it out of a repair-folded row without guessing where the human text starts."""
     where = f"{platform.value} {parent_ref}" if platform and parent_ref else (
         platform.value if platform else "gateway")
     return _FORK_NOTICE_TEMPLATE.format(prefix=FORK_NOTICE_PREFIX, parent=parent_session_id,
-                                        row=row_count, where=where)
+                                        row=row_count, where=where, end=FORK_NOTICE_END)
 
 
 def fork_notice_row(content: str) -> dict:
@@ -92,25 +99,37 @@ def is_fork_notice_row(msg: dict) -> bool:
     return isinstance(msg, dict) and msg.get("display_kind") == FORK_NOTICE_DISPLAY_KIND
 
 
+def strip_fork_notices(content: str) -> Optional[str]:
+    """*content* with every sentinel-delimited notice lifted out, or None when nothing but notices
+    (and the blank-line joins the alternation repair put between them) was there. Text outside the
+    ``[Forked session] ... [/Forked session]`` spans is kept verbatim apart from the join whitespace;
+    a string with no closing sentinel is returned unchanged, whatever it starts with."""
+    if FORK_NOTICE_END not in content:
+        return content
+    pieces = [p.strip() for p in _FORK_NOTICE_SPAN_RE.split(content)]
+    rest = "\n\n".join(p for p in pieces if p)
+    return rest or None
+
+
 def merge_delta_rows(rows: list) -> list:
     """The post-branch rows /merge summarizes: the fork notice is bookkeeping, not exploration.
 
-    A standalone notice row is dropped. The live-replay read repairs ``user;user`` alternation by
-    folding the notice into the next human turn (``notice + "\\n\\n" + prompt``, display_kind
-    dropped), so a user row that starts with the COMPLETE generated notice keeps only the human
-    part. Anything else, including a human prompt that merely begins with the prefix, is kept.
+    A typed notice row is dropped. A user row that carries a sentinel-delimited notice (the
+    live-replay alternation repair folds the notice into an adjacent user row: a mid-turn parent's
+    unanswered prompt, the child's first prompt, a second notice on a re-forked branch) keeps only
+    the text outside the notice span(s), or is dropped when nothing else is left. A row with no
+    closing sentinel is kept untouched, including a human prompt that begins with the prefix.
     """
     out = []
     for m in rows:
         if is_fork_notice_row(m):
             continue
         content = m.get("content") if isinstance(m, dict) else None
-        if m.get("role") == "user" and isinstance(content, str) and content.startswith(FORK_NOTICE_PREFIX):
-            match = _FORK_NOTICE_RE.match(content)
-            if match is not None:
-                rest = content[match.end():]
-                if not rest.strip():
-                    continue
+        if m.get("role") == "user" and isinstance(content, str):
+            rest = strip_fork_notices(content)
+            if rest is None:
+                continue
+            if rest != content:
                 m = {**m, "content": rest}
         out.append(m)
     return out

@@ -130,6 +130,33 @@ def test_merge_delta_rows_strips_only_the_complete_notice():
     ]
 
 
+def test_merge_delta_rows_keeps_human_text_around_folded_notices():
+    """Apollo review r1 (Prism b3522bab429c / 199166e82bdc): the notice is lifted out by its own
+    sentinel, never by guessing the seam. Same-line continuation, a second notice on a re-forked
+    branch, and the mid-turn parent's unanswered prompt BEFORE the notice all keep the human text;
+    a row with no closing sentinel is never touched."""
+    from gateway.slash_commands_branch_thread import FORK_NOTICE_END, merge_delta_rows
+
+    notice = fork_notice_content(parent_session_id="p_1", row_count=5, platform=None, parent_ref=None)
+    assert notice.endswith(FORK_NOTICE_END)
+    rows = [
+        {"role": "user", "content": notice + " and also do X"},                   # (a) same line
+        {"role": "user", "content": notice + "\n\n" + notice + "\n\nGo"},         # (b) re-forked branch
+        {"role": "user", "content": "mid-turn ask\n\n" + notice + "\n\nNEW q"},   # parent's unanswered prompt
+        {"role": "user", "content": notice + "\n\n" + notice},                    # two notices, nothing else
+        {"role": "user", "content": "[Forked session] This session was forked from p_1 at row 5 (gateway). "
+                                    "Please compare."},                           # truncated lookalike, no sentinel
+        {"role": "user", "content": "plain prompt"},
+    ]
+    assert [m["content"] for m in merge_delta_rows(rows)] == [
+        "and also do X",
+        "Go",
+        "mid-turn ask\n\nNEW q",
+        "[Forked session] This session was forked from p_1 at row 5 (gateway). Please compare.",
+        "plain prompt",
+    ]
+
+
 # ----------------------------------------------------------------------------- (a) notice row
 
 @pytest.mark.asyncio
