@@ -143,9 +143,9 @@ def live_boards() -> List[Tuple[str, Path]]:
         slug = (meta.get("slug") if isinstance(meta, dict) else None) or _kb.DEFAULT_BOARD
         # Each slug's OWN db: a worker's HERMES_KANBAN_DB pin would map every
         # slug to one file and multiply every count by N boards.
-        path = _kb._board_db_path_ignoring_pin(_kb._normalize_board_slug(slug) or slug)
-        if path.exists():
-            out.append((slug, path))
+        # A registered board whose DB is gone stays in: read_boards reports it
+        # as an error, never as a board with no running work.
+        out.append((slug, _kb._board_db_path_ignoring_pin(_kb._normalize_board_slug(slug) or slug)))
     return out
 
 

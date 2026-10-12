@@ -200,6 +200,20 @@ def test_ac12_unreadable_board_is_an_error_not_empty(home, boards, tmp_path):
     assert len(rep["errors"]) == 1 and rep["errors"][0].startswith("ghost:")
 
 
+def test_registered_board_with_missing_db_is_an_error_not_dropped(home, boards):
+    """Apollo r1 on 26668b7a99a1: a board list_boards() registers (board.json)
+    whose kanban.db is gone must surface as an error, never as an idle board."""
+    want = _report(home, _gate())
+    gone = kb._board_db_path_ignoring_pin("second")
+    kb.create_board("vanished")
+    kb._board_db_path_ignoring_pin("vanished").unlink()
+    rep = _report(home, _gate())
+    assert [e.split(":", 1)[0] for e in rep["errors"]] == ["vanished"]
+    assert {n: h["running"] for n, h in rep["hosts"].items()} == {n: h["running"] for n, h in want["hosts"].items()}
+    assert rep["held"]["by_code"] == want["held"]["by_code"]
+    assert gone.exists()
+
+
 def test_live_boards_ignore_the_worker_db_pin(home, boards, monkeypatch):
     """Prism 26668b7a99a1: under the dispatcher's HERMES_KANBAN_DB pin every
     slug must still resolve to its OWN board, or counts multiply by N boards."""
