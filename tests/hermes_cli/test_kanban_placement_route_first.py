@@ -341,6 +341,28 @@ def test_ra_unassigned_and_per_profile_holds_are_recorded(kanban_home):
         assert ev["code"] == "per_profile_cap" and ev["detail"] == "alpha 1/1"
 
 
+def test_ra_assignment_ends_the_wait_episode(kanban_home, monkeypatch):
+    """Prism 57fba9daaa3c: unassigned/per_profile_cap are keyed on the
+    assignee, so (re)assigning the card is a reason boundary. The next hold is a
+    new episode (since = now), never a continuation or an A->B flap."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, assignee=None)
+        _hold(conn, monkeypatch, tid, "unassigned")
+        _hold(conn, monkeypatch, tid, "local_full")
+        conn.execute("UPDATE task_events SET created_at = created_at - 600, "
+                     "payload = json_set(payload, '$.since', "
+                     "json_extract(payload, '$.since') - 600) "
+                     "WHERE task_id=? AND kind='placement_wait'", (tid,))
+        conn.commit()
+        assert kb.assign_task(conn, tid, "alpha")
+        _hold(conn, monkeypatch, tid, "unassigned")
+        evs = _events(conn, tid, "placement_wait")
+        assert [e["code"] for e in evs] == ["unassigned", "local_full", "unassigned"]
+        assert abs(evs[-1]["since"] - int(__import__("time").time())) <= 2
+        _hold(conn, monkeypatch, tid, "local_full")
+        assert "flapping" not in [e["code"] for e in _events(conn, tid, "placement_wait")]
+
+
 # -- AC-10 ----------------------------------------------------------------------
 
 def test_ac10_one_shot_dry_run_header_and_rows(kanban_home, monkeypatch, capsys):

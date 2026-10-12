@@ -40,11 +40,13 @@ PLACEMENT_EVENT = "placement"
 PLACEMENT_WAIT_REFRESH_SECONDS = 900
 # A task_event of one of these kinds after the latest placement_wait ends that
 # wait episode: the next hold is a new episode (new event, ``since`` = now),
-# never deduplicated against or timed from the old one.
+# never deduplicated against or timed from the old one. ``assigned`` is one:
+# unassigned/per_profile_cap are keyed on the assignee, so a (re)assignment is
+# a reason boundary (Prism 57fba9daaa3c).
 PLACEMENT_WAIT_EPISODE_END_KINDS = frozenset({
     "claimed", "spawned", "blocked", "unblocked", "requeued", "reopened",
     "promoted", "reclaimed", "completed", "review_requested", "scheduled",
-    "deferred", "archived",
+    "deferred", "archived", "assigned",
 })
 
 # kanban.placement.lineage_pins (read per tick). ``kinds`` (default): only a
