@@ -334,6 +334,17 @@ def _worker_session(tid, sid, profile):
         conn.close()
 
 
+def _state_session(home, sid, source):
+    """Record ``sid`` in the profile's own state.db (``home`` = that profile's HERMES_HOME)."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(home / "state.db")
+    try:
+        db.create_session(sid, source=source)
+    finally:
+        db.close()
+
+
 def _comment_as(tid, sid, profile, author):
     conn = kb.connect()
     try:
@@ -404,6 +415,7 @@ def test_sessionless_write_under_owner_profile_does_not_cancel_the_wake(board, m
 def test_owner_chat_session_comment_still_drops_the_row(board, monkeypatch, caplog):
     """The owner's own chat session (profile default, no worker run) acting still dedups."""
     tid, adapter, runner = _deferred_runner(board, monkeypatch, caplog)
+    _state_session(board, "20261012_092000_apollochat", "discord")
     _comment_as(tid, "20261012_092000_apollochat", "default", "default")
     runner._kanban_wake_gate._dispatcher_state = FakeDispatcher("admitting")
     _set_load(runner, 10.0)
@@ -423,6 +435,7 @@ def test_verified_owner_home_session_is_recorded(board, monkeypatch, caplog):
                           chat_type="dm", delivery_mode="notify+wake")
     finally:
         conn.close()
+    _state_session(board, owner_sid, "discord")
     _comment_as(tid, owner_sid, "default", "default")  # the owner's session, stamped
     conn = kb.connect()
     try:
@@ -437,3 +450,46 @@ def test_verified_owner_home_session_is_recorded(board, monkeypatch, caplog):
     asyncio.run(_tick(monkeypatch, runner))
     row = next(iter(_pending(runner).values()))
     assert row["home_sid"] == owner_sid
+
+
+def test_cross_board_worker_comment_does_not_cancel_the_wake(board, monkeypatch, caplog):
+    """7d9c8fa1f2ee: a default-profile worker heartbeating ANOTHER board comments here."""
+    tid, adapter, runner = _deferred_runner(board, monkeypatch, caplog)
+    worker_sid = "20261012_094000_otherboardworker"
+    _state_session(board, worker_sid, "kanban")  # no heartbeat on THIS board
+    _comment_as(tid, worker_sid, "default", "default")
+    runner._kanban_wake_gate._dispatcher_state = FakeDispatcher("admitting")
+    _set_load(runner, 10.0)
+    assert asyncio.run(defer.tick(runner)) == 1
+    assert len(adapter.handled) == 1
+
+
+def test_unrecorded_session_comment_does_not_cancel_the_wake(board, monkeypatch, caplog):
+    """No provenance in the owner profile's state.db is not proof of a human."""
+    tid, adapter, runner = _deferred_runner(board, monkeypatch, caplog)
+    _comment_as(tid, "20261012_094500_nowhere", "default", "default")
+    runner._kanban_wake_gate._dispatcher_state = FakeDispatcher("admitting")
+    _set_load(runner, 10.0)
+    assert asyncio.run(defer.tick(runner)) == 1
+
+
+def test_delegated_child_comment_does_not_cancel_the_wake(board, monkeypatch, caplog):
+    """cb8149c5fbc5: a delegate child's comment (the permitted child path) is not the owner."""
+    tid, adapter, runner = _deferred_runner(board, monkeypatch, caplog)
+    child_sid = "20261012_095000_childsess"
+    # Even a child recorded under a chat-looking source is refused by its author marker.
+    _state_session(board, child_sid, "discord")
+    with monkeypatch.context() as m:
+        m.setattr(kb, "_is_delegated_child", lambda: True)
+        _comment_as(tid, child_sid, "default", "default")
+    conn = kb.connect()
+    try:
+        author = conn.execute(
+            "SELECT author FROM task_comments WHERE task_id = ? ORDER BY id DESC", (tid,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert author.endswith(kb.SUBAGENT_AUTHOR_MARKER.strip())
+    runner._kanban_wake_gate._dispatcher_state = FakeDispatcher("admitting")
+    _set_load(runner, 10.0)
+    assert asyncio.run(defer.tick(runner)) == 1

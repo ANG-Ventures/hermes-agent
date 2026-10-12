@@ -18,9 +18,11 @@ contract) plus one line ``(deferred Nm under <reason>)``.
 
 Dedup: a row whose card is now done/archived, or whose owner acted on the card
 after the deferred cursor, is dropped with a log line: the wake already happened
-in effect. "Owner acted" needs an event written from a HUMAN session (see
-:func:`_human_session`): a worker running under the owner's profile, a cron, or
-a session-less script is not the owner taking a turn (Prism 1a09cf36846b). A
+in effect. "Owner acted" needs an event written from a HUMAN session, proven by the
+session's chat source in the owner profile's state.db (see
+:func:`_human_session`): a worker running under the owner's profile (any
+board), a delegate child, a cron, or a session-less script is not the owner
+taking a turn (Prism 1a09cf36846b, 7d9c8fa1f2ee, cb8149c5fbc5). A
 delivery failure keeps the row for the next poll.
 
 State: ``<HERMES_HOME>/gateway/kanban_pending_wakes.json`` (the same durable
@@ -51,6 +53,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from gateway import kanban_notify_suppress as _ns
 from gateway import kanban_wake_freshness as _fresh
+from hermes_cli.kanban_db import SUBAGENT_AUTHOR_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -198,30 +201,69 @@ class PendingWakes:
         return row
 
 
-def _human_session(conn: sqlite3.Connection, sid: Any) -> bool:
-    """True when ``sid`` is a chat session a human can be behind.
+# ``sessions.source`` values written by autonomous runs: a dispatched worker
+# (``kanban``), a delegate child (``subagent``), cron, one-shot / agent runs and
+# recovery replays. Anything else in the owner profile's state.db is a chat
+# surface (cli, tui, discord, telegram, ...) a human drives.
+_MACHINE_SOURCES = frozenset({
+    "kanban", "subagent", "cron", "oneshot", "agent", "batch", "cache-probe",
+    "gateway_recovery", "recovered", "api_server", "webhook", "msgraph_webhook",
+    "unknown",
+})
 
-    Not: a missing id (session-less script / dispatcher), a cron session, a
-    board pseudo-home (``unhomed`` / ``operator:*``), or a dispatched worker's
-    session. A worker run writes a ``heartbeat`` event from its session at
-    spawn; no chat session does. ``run_id`` on an event is NOT the worker
-    signal: an operator completing or rejecting a review writes against the
-    worker's run.
+
+def _session_source(profile: Any, sid: str) -> Optional[str]:
+    """``sessions.source`` of ``sid`` in ``profile``'s own state.db, else None.
+
+    Read-only, one primary-key lookup. Unknown profile, missing DB or row ->
+    None (callers treat that as "not provably human").
+    """
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        path = get_profile_dir(_ns._operator_label(profile) or "default") / "state.db"  # noqa: SLF001
+    except Exception:
+        return None
+    if not path.is_file():
+        return None
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return None
+    try:
+        row = db.execute("SELECT source FROM sessions WHERE id = ?", (sid,)).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        db.close()
+    return str(row[0] or "") if row else None
+
+
+def _human_session(conn: sqlite3.Connection, sid: Any, profile: Any) -> bool:
+    """True only with POSITIVE evidence that ``sid`` is a human chat session.
+
+    The session must be recorded in ``profile``'s own state.db with a chat
+    source (not :data:`_MACHINE_SOURCES`). A board-local absence of worker
+    signals is not evidence: a worker heartbeats its own board and can comment
+    on another (Prism 7d9c8fa1f2ee), and a delegate child never heartbeats
+    (Prism cb8149c5fbc5). A worker heartbeat on this board still disqualifies.
     """
     from hermes_cli.kanban_db import is_operator_home, is_unhomed
 
     sid = str(sid or "").strip()
     if not sid or sid.startswith("cron_") or is_unhomed(sid) or is_operator_home(sid):
         return False
-    hit = conn.execute(
+    if conn.execute(
         "SELECT 1 FROM task_events WHERE actor_session_id = ? AND kind = 'heartbeat' LIMIT 1",
         (sid,),
-    ).fetchone()
-    return hit is None
+    ).fetchone():
+        return False
+    source = _session_source(profile, sid)
+    return bool(source) and source not in _MACHINE_SOURCES
 
 
 def _session_is_owner(conn: sqlite3.Connection, sid: Any, profile: Any, owner: str,
-                      home_sid: Optional[str], cache: dict[str, bool]) -> bool:
+                      home_sid: Optional[str], cache: dict[tuple, bool]) -> bool:
     """A human session (:func:`_human_session`) that is the owner's: its profile
     is the owner's operator label, or, for a bare ``human`` owner with no label,
     it is the card's verified home session."""
@@ -231,9 +273,9 @@ def _session_is_owner(conn: sqlite3.Connection, sid: Any, profile: Any, owner: s
             return False
     elif not (home_sid and str(sid or "") == home_sid):
         return False
-    key = str(sid or "")
+    key = (str(sid or ""), _ns._operator_label(profile))  # noqa: SLF001
     if key not in cache:
-        cache[key] = _human_session(conn, sid)
+        cache[key] = _human_session(conn, sid, profile)
     return cache[key]
 
 
@@ -244,18 +286,19 @@ def verified_home_sid(conn: sqlite3.Connection, owner: str, home_sid: Any) -> Op
     originating agent (a worker) rather than the human reviewer; recording it
     would let that agent's later events read as the owner acting (Prism
     dfc7f883625d). Verified = a human session whose own events carry the
-    owner's operator label (any profile for a bare ``human`` owner).
+    owner's operator label (any profile for a bare ``human`` owner), recorded
+    as a chat session in that profile's state.db.
     """
     sid = str(home_sid or "").strip()
-    if not sid or not _human_session(conn, sid):
+    if not sid:
         return None
     label = _ns._operator_label(owner)  # noqa: SLF001
-    if not label:
-        return sid
     for (profile,) in conn.execute(
         "SELECT DISTINCT actor_profile FROM task_events WHERE actor_session_id = ?", (sid,),
     ):
-        if _ns.same_operator(profile, label):
+        if label and not _ns.same_operator(profile, label):
+            continue
+        if _human_session(conn, sid, profile):
             return sid
     return None
 
@@ -264,7 +307,7 @@ def owner_acted(conn: sqlite3.Connection, row: dict) -> Optional[str]:
     """Why the owner has already acted on the card since the deferred cursor, else None.
 
     Evidence: a ``task_events`` row after the cursor written from the owner's
-    own human session (:func:`_session_is_owner`), or a ``commented`` event
+    own human session (:func:`_session_is_owner`), or a non-subagent ``commented`` event
     whose author is the explicit ``human:<name>`` label of the owner (a label
     a worker cannot write: ``--author`` needs the operator token). A worker,
     cron or session-less write under the owner's PROFILE label is not evidence
@@ -280,7 +323,7 @@ def owner_acted(conn: sqlite3.Connection, row: dict) -> Optional[str]:
             "WHERE task_id = ? AND id > ? ORDER BY id",
             (task_id, int(row.get("cursor") or 0)),
         ).fetchall()
-        human: dict[str, bool] = {}  # one worker-session probe per sid
+        human: dict[tuple, bool] = {}  # one provenance probe per (sid, profile)
         for r in events:
             sid = r["actor_session_id"]
             profiles = [r["actor_profile"]]
@@ -290,6 +333,8 @@ def owner_acted(conn: sqlite3.Connection, row: dict) -> Optional[str]:
                 except ValueError:
                     payload = {}
                 author = payload.get("author") if isinstance(payload, dict) else None
+                if str(author or "").rstrip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
+                    continue  # a delegate child's comment is never the owner (cb8149c5fbc5)
                 if _is_human(author) and _ns.same_operator(author, owner):
                     return f"owner {owner} commented (event {r['id']})"
                 if author:
