@@ -69,6 +69,30 @@ def _rollup_turn_usage(turn_calls: list[dict]) -> dict:
     }
 
 
+def turn_reasoning_effort(agent, turn_calls=None) -> "str | None":
+    """Resolved reasoning-effort label the turn ran at, for the turn ledger.
+
+    The same value the runtime footer prints: ``reasoning_label`` over the
+    LIVE ``agent.reasoning_config`` (session ``/reasoning`` override, per-model
+    override and fallback-entry effort already folded in), never the config
+    default re-read from disk. ``none`` when reasoning is disabled. When the
+    agent carries no config at all (unset ``agent.reasoning_effort``), the
+    label is what actually went on the wire for this turn's calls (the
+    provider default ``_reasoning_config_for_wire`` resolved); None when the
+    turn made no call, so a non-reasoning turn records no fabricated level.
+    """
+    from hermes_constants import reasoning_label
+
+    label = reasoning_label(getattr(agent, "reasoning_config", None))
+    if label:
+        return label
+    if turn_calls:
+        label = reasoning_label(getattr(agent, "_wire_reasoning_config", None))
+        if label:
+            return label
+    return None
+
+
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
     """True when an assistant row has no visible text (blank final or tool-only)."""
     if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -1005,6 +1029,7 @@ def emit_session_end(
                     parent_chat_name=getattr(agent, "_blackbox_parent_chat_name", None),
                     is_subagent=bool(getattr(agent, "_blackbox_is_subagent", False)),
                     depth=getattr(agent, "_blackbox_depth", None),
+                    reasoning_effort=turn_reasoning_effort(agent, _turn_calls),
                 )
                 return True
             agent._session_end_emitted_turn_id = turn_id
@@ -1036,6 +1061,10 @@ def emit_session_end(
                 final_response=final_response,
                 turn_usage=_turn_usage,
                 cli_invocation_id=getattr(agent, "_cli_invocation_id", None),
+                # Resolved effort label (session override folded in), the
+                # value the runtime footer prints; the ledger keeps it per
+                # turn so /context and /usage can show it (t_09a1e42a).
+                reasoning_effort=turn_reasoning_effort(agent, _turn_calls),
             )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)

@@ -51,6 +51,13 @@ class TurnRecord:
     compaction_tokens_after: Optional[int] = None
     compaction_cost_usd: Optional[float] = None
     reasoning_tokens: int = 0
+    # Reasoning EFFORT the turn ran at (``xhigh``/``medium``/...; ``none`` when
+    # reasoning was disabled) — distinct from ``reasoning_tokens`` above. The
+    # resolved label the runtime footer printed, taken from the live agent
+    # config at turn end (session ``/reasoning`` override included), never the
+    # config default. None on rows that predate the column or whose turn
+    # carried no reasoning config at all.
+    reasoning_effort: Optional[str] = None
     context_used: int = 0
     context_length: int = 0
     # Last-call cache split — decomposes the context WINDOW (occupancy), as

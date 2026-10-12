@@ -492,6 +492,12 @@ def _config() -> dict[str, Any] | None:
         return None
 
 
+def _reasoning_effort_value(value: Any) -> str | None:
+    """Effort label as stored: a stripped non-empty string, else None (unknown)."""
+    text = str(value or "").strip()
+    return text or None
+
+
 def _int_value(value: Any) -> int:
     try:
         return max(0, int(value or 0))
@@ -710,6 +716,7 @@ def _build_record(
         compaction_tokens_after=_int_or_none_value(usage.get("compaction_tokens_after")),
         compaction_cost_usd=usage.get("compaction_cost_usd"),
         reasoning_tokens=_int_value(usage.get("reasoning_tokens")),
+        reasoning_effort=_reasoning_effort_value(kwargs.get("reasoning_effort")),
         context_used=_int_value(usage.get("context_used")),
         context_length=_int_value(usage.get("context_length")),
         last_cache_read_tokens=_int_or_none_value(usage.get("last_cache_read_tokens")),
@@ -784,6 +791,7 @@ def _abandoned_record(args: dict[str, Any], cfg: dict[str, Any]) -> TurnRecord |
             "chat_id": args.get("chat_id"),
             "chat_name": args.get("chat_name"),
             "turn_exit_reason": args.get("reason"),
+            "reasoning_effort": args.get("reasoning_effort"),
             "provisional": True,
         },
     )
