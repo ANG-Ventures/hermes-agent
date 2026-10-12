@@ -355,12 +355,14 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     except Exception as e:
         # t_db491366: a placed worker whose pool host cannot bring up a desktop has no screen left
         # but the Studio's. Only a placement failure is that; any other startup error (missing
-        # cua-driver, bad manifest) keeps its own message.
+        # cua-driver, bad manifest) keeps its own message. A bounded/unrestricted private daemon that
+        # would run on this host instead of the pool host's sandbox is no screen either (t_08423f24).
         from tools.bot_desktop.runtime import tool_placement as _bd_tool_placement
+        from tools.computer_use.cua_backend_daemon import PrivateDaemonOffScreen
         from tools.rail_preflight import screen_rail_error
         try:
-            _bd_tool_placement()
-            screen_down = False
+            screen_down = isinstance(e, PrivateDaemonOffScreen)
+            screen_down or _bd_tool_placement()
         except RuntimeError:
             screen_down = True
         if screen_down and (rail := screen_rail_error()):
