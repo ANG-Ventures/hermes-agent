@@ -2258,13 +2258,17 @@ class GatewayTurnMixin:
         # the system prompt cannot drift turn-over-turn; a miss (thread rename, /sethome) re-renders.
         if event.internal and session_key:
             await self._rehydrate_prompt_pins(session_key, session_entry.session_id)
+        # A /branch thread child keeps its parent's context bytes (warm prefix); its own thread facts
+        # ride this turn's user message instead (t_84dabcc7).
+        _branch_context_note = None if event.internal else self._adopt_inherited_context_pin(
+            context, _redact_pii, session_key)
         context_prompt = self._pinned_session_context_prompt(
             context, _redact_pii, session_key, internal=event.internal,
         )
 
         # Per-turn notes ride the user message via the api_content sidecar, NOT context_prompt
         # (appending to the ephemeral system prompt forced a full agent rebuild).
-        turn_sidecar_notes: List[str] = []
+        turn_sidecar_notes: List[str] = [_branch_context_note] if _branch_context_note else []
         if _was_auto_reset:
             await self._hmwa_deliver_auto_reset_notice(session_entry, source, turn_sidecar_notes)
 

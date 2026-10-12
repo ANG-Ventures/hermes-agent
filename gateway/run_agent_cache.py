@@ -14,7 +14,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from agent.interrupt_compat import _accepts_keyword
 from gateway.config import Platform
-from gateway.session import SessionSource, build_session_context_prompt
+from gateway.session import (
+    BRANCH_INHERITED_PIN_KEY, SessionSource, branch_thread_context_note, build_session_context_prompt,
+)
 from gateway.session_prompt_pin import PROMPT_PIN_VERSION, sanitize_prompt_pin
 from gateway.run_shutdown import _log_suppressed
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
@@ -815,6 +817,44 @@ class GatewayAgentCacheMixin:
         if session_key:
             self._session_state(session_key).conversation.ephemeral_pin = (_eph_key, text, redact_pii)
         return text
+
+    def _inherit_branch_context_pin(self, parent_key: str, child_key: str) -> bool:
+        """``/branch`` into a NEW thread: seed the child's pin with the parent's session-context bytes.
+
+        The child replays the parent's whole transcript, and the session-context paragraph sits ahead
+        of the tool schemas and that history in the cached prefix. Rendering it fresh from the thread
+        source (``thread: <id>``, ``Multi-user thread``) re-wrote everything behind it on the child's
+        first turn: 61% prefix hit vs 99% for ``/branch --here`` (t_1908b8bc). The inherited pin is
+        adopted on the child's first human turn (``_adopt_inherited_context_pin``), which moves the
+        thread facts to that turn's user message. Call AFTER the child's agent eviction (eviction
+        clears the pin). Returns True when a parent pin was available."""
+        state = self._peek_session_state(parent_key) if parent_key else None
+        pin = state.conversation.ephemeral_pin if state else None
+        if pin is None:
+            with suppress(Exception):
+                durable = sanitize_prompt_pin(self.session_store.get_prompt_pin(parent_key))
+                if durable is not None:
+                    pin = (durable["context_key"], durable["context_prompt"], durable["redact_pii"])
+        if pin is None or not child_key:
+            return False
+        self._session_state(child_key).conversation.ephemeral_pin = (
+            BRANCH_INHERITED_PIN_KEY, pin[1], pin[2])
+        return True
+
+    def _adopt_inherited_context_pin(self, context, redact_pii: bool, session_key: Optional[str]) -> Optional[str]:
+        """Re-key an inherited ``/branch`` pin to this session's own render key, keeping the parent's
+        bytes, and return the per-turn note carrying the thread's own session facts (``None`` when
+        there is nothing to adopt). After this the usual pin rules apply: a later real metadata
+        change (rename, /sethome) re-renders once, as on any session."""
+        state = self._peek_session_state(session_key) if session_key else None
+        pin = state.conversation.ephemeral_pin if state else None
+        if pin is None or pin[0] != BRANCH_INHERITED_PIN_KEY:
+            return None
+        if pin[2] != redact_pii:
+            state.conversation.ephemeral_pin = None  # never reuse bytes from another privacy policy
+            return None
+        state.conversation.ephemeral_pin = (self._ephemeral_change_key(context, redact_pii), pin[1], pin[2])
+        return branch_thread_context_note(context, redact_pii=redact_pii)
 
     def _pinned_channel_inputs(
         self, session_key: Optional[str], channel_prompt: Optional[str], source: SessionSource, *, internal: bool,

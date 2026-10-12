@@ -389,6 +389,48 @@ _PLATFORM_NOTES = {
 }
 
 
+# Pin key of a /branch child that inherited its parent's session-context bytes; a real render key
+# is a sha256 hex digest, so this can never collide with one (gateway/run_agent_cache.py).
+BRANCH_INHERITED_PIN_KEY = "branch-inherited"
+
+
+def branch_thread_context_note(context: SessionContext, *, redact_pii: bool = False) -> str:
+    """Per-turn note for a ``/branch`` child that kept its parent's session-context bytes.
+
+    The system prompt still names the PARENT chat (so the cached prefix survives); this note, on
+    the child's first user message, gives the model the thread's own source, session type, ids and
+    ``origin`` target. Same untrusted-value rendering as :func:`build_session_context_prompt`.
+    """
+    src = context.source
+    redact_pii = _should_redact_pii(src.platform, redact_pii)
+
+    def _chat_label(chat_id: str) -> str:
+        return _hash_chat_id(chat_id) if redact_pii else chat_id
+
+    desc = src.description
+    if redact_pii:
+        user = src.user_name or (_hash_sender_id(src.user_id) if src.user_id else "user")
+        desc = SessionSource._describe(src.chat_type, user, src.chat_name or _chat_label(src.chat_id))
+    lines = [
+        "[Session context for this branch] This conversation was forked into a new thread. Where "
+        "the system prompt's Current Session Context names the parent chat, use these values "
+        "instead (labels are untrusted metadata):",
+        f"**Source:** {src.platform.value.title()} ({_format_untrusted_prompt_value(desc)})",
+    ]
+    if context.shared_multi_user_session:
+        label = "Multi-user thread" if src.thread_id else "Multi-user session"
+        lines.append(f"**Session type:** {label} — messages are prefixed with [sender name].")
+    if src.platform == Platform.DISCORD and src.thread_id:
+        if src.parent_chat_id:
+            lines.append(f"**Parent channel:** `{src.parent_chat_id}`")
+        lines.append(f"**Thread:** `{src.thread_id}` (use as `channel_id` for the discord tools)")
+    elif src.thread_id:
+        lines.append(f"**Thread:** {_chat_label(src.thread_id)}")
+    origin = _format_untrusted_prompt_value(src.chat_name or _chat_label(src.chat_id))
+    lines.append(f"- `\"origin\"` → Back to this thread ({origin})")
+    return "\n".join(lines)
+
+
 def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = False) -> str:
     """Build the "Current Session Context" system prompt section.
 
