@@ -17,7 +17,7 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource, SessionStore, build_session_key
 from gateway.slash_commands_branch_thread import (
-    FORK_NOTICE_DISPLAY_KIND, fork_notice_content, is_fork_notice_row, parse_branch_flags,
+    BRANCH_NOTICE_DISPLAY_KIND, branch_notice_content, is_branch_notice_row, parse_branch_flags,
 )
 from hermes_state import AsyncSessionDB
 
@@ -114,18 +114,18 @@ def test_merge_delta_rows_strips_only_the_complete_notice():
     """Prism P1 e8e07ff8b118: a human prompt that merely starts with the prefix is kept whole."""
     from gateway.slash_commands_branch_thread import merge_delta_rows
 
-    notice = fork_notice_content(parent_session_id="p_1", row_count=2, platform=Platform.DISCORD, parent_ref="123")
+    notice = branch_notice_content(parent_session_id="p_1", row_count=2, platform=Platform.DISCORD, parent_ref="123")
     rows = [
         {"role": "user", "content": notice + "\n\nNEW q"},                        # repair-folded
         {"role": "user", "content": notice},                                      # display_kind lost
-        {"role": "user", "content": "[Forked session] Please compare the two approaches."},
-        {"role": "user", "content": "[Forked session] first para\n\nsecond"},
+        {"role": "user", "content": "[Branched session] Please compare the two approaches."},
+        {"role": "user", "content": "[Branched session] first para\n\nsecond"},
         {"role": "assistant", "content": notice},
     ]
     assert [m["content"] for m in merge_delta_rows(rows)] == [
         "NEW q",
-        "[Forked session] Please compare the two approaches.",
-        "[Forked session] first para\n\nsecond",
+        "[Branched session] Please compare the two approaches.",
+        "[Branched session] first para\n\nsecond",
         notice,
     ]
 
@@ -135,16 +135,16 @@ def test_merge_delta_rows_keeps_human_text_around_folded_notices():
     sentinel, never by guessing the seam. Same-line continuation, a second notice on a re-forked
     branch, and the mid-turn parent's unanswered prompt BEFORE the notice all keep the human text;
     a row with no closing sentinel is never touched."""
-    from gateway.slash_commands_branch_thread import FORK_NOTICE_END, merge_delta_rows
+    from gateway.slash_commands_branch_thread import BRANCH_NOTICE_END, merge_delta_rows
 
-    notice = fork_notice_content(parent_session_id="p_1", row_count=5, platform=None, parent_ref=None)
-    assert notice.endswith(FORK_NOTICE_END)
+    notice = branch_notice_content(parent_session_id="p_1", row_count=5, platform=None, parent_ref=None)
+    assert notice.endswith(BRANCH_NOTICE_END)
     rows = [
         {"role": "user", "content": notice + " and also do X"},                   # (a) same line
         {"role": "user", "content": notice + "\n\n" + notice + "\n\nGo"},         # (b) re-forked branch
         {"role": "user", "content": "mid-turn ask\n\n" + notice + "\n\nNEW q"},   # parent's unanswered prompt
         {"role": "user", "content": notice + "\n\n" + notice},                    # two notices, nothing else
-        {"role": "user", "content": "[Forked session] This session was forked from p_1 at row 5 (gateway). "
+        {"role": "user", "content": "[Branched session] This session was branched from p_1 at row 5 (gateway). "
                                     "Please compare."},                           # truncated lookalike, no sentinel
         {"role": "user", "content": "plain prompt"},
     ]
@@ -152,7 +152,7 @@ def test_merge_delta_rows_keeps_human_text_around_folded_notices():
         "and also do X",
         "Go",
         "mid-turn ask\n\nNEW q",
-        "[Forked session] This session was forked from p_1 at row 5 (gateway). Please compare.",
+        "[Branched session] This session was branched from p_1 at row 5 (gateway). Please compare.",
         "plain prompt",
     ]
 
@@ -160,7 +160,7 @@ def test_merge_delta_rows_keeps_human_text_around_folded_notices():
 # ----------------------------------------------------------------------------- (a) notice row
 
 @pytest.mark.asyncio
-async def test_branch_child_transcript_ends_with_fork_notice(store):
+async def test_branch_child_transcript_ends_with_branch_notice(store):
     source = _channel_source()
     parent = _seed(store, source)
     runner = _runner(store, _ThreadAdapter())
@@ -171,14 +171,14 @@ async def test_branch_child_transcript_ends_with_fork_notice(store):
     rows = store._db.get_messages(child.session_id)
     assert [r["content"] for r in rows[:2]] == ["hello", "world"]
     notice = rows[-1]
-    assert notice["role"] == "user" and notice["display_kind"] == FORK_NOTICE_DISPLAY_KIND
-    assert notice["content"] == fork_notice_content(
+    assert notice["role"] == "user" and notice["display_kind"] == BRANCH_NOTICE_DISPLAY_KIND
+    assert notice["content"] == branch_notice_content(
         parent_session_id=parent.session_id, row_count=2, platform=Platform.DISCORD, parent_ref="123")
     assert parent.session_id in notice["content"] and "at row 2" in notice["content"]
     # The notice is what the child REPLAYS to the model (load_transcript is the live-replay read),
     # and it is machinery, not a human turn.
     replay = store.load_transcript(child.session_id)
-    assert is_fork_notice_row(replay[-1])
+    assert is_branch_notice_row(replay[-1])
     from agent.context_compressor import is_user_originated_turn
     assert not is_user_originated_turn(replay[-1])
     # The parent transcript is untouched.
@@ -339,7 +339,7 @@ async def test_branch_parent_without_overrides_yields_none_and_reply_claims_none
 # ----------------------------------------------------------------------------- (d) merge delta
 
 @pytest.mark.asyncio
-async def test_merge_delta_excludes_fork_notice(store):
+async def test_merge_delta_excludes_branch_notice(store):
     """Decision (1): the notice sits AFTER ``_branch_point_len`` and is dropped from the merge delta —
     a fork with no new turns is still 'nothing new', and a fork with turns summarizes only them."""
     source = _channel_source()
@@ -349,7 +349,7 @@ async def test_merge_delta_excludes_fork_notice(store):
     await runner._handle_branch_command(MessageEvent(text="/fork idea", source=source))
     thread = _thread_source()
     child = store.get_or_create_session(thread)
-    assert is_fork_notice_row(store.load_transcript(child.session_id)[-1])
+    assert is_branch_notice_row(store.load_transcript(child.session_id)[-1])
 
     seen = {}
     fake = MagicMock()
@@ -376,7 +376,7 @@ async def test_merge_delta_excludes_fork_notice(store):
     assert "DELTA SUMMARY" in result or "Folded" in result
     contents = [m["content"] for m in seen["history"]]
     assert contents == ["NEW q", "NEW a"]
-    assert not any(is_fork_notice_row(m) for m in seen["history"])
+    assert not any(is_branch_notice_row(m) for m in seen["history"])
     parent_rows = [r["content"] for r in store._db.get_messages(parent.session_id)]
     assert any("DELTA SUMMARY" in c for c in parent_rows)
 
@@ -442,7 +442,7 @@ async def test_merge_delta_after_branching_an_unexplored_branch_again(store):
     import json
     assert json.loads(store._db.get_session(child2.session_id)["model_config"])["_branched_from"] == child1.session_id
     raw = store._db.get_messages(child2.session_id)
-    assert [r.get("display_kind") for r in raw] == [None, None, FORK_NOTICE_DISPLAY_KIND, FORK_NOTICE_DISPLAY_KIND]
+    assert [r.get("display_kind") for r in raw] == [None, None, BRANCH_NOTICE_DISPLAY_KIND, BRANCH_NOTICE_DISPLAY_KIND]
 
     seen = _capture_merge(runner)
     result = await runner._handle_merge_command(MessageEvent(text="/merge", source=child2_src))
@@ -456,5 +456,5 @@ async def test_merge_delta_after_branching_an_unexplored_branch_again(store):
     assert [m["content"] for m in seen["history"]] == ["NEW q", "NEW a"]
     # Folded into child1 (its parent), which keeps its own notice row intact.
     child1_rows = store._db.get_messages(child1.session_id)
-    assert child1_rows[2]["display_kind"] == FORK_NOTICE_DISPLAY_KIND
+    assert child1_rows[2]["display_kind"] == BRANCH_NOTICE_DISPLAY_KIND
     assert any("DELTA SUMMARY" in (r["content"] or "") for r in child1_rows)
