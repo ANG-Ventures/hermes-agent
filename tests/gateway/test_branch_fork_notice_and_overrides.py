@@ -331,3 +331,82 @@ async def test_merge_delta_excludes_fork_notice(store):
     assert not any(is_fork_notice_row(m) for m in seen["history"])
     parent_rows = [r["content"] for r in store._db.get_messages(parent.session_id)]
     assert any("DELTA SUMMARY" in c for c in parent_rows)
+
+
+def _capture_merge(runner):
+    seen = {}
+    fake = MagicMock()
+
+    def _cap(history, focus=None):
+        seen["history"] = history
+        return "DELTA SUMMARY"
+    fake._generate_summary = _cap
+    runner._build_merge_summarizer = lambda: fake
+    runner._gateway_session_origin_for_id = lambda sid: None
+    runner._evict_cached_agent = MagicMock()
+    runner._resume_target_allowed = AsyncMock(return_value=True)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_merge_delta_survives_fold_when_parent_was_mid_turn(store):
+    """Prism P1 199166e82bdc: the parent's copied history ends with an UNANSWERED user row, so the
+    live-replay alternation repair folds the notice AND the child's first prompt into that row and the
+    repaired replay is shorter than ``_branch_point_len``. The delta must come from the durable rows."""
+    source = _channel_source()
+    parent = _seed(store, source, rows=(("user", "hello"), ("assistant", "world"), ("user", "mid-turn ask")))
+    runner = _runner(store, _ThreadAdapter())
+    await runner._handle_branch_command(MessageEvent(text="/fork idea", source=source))
+    thread = _thread_source()
+    child = store.get_or_create_session(thread)
+    store._db.append_message(child.session_id, role="user", content="NEW q")
+    store._db.append_message(child.session_id, role="assistant", content="NEW a")
+    # The replay really does fold three user rows into one (the condition the bug needs).
+    replay = store.load_transcript(child.session_id)
+    assert len(replay) == 4 and "NEW q" in replay[2]["content"] and "mid-turn ask" in replay[2]["content"]
+
+    seen = _capture_merge(runner)
+    result = await runner._handle_merge_command(MessageEvent(text="/merge", source=thread))
+
+    assert "DELTA SUMMARY" in result or "Folded" in result
+    assert [m["content"] for m in seen["history"]] == ["NEW q", "NEW a"]
+    parent_rows = [r["content"] for r in store._db.get_messages(parent.session_id)]
+    assert parent_rows[:3] == ["hello", "world", "mid-turn ask"]
+    assert any("DELTA SUMMARY" in c for c in parent_rows)
+
+
+@pytest.mark.asyncio
+async def test_merge_delta_after_branching_an_unexplored_branch_again(store):
+    """Prism P1 b3522bab429c: fork, then fork the child before any human turn. The grandchild's copied
+    history ends with the first notice; replay coalesces notice1 + notice2 + the first prompt, so an
+    index into the repaired replay drops the prompt. Zero new turns stays 'nothing new', too."""
+    source = _channel_source()
+    _seed(store, source)
+    adapter = _ThreadAdapter()
+    runner = _runner(store, adapter)
+    await runner._handle_branch_command(MessageEvent(text="/fork one", source=source))
+    child1_src = _thread_source("777000")
+    child1 = store.get_or_create_session(child1_src)
+    adapter.thread_id = "777001"
+    await runner._handle_branch_command(MessageEvent(text="/fork two", source=child1_src))
+    child2_src = _thread_source("777001")
+    child2 = store.get_or_create_session(child2_src)
+    import json
+    assert json.loads(store._db.get_session(child2.session_id)["model_config"])["_branched_from"] == child1.session_id
+    raw = store._db.get_messages(child2.session_id)
+    assert [r.get("display_kind") for r in raw] == [None, None, FORK_NOTICE_DISPLAY_KIND, FORK_NOTICE_DISPLAY_KIND]
+
+    seen = _capture_merge(runner)
+    result = await runner._handle_merge_command(MessageEvent(text="/merge", source=child2_src))
+    assert "nothing new" in result.lower() or "no turns" in result.lower()
+    assert "history" not in seen
+
+    store._db.append_message(child2.session_id, role="user", content="NEW q")
+    store._db.append_message(child2.session_id, role="assistant", content="NEW a")
+    result = await runner._handle_merge_command(MessageEvent(text="/merge", source=child2_src))
+    assert "DELTA SUMMARY" in result or "Folded" in result
+    assert [m["content"] for m in seen["history"]] == ["NEW q", "NEW a"]
+    # Folded into child1 (its parent), which keeps its own notice row intact.
+    child1_rows = store._db.get_messages(child1.session_id)
+    assert child1_rows[2]["display_kind"] == FORK_NOTICE_DISPLAY_KIND
+    assert any("DELTA SUMMARY" in (r["content"] or "") for r in child1_rows)

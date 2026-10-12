@@ -4581,11 +4581,16 @@ class GatewaySlashCommandsMixin(
         summarize_history = source_history
         if is_thread_form and isinstance(branch_point_len, int) and branch_point_len >= 0:
             # The delta is authoritative once we have a valid branch point: even
-            # branch_point_len == len(source_history) (zero new turns) must yield
-            # an EMPTY delta → no_new_turns, NOT a re-summary of the whole copy.
-            # The fork notice sits right after the branch point (t_424dcfb5); it is
-            # bookkeeping, not exploration, so it never counts as a new turn.
-            summarize_history = merge_delta_rows(source_history[branch_point_len:])
+            # branch_point_len == len(rows) (zero new turns) must yield an EMPTY
+            # delta → no_new_turns, NOT a re-summary of the whole copy.
+            # ``_branch_point_len`` counts durable ROWS copied at branch time, so the
+            # slice is taken on the unrepaired rows: the replay's alternation repair
+            # folds the fork notice (t_424dcfb5) into a mid-turn parent's trailing
+            # user row, or two notices on a re-forked branch, and an index into that
+            # shorter list drops the child's first prompt (Prism 199166e82bdc,
+            # b3522bab429c). The notice itself is bookkeeping, not exploration.
+            source_rows = await self.async_session_store.load_transcript_rows(source_session_id)
+            summarize_history = merge_delta_rows(source_rows[branch_point_len:])
             if not summarize_history:
                 return t("gateway.merge.no_new_turns")
         if not summarize_history:
