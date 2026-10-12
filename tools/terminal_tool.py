@@ -1007,78 +1007,7 @@ from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_proce
 from tools.terminal_tool_result import finalize_foreground_result
 
 
-# In-turn polling loops (messaging-gateway turns only). A loop whose body
-# sleeps >= this many seconds is a wait, not work; in a chat session it keeps
-# the conversation deaf for the whole wait.
-POLL_LOOP_MIN_SLEEP_S = 30
-
-_POLL_LOOP_KEYWORD_RE = re.compile(
-    r"(?:^|[;&|(\n{]|\b(?:do|then|else)\s)\s*(?:for|while|until)\b"
-)
-_POLL_SLEEP_RE = re.compile(
-    r"(?:^|[;&|(\n{]|\b(?:then|do|else|command|builtin)\s+|/(?:usr/)?bin/)"
-    r"\s*sleep\s+(\d+(?:\.\d+)?)\s*([smhd]?)\b",
-    re.IGNORECASE,
-)
-_POLL_SLEEP_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
-# A loop ends at `done` in command position (after ; & | ( newline {).
-_POLL_LOOP_DONE_RE = re.compile(r"(?:^|[;&|(\n{])\s*done\b")
-# `watch CMD` repeats until interrupted — always a poll. Anchored at command
-# position so `gh run watch` / `npm run watch` / `--watch` don't match.
-_WATCH_COMMAND_RE = re.compile(
-    r"(?:^|[;&|(\n{]|\b(?:do|then|else|exec|command)\s)\s*(?:/usr/bin/)?watch\s"
-)
-
-
-def _inside_loop(unquoted: str, pos: int) -> bool:
-    """True when ``pos`` falls between a for/while/until keyword and its
-    ``done`` (condition or body). Nesting is counted, so a sleep after an
-    inner loop closes but before the outer one does still counts."""
-    events = [(m.start(), 1) for m in _POLL_LOOP_KEYWORD_RE.finditer(unquoted)]
-    events += [(m.start(), -1) for m in _POLL_LOOP_DONE_RE.finditer(unquoted)]
-    depth = 0
-    for at, delta in sorted(events):
-        if at >= pos:
-            break
-        depth = max(0, depth + delta)
-    return depth > 0
-
-
-def _gateway_polling_loop_guidance(command: str) -> str | None:
-    """Refusal text for a foreground polling loop, else None.
-
-    Only consulted for messaging-gateway turns (CLI behavior is unchanged).
-    Quoted spans are stripped first so data like a commit message cannot trip
-    it. This is a behavioral guardrail, not a sandbox: the foreground cap in
-    ``_effective_foreground_max_timeout`` is the hard backstop for shapes it
-    cannot see (a script file, ``bash -c "..."``, a python sleep loop).
-    """
-    if not command:
-        return None
-    from tools.terminal_tool_guards import _strip_quotes
-    unquoted = _strip_quotes(command)
-    literal = None
-    if _WATCH_COMMAND_RE.search(unquoted):
-        literal = "watch"
-    elif _POLL_LOOP_KEYWORD_RE.search(unquoted):
-        for m in _POLL_SLEEP_RE.finditer(unquoted):
-            secs = float(m.group(1)) * _POLL_SLEEP_UNITS[m.group(2).lower()]
-            if secs >= POLL_LOOP_MIN_SLEEP_S and _inside_loop(unquoted, m.start()):
-                literal = f"sleep {m.group(1)}{m.group(2)} inside a for/while/until loop"
-                break
-    if literal is None:
-        return None
-    return (
-        f"Refused: foreground polling loop ({literal}) in a messaging-gateway "
-        f"session. While a foreground tool call runs, this chat cannot answer "
-        f"new messages — a 60-minute poll leaves the user unanswered for 60 "
-        f"minutes. Do this instead: (1) re-send it with background=true (or "
-        f"watch_patterns for the line you are waiting for) and collect it with "
-        f"process(action='wait', timeout=...) in slices of a few minutes; (2) for "
-        f"waits longer than ~10 minutes, hand the work to a kanban card or a "
-        f"cron job; (3) for a one-shot status check, run the check once "
-        f"without the loop."
-    )
+from tools.terminal_tool_poll_guard import _gateway_polling_loop_guidance
 
 
 def _resolve_notification_flag_conflict(*, notify_on_complete: bool, watch_patterns, background: bool) -> tuple:
