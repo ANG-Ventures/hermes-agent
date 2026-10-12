@@ -3855,7 +3855,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         from hermes_cli import kanban_host_capabilities as _khc
         verdict = _khc.evaluate(
             row["body"], skills, caps,
-            pin_host=pin if pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) else None)
+            pin_host=pin if pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) else None,
+            any_pin=pin == _kwp.PIN_ANY)
     ok, rule, route_class = _kwp.portable(
         workspace_kind=row["workspace_kind"], has_links=linked,
         workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
@@ -3869,7 +3870,7 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     if ignored is not None:
         _kwp.note_ignored_pin(row["id"], ignored)
     if (verdict is not None and not ok and pin in (None, _kwp.PIN_ANY)
-            and _identity_only_needed(verdict, caps)):
+            and _identity_only_needed(verdict, caps, any_pin=pin == _kwp.PIN_ANY)):
         # An identity-only capability (docker, spec v0.3 §3.4) may run on the
         # Studio only under an explicit `host: studio` pin, whatever ELSE kept
         # the card off the pool (native command, studio-bound skill, linked):
@@ -3950,9 +3951,12 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
 _STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body"})
 
 
-def _identity_only_needed(verdict, caps) -> bool:
-    """An enforced requirement the Studio serves to `host: studio` pins only."""
-    return caps is not None and any(r.cap in caps.cmap.identity_only for r in verdict.enforced)
+def _identity_only_needed(verdict, caps, any_pin: bool = False) -> bool:
+    """An enforced requirement the Studio serves to `host: studio` pins only.
+    Under `host: any` only HARD requirements count (F12)."""
+    from hermes_cli import kanban_host_capabilities as _khc
+    return caps is not None and any(r.cap in caps.cmap.identity_only for r in verdict.enforced
+                                    if not any_pin or r.strength == _khc.HARD)
 
 
 def _note_capability_verdict(tid, verdict, caps, rule, pin, caps_out: dict) -> None:
@@ -4043,8 +4047,10 @@ def _identity_only_unplanned(rows) -> dict:
             except (TypeError, ValueError):
                 skills = ()
             v = _khc.evaluate(r["body"], skills, caps,
-                              pin_host=pin if pin not in (None, _kwp.PIN_ANY) else None)
-            need = sorted(c.cap for c in v.enforced if c.cap in caps.cmap.identity_only)
+                              pin_host=pin if pin not in (None, _kwp.PIN_ANY) else None,
+                              any_pin=pin == _kwp.PIN_ANY)
+            need = sorted(c.cap for c in v.enforced if c.cap in caps.cmap.identity_only
+                          and (pin != _kwp.PIN_ANY or c.strength == _khc.HARD))
             if need and pin in (None, _kwp.PIN_ANY):
                 out[r["id"]] = f"{_khc.UNSATISFIED}:{need[0]}"
         return out

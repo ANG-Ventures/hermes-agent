@@ -274,3 +274,17 @@ def test_worker_env_honours_the_map_hardness(home):
     env = json.loads(khc.spawn_env(home / "fleet", {"placement": {"capabilities": "enforce",
                                                                  "capabilities_enforce": ["docker"]}}))
     assert env.get("docker", env["*"]) == "warn"
+
+
+def test_host_any_overrides_a_soft_capability_restriction(home):
+    """Prism dab1f537f2a0 / a5b769beaf55: `host: any` drops a SOFT (body-sniff)
+    requirement, so it is neither restricted to the advertising host nor held."""
+    _map(home, lambda d: d["hosts"]["ace-media"]["capabilities"].append("docker"))
+    with kb.connect_closing() as conn:
+        tid = _card(conn, "host: any\n" + DOCKER)
+        (route, aff, out) = _route(conn, tid)
+        assert route == ("portable", None) and tid not in out.get("only", {}) and tid not in aff
+        tid2 = _card(conn, "host: any\n" + DOCKER)
+        _map(home, lambda d: d["hosts"]["ace-media"]["capabilities"].remove("docker"))
+        (route2, _a, _o) = _route(conn, tid2)
+        assert route2[0] != "wait"
