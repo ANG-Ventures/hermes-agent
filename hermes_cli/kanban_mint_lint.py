@@ -24,16 +24,31 @@ or such a series sibling.
 
 from __future__ import annotations
 
+import datetime as _dt
 import re
 import sqlite3
 from typing import Iterable, Optional
 
+# Lead word + duration/window shape. The gap spans line breaks: a wrapped
+# "Wait until\n24 hours of shadow have elapsed" is the same gate.
 TIME_GATE_RE = re.compile(
-    r"\b(after|once|until|when)\b.{0,40}"
+    r"\b(after|once|until|when)\b[\s\S]{0,40}?"
     r"\b(\d+\s*(h|hr|hours?|d|days?|min)\b|window (closes|ends)|shadow|elapsed"
     r"|tomorrow|\d{4}-\d\d-\d\d)",
     re.IGNORECASE,
 )
+# A bare future marker reads time-gated with no lead word ("Read the VAD
+# shadow numbers tomorrow 01:30"). "tonight" counts only with a clock time:
+# on the live board it is mostly past tense ("3 false positives tonight").
+# Dates are checked separately: only one strictly after the mint day counts,
+# since a same-day or past date is almost always a provenance stamp
+# ("spec v1.1 (2026-10-11)").
+FUTURE_MARKER_RE = re.compile(
+    r"\b(tomorrow|next (week|monday|tuesday|wednesday|thursday|friday|saturday"
+    r"|sunday)|tonight (at )?\d{1,2}(:\d\d)?\b)",
+    re.IGNORECASE,
+)
+_ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d\d)-(\d\d)\b")
 TIME_GATE_REFUSAL = (
     "this card reads time-gated; mint it --kind deferred --until <when> "
     "(the blocks edge releases it the instant the parent closes)"
@@ -63,12 +78,29 @@ def _strip_origin(body: Optional[str]) -> str:
     )
 
 
-def time_gate_match(title: Optional[str], body: Optional[str]) -> Optional[str]:
+def _future_date(text: str, today: _dt.date) -> Optional[str]:
+    for m in _ISO_DATE_RE.finditer(text):
+        try:
+            when = _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            continue
+        if when > today:
+            return m.group(0)
+    return None
+
+
+def time_gate_match(
+    title: Optional[str], body: Optional[str], *, today: Optional[_dt.date] = None,
+) -> Optional[str]:
     """The text that makes this card read time-gated, or None."""
+    today = today or _dt.date.today()
     for text in (title or "", _strip_origin(body)):
-        m = TIME_GATE_RE.search(text)
+        m = TIME_GATE_RE.search(text) or FUTURE_MARKER_RE.search(text)
         if m:
             return m.group(0)
+        hit = _future_date(text, today)
+        if hit:
+            return hit
     return None
 
 

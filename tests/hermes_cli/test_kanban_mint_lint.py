@@ -13,6 +13,7 @@ OPEN DUPLICATE: t_22499911 / t_07450218 re-filed Momus passes whose cards
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import shlex
 import time
@@ -119,6 +120,37 @@ def test_i_mean_blocks_mints_and_records_event(kanban_home):
         forced = _events(conn, tid, "time_gate_forced")
     assert len(forced) == 1 and forced[0]["parents"] == [parent]
     assert "24 h" in forced[0]["match"] or "shadow" in forced[0]["match"]
+
+
+@pytest.mark.parametrize("text", [
+    "Read the VAD shadow numbers tomorrow 01:30",       # bare marker, no lead word
+    "run this on 2026-10-13 after the window",          # future date before 'after'
+    "Wait until\n24 hours of shadow have elapsed",      # wrapped across a line break
+    "check the load tonight at 23:00",
+    "next Monday re-run the bench",
+])
+def test_time_gate_shapes_without_lead_word_or_on_one_line(text):
+    assert kb_lint().time_gate_match(text, None, today=_dt.date(2026, 10, 12))
+
+
+@pytest.mark.parametrize("text", [
+    "Momus pass 2: spec v1.1 (2026-10-11)",              # provenance stamp: past date
+    "filed 2026-10-12 from the alerts sweep",            # same-day stamp
+    "3 false positives tonight incl. the card itself",   # past-tense tonight
+    "fix the bug after the parent PR lands",
+    "when the test fails, read the log",
+])
+def test_non_gate_text_passes(text):
+    assert kb_lint().time_gate_match(text, None, today=_dt.date(2026, 10, 12)) is None
+
+
+def test_wrapped_body_blocks_child_refused(kanban_home):
+    with kb.connect_closing() as conn:
+        parent = _parent(conn)
+        with pytest.raises(kb_lint().TimeGateError):
+            kb.create_task(conn, title="Read the shadow numbers", assignee="argus",
+                           body="Wait until\n24 hours of shadow have elapsed.",
+                           parents=[parent], time_gate_guard=True)
 
 
 def test_derived_from_and_parentless_time_text_are_not_gated(kanban_home):
