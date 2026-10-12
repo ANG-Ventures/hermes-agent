@@ -29,11 +29,12 @@ def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
     return Context().run(func, *args)
 
 
-def _wake_downgrade_reason(owner: Any, profile: Optional[str]) -> Optional[str]:
+def _wake_downgrade_reason(owner: Any, profile: Optional[str], human_owner: bool = False) -> Optional[str]:
     """Per-event wake -> notify reason from the owner's lazily-built WakeGate.
 
     Fails open toward WAKE: a gate that cannot be built or read must not
     silence the wake (the notify line is delivered either way).
+    ``human_owner``: see ``WakeGate.downgrade_reason`` (t_b7b31563).
     """
     try:
         gate = getattr(owner, "_kanban_wake_gate", None)
@@ -42,7 +43,7 @@ def _wake_downgrade_reason(owner: Any, profile: Optional[str]) -> Optional[str]:
 
             gate = gate_from_config()
             setattr(owner, "_kanban_wake_gate", gate)
-        return gate.downgrade_reason(profile)
+        return gate.downgrade_reason(profile, human_owner=human_owner)
     except Exception:
         logger.debug("kanban notifier: wake gate unavailable", exc_info=True)
         return None
