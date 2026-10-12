@@ -70,6 +70,9 @@ _PLAIN_RE = re.compile(r"[a-z][a-z0-9-]{0,62}")
 _ROLE_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
 _ROLES_TOP = frozenset({"_doc", "schema", "hosts"})
 _ROLES_ROW = frozenset({"roles", "state"})
+# Optional audit field {by, card, reason, at} the fleet-host CLI stamps on a row (who/why/when of the last state
+# change); validated by the router's registry, never read for placement here.
+_ROLES_ROW_OPTIONAL = frozenset({"last_change"})
 _SIDECAR_TOP = frozenset({"_doc", "schema", "ssh_user", "capacity_pct", "priority",
                           "profiles", "studio_bound_skills", "hosts"})
 _SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles"})
@@ -204,8 +207,8 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, int], str]]:
     for hid, row in hosts.items():
         if not isinstance(hid, str) or not _PLAIN_RE.fullmatch(hid):
             raise PoolError(f"fleet-roles.json: host id {hid!r} is not a plain name")
-        if not isinstance(row, dict) or set(row) != _ROLES_ROW:
-            raise PoolError(f"fleet-roles.json: host {hid}: fields must be roles, state")
+        if not isinstance(row, dict) or not _ROLES_ROW <= set(row) <= _ROLES_ROW | _ROLES_ROW_OPTIONAL:
+            raise PoolError(f"fleet-roles.json: host {hid}: fields must be roles, state (+ optional last_change)")
         roles = row["roles"]
         if not isinstance(roles, dict) or not roles:
             raise PoolError(f"fleet-roles.json: host {hid}: roles must be a non-empty object")
