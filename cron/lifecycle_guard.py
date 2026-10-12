@@ -107,10 +107,8 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # force=True) as the only cover, while this hard block — documented as
     # "force=True cannot help here" — let them through (#80260).
     r"|(?:launchctl\s+(?:kickstart|unload|load|stop|restart|submit|bootstrap|bootout|remove|disable)\b[^\n]*\bhermes[.\-]?gateway)"
-    # Branch C: systemctl ops on a hermes-gateway unit. `disable` sits beside
-    # `stop` for the same reason it does in Branch B: `disable --now` IS a stop,
-    # and a bare `disable` is what makes one durable across boots (t_4fded0bd).
-    r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start|disable)\b[^\n]*\bhermes[.\-]?gateway)"
+    # Branch C: systemctl ops on a hermes-gateway unit.
+    r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch D: pkill / kill targeting the hermes gateway process. Both
     # token orders because real reproductions show both.
     #   - LEADING \b on the command so `skill`/`skills` can't match the bare
@@ -1847,6 +1845,12 @@ _REPARSER_NAME_RE = re.compile(r"^(?:python|pythonw|perl|ruby|node|php)[\d.]*(?:
 # Wrappers that only re-parse with a specific option: `env -S "…"`, `sudo -i|-s "…"`.
 _REPARSER_OPTION_TOKENS = frozenset({"-S", "--split-string", "-i", "-s", "--login", "--shell"})
 _ARG_SEGMENT_SEPARATORS = frozenset(";&|\n(`")
+# A line whose quoted data can reach an executor another way: piped into a
+# shell/re-parser, process substitution, here-string. No masking on such a line.
+_LINE_FEEDS_EXECUTOR_RE = re.compile(
+    r"\|&?\s*(?:sudo\s+)?(?:/\S*/)?(?:sh|bash|dash|ksh|zsh|fish|xargs|parallel|eval|source|awk|gawk|mawk|nawk|"
+    r"perl|python\d*|ruby|node|osascript|tee)\b|[<>]\(|<<<"
+)
 
 
 def _segment_command_reparses(prefix: str) -> Optional[bool]:
@@ -1891,16 +1895,30 @@ def _mask_quoted_argument_data(text: str) -> str:
     i, n = 0, len(text)
     seg_start = 0
     changed = False
+    line_start = 0
+    line_unmaskable = bool(_LINE_FEEDS_EXECUTOR_RE.search(text[: text.find("\n") if "\n" in text else n]))
     while i < n:
         ch = text[i]
         if ch == "\\" and i + 1 < n:
             out.append(text[i:i + 2])
             i += 2
             continue
+        if ch == "#" and (i == 0 or text[i - 1].isspace() or text[i - 1] in _ARG_SEGMENT_SEPARATORS):
+            # A comment runs to end of line and swallows any quote in it; copying it verbatim keeps
+            # a stray apostrophe (`# don't`) from opening a span over the next command line.
+            end = text.find("\n", i)
+            end = n if end == -1 else end
+            out.append(text[i:end])
+            i = end
+            continue
         if ch in _ARG_SEGMENT_SEPARATORS:
             out.append(ch)
             i += 1
             seg_start = i
+            if ch == "\n":
+                line_start = i
+                nl = text.find("\n", i)
+                line_unmaskable = bool(_LINE_FEEDS_EXECUTOR_RE.search(text[i: n if nl == -1 else nl]))
             continue
         if text.startswith("$(", i):
             out.append("$(")
@@ -1923,7 +1941,7 @@ def _mask_quoted_argument_data(text: str) -> str:
             multi_word = any(c.isspace() for c in inner)
             expands = ch == '"' and ("$(" in inner or "`" in inner)
             reparses = _segment_command_reparses(text[seg_start:i]) if multi_word else None
-            if multi_word and not expands and reparses is False:
+            if multi_word and not expands and not line_unmaskable and reparses is False:
                 out.append(ch + "quoted-argument" + ch)
                 changed = True
             else:

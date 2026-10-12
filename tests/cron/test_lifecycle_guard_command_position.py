@@ -26,7 +26,7 @@ from tools.terminal_tool_guards import gateway_lifecycle_block
 LABEL = "ai.hermes." + "gateway-zeus"
 UNIT = "hermes-" + "gateway-zeus"
 BOOTOUT = "launch" + "ctl boot" + "out gui/502/" + LABEL
-SYSTEMCTL = "systemctl --user " + "dis" + "able --now " + UNIT
+SYSTEMCTL = "systemctl --user " + "st" + "op " + UNIT
 RESTART = "hermes gateway " + "re" + "start"
 
 
@@ -107,6 +107,16 @@ def test_python_heredoc_reading_a_document_that_names_a_stop_passes(tmp_path):
     f'hermes kanban create "x" --body "the incident was `{BOOTOUT}`"',
     # a quoted argument handed to a re-parser is code
     f"env -S '{RESTART}'",
+    # quoted data that reaches an executor another way
+    f"echo '{BOOTOUT}' | sh",
+    f"echo '{BOOTOUT}' |& bash",
+    f"echo '{BOOTOUT}' | tee >(bash)",
+    f"echo '{BOOTOUT}' > >(bash)",
+    f"bash <<< '{BOOTOUT}'",
+    f"echo '{BOOTOUT}' | awk '{{system($0)}}'",
+    # a comment's apostrophe must not open a span over the next line
+    f"# don't\n{BOOTOUT}\necho 'x'",
+    f"echo 'a' # it's\n{BOOTOUT}\necho 'b'",
 ])
 def test_real_incident_shapes_still_block(command):
     assert _blocked(command)
