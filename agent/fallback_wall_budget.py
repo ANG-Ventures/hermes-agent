@@ -13,16 +13,23 @@ not count) or a completed response. While armed:
 * every ``fallback.still_waiting_notice_seconds`` (120) the chat gets a
   "still waiting" line naming how many lanes were tried and what is left ahead;
 * once ``fallback.no_first_byte_budget_seconds`` (600) is spent, the current
-  attempt is cut (only when a lane on a DIFFERENT model is still ahead in the
-  chain), and the chain walker skips the remaining lanes that serve the same
-  model as the stalled one: they are other faces of the same pool, which is
-  what just failed to answer. If the walk then finds no usable lane on another
-  model, it goes back and tries the skipped same-model lanes after all.
+  attempt is cut (once per wait, and only when a usable lane is still ahead),
+  and the native chain walker takes the NEXT lane in ``fallback_providers``
+  order, whatever model it serves.
+
+No same-model skip (Ace ruling 2026-10-12 01:43 + 02:43 PT, t_778185f3). The
+first version also skipped every remaining lane on the model that stalled and
+only cut when a lane on a DIFFERENT model was ahead. On 2026-10-11 23:26 that
+sent a 378k-token fable turn from claude-alr straight to cpa/gpt-6.1-sol,
+skipping claude-dtlr, claude-btpr and claude-bpr, which were healthy and next in
+the chain. Ace: every lane in the chain is tried first; use the native stale
+timer and the chain. The skip is gone because the 34-minute cascade it was
+written against is now guarded where it happened: claude-bpx#505 (60 s
+first-event cut on a dead TUI), claude-pool#244/#247/#248 (read-timeout bench +
+valve) and claude-pool#249 (tui gate).
 
 The 600 s default sits above every lane's healthy p99 (alr 100 s, dtlr TUI
-p90 168 s / max 275 s on 2026-10-11): it ends dead air, not slow turns, and its
-destination is usually a different model, which is a last resort (Apollo ruling
-2026-10-11).
+p90 168 s / max 275 s on 2026-10-11): it ends dead air, not slow turns.
 
 ``0`` disables either knob. State lives on the agent as ``_wall_budget``.
 """
@@ -43,7 +50,19 @@ class FallbackWallBudgetExceeded(RuntimeError):
     """The attempt was cut because the turn's no-first-byte budget was spent.
 
     Classified ``pool_stalled`` (non-retryable, fall back): re-sending to the same
-    lane re-enters the stall the budget just measured."""
+    lane re-enters the stall the budget just measured. Carries the cut evidence the
+    fallback banner renders (``fallback_events`` class ``no_first_byte_budget``):
+    ``lane`` (the provider cut), ``elapsed_s`` (the budget clock at the cut) and
+    ``pool_headers`` (the relay attribution headers seen before the cut, ``{}`` when
+    the cut came before any header)."""
+
+    def __init__(self, message: str = "", *, lane: Optional[str] = None,
+                 elapsed_s: Optional[float] = None,
+                 pool_headers: Optional[dict] = None) -> None:
+        super().__init__(message)
+        self.lane = lane
+        self.elapsed_s = elapsed_s
+        self.pool_headers = dict(pool_headers or {})
 
 
 def _knobs() -> tuple[float, float]:
@@ -137,10 +156,6 @@ def spent(agent: Any, now: Optional[float] = None) -> bool:
     return elapsed(agent, now) >= st["budget_s"]
 
 
-def _norm(model: Any) -> str:
-    return str(model or "").strip().lower()
-
-
 def _remaining_entries(agent: Any) -> list:
     chain = getattr(agent, "_fallback_chain", None) or []
     idx = int(getattr(agent, "_fallback_index", 0) or 0)
@@ -149,7 +164,7 @@ def _remaining_entries(agent: Any) -> list:
 
 def _viable(agent: Any, fb: dict) -> bool:
     """The walker's side-effect-free filters: an entry it would skip anyway is no
-    reason to skip or cut the stalled model (Prism a54a5cb796b0)."""
+    reason to cut the attempt (Prism a54a5cb796b0)."""
     provider = str(fb.get("provider") or "").strip().lower()
     model = str(fb.get("model") or "").strip()
     if not provider or not model:
@@ -171,35 +186,19 @@ def _viable(agent: Any, fb: dict) -> bool:
     return True
 
 
-def has_other_model_ahead(agent: Any, model: Any = None) -> bool:
-    """A usable lane on a model other than ``model`` (default: the current one) is still ahead."""
-    current = _norm(getattr(agent, "model", "") if model is None else model)
-    return any(_norm(fb.get("model")) not in ("", current) and _viable(agent, fb)
-               for fb in _remaining_entries(agent))
+def _lane_ahead(agent: Any) -> bool:
+    """A usable lane is still ahead in the chain, on any model."""
+    return any(_viable(agent, fb) for fb in _remaining_entries(agent))
 
 
 def should_cut_attempt(agent: Any, now: Optional[float] = None) -> bool:
-    """Cut the in-flight attempt: budget spent and somewhere better to go. Fires once per
-    wait, so the lane the cut moves to gets its own clocks instead of an instant cut."""
+    """Cut the in-flight attempt: budget spent and a lane is still ahead to walk to.
+    Fires once per wait, so the lane the cut moves to gets its own clocks instead of
+    an instant cut. With nothing ahead the native per-lane timers keep the attempt."""
     st = _state(agent)
-    if st is None or st.get("fired") or not spent(agent, now) or not has_other_model_ahead(agent):
+    if st is None or st.get("fired") or not spent(agent, now) or not _lane_ahead(agent):
         return False
     st["fired"] = True
-    return True
-
-
-def skip_lane(agent: Any, fb_model: Any, now: Optional[float] = None) -> bool:
-    """Chain walker: skip ``fb_model`` when the budget is spent, it is the model that
-    just stalled, and a lane on another model is still ahead (the walk reaches it)."""
-    if not spent(agent, now):
-        return False
-    stalled = _norm(getattr(agent, "model", ""))
-    if _norm(fb_model) != stalled or not has_other_model_ahead(agent, stalled):
-        return False
-    st = _state(agent) or {}
-    logger.info("Fallback skip: %s lane is the model that stalled; no-first-byte budget spent "
-                "(%.0fs >= %.0fs, %d lanes tried)", fb_model, elapsed(agent, now) or 0.0,
-                st.get("budget_s", 0.0), st.get("lanes", 0))
     return True
 
 
