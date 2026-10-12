@@ -22,7 +22,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, build_session_key, is_shared_multi_user_session
 from gateway.session_transcript import TranscriptReadError
 from gateway.slash_commands_branch_thread import (
-    BRANCH_THREAD_PLATFORMS, branch_dest_source, branch_thread_parent, fork_notice_content, fork_notice_row,
+    BRANCH_THREAD_PLATFORMS, branch_dest_source, branch_notice_content, branch_notice_row, branch_thread_parent,
     format_thread_ref, parse_branch_flags,
 )
 from gateway.slash_commands_status import history_unreadable
@@ -1018,7 +1018,7 @@ class GatewaySessionCommandsMixin:
     # ----------------------------------------------------------------------- /branch
 
     async def _handle_branch_command(self, event: MessageEvent) -> str:
-        """Handle /branch [--here] [name] — fork the current session into an independent copy.
+        """Handle /branch [--here] [--fresh] [name] — branch the current session into an independent copy.
 
         Thread-capable platforms (Discord/Telegram/Slack/Matrix) open a NEW sibling thread bound
         to the clone and leave this chat on the original session; ``--here`` (and every platform
@@ -1089,15 +1089,15 @@ class GatewaySessionCommandsMixin:
             # rows.
             await self._session_db.append_messages_batch(
                 new_session_id, [_branch_row(msg) for msg in history], chunk_rows=500)
-        # Fork notice the MODEL reads (t_424dcfb5): without it the child's context simply ends where
+        # Branch notice the MODEL reads (t_424dcfb5): without it the child's context simply ends where
         # the parent's did and the child resumes the parent's in-flight work. Appended AFTER the copied
         # rows and OUTSIDE ``_branch_point_len`` (== len(history)), so /merge's delta starts at the notice;
         # ``_merge_delta_rows`` drops it again because a bookkeeping row is not exploration.
         parent_ref = source.thread_id or source.chat_id
-        notice = fork_notice_content(parent_session_id=parent_session_id, row_count=len(history),
-                                     platform=source.platform, parent_ref=str(parent_ref) if parent_ref else None)
+        notice = branch_notice_content(parent_session_id=parent_session_id, row_count=len(history),
+                                       platform=source.platform, parent_ref=str(parent_ref) if parent_ref else None)
         with contextlib.suppress(Exception):
-            await self._session_db.append_messages_batch(new_session_id, [fork_notice_row(notice)])
+            await self._session_db.append_messages_batch(new_session_id, [branch_notice_row(notice)])
         with contextlib.suppress(Exception):
             await self._session_db.set_session_title(new_session_id, branch_title)
         if not in_place:
