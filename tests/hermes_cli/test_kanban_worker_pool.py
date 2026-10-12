@@ -130,6 +130,23 @@ def test_reader_drops_one_host_on_disagreement_and_refuses_structure(tmp_path):
     assert kwp.load_pool(tmp_path, kanban_cfg={})[0] == []
 
 
+def test_reader_accepts_the_last_change_audit_field_and_still_refuses_unknown_row_keys(tmp_path):
+    """fleet-host stamps `last_change` {by, card, reason, at} on a row (who/why/when); it never drives placement."""
+    lc = {"by": "sess-A", "card": "t_1234abcd", "reason": "drain: x", "at": "2026-10-12T09:00:00Z"}
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {"slots": 4}}, "state": "draining", "last_change": lc},
+        "ace-media": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"},
+    }}
+    _write_pool(tmp_path, roles=roles)
+    assert kwp.parse_roles(roles) == {"ace-ai": ({"kanban-worker": 4}, "draining"),
+                                      "ace-media": ({"kanban-worker": 4}, "active")}
+    hosts, _ = kwp.load_pool(tmp_path, kanban_cfg={})
+    assert {h.name: h.state for h in hosts}.get("ace-media") == "active"
+    roles["hosts"]["ace-media"]["note"] = "x"
+    with pytest.raises(kwp.PoolError, match="fields must be roles, state"):
+        kwp.parse_roles(roles)
+
+
 def _studio_registered(fleet: Path, policy_hosts=None):
     """The QA t_1302fe6c repro: mac-studio carries the kanban-worker role and
     sits FIRST in the sidecar priority, while the placement policy says
