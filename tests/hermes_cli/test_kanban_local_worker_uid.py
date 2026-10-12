@@ -145,3 +145,16 @@ def test_rollback_is_one_edit(spawn):
     off, _ = spawn("")
     assert "KANBAN_WORKER_PLACEMENT" in on["env"]
     assert "KANBAN_WORKER_PLACEMENT" not in off["env"]
+
+
+@pytest.mark.parametrize("section", ["_kanbanw", ["_kanbanw"], 1, True])
+def test_malformed_kanban_section_fails_closed(monkeypatch, section):
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"kanban": section})
+    with pytest.raises(klu.LocalWorkerUidError):
+        klu.configured_user()
+
+
+def test_absent_or_null_kanban_section_is_unset(monkeypatch):
+    for cfg in ({}, {"kanban": None}):
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda cfg=cfg: cfg)
+        assert klu.configured_user() is None

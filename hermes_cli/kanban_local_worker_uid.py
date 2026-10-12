@@ -50,7 +50,9 @@ def resolve_user(kanban_cfg: Optional[Mapping[str, Any]], *, me: Optional[str] =
     dispatcher's own uid. A set-but-unusable value (malformed, unknown uid/login) raises
     ``LocalWorkerUidError``: this knob is a privilege boundary, so a typo must fail closed.
     """
-    raw = (kanban_cfg or {}).get(KNOB) if isinstance(kanban_cfg, Mapping) else None
+    if kanban_cfg is not None and not isinstance(kanban_cfg, Mapping):
+        raise LocalWorkerUidError(f"kanban.{KNOB}: the kanban section is a {type(kanban_cfg).__name__}, not a mapping")
+    raw = (kanban_cfg or {}).get(KNOB)
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return None
     if isinstance(raw, bool):
@@ -87,7 +89,9 @@ def configured_user() -> Optional[str]:
         kcfg = (load_config_readonly() or {}).get("kanban")
     except Exception as exc:
         raise LocalWorkerUidError(f"kanban.{KNOB}: config unreadable: {exc}") from exc
-    return resolve_user(kcfg if isinstance(kcfg, Mapping) else None)
+    if kcfg is not None and not isinstance(kcfg, Mapping):
+        raise LocalWorkerUidError(f"kanban.{KNOB}: the kanban section is a {type(kcfg).__name__}, not a mapping")
+    return resolve_user(kcfg)
 
 
 def local_host(user: str) -> PoolHost:
