@@ -91,11 +91,12 @@ def test_unreadable_prose_pr_still_gates():
     assert _numbers(op.open_pr_refs(f"see {REPO}#7", query_fn=q, task_id=CARD)) == [7]
 
 
-def test_without_task_id_behaviour_is_unchanged():
+def test_without_task_id_prose_gates_only_when_nothing_is_declared():
     run = FIXTURE["runs"]["23979"]
     q = _oracle({1904: "OPEN", 1902: "OPEN", 1903: "OPEN", 1897: "MERGED"}, _heads())
-    assert _numbers(op.open_pr_refs(run["summary"], metadata=run["metadata"], query_fn=q)) == [
-        1904, 1902, 1903]
+    # Declared pr_url beats prose (t_0ecd6506); with no declaration the text scan still gates.
+    assert _numbers(op.open_pr_refs(run["summary"], metadata=run["metadata"], query_fn=q)) == [1904]
+    assert _numbers(op.open_pr_refs(run["summary"], metadata={}, query_fn=q)) == [1904, 1902, 1903]
 
 
 def test_branch_names_other_card():

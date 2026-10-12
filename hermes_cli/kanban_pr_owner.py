@@ -16,10 +16,20 @@ The rule: a PR has at most ONE running card.
   same 3 days they added 43 overlap pairs of mostly unrelated cards.
 * The dispatcher refuses to spawn a ready card while another card running on
   one of its PRs is fresh (``pr_owner_busy``, owner named). A STALE owner (its
-  run is older than :data:`STALE_OWNER_SECONDS` and the PR head's commit is
-  older too) is reclaimed and the PR passes to the waiting card. There is never
-  a second worker. An unknown head-commit time counts as fresh: no reclaim and
-  no spawn.
+  run is older than :data:`STALE_OWNER_SECONDS`, its run has NOT heartbeated
+  inside that window, and the PR head's commit is older too) is reclaimed and
+  the PR passes to the waiting card. There is never a second worker. An
+  unknown head-commit time counts as fresh: no reclaim and no spawn.
+* Incident 2026-10-12 06:12 (t_0a9a20ea): t_4fded0bd was mid-round-2 on
+  hermes-agent#1917, heartbeating every minute, with a 2 h-old PR head by
+  construction (reading, probing, writing tests before the push). The old
+  verdict read only run age + head age, so the reclaim SIGTERM'd a live
+  worker and the dispatcher respawned the same card. Now a heartbeat inside
+  the window makes the owner fresh (``pr_owner_stale_skipped`` is ledgered on
+  the owner once per run), and the pr-owner reclaim path never sends a
+  signal: it reclaims a run only when the host can prove it gone. Reassigning
+  to another card is therefore only ever possible over a dead run; an
+  operator ``kanban reclaim`` keeps its own signalling.
 * ``create_task`` refuses a ``rebase:``-keyed helper card at birth while a
   fresh owner runs (:class:`PrOwnerBusyError`). Override: ``force_reason``
   (CLI ``--force "<reason>"``), ledgered as a ``pr_owner_forced`` event. The
@@ -50,6 +60,10 @@ _log = logging.getLogger(__name__)
 STALE_OWNER_SECONDS = 2 * 3600
 GUARD_REASON = "pr_owner_busy"
 REASSIGN_EVENT = "pr_owner_reassigned"
+# Ledgered on the owner (once per run) when a heartbeat inside the window
+# vetoed a stale verdict the run age + head age alone would have given.
+STALE_SKIP_EVENT = "pr_owner_stale_skipped"
+STALE_SKIP_REASON = "run_heartbeating"
 
 _REBASE_KEY_RE = re.compile(r"^rebase:([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#(\d+)@", re.IGNORECASE)
 _META_KEYS = ("pr_url", "pr_urls", "pr")
@@ -136,14 +150,17 @@ def running_owners(conn: sqlite3.Connection, targets: set, *, exclude: str = "")
         return []
     out = []
     for row in conn.execute(
-        "SELECT t.id, t.assignee, t.started_at, r.started_at, r.profile "
+        "SELECT t.id, t.assignee, t.started_at, r.started_at, r.profile, r.id, "
+        "r.last_heartbeat_at, t.last_heartbeat_at "
         "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.id != ?", (exclude or "",),
     ).fetchall():
         if str(row[4] or "").startswith("human"):
             continue  # an operator `claim --review` never pushes
+        heartbeat = max((int(h) for h in (row[6], row[7]) if h), default=None)
         for target in sorted(targets & card_pr_targets(conn, row[0])):
             out.append({"task_id": row[0], "assignee": row[1], "since": row[3] or row[2],
+                        "run_id": row[5], "last_heartbeat_at": heartbeat,
                         "pr": fmt_pr(target), "repo": target[0], "number": target[1]})
     out.sort(key=lambda o: (o["since"] or 0, o["task_id"]))
     for o in out:
@@ -214,9 +231,19 @@ def pr_head_committed_at(repo: str, number: int, *, refresh: bool = False) -> Op
 
 def owner_is_stale(owner: dict, *, now: Optional[int] = None,
                    head_commit_fn: Optional[HeadCommitFn] = None) -> bool:
-    """True only when the owner's run AND the PR head commit are both older than 2 h."""
+    """True only when the owner's run, its last heartbeat AND the PR head commit are all older than 2 h.
+
+    A worker in a long review round has a 2 h-old PR head by construction
+    (reading, probing, running tests before the push); its heartbeat is what
+    says it is still working (t_0a9a20ea). A heartbeat inside the window sets
+    ``owner["stale_skipped"]`` so the caller can ledger the skip.
+    """
     now = int(time.time()) if now is None else int(now)
     if owner.get("since") and now - int(owner["since"]) < STALE_OWNER_SECONDS:
+        return False
+    heartbeat = owner.get("last_heartbeat_at")
+    if heartbeat and now - int(heartbeat) < STALE_OWNER_SECONDS:
+        owner["stale_skipped"] = STALE_SKIP_REASON
         return False
     at = (head_commit_fn or pr_head_committed_at)(owner["repo"], owner["number"])
     if head_commit_fn is None and at is not None and now - int(at) >= STALE_OWNER_SECONDS:

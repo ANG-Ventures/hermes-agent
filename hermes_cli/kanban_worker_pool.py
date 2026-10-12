@@ -70,6 +70,9 @@ _PLAIN_RE = re.compile(r"[a-z][a-z0-9-]{0,62}")
 _ROLE_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
 _ROLES_TOP = frozenset({"_doc", "schema", "hosts"})
 _ROLES_ROW = frozenset({"roles", "state"})
+# Optional audit field {by, card, reason, at} the fleet-host CLI stamps on a row (who/why/when of the last state
+# change); validated by the router's registry, never read for placement here.
+_ROLES_ROW_OPTIONAL = frozenset({"last_change"})
 _SIDECAR_TOP = frozenset({"_doc", "schema", "ssh_user", "capacity_pct", "priority",
                           "profiles", "studio_bound_skills", "hosts"})
 _SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles"})
@@ -102,6 +105,23 @@ CI_HOSTS_FILE = "ci-hosts.json"
 STUDIO_BODY_RE = re.compile(
     r"(?<![\w.-])(?:localhost|127\.0\.0\.1)?:922\d\b|signed-in browser|add to cart|\bpeekaboo\b",
     re.IGNORECASE)
+# Studio-only resources a card body names (card t_aea826a9: t_dec6d40f named
+# the vault + skills-shared, t_6af0c092 the relay logs + a sub-vps ssh; both
+# spilled to ci-box and blocked). THE one table: ``card_needs`` derives a
+# card's needs from it, the reach matrix row's ``caps`` says which needs a
+# worker host covers, and hermes-home's kanban_pool_lint imports both.
+# Over 14 days (5,045 bodies) the table matched 1,000; the bare words
+# ``relay`` (+334, mostly prose) and ``CDP`` are deliberately absent.
+CARD_NEEDS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
+    ("vault", re.compile(r"Obsidian/Ace Place|(?<![\w-])vault(?![\w-])", re.IGNORECASE)),
+    ("skills_tree", re.compile(r"\.hermes/skills-shared\b|\bskill_view\b")),
+    ("studio_relay", re.compile(
+        r"\.hermes/logs/|(?<![\w-])deploy/claude-[\w-]+|(?<![\w.-])(?:localhost|127\.0\.0\.1)?:1881\d\b"
+        r"|\blive gate\b|\bpinned (?:relay )?turn\b", re.IGNORECASE)),
+    ("sub_ssh", re.compile(r"(?<![\w-])sub-vps-\d+\b", re.IGNORECASE)),
+    ("studio_launchd", re.compile(r"\blaunchctl\b|Library/LaunchAgents\b")),
+)
+STUDIO_NEEDS_RULE = "studio_needs"
 IGNORED_PIN_WARN_SECONDS = 300
 
 _log = logging.getLogger(__name__)
@@ -159,6 +179,9 @@ class PoolConfig:
     ssh_hosts: Optional[frozenset] = None
     # ``{alias: canonical pin}`` from :func:`pin_aliases` (t_cb2b888d).
     pin_aliases: Mapping[str, str] = field(default_factory=dict)
+    # ``{host: needs it covers}`` from fresh reach-matrix rows (t_aea826a9).
+    # A host with no row or no ``caps`` covers nothing: fail closed.
+    caps: Mapping[str, frozenset] = field(default_factory=dict)
 
 
 # -- registry ---------------------------------------------------------------
@@ -184,8 +207,8 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, int], str]]:
     for hid, row in hosts.items():
         if not isinstance(hid, str) or not _PLAIN_RE.fullmatch(hid):
             raise PoolError(f"fleet-roles.json: host id {hid!r} is not a plain name")
-        if not isinstance(row, dict) or set(row) != _ROLES_ROW:
-            raise PoolError(f"fleet-roles.json: host {hid}: fields must be roles, state")
+        if not isinstance(row, dict) or not _ROLES_ROW <= set(row) <= _ROLES_ROW | _ROLES_ROW_OPTIONAL:
+            raise PoolError(f"fleet-roles.json: host {hid}: fields must be roles, state (+ optional last_change)")
         roles = row["roles"]
         if not isinstance(roles, dict) or not roles:
             raise PoolError(f"fleet-roles.json: host {hid}: roles must be a non-empty object")
@@ -342,7 +365,49 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         reach=reach, reach_aliases=aliases, reach_status=reach_status,
         ssh_hosts=known_ssh_hosts(fleet_dir),
         pin_aliases=pin_aliases(fleet_dir),
+        caps=read_caps(fleet_dir),
     )
+
+
+def card_needs(body: Optional[str]) -> frozenset:
+    """The Studio-only resources a card body names (:data:`CARD_NEEDS`)."""
+    return frozenset(name for name, rx in CARD_NEEDS if rx.search(body or ""))
+
+
+def read_caps(fleet_dir: Path, *, now: Optional[float] = None,
+              stale_after_s: float = REACH_STALE_SECONDS) -> Dict[str, frozenset]:
+    """``{host: needs covered}`` from ``kanban-reach-matrix.json`` row
+    ``caps: {<need>: true|false}``. Same freshness rule as :func:`read_reach`;
+    an absent, unreadable or stale row covers nothing (fail closed)."""
+    now = time.time() if now is None else now
+    try:
+        doc = _read_json(Path(fleet_dir) / REACH_FILE)
+    except (OSError, ValueError):
+        return {}
+    rows = doc.get("hosts") if isinstance(doc, dict) and doc.get("schema") == 1 else None
+    out: Dict[str, frozenset] = {}
+    for hid, row in (rows.items() if isinstance(rows, dict) else ()):
+        if not isinstance(hid, str) or not isinstance(row, dict):
+            continue
+        at, caps = row.get("at"), row.get("caps")
+        if isinstance(at, bool) or not isinstance(at, (int, float)) or not isinstance(caps, dict):
+            continue
+        if now - float(at) > stale_after_s or at > now + 3600:
+            continue
+        out[hid.lower()] = frozenset(k for k, v in caps.items() if isinstance(k, str) and v is True)
+    return out
+
+
+def needs_allowed_hosts(body: Optional[str], pool) -> Optional[Tuple[str, ...]]:
+    """None when the body names no Studio-only resource; else the enabled
+    pool hosts whose fresh reach-matrix ``caps`` cover every need (``()`` =
+    none: the card runs on the Studio or waits, never spills)."""
+    needs = card_needs(body)
+    if not needs:
+        return None
+    caps = getattr(pool, "caps", None) or {}
+    return tuple(h.name for h in (getattr(pool, "pool_hosts", ()) or ())
+                 if needs <= caps.get(h.name.lower(), frozenset()))
 
 
 def read_reach(fleet_dir: Path, *, now: Optional[float] = None,
@@ -870,10 +935,12 @@ def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
     """``(rule, matched_by)`` when the card's WORK is bound to the Studio's state
     (signed-in browsers, Messages.app, a macOS GUI session), else None.
 
-    Three sources, first hit wins: the pool sidecar's ``studio_bound_skills``
+    Four sources, first hit wins: the pool sidecar's ``studio_bound_skills``
     (rule ``studio_bound_skill``), a skill manifest that declares the binding
     (``manifest``: ``{skill: why}`` from :mod:`kanban_host_affinity`; rule
-    ``studio_manifest``), and the card body (rule ``studio_body``). An explicit
+    ``studio_manifest``), the card body (rule ``studio_body``), and the
+    Studio-only resources the body names that no pool host covers (rule
+    ``studio_needs``, :func:`card_needs`). An explicit
     ``host:`` pin is decided before this and wins.
     """
     names = [s for s in (skills or ()) if isinstance(s, str)]
@@ -888,6 +955,10 @@ def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
     m = STUDIO_BODY_RE.search(body or "")
     if m:
         return "studio_body", f"body:{m.group(0)}"
+    # Studio-only resources the body names (t_aea826a9): bound unless some
+    # pool host's fresh reach-matrix caps cover every one of them.
+    if needs_allowed_hosts(body, pool) == ():
+        return STUDIO_NEEDS_RULE, "needs:" + ",".join(sorted(card_needs(body)))
     return None
 
 

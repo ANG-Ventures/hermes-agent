@@ -955,6 +955,8 @@ _TASK_RUN_COLUMNS = (
     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Resources the run started (kanban_resources); legacy rows read as [].
+    ("resources", "resources TEXT NOT NULL DEFAULT '[]'"),
 )
 
 
@@ -1206,7 +1208,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, resources TEXT NOT NULL DEFAULT '[]')",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",

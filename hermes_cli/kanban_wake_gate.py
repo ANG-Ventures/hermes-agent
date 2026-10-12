@@ -26,6 +26,14 @@ a 4-core box it would silence every wake whenever load1 > 4.
 
 State is written to ``<kanban_home>/wake_gate.json`` on every transition and
 summary so ``hermes kanban notify-status`` can show the live mode.
+
+2026-10-12 05:38 (t_b7b31563, Ace 06:25): a review handoff to ``human:apollo``
+was downgraded on ``host load 184`` alone and the chain sat 25 min. For a wake
+whose owner is a HUMAN session the host half is no longer load1 by itself:
+host load counts only while the dispatcher's own LoadGate is ``proc_paused``
+(read from ``load_gate.json``); the lane-headroom probe still applies. The
+notifier then DEFERS such a downgrade (``gateway.kanban_wake_defer``) instead
+of dropping it.
 """
 
 from __future__ import annotations
@@ -75,6 +83,7 @@ class WakeGate:
         ncpu: Optional[int] = None,
         loadavg: Callable[[], tuple] = os.getloadavg,
         lane_probe: Optional[Callable[[str], Optional[str]]] = None,
+        dispatcher_state: Optional[Callable[[], Optional[dict]]] = None,
         state_file: Optional[Path] = None,
     ) -> None:
         cfg = _merged_cfg(config)
@@ -96,6 +105,7 @@ class WakeGate:
         )
         self._loadavg = loadavg
         self._lane_probe = lane_probe or _default_lane_probe
+        self._dispatcher_state = dispatcher_state or _default_dispatcher_state
         self._lane_cache: dict[str, tuple[float, Optional[str]]] = {}
         self._sampled_at: Optional[float] = None
         self.load1: Optional[float] = None
@@ -149,9 +159,33 @@ class WakeGate:
 
     def downgrade_reason(
         self, profile: Optional[str] = None, now: Optional[float] = None,
+        *, human_owner: bool = False,
     ) -> Optional[str]:
-        """Why a wake for ``profile``'s session is sent as a notify, or None."""
-        return self.host_contended(now) or self.lane_contended(profile, now)
+        """Why a wake for ``profile``'s session is sent as a notify, or None.
+
+        ``human_owner``: the wake targets a human-owned operator session (a
+        ``human:*`` reviewer/owner). Host load1 alone never blocks it; the
+        host half counts only while the dispatcher LoadGate is ``proc_paused``
+        (t_b7b31563), and the lane probe still applies.
+        """
+        host = self.host_contended(now)
+        if host and human_owner:
+            host = self.dispatcher_proc_paused()
+        return host or self.lane_contended(profile, now)
+
+    def dispatcher_proc_paused(self) -> Optional[str]:
+        """``"dispatcher proc_paused"`` while the spawn gate is in that state, else None.
+
+        Read from the dispatcher's own ``load_gate.json`` (one gateway writes it
+        per tick). An unreadable or absent state is not evidence of contention.
+        """
+        try:
+            state = self._dispatcher_state()
+        except Exception:
+            return None
+        if isinstance(state, dict) and state.get("state") == "proc_paused":
+            return "dispatcher proc_paused"
+        return None
 
     # -- observability -----------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
@@ -211,6 +245,13 @@ def _default_lane_probe(profile: str) -> Optional[str]:
     if not capped:
         return None
     return f"lane {capped.get('provider') or '?'} capped"
+
+
+def _default_dispatcher_state() -> Optional[dict]:
+    """The dispatcher LoadGate's published ``load_gate.json`` (None when absent)."""
+    from hermes_cli.kanban_load_gate import read_state as _read_gate_state
+
+    return _read_gate_state()
 
 
 def state_path() -> Path:

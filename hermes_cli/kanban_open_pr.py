@@ -158,7 +158,7 @@ def extract_pr_refs(
 
     sources = [t for t in texts if isinstance(t, str) and t.strip()]
     if isinstance(metadata, dict):
-        for key in ("pr_url", "pr_urls", "pr"):
+        for key in ("pr_url", "pr_urls", "pr", "own_prs"):
             sources.extend(_iter_strings(metadata.get(key)))
     sources.extend(_split_qualifier(claim)[1] for claim in _iter_strings(survivor_pr))
     out = []
@@ -259,6 +259,12 @@ def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
     ``unowned`` and does not gate. Declared refs (``metadata.pr_url`` / ``pr_urls`` / ``pr``,
     ``--survivor-pr``) always gate. A prose ref whose head branch names this card, names no card, or
     is unknown (unreadable) still gates: fail closed, as before (t_1bd02e0b).
+
+    Declared beats prose (t_0ecd6506): when the handoff declares its PRs (``own_prs`` / ``pr_url`` /
+    ``pr_urls`` / ``pr`` / ``--survivor-pr``), the route and the close-on-merged set are exactly those
+    refs; an OPEN ref the text merely mentions goes to ``unowned`` (warn, never a gate). The text gates
+    only when nothing is declared. t_536b03d9 declared #3918 and was gated on #3853 too because its
+    prose said "the fix is Apollo's #3853".
     """
     refs = split_fleet(extract_pr_refs(*texts, metadata=metadata, survivor_pr=survivor_pr))[0]
     if not refs:
@@ -268,6 +274,11 @@ def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
         return []
     primary = split_fleet(extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]
     opened, unverified = unmerged_refs(refs, query_fn=query_fn, primary=primary)
+    if primary:
+        declared = {(r.repo.lower(), r.number) for r in primary}
+        if unowned is not None:
+            unowned.extend(r for r in opened if (r.repo.lower(), r.number) not in declared)
+        return [r for r in opened + unverified if (r.repo.lower(), r.number) in declared]
     if task_id:
         declared = {(r.repo.lower(), r.number) for r in primary}
         kept = []

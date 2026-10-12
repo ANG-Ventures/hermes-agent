@@ -11,6 +11,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource, SessionStore
+from gateway.slash_commands_branch_thread import BRANCH_NOTICE_DISPLAY_KIND
 from hermes_state import AsyncSessionDB
 
 
@@ -86,7 +87,11 @@ async def test_plain_branch_binds_new_thread_and_keeps_origin(store):
     row = store._db.get_session(branch.session_id)
     assert (row["parent_session_id"], row["chat_id"], row["thread_id"], row["chat_type"]) == (
         parent.session_id, "777000", "777000", "thread")
-    assert [m["content"] for m in store._db.get_messages(branch.session_id)] == ["hello", "world"]
+    rows = store._db.get_messages(branch.session_id)
+    assert [m["content"] for m in rows[:2]] == ["hello", "world"]
+    # The copied history is followed by ONE branch notice the model replays (t_424dcfb5).
+    assert len(rows) == 3 and rows[2]["display_kind"] == BRANCH_NOTICE_DISPLAY_KIND
+    assert rows[2]["role"] == "user" and parent.session_id in rows[2]["content"]
     assert "<#777000>" in reply and parent.session_id in reply
 
 

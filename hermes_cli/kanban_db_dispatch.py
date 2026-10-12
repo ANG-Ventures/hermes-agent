@@ -761,8 +761,15 @@ def _terminate_reclaimed_worker(
     task_id: Optional[str] = None,
     run_id: Optional[int] = None,
     started_at=None,
+    signal_allowed: bool = True,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths.
+
+    ``signal_allowed=False`` makes this a liveness probe with reap: a dead or
+    recycled recorded worker is reported ``terminated`` exactly as before, but
+    a live, verified one is never signalled (``worker_alive_unsignalled``),
+    so the caller's :func:`_worker_survived_termination` check fails closed
+    BEFORE any signal. The pr-owner reclaimer uses it (t_0a9a20ea).
 
     ``run_id`` is the run ``owner_window`` was computed for. The post-death
     reap sweeps only that run's identity; it never re-reads
@@ -894,6 +901,21 @@ def _terminate_reclaimed_worker(
             info["liveness_unprovable"] = True
             info["needs_attention"] = True
             return info
+        if not signal_allowed:
+            # The caller may reclaim a DEAD run but never end a live one
+            # (the pr-owner reclaimer, t_0a9a20ea: it SIGTERM'd a heartbeating
+            # worker and only then recorded the refusal). Report the live,
+            # verified worker and send nothing.
+            info["signal_refused"] = True
+            info["worker_alive_unsignalled"] = True
+            return info
+    elif not signal_allowed:
+        # Already gone: nothing to signal, reap its leftovers as a kill would.
+        info["terminated"] = True
+        _kb._reap_terminated_worker_session(
+            pid, info, signal_fn, owner_window, None, conn, task_id, run_id,
+        )
+        return info
 
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
@@ -1029,6 +1051,7 @@ def _worker_survived_termination(termination: dict) -> bool:
     return bool(
         termination.get("termination_attempted")
         or termination.get("liveness_unprovable")
+        or termination.get("worker_alive_unsignalled")
     )
 
 
@@ -1951,12 +1974,15 @@ def detect_crashed_workers(
                 )
                 if stderr_exit_class is not None:
                     kind = "rate_limited"
-            if kind == "rate_limited" and not cohort_death:
-                # The worker said "wall", but its own last lines carry the provider's
-                # verdict. A 400/401/403/404 is a REJECTION (dead model id, bad
-                # credential): the same answer on every retry, so it is a failure
-                # that counts, never a requeue-without-a-strike (t_d564a8dd: 24 such
-                # exits booked ``rate_limited`` for 8 h). 429/503/529 stay a wall.
+            if kind in ("rate_limited", "nonzero_exit") and not cohort_death:
+                # Whatever the worker said ("wall", or a plain nonzero exit), its own
+                # last lines carry the provider's verdict. A 400/401/403/404 is a
+                # REJECTION (dead model id, bad credential): the same answer on every
+                # retry, so it is a failure that counts toward the rejection streak,
+                # never a requeue-without-a-strike (t_d564a8dd: 24 such exits booked
+                # ``rate_limited`` for 8 h) and never generic crash accounting (the
+                # pinned-worker refusal path now exits nonzero on a 4xx on purpose,
+                # ``apply_pin_refusal_to_result``). 429/503/529 stay a wall.
                 from hermes_cli.kanban_worker_exit import provider_rejected_status
 
                 provider_rejected_line = provider_rejected_status(
@@ -2815,6 +2841,37 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _ledger_pr_owner_stale_skips(
+    conn: sqlite3.Connection, task_id: str, owners: list,
+) -> None:
+    """Record ``pr_owner_stale_skipped`` on each owner a heartbeat kept fresh (t_0a9a20ea).
+
+    Once per owner run: the guard runs every tick, and the event is for the
+    operator reading ``kanban tail`` after the fact, not a heartbeat mirror.
+    """
+    from . import kanban_pr_owner as _kpo
+
+    for owner in owners:
+        if owner.get("stale_skipped") != _kpo.STALE_SKIP_REASON:
+            continue
+        run_id = owner.get("run_id")
+        already = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+            "AND run_id IS ? LIMIT 1",
+            (owner["task_id"], _kpo.STALE_SKIP_EVENT, run_id),
+        ).fetchone()
+        if already is not None:
+            continue
+        with _kbc.write_txn(conn):
+            _kb._append_event(
+                conn, owner["task_id"], _kpo.STALE_SKIP_EVENT,
+                {"reason": _kpo.STALE_SKIP_REASON, "pr": owner["pr"],
+                 "waiting": task_id, "last_progress_at": owner.get("last_heartbeat_at"),
+                 "head_committed_at": owner.get("head_committed_at")},
+                run_id=run_id,
+            )
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2921,13 +2978,14 @@ def check_respawn_guard(
             return "overlap_hold"
 
     # 0b. One running card per PR (t_cb70d390). A fresh owner holds the card;
-    #     a stale one (run and PR head both >2 h old) is left in
+    #     a stale one (run, heartbeat and PR head all >2 h old) is left in
     #     ``detail["pr_owner_stale"]`` for the dispatcher to reclaim.
     if lane == "ready":
         from . import kanban_pr_owner as _kpo
 
         owners = _kpo.spawn_owners(conn, task_id, now=now)
         fresh = [o for o in owners if not o["stale"]]
+        _ledger_pr_owner_stale_skips(conn, task_id, fresh)
         if fresh:
             if detail is not None:
                 detail.update(
@@ -3547,12 +3605,26 @@ def dispatch_once(
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
             _kbc._maybe_checkpoint_wal(conn, db_path)
+    # Outside the dispatch lock: stop resources (VM/container/unit) whose card finished
+    # (t_2df204e5). Only the tick that held the lock sweeps, so two dispatchers never double-stop.
+    if held and not dry_run:
+        _release_finished_resources(conn, board)
     # The dispatch lock has been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
+
+
+def _release_finished_resources(conn: sqlite3.Connection, board: Optional[str]) -> None:
+    """Best-effort: a failing sweep is logged and retried next tick, never breaks dispatch."""
+    try:
+        from hermes_cli import kanban_resources
+
+        kanban_resources.release_finished(conn, board=board)
+    except Exception as exc:
+        _kb._log.warning("kanban resource release failed (%s: %s)", type(exc).__name__, exc)
 
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
@@ -3948,13 +4020,17 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         if affinity_out is not None:
             affinity_out[row["id"]] = {"host": _kwp.STUDIO_HOST, "rule": rule,
                                        "matched_by": hit[1] if hit else rule}
+        if rule == _kwp.STUDIO_NEEDS_RULE:
+            # Name what it needs (t_aea826a9): ``studio_affinity:studio_needs(vault,skills_tree)``.
+            return "local", f"studio_affinity:{rule}({','.join(sorted(_kwp.card_needs(row['body'])))})"
         return "local", f"studio_affinity:{rule}"
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
     return "local", (_pr.not_portable(rule) if pin == _kwp.PIN_ANY else None)
 
 
-_STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body"})
+_STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body",
+                                    "studio_needs"})
 
 
 def _manifest_affinity(skills, assignee) -> dict:
@@ -5279,6 +5355,12 @@ def _dispatch_once_locked(
                 _only = _kwp_take.reach_allowed_hosts(
                     body=row["body"], skills=_skills, pool=spillover.config,
                     targets=_manifest_targets(_skills, row_assignee) if _skills else {})
+                # A body naming Studio-only resources lands only on a host
+                # whose caps cover them (t_aea826a9); never widen ``_only``.
+                _need_hosts = _kwp_take.needs_allowed_hosts(row["body"], spillover.config)
+                if _need_hosts is not None:
+                    _only = _need_hosts if _only is None else tuple(
+                        h for h in _only if h.lower() in {n.lower() for n in _need_hosts})
             if _only is None:
                 placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
             else:

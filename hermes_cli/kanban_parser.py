@@ -288,10 +288,19 @@ _SPECS = [
              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
                   "SIGKILLs) the worker and re-queues the task."),
-        _arg("--force", dest="force_reason", metavar="REASON",
-             help="File the card even though a non-archived card with the same title was "
-                  "created in the last 24h (near-duplicate guard). The reason is recorded "
-                  "as a near_duplicate_forced event."),
+        _arg("--force", "--not-a-duplicate", dest="force_reason", metavar="REASON",
+             help="File the card even though the duplicate guard matched: a non-archived "
+                  "card with the same title created in the last 24h, or an OPEN card with "
+                  "a >=0.6 similar title head or the same 'Momus pass N' + spec. The reason "
+                  "is recorded as a near_duplicate_forced event."),
+        _arg("--until", metavar="TS",
+             help="Mint the card parked in 'scheduled' until TS (ISO-8601, epoch, or +<N>[smhd]); "
+                  "the dispatcher wakes it then (todo while parents are open). Use this for a "
+                  "time-gated card instead of a bare blocks edge."),
+        _arg("--i-mean-blocks", action="store_true", dest="i_mean_blocks",
+             help="Mint a blocks-edge card whose text reads time-gated ('after 24 h', "
+                  "'once ... elapsed') without --until: the parent closing really is the "
+                  "gate. Recorded as a time_gate_forced event."),
         _arg("--created-by", default="user", help="Author name recorded on the task (default: user)"),
         _arg("--skill", action="append", default=[], dest="skills",
              help="Skill to force-load into the worker (repeatable). The kanban "
@@ -870,6 +879,29 @@ _SPECS = [
         _TASK_ID,
         _arg("--note", help="Optional short note attached to the heartbeat event"),
     ], help="Emit a heartbeat event for a running task (worker liveness signal)"),
+    _cmd("resource", children=("resource_action", [
+        _cmd("add", [
+            _TASK_ID,
+            _arg("--kind", required=True, choices=("vm", "container", "compose", "gpu-resident"),
+                 help="vm = libvirt domain; container = docker container; compose = compose project; "
+                      "gpu-resident = systemd unit (prefix user: for a --user unit)"),
+            _arg("--id", dest="resource_id", required=True, help="Domain / container / project / unit name"),
+            _arg("--host", required=True, help="SSH alias of the host it runs on (local = this host)"),
+            _arg("--run", dest="run_id", type=int, help="Run id (default: the card's current run)"),
+            _json_flag(),
+        ], help="Record a resource this card's run started (stopped when the card finishes)"),
+        _cmd("list", [_TASK_ID, _json_flag()], help="Resources recorded on every run of a card"),
+        _cmd("check", [_TASK_ID, _json_flag()],
+             help="Exit 1 if a recorded resource is neither stopped nor kept (closeout gate)"),
+        _cmd("mark", [
+            _TASK_ID,
+            _arg("--kind", required=True), _arg("--id", dest="resource_id", required=True),
+            _arg("--host", required=True), _arg("--state", required=True, choices=("stopped", "kept")),
+            _arg("--reason", required=True),
+        ], help="Operator override after a manual stop (or a keep decided after the fact)"),
+        _cmd("release", [_arg("--dry-run", action="store_true"), _json_flag()],
+             help="Run the finished-card stop sweep now (the dispatcher runs it every tick)"),
+    ]), help="Resources (VM / container / GPU unit) bound to a card's lifetime"),
     _cmd("assignees", [_json_flag()],
          help="List known profiles + per-profile task counts (union of ~/.hermes/profiles/ and current assignees on the board)"),
     _cmd("context", [_TASK_ID],
