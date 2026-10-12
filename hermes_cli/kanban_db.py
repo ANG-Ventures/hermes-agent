@@ -2916,7 +2916,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Resources (VM / container / GPU-resident unit) this run started, JSON list of
+    -- {kind, id, host, started_at, state}. The dispatcher stops each one after the card
+    -- is done/archived unless the body carries `keep-alive: <reason>` (kanban_resources).
+    resources           TEXT NOT NULL DEFAULT '[]'
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
