@@ -2706,6 +2706,9 @@ class Event:
     # notifier uses it to skip waking the chat whose own session made the
     # transition (t_a4890a77).
     actor_session_id: Optional[str] = None
+    # Profile that wrote the event (``task_events.actor_profile``); with the
+    # session id, what the redundancy filter (kanban_notify_suppress) keys on.
+    actor_profile: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Event":
@@ -2714,6 +2717,7 @@ class Event:
             id=row["id"], task_id=row["task_id"], kind=_lossy_text(row["kind"]),
             payload=_json_or(_lossy_text(row["payload"])), created_at=row["created_at"], run_id=_opt_int(run_id),
             actor_session_id=_row_get(row, "actor_session_id"),
+            actor_profile=_row_get(row, "actor_profile"),
         )
 
 # ---------------------------------------------------------------------------

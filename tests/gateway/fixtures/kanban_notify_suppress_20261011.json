@@ -1,0 +1,201 @@
+{
+ "home_session_id": "20261008_184838_dbe0955f",
+ "operator_profile": "default",
+ "note": "real task_events rows from 2026-10-11 (board default); the five completed rows woke the home chat as echoes",
+ "events": [
+  {
+   "id": 622453,
+   "task_id": "t_e2f7e780",
+   "kind": "review_requested",
+   "payload": {
+    "summary": "Bambuddy is now the spool source of truth. The Low-Filament chain is live up to the gateway, and three PRs are open. Two acceptance items are not yet proven liv",
+    "implementer": "daedalus",
+    "reviewer": "human"
+   },
+   "created_at": 1791759273,
+   "run_id": 23705,
+   "actor_profile": "daedalus",
+   "actor_session_id": "20261011_135809_2af3cc"
+  },
+  {
+   "id": 622460,
+   "task_id": "t_9eeb9c40",
+   "kind": "changes_requested",
+   "payload": {
+    "reason": "Two real Prism P1s, both small: #1892 unnamed host-bound fallback drops manifest targets (routing hole for the exact cla",
+    "implementer": "daedalus-opus",
+    "reviewer": "human:apollo"
+   },
+   "created_at": 1791759283,
+   "run_id": 23784,
+   "actor_profile": "default",
+   "actor_session_id": "20261008_184838_dbe0955f"
+  },
+  {
+   "id": 622950,
+   "task_id": "t_e2f7e780",
+   "kind": "completed",
+   "payload": {
+    "result_len": 313,
+    "summary": "Bambuddy is the spool source of truth (12 spools incl. 3 in-transit with order ids; spools 3/4 double-count corrected; weight_locked). Low-Filament chain PROVEN"
+   },
+   "created_at": 1791760828,
+   "run_id": 23807,
+   "actor_profile": "default",
+   "actor_session_id": "20261008_184838_dbe0955f"
+  },
+  {
+   "id": 623034,
+   "task_id": "t_04db7488",
+   "kind": "review_requested",
+   "payload": {
+    "summary": "auto-routed: PR ANG-Ventures/obsidian-vault#72 still open",
+    "implementer": "daedalus-opus",
+    "reviewer": "human:apollo"
+   },
+   "created_at": 1791761157,
+   "run_id": 23768,
+   "actor_profile": "daedalus-opus",
+   "actor_session_id": "20261011_153550_08aa94"
+  },
+  {
+   "id": 623122,
+   "task_id": "t_9eeb9c40",
+   "kind": "completed",
+   "payload": {
+    "result_len": 310,
+    "summary": "Option A (precise): manifest host_affinity:<host> = work TARGETS that host, routed through reach_allowed_hosts; never a pin (kanbanw@ace-ai cannot see GPUs unde"
+   },
+   "created_at": 1791761639,
+   "run_id": 23813,
+   "actor_profile": "default",
+   "actor_session_id": "20261008_184838_dbe0955f"
+  },
+  {
+   "id": 623162,
+   "task_id": "t_04db7488",
+   "kind": "completed",
+   "payload": {
+    "result_len": 0,
+    "summary": "Apollo merge pass (review-card closer, board default): ANG-Ventures/obsidian-vault#72 landed on main, merge commit 8d06861f5 (REST merged=true); no hermes-home "
+   },
+   "created_at": 1791761778,
+   "run_id": 23816,
+   "actor_profile": null,
+   "actor_session_id": null
+  },
+  {
+   "id": 623253,
+   "task_id": "t_dbb4cdd9",
+   "kind": "review_requested",
+   "payload": {
+    "summary": "auto-routed: PR ANG-Ventures/hermes-home#3731 still open",
+    "implementer": "daedalus-opus",
+    "reviewer": "human:apollo"
+   },
+   "created_at": 1791762084,
+   "run_id": 23783,
+   "actor_profile": "daedalus-opus",
+   "actor_session_id": "20261011_155337_05c1e9"
+  },
+  {
+   "id": 623690,
+   "task_id": "t_dbb4cdd9",
+   "kind": "completed",
+   "payload": {
+    "result_len": 95,
+    "summary": "Apollo merge pass (review-card closer, board default): ANG-Ventures/hermes-home#3731 landed on main, merge commit 7fe9f407e (REST merged=true); ANG-Ventures/her"
+   },
+   "created_at": 1791763127,
+   "run_id": 23834,
+   "actor_profile": null,
+   "actor_session_id": null
+  },
+  {
+   "id": 624370,
+   "task_id": "t_be8a8915",
+   "kind": "block_loop_detected",
+   "payload": {
+    "reason": "Acceptance (a) passed on duct #2: Safe badge with frames rising 21\u2192129, and the First Layer Complete photo posted to #lo",
+    "kind": "needs_input"
+   },
+   "created_at": 1791764690,
+   "run_id": 23847,
+   "actor_profile": "daedalus-opus",
+   "actor_session_id": "20261011_170106_1e0a96"
+  },
+  {
+   "id": 625564,
+   "task_id": "t_26bd186f",
+   "kind": "completed",
+   "payload": {
+    "result_len": 34,
+    "summary": "survivor=none follow-up=t_2ee29c89"
+   },
+   "created_at": 1791768638,
+   "run_id": 23916,
+   "actor_profile": "default",
+   "actor_session_id": "20261008_184838_dbe0955f"
+  }
+ ],
+ "review_coverage_comments": {
+  "t_04db7488": [
+   {
+    "author": "land-autopilot",
+    "created_at": 1791761451,
+    "body": "review_coverage: {\"verdict\": \"APPROVE\", \"reviewer\": \"apollo\", \"by\": \"apollo/land-autopilot\", \"head_sha\": \"e96f1814e4f6f4a5139f672de995423a6374ae89\"}"
+   }
+  ],
+  "t_dbb4cdd9": [
+   {
+    "author": "default",
+    "created_at": 1791762296,
+    "body": "review_coverage: {\"verdict\": \"APPROVE\", \"reviewer\": \"apollo\", \"head_sha\": \"c47d704dba261852c6e9130b6cf481a386ee34c9\"}"
+   },
+   {
+    "author": "default",
+    "created_at": 1791759157,
+    "body": "review_coverage: {\"verdict\": \"CHANGES_REQUESTED\", \"head_sha\": \"82731261d946e888df7445cbeb8d158292ec687f\"}"
+   },
+   {
+    "author": "default",
+    "created_at": 1791756978,
+    "body": "review_coverage: {\"verdict\": \"CHANGES_REQUESTED\", \"head_sha\": \"4f3675063f1fa2de364c6a9e0d4700b3261a522d\"}"
+   }
+  ],
+  "t_e2f7e780": [
+   {
+    "author": "default",
+    "created_at": 1791760092,
+    "body": "review_coverage: {\"verdict\": \"APPROVE\", \"reviewer\": \"apollo\", \"head_sha\": \"c0893501f9cc49a377367408296e1b64430228fc\"}"
+   },
+   {
+    "author": "default",
+    "created_at": 1791760090,
+    "body": "review_coverage: {\"verdict\": \"APPROVE\", \"reviewer\": \"apollo\", \"head_sha\": \"a50aba4930af6f1fa995c699770bb7a0351b36db\"}"
+   },
+   {
+    "author": "default",
+    "created_at": 1791759502,
+    "body": "review_coverage: {\"verdict\": \"APPROVE\", \"reviewer\": \"apollo\", \"head_sha\": \"efd2c16342d543bb20840ea37241d185fc5d2851\"}"
+   }
+  ],
+  "t_9eeb9c40": [
+   {
+    "author": "default",
+    "created_at": 1791761076,
+    "body": "review_coverage: {\"verdict\": \"APPROVE\", \"reviewer\": \"apollo\", \"head_sha\": \"b4b3c52049339c8b0eb571806d263090da8856b6\"}"
+   },
+   {
+    "author": "default",
+    "created_at": 1791761074,
+    "body": "review_coverage: {\"verdict\": \"APPROVE\", \"reviewer\": \"apollo\", \"head_sha\": \"3e555c448b2c43d65801322fffcbcaa54d874eb1\"}"
+   },
+   {
+    "author": "default",
+    "created_at": 1791759283,
+    "body": "review_coverage: {\"verdict\": \"CHANGES_REQUESTED\", \"head_sha\": \"3ff98ab376f7ed3ff265d24c14a2a2feace65a43\"}"
+   }
+  ]
+ }
+}
