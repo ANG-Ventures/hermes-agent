@@ -29,6 +29,7 @@ from gateway.session import AsyncSessionStore, SessionSource, build_session_key
 from gateway.session_transcript import TranscriptReadError
 from gateway.slash_commands_goals import GatewayGoalCommandsMixin
 from gateway.slash_commands_model import GatewayModelCommandsMixin, _model_switch_skew_guard
+from gateway.slash_commands_branch_thread import merge_delta_rows
 from gateway.slash_commands_session import (
     _RESET_CLEANUP_TIMEOUT_S,
     _reset_process_scoped_tool_state,
@@ -4582,7 +4583,9 @@ class GatewaySlashCommandsMixin(
             # The delta is authoritative once we have a valid branch point: even
             # branch_point_len == len(source_history) (zero new turns) must yield
             # an EMPTY delta → no_new_turns, NOT a re-summary of the whole copy.
-            summarize_history = source_history[branch_point_len:]
+            # The fork notice sits right after the branch point (t_424dcfb5); it is
+            # bookkeeping, not exploration, so it never counts as a new turn.
+            summarize_history = merge_delta_rows(source_history[branch_point_len:])
             if not summarize_history:
                 return t("gateway.merge.no_new_turns")
         if not summarize_history:
