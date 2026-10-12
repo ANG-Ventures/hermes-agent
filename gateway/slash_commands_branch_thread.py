@@ -9,6 +9,7 @@ always branch in place. Pure helpers only — the handler lives in ``slash_comma
 from __future__ import annotations
 
 import dataclasses
+import re
 from typing import Optional
 
 from gateway.config import Platform
@@ -54,6 +55,21 @@ def parse_branch_args(raw: str) -> tuple[bool, str]:
 
 
 FORK_NOTICE_PREFIX = "[Forked session]"
+_FORK_NOTICE_TEMPLATE = (
+    "{prefix} This session was forked from {parent} at row {row} ({where}). The parent session "
+    "continues the work that was in progress above; do NOT resume it here. Take new direction "
+    "from the user in this thread."
+)
+# The COMPLETE notice, anchored at the start of a user row; a human prompt that merely starts
+# with "[Forked session]" does not match and is never stripped (Prism P1 e8e07ff8b118).
+_FORK_NOTICE_RE = re.compile(
+    "^" + re.escape(_FORK_NOTICE_TEMPLATE).replace(
+        re.escape("{prefix}"), re.escape(FORK_NOTICE_PREFIX)).replace(
+        re.escape("{parent}"), r"\S+").replace(
+        re.escape("{row}"), r"\d+").replace(
+        re.escape("{where}"), r"[^()\n]*")
+    + r"(?:\n\n|$)"
+)
 
 
 def fork_notice_content(*, parent_session_id: str, row_count: int, platform: Optional[Platform],
@@ -63,11 +79,8 @@ def fork_notice_content(*, parent_session_id: str, row_count: int, platform: Opt
     :func:`merge_delta_rows` splits on)."""
     where = f"{platform.value} {parent_ref}" if platform and parent_ref else (
         platform.value if platform else "gateway")
-    return (
-        f"{FORK_NOTICE_PREFIX} This session was forked from {parent_session_id} at row {row_count} "
-        f"({where}). The parent session continues the work that was in progress above; do NOT "
-        "resume it here. Take new direction from the user in this thread."
-    )
+    return _FORK_NOTICE_TEMPLATE.format(prefix=FORK_NOTICE_PREFIX, parent=parent_session_id,
+                                        row=row_count, where=where)
 
 
 def fork_notice_row(content: str) -> dict:
@@ -84,7 +97,8 @@ def merge_delta_rows(rows: list) -> list:
 
     A standalone notice row is dropped. The live-replay read repairs ``user;user`` alternation by
     folding the notice into the next human turn (``notice + "\\n\\n" + prompt``, display_kind
-    dropped), so a user row that still starts with the notice keeps only the human part.
+    dropped), so a user row that starts with the COMPLETE generated notice keeps only the human
+    part. Anything else, including a human prompt that merely begins with the prefix, is kept.
     """
     out = []
     for m in rows:
@@ -92,10 +106,12 @@ def merge_delta_rows(rows: list) -> list:
             continue
         content = m.get("content") if isinstance(m, dict) else None
         if m.get("role") == "user" and isinstance(content, str) and content.startswith(FORK_NOTICE_PREFIX):
-            _notice, _sep, rest = content.partition("\n\n")
-            if not rest.strip():
-                continue
-            m = {**m, "content": rest}
+            match = _FORK_NOTICE_RE.match(content)
+            if match is not None:
+                rest = content[match.end():]
+                if not rest.strip():
+                    continue
+                m = {**m, "content": rest}
         out.append(m)
     return out
 

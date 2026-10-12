@@ -110,6 +110,26 @@ def test_parse_branch_flags_leading_only():
     assert parse_branch_flags("") == (False, False, "")
 
 
+def test_merge_delta_rows_strips_only_the_complete_notice():
+    """Prism P1 e8e07ff8b118: a human prompt that merely starts with the prefix is kept whole."""
+    from gateway.slash_commands_branch_thread import merge_delta_rows
+
+    notice = fork_notice_content(parent_session_id="p_1", row_count=2, platform=Platform.DISCORD, parent_ref="123")
+    rows = [
+        {"role": "user", "content": notice + "\n\nNEW q"},                        # repair-folded
+        {"role": "user", "content": notice},                                      # display_kind lost
+        {"role": "user", "content": "[Forked session] Please compare the two approaches."},
+        {"role": "user", "content": "[Forked session] first para\n\nsecond"},
+        {"role": "assistant", "content": notice},
+    ]
+    assert [m["content"] for m in merge_delta_rows(rows)] == [
+        "NEW q",
+        "[Forked session] Please compare the two approaches.",
+        "[Forked session] first para\n\nsecond",
+        notice,
+    ]
+
+
 # ----------------------------------------------------------------------------- (a) notice row
 
 @pytest.mark.asyncio
