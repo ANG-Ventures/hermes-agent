@@ -107,8 +107,10 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # force=True) as the only cover, while this hard block — documented as
     # "force=True cannot help here" — let them through (#80260).
     r"|(?:launchctl\s+(?:kickstart|unload|load|stop|restart|submit|bootstrap|bootout|remove|disable)\b[^\n]*\bhermes[.\-]?gateway)"
-    # Branch C: systemctl ops on a hermes-gateway unit.
-    r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
+    # Branch C: systemctl ops on a hermes-gateway unit. `disable` sits beside
+    # `stop` for the same reason it does in Branch B: `disable --now` IS a stop,
+    # and a bare `disable` is what makes one durable across boots (t_4fded0bd).
+    r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start|disable)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch D: pkill / kill targeting the hermes gateway process. Both
     # token orders because real reproductions show both.
     #   - LEADING \b on the command so `skill`/`skills` can't match the bare
@@ -823,8 +825,9 @@ def _match_is_sibling_exemptable(matched: str) -> bool:
     return True
 
 
-def contains_gateway_lifecycle_command(text: str) -> bool:
-    """Return True if *text* contains a gateway lifecycle command pattern.
+def describe_gateway_lifecycle_command(text: str) -> Optional[str]:
+    """Return a one-line description of the FIRST gateway lifecycle command in *text* (which token,
+    at which position tripped the guard), or ``None`` when there is none.
 
     Matches that are ssh-wrapped to a remote (non-loopback) host are
     exempt — restarting a *different* machine's gateway is legitimate fleet
@@ -852,7 +855,7 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     fix automatically.
     """
     if not text:
-        return False
+        return None
     # Heredoc bodies that are provably inert data (quoted delimiter, data-sink
     # consumer like `cat > file <<'EOF'`) are masked before scanning (#88336):
     # a runbook line "a human can run: hermes gateway restart" inside such a
@@ -884,7 +887,7 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
             normalized
         ):
             continue
-        return True
+        return _describe_hit(normalized, match.start(), matched)
     # Profile-flag form (#78028): `hermes -p <profile> gateway restart|stop`
     # bypasses Branch A because the selector sits between `hermes` and
     # `gateway`. It is only the same foot-gun when the named profile IS the
@@ -899,7 +902,7 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
             # `-p 'zeus'` compares equal to the bare name.
             named = named.strip().strip("\"'")
             if _named_profile_is_current(named):
-                return True
+                return _describe_hit(normalized, profile_match.start(), profile_match.group(0))
     # Token-aware second pass (#80269): re-run the pattern on shell-tokenized
     # segments where quotes/escapes are resolved, closing splice bypasses
     # like `kick"start"`. Runs after the profile-flag check so both passes
@@ -942,7 +945,7 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
                 _seg_match.group(0)
             ) and _lifecycle_targets_only_sibling_gateways(joined):
                 continue
-            return True
+            return f"`{_seg_match.group(0).strip()}` at command position (tokenized segment `{joined[:80]}`)"
     # Order-independent launchctl pass (#77083): a shell loop can build the
     # gateway label from a variable defined in an earlier `;`-separated
     # segment (`label=${item%%:*}; launchctl bootout "gui/$uid/$label"`), so
@@ -977,9 +980,23 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
         # lifecycle segment is not (it could expand to our own label).
         if _lifecycle_targets_only_sibling_gateways(_line):
             continue
-        return True
+        return f"`{_line.strip()[:120]}` (launchctl verb and a gateway label on one line)"
     # Branch E (#113667): killers aimed at the interpreter image itself carry no hermes/gateway token.
-    return contains_host_interpreter_kill(normalized)
+    if contains_host_interpreter_kill(normalized):
+        return "a process killer aimed at the interpreter image hosting this gateway"
+    return None
+
+
+def _describe_hit(text: str, start: int, matched: str) -> str:
+    """Name the tripping token and where it sits (line/column in the command text)."""
+    line_no = text.count("\n", 0, start) + 1
+    col = start - (text.rfind("\n", 0, start) + 1) + 1
+    return f"`{matched.strip()[:120]}` at line {line_no}, column {col}"
+
+
+def contains_gateway_lifecycle_command(text: str) -> bool:
+    """Boolean form of :func:`describe_gateway_lifecycle_command`."""
+    return describe_gateway_lifecycle_command(text) is not None
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
@@ -1143,7 +1160,7 @@ class _LifecycleScanBudget:
     cloud placeholder) so the caller can tell the model the real reason (#113944)."""
 
     __slots__ = ("bytes_remaining", "lines_remaining", "paths_remaining", "remote_reads_remaining",
-                 "refusal")
+                 "refusal", "hit")
 
     def __init__(self) -> None:
         # Read the module constants at construction so tests/operators can lower them at runtime.
@@ -1152,6 +1169,10 @@ class _LifecycleScanBudget:
         self.paths_remaining = _MAX_LIFECYCLE_SCAN_PATHS
         self.remote_reads_remaining = _MAX_LIFECYCLE_SCAN_REMOTE_READS
         self.refusal: Optional[str] = None
+        # Which token tripped the guard, and where (the FIRST lifecycle hit the walk saw), so the
+        # refusal can be diagnosed in one read (card t_4fded0bd: three false positives in one night
+        # were only traceable by bisecting the command text).
+        self.hit: Optional[str] = None
 
     def charge_text(self, text: str) -> bool:
         """Charge *text* before tokenization; False when it does not fit."""
@@ -1809,6 +1830,111 @@ def _mask_data_sink_arguments(text: str) -> str:
     return "\n".join(lines_out)
 
 
+# Commands that RE-PARSE a quoted argument as shell/program source. A quoted
+# multi-word argument to anything else reaches the program as ONE argv element
+# (`hermes kanban create --body "launchctl bootout …"` hands the kanban CLI a
+# string; nothing executes it), so the lifecycle words inside it are data.
+# Over-inclusive on purpose: an unknown re-parser here is a bypass, an extra
+# entry only keeps a quoted argument visible to the raw regex.
+_ARGUMENT_REPARSERS = frozenset({
+    "sh", "bash", "dash", "ksh", "zsh", "fish", "eval", "exec", "xargs", "parallel",
+    "ssh", "autossh", "su", "runuser", "python", "python2", "python3", "pythonw",
+    "perl", "ruby", "node", "deno", "bun", "php", "osascript", "awk", "gawk", "mawk",
+    "nawk", "sed", "tmux", "screen", "expect", "script", "at", "batch", "watch", "entr",
+    "find", "fd", "make", "cmd", "cmd.exe", "powershell", "pwsh",
+})
+_REPARSER_NAME_RE = re.compile(r"^(?:python|pythonw|perl|ruby|node|php)[\d.]*(?:\.exe)?$", re.IGNORECASE)
+# Wrappers that only re-parse with a specific option: `env -S "…"`, `sudo -i|-s "…"`.
+_REPARSER_OPTION_TOKENS = frozenset({"-S", "--split-string", "-i", "-s", "--login", "--shell"})
+_ARG_SEGMENT_SEPARATORS = frozenset(";&|\n(`")
+
+
+def _segment_command_reparses(prefix: str) -> Optional[bool]:
+    """Whether the command the quoted argument belongs to re-parses it. ``None`` when the
+    quoted span is itself at command position (no command word before it)."""
+    try:
+        tokens = shlex.split(prefix, posix=True)
+    except ValueError:
+        tokens = prefix.split()
+    tokens = [t for t in tokens if t and not (set(t) <= _CONTROL_CHARS)]
+    if not tokens:
+        return None
+    # A Python argv list (`subprocess.run(["kill", "…"])`) reaches this scan as shell-shaped text
+    # whose "command" is list punctuation; its elements are argv the OS will see, never data.
+    if any("[" in t or t.endswith(",") for t in tokens):
+        return None
+    for token in tokens:
+        name = _executable_name(token).lower()
+        if name in _ARGUMENT_REPARSERS or _REPARSER_NAME_RE.match(name):
+            return True
+        if token in _REPARSER_OPTION_TOKENS:
+            return True
+    return False
+
+
+def _mask_quoted_argument_data(text: str) -> str:
+    """Blank quoted ARGUMENT values that the shell hands over as one word.
+
+    Three false positives in one night (card t_4fded0bd) were lifecycle words
+    inside a `--body`/`--reason`/`--coverage` value: the guard read the whole
+    tool-call text, not the command position. A single- or double-quoted span
+    containing whitespace is masked when (1) it is an ARGUMENT (a command word
+    precedes it in its segment), (2) that segment's command is not a known
+    re-parser (`bash -c`, `ssh`, `xargs`, `python -c`, …), and (3) a
+    double-quoted span carries no command substitution (`$(` / backtick DO run
+    inside double quotes -- the 2026-10-04 `--handoff` incident). Everything
+    else is left exactly as written, so this view can only ever ALLOW.
+    """
+    if "'" not in text and '"' not in text:
+        return text
+    out: list[str] = []
+    i, n = 0, len(text)
+    seg_start = 0
+    changed = False
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if ch in _ARG_SEGMENT_SEPARATORS:
+            out.append(ch)
+            i += 1
+            seg_start = i
+            continue
+        if text.startswith("$(", i):
+            out.append("$(")
+            i += 2
+            seg_start = i
+            continue
+        if ch in _OPENING_QUOTES:
+            end = i + 1
+            while end < n:
+                if ch == '"' and text[end] == "\\":
+                    end += 2
+                    continue
+                if text[end] == ch:
+                    break
+                end += 1
+            if end >= n:  # unterminated: leave the tail alone
+                out.append(text[i:])
+                break
+            inner = text[i + 1:end]
+            multi_word = any(c.isspace() for c in inner)
+            expands = ch == '"' and ("$(" in inner or "`" in inner)
+            reparses = _segment_command_reparses(text[seg_start:i]) if multi_word else None
+            if multi_word and not expands and reparses is False:
+                out.append(ch + "quoted-argument" + ch)
+                changed = True
+            else:
+                out.append(text[i:end + 1])
+            i = end + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out) if changed else text
+
+
 def _mask_heredoc_bodies(text: str) -> str:
     """Replace HEREDOC BODY lines with a neutral placeholder, fail-closed.
 
@@ -1883,26 +2009,39 @@ def _mask_heredoc_bodies(text: str) -> str:
     return "\n".join(out)
 
 
-def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
-    """Lifecycle-regex scan that exempts matches living inside data arguments.
+def _describe_lifecycle_command_with_data_exemption(text: str) -> Optional[str]:
+    """Lifecycle-regex scan that exempts matches living inside data arguments; names the hit.
 
     Two-pass: the cheap regex first (the overwhelmingly common no-match case
     pays nothing extra); on a raw match, re-scan with data-sink arguments and
     heredoc bodies masked out. Only a match that survives masking — i.e. one in
     actual command position — blocks.
     """
-    if not contains_gateway_lifecycle_command(text):
-        return False
+    if describe_gateway_lifecycle_command(text) is None:
+        return None
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    masked = _mask_data_sink_arguments(_mask_heredoc_bodies(normalized))
-    return contains_gateway_lifecycle_command(masked)
+    masked = _mask_data_sink_arguments(
+        _mask_heredoc_bodies(_mask_quoted_argument_data(normalized))
+    )
+    return describe_gateway_lifecycle_command(masked)
+
+
+def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
+    return _describe_lifecycle_command_with_data_exemption(text) is not None
+
+
+def _describe_direct_lifecycle_scan(command: str) -> Optional[str]:
+    """Pure-string direct scans: lifecycle regex (data-exempted) + submit. Names the hit."""
+    hit = _describe_lifecycle_command_with_data_exemption(command)
+    if hit is not None:
+        return hit
+    if contains_launchctl_submit_command(command):
+        return "`launchctl submit|bootstrap` at command position"
+    return None
 
 
 def _direct_lifecycle_scan(command: str) -> bool:
-    """Pure-string direct scans: lifecycle regex (data-exempted) + submit."""
-    return _lifecycle_command_scan_with_data_exemption(
-        command
-    ) or contains_launchctl_submit_command(command)
+    return _describe_direct_lifecycle_scan(command) is not None
 
 
 def _expand_candidate_path(candidate: str) -> Optional[Path]:
@@ -2373,7 +2512,7 @@ def _sanitize_remote_script_text(
 _MASK_SAFE_NODE_TYPES = (
     ast.Module, ast.Import, ast.ImportFrom, ast.alias,
     ast.Assign, ast.AugAssign, ast.Expr, ast.For, ast.If, ast.Try,
-    ast.ExceptHandler, ast.Continue, ast.Break, ast.Pass,
+    ast.ExceptHandler, ast.Continue, ast.Break, ast.Pass, ast.With, ast.withitem,
     ast.Name, ast.Load, ast.Store, ast.Constant, ast.Attribute,
     ast.Subscript, ast.Slice, ast.Call, ast.keyword,
     ast.List, ast.Tuple, ast.Dict, ast.Set,
@@ -2450,6 +2589,16 @@ def _python_body_is_mask_safe(tree: ast.AST) -> bool:
             imported.add("Path")
         elif isinstance(node, ast.ExceptHandler) and node.name is not None:
             bound.add(node.name)
+        elif isinstance(node, ast.With):
+            # `with open(<literal>) as f:` only: `__enter__` on a file handle returns the handle.
+            # Any other context expression could run arbitrary enter/exit code.
+            for item in node.items:
+                ctx = item.context_expr
+                if not (isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Name)
+                        and ctx.func.id == "open"):
+                    return False
+                if item.optional_vars is not None and not isinstance(item.optional_vars, ast.Name):
+                    return False
         elif isinstance(node, ast.Name):
             if _is_dunder(node.id) or node.id in _MASK_FORBIDDEN_NAMES:
                 return False
@@ -2544,6 +2693,50 @@ def _python_body_is_mask_safe(tree: ast.AST) -> bool:
     return True
 
 
+def _mask_python_data_strings(body: str) -> str:
+    """In a mask-safe Python body (see ``_python_body_is_mask_safe``), replace every string
+    constant with ``"data"`` EXCEPT the elements of a ``subprocess.run([...])`` argv list.
+
+    A mask-safe body cannot reach a callable, so a string there is only ever printed, sliced,
+    searched or written -- `print("systemctl --user disable --now x")` is prose. The argv list is
+    the one allowlisted execution path and stays visible to the lifecycle scan. Anything the
+    allowlist refuses keeps the whole body visible (fail closed).
+    """
+    if not body.isascii():
+        return body
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return body
+    if not _python_body_is_mask_safe(tree):
+        return body
+    lines = body.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    executed: set[int] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and (node.func.value.id, node.func.attr) == ("subprocess", "run")
+                and node.args and isinstance(node.args[0], (ast.List, ast.Tuple))):
+            executed.update(id(item) for item in node.args[0].elts)
+    skip: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.JoinedStr, ast.FormattedValue)):
+            skip.update(id(child) for child in ast.walk(node))
+    spans = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and id(node) not in executed and id(node) not in skip
+                and node.end_lineno is not None and node.end_col_offset is not None):
+            spans.append((offsets[node.lineno - 1] + node.col_offset,
+                          offsets[node.end_lineno - 1] + node.end_col_offset))
+    for start, end in sorted(spans, reverse=True):
+        body = body[:start] + '"data"' + body[end:]
+    return body
+
+
 def _mask_read_only_python_paths(body: str) -> str:
     """Exclude literal paths read as diagnostic data, never executable input.
 
@@ -2569,108 +2762,29 @@ def _mask_read_only_python_paths(body: str) -> str:
     offsets = [0]
     for line in lines:
         offsets.append(offsets[-1] + len(line))
-    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-    def only_binding(name: str, predicate) -> bool:
-        writes = [n for n in ast.walk(tree) if isinstance(n, ast.Name)
-                  and n.id == name and isinstance(n.ctx, (ast.Store, ast.Del))]
-        return len(writes) == 1 and isinstance(writes[0].ctx, ast.Store) and predicate(parents.get(writes[0]))
-
-    open_shadowed = any(
-        (isinstance(other, ast.Name) and other.id == "open" and isinstance(other.ctx, ast.Store))
-        or (isinstance(other, (ast.FunctionDef, ast.ClassDef)) and other.name == "open")
-        or (isinstance(other, ast.arg) and other.arg == "open")
-        or (isinstance(other, (ast.Import, ast.ImportFrom)) and any(
-            alias.asname == "open" or alias.name == "open" for alias in other.names
-        )) for other in ast.walk(tree)
-    )
+    # Inside a mask-safe body every value is built-in data (see the allowlist
+    # note above): no callable can be reached or rebound, `subprocess.run` only
+    # takes a constant argv, and callback keywords are constants. So a file
+    # opened by a literal path can only ever be READ -- sliced, searched,
+    # printed -- never executed. Mask EVERY literal `open(...)` / `Path(...)`
+    # operand, not only the `reversed(open(..).read().splitlines())` loop and
+    # `print(Path(..).read_text())` shapes the first version recognised: on
+    # 2026-10-12 `spec = open(p).read(); print(spec[i:j])` (printing a slice
+    # of a vault spec that names a gateway unit) was blocked because its path
+    # kept the referenced-script scan, which then judged the DOCUMENT as a
+    # script (card t_4fded0bd).
     spans = []
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == "open" and len(node.args) == 1
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in {"open", "Path"} and node.args
                 and isinstance(node.args[0], ast.Constant)
                 and isinstance(node.args[0].value, str)
-                and not open_shadowed):
-            read_attr = parents.get(node)
-            read_call = parents.get(read_attr) if read_attr is not None else None
-            split_attr = parents.get(read_call) if read_call is not None else None
-            split_call = parents.get(split_attr) if split_attr is not None else None
-            reverse_call = parents.get(split_call) if split_call is not None else None
-            loop = parents.get(reverse_call) if reverse_call is not None else None
-            parsers = {
-                target.id
-                for statement in loop.body for assignment in ast.walk(statement)
-                if isinstance(loop, ast.For) and isinstance(assignment, ast.Assign)
-                and isinstance(assignment.value, ast.Call)
-                and isinstance(assignment.value.func, ast.Attribute)
-                and isinstance(assignment.value.func.value, ast.Name)
-                and (assignment.value.func.value.id, assignment.value.func.attr) == ("json", "loads")
-                for target in assignment.targets if isinstance(target, ast.Name)
-            } if isinstance(loop, ast.For) else set()
-            parser = next(iter(parsers)) if len(parsers) == 1 else None
-            parser_safe = parser is not None and isinstance(loop, ast.For) and isinstance(loop.target, ast.Name) and only_binding(
-                parser,
-                lambda a: isinstance(a, ast.Assign) and isinstance(a.value, ast.Call)
-                and isinstance(a.value.func, ast.Attribute)
-                and isinstance(a.value.func.value, ast.Name)
-                and (a.value.func.value.id, a.value.func.attr) == ("json", "loads")
-                and len(a.targets) == 1 and len(a.value.args) == 1 and isinstance(a.value.args[0], ast.Name)
-                and a.value.args[0].id == loop.target.id and not a.value.keywords
-            )
-            methods = {(c.func.value.id, c.func.attr) for stmt in loop.body
-                       for c in ast.walk(stmt) if isinstance(c, ast.Call)
-                       and isinstance(c.func, ast.Attribute)
-                       and isinstance(c.func.value, ast.Name)} if isinstance(loop, ast.For) else set()
-            containers_safe = all(
-                only_binding(name, lambda a: isinstance(a, ast.Assign) and (
-                    isinstance(a.value, ast.List) and not a.value.elts if name == "out" else
-                    isinstance(a.value, ast.Call) and isinstance(a.value.func, ast.Name)
-                    and a.value.func.id == "set" and not a.value.args and not a.value.keywords
-                )) for name, method in (("seen", "add"), ("out", "append"))
-                if (name, method) in methods
-            )
-            if (isinstance(read_attr, ast.Attribute) and read_attr.attr == "read"
-                    and isinstance(read_call, ast.Call) and not read_call.args and not read_call.keywords
-                    and isinstance(split_attr, ast.Attribute) and split_attr.attr == "splitlines"
-                    and isinstance(split_call, ast.Call) and not split_call.args and not split_call.keywords
-                    and isinstance(reverse_call, ast.Call) and isinstance(reverse_call.func, ast.Name)
-                    and reverse_call.func.id == "reversed" and reverse_call.args == [split_call]
-                    and isinstance(loop, ast.For) and loop.iter is reverse_call
-                    and node.end_lineno is not None and node.end_col_offset is not None
-                    and parser_safe and containers_safe
-                    and all(
-                        isinstance(call.func, ast.Name) and call.func.id in {"len", "print"}
-                        or isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
-                        and (call.func.value.id, call.func.attr) in {
-                            ("json", "loads"), (parser, "get"),
-                            ("seen", "add"), ("out", "append")
-                        }
-                        or isinstance(call.func, ast.Attribute) and call.func.attr == "lower"
-                        and isinstance(call.func.value, ast.Subscript)
-                        and isinstance(call.func.value.value, ast.Name)
-                        and call.func.value.value.id in parsers
-                        for statement in loop.body for call in ast.walk(statement)
-                        if isinstance(call, ast.Call)
-                    )):
-                spans.append((offsets[node.lineno - 1] + node.col_offset,
-                              offsets[node.end_lineno - 1] + node.end_col_offset))
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                and node.end_lineno is not None and node.end_col_offset is not None):
             continue
-        if node.func.attr not in {"read_text", "read_bytes"}:
+        if node.func.id == "Path" and not has_path:
             continue
-        parent = parents.get(node)
-        if not has_path or not (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
-                and parent.func.id == "print"):
-            continue
-        path_call = node.func.value
-        if not (isinstance(path_call, ast.Call) and isinstance(path_call.func, ast.Name)
-                and path_call.func.id == "Path" and len(path_call.args) == 1
-                and isinstance(path_call.args[0], ast.Constant)
-                and isinstance(path_call.args[0].value, str)
-                and path_call.end_lineno is not None and path_call.end_col_offset is not None):
-            continue
-        start = offsets[path_call.lineno - 1] + path_call.col_offset
-        end = offsets[path_call.end_lineno - 1] + path_call.end_col_offset
-        spans.append((start, end))
+        spans.append((offsets[node.lineno - 1] + node.col_offset,
+                      offsets[node.end_lineno - 1] + node.end_col_offset))
     for start, end in sorted(spans, reverse=True):
         body = body[:start] + "read_only_path" + body[end:]
     return body
@@ -2692,7 +2806,9 @@ def _contains_unsafe_gateway_action(
     # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
     if not budget.charge_text(command):
         return _budget_exhausted(budget, "text", depth) if executed else False
-    if _direct_lifecycle_scan(command):
+    hit = _describe_direct_lifecycle_scan(command)
+    if hit is not None:
+        budget.hit = budget.hit or hit + ("" if depth == 0 else f" (in a referenced script, depth {depth})")
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return executed
@@ -2718,7 +2834,9 @@ def _contains_unsafe_gateway_action(
     # its path strings from the shell's referenced-script walk.
     python_bodies = inert_python_heredoc_bodies(command, semicolon_chain=True)
     for body in python_bodies:
-        if _direct_lifecycle_scan(body):
+        hit = _describe_direct_lifecycle_scan(_mask_python_data_strings(body))
+        if hit is not None:
+            budget.hit = budget.hit or hit + " (inside a python heredoc body)"
             return True
     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
     # path or `sh -c` payload inside a provably-inert heredoc body is never shell-executed, and an
@@ -2822,7 +2940,8 @@ def scan_gateway_lifecycle(
 ) -> tuple[bool, Optional[str]]:
     """``(unsafe, refusal)``: *refusal* names a non-lifecycle reason the walk failed closed (budget,
     size, device, live SQLite, cloud) so callers can tell the model; ``None`` when the verdict is a
-    real lifecycle command or the command is allowed.
+    real lifecycle command or the command is allowed. :func:`scan_gateway_lifecycle_detail` adds
+    WHICH token tripped it.
 
     Total by construction: this function returns a verdict for *every*
     input and never raises. The direct scans below are pure string
@@ -2837,6 +2956,21 @@ def scan_gateway_lifecycle(
     every terminal command until the gateway restarts (#77780, #78256),
     which is strictly worse than either verdict.
     """
+    unsafe, refusal, _hit = scan_gateway_lifecycle_detail(
+        command, cwd=cwd, read_remote_script=read_remote_script
+    )
+    return unsafe, refusal
+
+
+def scan_gateway_lifecycle_detail(
+    command: str,
+    *,
+    cwd: Optional[str] = None,
+    read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+) -> tuple[bool, Optional[str], Optional[str]]:
+    """``(unsafe, refusal, hit)``: :func:`scan_gateway_lifecycle` plus *hit*, a one-line
+    description of the token and position that tripped the guard (``None`` when allowed or when
+    the verdict is a non-lifecycle refusal)."""
     budget = _LifecycleScanBudget()
     try:
         # Includes the direct regex/submit scans at depth 0.
@@ -2848,7 +2982,9 @@ def scan_gateway_lifecycle(
             budget=budget,
             read_remote_script=read_remote_script,
         )
-        return unsafe, budget.refusal if unsafe else None
+        if not unsafe:
+            return False, None, None
+        return True, budget.refusal, None if budget.refusal else budget.hit
     except Exception:
         logger.warning(
             "lifecycle guard referenced-script walk failed; "
@@ -2857,15 +2993,16 @@ def scan_gateway_lifecycle(
         )
         # Pure string scans of the top-level command — cannot raise.
         try:
-            return _direct_lifecycle_scan(command), None
+            hit = _describe_direct_lifecycle_scan(command)
+            return hit is not None, None, hit
         except Exception:
             # The data-argument masker tokenizes arbitrary text; if even
             # that fails, fall to the raw regex + submit scan so the guard
             # stays total.
-            return (
-                contains_gateway_lifecycle_command(command)
-                or contains_launchctl_submit_command(command)
-            ), None
+            hit = describe_gateway_lifecycle_command(command)
+            if hit is None and contains_launchctl_submit_command(command):
+                hit = "`launchctl submit|bootstrap` at command position"
+            return hit is not None, None, hit
 
 
 def contains_gateway_lifecycle_command_or_referenced_script(

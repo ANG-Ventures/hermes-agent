@@ -77,7 +77,9 @@ def test_mentioned_data_file_that_cannot_be_scanned_is_not_a_verdict(tmp_path, m
 
     try:
         for data in (minified, notes, db):
-            command = f"cd {tmp_path} && python3 - <<'PY'\nt = open('{data}', encoding='utf-8').read()\nPY"
+            # `hash` is not on the read-only mask allowlist, so the path stays a MENTION
+            # candidate (a mask-safe body would drop it from the walk entirely).
+            command = f"cd {tmp_path} && python3 - <<'PY'\nt = open('{data}', encoding='utf-8').read()\nprint(hash(t))\nPY"
             assert guard(command, cwd=str(tmp_path), read_remote_script=remote) is False, data.name
         assert remote_misses  # the notes table was walked and its misses were bounded, not fatal
         unsafe, refusal = lifecycle_guard.scan_gateway_lifecycle(f"bash {minified}")
