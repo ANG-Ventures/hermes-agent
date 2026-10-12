@@ -2351,6 +2351,11 @@ DEFAULT_CONFIG = {
         # retired: set next to a kanban-worker role, the pool places nothing.
         # See kanban_worker_pool.py.
         "worker_pool": {"enabled": True},
+        # Login whose uid runs a LOCAL worker's terminal + file tools (over
+        # ssh <user>@localhost, the worker-pool placement path). None/"" or
+        # the dispatcher's own login = the dispatcher's uid (today). Read per
+        # spawn, so a flip and its rollback are one edit. Q8 (a), t_405acdf0.
+        "local_worker_uid": None,
         # Placement PRD Phase 1b (t_1e4b9684): read_signal true = the pool probe
         # also reads each host's host-pressure.json (same ssh round-trip), a
         # host turns hot after 2 hot samples and clears after 3 (state in

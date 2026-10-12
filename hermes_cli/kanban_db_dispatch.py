@@ -6725,6 +6725,13 @@ def _default_spawn(
     # Worker-pool placement (kanban_worker_pool): same process, same grant,
     # tools on the worker host. Never inherit a placement from our own env.
     env.pop(_kb._kwh.PLACEMENT_ENV, None)
+    if placement is None:
+        # kanban.local_worker_uid (Q8 (a), t_405acdf0): a local worker's tools
+        # run as a dedicated non-sudo uid over ssh to localhost. Unset = 502.
+        from hermes_cli import kanban_local_worker_uid as _klu
+        _local_user = _klu.configured_user()
+        if _local_user:
+            placement = _klu.local_host(_local_user)
     # The capability modes the worker's rail gates honour (t_8c474c2e, F5):
     # workers never read config.yaml for this, the dispatcher decides.
     from hermes_cli import kanban_host_capabilities as _khc
