@@ -225,6 +225,7 @@ def test_computer_use_placed_worker_without_desktop_gets_screen_message(monkeypa
     _placed(monkeypatch, "ace-ai")
     out, _ = _computer_use(monkeypatch, backend_error="Bot Desktop needs Xvnc inside the terminal backend's sandbox")
     assert out["error"] == EXPECTED_SCREEN.format(host="ace-ai")
+    assert "Xvnc" in out["detail"]
     assert rp.take_rail_absent() == EXPECTED_SCREEN.format(host="ace-ai")
 
 
@@ -253,12 +254,29 @@ def test_background_cleanup_failure_never_queues_a_rail(monkeypatch):
 def test_active_browser_tool_call_with_sandbox_failure_queues_rail(monkeypatch):
     _worker(monkeypatch)
     _placed(monkeypatch, "ace-media")
-    from tools import browser_tool as bt
-    message = EXPECTED_BROWSER.format(host="ace-media")
-    monkeypatch.setattr(bt, "browser_navigate", lambda **kw: json.dumps({"success": False, "error": message}))
+    from tools.bot_desktop import runtime as bd
+
+    def refused():
+        raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+    monkeypatch.setattr(bd, "tool_placement", refused)
     out = _navigate(monkeypatch, "")
-    assert out["error"] == message
-    assert rp.take_rail_absent() == message
+    assert out["error"] == EXPECTED_BROWSER.format(host="ace-media")
+    assert rp.take_rail_absent() == EXPECTED_BROWSER.format(host="ace-media")
+
+
+def test_adapter_that_drops_the_error_still_queues_rail(monkeypatch):
+    # browser_console swallows per-command failures; the rail must still park the card.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-media")
+    from tools.bot_desktop import runtime as bd
+    from tools.registry import registry
+    import model_tools  # noqa: F401
+
+    def refused():
+        raise RuntimeError("Bot Desktop needs Xvnc inside the terminal backend's sandbox")
+    monkeypatch.setattr(bd, "tool_placement", refused)
+    registry.dispatch("browser_console", {}, task_id="rail")
+    assert rp.take_rail_absent() == EXPECTED_BROWSER.format(host="ace-media")
 
 
 def test_browser_cdp_on_placed_worker_uses_dispatcher_side_liveness(monkeypatch):
