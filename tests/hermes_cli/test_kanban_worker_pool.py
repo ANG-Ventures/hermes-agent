@@ -1641,3 +1641,30 @@ def test_drained_pin_latch_survives_a_tick_the_card_is_missing_from(kanban_home,
         kdp.notify_drained_pins(conn, None, {}, now + 60)  # card not evaluated this tick
         assert kdp.notify_drained_pins(conn, None, {tid: "pin_host_draining"}, now + 120) == []
     assert len(sent) == 1
+
+
+def test_drained_pin_corrupt_marker_posts_nothing_and_is_rewritten(kanban_home, monkeypatch):
+    """Prism ac5ce939aace: a torn/unreadable latch marker is latched-unknown,
+    not empty: no #logs storm this tick, and the marker is rewritten valid."""
+    from hermes_cli import kanban_budget as kbud
+    from hermes_cli import kanban_drained_pin as kdp
+    sent = []
+    monkeypatch.setattr(kbud, "_notify_script_path", lambda home=None: "/x/notify.py")
+    monkeypatch.setattr(kbud, "_run_notify", lambda argv: sent.append(argv) or True)
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="host: ci-box")
+        _tick(conn, spillover=_drained_plan(), spawn_limit=4)
+        conn.execute("UPDATE task_events SET payload = json_set(payload, '$.since', "
+                     "json_extract(payload, '$.since') - 16*60) WHERE task_id=? "
+                     "AND kind='placement_wait'", (tid,))
+        conn.commit()
+        marker = kb.board_state_dir(None) / kdp._MARKER
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{"t_', encoding="utf-8")  # torn write
+        now = int(time.time())
+        assert kdp.notify_drained_pins(conn, None, {tid: "pin_host_draining"}, now) == []
+        latched = json.loads(marker.read_text(encoding="utf-8"))
+        assert isinstance(latched.get(tid), int)
+        assert kdp.notify_drained_pins(conn, None, {tid: "pin_host_draining"}, now + 60) == []
+    assert sent == []
+    assert not list(marker.parent.glob(kdp._MARKER + ".*"))  # no tmp left behind

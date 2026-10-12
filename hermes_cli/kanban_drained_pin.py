@@ -13,8 +13,11 @@ again.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import sys
+import tempfile
 from typing import Mapping, Optional
 
 DRAINED_PIN_NOTIFY_SECONDS = 15 * 60
@@ -74,13 +77,21 @@ def notify_drained_pins(conn, board: Optional[str], waits: Mapping[str, str], no
 
     hits = drained_pin_waits(conn, waits, now)
     marker = _kb.board_state_dir(board) / _MARKER
+    current = {h["task_id"]: h["since"] for h in hits}
     try:
         seen = json.loads(marker.read_text(encoding="utf-8-sig"))
-    except Exception:
+    except FileNotFoundError:
         seen = {}
+    except (OSError, ValueError):
+        seen = None
     if not isinstance(seen, dict):
-        seen = {}
-    current = {h["task_id"]: h["since"] for h in hits}
+        # Torn or unreadable marker (Prism ac5ce939aace): what was already
+        # posted is unknown, so treat every current hit as latched rather than
+        # re-posting all of them, and rewrite the marker valid.
+        _kb._log.warning("kanban drained-pin latch %s unreadable; latching %d current wait(s) "
+                         "without posting this tick", marker, len(current))
+        _write_marker(marker, current)
+        return []
     # Prune by board state, never by this tick's view: a held card can be
     # missing from ``waits`` for a tick (the ready scan stopped at the no-slot
     # wall, a gateway restart's first ticks) and must not re-post when it
@@ -106,6 +117,19 @@ def notify_drained_pins(conn, board: Optional[str], waits: Mapping[str, str], no
         changed = True
         posted.append(h)
     if changed:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(json.dumps(latched), encoding="utf-8")
+        _write_marker(marker, latched)
     return posted
+
+
+def _write_marker(marker, latched: Mapping[str, int]) -> None:
+    """Atomic replace: a crash mid-write leaves the previous marker intact."""
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=marker.parent, prefix=marker.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(dict(latched), fh)
+        os.replace(tmp, marker)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
