@@ -446,3 +446,36 @@ def test_warn_observation_never_shadows_a_binding_and_clears_when_off(home, flee
         _tick(conn)
         assert _events(conn, tid, khc.WARN_EVENT)[1:] == [{"cleared": True}]
         assert _events(conn, tid, "placement_affinity")[-1]["rule"] == "studio_body"
+
+
+def test_overridden_soft_unknown_posts_no_stays_local_comment(home, fleet, monkeypatch):
+    # Prism 027ec54981dd: an index row with a misspelt capability, named in the
+    # body (SOFT), on a ``host: any`` card: the card spills, so no comment may
+    # say it stays on the Studio.
+    doc = _index(fleet)
+    doc["skills"]["typo-skill"] = ["browser_sesion"]
+    doc["source_hash"] = khc.index_hash(doc["skills"])
+    (fleet / khc.INDEX_FILE).write_text(json.dumps(doc), encoding="utf-8")
+    _mode(monkeypatch)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="host: any\nload `typo-skill` first")
+        res, spawned = _tick(conn)
+        assert spawned == [(tid, "ace-ai")]
+        assert _comments(conn, tid) == [] and "unknown" not in res.placement_caps.get(tid, {})
+        held = _card(conn, body="load `typo-skill` first")          # unpinned: it IS held
+        res, _ = _tick(conn)
+        assert res.placement_waits[held] == "studio_affinity:requires:unknown:browser_sesion"
+        assert len(_comments(conn, held)) == 1
+
+
+def test_unplanned_dry_run_drops_legacy_body_binding_while_enforcing(home, fleet, monkeypatch):
+    # Prism 6b270fae4947: with a valid enforcing map the planned path does not
+    # apply #1877's body list; the no-plan dry run must not show it either.
+    _mode(monkeypatch, "enforce", capabilities_enforce=["screen"])
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="attach to the signed-in browser")
+        assert _route(conn, tid)[0] == ("portable", None)
+        dry = kbd.dispatch_once(conn, dry_run=True, max_spawn=8, spillover=None,
+                                reconcile_orphans=False)
+        assert tid not in dry.placement_affinity
+        assert dry.placement_caps[tid]["warn"]["rule"] == "requires:browser-session"

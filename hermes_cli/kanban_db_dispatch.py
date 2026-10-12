@@ -4062,7 +4062,9 @@ def _note_capability_verdict(tid, verdict, caps, rule, pin, caps_out: dict) -> N
             and pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO)):
         caps_out.setdefault("pin_lacks", {})[tid] = (pin, verdict.pin)
     for req in verdict.enforced:
-        if req.unknown:
+        # Only the word that actually holds the card: a soft one that
+        # ``host: any`` overrode must not claim the card stays local (Prism 027ec54981dd).
+        if req.unknown and rule == req.rule:
             caps_out.setdefault("unknown", {})[tid] = req
             break
     if verdict.observed is not None and verdict.pin is None:
@@ -4121,6 +4123,12 @@ def _capabilities_unplanned(rows, result) -> None:
         caps = _capability_tick(cfg)
         if caps is None:
             return
+        if not caps.legacy_body:
+            # The planned path drops #1877's body list while the map enforces
+            # (F13); the preview must too (Prism 6b270fae4947).
+            for tid in [t for t, a in result.placement_affinity.items()
+                        if a.get("rule") == "studio_body"]:
+                del result.placement_affinity[tid]
         known = tuple(cfg.hosts or ()) or _kwp.known_host_ids(_kb.kanban_home() / "fleet")
         out: dict = {}
         for r in rows:
