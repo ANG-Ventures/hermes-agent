@@ -4980,7 +4980,8 @@ def _dispatch_once_locked(
             if spillover is not None:
                 result.placement_waits[row["id"]] = (
                     _route_wait(route, route_arg, False, spillover)
-                    or ("pin_host_full" if route == "pin" else spillover.full_reason())
+                    or ((spillover.pin_host_refusal(route_arg) or "pin_host_full")
+                        if route == "pin" else spillover.full_reason())
                 )
                 # Host-bound cards behind the wall still say why (t_3e6c9b2b).
                 for rest in ready_rows[row_index + 1:]:
@@ -5380,6 +5381,12 @@ def _dispatch_once_locked(
         from hermes_cli.kanban_host_affinity import record_affinity_events
         record_affinity_events(conn, result, _affinity_evaluated, _affinity_reached)
     _record_placement_waits(conn, result, row_route, dry_run)
+    if not dry_run and result.placement_waits:
+        try:
+            from hermes_cli.kanban_drained_pin import notify_drained_pins
+            notify_drained_pins(conn, board, result.placement_waits, int(time.time()))
+        except Exception as exc:  # never break a dispatcher tick
+            _kb._log.warning("kanban drained-pin notify failed: %s", exc)
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after

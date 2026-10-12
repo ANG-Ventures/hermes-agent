@@ -870,6 +870,31 @@ class SpilloverPlan:
             return None
         return {"load1": d.get("load1"), "ncpu": d.get("ncpu")}
 
+    def pin_host_refusal(self, pin: str) -> Optional[str]:
+        """Why the HOST behind ``pin`` cannot give a slot now, or None.
+
+        Host state only: no profile check and no reservation, so the no-slot
+        wall can name the state too. ``take()`` checks the assignee before
+        this. A host that is not ``active`` in fleet-roles.json (``draining``)
+        reads ``pin_host_<state>``, never ``pin_host_full``: full means wait,
+        a drained member means re-pin or wait for re-admit (t_e10add5a)."""
+        pin = {n.lower(): n for n in self.hosts}.get(pin.lower(), pin)
+        host = self.hosts.get(pin)
+        if host is None:
+            low = pin.lower()
+            return ("pin_host_disabled" if low in {d.lower() for d in self.disabled}
+                    else "pin_host_dropped"
+                    if low in {h.lower() for h in (self.config.hosts or ())}
+                    else "pin_unknown_host")
+        if self.slots.get(pin, 0) > 0:
+            return None
+        if host.state != "active":
+            return f"pin_host_{host.state}"
+        d = self.detail.get(pin) or {}
+        if self.signal is not None and d.get("pressure"):
+            return f"pin_host_{'hot' if d.get('hot') else 'unknown'} ({d['pressure']})"
+        return "pin_host_unreachable" if d.get("reachable") is False else "pin_host_full"
+
     def take(self, assignee: Optional[str], pin: Optional[str] = None,
              only: Optional[Collection[str]] = None) -> Optional[PoolHost]:
         """Reserve one slot: on ``pin`` only, else the first host in priority
@@ -883,23 +908,11 @@ class SpilloverPlan:
         if pin is not None:
             pin = fold.get(pin.lower(), pin)
             host = self.hosts.get(pin)
-            if host is None:
-                low = pin.lower()
-                self.refusal = ("pin_host_disabled" if low in {d.lower() for d in self.disabled}
-                                else "pin_host_dropped"
-                                if low in {h.lower() for h in (self.config.hosts or ())}
-                                else "pin_unknown_host")
-                return None
-            if assignee not in host.profiles:
+            if host is not None and assignee not in host.profiles:
                 self.refusal = "pin_profile"  # the pinned host does not serve this assignee
                 return None
-            if self.slots.get(pin, 0) <= 0:
-                d = self.detail.get(pin) or {}
-                if self.signal is not None and d.get("pressure"):
-                    self.refusal = f"pin_host_{'hot' if d.get('hot') else 'unknown'} ({d['pressure']})"
-                    return None
-                reachable = d.get("reachable")
-                self.refusal = "pin_host_unreachable" if reachable is False else "pin_host_full"
+            self.refusal = self.pin_host_refusal(pin)
+            if self.refusal is not None:
                 return None
             self.slots[pin] -= 1
             self.taken[pin] = self.taken.get(pin, 0) + 1
