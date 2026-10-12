@@ -12089,8 +12089,14 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     until: Optional[int] = None,
+    precondition: Optional[Callable[[sqlite3.Connection], bool]] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+
+    ``precondition(conn)``, when given, runs inside the block's write
+    transaction before any change; a falsy result refuses the block
+    (returns False). A caller acting on an earlier snapshot of the card uses
+    it to re-check that snapshot atomically with the transition.
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -12160,6 +12166,8 @@ def block_task(
             (task_id,),
         ).fetchone()
         if cur_row is None:
+            return False
+        if precondition is not None and not precondition(conn):
             return False
         # Refuse only where a block could have landed; a done/archived/
         # scheduled/todo card keeps the plain ``False`` every caller handles.

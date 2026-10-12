@@ -3959,6 +3959,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         return "wait", verdict.wait or f"requires_unsatisfied:{req.cap}+{rule}"
     if verdict is not None and caps_out is not None:
         _note_capability_verdict(row["id"], verdict, caps, rule, pin, caps_out)
+        if row["id"] in (caps_out.get("pin_lacks") or {}):
+            # What the park after the spawn loop must still see (Prism 428f0d84fbf6).
+            caps_out.setdefault("pin_lacks_snapshot", {})[row["id"]] = (row["body"], row["skills"])
         if not ok and verdict.pin is not None:
             # Every door that keeps the card home, named (spec v0.3 AC-11b:
             # `ssh ci sudo` reads `host_reach` from the matrix AND

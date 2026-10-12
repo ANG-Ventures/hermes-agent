@@ -354,9 +354,12 @@ def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
         for s in attached:
             for c in cmap.index.get(s.rsplit("/", 1)[-1], ()):
                 reqs.append(Requirement(cap_of(c), HARD, SKILL, s))
+        # Skill names are case-insensitive everywhere in the fleet: the cheap
+        # prefilter must not drop "load BROWSER-ACCESS" (Prism 43ff9bd89529).
         text = body or ""
+        folded = text.lower()
         for name, caps in cmap.index.items():
-            if name in attached or not caps or name not in text:
+            if name in attached or not caps or name.lower() not in folded:
                 continue
             if _named_skill_re(name).search(text):
                 for c in caps:
@@ -570,16 +573,20 @@ def record_capability_events(conn, result, caps: Optional[CapabilityTick], caps_
                                 (tid, body)).fetchone() is None:
                     _kb.add_comment(conn, tid, "dispatcher", body)
             observed = caps_out.get("observed") or {}
+            bound = result.placement_affinity or {}
             for tid in dict.fromkeys([*evaluated_ids, *observed]):
                 last = conn.execute(
                     "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'placement_affinity' "
                     "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
                 last = json.loads(last[0] or "{}") if last is not None else None
                 want = observed.get(tid)
-                if want is not None and last != want:
+                if want is not None and last != want and tid not in bound:
+                    # A binding record_affinity_events just wrote is the card's
+                    # placement state; a warn observation must not supersede it
+                    # (Prism b18b269fe1b9).
                     _kb._append_event(conn, tid, "placement_affinity", dict(want))
                 elif want is None and last is not None and last.get("mode") == WARN \
-                        and tid not in (result.placement_affinity or {}):
+                        and tid not in bound:
                     _kb._append_event(conn, tid, "placement_affinity", {"cleared": True})
             error = caps.error
             if error:
@@ -597,13 +604,35 @@ def record_capability_events(conn, result, caps: Optional[CapabilityTick], caps_
     if caps.error and _note_map_invalid(caps.error, _time.monotonic()):
         log.warning("kanban placement: %s; every capability is warn this tick, the pool is NOT "
                     "refused (fix the file or set kanban.placement.capabilities: off)", caps.error)
+    snapshots = caps_out.get("pin_lacks_snapshot") or {}
     for tid, (host, req) in (caps_out.get("pin_lacks") or {}).items():
         try:
             reason = pin_lacks_comment(host, req)
-            if _kb.block_task(conn, tid, reason=reason, kind="needs_input"):
+            if _kb.block_task(conn, tid, reason=reason, kind="needs_input",
+                              precondition=_still_as_evaluated(tid, snapshots.get(tid))):
                 _kb.add_comment(conn, tid, "dispatcher", reason)
                 (result.placement_waits or {}).pop(tid, None)
                 result.placement_caps.setdefault(tid, {})["action"] = "needs_input"
         except Exception:
             log.warning("kanban dispatch: could not park %s needs_input (pin lacks %s)",
                         tid, req.cap, exc_info=True)
+
+
+def _still_as_evaluated(tid: str, snapshot):
+    """``block_task`` precondition for a ``pin_lacks`` park: the verdict came
+    from this tick's ready-row snapshot, and the park runs after the spawn
+    loop. Only a card that is STILL ready, unclaimed, run-less and carries the
+    body and skills the verdict was computed from may be parked; anything else
+    (a CLI claim, an edited pin or requirement) is left for the next tick to
+    re-evaluate (Prism 428f0d84fbf6 / 5cabff84da83). Runs inside block_task's
+    write transaction, so the check and the transition are atomic."""
+    def check(conn) -> bool:
+        if snapshot is None:
+            return False
+        row = conn.execute(
+            "SELECT status, claim_lock, current_run_id, body, skills FROM tasks WHERE id = ?",
+            (tid,)).fetchone()
+        return (row is not None and row["status"] == "ready" and row["claim_lock"] is None
+                and row["current_run_id"] is None
+                and (row["body"], row["skills"]) == tuple(snapshot))
+    return check

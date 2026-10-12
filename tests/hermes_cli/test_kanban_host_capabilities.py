@@ -323,3 +323,62 @@ def test_malformed_map_degrades_to_warn(home, fleet, monkeypatch):
         assert len(inv) == 1 and inv[0]["mode"] == "warn"
         assert json.loads(khc.spawn_env(fleet, kbd._root_kanban_cfg())) == {"*": "warn"}
         assert _comments(conn, browser) == []
+
+
+# -- Prism r2 on #1902 ------------------------------------------------------------
+
+def test_named_skill_matches_case_insensitively(home, fleet, monkeypatch):
+    """Prism 43ff9bd89529: the substring prefilter must not drop `load BROWSER-ACCESS`."""
+    _mode(monkeypatch)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="load BROWSER-ACCESS and check the order page")
+        (route, out) = _route(conn, tid)
+        assert route == ("local", "studio_affinity:requires:browser-session")
+        assert out[tid]["matched_by"] == "named_skill"
+
+
+def test_warn_observation_does_not_overwrite_a_binding(home, fleet, monkeypatch):
+    """Prism b18b269fe1b9: a card the affinity rules bound this tick keeps that
+    binding as its latest placement_affinity event; the warn observation is not
+    appended over it, on this tick or the next."""
+    _mode(monkeypatch, "warn")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="restock", skills=[WAVE])
+        caps = kbd._capability_tick(_plan().config)
+        binding = {"host": kwp.STUDIO_HOST, "rule": "studio_bound_skill", "matched_by": "x"}
+        res = kbd.DispatchResult()
+        res.placement_affinity[tid] = binding
+        out = {"observed": {tid: {"rule": "requires:browser-session", "mode": khc.WARN}}}
+        with kb.write_txn(conn):   # what record_affinity_events wrote first
+            kb._append_event(conn, tid, "placement_affinity", dict(binding))
+        for _ in range(2):          # two ticks
+            khc.record_capability_events(conn, res, caps, out, [tid], [])
+        assert _events(conn, tid, "placement_affinity") == [binding]
+
+
+def test_pin_lacks_park_skips_a_card_claimed_after_evaluation(home, fleet, monkeypatch):
+    """Prism 428f0d84fbf6 / 5cabff84da83: the park runs after the spawn loop on
+    a ready-row snapshot; a card claimed (or edited) since is not blocked."""
+    _mode(monkeypatch)
+    with kb.connect_closing() as conn:
+        claimed = _card(conn, body="host: ace-ai\nrestock", skills=[WAVE])
+        edited = _card(conn, body="host: ace-ai\nrestock", skills=[WAVE])
+        parked = _card(conn, body="host: ace-ai\nrestock", skills=[WAVE])
+        real = khc.record_capability_events
+
+        def race(conn_, result, caps, caps_out, evaluated, comments):
+            assert set(caps_out["pin_lacks"]) == {claimed, edited, parked}
+            assert kb.claim_task(conn_, claimed) is not None
+            with kb.write_txn(conn_):
+                conn_.execute("UPDATE tasks SET body = ? WHERE id = ?", ("host: any\nrestock", edited))
+            return real(conn_, result, caps, caps_out, evaluated, comments)
+        monkeypatch.setattr(khc, "record_capability_events", race)
+        res, spawned = _tick(conn)
+        status = {t: tuple(conn.execute("SELECT status, block_kind FROM tasks WHERE id=?", (t,)).fetchone())
+                  for t in (claimed, edited, parked)}
+        assert status[claimed][0] == "running"
+        assert status[edited] == ("ready", None)
+        assert status[parked] == ("blocked", "needs_input")
+        assert res.placement_caps[parked].get("action") == "needs_input"
+        assert "action" not in res.placement_caps.get(claimed, {})
+        assert not _comments(conn, claimed, prefix="pin host:ace-ai")
