@@ -141,7 +141,9 @@ def live_boards() -> List[Tuple[str, Path]]:
     out = []
     for meta in _kb.enumerating_each(_kb.list_boards(include_archived=False)):
         slug = (meta.get("slug") if isinstance(meta, dict) else None) or _kb.DEFAULT_BOARD
-        path = _kb.kanban_db_path(slug)
+        # Each slug's OWN db: a worker's HERMES_KANBAN_DB pin would map every
+        # slug to one file and multiply every count by N boards.
+        path = _kb._board_db_path_ignoring_pin(_kb._normalize_board_slug(slug) or slug)
         if path.exists():
             out.append((slug, path))
     return out
@@ -249,6 +251,17 @@ def format_fleet(rep: Mapping) -> List[str]:
 def task_block(conn, task_id: str, *, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """The ``Placement:`` block for one card (None = no such card)."""
     now = time.time() if now is None else float(now)
+    own = not conn.in_transaction  # one snapshot; a caller's transaction is left as found
+    if own:
+        conn.execute("BEGIN")
+    try:
+        return _task_block(conn, task_id, now)
+    finally:
+        if own and conn.in_transaction:
+            conn.execute("ROLLBACK")  # read-only: nothing to keep
+
+
+def _task_block(conn, task_id: str, now: float) -> Optional[Dict[str, Any]]:
     row = conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
         return None

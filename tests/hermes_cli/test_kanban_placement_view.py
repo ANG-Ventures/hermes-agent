@@ -200,6 +200,35 @@ def test_ac12_unreadable_board_is_an_error_not_empty(home, boards, tmp_path):
     assert len(rep["errors"]) == 1 and rep["errors"][0].startswith("ghost:")
 
 
+def test_live_boards_ignore_the_worker_db_pin(home, boards, monkeypatch):
+    """Prism 26668b7a99a1: under the dispatcher's HERMES_KANBAN_DB pin every
+    slug must still resolve to its OWN board, or counts multiply by N boards."""
+    want = _report(home, _gate())
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # conftest neutralises pins
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb._board_db_path_ignoring_pin("default")))
+    assert kb.kanban_db_path() == kb._board_db_path_ignoring_pin("default")  # the pin is live
+    paths = [p for _, p in kpv.live_boards()]
+    assert len(paths) == len(set(paths)) == 2
+    got = _report(home, _gate())
+    assert {n: h["running"] for n, h in got["hosts"].items()} == {n: h["running"] for n, h in want["hosts"].items()}
+    assert got["held"]["by_code"] == want["held"]["by_code"]
+
+
+def test_task_block_reads_one_snapshot(home, boards, monkeypatch):
+    """Prism bac7a74e910f: the tasks row, the current run and the held episode
+    come from one read transaction; a caller's own transaction is preserved."""
+    seen = []
+    real = kpv._running
+    monkeypatch.setattr(kpv, "_running", lambda c: (seen.append(c.in_transaction), real(c))[1])
+    with kb.connect_closing(board="default") as c:
+        assert kpv.task_block(c, boards["z2"], now=NOW)["running_on"]["host"] == "zeta-box"
+        assert seen == [True] and not c.in_transaction  # opened, then released
+        c.execute("BEGIN")
+        kpv.task_block(c, boards["z2"], now=NOW)
+        assert seen == [True, True] and c.in_transaction  # caller's txn left open
+        c.execute("ROLLBACK")
+
+
 def test_ac12_no_reason_literal_outside_the_reasons_module():
     """I-S5: the reader module names no reason/event string itself; it imports them."""
     values = {v for k, v in vars(pr).items() if k.isupper() and isinstance(v, str)}
