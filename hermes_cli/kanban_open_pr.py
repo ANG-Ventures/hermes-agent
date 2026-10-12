@@ -116,6 +116,8 @@ def query_pr_state(repo: str, number: int) -> Optional[dict]:
     if out["state"] == "MERGED" and payload.get("merge_commit_sha"):
         out["merge_commit_sha"] = str(payload["merge_commit_sha"])
     head = payload.get("head")
+    if isinstance(head, dict) and head.get("ref"):
+        out["head_ref"] = str(head["ref"])
     if out["state"] == "MERGED" and isinstance(head, dict) and head.get("sha"):
         out["head_sha"] = str(head["sha"])
     return out
@@ -234,17 +236,51 @@ def unmerged_refs(refs, *, query_fn: Optional[QueryFn] = None,
     return opened, unverified
 
 
+_CARD_IN_BRANCH_RE = re.compile(r"(?:^|/)(t_[0-9a-f]{8})(?:$|[-_/.])")
+
+
+def branch_names_other_card(head_ref: Optional[str], task_id: Optional[str]) -> bool:
+    """True when ``head_ref`` carries a card id and none of them is ``task_id``: another card's PR.
+    A branch with no card id at all proves nothing either way (False)."""
+    cards = _CARD_IN_BRANCH_RE.findall(head_ref or "")
+    return bool(cards) and task_id not in cards
+
+
 def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
-                 survivor_pr=None, query_fn: Optional[QueryFn] = None) -> list:
+                 survivor_pr=None, query_fn: Optional[QueryFn] = None,
+                 task_id: Optional[str] = None, unowned: Optional[list] = None) -> list:
     """Extract + resolve: the FLEET PRs that block ``done`` -- OPEN or unreadable.
 
     Foreign-owner refs are dropped before any lookup (see :data:`FLEET_OWNERS`).
+
+    Prose is not provenance (t_60b39483): t_f1b135a8's handoff said "#1902 and #1903 are not this
+    card's" and was gated on both. With ``task_id``, an OPEN ref found only in the handoff TEXT whose
+    head branch names a DIFFERENT card (``<profile>/<other card>-*``) is a mention: it is appended to
+    ``unowned`` and does not gate. Declared refs (``metadata.pr_url`` / ``pr_urls`` / ``pr``,
+    ``--survivor-pr``) always gate. A prose ref whose head branch names this card, names no card, or
+    is unknown (unreadable) still gates: fail closed, as before (t_1bd02e0b).
     """
     refs = split_fleet(extract_pr_refs(*texts, metadata=metadata, survivor_pr=survivor_pr))[0]
     if not refs:
         return []
+    query_fn = memo_query(query_fn)
+    if query_fn is None:
+        return []
     primary = split_fleet(extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]
     opened, unverified = unmerged_refs(refs, query_fn=query_fn, primary=primary)
+    if task_id:
+        declared = {(r.repo.lower(), r.number) for r in primary}
+        kept = []
+        for ref in opened:
+            if (ref.repo.lower(), ref.number) not in declared:
+                payload = query_fn(ref.repo, ref.number)  # memoised: no second lookup
+                head_ref = payload.get("head_ref") if isinstance(payload, dict) else None
+                if branch_names_other_card(head_ref, task_id):
+                    if unowned is not None:
+                        unowned.append(ref)
+                    continue
+            kept.append(ref)
+        opened = kept
     return opened + unverified
 
 
