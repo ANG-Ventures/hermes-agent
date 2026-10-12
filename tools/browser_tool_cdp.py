@@ -4,10 +4,24 @@ Split out of ``tools/browser_tool.py``. Facade-owned state is read through ``_bt
 
 import contextlib
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 from agent.proxy_bypass import loopback_request_kwargs
 from tools.browser_tool_origin import origin_module as _origin
+
+
+def cdp_version_url(raw: str) -> Optional[str]:
+    """The ``/json/version`` discovery URL for a configured CDP endpoint, or None when the endpoint is used
+    as-is (a full ``/devtools/browser/`` URL, or any ``ws(s)://`` URL other than a bare ``host:port``)."""
+    lowered = raw.lower()
+    if "/devtools/browser/" in lowered:
+        return None
+    discovery_url = raw
+    if lowered.startswith(("ws://", "wss://")):
+        if not (raw.count(":") == 2 and raw.rstrip("/").rsplit(":", 1)[-1].isdigit() and "/" not in raw.split(":", 2)[-1]):
+            return None
+        discovery_url = ("http://" if lowered.startswith("ws://") else "https://") + raw.split("://", 1)[1]
+    return discovery_url if discovery_url.lower().endswith("/json/version") else discovery_url.rstrip("/") + "/json/version"
 
 
 def _resolve_cdp_override(cdp_url: str) -> str:
@@ -20,16 +34,9 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     raw = (cdp_url or "").strip()
     if not raw:
         return ""
-    lowered = raw.lower()
-    if "/devtools/browser/" in lowered:
+    version_url = cdp_version_url(raw)
+    if version_url is None:
         return raw
-
-    discovery_url = raw
-    if lowered.startswith(("ws://", "wss://")):
-        if not (raw.count(":") == 2 and raw.rstrip("/").rsplit(":", 1)[-1].isdigit() and "/" not in raw.split(":", 2)[-1]):
-            return raw
-        discovery_url = ("http://" if lowered.startswith("ws://") else "https://") + raw.split("://", 1)[1]
-    version_url = discovery_url if discovery_url.lower().endswith("/json/version") else discovery_url.rstrip("/") + "/json/version"
 
     san = _bt._sanitize_url_for_logs
     try:

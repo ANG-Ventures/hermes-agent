@@ -10,13 +10,15 @@ minutes in (t_db491366).
 
 Scope: only the dispatcher-owned worker (``owned_kanban_task``); interactive sessions, in-process
 cron and delegate children never see these errors. A configured LOOPBACK CDP override is the
-operator's browser and is refused up front off the dispatcher host. The agent's own Chromium is
-not an operator rail: a placed worker keeps it wherever the pool host's sandbox can host it, and
-only when that placement fails is the failure reported as this rail (``placed_browser_rail_error``).
-The screen rail is the dispatcher host's own screen, so only a placed worker lacks it; a
-Linux/Windows dispatcher with its own (Bot Desktop) screen is left alone. Every emitted error is
-recorded under the owning task, so that worker's turn loop, and only it, parks the card
-``needs_input`` with the message verbatim (``take_rail_absent``).
+operator's browser: the browser_* tools (whose agent-browser runs on the pool host under
+placement) are refused up front off the dispatcher host, while ``browser_cdp`` (which connects from
+the dispatcher process itself) only gets the liveness probe. The agent's own Chromium and the
+computer_use desktop are not operator rails: a placed worker keeps both wherever the pool host can
+host them, and only when that placement fails is the failure reported as this rail
+(``placed_browser_rail_error`` / ``screen_rail_error``). Only a rail error returned by an active
+model tool call is recorded (background cleanup, ``background_cleanup``, never is), under the owning task, so that worker's
+turn loop, and only it, parks the card ``needs_input`` with the message verbatim
+(``take_rail_absent``).
 """
 
 from __future__ import annotations
@@ -25,7 +27,9 @@ import os
 import socket
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Dict, Iterator, Optional, Tuple
 
 RAIL_ABSENT_SUFFIX = "_RAIL_ABSENT"
 _PROBE_TIMEOUT_S = 2.0
@@ -34,6 +38,20 @@ _PROBE_OK_TTL_S = 30.0
 _lock = threading.Lock()
 _emitted: Dict[str, str] = {}  # owning task id -> first unconsumed rail message
 _probe_ok: Dict[str, float] = {}
+_in_cleanup: ContextVar[bool] = ContextVar("rail_preflight_in_cleanup", default=False)
+
+
+@contextmanager
+def background_cleanup() -> Iterator[None]:
+    """Mark browser session teardown (janitor / ``close``): a rail failure inside it is returned to
+    the caller but never recorded, so it cannot park the card. Every other browser command runs on
+    behalf of a model tool call (browser_*, vault, browser-use) and records its rail failure however
+    that tool's adapter reformats or drops the error."""
+    token = _in_cleanup.set(True)
+    try:
+        yield
+    finally:
+        _in_cleanup.reset(token)
 
 
 def rail_absent_message(rail: str, host: str) -> str:
@@ -59,24 +77,17 @@ def _placed_host() -> Optional[str]:
 
 
 def _probe_target(cdp_url: str) -> Tuple[str, object]:
-    """What proves the endpoint is up, with ``browser_tool_cdp._resolve_cdp_override``'s
-    semantics: ``("tcp", (host, port))`` for a WebSocket URL with a path (full
-    ``/devtools/browser/...`` or a proxy route, which need no HTTP discovery), else
-    ``("http", <discovery root>/json/version)`` keeping any path prefix."""
+    """What proves the endpoint is up, using the resolver's own discovery decision
+    (``browser_tool_cdp.cdp_version_url``): ``("http", <discovery>/json/version)`` when the resolver
+    would discover, else ``("tcp", (host, port))`` for an endpoint it passes through unchanged."""
     from agent.proxy_bypass import split_host_port
+    from tools.browser_tool_cdp import cdp_version_url
     raw = cdp_url.strip()
-    lowered = raw.lower()
-    is_ws = lowered.startswith(("ws://", "wss://"))
-    if "/devtools/browser/" in lowered or (is_ws and "/" in raw.split("://", 1)[1].rstrip("/")):
-        host, port = split_host_port(raw)
-        return "tcp", (host, port or (443 if lowered.startswith(("wss://", "https://")) else 80))
-    if is_ws:
-        discovery = ("https://" if lowered.startswith("wss://") else "http://") + raw.split("://", 1)[1]
-    else:
-        discovery = raw if "://" in raw else "http://" + raw
-    if discovery.lower().endswith("/json/version"):
-        return "http", discovery
-    return "http", discovery.rstrip("/") + "/json/version"
+    version_url = cdp_version_url(raw if "://" in raw else "http://" + raw)
+    if version_url is not None:
+        return "http", version_url
+    host, port = split_host_port(raw)
+    return "tcp", (host, port or (443 if raw.lower().startswith(("wss://", "https://")) else 80))
 
 
 def _endpoint_answers(cdp_url: str) -> bool:
@@ -111,16 +122,18 @@ def _emit(task: str, message: str) -> str:
     return message
 
 
-def browser_rail_error(cdp_url: str) -> Optional[str]:
+def browser_rail_error(cdp_url: str, *, host_side: bool = False) -> Optional[str]:
     """``BROWSER_RAIL_ABSENT`` for a configured loopback CDP override (the operator's browser),
-    or None to proceed. ``cdp_url`` is the configured, unresolved override."""
+    or None to proceed. ``cdp_url`` is the configured, unresolved override. ``host_side``: the
+    caller connects from this (dispatcher) process, not from the pool host, so placement does
+    not move the endpoint and only liveness counts."""
     task = _owned_task()
     if not task or not cdp_url:
         return None
     from agent.proxy_bypass import is_loopback_host, split_host_port
     if not is_loopback_host(split_host_port(cdp_url)[0]):
         return None  # a remote CDP endpoint is reachable from any host
-    placed = _placed_host()
+    placed = None if host_side else _placed_host()
     if placed:
         return _emit(task, rail_absent_message("browser", placed))
     if not _endpoint_answers(cdp_url):
@@ -131,15 +144,20 @@ def browser_rail_error(cdp_url: str) -> Optional[str]:
 def placed_browser_rail_error() -> Optional[str]:
     """The agent's own browser could not be placed on this worker's pool host (no desktop stack
     in its sandbox): report it as the browser rail, since the only browser left is the Studio's.
-    None for anything but a placed, dispatcher-owned worker."""
+    None for anything but a placed, dispatcher-owned worker. Never recorded for parking from a
+    background cleanup ``close`` (``background_cleanup``)."""
     task = _owned_task()
     placed = _placed_host() if task else None
-    return _emit(task, rail_absent_message("browser", placed)) if placed else None
+    if not placed:
+        return None
+    message = rail_absent_message("browser", placed)
+    return message if _in_cleanup.get() else _emit(task, message)
 
 
 def screen_rail_error() -> Optional[str]:
-    """``SCREEN_RAIL_ABSENT`` for computer_use, or None. A placed worker's desktop would be the
-    pool host's, never the operator's screen; an unplaced worker uses its own host's screen."""
+    """``SCREEN_RAIL_ABSENT`` for a placed worker whose computer_use desktop could not be brought up
+    on its pool host, or None. Call it only after that failure: a working pool-host desktop (Bot
+    Desktop in the ssh sandbox) is the worker's own and stays usable."""
     task = _owned_task()
     placed = _placed_host() if task else None
     return _emit(task, rail_absent_message("screen", placed)) if placed else None
