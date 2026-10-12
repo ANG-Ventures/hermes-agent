@@ -601,6 +601,10 @@ class TestGatewaySelfTargetingGuard:
 
         monkeypatch.setattr(gw, "_dispatch_via_service_manager_if_s6", _sentinel)
         monkeypatch.setattr(gw, "_dispatch_all_via_service_manager_if_s6", _sentinel)
+        # The stop path scans live host processes first; on a box running a
+        # real gateway that resolves the gateway's own home and reads the REAL
+        # ~/.hermes/active_profile. Stop at the scan to stay hermetic.
+        monkeypatch.setattr(gw, "find_gateway_pids", _sentinel)
         args = Namespace(gateway_command="stop", all=False, system=False)
         with pytest.raises(_Reached):
             gw.gateway_command(args)
