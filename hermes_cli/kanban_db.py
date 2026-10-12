@@ -5851,6 +5851,9 @@ def create_task(
     duplicate_guard: bool = False,
     force_reason: Optional[str] = None,
     require_home: bool = False,
+    until: Optional[int] = None,
+    time_gate_guard: bool = False,
+    i_mean_blocks: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -5905,7 +5908,18 @@ def create_task(
     ``near_duplicate_warning`` event on the new card. A same-title hit only
     warns when the matched card is ``done`` (a refile after completion) or when
     the caller passed an ``idempotency_key`` that matched no live card (the
-    documented recurring-automation pattern owns its own dedup).
+    documented recurring-automation pattern owns its own dedup). The same
+    guard also refuses a duplicate of any OPEN card, no window
+    (:func:`kanban_mint_lint.find_open_duplicates`); ``force_reason`` (CLI
+    ``--not-a-duplicate``) overrides that too.
+
+    ``until`` (epoch seconds) mints a card that would queue (todo/ready)
+    parked in ``scheduled`` with ``next_eligible_at = until`` and a
+    ``scheduled`` {kind: deferred} event, so :func:`wake_due_scheduled` owns
+    the wake. ``time_gate_guard`` (CLI + tool) refuses a ``blocks``-edge card
+    whose text reads time-gated and has no ``until``
+    (:class:`kanban_mint_lint.TimeGateError`); ``i_mean_blocks`` overrides it
+    and is ledgered as a ``time_gate_forced`` event.
 
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
@@ -5955,6 +5969,10 @@ def create_task(
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    from hermes_cli import kanban_mint_lint as _mint_lint
+
+    if until is not None:
+        until = validate_wake_at(until)
     # ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     # an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     if project_id is None and workspace_kind != "scratch":
@@ -6024,6 +6042,9 @@ def create_task(
     # Raise on a bad kind before any row is written, and resolve NULL to
     # ``blocks`` so the status decision below reads one value.
     parents_kind = normalize_link_kind(parents_kind)
+    time_gate_hit: Optional[str] = None
+    if time_gate_guard and parents and parents_kind == LINK_KIND_BLOCKS and until is None:
+        time_gate_hit = _mint_lint.time_gate_match(title, body)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -6225,6 +6246,7 @@ def create_task(
                     ), None)
                 near_dups: list[dict] = []
                 same: list[dict] = []
+                open_dups: list[dict] = []
                 if duplicate_guard:
                     near_dups = find_near_duplicates(
                         conn, title=title, body=body, tenant=tenant, now=now,
@@ -6246,6 +6268,36 @@ def create_task(
                             "--force <reason> / force_reason to file anyway",
                             same,
                         )
+                    # Open-card duplicates, no window (t_6d1df155). Keyed
+                    # automation owns its dedup, as above.
+                    if not idempotency_key:
+                        open_dups = _mint_lint.find_open_duplicates(
+                            conn, title=title, tenant=tenant, exclude_ids=parents,
+                        )
+                    if open_dups and not force_reason:
+                        raise NearDuplicateError(
+                            _mint_lint.open_duplicate_message(open_dups), open_dups,
+                        )
+                if until is not None:
+                    if task_status not in ("todo", "ready"):
+                        raise ValueError(
+                            f"--until parks a card that would queue; this one lands in "
+                            f"{task_status!r} (initial status / triage / worker park policy). "
+                            "Mint it without --until and defer it once promoted "
+                            "(`hermes kanban block <id> --kind deferred --until <when>`)."
+                        )
+                    task_status = "scheduled"
+                # Only a card that queues behind the edge is released by it; a
+                # triage/blocked park waits on a human ruling anyway.
+                time_gate_forced = bool(
+                    time_gate_hit and task_status in ("todo", "ready"))
+                if time_gate_forced and not i_mean_blocks:
+                    raise _mint_lint.TimeGateError(
+                        f"{_mint_lint.TIME_GATE_REFUSAL}; matched {time_gate_hit!r}. "
+                        "Pass --until <ISO|+24h> (tool: until), or --i-mean-blocks "
+                        "(tool: i_mean_blocks) if the parent closing really is the gate.",
+                        time_gate_hit or "",
+                    )
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -6341,8 +6393,8 @@ def create_task(
                         conn, task_id, flagship_override_author or created_by or "operator",
                         _model_force_comment(provider_override, model_override, _model_verdict.force_reason or ""),
                     )
-                if near_dups:
-                    forced = force_reason and bool(same)
+                if near_dups or (open_dups and force_reason):
+                    forced = bool(force_reason and (same or open_dups))
                     _append_event(
                         conn,
                         task_id,
@@ -6352,9 +6404,27 @@ def create_task(
                                 {k: d[k] for k in ("id", "score", "same_title")}
                                 for d in near_dups[:5]
                             ],
+                            **({"open_duplicates": [
+                                {k: d[k] for k in ("id", "status", "assignee", "rule", "score")}
+                                for d in open_dups[:5]
+                            ]} if open_dups else {}),
                             **({"reason": force_reason} if forced else {}),
                         },
                     )
+                if time_gate_forced:
+                    _append_event(conn, task_id, "time_gate_forced", {
+                        "match": time_gate_hit, "parents": list(parents),
+                        "reason": "--i-mean-blocks: the parent closing is the gate",
+                    })
+                if until is not None:
+                    conn.execute(
+                        "UPDATE tasks SET block_kind = 'deferred', next_eligible_at = ? "
+                        "WHERE id = ?", (int(until), task_id),
+                    )
+                    _append_event(conn, task_id, "scheduled", {
+                        "reason": "minted with --until", "kind": "deferred",
+                        "until": int(until), "source_status": "ready",
+                    })
                 if pr_owner_forced:
                     _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
                 overlap_hits: list[dict] = []

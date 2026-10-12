@@ -288,10 +288,19 @@ _SPECS = [
              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
                   "SIGKILLs) the worker and re-queues the task."),
-        _arg("--force", dest="force_reason", metavar="REASON",
-             help="File the card even though a non-archived card with the same title was "
-                  "created in the last 24h (near-duplicate guard). The reason is recorded "
-                  "as a near_duplicate_forced event."),
+        _arg("--force", "--not-a-duplicate", dest="force_reason", metavar="REASON",
+             help="File the card even though the duplicate guard matched: a non-archived "
+                  "card with the same title created in the last 24h, or an OPEN card with "
+                  "a >=0.6 similar title head or the same 'Momus pass N' + spec. The reason "
+                  "is recorded as a near_duplicate_forced event."),
+        _arg("--until", metavar="TS",
+             help="Mint the card parked in 'scheduled' until TS (ISO-8601, epoch, or +<N>[smhd]); "
+                  "the dispatcher wakes it then (todo while parents are open). Use this for a "
+                  "time-gated card instead of a bare blocks edge."),
+        _arg("--i-mean-blocks", action="store_true", dest="i_mean_blocks",
+             help="Mint a blocks-edge card whose text reads time-gated ('after 24 h', "
+                  "'once ... elapsed') without --until: the parent closing really is the "
+                  "gate. Recorded as a time_gate_forced event."),
         _arg("--created-by", default="user", help="Author name recorded on the task (default: user)"),
         _arg("--skill", action="append", default=[], dest="skills",
              help="Skill to force-load into the worker (repeatable). The kanban "
