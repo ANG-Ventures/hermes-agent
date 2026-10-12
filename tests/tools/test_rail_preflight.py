@@ -479,3 +479,63 @@ def test_computer_use_placed_private_daemon_refusal_is_the_screen_rail(monkeypat
     assert out["error"] == EXPECTED_SCREEN.format(host="ace-ai")
     assert out["detail"] == "off-screen host"
     assert rp.take_rail_absent() == EXPECTED_SCREEN.format(host="ace-ai")
+
+
+# ── t_6276f6ec: approvals.mode off must not escalate a PLACED worker onto the refused private daemon ────
+def _bypassed_mode(monkeypatch, tmp_path, configured, *, placed):
+    """_cua_permission_mode under approvals.mode: off (the daedalus profile) through the real placement
+    resolution, with computer_use.permission_mode = ``configured``."""
+    from tools import approval_context
+    from tools.computer_use import cua_backend, tool as cu
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"version": 2}', encoding="utf-8")
+    monkeypatch.setattr(cua_backend, "_computer_use_cfg",
+                        lambda: {"permission_mode": configured, "capability_manifest": str(manifest)})
+    monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "off")
+    monkeypatch.setenv("TERMINAL_ENV", "ssh" if placed else "local")
+    if placed:
+        _placed(monkeypatch, "ci-box")
+    monkeypatch.setattr(cu, "_escalation_warned", set())
+    return cu._cua_permission_mode("t6276-session")
+
+
+def test_placed_bypass_is_capped_to_standard_and_starts_on_the_shared_daemon(monkeypatch, tmp_path, caplog):
+    # Red on base: approvals.mode off -> 'unrestricted' -> private daemon -> PrivateDaemonOffScreen ->
+    # SCREEN_RAIL_ABSENT on a fully provisioned pool host.
+    import logging
+    from unittest.mock import Mock
+    import pm
+    from tools.computer_use import cua_backend, cua_backend_daemon, tool as cu
+    _worker(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=cu.logger.name):
+        mode = _bypassed_mode(monkeypatch, tmp_path, "standard", placed=True)
+        assert cu._cua_permission_mode("t6276-session") == mode
+    assert mode == "standard"
+    caps = [r for r in caplog.records if "capped to standard" in r.getMessage()]
+    assert len(caps) == 1, "one WARN per session naming the cap"
+    assert "approvals.mode off escalated cua to unrestricted" in caps[0].getMessage()
+    assert not [r for r in caplog.records if "escalated the cua-driver" in r.getMessage()]
+    # The backend that mode builds starts without a private daemon on this host.
+    monkeypatch.setattr(cua_backend, "sandbox_mcp_invocation",
+                        lambda: (("ssh", ["kanbanw@ci-box", "cua-driver", "mcp"]), {"PATH": ""}))
+    monkeypatch.setattr(pm, "ensure_import", lambda *a, **k: None)
+    popen = Mock(side_effect=OSError("recorded: private daemon spawn on this host"))
+    monkeypatch.setattr(cua_backend_daemon.subprocess, "Popen", popen)
+    backend = cua_backend.CuaDriverBackend(permission_mode=mode)
+    monkeypatch.setattr(backend._session, "start", lambda: None)
+    backend.start()
+    assert backend._embedded_daemon is None and popen.call_count == 0
+
+
+def test_placed_configured_bounded_still_refuses_under_bypass(monkeypatch, tmp_path):
+    # Only the escalation is capped: a CONFIGURED bounded mode keeps failing fast under terminal placement.
+    _worker(monkeypatch)
+    from tools.computer_use.cua_backend_daemon import PrivateDaemonOffScreen
+    mode = _bypassed_mode(monkeypatch, tmp_path, "bounded", placed=True)
+    assert mode == "bounded"
+    popen, exc = _private_daemon_start(monkeypatch, tmp_path, mode, placed=True)
+    assert popen.call_count == 0 and isinstance(exc, PrivateDaemonOffScreen)
+
+
+def test_unplaced_bypass_still_escalates_to_unrestricted(monkeypatch, tmp_path):
+    assert _bypassed_mode(monkeypatch, tmp_path, "standard", placed=False) == "unrestricted"
