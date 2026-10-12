@@ -4119,10 +4119,27 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         _kwp.note_ignored_pin(row["id"], ignored)
     if verdict is not None and caps_out is not None:
         _note_capability_verdict(row["id"], verdict, caps, rule, pin, caps_out)
+        if not ok and verdict.pin is not None:
+            # Every door that keeps the card home, named (spec v0.3 AC-11b:
+            # `ssh ci sudo` reads `host_reach` from the matrix AND
+            # `requires:fleet-ssh` from the map).
+            caps_out.setdefault("reasons", {})[row["id"]] = list(dict.fromkeys(
+                [rule, *(r.rule for r in verdict.enforced)]))
         if caps.error and (verdict.observed is not None or skills):
             # A card the bad map/index demoted (F11): it carries the event.
             caps_out.setdefault("touched", []).append(row["id"])
     if ok:
+        if verdict is not None and verdict.only and route_class != "pin":
+            # Capability-aware placement (t_90887924): some pool host
+            # advertises what the card needs; it goes to those hosts only,
+            # never to a local slot (a docker card does not drift onto the
+            # Studio as portable overflow, spec v0.3 §3.4).
+            if caps_out is not None:
+                caps_out.setdefault("only", {})[row["id"]] = verdict.only
+            if affinity_out is not None and verdict.pin is not None:
+                from hermes_cli import kanban_host_capabilities as _khc
+                affinity_out[row["id"]] = _khc.affinity_payload(
+                    verdict.pin, verdict, _khc.ENFORCE, host="|".join(verdict.only))
         return ("pin", pin) if route_class == "pin" else ("portable", None)
     if rule == _pr.PIN_UNKNOWN_HOST:
         # A host: line naming no host: local only, named, never spilled (t_cb2b888d).
@@ -4140,6 +4157,16 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                       row["id"], getattr(plan.config, "reach_status", "absent"))
     if pin is not None and pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
         return "wait", _pr.not_portable(rule)
+    if (verdict is not None and verdict.wait and verdict.pin is not None
+            and rule == verdict.pin.rule and pin != _kwp.PIN_STUDIO):
+        # An identity-only capability (the Studio serves it to `host: studio`
+        # pins only) that no pool host advertises: WAIT, named, never spawn
+        # locally unpinned (spec v0.3 §3.4, AC-5; t_90887924).
+        if affinity_out is not None:
+            from hermes_cli import kanban_host_capabilities as _khc
+            affinity_out[row["id"]] = _khc.affinity_payload(verdict.pin, verdict, _khc.ENFORCE,
+                                                            host="none")
+        return "wait", verdict.wait
     if verdict is not None and verdict.pin is not None and rule == verdict.pin.rule:
         # An enforced capability no pool host has (t_8c474c2e): runs here
         # or waits, named, never spills.
@@ -4228,6 +4255,10 @@ def _caps_into_result(result, caps, caps_out: dict) -> None:
         result.placement_caps.setdefault(tid, {})["unknown"] = req.cap.split(":", 1)[-1]
     for tid, (host, req) in (caps_out.get("pin_lacks") or {}).items():
         result.placement_caps.setdefault(tid, {})["pin_lacks"] = f"host:{host} lacks {req.cap}"
+    for tid, reasons in (caps_out.get("reasons") or {}).items():
+        result.placement_caps.setdefault(tid, {})["reasons"] = reasons
+    for tid, hosts in (caps_out.get("only") or {}).items():
+        result.placement_caps.setdefault(tid, {})["only"] = list(hosts)
 
 
 def _capabilities_unplanned(rows, result) -> None:
@@ -5584,7 +5615,8 @@ def _dispatch_once_locked(
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
         placed_host = None
-        if route == "pin" or (route == "portable" and not local_free):
+        _cap_only = _caps_out.get("only", {}).get(row["id"])
+        if route == "pin" or (route == "portable" and (not local_free or _cap_only)):
             # A refused take() NEVER falls through to a local spawn (I-11).
             # A host-bound portable card only lands on a host the reach
             # matrix proves (t_1e9ea7e9); None = any pool host.
@@ -5605,6 +5637,11 @@ def _dispatch_once_locked(
                 if _need_hosts is not None:
                     _only = _need_hosts if _only is None else tuple(
                         h for h in _only if h.lower() in {n.lower() for n in _need_hosts})
+                if _cap_only:
+                    # Hosts advertising the card's capability (t_90887924),
+                    # intersected with the reach proof when both apply.
+                    _only = tuple(_cap_only) if _only is None else \
+                        tuple(h for h in _only if h in _cap_only)
             if _only is None:
                 placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
             else:

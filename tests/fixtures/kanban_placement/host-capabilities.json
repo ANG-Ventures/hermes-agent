@@ -58,6 +58,41 @@
         "\\bsay the wake\\b",
         "\\bbench satellite\\b"
       ]
+    },
+    "studio-state": {
+      "what": "Studio filesystem state outside the vault and runtime tree: the board DBs, turns.db, gateway.log, load_gate.json, ledgers under ~/.hermes/var and state/*.jsonl, fleet-merge.sh, the deploy windows (host-affinity spec v2 F8; 5 of the 9 measured wrong-host blocks)",
+      "probe_negative": "python3 -c \"import sqlite3,os;sqlite3.connect('file:'+os.path.expanduser('~/.hermes/kanban.db')+'?mode=ro',uri=True).execute('select 1 from tasks')\"",
+      "sniff": [
+        "(?<![\\w-])(?:kanban|turns|state)\\.db(?![\\w-])",
+        "(?<![\\w-])gateway\\.log(?![\\w-])",
+        "(?<![\\w-])load_gate\\.json(?![\\w-])",
+        "~/\\.hermes/(?:var|state|logs)/",
+        "(?<![\\w-])state/[\\w.-]+\\.jsonl\\b",
+        "(?<![\\w-])fleet-merge\\.sh\\b",
+        "@studio(?:-raw)?\\b"
+      ],
+      "soft": false
+    },
+    "fleet-ssh": {
+      "what": "Ace's operator ssh identity to fleet boxes (ace@ keys, NOPASSWD sudo) and his PAT; kanbanw has neither. Second door: the reach matrix fails closed on the same aliases (spec v0.3 §3.1 two doors)",
+      "probe_negative": "ssh -o BatchMode=yes -o ConnectTimeout=4 ci true",
+      "sniff": [
+        "(?<![\\w-])ssh(?![\\w-])[^\\n]*?(?:\\s|@)(?:ci|ci-box|ci\\.ace|ace-ai|ace-ai\\.local|ace-media|ace-media-ubuntu|mac-studio-m3u|studio-mint|fleet-nas|haos|unifi|nick-pc|sub-vps-\\d+|claude-sub-\\d+)(?=[\\s'\"]|$)"
+      ],
+      "soft": false
+    },
+    "docker": {
+      "what": "a working ROOTLESS docker engine for the pool user (a kanbanw in the docker group is root-equivalent and must FAIL the probe, Momus R8)",
+      "probe": "docker info --format '{{.ServerVersion}} {{.SecurityOptions}}' | grep -q rootless",
+      "sniff": [
+        "\\bdocker compose\\b",
+        "\\bdocker run\\b",
+        "\\bdocker build\\b",
+        "compose\\.ya?ml",
+        "testcontainers"
+      ],
+      "act": [],
+      "soft": false
     }
   },
   "hosts": {
@@ -71,8 +106,14 @@
         "apple-apps",
         "obsidian-vault",
         "control-plane",
-        "acoustic-bench"
-      ]
+        "acoustic-bench",
+        "studio-state",
+        "fleet-ssh",
+        "docker"
+      ],
+      "studio_tier": {
+        "docker": "identity-only"
+      }
     },
     "ace-ai": {
       "capabilities": []
