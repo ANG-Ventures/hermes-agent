@@ -3605,12 +3605,26 @@ def dispatch_once(
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
             _kbc._maybe_checkpoint_wal(conn, db_path)
+    # Outside the dispatch lock: stop resources (VM/container/unit) whose card finished
+    # (t_2df204e5). Only the tick that held the lock sweeps, so two dispatchers never double-stop.
+    if held and not dry_run:
+        _release_finished_resources(conn, board)
     # The dispatch lock has been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
+
+
+def _release_finished_resources(conn: sqlite3.Connection, board: Optional[str]) -> None:
+    """Best-effort: a failing sweep is logged and retried next tick, never breaks dispatch."""
+    try:
+        from hermes_cli import kanban_resources
+
+        kanban_resources.release_finished(conn, board=board)
+    except Exception as exc:
+        _kb._log.warning("kanban resource release failed (%s: %s)", type(exc).__name__, exc)
 
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:

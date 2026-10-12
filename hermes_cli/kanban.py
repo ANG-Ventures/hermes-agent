@@ -728,6 +728,42 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
                       f"Heartbeat recorded for {args.task_id}")
 
 
+def _cmd_resource(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_resources as kres
+
+    action = getattr(args, "resource_action", None)
+    if action is None:
+        return _err("usage: kanban resource add|list|check|mark|release")
+    try:
+        with kbc.connect_closing() as conn:
+            if action == "add":
+                out = kres.kanban_run_resource(conn, args.task_id, args.kind, args.resource_id, args.host,
+                                               run_id=args.run_id)
+                if not _json_out(args, out):
+                    print(f"run {out['run_id']}: recorded {args.kind} {args.resource_id} on {args.host}")
+                return 0
+            if action == "release":
+                acts = kres.release_finished(conn, dry_run=args.dry_run)
+                if not _json_out(args, acts):
+                    for a in acts:
+                        print(f"{a['action']:12s} {a['task_id']} {a['kind']} {a['id']} @ {a['host']}")
+                return 0
+            if action == "mark":
+                n = kres.mark(conn, args.task_id, args.kind, args.resource_id, args.host, args.state,
+                              reason=args.reason)
+                return _ok_or_err(n, f"no recorded {args.kind} {args.resource_id} on {args.host} to mark",
+                                  f"marked {n} record(s) {args.state}")
+            rows = kres.list_resources(conn, args.task_id) if action == "list" else kres.outstanding(conn, args.task_id)
+    except ValueError as exc:
+        return _err(f"kanban resource {action}: {exc}")
+    if not _json_out(args, rows):
+        for r in rows:
+            print(f"run {r['run_id']}  {r.get('state', '?'):11s} {r.get('kind')} {r.get('id')} @ {r.get('host')}")
+        if action == "check":
+            print(f"RESOURCES={'open' if rows else 'ok'} outstanding={len(rows)}")
+    return 1 if action == "check" and rows else 0
+
+
 def _cmd_assignees(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         data = kb.known_assignees(conn)
@@ -4745,7 +4781,7 @@ _HANDLERS = {
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "home-index": _cmd_home_index, "session-closeout": _cmd_session_closeout,
-    "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
+    "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat, "resource": _cmd_resource,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-status": _cmd_notify_status,
     "notify-unsubscribe": _cmd_notify_unsubscribe,
