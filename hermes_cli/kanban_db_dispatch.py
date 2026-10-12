@@ -3951,13 +3951,17 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         if affinity_out is not None:
             affinity_out[row["id"]] = {"host": _kwp.STUDIO_HOST, "rule": rule,
                                        "matched_by": hit[1] if hit else rule}
+        if rule == _kwp.STUDIO_NEEDS_RULE:
+            # Name what it needs (t_aea826a9): ``studio_affinity:studio_needs(vault,skills_tree)``.
+            return "local", f"studio_affinity:{rule}({','.join(sorted(_kwp.card_needs(row['body'])))})"
         return "local", f"studio_affinity:{rule}"
     # host:any that fails hard_ok may still run locally; with no local slot
     # it waits on the failed hard rule (RC-1), an unpinned card on local_full.
     return "local", (_pr.not_portable(rule) if pin == _kwp.PIN_ANY else None)
 
 
-_STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body"})
+_STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body",
+                                    "studio_needs"})
 
 
 def _manifest_affinity(skills, assignee) -> dict:
@@ -5282,6 +5286,12 @@ def _dispatch_once_locked(
                 _only = _kwp_take.reach_allowed_hosts(
                     body=row["body"], skills=_skills, pool=spillover.config,
                     targets=_manifest_targets(_skills, row_assignee) if _skills else {})
+                # A body naming Studio-only resources lands only on a host
+                # whose caps cover them (t_aea826a9); never widen ``_only``.
+                _need_hosts = _kwp_take.needs_allowed_hosts(row["body"], spillover.config)
+                if _need_hosts is not None:
+                    _only = _need_hosts if _only is None else tuple(
+                        h for h in _only if h.lower() in {n.lower() for n in _need_hosts})
             if _only is None:
                 placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
             else:
