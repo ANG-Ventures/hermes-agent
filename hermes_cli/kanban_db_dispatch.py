@@ -1951,12 +1951,15 @@ def detect_crashed_workers(
                 )
                 if stderr_exit_class is not None:
                     kind = "rate_limited"
-            if kind == "rate_limited" and not cohort_death:
-                # The worker said "wall", but its own last lines carry the provider's
-                # verdict. A 400/401/403/404 is a REJECTION (dead model id, bad
-                # credential): the same answer on every retry, so it is a failure
-                # that counts, never a requeue-without-a-strike (t_d564a8dd: 24 such
-                # exits booked ``rate_limited`` for 8 h). 429/503/529 stay a wall.
+            if kind in ("rate_limited", "nonzero_exit") and not cohort_death:
+                # Whatever the worker said ("wall", or a plain nonzero exit), its own
+                # last lines carry the provider's verdict. A 400/401/403/404 is a
+                # REJECTION (dead model id, bad credential): the same answer on every
+                # retry, so it is a failure that counts toward the rejection streak,
+                # never a requeue-without-a-strike (t_d564a8dd: 24 such exits booked
+                # ``rate_limited`` for 8 h) and never generic crash accounting (the
+                # pinned-worker refusal path now exits nonzero on a 4xx on purpose,
+                # ``apply_pin_refusal_to_result``). 429/503/529 stay a wall.
                 from hermes_cli.kanban_worker_exit import provider_rejected_status
 
                 provider_rejected_line = provider_rejected_status(

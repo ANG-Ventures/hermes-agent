@@ -25,6 +25,10 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     monkeypatch.delenv("HERMES_KANBAN_OWNER_PID", raising=False)
+    # A dispatcher-spawned shell carries the CLAIMED pin of ITS card; an inherited
+    # ``{"model": null, "provider": null}`` would seed this board as unpinned (15 reds
+    # on a worker-run control worktree, t_b730782e). Pin reads come from the row.
+    monkeypatch.delenv("KANBAN_CLAIMED_CARD_PIN", raising=False)
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="pinned", assignee="a",
                              model_override="gpt-6-sol-900k",
