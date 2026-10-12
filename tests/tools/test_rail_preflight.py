@@ -181,7 +181,7 @@ EXPECTED_SCREEN = (
 )
 
 
-def _computer_use(monkeypatch, *, backend_error=None, screen_up=None):
+def _computer_use(monkeypatch, *, backend_error=None, screen_up=None, backend_exc=None):
     """handle_computer_use with the lease/screen start stubbed and the backend either failing or working."""
     import contextlib
     from tools.bot_desktop import lease, runtime as bd
@@ -208,6 +208,8 @@ def _computer_use(monkeypatch, *, backend_error=None, screen_up=None):
 
     @contextlib.contextmanager
     def backend_for_call(session_id=""):
+        if backend_exc is not None:
+            raise backend_exc
         if backend_error:
             raise RuntimeError(backend_error)
         yield _Backend()
@@ -414,3 +416,66 @@ def test_tool_round_breaks_on_rail_absent_instead_of_retrying(monkeypatch):
     assert v._turn_exit_reason == "rail_absent"
     assert parked == [EXPECTED_BROWSER.format(host="ace-ai")]
     assert v.final_response == parked[0]
+
+
+# ── t_08423f24: the private (bounded/unrestricted) cua-driver daemon is a host process ──────────────
+def _private_daemon_start(monkeypatch, tmp_path, mode, *, placed):
+    """CuaDriverBackend(mode).start() through the REAL placement resolution (KANBAN_WORKER_PLACEMENT ->
+    TERMINAL_ENV=ssh, as on a pool host), recording any local daemon spawn instead of running it."""
+    from unittest.mock import Mock
+    import pm
+    from tools.computer_use import cua_backend, cua_backend_daemon
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"version": 2}', encoding="utf-8")
+    monkeypatch.setattr(cua_backend, "_computer_use_cfg",
+                        lambda: {"permission_mode": "bounded", "capability_manifest": str(manifest)})
+    monkeypatch.setenv("TERMINAL_ENV", "ssh" if placed else "local")
+    if placed:
+        _placed(monkeypatch, "ace-ai")
+        # The pool host's screen is up, so the MCP proxy itself would already go over ssh.
+        monkeypatch.setattr(cua_backend, "sandbox_mcp_invocation",
+                            lambda: (("ssh", ["kanbanw@ace-ai", "cua-driver", "mcp"]), {"PATH": ""}))
+    else:
+        monkeypatch.setattr(cua_backend, "sandbox_mcp_invocation", lambda: None)
+        monkeypatch.setattr(cua_backend, "cua_driver_runtime_contract_status", lambda: {"ready": True})
+        monkeypatch.setenv("HERMES_CUA_DRIVER_CMD", "/opt/cua-driver")
+    monkeypatch.setattr(sys, "platform", "linux")  # plain `serve` argv, no CuaDriver.app codesign probe
+    monkeypatch.setattr(pm, "ensure_import", lambda *a, **k: None)
+    monkeypatch.setattr(cua_backend, "_cua_no_overlay", lambda: False)
+    monkeypatch.setattr(cua_backend_daemon._driver, "resolve_cua_driver_cmd", lambda: "/opt/cua-driver")
+    monkeypatch.setattr(cua_backend_daemon._driver, "_resolve_mcp_invocation", lambda c: (c, ["mcp"]))
+    popen = Mock(side_effect=OSError("recorded: private daemon spawn on this host"))
+    monkeypatch.setattr(cua_backend_daemon.subprocess, "Popen", popen)
+    backend = cua_backend.CuaDriverBackend(permission_mode=mode)
+    monkeypatch.setattr(backend._session, "start", lambda: None)
+    with pytest.raises(Exception) as exc:
+        backend.start()
+    return popen, exc.value
+
+
+@pytest.mark.parametrize("mode", ["bounded", "unrestricted"])
+def test_placed_worker_never_starts_the_private_daemon_on_the_dispatcher(monkeypatch, tmp_path, mode):
+    # Red on base: `serve --embedded` (macOS: `open -a CuaDriver.app --args serve ...`) ran on the
+    # dispatcher, so a placed worker's computer_use drove the operator's screen, not ace-ai's.
+    _worker(monkeypatch)
+    from tools.computer_use.cua_backend_daemon import PrivateDaemonOffScreen
+    popen, exc = _private_daemon_start(monkeypatch, tmp_path, mode, placed=True)
+    assert popen.call_count == 0, f"private daemon spawned on the dispatcher: {popen.call_args}"
+    assert isinstance(exc, PrivateDaemonOffScreen)
+
+
+def test_unplaced_bounded_worker_still_starts_its_private_daemon(monkeypatch, tmp_path):
+    _worker(monkeypatch)
+    popen, _ = _private_daemon_start(monkeypatch, tmp_path, "bounded", placed=False)
+    assert popen.call_count == 1 and popen.call_args.args[0][:2] == ["/opt/cua-driver", "serve"]
+
+
+def test_computer_use_placed_private_daemon_refusal_is_the_screen_rail(monkeypatch):
+    # The pool host's desktop is up, yet the private daemon cannot live there: park SCREEN_RAIL_ABSENT.
+    _worker(monkeypatch)
+    _placed(monkeypatch, "ace-ai")
+    from tools.computer_use.cua_backend_daemon import PrivateDaemonOffScreen
+    out, _ = _computer_use(monkeypatch, screen_up=True, backend_exc=PrivateDaemonOffScreen("off-screen host"))
+    assert out["error"] == EXPECTED_SCREEN.format(host="ace-ai")
+    assert out["detail"] == "off-screen host"
+    assert rp.take_rail_absent() == EXPECTED_SCREEN.format(host="ace-ai")

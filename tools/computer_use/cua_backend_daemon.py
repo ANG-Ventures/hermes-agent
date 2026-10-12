@@ -91,6 +91,24 @@ def _wait_or_kill(process: Any) -> None:
             process.wait(timeout=2.0)
 
 
+class PrivateDaemonOffScreen(RuntimeError):
+    """The private daemon would run on this host while the agent's screen lives elsewhere (t_08423f24)."""
+
+
+def _refuse_off_screen_host(permission_mode: str) -> None:
+    """The private daemon is a host process (``open -a CuaDriver.app`` / a local ``serve``), so it drives THIS
+    host's screen. Under a ``terminal`` or ``refused`` desktop placement the agent's screen is not this host's
+    (for a placed kanban worker this host is the operator's desktop): refuse instead of starting it here."""
+    from tools.bot_desktop import placement
+    where = placement.resolve()
+    if where.where != placement.GATEWAY:
+        raise PrivateDaemonOffScreen(
+            f"computer_use permission mode '{permission_mode}' needs a private cua-driver daemon on the machine whose "
+            f"screen it drives, and this profile's screen is placed inside the {where.backend} terminal backend, which "
+            "cannot host one yet. Use computer_use.permission_mode: standard (and no --yolo) there, or set "
+            "bot_desktop.placement: gateway to drive this host's screen deliberately.")
+
+
 class _EmbeddedCuaDaemon:
     """Private daemon for a non-standard permission mode. cua-driver's permission mode is immutable after daemon
     startup, so reusing the machine-wide daemon would let one Hermes session's YOLO choice affect another. A
@@ -160,6 +178,7 @@ class _EmbeddedCuaDaemon:
     def start(self) -> None:
         if self._running:
             return
+        _refuse_off_screen_host(self.permission_mode)
         # Keep an explicit command fixed, but reselect managed drivers on every
         # launch: PM may have acquired a new pin since construction or last stop.
         driver_cmd = self._driver_cmd or _driver.resolve_cua_driver_cmd()
