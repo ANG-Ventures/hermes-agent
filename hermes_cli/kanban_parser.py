@@ -135,6 +135,11 @@ _PIN_SUB_FALLBACK = _arg(
     help="With --pin-sub: when the pinned sub is capped/cooling, ride its family pool "
          "(bpx-N -> claude-bpr, apx-N -> claude-apr) instead of waiting.",
 )
+_FORCE_MODEL = _arg(
+    "--force-model", dest="force_model", metavar="REASON",
+    help="Pin a model id the lane's live model list does not know (normally refused with the "
+         "valid list; incident t_d564a8dd). Requires a non-empty reason, recorded as a comment.",
+)
 _ALLOW_FLAGSHIP = _arg(
     "--allow-flagship", "--firepower", dest="allow_flagship", metavar="REASON",
     help="Allow an orchestrator-only flagship model for this task. Requires a non-empty "
@@ -306,6 +311,7 @@ _SPECS = [
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
         _ALLOW_FLAGSHIP,
+        _FORCE_MODEL,
         _PIN_SUB,
         _PIN_SUB_FALLBACK,
         _arg("--reasoning", "--effort", dest="reasoning_effort", metavar="LEVEL",
@@ -420,6 +426,7 @@ _SPECS = [
         _arg("--allow-flagship", "--firepower", dest="allow_flagship", metavar="REASON",
              help="Allow an orchestrator-only flagship model. Requires a non-empty "
                   "reason, recorded as a task comment. --firepower is an alias."),
+        _FORCE_MODEL,
         _PIN_SUB,
         _PIN_SUB_FALLBACK,
         _group(
@@ -597,6 +604,7 @@ _SPECS = [
         _arg("--clear-model", action="store_true", dest="clear_model",
              help="Clear the per-task model override (revert to the assignee profile default). "
                   "Mutually exclusive with --model."),
+        _FORCE_MODEL,
         _arg("--session", metavar="SESSION_ID",
              help="(Re)stamp the card's home session ('none' = unstamped)."),
         _group(

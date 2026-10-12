@@ -3723,6 +3723,7 @@ def delegate_task(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     allow_flagship_reason: Optional[str] = None,
+    force_model: Optional[str] = None,
     images: Optional[List[str]] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
@@ -3780,6 +3781,11 @@ def delegate_task(
         model, provider = resolve_model_pair_for_storage(model, provider)
         try:
             reason = validate_worker_model(model, allow_flagship_reason=allow_flagship_reason)
+            # An id the lane does not serve fails every child turn with a 404 (t_d564a8dd);
+            # refuse here with the lane's list unless the caller forces it with a reason.
+            from hermes_cli.model_registry import require as _require_known_model
+
+            _require_known_model(provider, model, force_reason=force_model, flag="force_model")
         except ValueError as exc:
             return tool_error(str(exc))
         if flagship_model_match(model):
@@ -4890,6 +4896,10 @@ DELEGATE_TASK_SCHEMA = {
             "allow_flagship_reason": _p(
                 "string", "Nonblank audited justification for an explicit flagship model override.",
             ),
+            "force_model": _p(
+                "string", "Reason to use a model id the provider's live model list does not know "
+                "(otherwise refused with the valid list).",
+            ),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(
@@ -4952,7 +4962,7 @@ registry.register(
         background=_model_background_value(args, kw.get("parent_agent")),
         inherit_context=args.get("inherit_context"), skills=args.get("skills"), output_schema=args.get("output_schema"),
         model=args.get("model"), provider=args.get("provider"), allow_flagship_reason=args.get("allow_flagship_reason"),
-        images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        force_model=args.get("force_model"), images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

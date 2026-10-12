@@ -1187,6 +1187,7 @@ def _action_create(a: Dict[str, Any]) -> str:
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
             reasoning_effort=a["reasoning_effort"], interpreter=a["interpreter"],
+            force_model_reason=a["force_model"],
             pinned=bool(a["pinned"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
@@ -1464,6 +1465,8 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
     _admission_error = _creation_admission_error({**job, **updates})
     if _admission_error:
         return tool_error(_admission_error, success=False)
+    if a.get("force_model") and {"model", "provider", "fallback"}.intersection(updates):
+        updates["force_model_reason"] = a["force_model"]
     updated = update_job(job["id"], updates)
     if not updated:
         return tool_error(f"Failed to update cron job '{job['id']}'.", success=False)
@@ -1540,7 +1543,8 @@ def cronjob(
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: Optional[bool] = None,
-    interpreter: Optional[str] = None) -> str:
+    interpreter: Optional[str] = None,
+    force_model: Optional[str] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility

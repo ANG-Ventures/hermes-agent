@@ -2445,6 +2445,7 @@ def create_job(
     paused_reason: Optional[str] = None,
     pinned: bool = False,
     interpreter: Optional[str] = None,
+    force_model_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -2494,6 +2495,7 @@ def create_job(
     flagship_reason = validate_worker_model(
         f["model"], allow_flagship_reason=allow_flagship_reason
     )
+    _require_known_job_route(f["model"], f["provider"], force_model_reason=force_model_reason)
     _revalidate_resolved_provider(provider, f["provider"], f["base_url"])
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
@@ -2634,6 +2636,27 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     for job in jobs:
         job["latest_execution"] = latest.get(job.get("id", ""))
     return jobs
+
+
+def _require_known_job_route(
+    model: Any, provider: Any, fallback: Any = None, *, force_model_reason: Optional[str] = None,
+) -> None:
+    """Refuse a primary or fallback-chain model the lane's live list does not serve.
+
+    Cron 6c0e2279b47e (2026-10-11) was minted with ``claude-sonnet-4-8`` as its primary
+    AND in its fallback chain; the lane serves ``claude-sonnet-5-5``. Every entry of a
+    chain is a route the job may fire on, so each is checked exactly like the primary.
+    A lane whose list cannot be read is admitted (unverifiable), never guessed at.
+    """
+    from hermes_cli.model_registry import require
+
+    if model:
+        require(provider, model, force_reason=force_model_reason, flag="--force-model")
+    entries = [fallback] if isinstance(fallback, dict) else (fallback if isinstance(fallback, list) else [])
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("model"):
+            require(entry.get("provider"), entry.get("model"), force_reason=force_model_reason,
+                    flag="--force-model")
 
 
 def _pin_fallback_reasoning_effort(chain: Any, effort: str) -> Any:
@@ -2868,6 +2891,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 allow_flagship_reason=updated.get("allow_flagship_reason"),
             )
 
+        if {"model", "provider", "fallback"}.intersection(updates):
+            # The merged route (primary + every chain entry) must be one the lanes serve;
+            # a chain derived or edited onto an unknown primary is just as dead (t_d564a8dd).
+            _force = updates.pop("force_model_reason", None)
+            _require_known_job_route(
+                updated.get("model"), updated.get("provider"), updated.get("fallback"),
+                force_model_reason=_force,
+            )
+            updated.pop("force_model_reason", None)
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
