@@ -9615,8 +9615,14 @@ def reclaim_task(
     reason: Optional[str] = None,
     signal_fn=None,
     operator: Optional[str] = None,
+    signal_allowed: bool = True,
 ) -> bool:
     """Operator-driven reclaim: release the claim and restore its source phase.
+
+    ``signal_allowed=False`` (the pr-owner reclaimer, t_0a9a20ea) reclaims
+    only a run the host proves dead: a live verified worker is never
+    signalled, the reclaim is refused (``reclaim_refused`` with
+    ``worker_alive_unsignalled``) and the card keeps its owner.
 
     Unlike :func:`release_stale_claims` which only acts on tasks whose
     ``claim_expires`` has passed, this function reclaims immediately
@@ -9679,6 +9685,7 @@ def reclaim_task(
             conn, task_id, row["worker_pid"], row["current_run_id"],
         ),
         conn=conn, task_id=task_id, run_id=row["current_run_id"],
+        signal_allowed=signal_allowed,
     )
     # Never release a claim while our host-local worker is alive or its
     # liveness is unknown. This also covers NULL pid in the TTL and stale
@@ -17468,6 +17475,8 @@ def _refuse_reclaim_unproven_death(
             "reason": (
                 "liveness_unprovable"
                 if termination.get("liveness_unprovable")
+                else "worker_alive_unsignalled"
+                if termination.get("worker_alive_unsignalled")
                 else "worker_survived_termination"
             ),
             "requested_reason": reason,
@@ -18129,6 +18138,12 @@ def _reassign_stale_pr_owners(
     owner was reclaimed (spawn may proceed), else ``pr_owner_busy``: a reclaim
     that cannot prove the old worker dead (``reclaim_task`` fails closed) never
     becomes a second writer.
+
+    The reclaim here never signals (t_0a9a20ea): a stale verdict is "no push,
+    no heartbeat for 2 h", not proof of death, and on 2026-10-12 it SIGTERM'd a
+    live round-2 worker. Only a run the host proves gone is reassigned; a live
+    one is refused (``reclaim_refused: worker_alive_unsignalled``) and the
+    waiting card holds. An operator ``kanban reclaim`` keeps its signal.
     """
     from . import kanban_pr_owner as _kpo
 
@@ -18141,7 +18156,7 @@ def _reassign_stale_pr_owners(
             continue
         ok = False
         try:
-            ok = reclaim_task(conn, owner["task_id"], reason=reason)
+            ok = reclaim_task(conn, owner["task_id"], reason=reason, signal_allowed=False)
         except Exception:
             _log.exception("kanban dispatch: stale PR owner reclaim failed for %s",
                            owner["task_id"])
