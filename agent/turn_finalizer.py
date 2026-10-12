@@ -72,43 +72,45 @@ def _rollup_turn_usage(turn_calls: list[dict]) -> dict:
 def turn_reasoning_effort(agent, turn_calls=None) -> "str | None":
     """Resolved reasoning-effort label the turn ran at, for the turn ledger.
 
-    The same value the runtime footer prints: ``reasoning_label`` over the
-    LIVE ``agent.reasoning_config`` (session ``/reasoning`` override, per-model
-    override and fallback-entry effort already folded in), never the config
-    default re-read from disk. ``none`` when reasoning is disabled.
+    None when the turn made no API call: no effort ran, so none is recorded
+    (a turn that failed before its first request must not show ``xhigh``).
 
-    Two cases follow what actually went on the wire instead
-    (``_wire_reasoning_config``, the config of the last request built):
+    Otherwise the same value the runtime footer prints: ``reasoning_label``
+    over the LIVE ``agent.reasoning_config`` (session ``/reasoning`` override,
+    per-model override and fallback-entry effort already folded in), never the
+    config default re-read from disk. ``none`` when reasoning is disabled.
+
+    Two cases do not trust that config:
 
     - reasoning recovery rewrote the request for the session
       (``_reasoning_disable_rejected``: the route refused the OFF and the floor
       effort was sent; ``_reasoning_effort_rejected``: the route refused the
       level and the fields were omitted). The requested config is then not
-      what ran: record the floor, or None (unknown) when the effort was
-      omitted and the route applied its own default.
+      what ran: record what went on the wire (``_wire_reasoning_config``) --
+      the floor, or None (unknown) when the effort was omitted and the route
+      applied its own default.
     - the agent carries no config at all (unset ``agent.reasoning_effort``):
-      the provider default resolved at request time is the truth.
-
-    None when the turn made no call, so nothing is fabricated. The one-shot
-    ``_ephemeral_reasoning_off`` continuation is NOT read from the wire: it
-    disables thinking for a single follow-up call, not the turn.
+      the provider default ``unset_reasoning_default`` resolves is the truth,
+      re-derived here rather than read from ``_wire_reasoning_config``: the
+      one-shot ``_ephemeral_reasoning_off`` continuation rewrites the last
+      request's wire config to a disable for a single follow-up call, which
+      is not the effort the turn ran at.
     """
     from hermes_constants import reasoning_label
 
+    if not turn_calls:
+        return None
     recovered = bool(
         getattr(agent, "_reasoning_disable_rejected", False)
         or getattr(agent, "_reasoning_effort_rejected", False)
     )
-    if turn_calls and recovered:
+    if recovered:
         return reasoning_label(getattr(agent, "_wire_reasoning_config", None)) or None
-    label = reasoning_label(getattr(agent, "reasoning_config", None))
-    if label:
-        return label
-    if turn_calls:
-        label = reasoning_label(getattr(agent, "_wire_reasoning_config", None))
-        if label:
-            return label
-    return None
+    cfg = getattr(agent, "reasoning_config", None)
+    if cfg is None:
+        from agent.reasoning_params import unset_reasoning_default
+        cfg = unset_reasoning_default(agent)
+    return reasoning_label(cfg) or None
 
 
 def _assistant_row_missing_visible_text(msg: dict) -> bool:

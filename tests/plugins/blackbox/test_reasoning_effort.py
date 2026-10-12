@@ -75,6 +75,9 @@ def _effort(agent, calls=None):
     return turn_reasoning_effort(agent, calls)
 
 
+CALL = [{"input_tokens": 1}]
+
+
 def test_resolved_effort_is_the_session_override_not_the_config_default(monkeypatch):
     # The gateway folds a /reasoning override into the live agent config; the
     # ledger must read THAT, never re-resolve config.yaml.
@@ -84,24 +87,43 @@ def test_resolved_effort_is_the_session_override_not_the_config_default(monkeypa
         lambda *a, **k: {"enabled": True, "effort": "medium"},
     )
     agent = SimpleNamespace(reasoning_config={"enabled": True, "effort": "xhigh"})
-    assert _effort(agent) == "xhigh"
+    assert _effort(agent, CALL) == "xhigh"
 
 
 def test_resolved_effort_none_when_reasoning_disabled():
     agent = SimpleNamespace(reasoning_config={"enabled": False})
-    assert _effort(agent) == "none"
+    assert _effort(agent, CALL) == "none"
 
 
-def test_resolved_effort_falls_back_to_the_wire_config_when_unset():
-    # No session/config value: the provider default that actually went on the
-    # wire for this turn's calls is the truth (medium on OpenAI-compatible routes).
-    agent = SimpleNamespace(
-        reasoning_config=None,
-        _wire_reasoning_config={"enabled": True, "effort": "medium"},
-    )
-    assert _effort(agent, [{"input_tokens": 1}]) == "medium"
-    # No call made this turn -> nothing went on the wire -> unknown, not fabricated.
+def test_no_api_call_records_unknown_not_the_configured_effort():
+    # A turn that failed before its first request ran at no effort at all;
+    # persisting the configured xhigh would fabricate one (Prism #1906 r2).
+    agent = SimpleNamespace(reasoning_config={"enabled": True, "effort": "xhigh"})
     assert _effort(agent, []) is None
+    assert _effort(agent, None) is None
+
+
+def test_unset_config_records_the_provider_default_that_ran():
+    # No session/config value on a custom/OpenAI-compatible route: the profile
+    # default (medium) is what the turn ran at, resolved through the real
+    # unset_reasoning_default.
+    agent = SimpleNamespace(
+        reasoning_config=None, api_mode="chat_completions", provider="custom", model="some-model",
+    )
+    assert _effort(agent, CALL) == "medium"
+
+
+def test_unset_config_ignores_the_ephemeral_continuation_disable():
+    # The one-shot "answer without thinking" continuation rewrites the LAST
+    # request's wire config to a disable; the turn still ran at the default
+    # effort, so the ledger must not record "none" (Prism #1906 r2).
+    agent = SimpleNamespace(
+        reasoning_config=None, api_mode="chat_completions", provider="custom", model="some-model",
+        _ephemeral_reasoning_off=True,
+    )
+    assert _wire(agent) == {"enabled": False, "effort": "none"}
+    assert agent._wire_reasoning_config == {"enabled": False, "effort": "none"}
+    assert _effort(agent, CALL) == "medium"
 
 
 def _wire(agent):
@@ -121,7 +143,7 @@ def test_recovery_floor_records_the_effort_actually_sent_not_the_disable():
     )
     sent = _wire(agent)
     assert sent == {"enabled": True, "effort": REASONING_FLOOR_EFFORT}
-    assert _effort(agent, [{"input_tokens": 1}]) == REASONING_FLOOR_EFFORT
+    assert _effort(agent, CALL) == REASONING_FLOOR_EFFORT
 
 
 def test_recovery_omission_records_unknown_not_the_rejected_level():
@@ -133,7 +155,7 @@ def test_recovery_omission_records_unknown_not_the_rejected_level():
         _reasoning_effort_rejected=True,
     )
     assert _wire(agent) is None
-    assert _effort(agent, [{"input_tokens": 1}]) is None
+    assert _effort(agent, CALL) is None
     assert _line_after_model(render_last_turn_record(_rec(reasoning_effort=None))) == "• Reasoning: —"
 
 
@@ -145,7 +167,7 @@ def test_recovery_relay_drop_of_a_disable_records_unknown():
         _reasoning_disable_rejected=True, _reasoning_floor_required=False,
     )
     assert _wire(agent) is None
-    assert _effort(agent, [{"input_tokens": 1}]) is None
+    assert _effort(agent, CALL) is None
 
 
 def test_on_session_end_persists_reasoning_effort(tmp_path, monkeypatch):
@@ -170,6 +192,11 @@ def test_on_session_end_persists_reasoning_effort(tmp_path, monkeypatch):
         assert store.get_turn(turn_id)["reasoning_effort"] == effort
 
 
+def _call():
+    return {"input_tokens": 1, "output_tokens": 1, "cache_read_tokens": 0, "cache_write_tokens": 0,
+            "reasoning_tokens": 0, "total_tokens": 2, "latency_s": 0.1}
+
+
 def test_emit_session_end_threads_resolved_effort_into_the_hook(monkeypatch):
     """The finalizer's hook fire carries ``reasoning_effort`` from the LIVE agent config."""
     import hermes_cli.lifecycle as lifecycle
@@ -191,9 +218,34 @@ def test_emit_session_end_threads_resolved_effort_into_the_hook(monkeypatch):
     tf.emit_session_end(
         agent, turn_id="t1", effective_task_id=None, completed=True, failed=False,
         interrupted=False, turn_exit_reason=None, original_user_message="hi",
-        final_response="ok", turn_calls=[], provisional=False,
+        final_response="ok", turn_calls=[_call()], provisional=False,
     )
     assert seen.get("reasoning_effort") == "xhigh"
+
+
+def test_emit_session_end_with_no_calls_records_unknown(monkeypatch):
+    import hermes_cli.lifecycle as lifecycle
+    from agent import turn_finalizer as tf
+
+    seen = {}
+
+    def _fake_invoke_hook(name, **kwargs):
+        if name == "on_session_end":
+            seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", _fake_invoke_hook)
+    agent = SimpleNamespace(
+        session_id="s", model="m", platform="discord", provider="p",
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+        _blackbox_compaction={}, context_compressor=None,
+    )
+    tf.emit_session_end(
+        agent, turn_id="t0", effective_task_id=None, completed=False, failed=True,
+        interrupted=False, turn_exit_reason="failed", original_user_message="hi",
+        final_response="", turn_calls=[], provisional=False,
+    )
+    assert "reasoning_effort" in seen and seen["reasoning_effort"] is None
 
 
 # --------------------------------------------------------------------------- #
