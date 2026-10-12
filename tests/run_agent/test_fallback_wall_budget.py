@@ -1,11 +1,8 @@
 """Per-turn no-first-byte wall budget across the fallback chain (t_452c6ead).
 
-Acceptance fixture: the 2026-10-11 01:59-02:34 cascade (t_f2ddf6d1). Chain
-alr -> dtlr -> btpr -> bpr (all claude-fable-5-1) -> cpa (gpt). alr failed in
-seconds, dtlr and btpr each held the turn 420 s with no byte and 504'd, and the
-walk went on to bpr on the same model: 34 min of dead air. With the DEFAULT budget
-(600 s) spent once btpr fails, the walker skips the remaining fable face and lands
-on the first lane on another model.
+Chain alr -> dtlr -> btpr -> bpr (all claude-fable-5-1) -> cpa (gpt). Since the
+2026-10-12 ruling (t_778185f3) a spent budget cuts the attempt and the native
+walker takes the NEXT lane in chain order, same model or not: no same-model skip.
 """
 
 from __future__ import annotations
@@ -94,12 +91,25 @@ INCIDENT = [
 ]
 
 
-def test_incident_timeline_skips_remaining_fable_lanes_once_default_budget_is_spent():
+def test_budget_cut_on_alr_walks_to_dtlr_on_the_same_model():
+    """2026-10-11 23:26 (t_778185f3): alr held a fable turn 600 s with no byte and the
+    wall budget cut it. The next lane in the chain is dtlr, on the SAME model: it is
+    tried. The old same-model skip passed dtlr, btpr and bpr and landed on cpa/gpt."""
+    from agent.fallback_wall_budget import FallbackWallBudgetExceeded
     agent = _agent([])
-    result, called = _drive(agent, INCIDENT, {})  # pins the shipped default, not a test value
+    script = [(601.0, FallbackWallBudgetExceeded("cut")), (3.0, _response("served"))]
+    result, called = _drive(agent, script, {})  # the shipped default budget
     assert result["final_response"] == "served"
-    # dtlr+btpr burned the budget; bpr is another face of the same stalled model: go to cpa.
-    assert called == ["claude-alr", "claude-dtlr", "claude-btpr", "cpa"]
+    assert called == ["claude-alr", "claude-dtlr"]
+
+
+def test_incident_timeline_keeps_the_chain_order_after_the_budget_is_spent():
+    """The 01:59-02:34 cascade: dtlr+btpr burn the default budget, and bpr (same model,
+    next in the chain) is still tried before cpa."""
+    agent = _agent([])
+    result, called = _drive(agent, INCIDENT, {})
+    assert result["final_response"] == "served"
+    assert called == ["claude-alr", "claude-dtlr", "claude-btpr", "claude-bpr"]
 
 
 def test_healthy_slow_lane_inside_default_budget_is_not_skipped():
@@ -128,28 +138,7 @@ def test_zero_disables_the_budget():
     assert called == ["claude-alr", "claude-dtlr", "claude-btpr", "claude-bpr"]
 
 
-def test_unusable_other_model_lane_does_not_strand_the_turn():
-    """Prism a54a5cb796b0: the only other-model lane is unusable, so the spent budget must
-    not skip the remaining fable face into an exhausted chain."""
-    agent = _agent([])
-    agent._unavailable_fallback_keys = {("cpa", "gpt-6.1-sol", "")}  # e.g. a 401 earlier this session
-    result, called = _drive(agent, INCIDENT, {})
-    assert result["final_response"] == "served"
-    assert called == ["claude-alr", "claude-dtlr", "claude-btpr", "claude-bpr"]
-
-
-def test_walker_revisits_budget_skipped_lanes_when_the_other_model_is_refused_late():
-    """A filter the budget cannot see ahead of time (a card pin refusing cpa): the walk
-    comes back to the skipped fable face instead of ending the turn with no reply."""
-    agent = _agent([])
-    with patch("hermes_cli.kanban_worker_route.refuse_runtime_failover",
-               side_effect=lambda _a, prov, _m, _r=None: prov == "cpa"):
-        result, called = _drive(agent, INCIDENT, {})
-    assert result["final_response"] == "served"
-    assert called == ["claude-alr", "claude-dtlr", "claude-btpr", "claude-bpr"]
-
-
-# ── unit: clock, skip rule, notices ─────────────────────────────────────────
+# ── unit: clock, cut rule, notices ─────────────────────────────────────────
 
 
 def _bare(model=FABLE, chain=CHAIN, index=1):
@@ -157,24 +146,29 @@ def _bare(model=FABLE, chain=CHAIN, index=1):
                            _fallback_index=index, _wall_budget=None)
 
 
-def test_skip_lane_only_for_the_stalled_model_and_only_with_another_model_ahead():
+def test_cut_fires_with_only_same_model_lanes_ahead():
+    """t_778185f3: the cut no longer waits for a lane on a DIFFERENT model."""
     from agent import fallback_wall_budget as wb
     with patch("hermes_cli.config.load_config_readonly",
                return_value={"fallback": {"no_first_byte_budget_seconds": 180}}):
-        a = _bare()
-        wb.arm(a, now=0.0)
-        assert not wb.skip_lane(a, FABLE, now=179.0)
-        assert wb.skip_lane(a, FABLE, now=181.0)
-        assert not wb.skip_lane(a, "gpt-6.1-sol", now=181.0)
-        # Nothing on another model ahead: never skip into an empty chain.
         only_fable = _bare(chain=CHAIN[:3])
         wb.arm(only_fable, now=0.0)
-        assert not wb.skip_lane(only_fable, FABLE, now=500.0)
-        # The only other-model lane is unusable: same answer.
-        blocked = _bare()
+        assert not wb.should_cut_attempt(only_fable, now=179.0)
+        assert wb.should_cut_attempt(only_fable, now=181.0)
+        assert not wb.should_cut_attempt(only_fable, now=500.0), "fires once per wait"
+
+
+def test_cut_needs_a_usable_lane_ahead():
+    """Nothing usable left in the chain: the native per-lane timers keep the attempt."""
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly",
+               return_value={"fallback": {"no_first_byte_budget_seconds": 180}}):
+        last = _bare(index=len(CHAIN))
+        wb.arm(last, now=0.0)
+        assert not wb.should_cut_attempt(last, now=500.0)
+        blocked = _bare(chain=CHAIN[3:], index=0)
         blocked._quota_gate_skipped_providers = {"cpa"}
         wb.arm(blocked, now=0.0)
-        assert not wb.skip_lane(blocked, FABLE, now=500.0)
         assert not wb.should_cut_attempt(blocked, now=500.0)
 
 
@@ -284,6 +278,43 @@ def test_budget_cut_error_falls_over_on_first_hit():
     assert c.retryable is False and c.should_fallback is True
 
 
+# ── banner: the cut is classified, not "unclassified error" (t_778185f3) ────
+
+
+def _budget_cut_rider(exc):
+    import datetime as dt
+
+    from agent import fallback_events as fbe
+    from agent import fallback_policy as fp
+    a = SimpleNamespace(_pending_fallback_error=None, session_id="s", _current_turn_id="s:1")
+    fbe.stash_api_error(a, exc, None, None, elapsed_s=600.0)
+    row = fbe.build_row(a, "failover", from_provider="claude-alr", from_model=FABLE,
+                        to_provider="claude-dtlr", to_model=FABLE, reason="pool_stalled")
+    row["first_err_ts"] = dt.datetime(2026, 10, 11, 23, 26, 32, tzinfo=dt.timezone.utc).timestamp()
+    floors: list = []
+    return row, fp.format_cause_rider(row, tz=dt.timezone.utc, floors=floors), floors
+
+
+def test_budget_cut_banner_names_lane_elapsed_and_seat():
+    from agent.fallback_wall_budget import FallbackWallBudgetExceeded
+    exc = FallbackWallBudgetExceeded("cut", lane="claude-alr", elapsed_s=600.2,
+                                     pool_headers={"x-pool-served-by": "sub-vps-5",
+                                                   "x-pool-route-id": "65a4c896ecf1"})
+    row, rider, floors = _budget_cut_rider(exc)
+    assert (row["trigger_class"], row["class_source"]) == ("no_first_byte_budget", "harness")
+    assert row["seat"] == "sub-vps-5" and row["route_id"] == "65a4c896ecf1"
+    assert rider == "no first byte in 600 s on claude-alr (sub-vps-5), 23:26:32"
+    assert floors == [], "a classified cut is not a dead-letter floor"
+
+
+def test_budget_cut_before_headers_says_so():
+    from agent.fallback_wall_budget import FallbackWallBudgetExceeded
+    exc = FallbackWallBudgetExceeded("cut", lane="claude-alr", elapsed_s=600.0, pool_headers={})
+    _row, rider, _floors = _budget_cut_rider(exc)
+    assert rider == "no first byte in 600 s on claude-alr (seat unknown — cut before headers), 23:26:32"
+    assert "unclassified" not in rider and "hop unknown" not in rider
+
+
 # ── streaming: the monitor cuts a silent attempt and posts the notice ──────
 
 
@@ -323,6 +354,11 @@ def test_streaming_monitor_cuts_silent_attempt_and_posts_notice(monkeypatch):
     with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
         from agent.fallback_wall_budget import arm
         arm(agent)  # the turn loop arms it in build_api_request; this drives the call directly
-        with pytest.raises(FallbackWallBudgetExceeded):
+        with pytest.raises(FallbackWallBudgetExceeded) as cut:
             agent._interruptible_streaming_api_call({"model": FABLE})
     assert any("still waiting for a first reply" in str(m) for _k, m in statuses)
+    # The cut carries its banner evidence (t_778185f3): lane, budget clock, and the
+    # attempt's relay headers (the mock stream response answers every header name).
+    assert cut.value.lane == agent.provider
+    assert cut.value.elapsed_s is not None and cut.value.elapsed_s >= 0.6
+    assert "x-pool-served-by" in cut.value.pool_headers

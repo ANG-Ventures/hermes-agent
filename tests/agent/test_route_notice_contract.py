@@ -34,6 +34,7 @@ _CAUSE_TEXT = {
     "auth": "OAuth access token has been revoked",
     "provider_invalid_response": None,
     "lane_incapable": "interactive mode on this box serves tool-less turns only; tools[] must be empty (52 tools)",
+    "no_first_byte_budget": None,
     "unclassified": "weird thing",
 }
 _CAUSE_RE = re.compile(r"[a-zA-Z]{3,}")
@@ -55,6 +56,13 @@ def _row(cls, hop, seat, attempts, provider="claude-bpr"):
     fp.TRIGGER_CLASSES, fp.HOPS + (None,), ("sub-vps-9", None), (1, 3))))
 def test_rider_carries_all_four_fields(cls, hop, seat, attempts):
     rider = fp.format_cause_rider(_row(cls, hop, seat, attempts), tz=UTC)
+    if cls == "no_first_byte_budget":
+        # t_778185f3: the HARNESS cut the attempt, so there is no relay hop to name;
+        # the seat is the relay's served-by, or says the cut came before headers.
+        assert rider.startswith(f"{'3x ' if attempts > 1 else ''}no first byte"), rider
+        assert ("(sub-vps-9)" if seat else "(seat unknown — cut before headers)") in rider, rider
+        assert _TIME_RE.search(rider) and "?" not in rider, rider
+        return
     assert _CAUSE_RE.search(rider)
     assert _HOP_RE.search(rider), rider
     assert _SUB_RE.search(rider), rider
