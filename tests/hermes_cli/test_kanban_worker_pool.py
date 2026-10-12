@@ -1271,6 +1271,14 @@ def test_browser_card_under_spilling_studio_waits_never_spills(kanban_home, monk
         _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
               spawn_paused="spilling")
         assert len(_events(conn, browser, "placement_wait")) == 2
+        # A (re)assignment ends the episode too (shared end-kind set, Prism
+        # 75f6107b): the same wait is re-written, so the view still lists it.
+        assert kb.assign_task(conn, browser, "alpha")
+        _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
+              spawn_paused="spilling")
+        assert len(_events(conn, browser, "placement_wait")) == 3
+        from hermes_cli import kanban_placement_view as kpv
+        assert browser in [h["task_id"] for h in kpv._held(conn)]
 
 
 def test_body_bound_card_runs_locally_when_the_studio_has_room(kanban_home):

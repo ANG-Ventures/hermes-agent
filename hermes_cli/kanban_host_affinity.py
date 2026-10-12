@@ -318,6 +318,7 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
     """
     from hermes_cli import kanban_db as _kb
     from hermes_cli import kanban_db_connect as _kbc
+    from hermes_cli import kanban_placement_reasons as _pr
     affinity = result.placement_affinity or {}
     waits = result.placement_waits or {}
     evaluated = list(dict.fromkeys([*evaluated_ids, *affinity.keys()]))
@@ -354,10 +355,14 @@ def record_affinity_events(conn, result, evaluated_ids: Iterable[str] = (),
                         _kb._append_event(conn, tid, "placement_wait", dict(CLEARED))
                     continue
                 payload = {"host": aff["host"], "reason": reason, "matched_by": aff["matched_by"]}
-                claimed_since = last is not None and conn.execute(
-                    "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' AND id > ? "
-                    "LIMIT 1", (tid, last[0])).fetchone() is not None
-                if last is None or claimed_since or last_payload != payload:
+                # Same episode boundary the readers use (kanban_placement_view
+                # ._held), so an `assigned`/`requeued`/... after the wait makes
+                # the same wait a new row, not a hold the view drops (Prism 75f6107b).
+                ended = last is not None and conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN (%s) "
+                    "LIMIT 1" % ",".join("?" * len(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)),
+                    (tid, last[0], *sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS))).fetchone() is not None
+                if last is None or ended or last_payload != payload:
                     _kb._append_event(conn, tid, "placement_wait", payload)
     except Exception:
         _log.warning("kanban dispatch: could not record placement affinity events", exc_info=True)
