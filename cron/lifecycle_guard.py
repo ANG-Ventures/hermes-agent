@@ -379,8 +379,9 @@ def _match_is_ssh_remote(text: str, match_start: int) -> bool:
 # etc.): `bash -c "hermes gateway restart"` re-executes the phrase and MUST
 # stay blocked. Anchored at the start of the segment (optional leading path).
 _TEXT_CONSUMER_RE = re.compile(
+    # No awk (`system()`) and no sed (`e` command): both execute their program argument.
     r"(?i)(?:^|\s)(?:/\S*/)?(?:echo|printf|grep|egrep|fgrep|rg|cat|head|tail|"
-    r"less|more|comm|diff|sed\s+-n|awk|jq|tee|column|sort|uniq|wc|"
+    r"less|more|comm|diff|jq|tee|column|sort|uniq|wc|"
     # Message-carrying VCS verbs. A commit/tag/stash message that merely
     # *documents* the lifecycle command (e.g. a fix whose commit body says
     # "run `hermes gateway restart` from a separate shell") is data, not an
@@ -443,21 +444,22 @@ def _match_is_quoted_data(text: str, match_start: int, match_str: str) -> bool:
     # PIPED INTO A SHELL executes the very lines it matched --
     # `grep -r 'hermes gateway restart' . | sh` runs the command. Upstream's
     # data-sink masker has always fail-closed on this shape via
-    # `_PIPE_TO_INTERPRETER`; the fork's quoted-data exemption predates that
+    # `_pipeline_reaches_executor`; the fork's quoted-data exemption predates that
     # masker and had no equivalent guard, so unioning the two exemptions
     # without this check let the pipe-to-shell form through. Scoped to the
     # match's own logical line so an unrelated pipe elsewhere in a multi-line
     # payload cannot revive the false positive this exemption exists to fix.
-    _line_start = text.rfind("\n", 0, match_start) + 1
-    _line_end = text.find("\n", match_start)
-    _line = text[_line_start:] if _line_end == -1 else text[_line_start:_line_end]
-    if _PIPE_TO_INTERPRETER.search(_line):
-        return False
-
     # Condition 1: a single/double quote region is OPEN at the match, and it
     # closes somewhere in the suffix (data is bounded, not a trailing dangle).
     open_q = _open_quote_at(prefix)
     if open_q is None or open_q not in suffix:
+        return False
+    # Condition 0 spans from the line that OPENS the quote to the line that CLOSES it: a
+    # multi-line quoted argument piped on its last line (`echo 'a<NL>…' | env bash`) is fed whole.
+    _close = match_start + len(match_str) + suffix.find(open_q)
+    _line_start = text.rfind("\n", 0, prefix.rfind(open_q)) + 1
+    _line_end = text.find("\n", _close)
+    if _pipeline_reaches_executor(text[_line_start:] if _line_end == -1 else text[_line_start:_line_end]):
         return False
 
     # Condition 1b: no COMMAND SUBSTITUTION between the opening quote and the
@@ -860,9 +862,9 @@ def describe_gateway_lifecycle_command(text: str) -> Optional[str]:
     # body is documentation, not a command this shell will execute. The
     # stripper fails open on ANY ambiguity (unquoted delimiter, shell
     # consumer, unterminated body), so executable heredocs are still scanned.
-    from tools.shell_heredoc import strip_inert_heredoc_bodies
+    from tools.shell_heredoc import DATA_HEREDOC_CONSUMER_RE, strip_inert_heredoc_bodies
 
-    text = strip_inert_heredoc_bodies(text)
+    text = strip_inert_heredoc_bodies(text, consumer_re=DATA_HEREDOC_CONSUMER_RE)
     # Collapse POSIX shell line-continuations first (#62891) so a multi-line
     # invocation cannot slip past the `[^\\n]*` branches.
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
@@ -1091,10 +1093,25 @@ _UNSAFE_DATA_ARG_MARKERS = ("`", "$(", "<(", ">(", "\\!")
 _DOT_COMMAND_ARGUMENT = re.compile(r"^\.[A-Za-z]")
 # A data sink piped into a shell/interpreter can feed matched lines straight
 # to execution (`grep 'systemctl restart hermes-gateway' f | sh`); never mask
-# such a line.
-_PIPE_TO_INTERPRETER = re.compile(
-    r"\|\s*&?\s*(?:sudo\s+)?(?:sh|bash|dash|ksh|zsh|xargs|eval|source)\b"
-)
+# such a line. ALLOWLIST, not a denylist of executors: `| env bash`, `| command
+# bash`, `| lua`, `| nice bash` each reached an executor a denylist did not name
+# (Prism d7ce1e92 on #1917). A pipe into anything not listed here keeps the line visible.
+_PIPE_DATA_SINKS = frozenset({
+    "grep", "egrep", "fgrep", "rg", "head", "tail", "wc", "sort", "uniq", "cut", "tr",
+    "jq", "less", "more", "cat", "column", "nl", "tac",
+})
+_PIPE_TARGET_RE = re.compile(r"(?<!\|)\|(?!\|)&?\s*([^\s;&|]*)")
+
+
+def _pipeline_reaches_executor(text: str) -> bool:
+    """True when *text* hands output to anything but a known data sink: a pipe into a command
+    outside :data:`_PIPE_DATA_SINKS`, process substitution, or a here-string."""
+    if "<<<" in text or "<(" in text or ">(" in text:
+        return True
+    return any(
+        _executable_name(target.rstrip(")")).lower() not in _PIPE_DATA_SINKS
+        for target in _PIPE_TARGET_RE.findall(text)
+    )
 
 # Heredoc opener: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`. The delimiter's
 # quoting matters — a QUOTED delimiter means the shell performs no expansion on
@@ -1110,12 +1127,12 @@ def _heredoc_delimiter(match: "re.Match[str]") -> str:
     return match.group("q1") or match.group("q2") or match.group("bare") or ""
 
 
-# A heredoc whose RECEIVING command is a shell/interpreter executes its body
-# (`bash <<EOF` / `sh <<'EOF'`), so such a body is code, never data.
-_HEREDOC_TO_INTERPRETER = re.compile(
-    r"(?i)(?:^|[|;&]|\s)(?:sudo\s+)?(?:/\S*/)?"
-    r"(?:sh|bash|dash|ksh|zsh|eval|source)\b[^\n]*<<"
-)
+# A heredoc body is data only when its RECEIVING command is one of these: `cat`/`tee` copy
+# it, python bodies are masked by the AST allowlist (`_mask_python_data_strings`). Any other
+# receiver (`bash`, `lua -`, `ruby`, `env bash`, `sudo bash`) may execute it, so its body stays
+# visible -- an allowlist, so an interpreter nobody listed is never a bypass.
+_HEREDOC_DATA_RECEIVERS = frozenset({"cat", "tee"})
+_PYTHON_RECEIVER_RE = re.compile(r"^python(?:\d+(?:\.\d+)*)?$")
 
 # Executable-image magic numbers: ELF, PE/COFF, Mach-O (universal + thin,
 # both endiannesses). A referenced file starting with one of these is a
@@ -1385,7 +1402,7 @@ def _executable_name(token: str) -> str:
 # token sees `sudo`/`env`/`nohup` and never inspects what they run, so
 # `sudo bash ~/restart.sh` walked past the same walk that stops
 # `bash ~/restart.sh`, and `sudo launchctl submit ...` past the
-# label-independent submit block (#62891). `_PIPE_TO_INTERPRETER` above
+# label-independent submit block (#62891). `_pipeline_reaches_executor` above
 # already reads `sudo ` this way for the pipe case; this generalises that
 # reading to the command position.
 _TRANSPARENT_COMMAND_PREFIXES = frozenset({
@@ -1782,7 +1799,7 @@ def _mask_data_sink_arguments(text: str) -> str:
     lines_out: list[str] = []
     changed = False
     for line in text.splitlines() or [text]:
-        if _PIPE_TO_INTERPRETER.search(line):
+        if _pipeline_reaches_executor(line):
             lines_out.append(line)
             continue
         try:
@@ -1828,34 +1845,40 @@ def _mask_data_sink_arguments(text: str) -> str:
     return "\n".join(lines_out)
 
 
-# Commands that RE-PARSE a quoted argument as shell/program source. A quoted
-# multi-word argument to anything else reaches the program as ONE argv element
-# (`hermes kanban create --body "launchctl bootout …"` hands the kanban CLI a
-# string; nothing executes it), so the lifecycle words inside it are data.
-# Over-inclusive on purpose: an unknown re-parser here is a bypass, an extra
-# entry only keeps a quoted argument visible to the raw regex.
-_ARGUMENT_REPARSERS = frozenset({
-    "sh", "bash", "dash", "ksh", "zsh", "fish", "eval", "exec", "xargs", "parallel",
-    "ssh", "autossh", "su", "runuser", "python", "python2", "python3", "pythonw",
-    "perl", "ruby", "node", "deno", "bun", "php", "osascript", "awk", "gawk", "mawk",
-    "nawk", "sed", "tmux", "screen", "expect", "script", "at", "batch", "watch", "entr",
-    "find", "fd", "make", "cmd", "cmd.exe", "powershell", "pwsh",
-})
-_REPARSER_NAME_RE = re.compile(r"^(?:python|pythonw|perl|ruby|node|php)[\d.]*(?:\.exe)?$", re.IGNORECASE)
-# Wrappers that only re-parse with a specific option: `env -S "…"`, `sudo -i|-s "…"`.
-_REPARSER_OPTION_TOKENS = frozenset({"-S", "--split-string", "-i", "-s", "--login", "--shell"})
+# Commands whose quoted multi-word argument is DATA: the program receives it as ONE argv
+# element and never executes it (`hermes kanban create --body "launchctl bootout …"` hands the
+# kanban CLI a string). ALLOWLIST, not a list of re-parsers: the denylist this replaced missed
+# `lua -e`, `Rscript -e`, `vim -c`, `gdb -ex`, `git -c alias.x='!…'` (Prism 95b11533 on #1917),
+# and every interpreter nobody listed was a bypass. A command not named here keeps its quoted
+# arguments visible to the raw regex. Value = the subcommands allowed (None = any argument).
+# Wrappers (`sudo`, `env`, `nice`) are never peeled: they run whatever follows.
+_DATA_ARGUMENT_COMMANDS: dict[str, Optional[frozenset[str]]] = {
+    "echo": None, "printf": None, "grep": None, "egrep": None, "fgrep": None, "jq": None,
+    # `hermes kanban …` / `hermes -p x kanban …`: card text. Not `hermes cron create` (a prompt).
+    "hermes": frozenset({"kanban"}),
+    # `gh alias set x '!cmd'` and `gh extension exec` run commands; pr/issue/api carry text.
+    "gh": frozenset({"pr", "issue", "api"}),
+    # Message/search arguments only. `git -c alias.x='!cmd'` and `rebase -x` execute, so the
+    # subcommand must be the FIRST argument (no `-c`/`-C` global option before it).
+    "git": frozenset({"commit", "tag", "notes", "log", "show"}),
+}
 _ARG_SEGMENT_SEPARATORS = frozenset(";&|\n(`")
-# A line whose quoted data can reach an executor another way: piped into a
-# shell/re-parser, process substitution, here-string. No masking on such a line.
-_LINE_FEEDS_EXECUTOR_RE = re.compile(
-    r"\|&?\s*(?:sudo\s+)?(?:/\S*/)?(?:sh|bash|dash|ksh|zsh|fish|xargs|parallel|eval|source|awk|gawk|mawk|nawk|"
-    r"perl|python\d*|ruby|node|osascript|tee)\b|[<>]\(|<<<"
-)
+# Simple quoted spans blanked before looking for pipes, so `grep 'a|b'` is not a pipe. A
+# double-quoted span carrying `$(`/backtick is kept: it runs.
+_QUOTED_SPAN_RE = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
 
 
-def _segment_command_reparses(prefix: str) -> Optional[bool]:
-    """Whether the command the quoted argument belongs to re-parses it. ``None`` when the
-    quoted span is itself at command position (no command word before it)."""
+def _blank_inert_quotes(text: str) -> str:
+    return _QUOTED_SPAN_RE.sub(
+        lambda m: m.group(0) if m.group(0)[0] == '"' and ("$(" in m.group(0) or "`" in m.group(0)) else "''",
+        text,
+    )
+
+
+def _segment_command_takes_data(prefix: str) -> Optional[bool]:
+    """Whether the command the quoted argument belongs to takes it as plain data (see
+    :data:`_DATA_ARGUMENT_COMMANDS`). ``None`` when the quoted span is itself at command
+    position (no command word before it)."""
     try:
         tokens = shlex.split(prefix, posix=True)
     except ValueError:
@@ -1867,13 +1890,33 @@ def _segment_command_reparses(prefix: str) -> Optional[bool]:
     # whose "command" is list punctuation; its elements are argv the OS will see, never data.
     if any("[" in t or t.endswith(",") for t in tokens):
         return None
-    for token in tokens:
-        name = _executable_name(token).lower()
-        if name in _ARGUMENT_REPARSERS or _REPARSER_NAME_RE.match(name):
-            return True
-        if token in _REPARSER_OPTION_TOKENS:
-            return True
-    return False
+    index = _command_token_index(tokens)
+    if index is None:
+        return None
+    name = _executable_name(tokens[index]).lower()
+    if name not in _DATA_ARGUMENT_COMMANDS:
+        return False
+    subcommands = _DATA_ARGUMENT_COMMANDS[name]
+    if subcommands is None:
+        return True
+    rest = tokens[index + 1:]
+    if name == "hermes":
+        # `hermes [-p NAME|--profile NAME|--profile=NAME] kanban …`
+        while rest and rest[0] in ("-p", "--profile"):
+            rest = rest[2:]
+        if rest and rest[0].startswith("--profile="):
+            rest = rest[1:]
+    return bool(rest) and rest[0] in subcommands
+
+
+def _span_feeds_executor(text: str, open_at: int, close_at: int) -> bool:
+    """True when the logical line(s) holding the quoted span at ``[open_at, close_at]`` can hand
+    its bytes to an executor: a pipe into a non-data-sink, process substitution, here-string, or
+    a command substitution whose output the shell may run (`eval $(echo '…')`)."""
+    start = text.rfind("\n", 0, open_at) + 1
+    end = text.find("\n", close_at)
+    span = _blank_inert_quotes(text[start:] if end == -1 else text[start:end])
+    return _pipeline_reaches_executor(span) or "$(" in span or "`" in span
 
 
 def _mask_quoted_argument_data(text: str) -> str:
@@ -1883,10 +1926,11 @@ def _mask_quoted_argument_data(text: str) -> str:
     inside a `--body`/`--reason`/`--coverage` value: the guard read the whole
     tool-call text, not the command position. A single- or double-quoted span
     containing whitespace is masked when (1) it is an ARGUMENT (a command word
-    precedes it in its segment), (2) that segment's command is not a known
-    re-parser (`bash -c`, `ssh`, `xargs`, `python -c`, …), and (3) a
-    double-quoted span carries no command substitution (`$(` / backtick DO run
-    inside double quotes -- the 2026-10-04 `--handoff` incident). Everything
+    precedes it in its segment), (2) that segment's command is on the
+    :data:`_DATA_ARGUMENT_COMMANDS` allowlist, (3) a double-quoted span carries
+    no command substitution (`$(` / backtick DO run inside double quotes -- the
+    2026-10-04 `--handoff` incident), and (4) the line(s) it sits on hand nothing
+    to an executor (pipe to a non-sink, `<<<`, `>(`, `$(`). Everything
     else is left exactly as written, so this view can only ever ALLOW.
     """
     if "'" not in text and '"' not in text:
@@ -1895,8 +1939,6 @@ def _mask_quoted_argument_data(text: str) -> str:
     i, n = 0, len(text)
     seg_start = 0
     changed = False
-    line_start = 0
-    line_unmaskable = bool(_LINE_FEEDS_EXECUTOR_RE.search(text[: text.find("\n") if "\n" in text else n]))
     while i < n:
         ch = text[i]
         if ch == "\\" and i + 1 < n:
@@ -1915,10 +1957,6 @@ def _mask_quoted_argument_data(text: str) -> str:
             out.append(ch)
             i += 1
             seg_start = i
-            if ch == "\n":
-                line_start = i
-                nl = text.find("\n", i)
-                line_unmaskable = bool(_LINE_FEEDS_EXECUTOR_RE.search(text[i: n if nl == -1 else nl]))
             continue
         if text.startswith("$(", i):
             out.append("$(")
@@ -1940,8 +1978,8 @@ def _mask_quoted_argument_data(text: str) -> str:
             inner = text[i + 1:end]
             multi_word = any(c.isspace() for c in inner)
             expands = ch == '"' and ("$(" in inner or "`" in inner)
-            reparses = _segment_command_reparses(text[seg_start:i]) if multi_word else None
-            if multi_word and not expands and not line_unmaskable and reparses is False:
+            if (multi_word and not expands and _segment_command_takes_data(text[seg_start:i])
+                    and not _span_feeds_executor(text, i, end)):
                 out.append(ch + "quoted-argument" + ch)
                 changed = True
             else:
@@ -1951,6 +1989,31 @@ def _mask_quoted_argument_data(text: str) -> str:
         out.append(ch)
         i += 1
     return "".join(out) if changed else text
+
+
+def _heredoc_receiver(before_opener: str) -> str:
+    """Lower-cased command name of the simple command that owns a heredoc opener (``""`` when
+    unknown). Wrappers (``sudo``/``env``/``nice``) are NOT peeled: they hand stdin to whatever
+    they run, so they are never a data receiver."""
+    segment = re.split(r"\|\||&&|[;&|(]", before_opener)[-1]
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        return ""
+    index = _command_token_index(tokens)
+    return "" if index is None else _executable_name(tokens[index]).lower()
+
+
+def _substituted_into_non_data(before_opener: str) -> bool:
+    """True when the heredoc's receiver sits inside ``$(…)``/backticks whose OUTPUT becomes an
+    argument of a command that is not a data-argument command: ``lua -e "$(cat <<'EOF'"`` runs
+    the body, ``git commit -m "$(cat <<'EOF'"`` only carries it."""
+    cut = max(before_opener.rfind("$("), before_opener.rfind("`"))
+    if cut == -1:
+        return False
+    outer = before_opener[:cut].rstrip().rstrip("\"'")
+    outer = re.split(r"\|\||&&|[;&|(]", outer)[-1]
+    return _segment_command_takes_data(outer) is not True
 
 
 def _mask_heredoc_bodies(text: str) -> str:
@@ -1973,8 +2036,10 @@ def _mask_heredoc_bodies(text: str) -> str:
     STRICTLY FAIL-CLOSED — masking is skipped, leaving the original
     regex-matching text in place, whenever the body could actually be EXECUTED:
 
-    * the heredoc feeds a shell/interpreter (``bash <<EOF``, ``sh <<EOF``), or
-    * the opening line pipes the heredoc into one (``cat <<EOF | bash``), or
+    * the heredoc's receiver is not a known data receiver (``cat``/``tee``) or
+      python (whose body gets the AST string mask) -- ``bash``, ``lua -``,
+      ``env bash`` all keep the body visible, or
+    * the opening line pipes into anything but a data sink (``cat <<EOF | env bash``), or
     * the delimiter is UNQUOTED and the body contains command substitution
       (``$(…)`` / backticks), which the shell WOULD expand before delivery.
 
@@ -2009,16 +2074,26 @@ def _mask_heredoc_bodies(text: str) -> str:
         terminator = lines[end] if end < len(lines) else None
 
         # Fail-closed conditions: the body may actually be executed.
-        feeds_interpreter = bool(_HEREDOC_TO_INTERPRETER.search(line))
-        piped_to_interpreter = bool(_PIPE_TO_INTERPRETER.search(line))
+        receiver = _heredoc_receiver(line[: match.start()])
+        piped_to_interpreter = _pipeline_reaches_executor(line) or _substituted_into_non_data(
+            line[: match.start()]
+        )
         expands = (not quoted) and any(
             marker in "\n".join(body) for marker in ("$(", "`")
         )
-        if feeds_interpreter or piped_to_interpreter or expands:
+        if piped_to_interpreter or expands or (
+            receiver not in _HEREDOC_DATA_RECEIVERS and not _PYTHON_RECEIVER_RE.match(receiver)
+        ):
             out.extend(body)
-        else:
+        elif receiver in _HEREDOC_DATA_RECEIVERS:
             changed = changed or bool(body)
             out.extend("heredoc-data" for _ in body)
+        else:
+            # Python stdin is code: only its string constants are data, and only when the
+            # AST allowlist proves nothing in the body can call out (otherwise unchanged).
+            masked = _mask_python_data_strings("\n".join(body)).split("\n")
+            changed = changed or masked != body
+            out.extend(masked)
         if terminator is not None:
             out.append(terminator)
         i = end + 1 if terminator is not None else end
@@ -2832,6 +2907,7 @@ def _contains_unsafe_gateway_action(
         return executed
 
     from tools.shell_heredoc import (
+        DATA_HEREDOC_CONSUMER_RE,
         inert_python_heredoc_bodies,
         strip_inert_heredoc_bodies,
     )
@@ -2859,7 +2935,9 @@ def _contains_unsafe_gateway_action(
     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
     # path or `sh -c` payload inside a provably-inert heredoc body is never shell-executed, and an
     # oversized data file mentioned there otherwise fails closed as a "script".
-    shell_command = strip_inert_heredoc_bodies(command, python_semicolon_chain=True)
+    shell_command = strip_inert_heredoc_bodies(
+        command, python_semicolon_chain=True, consumer_re=DATA_HEREDOC_CONSUMER_RE
+    )
     masked_bodies = [_mask_read_only_python_paths(body) for body in python_bodies]
     referenced_command = shell_command + "\n" + "\n".join(masked_bodies)
 

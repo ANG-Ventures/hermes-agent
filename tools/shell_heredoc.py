@@ -17,6 +17,13 @@ _INERT_HEREDOC_CONSUMER_RE = re.compile(
     r"^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?(?:[A-Za-z0-9_./-]+/)?"
     r"(?:python(?:3(?:\.\d+)*)?|osascript|cat)(?=\s|$)",
     re.IGNORECASE)
+# The same consumers minus osascript, whose body can `do shell script`: for scanners that judge
+# EXECUTION (the gateway lifecycle guard), not syntax (the '&' guard). Python bodies the caller
+# scans as Python (``inert_python_heredoc_bodies``).
+DATA_HEREDOC_CONSUMER_RE = re.compile(
+    r"^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?(?:[A-Za-z0-9_./-]+/)?"
+    r"(?:python(?:3(?:\.\d+)*)?|cat)(?=\s|$)",
+    re.IGNORECASE)
 
 
 def _span_end(command: str, cursor: int, closer: str) -> int:
@@ -191,7 +198,7 @@ def _find_heredoc_close(
 
 
 def _inert_heredoc_ranges(
-    command: str, *, python_semicolon_chain: bool = False
+    command: str, *, python_semicolon_chain: bool = False, consumer_re: "re.Pattern[str]" = _INERT_HEREDOC_CONSUMER_RE
 ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     """Return safely masked body ranges and the subset that is Python stdin source.
 
@@ -250,7 +257,7 @@ def _inert_heredoc_ranges(
                 owner_stop = owner_end
                 eligible = True
             masked_owner = _mask_simple_quotes(command[owner_start:owner_stop])
-            consumer_match = _INERT_HEREDOC_CONSUMER_RE.search(masked_owner) if eligible else None
+            consumer_match = consumer_re.search(masked_owner) if eligible else None
             if consumer_match and not any(
                 marker in masked_opener
                 for marker in ("$(", "`", "<(", ">(", "(", ")", "{", "}")
@@ -272,9 +279,13 @@ def inert_python_heredoc_bodies(
     return tuple(command[start:end] for start, end in python_ranges)
 
 
-def strip_inert_heredoc_bodies(command: str, *, python_semicolon_chain: bool = False) -> str:
+def strip_inert_heredoc_bodies(
+    command: str, *, python_semicolon_chain: bool = False, consumer_re: "re.Pattern[str]" = _INERT_HEREDOC_CONSUMER_RE
+) -> str:
     """Mask heredoc bodies that are provably inert data (see module docstring)."""
-    ranges, _python_ranges = _inert_heredoc_ranges(command, python_semicolon_chain=python_semicolon_chain)
+    ranges, _python_ranges = _inert_heredoc_ranges(
+        command, python_semicolon_chain=python_semicolon_chain, consumer_re=consumer_re
+    )
     if not ranges:
         return command
     # Single-pass rebuild (ranges are sorted and non-overlapping), bodies -> their newlines only.
