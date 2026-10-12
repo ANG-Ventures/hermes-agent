@@ -211,6 +211,72 @@ def test_still_waiting_notice_once_per_interval_names_lanes():
         assert wb.notice_due(a, now=241.0) is not None
 
 
+def test_relay_drain_wait_is_credited_not_counted():
+    """2026-10-11 16:37 PT: merging claude-pool#249 drained the alr relay for 126 s
+    (deploy_drain_refused x47). The harness waited in place as designed, and the wall
+    clock posted "still waiting for a first reply: 124s" into a healthy BIOS session.
+    A wait the relay ASKED for ("draining-for-deploy", Retry-After) is not provider
+    silence: it must not count toward the notice or the budget."""
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly",
+               return_value={"fallback": {"still_waiting_notice_seconds": 120,
+                                          "no_first_byte_budget_seconds": 600}}):
+        a = _bare()
+        wb.arm(a, now=0.0)
+        # 126 s of deploy-drain wait, reported by the retry loop as it sleeps.
+        wb.note_excused_wait(a, 126.0)
+        assert wb.elapsed(a, now=130.0) == pytest.approx(4.0)
+        assert wb.notice_due(a, now=130.0) is None, "drain wait must not trigger the notice"
+        # Real silence after the drain still counts from where the drain left off.
+        assert wb.notice_due(a, now=126.0 + 121.0) is not None
+        # The budget is credited the same way: 600 s of provider silence, not 600 s wall.
+        wb.note_excused_wait(a, 300.0)
+        assert not wb.spent(a, now=126.0 + 300.0 + 599.0)
+        assert wb.spent(a, now=126.0 + 300.0 + 600.0)
+
+
+def test_excused_wait_without_an_armed_clock_is_a_noop():
+    from agent import fallback_wall_budget as wb
+    a = _bare()
+    wb.note_excused_wait(a, 50.0)  # nothing armed: must not create state or raise
+    assert wb.elapsed(a) is None
+
+
+def test_turn_recovery_drain_sleep_credits_the_wall_clock_for_the_real_wait():
+    """Drive the real relay_draining branch (same rig as test_relay_deploy_drain): four
+    drain 503s with Retry-After 0.05 s, then a served response. The wall clock must be
+    credited for the seconds actually slept in that branch, not left running (the
+    16:37 PT notice) and not credited a made-up number (a mutant that credits 0 or the
+    hint must fail)."""
+    from agent import fallback_wall_budget as wb
+    from tests.run_agent.test_relay_deploy_drain import _make_agent, _run, _drain_error, _mock_response
+    agent = _make_agent()
+    credits: list[float] = []
+    real = wb.note_excused_wait
+
+    def _spy(a, seconds):
+        credits.append(float(seconds))
+        real(a, seconds)
+
+    calls = []
+
+    def fake_api_call(api_kwargs):
+        calls.append(1)
+        if len(calls) <= 4:
+            raise _drain_error(retry_after="0.05")
+        return _mock_response("served after the drain")
+
+    with patch("agent.turn_recovery.note_excused_wait", _spy, create=True), \
+         patch("agent.fallback_wall_budget.note_excused_wait", _spy):
+        result, _ = _run(agent, fake_api_call, drain_wait_s=30.0)
+    assert result["completed"] is True
+    assert len(credits) == 4, f"one credit per drain sleep, got {credits}"
+    # Each credit is the REAL slept span: ~0.05 s (the Retry-After), never 0, never the
+    # 30 s window or any other constant.
+    for c in credits:
+        assert 0.03 <= c <= 1.0, f"credit must be the measured sleep, got {c}"
+
+
 def test_budget_cut_error_falls_over_on_first_hit():
     from agent.fallback_wall_budget import FallbackWallBudgetExceeded
     c = classify_api_error(FallbackWallBudgetExceeded("cut"), provider="claude-dtlr", model=FABLE)

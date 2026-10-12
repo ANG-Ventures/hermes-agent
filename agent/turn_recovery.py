@@ -2077,6 +2077,7 @@ def route_classified_error(
     if classified.reason == FailoverReason.relay_draining:
         from agent.fallback_wiring import relay_drain_wait_s
         from agent.retry_utils import relay_drain_wait
+        from agent.fallback_wall_budget import note_excused_wait
 
         _drain_max = relay_drain_wait_s()
         _drain_now = time.monotonic()
@@ -2103,8 +2104,13 @@ def route_classified_error(
                 model, _drain_wait, _drain_waited, _drain_max, _drain_ra, agent._client_log_context(),
             )
             _drain_end = time.monotonic() + _drain_wait
+            _drain_sleep_t0 = time.monotonic()
             while time.monotonic() < _drain_end and not agent._interrupt_requested:
                 time.sleep(min(0.2, max(_drain_end - time.monotonic(), 0.0)))
+            # The relay asked for this wait (Retry-After on a deploy drain); it is not
+            # provider silence. Credit the cross-lane no-first-byte clock for the real
+            # slept span so it neither posts "still waiting" nor spends the budget on it.
+            note_excused_wait(agent, time.monotonic() - _drain_sleep_t0)
             # Not an attempt: the relay refused before serving. An interrupt is handled
             # by the checkpoint at loop top.
             retry_count = max(retry_count - 1, 0)
