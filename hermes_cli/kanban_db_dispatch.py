@@ -2179,6 +2179,7 @@ def detect_crashed_workers(
                     "exit_code": code,
                     "cohort_size": len(cohort_ids),
                     "cohort": sorted(cohort_ids)[:50],
+                    "liveness": liveness[row["id"]],
                 }
                 event_payload.update(_cohort_member_evidence(
                     pid, _spawn_group(conn, row["id"], row["current_run_id"], pid),

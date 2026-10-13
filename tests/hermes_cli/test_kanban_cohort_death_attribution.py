@@ -171,6 +171,8 @@ def test_group_kill_is_a_cohort_death_that_names_its_group(board, pages, sleeper
         [death] = _events(board, t, "cohort_death")
         assert death["pid_alive"] is False
         assert death["group_members"] == []
+        assert death["liveness"]["decision"] == "not-alive"  # reaped by the test, exit status unseen
+        assert death["liveness"]["pid_exists"] is False
 
 
 def test_page_goes_to_alerts_and_names_live_members(board, monkeypatch):
