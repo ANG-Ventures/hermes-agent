@@ -153,6 +153,50 @@ def test_refusals_land_as_run_events(tmp_path, monkeypatch):
     ]
 
 
+def test_failed_audit_write_is_kept_for_the_next_flush(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="alpha")
+        run_id = kb.claim_task(conn, tid).current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setattr("agent.delegation_context.is_dispatcher_owned_worker_context", lambda: True)
+    monkeypatch.setenv(kwh.PLACEMENT_ENV, json.dumps({"host": "studio-local", "env": {}}))
+    assert kpt.gate_registration("execute_code", "code_execution")
+    real_connect = kb.connect
+
+    def broken_connect(*a, **k):
+        raise OSError("database is locked")
+
+    monkeypatch.setattr(kb, "connect", broken_connect)
+    assert kpt.flush_events() == 0
+    monkeypatch.setattr(kb, "connect", real_connect)
+    assert kpt.flush_events() == 1
+    assert kpt.flush_events() == 0
+    with kb.connect_closing() as conn:
+        rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+                            (tid, kpt.EVENT)).fetchall()
+    assert [json.loads(p)["tools"] for (p,) in rows] == [["execute_code"]]
+
+
+def test_checkpoints_follow_the_boot_record_when_env_is_cleared(monkeypatch):
+    monkeypatch.setenv(kwh.PLACEMENT_ENV, json.dumps({"host": "studio-local", "env": {}}))
+    kwh.capture_boot_placement()
+    monkeypatch.delenv(kwh.PLACEMENT_ENV)
+    assert kpt.at_agent_init(True) is False
+    assert ("checkpoints", "local_spawner", "checkpoints") in kpt._recorded
+
+
+def test_checkpoints_untouched_when_unplaced():
+    assert kpt.at_agent_init(True) is True
+    assert kpt.at_agent_init(False) is False
+    assert not kpt._recorded
+
+
 # -- E2E: a real worker interpreter, real tool discovery ----------------------------
 
 _PROBE = r"""
@@ -204,3 +248,87 @@ def test_e2e_unplaced_worker_keeps_every_tool(tmp_path):
     assert "execute_code@code_execution" in out["tools"]
     assert out["mcp"] == ["build123d", "twozero_td"]
     assert "tool_refused_by_placement" not in log
+
+
+# -- E2E: the process tree, not the registry ------------------------------------------
+
+_TREE_PROBE = r"""
+import json, os, subprocess, sys, threading, time
+from hermes_cli import kanban_worker_hosts  # noqa: F401
+import model_tools  # noqa: F401
+from tools import mcp_tool_discovery
+import importlib.util
+if importlib.util.find_spec("mcp") is None:
+    print("null")
+    sys.exit(0)
+
+me = os.getpid()
+seen = {}
+stop = threading.Event()
+
+def walk():
+    while not stop.is_set():
+        out = subprocess.run(["ps", "-axo", "uid=,pid=,ppid=,args="], capture_output=True, text=True).stdout
+        rows = [l.split(None, 3) for l in out.splitlines() if l.strip()]
+        kids, tree = {}, {me}
+        for r in rows:
+            kids.setdefault(int(r[2]), []).append(r)
+        stack = [me]
+        while stack:
+            for r in kids.get(stack.pop(), []):
+                pid = int(r[1])
+                if pid not in tree:
+                    tree.add(pid)
+                    stack.append(pid)
+                    if not (len(r) > 3 and r[3].startswith("ps ")):
+                        seen[pid] = r[3] if len(r) > 3 else ""
+        time.sleep(0.1)
+
+t = threading.Thread(target=walk, daemon=True)
+t.start()
+try:
+    mcp_tool_discovery.discover_mcp_tools()
+except Exception as exc:  # noqa: BLE001
+    print("discover failed:", exc, file=sys.stderr)
+time.sleep(1.5)
+stop.set()
+t.join()
+print(json.dumps(sorted(seen.values())))
+"""
+
+
+def _tree(tmp_path, placed):
+    home = tmp_path / ("placed" if placed else "local")
+    home.mkdir()
+    marker = f"{tmp_path}/stdio-mcp-marker"
+    (home / "config.yaml").write_text(
+        "mcp_servers:\n"
+        f"  stdio_probe:\n    command: /bin/sh\n    args: [-c, 'sleep 30; : {marker}']\n"
+        "    timeout: 3\n    connect_timeout: 3\n")
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("HERMES_KANBAN", "KANBAN_", "TERMINAL_"))}
+    env.update(HERMES_HOME=str(home), PYTHONPATH=str(REPO))
+    if placed:
+        kwh.apply_placement(env, STUDIO_LOCAL, str(tmp_path))
+        env[kpt.REFUSED_ENV] = kpt.spawn_env_value({})
+    proc = subprocess.run([sys.executable, "-c", _TREE_PROBE], cwd=str(tmp_path), env=env,
+                          capture_output=True, text=True, timeout=240)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    seen = json.loads(proc.stdout.strip().splitlines()[-1])
+    if seen is None:
+        pytest.skip("mcp SDK not installed in this interpreter")
+    return seen, marker
+
+
+def _not_provenance(cmds):
+    # version_info's import-time `git rev-parse/describe` on the install dir is a read-only
+    # provenance read, not a tool (Apollo's arm-7 wording); everything else is a local spawn.
+    return [c for c in cmds if not (c.lstrip("(").startswith("git") or "/git " in c)]
+
+
+@pytest.mark.platforms("posix")
+def test_e2e_placed_worker_spawns_no_local_descendant(tmp_path):
+    local, _ = _tree(tmp_path, placed=False)
+    assert _not_provenance(local), local  # control: the walker sees the stdio server + supervisor
+    placed, _ = _tree(tmp_path, placed=True)
+    assert _not_provenance(placed) == [], placed

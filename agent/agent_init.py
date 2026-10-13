@@ -1311,12 +1311,8 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
     # Filesystem checkpoint manager (transparent — not a tool). A placed kanban worker's git
     # snapshots would run locally as the dispatcher's uid, outside the placement (t_a2817825).
     from tools.checkpoint_manager import CheckpointManager
-    if checkpoints_enabled and os.environ.get("KANBAN_WORKER_PLACEMENT"):
-        from hermes_cli.kanban_placement_tools import gate_feature
-        checkpoints_enabled = not gate_feature("checkpoints")
-    if os.environ.get("KANBAN_WORKER_PLACEMENT"):
-        from hermes_cli.kanban_placement_tools import flush_events
-        flush_events()  # the refusals registry.register logged at import, onto this run
+    from hermes_cli.kanban_placement_tools import at_agent_init
+    checkpoints_enabled = at_agent_init(checkpoints_enabled)
     agent._checkpoint_mgr = CheckpointManager(
         enabled=checkpoints_enabled, max_snapshots=checkpoint_max_snapshots,
         max_total_size_mb=checkpoint_max_total_size_mb,

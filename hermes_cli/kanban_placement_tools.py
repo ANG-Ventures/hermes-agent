@@ -164,8 +164,7 @@ def flush_events() -> int:
         _pending.clear()
         return 0
     host = placed_host() or ""
-    batch = dict(_pending)
-    _pending.clear()
+    batch = {k: list(v) for k, v in _pending.items()}
     try:
         from hermes_cli import kanban_db as kb
         conn = kb.connect()
@@ -178,6 +177,28 @@ def flush_events() -> int:
         finally:
             conn.close()
     except Exception:
-        _log.debug("could not record %s on run %s", EVENT, run_id, exc_info=True)
+        # The refusal itself held; only its audit did not land. Keep the batch for the next flush.
+        _log.warning("could not record %s on run %s; kept for the next flush", EVENT, run_id, exc_info=True)
         return 0
+    for key, names in batch.items():  # drop only what committed; record() may have appended since
+        left = [n for n in _pending.get(key, []) if n not in names]
+        if left:
+            _pending[key] = left
+        else:
+            _pending.pop(key, None)
     return len(batch)
+
+
+def at_agent_init(checkpoints_enabled: bool) -> bool:
+    """Agent init in a placed worker: checkpoints off, registration-time refusals onto the run.
+
+    Keys on ``placed_host()`` (the boot record first), like the registry and MCP gates: the env
+    can be clobbered after boot, and the checkpoint manager's git would then run as the
+    dispatcher's uid. Returns whether checkpoints stay enabled.
+    """
+    if placed_host() is None:
+        return checkpoints_enabled
+    if checkpoints_enabled:
+        checkpoints_enabled = not gate_feature("checkpoints")
+    flush_events()
+    return checkpoints_enabled
