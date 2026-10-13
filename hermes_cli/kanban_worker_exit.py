@@ -37,6 +37,35 @@ _UPSTREAM_CAPACITY_PATTERNS = (
 _UPSTREAM_CAPACITY_STATUS_RE = re.compile(r"\b(?:503|529)\b")
 
 
+# A provider REJECTION is not a wall: HTTP 400/401/403/404 (bad request, bad credential,
+# forbidden, unknown model) answers the same way on every retry. Incident t_d564a8dd: 24
+# consecutive ``HTTP 404: model: claude-sonnet-4-8`` exits were booked ``rate_limited`` for 8 h
+# because the pinned worker's refusal path mapped every retryable "unknown" onto the
+# retry-preserving class. 429 and the relay's capacity 503 keep ``rate_limited``.
+_PROVIDER_REJECTED_RE = re.compile(
+    r"\bHTTP[\s:]*(?:400|401|403|404)\b[^\n]*", re.IGNORECASE,
+)
+_PROVIDER_WALL_RE = re.compile(r"\bHTTP[\s:]*(?:429|503|529)\b", re.IGNORECASE)
+PROVIDER_REJECTED_TAIL_LINES = 8
+
+
+def provider_rejected_status(text: str | None) -> str | None:
+    """The provider's own ``HTTP 4xx ...`` status line from a failure text, else None.
+
+    Reads only the LAST few non-empty lines (the run's verdict), so an earlier, already
+    recovered 404 inside a long log never re-labels a later quota wall. A 429/503/529 in
+    that tail wins: the run was walled, whatever came before.
+    """
+    if not text:
+        return None
+    lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+    tail = "\n".join(lines[-PROVIDER_REJECTED_TAIL_LINES:])
+    if _PROVIDER_WALL_RE.search(tail):
+        return None
+    match = _PROVIDER_REJECTED_RE.search(tail)
+    return match.group(0).strip() if match else None
+
+
 def is_quota_exit(failure_reason: str | None, error: str = "") -> bool:
     """Provider quota wall: rate-limited or billing-exhausted (#655)."""
     return failure_reason in ("rate_limit", "billing")
@@ -85,6 +114,50 @@ def worker_exit_class(failure_reason: str | None, error: str = "") -> str | None
 
 
 SAFEGUARD_REFUSAL_MARK = "safeguard_refusal"
+
+
+def _park_needs_input(reason: str) -> bool:
+    """Block THIS worker's running card ``needs_input`` with ``reason``, fenced to this run.
+
+    Only the owning worker of a running card acts; anything else is a no-op.
+    block_task's run CAS is off when expected_run_id is None, so a missing or
+    malformed run id must not mutate the card (a stale worker could otherwise
+    park a newer run). Raises on DB errors; callers own the logging.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    from agent.delegation_context import owns_kanban_worker_authority
+    if not task_id or not owns_kanban_worker_authority():
+        return False
+    try:
+        run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID") or "")
+    except ValueError:
+        return False
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        return bool(kb.block_task(conn, task_id, reason=reason, kind="needs_input",
+                                  expected_run_id=run_id))
+    finally:
+        conn.close()
+
+
+def block_on_rail_absent(message: str) -> bool:
+    """Park the card ``needs_input`` with a ``*_RAIL_ABSENT:`` tool error verbatim.
+
+    t_db491366: a worker that needs the operator's browser/screen but runs where
+    neither exists must not retry; the fix is re-pinning the card, which the
+    message names. Never raises.
+    """
+    try:
+        if "_RAIL_ABSENT:" not in str(message or ""):
+            return False
+        from agent.delegation_context import owned_kanban_task
+        if not owned_kanban_task():  # in-process cron / delegate child: never park the worker's card
+            return False
+        return _park_needs_input(str(message))
+    except Exception:
+        logging.getLogger(__name__).warning("rail-absent block failed", exc_info=True)
+        return False
 
 
 def block_on_safeguard_refusal(result) -> bool:

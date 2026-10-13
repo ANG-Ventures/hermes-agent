@@ -40,7 +40,7 @@ def board(tmp_path, monkeypatch):
 @pytest.fixture
 def pages(monkeypatch):
     sent = []
-    monkeypatch.setattr(kb, "_page_cohort_death", lambda conn, ids: sent.append(list(ids)))
+    monkeypatch.setattr(kb, "_page_cohort_death", lambda conn, ids, **_kw: sent.append(list(ids)))
     return sent
 
 

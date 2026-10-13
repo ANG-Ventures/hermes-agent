@@ -265,6 +265,10 @@ def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None, target_id:
     hit signed-URL expiry (Browserbase). Both paths share the same private-page/SSRF guard. Returns JSON
     ``{"success": True, "method", "result"}`` or ``{"error": ...}``."""
     effective_task_id = task_id or "default"
+    from tools.browser_tool_cdp import _get_cdp_override_raw
+    from tools.rail_preflight import browser_rail_error
+    if rail := browser_rail_error(_get_cdp_override_raw(), host_side=True):  # websockets.connect runs in this process
+        return tool_error(rail)
 
     if frame_id:
         blocked = _browser_cdp_private_guard(task_id=effective_task_id, method=method, params=params or {})

@@ -613,7 +613,7 @@ def test_board_liveness_gate_ignores_an_ambient_db_pin(kanban_home, monkeypatch)
         conn.commit()
 
     # Pin the process at the IDLE board, as the dispatcher pins every worker.
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — tests pin/root precedence itself
     monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir("idle") / "kanban.db"))
 
     assert kb._board_has_live_cards("busy") == [task_id], (

@@ -231,6 +231,9 @@ async def test_model_reset_db_commit_survives_json_mirror_failure(
         entry.model_override_identity = dict(identity)
         entry.model_override = dict(identity)
         store._save()
+    # On a running loop the mirror write is queued to the writer thread; settle it so its
+    # ``.sessions.lock`` cannot collide with the command's own inline mirror write.
+    assert store.drain_sessions_json_writes(timeout=10.0)
     runner.session_store = store
     runner._session_model_overrides[entry.session_key] = {
         **identity,
@@ -251,6 +254,9 @@ async def test_model_reset_db_commit_survives_json_mirror_failure(
     assert "after state.db commit" in caplog.text
 
     restarted = SessionStore(sessions_dir, GatewayConfig())
+    # Same pin as ``store``: an unpinned restart reads the isolated home's empty state.db and
+    # falls back to sessions.json, which the async writer thread may not have written yet.
+    restarted._db = db
     restarted._ensure_loaded()
     durable = restarted.entry_for(entry.session_key)
     assert durable.model_override_identity is None
@@ -287,6 +293,9 @@ async def test_model_reset_db_failure_rolls_back_memory_and_reports_failure(
         entry.model_override_identity = dict(identity)
         entry.model_override = dict(identity)
         store._save()
+    # On a running loop the mirror write is queued to the writer thread; settle it so its
+    # ``.sessions.lock`` cannot collide with the command's own inline mirror write.
+    assert store.drain_sessions_json_writes(timeout=10.0)
     runtime = {**identity, "api_key": "runtime-only"}
     runner.session_store = store
     runner._session_model_overrides[entry.session_key] = dict(runtime)
@@ -305,6 +314,9 @@ async def test_model_reset_db_failure_rolls_back_memory_and_reports_failure(
     assert entry.model_override == identity
 
     restarted = SessionStore(sessions_dir, GatewayConfig())
+    # Same pin as ``store``: an unpinned restart reads the isolated home's empty state.db and
+    # falls back to sessions.json, which the async writer thread may not have written yet.
+    restarted._db = db
     restarted._ensure_loaded()
     durable = restarted.entry_for(entry.session_key)
     assert durable.model_override_identity == identity

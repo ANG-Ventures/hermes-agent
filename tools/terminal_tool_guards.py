@@ -215,7 +215,7 @@ def gateway_lifecycle_block(
         contains_host_interpreter_kill,
         contains_launchctl_submit_command,
         lifecycle_scan_root_within_budget,
-        scan_gateway_lifecycle,
+        scan_gateway_lifecycle_detail,
     )
     # Keep the specific launchctl diagnostic when this optional pre-scan fits the
     # budget. The full fail-closed guard below still runs when it does not, so
@@ -238,7 +238,7 @@ def gateway_lifecycle_block(
         mounted_host=getattr(env, "host_cwd", None),
         env=env,
     )
-    unsafe, refusal = scan_gateway_lifecycle(
+    unsafe, refusal, hit = scan_gateway_lifecycle_detail(
         command,
         cwd=guard_cwd,
         read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
@@ -259,12 +259,15 @@ def gateway_lifecycle_block(
         # MY background job", and re-rolling the same over-broad spelling is what takes the gateway down.
         if lifecycle_scan_root_within_budget(command) and contains_host_interpreter_kill(command):
             return _blocked_json(HOST_INTERPRETER_KILL_REJECTION, "error", blocked_by=_GATEWAY_LIFECYCLE_BLOCK_MARKER)
+        # Name the tripping token and its position: the next false positive must be
+        # diagnosable from the refusal alone (card t_4fded0bd).
+        where = f" Tripped by {hit}." if hit else ""
         return _blocked_json(
             "Blocked: command or referenced script cannot restart, stop, or "
             "uninstall the gateway from inside the gateway process. The gateway would "
             "kill this command before it could complete (SIGTERM propagates "
             "to child processes). Run `hermes gateway restart` from a "
-            "separate shell outside the running gateway.",
+            f"separate shell outside the running gateway.{where}",
             "error", blocked_by=_GATEWAY_LIFECYCLE_BLOCK_MARKER,
         )
     return None

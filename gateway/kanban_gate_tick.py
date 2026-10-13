@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 
+from hermes_cli import kanban_admission as kadm
 from hermes_cli import kanban_load_gate as klg
 from hermes_cli import kanban_worker_pool as kwp
 from hermes_cli import placement_ledger as pledger
@@ -82,15 +83,16 @@ def read_signal_enabled(kanban_cfg) -> bool:
     return not (isinstance(pl, dict) and pl.get("read_signal", True) is False)
 
 
-def any_remote_pin(boards, connect, known_hosts=()) -> bool:
-    """A ready card on any board pins a KNOWN pool host (``host:<id>``)."""
+def any_remote_pin(boards, connect, known_hosts=(), aliases=None) -> bool:
+    """A ready card on any board pins a KNOWN pool host (``host:<id>`` or a
+    registry alias of one, t_cb2b888d)."""
     for b in boards:
         slug = (b.get("slug") if isinstance(b, dict) else None) or "default"
         conn = None
         try:
             conn = connect(board=slug)
             for (body,) in conn.execute(_REMOTE_PIN_SQL).fetchall():
-                pin, _ignored = kwp.resolve_pin(body, known_hosts)
+                pin, _ignored = kwp.resolve_pin(body, known_hosts, aliases)
                 if pin is not None and pin not in (kwp.PIN_ANY, kwp.PIN_STUDIO):
                     return True
         except Exception:
@@ -118,6 +120,7 @@ class GateTickBuilder:
         self._probe = probe
         self._log = _Every5Min()
         self._remote_by_host: Dict[str, int] = {}
+        self.running_local: Optional[int] = None   # last build()'s local count
         self._signal: Optional[kwp.TargetSignal] = None
 
     def _root(self):
@@ -134,12 +137,15 @@ class GateTickBuilder:
             state_path=root / "var" / kwp.TARGET_STATE_FILE,
             ledger_dir=pledger.ledger_dir(root),
             cpu_est=float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+            admit_on_memory=kadm.enabled(cfg),
+            reservation_gb=kadm.reservation_gb(cfg),
         )
 
     def build(self, boards) -> GateTick:
         gate = self.gate
         running_local, remote_by_host = running_split(self._ledger(boards))
         self._remote_by_host = dict(remote_by_host)
+        self.running_local = running_local
         allowance, paused = gate.admit_now(running=running_local if gate.enabled else None)
         if gate.enabled and allowance is None and klg.loadavg_supported():
             # Enabled gate, load1 unreadable on a host that has the sampler:
@@ -167,7 +173,8 @@ class GateTickBuilder:
             return None
         pins_only = gate.band not in ("spilling", "paused")
         if pins_only and not any_remote_pin(boards, self._connect,
-                                            kwp.known_host_ids(self._fleet_dir())):
+                                            kwp.known_host_ids(self._fleet_dir()),
+                                            kwp.pin_aliases(self._fleet_dir())):
             gate.pool = {"planned": False, "reason": "not_needed"}
             return None
         pool = kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg)
@@ -198,6 +205,14 @@ class GateTickBuilder:
             for name, d in plan.detail.items():
                 if d.get("pressure"):
                     self._log(logger.warning, f"kanban pool: {name} refused: {d['pressure']}")
+            # Saturation 4.2 readback (t_31350981): every tick that caps a
+            # host, dry or enforcing; an all-clear line at most every 5 min.
+            line = kadm.readback_line(plan.admission, enforcing=signal.admit_on_memory,
+                                      reservation=signal.reservation_gb)
+            if plan.admission:
+                logger.info("%s", line)
+            else:
+                self._log(logger.info, line)
             if plan.budget <= 0:
                 self._log(logger.warning, f"kanban pool: {plan.full_reason()}")
         return plan

@@ -524,6 +524,10 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "the profile's provider and will fail if it belongs "
                 "to a different one. Requires 'model'."
         )),
+        "force_model": _prop("string", (
+                "Reason to pin a 'model' id the provider's live model list does not "
+                "know. Without it an unknown id is refused with the valid list."
+        )),
     },
     ["title", "assignee"],
 )
@@ -710,6 +714,27 @@ _FORK_PROPERTIES: dict[str, dict[str, Any]] = {'KANBAN_LIST_SCHEMA': {'all': {'t
                                                           'similarity) was created in the last '
                                                           '24h; pass why this is not a duplicate '
                                                           'to file anyway (recorded on the card).'},
+                          'not_a_duplicate': {'type': 'string',
+                                              'description': 'Duplicate-guard override (same as '
+                                                             'force_reason). Creation is also '
+                                                             'refused when an OPEN card has a '
+                                                             '>=0.6 similar title (first 80 '
+                                                             'chars) or the same "Momus pass N" + '
+                                                             'spec; pass why this is not a '
+                                                             'duplicate (recorded on the card).'},
+                          'until': {'type': 'string',
+                                    'description': 'Mint the card parked until this time '
+                                                   '(ISO-8601, epoch seconds or +<N>[smhd]); the '
+                                                   'dispatcher wakes it then. Use for a '
+                                                   'time-gated card ("after 24 h of shadow"): a '
+                                                   'blocks edge alone releases it the instant the '
+                                                   'parent closes.'},
+                          'i_mean_blocks': {'type': 'boolean',
+                                            'description': 'A blocks-edge card whose text reads '
+                                                           'time-gated is refused without until. '
+                                                           'Pass true when the parent closing '
+                                                           'really is the gate (recorded on the '
+                                                           'card).'},
                           'wake': {'type': 'boolean',
                                    'description': 'Only with a gateway auto-subscription: also '
                                                   "WAKE this chat's agent (a full turn) on "

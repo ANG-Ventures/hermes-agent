@@ -1,0 +1,66 @@
+{
+  "_doc": "Skill -> capabilities the skill needs (card t_8c474c2e, Phase 1, generated in shape (test fixture)). The s5.1 first pin wave (10 skills) plus the six studio_bound_skills harness skills as control-plane. Phase 2 generates this file (fleet-host capabilities --sync) from SKILL.md signals + metadata.hermes.host_requires overrides. Attached skill = HARD requirement; skill named in the body (`name`, 'skill name', 'load name') = SOFT.",
+  "schema": 1,
+  "generated_by": "fleet-host capabilities --sync",
+  "source_hash": "5c014872a37f32318d33701dae04c1c11673b2fa4b0dbfc79cc80284f64725cc",
+  "skills": {
+    "amazon-cart-ops-local": [
+      "browser-session",
+      "screen"
+    ],
+    "amazon-login": [
+      "browser-session",
+      "imessage",
+      "screen"
+    ],
+    "browser-access": [
+      "browser-session",
+      "keychain"
+    ],
+    "deal-alerts": [
+      "browser-session"
+    ],
+    "sub-reset-credits": [
+      "browser-session",
+      "imessage"
+    ],
+    "github-login": [
+      "browser-session",
+      "imessage",
+      "screen"
+    ],
+    "google-login": [
+      "browser-session",
+      "imessage"
+    ],
+    "account-signup-autofill": [
+      "browser-session",
+      "screen",
+      "imessage"
+    ],
+    "magic-link-login-automation": [
+      "browser-session"
+    ],
+    "computer-use": [
+      "screen"
+    ],
+    "hermes-config-editing": [
+      "control-plane"
+    ],
+    "safe-gateway-restart": [
+      "control-plane"
+    ],
+    "fleet-stop-window-operations": [
+      "control-plane"
+    ],
+    "fleet-live-prompt-file-ops": [
+      "control-plane"
+    ],
+    "hermes-home-commit-hygiene": [
+      "control-plane"
+    ],
+    "live-tree-slice-landing": [
+      "control-plane"
+    ]
+  }
+}

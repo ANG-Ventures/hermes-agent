@@ -155,12 +155,160 @@ def check_source(src: str, filename: str = "<src>") -> list[str]:
     return problems
 
 
+# ── Kanban sandbox (t_65791cd2) ─────────────────────────────────────────────
+# Every test runs with HERMES_KANBAN_SANDBOX=1, set by an autouse fixture in
+# tests/conftest.py: kanban paths resolve from the per-test HERMES_HOME and no
+# HERMES_KANBAN_* pin or home nested under ~/.hermes can reach the live board.
+SANDBOX_ENV = "HERMES_KANBAN_SANDBOX"
+SANDBOX_SUPPRESS = "# kanban-sandbox: off"
+# The runtime arms only on these (utils.TRUTHY_STRINGS via env_var_enabled), so
+# the lint arms only on them too: "2", "disabled" or a non-constant value is
+# OFF at runtime and must read as a disarm here (Prism #1873 dc144f865127).
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+# Calls that REMOVE the key when it is a positional argument.
+_REMOVERS = frozenset({"delenv", "pop", "unsetenv", "delitem", "popitem", "remove", "discard"})
+# Calls that only READ the key.
+_READERS = frozenset({"get", "getenv", "environ_get", "index", "count", "startswith", "endswith"})
+
+
+def _is_sandbox_key(node: ast.expr | None) -> bool:
+    return isinstance(node, ast.Constant) and node.value == SANDBOX_ENV
+
+
+def _arms(val: ast.expr | None) -> bool:
+    """True only for a constant the runtime treats as ON."""
+    return isinstance(val, ast.Constant) and str(val.value).strip().lower() in _TRUTHY
+
+
+def _disarms_sandbox(call: ast.Call) -> bool:
+    """Any call that removes the flag or binds it to a value the runtime reads as OFF.
+
+    One rule instead of a list of call shapes, so a new spelling cannot slip
+    past: the key as a positional argument binds the NEXT positional (or the
+    ``value=`` keyword) unless the call only reads or removes it, and the key
+    as a keyword (``update(HERMES_KANBAN_SANDBOX="0")``,
+    ``dict(os.environ, HERMES_KANBAN_SANDBOX="0")``) binds that keyword's value.
+    Dict literals are checked by :func:`_dict_disarms_sandbox`.
+    """
+    name = _func_name(call.func)
+    for kw in call.keywords:
+        if kw.arg == SANDBOX_ENV and not _arms(kw.value):
+            return True
+    for i, arg in enumerate(call.args):
+        if not _is_sandbox_key(arg):
+            continue
+        if name in _READERS:
+            return False
+        if name in _REMOVERS:
+            return True
+        value = call.args[i + 1] if i + 1 < len(call.args) else next(
+            (kw.value for kw in call.keywords if kw.arg == "value"), None)
+        if value is None:
+            return False  # no binding: ``"K" in x``-style helpers, comparisons
+        return not _arms(value)
+    return False
+
+
+def _dict_disarms_sandbox(node: ast.Dict) -> bool:
+    """``{"HERMES_KANBAN_SANDBOX": "0"}`` / ``{**os.environ, KEY: ""}`` (update, env=)."""
+    return any(_is_sandbox_key(k) and not _arms(v) for k, v in zip(node.keys, node.values))
+
+
+def _assign_disarms_sandbox(node: ast.AST) -> bool:
+    """``os.environ[KEY] = "0"`` (plain or annotated assignment)."""
+    if isinstance(node, ast.Assign):
+        targets, value = node.targets, node.value
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        targets, value = [node.target], node.value
+    else:
+        return False
+    return not _arms(value) and any(
+        isinstance(t, ast.Subscript) and _is_sandbox_key(t.slice) for t in targets)
+
+
+def _loop_disarms(node: ast.For) -> list[int]:
+    """``for var in ("HERMES_KANBAN_SANDBOX", ...): monkeypatch.delenv(var)``: lines that remove it."""
+    if not (isinstance(node.iter, (ast.Tuple, ast.List, ast.Set))
+            and any(_is_sandbox_key(e) for e in node.iter.elts) and isinstance(node.target, ast.Name)):
+        return []
+    var = node.target.id
+    lines = []
+    for call in (n for stmt in node.body for n in ast.walk(stmt) if isinstance(n, ast.Call)):
+        if _func_name(call.func) in _REMOVERS and any(
+                isinstance(a, ast.Name) and a.id == var for a in call.args[:2]):
+            lines.append(call.lineno)
+    for stmt in node.body:
+        for n in ast.walk(stmt):
+            if isinstance(n, ast.Delete) and any(
+                    isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Name) and t.slice.id == var
+                    for t in n.targets):
+                lines.append(n.lineno)
+    return lines
+
+
+def check_sandbox_disarm(src: str, filename: str = "<src>") -> list[str]:
+    """A test that turns the kanban sandbox off must say why on that line."""
+    if SANDBOX_ENV not in src:
+        return []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        tree = ast.parse(src, filename=filename)
+    lines = src.splitlines()
+    hits: list[int] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.For):
+            hits.extend(_loop_disarms(node))
+            continue
+        disarm = ((isinstance(node, ast.Call) and _disarms_sandbox(node))
+                  or (isinstance(node, ast.Dict) and _dict_disarms_sandbox(node))
+                  or _assign_disarms_sandbox(node))
+        if isinstance(node, ast.Delete):
+            disarm = any(isinstance(t, ast.Subscript) and _is_sandbox_key(t.slice) for t in node.targets)
+        if disarm:
+            hits.append(node.lineno)
+    problems: list[str] = []
+    for lineno in sorted(set(hits)):
+        line = lines[lineno - 1] if lineno <= len(lines) else ""
+        if SANDBOX_SUPPRESS not in line:
+            problems.append(
+                f"{filename}:{lineno}: turns off {SANDBOX_ENV} (the conftest autouse sandbox) "
+                f"with no reason: add `{SANDBOX_SUPPRESS} — <why>` on the line, and keep the "
+                f"test's HERMES_HOME off the live root")
+    return problems
+
+
+def check_conftest_sandbox(conftest: Path) -> list[str]:
+    """tests/conftest.py must set the sandbox flag inside an autouse fixture."""
+    try:
+        tree = ast.parse(conftest.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError) as exc:
+        return [f"{conftest}: unreadable: {exc}"]
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        autouse = any(
+            isinstance(d, ast.Call) and any(
+                k.arg == "autouse" and isinstance(k.value, ast.Constant) and k.value.value is True
+                for k in d.keywords)
+            for d in fn.decorator_list)
+        if not autouse:
+            continue
+        for call in (n for n in ast.walk(fn) if isinstance(n, ast.Call)):
+            if (_func_name(call.func) == "setenv" and len(call.args) > 1 and _is_sandbox_key(call.args[0])
+                    and not _disarms_sandbox(call)):
+                return []
+    return [f"tests/conftest.py: no autouse fixture sets {SANDBOX_ENV}=1; every test must run "
+            f"kanban-sandboxed (t_65791cd2)"]
+
+
 def main(argv: list[str]) -> int:
     targets = [Path(p) for p in argv] or [ROOT / "tests"]
     files: list[Path] = []
     for t in targets:
         files.extend(sorted(t.rglob("*.py")) if t.is_dir() else [t])
     problems: list[str] = []
+    if not argv:
+        problems.extend(check_conftest_sandbox(ROOT / "tests" / "conftest.py"))
     for f in files:
         try:
             src = f.read_text(encoding="utf-8")
@@ -172,12 +320,14 @@ def main(argv: list[str]) -> int:
             rel = str(f)
         try:
             problems.extend(check_source(src, rel))
+            problems.extend(check_sandbox_disarm(src, rel))
         except SyntaxError as exc:
             problems.append(f"{rel}: unparsable: {exc}")
     for p in problems:
         print(p)
     if problems:
-        print(f"\n{len(problems)} kanban spawn(s) without a stated identity (t_f4c584e2).", file=sys.stderr)
+        print(f"\n{len(problems)} kanban test identity/sandbox problem(s) (t_f4c584e2, t_65791cd2).",
+              file=sys.stderr)
         return 1
     return 0
 

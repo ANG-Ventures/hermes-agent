@@ -646,6 +646,35 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
         )
 
 
+_STATEMENT_COUNTER = threading.local()
+
+
+@contextlib.contextmanager
+def count_statements():
+    """Count SQL statements run on kanban connections OPENED on this thread
+    inside the block (the gateway tick series' ``queries`` field). Connections
+    opened outside a block get no trace callback, so nothing else pays for it.
+    Yields a one-item list holding the running count."""
+    box = [0]
+    prev = getattr(_STATEMENT_COUNTER, "box", None)
+    _STATEMENT_COUNTER.box = box
+    try:
+        yield box
+    finally:
+        _STATEMENT_COUNTER.box = prev
+
+
+def _count_statements_on(conn: sqlite3.Connection) -> None:
+    box = getattr(_STATEMENT_COUNTER, "box", None)
+    if box is None:
+        return
+
+    def _trace(_sql, _box=box):
+        _box[0] += 1
+
+    conn.set_trace_callback(_trace)
+
+
 def _schema_is_present(conn: sqlite3.Connection) -> bool:
     """Whether an open connection actually sees the kanban schema. ``tasks`` is
     the sentinel (SCHEMA_SQL always creates it; SQLite loses tables
@@ -669,6 +698,7 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     fresh DB, and concurrent gateway startup threads must not race before
     ``_INITIALIZED_PATHS`` is populated. Closed if anything raises."""
     conn = _sqlite_connect(path)
+    _count_statements_on(conn)
     try:
         conn.row_factory = sqlite3.Row
         conn.text_factory = _kb._lossy_text
@@ -955,6 +985,8 @@ _TASK_RUN_COLUMNS = (
     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Resources the run started (kanban_resources); legacy rows read as [].
+    ("resources", "resources TEXT NOT NULL DEFAULT '[]'"),
 )
 
 
@@ -1206,7 +1238,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, resources TEXT NOT NULL DEFAULT '[]')",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",

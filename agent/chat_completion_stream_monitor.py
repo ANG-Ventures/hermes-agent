@@ -4,6 +4,7 @@ import time
 from types import SimpleNamespace
 
 from agent import chat_completion_wait_notice as wn
+from agent import fallback_wall_budget as wb
 from agent.model_metadata import is_local_endpoint
 
 
@@ -34,6 +35,18 @@ class StreamingWaitMonitor:
             if m.load_notice_misses >= 3:
                 m.load_notice_shown, m.load_notice_misses = False, 0
                 self.agent._emit_wait_notice("")
+        return False
+
+    def _poll_wall_budget(self) -> bool:
+        """Cross-lane no-first-byte budget (t_452c6ead): post the periodic "still waiting,
+        N lanes tried" line to the chat, and cut the attempt once the budget is spent and a
+        lane on another model is ahead. True = the attempt was cut."""
+        notice = wb.notice_due(self.agent)
+        if notice:
+            self.agent._emit_diagnostic_status(notice)
+        if wb.should_cut_attempt(self.agent):
+            self._cut_for_wall_budget()
+            return True
         return False
 
     def _heartbeat(self, waiting_secs: int) -> None:
@@ -86,5 +99,7 @@ class StreamingWaitMonitor:
                 self._kill_stale_stream(_stale_elapsed)
             if self.agent._interrupt_requested:
                 self._abort_for_interrupt(_stale_elapsed)
+                return
+            if self._poll_wall_budget():
                 return
 

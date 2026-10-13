@@ -1016,3 +1016,47 @@ def test_admin_api_key_is_scrubbed_from_tool_output_after_initialize(monkeypatch
     finally:
         monkeypatch.setenv("HERMES_HOME", str(home_a))
         redact.clear_vault_redaction_values()
+
+
+def test_admin_api_key_redaction_survives_a_full_vault_cache(monkeypatch, tmp_path):
+    """The provider registers the key once per session, so a burst of vault fills (passwords, OTP
+    codes) after initialize must not evict it from the bounded vault bucket (Prism 7bb47633f67b)."""
+    from agent import redact
+
+    nonce = "e2e" + "7a3d" * 15 + "q"
+    cat_output = json.dumps({"host": "http://mem0.test", "admin_api_key": nonce}, indent=2)
+    (tmp_path / "mem0.json").write_text(cat_output)
+    monkeypatch.delenv("MEM0_ADMIN_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(redact, "_VAULT_REDACTION_VALUES", {})
+    monkeypatch.setattr(redact, "_CREDENTIAL_REDACTION_VALUES", {}, raising=False)
+
+    Mem0MemoryProvider().initialize("test-session")
+    for i in range(redact._VAULT_REDACTION_MAX_PER_PROFILE * 2):
+        redact.register_vault_redaction_value(f"otp-{i:06d}")
+
+    assert nonce not in redact.redact_terminal_output(cat_output, "cat mem0.json")
+    assert nonce not in redact.redact_sensitive_text(cat_output)
+
+
+def test_rotated_admin_api_key_stays_redacted_alongside_new_key(monkeypatch, tmp_path):
+    """Re-initializing with a rotated key must not un-redact the previous one: both may be valid
+    mid-rotation and a backup mem0.json still holds the old value (Prism d352a3deb1bc)."""
+    from agent import redact
+
+    old_key = "e2e" + "4b2a" * 15 + "o"
+    new_key = "e2e" + "8d6e" * 15 + "n"
+    monkeypatch.delenv("MEM0_ADMIN_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(redact, "_VAULT_REDACTION_VALUES", {})
+    monkeypatch.setattr(redact, "_CREDENTIAL_REDACTION_VALUES", {}, raising=False)
+
+    for key in (old_key, new_key):
+        (tmp_path / "mem0.json").write_text(json.dumps({"host": "http://mem0.test", "admin_api_key": key}))
+        Mem0MemoryProvider().initialize("test-session")
+
+    backup = json.dumps({"host": "http://mem0.test", "admin_api_key": old_key}, indent=2)
+    current = json.dumps({"host": "http://mem0.test", "admin_api_key": new_key}, indent=2)
+    for text, key in ((backup, old_key), (current, new_key)):
+        assert key not in redact.redact_terminal_output(text, "cat mem0.json.bak")
+        assert key not in redact.redact_sensitive_text(text)

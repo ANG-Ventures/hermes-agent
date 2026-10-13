@@ -116,6 +116,8 @@ def query_pr_state(repo: str, number: int) -> Optional[dict]:
     if out["state"] == "MERGED" and payload.get("merge_commit_sha"):
         out["merge_commit_sha"] = str(payload["merge_commit_sha"])
     head = payload.get("head")
+    if isinstance(head, dict) and head.get("ref"):
+        out["head_ref"] = str(head["ref"])
     if out["state"] == "MERGED" and isinstance(head, dict) and head.get("sha"):
         out["head_sha"] = str(head["sha"])
     return out
@@ -156,7 +158,7 @@ def extract_pr_refs(
 
     sources = [t for t in texts if isinstance(t, str) and t.strip()]
     if isinstance(metadata, dict):
-        for key in ("pr_url", "pr_urls", "pr"):
+        for key in ("pr_url", "pr_urls", "pr", "own_prs"):
             sources.extend(_iter_strings(metadata.get(key)))
     sources.extend(_split_qualifier(claim)[1] for claim in _iter_strings(survivor_pr))
     out = []
@@ -234,17 +236,78 @@ def unmerged_refs(refs, *, query_fn: Optional[QueryFn] = None,
     return opened, unverified
 
 
+_CARD_IN_BRANCH_RE = re.compile(r"(?:^|/)(t_[0-9a-f]{8})(?:$|[-_/.])")
+
+
+def branch_names_other_card(head_ref: Optional[str], task_id: Optional[str]) -> bool:
+    """True when ``head_ref`` carries a card id and none of them is ``task_id``: another card's PR.
+    A branch with no card id at all proves nothing either way (False)."""
+    cards = _CARD_IN_BRANCH_RE.findall(head_ref or "")
+    return bool(cards) and task_id not in cards
+
+
+def branch_is_operators(head_ref: Optional[str]) -> bool:
+    """True when ``head_ref`` is an operator branch (``apollo/*``, ``aegis/*``) naming no card at all.
+
+    Operator branches belong to no card by construction (t_472fba2e: hermes-home#3843 on
+    ``apollo/bash32-bison-no-sudo`` gated every card whose prose said "lands behind #3843"). The
+    prefixes are :data:`kanban_db.OPERATOR_PROFILES`. An operator branch that names a card is
+    judged by its card id instead (:func:`branch_names_other_card`)."""
+    from hermes_cli.kanban_db import OPERATOR_PROFILES
+
+    if not head_ref or "/" not in head_ref or _CARD_IN_BRANCH_RE.search(head_ref):
+        return False
+    return head_ref.split("/", 1)[0].lower() in OPERATOR_PROFILES
+
+
 def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
-                 survivor_pr=None, query_fn: Optional[QueryFn] = None) -> list:
+                 survivor_pr=None, query_fn: Optional[QueryFn] = None,
+                 task_id: Optional[str] = None, unowned: Optional[list] = None) -> list:
     """Extract + resolve: the FLEET PRs that block ``done`` -- OPEN or unreadable.
 
     Foreign-owner refs are dropped before any lookup (see :data:`FLEET_OWNERS`).
+
+    Prose is not provenance (t_60b39483): t_f1b135a8's handoff said "#1902 and #1903 are not this
+    card's" and was gated on both. With ``task_id``, an OPEN ref found only in the handoff TEXT whose
+    head branch names a DIFFERENT card (``<profile>/<other card>-*``), or is an operator branch naming
+    no card (``apollo/*``, ``aegis/*``; t_472fba2e), is a mention: it is appended to ``unowned`` and
+    does not gate. Declared refs (``metadata.pr_url`` / ``pr_urls`` / ``pr``,
+    ``--survivor-pr``) always gate. A prose ref whose head branch names this card, names no card, or
+    is unknown (unreadable) still gates: fail closed, as before (t_1bd02e0b). "Names no card" includes
+    a branch with no operator prefix (``feature/x``: a worker branch that lost its id).
+
+    Declared beats prose (t_0ecd6506): when the handoff declares its PRs (``own_prs`` / ``pr_url`` /
+    ``pr_urls`` / ``pr`` / ``--survivor-pr``), the route and the close-on-merged set are exactly those
+    refs; an OPEN ref the text merely mentions goes to ``unowned`` (warn, never a gate). The text gates
+    only when nothing is declared. t_536b03d9 declared #3918 and was gated on #3853 too because its
+    prose said "the fix is Apollo's #3853".
     """
     refs = split_fleet(extract_pr_refs(*texts, metadata=metadata, survivor_pr=survivor_pr))[0]
     if not refs:
         return []
+    query_fn = memo_query(query_fn)
+    if query_fn is None:
+        return []
     primary = split_fleet(extract_pr_refs(metadata=metadata, survivor_pr=survivor_pr))[0]
     opened, unverified = unmerged_refs(refs, query_fn=query_fn, primary=primary)
+    if primary:
+        declared = {(r.repo.lower(), r.number) for r in primary}
+        if unowned is not None:
+            unowned.extend(r for r in opened if (r.repo.lower(), r.number) not in declared)
+        return [r for r in opened + unverified if (r.repo.lower(), r.number) in declared]
+    if task_id:
+        declared = {(r.repo.lower(), r.number) for r in primary}
+        kept = []
+        for ref in opened:
+            if (ref.repo.lower(), ref.number) not in declared:
+                payload = query_fn(ref.repo, ref.number)  # memoised: no second lookup
+                head_ref = payload.get("head_ref") if isinstance(payload, dict) else None
+                if branch_names_other_card(head_ref, task_id) or branch_is_operators(head_ref):
+                    if unowned is not None:
+                        unowned.append(ref)
+                    continue
+            kept.append(ref)
+        opened = kept
     return opened + unverified
 
 

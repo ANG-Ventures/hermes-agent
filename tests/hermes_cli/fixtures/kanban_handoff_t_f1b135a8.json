@@ -1,0 +1,57 @@
+{
+ "_source": "~/.hermes/kanban.db task_runs 23979 + 24059 for t_f1b135a8 (router-prepended first line and router-added metadata keys stripped)",
+ "runs": {
+  "23979": {
+   "summary": "PR ANG-Ventures/hermes-agent#1904 (head 15d3dec946) changes host_reach so only the ssh TARGET position binds a card, and word-shaped aliases (ci/ai/media/unifi) also need a known ssh host. The reach census was NOT run: this worker was on ACE-AI and cannot reach the Studio board DBs or the reach matrix. Follow-up card t_da0f5e9b (host: studio) runs it with the script I wrote for it.\n\nWhat changed (hermes_cli/kanban_worker_pool.py):\n- ssh/sftp/mosh: only the first non-option operand binds. Options that take a value are skipped, and each verb on a line is parsed on its own.\n- scp/rsync: only `[user@]host:path` and `rsync://host/` operands bind.\n- A word alias binds only in a verb target position, and only if it is either a literal Host in the dispatcher's ~/.ssh/config (Includes followed) or an alias some reach-matrix row reached with rc 0. A verbless `word:path` never binds.\n- If ssh config is unreadable, the check is skipped and the card stays local (fail closed).\n- Separator aliases (ace-ai, ci-box) keep the verbless `host:path` and `-H` forms; `-H` now also takes `ssh://`.\n- PoolConfig.ssh_hosts is filled by read_pool via known_ssh_hosts(), so tests stay hermetic.\n\nVerified:\n- Base is red: `host_bound_targets` on origin/main binds 'ssh in and check the ai lane' -> ai, 'scp media:/srv/x .' -> media, 'rsync the media library' -> media, 'run ci:lint' -> ci.\n- New tests: 7 prose shapes must not bind; 10 target shapes must (including `ssh ci sudo ...` and `scp ci:/path .`); plus tests for the ssh-config gate, Include parsing, and matrix rc 0.\n- Narrow run through test-gate: test_kanban_reach_matrix + test_kanban_worker_pool + test_kanban_diagnostics_placement, 164 passed. ruff clean.\n\nCI: no GitHub check-runs or workflow runs registered on #1904 after about 15 min. #1902, #1903 and the merged #1897 show the same, so the repo appears to have no PR CI. There is no CI URL to cite.\n\nCheck:\n1. One existing test changed: 'ssh ace-ai then mac-studio-m3u' became 'ssh ace-ai, then ssh mac-studio-m3u'. A word after the target is now prose by design.\n2. Matrix-reached aliases (fresh or stale) count as known ssh hosts. That keeps a DNS-only `unifi` binding so it does not spill.\n\nlive-evidence: no",
+   "metadata": {
+    "pr_url": "https://github.com/ANG-Ventures/hermes-agent/pull/1904",
+    "head_sha": "15d3dec946f168ba6742160fa0fc3659bfb1d6c9",
+    "changed_files": [
+     "hermes_cli/kanban_worker_pool.py",
+     "tests/hermes_cli/test_kanban_reach_matrix.py"
+    ],
+    "tests_run": 164,
+    "tests_passed": 164,
+    "red_on_base": true,
+    "census_run": false,
+    "census_blocker": "worker placed on ACE-AI (kanbanw): no Studio board DB, no fleet/kanban-reach-matrix.json; studio-mint is a forced-command mint key",
+    "census_script_ref": "daedalus/t_f1b135a8-reach-census@19428c0b55:scripts/census/reach_census_t_f1b135a8.py",
+    "follow_up_card": "t_da0f5e9b",
+    "ci": "no check-runs/workflow runs register on hermes-agent PRs (also 0 on #1897/#1902/#1903)",
+    "decisions": [
+     "word-shaped alias = letters only; needs ~/.ssh/config Host OR any matrix row rc 0",
+     "ssh config unreadable -> gate skipped (fail closed)",
+     "verbless word:path never binds; separator aliases keep verbless host:path"
+    ],
+    "live_evidence": "no"
+   }
+  },
+  "24059": {
+   "summary": "This card is done. ANG-Ventures/hermes-agent#1904 is merged (ba92ce6ca1). host_reach now binds only the ssh/scp/rsync TARGET position, and a word-shaped alias also has to be a known ssh host. Apollo approved it at 15d3dec946. The reach census ran on t_da0f5e9b across 216 open cards: 5 unbind, 0 newly bound, and all 3 changed cards narrowed. The Prism follow-ups on #1904 (per-verb option arity for sftp/mosh, the nested Include base dir) are on t_de66b34e. The requeue to fold main into #1902 was misrouted: #1902 is t_90887924's PR, stacked on #1893 and waiting by Apollo's sequencing, and #1903 is t_1a02039e's. I touched neither. Flip t_667f1f6a should also wait for t_de66b34e (Momus). live-evidence: no",
+   "metadata": {
+    "pr_url": "https://github.com/ANG-Ventures/hermes-agent/pull/1904",
+    "merged": true,
+    "merge_sha": "ba92ce6ca1",
+    "head_sha": "15d3dec946f168ba6742160fa0fc3659bfb1d6c9",
+    "census_card": "t_da0f5e9b",
+    "census": {
+     "open": 216,
+     "unbind": 5,
+     "newly_bound": 0
+    },
+    "prism_followup_card": "t_de66b34e",
+    "not_this_card": {
+     "ANG-Ventures/hermes-agent#1902": "t_90887924 (daedalus-opus), stacked on #1893, rebase after #1893 merges per Apollo",
+     "ANG-Ventures/hermes-agent#1903": "t_1a02039e"
+    },
+    "live_evidence": "no"
+   }
+  }
+ },
+ "heads": {
+  "1904": "daedalus/t_f1b135a8-ssh-target-position",
+  "1902": "daedalus-opus/t_90887924-hard-classes",
+  "1893": "daedalus-opus/t_8c474c2e-host-affinity-p1",
+  "1903": "daedalus/t_1a02039e-model-override-validate"
+ }
+}

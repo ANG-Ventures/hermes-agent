@@ -2258,6 +2258,9 @@ class GatewayTurnMixin:
         # the system prompt cannot drift turn-over-turn; a miss (thread rename, /sethome) re-renders.
         if event.internal and session_key:
             await self._rehydrate_prompt_pins(session_key, session_entry.session_id)
+        # A /branch thread child keeps its parent's context bytes (warm prefix); the inherited pin
+        # is returned verbatim here and adopted (re-keyed + its thread note staged) only after the
+        # early-outs below, so an aborted first turn leaves it adoptable (t_84dabcc7).
         context_prompt = self._pinned_session_context_prompt(
             context, _redact_pii, session_key, internal=event.internal,
         )
@@ -2312,6 +2315,14 @@ class GatewayTurnMixin:
         message_text, persist_user_message, persist_user_timestamp = (
             self._hmwa_apply_message_timestamp(event, message_text)
         )
+
+        # Adopt an inherited /branch pin only now, past every early-out: it re-keys the pin and the
+        # thread's own facts ride this turn's user message (Prism d78579970af8). An internal turn
+        # gets the note but leaves the pin for the first human turn (Prism b6bd0d66ca29).
+        _branch_context_note = self._adopt_inherited_context_pin(
+            context, _redact_pii, session_key, internal=event.internal)
+        if _branch_context_note:
+            turn_sidecar_notes.insert(0, _branch_context_note)
 
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.

@@ -21,7 +21,7 @@ from hermes_cli import kanban_db as kb
 def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     for var in ("HERMES_KANBAN_SANDBOX", "HERMES_KANBAN_DB"):
-        monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv(var, raising=False)  # kanban-sandbox: off — HERMES_KANBAN_HOME=tmp_path pins the root under test
     monkeypatch.setattr(kbudget, "_notify_script_path", lambda home=None: None)
     return tmp_path
 

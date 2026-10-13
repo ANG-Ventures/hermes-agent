@@ -19,10 +19,11 @@ from agent.turn_context import extract_api_content_sidecar
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.session import SessionSource, build_session_key, is_shared_multi_user_session
+from gateway.session import SessionEntry, SessionSource, build_session_key, is_shared_multi_user_session
 from gateway.session_transcript import TranscriptReadError
 from gateway.slash_commands_branch_thread import (
-    BRANCH_THREAD_PLATFORMS, branch_dest_source, branch_thread_parent, format_thread_ref, parse_branch_args,
+    BRANCH_THREAD_PLATFORMS, branch_dest_source, branch_notice_content, branch_notice_row, branch_thread_parent,
+    format_thread_ref, parse_branch_flags,
 )
 from gateway.slash_commands_status import history_unreadable
 
@@ -34,9 +35,11 @@ _RESET_CLEANUP_TIMEOUT_S = 30.0
 # chat_type values whose session key is per-user (DM-like), incl. the unknown/blank case.
 _DM_CHAT_TYPES = {"dm", "direct", "private", ""}
 
+# ``display_kind`` travels with the copy: a typed row (fork notice, /steer, failed-turn boundary)
+# that lost its kind would be re-merged by the child's alternation repair as a plain user turn.
 _BRANCH_COPIED_FIELDS = ("content", "tool_calls", "tool_call_id", "finish_reason", "reasoning",
                          "reasoning_content", "reasoning_details", "codex_reasoning_items",
-                         "codex_message_items", "timestamp")
+                         "codex_message_items", "timestamp", "display_kind")
 
 
 def _sattr(obj, name: str) -> str:
@@ -1015,7 +1018,7 @@ class GatewaySessionCommandsMixin:
     # ----------------------------------------------------------------------- /branch
 
     async def _handle_branch_command(self, event: MessageEvent) -> str:
-        """Handle /branch [--here] [name] — fork the current session into an independent copy.
+        """Handle /branch [--here] [--fresh] [name] — branch the current session into an independent copy.
 
         Thread-capable platforms (Discord/Telegram/Slack/Matrix) open a NEW sibling thread bound
         to the clone and leave this chat on the original session; ``--here`` (and every platform
@@ -1037,7 +1040,7 @@ class GatewaySessionCommandsMixin:
         if not history:
             return t("gateway.branch.no_conversation")
         new_session_id = f"{_dt.now().strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
-        stay_here, branch_title = parse_branch_args(event.get_command_args())
+        stay_here, fresh, branch_title = parse_branch_flags(event.get_command_args())
         if not branch_title:
             current_title = await self._session_db.get_session_title(current_entry.session_id)
             branch_title = await self._session_db.get_next_title_in_lineage(current_title or "branch")
@@ -1086,6 +1089,15 @@ class GatewaySessionCommandsMixin:
             # rows.
             await self._session_db.append_messages_batch(
                 new_session_id, [_branch_row(msg) for msg in history], chunk_rows=500)
+        # Branch notice the MODEL reads (t_424dcfb5): without it the child's context simply ends where
+        # the parent's did and the child resumes the parent's in-flight work. Appended AFTER the copied
+        # rows and OUTSIDE ``_branch_point_len`` (== len(history)), so /merge's delta starts at the notice;
+        # ``_merge_delta_rows`` drops it again because a bookkeeping row is not exploration.
+        parent_ref = source.thread_id or source.chat_id
+        notice = branch_notice_content(parent_session_id=parent_session_id, row_count=len(history),
+                                       platform=source.platform, parent_ref=str(parent_ref) if parent_ref else None)
+        with contextlib.suppress(Exception):
+            await self._session_db.append_messages_batch(new_session_id, [branch_notice_row(notice)])
         with contextlib.suppress(Exception):
             await self._session_db.set_session_title(new_session_id, branch_title)
         if not in_place:
@@ -1100,6 +1112,22 @@ class GatewaySessionCommandsMixin:
         if not in_place:
             with contextlib.suppress(Exception):
                 self._release_running_agent_state(dest_key)
+            # The thread child replays the parent's history behind the session-context paragraph;
+            # keeping the parent's bytes keeps that prefix warm (t_84dabcc7).
+            with contextlib.suppress(Exception):
+                self._inherit_branch_context_pin(session_key, dest_key)
+        # The parent's /model + /reasoning overrides follow the fork (default) so the child's FIRST turn
+        # runs at the parent's effort/model; ``--fresh`` leaves the child on the config default. The
+        # snapshot is taken from the PARENT entry captured above: in place, ``switch_session`` has just
+        # replaced that key's entry with one carrying neither field.
+        if fresh:
+            inherited = {}
+            if in_place:
+                await asyncio.to_thread(self._branch_drop_route_overrides, dest_key)
+        else:
+            inherited = await asyncio.to_thread(
+                self._branch_inherit_route_overrides, current_entry, session_key, dest_key)
+        inherit_line = self._branch_inherit_line(inherited)
         # Count = raw transcript rows (matches the /footer "N msgs" tally = sessions.message_count),
         # NOT a user-only subset, so the "inherits N messages" line reconciles with the footer.
         msg_count = len(history)
@@ -1112,10 +1140,67 @@ class GatewaySessionCommandsMixin:
             reply = t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
             if not stay_here and source.platform in BRANCH_THREAD_PLATFORMS:
                 reply += "\n" + t("gateway.branch.thread_fallback")
-            return reply
+            return reply + inherit_line
         key = "gateway.branch.branched_thread_one" if msg_count == 1 else "gateway.branch.branched_thread_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id,
-                 thread=format_thread_ref(source.platform, dest_source.thread_id))
+                 thread=format_thread_ref(source.platform, dest_source.thread_id)) + inherit_line
+
+    def _branch_inherit_route_overrides(self, parent: "SessionEntry", parent_key: str, child_key: str) -> dict:
+        """Copy the parent's ``reasoning_override`` + ``model_override_identity`` onto the child's store
+        entry AND the runner's live maps, exactly as the restart rehydrate does
+        (``_rehydrate_session_overrides_from_store``). The reasoning override is read from the parent's
+        LIVE session state first (what the parent actually runs at), then its persisted entry: a
+        ``/reasoning`` typed as the first message of a fresh chat lands in the live map before the entry
+        exists, so the entry alone under-reports (measured live 2026-10-12, t_424dcfb5 E2E). Returns
+        ``{"reasoning": label, "model": id}`` for what actually landed; a model whose credentials no
+        longer resolve is NOT inherited (the child stays on the config route, and the reply does not
+        claim it). Runs off the loop: the credential re-resolution can refresh an OAuth token."""
+        from hermes_constants import reasoning_label
+
+        inherited: dict = {}
+        store = getattr(self, "session_store", None)
+        child = store.entry_for(child_key) if store is not None else None
+        if parent is None or child is None:
+            return inherited
+        ro = self._session_state(parent_key).conversation.reasoning_override or parent.reasoning_override
+        if isinstance(ro, dict) and ro:
+            child.reasoning_override = dict(ro)
+            self._session_state(child_key).conversation.reasoning_override = dict(ro)
+            inherited["reasoning"] = reasoning_label(ro) or "medium"
+        mo = parent.model_override_identity
+        if isinstance(mo, dict) and mo.get("model") and mo.get("provider"):
+            try:
+                resolved = self._reresolve_model_override_credentials(mo)
+            except Exception:
+                resolved = None
+            if resolved is not None:
+                child.model_override_identity = dict(mo)
+                child._model_override_identity_invalid = False
+                self._session_state(child_key).conversation.model_override = resolved
+                getattr(self, "_session_model_override_unavailable", set()).discard(child_key)
+                inherited["model"] = str(mo.get("model"))
+            else:
+                logger.info("branch: model override %r not inherited by %s (provider %r unresolvable)",
+                            mo.get("model"), child_key, mo.get("provider"))
+        if inherited:
+            with contextlib.suppress(Exception):
+                store.persist()
+        return inherited
+
+    def _branch_drop_route_overrides(self, session_key: str) -> None:
+        """``/branch --fresh --here``: the clone shares the parent's key, so drop the overrides there."""
+        self._set_session_reasoning_override(session_key, None)
+        self._set_session_model_override(session_key, None)
+
+    @staticmethod
+    def _branch_inherit_line(inherited: dict) -> str:
+        """Reply suffix naming the inherited overrides, so a drop is visible; empty when none."""
+        parts = []
+        if inherited.get("model"):
+            parts.append(t("gateway.branch.inherits_model", model=inherited["model"]))
+        if inherited.get("reasoning"):
+            parts.append(t("gateway.branch.inherits_reasoning", effort=inherited["reasoning"]))
+        return ("\n" + t("gateway.branch.inherits", items=", ".join(parts))) if parts else ""
 
     async def _branch_post_thread_intro(self, source: SessionSource, dest_source: SessionSource,
                                         title: str, msg_count: int) -> None:

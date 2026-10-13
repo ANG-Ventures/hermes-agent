@@ -129,6 +129,23 @@ def reset_screenshot_dedup(session_id: str) -> None:
     "unchanged" note would point at, so the next capture of this session must deliver pixels again."""
     _reset_screenshot_dedup(_scoped_sid(session_id))
 
+def _bypass_escalation_capped(session_id: str, configured: str) -> bool:
+    """True when the screen is placed inside a terminal backend (a placed kanban worker on a pool host): 'unrestricted'
+    needs a private daemon on THIS host, which ``_refuse_off_screen_host`` refuses, so the bypass would turn a working
+    shared-daemon capture into SCREEN_RAIL_ABSENT (t_6276f6ec). Only the escalation is dropped; the configured mode is
+    kept, so a configured ``bounded`` still refuses there. Warns once per session."""
+    from tools.bot_desktop import placement
+    if placement.resolve().where != placement.TERMINAL:
+        return False
+    with _approval_lock:
+        warn = (key := f"cap:{session_id or ''}") not in _escalation_warned
+        _escalation_warned.add(key)
+    if warn:
+        logger.warning(
+            "computer_use: approvals.mode off escalated cua to unrestricted; terminal placement has no private "
+            "daemon; capped to %s for this session.", configured)
+    return True
+
 def _cua_permission_mode(session_id: str) -> str:
     """Map Hermes's approval bypass onto Cua's immutable mode; fails closed. Both identity namespaces are consulted
     (DB ``session_id`` and gateway ``session_key`` contextvar) or a gateway ``/yolo`` would be invisible here.
@@ -145,6 +162,8 @@ def _cua_permission_mode(session_id: str) -> str:
         from tools.approval_context import get_current_session_key
         if is_approval_bypass_active_for_session(session_id) or (
                 bool(key := get_current_session_key(default="")) and is_approval_bypass_active_for_session(key)):
+            if _bypass_escalation_capped(session_id, configured):
+                return configured
             with _approval_lock:
                 warn = (key := str(session_id or "")) not in _escalation_warned
                 _escalation_warned.add(key)
@@ -353,6 +372,20 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     try:
         backend = call.enter_context(_backend_for_call(session_id))
     except Exception as e:
+        # t_db491366: a placed worker whose pool host cannot bring up a desktop has no screen left
+        # but the Studio's. Only a placement failure is that; any other startup error (missing
+        # cua-driver, bad manifest) keeps its own message. A bounded/unrestricted private daemon that
+        # would run on this host instead of the pool host's sandbox is no screen either (t_08423f24).
+        from tools.bot_desktop.runtime import tool_placement as _bd_tool_placement
+        from tools.computer_use.cua_backend_daemon import PrivateDaemonOffScreen
+        from tools.rail_preflight import screen_rail_error
+        try:
+            screen_down = isinstance(e, PrivateDaemonOffScreen)
+            screen_down or _bd_tool_placement()
+        except RuntimeError:
+            screen_down = True
+        if screen_down and (rail := screen_rail_error()):
+            return json.dumps({"ok": False, "action": action, "error": rail, "detail": str(e)})
         return json.dumps({"error": f"computer_use backend unavailable: {e}",
                            "hint": "If the cua-driver binary is missing, run `hermes computer-use install`. "
                                    "If a Python dependency is missing, the error above shows the exact install command."})

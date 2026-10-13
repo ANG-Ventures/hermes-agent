@@ -14,7 +14,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from agent.interrupt_compat import _accepts_keyword
 from gateway.config import Platform
-from gateway.session import SessionSource, build_session_context_prompt
+from gateway.session import (
+    BRANCH_INHERITED_PIN_KEY, SessionSource, branch_pin_routing_matches, branch_thread_context_note,
+    build_session_context_prompt,
+)
 from gateway.session_prompt_pin import PROMPT_PIN_VERSION, sanitize_prompt_pin
 from gateway.run_shutdown import _log_suppressed
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
@@ -806,6 +809,15 @@ class GatewayAgentCacheMixin:
         _eph_pin = _pin_state.conversation.ephemeral_pin if _pin_state else None
         if _eph_pin is not None and _eph_pin[2] != redact_pii:
             _eph_pin = None
+        # An inherited /branch pin is served verbatim (human AND internal turns) while the parent's
+        # bytes still state this thread's own Home Channels / delivery options; the branch note only
+        # overrides source/ids/origin. Any routing drift drops it and renders this thread's own
+        # context: one cold prefix is the price of never stating a stale home (Prism 89f1a3a47431).
+        # The sentinel is re-keyed only once a human turn commits (``_adopt_inherited_context_pin``).
+        if _eph_pin is not None and _eph_pin[0] == BRANCH_INHERITED_PIN_KEY:
+            if branch_pin_routing_matches(_eph_pin[1], context, redact_pii=redact_pii):
+                return _eph_pin[1]
+            _pin_state.conversation.ephemeral_pin = _eph_pin = None
         if internal and _eph_pin is not None:
             return _eph_pin[1]
         _eph_key = self._ephemeral_change_key(context, redact_pii)
@@ -815,6 +827,51 @@ class GatewayAgentCacheMixin:
         if session_key:
             self._session_state(session_key).conversation.ephemeral_pin = (_eph_key, text, redact_pii)
         return text
+
+    def _inherit_branch_context_pin(self, parent_key: str, child_key: str) -> bool:
+        """``/branch`` into a NEW thread: seed the child's pin with the parent's session-context bytes.
+
+        The child replays the parent's whole transcript, and the session-context paragraph sits ahead
+        of the tool schemas and that history in the cached prefix. Rendering it fresh from the thread
+        source (``thread: <id>``, ``Multi-user thread``) re-wrote everything behind it on the child's
+        first turn: 61% prefix hit vs 99% for ``/branch --here`` (t_1908b8bc). The inherited pin is
+        adopted on the child's first human turn (``_adopt_inherited_context_pin``), which moves the
+        thread facts to that turn's user message. Call AFTER the child's agent eviction (eviction
+        clears the pin). Returns True when a parent pin was available."""
+        state = self._peek_session_state(parent_key) if parent_key else None
+        pin = state.conversation.ephemeral_pin if state else None
+        if pin is None:
+            with suppress(Exception):
+                durable = sanitize_prompt_pin(self.session_store.get_prompt_pin(parent_key))
+                if durable is not None:
+                    pin = (durable["context_key"], durable["context_prompt"], durable["redact_pii"])
+        if pin is None or not child_key:
+            return False
+        self._session_state(child_key).conversation.ephemeral_pin = (
+            BRANCH_INHERITED_PIN_KEY, pin[1], pin[2])
+        return True
+
+    def _adopt_inherited_context_pin(
+        self, context, redact_pii: bool, session_key: Optional[str], *, internal: bool = False,
+    ) -> Optional[str]:
+        """Re-key an inherited ``/branch`` pin to this session's own render key, keeping the parent's
+        bytes, and return the per-turn note carrying the thread's own session facts (``None`` when
+        there is nothing to adopt). Called from ``_hmwa_prepare_turn`` only once the turn is past its
+        early-outs: until then ``_pinned_session_context_prompt`` serves the sentinel pin verbatim,
+        so an aborted first turn leaves the note still deliverable. An ``internal`` turn (kanban
+        wake, webhook, scheduled run) gets the note too, since it reads the same parent bytes, but
+        leaves the sentinel for the first human turn (Prism b6bd0d66ca29). After adoption the usual
+        pin rules apply: a later real metadata change (rename, /sethome) re-renders once."""
+        state = self._peek_session_state(session_key) if session_key else None
+        pin = state.conversation.ephemeral_pin if state else None
+        if pin is None or pin[0] != BRANCH_INHERITED_PIN_KEY:
+            return None
+        if pin[2] != redact_pii:
+            state.conversation.ephemeral_pin = None  # never reuse bytes from another privacy policy
+            return None
+        if not internal:
+            state.conversation.ephemeral_pin = (self._ephemeral_change_key(context, redact_pii), pin[1], pin[2])
+        return branch_thread_context_note(context, redact_pii=redact_pii)
 
     def _pinned_channel_inputs(
         self, session_key: Optional[str], channel_prompt: Optional[str], source: SessionSource, *, internal: bool,

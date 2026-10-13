@@ -171,7 +171,7 @@ _FORK_MUTATION_ARGS = frozenset({"foreign_ok"})
 _UNDECLARED_ARGS: dict[str, frozenset[str]] = {
     "kanban_create": frozenset({
         "session_id", "project_id", "parents_kind", "force_reason", "wake",
-        "model_override", "reasoning_effort"}),
+        "model_override", "reasoning_effort", "force_model"}),
     # ``title`` is the pre-schema alias of ``filename`` that ``_handle_attach_url`` still honours.
     "kanban_attach_url": frozenset({"title"}),
     "kanban_list": frozenset({"all"}),
@@ -1367,8 +1367,22 @@ def _handle_create(args: dict, **kw) -> str:
     parents_kind = args.get("parents_kind")
     force_reason = args.get("force_reason")
     _check(force_reason is None or isinstance(force_reason, str), "force_reason must be a string")
+    not_a_duplicate = args.get("not_a_duplicate")
+    _check(not_a_duplicate is None or isinstance(not_a_duplicate, str),
+           "not_a_duplicate must be a reason string")
+    force_reason = force_reason or not_a_duplicate
+    i_mean_blocks = _parse_bool_arg(args, "i_mean_blocks")
+    until_raw = args.get("until")
+    force_model = args.get("force_model")
+    _check(force_model is None or isinstance(force_model, str), "force_model must be a reason string")
     from hermes_cli import kanban_worker_policy as _worker_policy
     with _board(args.get("board")) as (kb, conn):
+        until = None
+        if until_raw not in (None, ""):
+            try:
+                until = kb.parse_wake_at(str(until_raw))
+            except ValueError:
+                raise _Reject(f"invalid until {until_raw!r} (+<N>[smhd], epoch seconds or ISO-8601)")
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
@@ -1401,6 +1415,7 @@ def _handle_create(args: dict, **kw) -> str:
             idempotency_key=args.get("idempotency_key"),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
+            force_model_reason=force_model,
             reasoning_effort=reasoning_effort,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
@@ -1410,7 +1425,8 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(args.get("initial_status") or "running"), triage=bool(triage)),
             created_by=_persisted_identity(), session_id=None if unhomed else session_id,
             session_explicit=unhomed, require_home=True,
-            duplicate_guard=True, force_reason=force_reason)
+            duplicate_guard=True, force_reason=force_reason,
+            until=until, time_gate_guard=True, i_mean_blocks=i_mean_blocks)
         dup_warning = kb.near_duplicate_warning(conn, new_tid)
         # Placeholder-assignee lint (``default``/``apollo``/``human:x``) runs inside
         # ``create_task`` so it can see the parent's lane (r16 K); read the remap back.

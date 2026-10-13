@@ -728,6 +728,42 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
                       f"Heartbeat recorded for {args.task_id}")
 
 
+def _cmd_resource(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_resources as kres
+
+    action = getattr(args, "resource_action", None)
+    if action is None:
+        return _err("usage: kanban resource add|list|check|mark|release")
+    try:
+        with kbc.connect_closing() as conn:
+            if action == "add":
+                out = kres.kanban_run_resource(conn, args.task_id, args.kind, args.resource_id, args.host,
+                                               run_id=args.run_id)
+                if not _json_out(args, out):
+                    print(f"run {out['run_id']}: recorded {args.kind} {args.resource_id} on {args.host}")
+                return 0
+            if action == "release":
+                acts = kres.release_finished(conn, dry_run=args.dry_run)
+                if not _json_out(args, acts):
+                    for a in acts:
+                        print(f"{a['action']:12s} {a['task_id']} {a['kind']} {a['id']} @ {a['host']}")
+                return 0
+            if action == "mark":
+                n = kres.mark(conn, args.task_id, args.kind, args.resource_id, args.host, args.state,
+                              reason=args.reason)
+                return _ok_or_err(n, f"no recorded {args.kind} {args.resource_id} on {args.host} to mark",
+                                  f"marked {n} record(s) {args.state}")
+            rows = kres.list_resources(conn, args.task_id) if action == "list" else kres.outstanding(conn, args.task_id)
+    except ValueError as exc:
+        return _err(f"kanban resource {action}: {exc}")
+    if not _json_out(args, rows):
+        for r in rows:
+            print(f"run {r['run_id']}  {r.get('state', '?'):11s} {r.get('kind')} {r.get('id')} @ {r.get('host')}")
+        if action == "check":
+            print(f"RESOURCES={'open' if rows else 'ok'} outstanding={len(rows)}")
+    return 1 if action == "check" and rows else 0
+
+
 def _cmd_assignees(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         data = kb.known_assignees(conn)
@@ -865,6 +901,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
             )
             return 2
         args.session = home_flag
+    until = None
+    if getattr(args, "until", None):
+        try:
+            until = kb.parse_wake_at(args.until)
+        except ValueError as exc:
+            print(f"kanban: --until: {exc}", file=sys.stderr)
+            return 2
     try:
         with kb.connect_closing() as conn:
             _event_mark = kb.max_event_id(conn)
@@ -891,6 +934,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 provider_override=getattr(args, "provider_override", None),
                 pin_sub_reason=getattr(args, "pin_sub", None),
                 pin_sub_fallback=bool(getattr(args, "pin_sub_fallback", False)),
+                force_model_reason=getattr(args, "force_model", None),
                 flagship_override_reason=getattr(args, "allow_flagship", None),
                 flagship_override_author=_comment_author(args.created_by)[0],
                 reasoning_effort=getattr(args, "reasoning_effort", None),
@@ -910,6 +954,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 require_home=True,
                 duplicate_guard=True,
                 force_reason=getattr(args, "force_reason", None),
+                until=until,
+                time_gate_guard=True,
+                i_mean_blocks=bool(getattr(args, "i_mean_blocks", False)),
             )
             task = kb.get_task(conn, task_id)
             # Notice only when THIS call created the card and auto-added the
@@ -1283,6 +1330,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
         try:
+            from hermes_cli import kanban_placement_view as kpv
+            placement = kpv.task_block(conn, task.id)
+        except kb.sqlite3.Error:  # older/minimal board schema
+            placement = None
+        try:
             from hermes_cli import kanban_pr_owner as kpo
 
             pr_card_map = kpo.pr_card_map(conn, task.id)
@@ -1312,6 +1364,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             ],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
+            "placement": placement,
         })
         return 0
 
@@ -1378,6 +1431,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
     for pr, others in (pr_card_map or {}).items():
         field("pr-cards", f"{pr}: " + (", ".join(
             f"{o['id']} ({o['status']}, {o['assignee'] or '-'})" for o in others) or "none other"))
+    if placement and (placement.get("running_on") or placement.get("last_placement")
+                      or placement.get("held")):
+        # The block `kanban placement <id>` prints (spec §4.3; one reader, I-S5).
+        from hermes_cli import kanban_placement_view as kpv
+        print()
+        print("\n".join(kpv.format_task(placement)))
     if task.body:
         _print_section("Body:", [task.body])
     if task.result:
@@ -1948,6 +2007,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
                     write.provider = provider
                     write.pin_sub_reason = getattr(args, "pin_sub", None)
                     write.pin_sub_fallback = bool(getattr(args, "pin_sub_fallback", False))
+                    write.force_model_reason = getattr(args, "force_model", None)
                     if write.pin_sub_reason:
                         write.pin_sub_author = _profile_author()
                     if firepower:
@@ -2513,6 +2573,41 @@ def _cmd_diagnostics_placement(args: argparse.Namespace, config) -> int:
     return 0
 
 
+def _cmd_placement(args: argparse.Namespace) -> int:
+    """``placement --fleet`` / ``placement <id>``: read-only (spec §4.3, Phase 3)."""
+    from hermes_cli import kanban_load_gate as _klg
+    from hermes_cli import kanban_placement_view as kpv
+    from hermes_cli.config_effective import load_user_config_effective
+
+    task_id = getattr(args, "task_id", None)
+    if task_id:
+        with kb.connect_closing() as conn:
+            blk = kpv.task_block(conn, task_id)
+        if blk is None:
+            return _err(f"placement: no task {task_id}")
+        if getattr(args, "json", False):
+            _print_json(blk)
+        else:
+            print("\n".join(kpv.format_task(blk)))
+        return 0
+    if not getattr(args, "fleet", False):
+        return _err("placement: give a task id or --fleet")
+    root = kb.kanban_home()
+    try:  # the shared root's pool config, never the invoking profile's
+        root_cfg = load_user_config_effective(root / "config.yaml")
+    except Exception as exc:
+        return _err(f"placement --fleet: cannot read {root / 'config.yaml'}: {exc}")
+    kcfg = (root_cfg or {}).get("kanban") if isinstance(root_cfg, dict) else None
+    gate_path = getattr(args, "gate", None)
+    rep = kpv.compute(root, boards=kpv.live_boards(), gate_state=_klg.read_state(gate_path),
+                      kanban_cfg=kcfg if isinstance(kcfg, dict) else {})
+    if getattr(args, "json", False):
+        _print_json(rep)
+    else:
+        print("\n".join(kpv.format_fleet(rep)))
+    return 0 if not rep["errors"] else 1
+
+
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board via the same rule engine the dashboard uses."""
     from hermes_cli import kanban_diagnostics as kd
@@ -2525,6 +2620,9 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
     runtime_config = load_config()
     if getattr(args, "placement", False):
+        if getattr(args, "fleet", False):  # Q5 alias, one release: `kanban placement --fleet`
+            args.task_id, args.gate = None, None
+            return _cmd_placement(args)
         return _cmd_diagnostics_placement(args, runtime_config)
     diag_config = kd.config_from_runtime_config(runtime_config)
 
@@ -3269,7 +3367,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             # --clear-model writes NULL; --model X writes X literally. The
             # None sentinel ("--model omitted") never reaches here.
             new_model = None if clear_model else model_override
-            affected = kb.set_task_model(conn, args.task_id, new_model)
+            try:
+                affected = kb.set_task_model(
+                    conn, args.task_id, new_model,
+                    force_model_reason=getattr(args, "force_model", None),
+                    actor=_profile_author(),
+                )
+            except ValueError as exc:
+                return _err(f"kanban: {exc}")
             if affected == 0:
                 return _err(f"cannot set model on {args.task_id} (unknown id)")
             if clear_model:
@@ -3361,10 +3466,10 @@ def _parse_wake_at(value: str) -> int:
     (a naive timestamp is local time, like every other human-typed time)."""
     value = (value or "").strip()
     if value.isdigit():
-        return int(value)
+        return kb.validate_wake_at(int(value))
     from datetime import datetime
 
-    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    return kb.validate_wake_at(int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()))
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -4675,7 +4780,7 @@ _HANDLERS = {
     "assign": _cmd_assign, "set-model": _cmd_set_model, "priority": _cmd_priority,
     "lane-model": _cmd_lane_model, "pins": _cmd_pins,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
-    "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
+    "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics, "placement": _cmd_placement,
     "link": _cmd_link, "rehome": _cmd_rehome, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
@@ -4688,7 +4793,7 @@ _HANDLERS = {
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "home-index": _cmd_home_index, "session-closeout": _cmd_session_closeout,
-    "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
+    "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat, "resource": _cmd_resource,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-status": _cmd_notify_status,
     "notify-unsubscribe": _cmd_notify_unsubscribe,

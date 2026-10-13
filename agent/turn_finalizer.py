@@ -69,6 +69,50 @@ def _rollup_turn_usage(turn_calls: list[dict]) -> dict:
     }
 
 
+def turn_reasoning_effort(agent, turn_calls=None) -> "str | None":
+    """Resolved reasoning-effort label the turn ran at, for the turn ledger.
+
+    None when the turn made no API call: no effort ran, so none is recorded
+    (a turn that failed before its first request must not show ``xhigh``).
+
+    Otherwise the same value the runtime footer prints: ``reasoning_label``
+    over the LIVE ``agent.reasoning_config`` (session ``/reasoning`` override,
+    per-model override and fallback-entry effort already folded in), never the
+    config default re-read from disk. ``none`` when reasoning is disabled.
+
+    Two cases do not trust that config:
+
+    - reasoning recovery rewrote the request for the session
+      (``_reasoning_disable_rejected``: the route refused the OFF and the floor
+      effort was sent; ``_reasoning_effort_rejected``: the route refused the
+      level and the fields were omitted). The requested config is then not
+      what ran: record what went on the wire (``_wire_reasoning_config``) --
+      the floor, or None (unknown) when the effort was omitted and the route
+      applied its own default.
+    - the agent carries no config at all (unset ``agent.reasoning_effort``):
+      the provider default ``unset_reasoning_default`` resolves is the truth,
+      re-derived here rather than read from ``_wire_reasoning_config``: the
+      one-shot ``_ephemeral_reasoning_off`` continuation rewrites the last
+      request's wire config to a disable for a single follow-up call, which
+      is not the effort the turn ran at.
+    """
+    from hermes_constants import reasoning_label
+
+    if not turn_calls:
+        return None
+    recovered = bool(
+        getattr(agent, "_reasoning_disable_rejected", False)
+        or getattr(agent, "_reasoning_effort_rejected", False)
+    )
+    if recovered:
+        return reasoning_label(getattr(agent, "_wire_reasoning_config", None)) or None
+    cfg = getattr(agent, "reasoning_config", None)
+    if cfg is None:
+        from agent.reasoning_params import unset_reasoning_default
+        cfg = unset_reasoning_default(agent)
+    return reasoning_label(cfg) or None
+
+
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
     """True when an assistant row has no visible text (blank final or tool-only)."""
     if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -1005,6 +1049,7 @@ def emit_session_end(
                     parent_chat_name=getattr(agent, "_blackbox_parent_chat_name", None),
                     is_subagent=bool(getattr(agent, "_blackbox_is_subagent", False)),
                     depth=getattr(agent, "_blackbox_depth", None),
+                    reasoning_effort=turn_reasoning_effort(agent, _turn_calls),
                 )
                 return True
             agent._session_end_emitted_turn_id = turn_id
@@ -1036,6 +1081,10 @@ def emit_session_end(
                 final_response=final_response,
                 turn_usage=_turn_usage,
                 cli_invocation_id=getattr(agent, "_cli_invocation_id", None),
+                # Resolved effort label (session override folded in), the
+                # value the runtime footer prints; the ledger keeps it per
+                # turn so /context and /usage can show it (t_09a1e42a).
+                reasoning_effort=turn_reasoning_effort(agent, _turn_calls),
             )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)

@@ -1036,6 +1036,11 @@ def _relay_verdict(c: _Ctx) -> Optional[Verdict]:
     # re-enters the same stall for another per_attempt_timeout_s (t_bbb0dec5).
     if _is_read_phase_stall(c):
         return _V_POOL_STALLED
+    # The harness cut the attempt itself: the turn's cross-lane no-first-byte budget is spent
+    # (agent/fallback_wall_budget.py). Same recovery as a relay stall: fall over now.
+    from agent.fallback_wall_budget import FallbackWallBudgetExceeded
+    if isinstance(c.error, FallbackWallBudgetExceeded):
+        return _V_POOL_STALLED
     try:
         from agent.fallback_events import relay_error_class as _relay_error_class
         relay_class, _src = _relay_error_class(c.error)

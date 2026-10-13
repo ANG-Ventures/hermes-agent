@@ -70,3 +70,81 @@ def test_the_1825_helper_shape_is_red_bare_and_green_with_an_identity():
 
 def test_the_live_tests_tree_is_clean():
     assert lint.main([str(ROOT / "tests")]) == 0
+
+
+# --- kanban sandbox (t_65791cd2) --------------------------------------------
+
+def test_disarming_the_sandbox_needs_a_stated_reason():
+    bare = 'def test_x(monkeypatch):\n    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)\n'
+    assert lint.check_sandbox_disarm(bare, "t.py")
+    for shape in ('monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "0")',
+                  'os.environ.pop("HERMES_KANBAN_SANDBOX", None)',
+                  'del os.environ["HERMES_KANBAN_SANDBOX"]',
+                  'os.environ["HERMES_KANBAN_SANDBOX"] = "0"',
+                  'monkeypatch.setitem(os.environ, "HERMES_KANBAN_SANDBOX", "0")',
+                  'monkeypatch.delitem(os.environ, "HERMES_KANBAN_SANDBOX")',
+                  'os.environ.update({"HERMES_KANBAN_SANDBOX": ""})'):
+        assert lint.check_sandbox_disarm(f"import os\ndef test_x(monkeypatch):\n    {shape}\n", "t.py"), shape
+    stated = bare.rstrip("\n") + "  # kanban-sandbox: off — tests pin precedence\n"
+    assert lint.check_sandbox_disarm(stated, "t.py") == []
+    armed = 'def test_x(monkeypatch):\n    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")\n'
+    assert lint.check_sandbox_disarm(armed, "t.py") == []
+    for armed in ('os.environ["HERMES_KANBAN_SANDBOX"] = "1"',
+                  'monkeypatch.setitem(os.environ, "HERMES_KANBAN_SANDBOX", "1")'):
+        assert lint.check_sandbox_disarm(f"import os\ndef test_x(monkeypatch):\n    {armed}\n", "t.py") == [], armed
+
+
+def test_conftest_must_arm_the_sandbox_in_an_autouse_fixture(tmp_path):
+    good = tmp_path / "good.py"
+    good.write_text('import pytest\n@pytest.fixture(autouse=True)\ndef _env(monkeypatch):\n'
+                    '    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")\n')
+    assert lint.check_conftest_sandbox(good) == []
+    not_autouse = tmp_path / "plain.py"
+    not_autouse.write_text(good.read_text().replace("(autouse=True)", ""))
+    assert lint.check_conftest_sandbox(not_autouse)
+    assert lint.check_conftest_sandbox(ROOT / "tests" / "conftest.py") == []
+
+
+def test_every_binding_that_leaves_the_sandbox_off_is_a_disarm():
+    """Prism #1873 dc144f865127 + C-assert-xhigh: keyword, dict-literal, env= and non-truthy forms."""
+    disarms = (
+        'os.environ.update(HERMES_KANBAN_SANDBOX="0")',
+        'monkeypatch.setenv("HERMES_KANBAN_SANDBOX", value="0")',
+        'os.environ.setdefault("HERMES_KANBAN_SANDBOX", "0")',
+        'env = dict(os.environ, HERMES_KANBAN_SANDBOX="0")',
+        'subprocess.run(["x"], env={**os.environ, "HERMES_KANBAN_SANDBOX": "0"})',
+        'env.update({"HERMES_KANBAN_SANDBOX": "off"})',
+        'monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "2")',
+        'monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "disabled")',
+        'monkeypatch.setenv("HERMES_KANBAN_SANDBOX", flag)',
+        'os.environ["HERMES_KANBAN_SANDBOX"] = flag',
+        'os.putenv("HERMES_KANBAN_SANDBOX", "")',
+        'os.unsetenv("HERMES_KANBAN_SANDBOX")',
+        'for k in ("HERMES_KANBAN_SANDBOX", "HERMES_KANBAN_DB"):\n        monkeypatch.delenv(k)',
+        'for k in ["HERMES_KANBAN_SANDBOX"]:\n        del os.environ[k]',
+    )
+    for shape in disarms:
+        src = f"import os, subprocess\ndef test_x(monkeypatch, flag, env):\n    {shape}\n"
+        assert lint.check_sandbox_disarm(src, "t.py"), shape
+    armed_or_reads = (
+        'os.environ.update(HERMES_KANBAN_SANDBOX="1")',
+        'monkeypatch.setenv("HERMES_KANBAN_SANDBOX", value="true")',
+        'env = dict(os.environ, HERMES_KANBAN_SANDBOX="yes")',
+        'subprocess.run(["x"], env={**os.environ, "HERMES_KANBAN_SANDBOX": "on"})',
+        'x = os.environ.get("HERMES_KANBAN_SANDBOX", "0")',
+        'x = os.getenv("HERMES_KANBAN_SANDBOX", "")',
+        'assert "HERMES_KANBAN_SANDBOX" in os.environ',
+        'for k in ("HERMES_KANBAN_SANDBOX",):\n        print(os.environ.get(k))',
+    )
+    for shape in armed_or_reads:
+        src = f"import os, subprocess\ndef test_x(monkeypatch, env):\n    {shape}\n"
+        assert lint.check_sandbox_disarm(src, "t.py") == [], shape
+    looped = 'for k in ("HERMES_KANBAN_SANDBOX",):\n        monkeypatch.delenv(k)  # kanban-sandbox: off — pin test'
+    assert lint.check_sandbox_disarm(f"def test_x(monkeypatch):\n    {looped}\n", "t.py") == []
+
+
+def test_conftest_arming_with_a_non_truthy_value_does_not_count(tmp_path):
+    bad = tmp_path / "bad.py"
+    bad.write_text('import pytest\n@pytest.fixture(autouse=True)\ndef _env(monkeypatch):\n'
+                   '    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "2")\n')
+    assert lint.check_conftest_sandbox(bad)

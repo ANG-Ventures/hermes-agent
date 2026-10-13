@@ -113,6 +113,7 @@ class TestInstantiationEpoch:
 
         dc.current_instantiation_epoch.cache_clear()
         monkeypatch.setattr(_P, "read_text", _boom)
+        monkeypatch.setattr(dc, "_darwin_boot_session_uuid", lambda: "")
         try:
             assert dc.current_instantiation_epoch() == ""
         finally:

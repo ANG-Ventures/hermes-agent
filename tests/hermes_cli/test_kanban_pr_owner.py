@@ -273,3 +273,117 @@ def test_cached_old_head_never_authorizes_reclaim(monkeypatch):
     n = len(calls)
     assert kpo.owner_is_stale(dict(owner), now=now) is False
     assert len(calls) == n
+
+
+# ---- t_0a9a20ea: a heartbeating owner is never stale, and the reclaimer never signals ----
+
+def _heartbeat(conn, tid, *, age):
+    at = int(time.time()) - age
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?", (at, tid))
+        conn.execute("UPDATE task_runs SET last_heartbeat_at = ? WHERE task_id = ?", (at, tid))
+    return at
+
+
+def test_heartbeating_owner_with_old_head_is_not_stale(kanban_home, head_at):
+    """2026-10-12 06:12: t_4fded0bd, run 2 h+ old, PR head 2 h+ old, heartbeats every minute."""
+    with kb.connect() as conn:
+        owner = _run_owner(conn, age=3 * 3600)
+        beat = _heartbeat(conn, owner, age=60)
+        head_at["at"] = int(time.time()) - 3 * 3600
+        helper = kb.create_task(conn, title=f"fix {PR}", assignee="alice")
+        owners = kpo.spawn_owners(conn, helper)
+        assert [o["stale"] for o in owners] == [False]
+        assert owners[0]["stale_skipped"] == kpo.STALE_SKIP_REASON
+        detail: dict = {}
+        assert kb.check_respawn_guard(conn, helper, detail=detail) == kpo.GUARD_REASON
+        assert detail["owner"] == owner and "pr_owner_stale" not in detail
+        skips = [e.payload for e in kb.list_events(conn, owner) if e.kind == kpo.STALE_SKIP_EVENT]
+        assert skips == [{"reason": "run_heartbeating", "pr": "ang-ventures/hermes-agent#1624",
+                          "waiting": helper, "last_progress_at": beat, "head_committed_at": None}]
+        # once per run, not once per tick
+        kb.check_respawn_guard(conn, helper, detail={})
+        assert sum(e.kind == kpo.STALE_SKIP_EVENT for e in kb.list_events(conn, owner)) == 1
+
+
+def test_owner_whose_heartbeat_also_went_quiet_is_stale(kanban_home, head_at):
+    with kb.connect() as conn:
+        owner = _run_owner(conn, age=3 * 3600)
+        _heartbeat(conn, owner, age=3 * 3600)
+        head_at["at"] = int(time.time()) - 3 * 3600
+        helper = kb.create_task(conn, title=f"fix {PR}", assignee="alice")
+        assert [o["stale"] for o in kpo.spawn_owners(conn, helper)] == [True]
+        assert not [e for e in kb.list_events(conn, owner) if e.kind == kpo.STALE_SKIP_EVENT]
+
+
+def _recording_kill(signals: list):
+    """``os.kill`` stand-in: records real signals, keeps the ``kill(pid, 0)`` liveness probe honest."""
+    real = os.kill
+
+    def _kill(pid, sig):
+        if sig == 0:
+            return real(pid, sig)
+        signals.append((pid, sig))
+    return _kill
+
+
+def _live_verified_owner(conn, monkeypatch, *, age):
+    """A stale-by-age owner whose recorded worker pid is live and verified ours."""
+    owner = _run_owner(conn, age=age)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET worker_pid = 4242 WHERE id = ?", (owner,))
+        conn.execute("UPDATE task_runs SET worker_pid = 4242 WHERE task_id = ?", (owner,))
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: int(pid) == 4242)
+    monkeypatch.setattr(kb, "_pid_started_in_claim", lambda *a: True)
+    return owner
+
+
+def test_pr_owner_reclaim_never_signals_a_live_worker(kanban_home, head_at, monkeypatch):
+    """Even when every age says stale, a live verified worker gets no SIGTERM from this path."""
+    signals = []
+    monkeypatch.setattr(os, "kill", _recording_kill(signals))
+    with kb.connect() as conn:
+        owner = _live_verified_owner(conn, monkeypatch, age=3 * 3600)
+        head_at["at"] = int(time.time()) - 3 * 3600
+        helper = kb.create_task(conn, title=f"fix {PR}", assignee="alice")
+        stale = kpo.spawn_owners(conn, helper)
+        assert [o["stale"] for o in stale] == [True]
+        detail: dict = {}
+        assert kb._reassign_stale_pr_owners(conn, helper, stale, detail) == kpo.GUARD_REASON
+        assert signals == []
+        assert kb.get_task(conn, owner).status == "running"
+        refused = [e.payload for e in kb.list_events(conn, owner) if e.kind == "reclaim_refused"]
+        assert [r["reason"] for r in refused] == ["worker_alive_unsignalled"]
+        assert refused[0]["termination_attempted"] is False
+        assert "could not be reclaimed" in detail["hold"]
+        assert not [e for e in kb.list_events(conn, owner) if e.kind == kpo.REASSIGN_EVENT]
+
+
+def test_pr_owner_reclaim_takes_a_dead_worker(kanban_home, head_at, monkeypatch):
+    """Same ages, recorded worker gone: the reclaim proves death without a signal and reassigns."""
+    signals = []
+    monkeypatch.setattr(os, "kill", _recording_kill(signals))
+    with kb.connect() as conn:
+        owner = _live_verified_owner(conn, monkeypatch, age=3 * 3600)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        head_at["at"] = int(time.time()) - 3 * 3600
+        helper = kb.create_task(conn, title=f"fix {PR}", assignee="alice")
+        stale = kpo.spawn_owners(conn, helper)
+        assert [o["stale"] for o in stale] == [True]
+        assert kb._reassign_stale_pr_owners(conn, helper, stale, {}) is None
+        assert signals == []
+        assert kb.get_task(conn, owner).status != "running"
+        kinds = {e.kind: e.payload for e in kb.list_events(conn, owner)}
+        assert kinds[kpo.REASSIGN_EVENT]["to"] == helper
+        assert kinds["reclaimed"]["terminated"] is True
+        assert kinds["reclaimed"]["termination_attempted"] is False
+
+
+def test_operator_reclaim_still_signals(kanban_home, head_at, monkeypatch):
+    """The no-signal rule is the pr-owner reclaimer's, not ``kanban reclaim``'s."""
+    signals = []
+    with kb.connect() as conn:
+        owner = _live_verified_owner(conn, monkeypatch, age=3 * 3600)
+        assert kb.reclaim_task(conn, owner, reason="operator",
+                               signal_fn=lambda pid, sig: signals.append(sig)) is False
+        assert len(signals) >= 1

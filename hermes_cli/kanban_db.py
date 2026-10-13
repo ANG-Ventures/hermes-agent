@@ -153,28 +153,50 @@ DEPENDENCY_NO_PARENT_REFUSAL = (
 )
 
 
+# Statuses block_task can act on for a dependency kind (the transition guard's
+# running/ready/review, plus blocked for in-place classification).
+_DEPENDENCY_REFUSAL_STATUSES = ("running", "ready", "review", "blocked")
+
+
 class BlockRefused(ValueError):
     """``block_task`` refused the requested kind; the message says what to use instead."""
 
 
+def validate_wake_at(value: int) -> int:
+    """*value* if it renders as a local time, else ValueError. A wake that
+    fits SQLite but not ``time.localtime`` (a nanosecond epoch) would be
+    persisted and then break every list/show of the card."""
+    try:
+        time.localtime(int(value))
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError(f"wake time {value!r} is not a representable epoch-seconds time") from exc
+    return int(value)
+
+
 def parse_wake_at(value: str, *, now: Optional[int] = None) -> int:
     """Wake time -> epoch seconds: epoch digits, ``+<N>[smhd]`` relative to
-    *now*, or ISO-8601 (a naive timestamp is local time). Raises ValueError."""
+    *now*, or ISO-8601 (a naive timestamp is local time). Raises ValueError,
+    including for a time :func:`validate_wake_at` cannot render."""
     value = (value or "").strip()
     if value.isdigit():
-        return int(value)
+        return validate_wake_at(int(value))
     rel = re.fullmatch(r"\+(\d+)([smhd])", value)
     if rel:
         base = int(time.time()) if now is None else int(now)
-        return base + int(rel.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[rel.group(2)]
+        return validate_wake_at(
+            base + int(rel.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[rel.group(2)])
     from datetime import datetime
 
-    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    return validate_wake_at(int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()))
 
 
 def format_deferred_until(until: Optional[int]) -> str:
-    """``⏸ deferred until <local time>``: the one rendering of a deferred park."""
-    when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(int(until))) if until else "?"
+    """``⏸ deferred until <local time>``: the one rendering of a deferred park.
+    A stored wake that cannot render (written before validation) shows raw."""
+    try:
+        when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(int(until))) if until else "?"
+    except (OverflowError, OSError, ValueError):
+        when = f"epoch {until}"
     return f"⏸ deferred until {when}"
 
 
@@ -716,7 +738,10 @@ def _kanban_path_override(name: str) -> str:
     """
     if kanban_sandbox_enabled():
         return ""
-    return os.environ.get(name, "").strip()
+    value = os.environ.get(name, "").strip()
+    if value:
+        _refuse_live_kanban_pin_in_isolation(Path(value), name)
+    return value
 
 # The ``HERMES_KANBAN_DB`` pin and ``HERMES_HOME`` as they were when this
 # module was first imported. Load-bearing for telling the INCIDENT shape apart
@@ -1135,12 +1160,331 @@ def kanban_home() -> Path:
     module docstring). Resolving the kanban paths through the active
     profile's ``HERMES_HOME`` would silently fork the board per profile,
     which breaks the dispatcher / worker handoff.
+
+    ``HERMES_REAL_HOME`` plays no part here. It is the OS account home that
+    the subprocess HOME contract (``hermes_constants.get_real_home``) uses so a
+    child with ``HOME={HERMES_HOME}/home`` still finds ``~``-based credentials.
+    The live-board leak blamed on it (t_db9ca661) was step 2: a HERMES_HOME
+    anywhere under the native root resolves to the native root.
+
+    With ``HERMES_KANBAN_SANDBOX`` set, step 2 never climbs from a home
+    nested under the live root to the live root (see
+    :func:`_sandbox_kanban_home`). In a test or drill context
+    (:func:`_kanban_isolation_context`) a root that is the live Hermes root
+    raises :class:`KanbanLiveBoardRefusedError`.
     """
     override = _kanban_path_override("HERMES_KANBAN_HOME")
     if override:
-        return Path(override).expanduser()
-    from hermes_constants import get_default_hermes_root
-    return get_default_hermes_root()
+        root = Path(override).expanduser()
+    else:
+        from hermes_constants import get_default_hermes_root
+        root = get_default_hermes_root()
+        if kanban_sandbox_enabled():
+            root = _sandbox_kanban_home(root)
+        else:
+            _refuse_nested_non_profile_home(root)
+    _refuse_live_kanban_root_in_isolation(root, "kanban_home()")
+    return root
+
+
+class KanbanLiveBoardRefusedError(RuntimeError):
+    """A test, drill or declared sandbox resolved a kanban path on the LIVE board.
+
+    2026-10-10: two drills (t_db9ca661, t_7a6f4611) pointed ``HERMES_HOME`` at a
+    scratch dir under ``~/.hermes/profiles/<p>/cache/scratch`` (the fleet's
+    default ``TMPDIR``). ``get_default_hermes_root()`` maps every home under
+    the native root to the native root, so 8 fixture cards landed on the live
+    default board, the second time with ``HERMES_KANBAN_SANDBOX=1`` set and
+    every pin unset. The dispatcher then spawned real workers on 4 of them.
+    """
+
+
+# Env markers that declare "this process must never touch the live board".
+# PYTEST_CURRENT_TEST is pytest's own; HERMES_TEST_ISOLATION is exported by
+# tests/conftest.py and inherits into children that strip PYTEST_*;
+# HERMES_KANBAN_DRILL=<card> marks a hand-run drill.
+_KANBAN_ISOLATION_ENV_VARS = ("PYTEST_CURRENT_TEST", "HERMES_TEST_ISOLATION", "HERMES_KANBAN_DRILL")
+
+
+def _kanban_isolation_context() -> Optional[str]:
+    """Name of the first isolation marker set in the environment, else None."""
+    for name in _KANBAN_ISOLATION_ENV_VARS:
+        if os.environ.get(name, "").strip():
+            return name
+    return None
+
+
+def _live_kanban_root() -> Optional[Path]:
+    """The live Hermes root, anchored on the OS account (passwd), not ``$HOME``.
+
+    Tests monkeypatch ``Path.home`` and the platform default; the passwd entry
+    is the one anchor they cannot move, so this keeps naming production.
+    Only consulted when an isolation marker or the sandbox flag is set, so a
+    production process never pays for it.
+    """
+    global _LIVE_KANBAN_ROOT_MEMO
+    if _LIVE_KANBAN_ROOT_MEMO is None:
+        from hermes_state_guard import _real_platform_state_root
+        _LIVE_KANBAN_ROOT_MEMO = (_real_platform_state_root(),)
+    return _LIVE_KANBAN_ROOT_MEMO[0]
+
+
+_LIVE_KANBAN_ROOT_MEMO: Optional[tuple] = None
+
+
+def _account_home_board_root() -> Optional[Path]:
+    """The passwd account home when a board lives there, regardless of HERMES_HOME.
+
+    The official container keeps its live board at ``<account>/kanban.db``
+    (``/opt/data``). ``hermes_state._deployed_hermes_home_root`` only sees that
+    while ``HERMES_HOME`` still names the account home, so a drill that
+    redirects its home first lost the deployed root (Prism round 2, #1873). The
+    board files on disk are the identity; nothing a process sets can move them.
+    Inert on fleet hosts: no ``~/kanban.db`` exists there (checked Studio and
+    ace-ai 2026-10-10).
+    """
+    from hermes_state import _os_account_home
+    account = _os_account_home()
+    if account is None:
+        return None
+    try:
+        account = account.resolve()
+    except OSError:
+        return None
+    if (account / "kanban.db").exists() or (account / "kanban" / "boards").is_dir():
+        return account
+    return None
+
+
+def _live_kanban_roots() -> tuple:
+    """Every live root: the passwd-anchored native root plus a deployed root.
+
+    The deployed root is the official container shape (``HERMES_HOME`` = the
+    account home, e.g. ``/opt/data``), where the native ``<account>/.hermes``
+    is not where the board lives (``hermes_state._deployed_hermes_home_root``,
+    plus :func:`_account_home_board_root` for a process that redirected its home).
+    """
+    from hermes_state import _deployed_hermes_home_root
+    roots = [r for r in (_live_kanban_root(), _deployed_hermes_home_root(), _account_home_board_root())
+             if r is not None]
+    return tuple(dict.fromkeys(roots))
+
+
+def _rel_to_live(path: Path, live: Path) -> Optional[tuple]:
+    """Parts of resolved *path* below *live*, by spelling OR filesystem identity.
+
+    ``Path.resolve()`` keeps the caller's casing on a case-insensitive volume,
+    so ``~/.HERMES`` is the live root on macOS while comparing unequal to
+    ``~/.hermes`` (Prism #1873). Lexical match first (free, the production
+    case); a spelling fold only decides whether the identity walk runs, and
+    the walk compares ``(st_dev, st_ino)``, so a case-sensitive volume where
+    ``.HERMES`` is a different directory never matches.
+
+    Sub-root parts keep the caller's spelling too (``~/.Hermes/KANBAN/boards/x``,
+    Prism #1873 round 3, 8e093c37e43a), so a part is canonicalized to lowercase
+    when the kernel says both spellings are the same directory entry; callers
+    compare parts against lowercase layout names (``kanban``, ``boards``).
+    """
+    parts = _rel_to_dir(path, live)
+    if not parts:
+        return parts
+    canonical: list[str] = []
+    current = live
+    for part in parts:
+        lower = part.lower()
+        if lower != part:
+            ident = _path_identity(current / part)
+            if ident is not None and ident == _path_identity(current / lower):
+                part = lower
+        canonical.append(part)
+        current = current / part
+    return tuple(canonical)
+
+
+def _path_spellings(path: Path) -> tuple:
+    """*path* resolved, plus its lexical absolute form when that differs.
+
+    A structural dir symlinked off the root (``<live>/kanban -> /mnt/k``, a
+    layout the noncanonical-board-path tests support) makes the resolved form
+    of ``<live>/kanban/boards/proj`` leave the root, so every live-relative
+    compare missed it (Prism #1873 round 3, member F on 1317). The caller's own
+    spelling still names the live layout, and checking it costs no I/O.
+    """
+    expanded = path.expanduser()
+    lexical = Path(os.path.normpath(os.path.abspath(expanded)))
+    try:
+        resolved = expanded.resolve(strict=False)
+    except OSError:
+        return (lexical,)
+    return (resolved,) if resolved == lexical else (resolved, lexical)
+
+
+def _rel_to_dir(path: Path, live: Path) -> Optional[tuple]:
+    """:func:`_rel_to_live` for one directory: lexical, then the identity walk."""
+    try:
+        return path.relative_to(live).parts
+    except ValueError:
+        pass
+    folded, folded_live = _spelling_fold(path), _spelling_fold(live)
+    if folded != folded_live and not folded.startswith(folded_live.rstrip("/") + "/"):
+        return None
+    target = _path_identity(live)
+    if target is None:
+        return None
+    tail: list[str] = []
+    current = path
+    while True:
+        if _path_identity(current) == target:
+            return tuple(reversed(tail))
+        if current.parent == current:
+            return None
+        tail.append(current.name)
+        current = current.parent
+
+
+def _matching_live_root(path: Path) -> Optional[Path]:
+    """The live root *path* is (same directory, any spelling), else None."""
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    for live in _live_kanban_roots():
+        if _rel_to_live(resolved, live) == ():
+            return live
+    return None
+
+
+def _is_live_kanban_root(root: Path) -> bool:
+    return _matching_live_root(root) is not None
+
+
+def _is_live_board_pin_target(target: Path, live: Path) -> bool:
+    """True when a path pin names live board state of *live*.
+
+    The root itself, a board DB, the board set (``kanban/boards/...``,
+    ``current``, aliases) and the shared ``kanban``/``workspaces``/``attachments``
+    roots. A path INSIDE one task's workspace is a scratch location, not the
+    board (same narrow rule as :func:`_is_production_board_db`).
+    """
+    parts = _rel_to_live(target, live)
+    if parts is None:
+        return False
+    if not parts or _is_production_board_db(target, live) or _is_live_board_tree_path(target, live):
+        return True
+    return parts in (("kanban",), ("kanban", "workspaces"), ("kanban", "attachments"))
+
+
+def _refuse_live_kanban_pin_in_isolation(path: Path, name: str) -> None:
+    """Refuse a path pin that names live board state in an isolated process.
+
+    Live board state is the root, a board DB, the board set and the shared
+    kanban/workspaces/attachments roots (:func:`_is_live_board_pin_target`), for
+    every live root including a deployed one. A pin elsewhere under the root (a
+    sandbox in a profile's cache/scratch, a DB inside one task's workspace) is
+    not the live board and is left alone.
+    """
+    marker = _kanban_isolation_context()
+    if marker is None and not kanban_sandbox_enabled():
+        return
+    for target in _path_spellings(path):
+        for live in _live_kanban_roots():
+            if not _is_live_board_pin_target(target, live):
+                continue
+            why = f"{marker} is set" if marker else "HERMES_KANBAN_SANDBOX is set"
+            raise KanbanLiveBoardRefusedError(
+                f"{name}={target} is a LIVE board path under {live} while {why}. Refusing: "
+                f"a test, drill or sandbox must not read or write the live board."
+            )
+
+
+def _sandbox_kanban_home(root: Path) -> Path:
+    """Under SANDBOX, keep a home nested in the live root from resolving to it.
+
+    ``get_default_hermes_root()`` returns the live root for ``~/.hermes`` itself,
+    for a real profile ``~/.hermes/profiles/<p>``, and for ANY deeper path
+    such as ``~/.hermes/profiles/<p>/cache/scratch/x``. A sandbox asked for the
+    last one; give it that directory. A sandbox whose ``HERMES_HOME`` is the
+    live root itself, or unset, has nowhere isolated to go: refuse. So does a
+    home that is itself live board state: ``<live>/kanban/boards/<slug>`` as a
+    home would make that live board's DB the sandbox's default board.
+    """
+    live = _matching_live_root(root)
+    if live is None:
+        return root
+    raw = os.environ.get("HERMES_HOME", "").strip()
+    home = Path(os.path.expanduser(os.path.expandvars(raw))) if raw else None
+    if home is None or _is_live_kanban_root(home):
+        raise KanbanLiveBoardRefusedError(
+            f"HERMES_KANBAN_SANDBOX is set but HERMES_HOME={raw or '<unset>'} is the "
+            f"live Hermes root {root}; there is no isolated board to resolve. Point "
+            f"HERMES_HOME at a throwaway directory."
+        )
+    inside_board = any(_is_live_board_pin_target(spelled, live) for spelled in _path_spellings(home))
+    if inside_board:
+        raise KanbanLiveBoardRefusedError(
+            f"HERMES_KANBAN_SANDBOX is set but HERMES_HOME={home} is live board state "
+            f"under {live} (e.g. a named board's directory); a sandbox there would open "
+            f"that live board. Point HERMES_HOME at a throwaway directory."
+        )
+    return home
+
+
+def _refuse_nested_non_profile_home(root: Path) -> None:
+    """Refuse a HERMES_HOME nested under the live root that is not a profile.
+
+    ``get_default_hermes_root()`` maps the root itself and ``<root>/profiles/<p>``
+    to the shared root, which is the board-sharing design. It ALSO maps every
+    other path under the root (``<root>/profiles/<p>/cache/scratch/x``, the
+    fleet's default ``TMPDIR``) to the live root; a caller that set such a home
+    asked for isolation and silently got the live board (t_db9ca661 drill).
+    Measured 2026-10-10: every launchd job and running process sets the root
+    or a profile dir, never a deeper path, so this refuses only the drill shape.
+    """
+    live = _matching_live_root(root)
+    if live is None:
+        return
+    raw = os.environ.get("HERMES_HOME", "").strip()
+    if not raw:
+        return
+    try:
+        home = Path(os.path.expanduser(os.path.expandvars(raw))).resolve(strict=False)
+    except (OSError, ValueError, TypeError):
+        return
+    parts = _rel_to_live(home, live)
+    if parts is None:
+        return
+    if not parts or (len(parts) == 2 and parts[0] == "profiles"):
+        return
+    raise KanbanLiveBoardRefusedError(
+        f"HERMES_HOME={home} is inside the live Hermes root {root} but is neither the "
+        f"root nor a profile home, so kanban would resolve the LIVE board for a "
+        f"process that pointed its home somewhere else. Refusing. To isolate, set "
+        f"HERMES_KANBAN_SANDBOX=1 (the board then lives in {home}); to use the live "
+        f"board, set HERMES_HOME to the root or a profile home."
+    )
+
+
+def _refuse_live_kanban_root_in_isolation(root: Path, what: str) -> None:
+    """Refuse a live-root kanban path for a sandboxed, test or drill process."""
+    marker = _kanban_isolation_context()
+    if marker is None and not kanban_sandbox_enabled():
+        return
+    # The root itself OR board state under ANY live root: a container home of
+    # /opt/data/kanban/boards/proj resolves to itself, and its kanban.db is the
+    # live proj board (Prism #1873).
+    live = next((r for spelled in _path_spellings(root) for r in _live_kanban_roots()
+                 if _is_live_board_pin_target(spelled, r)), None)
+    if live is None:
+        return
+    why = f"{marker} is set" if marker else "HERMES_KANBAN_SANDBOX is set"
+    raise KanbanLiveBoardRefusedError(
+        f"{what} resolved to {root}, the LIVE Hermes root {live} or board state under it, "
+        f"while {why}. Refusing: a "
+        f"test, drill or sandbox must not read or write the live board. Set "
+        f"HERMES_KANBAN_SANDBOX=1 and point HERMES_HOME at a throwaway directory "
+        f"(any path, including one under ~/.hermes, resolves to itself under the "
+        f"sandbox)."
+    )
 
 
 def boards_root() -> Path:
@@ -2362,6 +2706,9 @@ class Event:
     # notifier uses it to skip waking the chat whose own session made the
     # transition (t_a4890a77).
     actor_session_id: Optional[str] = None
+    # Profile that wrote the event (``task_events.actor_profile``); with the
+    # session id, what the redundancy filter (kanban_notify_suppress) keys on.
+    actor_profile: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Event":
@@ -2370,6 +2717,7 @@ class Event:
             id=row["id"], task_id=row["task_id"], kind=_lossy_text(row["kind"]),
             payload=_json_or(_lossy_text(row["payload"])), created_at=row["created_at"], run_id=_opt_int(run_id),
             actor_session_id=_row_get(row, "actor_session_id"),
+            actor_profile=_row_get(row, "actor_profile"),
         )
 
 # ---------------------------------------------------------------------------
@@ -2568,7 +2916,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Resources (VM / container / GPU-resident unit) this run started, JSON list of
+    -- {kind, id, host, started_at, state}. The dispatcher stops each one after the card
+    -- is done/archived unless the body carries `keep-alive: <reason>` (kanban_resources).
+    resources           TEXT NOT NULL DEFAULT '[]'
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2856,7 +3208,13 @@ def _production_kanban_roots() -> list[Path]:
     kept leaking.
     """
     from hermes_state import _production_state_roots
-    return list(_production_state_roots())
+    roots = list(_production_state_roots())
+    # A container drill that redirected HERMES_HOME still must see /opt/data
+    # as live (Prism round 2, #1873); identity comes from the board on disk.
+    account_board = _account_home_board_root()
+    if account_board is not None and account_board not in roots:
+        roots.append(account_board)
+    return roots
 
 
 def _in_test_context() -> bool:
@@ -2887,14 +3245,10 @@ def _is_production_board_db(resolved: Path, root: Path) -> bool:
     tests and workers legitimately create throwaway DBs. A containment-only
     check (``is_relative_to(root)``) would refuse all of those.
     """
-    if resolved == root / "kanban.db":
-        return True
-    try:
-        rel = resolved.relative_to(root)
-    except ValueError:
+    parts = _rel_to_live(resolved, root)
+    if parts is None:
         return False
-    parts = rel.parts
-    return (
+    return parts == ("kanban.db",) or (
         len(parts) == 4
         and parts[0] == "kanban"
         and parts[1] == "boards"
@@ -2946,14 +3300,11 @@ def _assert_live_board_write_allowed(path: Path) -> None:
     A deliberate operator pin to a board outside every production root — the
     documented ``HERMES_KANBAN_DB`` use — is untouched.
     """
-    try:
-        target = path.expanduser().resolve(strict=False)
-    except OSError:  # pragma: no cover - resolution failure is not a leak
-        return
     live_root: Optional[Path] = None
-    for root in _production_kanban_roots():
-        if _is_production_board_db(target, root):
-            live_root = root
+    roots = _production_kanban_roots()
+    for target in _path_spellings(path):
+        live_root = next((r for r in roots if _is_production_board_db(target, r)), None)
+        if live_root is not None:
             break
     if live_root is None:
         return  # not a live board — nothing this guard is about.
@@ -2964,10 +3315,20 @@ def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> Non
     """Shared R1/R2 decision for :func:`_assert_live_board_write_allowed` and
     :func:`_assert_live_board_tree_write_allowed`; raises or returns."""
     reason: Optional[str] = None
+    drill = os.environ.get("HERMES_KANBAN_DRILL", "").strip()
     if _in_test_context():
         reason = (
             f"this process is a TEST context and {target} is the LIVE board "
             f"(under real Hermes root {live_root})"
+        )
+    elif drill:
+        # An explicit db_path never passes through kanban_db_path(), so the
+        # drill declaration has to be honoured at the write boundary too
+        # (Prism #1873). Test contexts are R1's; the sandbox flag only
+        # re-roots resolved paths and never vetoes an explicit one.
+        reason = (
+            f"HERMES_KANBAN_DRILL={drill} declares a drill and {target} is the "
+            f"LIVE board (under real Hermes root {live_root})"
         )
     else:
         declared = os.environ.get("HERMES_HOME", "").strip()
@@ -2976,9 +3337,7 @@ def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> Non
                 declared_root = kanban_home().expanduser().resolve(strict=False)
             except OSError:  # pragma: no cover - diagnostic only
                 declared_root = live_root
-            if declared_root not in {
-                r for r in _production_kanban_roots()
-            }:
+            if not any(_rel_to_live(declared_root, r) == () for r in _production_kanban_roots()):
                 reason = (
                     f"HERMES_HOME={declared} declares the kanban root "
                     f"{declared_root}, but a HERMES_KANBAN_* path pin "
@@ -3007,12 +3366,8 @@ def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> Non
 def _is_live_board_tree_path(resolved: Path, root: Path) -> bool:
     """True for board-set state of *root* that is not a DB: the ``current``
     pointer, ``board-aliases.json`` and anything under ``kanban/boards/``."""
-    try:
-        rel = resolved.relative_to(root)
-    except ValueError:
-        return False
-    parts = rel.parts
-    if len(parts) < 2 or parts[0] != "kanban":
+    parts = _rel_to_live(resolved, root)
+    if parts is None or len(parts) < 2 or parts[0] != "kanban":
         return False
     return parts[1] == "boards" or (len(parts) == 2 and parts[1] in ("current", "board-aliases.json"))
 
@@ -3026,16 +3381,15 @@ def _assert_live_board_tree_write_allowed(path: Path) -> None:
     ``set_current_board()`` / ``remove_board()`` never touch the DB at all.
     That is how ten fixture boards (alpha, curr, spawntest, slug-immutable, …)
     landed in the live ``kanban/boards/`` on 2026-09-22 (card t_216b74e0).
-    Same production-root list and R1/R2 predicate as the DB guard.
+    Same production-root list and R1/R2 predicate as the DB guard, and the same
+    spellings (:func:`_path_spellings`, so a symlinked ``<live>/kanban`` counts).
     """
-    try:
-        target = path.expanduser().resolve(strict=False)
-    except OSError:  # pragma: no cover - resolution failure is not a leak
-        return
-    for root in _production_kanban_roots():
-        if _is_live_board_tree_path(target, root):
-            _refuse_live_kanban_write(target, root, f"write live board state {target}")
-            return
+    roots = _production_kanban_roots()
+    for target in _path_spellings(path):
+        for root in roots:
+            if _is_live_board_tree_path(target, root):
+                _refuse_live_kanban_write(target, root, f"write live board state {target}")
+                return
 
 
 def connect_readonly(
@@ -3456,6 +3810,62 @@ def _resolve_stored_model_pair(
     except Exception:  # pragma: no cover - a board write must never fail here
         _log.debug("kanban model alias resolution failed for %r", model, exc_info=True)
         return model, provider
+
+
+# ``--force-model`` audit comment: a pin the lane's model list did not know, admitted
+# on purpose (t_d564a8dd: an unknown id otherwise 404s on every dispatch for hours).
+MODEL_FORCE_COMMENT_PREFIX = "model force:"
+
+
+def _require_known_model(
+    model: Optional[str], provider: Optional[str], *, force_model_reason: Optional[str] = None,
+):
+    """Refuse a ``(provider, model)`` pair the lane does not serve (``ValueError``).
+
+    The pair must already be alias-resolved. Returns the registry verdict so the
+    caller can leave the ``model force:`` comment when the id was forced through.
+    """
+    from hermes_cli.model_registry import require
+
+    return require(provider, model, force_reason=force_model_reason, flag="--force-model")
+
+
+def _model_registry_valid_ids(provider: Optional[str]) -> tuple[str, ...]:
+    """The lane's model list for a refusal message; empty when unreadable."""
+    try:
+        from hermes_cli.model_registry import catalog_for
+
+        return catalog_for(provider or "")
+    except Exception:
+        return ()
+
+
+def _model_force_comment(provider: Optional[str], model: Optional[str], reason: str) -> str:
+    return f"{MODEL_FORCE_COMMENT_PREFIX} {provider or '?'}/{model} not on the lane list; reason={reason.strip()}"
+
+
+def model_force_comment_present(
+    conn: sqlite3.Connection, task_id: str, provider: Optional[str], model: Optional[str],
+) -> bool:
+    """True when the card carries the ``model force:`` audit comment for exactly this pair.
+
+    The dispatcher's pre-spawn pin check (``invalid_pin_refused``) consults this so a pin
+    the operator deliberately forced through ``--force-model`` runs instead of being
+    capability-blocked on every tick (Prism 68402070f7c9 on hermes-agent#1903). The match is
+    on the ``provider/model`` token the writer recorded, so re-pinning to a different unknown
+    id does not inherit the exemption.
+    """
+    if not model:
+        return False
+    # Prism 20f583066d18 (#1912): SQLite LIKE is ASCII-case-insensitive, so `custommodel` would inherit
+    # `CustomModel`'s exemption. Match the exact token bytes: a case-sensitive prefix via substr().
+    token = f"{MODEL_FORCE_COMMENT_PREFIX} {provider or '?'}/{model} "
+    row = conn.execute(
+        "SELECT 1 FROM task_comments WHERE task_id=? AND substr(body, 1, ?) = ? LIMIT 1",
+        (task_id, len(token), token),
+    ).fetchone()
+    return row is not None
+
 
 # ---------------------------------------------------------------------------
 # Home-session card ownership (foreign-session mutation guard)
@@ -5436,6 +5846,7 @@ def create_task(
     brain: Optional[str] = None,
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
+    force_model_reason: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -5450,6 +5861,9 @@ def create_task(
     duplicate_guard: bool = False,
     force_reason: Optional[str] = None,
     require_home: bool = False,
+    until: Optional[int] = None,
+    time_gate_guard: bool = False,
+    i_mean_blocks: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -5504,7 +5918,18 @@ def create_task(
     ``near_duplicate_warning`` event on the new card. A same-title hit only
     warns when the matched card is ``done`` (a refile after completion) or when
     the caller passed an ``idempotency_key`` that matched no live card (the
-    documented recurring-automation pattern owns its own dedup).
+    documented recurring-automation pattern owns its own dedup). The same
+    guard also refuses a duplicate of any OPEN card, no window
+    (:func:`kanban_mint_lint.find_open_duplicates`); ``force_reason`` (CLI
+    ``--not-a-duplicate``) overrides that too.
+
+    ``until`` (epoch seconds) mints a card that would queue (todo/ready)
+    parked in ``scheduled`` with ``next_eligible_at = until`` and a
+    ``scheduled`` {kind: deferred} event, so :func:`wake_due_scheduled` owns
+    the wake. ``time_gate_guard`` (CLI + tool) refuses a ``blocks``-edge card
+    whose text reads time-gated and has no ``until``
+    (:class:`kanban_mint_lint.TimeGateError`); ``i_mean_blocks`` overrides it
+    and is ledgered as a ``time_gate_forced`` event.
 
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
@@ -5540,6 +5965,9 @@ def create_task(
         model_override,
         allow_flagship_reason=flagship_override_reason,
     )
+    _model_verdict = _require_known_model(
+        model_override, provider_override, force_model_reason=force_model_reason,
+    )
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -5551,6 +5979,10 @@ def create_task(
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    from hermes_cli import kanban_mint_lint as _mint_lint
+
+    if until is not None:
+        until = validate_wake_at(until)
     # ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     # an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     if project_id is None and workspace_kind != "scratch":
@@ -5620,6 +6052,9 @@ def create_task(
     # Raise on a bad kind before any row is written, and resolve NULL to
     # ``blocks`` so the status decision below reads one value.
     parents_kind = normalize_link_kind(parents_kind)
+    time_gate_hit: Optional[str] = None
+    if time_gate_guard and parents and parents_kind == LINK_KIND_BLOCKS and until is None:
+        time_gate_hit = _mint_lint.time_gate_match(title, body)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -5821,6 +6256,7 @@ def create_task(
                     ), None)
                 near_dups: list[dict] = []
                 same: list[dict] = []
+                open_dups: list[dict] = []
                 if duplicate_guard:
                     near_dups = find_near_duplicates(
                         conn, title=title, body=body, tenant=tenant, now=now,
@@ -5842,6 +6278,36 @@ def create_task(
                             "--force <reason> / force_reason to file anyway",
                             same,
                         )
+                    # Open-card duplicates, no window (t_6d1df155). Keyed
+                    # automation owns its dedup, as above.
+                    if not idempotency_key:
+                        open_dups = _mint_lint.find_open_duplicates(
+                            conn, title=title, tenant=tenant, exclude_ids=parents,
+                        )
+                    if open_dups and not force_reason:
+                        raise NearDuplicateError(
+                            _mint_lint.open_duplicate_message(open_dups), open_dups,
+                        )
+                if until is not None:
+                    if task_status not in ("todo", "ready"):
+                        raise ValueError(
+                            f"--until parks a card that would queue; this one lands in "
+                            f"{task_status!r} (initial status / triage / worker park policy). "
+                            "Mint it without --until and defer it once promoted "
+                            "(`hermes kanban block <id> --kind deferred --until <when>`)."
+                        )
+                    task_status = "scheduled"
+                # Only a card that queues behind the edge is released by it; a
+                # triage/blocked park waits on a human ruling anyway.
+                time_gate_forced = bool(
+                    time_gate_hit and task_status in ("todo", "ready"))
+                if time_gate_forced and not i_mean_blocks:
+                    raise _mint_lint.TimeGateError(
+                        f"{_mint_lint.TIME_GATE_REFUSAL}; matched {time_gate_hit!r}. "
+                        "Pass --until <ISO|+24h> (tool: until), or --i-mean-blocks "
+                        "(tool: i_mean_blocks) if the parent closing really is the gate.",
+                        time_gate_hit or "",
+                    )
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -5932,8 +6398,13 @@ def create_task(
                         sub_pin_comment(provider_override, pin_sub_reason,
                                         fallback=bool(pin_sub_fallback)),
                     )
-                if near_dups:
-                    forced = force_reason and bool(same)
+                if _model_verdict.reason == "forced":
+                    add_comment(
+                        conn, task_id, flagship_override_author or created_by or "operator",
+                        _model_force_comment(provider_override, model_override, _model_verdict.force_reason or ""),
+                    )
+                if near_dups or (open_dups and force_reason):
+                    forced = bool(force_reason and (same or open_dups))
                     _append_event(
                         conn,
                         task_id,
@@ -5943,9 +6414,27 @@ def create_task(
                                 {k: d[k] for k in ("id", "score", "same_title")}
                                 for d in near_dups[:5]
                             ],
+                            **({"open_duplicates": [
+                                {k: d[k] for k in ("id", "status", "assignee", "rule", "score")}
+                                for d in open_dups[:5]
+                            ]} if open_dups else {}),
                             **({"reason": force_reason} if forced else {}),
                         },
                     )
+                if time_gate_forced:
+                    _append_event(conn, task_id, "time_gate_forced", {
+                        "match": time_gate_hit, "parents": list(parents),
+                        "reason": "--i-mean-blocks: the parent closing is the gate",
+                    })
+                if until is not None:
+                    conn.execute(
+                        "UPDATE tasks SET block_kind = 'deferred', next_eligible_at = ? "
+                        "WHERE id = ?", (int(until), task_id),
+                    )
+                    _append_event(conn, task_id, "scheduled", {
+                        "reason": "minted with --until", "kind": "deferred",
+                        "until": int(until), "source_status": "ready",
+                    })
                 if pr_owner_forced:
                     _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
                 overlap_hits: list[dict] = []
@@ -6444,6 +6933,7 @@ def set_model_override(
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
     pin_sub_author: Optional[str] = None,
+    force_model_reason: Optional[str] = None,
 ) -> bool:
     """Set (or clear) the per-task model/provider override.
 
@@ -6476,6 +6966,7 @@ def set_model_override(
         audit_comment_body=audit_comment_body,
         pin_sub_reason=pin_sub_reason,
         pin_sub_fallback=pin_sub_fallback,
+        force_model_reason=force_model_reason,
     )
     with write_txn(conn):
         if not _set_model_override_locked(
@@ -6485,6 +6976,7 @@ def set_model_override(
             pin_sub_reason=pin_sub_reason,
             pin_sub_fallback=pin_sub_fallback,
             pin_sub_author=pin_sub_author,
+            force_model_reason=force_model_reason,
         ):
             return False
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
@@ -6518,6 +7010,7 @@ def _validate_model_override_args(
     audit_comment_body: Optional[str] = None,
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
+    force_model_reason: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Normalise + validate a route pair WITHOUT touching the database.
 
@@ -6561,6 +7054,7 @@ def _validate_model_override_args(
         body = (audit_comment_body or "").lstrip().casefold()
         if not body.startswith(FLAGSHIP_OVERRIDE_COMMENT_PREFIX):
             raise ValueError(flagship_model_error(str(model)))
+    _require_known_model(model, provider, force_model_reason=force_model_reason)
     return model, provider
 
 
@@ -6602,6 +7096,7 @@ def _set_model_override_locked(
     pin_sub_reason: Optional[str] = None,
     pin_sub_fallback: bool = False,
     pin_sub_author: Optional[str] = None,
+    force_model_reason: Optional[str] = None,
 ) -> bool:
     """Write one route override. MUST already be inside a ``write_txn``.
 
@@ -6650,6 +7145,14 @@ def _set_model_override_locked(
             conn, task_id, pin_sub_author or audit_comment_author or "operator",
             sub_pin_comment(provider, pin_sub_reason, fallback=pin_sub_fallback),
         )
+    if model and (force_model_reason or "").strip():
+        from hermes_cli.model_registry import resolve
+
+        if resolve(provider, model, force_reason=force_model_reason, resolve_aliases=False).reason == "forced":
+            add_comment(
+                conn, task_id, pin_sub_author or audit_comment_author or "operator",
+                _model_force_comment(provider, model, force_model_reason or ""),
+            )
     return True
 
 
@@ -6753,6 +7256,8 @@ class BatchRouteWrite:
     pin_sub_reason: Optional[str] = None
     pin_sub_fallback: bool = False
     pin_sub_author: Optional[str] = None
+    # ``--force-model <reason>``: admit an id the lane's model list lacks.
+    force_model_reason: Optional[str] = None
     # The selection predicate that chose this card, re-checked under the
     # batch's writer lock. ``None`` means "no constraint on that column".
     require_statuses: Optional[frozenset] = None
@@ -6875,6 +7380,7 @@ def apply_batch_route_writes(
                 audit_comment_body=write.audit_comment_body,
                 pin_sub_reason=write.pin_sub_reason,
                 pin_sub_fallback=write.pin_sub_fallback,
+                force_model_reason=write.force_model_reason,
             )
         effort = normalize_reasoning_effort(write.effort) if write.touch_effort else None
         if write.touch_brain:
@@ -6912,6 +7418,7 @@ def apply_batch_route_writes(
                     pin_sub_reason=write.pin_sub_reason,
                     pin_sub_fallback=write.pin_sub_fallback,
                     pin_sub_author=write.pin_sub_author or write.audit_comment_author,
+                    force_model_reason=write.force_model_reason,
                 ):
                     raise RuntimeError(f"no such task: {write.task_id}")
                 changed += ("model_override", "provider_override")
@@ -7917,7 +8424,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         # 'review_reopened' is historical (verb retired); legacy rows still count.
         "'review_reopened', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', "
-        "'infra_unavailable'"
+        "'infra_unavailable', 'provider_rejected', 'scheduled'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -7925,6 +8432,18 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     for key in ("resume_status", "retry_status", "source_status"):
         if payload.get(key) == "review":
             return "review"
+    return "ready"
+
+
+def _resume_phase_for_park(conn: sqlite3.Connection, task_id: str, status: str) -> str:
+    """``review`` or ``ready``: the phase a card parked from *status* resumes in.
+    A running card answers from its claim, a blocked one from its block event."""
+    if status == "running":
+        return _retry_status_for_run(conn, task_id)
+    if status == "blocked":
+        return _resume_status_from_events(conn, task_id)
+    if status == "review":
+        return "review"
     return "ready"
 
 
@@ -9100,8 +9619,14 @@ def reclaim_task(
     reason: Optional[str] = None,
     signal_fn=None,
     operator: Optional[str] = None,
+    signal_allowed: bool = True,
 ) -> bool:
     """Operator-driven reclaim: release the claim and restore its source phase.
+
+    ``signal_allowed=False`` (the pr-owner reclaimer, t_0a9a20ea) reclaims
+    only a run the host proves dead: a live verified worker is never
+    signalled, the reclaim is refused (``reclaim_refused`` with
+    ``worker_alive_unsignalled``) and the card keeps its owner.
 
     Unlike :func:`release_stale_claims` which only acts on tasks whose
     ``claim_expires`` has passed, this function reclaims immediately
@@ -9164,6 +9689,7 @@ def reclaim_task(
             conn, task_id, row["worker_pid"], row["current_run_id"],
         ),
         conn=conn, task_id=task_id, run_id=row["current_run_id"],
+        signal_allowed=signal_allowed,
     )
     # Never release a claim while our host-local worker is alive or its
     # liveness is unknown. This also covers NULL pid in the TTL and stale
@@ -9949,10 +10475,20 @@ def complete_task(
                 f"{r.repo}#{r.number}" for r in foreign
             ])
         _pr_query = _open_pr.memo_query()
+        unowned_prs: list = []
         still_open = _open_pr.open_pr_refs(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
-            query_fn=_pr_query,
+            query_fn=_pr_query, task_id=task_id, unowned=unowned_prs,
         )
+        if unowned_prs:
+            # Prose is not provenance (t_60b39483): the handoff named open PRs whose head branch
+            # belongs to another card. Keep the information, never gate on it.
+            mentioned = [f"{r.repo}#{r.number}" for r in unowned_prs]
+            metadata = dict(metadata or {}, mentioned_unowned_prs=mentioned)
+            _log.warning("kanban %s: handoff mentions PRs not owned by this card: %s",
+                         task_id, ", ".join(mentioned))
+            with write_txn(conn):
+                _append_event(conn, task_id, "completion_unowned_pr_mentions", {"prs": mentioned})
         if still_open:
             # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
             # DraftPrError, nothing mutated), update a stale head, arm a green
@@ -11640,8 +12176,14 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     until: Optional[int] = None,
+    require_unclaimed_ready: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+
+    ``require_unclaimed_ready`` fences a caller acting on a stale snapshot
+    (the dispatcher's post-loop parking, t_8c474c2e): the block happens only
+    if the task is still ``ready`` with no claim, read in the same write
+    transaction, so it never ends a run claimed in the meantime.
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -11699,25 +12241,38 @@ def block_task(
         raise BlockRefused("until only applies to kind 'deferred'")
     if kind == "deferred" and until is None:
         raise BlockRefused("kind 'deferred' needs until (--until <ISO|+6h>): the wake time")
+    if until is not None:
+        try:
+            until = validate_wake_at(until)
+        except ValueError as exc:
+            raise BlockRefused(str(exc)) from None
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, claim_lock FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
+        if require_unclaimed_ready and (cur_row["status"] != "ready" or cur_row["claim_lock"] is not None):
+            return False
+        # Refuse only where a block could have landed; a done/archived/
+        # scheduled/todo card keeps the plain ``False`` every caller handles.
+        if (kind == "dependency" and cur_row["status"] in _DEPENDENCY_REFUSAL_STATUSES
+                and _parents_satisfied(conn, task_id)):
             raise BlockRefused(DEPENDENCY_NO_PARENT_REFUSAL)
         if kind == "deferred":
             # Same transition as schedule_task + set_schedule_wake in one step, so
             # the dispatcher's wake_due_scheduled owns the wake. No ``blocked``
             # event and no ``kanban_task_blocked`` hook: a time park is not a
-            # human question, and every pager keys on those.
+            # human question, and every pager keys on those. The phase to
+            # resume is read before the run ends: a claimed reviewer or a
+            # blocked review card must wake back into review.
+            parked_from = _resume_phase_for_park(conn, task_id, cur_row["status"])
             sql = (
                 "UPDATE tasks SET status = 'scheduled', claim_lock = NULL, claim_expires = NULL, "
                 "worker_pid = NULL, block_kind = 'deferred', next_eligible_at = ? "
-                "WHERE id = ? AND status IN ('todo', 'ready', 'running', 'blocked')"
+                "WHERE id = ? AND status IN ('todo', 'ready', 'running', 'blocked', 'review')"
             )
             params: list[Any] = [int(until), task_id]
             if expected_run_id is not None:
@@ -11731,7 +12286,7 @@ def block_task(
             )
             _append_event(conn, task_id, "scheduled", {
                 "reason": reason, "kind": "deferred", "until": int(until),
-                "source_status": cur_row["status"],
+                "source_status": parked_from,
             }, run_id=run_id)
             return True
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
@@ -13606,7 +14161,7 @@ def unblock_task(
     with write_txn(conn):
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
+            if _task_status(conn, task_id) in ("blocked", "scheduled")
             else "ready"
         )
         _reclaim_dangling_run(
@@ -14874,7 +15429,8 @@ def _release_claim_for_workspace_refusal(conn, task_id, result, reason):
 
 @_home_session_guarded("set-model")
 def set_task_model(
-    conn: sqlite3.Connection, task_id: str, model: Optional[str]
+    conn: sqlite3.Connection, task_id: str, model: Optional[str],
+    *, force_model_reason: Optional[str] = None, actor: Optional[str] = None,
 ) -> int:
     """Set (or clear) a task's per-task model override.
 
@@ -14903,6 +15459,9 @@ def set_task_model(
     resolved_model, resolved_provider = _resolve_stored_model_pair(model, None)
     validate_route_provider(resolved_model, resolved_provider)
     validate_worker_model(resolved_model)
+    _verdict = _require_known_model(
+        resolved_model, resolved_provider, force_model_reason=force_model_reason,
+    )
     if not resolved_model:
         resolved_provider = None
     with write_txn(conn):
@@ -14911,6 +15470,11 @@ def set_task_model(
             "pin_sub_reason = NULL, pin_sub_fallback = 0 WHERE id = ?",
             (resolved_model, resolved_provider, task_id),
         )
+        if cur.rowcount and _verdict.reason == "forced":
+            add_comment(
+                conn, task_id, actor or "operator",
+                _model_force_comment(resolved_provider, resolved_model, _verdict.force_reason or ""),
+            )
     return int(cur.rowcount or 0)
 
 
@@ -15005,6 +15569,8 @@ def schedule_task(
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
     with write_txn(conn):
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        parked_from = _resume_phase_for_park(conn, task_id, row["status"]) if row else "ready"
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -15016,7 +15582,7 @@ def schedule_task(
                    -- to wake_due_scheduled; set_schedule_wake stamps a real one.
                    next_eligible_at = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'review')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -15026,7 +15592,8 @@ def schedule_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        _append_event(conn, task_id, "scheduled",
+                      {"reason": reason, "source_status": parked_from}, run_id=run_id)
         return True
 
 # Scheduled cards with no timed wake (``next_eligible_at IS NULL``) wait on a
@@ -15066,6 +15633,10 @@ def set_schedule_wake(
                 f"task {task_id} is {row['status']!r}; a wake time only "
                 f"applies to 'scheduled' tasks"
             )
+        try:
+            wake_at = validate_wake_at(wake_at)
+        except ValueError as exc:
+            return False, str(exc)
         cur = conn.execute(
             "UPDATE tasks SET next_eligible_at = ? "
             "WHERE id = ? AND status = 'scheduled'",
@@ -15209,6 +15780,21 @@ def _rate_limit_hold_seconds(streak: int, *, base: int) -> int:
         return base
     rung = RATE_LIMIT_BACKOFF_LADDER[min(streak, len(RATE_LIMIT_BACKOFF_LADDER)) - 1]
     return max(base, rung)
+
+
+def _provider_rejected_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Trailing count of CLOSED runs whose outcome is ``provider_rejected``."""
+    rows = conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT 50",
+        (task_id,),
+    ).fetchall()
+    streak = 0
+    for r in rows:
+        if r["outcome"] != "provider_rejected":
+            break
+        streak += 1
+    return streak
 
 
 def consecutive_rate_limited_runs(conn: sqlite3.Connection, task_id: str) -> int:
@@ -15502,7 +16088,7 @@ _RESPAWN_GUARD_FAILURE_RESET_KINDS: tuple[str, ...] = (
 # reclaimed / stale ...) supersedes the stamped text: it belongs to history.
 _RESPAWN_GUARD_FAILURE_OUTCOMES: frozenset[str] = frozenset(
     {"crashed", "timed_out", "spawn_failed", "gave_up", "rate_limited",
-     "infra_unavailable"}
+     "infra_unavailable", "provider_rejected"}
 )
 _RESPAWN_GUARD_PR_QUERY_LIMIT = 5
 _RESPAWN_GUARD_PR_QUERY_TIMEOUT_SECONDS = 5
@@ -16901,6 +17487,8 @@ def _refuse_reclaim_unproven_death(
             "reason": (
                 "liveness_unprovable"
                 if termination.get("liveness_unprovable")
+                else "worker_alive_unsignalled"
+                if termination.get("worker_alive_unsignalled")
                 else "worker_survived_termination"
             ),
             "requested_reason": reason,
@@ -17298,11 +17886,16 @@ def _cohort_death_ids(dead: list, *, now: float) -> set:
     return members if len(members) >= _COHORT_DEATH_MIN else set()
 
 
-def _page_cohort_death(conn: sqlite3.Connection, task_ids: list) -> None:
+def _page_cohort_death(conn: sqlite3.Connection, task_ids: list, *, still_alive: Optional[list] = None) -> None:
     """Page #alerts ONCE for a cohort death. Best-effort, never raises.
 
     Once per cohort by construction: the members are released in the same
     tick that detects them, so the next tick cannot see them dead again.
+
+    ``--sev error`` routes the page to #alerts; without it notify.py sends a
+    bare send to the #logs digest, which is where both 2026-10-12 12:11 pages
+    went (t_5c37ab9d). ``still_alive`` are members whose pid still existed:
+    the page then says the dispatcher misjudged them instead of blaming a killer.
     """
     try:
         import importlib
@@ -17313,16 +17906,29 @@ def _page_cohort_death(conn: sqlite3.Connection, task_ids: list) -> None:
         if script is None:
             return
         db_path = next(r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main")
+        if still_alive:
+            cause = (
+                f"{len(still_alive)} of them still had a live pid at detection "
+                f"({', '.join(list(still_alive)[:5])}{' …' if len(still_alive) > 5 else ''}): "
+                "the dispatcher's liveness/identity check misjudged them (clock step? "
+                "`log show --predicate 'process == \"timed\"'`), so live workers may now "
+                "be running beside their own requeued card."
+            )
+        else:
+            cause = (
+                "Something outside the dispatcher killed them (reaper / OOM / signal sweep): "
+                "the cohort_death events carry each member's spawn pgid and who else was in it; "
+                "find the sender with `log show --predicate 'eventMessage CONTAINS \"sent by\"'` "
+                "around the tick."
+            )
         body = (
             f"💀 Kanban cohort death: {len(task_ids)} workers ended externally in ONE "
             f"dispatcher tick while still heartbeating ({os.path.basename(db_path or '')}).\n"
             f"Tasks: {', '.join(task_ids[:20])}{' …' if len(task_ids) > 20 else ''}\n"
-            "Requeued WITHOUT counting a failure. Something outside the dispatcher killed "
-            "them (reaper / OOM / signal sweep) — find the sender: "
-            "`log show --predicate 'eventMessage CONTAINS \"sent by\"'` around the tick."
+            f"Requeued WITHOUT counting a failure. {cause}"
         )
         subprocess.run(
-            [sys.executable, str(script), "--send", body, "--channel", "discord"],
+            [sys.executable, str(script), "--send", body, "--channel", "discord", "--sev", "error"],
             check=False,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -17562,6 +18168,12 @@ def _reassign_stale_pr_owners(
     owner was reclaimed (spawn may proceed), else ``pr_owner_busy``: a reclaim
     that cannot prove the old worker dead (``reclaim_task`` fails closed) never
     becomes a second writer.
+
+    The reclaim here never signals (t_0a9a20ea): a stale verdict is "no push,
+    no heartbeat for 2 h", not proof of death, and on 2026-10-12 it SIGTERM'd a
+    live round-2 worker. Only a run the host proves gone is reassigned; a live
+    one is refused (``reclaim_refused: worker_alive_unsignalled``) and the
+    waiting card holds. An operator ``kanban reclaim`` keeps its signal.
     """
     from . import kanban_pr_owner as _kpo
 
@@ -17574,7 +18186,7 @@ def _reassign_stale_pr_owners(
             continue
         ok = False
         try:
-            ok = reclaim_task(conn, owner["task_id"], reason=reason)
+            ok = reclaim_task(conn, owner["task_id"], reason=reason, signal_allowed=False)
         except Exception:
             _log.exception("kanban dispatch: stale PR owner reclaim failed for %s",
                            owner["task_id"])

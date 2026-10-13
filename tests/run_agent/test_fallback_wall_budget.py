@@ -1,0 +1,364 @@
+"""Per-turn no-first-byte wall budget across the fallback chain (t_452c6ead).
+
+Chain alr -> dtlr -> btpr -> bpr (all claude-fable-5-1) -> cpa (gpt). Since the
+2026-10-12 ruling (t_778185f3) a spent budget cuts the attempt and the native
+walker takes the NEXT lane in chain order, same model or not: no same-model skip.
+"""
+
+from __future__ import annotations
+
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import httpx
+import pytest
+
+from agent.error_classifier import FailoverReason, classify_api_error
+from tests.agent.test_relay_error_class import RelayError
+from tests.run_agent.test_pool_capacity_503_retry import _FakeClock, _fallback_client, _response
+from run_agent import AIAgent
+
+FABLE = "claude-fable-5-1"
+CHAIN = [
+    {"provider": "claude-dtlr", "model": FABLE},
+    {"provider": "claude-btpr", "model": FABLE},
+    {"provider": "claude-bpr", "model": FABLE},
+    {"provider": "cpa", "model": "gpt-6.1-sol"},
+]
+# Relay 504 after per_attempt_timeout_s (bytes verbatim, see test_relay_stall_capacity_fallback).
+STALL_504 = {"error": "upstream attempt timed out"}
+
+
+def _agent(statuses):
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI", return_value=MagicMock()),
+    ):
+        agent = AIAgent(
+            api_key="k", base_url="http://127.0.0.1:18810/v1", provider="claude-alr",
+            model=FABLE, quiet_mode=True, skip_context_files=True, skip_memory=True,
+            fallback_model=[dict(e) for e in CHAIN],
+            status_callback=lambda kind, message: statuses.append((kind, message)),
+        )
+    agent.api_mode = "chat_completions"
+    agent._api_max_retries = 3
+    return agent
+
+
+def _drive(agent, script, fallback_cfg):
+    """``script``: list of (seconds_the_call_takes, outcome) consumed per provider call.
+    Returns (result, providers_called)."""
+    seq = list(script)
+    called: list[str] = []
+    clock = _FakeClock([])
+
+    def _fake_call(*_a, **_k):
+        called.append(agent.provider)
+        secs, outcome = seq.pop(0) if len(seq) > 1 else seq[0]
+        clock._offset += secs
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    agent._disable_streaming = True
+    cfg = {"fallback": fallback_cfg}
+    with (
+        patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=True),
+        patch.object(agent, "_interruptible_api_call", side_effect=_fake_call),
+        patch.object(agent, "_try_recover_primary_transport", return_value=False),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.auxiliary_client.resolve_provider_client", return_value=(_fallback_client(), "m")),
+        patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, _p: m),
+        patch("agent.model_metadata.get_model_context_length", return_value=200000),
+        patch("hermes_cli.config.read_raw_config", return_value={"model": {"announce_route_change": True}}),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("agent.turn_recovery.time", clock),
+        patch("agent.fallback_wall_budget.time", clock, create=True),
+    ):
+        result = agent.run_conversation("hello")
+    return result, called
+
+
+INCIDENT = [
+    (2.0, RelayError(504, STALL_504)),     # alr: fails fast (01:59:43)
+    (420.0, RelayError(504, STALL_504)),   # dtlr: 420 s silent, relay 504 (02:06:44)
+    (420.0, RelayError(504, STALL_504)),   # btpr: another 420 s silent seat; 842 s spent
+    (3.0, _response("served")),           # whichever lane comes next answers
+]
+
+
+def test_budget_cut_on_alr_walks_to_dtlr_on_the_same_model():
+    """2026-10-11 23:26 (t_778185f3): alr held a fable turn 600 s with no byte and the
+    wall budget cut it. The next lane in the chain is dtlr, on the SAME model: it is
+    tried. The old same-model skip passed dtlr, btpr and bpr and landed on cpa/gpt."""
+    from agent.fallback_wall_budget import FallbackWallBudgetExceeded
+    agent = _agent([])
+    script = [(601.0, FallbackWallBudgetExceeded("cut")), (3.0, _response("served"))]
+    result, called = _drive(agent, script, {})  # the shipped default budget
+    assert result["final_response"] == "served"
+    assert called == ["claude-alr", "claude-dtlr"]
+
+
+def test_incident_timeline_keeps_the_chain_order_after_the_budget_is_spent():
+    """The 01:59-02:34 cascade: dtlr+btpr burn the default budget, and bpr (same model,
+    next in the chain) is still tried before cpa."""
+    agent = _agent([])
+    result, called = _drive(agent, INCIDENT, {})
+    assert result["final_response"] == "served"
+    assert called == ["claude-alr", "claude-dtlr", "claude-btpr", "claude-bpr"]
+
+
+def test_healthy_slow_lane_inside_default_budget_is_not_skipped():
+    """A 500 s silent dtlr then a healthy btpr: the default budget is not spent, so the
+    chain order holds and the turn stays on fable (no mid-conversation model change)."""
+    agent = _agent([])
+    script = [(2.0, RelayError(504, STALL_504)), (500.0, RelayError(504, STALL_504)), (3.0, _response("served"))]
+    result, called = _drive(agent, script, {})
+    assert result["final_response"] == "served"
+    assert called == ["claude-alr", "claude-dtlr", "claude-btpr"]
+
+
+def test_budget_not_spent_keeps_the_chain_order():
+    """Negative control: dtlr fails inside the budget, so btpr (same model) still gets its turn."""
+    agent = _agent([])
+    script = [(2.0, RelayError(504, STALL_504)), (30.0, RelayError(504, STALL_504)), (3.0, _response("served"))]
+    result, called = _drive(agent, script, {"no_first_byte_budget_seconds": 180})
+    assert result["final_response"] == "served"
+    assert called == ["claude-alr", "claude-dtlr", "claude-btpr"]
+
+
+def test_zero_disables_the_budget():
+    agent = _agent([])
+    result, called = _drive(agent, INCIDENT, {"no_first_byte_budget_seconds": 0})
+    assert result["final_response"] == "served"
+    assert called == ["claude-alr", "claude-dtlr", "claude-btpr", "claude-bpr"]
+
+
+# ── unit: clock, cut rule, notices ─────────────────────────────────────────
+
+
+def _bare(model=FABLE, chain=CHAIN, index=1):
+    return SimpleNamespace(model=model, provider="claude-dtlr", _fallback_chain=chain,
+                           _fallback_index=index, _wall_budget=None)
+
+
+def test_cut_fires_with_only_same_model_lanes_ahead():
+    """t_778185f3: the cut no longer waits for a lane on a DIFFERENT model."""
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly",
+               return_value={"fallback": {"no_first_byte_budget_seconds": 180}}):
+        only_fable = _bare(chain=CHAIN[:3])
+        wb.arm(only_fable, now=0.0)
+        assert not wb.should_cut_attempt(only_fable, now=179.0)
+        assert wb.should_cut_attempt(only_fable, now=181.0)
+        assert not wb.should_cut_attempt(only_fable, now=500.0), "fires once per wait"
+
+
+def test_cut_needs_a_usable_lane_ahead():
+    """Nothing usable left in the chain: the native per-lane timers keep the attempt."""
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly",
+               return_value={"fallback": {"no_first_byte_budget_seconds": 180}}):
+        last = _bare(index=len(CHAIN))
+        wb.arm(last, now=0.0)
+        assert not wb.should_cut_attempt(last, now=500.0)
+        blocked = _bare(chain=CHAIN[3:], index=0)
+        blocked._quota_gate_skipped_providers = {"cpa"}
+        wb.arm(blocked, now=0.0)
+        assert not wb.should_cut_attempt(blocked, now=500.0)
+
+
+def test_default_budget_does_not_cut_a_healthy_slow_attempt():
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly", return_value={}):
+        a = _bare()
+        wb.arm(a, now=0.0)
+        assert not wb.should_cut_attempt(a, now=500.0)
+        assert wb.should_cut_attempt(a, now=wb.DEFAULT_BUDGET_S + 1)
+
+
+def test_first_real_byte_disarms():
+    from agent import fallback_wall_budget as wb
+    a = _bare()
+    wb.arm(a, now=0.0)
+    wb.disarm(a)
+    assert not wb.spent(a, now=10_000.0)
+
+
+def test_still_waiting_notice_once_per_interval_names_lanes():
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly",
+               return_value={"fallback": {"still_waiting_notice_seconds": 120}}):
+        a = _bare()
+        wb.arm(a, now=0.0)
+        assert wb.notice_due(a, now=119.0) is None
+        wb.note_lane_switch(a)
+        text = wb.notice_due(a, now=121.0)
+        assert text and "121s" in text and "2 lanes tried" in text and "claude-dtlr" in text
+        # It names what is left: the fable faces ahead and the other model behind them.
+        assert "ahead: claude-btpr, claude-bpr [claude-fable-5-1] + cpa [gpt-6.1-sol]" in text
+        assert wb.notice_due(a, now=200.0) is None
+        assert wb.notice_due(a, now=241.0) is not None
+
+
+def test_relay_drain_wait_is_credited_not_counted():
+    """2026-10-11 16:37 PT: merging claude-pool#249 drained the alr relay for 126 s
+    (deploy_drain_refused x47). The harness waited in place as designed, and the wall
+    clock posted "still waiting for a first reply: 124s" into a healthy BIOS session.
+    A wait the relay ASKED for ("draining-for-deploy", Retry-After) is not provider
+    silence: it must not count toward the notice or the budget."""
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly",
+               return_value={"fallback": {"still_waiting_notice_seconds": 120,
+                                          "no_first_byte_budget_seconds": 600}}):
+        a = _bare()
+        wb.arm(a, now=0.0)
+        # 126 s of deploy-drain wait, reported by the retry loop as it sleeps.
+        wb.note_excused_wait(a, 126.0)
+        assert wb.elapsed(a, now=130.0) == pytest.approx(4.0)
+        assert wb.notice_due(a, now=130.0) is None, "drain wait must not trigger the notice"
+        # Real silence after the drain still counts from where the drain left off.
+        assert wb.notice_due(a, now=126.0 + 121.0) is not None
+        # The budget is credited the same way: 600 s of provider silence, not 600 s wall.
+        wb.note_excused_wait(a, 300.0)
+        assert not wb.spent(a, now=126.0 + 300.0 + 599.0)
+        assert wb.spent(a, now=126.0 + 300.0 + 600.0)
+
+
+def test_excused_wait_without_an_armed_clock_is_a_noop():
+    from agent import fallback_wall_budget as wb
+    a = _bare()
+    wb.note_excused_wait(a, 50.0)  # nothing armed: must not create state or raise
+    assert wb.elapsed(a) is None
+
+
+def test_turn_recovery_drain_sleep_credits_the_wall_clock_for_the_real_wait():
+    """Drive the real relay_draining branch (same rig as test_relay_deploy_drain): four
+    drain 503s with Retry-After 0.05 s, then a served response. The wall clock must be
+    credited for the seconds actually slept in that branch, not left running (the
+    16:37 PT notice) and not credited a made-up number (a mutant that credits 0 or the
+    hint must fail)."""
+    from agent import fallback_wall_budget as wb
+    from tests.run_agent.test_relay_deploy_drain import _make_agent, _run, _drain_error, _mock_response
+    agent = _make_agent()
+    credits: list[float] = []
+    real = wb.note_excused_wait
+
+    def _spy(a, seconds):
+        credits.append(float(seconds))
+        real(a, seconds)
+
+    calls = []
+
+    def fake_api_call(api_kwargs):
+        calls.append(1)
+        if len(calls) <= 4:
+            raise _drain_error(retry_after="0.05")
+        return _mock_response("served after the drain")
+
+    with patch("agent.turn_recovery.note_excused_wait", _spy, create=True), \
+         patch("agent.fallback_wall_budget.note_excused_wait", _spy):
+        result, _ = _run(agent, fake_api_call, drain_wait_s=30.0)
+    assert result["completed"] is True
+    assert len(credits) == 4, f"one credit per drain sleep, got {credits}"
+    # Each credit is the REAL slept span: ~0.05 s (the Retry-After), never 0, never the
+    # 30 s window or any other constant.
+    for c in credits:
+        assert 0.03 <= c <= 1.0, f"credit must be the measured sleep, got {c}"
+
+
+def test_budget_cut_error_falls_over_on_first_hit():
+    from agent.fallback_wall_budget import FallbackWallBudgetExceeded
+    c = classify_api_error(FallbackWallBudgetExceeded("cut"), provider="claude-dtlr", model=FABLE)
+    assert c.reason is FailoverReason.pool_stalled
+    assert c.retryable is False and c.should_fallback is True
+
+
+# ── banner: the cut is classified, not "unclassified error" (t_778185f3) ────
+
+
+def _budget_cut_rider(exc):
+    import datetime as dt
+
+    from agent import fallback_events as fbe
+    from agent import fallback_policy as fp
+    a = SimpleNamespace(_pending_fallback_error=None, session_id="s", _current_turn_id="s:1")
+    fbe.stash_api_error(a, exc, None, None, elapsed_s=600.0)
+    row = fbe.build_row(a, "failover", from_provider="claude-alr", from_model=FABLE,
+                        to_provider="claude-dtlr", to_model=FABLE, reason="pool_stalled")
+    row["first_err_ts"] = dt.datetime(2026, 10, 11, 23, 26, 32, tzinfo=dt.timezone.utc).timestamp()
+    floors: list = []
+    return row, fp.format_cause_rider(row, tz=dt.timezone.utc, floors=floors), floors
+
+
+def test_budget_cut_banner_names_lane_elapsed_and_seat():
+    from agent.fallback_wall_budget import FallbackWallBudgetExceeded
+    exc = FallbackWallBudgetExceeded("cut", lane="claude-alr", elapsed_s=600.2,
+                                     pool_headers={"x-pool-served-by": "sub-vps-5",
+                                                   "x-pool-route-id": "65a4c896ecf1"})
+    row, rider, floors = _budget_cut_rider(exc)
+    assert (row["trigger_class"], row["class_source"]) == ("no_first_byte_budget", "harness")
+    assert row["seat"] == "sub-vps-5" and row["route_id"] == "65a4c896ecf1"
+    assert rider == "no first byte in 600 s on claude-alr (sub-vps-5), 23:26:32"
+    assert floors == [], "a classified cut is not a dead-letter floor"
+
+
+def test_budget_cut_before_headers_says_so():
+    from agent.fallback_wall_budget import FallbackWallBudgetExceeded
+    exc = FallbackWallBudgetExceeded("cut", lane="claude-alr", elapsed_s=600.0, pool_headers={})
+    _row, rider, _floors = _budget_cut_rider(exc)
+    assert rider == "no first byte in 600 s on claude-alr (seat unknown — cut before headers), 23:26:32"
+    assert "unclassified" not in rider and "hop unknown" not in rider
+
+
+# ── streaming: the monitor cuts a silent attempt and posts the notice ──────
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_streaming_monitor_cuts_silent_attempt_and_posts_notice(monkeypatch):
+    from agent.fallback_wall_budget import FallbackWallBudgetExceeded
+
+    monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "60")
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    statuses: list = []
+    agent = AIAgent(api_key="k", base_url="https://example.com/v1", model=FABLE, quiet_mode=True,
+                    skip_context_files=True, skip_memory=True,
+                    status_callback=lambda kind, message: statuses.append((kind, message)))
+    agent.api_mode = "anthropic_messages"
+    agent._anthropic_client = MagicMock()
+    agent._anthropic_api_key = "k"
+    agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
+    agent._fallback_chain = [dict(e) for e in CHAIN]
+    agent._fallback_index = 1
+    unblock = threading.Event()
+    agent._abort_request_anthropic_client = lambda *a, **k: unblock.set()
+
+    def _silent():
+        unblock.wait(timeout=10.0)
+        raise httpx.ReadError("socket shut down")
+        yield
+
+    def _stream(*_a, **_k):
+        cm, stream = MagicMock(), MagicMock()
+        stream.__iter__ = MagicMock(return_value=_silent())
+        cm.__enter__ = MagicMock(return_value=stream)
+        cm.__exit__ = MagicMock(return_value=False)
+        return cm
+
+    agent._anthropic_client.messages.stream.side_effect = _stream
+    cfg = {"fallback": {"no_first_byte_budget_seconds": 0.6, "still_waiting_notice_seconds": 0.3}}
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        from agent.fallback_wall_budget import arm
+        arm(agent)  # the turn loop arms it in build_api_request; this drives the call directly
+        with pytest.raises(FallbackWallBudgetExceeded) as cut:
+            agent._interruptible_streaming_api_call({"model": FABLE})
+    assert any("still waiting for a first reply" in str(m) for _k, m in statuses)
+    # The cut carries its banner evidence (t_778185f3): lane, budget clock, and the
+    # attempt's relay headers (the mock stream response answers every header name).
+    assert cut.value.lane == agent.provider
+    assert cut.value.elapsed_s is not None and cut.value.elapsed_s >= 0.6
+    assert "x-pool-served-by" in cut.value.pool_headers

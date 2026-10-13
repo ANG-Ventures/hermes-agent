@@ -37,24 +37,34 @@ def _vault_scope() -> str:
     return str(get_hermes_home())
 
 
+def _redaction_forms(value: str) -> tuple:
+    """The value plus the form a text input normalizes it to (CR/LF stripped): that is what the page or a
+    flattened tool result holds, so both must be scrubbed."""
+    # Empty forms are dropped: an empty string matches every text (a CR/LF-only value, Prism 5d5afe2c8d8e).
+    return tuple(v for v in (value, value.replace("\r", "").replace("\n", "")) if v)
+
+
 def register_vault_redaction_value(value) -> None:
     """Register an exact vault secret value for model-facing redaction.
 
     Called by the vault fill path BEFORE the injection happens, so no later browser tool result
-    can echo the value back into model context. Also registers the form a text input normalizes
-    it to (CR/LF stripped), since that is what the page holds.
+    can echo the value back into model context. Also registers the normalized form.
     """
     if not isinstance(value, str) or not value:
         return
-    normalized = value.replace("\r", "").replace("\n", "")
     with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
-        for v in (value, normalized):
-            if v:
-                bucket.pop(v, None)  # re-registering refreshes recency
-                bucket[v] = None
-        while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
-            del bucket[next(iter(bucket))]
+        _vault_bucket_add_locked(_vault_scope(), _redaction_forms(value))
+
+
+def _vault_bucket_add_locked(scope: str, values) -> None:
+    """Add ``values`` to the profile's bounded vault bucket. Caller holds ``_VAULT_REDACTION_LOCK``."""
+    bucket = _VAULT_REDACTION_VALUES.setdefault(scope, {})
+    for v in values:
+        if v:
+            bucket.pop(v, None)  # re-registering refreshes recency
+            bucket[v] = None
+    while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
+        del bucket[next(iter(bucket))]
 
 
 def clear_vault_redaction_values() -> None:
@@ -63,13 +73,37 @@ def clear_vault_redaction_values() -> None:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
 
 
+# Long-lived configured credentials (mem0 admin key, MCP live-endpoint token) live outside the bounded
+# vault bucket: transient fills must never evict them, and nothing re-registers them after init.
+# One slot per credential name, so slots never accumulate. A rotated value takes the slot and the
+# displaced one moves to the bounded vault bucket: during a rotation both may still be valid, so the old
+# value stays redacted until ordinary vault eviction instead of leaking the moment the new one registers.
+_CREDENTIAL_REDACTION_VALUES: dict = {}  # profile home → {name: value}
+
+
+def register_credential_redaction_value(name: str, value) -> None:
+    """Register a long-lived configured credential for model-facing redaction (never evicted by vault fills)."""
+    if not isinstance(value, str) or not value:
+        return
+    with _VAULT_REDACTION_LOCK:
+        scope = _vault_scope()
+        slots = _CREDENTIAL_REDACTION_VALUES.setdefault(scope, {})
+        displaced = slots.get(name)
+        slots[name] = value
+        if displaced and displaced != value:
+            _vault_bucket_add_locked(scope, _redaction_forms(displaced))
+
+
 def redact_registered_vault_values(text: str) -> str:
-    """Exact-substring scrub of every vault secret value registered for the current profile."""
+    """Exact-substring scrub of every vault secret / configured credential registered for the current profile."""
     if not isinstance(text, str) or not text:
         return text
     with _VAULT_REDACTION_LOCK:
-        bucket = _VAULT_REDACTION_VALUES.get(_vault_scope())
-        values = sorted(bucket, key=len, reverse=True) if bucket else ()  # longest first: a substring never shadows its superstring
+        scope = _vault_scope()
+        values = {*(_VAULT_REDACTION_VALUES.get(scope) or ())}
+        for current in (_CREDENTIAL_REDACTION_VALUES.get(scope) or {}).values():
+            values.update(_redaction_forms(current))
+        values = sorted(values, key=len, reverse=True)  # longest first: a substring never shadows its superstring
     for value in values:
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")

@@ -193,6 +193,33 @@ LOOPS_ALLOWED = [
     # a finite loop) -- not a poll.
     "sleep 60; for f in *.py; do ruff check $f; done",
     "for f in *.py; do ruff check $f; done; sleep 45",
+    # t_2c070599 incident 1 (reduced): an apostrophe in a heredoc body / a
+    # double-quoted string paired with a later ' in the regex quote-stripper,
+    # so review prose about "#3776 (watch imports)" read as the watch command.
+    "H=$(git rev-parse HEAD); python3 - \"$H\" <<'PY'\n"
+    "d={\"note\":\"#3776 (watch imports) lands after; the view's fallback\"}\n"
+    "open('f.json','w')\nPY",
+    "echo \"#3776 (watch imports); the view's fallback\" 'x'",
+    # t_2c070599 incident 2 (reduced): same apostrophe shift exposed the loop
+    # inside a detached nohup subshell; it never runs in the foreground.
+    "hermes kanban comment t_1 --body-file - <<'EOF'\nI re-run #3773's checks.\nEOF\n"
+    "(nohup bash -c 'cd ~; for i in 1 2; do gh pr view 1; sleep 60; done' > out 2>&1 &)",
+    # Background job control is decided on the parsed and-or list.
+    "nohup sh -c 'until x; do sleep 60; done' >/dev/null 2>&1 &",
+    "for i in 1 2; do gh pr view 1; sleep 60; done &",
+    "setsid -f bash -c 'while :; do sleep 300; done'",
+    "python3 - <<'EOF'\nwhile True: time.sleep(60)\nwatch = 1\nEOF",
+    "tail -n 50 /var/log/x.log",
+    "case $x in a) sleep 60;; esac",
+]
+LOOPS_REFUSED += [
+    "for i in 1 2 3; do sleep 60; done",
+    "watch -n 5 ls",
+    "tail -f /var/log/x.log",
+    "bash -c 'while true; do sleep 60; done'",                 # foreground shell body
+    "bash <<'EOF'\nwhile true; do sleep 60; done\nEOF",       # heredoc fed to a shell
+    "for i in 1 2; do sleep 60; done; echo x &",              # only the echo is backgrounded
+    "echo $(for i in 1 2; do sleep 60; done)",                # substitution runs in foreground
 ]
 
 

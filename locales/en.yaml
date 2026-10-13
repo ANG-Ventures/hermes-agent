@@ -137,6 +137,9 @@ gateway:
     thread_intro: "⑂ **Branched thread — {title}**\nThis thread inherits the parent conversation ({count} messages) from {parent}. Explore freely here; the parent channel keeps its own session. Use `/merge` to fold a summary back into the parent."
     thread_parent_fallback: "the parent conversation"
     thread_branched_many: "⑂ Branched into a new thread → {thread} (**{title}**, {count} messages inherited).\nThe parent channel stays on its own session; use `/merge` inside the thread to fold it back."
+    inherits: "Inherits from the original: {items}"
+    inherits_model: "model {model}"
+    inherits_reasoning: "reasoning {effort}"
   commands:
     usage: "Usage: `/commands [page]`"
     skill_header: "⚡ **Skill Commands**:"

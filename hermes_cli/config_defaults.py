@@ -40,7 +40,14 @@ DEFAULT_CONFIG = {
     # min_switch_reset_seconds: opt-in (0 = off). When a rate-limited primary declares a reset
     # sooner than this many seconds, stay on it (the retry backoff rides out the window) instead
     # of switching the turn to a fallback model.
-    "fallback": {"min_switch_reset_seconds": 0},
+    # no_first_byte_budget_seconds: per-turn wall budget across the fallback chain while no byte
+    # has arrived. Once spent, the attempt is cut and the walker skips the remaining lanes on the
+    # stalled model for the first lane on another model (t_452c6ead). 600 s sits above every
+    # lane's healthy p99, so it ends dead air, not slow turns (Apollo ruling 2026-10-11). 0 = off.
+    # still_waiting_notice_seconds: post "still waiting, N lanes tried; ahead: ..." to the chat
+    # this often during that wait. 0 = off.
+    "fallback": {"min_switch_reset_seconds": 0, "no_first_byte_budget_seconds": 600,
+                 "still_waiting_notice_seconds": 120},
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # journal_mode: SQLite journal mode for every Hermes DB. "wal" default; use "delete" on
@@ -2344,13 +2351,36 @@ DEFAULT_CONFIG = {
         # retired: set next to a kanban-worker role, the pool places nothing.
         # See kanban_worker_pool.py.
         "worker_pool": {"enabled": True},
+        # Login whose uid runs a LOCAL worker's terminal + file tools (over
+        # ssh <user>@localhost, the worker-pool placement path). None/"" or
+        # the dispatcher's own login = the dispatcher's uid (today). Read per
+        # spawn, so a flip and its rollback are one edit. Q8 (a), t_405acdf0.
+        "local_worker_uid": None,
         # Placement PRD Phase 1b (t_1e4b9684): read_signal true = the pool probe
         # also reads each host's host-pressure.json (same ssh round-trip), a
         # host turns hot after 2 hot samples and clears after 3 (state in
         # <root>/var/kanban-target-state.json), warm hosts are picked last by
         # projected load, and kanban's placements are written to
         # <root>/var/placement/host-reservations.kanban.json. false = KWLB v0.1.
-        "placement": {"read_signal": True},
+        # kanban.placement.capabilities (t_8c474c2e, Fleet Work Placement
+        # Phase 1): off | warn | enforce, read per tick from the ROOT
+        # config.yaml only, never merged from here (absent = warn). enforce
+        # acts on capabilities_enforce [browser-session, screen] (the rest warn)
+        # and only while fleet/skill-host-requires.json is the verified output
+        # of `fleet-host capabilities --sync` (generated_by + source_hash);
+        # a hand-written index runs warn. Absent host-capabilities.json = off.
+        # See hermes_cli/kanban_host_capabilities.py.
+        # route_first (t_7133e03d, read per tick): every ready row is routed
+        # and every held row gets a placement_wait, including rows a total
+        # gate or an exhausted budget holds; false restores the silent early
+        # returns and the old one-shot gate line.
+        # admit_on_memory (t_31350981, Saturation spec 4.2; D1: off until
+        # Ace's yes): a pool host takes at most floor(mem_available_gb /
+        # worker_reservation_gb) new workers per tick and none while its
+        # sampler publishes band.kanban hot. false = computed and logged per
+        # tick ("kanban admission (dry ...): would-refuse N"), never applied.
+        "placement": {"read_signal": True, "route_first": True,
+                      "admit_on_memory": False, "worker_reservation_gb": 6},
         "dispatch_load_gate": {
             "enabled": True,
             "pause_above": None,
@@ -2418,6 +2448,20 @@ DEFAULT_CONFIG = {
         "wake_owner_session": True,
         # Gateway profiles whose sessions are operator sessions (woken).
         "wake_owner_profiles": ["default", "aegis"],
+        # t_4c7da648: withhold the chat line + wake for an event the receiving
+        # side caused itself (its own session / operator profile closed the
+        # card, or a configured closer landed it within self_window_min of the
+        # operator's review_coverage APPROVE). A notify_suppressed event is
+        # written on the card instead. Handbacks (review_requested, blocked,
+        # changes_requested, block_loop_detected, crashed, timed_out, gave_up)
+        # are never suppressed. enabled: false = kill switch.
+        "notify_suppress": {
+            "enabled": True,
+            "kinds": ["completed", "archived"],
+            "self_window_min": 30,
+            "closers": ["review-card closer", "land-autopilot", "merge-pass",
+                        "review-merge-pass", "kanban-review-merge-pass"],
+        },
         # True: a completion whose handoff says it did not land ("NOT
         # DEPLOYED", "STOP finding", outcome=partial, ...) goes to review
         # (human:apollo) instead of done. See kanban_negative_handoff.py.
@@ -2530,6 +2574,11 @@ DEFAULT_CONFIG = {
             "lane_headroom": True,
             "sample_seconds": 15,
         },
+        # t_b7b31563 (Ace 2026-10-12 06:25): a downgraded wake for a HUMAN-owned
+        # card (human:* assignee/reviewer; review_requested / blocked /
+        # block_loop_detected) is deferred, never dropped. It fires when the
+        # gate clears or after this many seconds, whichever comes first.
+        "wake_defer_ceiling_s": 1200,
         "reconcile_orphans": True,
         # Notify subscriptions survive `done` (completion is reversible) and are removed on archive.
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no

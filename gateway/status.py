@@ -523,9 +523,16 @@ def _get_process_start_time(pid: int) -> Optional[int]:
     # No /proc (macOS / Windows): psutil is a hard dependency and exposes a
     # cross-platform creation time.  Quantize to centiseconds so repeated reads
     # of the same process compare equal without float-precision fragility.
+    # On macOS/BSD read the raw kernel stamp (``monotonic=True``): the default
+    # re-bases it by ``INIT_BOOT_TIME - boot_time()``, where INIT_BOOT_TIME is
+    # captured when the READING process imported psutil, so after a clock step
+    # two processes read one pid a whole second apart (t_7fe63baa).
     try:
         import psutil  # type: ignore
-        return int(round(psutil.Process(pid).create_time() * 100))
+        proc = psutil.Process(pid)
+        if psutil.MACOS or psutil.BSD:
+            return int(round(proc._proc.create_time(monotonic=True) * 100))
+        return int(round(proc.create_time() * 100))
     except Exception:
         return None
 
