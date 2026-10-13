@@ -86,6 +86,77 @@ def test_replacements_that_can_end_the_loop_are_green():
         assert _hits(src) == [], src
 
 
+# ── Prism #1946 round 2 (t_4a3eba50). Every case below was GREEN (a miss) at 15aafdde99. ──
+
+def test_return_value_never_raises_whatever_it_is():
+    """3f238f646a10: ``return_value`` is returned on every call; a list or exception there is not a side_effect."""
+    for rv in ("[]", "[None, ProcessLookupError()]", "ProcessLookupError", "ProcessLookupError(3)", "None"):
+        src = f'from unittest.mock import patch\ndef test_x():\n    with patch("os.kill", return_value={rv}):\n        pass\n'
+        assert len(_hits(src)) == 1, src
+    src = 'from unittest.mock import patch\ndef test_x():\n    with patch("psutil.pid_exists", return_value=False):\n        pass\n'
+    assert _hits(src) == []
+
+
+def test_side_effect_is_judged_by_its_value_not_its_presence():
+    """24f441782ae3: ``Mock(side_effect=None)`` / a non-raising callable side_effect never raises."""
+    red = (
+        'import os\nfrom unittest.mock import Mock\ndef test_x(monkeypatch):\n    monkeypatch.setattr(os, "kill", Mock(side_effect=None))\n',
+        'import os\nfrom unittest.mock import Mock\ndef test_x(monkeypatch):\n    monkeypatch.setattr(os, "kill", Mock(side_effect=lambda *a: None))\n',
+        'import os\nfrom unittest.mock import Mock\ndef test_x(monkeypatch):\n    k = Mock(side_effect=lambda *a: None)\n    monkeypatch.setattr(os, "kill", k)\n',
+        'import os\nfrom unittest.mock import MagicMock\ndef test_x(monkeypatch):\n    k = MagicMock(return_value=None)\n    monkeypatch.setattr(os, "kill", k)\n',
+        'from unittest.mock import patch\ndef test_x():\n    with patch("os.kill", side_effect=None):\n        pass\n',
+        'from unittest.mock import patch\ndef test_x():\n    with patch("os.kill", side_effect=lambda *a: None):\n        pass\n',
+    )
+    for src in red:
+        assert len(_hits(src)) == 1, src
+    green = (
+        'import os\nfrom unittest.mock import Mock\ndef test_x(monkeypatch):\n    monkeypatch.setattr(os, "kill", Mock(side_effect=ProcessLookupError))\n',
+        'import os\nfrom unittest.mock import Mock\ndef test_x(monkeypatch):\n    k = Mock(side_effect=[None, OSError()])\n    monkeypatch.setattr(os, "kill", k)\n',
+    )
+    for src in green:
+        assert _hits(src) == [], src
+
+
+def test_names_resolve_in_their_own_scope():
+    """cc5475624092: two tests each defining ``fake_kill``; the second (non-raising) one is red."""
+    src = (
+        'import os\n'
+        'def test_a(monkeypatch):\n'
+        '    def fake_kill(pid, sig):\n'
+        '        raise ProcessLookupError\n'
+        '    monkeypatch.setattr(os, "kill", fake_kill)\n'
+        'def test_b(monkeypatch):\n'
+        '    seen = []\n'
+        '    def fake_kill(pid, sig):\n'
+        '        seen.append(sig)\n'
+        '    monkeypatch.setattr(os, "kill", fake_kill)\n'
+    )
+    (hit,) = _hits(src)
+    assert "t.py:10" in hit
+    # same name rebound later in one scope: the binding at the patch site counts
+    src = (
+        'import os\n'
+        'def test_c(monkeypatch):\n'
+        '    def fake_kill(pid, sig):\n'
+        '        pass\n'
+        '    monkeypatch.setattr(os, "kill", fake_kill)\n'
+        '    def fake_kill(pid, sig):\n'
+        '        raise ProcessLookupError\n'
+    )
+    (hit,) = _hits(src)
+    assert "t.py:5" in hit
+
+
+def test_a_named_constant_true_pid_exists_is_red():
+    """f5bbb3106cb7: ``def always_alive(pid): return True`` for psutil.pid_exists."""
+    src = 'import psutil\ndef always_alive(pid):\n    return True\ndef test_x(monkeypatch):\n    monkeypatch.setattr(psutil, "pid_exists", always_alive)\n'
+    assert len(_hits(src)) == 1
+    src = 'import psutil\nfrom unittest.mock import Mock\ndef test_x(monkeypatch):\n    monkeypatch.setattr(psutil, "pid_exists", Mock(return_value=True))\n'
+    assert len(_hits(src)) == 1
+    src = 'import psutil\ndef gone_after(n):\n    def f(pid):\n        n[0] -= 1\n        return n[0] > 0\n    return f\ndef test_x(monkeypatch):\n    monkeypatch.setattr(psutil, "pid_exists", gone_after([3]))\n'
+    assert _hits(src) == []
+
+
 def test_suppress_marker_names_a_reason_and_silences_one_line():
     src = INCIDENT.replace("signals.append((pid, sig)))",
                            "signals.append((pid, sig)))  # liveness-patch: ok — terminate_pid is single-shot")

@@ -23,8 +23,11 @@ guard people disable.
 A replacement is "honest" when it can end the loop: a ``def`` containing a ``raise``, a
 ``def``/``lambda`` that forwards to the saved original (``real = os.kill`` ... ``real(pid, 0)``),
 a ``side_effect`` that is an exception class/instance or a list (``StopIteration`` ends it), or a
-generator ``.throw``. A bare ``patch("os.kill")`` (MagicMock), a ``return_value=``, a recorder
-``lambda`` or a ``def`` with neither a ``raise`` nor a forward is refused.
+generator ``.throw``. A bare ``patch("os.kill")`` (MagicMock), any ``return_value=`` (returned on
+every call, whatever it is), ``Mock(side_effect=None)`` or a side_effect callable that cannot
+raise, a recorder ``lambda`` or a ``def`` with neither a ``raise`` nor a forward is refused. For
+``psutil.pid_exists`` a ``def``/``lambda`` whose every return is the literal ``True`` is refused.
+Names resolve lexically (the binding visible at the patch site), never file-wide by bare name.
 
 Suppress one line with ``# liveness-patch: ok — <why the loop under test is bounded>``.
 
@@ -101,42 +104,118 @@ def _target_of(call: ast.Call) -> str | None:
     return None
 
 
-def _replacement(call: ast.Call, fname: str) -> ast.expr | None:
-    """The expression installed as the replacement (None = bare MagicMock)."""
+# How the replacement is installed. A ``side_effect`` is called/raised/iterated; a
+# ``return_value`` is only ever returned (Prism 3f238f646a10, t_4a3eba50).
+_CALLABLE, _SIDE_EFFECT, _RETURN_VALUE = "callable", "side_effect", "return_value"
+_MOCKS = frozenset({"MagicMock", "Mock", "AsyncMock", "NonCallableMock", "create_autospec"})
+_PRIM_TAILS = frozenset({"kill", "waitpid", "connect", "pid_exists"})
+
+
+def _replacement(call: ast.Call, fname: str) -> tuple[ast.expr | None, str]:
+    """(expression installed, mode). ``(None, _CALLABLE)`` = a bare MagicMock."""
     kw = {k.arg: k.value for k in call.keywords}
     if fname == "setattr":
         pos = 2 if (len(call.args) >= 2 and isinstance(call.args[1], ast.Constant)
                     and isinstance(call.args[1].value, str) and not isinstance(call.args[0], ast.Constant)) else 1
         if len(call.args) > pos:
-            return call.args[pos]
-        return kw.get("value")
-    # mock.patch / patch.object
-    if "side_effect" in kw:
-        return kw["side_effect"]
-    if "new" in kw:
-        return kw["new"]
+            return call.args[pos], _CALLABLE
+        return kw.get("value"), _CALLABLE
+    # mock.patch / patch.object: ``new`` replaces the attribute outright
     pos = 2 if fname == "object" else 1
+    if "new" in kw:
+        return kw["new"], _CALLABLE
     if len(call.args) > pos:
-        return call.args[pos]
+        return call.args[pos], _CALLABLE
+    if "side_effect" in kw and not _is_none(kw["side_effect"]):
+        return kw["side_effect"], _SIDE_EFFECT
     if "return_value" in kw:
-        return kw["return_value"]  # a value: returns it, never raises
-    return None  # bare patch -> MagicMock: returns, never raises
+        return kw["return_value"], _RETURN_VALUE
+    return None, _CALLABLE  # bare patch -> MagicMock: returns a MagicMock, never raises
+
+
+def _is_none(node: ast.AST | None) -> bool:
+    return isinstance(node, ast.Constant) and node.value is None
+
+
+def _scope_children(node: ast.AST):
+    """Statements/expressions in ``node``'s own scope: nested function and class bodies are
+    their own scopes and are not entered (their ``def`` statement itself is yielded)."""
+    for child in ast.iter_child_nodes(node):
+        yield child
+        if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            yield from _scope_children(child)
+
+
+_SCOPES = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
 
 
 class _File:
+    """Names resolved LEXICALLY: the binding visible at the use site, innermost scope first,
+    latest binding at or above the use line (Prism cc5475624092: two tests that each define
+    ``fake_kill`` no longer share the first one's verdict)."""
+
     def __init__(self, tree: ast.AST) -> None:
-        self.defs: dict[str, ast.AST] = {}
-        self.originals: set[str] = set()  # names bound to a real primitive: real = os.kill
-        self.raisers: set[str] = set()  # names bound to Mock(side_effect=<exception>)
+        self._resolving: set[ast.AST] = set()
+        self.parent: dict[ast.AST, ast.AST] = {}
         for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                self.defs.setdefault(node.name, node)
-            elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                src = _dotted(node.value)
-                if src in PRIMITIVES or (src and src.rsplit(".", 1)[-1] in {"kill", "waitpid", "connect", "pid_exists"}):
-                    self.originals.add(node.targets[0].id)
-                elif isinstance(node.value, ast.Call) and any(k.arg == "side_effect" for k in node.value.keywords):
-                    self.raisers.add(node.targets[0].id)
+            for child in ast.iter_child_nodes(node):
+                self.parent[child] = node
+        # scope -> name -> [(lineno, kind, node)]; kind: "def" | "original" | "mock" | "other"
+        self.bindings: dict[ast.AST, dict[str, list[tuple[int, str, ast.AST]]]] = {}
+        for scope in (n for n in ast.walk(tree) if isinstance(n, _SCOPES)):
+            table: dict[str, list[tuple[int, str, ast.AST]]] = {}
+            for node in _scope_children(scope):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    table.setdefault(node.name, []).append((node.lineno, "def", node))
+                elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                    table.setdefault(node.targets[0].id, []).append((node.lineno, self._assign_kind(node.value), node.value))
+            self.bindings[scope] = table
+
+    @staticmethod
+    def _assign_kind(value: ast.expr) -> str:
+        src = _dotted(value)
+        if src in PRIMITIVES or (src and src.rsplit(".", 1)[-1] in _PRIM_TAILS):
+            return "original"
+        if isinstance(value, ast.Call) and (_dotted(value.func) or "").rsplit(".", 1)[-1] in _MOCKS:
+            return "mock"
+        return "other"
+
+    def _scopes_of(self, node: ast.AST):
+        """Enclosing scopes, innermost first. A class body is visible only to code directly in
+        it, never to its methods (Python's rule)."""
+        cur, first = self.parent.get(node), True
+        while cur is not None:
+            if isinstance(cur, _SCOPES):
+                if first or not isinstance(cur, ast.ClassDef):
+                    yield cur
+                first = False
+            cur = self.parent.get(cur)
+
+    def lookup(self, name: str, at: ast.AST) -> tuple[str, ast.AST] | None:
+        line = getattr(at, "lineno", 10 ** 9)
+        for scope in self._scopes_of(at):
+            hits = self.bindings.get(scope, {}).get(name)
+            if not hits:
+                continue
+            before = [h for h in hits if h[0] <= line]
+            # a module/enclosing-function binding after the use line is still the one a
+            # nested function sees when it runs; prefer the latest one before the use
+            _, kind, node = (before or hits)[-1]
+            return kind, node
+        return None
+
+    def method(self, attr: str, at: ast.AST) -> ast.AST | None:
+        """``self.<attr>`` / ``cls.<attr>``: the def in the enclosing class, else None."""
+        for scope in self._scopes_of(at):
+            if isinstance(scope, ast.ClassDef):
+                hits = self.bindings[scope].get(attr)
+                if hits and hits[-1][1] == "def":
+                    return hits[-1][2]
+        return None
+
+    def _calls_original(self, name: str, at: ast.AST) -> bool:
+        hit = self.lookup(name, at)
+        return hit is not None and hit[0] == "original"
 
     def _forwards(self, node: ast.AST) -> bool:
         """The body can END a poll loop: it forwards to the real primitive or raises
@@ -147,78 +226,126 @@ class _File:
             name = _dotted(call.func)
             if name is None:
                 continue
-            if name in self.originals or name in PRIMITIVES or name in self.raisers:
+            if name in PRIMITIVES or self._calls_original(name, call):
                 return True
             if name.rsplit(".", 1)[-1] in {"throw", "fail", "skip", "exit", "_exit"}:
                 return True
-            helper = self.defs.get(name)
-            if helper is not None and helper is not node and self._raises(helper):
-                return True
-            if name.rsplit(".", 1)[-1] in {"kill", "waitpid", "connect", "pid_exists"} and "." in name:
+            if "." not in name:
+                hit = self.lookup(name, call)
+                if hit is not None and hit[0] == "def" and hit[1] is not node and self._raises(hit[1]):
+                    return True
+                if hit is not None and hit[0] == "mock" and self._mock_can_end(hit[1], "raise"):
+                    return True
+            if name.rsplit(".", 1)[-1] in _PRIM_TAILS and "." in name:
                 return True
         return False
 
     def _raises(self, fn: ast.AST) -> bool:
         return any(isinstance(n, ast.Raise) for n in ast.walk(fn)) or self._forwards(fn)
 
-    def can_end_loop(self, repl: ast.expr | None, kind: str) -> bool:
+    @staticmethod
+    def _constant_true(fn: ast.AST) -> bool:
+        """Every ``return`` in the def's own body returns the literal True (and nothing raises)."""
+        if isinstance(fn, ast.Lambda):
+            return isinstance(fn.body, ast.Constant) and fn.body.value is True
+        rets = [n for n in _scope_children(fn) if isinstance(n, ast.Return)]
+        raises = any(isinstance(n, ast.Raise) for n in _scope_children(fn))
+        return bool(rets) and not raises and all(
+            isinstance(r.value, ast.Constant) and r.value.value is True for r in rets)
+
+    def _mock_can_end(self, mock: ast.Call, kind: str) -> bool:
+        """A ``Mock(...)`` call: judged by WHAT its side_effect / return_value is, not by the
+        keyword being present (Prism 24f441782ae3)."""
+        kw = {k.arg: k.value for k in mock.keywords}
+        se = kw.get("side_effect")
+        if se is not None and not _is_none(se):
+            return self.can_end_loop(se, kind, _SIDE_EFFECT)
+        if kind == "raise":
+            return False  # returns its return_value, never raises
+        rv = kw.get("return_value")
+        return rv is not None and self.can_end_loop(rv, kind, _RETURN_VALUE)  # absent: a truthy MagicMock
+
+    def _fn_can_end(self, fn: ast.AST, kind: str) -> bool:
+        return not self._constant_true(fn) if kind == "true" else self._raises(fn)
+
+    def can_end_loop(self, repl: ast.expr | None, kind: str, mode: str = _CALLABLE) -> bool:
         if repl is None:
             return False
-        if kind == "true":
-            if isinstance(repl, ast.Lambda):
-                return not (isinstance(repl.body, ast.Constant) and repl.body.value is True)
-            if isinstance(repl, ast.Constant):
-                return repl.value is not True
-            return True
+        if mode == _RETURN_VALUE:
+            # returned as-is on every call: never raises, whatever the expression is
+            if kind == "raise":
+                return False
+            return not (isinstance(repl, ast.Constant) and repl.value is True)
         if isinstance(repl, ast.Constant):
-            return False  # return_value=None / a literal: returns, never raises
+            if kind == "true":
+                return mode == _SIDE_EFFECT or repl.value is not True
+            return False  # a literal: returns, never raises
+        if isinstance(repl, (ast.List, ast.Tuple, ast.Set)):
+            return mode == _SIDE_EFFECT  # a side_effect iterable raises StopIteration when exhausted
         if isinstance(repl, ast.Lambda):
+            if kind == "true":
+                return not self._constant_true(repl)
             return self._forwards(repl.body)
-        if isinstance(repl, (ast.List, ast.Tuple)):
-            return True  # a side_effect iterable raises StopIteration when exhausted
         if isinstance(repl, ast.Name):
-            fn = self.defs.get(repl.id)
-            if fn is not None:
-                return self._raises(fn)
-            if repl.id in self.originals or repl.id in self.raisers:
+            hit = self.lookup(repl.id, repl)
+            if hit is not None:
+                bkind, node = hit
+                if bkind == "def":
+                    return self._fn_can_end(node, kind)
+                if bkind == "original":
+                    return True
+                if bkind == "mock":
+                    return self._mock_can_end(node, kind)  # type: ignore[arg-type]
+                if node in self._resolving:  # x = y; y = x
+                    return True
+                self._resolving.add(node)
+                try:
+                    return self.can_end_loop(node, kind, mode)  # type: ignore[arg-type]
+                finally:
+                    self._resolving.discard(node)
+            if kind == "true":
                 return True
             return repl.id[:1].isupper()  # an exception class, e.g. side_effect=ProcessLookupError
         if isinstance(repl, ast.Call):
             name = _dotted(repl.func) or ""
-            if name.rsplit(".", 1)[-1] in {"MagicMock", "Mock", "AsyncMock"}:
-                return "side_effect" in {k.arg for k in repl.keywords}
-            if name.rsplit(".", 1)[-1][:1].isupper():
+            tail = name.rsplit(".", 1)[-1]
+            if tail in _MOCKS:
+                return self._mock_can_end(repl, kind)
+            if tail[:1].isupper():
                 return True  # an exception instance, or a factory we cannot see into
-            fn = self.defs.get(name)
-            if fn is not None:  # factory: _recording_kill(signals) -> inner def
-                return self._raises(fn)
+            if "." not in name:
+                hit = self.lookup(name, repl)
+                if hit is not None and hit[0] == "def":  # factory: _recording_kill(signals) -> inner def
+                    return self._fn_can_end(hit[1], kind)
             return True
         if isinstance(repl, ast.Attribute):
-            fn = self.defs.get(repl.attr)
+            fn = self.method(repl.attr, repl) if _dotted(repl.value) in {"self", "cls"} else None
             if fn is not None:
-                return self._raises(fn)
+                return self._fn_can_end(fn, kind)
             return True
         return True
 
 
 def check_source(src: str, filename: str = "<src>") -> list[str]:
+    if not any(t in src for t in _PRIM_TAILS):
+        return []  # cannot name a primitive: skip the parse (most of tests/)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         tree = ast.parse(src, filename=filename)
-    info = _File(tree)
+    patches = [(c, t) for c in ast.walk(tree) if isinstance(c, ast.Call) for t in [_target_of(c)] if t]
+    if not patches:
+        return []
+    info = _File(tree)  # scope tables only for files that patch a primitive
     lines = src.splitlines()
     problems: list[str] = []
-    for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
-        target = _target_of(call)
-        if target is None:
-            continue
+    for call, target in patches:
         line = lines[call.lineno - 1] if call.lineno <= len(lines) else ""
         if SUPPRESS in line:
             continue
         fname = call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id  # type: ignore[union-attr]
-        repl = _replacement(call, fname)
+        repl, mode = _replacement(call, fname)
         kind = PRIMITIVES[target]
-        if info.can_end_loop(repl, kind):
+        if info.can_end_loop(repl, kind, mode):
             continue
         how = ("is pinned to True, so a wait-for-exit loop never ends" if kind == "true"
                else "can never raise, so a poll-until-exception loop never ends")
@@ -240,7 +367,7 @@ _BASELINE: dict[str, int] = {
     "tests/hermes_cli/test_gateway.py": 8,
     "tests/hermes_cli/test_local_runtime_legacy_state.py": 1,
     "tests/hermes_cli/test_local_runtime_recovery.py": 1,
-    "tests/hermes_cli/test_orphan_desktop_serve_reap.py": 2,
+    "tests/hermes_cli/test_orphan_desktop_serve_reap.py": 4,
     "tests/hermes_cli/test_update_cron_deadlock_guard.py": 2,
     "tests/hermes_cli/test_update_fleet_home_scope.py": 1,
     "tests/hermes_cli/test_update_serve_generation_recovery.py": 1,
@@ -251,7 +378,7 @@ _BASELINE: dict[str, int] = {
     "tests/tools/test_mcp_stability.py": 4,
     "tests/tools/test_mcp_stdio_children_dead.py": 2,
     "tests/tools/test_process_registry.py": 1,
-    "tests/tools/test_windows_native_support.py": 4,
+    "tests/tools/test_windows_native_support.py": 2,
 }
 
 
