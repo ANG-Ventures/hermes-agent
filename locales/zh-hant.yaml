@@ -804,6 +804,7 @@ gateway:
     empty: "佇列是空的。"
     list_header: "佇列（{count} 則待處理）："
     held_header: "佇列（/stop 後暫留 {count} 則；在 /queue run 之前不會執行任何項目）："
+    active_after_held: "另有等待中 ({count} 項，未保留)，將在目前回合結束後執行:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

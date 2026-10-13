@@ -804,6 +804,7 @@ gateway:
     empty: "Черга порожня."
     list_header: "Черга (в очікуванні: {count}):"
     held_header: "Черга (утримано після /stop: {count}; нічого не запуститься до /queue run):"
+    active_after_held: "Також очікують ({count}), не утримані; виконаються після поточного ходу:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

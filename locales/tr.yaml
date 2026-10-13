@@ -804,6 +804,7 @@ gateway:
     empty: "Kuyruk boş."
     list_header: "Kuyruk ({count} bekliyor):"
     held_header: "Kuyruk (/stop sonrası {count} bekletiliyor; /queue run olana kadar hiçbir şey çalışmaz):"
+    active_after_held: "Ayrıca bekleyen ({count}), tutulmuyor; mevcut turdan sonra çalışır:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

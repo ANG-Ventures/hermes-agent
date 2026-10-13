@@ -804,6 +804,7 @@ gateway:
     empty: "A fila está vazia."
     list_header: "Fila ({count} pendentes):"
     held_header: "Fila ({count} retido(s) após /stop; nada é executado até /queue run):"
+    active_after_held: "Também aguardando ({count}), não retidos; executam após o turno atual:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

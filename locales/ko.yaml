@@ -804,6 +804,7 @@ gateway:
     empty: "대기열이 비어 있어요."
     list_header: "대기열 ({count}개 대기 중):"
     held_header: "대기열 (/stop 이후 {count}개 보류 중; /queue run 전까지 아무것도 실행되지 않아요):"
+    active_after_held: "추가 대기 중 ({count}개, 보류 아님). 현재 턴이 끝나면 실행됩니다:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

@@ -804,6 +804,7 @@ gateway:
     empty: "La coda è vuota."
     list_header: "Coda ({count} in attesa):"
     held_header: "Coda ({count} trattenuti dopo /stop; nulla viene eseguito fino a /queue run):"
+    active_after_held: "Anche in attesa ({count}), non trattenuti; vengono eseguiti dopo il turno corrente:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

@@ -384,3 +384,54 @@ async def test_released_queue_dispatches_exactly_one_head_through_the_tail(rig):
     await adapter._drain_pending_after_session_command(KEY, asyncio.Event())
     assert started == ["a"]
     assert [e.text for e in runner._session_state(KEY).conversation.queued_events] == ["b"]
+
+
+# --------------------------------------------------------------------------- Momus pass-3 fixes
+
+def test_edit_refuses_a_slash_command_and_leaves_the_item(rig):
+    """RC1: `/queue edit 1 /model x` must not reopen the silent dequeue-discard path."""
+    runner, adapter = rig
+    _seed(runner, adapter, "a")
+    reply = qm.apply_management(runner, qm.QueueOp("edit", index=1, text="/model opus"), KEY, adapter)
+    assert "/model is a command" in reply and _active(runner, adapter) == ["a"]
+
+
+def test_auto_reset_carries_active_user_items_into_held(rig):
+    """RC2b: an automatic reset has no reply target, so nothing may drop."""
+    runner, adapter = rig
+    runner._session_state(KEY).conversation.queued_events.extend([_ev("x"), _ev("wake", internal=True)])
+    runner._clear_conversation_scope(KEY, reason="auto_reset")
+    assert _held(runner) == ["x"]
+
+
+def test_unclassified_reset_reason_carries_and_warns(rig, caplog):
+    """RC2a: a boundary reason nobody classified carries the queue rather than dropping it."""
+    runner, adapter = rig
+    _seed(runner, adapter, "a")
+    qm.hold_user_items(runner, KEY, adapter)
+    runner._clear_conversation_scope(KEY, reason="some_future_boundary")
+    assert _held(runner) == ["a"] and "unclassified" in caplog.text
+
+
+def test_every_scope_clear_call_site_reason_is_classified():
+    """RC2a: each literal reason passed to _clear_conversation_scope is a known auto or user reset."""
+    import pathlib
+    import re
+    root = pathlib.Path(qm.__file__).resolve().parent
+    reasons = set()
+    for path in root.glob("*.py"):
+        reasons |= set(re.findall(r'_clear_conversation_scope\([^)]*reason="([a-z_]+)"', path.read_text()))
+    assert reasons, "no call sites found: the scan is broken"
+    assert reasons <= (qm.AUTO_RESET_REASONS | qm.USER_RESET_REASONS), reasons
+
+
+def test_list_shows_later_active_items_under_held_and_run_restages_oldest_first(rig):
+    """RC4: a plain busy-mode follow-up after /stop stays active; list shows it, run keeps age order."""
+    runner, adapter = rig
+    _seed(runner, adapter, "a", "b")
+    qm.hold_user_items(runner, KEY, adapter)
+    _seed(runner, adapter, "later")                 # e.g. busy_input_mode: queue after /stop
+    out = qm.apply_management(runner, qm.QueueOp("list"), KEY, adapter)
+    assert "1. a" in out and "2. b" in out and "Also waiting (1)" in out and "· later" in out
+    qm.restage_held(runner, KEY, adapter)
+    assert _active(runner, adapter) == ["a", "b", "later"]

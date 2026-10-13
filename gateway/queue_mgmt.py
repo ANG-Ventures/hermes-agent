@@ -12,8 +12,11 @@ Stores (spec 2026-10-12_gateway-queue-management-spec.md):
   No drain, rescue, or promotion path reads it; only ``/queue run`` / ``/queue clear`` /
   a session boundary empty it.
 
-Invariant used throughout: while ``held`` is non-empty, new ``/queue`` items append to it, so the
-active store holds no user items. Each verb therefore operates on exactly ONE store.
+While ``held`` is non-empty, new ``/queue`` items append to it, and the verbs (list numbering, rm,
+edit, move, clear) operate on the held store. The active store can still gain user items at the
+same time: a plain message under ``busy_input_mode: queue`` is a normal message (D14: it runs
+normally; held items keep waiting). ``/queue list`` shows those in a second, unnumbered section and
+``/queue run`` restages oldest first: held, then those later active items.
 """
 
 from __future__ import annotations
@@ -130,6 +133,11 @@ def format_list(runner: Any, key: str, adapter: Any) -> str:
     for i, ev in enumerate(items, 1):
         key_ = "gateway.queue.item_system" if is_system_event(runner, ev) else "gateway.queue.item"
         lines.append(t(key_, index=i, preview=preview(ev)))
+    if which == "held":
+        later = [e for e in active_items(runner, key, adapter) if not is_system_event(runner, e)]
+        if later:
+            lines.append(t("gateway.queue.active_after_held", count=len(later)))
+            lines.extend(f"  · {preview(e)}" for e in later)
     lines.append(t("gateway.queue.list_footer"))
     return "\n".join(lines)
 
@@ -173,9 +181,11 @@ def apply_management(runner: Any, op: QueueOp, key: str, adapter: Any) -> str:
     if op.kind == "edit":
         if not op.text:
             return t("gateway.queue.usage_edit")
-        refused = _refuse_system(runner, items, idx)
+        refused = _refuse_system(runner, items, idx) or refuse_command_prompt(op.text)
         if refused:
             return refused
+        if which == "active" and not isinstance(getattr(adapter, "_pending_messages", None), dict):
+            return t("gateway.queue.unavailable")   # check storage before mutating the shared event
         ev = items[idx - 1]
         kept_media = bool(getattr(ev, "media_urls", None))
         try:
@@ -246,7 +256,9 @@ def restage_held(runner: Any, key: str, adapter: Any) -> Optional[int]:
     held = held_list(runner, key)
     active = active_items(runner, key, adapter)
     if held:
-        if not rewrite_active(runner, key, adapter, active + list(held)):
+        system = [e for e in active if is_system_event(runner, e)]
+        later_users = [e for e in active if not is_system_event(runner, e)]
+        if not rewrite_active(runner, key, adapter, system + list(held) + later_users):
             return None
         moved = len(held)
         del held[:]
@@ -327,13 +339,20 @@ def before_scope_clear(runner: Any, key: str, reason: str) -> Optional[List[Any]
         overflow_raw = getattr(state.conversation, "queued_events", None)
         overflow = list(overflow_raw) if isinstance(overflow_raw, list) else []
         users_overflow = [e for e in overflow if not is_system_event(runner, e)]
-        if reason in AUTO_RESET_REASONS:
-            if users_overflow:
-                logger.warning("queue_mgmt op=auto_reset session=%s dropped %d active queued item(s) "
-                               "(no reply target)", key, len(users_overflow))
-            return held or None
         if reason in USER_RESET_REASONS:
             note_reset_drop(runner, key, len(held) + len(users_overflow))
+            return None
+        # Automatic resets have no reply target, so they must not drop anything (D5/D21): carry the
+        # held items AND any active user items into the held store. An unknown reason is treated
+        # the same way (carry + WARNING) so a new boundary can never drop the queue silently.
+        carried = held + users_overflow
+        if reason not in AUTO_RESET_REASONS and carried:
+            logger.warning("queue_mgmt op=scope_clear session=%s reason=%s (unclassified) carried %d "
+                           "queued item(s) into the held store", key, reason, len(carried))
+        elif users_overflow:
+            logger.info("queue_mgmt op=auto_reset session=%s carried %d active item(s) into held",
+                        key, len(users_overflow))
+        return carried or None
     except Exception:
         logger.warning("queue_mgmt before_scope_clear failed for %s (%s); clearing without carry",
                        key, reason, exc_info=True)

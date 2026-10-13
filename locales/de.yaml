@@ -804,6 +804,7 @@ gateway:
     empty: "Warteschlange ist leer."
     list_header: "Warteschlange ({count} ausstehend):"
     held_header: "Warteschlange ({count} nach /stop zurückgehalten; nichts läuft bis /queue run):"
+    active_after_held: "Ebenfalls wartend ({count}), nicht zurückgehalten; laufen nach dem aktuellen Zug:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

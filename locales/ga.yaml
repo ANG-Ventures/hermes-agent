@@ -804,6 +804,7 @@ gateway:
     empty: "Tá an scuaine folamh."
     list_header: "Scuaine ({count} ar feitheamh):"
     held_header: "Scuaine ({count} á gcoinneáil tar éis /stop; ní ritheann aon rud go dtí /queue run):"
+    active_after_held: "Ag fanacht freisin ({count}), gan coinneáil; ritheann siad tar éis na seala reatha:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

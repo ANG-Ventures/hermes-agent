@@ -804,6 +804,7 @@ gateway:
     empty: "قائمة الانتظار فارغة."
     list_header: "قائمة الانتظار ({count} قيد الانتظار):"
     held_header: "قائمة الانتظار ({count} معلّقة بعد /stop؛ لن يُنفَّذ شيء حتى /queue run):"
+    active_after_held: "في الانتظار أيضًا ({count})، غير محجوزة؛ تُنفَّذ بعد الدور الحالي:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

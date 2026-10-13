@@ -804,6 +804,7 @@ gateway:
     empty: "La cola está vacía."
     list_header: "Cola ({count} pendientes):"
     held_header: "Cola ({count} retenidos tras /stop; nada se ejecuta hasta /queue run):"
+    active_after_held: "También en espera ({count}), no retenidos; se ejecutan tras el turno actual:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

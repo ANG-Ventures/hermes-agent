@@ -814,6 +814,7 @@ gateway:
     empty: "Queue is empty."
     list_header: "Queue ({count} pending):"
     held_header: "Queue ({count} held after /stop; nothing runs until /queue run):"
+    active_after_held: "Also waiting ({count}), not held; these run after the current turn:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

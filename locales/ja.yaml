@@ -804,6 +804,7 @@ gateway:
     empty: "キューは空です。"
     list_header: "キュー（{count} 件待機中）:"
     held_header: "キュー（/stop 後に {count} 件保留中。/queue run まで何も実行されません）:"
+    active_after_held: "その他の待機中 ({count} 件、保留ではありません)。現在のターンの後に実行されます:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

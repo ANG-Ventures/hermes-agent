@@ -804,6 +804,7 @@ gateway:
     empty: "Очередь пуста."
     list_header: "Очередь (ожидает: {count}):"
     held_header: "Очередь (удержано после /stop: {count}; ничего не запустится до /queue run):"
+    active_after_held: "Также ожидают ({count}), не удержаны; выполнятся после текущего хода:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

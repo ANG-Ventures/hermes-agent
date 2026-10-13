@@ -930,6 +930,7 @@ gateway:
     empty: "File d'attente vide."
     list_header: "File d'attente ({count} en attente) :"
     held_header: "File d'attente ({count} retenu(s) après /stop ; rien ne s'exécute avant /queue run) :"
+    active_after_held: "Également en attente ({count}), non retenus ; ils s'exécutent après le tour en cours :"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"

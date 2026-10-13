@@ -463,8 +463,12 @@ class GatewayAgentCacheMixin:
         if not session_key:
             return
         state = self._peek_session_state(session_key)
-        from gateway import queue_mgmt
-        _carry_held = queue_mgmt.before_scope_clear(self, session_key, reason)  # spec D21
+        _carry_held = None
+        try:  # spec D21; fail open: the boundary clear below must always run
+            from gateway import queue_mgmt
+            _carry_held = queue_mgmt.before_scope_clear(self, session_key, reason)
+        except Exception:
+            logger.warning("queue carry skipped for %s (%s)", session_key, reason, exc_info=True)
         if state is not None:
             state.conversation.clear()
             if _carry_held:
@@ -600,10 +604,13 @@ class GatewayAgentCacheMixin:
             # held store, which no drain reads. Done BEFORE any await so no drain can run between the
             # generation bump above and the hold. System events stay put for the wake-preserving block
             # below. /new and /reset keep their reset semantics.
-            from gateway import queue_mgmt
-            _hold_adapter = self._delivery_adapter_for(source)
-            if _hold_adapter is not None:
-                queue_mgmt.hold_user_items(self, session_key, _hold_adapter)
+            try:  # fail open: a queue_mgmt failure must never break /stop
+                from gateway import queue_mgmt
+                _hold_adapter = self._delivery_adapter_for(source)
+                if _hold_adapter is not None:
+                    queue_mgmt.hold_user_items(self, session_key, _hold_adapter)
+            except Exception:
+                logger.warning("queue hold skipped on /stop for %s", session_key, exc_info=True)
         from gateway.run import _AGENT_PENDING_SENTINEL
         # The turn's hard interrupt reaches only its in-turn children; background delegations were
         # detached at dispatch and would otherwise run to completion and wake the session later.
@@ -668,11 +675,25 @@ class GatewayAgentCacheMixin:
             # against a session /new just closed is decided where it is processed
             # (_resolve_async_delegation_session fails closed), not here.
             parked = adapter.get_pending_message(session_key)
-            from gateway import queue_mgmt as _qm
-            if parked is not None and not _qm.is_system_event(self, parked):
-                # Only /new|/reset reach here with a user item (stop reasons held it above): it is
-                # dropped with the conversation, so count it for the reset reply (spec D21/I8).
-                _qm.note_reset_drop(self, session_key, 1)
+            _reseated = False
+            _is_user_item = parked is not None and not getattr(parked, "internal", False) \
+                and not self._is_goal_continuation_event(parked)
+            if _is_user_item and (_reason.startswith("stop_command") or _reason == "queue_run"):
+                # The hold above should have moved it; if it did not (hold failed), never drop it:
+                # put it back so it still runs (spec D5: queued prompts are never dropped by /stop).
+                # Re-seat via the overflow HEAD (not the slot): the wake promotion below may claim the
+                # slot, and a direct slot write here would be overwritten by it.
+                logger.warning("queue item still in slot after /stop hold for %s; re-seating it", session_key)
+                self._session_state(session_key).conversation.queued_events.insert(0, parked)
+                parked = None
+                _reseated = True
+            elif _is_user_item:
+                # /new | /reset drop it with the conversation; count it for the reply (spec D21/I8).
+                try:
+                    from gateway import queue_mgmt as _qm
+                    _qm.note_reset_drop(self, session_key, 1)
+                except Exception:
+                    logger.warning("reset-drop count skipped for %s", session_key, exc_info=True)
             wake = parked if getattr(parked, "internal", False) else None
             if wake is None:
                 overflow = self._overflow_queue(session_key) or []
@@ -681,6 +702,11 @@ class GatewayAgentCacheMixin:
                     overflow.remove(wake)
             if wake is not None:
                 adapter._pending_messages[session_key] = wake
+            elif _reseated and session_key not in adapter._pending_messages:
+                # Hold-failure fallback only: keep slot = item 1 for the re-seated user item.
+                _ov = self._overflow_queue(session_key) or []
+                if _ov:
+                    adapter._pending_messages[session_key] = _ov.pop(0)
         if state is not None:
             state.persistent.pending_command_text = None
         if release_running_state:

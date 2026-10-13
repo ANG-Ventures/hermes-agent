@@ -804,6 +804,7 @@ gateway:
     empty: "Tou is leeg."
     list_header: "Tou ({count} hangend):"
     held_header: "Tou ({count} teruggehou ná /stop; niks loop tot /queue run nie):"
+    active_after_held: "Wag ook ({count}), nie teruggehou nie; dit loop ná die huidige beurt:"
     item: "{index}. {preview}"
     item_system: "{index}. [system] {preview}"
     list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"
