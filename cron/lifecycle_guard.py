@@ -1925,12 +1925,20 @@ _LINE_FEEDS_EXECUTOR_RE = re.compile(
 
 
 def _unquoted_view(text: str) -> str:
-    """*text* with the inside of every quoted span blanked (same length, quotes kept)."""
+    """*text* with the inside of every quoted span and every comment blanked (same length, quotes
+    kept). A comment is not shell text: its apostrophe (`# it's`) must not open a quote over the
+    commands after it (Prism 707a77ad on #1954)."""
     out: list[str] = []
     q = None
     i = 0
     while i < len(text):
         c = text[i]
+        if not q and c == "#" and (i == 0 or text[i - 1] in " \t\n;&|()"):
+            end = text.find("\n", i)
+            end = len(text) if end == -1 else end
+            out.append(" " * (end - i))
+            i = end
+            continue
         if q:
             if c == q:
                 q = None
@@ -1994,151 +2002,260 @@ def _drop_heredoc_bodies(text: str) -> str:
 # `nohup`, `timeout 5`, `exec`, `command`) are peeled first, so `| env bash` is `| bash`
 # (Prism 7bdfbaaa on #1917, t_9c269c34: the three pipe regexes only knew `| [sudo ]<shell>`).
 _STAGE_EXECUTORS = frozenset({"source", "."})
-_PIPE_CONTINUATION_RE = re.compile(r"(\|&?)[ \t]*(?:#[^\n]*)?\r?\n")
+
+# ONE shell lexer behind every pipe / group / compound / heredoc-receiver rule. Four review rounds
+# on agent#1954 each found a shape a hand-rolled text splitter lost: `2>&1` read as a control `&`,
+# `fi` as an ARGUMENT closing an `if`, an apostrophe in a comment opening a quote, `# }` closing a
+# group (Apollo r3, t_9c269c34). Tokens: ("word", value with quotes removed), ("op", control
+# operator or "\n"), ("redir", redirection operator with its fd prefix; its target is the next
+# word). Comments are dropped; heredoc bodies are skipped at the newline ending their opener.
+_LEX_CONTROL_OPS = (";;&", "&&", "||", "|&", ";;", ";&", ";", "&", "|", "(", ")")
+_LEX_REDIRECT_OPS = ("&>>", "<<<", "<<-", "<<", "<>", "<&", ">>", ">&", ">|", "&>", "<", ">")
+_LEX_WORD_BREAK = frozenset(" \t\r\n;&|()<>")
+_LEX_FD_PREFIX_RE = re.compile(r"\d+(?=[<>])")
+_LEX_CASE_ARM_OPS = frozenset({";;", ";&", ";;&"})
+_LEX_COMPOUND_OPENERS = frozenset({"if", "while", "until", "for", "select", "case", "{"})
+_LEX_COMPOUND_CLOSERS = frozenset({"fi", "done", "esac", "}"})
+_LEX_LEAD_WORDS = frozenset({"then", "do", "else", "elif", "!", "time"})
 
 
-# A redirection word: `[n]>f`, `>>f`, `&>f`, `2>&1`, `<f`, `<>f`, `>|f`, or the bare operator whose
-# target is the NEXT word (`> /tmp/o`). It may precede the command word (`| 2>/dev/null bash`).
-_REDIRECTION_WORD_RE = re.compile(r"^(?:\d+|&)?(?:>>|>&|>\||<>|<<<|<<-?|<&|>|<)(?P<target>.*)$", re.DOTALL)
-# Reserved words that open or continue a compound command; the command they run follows them
-# (`| if true; then bash; fi`, Prism 7f7a1d3f on #1954).
-_COMPOUND_LEAD_WORDS = frozenset({"if", "then", "else", "elif", "while", "until", "do", "!", "time", "{", "("})
-_COMPOUND_OPENERS = frozenset({"if", "while", "until", "for", "case", "select"})
-_COMPOUND_CLOSERS = frozenset({"fi", "done", "esac"})
-
-
-def _strip_redirections(tokens: list[str]) -> list[str]:
-    """*tokens* without redirection words (and the separate target of a bare operator)."""
-    out: list[str] = []
-    skip = False
-    for token in tokens:
-        if skip:
-            skip = False
-            continue
-        match = _REDIRECTION_WORD_RE.match(token) if token else None
-        if match is not None:
-            skip = not match.group("target")
-            continue
-        if token:
-            out.append(token)
-    return out
-
-
-def _stage_is_executor(stage: str) -> bool:
-    """The pipeline stage *stage* (its own text, no control operators) runs its stdin. Leading
-    redirections (Prism b74a2fa3 r2: `| 2>/dev/null bash`) and compound reserved words are skipped."""
-    try:
-        tokens = shlex.split(stage, posix=True)
-    except ValueError:
-        tokens = stage.split()
-    tokens = _strip_redirections(tokens)
-    while tokens and tokens[0] in _COMPOUND_LEAD_WORDS:
-        tokens = tokens[1:]
-    index = _command_token_index(tokens)
-    if index is None:
-        return False
-    index = _peel_transparent_prefixes(tokens, index)
-    if index >= len(tokens):
-        return _executable_name(tokens[-1]) in _TRANSPARENT_COMMAND_PREFIXES  # `| sudo` alone
-    name = _executable_name(tokens[index]).lower()
-    return bool(name in _ARGUMENT_REPARSERS or name in _STAGE_EXECUTORS or _REPARSER_NAME_RE.match(name))
-
-
-def _group_extent(view: str, start: int) -> int:
-    """End index (exclusive) of the `( … )` / `{ …; }` group opening at *view*[start]; the end of
-    *view* when it never closes."""
-    depth = 0
-    for i in range(start, len(view)):
-        ch = view[i]
-        if ch in "({":
+def _skip_balanced(text: str, i: int) -> int:
+    """Index just past the `)` matching the `(` at *text*[i], quotes respected; len(text) if none."""
+    depth, quote = 0, None
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == quote:
+                quote = None
+            elif c == "\\" and quote == '"':
+                i += 1
+        elif c in _OPENING_QUOTES:
+            quote = c
+        elif c == "\\":
+            i += 1
+        elif c == "(":
             depth += 1
-        elif ch in ")}":
+        elif c == ")":
             depth -= 1
             if depth == 0:
                 return i + 1
-    return len(view)
+        i += 1
+    return len(text)
 
 
-def _group_body_executes(body: str) -> bool:
-    """Some command inside a grouped stage runs the shared stdin: every command in `( … )` or
-    `{ …; }` reads the pipe, so `| (bash)`, `| { cd /tmp; bash; }` execute it (Prism b74a2fa3,
-    Apollo r1 on agent#1954). Braces are blanked; a paren ends a stage, so a case pattern's `)`
-    starts one (`| case x in x) bash;; esac`, Prism 7f7a1d3f)."""
-    body, view = _blank_comments(body, _unquoted_view(body))
-    flat = "".join(" " if v in "{}" else "\n" if v in "()" else c for c, v in zip(body, view))
-    pos = 0
-    for stop in [*(m.start() for m in re.finditer(r"[;&|\n]", _unquoted_view(flat))), len(flat)]:
-        if _stage_is_executor(flat[pos:stop]):
-            return True
-        pos = stop + 1
-    return False
+def _lex_word(text: str, i: int) -> tuple[str, int]:
+    """The shell word starting at *text*[i] with its quoting removed, and the index after it."""
+    n, buf = len(text), []
+    while i < n and text[i] not in _LEX_WORD_BREAK:
+        c = text[i]
+        if c == "\\":
+            if i + 1 < n and text[i + 1] != "\n":
+                buf.append(text[i + 1])
+            i += 2
+        elif c == "'":
+            end = text.find("'", i + 1)
+            end = n if end == -1 else end
+            buf.append(text[i + 1:end])
+            i = end + 1
+        elif c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\" and i + 1 < n:
+                    buf.append(text[i + 1])
+                    i += 2
+                elif text.startswith("$(", i):
+                    end = _skip_balanced(text, i + 1)
+                    buf.append(text[i:end])
+                    i = end
+                else:
+                    buf.append(text[i])
+                    i += 1
+            i += 1
+        elif text.startswith("$(", i):
+            end = _skip_balanced(text, i + 1)
+            buf.append(text[i:end])
+            i = end
+        elif c == "`":
+            end = text.find("`", i + 1)
+            end = n if end == -1 else end
+            buf.append(text[i:end + 1])
+            i = end + 1
+        else:
+            buf.append(c)
+            i += 1
+    return "".join(buf), i
 
 
-def _blank_comments(text: str, view: str) -> tuple[str, str]:
-    """*text* and its unquoted *view* with every shell comment (`#` at a word start, outside quotes,
-    to end of line) blanked, same length: a `# }` must not close a group (Prism 5d269848 on #1954)."""
-    chars, vchars = list(text), list(view)
-    for match in re.finditer(r"(?:(?<=^)|(?<=[\s;&|()]))#[^\n]*", view, re.MULTILINE):
-        for k in range(match.start(), match.end()):
-            chars[k] = vchars[k] = " "
-    return "".join(chars), "".join(vchars)
+def _lex_shell(text: str) -> list[tuple[str, str]]:
+    """*text* as shell tokens (see `_LEX_CONTROL_OPS`)."""
+    tokens: list[tuple[str, str]] = []
+    pending: list[tuple[str, bool]] = []   # heredoc (delimiter, strip tabs) awaiting a body
+    heredoc_op: Optional[str] = None
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r":
+            i += 1
+        elif c == "\\" and text.startswith("\n", i + 1):
+            i += 2
+        elif c == "#":
+            end = text.find("\n", i)
+            i = n if end == -1 else end
+        elif c == "\n":
+            tokens.append(("op", "\n"))
+            i += 1
+            for delimiter, strip_tabs in pending:
+                while i < n:
+                    end = text.find("\n", i)
+                    line = text[i:] if end == -1 else text[i:end]
+                    i = n if end == -1 else end + 1
+                    if (line.lstrip("\t") if strip_tabs else line).strip() == delimiter:
+                        break
+            pending.clear()
+        elif text.startswith(("<(", ">("), i):
+            end = _skip_balanced(text, i + 1)
+            tokens.append(("word", text[i:end]))
+            i = end
+        else:
+            fd = _LEX_FD_PREFIX_RE.match(text, i)
+            at = fd.end() if fd else i
+            redirect = next((o for o in _LEX_REDIRECT_OPS if text.startswith(o, at)), None)
+            control = None if redirect else next((o for o in _LEX_CONTROL_OPS if text.startswith(o, i)), None)
+            if redirect is not None:
+                tokens.append(("redir", text[i:at] + redirect))
+                heredoc_op = redirect if redirect in ("<<", "<<-") else None
+                i = at + len(redirect)
+            elif control is not None:
+                tokens.append(("op", control))
+                i += len(control)
+            else:
+                word, i = _lex_word(text, i)
+                if heredoc_op is not None:
+                    pending.append((word, heredoc_op == "<<-"))
+                    heredoc_op = None
+                tokens.append(("word", word))
+    return tokens
 
 
-def _compound_extent(view: str, start: int) -> int:
-    """End index (exclusive) of the compound command (`if … fi`, `while … done`, `case … esac`)
-    whose opening reserved word starts at *view*[start]; the end of *view* when it never closes."""
-    depth = 0
-    for match in re.finditer(r"[^\s;&|()]+", view[start:]):
-        word = match.group()
-        if word in _COMPOUND_OPENERS:
-            depth += 1
-        elif word in _COMPOUND_CLOSERS:
-            depth -= 1
-            if depth <= 0:
-                return start + match.end()
-    return len(view)
+def _element_commands(tokens: list[tuple[str, str]], start: int) -> list[list[str]]:
+    """Every simple command (words, redirections dropped) of the pipeline element that starts at
+    *tokens*[start]: one simple command, or a whole `( … )`, `{ …; }`, if / while / until / for /
+    select / case compound with every command in its body (Prism 7f7a1d3f, b74a2fa3). Reserved
+    words count only at command position, so `| if true; then echo fi; bash; fi` keeps `bash`
+    inside the `if` (Prism 3a48713a on #1954)."""
+    commands: list[list[str]] = []
+    words: list[str] = []
+    stack: list[str] = []
+    command_position, header, pattern = True, False, False
+    i = start
+    while i < len(tokens):
+        kind, value = tokens[i]
+        i += 1
+        if pattern:   # a case arm's pattern list, up to its `)`; `esac` closes the case
+            if kind == "op" and value == ")":
+                pattern, command_position = False, True
+            elif kind == "word" and value == "esac":
+                pattern = False
+                stack.pop()
+                if not stack:
+                    return commands
+                command_position = False
+            continue
+        if kind == "redir":
+            i += 1   # skip its target word
+            continue
+        if kind == "op":
+            if words:
+                commands.append(words)
+                words = []
+            if value == "(":
+                stack.append("(")
+            elif value == ")":
+                if not stack or stack[-1] != "(":
+                    return commands
+                stack.pop()
+                if not stack:
+                    return commands
+                command_position = False
+                continue
+            elif value in _LEX_CASE_ARM_OPS:
+                pattern = bool(stack) and stack[-1] == "case"
+            elif not stack:
+                return commands
+            header, command_position = False, True
+            continue
+        if header:   # `for x in a b`, `case x in`: the words are not commands
+            if value == "in" and stack[-1] == "case":
+                header, pattern = False, True
+            continue
+        if command_position:
+            if value in _LEX_COMPOUND_OPENERS:
+                stack.append(value)
+                header = value in ("for", "select", "case")
+                continue
+            if value in _LEX_COMPOUND_CLOSERS:
+                if stack:
+                    stack.pop()
+                if not stack:
+                    return commands
+                command_position = False
+                continue
+            if value in _LEX_LEAD_WORDS:
+                continue
+        words.append(value)
+        command_position = False
+    if words:
+        commands.append(words)
+    return commands
+
+
+def _words_execute(words: list[str]) -> bool:
+    """The simple command *words* runs its stdin (a shell, an interpreter, `source`, `xargs`)."""
+    index = _command_token_index(words)
+    if index is None:
+        return False
+    index = _peel_transparent_prefixes(words, index)
+    if index >= len(words):
+        return _executable_name(words[-1]) in _TRANSPARENT_COMMAND_PREFIXES  # `| sudo` alone
+    name = _executable_name(words[index]).lower()
+    return bool(name in _ARGUMENT_REPARSERS or name in _STAGE_EXECUTORS or _REPARSER_NAME_RE.match(name))
 
 
 def _feeds_executor(text: str) -> bool:
-    """Some pipe in *text* (a trailing `|` continues the pipeline onto the next line, Prism
-    31197de5) hands its stream to an executor stage: bare, inside a `( … )` / `{ …; }` group, or
-    in the body of a compound command (`| if …; then bash; fi`). Heredoc bodies and comments are
-    not shell text."""
-    joined = _PIPE_CONTINUATION_RE.sub(r"\1 ", _drop_heredoc_bodies(text))
-    joined, view = _blank_comments(joined, _unquoted_view(joined))
-    for match in re.finditer(r"(?<!\|)\|(?!\|)&?", view):
-        rest = view[match.end():]
-        lead = len(rest) - len(rest.lstrip(" \t"))
-        start = match.end() + lead
-        first = re.match(r"[^\s;&|()]+", rest[lead:])
-        if rest[lead:lead + 1] in ("(", "{") or (first and first.group() in _COMPOUND_OPENERS):
-            end = (_group_extent(view, start) if rest[lead:lead + 1] in ("(", "{")
-                   else _compound_extent(view, start))
-            if _group_body_executes(joined[start:end]):
-                return True
+    """Some pipe in *text* hands its stream to an executor: a bare stage, a stage behind
+    redirections (`| 2>&1 bash`, Prism 974f0b3f), or any command inside a grouped or compound
+    stage. A pipe continues across newlines and comments (Prism 31197de5, 707a77ad)."""
+    tokens = _lex_shell(text)
+    for k, (kind, value) in enumerate(tokens):
+        if kind != "op" or value not in ("|", "|&"):
             continue
-        stop = re.search(r"[;&|\n)]", rest)
-        end = match.end() + (stop.start() if stop else len(rest))
-        if _stage_is_executor(joined[match.end():end]):
+        j = k + 1
+        while j < len(tokens) and tokens[j] == ("op", "\n"):
+            j += 1
+        if any(_words_execute(words) for words in _element_commands(tokens, j)):
             return True
     return False
+
+
+def _ends_in_pipe(line: str) -> bool:
+    tokens = _lex_shell(line)
+    return bool(tokens) and tokens[-1][0] == "op" and tokens[-1][1] in ("|", "|&")
 
 
 def _heredoc_receiver_executes(line: str, at: int) -> bool:
     """The command receiving the heredoc opened at *at* on *line* is a SHELL-like executor
-    (`env bash <<EOF`, `sudo -u x sh <<EOF`). A Python body is not shell text: it is scanned by
-    the AST path in `_contains_unsafe_gateway_action`, so python receivers are left to it."""
-    view = _unquoted_view(line[:at])
-    start = max(view.rfind(c) for c in ";&|(") + 1
-    stage = line[start:at]
-    try:
-        tokens = shlex.split(stage, posix=True)
-    except ValueError:
-        tokens = stage.split()
-    index = _executed_command_index(tokens)
-    if index is not None and re.match(r"^pythonw?[\d.]*$", _executable_name(tokens[index]).lower()):
-        return False
-    return _stage_is_executor(stage)
+    (`env bash <<EOF`, `sudo -u x sh <<EOF`, `bash 2>&1 <<EOF`). A Python body is not shell text:
+    it is scanned by the AST path in `_contains_unsafe_gateway_action`, so python receivers are
+    left to it."""
+    tokens = _lex_shell(line[:at])
+    start = max((k + 1 for k, (kind, value) in enumerate(tokens)
+                 if kind == "op" and value not in ("(", ")")), default=0)
+    for words in _element_commands(tokens, start):
+        index = _executed_command_index(words)
+        if index is not None and re.match(r"^pythonw?[\d.]*$", _executable_name(words[index]).lower()):
+            return False
+        return _words_execute(words)
+    return False
 
 
 def _writes_then_runs(text: str) -> bool:
@@ -2231,7 +2348,9 @@ _CONTENT_ARGUMENT_COMMANDS = frozenset({
 # value something else later runs.
 _CONTENT_ARGUMENT_SUBCOMMANDS = {
     "hermes": frozenset({"kanban"}),
-    "git": frozenset({"commit", "tag", "log", "show", "grep", "notes"}),
+    # `git grep -O<cmd>` / `--open-files-in-pager` (any unique abbreviation) runs a program and
+    # `git log|show --output=` writes a file: not content consumers (Prism 22612976 P0 on #1954).
+    "git": frozenset({"commit", "tag", "notes"}),
     "gh": frozenset({"pr", "issue", "release", "api"}),
 }
 
@@ -2410,9 +2529,7 @@ def _mask_heredoc_bodies(text: str) -> str:
             line, match.start())
         # A `|` after the opener continues the pipeline on the line AFTER the terminator
         # (`cat <<'EOF' |` … `EOF` / `bash`, Prism a3c0cfc0 on #1954): judge the whole rest.
-        pipeline = line
-        if re.search(r"\|&?\s*$", _blank_comments(line, _unquoted_view(line))[1]):
-            pipeline = "\n".join(lines[i - 1:])
+        pipeline = "\n".join(lines[i - 1:]) if _ends_in_pipe(line) else line
         piped_to_interpreter = bool(_PIPE_TO_INTERPRETER.search(line)) or _feeds_executor(pipeline)
         expands = (not quoted) and any(
             marker in "\n".join(body) for marker in ("$(", "`")

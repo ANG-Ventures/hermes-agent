@@ -177,3 +177,39 @@ def test_pipe_stage_parser_r2_shapes_block(command):
 ])
 def test_pipe_stage_parser_r2_controls_pass(command):
     assert not _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
+    # 22612976 (P0): git grep runs `-O<cmd>` / `--open-files-in-pager` (any unique abbreviation);
+    # git log/show `--output=` writes a file a later segment runs
+    f"git grep --open-files-in-pager='{BOOTOUT}' x",
+    f"git grep --open='{BOOTOUT}' x",
+    f"git log --output=/tmp/o.sh --format='{BOOTOUT}' -1; bash /tmp/o.sh",
+    # 974f0b3f: fd-duplication before the executor is a redirection, not a control `&`
+    f"echo '{BOOTOUT}' | 2>&1 bash",
+    f"echo '{BOOTOUT}' | >&2 bash",
+    f"echo '{BOOTOUT}' | &>/dev/null bash",
+    f"echo '{BOOTOUT}' |& 2>&1 sh",
+    f"echo '{BOOTOUT}' | (2>&1 bash)",
+    # 3a48713a: reserved words close a compound only at command position
+    f"echo '{BOOTOUT}' | if true; then echo fi; bash; fi",
+    f"echo '{BOOTOUT}' | while true; do echo done; bash; break; done",
+    f"echo '{BOOTOUT}' | case x in x) echo esac; bash;; esac",
+    f"echo '{BOOTOUT}' | {{ echo }}; bash; }}",
+    # 707a77ad: an apostrophe in a comment does not open a quote over the next line
+    f"echo x # it's\nprintf '{BOOTOUT}' > /tmp/x.sh; bash /tmp/x.sh",
+])
+def test_shell_lexer_r3_shapes_block(command):
+    assert _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
+    # the `if` closes at its second `fi`; the trailing bash does not read the pipe
+    f"echo '{BOOTOUT}' | if true; then echo fi; fi",
+    f"echo '{BOOTOUT}' | 2>&1 cat",
+    f"echo '{BOOTOUT}' # it's a note",
+    f"echo '{BOOTOUT}' | {{ # bash\n cat; }}",
+    f"cat <<'EOF' | wc -l\n{BOOTOUT}\nEOF",
+])
+def test_shell_lexer_r3_controls_pass(command):
+    assert not _blocked(command)
