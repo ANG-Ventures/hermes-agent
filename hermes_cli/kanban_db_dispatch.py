@@ -4570,6 +4570,52 @@ def _capability_tick(pool_config):
         return None
 
 
+def _record_legacy_routes(conn, rows, result) -> None:
+    """``legacy_route {need, lane, reason}`` once per (card, need, lane) for every
+    ``browser:*`` need this tick (t_ecfd5591, browser spec v1.2 s3.3). With
+    ``migrated_lanes = []`` every browser need is one; the route is unchanged.
+    Best-effort: never breaks a tick."""
+    try:
+        from hermes_cli import kanban_needs as _kn
+        reg = None
+        with _kbc.write_txn(conn):
+            for row in rows:
+                needs = _kn.declared_resources(row["body"])
+                if not needs:
+                    continue
+                if reg is None:
+                    reg = _kn.load_registry(_kb.kanban_home() / "fleet")
+                try:
+                    skills = json.loads(row["skills"] or "[]") or []
+                except (TypeError, ValueError):
+                    skills = []
+                lane = _kn.lane_of(skills, row["body"], reg)
+                for need in needs:
+                    verdict = _kn.resolve(need, lane, reg)
+                    if isinstance(verdict, _kn.Refusal):
+                        continue   # resolution is P1-4's (t_42728faf); this card resolves nothing
+                    result.placement_caps.setdefault(row["id"], {})["legacy_route"] = verdict
+                    if conn.execute(
+                            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+                            "AND json_extract(payload, '$.need') = ? AND json_extract(payload, '$.lane') = ? LIMIT 1",
+                            (row["id"], _kn.LEGACY_ROUTE_EVENT, need, lane)).fetchone() is None:
+                        _kb._append_event(conn, row["id"], _kn.LEGACY_ROUTE_EVENT, verdict)
+    except Exception:
+        _kb._log.warning("kanban dispatch: could not record legacy_route events", exc_info=True)
+
+
+def _attached_skill_gap(row, host: str, caps) -> Optional[str]:
+    """Layer 0b: the enforced capability an attached skill needs that ``host``
+    lacks (t_ecfd5591, F14), or None. Never raises."""
+    try:
+        from hermes_cli import kanban_placement_failfast as _pff
+        skills = json.loads(row["skills"] or "[]") or []
+        return _pff.attached_skill_gap(skills, host, caps)
+    except Exception:
+        _kb._log.debug("kanban dispatch: layer 0b check failed open", exc_info=True)
+        return None
+
+
 def _caps_into_result(result, caps, caps_out: dict) -> None:
     """Surface the capability layer's non-route observations on the result
     (the dry-run column reads them)."""
@@ -6102,6 +6148,18 @@ def _dispatch_once_locked(
             if placed_host is None:
                 result.placement_waits[row["id"]] = spillover.refusal or "pool_full"
                 continue
+            # Layer 0b (t_ecfd5591, F14): never spawn a card whose ATTACHED skills need
+            # an enforced capability the chosen host lacks (a stale route's belt).
+            _gap = _attached_skill_gap(row, placed_host.name, _caps)
+            if _gap is not None:
+                spillover.release(placed_host, _rid)
+                result.placement_waits[row["id"]] = f"requires:{_gap}+layer0b:{placed_host.name}"
+                result.placement_caps.setdefault(row["id"], {})["layer0b"] = f"{placed_host.name} lacks {_gap}"
+                if not dry_run:
+                    with _kbc.write_txn(conn):
+                        _kb._append_event(conn, row["id"], "placement_gate_refused",
+                                          {"layer": "0b", "host": placed_host.name, "cap": _gap})
+                continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             charge_pool(row["id"])
@@ -6336,6 +6394,7 @@ def _dispatch_once_locked(
         record_affinity_events(conn, result, _affinity_evaluated, _affinity_reached)
         _khc.record_capability_events(conn, result, _caps, _caps_out, _affinity_evaluated,
                                       _cap_comments)
+        _record_legacy_routes(conn, ready_rows, result)
     _record_placement_waits(conn, result, row_route, dry_run, _wait_reached)
     result.rows_routed = len(ready_rows)
     result.portable_waiting = sum(
@@ -7261,6 +7320,13 @@ def _default_spawn(
         _kb._kwh.apply_placement(
             env, placement, workspace, run_id=task.current_run_id,
             log_file=str(_kb.worker_log_path(task.id, board=board)))
+        # Layer 0 inputs (t_ecfd5591, F1): the card's hard requirements and the
+        # route hash, so the worker can tell a stale route at boot.
+        try:
+            from hermes_cli import kanban_placement_failfast as _pff
+            _pff.stamp_placement(env, task, _kb.kanban_home() / "fleet")
+        except Exception:
+            _kb._log.debug("kanban dispatch: placement record stamp failed", exc_info=True)
 
     cmd = [
         *_resolve_hermes_argv(),

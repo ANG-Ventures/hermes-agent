@@ -732,6 +732,14 @@ def _skill_view_with_bump(args, **kw):
     # possibly-pruned transcript copy (#95976). No dedup in the fork; None also keeps its views
     # out of the parent's bucket.
     dedup_task_id = None if is_background_review() else task_id
+    # Layer 1 (t_ecfd5591, F14): a placed worker loading a skill its host cannot serve gets
+    # the ABSENT line, recorded so the turn loop ends the run. Only here, in the model's
+    # tool handler: the --skills preload calls skill_view() directly and is gated at boot.
+    from hermes_cli.kanban_placement_failfast import skill_gate
+    if (absent := skill_gate(name)) is not None:
+        from tools.rail_preflight import record_absent
+        record_absent(absent)
+        return tool_error(absent, success=False)
     if (stub := _check_skill_view_dedup(dedup_task_id, name, args.get("file_path"))) is not None:
         return stub
     result = skill_view(name, file_path=args.get("file_path"), task_id=task_id)

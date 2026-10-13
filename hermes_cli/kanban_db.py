@@ -12219,8 +12219,13 @@ def block_task(
     expected_run_id: Optional[int] = None,
     until: Optional[int] = None,
     require_unclaimed_ready: bool = False,
+    loop_breaker: bool = True,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+
+    ``loop_breaker=False``: the caller already decided this block from its own
+    ledger (the placement re-route, t_ecfd5591 F1), so a recurrence never
+    routes the card to ``triage``; it lands ``blocked`` like a first block.
 
     ``require_unclaimed_ready`` fences a caller acting on a stale snapshot
     (the dispatcher's post-loop parking, t_8c474c2e): the block happens only
@@ -12427,7 +12432,7 @@ def block_task(
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
 
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
+        if loop_breaker and recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
             cur = conn.execute(

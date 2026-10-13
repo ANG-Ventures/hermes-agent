@@ -572,6 +572,15 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
             # No exit trailer: the task log now belongs to the run that replaced this one.
             print(t("cli.single_query.kanban_run_reclaimed"), file=sys.stderr)
             sys.exit(0)
+        # Layer 0 (t_ecfd5591, F1): a placed worker whose host lacks an enforced hard
+        # requirement ends here, before the first model call (and before the --skills
+        # preload is folded in, F14).
+        from hermes_cli import kanban_placement_failfast as _pff
+        from agent.delegation_context import owned_kanban_task
+        if (_task := owned_kanban_task()) and (_absent := _pff.boot_check(_task)) is not None:
+            print(_absent, file=sys.stderr)
+            _pff.worker_exit_on_absent(_absent)
+            exit_single_query(0)
     if not cli._claim_active_session("cli", stderr=bool(quiet)):
         exit_single_query(1)
     try:

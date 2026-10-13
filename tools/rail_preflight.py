@@ -116,7 +116,34 @@ def _endpoint_answers(cdp_url: str) -> bool:
     return ok
 
 
+_RAIL_CAP = {"BROWSER": "browser-session", "SCREEN": "screen"}
+
+
 def _emit(task: str, message: str) -> str:
+    """Record ``message`` for the owning worker's turn loop to act on (park or re-route).
+
+    ``KANBAN_PLACEMENT_CAPS`` (F5, t_ecfd5591): when the dispatcher set it and this
+    rail's capability is not ``enforce``, the tool call is still refused (the operator's
+    browser/screen is not on this host either way) but nothing is recorded, so a
+    warn/off capability never blocks or re-routes the card. Absent = enforce (#1876).
+    """
+    from hermes_cli import kanban_placement_failfast as pff
+    modes = pff.caps_modes()
+    cap = _RAIL_CAP.get(message.split("_", 1)[0])
+    if modes and cap and not pff.enforced(cap, modes):
+        pff.note_gate_warn(cap, message, modes)
+        return message
+    with _lock:
+        _emitted.setdefault(task, message)
+    return message
+
+
+def record_absent(message: str) -> Optional[str]:
+    """Record a ``<CAP>_ABSENT`` line from another gate (the mid-run skill_view gate) for the
+    owning worker's turn loop; None outside a dispatcher-owned worker."""
+    task = _owned_task()
+    if not task:
+        return None
     with _lock:
         _emitted.setdefault(task, message)
     return message
