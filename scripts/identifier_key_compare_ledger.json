@@ -297,15 +297,10 @@
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
    "where": "hermes_cli/kanban_open_pr.py:302 open_pr_refs"
   },
-  "hermes_cli/kanban_open_pr.py::open_pr_refs::fold::repo::return [r for r in opened + unverified if (r.repo.lower(), r.number) in declared]": {
+  "hermes_cli/kanban_open_pr.py::open_pr_refs::fold::repo::return kept + [r for r in unverified if (r.repo.lower(), r.number) in declared]": {
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
-   "where": "hermes_cli/kanban_open_pr.py:297 open_pr_refs"
-  },
-  "hermes_cli/kanban_open_pr.py::open_pr_refs::fold::repo::unowned.extend(r for r in opened if (r.repo.lower(), r.number) not in declared)": {
-   "verdict": "kept",
-   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
-   "where": "hermes_cli/kanban_open_pr.py:296 open_pr_refs"
+   "where": "hermes_cli/kanban_open_pr.py:312 open_pr_refs"
   },
   "hermes_cli/kanban_open_pr.py::routed_prs_still_open::fold::repo::named = {(r.repo.lower(), r.number) for r in extract_pr_refs(survivor_pr=survivor_pr)}": {
    "verdict": "kept",
