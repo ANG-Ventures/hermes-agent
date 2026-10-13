@@ -2137,19 +2137,59 @@ def _lex_shell(text: str) -> list[tuple[str, str]]:
     return tokens
 
 
+def _function_definition_body(tokens: list[tuple[str, str]], i: int) -> Optional[int]:
+    """Index of the body when *tokens*[i] (at command position) starts a function definition:
+    `name()`, `function name`, `function name()`; None otherwise."""
+    if tokens[i][0] != "word":
+        return None
+    if tokens[i][1] == "function" and i + 1 < len(tokens) and tokens[i + 1][0] == "word":
+        j = i + 2
+        if tokens[j:j + 2] == [("op", "("), ("op", ")")]:
+            j += 2
+    elif tokens[i + 1:i + 3] == [("op", "("), ("op", ")")]:
+        j = i + 3
+    else:
+        return None
+    while j < len(tokens) and tokens[j] == ("op", "\n"):
+        j += 1
+    return j
+
+
+def _shell_functions(tokens: list[tuple[str, str]]) -> dict[str, list[list[str]]]:
+    """Every function defined anywhere in *tokens*: name -> the simple commands of its body. Two
+    definitions of one name are merged; the guard cannot tell which one a call reaches."""
+    functions: dict[str, list[list[str]]] = {}
+    for k, (kind, value) in enumerate(tokens):
+        at_command = k == 0 or tokens[k - 1][0] == "op" or tokens[k - 1][1] in _LEX_LEAD_WORDS
+        body = _function_definition_body(tokens, k) if at_command else None
+        if body is not None:
+            name = tokens[k + 1][1] if value == "function" else value
+            functions.setdefault(name, []).extend(_element_span(tokens, body)[0])
+    return functions
+
+
 def _element_commands(tokens: list[tuple[str, str]], start: int) -> list[list[str]]:
+    return _element_span(tokens, start)[0]
+
+
+def _element_span(tokens: list[tuple[str, str]], start: int) -> tuple[list[list[str]], int]:
     """Every simple command (words, redirections dropped) of the pipeline element that starts at
-    *tokens*[start]: one simple command, or a whole `( … )`, `{ …; }`, if / while / until / for /
-    select / case compound with every command in its body (Prism 7f7a1d3f, b74a2fa3). Reserved
-    words count only at command position, so `| if true; then echo fi; bash; fi` keeps `bash`
-    inside the `if` (Prism 3a48713a on #1954)."""
+    *tokens*[start], and the index of the token that ends it (the unconsumed control operator, or
+    len(tokens)). An element is one simple command, or a whole `( … )`, `{ …; }`, if / while /
+    until / for / select / case compound with every command in its body, trailing redirections
+    included (Prism 7f7a1d3f, b74a2fa3). Reserved words count only at command position, so
+    `| if true; then echo fi; bash; fi` keeps `bash` inside the `if` (Prism 3a48713a on #1954). A
+    function definition's body is walked as part of the element: `| { f() { bash; }; f; }` runs
+    the pipe through bash (Prism e7cf8c08 on #1954)."""
     commands: list[list[str]] = []
     words: list[str] = []
     stack: list[str] = []
-    command_position, header, pattern = True, False, False
+    command_position, header, pattern, closed = True, False, False, False
     i = start
     while i < len(tokens):
         kind, value = tokens[i]
+        if closed and kind != "redir":   # a closed compound takes only trailing redirections
+            return commands, i
         i += 1
         if pattern:   # a case arm's pattern list, up to its `)`; `esac` closes the case
             if kind == "op" and value == ")":
@@ -2157,8 +2197,7 @@ def _element_commands(tokens: list[tuple[str, str]], start: int) -> list[list[st
             elif kind == "word" and value == "esac":
                 pattern = False
                 stack.pop()
-                if not stack:
-                    return commands
+                closed = not stack
                 command_position = False
             continue
         if kind == "redir":
@@ -2172,16 +2211,15 @@ def _element_commands(tokens: list[tuple[str, str]], start: int) -> list[list[st
                 stack.append("(")
             elif value == ")":
                 if not stack or stack[-1] != "(":
-                    return commands
+                    return commands, i - 1
                 stack.pop()
-                if not stack:
-                    return commands
+                closed = not stack
                 command_position = False
                 continue
             elif value in _LEX_CASE_ARM_OPS:
                 pattern = bool(stack) and stack[-1] == "case"
             elif not stack:
-                return commands
+                return commands, i - 1
             header, command_position = False, True
             continue
         if header:   # `for x in a b`, `case x in`: the words are not commands
@@ -2189,6 +2227,10 @@ def _element_commands(tokens: list[tuple[str, str]], start: int) -> list[list[st
                 header, pattern = False, True
             continue
         if command_position:
+            body = _function_definition_body(tokens, i - 1)
+            if body is not None:
+                i = body   # the body (a compound) follows, at command position
+                continue
             if value in _LEX_COMPOUND_OPENERS:
                 stack.append(value)
                 header = value in ("for", "select", "case")
@@ -2196,8 +2238,7 @@ def _element_commands(tokens: list[tuple[str, str]], start: int) -> list[list[st
             if value in _LEX_COMPOUND_CLOSERS:
                 if stack:
                     stack.pop()
-                if not stack:
-                    return commands
+                closed = not stack
                 command_position = False
                 continue
             if value in _LEX_LEAD_WORDS:
@@ -2206,7 +2247,23 @@ def _element_commands(tokens: list[tuple[str, str]], start: int) -> list[list[st
         command_position = False
     if words:
         commands.append(words)
-    return commands
+    return commands, i
+
+
+def _commands_execute(commands: list[list[str]], functions: dict[str, list[list[str]]]) -> bool:
+    """Some command in *commands* runs its stdin: directly, or as a call to a function defined in
+    the same text whose body does (`f() { bash; }; echo … | f`, Prism e7cf8c08 on #1954)."""
+    pending, seen = list(commands), set()
+    while pending:
+        words = pending.pop()
+        if _words_execute(words):
+            return True
+        index = _command_token_index(words)
+        name = words[index] if index is not None else None
+        if name in functions and name not in seen:
+            seen.add(name)
+            pending.extend(functions[name])
+    return False
 
 
 def _words_execute(words: list[str]) -> bool:
@@ -2226,13 +2283,14 @@ def _feeds_executor(text: str) -> bool:
     redirections (`| 2>&1 bash`, Prism 974f0b3f), or any command inside a grouped or compound
     stage. A pipe continues across newlines and comments (Prism 31197de5, 707a77ad)."""
     tokens = _lex_shell(text)
+    functions = _shell_functions(tokens)
     for k, (kind, value) in enumerate(tokens):
         if kind != "op" or value not in ("|", "|&"):
             continue
         j = k + 1
         while j < len(tokens) and tokens[j] == ("op", "\n"):
             j += 1
-        if any(_words_execute(words) for words in _element_commands(tokens, j)):
+        if _commands_execute(_element_commands(tokens, j), functions):
             return True
     return False
 
@@ -2242,20 +2300,25 @@ def _ends_in_pipe(line: str) -> bool:
     return bool(tokens) and tokens[-1][0] == "op" and tokens[-1][1] in ("|", "|&")
 
 
-def _heredoc_receiver_executes(line: str, at: int) -> bool:
+def _heredoc_receiver_executes(text: str, at: int) -> bool:
     """The command receiving the heredoc opened at *at* on *line* is a SHELL-like executor
     (`env bash <<EOF`, `sudo -u x sh <<EOF`, `bash 2>&1 <<EOF`). A Python body is not shell text:
     it is scanned by the AST path in `_contains_unsafe_gateway_action`, so python receivers are
     left to it."""
-    tokens = _lex_shell(line[:at])
-    start = max((k + 1 for k, (kind, value) in enumerate(tokens)
-                 if kind == "op" and value not in ("(", ")")), default=0)
-    for words in _element_commands(tokens, start):
-        index = _executed_command_index(words)
-        if index is not None and re.match(r"^pythonw?[\d.]*$", _executable_name(words[index]).lower()):
+    tokens = _lex_shell(text[:at])
+    # The receiver is the WHOLE last element before the `<<`: `(bash; :) <<EOF` feeds the group,
+    # whose first command reads the body (Prism af4c69a0 on #1954), not just the `:` after the `;`.
+    start, commands = 0, []
+    while start < len(tokens):
+        commands, end = _element_span(tokens, start)
+        if end >= len(tokens):
+            break
+        start, commands = end + 1, []
+    if len(commands) == 1:
+        index = _executed_command_index(commands[0])
+        if index is not None and re.match(r"^pythonw?[\d.]*$", _executable_name(commands[0][index]).lower()):
             return False
-        return _words_execute(words)
-    return False
+    return _commands_execute(commands, _shell_functions(_lex_shell(text)))
 
 
 def _writes_then_runs(text: str) -> bool:
@@ -2525,8 +2588,10 @@ def _mask_heredoc_bodies(text: str) -> str:
         terminator = lines[end] if end < len(lines) else None
 
         # Fail-closed conditions: the body may actually be executed.
+        # Lex from the top so a function defined on an earlier line is known to the receiver.
+        before = "\n".join(lines[:i - 1] + [""])
         feeds_interpreter = bool(_HEREDOC_TO_INTERPRETER.search(line)) or _heredoc_receiver_executes(
-            line, match.start())
+            before + line, len(before) + match.start())
         # A `|` after the opener continues the pipeline on the line AFTER the terminator
         # (`cat <<'EOF' |` … `EOF` / `bash`, Prism a3c0cfc0 on #1954): judge the whole rest.
         pipeline = "\n".join(lines[i - 1:]) if _ends_in_pipe(line) else line

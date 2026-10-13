@@ -213,3 +213,30 @@ def test_shell_lexer_r3_shapes_block(command):
 ])
 def test_shell_lexer_r3_controls_pass(command):
     assert not _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
+    # af4c69a0: a heredoc into a group or compound is read by the group's first executor,
+    # not only by the command after its last `;`
+    f"(bash; :) <<'EOF'\n{BOOTOUT}\nEOF",
+    f"cd /tmp; (bash; :) <<'EOF'\n{BOOTOUT}\nEOF",
+    f"{{ bash; :; }} <<'EOF'\n{BOOTOUT}\nEOF",
+    # e7cf8c08: a function whose body runs its stdin, defined in the group or earlier
+    f"echo '{BOOTOUT}' | {{ f() {{ bash; }}; f; }}",
+    f"echo '{BOOTOUT}' | ( f() {{ bash; }}; f )",
+    f"echo '{BOOTOUT}' | {{ function f {{ bash; }}; f; }}",
+    f"f() {{ bash; }}; echo '{BOOTOUT}' | f",
+    f"function f {{ bash; }}; echo '{BOOTOUT}' | f",
+])
+def test_executable_compound_r4_shapes_block(command):
+    assert _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
+    f"(cat; wc -l) <<'EOF'\n{BOOTOUT}\nEOF",
+    f"echo '{BOOTOUT}' | {{ f() {{ cat; }}; f; }}",
+    f"f() {{ cat; }}; echo '{BOOTOUT}' | f",
+    f"echo '{BOOTOUT}' | (cat; wc -l)",
+])
+def test_executable_compound_r4_controls_pass(command):
+    assert not _blocked(command)
