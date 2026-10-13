@@ -1044,7 +1044,9 @@ class GatewayBusySessionMixin:
             quick_key, source, interrupt_reason=_INTERRUPT_REASON_STOP, invalidation_reason="stop_command",
         )
         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
-        return EphemeralReply(t("gateway.stop.stopped"))
+        from gateway import queue_mgmt
+        suffix = queue_mgmt.stop_reply_suffix(self, quick_key, self._delivery_adapter_for(source))
+        return EphemeralReply(t("gateway.stop.stopped") + suffix)
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):
         # /reset and /new bypass the running-agent guard (else they'd queue as user text and replay
@@ -1059,14 +1061,25 @@ class GatewayBusySessionMixin:
 
     async def _busy_queue_command(self, event: MessageEvent, quick_key: str, source):
         # Each /queue is its own full agent turn, run FIFO after the current run; never merged.
-        queued_text = event.get_command_args().strip()
+        # Management verbs (list/edit/rm/move/clear/run/help) are parsed by the shared CLI+gateway
+        # parser and handled in gateway/queue_mgmt.py (spec 2026-10-12).
+        from gateway import queue_mgmt
+        adapter = self._delivery_adapter_for(source)
+        op = queue_mgmt.classify(event)
+        if op.kind == "run":
+            return await queue_mgmt.release(self, quick_key, source, adapter, busy=True)
+        if op.is_management:
+            return queue_mgmt.apply_management(self, op, quick_key, adapter)
+        queued_text = op.text
         # A /queue carrying media or reply context is valid with no prompt text (image caption).
         has_media = bool(getattr(event, "media_urls", None))
         if not queued_text and not has_media:
             return t("gateway.queue.usage")
-        adapter = self._delivery_adapter_for(source)
+        refused = queue_mgmt.refuse_command_prompt(queued_text) or queue_mgmt.cap_reply(self, quick_key, adapter)
+        if refused:
+            return refused
         if adapter:
-            self._enqueue_fifo(quick_key, MessageEvent(
+            _queued_event = MessageEvent(
                 text=queued_text, message_type=event.message_type if has_media else MessageType.TEXT,
                 source=event.source, raw_message=event.raw_message, message_id=event.message_id,
                 media_urls=list(getattr(event, "media_urls", []) or []),
@@ -1078,7 +1091,11 @@ class GatewayBusySessionMixin:
                 reply_to_is_own_message=event.reply_to_is_own_message, auto_skill=event.auto_skill,
                 channel_prompt=event.channel_prompt, channel_context=event.channel_context,
                 internal=event.internal, timestamp=event.timestamp,
-            ), adapter)
+            )
+            held_reply = queue_mgmt.append_if_held(self, quick_key, _queued_event)
+            if held_reply:
+                return held_reply
+            self._enqueue_fifo(quick_key, _queued_event, adapter)
         depth = self._queue_depth(quick_key, adapter=adapter)
         return t("gateway.queue.queued") + (t("gateway.queue.queued_depth", depth=depth) if depth > 1 else "")
 

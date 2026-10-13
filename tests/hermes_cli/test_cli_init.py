@@ -137,6 +137,28 @@ class TestBusyInputMode:
         assert cli._pending_input.unfinished_tasks == 0
         assert cli._pending_input.empty()
 
+    def test_queue_run_when_busy_interrupts_with_the_head_and_keeps_the_rest(self):
+        cli = _make_cli()
+        cli.process_command("/queue first")
+        cli.process_command("/queue second")
+        cli._agent_running = True
+        cli.process_command("/queue run")
+        assert cli._interrupt_queue.get_nowait() == "first"      # same channel as typing mid-turn
+        assert cli._pending_input_items() == ["second"]           # drains after, in order
+
+    def test_queue_run_when_idle_leaves_the_queue_to_the_process_loop(self):
+        cli = _make_cli()
+        cli.process_command("/queue first")
+        cli._agent_running = False
+        cli.process_command("/queue run")
+        assert cli._pending_input_items() == ["first"]
+        assert cli._interrupt_queue.empty()
+
+    def test_queue_run_with_prose_is_a_prompt(self):
+        cli = _make_cli()
+        cli.process_command("/queue run the tests please")
+        assert cli._pending_input_items() == ["run the tests please"]
+
     def test_queue_command_preserves_prompts_that_start_with_non_subcommand_words(self):
         cli = _make_cli()
         cli.process_command("/queue maybe run later")

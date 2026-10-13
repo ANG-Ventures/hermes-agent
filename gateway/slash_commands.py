@@ -741,14 +741,18 @@ class GatewaySlashCommandsMixin(
             await self._interrupt_and_clear_session(
                 key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason=invalidation_reason)
+        from gateway import queue_mgmt
+
+        def _queue_suffix() -> str:
+            return queue_mgmt.stop_reply_suffix(self, session_key, self._delivery_adapter_for(source))
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:  # force-clean the sentinel so the session is unlocked
             await _stop(session_key, "stop_command_pending")
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
-            return EphemeralReply(t("gateway.stop.stopped_pending"))
+            return EphemeralReply(t("gateway.stop.stopped_pending") + _queue_suffix())
         if agent:  # force-clean the session lock so a truly hung agent doesn't keep it forever
             await _stop(session_key, "stop_command_handler")
-            return EphemeralReply(t("gateway.stop.stopped"))
+            return EphemeralReply(t("gateway.stop.stopped") + _queue_suffix())
 
         # No run under the caller's own key: a live turn in THIS chat may still carry a differently
         # shaped key. One scan feeds both tiers; the chat tier is a superset of the thread-sibling
@@ -804,7 +808,7 @@ class GatewaySlashCommandsMixin(
                 await adapter._stop_typing_with_metadata(source.chat_id, self._reply_metadata(event))
         except Exception:
             logger.debug("Failed to clear typing on /stop with no active agent", exc_info=True)
-        return t("gateway.stop.no_active")
+        return t("gateway.stop.no_active") + _queue_suffix()
 
     async def _handle_platform_command(self, event: MessageEvent) -> str:
         """Handle ``/platform list|pause|resume [name]`` — inspect and manually control failed/paused
@@ -1796,6 +1800,8 @@ class GatewaySlashCommandsMixin(
         _title_arg = event.get_command_args().strip()
         if _title_arg and self._session_db and new_entry:
             header = await self._reset_titled_header(header, new_entry.session_id, _title_arg)
+        from gateway import queue_mgmt
+        header += queue_mgmt.take_reset_drop_suffix(self, session_key)  # spec D21/I8: never silent
 
         preserved_preferences = []
         unavailable_model_preference = False

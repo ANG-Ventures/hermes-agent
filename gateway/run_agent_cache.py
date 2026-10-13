@@ -463,8 +463,12 @@ class GatewayAgentCacheMixin:
         if not session_key:
             return
         state = self._peek_session_state(session_key)
+        from gateway import queue_mgmt
+        _carry_held = queue_mgmt.before_scope_clear(self, session_key, reason)  # spec D21
         if state is not None:
             state.conversation.clear()
+            if _carry_held:
+                state.conversation.held_queue.extend(_carry_held)
         # Legacy plain-dict stores still in _CONVERSATION_SCOPED_STATE (not yet folded into
         # SessionState), e.g. _pending_model_notes. SessionState-backed names resolve to MutableMapping
         # views (not dict), so the isinstance(dict) guard skips them — already handled above.
@@ -589,6 +593,17 @@ class GatewayAgentCacheMixin:
         _generation_at_interrupt = self._interrupt_running_turn(
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
         )
+        _reason = str(invalidation_reason or "")
+        if _reason.startswith("stop_command") or _reason == "queue_run":
+            # /stop never drops a queued user prompt (spec 2026-10-12 D14). Move every user item out of
+            # the slot (a run-next trigger the post-command drain consumes) and the overflow into the
+            # held store, which no drain reads. Done BEFORE any await so no drain can run between the
+            # generation bump above and the hold. System events stay put for the wake-preserving block
+            # below. /new and /reset keep their reset semantics.
+            from gateway import queue_mgmt
+            _hold_adapter = self._delivery_adapter_for(source)
+            if _hold_adapter is not None:
+                queue_mgmt.hold_user_items(self, session_key, _hold_adapter)
         from gateway.run import _AGENT_PENDING_SENTINEL
         # The turn's hard interrupt reaches only its in-turn children; background delegations were
         # detached at dispatch and would otherwise run to completion and wake the session later.
@@ -653,6 +668,11 @@ class GatewayAgentCacheMixin:
             # against a session /new just closed is decided where it is processed
             # (_resolve_async_delegation_session fails closed), not here.
             parked = adapter.get_pending_message(session_key)
+            from gateway import queue_mgmt as _qm
+            if parked is not None and not _qm.is_system_event(self, parked):
+                # Only /new|/reset reach here with a user item (stop reasons held it above): it is
+                # dropped with the conversation, so count it for the reset reply (spec D21/I8).
+                _qm.note_reset_drop(self, session_key, 1)
             wake = parked if getattr(parked, "internal", False) else None
             if wake is None:
                 overflow = self._overflow_queue(session_key) or []
