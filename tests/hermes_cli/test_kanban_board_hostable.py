@@ -159,11 +159,35 @@ def _mkdir_proc(rc, err):
     return lambda argv, **kw: type("P", (), {"returncode": rc, "stdout": "", "stderr": err})()
 
 
-def test_remote_mkdir_permission_denied_is_a_board_fault():
-    with pytest.raises(kwh.RemoteWorkspaceUnavailable) as ei:
-        kwh.prepare_remote_workspace(_host("ci-box"), "/Volumes/fleet-scratch/workspaces/subs-ace/t_x",
-                                     runner=_mkdir_proc(1, "mkdir: Permission denied"), board="subs-ace")
+def _local_mkdir(argv, **kw):
+    return subprocess.run(["sh", "-c", argv[-1]], capture_output=True, text=True)
+
+
+def test_remote_mkdir_under_an_unwritable_board_root_is_a_board_fault(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root can write a 0555 dir")
+    board = tmp_path / "subs-ace"
+    board.mkdir()
+    board.chmod(0o555)                     # the 19:29 ci-box shape
+    try:
+        with pytest.raises(kwh.RemoteWorkspaceUnavailable) as ei:
+            kwh.prepare_remote_workspace(_host("ci-box"), str(board / "t_x"), runner=_local_mkdir,
+                                         board="subs-ace")
+    finally:
+        board.chmod(0o755)
     assert (ei.value.host, ei.value.board) == ("ci-box", "subs-ace")
+
+
+def test_a_card_path_fault_under_a_writable_root_is_the_cards(tmp_path):
+    """Prism d72c091b628d: the card's path exists as a FILE; the board is fine."""
+    board = tmp_path / "subs-ace"
+    board.mkdir()
+    (board / "t_x").write_text("not a dir")
+    with pytest.raises(RuntimeError) as ei:
+        kwh.prepare_remote_workspace(_host("ci-box"), str(board / "t_x"), runner=_local_mkdir, board="subs-ace")
+    assert not isinstance(ei.value, kwh.RemoteWorkspaceUnavailable)
+    kwh.prepare_remote_workspace(_host("ci-box"), str(board / "t_y"), runner=_local_mkdir, board="subs-ace")
+    assert (board / "t_y").is_dir()
 
 
 def test_ssh_transport_failure_is_not_a_board_fact():

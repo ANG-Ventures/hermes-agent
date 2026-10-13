@@ -75,15 +75,20 @@ class RemoteWorkspaceUnavailable(RuntimeError):
         self.host, self.board = host, board
 
 
-_SSH_TRANSPORT_RC = 255
+_BOARD_ROOT_RC = 86
 
 
 def prepare_remote_workspace(host: PoolHost, workspace: str,
                              runner: Callable = subprocess.run, *,
                              board: Optional[str] = None) -> None:
     """Create the card's workspace at the same absolute path on the host."""
+    # rc _BOARD_ROOT_RC only when the BOARD root itself is unusable (missing,
+    # unwritable): a card-specific failure (its path exists as a file) stays a
+    # card failure and is charged (Prism d72c091b628d).
+    w, b = shlex.quote(workspace), shlex.quote(os.path.dirname(workspace.rstrip("/")) or "/")
     proc = runner(
-        _ssh_argv(host, f"mkdir -p -- {shlex.quote(workspace)}"),
+        _ssh_argv(host, f"mkdir -p -- {w} && exit 0; [ -d {b} ] && [ -w {b} ] && [ -x {b} ] && exit 1; "
+                        f"exit {_BOARD_ROOT_RC}"),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=_PROBE_TIMEOUT_SECONDS,
         stdin=subprocess.DEVNULL,
@@ -92,8 +97,8 @@ def prepare_remote_workspace(host: PoolHost, workspace: str,
     if rc != 0:
         msg = (f"worker host {host.name}: mkdir {workspace} failed: "
                f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
-        if rc == _SSH_TRANSPORT_RC or not board:
-            raise RuntimeError(msg)  # ssh itself failed, or no pool board: not a board fact
+        if rc != _BOARD_ROOT_RC or not board:
+            raise RuntimeError(msg)  # ssh failed, a card-path fault, or no pool board: not a board fact
         raise RemoteWorkspaceUnavailable(host.name, board, msg)
 
 
