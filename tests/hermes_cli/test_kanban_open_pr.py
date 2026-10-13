@@ -133,3 +133,20 @@ def test_branch_owned_prose_pr_gates_a_later_survivor_done(kanban_home, monkeypa
             kb.complete_task(conn, tid, summary="landed", survivor_pr=f"{REPO}#{OWN}")
         assert f"{REPO}#{MENTIONED}" in str(exc.value)
         assert kb.get_task(conn, tid).status == "review"
+
+
+def test_fail_closed_prose_pr_gates_the_route_but_is_not_own(kanban_home, monkeypatch):
+    """t_3a606d89 review: a prose ref whose head branch names NO card (e.g. ``feature/x``) is kept on
+    the route because it fails closed, but it is not provenance, so it must NOT be persisted in own_prs."""
+    def query(repo, number):
+        if number == OWN:
+            return {"state": "MERGED", "merged": True, "head_ref": "daedalus/t_x-main"}
+        return {"state": "OPEN", "head_ref": "feature/no-card-id-here"}
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="fail-closed prose", assignee="daedalus")
+        monkeypatch.setattr(op, "_default_query", lambda: query)
+        kb.claim_task(conn, tid)
+        assert kb.complete_task(conn, tid, summary=f"follow-up in {REPO}#{MENTIONED}")
+        meta = kb.latest_run(conn, tid).metadata
+    assert meta["auto_routed_open_prs"] == [f"{REPO}#{MENTIONED}"]   # still gates the route
+    assert meta["own_prs"] == []                                      # but is not the card's own PR
