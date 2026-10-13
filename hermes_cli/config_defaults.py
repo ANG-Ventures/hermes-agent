@@ -1041,6 +1041,8 @@ DEFAULT_CONFIG = {
         # Gateway /stop and queued (/queue) prompts: false (default) HOLDS them after /stop until
         # `/queue run` or `/queue clear`; true releases them right after the stop, in order.
         "stop_releases_queue": False,
+        # /queue run: "per_item" = each released prompt is its own turn; "merged" = all in ONE turn.
+        "queue_release_mode": "per_item",
         # steer mode: false hides only the "Steered into current run" bubble; steering itself still
         # happens.
         "busy_steer_ack_enabled": True,

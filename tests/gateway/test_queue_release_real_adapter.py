@@ -123,6 +123,7 @@ class _Rig:
         runner.config = SimpleNamespace(thread_sessions_per_user=False, group_sessions_per_user=False,
                                         stt_enabled=False)
         runner._delivery_adapter_for = lambda source: adapter
+        runner._queue_release_mode = "per_item"
 
         async def interrupt_and_clear(key, source, *, interrupt_reason, invalidation_reason,
                                       release_running_state=True):
@@ -146,6 +147,11 @@ class _Rig:
             if text.startswith("/stop"):
                 reply = await runner._busy_stop_command(event, KEY, _source())
                 return getattr(reply, "text", None) or str(reply)
+            # The real _handle_message runs the FIFO orphan rescue right before claiming the turn;
+            # thread it here so a release's item 2 (in overflow by design) is not misread as an
+            # orphan and run ahead of item 1 (live E2E 2026-10-13 01:45: c ran before b).
+            event, _src, _internal = runner._hm_rescue_orphaned_fifo(event, _source(), False, KEY)
+            text = event.text or ""
             generation = runner._begin_session_run_generation(KEY)
             self.turn_running += 1
             try:
@@ -240,3 +246,32 @@ async def test_plain_message_after_stop_runs_and_held_items_stay_held(monkeypatc
     await asyncio.sleep(0.3)
     assert rig.calls == ["first", "ping"]
     assert [e.text for e in rig.runner._session_state(KEY).conversation.held_queue] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_merged_mode_releases_all_held_items_as_one_turn(monkeypatch, tmp_path):
+    """Follow-up D3: display.queue_release_mode=merged -> ONE agent call carrying a, b, c in order."""
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.runner._queue_release_mode = "merged"
+    assert qm.rewrite_active(rig.runner, KEY, rig.adapter, [_msg("a"), _msg("b"), _msg("c")])
+    qm.hold_user_items(rig.runner, KEY, rig.adapter)
+    await rig.adapter.handle_message(_msg("/queue run"))
+    await rig.settle(expect=1)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["a\n\nb\n\nc"]
+    assert any("Released 3" in s for s in rig.adapter.sent), rig.adapter.sent
+
+
+@pytest.mark.asyncio
+async def test_merged_mode_keeps_system_wake_as_its_own_turn_first(monkeypatch, tmp_path):
+    rig = _Rig(monkeypatch, tmp_path)
+    rig.runner._queue_release_mode = "merged"
+    rig.runner._is_goal_continuation_event = lambda e: False
+    wake = _msg("[wake] batch done")
+    wake.internal = True
+    assert qm.rewrite_active(rig.runner, KEY, rig.adapter, [_msg("a"), _msg("b")])
+    qm.hold_user_items(rig.runner, KEY, rig.adapter)
+    rig.runner._session_state(KEY).conversation.queued_events.append(wake)
+    await rig.adapter.handle_message(_msg("/queue run"))
+    await rig.settle(expect=2)
+    assert rig.calls == ["[wake] batch done", "a\n\nb"]
