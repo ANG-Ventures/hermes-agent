@@ -16308,7 +16308,9 @@ _PR_HEAD_REF_CACHE_LIMIT = 1024
 # Owner position only: the card id that OPENS the branch's last path segment
 # (``<assignee>/<card_id>-<topic>``, ``wt/<card_id>``, ``<slug>/<card_id>``).
 # An id elsewhere (``alice/fix-t_11111111``) is a topic mention, not an owner.
-_CARD_ID_OWNER_RE = re.compile(r"t_[0-9a-f]{8}(?![0-9a-z])")
+# Byte-exact (t_75fdedd4): card ids are minted lower-case (`_new_task_id`) and git branch names
+# are case-sensitive, so `T_0000ABCD` in a branch is not card t_0000abcd. No case folding.
+_CARD_ID_OWNER_RE = re.compile(r"t_[0-9a-f]{8}(?![0-9A-Za-z])")
 
 
 def _pr_belongs_to_other_card(repo: str, number: int, task_id: str) -> bool:
@@ -16325,8 +16327,8 @@ def _pr_belongs_to_other_card(repo: str, number: int, task_id: str) -> bool:
     head = _PR_HEAD_REF_CACHE.get((repo.lower(), int(number)))
     if not head:
         return False
-    owner = _CARD_ID_OWNER_RE.match(head.lower().rsplit("/", 1)[-1])
-    return owner is not None and owner.group(0) != task_id.lower()
+    owner = _CARD_ID_OWNER_RE.match(head.rsplit("/", 1)[-1])
+    return owner is not None and owner.group(0) != task_id
 
 
 def _pr_owned_by_card(repo: str, number: int, task_id: str) -> bool:
@@ -16340,8 +16342,8 @@ def _pr_owned_by_card(repo: str, number: int, task_id: str) -> bool:
     head = _PR_HEAD_REF_CACHE.get((repo.lower(), int(number)))
     if not head:
         return False
-    owner = _CARD_ID_OWNER_RE.match(head.lower().rsplit("/", 1)[-1])
-    return owner is not None and owner.group(0) == task_id.lower()
+    owner = _CARD_ID_OWNER_RE.match(head.rsplit("/", 1)[-1])
+    return owner is not None and owner.group(0) == task_id
 
 
 def _query_github_pr_state(repo: str, number: int) -> Optional[str]:

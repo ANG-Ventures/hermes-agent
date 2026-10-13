@@ -207,6 +207,7 @@ def detect_hardline_command(command: str) -> tuple:
     """Check hardline patterns (NEVER bypassable, even in YOLO) -> (is_hardline, description)."""
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
+    command = _mask_data_heredoc_bodies(command)
     allow_reboot = _reboot_shutdown_allowed()
     # The malformed-quoting verdict needs the author's quote state. Normalization strips escapes
     # (`\"` -> `"`), so a shell-valid pattern like `grep -o "[^\"]*"` lexed as unterminated and was
@@ -1167,6 +1168,46 @@ def _deobfuscate_shell_word_for_detection(word: str) -> str:
 def _is_shell_comment_start(command: str, index: int) -> bool:
     return command[index] == "#" and (index == 0 or command[index - 1].isspace()
                                       or command[index - 1] in ";&|()<>")
+
+
+def _mask_data_heredoc_bodies(command: str) -> str:
+    """Detection-only: blank provably-inert here-doc bodies before the hardline scan (t_75fdedd4).
+
+    A quoted-delimiter body read by a non-shell consumer (cat, python) is bytes on that reader's
+    stdin, yet the shell scanner read its backticks and apostrophes as shell quoting and put a
+    runbook line inside a `python3 - <<'PY'` STRING at command position (2026-10-10 21:26 false
+    block). Reuses the conservative heredoc masker the gateway-lifecycle guard already trusts:
+
+    * `tools.shell_heredoc.strip_inert_heredoc_bodies` masks nothing on ANY ambiguity (unquoted,
+      unterminated or spliced delimiter, a shell consumer, a list operator, a `<<` inside quotes),
+    * nothing is masked when the command WRITES and later RUNS (`cat > x.sh <<'EOF' ... bash x.sh`),
+    * a PYTHON body is executable code: only its string constants are blanked, and only when the
+      lifecycle guard's allowlist proves the body reaches no process/exec call
+      (`_mask_python_data_strings`); any other python body stays fully visible.
+    """
+    if "<<" not in command:
+        return command
+    from cron.lifecycle_guard import _mask_python_data_strings, _writes_then_runs
+    from tools.shell_heredoc import _inert_heredoc_ranges
+
+    if _writes_then_runs(command):
+        return command
+    ranges, python_ranges = _inert_heredoc_ranges(command, python_semicolon_chain=True)
+    if not ranges:
+        return command
+    python_set = set(python_ranges)
+    parts, previous = [], 0
+    for start, end in ranges:
+        body = command[start:end]
+        if (start, end) in python_set:
+            masked = _mask_python_data_strings(body)
+            # an unsafe body comes back unchanged and stays scanned; keep line count for positions
+            replacement = masked if masked != body else body
+        else:
+            replacement = "\n" * body.count("\n")
+        parts += [command[previous:start], replacement]
+        previous = end
+    return "".join(parts) + command[previous:]
 
 
 def _iter_shell_command_starts(command: str):

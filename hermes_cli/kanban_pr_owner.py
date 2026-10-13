@@ -322,7 +322,8 @@ def concurrent_pr_runs(conn: sqlite3.Connection, since: int) -> list:
     """
     runs = conn.execute(
         "SELECT id, task_id, started_at, COALESCE(ended_at, CAST(strftime('%s','now') AS INTEGER)) "
-        "FROM task_runs WHERE started_at >= ? AND profile NOT LIKE 'human%' ORDER BY started_at",
+        # byte-exact prefix, not LIKE (ASCII-case-insensitive): the lane is `human` / `human:<name>` (t_75fdedd4)
+        "FROM task_runs WHERE started_at >= ? AND substr(profile, 1, 5) != 'human' ORDER BY started_at",
         (int(since),),
     ).fetchall()
     memo: dict = {}

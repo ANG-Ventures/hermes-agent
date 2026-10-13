@@ -206,6 +206,20 @@ def test_concurrent_pr_runs_counts_overlapping_pairs(kanban_home, head_at):
         assert [(p["first"], p["second"]) for p in pairs] == [(a, b)]
 
 
+
+def test_concurrent_pr_runs_human_lane_prefix_is_byte_exact(kanban_home, head_at):
+    """t_75fdedd4: the human-lane exclusion was `profile NOT LIKE 'human%'` (ASCII-case-insensitive),
+    so a worker profile spelled `Humane-bot` was dropped from the overlap audit. Byte-exact prefix now."""
+    with kb.connect() as conn:
+        a = _run_owner(conn, age=100)
+        b = _run_owner(conn, title=f"rebase {PR}", age=50)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_runs SET profile = 'Humane-bot' WHERE task_id = ?", (b,))
+        assert [(p["first"], p["second"]) for p in kpo.concurrent_pr_runs(conn, int(time.time()) - 1000)] == [(a, b)]
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_runs SET profile = 'human:apollo' WHERE task_id = ?", (b,))
+        assert kpo.concurrent_pr_runs(conn, int(time.time()) - 1000) == []
+
 def test_bare_title_ref_inherits_the_parents_pr(kanban_home, head_at):
     """Live 10-03: t_31fb6cad '#1624 residual: ...' ran beside the owner; its parent's handoff named the PR."""
     with kb.connect() as conn:

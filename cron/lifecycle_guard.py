@@ -182,6 +182,12 @@ _ERE_WILDCARD_ONLY = re.compile(r"^[.*+?$\s]*$")
 _NAME_KILLERS = frozenset({"pkill", "killall", "taskkill", "stop-process"})
 _NAME_ENUMERATORS = frozenset({"pgrep", "pidof", "get-process"})
 _KILL_VERB_RE = re.compile(r"(?i)\b(?:kill|taskkill|stop-process)\b")
+# ssh options that send the connection somewhere a text guard cannot resolve (or run a LOCAL
+# command): such an ssh is never treated as remote.
+_SSH_DEST_REDIRECT_RE = re.compile(r"(?i)(?:^|\s)-[FJW]|(?:^|\s)-o\s*(?:HostName|ProxyCommand|ProxyJump|LocalCommand|"
+                                   r"PermitLocalCommand)\b")
+# ssh(1) single-letter options that take a value in the next word.
+_SSH_VALUED_FLAGS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
 # A `-f` pattern that does not start with the interpreter reaches the gateway cmdline
 # (`python -m hermes_cli.main gateway run` / `hermes gateway run`) only through its own tokens;
 # an unrelated script that merely contains "hermes" (`hermes-polis/run.sh`, `my_hermes_bot.py`)
@@ -295,18 +301,50 @@ def contains_host_interpreter_kill(text: str) -> bool:
     `Get-Process python | Stop-Process`). Segment-tokenized, so quoted/spliced spellings and Python
     argv lists resolve the same way the shell resolves them."""
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    # Judge the TARGET host (t_75fdedd4): a killer inside an ssh remote command runs under the
+    # remote sshd and cannot reach this gateway's interpreter, the same exemption Branches A-D
+    # take. Tokenizing whole lines first made the remote body one segment, so a later `python3` in
+    # it read as a `pkill -f` operand (2026-10-12 04:33, `ssh ci 'pkill -f "18765"; ... python3
+    # -c ...'`). Remoteness is decided on the SAME posix-shlex segments the scan below uses, so
+    # escapes, comments and spliced spellings (`it\'s`, `# don't`, `pk''ill`) resolve exactly as
+    # the shell resolves them (Prism 54ec70a8227c, 8c997d448d77, 88d6dcb1882e): a segment whose
+    # command word is ssh to a non-loopback host carries its remote command as ONE argument, and
+    # is skipped; every other segment gets the full scan.
     kill_verb_present = bool(_KILL_VERB_RE.search(normalized))
     for segment in _iter_command_segments(normalized):
+        if _segment_tokens_are_ssh_remote(segment):
+            continue
         joined = " ".join(segment)
         stripped = _ARGV_LIST_PUNCTUATION.sub(" ", joined)
-        # Python argv lists (`subprocess.run(["taskkill", "/IM", "python.exe"])`) re-split only when
-        # list punctuation was present, so a quoted `-f 'python my_script.py'` stays one operand.
         for tokens in ([segment, stripped.split()] if stripped != joined else [segment]):
             if _segment_names_host_interpreter(tokens, _NAME_KILLERS):
                 return True
             if kill_verb_present and _segment_names_host_interpreter(tokens, _NAME_ENUMERATORS):
                 return True
     return False
+
+
+def _segment_tokens_are_ssh_remote(segment: list[str]) -> bool:
+    """A tokenized segment whose executed command is `ssh <non-loopback host> <remote command>`.
+    Only the ssh OPTIONS and the destination are judged; the remote command (it may well mention
+    127.0.0.1, as the 2026-10-12 replay does) is not part of the target."""
+    index = _executed_command_index(segment)
+    if index is None or _executable_name(segment[index]).lower() not in ("ssh", "autossh"):
+        return False
+    position = index + 1
+    while position < len(segment) and segment[position].startswith("-"):
+        flag = segment[position]
+        position += 2 if len(flag) == 2 and flag[1] in _SSH_VALUED_FLAGS else 1
+    if position >= len(segment):
+        return False
+    # Exempt only the quoted-remote-command shape: exactly ONE word after the destination. Several
+    # words (`ssh h pkill python3`, or a comment that swallowed a newline: `ssh h up # don't<NL>pkill
+    # python3` tokenizes as one segment) keep the full scan, which is how main judged them.
+    tail = [t for t in segment[position + 1:] if not re.match(r"^\d*(?:[<>]{1,2}|&>{1,2}|>&|<&)$|^\d*[<>].+$|^-$", t)]
+    if len(tail) != 1:
+        return False
+    target = " ".join(segment[index:position + 1])
+    return not _LOOPBACK_HOST_RE.search(target) and not _SSH_DEST_REDIRECT_RE.search(target)
 
 
 _SSH_COMMAND_RE = re.compile(r"(?i)(?:^|\s)(?:/\S*/)?(?:ssh|autossh)\s")
@@ -2921,15 +2959,16 @@ def _mask_python_data_strings(body: str) -> str:
     the one allowlisted execution path and stays visible to the lifecycle scan. Anything the
     allowlist refuses keeps the whole body visible (fail closed).
     """
-    if not body.isascii():
-        return body
+    # AST columns are UTF-8 BYTE offsets: splice the encoded body so a non-ASCII runbook line
+    # (em dash, arrows) masks at the right place instead of failing closed (t_75fdedd4).
     try:
         tree = ast.parse(body)
     except SyntaxError:
         return body
     if not _python_body_is_mask_safe(tree):
         return body
-    lines = body.splitlines(keepends=True)
+    raw = body.encode("utf-8")
+    lines = raw.splitlines(keepends=True)
     offsets = [0]
     for line in lines:
         offsets.append(offsets[-1] + len(line))
@@ -2952,8 +2991,8 @@ def _mask_python_data_strings(body: str) -> str:
             spans.append((offsets[node.lineno - 1] + node.col_offset,
                           offsets[node.end_lineno - 1] + node.end_col_offset))
     for start, end in sorted(spans, reverse=True):
-        body = body[:start] + '"data"' + body[end:]
-    return body
+        raw = raw[:start] + b'"data"' + raw[end:]
+    return raw.decode("utf-8")
 
 
 def _mask_read_only_python_paths(body: str) -> str:
