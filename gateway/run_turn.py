@@ -1997,15 +1997,25 @@ class GatewayTurnMixin:
     async def _hmwa_persist_turn_transcript(
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
         prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
-    ):
+    ) -> List[Dict[str, Any]]:
         """Persist this turn to the transcript (session_meta on first turn, closed failed turn on
         transient failure, nothing on context overflow), update last_prompt_tokens, and re-baseline the
-        cached agent's message count."""
+        cached agent's message count. Returns the user rows this call appended (``[]`` when the agent
+        persisted them itself or nothing was written), so a caller can check what the transcript
+        actually holds instead of inferring it from failure flags."""
         from gateway.run import _resolve_gateway_model
         ts = time.time()  # Unix epoch float — consistent with DB storage
         store = self.async_session_store
         sid = session_entry.session_id
         history = prepared.history
+        appended_user_rows: List[Dict[str, Any]] = []
+
+        async def _append(row: Dict[str, Any]) -> None:
+            # Every user row that went through here is durable: written below, or (``skip_db``) the
+            # agent's own live dict, which it flushed itself.
+            await store.append_to_transcript(sid, row, skip_db=agent_persisted)
+            if row.get("role") == "user":
+                appended_user_rows.append(row)
         # The agent already persisted this turn's rows (codex app-server reports agent_persisted=True
         # too); skip the DB write. Default = a session DB exists; non-persisting runtimes pass False.
         # The agent already persisted these messages to SQLite via _flush_messages_to_session_db(), so skip
@@ -2041,7 +2051,7 @@ class GatewayTurnMixin:
                         event.message_id, sid,
                     )
                 else:
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
+                    await _append(_user_row)
                 # Close the failed turn: a user-only tail lets alternation repair merge this request
                 # into an unrelated future message and replay stale side effects (#107070).
                 await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
@@ -2052,7 +2062,7 @@ class GatewayTurnMixin:
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
                 if not new_messages:
                     # Edge case: fall back to simple user/assistant rows.
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
+                    await _append(_user_row)
                     if response:
                         await store.append_to_transcript(
                             sid, {"role": "assistant", "content": response, "timestamp": ts},
@@ -2074,7 +2084,7 @@ class GatewayTurnMixin:
                         ):
                             entry["message_id"] = str(event.message_id)
                             _user_msg_id_attached = True
-                        await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
+                        await _append(entry)
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
         await store.update_session(
@@ -2086,6 +2096,7 @@ class GatewayTurnMixin:
         # the coherence guard snapshots at agent-BUILD time, so our own writes would otherwise
         # trigger a rebuild next turn (destroying prompt caching).
         await self._refresh_agent_cache_message_count(session_key, sid)
+        return appended_user_rows
 
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
@@ -2332,7 +2343,7 @@ class GatewayTurnMixin:
         if _branch_context_note:
             turn_sidecar_notes.insert(0, _branch_context_note)
             if not event.internal:
-                _branch_pin_commit = (context, _redact_pii)
+                _branch_pin_commit = (context, _redact_pii, _branch_context_note)
 
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.
@@ -2355,18 +2366,37 @@ class GatewayTurnMixin:
             title_user_message=title_user_message, branch_pin_commit=_branch_pin_commit,
         ), _session_env_tokens
 
-    async def _hmwa_commit_branch_pin(self, prepared, session_key, session_id, *, persisted: bool) -> None:
+    async def _hmwa_commit_branch_pin(self, prepared, session_key, session_id, *, persisted_user_rows) -> None:
         """Adopt the inherited /branch sentinel after the turn that carried the correction note
-        ends. ``persisted`` = the user row went to the transcript (its ``api_content`` carries the
-        note, so every later replay states the thread's own ids); a cancelled or discarded run
-        persisted nothing, so the sentinel stays and the next turn stages the note again. The
-        durable pin snapshot written before the run still names the sentinel; refresh it."""
+        ends. Gated on the transcript itself (Prism c8ca8a1104c8): one of the user rows this turn
+        persisted must carry the note (``api_content`` for a string message, a text part for a
+        multimodal one), so every later replay states the thread's own ids. A cancelled or
+        discarded run, a failed run (its user row is persisted clean), or a proxy HTTP error (a
+        clean result with no annotated row) persisted no such row: the sentinel stays and the next
+        turn stages the note again. The durable pin snapshot written before the run still names
+        the sentinel; refresh it."""
         commit = getattr(prepared, "branch_pin_commit", None)
-        if not commit or not persisted:
+        if not commit:
             return
-        context, redact_pii = commit
+        context, redact_pii, note = commit
+        if not any(self._row_carries_note(row, note) for row in persisted_user_rows or ()):
+            return
         if self._commit_inherited_context_pin(context, redact_pii, session_key):
             await self._persist_prompt_pins(session_key, session_id)
+
+    @staticmethod
+    def _row_carries_note(row: Dict[str, Any], note: str) -> bool:
+        """Does a persisted user row carry ``note`` in the bytes a replay sends?"""
+        api = row.get("api_content")
+        if isinstance(api, str):
+            return note in api
+        content = row.get("content")
+        if isinstance(content, list):
+            return any(
+                isinstance(part, dict) and part.get("type") == "text" and note in str(part.get("text", ""))
+                for part in content
+            )
+        return False
 
     async def _hmwa_check_persisted_route(self, source, session_key) -> Optional[str]:
         """Fail closed on an unreadable or credential-less persisted session route BEFORE any session
@@ -2544,18 +2574,18 @@ class GatewayTurnMixin:
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )
-            await self._hmwa_persist_turn_transcript(
+            _persisted_user_rows = await self._hmwa_persist_turn_transcript(
                 event=event, source=source, session_entry=session_entry, session_key=session_key,
                 agent_result=agent_result, agent_messages=agent_messages, prepared=prepared,
                 response=response, agent_failed_early=agent_failed_early,
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
             )
-            # The /branch correction rode this turn's user row; only now is the inherited pin adopted
-            # (a cancelled/discarded or overflowed turn returned above and re-stages the note instead).
+            # The /branch correction rode this turn's user row; the inherited pin is adopted only once
+            # that annotated row is in the transcript (a cancelled/discarded turn returned above, a
+            # failed or proxy-error turn persisted no annotated row: both re-stage the note instead).
             await self._hmwa_commit_branch_pin(
-                prepared, session_key, _run_start_session_id,
-                persisted=not (is_context_overflow_failure or agent_failed_early or hidden_reasoning_incomplete),
+                prepared, session_key, _run_start_session_id, persisted_user_rows=_persisted_user_rows,
             )
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
@@ -3146,7 +3176,7 @@ class GatewayTurnMixin:
             )
             return {
                 "final_response": "", "messages": [], "api_calls": 0, "tools": [],
-                "history_offset": len(history), "session_id": session_id, "response_previewed": False,
+                "history_offset": 0, "session_id": session_id, "response_previewed": False,
             }
 
         # OpenAI chat format. The remote keeps continuity via X-Hermes-Session-Id; send the current
@@ -3164,15 +3194,26 @@ class GatewayTurnMixin:
         # on the user message the same way (Prism f813c37414ba), persisting the sent bytes as the
         # row's ``api_content`` sidecar so later replays keep the correction.
         _turn_notes = "\n\n".join(self._consume_pending_turn_sidecar_notes(session_key)) if session_key else ""
-        wire_message = f"{message}\n\n{_turn_notes}" if _turn_notes and isinstance(message, str) else message
+        wire_message: Any = message
+        if _turn_notes and isinstance(message, str):
+            wire_message = f"{message}\n\n{_turn_notes}"
+        elif _turn_notes and isinstance(message, list):
+            # Multimodal content: the notes ride a durable text part on a COPY (the caller's list
+            # is reused on error paths), like ``append_notes_to_multimodal_content`` locally.
+            wire_message = [*message, {"type": "text", "text": _turn_notes}]
         api_messages.append({"role": "user", "content": wire_message})
-        _user_row: Dict[str, Any] = {"role": "user", "content": message}
-        if wire_message != message:
+        # The persisted row: a string message keeps the clean text with the sent bytes on
+        # ``api_content``; a list message is persisted as sent (the text part IS the durable form).
+        _user_row: Dict[str, Any] = {"role": "user", "content": wire_message if isinstance(message, list) else message}
+        if isinstance(message, str) and wire_message != message:
             _user_row["api_content"] = wire_message
 
         def _undelivered(result: Dict[str, Any]) -> Dict[str, Any]:
-            """An error/stale result persists no annotated user row: the notes are owed again."""
-            if _turn_notes and session_key:
+            """An error/cancelled result persists no annotated user row: the notes are owed again.
+            Only while this run still owns the session: a superseded run (/stop, /new) must never
+            overwrite the notes its replacement turn has staged under the same key (Prism
+            34e5d7c608ae); the replacement re-derives the /branch correction from the sentinel."""
+            if _turn_notes and session_key and _run_still_current():
                 self._set_pending_turn_sidecar_notes(session_key, [_turn_notes])
             return result
 
@@ -3264,6 +3305,9 @@ class GatewayTurnMixin:
                         if not full_response:
                             return _undelivered(self._proxy_error_result(t("gateway.proxy.closed_early")))
         except asyncio.CancelledError:
+            # The notes were consumed above and no row persisted: hand them back to the next turn
+            # (Prism 2a6a71a01983); only the branch note has a regenerator, the rest would be lost.
+            _undelivered({})
             raise
         except Exception as e:
             logger.error("Proxy connection error to %s: %s", proxy_url, e)
@@ -3294,7 +3338,14 @@ class GatewayTurnMixin:
             ],
             "api_calls": 1,
             "tools": [],
-            "history_offset": len(history),
+            # ``messages`` holds only this turn's two rows (no history prefix): an offset of
+            # ``len(history)`` made the gateway persist the clean fallback row and drop the
+            # annotated one whenever the session had any history.
+            "history_offset": 0,
+            # The remote wrote nothing to THIS gateway's session DB: the transcript writer must
+            # append these rows itself (with a DB configured it otherwise assumes the agent did and
+            # skips the write, so the annotated row was never durable; Prism e1db9ce77012).
+            "agent_persisted": False,
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
         }
