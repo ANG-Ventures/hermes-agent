@@ -8167,6 +8167,13 @@ def _end_run(
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    # A pool run's headroom reservation ends with the run (t_d6ce856e), once
+    # the run row is COMMITTED: a rolled-back end keeps its promise (Prism 441fe743030f).
+    from hermes_cli import kanban_headroom as _kh
+    _rid = _kh.reservation_for_run(conn, task_id, run_id)
+    if _rid is not None:
+        from hermes_cli.kanban_db_connect import on_commit
+        on_commit(conn, lambda: _kh.release_reservation(_rid))
     return run_id
 
 

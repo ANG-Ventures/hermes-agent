@@ -122,6 +122,8 @@ class GateTickBuilder:
         self._remote_by_host: Dict[str, int] = {}
         self.running_local: Optional[int] = None   # last build()'s local count
         self._signal: Optional[kwp.TargetSignal] = None
+        self._boards = None                        # last build()'s boards (renewal)
+        self._renewed_at: float = 0.0
 
     def _root(self):
         return self._fleet_dir().parent
@@ -132,6 +134,9 @@ class GateTickBuilder:
             return None
         root = self._root()
         cost = getattr(self.gate, "cost", None)
+        from hermes_cli import kanban_headroom as kh
+        from hermes_cli import placement
+
         return kwp.TargetSignal(
             policy=ppolicy.load(self._fleet_dir()),
             state_path=root / "var" / kwp.TARGET_STATE_FILE,
@@ -139,12 +144,15 @@ class GateTickBuilder:
             cpu_est=float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
             admit_on_memory=kadm.enabled(cfg),
             reservation_gb=kadm.reservation_gb(cfg),
+            placement_table=kh.load_table(root),
+            placement_reservations=root / placement.RESERVATIONS_REL,
         )
 
     def build(self, boards) -> GateTick:
         gate = self.gate
         running_local, remote_by_host = running_split(self._ledger(boards))
         self._remote_by_host = dict(remote_by_host)
+        self._boards = boards
         self.running_local = running_local
         allowance, paused = gate.admit_now(running=running_local if gate.enabled else None)
         if gate.enabled and allowance is None and klg.loadavg_supported():
@@ -253,6 +261,31 @@ class GateTickBuilder:
             pledger.update(pledger.ledger_dir(root), "kanban", write)
         except Exception as exc:
             self._log(logger.warning, f"kanban pool: ledger_write_failed: {exc}")
+        self.renew_reservations()
+
+    def renew_reservations(self, *, now: Optional[float] = None) -> Optional[Dict[str, int]]:
+        """Keep every live pool run's headroom reservation from lapsing
+        (Prism 6c6c0c765a1a): at most every ``RENEW_EVERY_S``, over the boards
+        the last ``build()`` read. A lapsed row of a live run is logged as a
+        leak. None = not due / nothing to renew (no build yet, no table)."""
+        from hermes_cli import kanban_headroom as kh
+        from hermes_cli import placement
+
+        now = time.time() if now is None else now
+        if self._boards is None or now - self._renewed_at < kh.RENEW_EVERY_S:
+            return None
+        root = self._root()
+        if not kh.table_path(root).is_file():
+            return None
+        self._renewed_at = now
+        try:
+            got = kh.renew_running(self._boards, self._connect, root / placement.RESERVATIONS_REL, now=now)
+        except Exception as exc:
+            self._log(logger.warning, f"kanban pool: reservation renewal failed: {exc}")
+            return None
+        if got["lapsed"]:
+            logger.warning("kanban pool: %d live run reservation(s) had lapsed before renewal", got["lapsed"])
+        return got
 
 
 def standalone_builder(load_gate, kanban_cfg: Callable) -> GateTickBuilder:
