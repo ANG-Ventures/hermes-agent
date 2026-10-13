@@ -102,6 +102,36 @@ def test_sqlite_shell_escape_in_memory_blocks():
 
 
 @pytest.mark.parametrize("command", [
+    # b74a2fa3 (Apollo r1 on #1954): a pipe into a GROUPED executor; every command in the
+    # group reads the pipe
+    f"echo '{BOOTOUT}' | (bash)",
+    f"echo '{BOOTOUT}' | {{ bash; }}",
+    f"echo '{BOOTOUT}' | ( env bash )",
+    f"echo '{BOOTOUT}' | (cd /tmp; bash)",
+    f"echo '{BOOTOUT}' | {{ cd /tmp; bash; }}",
+    f"echo '{BOOTOUT}' | ( ( sudo -u root sh ) )",
+    f"echo '{BOOTOUT}' |\n(bash)",
+    f"echo '{RESTART}' | (sh)",
+    # ee373214: `printf -vNAME` (attached) stores the value exactly like `printf -v NAME`
+    f"printf -vX '%s' '{BOOTOUT}'; eval \"$X\"",
+    f"printf -vX -- '%s' '{BOOTOUT}'; eval \"$X\"",
+    f"printf -vX '%s' '{RESTART}'; $X",
+])
+def test_grouped_pipe_executor_and_attached_printf_v_block(command):
+    assert _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
+    # a group that only reads the pipe is not an executor feed
+    f"echo '{BOOTOUT}' | (cat)",
+    f"echo '{BOOTOUT}' | (cat; wc -l)",
+    f"grep '{LABEL}' /tmp/f | {{ head -1; }}",
+])
+def test_grouped_pipe_reader_still_passes(command):
+    assert not _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
     # the allowlisted content commands keep the #1917 false-positive fix
     f"gh pr comment 12 --body 'never {RESTART}'",
     f"hermes kanban complete t_x --summary 'avoid {RESTART} here'",

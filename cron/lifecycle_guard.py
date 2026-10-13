@@ -1958,7 +1958,7 @@ def _unquoted_view(text: str) -> str:
 # `>`, `>>`, `1>`, `&>`, `>|` are all file writes; `>&2` / `2>&1` / `> /dev/null` are not.
 _WRITES_OR_STORES_RE = re.compile(
     r"(?<![<])(?:(?<![&\d])|(?<=\s[1&])|(?<=^[1&]))>(?![(&])\|?(?!\s*/dev/null\b)|\btee\b|"
-    r"\bprintf\s+(?:-\S+\s+)*-v\b|\bread\s"
+    r"\bprintf\s+(?:-\S+\s+)*-v|\bread\s"   # `-v NAME` and attached `-vNAME` (Prism ee373214)
 )
 # Command words that only READ or LINT what they are given: a write followed by one of these is
 # not a write-then-run. Anything else at command position after a write (a shell, `source`, an
@@ -2014,13 +2014,50 @@ def _stage_is_executor(stage: str) -> bool:
     return bool(name in _ARGUMENT_REPARSERS or name in _STAGE_EXECUTORS or _REPARSER_NAME_RE.match(name))
 
 
+def _group_extent(view: str, start: int) -> int:
+    """End index (exclusive) of the `( … )` / `{ …; }` group opening at *view*[start]; the end of
+    *view* when it never closes."""
+    depth = 0
+    for i in range(start, len(view)):
+        ch = view[i]
+        if ch in "({":
+            depth += 1
+        elif ch in ")}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return len(view)
+
+
+def _group_body_executes(body: str) -> bool:
+    """Some command inside a grouped stage runs the shared stdin: every command in `( … )` or
+    `{ …; }` reads the pipe, so `| (bash)`, `| { cd /tmp; bash; }` execute it (Prism b74a2fa3,
+    Apollo r1 on agent#1954). Group punctuation is blanked; each segment is a stage."""
+    view = _unquoted_view(body)
+    flat = "".join(" " if v in "(){}" else c for c, v in zip(body, view))
+    pos = 0
+    for stop in [*(m.start() for m in re.finditer(r"[;&|\n]", _unquoted_view(flat))), len(flat)]:
+        if _stage_is_executor(flat[pos:stop]):
+            return True
+        pos = stop + 1
+    return False
+
+
 def _feeds_executor(text: str) -> bool:
     """Some pipe in *text* (a trailing `|` continues the pipeline onto the next line, Prism
-    31197de5) hands its stream to an executor stage. Heredoc bodies are not shell text."""
+    31197de5) hands its stream to an executor stage, bare or inside a `( … )` / `{ …; }` group.
+    Heredoc bodies are not shell text."""
     joined = _PIPE_CONTINUATION_RE.sub(r"\1 ", _drop_heredoc_bodies(text))
     view = _unquoted_view(joined)
     for match in re.finditer(r"(?<!\|)\|(?!\|)&?", view):
         rest = view[match.end():]
+        lead = len(rest) - len(rest.lstrip(" \t"))
+        if rest[lead:lead + 1] in ("(", "{"):
+            start = match.end() + lead
+            end = _group_extent(view, start)
+            if _group_body_executes(joined[start:end]):
+                return True
+            continue
         stop = re.search(r"[;&|\n)]", rest)
         end = match.end() + (stop.start() if stop else len(rest))
         if _stage_is_executor(joined[match.end():end]):
@@ -2145,8 +2182,9 @@ def _is_content_argument_command(tokens: list[str]) -> bool:
         return False
     name = tokens[0].lower()
     if name in _CONTENT_ARGUMENT_COMMANDS:
-        # `printf -v NAME '…'` stores the value; `_WRITES_OR_STORES_RE` also refuses it.
-        return not (name == "printf" and any(t == "-v" for t in tokens[1:]))
+        # `printf -v NAME '…'` / `printf -vNAME '…'` store the value; `_WRITES_OR_STORES_RE`
+        # also refuses both (Prism ee373214: the attached form was masked as content).
+        return not (name == "printf" and any(t.startswith("-v") for t in tokens[1:]))
     subcommands = _CONTENT_ARGUMENT_SUBCOMMANDS.get(name)
     if subcommands is None:
         return False
