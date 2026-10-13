@@ -16,6 +16,7 @@ import contextlib
 import functools
 import json
 import logging
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -53,7 +54,26 @@ def current_instantiation_epoch() -> str:
         # "<pid> (<comm>) <state> ...": comm may contain spaces/parens, so split on the
         # LAST ')'. starttime is field 22 (1-indexed) = tail index 19.
         pid1_start = Path("/proc/1/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[19]
+    if not (boot_id or pid1_start):
+        boot_id = _darwin_boot_session_uuid()
     return f"{boot_id}:{pid1_start}" if (boot_id or pid1_start) else ""
+
+
+@functools.lru_cache(maxsize=1)
+def _darwin_boot_session_uuid() -> str:
+    """macOS per-boot id (``kern.bootsessionuuid``); ``""`` elsewhere. Not ``kern.boottime``: a
+    clock step moves that value, and the epoch must change only on a reboot (t_7fe63baa)."""
+    if sys.platform != "darwin":
+        return ""
+    with contextlib.suppress(OSError, AttributeError):
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        buf, size = ctypes.create_string_buffer(64), ctypes.c_size_t(64)
+        if libc.sysctlbyname(b"kern.bootsessionuuid", buf, ctypes.byref(size), None, ctypes.c_size_t(0)) == 0:
+            return buf.value.decode("ascii", "ignore").strip()
+    return ""
 
 
 def drain_request_path(home: Optional[Path] = None) -> Path:

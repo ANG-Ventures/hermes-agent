@@ -732,12 +732,26 @@ def _fingerprints_agree(recorded: str, current: Optional[str]) -> bool:
         return False
     rec_epoch, _, rec_start = recorded.rpartition("|")
     cur_epoch, _, cur_start = current.rpartition("|")
-    if rec_epoch != cur_epoch:
+    # An empty recorded epoch is a row written where the epoch was unreadable (macOS before
+    # t_7fe63baa): it carries no boot witness, so only the start time can decide.
+    if rec_epoch and rec_epoch != cur_epoch:
         return False
     try:
         return start_time_fingerprints_match(rec_start, cur_start)
     except (TypeError, ValueError):
         return False
+
+
+def _live_pid_names_task(pid: int, task_id: str) -> bool:
+    """True when ``pid`` is running and its argv is a worker for ``task_id``
+    (``... chat -q "work kanban task <id>"``). The duplicate-worker guard: a recycled pid
+    cannot name the card, so this holds whatever the start fingerprint says."""
+    if not _kb._pid_alive(pid):
+        return False
+    from gateway.status import _read_process_cmdline
+
+    cmdline = _read_process_cmdline(int(pid)) or ""
+    return re.search(rf"\bwork kanban task {re.escape(task_id)}(?![0-9A-Za-z_])", cmdline) is not None
 
 
 def _process_group_evidence(pid: int) -> dict[str, Any]:
@@ -2037,6 +2051,15 @@ def detect_crashed_workers(
                 continue
 
             pid = int(row["worker_pid"])
+            if _live_pid_names_task(pid, row["id"]):
+                # The fingerprint disagrees, but the pid is running ``work kanban task <id>``:
+                # that is this card's worker. Booking it crashed spawns a duplicate beside it.
+                _kb._log.warning(
+                    "kanban: worker pid %s for %s fails the start fingerprint (recorded %s, live %s) "
+                    "but still names the task; not reclaiming",
+                    pid, row["id"], conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?",
+                                                 (row["id"],)).fetchone()[0], _process_fingerprint(pid))
+                continue
             kind, code = _kb._classify_run_exit(conn, row["id"], row["current_run_id"], pid)
             if kind == "unknown":
                 # Neither the run receipt nor the reap registry (children of THIS
