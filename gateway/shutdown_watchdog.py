@@ -156,6 +156,16 @@ class _LoopLivenessWatchdogHandle:
         self.stop, self.join, self.is_alive = stop_event.set, thread.join, thread.is_alive
 
 
+def _load_denominator(ncpu: Optional[int] = None) -> str:
+    """House load denominator ``24c·32t`` (Ace ruling 2026-10-12). Never raises: this runs on exit paths."""
+    try:
+        from hermes_platform.host.facts import load_denominator
+
+        return load_denominator(ncpu)
+    except Exception:
+        return f"{ncpu or os.cpu_count() or '?'}t"
+
+
 def _host_load_suffix() -> str:
     """Return ``load1=<x> ncpu=<n>`` for the missed-probe CRITICAL.
 
@@ -177,7 +187,7 @@ def _host_load_suffix() -> str:
         ncpu = str(os.cpu_count() or "unknown")
     except Exception:
         ncpu = "unknown"
-    return f"load1={load1} ncpu={ncpu}"
+    return f"load1={load1} ncpu={ncpu} (load {load1} tasks / {_load_denominator()})"
 
 
 def _sample_host_load() -> tuple[Optional[float], Optional[int]]:
@@ -289,7 +299,7 @@ def _format_starvation_line(
     ncpu_txt = str(ncpu) if ncpu else "unknown"
     return (
         f"PHASE={phase} load1={load_txt} ncpu={ncpu_txt} strikes={strikes} "
-        f"held_s={held_s:.1f}"
+        f"held_s={held_s:.1f} load=\"{load_txt} tasks / {_load_denominator(ncpu)}\""
     )
 
 

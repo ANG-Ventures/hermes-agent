@@ -12,6 +12,7 @@ Behaviour contract (kanban.dispatch_load_gate):
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -182,6 +183,15 @@ def test_log_line_on_state_change_and_five_minute_summary(caplog):
     summaries = [m for m in msgs if "summary" in m]
     assert len(summaries) == 1 and "admitted_5m=6" in summaries[0]
     assert "pending_ramp=" in summaries[0]
+    # Ace ruling 2026-10-12 (t_998e643d): the load figure carries its denominator, threads = the gate's ncpu
+    assert re.search(r"\(load 40\.0 tasks / (?:\d+c\u00b7)?32t\)", summaries[0]), summaries[0]
+
+
+def test_paused_reason_names_the_load_denominator():
+    g = LoadGate({}, ncpu=32)
+    g.admit(146.0, now=0)
+    assert re.search(r"load 146\.0 tasks / (?:\d+c\u00b7)?32t", g.last_reason or g.reason or ""), (
+        g.last_reason, g.reason)
 
 
 def test_state_file_round_trip_and_diagnostics_line(tmp_path):
@@ -195,6 +205,7 @@ def test_state_file_round_trip_and_diagnostics_line(tmp_path):
     line = klg.format_state_line(state)
     assert line.startswith("Load gate: admitting load1=20.0 load5=18.0")
     assert "allowance=4" in line
+    assert re.search(r"\(load 20\.0 tasks / (?:\d+c\u00b7)?32t\)", line), line
     assert "no state published" in klg.format_state_line(None)
 
 

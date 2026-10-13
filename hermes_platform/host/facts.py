@@ -170,6 +170,45 @@ def cpu_model() -> str:
     return parse_cpuinfo(_read_text("/proc/cpuinfo"), device_tree_model=_read_text("/proc/device-tree/model", 512))
 
 
+def parse_cpuinfo_cores(text: str) -> int | None:
+    """Return physical cores from ``/proc/cpuinfo`` text: distinct (physical id, core id) pairs."""
+    pairs, phys, core = set(), None, None
+    for line in (text or "").splitlines() + [""]:
+        key, _, value = line.partition(":")
+        key = key.strip()
+        if key == "physical id":
+            phys = value.strip()
+        elif key == "core id":
+            core = value.strip()
+        elif not line.strip():
+            if core is not None:
+                pairs.add((phys, core))
+            phys = core = None
+    return len(pairs) or None
+
+
+@functools.cache
+def physical_cores() -> int | None:
+    """Return physical CPU cores (SMT siblings excluded), or ``None`` when unavailable."""
+    try:
+        if sys.platform == "darwin":
+            return _sysctl_u64(b"hw.physicalcpu") or None
+        if sys.platform.startswith("linux"):
+            return parse_cpuinfo_cores(_read_text("/proc/cpuinfo", 4 * 1024 * 1024))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return None
+
+
+def load_denominator(threads: int | None = None) -> str:
+    """Return this host's load denominator in the house form: ``24c·32t`` (``32t`` when cores are unknown)."""
+    threads = threads or os.cpu_count()
+    cores = physical_cores()
+    if cores and threads:
+        return f"{cores}c\u00b7{threads}t"
+    return f"{threads}t" if threads else "?t"
+
+
 @functools.cache
 def cpu_vendor() -> str:
     """Return the CPU vendor, or an empty string when unavailable."""

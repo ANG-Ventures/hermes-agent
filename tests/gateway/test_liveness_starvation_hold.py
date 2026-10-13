@@ -22,6 +22,7 @@ Load is always MOCKED here — generating real load is the incident.
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -30,6 +31,7 @@ import pytest
 
 from gateway.config import GatewayConfig, load_gateway_config
 from gateway.shutdown_watchdog import (
+    _format_starvation_line,
     DEFAULT_LIVENESS_STARVATION_LOAD_FACTOR,
     DEFAULT_LIVENESS_STARVATION_MAX_HOLD_S,
     LIVENESS_STARVATION_LOAD_FLOOR,
@@ -350,3 +352,10 @@ def test_load_gateway_config_bridges_the_knobs(tmp_path, monkeypatch):
     cfg = load_gateway_config()
     assert cfg.liveness_starvation_load_factor == 5.0
     assert cfg.liveness_starvation_max_hold_s == 300.0
+
+
+def test_starvation_line_carries_the_house_load_denominator():
+    """Ace ruling 2026-10-12 (t_998e643d): load1=/ncpu= keys stay for greps; the line also names Cc\u00b7Tt."""
+    line = _format_starvation_line("starved", load1=538.0, ncpu=32, strikes=3, held_s=12.0)
+    assert "load1=538.00 ncpu=32" in line
+    assert re.search(r'load="538\.00 tasks / (?:\d+c\u00b7)?32t"', line), line
