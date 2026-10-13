@@ -2236,6 +2236,9 @@ class GatewayTurnMixin:
         persistence_session_id: Optional[str] = None
         persistence_owner: Optional[str] = None
         title_user_message: Optional[str] = None
+        # ``(context, redact_pii)`` when this human turn carries the /branch correction note on an
+        # inherited pin; the sentinel is adopted only once the turn's transcript has persisted.
+        branch_pin_commit: Optional[tuple] = None
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
@@ -2259,11 +2262,15 @@ class GatewayTurnMixin:
         if event.internal and session_key:
             await self._rehydrate_prompt_pins(session_key, session_entry.session_id)
         # A /branch thread child keeps its parent's context bytes (warm prefix); the inherited pin
-        # is returned verbatim here and adopted (re-keyed + its thread note staged) only after the
-        # early-outs below, so an aborted first turn leaves it adoptable (t_84dabcc7).
+        # is returned verbatim here, its correction note is staged NOW, and the sentinel is adopted
+        # only once this turn's transcript has persisted (t_84dabcc7, t_09e413e8).
         context_prompt = self._pinned_session_context_prompt(
             context, _redact_pii, session_key, internal=event.internal,
         )
+        # The note is derived while the sentinel is still in place: session hygiene below evicts
+        # the cached agent (clearing the pin) and the captured parent bytes would otherwise go out
+        # to the model with no correction (Prism eb4a633bdc78). Staged after the early-outs.
+        _branch_context_note = self._stage_inherited_context_pin(context, _redact_pii, session_key)
 
         # Per-turn notes ride the user message via the api_content sidecar, NOT context_prompt
         # (appending to the ephemeral system prompt forced a full agent rebuild).
@@ -2316,13 +2323,16 @@ class GatewayTurnMixin:
             self._hmwa_apply_message_timestamp(event, message_text)
         )
 
-        # Adopt an inherited /branch pin only now, past every early-out: it re-keys the pin and the
-        # thread's own facts ride this turn's user message (Prism d78579970af8). An internal turn
-        # gets the note but leaves the pin for the first human turn (Prism b6bd0d66ca29).
-        _branch_context_note = self._adopt_inherited_context_pin(
-            context, _redact_pii, session_key, internal=event.internal)
+        # Stage the /branch correction only now, past every early-out, so an aborted turn cannot
+        # leak it into the next turn (Prism d78579970af8). The sentinel itself is left in place:
+        # a human turn adopts it in ``_hmwa_commit_branch_pin`` once its transcript (with the note
+        # on the user row's api_content) is durable, so a failed/cancelled first run re-stages the
+        # note next time (Prism 80879ea93439). An internal turn never adopts (Prism b6bd0d66ca29).
+        _branch_pin_commit = None
         if _branch_context_note:
             turn_sidecar_notes.insert(0, _branch_context_note)
+            if not event.internal:
+                _branch_pin_commit = (context, _redact_pii)
 
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.
@@ -2342,8 +2352,21 @@ class GatewayTurnMixin:
         return self._PreparedTurn(
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
-            title_user_message=title_user_message,
+            title_user_message=title_user_message, branch_pin_commit=_branch_pin_commit,
         ), _session_env_tokens
+
+    async def _hmwa_commit_branch_pin(self, prepared, session_key, session_id, *, persisted: bool) -> None:
+        """Adopt the inherited /branch sentinel after the turn that carried the correction note
+        ends. ``persisted`` = the user row went to the transcript (its ``api_content`` carries the
+        note, so every later replay states the thread's own ids); a cancelled or discarded run
+        persisted nothing, so the sentinel stays and the next turn stages the note again. The
+        durable pin snapshot written before the run still names the sentinel; refresh it."""
+        commit = getattr(prepared, "branch_pin_commit", None)
+        if not commit or not persisted:
+            return
+        context, redact_pii = commit
+        if self._commit_inherited_context_pin(context, redact_pii, session_key):
+            await self._persist_prompt_pins(session_key, session_id)
 
     async def _hmwa_check_persisted_route(self, source, session_key) -> Optional[str]:
         """Fail closed on an unreadable or credential-less persisted session route BEFORE any session
@@ -2527,6 +2550,12 @@ class GatewayTurnMixin:
                 response=response, agent_failed_early=agent_failed_early,
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
+            )
+            # The /branch correction rode this turn's user row; only now is the inherited pin adopted
+            # (a cancelled/discarded or overflowed turn returned above and re-stages the note instead).
+            await self._hmwa_commit_branch_pin(
+                prepared, session_key, _run_start_session_id,
+                persisted=not (is_context_overflow_failure or agent_failed_early or hidden_reasoning_incomplete),
             )
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
@@ -3036,6 +3065,13 @@ class GatewayTurnMixin:
     def _proxy_error_result(text: str) -> Dict[str, Any]:
         return {"final_response": text, "messages": [], "api_calls": 0, "tools": []}
 
+    @staticmethod
+    def _proxy_history_text(msg: Dict[str, Any]) -> Any:
+        """The text a proxied turn replays for one history row: the ``api_content`` sidecar (the
+        bytes the row's own turn sent) when present, else ``content``."""
+        sidecar = msg.get("api_content")
+        return sidecar if isinstance(sidecar, str) and sidecar else msg.get("content")
+
     def _proxy_stream_consumer(self, source: "SessionSource", event_message_id, _thread_metadata, _run_still_current):
         """Platform stream consumer for the proxy path when streaming is enabled, else ``None``."""
         from gateway.run import _load_gateway_config, _platform_config_key
@@ -3080,12 +3116,12 @@ class GatewayTurnMixin:
 
         Lets a Docker container handle Matrix E2EE while the agent runs on the host with full
         access to local files, memory, skills, and a unified session store."""
-        from gateway.run import _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS
         try:
             from aiohttp import ClientSession as _AioClientSession, ClientTimeout
         except ImportError:
             return self._proxy_error_result(t("gateway.proxy.requires_aiohttp", hint=install_hint("messaging")))
 
+        from gateway.run import _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS
         proxy_url = self._get_proxy_url()
         if not proxy_url:
             return self._proxy_error_result(t("gateway.proxy.url_missing"))
@@ -3114,13 +3150,31 @@ class GatewayTurnMixin:
             }
 
         # OpenAI chat format. The remote keeps continuity via X-Hermes-Session-Id; send the current
-        # message plus a compact text-only history for a remote that has none yet.
+        # message plus a compact text-only history for a remote that has none yet. Historical user
+        # rows replay their ``api_content`` (the bytes actually sent: a /branch child's correction
+        # note rides there) so the remote reads the same transcript the local path would.
         api_messages: List[Dict[str, str]] = [{"role": "system", "content": context_prompt}] if context_prompt else []
+        _api_text = self._proxy_history_text
         api_messages += [
-            {"role": msg.get("role"), "content": msg.get("content")}
-            for msg in history if msg.get("role") in {"user", "assistant"} and msg.get("content")
+            {"role": msg.get("role"), "content": _api_text(msg)}
+            for msg in history if msg.get("role") in {"user", "assistant"} and _api_text(msg)
         ]
-        api_messages.append({"role": "user", "content": message})
+        # The gateway's one-shot must-deliver notes (the /branch thread correction, voice-channel
+        # state, onboarding) are consumed by the local TurnRunner only; a proxied turn forwards them
+        # on the user message the same way (Prism f813c37414ba), persisting the sent bytes as the
+        # row's ``api_content`` sidecar so later replays keep the correction.
+        _turn_notes = "\n\n".join(self._consume_pending_turn_sidecar_notes(session_key)) if session_key else ""
+        wire_message = f"{message}\n\n{_turn_notes}" if _turn_notes and isinstance(message, str) else message
+        api_messages.append({"role": "user", "content": wire_message})
+        _user_row: Dict[str, Any] = {"role": "user", "content": message}
+        if wire_message != message:
+            _user_row["api_content"] = wire_message
+
+        def _undelivered(result: Dict[str, Any]) -> Dict[str, Any]:
+            """An error/stale result persists no annotated user row: the notes are owed again."""
+            if _turn_notes and session_key:
+                self._set_pending_turn_sidecar_notes(session_key, [_turn_notes])
+            return result
 
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         if proxy_key:
@@ -3177,7 +3231,7 @@ class GatewayTurnMixin:
                     if resp.status != 200:
                         error_text = await resp.text()
                         logger.warning("Proxy error (%d) from %s: %s", resp.status, proxy_url, error_text[:500])
-                        return self._proxy_error_result(t("gateway.proxy.http_error", status=resp.status, error=error_text[:300]))
+                        return _undelivered(self._proxy_error_result(t("gateway.proxy.http_error", status=resp.status, error=error_text[:300])))
 
                     buffer = ""
                     async for chunk in resp.content.iter_any():
@@ -3186,7 +3240,7 @@ class GatewayTurnMixin:
                             # would otherwise block us for up to sock_read seconds.
                             break
                         if not _run_still_current():
-                            return _stale_result("stream")
+                            return _undelivered(_stale_result("stream"))
                         buffer += chunk.decode("utf-8", errors="replace")
                         while "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
@@ -3208,13 +3262,13 @@ class GatewayTurnMixin:
                             "(%d chars received)", proxy_url, len(full_response),
                         )
                         if not full_response:
-                            return self._proxy_error_result(t("gateway.proxy.closed_early"))
+                            return _undelivered(self._proxy_error_result(t("gateway.proxy.closed_early")))
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.error("Proxy connection error to %s: %s", proxy_url, e)
             if not full_response:
-                return self._proxy_error_result(t("gateway.proxy.connection_error", error=e))
+                return _undelivered(self._proxy_error_result(t("gateway.proxy.connection_error", error=e)))
             # Partial response — return what we got
         finally:
             if _stream_consumer:
@@ -3227,7 +3281,7 @@ class GatewayTurnMixin:
 
         _elapsed = time.time() - _start
         if not _run_still_current():
-            return _stale_result("result")
+            return _undelivered(_stale_result("result"))
         logger.info(
             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
@@ -3235,7 +3289,7 @@ class GatewayTurnMixin:
         return {
             "final_response": full_response or t("gateway.proxy.no_response"),
             "messages": [
-                {"role": "user", "content": message},
+                _user_row,
                 {"role": "assistant", "content": full_response},
             ],
             "api_calls": 1,

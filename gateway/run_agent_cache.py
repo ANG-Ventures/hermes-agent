@@ -897,17 +897,18 @@ class GatewayAgentCacheMixin:
             BRANCH_INHERITED_PIN_KEY, pin[1], pin[2])
         return True
 
-    def _adopt_inherited_context_pin(
-        self, context, redact_pii: bool, session_key: Optional[str], *, internal: bool = False,
+    def _stage_inherited_context_pin(
+        self, context, redact_pii: bool, session_key: Optional[str],
     ) -> Optional[str]:
-        """Re-key an inherited ``/branch`` pin to this session's own render key, keeping the parent's
-        bytes, and return the per-turn note carrying the thread's own session facts (``None`` when
-        there is nothing to adopt). Called from ``_hmwa_prepare_turn`` only once the turn is past its
-        early-outs: until then ``_pinned_session_context_prompt`` serves the sentinel pin verbatim,
-        so an aborted first turn leaves the note still deliverable. An ``internal`` turn (kanban
-        wake, webhook, scheduled run) gets the note too, since it reads the same parent bytes, but
-        leaves the sentinel for the first human turn (Prism b6bd0d66ca29). After adoption the usual
-        pin rules apply: a later real metadata change (rename, /sethome) re-renders once."""
+        """The per-turn note carrying the thread's own session facts for a turn that serves an
+        inherited ``/branch`` pin (``None`` when the pin is not the sentinel). Read-only on the pin:
+        the sentinel is re-keyed by ``_commit_inherited_context_pin`` once the turn that carried the
+        note has persisted its transcript, so every turn that serves the parent's bytes before then
+        (an aborted or cancelled first turn, an internal wake, a turn whose run failed) stages the
+        note again instead of losing it for good (Prism d78579970af8, b6bd0d66ca29, 80879ea93439).
+        Called right after the pin is served and BEFORE session hygiene: hygiene's agent eviction
+        clears the sentinel, and the captured parent bytes must never go out without their
+        correction (Prism eb4a633bdc78)."""
         state = self._peek_session_state(session_key) if session_key else None
         pin = state.conversation.ephemeral_pin if state else None
         if pin is None or pin[0] != BRANCH_INHERITED_PIN_KEY:
@@ -915,9 +916,21 @@ class GatewayAgentCacheMixin:
         if pin[2] != redact_pii:
             state.conversation.ephemeral_pin = None  # never reuse bytes from another privacy policy
             return None
-        if not internal:
-            state.conversation.ephemeral_pin = (self._ephemeral_change_key(context, redact_pii), pin[1], pin[2])
         return branch_thread_context_note(context, redact_pii=redact_pii)
+
+    def _commit_inherited_context_pin(self, context, redact_pii: bool, session_key: Optional[str]) -> bool:
+        """Re-key an inherited ``/branch`` pin to this session's own render key, keeping the parent's
+        bytes. Called only once a human turn that carried the branch note persisted its transcript
+        (the note rides that user row's ``api_content``, so later replays keep the correction).
+        After adoption the usual pin rules apply: a later real metadata change (rename, /sethome)
+        re-renders once. Returns True when a sentinel was adopted; a sentinel evicted mid-turn
+        (hygiene, model switch) leaves nothing to adopt and the next turn renders its own context."""
+        state = self._peek_session_state(session_key) if session_key else None
+        pin = state.conversation.ephemeral_pin if state else None
+        if pin is None or pin[0] != BRANCH_INHERITED_PIN_KEY or pin[2] != redact_pii:
+            return False
+        state.conversation.ephemeral_pin = (self._ephemeral_change_key(context, redact_pii), pin[1], pin[2])
+        return True
 
     def _pinned_channel_inputs(
         self, session_key: Optional[str], channel_prompt: Optional[str], source: SessionSource, *, internal: bool,
