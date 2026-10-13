@@ -33,6 +33,10 @@ CAPABILITY_MATRIX = [
     ("openai/gpt-6-astra", "openai", "codex_responses", "ultrafast", {"service_tier": "ultrafast"}),
     ("gpt-6-astra", "openai-codex", "codex_responses", "ultrafast", {"service_tier": "ultrafast"}),
     ("gpt-6-astra-900k", "openai-codex", "codex_responses", "ultrafast", {"service_tier": "ultrafast"}),
+    ("gpt-6.1-sol", "openai-codex", "codex_responses", "ultrafast", {"service_tier": "ultrafast"}),
+    ("gpt-6.1-sol", "openai-api", "codex_responses", "ultrafast", {"service_tier": "ultrafast"}),
+    ("gpt-6.1-sol", "openrouter", "chat_completions", "ultrafast", {}),
+    ("gpt-6.1-sol", "custom", "codex_responses", "ultrafast", {}),
     # Ultrafast is Responses-only.
     ("gpt-6-astra", "openai-api", "chat_completions", "ultrafast", {}),
     # Undocumented model: no tier at all, never a silent swap to priority.
