@@ -4459,6 +4459,7 @@ class GatewayRunner(
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
     _busy_input_mode: str = "interrupt"
     _busy_text_mode: str = "interrupt"
+    _stop_releases_queue: bool = False
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     _restart_after_turn_timeout: float = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
     _cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
@@ -4492,6 +4493,7 @@ class GatewayRunner(
     _session_service_tier_overrides = legacy_dict_property("_session_service_tier_overrides")
     _last_resolved_model = legacy_dict_property("_last_resolved_model")
     _queued_events = legacy_dict_property("_queued_events")
+    _held_queues = legacy_dict_property("_held_queues")  # /queue items held by /stop (queue_mgmt D14)
     _pending_turn_sidecar_notes = legacy_dict_property("_pending_turn_sidecar_notes")
     _pending_messages = legacy_dict_property("_pending_messages")
     _pending_native_image_paths_by_session = legacy_dict_property(
@@ -4599,6 +4601,7 @@ class GatewayRunner(
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
         self._busy_text_mode = self._load_busy_text_mode()
+        self._stop_releases_queue = self._load_stop_releases_queue()
         # Secondary-profile busy modes snapshotted at multiplex startup; handlers never reread config.
         self._busy_input_modes_by_profile: Dict[str, str] = {}
         self._busy_text_modes_by_profile: Dict[str, str] = {}
@@ -7065,8 +7068,13 @@ class GatewayRunner(
         pending_event: Any,
         pending: Any,
         source: Any = None,
+        *,
+        reason: Optional[str] = None,
     ) -> bool:
         """Spool a follow-up the draining gateway cannot run; next boot replays it.
+
+        ``reason="queue_held"`` marks a /queue item held by /stop: the boot loader restores it to
+        the session's held store instead of replaying it (spec 2026-10-12 D22).
 
         When ``pending_event`` exists the spooled record is that event itself
         (original text plus every carried field: message_type, media,
@@ -7135,7 +7143,7 @@ class GatewayRunner(
                     session_key or "",
                     text,
                     src_dict,
-                    reason=self._status_action_label(),
+                    reason=reason or self._status_action_label(),
                     event=fields,
                     # Adapter-granted admission (is_bot / role_authorized /
                     # relay) that SessionSource.to_dict never serialises;
@@ -8550,7 +8558,7 @@ class GatewayRunner(
         except Exception:
             logger.debug("restart follow-up spool load failed", exc_info=True)
             return 0
-        queued = 0
+        queued = held_restored = 0
         for record in records:
             try:
                 carried = record.get("event")
@@ -8568,6 +8576,14 @@ class GatewayRunner(
                     **kwargs,
                 )
                 event._hermes_restart_followup_path = record["_spool_path"]
+                if record.get("reason") == "queue_held":
+                    # A /queue item held by /stop before the restart: back into the held store,
+                    # never replayed as a turn (spec 2026-10-12 D22/I13).
+                    from gateway.fork_ext.restart_followups import acknowledge_followup
+                    self._session_state(record["session_key"]).conversation.held_queue.append(event)
+                    await asyncio.to_thread(acknowledge_followup, record["_spool_path"])
+                    held_restored += 1
+                    continue
                 self._queue_startup_restore_event(event)
                 queued += 1
             except Exception:
@@ -8576,11 +8592,12 @@ class GatewayRunner(
                     record.get("session_key"),
                     exc_info=True,
                 )
-        if queued or stale:
+        if queued or stale or held_restored:
             logger.warning(
-                "PHASE=restart_followups_replayed queued=%d stale_skipped=%d",
+                "PHASE=restart_followups_replayed queued=%d stale_skipped=%d held_restored=%d",
                 queued,
                 stale,
+                held_restored,
             )
         return queued
 
@@ -9621,6 +9638,19 @@ class GatewayRunner(
                     seen.add(id(event))
                     if await self._preserve_followup_across_restart(key, event, None):
                         spooled += 1
+        # Held /queue items (after /stop) restore as HELD on the next boot, never as a turn
+        # (spec 2026-10-12 D22/I13). Removed only once durably spooled.
+        held_by_session = getattr(self, "_held_queues", None)
+        if isinstance(held_by_session, _Mapping):
+            for key, events in list(held_by_session.items()):
+                for event in list(events or []):
+                    if event is None or id(event) in seen:
+                        continue
+                    seen.add(id(event))
+                    if await self._preserve_followup_across_restart(key, event, None, reason="queue_held"):
+                        spooled += 1
+                        with suppress(ValueError):
+                            events.remove(event)
         return spooled
 
     async def _send_startup_restore_ack(

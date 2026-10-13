@@ -929,22 +929,24 @@ class GatewaySessionCommandsMixin:
         # provider cached _session_id at initialize() and would keep writing to the wrong session.
         self._evict_cached_agent(session_key)
         title = await self._session_db.get_session_title(target_id) or name
+        from gateway import queue_mgmt
+        _queue_note = queue_mgmt.take_reset_drop_suffix(self, session_key)  # spec D21/I8: never silent
         try:
             history = await self.async_session_store.load_transcript(target_id)
         except TranscriptReadError:
             # The resume itself succeeded; only the count is missing — say so rather than "empty".
-            return t("gateway.resume.resumed_no_count", title=title) + "\n" + history_unreadable()
+            return t("gateway.resume.resumed_no_count", title=title) + "\n" + history_unreadable() + _queue_note
         msg_count = len([m for m in history if m.get("role") == "user"]) if history else 0
         if source.platform == Platform.MATRIX and allow_cross_room:
             msg_part = t("gateway.resume.msg_count_one" if msg_count == 1 else "gateway.resume.msg_count_other",
                          count=msg_count) if msg_count else ""
             return t("gateway.resume.matrix_cross_room_success", title=title,
-                     room=source.chat_name or source.chat_id, msg_part=msg_part)
+                     room=source.chat_name or source.chat_id, msg_part=msg_part) + _queue_note
         if not msg_count:
-            return t("gateway.resume.resumed_no_count", title=title)
+            return t("gateway.resume.resumed_no_count", title=title) + _queue_note
         if msg_count == 1:
-            return t("gateway.resume.resumed_one", title=title, count=msg_count)
-        return t("gateway.resume.resumed_many", title=title, count=msg_count)
+            return t("gateway.resume.resumed_one", title=title, count=msg_count) + _queue_note
+        return t("gateway.resume.resumed_many", title=title, count=msg_count) + _queue_note
 
     def _resume_listing_reply(self, source, titled: list[dict], allow_all: bool) -> str:
         """Numbered /resume list; a non-admin ``--all`` falls back to same-origin scoping and says so

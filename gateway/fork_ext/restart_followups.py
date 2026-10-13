@@ -356,7 +356,9 @@ def take_followups(
                 path.rename(path.with_suffix(".bad"))
                 continue
             age = current - float(record.get("ts", 0.0))
-            if age > MAX_REPLAY_AGE_S:
+            # A /queue item held by /stop never auto-runs (it is restored to the held store), so
+            # downtime cannot make it stale (spec 2026-10-12 D22).
+            if age > MAX_REPLAY_AGE_S and record.get("reason") != "queue_held":
                 stale += 1
                 path.rename(path.with_suffix(".stale"))
                 continue

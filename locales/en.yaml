@@ -489,6 +489,8 @@ gateway:
     stopped: "⚡ Stopping — finishing the current step and halting. You can continue this session."
     no_active: "No active task to stop."
     force_stopped_pending: "⚡ Force-stopped. The agent was still starting — session unlocked."
+    queue_held: "{count} queued prompt(s) held. /queue run releases them, /queue list shows them, /queue clear drops them."
+    queue_released: "Releasing {count} queued prompt(s) now, in order."
   title:
     db_unavailable: "Session database not available."
     warn_prefix: "⚠️ {error}"
@@ -805,9 +807,35 @@ gateway:
     paused: "⏸️ Paused{suffix}. New cron/kanban/gateway work is on hold; in-flight work finishes normally. Use `/pause off` to resume."
 
   queue:
-    usage: "Usage: /queue <prompt>"
+    usage: "Usage: /queue <prompt>  ·  /queue help for list, edit, rm, move, clear, run"
     queued: "Queued for the next turn."
     queued_depth: " ({depth} queued)"
+    help: "/queue <prompt> queue a prompt for after this turn\n/queue  or  /queue list  show the queue\n/queue rm N  remove item N\n/queue edit N <prompt>  replace item N's text\n/queue move A B  move item A to position B\n/queue clear  drop every queued prompt\n/queue run  release the queue now (interrupts a running turn)\n/queue add <prompt>  queue a prompt that starts with one of these words"
+    empty: "Queue is empty."
+    list_header: "Queue ({count} pending):"
+    held_header: "Queue ({count} held after /stop; nothing runs until /queue run):"
+    active_after_held: "Also waiting ({count}), not held; these run after the current turn:"
+    item: "{index}. {preview}"
+    item_system: "{index}. [system] {preview}"
+    list_footer: "/queue rm N · /queue edit N <text> · /queue move A B · /queue clear · /queue run"
+    unavailable: "Queue isn't available on this chat right now; nothing was changed."
+    cleared_one: "Cleared {count} queued prompt."
+    cleared_other: "Cleared {count} queued prompts."
+    item_not_found: "Queue item {index} not found. Current size: {size}"
+    refused_system: "Item {index} is a system event (a background task finishing or a goal step) and can't be edited or removed."
+    removed: "Removed queue item {index}: {preview}"
+    usage_edit: "Usage: /queue edit <number> <new prompt>"
+    updated: "Updated queue item {index}: {preview}"
+    attachment_kept: " (attachment kept)"
+    usage_move: "Usage: /queue move <from> <to>"
+    move_out_of_range: "Queue move out of range. Current size: {size}"
+    moved: "Moved queue item {source} to {destination}."
+    refused_command: "Not queued: /{command} is a command, and commands can't be queued as prompts. Send it on its own."
+    cap_reached: "Not queued: the queue is full ({cap} items). Use /queue list, /queue rm N or /queue clear."
+    added_to_held: "Added to the held queue ({count} held). /queue run releases them."
+    released: "Released {count} queued prompt(s); they run next, in order."
+    released_interrupting: "Interrupting the current turn; releasing {count} queued prompt(s) in order."
+    dropped_on_reset: "Dropped {count} queued prompt(s) with the old conversation."
 
   steer:
     usage: "Usage: /steer <prompt>"
@@ -1705,7 +1733,7 @@ slash:
   journey:
     description: "Open the learning journey timeline"
   queue:
-    description: "Queue a prompt for the next turn, or list/edit/rm/move/clear queued prompts"
+    description: "Queue a prompt for the next turn, or list/edit/rm/move/clear/run queued prompts"
   steer:
     description: "Inject a message after the next tool call without interrupting"
   goal:
@@ -2539,7 +2567,9 @@ cli:
     enable_disable_hint: "Enable/disable: hermes plugins enable/disable <name>"
     system_error: "Plugin system error: {error}"
   queue:
-    usage: "Usage: /queue <prompt> | /queue list | /queue edit N <prompt> | /queue rm N | /queue move FROM TO | /queue clear"
+    usage: "Usage: /queue <prompt> | /queue list | /queue edit N <prompt> | /queue rm N | /queue move FROM TO | /queue clear | /queue run"
+    released: "Released {count} queued prompt(s); they run next, in order."
+    released_interrupting: "Interrupting the current turn; releasing {count} queued prompt(s) in order."
     queued: "Queued: {preview}"
     queued_next_turn: "Queued for the next turn: {preview}"
     empty: "Queue is empty."

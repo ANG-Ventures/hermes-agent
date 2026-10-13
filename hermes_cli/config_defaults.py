@@ -1037,6 +1037,9 @@ DEFAULT_CONFIG = {
         # calls: ...]` lines; False shows them inline.
         "resume_skip_tool_only": True,
         "busy_input_mode": "interrupt",  # interrupt | queue | steer
+        # Gateway /stop and queued (/queue) prompts: false (default) HOLDS them after /stop until
+        # `/queue run` or `/queue clear`; true releases them right after the stop, in order.
+        "stop_releases_queue": False,
         # steer mode: false hides only the "Steered into current run" bubble; steering itself still
         # happens.
         "busy_steer_ack_enabled": True,

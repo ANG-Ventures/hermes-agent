@@ -4765,7 +4765,15 @@ class GatewayTurnMixin:
             result = turn_ctx.result_holder[0]
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
-            pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+            if (turn_ctx.run_generation is not None and session_key
+                    and not self._is_session_run_current(session_key, turn_ctx.run_generation)):
+                # A turn invalidated by /stop, /new or eviction must not consume queued items: popping
+                # them here recursed under the dead generation and dropped (or zombie-ran) them. Leave
+                # them for the current owner (spec 2026-10-12 D15; narrower than reverted #814).
+                logger.info("PHASE=stale_drain_skipped session=%s gen=%s", session_key, turn_ctx.run_generation)
+                pending_event, pending = None, None
+            else:
+                pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
