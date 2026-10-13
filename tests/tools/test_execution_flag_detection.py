@@ -106,6 +106,10 @@ def _exec_option_probe_verdict(tool, args, stdin, needs_tty, tmp_path):
       outright (``Found argument '-y'``). Nothing is executed, so the exec-flag
       surface the detector guards is not reachable on this build: the detector
       is merely CONSERVATIVE there (a false positive, never a missed danger).
+      Same class: uutils coreutils ``sort`` (the Ubuntu default, clap parser)
+      runs ``--compress-program plainhelper`` but refuses
+      ``--compress-program -payload-marker`` with ``a value is required for
+      '--compress-program <PROG>'``; GNU coreutils ``sort`` executes it.
 
     Returns ``None`` when the case is meaningful (run the real assertion), or a
     skip reason string otherwise.
@@ -123,7 +127,7 @@ def _exec_option_probe_verdict(tool, args, stdin, needs_tty, tmp_path):
     dash_ran, output = _run_exec_option_probe(
         tool, args, stdin, needs_tty, tmp_path, "-dashprobe-marker", "dash"
     )
-    if not dash_ran and re.search(r"(?i)\b(usage|unexpected|isn't valid|illegal option)\b", output):
+    if not dash_ran and re.search(r"(?i)\b(usage|unexpected|isn't valid|illegal option|a value is required)\b", output):
         return (
             f"this build of {tool} supports the option but its arg parser "
             f"REJECTS a leading-dash operand ({output.strip().splitlines()[0][:80]!r}) "
