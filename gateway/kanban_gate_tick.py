@@ -119,6 +119,7 @@ class GateTickBuilder:
         self._probe = probe
         self._log = _Every5Min()
         self._remote_by_host: Dict[str, int] = {}
+        self.running_local: Optional[int] = None   # last build()'s local count
         self._signal: Optional[kwp.TargetSignal] = None
 
     def _root(self):
@@ -141,6 +142,7 @@ class GateTickBuilder:
         gate = self.gate
         running_local, remote_by_host = running_split(self._ledger(boards))
         self._remote_by_host = dict(remote_by_host)
+        self.running_local = running_local
         allowance, paused = gate.admit_now(running=running_local if gate.enabled else None)
         if gate.enabled and allowance is None and klg.loadavg_supported():
             # Enabled gate, load1 unreadable on a host that has the sampler:

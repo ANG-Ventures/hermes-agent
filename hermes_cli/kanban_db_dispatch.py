@@ -296,6 +296,12 @@ class DispatchResult:
     """task id -> why a ready card was not spawned anywhere this tick
     (``local_full``, ``pool_full``, ``pin_*``, ``not_portable:<rule>``,
     ``studio_affinity:<rule>``)."""
+    rows_routed: int = 0
+    """Ready rows this tick's routing/spawn loop considered (pool plan or not).
+    Read by the gateway's tick series (``gate-ticks.jsonl``), never by dispatch."""
+    portable_waiting: int = 0
+    """Rows routed ``portable`` still in ``placement_waits`` at the end of the
+    ready section (the I-0 query's input, spec v0.3 §3.6)."""
     placement_affinity: dict = field(default_factory=dict)
     """task id -> ``{host, rule, matched_by}`` for ready cards whose work is
     bound to one host's state (t_3e6c9b2b): they run there or wait, never spill."""
@@ -5931,6 +5937,10 @@ def _dispatch_once_locked(
         _khc.record_capability_events(conn, result, _caps, _caps_out, _affinity_evaluated,
                                       _cap_comments)
     _record_placement_waits(conn, result, row_route, dry_run)
+    result.rows_routed = len(ready_rows)
+    result.portable_waiting = sum(
+        1 for tid in result.placement_waits
+        if row_route.get(tid, ("local", None))[0] == "portable")
     if not dry_run and result.placement_waits:
         try:
             from hermes_cli.kanban_drained_pin import notify_drained_pins
