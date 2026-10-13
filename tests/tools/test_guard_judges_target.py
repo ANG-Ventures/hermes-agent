@@ -54,7 +54,7 @@ REMOTE_PKILL_REPLAY = (
 @pytest.mark.parametrize("command", [
     MKFS_PROSE_REPLAY,
     "cat > /tmp/n.md <<'EOF'\nstep: `" + FS + ".xfs -L x /dev/nvme0n1`\nEOF",
-    "git commit -F - <<'EOF'\nran `" + FS + ".xfs` by hand, then `sudo reboot`\nEOF",
+    "python3 - <<'PY'\nadd = \'\'\'5. Post-install \u2014 by hand: `" + FS + ".xfs -L x /dev/nvme0n1`\'\'\'\nopen('r.md','a').write(add)\nPY",
     "python3 - <<\"PY\"\nprint('`shutdown -h now` is in the runbook')\nPY",
     "cat <<-'EOF' >> notes\n\t`" + FS + ".ext4 /dev/sda` was the old step\n\tEOF",
 ])
@@ -71,10 +71,28 @@ def test_quoted_heredoc_read_as_data_is_not_hardline(command):
     "python3 - <<'PY'\nnotes\nPY\nsudo reboot",
     "cat <<'EOF' > /tmp/x\n" + FS + ".ext4 /dev/sda",                 # unterminated: kept scanned
     "sudo bash <<'EOF'\n" + FS + ".ext4 /dev/sda\nEOF",
+    # Prism round 1 on #1958
+    "python3 - <<'PY'\nimport os\nos.system('`" + FS + ".ext4 /dev/sda`')\nPY",
+    "printf '%s\\n' \"\ncat <<'EOF'\n\"\n" + FS + ".ext4 /dev/sda\nprintf '%s\\n' \"\nEOF\n\"",      # 027487c60db5
+    "cat <<'EOF'X\nsafe\nEOFX\n" + FS + ".ext4 /dev/sda\nEOF",                                       # a2ace8ba9d1c
+    "cat <<'E'OF\ntext\nEOF\n" + FS + ".ext4 /dev/sda\nE",                                            # d30d5f7cc599
+    "cat > /tmp/guard.sh <<'EOF'\n" + FS + ".ext4 /dev/sda\nEOF\nbash /tmp/guard.sh",                 # c969ba3248db
 ])
 def test_heredoc_bodies_that_execute_still_hardline(command):
     blocked, desc = detect_hardline_command(command)
     assert blocked and desc
+
+
+def test_executable_python_heredoc_body_is_never_masked():
+    """Prism 4dfd8f02b909 / 2a668f325ee0: a python body that can reach a process call is code. The
+    masker must leave it byte-identical, so the hardline floor judges it exactly as it does on main
+    (the floor does not parse Python string payloads, before or after this change)."""
+    from tools.approval_detection import _mask_data_heredoc_bodies
+    for body in ("import os\nos.system('" + FS + ".ext4 /dev/sda')\n",
+                 "import subprocess\nsubprocess.run('" + FS + ".ext4 /dev/sda', shell=True)\n",
+                 "exec('print(1)')\n"):
+        command = "python3 - <<'PY'\n" + body + "PY"
+        assert _mask_data_heredoc_bodies(command) == command
 
 
 def test_remote_pkill_replay_is_not_a_host_interpreter_kill():
@@ -88,6 +106,11 @@ def test_remote_pkill_replay_is_not_a_host_interpreter_kill():
     "ssh ci 'true'\npkill -9 python",
     "pgrep python | xargs kill",
     "taskkill /F /IM python.exe",
+    # Prism round 1 on #1958 (54ec70a8227c / 4e94865089a7 / 8c997d448d77): a spliced LOCAL killer
+    "ssh ci 'pkill -f 18765'; pk''ill python3",
+    "ssh ci 'pkill -f 18765'; pk'ill' python3",
+    "ssh ci 'pkill x'; pk\"\"ill -f python3",
+    "ssh ci 'pkill x'; p\\kill python3",
 ])
 def test_local_interpreter_kill_still_blocks(command):
     assert contains_host_interpreter_kill(command) is True

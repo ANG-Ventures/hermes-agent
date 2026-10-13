@@ -303,8 +303,13 @@ def contains_host_interpreter_kill(text: str) -> bool:
     # take via _match_is_ssh_remote. Tokenizing first loses that: the whole remote body became one
     # segment and a later `python3` in it read as a `pkill -f` operand (2026-10-12 04:33,
     # `ssh ci 'pkill -f "18765"; ... python3 -c ...'`). Only when EVERY killer/enumerator word sits
-    # in a remote command is the text exempt; one local occurrence keeps the full scan.
-    killer_positions = [m.start() for m in _KILLER_WORD_RE.finditer(normalized)]
+    # in a remote command is the text exempt; one local occurrence keeps the full scan. Killer words
+    # are found on the DE-QUOTED text (quote chars and backslashes dropped, the way the shell joins
+    # `pk''ill` / `p\kill` into `pkill`), each mapped back to its original offset for the remote test
+    # (Prism 54ec70a8227c / 8c997d448d77).
+    kept = [i for i, ch in enumerate(normalized) if ch not in "'\"\\"]
+    dequoted = "".join(normalized[i] for i in kept)
+    killer_positions = [kept[m.start()] for m in _KILLER_WORD_RE.finditer(dequoted)]
     if killer_positions and all(_match_is_ssh_remote(normalized, pos) for pos in killer_positions):
         return False
     kill_verb_present = bool(_KILL_VERB_RE.search(normalized))
@@ -2933,15 +2938,16 @@ def _mask_python_data_strings(body: str) -> str:
     the one allowlisted execution path and stays visible to the lifecycle scan. Anything the
     allowlist refuses keeps the whole body visible (fail closed).
     """
-    if not body.isascii():
-        return body
+    # AST columns are UTF-8 BYTE offsets: splice the encoded body so a non-ASCII runbook line
+    # (em dash, arrows) masks at the right place instead of failing closed (t_75fdedd4).
     try:
         tree = ast.parse(body)
     except SyntaxError:
         return body
     if not _python_body_is_mask_safe(tree):
         return body
-    lines = body.splitlines(keepends=True)
+    raw = body.encode("utf-8")
+    lines = raw.splitlines(keepends=True)
     offsets = [0]
     for line in lines:
         offsets.append(offsets[-1] + len(line))
@@ -2964,8 +2970,8 @@ def _mask_python_data_strings(body: str) -> str:
             spans.append((offsets[node.lineno - 1] + node.col_offset,
                           offsets[node.end_lineno - 1] + node.end_col_offset))
     for start, end in sorted(spans, reverse=True):
-        body = body[:start] + '"data"' + body[end:]
-    return body
+        raw = raw[:start] + b'"data"' + raw[end:]
+    return raw.decode("utf-8")
 
 
 def _mask_read_only_python_paths(body: str) -> str:
