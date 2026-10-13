@@ -51,6 +51,11 @@ test, not a dead host:
    process (measured: a 1 GiB cgroup + the 1 GiB default budget = exit 137 with no
    verdict; clamped = the named failure in under a second).
 
+This file is self-contained (stdlib + pytest; psutil only off-Linux) so other repos carry
+a byte-identical copy as a plugin: ``pytest_plugins = ["pytest_bounds"]`` or ``-p``, via the
+hook functions at the bottom. hermes-agent imports it into ``tests/conftest.py`` instead
+(a non-root conftest cannot list ``pytest_plugins``), so those hooks are inert here.
+
 Opt-outs are markers with a reason, never env vars (root AGENTS.md: behaviour is
 config/markers, ``.env`` is secrets). The defaults are pytest ini values
 (``bounds_wall_seconds``, ``bounds_rss_growth_gb``; override with ``-o`` for a probe, never
@@ -115,8 +120,17 @@ def _limit_from_marker(item, name: str, default: float) -> float:
 
 
 def _current_rss() -> int:
-    import psutil
-
+    """Resident set size now. ``/proc`` on Linux (no dependency, ~1 us), psutil elsewhere."""
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/self/statm", "rb") as fh:
+                return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, IndexError):
+            pass
+    try:
+        import psutil
+    except ImportError:
+        return 0  # no RSS source: the wall clock still bounds the test
     return psutil.Process().memory_info().rss
 
 
@@ -326,3 +340,19 @@ def bounded_call(item):
                 _FIRED.remove(dog)
             # Cancel any still-pending async exception so it cannot land in teardown.
             ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(dog.target), None)
+
+
+# ── Plugin surface for repos that load this file directly (hermes-home, ace-ai-ops) ──
+
+def pytest_addoption(parser):  # noqa: D401 — pytest hook
+    addoption(parser)
+
+
+def pytest_configure(config):  # noqa: D401 — pytest hook
+    configure(config)
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_call(item):  # noqa: D401 — pytest hook
+    with bounded_call(item):
+        return (yield)
