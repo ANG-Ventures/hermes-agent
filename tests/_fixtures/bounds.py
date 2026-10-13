@@ -44,7 +44,12 @@ test, not a dead host:
    growth over the test's starting RSS crosses the threshold. Polling (not a post-hoc
    ``getrusage`` delta) is what makes this a *stop*, not an autopsy: the incident test
    would have been failed at ~1 GiB, three seconds in, on every host. The sample costs
-   ~2 us.
+   ~2 us. Inside a cgroup with a numeric ``memory.max`` (test-gate's ``MemoryMax``, a CI
+   container) the budget is clamped to what the cgroup leaves above the test's starting
+   RSS minus a headroom (35 % of the cgroup, min 96 MiB: the poll interval plus the
+   stop latency of a ~2 GB/s allocator), so the harness names the test BEFORE the kernel's OOM killer SIGKILLs the
+   process (measured: a 1 GiB cgroup + the 1 GiB default budget = exit 137 with no
+   verdict; clamped = the named failure in under a second).
 
 Opt-outs are markers with a reason, never env vars (root AGENTS.md: behaviour is
 config/markers, ``.env`` is secrets). The defaults are pytest ini values
@@ -68,8 +73,13 @@ import pytest
 _TEST_WALL_SECONDS = 60.0
 _TEST_RSS_GROWTH_GB = 1.0
 _PROCESS_RLIMIT_GB = 6.0
-_RSS_POLL_SECONDS = 0.1
+_RSS_POLL_SECONDS = 0.02  # the incident allocated at ~2 GB/s: 20 ms is ~40 MB of overshoot
 _ESCALATE_AFTER_SECONDS = 3.0
+_CGROUP_HEADROOM_MIN = 96 * 1024 ** 2
+# Measured under a 1 GiB cgroup on ace-media (memory.current traced at 10 ms): detection
+# lands one poll late and the test thread allocates another ~150 MB before the async
+# exception stops it, so a 1 GiB cgroup needs ~0.35 GiB above the budget.
+_CGROUP_HEADROOM_FRACTION = 0.35
 _ESCALATE_EXIT_CODE = 70
 # The watchdog that has fired and not yet been acknowledged by the hook wrapper; read by
 # the SIGURG handler on the main thread.
@@ -110,6 +120,31 @@ def _current_rss() -> int:
     return psutil.Process().memory_info().rss
 
 
+def _cgroup_memory_max() -> int | None:
+    """This process's cgroup v2 ``memory.max`` in bytes, or None (no cgroup / unlimited)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        with open("/proc/self/cgroup", encoding="utf-8") as fh:
+            rel = next((ln.split(":", 2)[2].strip() for ln in fh if ln.startswith("0::")), None)
+        if rel is None:
+            return None
+        with open(f"/sys/fs/cgroup{rel}/memory.max", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+    except (OSError, IndexError):
+        return None
+    return int(raw) if raw.isdigit() else None
+
+
+def _clamp_to_cgroup(growth_bytes: int, start_rss: int) -> int:
+    limit = _cgroup_memory_max()
+    if limit is None:
+        return growth_bytes
+    headroom = max(_CGROUP_HEADROOM_MIN, int(limit * _CGROUP_HEADROOM_FRACTION))
+    room = limit - start_rss - headroom
+    return max(min(growth_bytes, room), 16 * 1024 ** 2)
+
+
 def _on_sigurg(_signum, _frame) -> None:
     """Raise the fired watchdog's exception inside whatever syscall the main thread is in."""
     if _FIRED:
@@ -135,9 +170,9 @@ class _Watchdog:
     def __init__(self, item, wall_seconds: float, rss_growth_bytes: int) -> None:
         self.item = item
         self.wall_seconds = wall_seconds
-        self.rss_growth_bytes = rss_growth_bytes
         self.target = threading.get_ident()
         self.start_rss = _current_rss()
+        self.rss_growth_bytes = _clamp_to_cgroup(rss_growth_bytes, self.start_rss)
         self.started = time.monotonic()
         self.fired: tuple[type, str] | None = None
         self._stop = threading.Event()

@@ -152,14 +152,33 @@ def test_rlimit_as_turns_a_runaway_into_memory_error_on_linux(tmp_path):
     assert out.returncode == 0, out.stdout + out.stderr
 
 
+@pytest.mark.platforms("linux")
 def test_rlimit_env_zero_disables_the_process_ceiling(tmp_path):
-    out = _run_child(tmp_path, '''
-        import resource, sys
-        def test_uncapped():
-            if sys.platform.startswith("linux"):
+    """A soft rlimit is inherited, so lift this (parent) process's cap for the spawn."""
+    import resource
+
+    saved = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (saved[1], saved[1]))
+    try:
+        out = _run_child(tmp_path, '''
+            import resource
+            def test_uncapped():
                 assert resource.getrlimit(resource.RLIMIT_AS)[0] == resource.RLIM_INFINITY
-    ''', env={bounds._RLIMIT_ENV: "0"})
+        ''', env={bounds._RLIMIT_ENV: "0"})
+    finally:
+        resource.setrlimit(resource.RLIMIT_AS, saved)
     assert out.returncode == 0, out.stdout + out.stderr
+
+
+def test_growth_budget_is_clamped_to_the_cgroup_ceiling(monkeypatch):
+    gib = 1024 ** 3
+    monkeypatch.setattr(bounds, "_cgroup_memory_max", lambda: None)
+    assert bounds._clamp_to_cgroup(gib, 300 * 1024 ** 2) == gib
+    monkeypatch.setattr(bounds, "_cgroup_memory_max", lambda: gib)
+    assert bounds._clamp_to_cgroup(gib, 300 * 1024 ** 2) == gib - 300 * 1024 ** 2 - int(gib * 0.35)
+    assert bounds._clamp_to_cgroup(gib, 2 * gib) == 16 * 1024 ** 2  # already over: fail at the first poll
+    monkeypatch.setattr(bounds, "_cgroup_memory_max", lambda: 64 * gib)
+    assert bounds._clamp_to_cgroup(gib, 300 * 1024 ** 2) == gib  # roomy cgroup: the budget stands
 
 
 def test_marker_limits_are_read_from_the_item():
