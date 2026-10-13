@@ -242,6 +242,26 @@ def _live_keys(conn) -> set[tuple]:
     return keys
 
 
+def _renew_claims(conn, members: list) -> bool:
+    """Refresh ``claimed_at`` on every record in ``members`` still holding our token, so a batch of
+    slow stops never lets a queued claim go stale mid-sweep. False when none is ours any more."""
+    from hermes_cli import kanban_db as kb
+
+    held = False
+    now = int(time.time())
+    if not members:
+        return False
+    with kb.write_txn(conn):
+        for run_id, _task_id, token, _act in members:
+            items = _load(conn.execute("SELECT resources FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0])
+            mine = next((r for r in items if r.get("claim") == token), None)
+            if mine is not None:
+                mine["claimed_at"] = now
+                conn.execute("UPDATE task_runs SET resources = ? WHERE id = ?", (_dump(items), run_id))
+                held = True
+    return held
+
+
 def release_finished(
     conn, *, board: Optional[str] = None, runner: Callable[[list[str]], tuple[int, str]] = _default_runner,
     notify: Callable[[Optional[str], str], None] = _default_notify, dry_run: bool = False,
@@ -253,10 +273,12 @@ def release_finished(
       1. claim (one write txn): each candidate goes ``started`` -> ``stopping`` with a fresh claim
          token, so a second sweep never selects it; a resource another live card still has
          ``started`` is left alone until its last owner finishes; keep-alive/refusals settle here;
-      2. stop (no txn open): one stop per resource, however many finished runs recorded it;
-      3. settle (one write txn): a result lands only on a record still holding our claim token. A
-         record re-registered meanwhile is a new generation and keeps its ``started`` state.
-    A claim older than ``STALE_CLAIM_S`` (its sweep died mid-stop) is claimable again."""
+      2. stop (no txn open): one stop per resource, however many finished runs recorded it, each
+         preceded by renewing the claims still queued and re-checking that this one is still ours;
+      3. settle (a write txn right after each stop): a result lands only on a record still holding
+         our claim token. A record re-registered meanwhile is a new generation and stays ``started``.
+    Each claim is re-checked and renewed just before its own stop, so ``STALE_CLAIM_S`` bounds one
+    stop, not the whole batch; a claim older than that (its sweep died mid-stop) is claimable again."""
     from hermes_cli import kanban_db as kb
 
     now = int(time.time())
@@ -320,35 +342,40 @@ def release_finished(
     if dry_run:
         return actions
 
-    results = {key: runner(plan["argv"]) for key, plan in plans.items()}
-
+    # Stop and settle one resource at a time: renew every claim still queued, stop only if this one is
+    # still ours, then write its result at once, so no claim (queued or done) ever ages past STALE_CLAIM_S.
     stopped_acts: list[dict] = []
-    if plans:
+    pending = list(plans)
+    while pending:
+        key = pending.pop(0)
+        plan = plans[key]
+        _renew_claims(conn, [m for k in pending for m in plans[k]["members"]])
+        if not _renew_claims(conn, plan["members"]):
+            continue  # every claim was retaken before the stop ran: the other sweep owns it now
+        rc, tail = runner(plan["argv"])
         with kb.write_txn(conn):
-            for key, plan in plans.items():
-                rc, tail = results[key]
-                for run_id, task_id, token, act in plan["members"]:
-                    items = _load(conn.execute("SELECT resources FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0])
-                    mine = next((r for r in items if r.get("claim") == token), None)
-                    if mine is None:
-                        continue  # re-registered while the stop ran: that generation is not ours to settle
-                    mine.pop("claim", None)
-                    mine.pop("claimed_at", None)
-                    mine["stop_attempts"] = int(mine.get("stop_attempts") or 0) + 1
-                    if rc == 0:
-                        mine.update(state="stopped", released_at=int(time.time()))
-                        act["action"] = "stopped"
-                    else:
-                        mine["last_error"] = f"rc={rc} {tail}"[:240]
-                        mine["state"] = "stop_failed" if mine["stop_attempts"] >= MAX_STOP_ATTEMPTS else "started"
-                        act.update(action="stop_failed" if mine["state"] == "stop_failed" else "retry",
-                                   error=mine["last_error"])
-                    conn.execute("UPDATE task_runs SET resources = ? WHERE id = ?", (_dump(items), run_id))
-                    if act["action"] != "retry":
-                        kb._append_event(conn, task_id, f"resource_{act['action']}",
-                                         {k: act[k] for k in ("kind", "id", "host", "error") if k in act},
-                                         run_id=run_id)
-                    stopped_acts.append(act)
+            for run_id, task_id, token, act in plan["members"]:
+                items = _load(conn.execute("SELECT resources FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0])
+                mine = next((r for r in items if r.get("claim") == token), None)
+                if mine is None:
+                    continue  # re-registered while the stop ran: that generation is not ours to settle
+                mine.pop("claim", None)
+                mine.pop("claimed_at", None)
+                mine["stop_attempts"] = int(mine.get("stop_attempts") or 0) + 1
+                if rc == 0:
+                    mine.update(state="stopped", released_at=int(time.time()))
+                    act["action"] = "stopped"
+                else:
+                    mine["last_error"] = f"rc={rc} {tail}"[:240]
+                    mine["state"] = "stop_failed" if mine["stop_attempts"] >= MAX_STOP_ATTEMPTS else "started"
+                    act.update(action="stop_failed" if mine["state"] == "stop_failed" else "retry",
+                               error=mine["last_error"])
+                conn.execute("UPDATE task_runs SET resources = ? WHERE id = ?", (_dump(items), run_id))
+                if act["action"] != "retry":
+                    kb._append_event(conn, task_id, f"resource_{act['action']}",
+                                     {k: act[k] for k in ("kind", "id", "host", "error") if k in act},
+                                     run_id=run_id)
+                stopped_acts.append(act)
     actions.extend(stopped_acts)
     for act in actions:
         if act["action"] == "retry":

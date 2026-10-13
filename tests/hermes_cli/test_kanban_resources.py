@@ -310,3 +310,48 @@ def test_a_reregistration_during_the_stop_keeps_its_started_state(kanban_home):
         (rec,) = kres.list_resources(conn, tid)
         assert rec["state"] == "started" and "claim" not in rec
         assert kres.outstanding(conn, tid) == [rec]
+
+
+def test_a_slow_batch_renews_each_claim_before_its_stop(kanban_home, monkeypatch):
+    """Prism 275dd68484f0/f906e655a576: stops whose cumulative time exceeds STALE_CLAIM_S never let a
+    later claim go stale, so an overlapping sweep cannot retake it and stop it twice."""
+    clock = [1_000_000]
+    monkeypatch.setattr(kres.time, "time", lambda: clock[0])
+    stops, inner = [], []
+    with kbc.connect_closing() as conn:
+        tid, _ = _running_card(conn)
+        for i in range(4):
+            kres.kanban_run_resource(conn, tid, "container", f"c{i}", "local")
+        kb.complete_task(conn, tid, summary="ok")
+
+        def runner(argv):
+            stops.append(argv)
+            clock[0] += kres.STOP_TIMEOUT_S + 30  # each stop near its timeout: 4 x 120 s > STALE_CLAIM_S
+            with kbc.connect_closing() as other:
+                inner.extend(kres.release_finished(other, runner=lambda a: pytest.fail("double stop"),
+                                                   notify=_quiet))
+            return 0, ""
+
+        acts = kres.release_finished(conn, runner=runner, notify=_quiet)
+        assert len(stops) == 4 and inner == []
+        assert [a["action"] for a in acts] == ["stopped"] * 4
+
+
+def test_a_claim_lost_before_its_stop_skips_the_stop(kanban_home, monkeypatch):
+    with kbc.connect_closing() as conn:
+        tid, run = _running_card(conn)
+        kres.kanban_run_resource(conn, tid, "container", "c0", "local")
+        kb.complete_task(conn, tid, summary="ok")
+        real = kres._renew_claims
+
+        def steal(c, members):
+            items = kres._load(c.execute("SELECT resources FROM task_runs WHERE id=?", (run,)).fetchone()[0])
+            items[0]["claim"] = "other-sweep"
+            c.execute("UPDATE task_runs SET resources=? WHERE id=?", (kres._dump(items), run))
+            c.commit()
+            return real(c, members)
+
+        monkeypatch.setattr(kres, "_renew_claims", steal)
+        acts = kres.release_finished(conn, runner=lambda a: pytest.fail("stopped a claim it lost"), notify=_quiet)
+        assert acts == []
+        assert kres.list_resources(conn, tid)[0]["claim"] == "other-sweep"
