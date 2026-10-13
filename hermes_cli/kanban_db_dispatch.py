@@ -6214,7 +6214,8 @@ def _dispatch_once_locked(
                 band = getattr(spillover, "band", None)
                 spill_reason = getattr(spillover, "spill_reason", None)
                 reason = "pin" if route == "pin" else (
-                    "band_paused" if band == "paused" else "band_spilling")
+                    "band_paused" if band == "paused" else
+                    "band_spilling" if band == "spilling" else "overflow")
                 probe = spillover.probe(placed_host.name)
                 from hermes_cli import kanban_headroom as _kh_res
                 # _rid was written by take() under the ledger lock BEFORE launch.

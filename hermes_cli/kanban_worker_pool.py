@@ -7,7 +7,8 @@ Hosts come from two files under the fleet root (``<kanban_home>/fleet``):
 * ``fleet-roles.json``: role ``kanban-worker`` = ``{"slots": N}`` (schema 1,
   the same validators as the CI and Prism readers);
 * ``kanban-pool.json``: the kanban sidecar (``priority``, ``capacity_pct``,
-  ``profiles``, ``studio_bound_skills``, ``hosts.<id>.{enabled, absence,
+  ``studio_only`` (deny-list: every other profile is a pool profile) or the
+  legacy ``profiles`` allow-list, ``studio_bound_skills``, ``hosts.<id>.{enabled, absence,
   capacity_pct?, profiles?}``, ``ssh_user`` locked to ``kanbanw``). Written
   only by hermes-home ``scripts/fleet-host``.
 
@@ -75,7 +76,7 @@ _ROLES_ROW = frozenset({"roles", "state"})
 # change); validated by the router's registry, never read for placement here.
 _ROLES_ROW_OPTIONAL = frozenset({"last_change"})
 _SIDECAR_TOP = frozenset({"_doc", "schema", "ssh_user", "capacity_pct", "priority",
-                          "profiles", "studio_bound_skills", "hosts"})
+                          "profiles", "studio_only", "studio_bound_skills", "hosts"})
 _SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles"})
 _ABSENCE = ("required", "optional")
 _STATES = ("active", "draining")
@@ -242,7 +243,7 @@ def validate_sidecar(doc) -> List[str]:
         errs.append(f"ssh_user must be {SSH_USER!r} (locked), not {doc.get('ssh_user')!r}")
     if "capacity_pct" in doc and not _pct(doc["capacity_pct"]):
         errs.append(f"capacity_pct must be in (0, 1], not {doc['capacity_pct']!r}")
-    for key in ("profiles", "studio_bound_skills"):
+    for key in ("profiles", "studio_only", "studio_bound_skills"):
         if key in doc and not _str_list(doc[key]):
             errs.append(f"{key} must be a list of non-empty strings")
     prio = doc.get("priority")
@@ -276,6 +277,19 @@ def _read_json(path: Path):
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def derived_profiles(profiles_dir: Path, studio_only: Iterable[str]) -> Tuple[str, ...]:
+    """Pool profiles under the deny-list (t_7b1eca07): every named profile with a
+    ``config.yaml`` under ``profiles_dir``, minus ``studio_only``, sorted. A
+    native-command lane in the result is still refused by ``portable()``."""
+    deny = {s.strip().lower() for s in studio_only or ()}
+    try:
+        names = sorted(p.name for p in Path(profiles_dir).iterdir()
+                       if not p.name.startswith(".") and (p / "config.yaml").is_file())
+    except OSError:
+        return ()
+    return tuple(n for n in names if n.lower() not in deny)
 
 
 def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolConfig:
@@ -316,6 +330,13 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     prio: List[str] = sidecar["priority"]
     rows: dict = sidecar["hosts"]
     gprofiles = tuple(sidecar.get("profiles") or ())
+    # studio_only binds EVERY list a host serves, per-host overrides included,
+    # so no row can re-admit a denied profile (Prism 34f523dde2d6).
+    deny = {s.strip().lower() for s in sidecar.get("studio_only") or ()}
+    if "studio_only" in sidecar:
+        # Deny-list (t_7b1eca07): every live profile is a pool profile unless the
+        # sidecar keeps it on the Studio, so a new profile never lands Studio-bound.
+        gprofiles = derived_profiles(fleet_dir.parent / "profiles", sidecar["studio_only"])
     gcap = float(sidecar.get("capacity_pct", DEFAULT_CAPACITY))
     warnings: List[str] = []
     hosts: List[PoolHost] = []
@@ -341,7 +362,8 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         hosts.append(PoolHost(
             name=hid, ssh_host=hid, ssh_user=SSH_USER, slots=role_slots[ROLE],
             capacity_pct=float(row.get("capacity_pct", gcap)), absence=row["absence"],
-            profiles=tuple(row.get("profiles", gprofiles)), state=state, enabled=True,
+            profiles=tuple(p for p in row.get("profiles", gprofiles) if p.lower() not in deny),
+            state=state, enabled=True,
             priority=i,
         ))
     for hid in rows:
@@ -1249,7 +1271,7 @@ class SpilloverPlan:
     config: PoolConfig = field(default_factory=PoolConfig)  # what portable() reads
     band: Optional[str] = None           # the Studio gate band this tick
     spill_reason: Optional[str] = None
-    pins_only: bool = False              # admitting band: remote PINS only (PRD 5.2.5)
+    pins_only: bool = False              # admitting band, worker_pool.overflow off: remote PINS only
     signal: Optional[TargetSignal] = None  # None = KWLB v0.1 (read_signal false)
     taken: Dict[str, int] = field(default_factory=dict)  # this tick's takes, per host
     # host -> why the memory/band cap is below its free slots (t_31350981);

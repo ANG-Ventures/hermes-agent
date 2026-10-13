@@ -2354,7 +2354,11 @@ DEFAULT_CONFIG = {
         # plan, every card local. The old kanban.worker_hosts list is
         # retired: set next to a kanban-worker role, the pool places nothing.
         # See kanban_worker_pool.py.
-        "worker_pool": {"enabled": True},
+        # overflow (t_7b1eca07): true = in the admitting band too, a portable
+        # card that finds no local slot is placed on the pool (the pool is
+        # planned whenever a card is ready); false = remote pins only while
+        # admitting (KWLB v0.1 PRD 5.2.5).
+        "worker_pool": {"enabled": True, "overflow": True},
         # Login whose uid runs a LOCAL worker's terminal + file tools (over
         # ssh <user>@localhost, the worker-pool placement path). None/"" or
         # the dispatcher's own login = the dispatcher's uid (today). Read per
