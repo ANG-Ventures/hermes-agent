@@ -1330,6 +1330,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
         try:
+            from hermes_cli import kanban_placement_view as kpv
+            placement = kpv.task_block(conn, task.id)
+        except kb.sqlite3.Error:  # older/minimal board schema
+            placement = None
+        try:
             from hermes_cli import kanban_pr_owner as kpo
 
             pr_card_map = kpo.pr_card_map(conn, task.id)
@@ -1359,6 +1364,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             ],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
+            "placement": placement,
         })
         return 0
 
@@ -1425,6 +1431,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
     for pr, others in (pr_card_map or {}).items():
         field("pr-cards", f"{pr}: " + (", ".join(
             f"{o['id']} ({o['status']}, {o['assignee'] or '-'})" for o in others) or "none other"))
+    if placement and (placement.get("running_on") or placement.get("last_placement")
+                      or placement.get("held")):
+        # The block `kanban placement <id>` prints (spec §4.3; one reader, I-S5).
+        from hermes_cli import kanban_placement_view as kpv
+        print()
+        print("\n".join(kpv.format_task(placement)))
     if task.body:
         _print_section("Body:", [task.body])
     if task.result:

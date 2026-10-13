@@ -476,7 +476,9 @@ def test_dry_run_prints_the_placement_wait_reason(kanban_home, capsys, monkeypat
                                                max_running=None, failure_limit=2))
     out = capsys.readouterr().out
     assert rc == 0
-    assert f"Held ({child}): not_portable:linked(blocks->{parent})" in out
+    # route_first (t_7133e03d): one line per ready row replaces ``Held (...)``.
+    assert (f"  {child}  route=hold host=- rule=linked(blocks->{parent})  "
+            f"-> holds not_portable:linked(blocks->{parent})") in out
 
 
 def _lineage(monkeypatch, mode):
@@ -1269,6 +1271,14 @@ def test_browser_card_under_spilling_studio_waits_never_spills(kanban_home, monk
         _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
               spawn_paused="spilling")
         assert len(_events(conn, browser, "placement_wait")) == 2
+        # A (re)assignment ends the episode too (shared end-kind set, Prism
+        # 75f6107b): the same wait is re-written, so the view still lists it.
+        assert kb.assign_task(conn, browser, "alpha")
+        _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
+              spawn_paused="spilling")
+        assert len(_events(conn, browser, "placement_wait")) == 3
+        from hermes_cli import kanban_placement_view as kpv
+        assert browser in [h["task_id"] for h in kpv._held(conn)]
 
 
 def test_body_bound_card_runs_locally_when_the_studio_has_room(kanban_home):
@@ -1296,16 +1306,19 @@ def test_wait_cleared_without_a_claim_makes_the_next_wait_a_new_episode(kanban_h
         conn.commit()
         res, spawned = _tick(conn, spillover=spill(), spawn_limit=4,
                              max_in_progress_per_profile={"default": 8, "alpha": 1})
-        assert spawned == [] and cdp not in res.placement_waits
         assert cdp in [t for t, _who, _n in res.skipped_per_profile_capped]
+        # Momus R-A (t_7133e03d): the per-profile hold is a named wait now,
+        # so the episode turns over on the reason change instead of a clear.
+        assert spawned == [] and res.placement_waits[cdp] == "per_profile_cap (alpha 1/1)"
         waits = _events(conn, cdp, "placement_wait")
-        assert waits[-1] == {"cleared": True}
+        assert waits[-1]["reason"] == "per_profile_cap (alpha 1/1)"
         conn.execute("UPDATE tasks SET status='done', claim_lock=NULL WHERE id=?", (busy,))
         conn.commit()
         _tick(conn, spillover=spill(), spawn_limit=0, spawn_paused="spilling")
         waits = _events(conn, cdp, "placement_wait")
         assert [w.get("reason", "cleared") for w in waits] == [
-            "studio_affinity:studio_body", "cleared", "studio_affinity:studio_body"]
+            "studio_affinity:studio_body", "per_profile_cap (alpha 1/1)",
+            "studio_affinity:studio_body"]
         # Repeating the same wait writes nothing new.
         _tick(conn, spillover=spill(), spawn_limit=0, spawn_paused="spilling")
         assert len(_events(conn, cdp, "placement_wait")) == 3
@@ -1597,7 +1610,8 @@ def test_drained_pin_reason_reaches_placement_wait_and_dry_run(kanban_home, caps
     import argparse
     rc = kops._cmd_dispatch(argparse.Namespace(dry_run=True, json=False, max=None,
                                                max_running=None, failure_limit=2))
-    assert rc == 0 and f"Held ({tid}): pin_host_draining" in capsys.readouterr().out
+    assert rc == 0 and f"  {tid}  route=remote-pin host=ci-box rule=pin  -> holds pin_host_draining" \
+        in capsys.readouterr().out
 
 
 def test_drained_pin_behind_the_no_slot_wall_still_names_the_state(kanban_home):

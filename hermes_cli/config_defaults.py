@@ -2370,7 +2370,11 @@ DEFAULT_CONFIG = {
         # of `fleet-host capabilities --sync` (generated_by + source_hash);
         # a hand-written index runs warn. Absent host-capabilities.json = off.
         # See hermes_cli/kanban_host_capabilities.py.
-        "placement": {"read_signal": True},
+        # route_first (t_7133e03d, read per tick): every ready row is routed
+        # and every held row gets a placement_wait, including rows a total
+        # gate or an exhausted budget holds; false restores the silent early
+        # returns and the old one-shot gate line.
+        "placement": {"read_signal": True, "route_first": True},
         "dispatch_load_gate": {
             "enabled": True,
             "pause_above": None,
