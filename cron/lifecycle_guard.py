@@ -182,6 +182,9 @@ _ERE_WILDCARD_ONLY = re.compile(r"^[.*+?$\s]*$")
 _NAME_KILLERS = frozenset({"pkill", "killall", "taskkill", "stop-process"})
 _NAME_ENUMERATORS = frozenset({"pgrep", "pidof", "get-process"})
 _KILL_VERB_RE = re.compile(r"(?i)\b(?:kill|taskkill|stop-process)\b")
+# Every word Branch E can act on (a killer, an enumerator, or a bare `kill` fed by one).
+_KILLER_WORD_RE = re.compile(r"(?i)(?<![\w.-])(?:pkill|killall|taskkill|stop-process|pgrep|pidof|get-process|kill)"
+                             r"(?:\.exe)?(?![\w-])")
 # A `-f` pattern that does not start with the interpreter reaches the gateway cmdline
 # (`python -m hermes_cli.main gateway run` / `hermes gateway run`) only through its own tokens;
 # an unrelated script that merely contains "hermes" (`hermes-polis/run.sh`, `my_hermes_bot.py`)
@@ -295,6 +298,15 @@ def contains_host_interpreter_kill(text: str) -> bool:
     `Get-Process python | Stop-Process`). Segment-tokenized, so quoted/spliced spellings and Python
     argv lists resolve the same way the shell resolves them."""
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    # Judge the TARGET host (t_75fdedd4): a killer inside an ssh remote command runs under the
+    # remote sshd and cannot reach this gateway's interpreter, the same exemption Branches A-D
+    # take via _match_is_ssh_remote. Tokenizing first loses that: the whole remote body became one
+    # segment and a later `python3` in it read as a `pkill -f` operand (2026-10-12 04:33,
+    # `ssh ci 'pkill -f "18765"; ... python3 -c ...'`). Only when EVERY killer/enumerator word sits
+    # in a remote command is the text exempt; one local occurrence keeps the full scan.
+    killer_positions = [m.start() for m in _KILLER_WORD_RE.finditer(normalized)]
+    if killer_positions and all(_match_is_ssh_remote(normalized, pos) for pos in killer_positions):
+        return False
     kill_verb_present = bool(_KILL_VERB_RE.search(normalized))
     for segment in _iter_command_segments(normalized):
         joined = " ".join(segment)

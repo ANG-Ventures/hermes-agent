@@ -1,0 +1,491 @@
+{
+ "_doc": "Verdicts for every non-byte-exact compare on an identifier key in the kanban modules (scripts/check_identifier_key_compare.py). A site absent from `sites` fails the lint. `fixed_in_t_75fdedd4` lists the sites this card made byte-exact (no longer reported).",
+ "fixed_in_t_75fdedd4": [
+  {
+   "where": "hermes_cli/kanban_db.py:16298 _pr_belongs_to_other_card",
+   "kind": "fold",
+   "subject": "task_id",
+   "was": "return owner is not None and owner.group(0) != task_id.lower()"
+  },
+  {
+   "where": "hermes_cli/kanban_db.py:16313 _pr_owned_by_card",
+   "kind": "fold",
+   "subject": "task_id",
+   "was": "return owner is not None and owner.group(0) == task_id.lower()"
+  },
+  {
+   "where": "hermes_cli/kanban_pr_owner.py:324 concurrent_pr_runs",
+   "kind": "sql",
+   "subject": "profile NOT LIKE",
+   "was": "\"SELECT id, task_id, started_at, COALESCE(ended_at, CAST(strftime('%s','now') AS INTEGER)) \""
+  },
+  {
+   "where": "hermes_cli/kanban_worker_route.py:189 _is_sibling_pool_same_model",
+   "kind": "fold",
+   "subject": "from_model",
+   "was": "src = str(from_model or \"\").strip().lower()"
+  },
+  {
+   "where": "hermes_cli/kanban_worker_route.py:190 _is_sibling_pool_same_model",
+   "kind": "fold",
+   "subject": "to_model",
+   "was": "return bool(src) and src == str(to_model or \"\").strip().lower()"
+  },
+  {
+   "where": "hermes_cli/kanban_worker_route.py:279 refuse_runtime_failover",
+   "kind": "fold",
+   "subject": "serving_model",
+   "was": "if pinned_model and _norm(serving_model) != _norm(pinned_model):"
+  },
+  {
+   "where": "hermes_cli/kanban_worker_route.py:279 refuse_runtime_failover",
+   "kind": "fold",
+   "subject": "pinned_model",
+   "was": "if pinned_model and _norm(serving_model) != _norm(pinned_model):"
+  },
+  {
+   "where": "hermes_cli/kanban_worker_route.py:283 refuse_runtime_failover",
+   "kind": "fold",
+   "subject": "to_model",
+   "was": "model_ok = not pinned_model or _norm(to_model) == _norm(pinned_model)"
+  },
+  {
+   "where": "hermes_cli/kanban_worker_route.py:283 refuse_runtime_failover",
+   "kind": "fold",
+   "subject": "pinned_model",
+   "was": "model_ok = not pinned_model or _norm(to_model) == _norm(pinned_model)"
+  }
+ ],
+ "sites": {
+  "hermes_cli/kanban.py::_cmd_set_model::fold::model::clearing = args.model is None or str(args.model).lower() in {\"none\", \"-\", \"null\", \"\"}": {
+   "verdict": "kept",
+   "why": "sentinel-word detection on CLI input (`none`/`null`/`-` clears the pin); the model id itself is stored unfolded.",
+   "where": "hermes_cli/kanban.py:1821 _cmd_set_model"
+  },
+  "hermes_cli/kanban.py::_operator_review_session_ref::affix::session_id::if not session_id or session_id.startswith(\"cron_\"):": {
+   "verdict": "kept",
+   "why": "`cron_` is the session-KIND prefix the scheduler mints; the test is a kind check, not a compare of two session keys.",
+   "where": "hermes_cli/kanban.py:2949 _operator_review_session_ref"
+  },
+  "hermes_cli/kanban.py::_parse_branch_flag::affix::branch::if branch.startswith(\"-\"):": {
+   "verdict": "kept",
+   "why": "argv/namespace check on a branch name (`-` = a flag passed where a branch was expected; `wt/` = the dispatcher's own worktree-branch namespace); case-sensitive startswith is already byte-exact.",
+   "where": "hermes_cli/kanban.py:248 _parse_branch_flag"
+  },
+  "hermes_cli/kanban.py::_review_override_caller_allowed::affix::session_id::return not session_id.startswith(\"cron_\")": {
+   "verdict": "kept",
+   "why": "`cron_` is the session-KIND prefix the scheduler mints; the test is a kind check, not a compare of two session keys.",
+   "where": "hermes_cli/kanban.py:2972 _review_override_caller_allowed"
+  },
+  "hermes_cli/kanban.py::kanban_command::fold::top_board::if top_board and str(top_board).strip().lower() != str(verb_board).strip().lower():": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban.py:317 kanban_command"
+  },
+  "hermes_cli/kanban.py::kanban_command::fold::verb_board::if top_board and str(top_board).strip().lower() != str(verb_board).strip().lower():": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban.py:317 kanban_command"
+  },
+  "hermes_cli/kanban_db.py::_PrStateResolver.resolve::fold::repo::key = (repo.lower(), int(number))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_db.py:16439 _PrStateResolver.resolve"
+  },
+  "hermes_cli/kanban_db.py::_board_has_live_cards::fold::slug::db_path = _board_db_path_ignoring_pin(_normalize_board_slug(slug) or slug)": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:2460 _board_has_live_cards"
+  },
+  "hermes_cli/kanban_db.py::_board_path::fold::board::slug = _normalize_board_slug(board)": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:1692 _board_path"
+  },
+  "hermes_cli/kanban_db.py::_can_adopt_home::affix::session_id::if session_id.startswith(\"cron_\"):": {
+   "verdict": "kept",
+   "why": "`cron_` is the session-KIND prefix the scheduler mints; the test is a kind check, not a compare of two session keys.",
+   "where": "hermes_cli/kanban_db.py:5165 _can_adopt_home"
+  },
+  "hermes_cli/kanban_db.py::_conn_is_board::fold::board::want = _board_db_path_ignoring_pin(_normalize_board_slug(board) or board)": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:11389 _conn_is_board"
+  },
+  "hermes_cli/kanban_db.py::_normalize_board_slug::fold::slug::s = str(slug).strip().lower() if slug is not None else \"\"": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:1125 _normalize_board_slug"
+  },
+  "hermes_cli/kanban_db.py::_pr_belongs_to_other_card::fold::repo::head = _PR_HEAD_REF_CACHE.get((repo.lower(), int(number)))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_db.py:16296 _pr_belongs_to_other_card"
+  },
+  "hermes_cli/kanban_db.py::_pr_needs_its_worker::fold::repo::health = _PR_MERGE_HEALTH_CACHE.get((repo.lower(), int(number)))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_db.py:16409 _pr_needs_its_worker"
+  },
+  "hermes_cli/kanban_db.py::_pr_owned_by_card::fold::repo::head = _PR_HEAD_REF_CACHE.get((repo.lower(), int(number)))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_db.py:16311 _pr_owned_by_card"
+  },
+  "hermes_cli/kanban_db.py::_query_github_pr_state::fold::repo::_PR_HEAD_REF_CACHE[(repo.lower(), int(number))] = head": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_db.py:16353 _query_github_pr_state"
+  },
+  "hermes_cli/kanban_db.py::_query_github_pr_state::fold::repo::key = (repo.lower(), int(number))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_db.py:16326 _query_github_pr_state"
+  },
+  "hermes_cli/kanban_db.py::_record_no_worker_skip_once::sql::payload LIKE::\"SELECT 1 FROM task_events WHERE task_id = ? \"": {
+   "verdict": "kept",
+   "why": "prefilter on PROSE/JSON (no identifier key in the pattern; literal contains no _ or % wildcard that could widen it); every matched row is re-parsed and checked exactly in Python.",
+   "where": "hermes_cli/kanban_db.py:18966 _record_no_worker_skip_once"
+  },
+  "hermes_cli/kanban_db.py::_refuse_if_pin_contradicts_board_arg::fold::board::slug = _normalize_board_slug(board)": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:1081 _refuse_if_pin_contradicts_board_arg"
+  },
+  "hermes_cli/kanban_db.py::_require_slug::fold::slug::normed = _normalize_board_slug(slug)": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:1141 _require_slug"
+  },
+  "hermes_cli/kanban_db.py::_run_progress_at::sql::payload LIKE::\"SELECT payload FROM task_events WHERE task_id=? AND run_id=? \"": {
+   "verdict": "kept",
+   "why": "prefilter on PROSE/JSON (no identifier key in the pattern; literal contains no _ or % wildcard that could widen it); every matched row is re-parsed and checked exactly in Python.",
+   "where": "hermes_cli/kanban_db.py:17567 _run_progress_at"
+  },
+  "hermes_cli/kanban_db.py::_slug_or_default::fold::board::return _normalize_board_slug(board) or DEFAULT_BOARD": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:1137 _slug_or_default"
+  },
+  "hermes_cli/kanban_db.py::_validate_review_coverage::sql::body LIKE::\"SELECT body FROM task_comments WHERE task_id = ? AND run_id = ? \"": {
+   "verdict": "kept",
+   "why": "prefilter on PROSE/JSON (no identifier key in the pattern; literal contains no _ or % wildcard that could widen it); every matched row is re-parsed and checked exactly in Python.",
+   "where": "hermes_cli/kanban_db.py:13504 _validate_review_coverage"
+  },
+  "hermes_cli/kanban_db.py::attachments_root::fold::board::slug = _normalize_board_slug(board)": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:1874 attachments_root"
+  },
+  "hermes_cli/kanban_db.py::board_state_dir::fold::board::slug = _normalize_board_slug(board) or DEFAULT_BOARD": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:1664 board_state_dir"
+  },
+  "hermes_cli/kanban_db.py::cooling_providers::fold::provider::key = provider.strip().lower()": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_db.py:15976 cooling_providers"
+  },
+  "hermes_cli/kanban_db.py::kanban_db_path::fold::board::slug = _normalize_board_slug(board)": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:1758 kanban_db_path"
+  },
+  "hermes_cli/kanban_db.py::list_boards::fold::slug::normed = _normalize_board_slug(slug)": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:2238 list_boards"
+  },
+  "hermes_cli/kanban_db.py::read_board_metadata::fold::board::slug = _normalize_board_slug(board) or DEFAULT_BOARD": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:2088 read_board_metadata"
+  },
+  "hermes_cli/kanban_db.py::workspace_root_candidates::fold::board::slug = _normalize_board_slug(board)": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:1831 workspace_root_candidates"
+  },
+  "hermes_cli/kanban_db.py::workspaces_root::fold::board::slug = _normalize_board_slug(board)": {
+   "verdict": "kept",
+   "why": "board slugs are canonical lower-case: _normalize_board_slug folds then validates against ^[a-z0-9][a-z0-9-_]{0,63}$, every writer goes through it, so the fold is the canonicalization applied on both sides, not a lossy compare.",
+   "where": "hermes_cli/kanban_db.py:1802 workspaces_root"
+  },
+  "hermes_cli/kanban_db_dispatch.py::_dispatch_once_locked.fallback_flagship_banned::sql::lower(ltrim(body)) LIKE::\"SELECT 1 FROM task_comments WHERE task_id = ? \"": {
+   "verdict": "kept",
+   "why": "operator-typed prose marker `flagship override:` (any case accepted on purpose); the bound pattern is a constant with no model id in it, unlike #1921's token.",
+   "where": "hermes_cli/kanban_db_dispatch.py:5683 _dispatch_once_locked.fallback_flagship_banned"
+  },
+  "hermes_cli/kanban_db_dispatch.py::_dispatch_once_locked.flagship_refused::sql::lower(ltrim(body)) LIKE::\"SELECT 1 FROM task_comments WHERE task_id = ? \"": {
+   "verdict": "kept",
+   "why": "operator-typed prose marker `flagship override:` (any case accepted on purpose); the bound pattern is a constant with no model id in it, unlike #1921's token.",
+   "where": "hermes_cli/kanban_db_dispatch.py:5723 _dispatch_once_locked.flagship_refused"
+  },
+  "hermes_cli/kanban_db_dispatch.py::_dispatch_once_locked.provider_admission::fold::route_provider::\"until\": cooling[(route_provider or \"\").strip().lower()]}": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_db_dispatch.py:5542 _dispatch_once_locked.provider_admission"
+  },
+  "hermes_cli/kanban_db_dispatch.py::_dispatch_once_locked.provider_admission::fold::route_provider::elif (route_provider or \"\").strip().lower() in cooling:": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_db_dispatch.py:5538 _dispatch_once_locked.provider_admission"
+  },
+  "hermes_cli/kanban_db_dispatch.py::check_respawn_guard::fold::repo::health = _kb._PR_MERGE_HEALTH_CACHE.get((repo.lower(), int(number))) or {}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_db_dispatch.py:3377 check_respawn_guard"
+  },
+  "hermes_cli/kanban_db_notify.py::_notify_sub_admission::sql::LOWER(platform) =::\"SELECT * FROM kanban_notify_subs WHERE task_id = ?\"": {
+   "verdict": "kept",
+   "why": "messaging-platform names (discord/telegram/...) are an enum written by the gateway; LOWER on both sides is the canonical compare for a value users also type.",
+   "where": "hermes_cli/kanban_db_notify.py:234 _notify_sub_admission"
+  },
+  "hermes_cli/kanban_db_notify.py::dedupe_notify_subs::sql::LOWER(platform) =::\"SELECT * FROM kanban_notify_subs WHERE task_id = ?\"": {
+   "verdict": "kept",
+   "why": "messaging-platform names (discord/telegram/...) are an enum written by the gateway; LOWER on both sides is the canonical compare for a value users also type.",
+   "where": "hermes_cli/kanban_db_notify.py:714 dedupe_notify_subs"
+  },
+  "hermes_cli/kanban_db_workspace.py::_cleanup_worktree_workspace::affix::branch::if branch.startswith(\"wt/\"):": {
+   "verdict": "kept",
+   "why": "argv/namespace check on a branch name (`-` = a flag passed where a branch was expected; `wt/` = the dispatcher's own worktree-branch namespace); case-sensitive startswith is already byte-exact.",
+   "where": "hermes_cli/kanban_db_workspace.py:422 _cleanup_worktree_workspace"
+  },
+  "hermes_cli/kanban_diagnostics.py::_aux_slot_explicit::fold::provider::provider = str(slot.get(\"provider\") or \"\").strip().lower()": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_diagnostics.py:201 _aux_slot_explicit"
+  },
+  "hermes_cli/kanban_handback_head.py::_cached::fold::repo::key = (repo.lower(), number)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_handback_head.py:138 _cached"
+  },
+  "hermes_cli/kanban_open_pr.py::_binds::fold::repo::return (closed_ref.repo.lower(), closed_ref.number) in subject or (None, closed_ref.number) in subject": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:529 _binds"
+  },
+  "hermes_cli/kanban_open_pr.py::_subject_keys::fold::repo::keys = {(r.repo.lower(), r.number) for r in extract_pr_refs(text)}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:490 _subject_keys"
+  },
+  "hermes_cli/kanban_open_pr.py::extract_pr_refs::fold::repo::key = (ref.repo.lower(), ref.number)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:168 extract_pr_refs"
+  },
+  "hermes_cli/kanban_open_pr.py::find_done_with_open_pr::fold::repo::key = (ref.repo.lower(), ref.number)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:807 find_done_with_open_pr"
+  },
+  "hermes_cli/kanban_open_pr.py::memo_query._q::fold::repo::key = (repo.lower(), number)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:409 memo_query._q"
+  },
+  "hermes_cli/kanban_open_pr.py::open_pr_refs::fold::repo::declared = {(r.repo.lower(), r.number) for r in primary}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:299 open_pr_refs"
+  },
+  "hermes_cli/kanban_open_pr.py::open_pr_refs::fold::repo::if (ref.repo.lower(), ref.number) not in declared:": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:302 open_pr_refs"
+  },
+  "hermes_cli/kanban_open_pr.py::open_pr_refs::fold::repo::return [r for r in opened + unverified if (r.repo.lower(), r.number) in declared]": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:297 open_pr_refs"
+  },
+  "hermes_cli/kanban_open_pr.py::open_pr_refs::fold::repo::unowned.extend(r for r in opened if (r.repo.lower(), r.number) not in declared)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:296 open_pr_refs"
+  },
+  "hermes_cli/kanban_open_pr.py::routed_prs_still_open::fold::repo::named = {(r.repo.lower(), r.number) for r in extract_pr_refs(survivor_pr=survivor_pr)}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:755 routed_prs_still_open"
+  },
+  "hermes_cli/kanban_open_pr.py::routed_prs_still_open::fold::repo::refs = [r for r in split_fleet(extract_pr_refs(*routed))[0] if (r.repo.lower(), r.number) not in named]": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:756 routed_prs_still_open"
+  },
+  "hermes_cli/kanban_open_pr.py::supersedes::fold::repo::if (repo.lower(), number) == (closed_ref.repo.lower(), closed_ref.number) or query_fn is None:": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:467 supersedes"
+  },
+  "hermes_cli/kanban_open_pr.py::unmerged_refs::fold::repo::if (ref.repo.lower(), ref.number) not in primary_keys:": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:219 unmerged_refs"
+  },
+  "hermes_cli/kanban_open_pr.py::unmerged_refs::fold::repo::primary_keys = {(r.repo.lower(), r.number) for r in primary}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_open_pr.py:215 unmerged_refs"
+  },
+  "hermes_cli/kanban_pr_gate.py::_Resolver.resolve::fold::repo::key = (ref.repo.lower(), ref.number)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:1027 _Resolver.resolve"
+  },
+  "hermes_cli/kanban_pr_gate.py::_body_corroborates::fold::slug::return any(named.lower() == slug.lower() for named in corroborated)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:702 _body_corroborates"
+  },
+  "hermes_cli/kanban_pr_gate.py::_body_corroborates::fold::slug::return any(named.lower() == slug.lower() for named in mentions)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:706 _body_corroborates"
+  },
+  "hermes_cli/kanban_pr_gate.py::_prefetch_deploys::fold::repo::key = (ref.repo.lower(), ref.number)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:1430 _prefetch_deploys"
+  },
+  "hermes_cli/kanban_pr_gate.py::deploy_tree_for::fold::repo::return DEPLOY_TREES.get(repo.lower()) if isinstance(repo, str) else None": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:897 deploy_tree_for"
+  },
+  "hermes_cli/kanban_pr_gate.py::parse_pr_refs.add::fold::repo::key = (repo.lower(), number)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:475 parse_pr_refs.add"
+  },
+  "hermes_cli/kanban_pr_gate.py::parse_pr_refs::fold::slug::distinct = {slug.lower(): slug for slug in own}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:486 parse_pr_refs"
+  },
+  "hermes_cli/kanban_pr_gate.py::prefetch_pr_gate_states::fold::repo::key = (ref.repo.lower(), ref.number)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:1370 prefetch_pr_gate_states"
+  },
+  "hermes_cli/kanban_pr_gate.py::reevaluate_pr_gates::fold::repo::(unresolved_ref.repo.lower(), unresolved_ref.number)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:1531 reevaluate_pr_gates"
+  },
+  "hermes_cli/kanban_pr_gate.py::reevaluate_pr_gates::fold::repo::by_ref = {(r.repo.lower(), r.number): e for r, e in resolved}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:1598 reevaluate_pr_gates"
+  },
+  "hermes_cli/kanban_pr_gate.py::reevaluate_pr_gates::fold::repo::deploy_keys = {(r.repo.lower(), r.number) for r, t in deploy_checks if t}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:1559 reevaluate_pr_gates"
+  },
+  "hermes_cli/kanban_pr_gate.py::reevaluate_pr_gates::fold::repo::entry = by_ref.get((ref.repo.lower(), ref.number))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:1602 reevaluate_pr_gates"
+  },
+  "hermes_cli/kanban_pr_gate.py::reevaluate_pr_gates::fold::repo::if (r.repo.lower(), r.number) in deploy_keys": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:1562 reevaluate_pr_gates"
+  },
+  "hermes_cli/kanban_pr_gate.py::repo_exists::fold::slug::key = slug.lower()": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_gate.py:823 repo_exists"
+  },
+  "hermes_cli/kanban_pr_owner.py::_refs::fold::repo::return [(r.repo.lower(), r.number) for r in _prg.parse_pr_refs(text, default_repo=None)": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_owner.py:92 _refs"
+  },
+  "hermes_cli/kanban_pr_owner.py::pr_cards::sql::title LIKE::\"SELECT id, status, assignee FROM tasks WHERE status != 'archived' AND (\"": {
+   "verdict": "kept",
+   "why": "title/metadata LIKE is a candidate prefilter; pr_cards keeps only rows whose exact (repo, number) is in card_pr_targets(), so the LIKE cannot admit a wrong card.",
+   "where": "hermes_cli/kanban_pr_owner.py:300 pr_cards"
+  },
+  "hermes_cli/kanban_pr_owner.py::pr_head_committed_at::fold::repo::key = (repo.lower(), int(number))": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded (repo, number) tuple IS the canonical PR key; byte-exact would split one PR into two cache/route entries.",
+   "where": "hermes_cli/kanban_pr_owner.py:214 pr_head_committed_at"
+  },
+  "hermes_cli/kanban_provider_health.py::available_profile_fallback::fold::provider::if skip_providers and provider.strip().lower() in skip_providers:": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_provider_health.py:472 available_profile_fallback"
+  },
+  "hermes_cli/kanban_resources.py::_live_keys::sql::r.resources LIKE::\"SELECT r.resources FROM task_runs r JOIN tasks t ON t.id = r.task_id \"": {
+   "verdict": "kept",
+   "why": "prefilter on PROSE/JSON (no identifier key in the pattern; literal contains no _ or % wildcard that could widen it); every matched row is re-parsed and checked exactly in Python.",
+   "where": "hermes_cli/kanban_resources.py:238 _live_keys"
+  },
+  "hermes_cli/kanban_resources.py::release_finished::sql::r.resources LIKE::\"SELECT r.id AS run_id, r.task_id, r.resources, t.body FROM task_runs r \"": {
+   "verdict": "kept",
+   "why": "prefilter on PROSE/JSON (no identifier key in the pattern; literal contains no _ or % wildcard that could widen it); every matched row is re-parsed and checked exactly in Python.",
+   "where": "hermes_cli/kanban_resources.py:303 release_finished"
+  },
+  "hermes_cli/kanban_worker_policy.py::find_ruled_parent::sql::lower(author) IN::\"SELECT id, author FROM task_comments WHERE task_id = ? AND \"": {
+   "verdict": "kept",
+   "why": "comment authors are display labels, not keys: live boards carry `Apollo` (37 rows on default, 13 on others, 2026-10-12) for the ruling author `apollo`; byte-exact would silently stop honouring those rulings.",
+   "where": "hermes_cli/kanban_worker_policy.py:248 find_ruled_parent"
+  },
+  "hermes_cli/kanban_worker_route.py::_is_sibling_pool_same_model::fold::to_provider::if _SIBLING_POOL.get(pinned) != str(to_provider or \"\").strip().lower():": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_worker_route.py:187 _is_sibling_pool_same_model"
+  },
+  "hermes_cli/kanban_worker_route.py::_live_route_gate_error::sql::lower(ltrim(body)) LIKE::\"SELECT 1 FROM task_comments WHERE task_id = ? \"": {
+   "verdict": "kept",
+   "why": "operator-typed prose marker `flagship override:` (any case accepted on purpose); the bound pattern is a constant with no model id in it, unlike #1921's token.",
+   "where": "hermes_cli/kanban_worker_route.py:411 _live_route_gate_error"
+  },
+  "hermes_cli/kanban_worker_route.py::apply_pending_live_route::fold::provider::(agent.provider or \"\").strip().lower() or None if provider else None,": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_worker_route.py:733 apply_pending_live_route"
+  },
+  "hermes_cli/kanban_worker_route.py::apply_pending_live_route::fold::provider::model.strip() or None, (provider or \"\").strip().lower() or None,": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_worker_route.py:668 apply_pending_live_route"
+  },
+  "hermes_cli/kanban_worker_route.py::apply_pending_live_route::fold::provider::or bool(provider) and provider.strip().lower() != (agent.provider or \"\").strip().lower()": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_worker_route.py:652 apply_pending_live_route"
+  },
+  "hermes_cli/kanban_worker_route.py::card_pinned_route::fold::provider::provider = (provider or \"\").strip().lower() or None": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_worker_route.py:234 card_pinned_route"
+  },
+  "hermes_cli/kanban_worker_route.py::card_pinned_route::fold::provider::provider = (str(provider or \"\")).strip().lower() or None": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_worker_route.py:215 card_pinned_route"
+  },
+  "hermes_cli/kanban_worker_route.py::pinned_worker_provider::fold::explicit_provider::provider = (explicit_provider or \"\").strip().lower()": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_worker_route.py:54 pinned_worker_provider"
+  },
+  "hermes_cli/kanban_worker_route.py::refuse_runtime_failover::fold::provider::serving = str(primary.get(\"provider\") or getattr(agent, \"provider\", \"\") or \"\").strip().lower()": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_worker_route.py:277 refuse_runtime_failover"
+  },
+  "hermes_cli/kanban_worker_route.py::refuse_runtime_failover::fold::to_provider::if _norm(to_provider) == pinned:": {
+   "verdict": "kept",
+   "why": "provider ids are canonical lower-case aliases (hermes_cli.models.normalize_provider folds the same way before alias lookup); every side of these compares is folded identically. Model ids are NOT folded (see kanban_worker_route._model_key).",
+   "where": "hermes_cli/kanban_worker_route.py:294 refuse_runtime_failover"
+  }
+ }
+}

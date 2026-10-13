@@ -207,6 +207,7 @@ def detect_hardline_command(command: str) -> tuple:
     """Check hardline patterns (NEVER bypassable, even in YOLO) -> (is_hardline, description)."""
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
+    command = _mask_data_heredoc_bodies(command)
     allow_reboot = _reboot_shutdown_allowed()
     # The malformed-quoting verdict needs the author's quote state. Normalization strips escapes
     # (`\"` -> `"`), so a shell-valid pattern like `grep -o "[^\"]*"` lexed as unterminated and was
@@ -1167,6 +1168,78 @@ def _deobfuscate_shell_word_for_detection(word: str) -> str:
 def _is_shell_comment_start(command: str, index: int) -> bool:
     return command[index] == "#" and (index == 0 or command[index - 1].isspace()
                                       or command[index - 1] in ";&|()<>")
+
+
+# A here-document with a QUOTED delimiter (<<'EOF', <<"EOF", <<\EOF) is literal bytes on the
+# reader's stdin: no expansion, no command substitution. When the reader does not execute its
+# stdin as shell (cat > notes, python3 -, git commit -F -), backticks and apostrophes in that body
+# are prose, yet the shell scanner read them as quote/substitution syntax and put a quoted
+# `mkfs.xfs ...` runbook line at command position (t_75fdedd4: 2026-10-10 21:26 hardline block of a
+# python3 heredoc that edited a markdown file). Judge the reader, not the bytes. Unquoted
+# delimiters expand $(...) locally and stay scanned; a shell carrier, ssh or xargs anywhere on the
+# header line (`cat <<'EOF' | bash`, `ssh h bash -s <<'EOF'`) keeps the body scanned.
+_DATA_HEREDOC_READERS = frozenset({"cat", "tee", "git", "gh", "hermes"})
+_HEREDOC_BODY_EXECUTORS = _SHELL_CARRIER_NAMES | {"ssh", "autossh", "xargs", "parallel", "su", "runuser",
+                                                  "sudo", "doas", "env", "exec", "nohup", "timeout"}
+_HEREDOC_OP_RE = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\([A-Za-z_]\w*)|([A-Za-z_][\w.-]*))")
+
+
+def _heredoc_reader_is_data(header: str, op_offset: int) -> bool:
+    """True when the command reading the here-doc at *op_offset* of *header* treats it as data."""
+    words = [(start, os.path.basename(_deobfuscate_shell_word_for_detection(word)).lower())
+             for start, _, word in _iter_shell_command_word_spans(header)]
+    if not words or any(name in _HEREDOC_BODY_EXECUTORS for _, name in words):
+        return False
+    owner = [name for start, name in words if start < op_offset]
+    return bool(owner) and (owner[-1] in _DATA_HEREDOC_READERS or bool(re.fullmatch(r"python[\d.]*", owner[-1])))
+
+
+def _header_heredocs(line: str) -> list:
+    """[(delimiter, strip_tabs, mask_body)] for every unquoted `<<` operator on one header line."""
+    docs = []
+    for kind, i, _, quote in _scan_shell(line, comments=True):
+        if kind != "char" or quote is not None or not line.startswith("<<", i):
+            continue
+        if line.startswith("<<<", i) or (i and line[i - 1] == "<"):
+            continue
+        m = _HEREDOC_OP_RE.match(line, i)
+        if m:
+            literal = m.group(5) is None
+            docs.append((next(g for g in m.groups()[1:] if g), bool(m.group(1)),
+                         literal and _heredoc_reader_is_data(line, i)))
+    return docs
+
+
+def _mask_data_heredoc_bodies(command: str) -> str:
+    """Blank the bodies of quoted-delimiter here-documents read by a non-executing reader
+    (detection-only: every header and terminator line is kept byte-for-byte). A header line
+    inside a multi-line quote or with an unterminated here-doc leaves the text unchanged
+    from that point (fail-closed: scanned as before)."""
+    if "<<" not in command:
+        return command
+    lines = command.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        if "<<" not in line:
+            continue
+        docs = _header_heredocs(line)
+        if not docs:
+            continue
+        for delim, strip_tabs, mask in docs:
+            body_start = i
+            while i < len(lines) and (lines[i].lstrip("\t") if strip_tabs else lines[i]) != delim:
+                i += 1
+            if i >= len(lines):  # unterminated: the shell reads to EOF; keep it scanned
+                out.extend(lines[body_start:])
+                return "\n".join(out)
+            body = lines[body_start:i]
+            out.extend(" " * len(b) for b in body) if mask else out.extend(body)
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
 
 
 def _iter_shell_command_starts(command: str):

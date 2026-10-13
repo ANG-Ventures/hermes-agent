@@ -234,6 +234,12 @@ jobs:
       - name: Forbid non-raising stand-ins for liveness primitives in tests
         run: python scripts/check_liveness_patches.py
 
+      # Identifier keys (model ids, task ids, SHAs, lanes, providers) compare byte-exact in the kanban
+      # modules: no LIKE / .lower() / startswith / substring on a key without a ledgered verdict
+      # (#1921: LIKE let `custommodel` inherit `CustomModel`'s force exemption; t_75fdedd4).
+      - name: Forbid non-byte-exact compares on kanban identifier keys
+        run: python scripts/check_identifier_key_compare.py
+
       # A gateway service definition (systemd unit / launchd plist) is written or removed only through
       # gateway_service_owner.assert_may_mutate, which checks the file's pinned HERMES_HOME against the
       # caller's (t_8749a807: a scratch gateway's boot refresh rewrote ACE-AI's real unit by NAME).
