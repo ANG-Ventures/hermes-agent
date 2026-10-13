@@ -91,14 +91,15 @@ FAST_MODE_CAPABILITY_CATALOG: Mapping[str, Mapping[str, Any]] = MappingProxyType
 
 # OpenAI Ultrafast (``service_tier: "ultrafast"``, Responses API only). Published
 # per model, not per family: GPT-6 Astra is GA in the API and on the Codex
-# backend (Pro 500 / Enterprise) as of 2026-09-29; GPT-6.1 Sol is "coming soon".
+# backend (Pro 500 / Enterprise) as of 2026-09-29; GPT-6.1 Sol is listed in the
+# guide and pricing table and advertised by the Codex backend as of 2026-10-13.
 # Kept separate from FAST_MODE_CAPABILITY_CATALOG so the Priority/Fast contracts
 # (and their dated snapshot tests) stay untouched.
 ULTRAFAST_CAPABILITY_CONTRACT: Mapping[str, Any] = MappingProxyType(
     {
         "source_url": "https://developers.openai.com/api/docs/guides/ultrafast-mode",
-        "checked_date": "2026-09-29",
-        "models": ("gpt-6-astra",),
+        "checked_date": "2026-10-13",
+        "models": ("gpt-6-astra", "gpt-6.1-sol"),
     }
 )
 

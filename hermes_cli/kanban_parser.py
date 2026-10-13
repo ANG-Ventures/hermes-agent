@@ -1003,6 +1003,14 @@ def _add_home_guard_flags(sub: argparse._SubParsersAction) -> None:
                      "ownership transfer (the default for assign/unblock/promote/triage-resolve).",
             )
         p.add_argument(
+            "--actor", dest="event_actor", metavar="PROFILE",
+            help="Automated closer identity (kanban-review-merge-pass, review-card closer, "
+                 "land-autopilot) stamped as actor_profile on the events this verb writes, so the "
+                 "notify-suppress filter recognises the closer without parsing the summary. Never "
+                 "an operator label (default/apollo/aegis/human:*); ignored when a chat session is "
+                 "bound (that session is the actor).",
+        )
+        p.add_argument(
             "--operator", dest="operator", metavar="WHO: WHY",
             help="Operator profiles (apollo/default, aegis) applying a relayed human decision "
                  "to a foreign card; records an operator_override event (status/timing verbs also post "

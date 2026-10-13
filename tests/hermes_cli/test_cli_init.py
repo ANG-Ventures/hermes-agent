@@ -154,6 +154,25 @@ class TestBusyInputMode:
         assert cli._pending_input_items() == ["first"]
         assert cli._interrupt_queue.empty()
 
+    def test_queue_run_merged_mode_busy_sends_one_joined_message(self, monkeypatch):
+        cli = _make_cli()
+        monkeypatch.setattr(type(cli), "_queue_release_mode", staticmethod(lambda: "merged"))
+        cli.process_command("/queue first")
+        cli.process_command("/queue second")
+        cli._agent_running = True
+        cli.process_command("/queue run")
+        assert cli._interrupt_queue.get_nowait() == "first\n\nsecond"
+        assert cli._pending_input_items() == []
+
+    def test_queue_run_merged_mode_idle_collapses_the_queue_to_one_item(self, monkeypatch):
+        cli = _make_cli()
+        monkeypatch.setattr(type(cli), "_queue_release_mode", staticmethod(lambda: "merged"))
+        cli.process_command("/queue first")
+        cli.process_command("/queue second")
+        cli._agent_running = False
+        cli.process_command("/queue run")
+        assert cli._pending_input_items() == ["first\n\nsecond"]
+
     def test_queue_run_with_prose_is_a_prompt(self):
         cli = _make_cli()
         cli.process_command("/queue run the tests please")

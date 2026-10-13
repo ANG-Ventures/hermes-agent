@@ -4282,6 +4282,30 @@ def mutation_actor(
         _MUTATION_ACTOR.reset(token)
 
 
+@contextlib.contextmanager
+def event_actor(profile: str):
+    """Stamp ``profile`` as ``task_events.actor_profile`` on every event written
+    inside the block, WITHOUT binding the home-session guard (no caller session).
+
+    For automated closers (``kanban complete --actor kanban-review-merge-pass``):
+    a cron has no chat session, so :func:`_event_actor` resolved to ``(None,
+    None)`` and the notify-suppress filter had to guess the closer from the
+    completion summary's prose (t_7de359d9: "(CI gate, …)" read as the
+    closer, the owner-wake was delivered). The guard's own binding
+    (:func:`mutation_actor`) is untouched: an already-bound actor wins.
+    """
+    name = (str(profile).strip() or None) if profile else None
+    if name is None or _EVENT_ACTOR.get() is not None:
+        yield None
+        return
+    actor = MutationActor(session_ids=(), profile=name)
+    token = _EVENT_ACTOR.set(actor)
+    try:
+        yield actor
+    finally:
+        _EVENT_ACTOR.reset(token)
+
+
 def _caller_session_lineage(session_id: str) -> tuple[str, ...]:
     """Compression lineage of the caller's session (best effort).
 

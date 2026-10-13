@@ -101,6 +101,9 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    # Armed by /queue run (queue_mgmt.restage_held): this event was staged by a release and is being
+    # dispatched by the adapter drain, so the FIFO orphan rescue must not reorder behind it.
+    _queue_released: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 

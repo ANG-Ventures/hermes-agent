@@ -467,3 +467,35 @@ async def test_queue_run_arms_idle_orphans_so_released_is_true(rig):
     _seed_orphans(runner, adapter, "a", "b")
     reply = await qm.release(runner, KEY, _source(), adapter, busy=False)
     assert reply.startswith("Released 2") and adapter._pending_messages[KEY].text == "a"
+
+
+# --------------------------------------------------------------------------- follow-up: release mode
+
+@pytest.mark.parametrize("raw, expected", [(None, "per_item"), ("", "per_item"), ("per_item", "per_item"),
+                                            ("merged", "merged"), ("MERGED", "merged"), ("bogus", "per_item")])
+def test_release_mode_loader(monkeypatch, caplog, raw, expected):
+    gateway_run = importlib.import_module("gateway.run")
+    cfg = {} if raw is None else {"display": {"queue_release_mode": raw}}
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda *a, **k: cfg)
+    assert gateway_run.GatewayRunner._load_queue_release_mode() == expected
+    if raw == "bogus":
+        assert "queue_release_mode" in caplog.text
+
+
+def test_merged_release_builds_one_event_in_order_and_marks_it(rig):
+    runner, adapter = rig
+    runner._queue_release_mode = "merged"
+    _seed(runner, adapter, "a", "b", "c")
+    qm.hold_user_items(runner, KEY, adapter)
+    assert qm.restage_held(runner, KEY, adapter) == 3          # reply still says "Released 3"
+    assert _active(runner, adapter) == ["a\n\nb\n\nc"]
+    assert adapter._pending_messages[KEY]._queue_released is True
+    assert _held(runner) == []
+
+
+def test_per_item_release_marks_every_released_event(rig):
+    runner, adapter = rig
+    _seed(runner, adapter, "a", "b")
+    qm.hold_user_items(runner, KEY, adapter)
+    qm.restage_held(runner, KEY, adapter)
+    assert [e._queue_released for e in qm.active_items(runner, KEY, adapter)] == [True, True]

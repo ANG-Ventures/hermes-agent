@@ -258,24 +258,72 @@ def append_if_held(runner: Any, key: str, event: Any) -> Optional[str]:
     return t("gateway.queue.added_to_held", count=len(held))
 
 
+MERGE_SEPARATOR = "\n\n"
+
+
+def release_mode(runner: Any) -> str:
+    """``display.queue_release_mode``: ``per_item`` (each released prompt is its own turn) or
+    ``merged`` (every released prompt joins ONE turn). Anything else reads as ``per_item``."""
+    mode = getattr(runner, "_queue_release_mode", "per_item")
+    return "merged" if mode == "merged" else "per_item"
+
+
+def merge_user_events(events: List[Any]) -> Any:
+    """One event carrying every user prompt of ``events`` in order (follow-up spec D3): texts joined
+    by a blank line, media concatenated, the FIRST item's identity/reply anchor kept. The merged
+    event is the first item mutated in place, so its source/thread metadata survive."""
+    head = events[0]
+    texts = [str(getattr(e, "text", "") or "").strip() for e in events]
+    head.text = MERGE_SEPARATOR.join(t for t in texts if t)
+    for e in events[1:]:
+        if getattr(e, "media_urls", None):
+            head.media_urls.extend(e.media_urls)
+            head.media_types.extend(getattr(e, "media_types", []) or [])
+            if hasattr(head, "media_text_inlined"):
+                head.media_text_inlined.extend(getattr(e, "media_text_inlined", []) or [])
+        if hasattr(head, "absorb_reply_expected"):
+            try:
+                head.absorb_reply_expected(e)
+            except Exception:
+                pass
+    return head
+
+
 def restage_held(runner: Any, key: str, adapter: Any) -> Optional[int]:
     """Move held items back into the active store (slot = item 1) and return the user-item count
-    now active. The adapter's existing end-of-task / post-command drain is the ONLY dispatcher
-    (spec D16/I9: single door); this function never starts a task. None = no slot storage."""
+    released. The adapter's existing end-of-task / post-command drain is the ONLY dispatcher
+    (spec D16/I9: single door); this function never starts a task. None = no slot storage.
+
+    Under ``display.queue_release_mode: merged`` every released user item becomes ONE event (one
+    turn, one answer); system events keep their own turns ahead of it. The armed head carries
+    ``_queue_released`` so the inbound FIFO rescue never reorders the rest ahead of it (D1)."""
     held = held_list(runner, key)
     active = active_items(runner, key, adapter)
     system = [e for e in active if is_system_event(runner, e)]
     later_users = [e for e in active if not is_system_event(runner, e)]
-    if held or later_users:
-        # Always arm: release means "run next", including idle orphans whose slot was empty.
-        if not rewrite_active(runner, key, adapter, system + list(held or []) + later_users, arm=True):
-            return None
-        moved = len(held or [])
-        if held:
-            del held[:]
-        logger.info("queue_mgmt op=release session=%s moved=%d armed=%d", key, moved,
-                    moved + len(later_users))
-    return len([e for e in active_items(runner, key, adapter) if not is_system_event(runner, e)])
+    users = list(held or []) + later_users
+    if not users:
+        return 0
+    released = len(users)
+    if release_mode(runner) == "merged" and len(users) > 1:
+        users = [merge_user_events(users)]
+    for e in users:
+        try:
+            e._queue_released = True
+        except Exception:
+            pass
+    if not rewrite_active(runner, key, adapter, system + users, arm=True):
+        for e in users:
+            try:
+                e._queue_released = False
+            except Exception:
+                pass
+        return None
+    if held:
+        del held[:]
+    logger.info("queue_mgmt op=release session=%s released=%d mode=%s armed=%d", key, released,
+                release_mode(runner), len(system) + len(users))
+    return released
 
 
 async def release(runner: Any, key: str, source: Any, adapter: Any, *, busy: bool) -> str:
