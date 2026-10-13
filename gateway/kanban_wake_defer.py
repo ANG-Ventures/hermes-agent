@@ -53,7 +53,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from gateway import kanban_notify_suppress as _ns
 from gateway import kanban_wake_freshness as _fresh
-from hermes_cli.kanban_db import SUBAGENT_AUTHOR_MARKER
+from hermes_cli.kanban_db import HUMAN_REVIEWER_SENTINEL, SUBAGENT_AUTHOR_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -262,12 +262,24 @@ def _human_session(conn: sqlite3.Connection, sid: Any, profile: Any) -> bool:
     return bool(source) and source not in _MACHINE_SOURCES
 
 
+def _owner_label(owner: Any) -> str:
+    """The owner's operator label; ``""`` for the bare ``human`` sentinel.
+
+    ``_operator_label("human")`` is the truthy string ``"human"``, which names
+    no profile: treating it as a label made every ``same_operator`` test fail,
+    so a bare-``human`` owner's own events never cancelled its wake and a
+    STALE wake fired (Apollo review of #1934, cb8149c5fbc5 follow-up).
+    """
+    label = _ns._operator_label(owner)  # noqa: SLF001
+    return "" if label == HUMAN_REVIEWER_SENTINEL else label
+
+
 def _session_is_owner(conn: sqlite3.Connection, sid: Any, profile: Any, owner: str,
                       home_sid: Optional[str], cache: dict[tuple, bool]) -> bool:
     """A human session (:func:`_human_session`) that is the owner's: its profile
     is the owner's operator label, or, for a bare ``human`` owner with no label,
     it is the card's verified home session."""
-    label = _ns._operator_label(owner)  # noqa: SLF001
+    label = _owner_label(owner)
     if label:
         if not _ns.same_operator(profile, label):
             return False
@@ -292,7 +304,7 @@ def verified_home_sid(conn: sqlite3.Connection, owner: str, home_sid: Any) -> Op
     sid = str(home_sid or "").strip()
     if not sid:
         return None
-    label = _ns._operator_label(owner)  # noqa: SLF001
+    label = _owner_label(owner)
     for (profile,) in conn.execute(
         "SELECT DISTINCT actor_profile FROM task_events WHERE actor_session_id = ?", (sid,),
     ):
@@ -335,7 +347,11 @@ def owner_acted(conn: sqlite3.Connection, row: dict) -> Optional[str]:
                 author = payload.get("author") if isinstance(payload, dict) else None
                 if str(author or "").rstrip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
                     continue  # a delegate child's comment is never the owner (cb8149c5fbc5)
-                if _is_human(author) and _ns.same_operator(author, owner):
+                if _is_human(author) and (
+                    not _owner_label(owner) or _ns.same_operator(author, owner)
+                ):
+                    # A ``human:<name>`` author needs the operator token; for a
+                    # bare ``human`` owner any such author is the human acting.
                     return f"owner {owner} commented (event {r['id']})"
                 if author:
                     profiles.append(author)
