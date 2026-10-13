@@ -71,6 +71,9 @@ MAP_INVALID_EVENT = "placement_map_invalid"
 # never shadows the card's ``placement_affinity`` (Prism 415306946489).
 WARN_EVENT = "placement_affinity_warn"
 STUDIO_HOST = "mac-studio"
+STUDIO_ROW = "studio"          # the Studio's row in host-capabilities.json
+IDENTITY_ONLY = "identity-only"
+UNSATISFIED = "requires_unsatisfied"
 
 REQUIRES_RE = re.compile(r"^[ \t]*requires:[ \t]*(.*?)[ \t]*\r?$", re.IGNORECASE | re.MULTILINE)
 _WORD_SPLIT_RE = re.compile(r"[,\s]+")
@@ -104,6 +107,14 @@ class CapabilityMap:
     error: Optional[str] = None
     index_error: Optional[str] = None
     index_unverified: Optional[str] = None   # why ``enforce`` is demoted to ``warn``
+    # Per-capability hardness from the map (spec v0.3 §4 Phase 2-pre, t_90887924):
+    # ``soft: false`` = enforced whenever the layer enforces, ``soft: true`` = warn
+    # only. Absent = the root config's ``capabilities_enforce`` list decides.
+    soft: Mapping[str, bool] = field(default_factory=dict)
+    # Capabilities the Studio row serves to an explicit ``host: studio`` pin
+    # only (``hosts.studio.studio_tier: {cap: "identity-only"}``, §3.4): an
+    # unpinned card needing one waits for an advertising pool host.
+    identity_only: frozenset = frozenset()
 
     @property
     def valid(self) -> bool:
@@ -124,6 +135,12 @@ class Verdict:
     pin: Optional[Requirement] = None
     enforced: Tuple[Requirement, ...] = ()
     observed: Optional[Requirement] = None
+    # Pool hosts that advertise every enforced requirement (capability-aware
+    # take, t_90887924): the card is portable to these hosts only.
+    only: Tuple[str, ...] = ()
+    # ``requires_unsatisfied:<cap>``: an identity-only capability no pool host
+    # advertises. The card waits; it never spawns locally unpinned (AC-5).
+    wait: Optional[str] = None
 
     def for_portable(self) -> Optional[Tuple[Optional[str], Optional[str]]]:
         if self.hard_rule is None and self.soft_rule is None:
@@ -148,6 +165,8 @@ class CapabilityTick:
             return WARN   # F11: a malformed map degrades every capability to warn
         if cap.startswith(UNKNOWN_PREFIX):
             return ENFORCE  # F4: an unknown word keeps the card local
+        if cap in self.cmap.soft:
+            return WARN if self.cmap.soft[cap] else ENFORCE   # the map's kill switch, per class
         return ENFORCE if cap in self.enforce else WARN
 
     @property
@@ -206,7 +225,8 @@ def _read(path: Path):
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
-def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[str, frozenset]]:
+def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[str, frozenset],
+                             Dict[str, bool], frozenset]:
     if not isinstance(doc, dict) or doc.get("schema") != 1 or isinstance(doc.get("schema"), bool):
         raise ValueError("schema must be 1")
     caps = doc.get("capabilities")
@@ -220,6 +240,8 @@ def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[
             raise ValueError(f"capability {cap!r} is not a plain name")
         if not isinstance(row, dict):
             raise ValueError(f"capabilities.{cap} must be an object")
+        if "soft" in row and not isinstance(row["soft"], bool):
+            raise ValueError(f"capabilities.{cap}.soft must be true or false")
         terms = row.get("sniff", [])
         if not isinstance(terms, list) or not all(isinstance(t, str) and t for t in terms):
             raise ValueError(f"capabilities.{cap}.sniff must be a list of regexes")
@@ -238,7 +260,11 @@ def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[
         if bad:
             raise ValueError(f"hosts.{hid} names unknown capabilities {bad}")
         out[hid.lower()] = frozenset(row["capabilities"])
-    return tuple(names), tuple(sniff), out
+    soft = {c: r["soft"] for c, r in caps.items() if "soft" in r}
+    tier = (hosts.get(STUDIO_ROW) or {}).get("studio_tier", {})
+    if not isinstance(tier, dict) or any(c not in known or v != IDENTITY_ONLY for c, v in tier.items()):
+        raise ValueError(f"hosts.{STUDIO_ROW}.studio_tier must map known capabilities to {IDENTITY_ONLY!r}")
+    return tuple(names), tuple(sniff), out, soft, frozenset(tier)
 
 
 def index_hash(skills: Mapping[str, Iterable[str]]) -> str:
@@ -284,10 +310,11 @@ def load_map(fleet_dir: Path) -> Optional[CapabilityMap]:
     if doc is None:
         return None
     try:
-        names, sniff, hosts = _parse_map(doc)
+        names, sniff, hosts, soft, identity_only = _parse_map(doc)
         error = None
     except ValueError as exc:
         names, sniff, hosts, error = (), (), {}, f"{MAP_FILE}: {exc}"
+        soft, identity_only = {}, frozenset()
     index: Dict[str, Tuple[str, ...]] = {}
     index_error = None
     unverified = None
@@ -301,7 +328,8 @@ def load_map(fleet_dir: Path) -> Optional[CapabilityMap]:
     except (OSError, ValueError) as exc:
         index_error = f"{INDEX_FILE}: {exc}"
     return CapabilityMap(capabilities=names, sniff=sniff, hosts=hosts, index=index,
-                         error=error, index_error=index_error,
+                         error=error, index_error=index_error, soft=soft,
+                         identity_only=identity_only,
                          index_unverified=unverified if index_error is None else None)
 
 
@@ -433,7 +461,7 @@ def _first(reqs: List[Requirement]) -> Optional[Requirement]:
 
 
 def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[CapabilityTick], *,
-             pin_host: Optional[str] = None) -> Verdict:
+             pin_host: Optional[str] = None, any_pin: bool = False) -> Verdict:
     """The card's verdict under this tick's map and modes. ``pin_host`` is a
     resolved ``host:<pool-id>`` pin (never ``any``/``studio``)."""
     if ctx is None:
@@ -441,11 +469,34 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
     reqs, none = derive(body, skills, ctx.cmap)
     if none:
         reqs = [r for r in reqs if r.strength == HARD]   # F12: none overrides soft only
-    live = [r for r in reqs if ctx.mode_of(r.cap) != OFF and not _satisfied(r.cap, ctx, pin_host)]
+    # An identity-only capability is never "satisfied by every pool host" for
+    # an unpinned card: the Studio must not take it as portable overflow even
+    # when the whole pool advertises it (spec v0.3 §3.4).
+    live = [r for r in reqs if ctx.mode_of(r.cap) != OFF and (
+        not _satisfied(r.cap, ctx, pin_host)
+        or (pin_host is None and r.cap in ctx.cmap.identity_only))]
     enforced = [r for r in live if ctx.mode_of(r.cap) == ENFORCE]
     warned = [r for r in live if ctx.mode_of(r.cap) == WARN]
     hard = _first([r for r in enforced if r.strength == HARD])
     soft = _first([r for r in enforced if r.strength == SOFT])
+    # `host: any` overrides SOFT requirements (F12): they must not come back
+    # as a host restriction or an identity-only hold (Prism dab1f537f2a0 /
+    # a5b769beaf55 on #1902). HARD ones still apply.
+    binding = [r for r in enforced if r.strength == HARD] if any_pin else enforced
+    if binding and pin_host is None and not any(r.unknown for r in binding):
+        needed = {r.cap for r in binding}
+        servers = tuple(h for h in ctx.pool_hosts if needed <= ctx.cmap.hosts.get(h, frozenset()))
+        if servers:
+            # Some pool host advertises everything the card needs: portable,
+            # placed on those hosts only (t_90887924, AC-5 "host X").
+            return Verdict(pin=hard or soft, enforced=tuple(enforced),
+                           observed=_first(warned), only=servers)
+        idle = sorted(needed & ctx.cmap.identity_only)
+        if idle:
+            return Verdict(hard_rule=hard.rule if hard else None,
+                           soft_rule=soft.rule if soft else None, pin=hard or soft,
+                           enforced=tuple(enforced), observed=_first(warned),
+                           wait=f"{UNSATISFIED}:{idle[0]}")
     return Verdict(
         hard_rule=hard.rule if hard else None,
         soft_rule=soft.rule if soft else None,
@@ -457,10 +508,13 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
 
 # -- presentation -----------------------------------------------------------
 
-def affinity_payload(req: Requirement, verdict: Verdict, mode: str) -> Dict[str, Any]:
-    """The ``placement_affinity`` event payload (s2.3)."""
+def affinity_payload(req: Requirement, verdict: Verdict, mode: str, *,
+                     host: str = STUDIO_HOST) -> Dict[str, Any]:
+    """The ``placement_affinity`` event payload (s2.3). ``host`` is where the
+    card may run: the Studio, ``"|"``-joined advertising pool hosts, or
+    ``"none"`` (an identity-only capability nobody advertises: it waits)."""
     return {
-        "host": STUDIO_HOST, "rule": req.rule,
+        "host": host, "rule": req.rule,
         "requires": sorted({r.cap for r in verdict.enforced}) if mode == ENFORCE else [req.cap],
         "matched_by": req.matched_by, "term": req.term, "strength": req.strength, "mode": mode,
     }
@@ -476,9 +530,15 @@ def _source_text(req: Requirement) -> str:
     return f'body "{req.term}"'
 
 
-def pin_comment(req: Requirement, known: Iterable[str]) -> str:
+def pin_comment(req: Requirement, known: Iterable[str], *, host: str = STUDIO_HOST) -> str:
     """The one card comment per (card, capability, matched_by) pin."""
     head = f"{COMMENT_PREFIX} {req.cap} ({_source_text(req)})"
+    if host == "none":
+        return (f"{head}. No pool host advertises {req.cap} (its probe never passed as the pool "
+                f"user) and the Mac Studio serves it only to an explicit `host: studio` pin, so "
+                f"this card WAITS ({UNSATISFIED}). Add `host: studio` to run it on the Studio.")
+    if host != STUDIO_HOST:
+        return f"{head}. Placed only on a pool host that advertises it: {host.replace('|', ', ')}."
     if req.unknown:
         word = req.cap[len(UNKNOWN_PREFIX):]
         return (f"{COMMENT_PREFIX} unknown capability \"{word}\" ({_source_text(req)}). "
@@ -513,7 +573,13 @@ def spawn_env(fleet_dir: Path, kanban_cfg: Any) -> str:
         return env_value(OFF, ())
     if not cmap.valid:
         return env_value(WARN, ())
-    return env_value(effective_mode(mode, cmap), enforce)
+    mode = effective_mode(mode, cmap)
+    if mode == ENFORCE and cmap.soft:
+        # The map's per-class hardness wins, exactly as CapabilityTick.mode_of
+        # decides placement (Prism b8ddb038892b on #1902).
+        enforce = tuple(c for c in dict.fromkeys([*enforce, *(k for k, v in cmap.soft.items() if not v)])
+                        if not cmap.soft.get(c, False))
+    return env_value(mode, enforce)
 
 
 _MAP_INVALID_LOGGED: Dict[str, float] = {}
@@ -548,7 +614,7 @@ def pending_comments(conn, result, caps: Optional[CapabilityTick], caps_out: Map
         if not str(aff.get("rule", "")).startswith(RULE_PREFIX) or _has_pin_event(conn, tid, aff):
             continue
         req = Requirement(aff["rule"][len(RULE_PREFIX):], aff["strength"], aff["matched_by"], aff["term"])
-        out.append((tid, pin_comment(req, caps.cmap.capabilities)))
+        out.append((tid, pin_comment(req, caps.cmap.capabilities, host=aff.get("host", STUDIO_HOST))))
     for tid, req in (caps_out.get("unknown") or {}).items():
         aff = (result.placement_affinity or {}).get(tid)
         if aff is not None and aff.get("rule") == req.rule:
