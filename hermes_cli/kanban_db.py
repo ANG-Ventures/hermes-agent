@@ -10507,9 +10507,11 @@ def complete_task(
             ])
         _pr_query = _open_pr.memo_query()
         unowned_prs: list = []
+        branch_owned_prs: list = []
         still_open = _open_pr.open_pr_refs(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
             query_fn=_pr_query, task_id=task_id, unowned=unowned_prs,
+            owned=branch_owned_prs,
         )
         if unowned_prs:
             # Prose is not provenance (t_60b39483): the handoff named open PRs whose head branch
@@ -10566,6 +10568,15 @@ def complete_task(
             # gated on them; prose mentions in auto_routed_open_prs are not (FleetReview #1352).
             own = _open_pr.split_fleet(_open_pr.extract_pr_refs(
                 metadata=metadata, survivor_pr=survivor_pr))[0]
+            # Plus a still-open prose ref whose head branch names THIS card (t_3a606d89): it gates
+            # the route, so a later done/archive must be gated on it too.
+            own_keys = {(r.repo.lower(), r.number) for r in own}
+            routed_keys = {(r.repo.lower(), r.number) for r in still_open}
+            for r in branch_owned_prs:
+                key = (r.repo.lower(), r.number)
+                if key in routed_keys and key not in own_keys:
+                    own_keys.add(key)
+                    own.append(r)
             # Always written (even []): its presence marks the run as post-#1352 (no legacy fallback).
             routed_meta["own_prs"] = [f"{r.repo}#{r.number}" for r in own]
             if freshness.get("prs"):

@@ -267,7 +267,8 @@ def branch_names_card(head_ref: Optional[str], task_id: Optional[str]) -> bool:
 
 def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
                  survivor_pr=None, query_fn: Optional[QueryFn] = None,
-                 task_id: Optional[str] = None, unowned: Optional[list] = None) -> list:
+                 task_id: Optional[str] = None, unowned: Optional[list] = None,
+                 owned: Optional[list] = None) -> list:
     """Extract + resolve: the FLEET PRs that block ``done`` -- OPEN or unreadable.
 
     Foreign-owner refs are dropped before any lookup (see :data:`FLEET_OWNERS`).
@@ -288,6 +289,10 @@ def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
     prose said "the fix is Apollo's #3853". One exception (t_287a2872): an OPEN text-only ref whose
     head branch names THIS card (``<profile>/<task_id>-*``) is the card's own PR even when undeclared
     (a merged ``pr_url`` plus "follow-up in o/r#N"), so it still gates.
+
+    ``owned`` (t_3a606d89): every undeclared ref kept because its head branch names THIS card is
+    appended here, on both paths, so the caller persists it in ``own_prs``. A ref that gates only
+    because it fails closed (no card id, unreadable) is not provenance and is not appended.
     """
     refs = split_fleet(extract_pr_refs(*texts, metadata=metadata, survivor_pr=survivor_pr))[0]
     if not refs:
@@ -308,6 +313,8 @@ def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
                     if unowned is not None:
                         unowned.append(ref)
                     continue
+                if owned is not None:
+                    owned.append(ref)
             kept.append(ref)
         return kept + [r for r in unverified if (r.repo.lower(), r.number) in declared]
     if task_id:
@@ -321,6 +328,8 @@ def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
                     if unowned is not None:
                         unowned.append(ref)
                     continue
+                if owned is not None and branch_names_card(head_ref, task_id):
+                    owned.append(ref)
             kept.append(ref)
         opened = kept
     return opened + unverified
