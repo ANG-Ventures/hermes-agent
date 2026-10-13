@@ -122,3 +122,40 @@ def test_local_interpreter_kill_still_blocks(command):
 def test_remote_interpreter_kill_is_remote():
     assert contains_host_interpreter_kill("ssh ci 'pkill python3'") is False
     assert contains_host_interpreter_kill("ssh ci 'cd /tmp\npkill -f python3'") is False
+
+
+# t_6b04e90d (Prism 8c997d448d77, 3bb16d799c55, 74daf6278e75 on #1958): a word the tokenizer keeps
+# whole still runs LOCALLY when it is a `$( )`/backtick body outside single quotes, an ssh
+# ProxyCommand/LocalCommand value, or the remote command of an ssh whose destination is loopback
+# or redirected (-F/-J/-W, bundled -vF / -voX).
+@pytest.mark.parametrize("command", [
+    "ssh -voProxyCommand='pkill python3' ci 'pkill python3'",
+    "ssh -o ProxyCommand='pkill python3' ci true",
+    "ssh -oLocalCommand='pkill python3' -oPermitLocalCommand=yes ci true",
+    "ssh -F cfg ci 'pkill python3'",
+    "ssh -vF cfg ci 'pkill python3'",
+    "ssh -J jump ci 'pkill python3'",
+    "ssh ci \"pkill -f python3; $(pkill python3)\"",
+    "ssh ci \"echo `pkill python3`\"",
+    "ssh ci \"$(echo $(pkill python3))\"",
+    "echo \"$(pkill python3)\"",
+    "x=`pkill python3`",
+    "ssh localhost 'pkill python3'",
+    "ssh 127.0.0.1 'pkill -9 python'",
+])
+def test_locally_executed_words_are_scanned(command):
+    assert contains_host_interpreter_kill(command) is True
+    assert scan_gateway_lifecycle_detail(command, cwd="/tmp", read_remote_script=lambda p: None)[0] is True
+
+
+@pytest.mark.parametrize("command", [
+    "ssh ci 'pkill -f 18765'",
+    "ssh ci 'echo $(pkill python3)'",                  # single-quoted: expands on the remote host
+    "ssh ci \"echo \\$(pkill python3)\"",              # escaped: expands on the remote host
+    "echo '`pkill python3`'",
+    "ssh -v -o BatchMode=yes -p 22 ci 'pkill python3'",
+    "ssh -o ProxyCommand=none ci 'pkill -f 18765'",
+    "# note: $(pkill python3)\nls",
+])
+def test_remote_or_inert_substitutions_still_allow(command):
+    assert contains_host_interpreter_kill(command) is False

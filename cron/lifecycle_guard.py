@@ -184,10 +184,16 @@ _NAME_ENUMERATORS = frozenset({"pgrep", "pidof", "get-process"})
 _KILL_VERB_RE = re.compile(r"(?i)\b(?:kill|taskkill|stop-process)\b")
 # ssh options that send the connection somewhere a text guard cannot resolve (or run a LOCAL
 # command): such an ssh is never treated as remote.
-_SSH_DEST_REDIRECT_RE = re.compile(r"(?i)(?:^|\s)-[FJW]|(?:^|\s)-o\s*(?:HostName|ProxyCommand|ProxyJump|LocalCommand|"
-                                   r"PermitLocalCommand)\b")
-# ssh(1) single-letter options that take a value in the next word.
+_SSH_DEST_REDIRECT_FLAGS = frozenset("FJW")
+_SSH_DEST_REDIRECT_KEYS = frozenset({"hostname", "proxycommand", "proxyjump", "localcommand", "permitlocalcommand",
+                                     "knownhostscommand"})
+# `-o` keys whose value is a command ssh runs on THIS host (ssh_config(5)), whatever the destination.
+_SSH_LOCAL_COMMAND_KEYS = frozenset({"proxycommand", "localcommand", "knownhostscommand"})
+_SSH_CONFIG_OPTION_RE = re.compile(r"^\s*([A-Za-z]+)\s*(?:=\s*|\s+)(.*)$", re.S)
+# ssh(1) single-letter options that take a value (the rest of the word, or the next word).
 _SSH_VALUED_FLAGS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+# Nested substitutions / ssh wrappers deeper than this fail closed rather than recurse further.
+_MAX_BRANCH_E_DEPTH = 8
 # A `-f` pattern that does not start with the interpreter reaches the gateway cmdline
 # (`python -m hermes_cli.main gateway run` / `hermes gateway run`) only through its own tokens;
 # an unrelated script that merely contains "hermes" (`hermes-polis/run.sh`, `my_hermes_bot.py`)
@@ -300,7 +306,6 @@ def contains_host_interpreter_kill(text: str) -> bool:
     name-derived PID feed into one (`pgrep python | xargs kill`, `kill $(pidof python3)`,
     `Get-Process python | Stop-Process`). Segment-tokenized, so quoted/spliced spellings and Python
     argv lists resolve the same way the shell resolves them."""
-    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
     # Judge the TARGET host (t_75fdedd4): a killer inside an ssh remote command runs under the
     # remote sshd and cannot reach this gateway's interpreter, the same exemption Branches A-D
     # take. Tokenizing whole lines first made the remote body one segment, so a later `python3` in
@@ -310,10 +315,35 @@ def contains_host_interpreter_kill(text: str) -> bool:
     # the shell resolves them (Prism 54ec70a8227c, 8c997d448d77, 88d6dcb1882e): a segment whose
     # command word is ssh to a non-loopback host carries its remote command as ONE argument, and
     # is skipped; every other segment gets the full scan.
-    kill_verb_present = bool(_KILL_VERB_RE.search(normalized))
+    #
+    # Words the tokenizer keeps whole still execute LOCALLY (t_6b04e90d): a `$( )`/backtick body
+    # outside single quotes (`echo "$(pkill python3)"`, `ssh ci "… $(pkill python3)"`), an ssh
+    # ProxyCommand/LocalCommand value, and the remote command of an ssh that is NOT exempt
+    # (loopback, `-F`/`-J`/`-W`, HostName/ProxyJump redirect). Each is re-scanned as shell source.
+    return _contains_host_interpreter_kill(text, depth=0, kill_context=False)
+
+
+def _contains_host_interpreter_kill(text: str, *, depth: int, kill_context: bool) -> bool:
+    if depth > _MAX_BRANCH_E_DEPTH:
+        return True
+    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    kill_verb_present = kill_context or bool(_KILL_VERB_RE.search(normalized))
+
+    def rescan(source: str) -> bool:
+        return _contains_host_interpreter_kill(source, depth=depth + 1, kill_context=kill_verb_present)
+
+    if any(rescan(body) for body in _local_substitution_bodies(normalized)):
+        return True
     for segment in _iter_command_segments(normalized):
-        if _segment_tokens_are_ssh_remote(segment):
-            continue
+        ssh = _ssh_invocation(segment)
+        if ssh is not None:
+            local_commands, remote_words, exempt = ssh
+            if any(rescan(command) for command in local_commands):
+                return True
+            if exempt:
+                continue
+            if remote_words and rescan(" ".join(remote_words)):
+                return True
         joined = " ".join(segment)
         stripped = _ARGV_LIST_PUNCTUATION.sub(" ", joined)
         for tokens in ([segment, stripped.split()] if stripped != joined else [segment]):
@@ -324,27 +354,121 @@ def contains_host_interpreter_kill(text: str) -> bool:
     return False
 
 
-def _segment_tokens_are_ssh_remote(segment: list[str]) -> bool:
-    """A tokenized segment whose executed command is `ssh <non-loopback host> <remote command>`.
-    Only the ssh OPTIONS and the destination are judged; the remote command (it may well mention
-    127.0.0.1, as the 2026-10-12 replay does) is not part of the target."""
+def _ssh_invocation(segment: list[str]) -> Optional[tuple[list[str], list[str], bool]]:
+    """For a tokenized segment whose executed command is ssh/autossh: (commands ssh runs LOCALLY
+    from `-o ProxyCommand=…`/`LocalCommand=…`, the remote-command words, exempt). *exempt* means
+    `ssh <non-loopback host> '<one remote command>'` with no option that redirects the connection
+    (`-F`/`-J`/`-W`, HostName/ProxyJump/…): only then does the remote command run somewhere other
+    than this host. Options are parsed the way ssh(1) parses them, so bundled short flags
+    (`-voProxyCommand=…`, `-vF cfg`) and attached values are read, not skipped. The remote command
+    itself (it may well mention 127.0.0.1, as the 2026-10-12 replay does) is not part of the target.
+    None when the segment is not an ssh invocation."""
     index = _executed_command_index(segment)
-    if index is None or _executable_name(segment[index]).lower() not in ("ssh", "autossh"):
-        return False
+    if index is None:
+        return None
+    name = _executable_name(segment[index]).lower()
+    if name not in ("ssh", "autossh"):
+        return None
+    valued = _SSH_VALUED_FLAGS | {"M"} if name == "autossh" else _SSH_VALUED_FLAGS
+    local_commands: list[str] = []
+    redirected = False
     position = index + 1
-    while position < len(segment) and segment[position].startswith("-"):
-        flag = segment[position]
-        position += 2 if len(flag) == 2 and flag[1] in _SSH_VALUED_FLAGS else 1
+    while position < len(segment) and segment[position].startswith("-") and segment[position] != "-":
+        word = segment[position]
+        position += 1
+        if word == "--":
+            break
+        for offset in range(1, len(word)):
+            flag = word[offset]
+            if flag not in valued:
+                continue
+            value = word[offset + 1:]
+            if not value and position < len(segment):
+                value = segment[position]
+                position += 1
+            redirected = redirected or flag in _SSH_DEST_REDIRECT_FLAGS
+            option = _SSH_CONFIG_OPTION_RE.match(value) if flag == "o" else None
+            if option is not None:
+                key = option.group(1).lower()
+                redirected = redirected or key in _SSH_DEST_REDIRECT_KEYS
+                if key in _SSH_LOCAL_COMMAND_KEYS and option.group(2).strip().lower() != "none":
+                    local_commands.append(option.group(2))
+            break
     if position >= len(segment):
-        return False
+        return local_commands, [], False
     # Exempt only the quoted-remote-command shape: exactly ONE word after the destination. Several
     # words (`ssh h pkill python3`, or a comment that swallowed a newline: `ssh h up # don't<NL>pkill
     # python3` tokenizes as one segment) keep the full scan, which is how main judged them.
-    tail = [t for t in segment[position + 1:] if not re.match(r"^\d*(?:[<>]{1,2}|&>{1,2}|>&|<&)$|^\d*[<>].+$|^-$", t)]
-    if len(tail) != 1:
-        return False
+    remote_words = [t for t in segment[position + 1:]
+                    if not re.match(r"^\d*(?:[<>]{1,2}|&>{1,2}|>&|<&)$|^\d*[<>].+$|^-$", t)]
     target = " ".join(segment[index:position + 1])
-    return not _LOOPBACK_HOST_RE.search(target) and not _SSH_DEST_REDIRECT_RE.search(target)
+    exempt = len(remote_words) == 1 and not redirected and not _LOOPBACK_HOST_RE.search(target)
+    return local_commands, remote_words, exempt
+
+
+def _local_substitution_bodies(text: str) -> list[str]:
+    """Bodies of the `$( … )` and backtick command substitutions the LOCAL shell runs in *text*:
+    outside single quotes (a double-quoted one still executes), not escaped, not in a `#` comment.
+    Top level only; the caller rescans each body, which reaches nested ones."""
+    bodies: list[str] = []
+    in_double = False
+    position = 0
+    while position < len(text):
+        char = text[position]
+        if char == "\\":
+            position += 2
+            continue
+        if char == "'" and not in_double:
+            close = text.find("'", position + 1)
+            position = len(text) if close < 0 else close + 1
+            continue
+        if char == '"':
+            in_double = not in_double
+        elif char == "#" and not in_double and (position == 0 or text[position - 1] in " \t\n;&|("):
+            close = text.find("\n", position)
+            position = len(text) if close < 0 else close
+            continue
+        elif char == "`":
+            close = position + 1
+            while close < len(text) and text[close] != "`":
+                close += 2 if text[close] == "\\" else 1
+            bodies.append(text[position + 1:close])
+            position = close + 1
+            continue
+        elif char == "$" and text.startswith("(", position + 1):
+            close = _substitution_end(text, position + 2)
+            bodies.append(text[position + 2:close])
+            position = close + 1
+            continue
+        position += 1
+    return bodies
+
+
+def _substitution_end(text: str, start: int) -> int:
+    """Index of the `)` closing a `$(` whose body starts at *start* (len(text) when unclosed, so an
+    unbalanced body is scanned to the end rather than dropped)."""
+    depth = 1
+    in_double = False
+    position = start
+    while position < len(text):
+        char = text[position]
+        if char == "\\":
+            position += 2
+            continue
+        if char == "'" and not in_double:
+            close = text.find("'", position + 1)
+            position = len(text) if close < 0 else close + 1
+            continue
+        if char == '"':
+            in_double = not in_double
+        elif not in_double and char == "(":
+            depth += 1
+        elif not in_double and char == ")":
+            depth -= 1
+            if depth == 0:
+                return position
+        position += 1
+    return len(text)
 
 
 _SSH_COMMAND_RE = re.compile(r"(?i)(?:^|\s)(?:/\S*/)?(?:ssh|autossh)\s")
