@@ -132,46 +132,55 @@ def _drive_clean_exit(
     lets ``detect_crashed_workers`` read both back. The previous mocked version
     made per-run output identical/distinct BY CONSTRUCTION, which is precisely
     how the append-mode defects survived.
+
+    The fake worker pids are dead for the WHOLE drive, claim included, and
+    never resolve against the host's process table: the re-claim's
+    prior-worker probe reads every earlier spawn's pid, and on a host that
+    recycles pids fast (ci-box: ~3,450/s over pid_max 4,194,304) a fake
+    ``99xxxx`` pid is often a live process, which refused the second claim.
     """
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as kbd
     from hermes_cli.kanban_worker_exit import exit_file
 
-    host_prefix = _kb._claimer_id().split(":", 1)[0]
-    assert _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock") is not None
-    task = _kb.get_task(conn, tid)
-    assert task is not None and task.current_run_id is not None
-    kbd._set_worker_pid(conn, tid, fake_pid)
-
-    log_dir = _kb.worker_logs_dir()
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{tid}.log"
-    _kb._stamp_worker_log_run_boundary(log_path)
-    if worker_output:
-        with open(log_path, "ab") as fh:
-            fh.write(worker_output.encode("utf-8") + b"\n")
-
-    db_path = Path(
-        next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
-    )
-    receipt = exit_file(db_path, tid, task.current_run_id)
-    receipt.parent.mkdir(parents=True, exist_ok=True)
-    receipt.write_text(
-        json.dumps({
-            "exit_code": 0,
-            "failure_reason": None,
-            "exit_class": None,
-            "model_turn_completed": model_turn_completed,
-        }),
-        encoding="utf-8",
-    )
-    kbd._record_worker_exit(fake_pid, 0)  # receipt outranks this PID fallback
     original_alive = _kb._pid_alive
+    original_members = _kb._worker_session_members
     _kb._pid_alive = lambda p: False
+    _kb._worker_session_members = lambda sid: []
     try:
+        host_prefix = _kb._claimer_id().split(":", 1)[0]
+        assert _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock") is not None
+        task = _kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        kbd._set_worker_pid(conn, tid, fake_pid)
+
+        log_dir = _kb.worker_logs_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{tid}.log"
+        _kb._stamp_worker_log_run_boundary(log_path)
+        if worker_output:
+            with open(log_path, "ab") as fh:
+                fh.write(worker_output.encode("utf-8") + b"\n")
+
+        db_path = Path(
+            next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
+        )
+        receipt = exit_file(db_path, tid, task.current_run_id)
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(
+            json.dumps({
+                "exit_code": 0,
+                "failure_reason": None,
+                "exit_class": None,
+                "model_turn_completed": model_turn_completed,
+            }),
+            encoding="utf-8",
+        )
+        kbd._record_worker_exit(fake_pid, 0)  # receipt outranks this PID fallback
         return kbd.detect_crashed_workers(conn)
     finally:
         _kb._pid_alive = original_alive
+        _kb._worker_session_members = original_members
 
 
 # Realistic per-run shape, measured from the incident logs
