@@ -2330,3 +2330,30 @@ def test_an_exhaustion_newer_than_the_reset_still_binds(tmp_path, monkeypatch):
     live._persist()
     assert _disk_entry(tmp_path)["last_status"] == "exhausted"
     assert live.select() is None
+
+
+def test_codex_raw_client_resolves_for_other_model_while_one_model_is_benched(tmp_path, monkeypatch):
+    """Same-provider fallback (t_b948f3e3): one pool entry benched for model A by an entitlement
+    400 must still resolve a raw Codex client for fallback model B; A and an unscoped select stay
+    blocked."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("HERMES_CODEX_BASE_URL", raising=False)
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {"openai-codex": [{
+        "id": "cred-1", "label": "only", "auth_type": "oauth", "priority": 0, "source": "manual",
+        "access_token": "tok-pooled", "refresh_token": "rt-1", "expires_at_ms": 4_000_000_000_000,
+        "model_cooldowns": {"model-a": time.time() + 3600},
+    }]}})
+    import agent.auxiliary_client as aux
+    from agent.credential_pool import load_pool
+
+    monkeypatch.setattr(aux, "_client_cache", {})
+    built = []
+    monkeypatch.setattr(aux, "_create_openai_client", lambda **kw: built.append(kw) or object())
+    client, model = aux.resolve_provider_client("openai-codex", model="model-b", raw_codex=True)
+    assert client is not None and model == "model-b"
+    assert [kw["api_key"] for kw in built] == ["tok-pooled"]
+
+    assert aux.resolve_provider_client("openai-codex", model="model-a", raw_codex=True) == (None, None)
+    assert load_pool("openai-codex").select() is None
+    assert aux._resolve_codex_credential_and_base()[0] is None
