@@ -24,6 +24,8 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
         monkeypatch.delenv(var, raising=False)
+    # The fixture hosts (ace-ai, ace-media) must read as remote on whichever box runs the suite.
+    monkeypatch.setattr(kres, "_this_host", lambda: "kres-test-box")
     kb.init_db()
     # The fleet registry the sweep binds hosts to (live shape: kanban-reach-matrix.json aliases).
     (home / "fleet").mkdir()
