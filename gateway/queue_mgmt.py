@@ -279,6 +279,10 @@ def merge_user_events(events: List[Any]) -> Any:
     head.media_types = list(getattr(head, "media_types", None) or [])
     if hasattr(head, "media_text_inlined"):
         head.media_text_inlined = list(head.media_text_inlined or [])
+    # The derived STT cache describes the head alone and dispatch prefers it over ``text``: drop it
+    # so the merged turn re-derives from every item (same rule as the adapter merge in base.py).
+    for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
+        head.__dict__.pop(attr, None)
     texts = [str(getattr(e, "text", "") or "").strip() for e in events]
     head.text = MERGE_SEPARATOR.join(t for t in texts if t)
     for e in events[1:]:

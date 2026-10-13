@@ -511,6 +511,23 @@ def test_merged_release_without_slot_storage_leaves_held_items_untouched(rig):
     assert merged.media_urls == ["u1", "u2"]
 
 
+def test_merged_release_drops_heads_derived_stt_cache_but_keeps_held_original(rig):
+    runner, adapter = rig
+    runner._queue_release_mode = "merged"
+    head, tail = _ev("voice"), _ev("b")
+    head._gateway_pending_stt_text = "head transcript only"
+    head._gateway_pending_stt_transcripts = ["head transcript only"]
+    head._gateway_pending_stt_echoed = 1
+    runner._session_state(KEY).conversation.held_queue.extend([head, tail])
+    assert qm.restage_held(runner, KEY, adapter) == 2
+    merged = adapter._pending_messages[KEY]
+    assert merged.text == "voice\n\nb"
+    assert not hasattr(merged, "_gateway_pending_stt_text")
+    assert not hasattr(merged, "_gateway_pending_stt_transcripts")
+    assert merged._gateway_pending_stt_echoed == 1             # echo ledger survives (no double echo)
+    assert head._gateway_pending_stt_text == "head transcript only"
+
+
 def test_per_item_release_marks_every_released_event(rig):
     runner, adapter = rig
     _seed(runner, adapter, "a", "b")
