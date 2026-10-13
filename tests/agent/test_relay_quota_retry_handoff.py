@@ -18,6 +18,7 @@ def quota_error(status=503, retry_after="1783", cls="quota_seat"):
 def make_agent(statuses, *, fallback=True, provider="claude-alr"):
     # No SDK/network probing during construction; only the wire/client is synthetic.
     with patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()), \
+         patch("agent.context_compressor.get_model_context_length", return_value=200000), \
          patch("agent.model_metadata.get_model_context_length", return_value=200000):
         agent = _make_agent(statuses)
     agent.provider = provider
