@@ -101,4 +101,8 @@ async def test_interrupt_promotes_internal_wake_queued_behind_discarded_human_he
     runner._session_state(key).conversation.queued_events.extend([later_human, wake])
     await _run_command(runner, adapter, source, key, _COMMAND_REASONS[0])
     assert adapter.restarted == [wake]
-    assert runner._overflow_queue(key) == [later_human]
+    # /stop HOLDS human items now (spec 2026-10-12 D12/D14): "second human" moves to held_queue
+    # instead of staying in overflow, and the discarded head "human head" is held too, not dropped.
+    assert runner._overflow_queue(key) == []
+    held = [e.text for e in runner._session_state(key).conversation.held_queue]
+    assert held == ["human head", "second human"]
