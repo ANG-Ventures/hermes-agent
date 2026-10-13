@@ -213,9 +213,9 @@ def test_codex_gpt55_autoraise_suppressed_for_plugin_engine():
 
 
 def test_codex_gpt55_autoraise_still_applies_to_builtin_compressor():
-    """Stock built-in compressor keeps the 50% → 85% Codex gpt-5.5 autoraise."""
+    """Stock built-in compressor keeps the 50% → 85% Codex gpt-5.5 autoraise when opted in."""
     cfg = {
-        "compression": {"enabled": True, "threshold": 0.50},
+        "compression": {"enabled": True, "threshold": 0.50, "per_model_builtins": True},
         "agent": {},
     }
 

@@ -751,7 +751,7 @@ export const SECTIONS: DesktopConfigSection[] = [
       'context.engine',
       'compression.enabled',
       'compression.threshold',
-      'compression.codex_gpt55_autoraise',
+      'compression.per_model_builtins',
       'compression.target_ratio',
       'compression.protect_last_n',
       'auxiliary.compression.timeout'

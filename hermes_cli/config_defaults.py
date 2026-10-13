@@ -779,11 +779,12 @@ DEFAULT_CONFIG = {
         # instead of dropping the middle with a "summary unavailable" placeholder; the session
         # freezes at its size until /compress (bypasses the cooldown) or /new.
         "abort_on_summary_failure": False,
-        # (Historical key name.) When True, gpt-5.4/5.5/5.6 and gpt-6 Astra (any slug containing
-        # "astra" without "900k") on the ChatGPT Codex OAuth route raise their compaction trigger to
-        # 85%: Codex hard-caps them at a 272K window, so the global 50% would compact at ~136K. False = global `threshold`. Only that route; the same models via
-        # OpenAI direct, OpenRouter or Copilot keep the global value.
-        "codex_gpt55_autoraise": True,
+        # Built-in per-model thresholds (legacy). False (default) = every model uses the universal
+        # `threshold`. True = Codex-OAuth gpt-5.4/5.5/5.6/gpt-6 Astra raise to 85% (272K cap),
+        # Codex-OAuth gpt-5.3-codex-spark to 70%, Arcee Trinity Large Thinking to 75%.
+        # None (unset) = off, but falls through to the legacy alias `codex_gpt55_autoraise` when
+        # config.yaml sets it; a False default here would shadow that alias after the merge.
+        "per_model_builtins": None,
         # Show the one-time autoraise banner; False keeps the autoraise, hides the notice.
         "codex_gpt55_autoraise_notice": True,
         # Codex app-server thread compaction mode. The codex agent owns the thread context, so
