@@ -244,3 +244,31 @@ def test_dispatch_mkdir_fault_consumes_no_retry_and_spills_next_tick(kanban_home
     assert runs[0]["outcome"] == "spawn_failed" and '"infrastructure": true' in runs[0]["metadata"]
     assert '"board_fault"' in runs[0]["metadata"]
     assert len(pages) == 1
+
+
+def test_a_root_that_cannot_create_is_a_board_fault_even_if_access_tests_pass(tmp_path):
+    """Prism d762ee26a639: ENOSPC/quota pass -d/-w/-x. Shimmed mkdir/mktemp both fail like a full disk."""
+    board = tmp_path / "subs-ace"
+    board.mkdir()
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    for name in ("mkdir", "mktemp"):
+        (shim / name).write_text("#!/bin/sh\necho 'No space left on device' >&2\nexit 1\n")
+        (shim / name).chmod(0o755)
+
+    def full_disk(argv, **kw):
+        return subprocess.run(["sh", "-c", argv[-1]], capture_output=True, text=True,
+                              env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}"})
+
+    with pytest.raises(kwh.RemoteWorkspaceUnavailable):
+        kwh.prepare_remote_workspace(_host("ci-box"), str(board / "t_x"), runner=full_disk, board="subs-ace")
+    assert list(board.iterdir()) == []
+
+
+def test_root_probe_leaves_no_residue_on_a_card_path_fault(tmp_path):
+    board = tmp_path / "subs-ace"
+    board.mkdir()
+    (board / "t_x").write_text("file")
+    with pytest.raises(RuntimeError):
+        kwh.prepare_remote_workspace(_host("ci-box"), str(board / "t_x"), runner=_local_mkdir, board="subs-ace")
+    assert sorted(p.name for p in board.iterdir()) == ["t_x"]

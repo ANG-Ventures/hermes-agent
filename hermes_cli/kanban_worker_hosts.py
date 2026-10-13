@@ -87,8 +87,11 @@ def prepare_remote_workspace(host: PoolHost, workspace: str,
     # card failure and is charged (Prism d72c091b628d).
     w, b = shlex.quote(workspace), shlex.quote(os.path.dirname(workspace.rstrip("/")) or "/")
     proc = runner(
-        _ssh_argv(host, f"mkdir -p -- {w} && exit 0; [ -d {b} ] && [ -w {b} ] && [ -x {b} ] && exit 1; "
-                        f"exit {_BOARD_ROOT_RC}"),
+        # The root is proven by CREATING under it (ENOSPC / inodes / quota pass
+        # an access test; Prism d762ee26a639), then the probe dir is removed.
+        _ssh_argv(host, f"mkdir -p -- {w} && exit 0; "
+                        f"t=$(mktemp -d {b}/.hermes-root-probe.XXXXXX 2>/dev/null) && "
+                        f"{{ rmdir -- \"$t\"; exit 1; }}; exit {_BOARD_ROOT_RC}"),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=_PROBE_TIMEOUT_SECONDS,
         stdin=subprocess.DEVNULL,
