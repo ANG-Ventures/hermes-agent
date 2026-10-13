@@ -481,3 +481,20 @@ def test_unplanned_dry_run_drops_legacy_body_binding_while_enforcing(home, fleet
                                 reconcile_orphans=False)
         assert tid not in dry.placement_affinity
         assert dry.placement_caps[tid]["warn"]["rule"] == "requires:browser-session"
+
+
+def test_requires_line_trailing_note_is_not_a_word(home, fleet, monkeypatch):
+    # t_3f962f1c: a human note after the words (`requires: none — API only`)
+    # read as unknown words `—`, `api`, `only` and held the card local.
+    _mode(monkeypatch)
+    for line, words in (("requires: none — API only", ["none"]),
+                        ("requires: none -- API only", ["none"]),
+                        ("requires: browser-session (cart lane)", ["browser-session"]),
+                        ("requires: browser-session, screen # GUI too", ["browser-session", "screen"]),
+                        ("requires: browser_session", ["browser_session"])):
+        assert khc.declared_words(line) == words, line
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="requires: none — API only\nThe PAT lives in `github-login`.")
+        assert _route(conn, tid)[0] == ("portable", None)
+        bad = _card(conn, body="requires: browser_session (typo)\nlog in")   # F4 still holds
+        assert _route(conn, bad)[0] == ("local", "studio_affinity:requires:unknown:browser_session")
