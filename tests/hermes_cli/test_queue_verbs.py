@@ -24,6 +24,7 @@ from hermes_cli.queue_verbs import QUEUE_VERB_ALIASES, QueueOp, parse_queue_payl
     ("delete 7", QueueOp("rm", index=7, text="7")),
     ("edit 1 new text here", QueueOp("edit", index=1, text="new text here")),
     ("set 3 x", QueueOp("edit", index=3, text="x")),
+    ("edit 1\tnew text", QueueOp("edit", index=1, text="new text")),
     ("edit 1", QueueOp("edit", index=1, text="")),            # handler renders usage_edit
     ("move 2 1", QueueOp("move", index=2, to=1, text="2 1")),
     ("move 1", QueueOp("move", index=1, to=None, text="1")),  # handler renders usage_move

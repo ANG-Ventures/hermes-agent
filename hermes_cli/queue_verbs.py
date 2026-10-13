@@ -66,7 +66,8 @@ def parse_queue_payload(payload: str) -> QueueOp:
     index = int(first)
     bits = rest.split()
     if kind == "edit":
-        _, _, new_text = rest.partition(" ")
+        bits = rest.split(None, 1)
+        new_text = bits[1] if len(bits) == 2 else ""
         return QueueOp("edit", index=index, text=new_text.strip())  # empty text -> handler renders usage_edit
     if kind == "move":
         if len(bits) == 2 and bits[1].isdigit():
