@@ -157,6 +157,18 @@ def test_a_named_constant_true_pid_exists_is_red():
     assert _hits(src) == []
 
 
+def test_mutually_recursive_helpers_do_not_crash_the_lint():
+    """16935077eaee: ``fake_kill`` -> ``helper`` -> ``fake_kill``. The analysis must terminate
+    and judge the pair by whether anything on the cycle raises; a cycle that never raises is red."""
+    cycle = ('import os\n'
+             'def helper(pid):\n    if pid == 0:\n        return None\n    return fake_kill(0, 0)\n'
+             'def fake_kill(pid, sig):\n    return helper(pid)\n'
+             'def test_x(monkeypatch):\n    monkeypatch.setattr(os, "kill", fake_kill)\n')
+    assert len(_hits(cycle)) == 1
+    raising = cycle.replace("        return None\n", "        raise ProcessLookupError(pid)\n")
+    assert _hits(raising) == []
+
+
 def test_suppress_marker_names_a_reason_and_silences_one_line():
     src = INCIDENT.replace("signals.append((pid, sig)))",
                            "signals.append((pid, sig)))  # liveness-patch: ok — terminate_pid is single-shot")

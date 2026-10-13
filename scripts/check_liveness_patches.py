@@ -241,7 +241,18 @@ class _File:
         return False
 
     def _raises(self, fn: ast.AST) -> bool:
-        return any(isinstance(n, ast.Raise) for n in ast.walk(fn)) or self._forwards(fn)
+        """``fn`` raises itself or forwards through a helper that does. Guarded against
+        mutually recursive helpers (Prism 16935077eaee): a def already on the resolution
+        path cannot be the reason the loop ends."""
+        if fn in self._resolving:
+            return False
+        if any(isinstance(n, ast.Raise) for n in ast.walk(fn)):
+            return True
+        self._resolving.add(fn)
+        try:
+            return self._forwards(fn)
+        finally:
+            self._resolving.discard(fn)
 
     @staticmethod
     def _constant_true(fn: ast.AST) -> bool:

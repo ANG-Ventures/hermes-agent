@@ -173,6 +173,9 @@ def _has_psutil() -> bool:
     return True
 
 
+_CGROUP_ROOT = "/sys/fs/cgroup"
+
+
 def _cgroup_dir() -> str | None:
     if not sys.platform.startswith("linux"):
         return None
@@ -181,16 +184,22 @@ def _cgroup_dir() -> str | None:
     except OSError:
         return None
     rel = next((ln.split(":", 2)[2].strip() for ln in text.splitlines() if ln.startswith("0::")), None)
-    return None if rel is None else f"/sys/fs/cgroup{rel}"
+    return None if rel is None else (_CGROUP_ROOT + rel).rstrip("/") or _CGROUP_ROOT
 
 
 def _cgroup_levels() -> list[str]:
-    """This process's cgroup and every ancestor below the root: a parent slice's
-    ``memory.max`` binds as surely as our own (Prism e023de0647d5)."""
+    """This process's cgroup and every ancestor up to and including the mount root: a parent
+    slice's ``memory.max`` binds as surely as our own (Prism e023de0647d5), and inside a
+    cgroup-namespaced container ``/proc/self/cgroup`` is ``0::/`` while the container's limit
+    sits at ``/sys/fs/cgroup/memory.max`` itself (Prism 6e9e5d3d21cc; measured in the fleet's
+    ci-runner containers). On a bare host the root has no ``memory.max`` and is skipped by
+    ``_level_max``."""
     base = _cgroup_dir()
     out: list[str] = []
-    while base and base.rstrip("/") != "/sys/fs/cgroup":
+    while base:
         out.append(base)
+        if base.rstrip("/") == _CGROUP_ROOT:
+            break
         base = os.path.dirname(base.rstrip("/"))
     return out
 

@@ -292,6 +292,19 @@ def test_an_ancestor_cgroup_limit_binds(monkeypatch):
     assert bounds._clamp_to_cgroup(gib, int(0.1 * gib)) == 2 * gib - int(1.2 * gib) - int(2 * gib * 0.35)
 
 
+def test_a_namespaced_container_root_cgroup_is_a_level(monkeypatch):
+    """Prism 6e9e5d3d21cc: inside a cgroup-namespaced container ``/proc/self/cgroup`` reads ``0::/``
+    and the container's limit is ``/sys/fs/cgroup/memory.max`` itself (measured in the fleet's
+    ci-runner containers). The root must be a level, and the host's limit-less root must not be."""
+    monkeypatch.setattr(bounds.sys, "platform", "linux")
+    monkeypatch.setattr(bounds, "_read", lambda path: b"0::/\n" if path == "/proc/self/cgroup" else b"")
+    assert bounds._cgroup_levels() == ["/sys/fs/cgroup"]
+    monkeypatch.setattr(bounds, "_read", lambda path: b"0::/user.slice/leaf\n" if path == "/proc/self/cgroup" else b"")
+    assert bounds._cgroup_levels() == ["/sys/fs/cgroup/user.slice/leaf", "/sys/fs/cgroup/user.slice", "/sys/fs/cgroup"]
+    monkeypatch.setattr(bounds, "_level_max", lambda base: 1024 ** 3 if base == "/sys/fs/cgroup" else None)
+    assert bounds._cgroup_memory_max() == 1024 ** 3
+
+
 def test_the_budget_shrinks_when_siblings_grow_mid_test(tmp_path):
     """Prism 00c34a8dbc11: the room is re-read while the test runs, not once at start."""
     out = _run_child(tmp_path, '''
