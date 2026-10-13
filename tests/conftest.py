@@ -336,6 +336,7 @@ if not HOST_LOCK_DIR_AT_CONFTEST_IMPORT:
 # conftest (that is the repo root), and pytest fails a run that loads a
 # non-root conftest carrying ``pytest_plugins`` after startup (e.g. ``pytest .``).
 # Fixtures imported here register exactly as if they were defined here.
+from tests._fixtures.bounds import bounded_call, configure as _configure_test_bounds
 from tests._fixtures.env_filter import _HERMES_BEHAVIORAL_VARS, _looks_like_credential
 from tests._fixtures.kanban_identity import kanban_identity, kanban_pins  # noqa: F401 — fixtures register here
 from tests._fixtures.live_system_guard import (  # noqa: F401 — _live_system_guard registers here
@@ -1519,6 +1520,7 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     real per-file leak (each CI subprocess still starts at the OS default).
     """
     _relocate_basetemp_outside_operator_home(config)
+    _configure_test_bounds(config)
     try:
         import resource
 
@@ -1651,9 +1653,14 @@ def pytest_runtest_call(item):
     ``readouterr`` swaps the fd crashed the interpreter (SIGSEGV in
     ``_pytest/capture.py::snap``). The teardown join in
     ``_close_leaked_session_dbs`` runs after that snap, too late for this race.
+
+    ``bounded_call`` is the per-test wall-clock + RSS watchdog (t_69572750: a
+    monkeypatched ``os.kill`` turned a poll loop into a 34.6 GiB allocation that
+    hard-reset ACE-AI; see ``tests/_fixtures/bounds.py``).
     """
     try:
-        return (yield)
+        with bounded_call(item):
+            return (yield)
     finally:
         wait = getattr(sys.modules.get("agent.title_generator"), "wait_for_title_upgrades", None)
         if wait is not None:
