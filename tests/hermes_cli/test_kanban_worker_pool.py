@@ -1820,6 +1820,25 @@ def test_studio_only_derives_pool_profiles_from_the_profiles_dir(tmp_path):
                         assignee="new-worker", body="", pool=cfg)[0] is True
 
 
+def test_studio_only_also_filters_per_host_profile_overrides(tmp_path):
+    """Prism 34f523dde2d6: a hosts.<h>.profiles row naming a denied profile must
+    not re-admit it, neither on the host nor in the classifier allowlist."""
+    home = tmp_path / ".hermes"
+    for p in ("alpha", "cadmus"):
+        (home / "profiles" / p).mkdir(parents=True)
+        (home / "profiles" / p / "config.yaml").write_text("{}\n")
+    sidecar = _write_pool(home / "fleet")
+    del sidecar["profiles"]
+    sidecar["studio_only"] = ["Cadmus"]
+    sidecar["hosts"]["ace-ai"]["profiles"] = ["cadmus", "alpha"]
+    _write_pool(home / "fleet", sidecar=sidecar)
+    cfg = kwp.read_pool(home / "fleet")
+    assert "cadmus" not in cfg.profiles
+    assert all("cadmus" not in h.profiles for h in cfg.pool_hosts)
+    assert kwp.portable(workspace_kind="scratch", has_links=False, workspace_has_content=False,
+                        assignee="cadmus", body="", pool=cfg)[:2] == (False, "profile")
+
+
 def test_studio_only_must_be_a_string_list(tmp_path):
     sidecar = _write_pool(tmp_path)
     sidecar["studio_only"] = "cadmus"

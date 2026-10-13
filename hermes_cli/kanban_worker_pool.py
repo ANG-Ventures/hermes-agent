@@ -329,6 +329,9 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     prio: List[str] = sidecar["priority"]
     rows: dict = sidecar["hosts"]
     gprofiles = tuple(sidecar.get("profiles") or ())
+    # studio_only binds EVERY list a host serves, per-host overrides included,
+    # so no row can re-admit a denied profile (Prism 34f523dde2d6).
+    deny = {s.strip().lower() for s in sidecar.get("studio_only") or ()}
     if "studio_only" in sidecar:
         # Deny-list (t_7b1eca07): every live profile is a pool profile unless the
         # sidecar keeps it on the Studio, so a new profile never lands Studio-bound.
@@ -358,7 +361,8 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         hosts.append(PoolHost(
             name=hid, ssh_host=hid, ssh_user=SSH_USER, slots=role_slots[ROLE],
             capacity_pct=float(row.get("capacity_pct", gcap)), absence=row["absence"],
-            profiles=tuple(row.get("profiles", gprofiles)), state=state, enabled=True,
+            profiles=tuple(p for p in row.get("profiles", gprofiles) if p.lower() not in deny),
+            state=state, enabled=True,
             priority=i,
         ))
     for hid in rows:
