@@ -736,7 +736,7 @@ def _skill_view_with_bump(args, **kw):
     # the ABSENT line, recorded so the turn loop ends the run. Only here, in the model's
     # tool handler: the --skills preload calls skill_view() directly and is gated at boot.
     from hermes_cli.kanban_placement_failfast import skill_gate
-    if (absent := skill_gate(name)) is not None:
+    if dedup_task_id is not None and (absent := skill_gate(name)) is not None:   # never in the review fork
         from tools.rail_preflight import record_absent
         record_absent(absent)
         return tool_error(absent, success=False)

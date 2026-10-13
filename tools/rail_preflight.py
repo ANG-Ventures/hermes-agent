@@ -66,6 +66,12 @@ def rail_absent_message(rail: str, host: str) -> str:
 
 
 def _owned_task() -> str:
+    """The card this context may act for. A background-review fork runs in the worker's
+    process with the parent's task, but its reads are housekeeping, not the card's work:
+    it never queues (or drains) a rail/ABSENT line for the parent run (t_ecfd5591)."""
+    from tools.skill_provenance import is_background_review
+    if is_background_review():
+        return ""
     from agent.delegation_context import owned_kanban_task
     return owned_kanban_task()
 

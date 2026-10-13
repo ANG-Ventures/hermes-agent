@@ -312,3 +312,73 @@ def test_lane_of_and_migrated_lanes_empty_is_legacy(tmp_path):
     assert kn.resolve("browser:amazon-alex", "amazon-cart-ops-local", reg) == {
         "need": "browser:amazon-alex", "lane": "amazon-cart-ops-local", "reason": "lane_not_migrated"}
     assert kn.load_registry(tmp_path / "absent") == kn.LaneRegistry()
+
+
+# -- Prism round 1 on #1963 ------------------------------------------------------------
+
+@pytest.mark.parametrize("cap", ["gpu-v2", "screen", "browser-session", "x264-box", "4k-display"])
+def test_token_round_trips_for_every_capability_spelling(cap):
+    line = pff.absent_line(cap, "ace-ai")
+    assert pff.ABSENT_RE.match(line), line
+    assert pff.parse_absent(line)[1:] == (cap, "ace-ai")
+
+
+def test_reroute_of_a_reviewer_run_returns_to_review(board, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="cart", assignee="daedalus", body="x")
+    run1 = _claim(tid)
+    with kb.connect_closing() as conn:
+        assert kb.request_review(conn, tid, summary="impl done", expected_run_id=run1)
+        assert kb.claim_review_task(conn, tid) is not None
+        run2 = kb.latest_run(conn, tid).id
+    _placed_env(monkeypatch, tid, run2, host="studio-local")
+    assert kwe.block_on_rail_absent(RAIL) is True
+    assert _task(tid).status == "review"
+    assert _events(tid, pff.REROUTE_EVENT)[0]["to"] == "review"
+
+
+def test_stamp_is_dropped_when_the_files_change_during_derivation(board, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain")
+    real = pff.hard_requirements
+
+    def racing(body, skills, fleet_dir):
+        out = real(body, skills, fleet_dir)
+        idx = Path(fleet_dir) / khc.INDEX_FILE
+        idx.write_bytes(idx.read_bytes() + b"\n")          # the index changes mid-derivation
+        return out
+    monkeypatch.setattr(pff, "hard_requirements", racing)
+    assert pff.placement_record(_task(tid), board) == {}
+    monkeypatch.setattr(pff, "hard_requirements", real)
+    task = _task(tid)
+    rec = pff.placement_record(task, board)
+    assert rec[pff.ROUTE_HASH_KEY] == pff.route_hash(task.body, task.skills or (), board)
+
+
+def test_boot_check_survives_json_null_skills(board, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="requires: browser-session")
+        conn.execute("UPDATE tasks SET skills = 'null' WHERE id = ?", (tid,))
+        conn.commit()
+    _placed_env(monkeypatch, tid, 1)
+    assert pff.boot_check(tid).startswith("BROWSER_RAIL_ABSENT")
+
+
+def test_background_review_fork_never_gates_or_queues(board, monkeypatch, tmp_path):
+    _skills_home(monkeypatch, tmp_path)
+    from tools import rail_preflight as rp
+    from tools.registry import registry
+    from tools.skill_provenance import set_current_write_origin, BACKGROUND_REVIEW, _write_origin
+    import model_tools  # noqa: F401
+    rp._emitted.clear()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    _placed_env(monkeypatch, tid, 1)
+    tok = set_current_write_origin(BACKGROUND_REVIEW)
+    try:
+        out = json.loads(registry.dispatch("skill_view", {"name": "amazon-cart-ops-local"}, task_id="t"))
+        assert "error" not in out or not str(out.get("error", "")).startswith("BROWSER_RAIL_ABSENT")
+        assert rp.record_absent(pff.absent_line("screen", "ace-ai")) is None
+    finally:
+        _write_origin.reset(tok)
+    assert rp.take_rail_absent() is None

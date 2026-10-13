@@ -51,7 +51,7 @@ from typing import Any, Iterable, List, Mapping, Optional, Tuple
 
 _log = logging.getLogger(__name__)
 
-ABSENT_RE = re.compile(r"^([A-Z][A-Z_]*_ABSENT)\b")
+ABSENT_RE = re.compile(r"^([A-Z][A-Z0-9_]*_ABSENT)\b")  # token_for() alphabet: A-Z 0-9 _
 REROUTE_EVENT = "placement_reroute"
 GATE_REFUSED_EVENT = "placement_gate_refused"
 REROUTE_OUTCOME = "rerouted"
@@ -67,7 +67,8 @@ _FIELD_RE = re.compile(r"\b(cap|host)=([A-Za-z0-9._-]+)")
 # -- the token line -------------------------------------------------------------
 
 def token_for(cap: str) -> str:
-    return _TOKEN_OF_CAP.get(cap) or cap.upper().replace("-", "_") + "_ABSENT"
+    """The token for a capability; always matches :data:`ABSENT_RE` (round-trip tested)."""
+    return _TOKEN_OF_CAP.get(cap) or re.sub(r"[^A-Z0-9]", "_", cap.upper()).lstrip("_0123456789") + "_ABSENT"
 
 
 def absent_line(cap: str, host: str) -> str:
@@ -135,14 +136,17 @@ def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
                 return None
             if prior_reroutes(conn, task_id) == 0:
                 body = _with_requires_line(row["body"], cap)
+                # A reviewer run goes back to the review queue, never to ready (#1963 Prism).
+                back_to = kb._retry_status_for_run(conn, task_id, int(run_id))
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready', body = ?, claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, body = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL WHERE id = ? AND current_run_id = ?",
-                    (body, task_id, int(run_id)))
+                    (back_to, body, task_id, int(run_id)))
                 kb._end_run(conn, task_id, outcome=REROUTE_OUTCOME, status=REROUTE_OUTCOME,
                             summary=message.split("\n", 1)[0])
                 kb._append_event(conn, task_id, REROUTE_EVENT,
-                                 {"from": host, "cap": cap, "run_id": int(run_id), "token": token},
+                                 {"from": host, "cap": cap, "run_id": int(run_id), "token": token,
+                                  "to": back_to},
                                  run_id=int(run_id))
                 kb.add_comment(conn, task_id, "dispatcher",
                                f're-routed: {cap}, ran on {host}; I added "requires: {cap}" to the body. '
@@ -231,17 +235,26 @@ def _fleet_dir() -> Path:
     return kb.kanban_home() / "fleet"
 
 
-def route_hash(body: Optional[str], skills: Iterable[str], fleet_dir: Path) -> str:
-    """sha256 over (body, skills, map bytes, index bytes) at route time."""
+def _fleet_bytes(fleet_dir: Path) -> Tuple[Optional[bytes], Optional[bytes]]:
     from hermes_cli.kanban_host_capabilities import INDEX_FILE, MAP_FILE
+    out = []
+    for name in (MAP_FILE, INDEX_FILE):
+        try:
+            out.append((Path(fleet_dir) / name).read_bytes())
+        except OSError:
+            out.append(None)
+    return out[0], out[1]
+
+
+def route_hash(body: Optional[str], skills: Iterable[str], fleet_dir: Path, *,
+               snapshot: Optional[Tuple[Optional[bytes], Optional[bytes]]] = None) -> str:
+    """sha256 over (body, skills, map bytes, index bytes). ``snapshot`` = the bytes the
+    requirements were derived from, so stamp and hash can never describe different files."""
     h = hashlib.sha256()
     h.update((body or "").encode("utf-8"))
     h.update(b"\0" + json.dumps(sorted(s for s in skills or () if isinstance(s, str))).encode("utf-8"))
-    for name in (MAP_FILE, INDEX_FILE):
-        try:
-            h.update(b"\0" + (Path(fleet_dir) / name).read_bytes())
-        except OSError:
-            h.update(b"\0-")
+    for blob in (snapshot if snapshot is not None else _fleet_bytes(fleet_dir)):
+        h.update(b"\0" + (blob if blob is not None else b"-"))
     return h.hexdigest()
 
 
@@ -292,8 +305,14 @@ def placement_record(task, fleet_dir: Path) -> dict:
     the card's HARD requirements and the hash of what they were derived from."""
     skills = tuple(s for s in (getattr(task, "skills", None) or ()) if isinstance(s, str))
     body = getattr(task, "body", None)
-    return {REQUIRES_KEY: hard_requirements(body, skills, fleet_dir),
-            ROUTE_HASH_KEY: route_hash(body, skills, fleet_dir)}
+    # Bytes before and after derivation must agree; else the files changed under us and a
+    # stamp would pair old requirements with a new hash (#1963 Prism). No stamp then: the
+    # worker re-derives at boot from the files it sees.
+    before = _fleet_bytes(fleet_dir)
+    reqs = hard_requirements(body, skills, fleet_dir)
+    if _fleet_bytes(fleet_dir) != before:
+        return {}
+    return {REQUIRES_KEY: reqs, ROUTE_HASH_KEY: route_hash(body, skills, fleet_dir, snapshot=before)}
 
 
 def stamp_placement(env: dict, task, fleet_dir: Path) -> None:
@@ -341,8 +360,8 @@ def boot_check(task_id: str, environ: Optional[Mapping[str, str]] = None, *,
     if row is None:
         return None
     try:
-        skills = [s for s in json.loads(row["skills"] or "[]") if isinstance(s, str)]
-    except ValueError:
+        skills = [s for s in (json.loads(row["skills"] or "[]") or []) if isinstance(s, str)]
+    except (ValueError, TypeError):
         skills = []
     stamped = record.get(REQUIRES_KEY)
     if record.get(ROUTE_HASH_KEY) == route_hash(row["body"], skills, fleet_dir) and isinstance(stamped, list):
