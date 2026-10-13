@@ -172,6 +172,7 @@ def test_rlimit_env_zero_disables_the_process_ceiling(tmp_path):
 
 def test_growth_budget_is_clamped_to_the_cgroup_ceiling(monkeypatch):
     gib = 1024 ** 3
+    monkeypatch.setattr(bounds, "_cgroup_memory_used", lambda: None)
     monkeypatch.setattr(bounds, "_cgroup_memory_max", lambda: None)
     assert bounds._clamp_to_cgroup(gib, 300 * 1024 ** 2) == gib
     monkeypatch.setattr(bounds, "_cgroup_memory_max", lambda: gib)
@@ -201,3 +202,119 @@ def test_marker_limits_are_read_from_the_item():
         bounds._limit_from_marker(_Item(_M((120,), {})), "slow_test", 60.0)
     with pytest.raises(pytest.UsageError):
         bounds._limit_from_marker(_Item(_M(("soon",), {"reason": "x"})), "slow_test", 60.0)
+
+
+# ── Prism round on #1946 / #3957 (t_4a3eba50). Each case was red at a53d5d1afe / ce7856b09. ──
+
+_PATCHED_STDLIB_CHILD = '''
+    import builtins, os, threading, time, pytest
+
+    class _InlineThread:
+        """tests/tui_gateway/test_auto_continue.py's stand-in: start() runs the target inline."""
+        def __init__(self, target=None, args=(), kwargs=None, **_):
+            self._t, self._a, self._k = target, args, kwargs or {{}}
+        def start(self):
+            self._t(*self._a, **self._k)
+        def join(self, timeout=None):
+            pass
+
+    @pytest.fixture()
+    def patched(monkeypatch):
+        {patch}
+
+    def test_body_runs(patched):
+        assert True
+'''
+
+
+@pytest.mark.parametrize("patch", [
+    'monkeypatch.setattr(threading, "Thread", _InlineThread)',
+    'monkeypatch.setattr(threading.Thread, "start", lambda self: None)',
+    'monkeypatch.setattr(threading.Thread, "join", lambda self, timeout=None: None)',
+    'monkeypatch.setattr(threading.Event, "wait", lambda self, timeout=None: False)',
+    'monkeypatch.setattr(time, "monotonic", lambda: 1e12)',
+    'monkeypatch.setattr(builtins, "open", lambda *a, **k: (_ for _ in ()).throw(AssertionError("open")))',
+])
+def test_a_fixture_patching_the_stdlib_does_not_reach_the_watchdog(tmp_path, patch):
+    """Prism 6e9e5d3d21cc: ``turn_env`` in tests/tui_gateway swaps ``threading.Thread`` for an
+    inline class, so ``dog.start()`` ran the poll loop on the test thread and the test never ran."""
+    out = _run_child(tmp_path, _PATCHED_STDLIB_CHILD.format(patch=patch), "-o", "bounds_wall_seconds=4")
+    assert out.returncode == 0 and "1 passed" in out.stdout, out.stdout + out.stderr
+
+
+def test_a_frozen_clock_in_the_test_does_not_disable_the_wall_clock(tmp_path):
+    """Prism bbb775203d64: a test pinning ``time.monotonic`` froze the watchdog's deadline."""
+    out = _run_child(tmp_path, '''
+        import time
+        def test_frozen_and_hung(monkeypatch):
+            real_sleep = time.sleep
+            monkeypatch.setattr(time, "monotonic", lambda: 5.0)
+            while True:
+                real_sleep(0.01)
+    ''', "-o", "bounds_wall_seconds=2")
+    assert out.returncode == 1 and "test_frozen_and_hung ran past 2s" in out.stdout, out.stdout + out.stderr
+
+
+def test_a_test_that_catches_the_harness_stop_and_returns_still_fails(tmp_path):
+    """Prism 65e6a2d109d2: ``pytest.raises(BaseException)`` around a hang turned an
+    exceeded budget into a pass."""
+    out = _run_child(tmp_path, '''
+        import time, pytest
+        def test_swallows_once():
+            with pytest.raises(BaseException):
+                while True:
+                    time.sleep(0.01)
+    ''', "-o", "bounds_wall_seconds=2")
+    assert out.returncode == 1, out.stdout + out.stderr
+    assert "test_swallows_once ran past 2s" in out.stdout and "1 failed" in out.stdout
+
+
+def test_cgroup_room_counts_the_whole_cgroup_not_just_this_process(monkeypatch):
+    """Prism 69b22e334665: 1 GiB cgroup, 0.8 GiB already used by siblings, this process 0.1 GiB.
+    The room is what the cgroup has left, not ``limit - own RSS``."""
+    gib = 1024 ** 3
+    monkeypatch.setattr(bounds, "_cgroup_memory_max", lambda: gib)
+    monkeypatch.setattr(bounds, "_cgroup_memory_used", lambda: int(0.8 * gib))
+    room = bounds._clamp_to_cgroup(gib, int(0.1 * gib))
+    assert room == 16 * 1024 ** 2  # 1 - 0.8 - 0.35 < 0: fail at the first poll, before the OOM killer
+    monkeypatch.setattr(bounds, "_cgroup_memory_used", lambda: int(0.3 * gib))
+    assert bounds._clamp_to_cgroup(gib, int(0.1 * gib)) == gib - int(0.3 * gib) - int(gib * 0.35)
+
+
+@pytest.mark.platforms("linux")
+def test_a_browser_child_does_not_inherit_the_address_space_cap(tmp_path):
+    """Prism c8672c954293: Chromium dies (SIGTRAP) under a 6 GiB RLIMIT_AS. A browser child
+    gets the pre-harness limit; every other child, and the test itself, keeps the cap."""
+    import resource
+
+    saved = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (saved[1], saved[1]))
+    probe = tmp_path / "chrome-headless-shell"
+    probe.write_text("#!/bin/sh\nulimit -v\n", encoding="utf-8")
+    probe.chmod(0o755)
+    other = tmp_path / "plain-tool"
+    other.write_text("#!/bin/sh\nulimit -v\n", encoding="utf-8")
+    other.chmod(0o755)
+    try:
+        out = _run_child(tmp_path, f'''
+            import resource, subprocess
+            def test_children():
+                assert resource.getrlimit(resource.RLIMIT_AS)[0] == 1024 ** 3
+                browser = subprocess.run([{str(probe)!r}], capture_output=True, text=True).stdout.strip()
+                plain = subprocess.run([{str(other)!r}], capture_output=True, text=True).stdout.strip()
+                assert browser == "unlimited", browser
+                assert plain == str(1024 ** 2), plain
+                assert resource.getrlimit(resource.RLIMIT_AS)[0] == 1024 ** 3
+        ''', env={bounds._RLIMIT_ENV: "1"})
+    finally:
+        resource.setrlimit(resource.RLIMIT_AS, saved)
+    assert out.returncode == 0, out.stdout + out.stderr
+
+
+def test_browser_argv_detection():
+    assert bounds._is_browser_argv(["/usr/bin/google-chrome", "--headless"], None)
+    assert bounds._is_browser_argv(["/x/chromium_headless_shell-1243/chrome-linux/headless_shell"], None)
+    assert bounds._is_browser_argv(["/sp/playwright/driver/node", "/sp/playwright/driver/package/cli.js", "run-driver"], None)
+    assert not bounds._is_browser_argv(["node", "-e", "1"], None)
+    assert not bounds._is_browser_argv([sys.executable, "-m", "pytest"], None)
+    assert not bounds._is_browser_argv("git status", None)

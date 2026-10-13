@@ -64,15 +64,33 @@ and exists only because the rlimit is per PROCESS, decided before any test runs.
 """
 from __future__ import annotations
 
+import _thread
 import contextlib
 import ctypes
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
 
 import pytest
+
+# The watchdog runs while the test body runs, so the test's monkeypatches are live around it.
+# Tests in these trees replace ``threading.Thread`` with an inline class, patch
+# ``Thread.start``/``Thread.join``/``Event.wait``, pin ``time.monotonic`` and mock
+# ``builtins.open`` and ``os._exit``. Every primitive the watchdog uses is bound HERE, at import,
+# before any fixture runs. It never looks one up through a module attribute at test time
+# (Prism 6e9e5d3d21cc / bbb775203d64, t_4a3eba50).
+_start_new_thread = _thread.start_new_thread
+_allocate_lock = _thread.allocate_lock
+_get_ident = _thread.get_ident
+_monotonic = time.monotonic
+_os_open, _os_read, _os_close, _os_write, _os_exit = os.open, os.read, os.close, os.write, os._exit
+_pthread_kill = getattr(signal, "pthread_kill", None)
+_SIGURG = getattr(signal, "SIGURG", None)
+_set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
+_RLIMIT_AS_SAVED: tuple[int, int] | None = None  # (soft, hard) before configure() lowered it
 
 # Defaults. Raise per test with the markers; never edit these to make one test pass.
 _TEST_WALL_SECONDS = 60.0
@@ -119,12 +137,23 @@ def _limit_from_marker(item, name: str, default: float) -> float:
     return float(marker.args[0])
 
 
+def _read(path: str) -> bytes:
+    """Whole small file via the import-time ``os`` functions (a test may mock ``builtins.open``)."""
+    fd = _os_open(path, os.O_RDONLY)
+    try:
+        return _os_read(fd, 65536)
+    finally:
+        _os_close(fd)
+
+
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+
+
 def _current_rss() -> int:
     """Resident set size now. ``/proc`` on Linux (no dependency, ~1 us), psutil elsewhere."""
     if sys.platform.startswith("linux"):
         try:
-            with open("/proc/self/statm", "rb") as fh:
-                return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+            return int(_read("/proc/self/statm").split()[1]) * _PAGE_SIZE
         except (OSError, ValueError, IndexError):
             pass
     try:
@@ -134,28 +163,61 @@ def _current_rss() -> int:
     return psutil.Process().memory_info().rss
 
 
-def _cgroup_memory_max() -> int | None:
-    """This process's cgroup v2 ``memory.max`` in bytes, or None (no cgroup / unlimited)."""
+def _cgroup_dir() -> str | None:
     if not sys.platform.startswith("linux"):
         return None
     try:
-        with open("/proc/self/cgroup", encoding="utf-8") as fh:
-            rel = next((ln.split(":", 2)[2].strip() for ln in fh if ln.startswith("0::")), None)
-        if rel is None:
-            return None
-        with open(f"/sys/fs/cgroup{rel}/memory.max", encoding="utf-8") as fh:
-            raw = fh.read().strip()
-    except (OSError, IndexError):
+        text = _read("/proc/self/cgroup").decode("utf-8", "replace")
+    except OSError:
+        return None
+    rel = next((ln.split(":", 2)[2].strip() for ln in text.splitlines() if ln.startswith("0::")), None)
+    return None if rel is None else f"/sys/fs/cgroup{rel}"
+
+
+def _cgroup_memory_max() -> int | None:
+    """This process's cgroup v2 ``memory.max`` in bytes, or None (no cgroup / unlimited)."""
+    base = _cgroup_dir()
+    if base is None:
+        return None
+    try:
+        raw = _read(f"{base}/memory.max").decode().strip()
+    except OSError:
         return None
     return int(raw) if raw.isdigit() else None
 
 
+def _cgroup_memory_used() -> int | None:
+    """What the WHOLE cgroup holds that reclaim cannot give back: ``memory.current`` minus
+    ``inactive_file`` (the working set the OOM killer weighs). Includes other pytest workers,
+    child processes and active cache, not just this process. None = unreadable."""
+    base = _cgroup_dir()
+    if base is None:
+        return None
+    try:
+        current = int(_read(f"{base}/memory.current").decode().strip())
+    except (OSError, ValueError):
+        return None
+    inactive = 0
+    try:
+        for ln in _read(f"{base}/memory.stat").decode().splitlines():
+            if ln.startswith("inactive_file "):
+                inactive = int(ln.split()[1])
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    return max(current - inactive, 0)
+
+
 def _clamp_to_cgroup(growth_bytes: int, start_rss: int) -> int:
+    """Cap the growth budget at what the cgroup has left. ``memory.max`` bounds the whole
+    cgroup, so the room is the limit minus the cgroup's working set (Prism 69b22e334665).
+    This process's RSS is only the floor of that, used when ``memory.current`` is unreadable."""
     limit = _cgroup_memory_max()
     if limit is None:
         return growth_bytes
+    used = max(start_rss, _cgroup_memory_used() or 0)
     headroom = max(_CGROUP_HEADROOM_MIN, int(limit * _CGROUP_HEADROOM_FRACTION))
-    room = limit - start_rss - headroom
+    room = limit - used - headroom
     return max(min(growth_bytes, room), 16 * 1024 ** 2)
 
 
@@ -167,44 +229,59 @@ def _on_sigurg(_signum, _frame) -> None:
 
 def _interrupt(thread_ident: int, exc_type: type) -> None:
     """Raise ``exc_type`` in the test thread and unblock any syscall it sits in."""
-    ctypes.pythonapi.PyThreadState_SetAsyncExc(
-        ctypes.c_ulong(thread_ident), ctypes.py_object(exc_type)
-    )
-    sigurg = getattr(signal, "SIGURG", None)
-    if sigurg is not None and hasattr(signal, "pthread_kill"):
+    _set_async_exc(ctypes.c_ulong(thread_ident), ctypes.py_object(exc_type))
+    if _SIGURG is not None and _pthread_kill is not None:
         try:
-            signal.pthread_kill(thread_ident, sigurg)
+            _pthread_kill(thread_ident, _SIGURG)
         except (ProcessLookupError, OSError):
             pass
 
 
 class _Watchdog:
-    """One thread per test: wall clock + RSS growth, both ending in a named failure."""
+    """One thread per test: wall clock + RSS growth, both ending in a named failure.
+
+    Built on ``_thread`` locks and the import-time ``_monotonic``, never on ``threading.Thread``/
+    ``Event`` or ``time.monotonic`` looked up at test time (see the module-top note)."""
 
     def __init__(self, item, wall_seconds: float, rss_growth_bytes: int) -> None:
         self.item = item
         self.wall_seconds = wall_seconds
-        self.target = threading.get_ident()
+        self.target = _get_ident()
         self.start_rss = _current_rss()
         self.rss_growth_bytes = _clamp_to_cgroup(rss_growth_bytes, self.start_rss)
-        self.started = time.monotonic()
+        self.started = _monotonic()
         self.fired: tuple[type, str] | None = None
-        self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run, name=f"test-bounds:{item.name}", daemon=True
-        )
+        self._stop = _allocate_lock()  # held = keep running; released by stop()
+        self._stop.acquire()
+        self._done = _allocate_lock()  # held while _run runs; released on exit
+        self._done.acquire()
 
     def start(self) -> None:
-        self._thread.start()
+        _start_new_thread(self._main, ())
 
     def stop(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=2.0)
+        if self._stop.locked():
+            self._stop.release()
+        if self._done.acquire(timeout=2.0):
+            self._done.release()
+
+    def _stopped(self, seconds: float) -> bool:
+        """Sleep up to ``seconds``; True once stop() was called."""
+        if self._stop.acquire(timeout=seconds):
+            self._stop.release()
+            return True
+        return False
+
+    def _main(self) -> None:
+        try:
+            self._run()
+        finally:
+            self._done.release()
 
     def _run(self) -> None:
         deadline = self.started + self.wall_seconds
-        while not self._stop.wait(_RSS_POLL_SECONDS):
-            now = time.monotonic()
+        while not self._stopped(_RSS_POLL_SECONDS):
+            now = _monotonic()
             try:
                 rss = _current_rss()
             except Exception:  # psutil lost the process: nothing to bound
@@ -225,12 +302,12 @@ class _Watchdog:
                 )
             if self.fired is not None:
                 _FIRED.append(self)
-                first = time.monotonic()
+                first = _monotonic()
                 _interrupt(self.target, self.fired[0])
                 # A ``try: ... except BaseException: pass`` in the test swallows a
                 # delivery; keep re-raising, then end the process by name.
-                while not self._stop.wait(0.5):
-                    if time.monotonic() - first > _ESCALATE_AFTER_SECONDS:
+                while not self._stopped(0.5):
+                    if _monotonic() - first > _ESCALATE_AFTER_SECONDS:
                         self._escalate()
                     _interrupt(self.target, self.fired[0])
                 return
@@ -245,10 +322,10 @@ class _Watchdog:
         # wraps fd 2); the capture manager keeps the real terminal fd in
         # ``targetfd_save``. Write there so the verdict reaches the runner's log.
         try:
-            os.write(_real_stderr_fd(self.item.config), message.encode("utf-8", "replace"))
+            _os_write(_real_stderr_fd(self.item.config), message.encode("utf-8", "replace"))
         except OSError:
             pass
-        os._exit(_ESCALATE_EXIT_CODE)
+        _os_exit(_ESCALATE_EXIT_CODE)
 
 
 def _real_stderr_fd(config) -> int:
@@ -282,7 +359,62 @@ def _apply_process_rlimit() -> str | None:
         resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
     except (ValueError, OSError) as exc:
         return f"setrlimit(RLIMIT_AS) refused: {exc}"
+    global _RLIMIT_AS_SAVED
+    _RLIMIT_AS_SAVED = (soft, hard)
+    _exempt_browser_children()
     return None
+
+
+# A soft RLIMIT_AS is inherited across fork/exec. Chromium reserves far more address space
+# than it touches: chrome-headless-shell exits on SIGTRAP (rc -5) under a 6 or a 16 GiB AS
+# cap and starts under 64, and Playwright's ``chromium.launch()`` fails at 6 (measured on
+# ci-box, Linux 7.0, Chromium 1243, t_4a3eba50). The cap is for THIS interpreter, so a
+# browser child (and the Playwright node driver, which spawns the browser) is started with
+# the soft limit the process had before the harness lowered it (Prism c8672c954293).
+_BROWSER_EXES = frozenset({
+    "chrome", "chromium", "chromium-browser", "google-chrome", "google-chrome-stable",
+    "google-chrome-beta", "google-chrome-unstable", "chrome-headless-shell", "headless_shell",
+    "msedge", "microsoft-edge", "firefox", "brave", "brave-browser",
+})
+_SPAWN_LOCK = _allocate_lock()
+
+
+def _is_browser_argv(args, executable) -> bool:
+    if isinstance(args, (str, bytes, os.PathLike)):
+        argv = [os.fsdecode(args)]
+    else:
+        argv = [os.fsdecode(a) for a in args]
+    exe = os.fsdecode(executable) if executable is not None else (argv[0].split()[0] if argv else "")
+    name = os.path.basename(exe).lower()
+    if name in _BROWSER_EXES or "chrome" in name or "chromium" in name:
+        return True
+    # Playwright: ``<site-packages>/playwright/driver/node <...>/package/cli.js run-driver``
+    return name.startswith("node") and any("playwright" in a for a in argv[1:2])
+
+
+def _exempt_browser_children() -> None:
+    """Spawn browser children with the pre-harness soft RLIMIT_AS. Covers ``subprocess.Popen``
+    and asyncio subprocesses (both reach ``Popen._execute_child``). The pytest process
+    is uncapped only for the fork/exec of such a child, under a lock."""
+    import resource
+
+    real = subprocess.Popen._execute_child
+    if getattr(real, "_test_bounds_exempt", False):
+        return
+
+    def _execute_child(self, args, executable, *rest, **kw):
+        if _RLIMIT_AS_SAVED is None or not _is_browser_argv(args, executable):
+            return real(self, args, executable, *rest, **kw)
+        with _SPAWN_LOCK:
+            capped = resource.getrlimit(resource.RLIMIT_AS)
+            resource.setrlimit(resource.RLIMIT_AS, (_RLIMIT_AS_SAVED[0], capped[1]))
+            try:
+                return real(self, args, executable, *rest, **kw)
+            finally:
+                resource.setrlimit(resource.RLIMIT_AS, capped)
+
+    _execute_child._test_bounds_exempt = True  # type: ignore[attr-defined]
+    subprocess.Popen._execute_child = _execute_child  # type: ignore[method-assign]
 
 
 def addoption(parser) -> None:
@@ -310,8 +442,8 @@ def configure(config) -> None:
     )
     skipped = _apply_process_rlimit()
     config._hermes_test_bounds_rlimit = skipped  # read by the self-test; None = applied
-    if getattr(signal, "SIGURG", None) is not None and threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGURG, _on_sigurg)
+    if _SIGURG is not None and threading.current_thread() is threading.main_thread():
+        signal.signal(_SIGURG, _on_sigurg)
 
 
 @contextlib.contextmanager
@@ -328,6 +460,12 @@ def bounded_call(item):
     dog.start()
     try:
         yield
+        # The test returned normally. If the watchdog fired, the test caught the harness
+        # stop (``pytest.raises(BaseException)``, ``except BaseException: return``) and
+        # would otherwise pass over budget (Prism 65e6a2d109d2).
+        dog.stop()
+        if dog.fired is not None:
+            raise pytest.fail.Exception(dog.fired[1], pytrace=False)
     except (HarnessWallClockExceeded, HarnessMemoryExceeded):
         if dog.fired is None:
             raise
@@ -339,7 +477,7 @@ def bounded_call(item):
             if dog in _FIRED:
                 _FIRED.remove(dog)
             # Cancel any still-pending async exception so it cannot land in teardown.
-            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(dog.target), None)
+            _set_async_exc(ctypes.c_ulong(dog.target), None)
 
 
 # ── Plugin surface for repos that load this file directly (hermes-home, ace-ai-ops) ──
