@@ -115,3 +115,34 @@ async def test_internal_arrival_during_stop_await_is_held():
     await _run_command(runner, adapter, source, key, _COMMAND_REASONS[0])
     assert adapter.restarted == []
     assert runner._session_state(key).conversation.held_queue == [wake]
+
+
+@pytest.mark.asyncio
+async def test_stop_followed_by_real_model_handler_keeps_notifications_held(tmp_path, monkeypatch):
+    import gateway.run as gateway_run
+    from hermes_cli.model_switch import ModelSwitchResult
+    adapter, runner, source, key = _gateway()
+    runner._session_db = None
+    runner._voice_mode = {}
+    runner._pending_model_notes = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = None
+    runner._evict_cached_agent = lambda key: None
+    runner.session_store = None
+    (tmp_path / 'config.yaml').write_text('model:\n  default: old-model\n  provider: custom\n  persist_switch_by_default: false\n')
+    monkeypatch.setattr(gateway_run, '_hermes_home', tmp_path)
+    monkeypatch.setattr('hermes_cli.config.get_hermes_home', lambda: tmp_path)
+    monkeypatch.setattr('agent.models_dev.fetch_models_dev', lambda: {})
+    monkeypatch.setattr('hermes_cli.model_switch.switch_model', lambda **kw: ModelSwitchResult(
+        success=True, new_model='gpt-6-astra', target_provider='custom',
+        api_key='test-only', base_url='http://localhost:1/v1', api_mode='chat_completions',
+        provider_label='Test', is_global=False))
+    wake = _event(source, 'completion', internal=True)
+    adapter._pending_messages[key] = wake
+    await _run_command(runner, adapter, source, key, _COMMAND_REASONS[0])
+    reply = await runner._handle_model_command(_event(source, '/model astra --session', internal=False))
+    assert reply is not None
+    assert runner._session_model_overrides[key]['model'] == 'gpt-6-astra'
+    assert runner._session_state(key).conversation.automatic_turns_paused is True
+    assert runner._session_state(key).conversation.held_queue == [wake]
+    assert adapter.restarted == []

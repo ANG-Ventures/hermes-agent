@@ -375,7 +375,15 @@ async def release(runner: Any, key: str, source: Any, adapter: Any, *, busy: boo
         await runner._interrupt_and_clear_session(
             key, source, interrupt_reason=_INTERRUPT_REASON_STOP, invalidation_reason="queue_run")
     state = runner._session_state(key).conversation
+    async def lookup_stop_state():
+        entry = await runner.async_session_store.lookup_by_session_key(key)
+        return bool(entry and entry.user_stopped_at is not None)
     generation = runner._session_state(key).persistent.run_generation
+    if state.automatic_turns_paused is None and getattr(runner, "session_store", None) is not None:
+        paused = await lookup_stop_state()
+        if runner._session_state(key).persistent.run_generation != generation:
+            return t("gateway.queue.unavailable")
+        state.automatic_turns_paused = paused
     if state.automatic_turns_paused is True:
         await runner.async_session_store.clear_user_stopped(key)
         if runner._session_state(key).persistent.run_generation != generation:
