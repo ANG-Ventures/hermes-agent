@@ -103,6 +103,8 @@ _CGROUP_HEADROOM_MIN = 96 * 1024 ** 2
 # lands one poll late and the test thread allocates another ~150 MB before the async
 # exception stops it, so a 1 GiB cgroup needs ~0.35 GiB above the budget.
 _CGROUP_HEADROOM_FRACTION = 0.35
+_CGROUP_RECHECK_SECONDS = 0.5  # re-read the cgroup tree's room this often while a test runs
+_MIN_GROWTH = 16 * 1024 ** 2
 _ESCALATE_EXIT_CODE = 70
 # The watchdog that has fired and not yet been acknowledged by the hook wrapper; read by
 # the SIGURG handler on the main thread.
@@ -163,6 +165,14 @@ def _current_rss() -> int:
     return psutil.Process().memory_info().rss
 
 
+def _has_psutil() -> bool:
+    try:
+        import psutil  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def _cgroup_dir() -> str | None:
     if not sys.platform.startswith("linux"):
         return None
@@ -174,11 +184,18 @@ def _cgroup_dir() -> str | None:
     return None if rel is None else f"/sys/fs/cgroup{rel}"
 
 
-def _cgroup_memory_max() -> int | None:
-    """This process's cgroup v2 ``memory.max`` in bytes, or None (no cgroup / unlimited)."""
+def _cgroup_levels() -> list[str]:
+    """This process's cgroup and every ancestor below the root: a parent slice's
+    ``memory.max`` binds as surely as our own (Prism e023de0647d5)."""
     base = _cgroup_dir()
-    if base is None:
-        return None
+    out: list[str] = []
+    while base and base.rstrip("/") != "/sys/fs/cgroup":
+        out.append(base)
+        base = os.path.dirname(base.rstrip("/"))
+    return out
+
+
+def _level_max(base: str) -> int | None:
     try:
         raw = _read(f"{base}/memory.max").decode().strip()
     except OSError:
@@ -186,13 +203,9 @@ def _cgroup_memory_max() -> int | None:
     return int(raw) if raw.isdigit() else None
 
 
-def _cgroup_memory_used() -> int | None:
-    """What the WHOLE cgroup holds that reclaim cannot give back: ``memory.current`` minus
-    ``inactive_file`` (the working set the OOM killer weighs). Includes other pytest workers,
-    child processes and active cache, not just this process. None = unreadable."""
-    base = _cgroup_dir()
-    if base is None:
-        return None
+def _level_used(base: str) -> int | None:
+    """``memory.current`` minus ``inactive_file``: the working set the OOM killer weighs, for the
+    WHOLE cgroup (other pytest workers, children, active cache), not this process alone."""
     try:
         current = int(_read(f"{base}/memory.current").decode().strip())
     except (OSError, ValueError):
@@ -208,17 +221,40 @@ def _cgroup_memory_used() -> int | None:
     return max(current - inactive, 0)
 
 
+def _cgroup_room(own_rss: int) -> tuple[int, int] | None:
+    """(bytes left before the tightest limited level's ``memory.max``, that level's limit), or None
+    when no level has a numeric limit. A level whose usage is unreadable counts only this process."""
+    best: tuple[int, int] | None = None
+    for base in _cgroup_levels():
+        limit = _level_max(base)
+        if limit is None:
+            continue
+        used = max(own_rss, _level_used(base) or 0)
+        room = limit - used
+        if best is None or room - _headroom(limit) < best[0] - _headroom(best[1]):
+            best = (room, limit)
+    return best
+
+
+def _headroom(limit: int) -> int:
+    return max(_CGROUP_HEADROOM_MIN, int(limit * _CGROUP_HEADROOM_FRACTION))
+
+
+def _cgroup_memory_max() -> int | None:
+    """The tightest numeric ``memory.max`` over this process's cgroup and its ancestors."""
+    limits = [m for m in (_level_max(b) for b in _cgroup_levels()) if m is not None]
+    return min(limits) if limits else None
+
+
 def _clamp_to_cgroup(growth_bytes: int, start_rss: int) -> int:
-    """Cap the growth budget at what the cgroup has left. ``memory.max`` bounds the whole
-    cgroup, so the room is the limit minus the cgroup's working set (Prism 69b22e334665).
-    This process's RSS is only the floor of that, used when ``memory.current`` is unreadable."""
-    limit = _cgroup_memory_max()
-    if limit is None:
+    """Cap the growth budget at what the cgroup tree has left minus a headroom
+    (Prism 69b22e334665, e023de0647d5). The watchdog re-reads it while the test runs
+    (``_CGROUP_RECHECK_SECONDS``): siblings grow too (Prism 00c34a8dbc11)."""
+    got = _cgroup_room(start_rss)
+    if got is None:
         return growth_bytes
-    used = max(start_rss, _cgroup_memory_used() or 0)
-    headroom = max(_CGROUP_HEADROOM_MIN, int(limit * _CGROUP_HEADROOM_FRACTION))
-    room = limit - used - headroom
-    return max(min(growth_bytes, room), 16 * 1024 ** 2)
+    room, limit = got
+    return max(min(growth_bytes, room - _headroom(limit)), _MIN_GROWTH)
 
 
 def _on_sigurg(_signum, _frame) -> None:
@@ -250,6 +286,7 @@ class _Watchdog:
         self.start_rss = _current_rss()
         self.rss_growth_bytes = _clamp_to_cgroup(rss_growth_bytes, self.start_rss)
         self.started = _monotonic()
+        self._next_cgroup_check = self.started + _CGROUP_RECHECK_SECONDS
         self.fired: tuple[type, str] | None = None
         self._stop = _allocate_lock()  # held = keep running; released by stop()
         self._stop.acquire()
@@ -287,6 +324,12 @@ class _Watchdog:
             except Exception:  # psutil lost the process: nothing to bound
                 rss = self.start_rss
             grown = rss - self.start_rss
+            if now >= self._next_cgroup_check:
+                self._next_cgroup_check = now + _CGROUP_RECHECK_SECONDS
+                got = _cgroup_room(rss)
+                if got is not None:  # what is left now, on top of what this test already grew
+                    live = grown + got[0] - _headroom(got[1])
+                    self.rss_growth_bytes = max(min(self.rss_growth_bytes, live), _MIN_GROWTH)
             if grown > self.rss_growth_bytes:
                 self.fired = (
                     HarnessMemoryExceeded,
@@ -376,7 +419,6 @@ _BROWSER_EXES = frozenset({
     "google-chrome-beta", "google-chrome-unstable", "chrome-headless-shell", "headless_shell",
     "msedge", "microsoft-edge", "firefox", "brave", "brave-browser",
 })
-_SPAWN_LOCK = _allocate_lock()
 
 
 def _is_browser_argv(args, executable) -> bool:
@@ -392,11 +434,23 @@ def _is_browser_argv(args, executable) -> bool:
     return name.startswith("node") and any("playwright" in a for a in argv[1:2])
 
 
+# Runs in the CHILD between fork and the browser's exec: raise this process's own soft
+# RLIMIT_AS (allowed up to the hard limit), then become the browser. The pytest process is
+# never uncapped, so a concurrent spawn or allocation elsewhere keeps the cap (Prism 6ee6a42466dd).
+_EXEC_UNCAPPED = (
+    "import os, resource, sys\n"
+    "soft = int(sys.argv[1]); hard = resource.getrlimit(resource.RLIMIT_AS)[1]\n"
+    "resource.setrlimit(resource.RLIMIT_AS, (soft if hard == resource.RLIM_INFINITY else min(soft, hard), hard))\n"
+    "os.execv(sys.argv[2], sys.argv[3:])\n"
+)
+
+
 def _exempt_browser_children() -> None:
-    """Spawn browser children with the pre-harness soft RLIMIT_AS. Covers ``subprocess.Popen``
-    and asyncio subprocesses (both reach ``Popen._execute_child``). The pytest process
-    is uncapped only for the fork/exec of such a child, under a lock."""
-    import resource
+    """Spawn browser children (and the Playwright node driver) with the pre-harness soft
+    RLIMIT_AS. Covers ``subprocess.Popen`` and asyncio subprocesses (both reach
+    ``Popen._execute_child``): the argv is wrapped in ``_EXEC_UNCAPPED``, so the pid,
+    process group and exit status are the browser's own."""
+    import shutil
 
     real = subprocess.Popen._execute_child
     if getattr(real, "_test_bounds_exempt", False):
@@ -405,13 +459,13 @@ def _exempt_browser_children() -> None:
     def _execute_child(self, args, executable, *rest, **kw):
         if _RLIMIT_AS_SAVED is None or not _is_browser_argv(args, executable):
             return real(self, args, executable, *rest, **kw)
-        with _SPAWN_LOCK:
-            capped = resource.getrlimit(resource.RLIMIT_AS)
-            resource.setrlimit(resource.RLIMIT_AS, (_RLIMIT_AS_SAVED[0], capped[1]))
-            try:
-                return real(self, args, executable, *rest, **kw)
-            finally:
-                resource.setrlimit(resource.RLIMIT_AS, capped)
+        argv = [os.fsdecode(a) for a in ([args] if isinstance(args, (str, bytes, os.PathLike)) else args)]
+        target = os.fsdecode(executable) if executable is not None else argv[0]
+        if os.sep not in target:
+            target = shutil.which(target) or target
+        soft = _RLIMIT_AS_SAVED[0]
+        wrapped = [sys.executable, "-S", "-c", _EXEC_UNCAPPED, str(soft), target, *argv]
+        return real(self, wrapped, sys.executable, *rest, **kw)
 
     _execute_child._test_bounds_exempt = True  # type: ignore[attr-defined]
     subprocess.Popen._execute_child = _execute_child  # type: ignore[method-assign]
@@ -442,6 +496,13 @@ def configure(config) -> None:
     )
     skipped = _apply_process_rlimit()
     config._hermes_test_bounds_rlimit = skipped  # read by the self-test; None = applied
+    if not sys.platform.startswith("linux") and not _has_psutil():
+        # No /proc and no psutil: the per-test RSS bound cannot sample, and off Linux the
+        # RLIMIT_AS ceiling is not applied either. Say so instead of running unbounded
+        # (Prism a7c89e6bfce2); the wall clock still applies.
+        config.issue_config_time_warning(pytest.PytestConfigWarning(
+            "test bounds: no RSS source on this host (install psutil); the per-test memory bound "
+            "is OFF for this run, only the wall clock applies"), stacklevel=2)
     if _SIGURG is not None and threading.current_thread() is threading.main_thread():
         signal.signal(_SIGURG, _on_sigurg)
 

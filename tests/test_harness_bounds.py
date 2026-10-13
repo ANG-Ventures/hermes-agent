@@ -170,15 +170,21 @@ def test_rlimit_env_zero_disables_the_process_ceiling(tmp_path):
     assert out.returncode == 0, out.stdout + out.stderr
 
 
+def _fake_cgroups(monkeypatch, levels):
+    """levels: [(path, memory.max or None, working set or None)], innermost first."""
+    monkeypatch.setattr(bounds, "_cgroup_levels", lambda: [p for p, _, _ in levels])
+    monkeypatch.setattr(bounds, "_level_max", lambda b: {p: m for p, m, _ in levels}[b])
+    monkeypatch.setattr(bounds, "_level_used", lambda b: {p: u for p, _, u in levels}[b])
+
+
 def test_growth_budget_is_clamped_to_the_cgroup_ceiling(monkeypatch):
     gib = 1024 ** 3
-    monkeypatch.setattr(bounds, "_cgroup_memory_used", lambda: None)
-    monkeypatch.setattr(bounds, "_cgroup_memory_max", lambda: None)
+    _fake_cgroups(monkeypatch, [])
     assert bounds._clamp_to_cgroup(gib, 300 * 1024 ** 2) == gib
-    monkeypatch.setattr(bounds, "_cgroup_memory_max", lambda: gib)
+    _fake_cgroups(monkeypatch, [("/cg/a", gib, None)])
     assert bounds._clamp_to_cgroup(gib, 300 * 1024 ** 2) == gib - 300 * 1024 ** 2 - int(gib * 0.35)
     assert bounds._clamp_to_cgroup(gib, 2 * gib) == 16 * 1024 ** 2  # already over: fail at the first poll
-    monkeypatch.setattr(bounds, "_cgroup_memory_max", lambda: 64 * gib)
+    _fake_cgroups(monkeypatch, [("/cg/a", 64 * gib, None)])
     assert bounds._clamp_to_cgroup(gib, 300 * 1024 ** 2) == gib  # roomy cgroup: the budget stands
 
 
@@ -273,12 +279,36 @@ def test_cgroup_room_counts_the_whole_cgroup_not_just_this_process(monkeypatch):
     """Prism 69b22e334665: 1 GiB cgroup, 0.8 GiB already used by siblings, this process 0.1 GiB.
     The room is what the cgroup has left, not ``limit - own RSS``."""
     gib = 1024 ** 3
-    monkeypatch.setattr(bounds, "_cgroup_memory_max", lambda: gib)
-    monkeypatch.setattr(bounds, "_cgroup_memory_used", lambda: int(0.8 * gib))
-    room = bounds._clamp_to_cgroup(gib, int(0.1 * gib))
-    assert room == 16 * 1024 ** 2  # 1 - 0.8 - 0.35 < 0: fail at the first poll, before the OOM killer
-    monkeypatch.setattr(bounds, "_cgroup_memory_used", lambda: int(0.3 * gib))
+    _fake_cgroups(monkeypatch, [("/cg/a", gib, int(0.8 * gib))])
+    assert bounds._clamp_to_cgroup(gib, int(0.1 * gib)) == 16 * 1024 ** 2  # 1 - 0.8 - 0.35 < 0
+    _fake_cgroups(monkeypatch, [("/cg/a", gib, int(0.3 * gib))])
     assert bounds._clamp_to_cgroup(gib, int(0.1 * gib)) == gib - int(0.3 * gib) - int(gib * 0.35)
+
+
+def test_an_ancestor_cgroup_limit_binds(monkeypatch):
+    """Prism e023de0647d5: the leaf is unlimited, the parent slice holds memory.max."""
+    gib = 1024 ** 3
+    _fake_cgroups(monkeypatch, [("/cg/slice/leaf", None, int(0.1 * gib)), ("/cg/slice", 2 * gib, int(1.2 * gib))])
+    assert bounds._clamp_to_cgroup(gib, int(0.1 * gib)) == 2 * gib - int(1.2 * gib) - int(2 * gib * 0.35)
+
+
+def test_the_budget_shrinks_when_siblings_grow_mid_test(tmp_path):
+    """Prism 00c34a8dbc11: the room is re-read while the test runs, not once at start."""
+    out = _run_child(tmp_path, '''
+        import time
+        from tests._fixtures import bounds as B
+        def test_squeezed(monkeypatch):
+            gib = 1024 ** 3
+            used = [0]
+            monkeypatch.setattr(B, "_cgroup_room", lambda own: (8 * gib - used[0], 8 * gib))
+            time.sleep(0.3)  # the start-time budget is the full 1 GiB default
+            used[0] = 8 * gib  # then a sibling takes the whole cgroup
+            blob = bytearray(256 * 1024 * 1024)  # well under 1 GiB, over what is left
+            blob[::4096] = b"x" * len(blob[::4096])
+            while True:
+                time.sleep(0.05)
+    ''', "-o", "bounds_wall_seconds=20")
+    assert out.returncode == 1 and "test_squeezed grew" in out.stdout, out.stdout + out.stderr
 
 
 @pytest.mark.platforms("linux")
@@ -304,6 +334,9 @@ def test_a_browser_child_does_not_inherit_the_address_space_cap(tmp_path):
                 plain = subprocess.run([{str(other)!r}], capture_output=True, text=True).stdout.strip()
                 assert browser == "unlimited", browser
                 assert plain == str(1024 ** 2), plain
+                p = subprocess.Popen([{str(probe)!r}], stdout=subprocess.DEVNULL)
+                assert resource.getrlimit(resource.RLIMIT_AS)[0] == 1024 ** 3  # never uncapped, not even mid-spawn
+                assert p.wait() == 0
                 assert resource.getrlimit(resource.RLIMIT_AS)[0] == 1024 ** 3
         ''', env={bounds._RLIMIT_ENV: "1"})
     finally:
