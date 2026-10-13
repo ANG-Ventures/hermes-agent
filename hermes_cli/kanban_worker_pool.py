@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
+from hermes_cli import kanban_admission as _admission
 from hermes_cli import kanban_placement_reasons as _reasons
 from hermes_cli import placement_ledger as _ledger
 from hermes_cli import placement_policy as _policy
@@ -1068,6 +1069,10 @@ class TargetSignal:
     # A fixed ledger read for _warm_pick (diagnostics --placement keeps one
     # snapshot per report). None = read fresh per pick (RC7, the dispatcher).
     reservations: Optional[List[Any]] = None
+    # Saturation 4.2 (t_31350981): kanban.placement.admit_on_memory. False =
+    # the memory/band cap is computed and reported only (D1: Ace's yes flips it).
+    admit_on_memory: bool = False
+    reservation_gb: float = _admission.DEFAULT_RESERVATION_GB
 
     def kanban_cpu_est(self) -> float:
         if self.cpu_est is not None and self.cpu_est > 0:
@@ -1182,6 +1187,9 @@ class SpilloverPlan:
     pins_only: bool = False              # admitting band: remote PINS only (PRD 5.2.5)
     signal: Optional[TargetSignal] = None  # None = KWLB v0.1 (read_signal false)
     taken: Dict[str, int] = field(default_factory=dict)  # this tick's takes, per host
+    # host -> why the memory/band cap is below its free slots (t_31350981);
+    # filled with the flag off too, so the dry readback has its numbers.
+    admission: Dict[str, str] = field(default_factory=dict)
 
     @property
     def budget(self) -> int:
@@ -1389,9 +1397,10 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
         free = max(0, h.slots - running) if (h.enabled and h.state == "active") else 0
         sample = probe(h) if free > 0 else None
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
-               "band": None, "why": "", "probed": free > 0}
+               "band": None, "why": "", "probed": free > 0, "cap": (None, "")}
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"] = sample.load1, sample.ncpu
+            row["cap"] = _admission.cap(sample.pressure_text, reservation=signal.reservation_gb)
             kb = policy.kanban_band(h.name)
             got, row["why"] = read_pressure(sample.remote_now, sample.pressure_text,
                                             stale_after_s=policy.stale_after_s, warm=kb.warm, hot=kb.hot)
@@ -1426,6 +1435,7 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
 
     slots: Dict[str, int] = {}
     detail: Dict[str, dict] = {}
+    admission: Dict[str, str] = {}
     for h in ordered:
         r = probed[h.name]
         band, why, free = r["band"], r["why"], r["free"]
@@ -1436,6 +1446,14 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
         elif hot:
             free = 0
             why = f"band hot (streak {policy.kanban_band(h.name).hot_streak}, {band} now)"
+        else:
+            limit, cap_why = r["cap"]
+            if limit is not None and limit < free:
+                admission[h.name] = f"cap {limit} < free {free}: {cap_why}"
+                if signal.admit_on_memory:
+                    free = limit
+                    if free == 0:
+                        why = f"admission: {cap_why}"
         slots[h.name] = free
         detail[h.name] = {
             "slots": h.slots, "running": r["running"], "load1": r["load1"], "ncpu": r["ncpu"],
@@ -1443,5 +1461,8 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
             "reachable": (band not in (None, BAND_UNKNOWN)) if r["probed"] else None,
             "band": band, "hot": hot,
             **({"pressure": why} if why else {}),
+            **({"admission": admission[h.name]} if h.name in admission else {}),
         }
-    return _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal)
+    plan = _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal)
+    plan.admission = admission
+    return plan

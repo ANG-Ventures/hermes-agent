@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 
+from hermes_cli import kanban_admission as kadm
 from hermes_cli import kanban_load_gate as klg
 from hermes_cli import kanban_worker_pool as kwp
 from hermes_cli import placement_ledger as pledger
@@ -136,6 +137,8 @@ class GateTickBuilder:
             state_path=root / "var" / kwp.TARGET_STATE_FILE,
             ledger_dir=pledger.ledger_dir(root),
             cpu_est=float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+            admit_on_memory=kadm.enabled(cfg),
+            reservation_gb=kadm.reservation_gb(cfg),
         )
 
     def build(self, boards) -> GateTick:
@@ -202,6 +205,14 @@ class GateTickBuilder:
             for name, d in plan.detail.items():
                 if d.get("pressure"):
                     self._log(logger.warning, f"kanban pool: {name} refused: {d['pressure']}")
+            # Saturation 4.2 readback (t_31350981): every tick that caps a
+            # host, dry or enforcing; an all-clear line at most every 5 min.
+            line = kadm.readback_line(plan.admission, enforcing=signal.admit_on_memory,
+                                      reservation=signal.reservation_gb)
+            if plan.admission:
+                logger.info("%s", line)
+            else:
+                self._log(logger.info, line)
             if plan.budget <= 0:
                 self._log(logger.warning, f"kanban pool: {plan.full_reason()}")
         return plan

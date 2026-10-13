@@ -2374,7 +2374,13 @@ DEFAULT_CONFIG = {
         # and every held row gets a placement_wait, including rows a total
         # gate or an exhausted budget holds; false restores the silent early
         # returns and the old one-shot gate line.
-        "placement": {"read_signal": True, "route_first": True},
+        # admit_on_memory (t_31350981, Saturation spec 4.2; D1: off until
+        # Ace's yes): a pool host takes at most floor(mem_available_gb /
+        # worker_reservation_gb) new workers per tick and none while its
+        # sampler publishes band.kanban hot. false = computed and logged per
+        # tick ("kanban admission (dry ...): would-refuse N"), never applied.
+        "placement": {"read_signal": True, "route_first": True,
+                      "admit_on_memory": False, "worker_reservation_gb": 6},
         "dispatch_load_gate": {
             "enabled": True,
             "pause_above": None,
