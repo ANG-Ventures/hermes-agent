@@ -147,6 +147,8 @@ def test_hook_a_no_event_when_block_did_not_happen(fleet, monkeypatch):
 # ── Hook A, both rail spellings through the one seam (t_ecfd5591 review 77f581ae3801) ───────────────
 def _placed(monkeypatch, host="ace-ai"):
     monkeypatch.setenv(kwh.PLACEMENT_ENV, json.dumps({"host": host, "env": {}}))
+    # Hook A is under test, not custody: the host proved the run's workspace empty (no ssh).
+    monkeypatch.setattr(kwh, "remote_workspace_has_content", lambda raw, runner=None: False)
 
 
 @pytest.mark.parametrize("cap,tool,req", [("browser-session", "browser_*", "K23"), ("screen", "computer_use", "K21")])

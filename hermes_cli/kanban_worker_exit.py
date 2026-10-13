@@ -148,7 +148,8 @@ def block_on_rail_absent(message: str) -> bool:
     t_ecfd5591 (F1): a PLACED worker's card is re-routed once by its own
     ``placement_reroute`` ledger (``requires: <cap>`` appended to the body) and a
     second miss parks it ``needs_input``; an unplaced worker parks ``needs_input``
-    with the line verbatim. Never raises.
+    with the line verbatim. A first miss whose host-local workspace may hold work parks
+    instead (custody, 0e9694bf2944). Never raises.
     """
     try:
         from hermes_cli import kanban_worker_hosts as kwh

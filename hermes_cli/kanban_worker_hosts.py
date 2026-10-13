@@ -149,6 +149,36 @@ def local_workspace_has_content(path: Optional[str]) -> bool:
         return True
 
 
+def remote_workspace_has_content(placement_raw: Optional[str],
+                                 runner: Callable = subprocess.run) -> bool:
+    """True unless the placed host PROVES this run's workspace empty or absent.
+
+    Workspaces are host-local (``TERMINAL_SSH_SYNC_FILES=false``), so a run
+    re-routed elsewhere would leave anything here behind (t_ecfd5591
+    0e9694bf2944). Any doubt (no placement, no path, ssh failure) is content.
+    """
+    try:
+        env = json.loads(placement_raw or "").get("env") or {}
+        workspace, ssh_host = env.get("TERMINAL_CWD"), env.get("TERMINAL_SSH_HOST")
+        if not workspace or not ssh_host:
+            return True
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
+        if str(env.get("TERMINAL_SSH_PORT") or "22") != "22":
+            argv += ["-p", str(env["TERMINAL_SSH_PORT"])]
+        target = f"{env['TERMINAL_SSH_USER']}@{ssh_host}" if env.get("TERMINAL_SSH_USER") else ssh_host
+        w = shlex.quote(workspace)
+        # rc 0 = empty or absent, rc 3 = has entries; anything else (ssh 255, perms) fails closed.
+        proc = runner(argv + [target, f"[ -e {w} ] || exit 0; [ -d {w} ] || exit 3; "
+                                      f"o=$(ls -A -- {w}) || exit 4; [ -z \"$o\" ] && exit 0; exit 3"],
+                      capture_output=True, text=True, timeout=_PROBE_TIMEOUT_SECONDS,
+                      stdin=subprocess.DEVNULL)
+        return getattr(proc, "returncode", 1) != 0
+    except Exception:
+        _log.warning("placement custody probe failed; treating the workspace as holding work",
+                     exc_info=True)
+        return True
+
+
 def _placed_host(raw: Optional[str]) -> Optional[str]:
     try:
         return str(json.loads(raw or "").get("host") or "") or None

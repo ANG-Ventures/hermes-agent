@@ -115,8 +115,13 @@ def _with_requires_line(body: Optional[str], cap: str) -> str:
 
 
 def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
-                    placed_host: Optional[str]) -> Optional[str]:
+                    placed_host: Optional[str],
+                    placement_raw: Optional[str] = None) -> Optional[str]:
     """Apply the board decision for one ``*_ABSENT`` exit of run ``run_id``.
+
+    A first miss re-routes only when the placed host proves the run's
+    workspace (``placement_raw``) empty; otherwise it parks ``needs_input``
+    for recovery with host/run/workspace named (``placement_custody_hold``).
 
     Returns ``"rerouted"``, ``"needs_input"`` or None (not an ABSENT line, or
     the run no longer owns the card: a stale worker never mutates it).
@@ -127,8 +132,16 @@ def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
         return None
     token, cap, host = parsed
     host = host or placed_host
-    if token == INDETERMINATE_TOKEN:
-        cap = None          # nothing was proven missing: park with the line, never re-route
+    if token in _PARK_ONLY_TOKENS:
+        cap = None          # nothing re-routable was proven missing: park with the line
+    if placed_host and cap and placed_host != "studio-local" and prior_reroutes(conn, task_id) == 0:
+        # Workspaces are host-local (no sync): a mid-run tool, or an earlier run on this host,
+        # may have left work there that a re-route would strand (0e9694bf2944). Re-route only a
+        # workspace the host proves empty; anything else parks for recovery, source untouched.
+        from hermes_cli import kanban_worker_hosts as kwh
+        if kwh.remote_workspace_has_content(placement_raw):
+            return _custody_hold(conn, task_id, int(run_id), message, cap=cap, host=host,
+                                 token=token, placement_raw=placement_raw)
     if placed_host and cap:
         decided = None
         with kb.write_txn(conn):
@@ -175,6 +188,32 @@ def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
     return None
 
 
+CUSTODY_EVENT = "placement_custody_hold"
+
+
+def _custody_hold(conn, task_id: str, run_id: int, message: str, *, cap: str, host: Optional[str],
+                  token: str, placement_raw: Optional[str]) -> Optional[str]:
+    """Park a mid-run miss whose workspace may hold work: name host, run and workspace."""
+    from hermes_cli import kanban_db as kb
+    try:
+        workspace = (json.loads(placement_raw or "").get("env") or {}).get("TERMINAL_CWD")
+    except (ValueError, AttributeError):
+        workspace = None
+    reason = (f"{message.split(chr(10), 1)[0]}\n"
+              f"Placement custody hold: run {run_id} on {host} may have left work in its workspace "
+              f"{workspace or '(unknown path)'} on {host}. Workspaces are host-local (no sync), so the "
+              f"pool cannot move that work to another host. Recover or discard it on {host}, add "
+              f"`requires: {cap}` to pin the next run, then unblock.")
+    if not kb.block_task(conn, task_id, reason=reason, kind="needs_input",
+                         expected_run_id=int(run_id), loop_breaker=False):
+        return None
+    with kb.write_txn(conn):
+        kb._append_event(conn, task_id, CUSTODY_EVENT,
+                         {"host": host, "run_id": int(run_id), "workspace": workspace, "cap": cap,
+                          "token": token}, run_id=int(run_id))
+    return "needs_input"
+
+
 def worker_exit_on_absent(message: str) -> Optional[str]:
     """The owning worker's exit hook for an ABSENT line (#1876's fenced path)."""
     try:
@@ -193,7 +232,8 @@ def worker_exit_on_absent(message: str) -> Optional[str]:
         placed = kwh.BOOT_PLACED_HOST or kwh._placed_host(os.environ.get(kwh.PLACEMENT_ENV))
         conn = kb.connect()
         try:
-            return reroute_or_park(conn, task_id, run_id, message, placed_host=placed)
+            return reroute_or_park(conn, task_id, run_id, message, placed_host=placed,
+                                   placement_raw=os.environ.get(kwh.PLACEMENT_ENV))
         finally:
             conn.close()
     except Exception:
@@ -261,13 +301,15 @@ def route_hash(body: Optional[str], skills: Iterable[str], fleet_dir: Path, *,
 
 
 def hard_requirements(body: Optional[str], skills: Iterable[str], fleet_dir: Path) -> List[str]:
-    """Declared + attached-skill capabilities (HARD, s2.2), from the files now."""
+    """Declared + attached-skill capabilities (HARD, s2.2), from the files now. A word the map
+    does not define stays ``unknown:<word>`` (F4): an unresolved requirement is still a
+    requirement, never read as "needs nothing" (470af3484c95). [] for an absent/invalid map."""
     from hermes_cli import kanban_host_capabilities as khc
     cmap = khc.load_map(fleet_dir)
     if cmap is None or not cmap.valid:
         return []
     reqs, _none = khc.derive(body, skills, cmap)
-    return sorted({r.cap for r in reqs if r.strength == khc.HARD and not r.unknown})
+    return sorted({r.cap for r in reqs if r.strength == khc.HARD})
 
 
 def host_caps(host: str, fleet_dir: Path) -> Optional[frozenset]:
@@ -288,6 +330,25 @@ def _skill_key(name: str) -> str:
 _SNAPSHOT_TRIES = 5
 _SNAPSHOT_BACKOFF_S = 0.05          # attempt n sleeps n * this before re-reading (bounded: <= 0.5 s)
 INDETERMINATE_TOKEN = "PLACEMENT_INDETERMINATE_ABSENT"
+UNRESOLVED_TOKEN = "PLACEMENT_UNRESOLVED_ABSENT"
+_PARK_ONLY_TOKENS = frozenset({INDETERMINATE_TOKEN, UNRESOLVED_TOKEN})
+
+
+def unresolved_line(word: str, host: str) -> str:
+    """An enforcing worker's refusal of a hard requirement the map does not define (no host can
+    prove it, so it parks ``needs_input``; the dispatcher holds such a card the same way, F4)."""
+    return (f"{UNRESOLVED_TOKEN} cap=placement-unresolved host={host} need={word}: this card requires "
+            f"\"{word}\", which fleet/host-capabilities.json does not define, so no host can be shown "
+            f"to serve it. Fix the word or the map, then unblock.")
+
+
+def _refusal(cap: str, have, host: str, modes: Mapping[str, str]) -> Optional[str]:
+    from hermes_cli.kanban_host_capabilities import UNKNOWN_PREFIX
+    if cap.startswith(UNKNOWN_PREFIX):
+        return unresolved_line(cap[len(UNKNOWN_PREFIX):], host) if _any_enforced(modes) else None
+    if cap not in have and enforced(cap, modes):
+        return absent_line(cap, host)
+    return None
 
 
 def indeterminate_line(host: str) -> str:
@@ -375,10 +436,15 @@ def stamp_placement(env: dict, task, fleet_dir: Path) -> None:
 
 
 def boot_check(task_id: str, environ: Optional[Mapping[str, str]] = None, *,
-               conn=None, fleet_dir: Optional[Path] = None) -> Optional[str]:
+               conn=None, fleet_dir: Optional[Path] = None,
+               preloads: Iterable[str] = ()) -> Optional[str]:
     """The ABSENT line when this placed worker's host lacks an enforced hard
     requirement, else None. Zero model calls. A stale route (hash mismatch)
-    is re-derived from the CURRENT body and map, never trusted from env."""
+    is re-derived from the CURRENT body and map, never trusted from env.
+
+    ``preloads``: the skills this process will actually render before the first model call
+    (``skills.auto_load`` + ``--skills``), checked within the same snapshot as the card's
+    requirements, so a skill that is not on the card cannot slip past (fbadb37df1b5)."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_worker_hosts as kwh
     env = os.environ if environ is None else environ
@@ -408,6 +474,7 @@ def boot_check(task_id: str, environ: Optional[Mapping[str, str]] = None, *,
     except (ValueError, TypeError):
         skills = []
     stamped = record.get(REQUIRES_KEY)
+    preloaded = [s for s in dict.fromkeys(preloads or ()) if isinstance(s, str)]
 
     def check(snapshot):
         have = host_caps(host, fleet_dir)
@@ -418,9 +485,11 @@ def boot_check(task_id: str, environ: Optional[Mapping[str, str]] = None, *,
             reqs = [c for c in stamped if isinstance(c, str)]
         else:
             reqs = hard_requirements(row["body"], skills, fleet_dir)
-        for cap in reqs:
-            if cap not in have and enforced(cap, modes):
-                return absent_line(cap, host)
+        if preloaded:
+            reqs = [*reqs, *hard_requirements("", preloaded, fleet_dir)]
+        for cap in dict.fromkeys(reqs):
+            if (line := _refusal(cap, have, host, modes)) is not None:
+                return line
         return None
 
     # warn/off everywhere: nothing could have refused, so a torn read refuses nothing either.

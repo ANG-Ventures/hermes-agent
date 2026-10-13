@@ -397,7 +397,8 @@ def skill_key(name: Any) -> str:
     ``category:name`` through to the local ``category/name``) all key on ``name``. The ONE
     normalizer for derivation, the resource-lane lookup and the dispatch/boot/skill gates
     (t_ecfd5591 review 2972d9d25619 / 64301a687435)."""
-    return re.split(r"[/:]", str(name or ""))[-1].strip().lower()
+    # A trailing separator the loader accepts ("personal/x/") keys on "x", not "" (f779b3d305d8).
+    return re.split(r"[/:]", str(name or "").strip().rstrip("/"))[-1].strip().lower()
 
 
 def _named_skill_re(name: str):

@@ -44,6 +44,9 @@ def board(tmp_path, monkeypatch):
     fleet.mkdir()
     for f in (khc.MAP_FILE, khc.INDEX_FILE):
         shutil.copy(FIXTURES / f, fleet / f)
+    # Hermetic: no ssh. A mid-run re-route test models a host that proved the run's workspace
+    # empty; the custody tests below replace this with the real probe and a fake runner.
+    monkeypatch.setattr(kwh, "remote_workspace_has_content", lambda raw, runner=None: False)
     return fleet
 
 
@@ -93,6 +96,7 @@ def test_reroute_then_needs_input_never_triage(board, monkeypatch):
     assert t.status == "ready"
     assert t.body.rstrip().endswith("requires: browser-session")
     ev = _events(tid, pff.REROUTE_EVENT)
+    assert ev[0].pop("after_comment_id") == 0          # continuation causality snapshot (360354deb8ab)
     assert ev == [{"from": "ace-ai", "cap": "browser-session", "run_id": run1, "token": "BROWSER_RAIL_ABSENT",
                    "to": "ready"}]
     with kb.connect_closing() as conn:
@@ -585,9 +589,10 @@ def _boot(monkeypatch, line, decided):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_boot")
     monkeypatch.setattr(kt, "register_current_worker_from_env", lambda: True)
     monkeypatch.setattr("agent.delegation_context.owned_kanban_task", lambda: "t_boot")
-    monkeypatch.setattr(pff, "boot_check", lambda task: line)
+    monkeypatch.setattr(pff, "boot_check", lambda task, preloads=(): line)
     seen = []
-    monkeypatch.setattr(kwe, "block_on_rail_absent", lambda m: seen.append(m) or decided)
+    monkeypatch.setattr(kwe, "block_on_rail_absent",
+                        lambda m: seen.append(m) or decided)
     cli = _FakeCli()
     with pytest.raises(SystemExit) as exc:
         csq._run_single_query_mode(cli, "do it", None, True, True)
@@ -644,3 +649,279 @@ def test_kanban_worker_preload_does_not_render_before_the_boot_gate(monkeypatch)
     c2 = cli_mod._build_cli_from_args(**args)
     c2._preload_skills_thread.join(5)
     assert rendered == [["amazon-cart-ops-local"]] * 2
+
+
+
+# -- consolidated correction 2026-10-13 (Apollo, parent-verified) on #1963 @39b28b56 ------------
+
+def test_boot_check_covers_the_actual_preload_not_only_the_card(board, monkeypatch):
+    # fbadb37df1b5 / 54ceec367123 / 62677503233c: a plain card, but the worker's queued preload
+    # (auto_load or a CLI-only --skills) holds a browser skill. Boot must refuse.
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain coding card")
+    _placed_env(monkeypatch, tid, 1, record=pff.placement_record(_task(tid), board))
+    assert pff.boot_check(tid) is None                                         # card alone: admit
+    for spelling in ("amazon-cart-ops-local", "personal/amazon-cart-ops-local/"):
+        line = pff.boot_check(tid, preloads=[spelling])
+        assert (line or "").startswith("BROWSER_RAIL_ABSENT cap=browser-session host=ace-ai"), spelling
+    assert pff.boot_check(tid, preloads=["some-coding-skill"]) is None        # control
+    _placed_env(monkeypatch, tid, 1, caps=json.dumps({"*": "warn"}))
+    assert pff.boot_check(tid, preloads=["amazon-cart-ops-local"]) is None    # WARN stays inert
+
+
+def test_cli_only_preload_is_refused_before_anything_renders(board, monkeypatch, tmp_path):
+    # Real boot_check + real block_on_rail_absent through the one-shot entry: the --skills
+    # preload thread never starts, the card is re-routed, no payload was rendered.
+    from hermes_cli import cli_single_query as csq
+    import tools.kanban_tools as kt
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain coding card")
+    run = _claim(tid)
+    _placed_env(monkeypatch, tid, run)
+    monkeypatch.setattr(kt, "register_current_worker_from_env", lambda: True)
+    cli = _FakeCli()
+    cli._preload_skills_requested = ["amazon-cart-ops-local"]
+    with pytest.raises(SystemExit) as exc:
+        csq._run_single_query_mode(cli, "do it", None, True, True)
+    assert exc.value.code == 0 and cli.calls == []
+    t = _task(tid)
+    assert t.status == "ready" and t.body.rstrip().endswith("requires: browser-session")
+
+
+@pytest.mark.parametrize("body", ["requires: never-defined-cap", "plain\nrequires: browser-session, never-defined-cap"])
+def test_unknown_hard_requirement_is_kept_and_refused_under_enforcement(board, monkeypatch, body):
+    # 470af3484c95: an unresolved hard requirement is a requirement, never "needs nothing".
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body=body)
+    assert "unknown:never-defined-cap" in pff.hard_requirements(body, [], board)
+    rec = pff.placement_record(_task(tid), board)
+    assert "unknown:never-defined-cap" in rec[pff.REQUIRES_KEY]
+    for record in (rec, None):                                   # fresh stamp, and a stale route
+        _placed_env(monkeypatch, tid, 1, record=record)
+        line = pff.boot_check(tid)
+        assert line is not None and pff.ABSENT_RE.match(line), line
+    _placed_env(monkeypatch, tid, 1, caps=json.dumps({"*": "warn"}))
+    assert pff.boot_check(tid) is None                           # WARN: inert
+    (board / khc.MAP_FILE).write_text("{not json")
+    _placed_env(monkeypatch, tid, 1)
+    assert pff.boot_check(tid) is None                           # invalid map: deliberate WARN
+
+
+def test_unresolved_line_parks_needs_input_and_never_reroutes(board, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="requires: never-defined-cap")
+    run = _claim(tid)
+    _placed_env(monkeypatch, tid, run)
+    line = pff.boot_check(tid)
+    assert line.startswith(pff.UNRESOLVED_TOKEN)
+    assert kwe.block_on_rail_absent(line) is True
+    t = _task(tid)
+    assert t.status == "blocked" and t.block_kind == "needs_input"
+    assert _events(tid, pff.REROUTE_EVENT) == [] and "requires: placement" not in t.body
+
+
+@pytest.mark.parametrize("spelling", ["amazon-cart-ops-local", "personal/amazon-cart-ops-local",
+                                      "personal:amazon-cart-ops-local", "personal/amazon-cart-ops-local/"])
+def test_every_loader_spelling_is_gated_through_the_real_registry(board, monkeypatch, tmp_path, spelling):
+    # f779b3d305d8: the loader accepts a trailing separator; the gate must key it too.
+    _skills_home(monkeypatch, tmp_path)
+    from tools import rail_preflight as rp
+    from tools.registry import registry
+    from tools.skills_tool import skill_view
+    import model_tools  # noqa: F401
+    rp._emitted.clear()
+    assert khc.skill_key(spelling) == "amazon-cart-ops-local"
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    monkeypatch.delenv(khc.CAPS_ENV, raising=False)
+    assert json.loads(skill_view(spelling)).get("success") is True      # positive loader control
+    _placed_env(monkeypatch, tid, 1)
+    out = json.loads(registry.dispatch("skill_view", {"name": spelling}, task_id="t"))
+    assert out["error"].startswith("BROWSER_RAIL_ABSENT cap=browser-session host=ace-ai"), spelling
+    assert pff.attached_skill_gap([spelling], "ace-ai",
+                                  khc.tick(board, {"placement": {"capabilities": "enforce"}}, ("ace-ai",))) \
+        == "browser-session"
+
+
+@pytest.mark.parametrize("with_task_id", [True, False])
+def test_skill_gate_runs_without_the_optional_task_id(board, monkeypatch, tmp_path, with_task_id):
+    # 64c6bea00955: placement ownership decides, not the dedup id.
+    _skills_home(monkeypatch, tmp_path)
+    from tools import rail_preflight as rp
+    from tools.registry import registry
+    import model_tools  # noqa: F401
+    rp._emitted.clear()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    _placed_env(monkeypatch, tid, 1)
+    kw = {"task_id": "t"} if with_task_id else {}
+    out = json.loads(registry.dispatch("skill_view", {"name": "amazon-cart-ops-local"}, **kw))
+    assert out["error"].startswith("BROWSER_RAIL_ABSENT")
+    assert rp.take_rail_absent() == out["error"]
+
+
+def test_review_fork_without_task_id_is_never_gated(board, monkeypatch, tmp_path):
+    _skills_home(monkeypatch, tmp_path)
+    from tools import rail_preflight as rp
+    from tools.registry import registry
+    from tools.skill_provenance import set_current_write_origin, BACKGROUND_REVIEW, _write_origin
+    import model_tools  # noqa: F401
+    rp._emitted.clear()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    _placed_env(monkeypatch, tid, 1)
+    tok = set_current_write_origin(BACKGROUND_REVIEW)
+    try:
+        out = json.loads(registry.dispatch("skill_view", {"name": "amazon-cart-ops-local"}))
+    finally:
+        _write_origin.reset(tok)
+    assert not str(out.get("error", "")).startswith("BROWSER_RAIL_ABSENT")
+    assert rp.take_rail_absent() is None
+
+
+def _guard(tid):
+    from types import SimpleNamespace
+    from hermes_cli import kanban_db_dispatch as kdd
+    with kb.connect_closing() as conn:
+        return kdd.check_respawn_guard(conn, tid, pr_state_resolver=SimpleNamespace(resolve=lambda *a, **k: "OPEN"))
+
+
+def test_reroute_is_a_one_shot_continuation_for_the_active_pr_guard(board, monkeypatch):
+    # 360354deb8ab: real claim -> PR comment -> re-route. The next spawn may resume the PR once.
+    monkeypatch.setattr(kb, "_pr_belongs_to_other_card", lambda *a, **k: False)
+    monkeypatch.setattr(kb, "_pr_needs_its_worker", lambda *a, **k: None)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="host: ace-ai\nplain")
+    run = _claim(tid)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "daedalus", "PR: https://github.com/ANG-Ventures/hermes-agent/pull/1963")
+    assert _guard(tid) == "active_pr"                             # control: no intent yet
+    _placed_env(monkeypatch, tid, run)
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-ai")) is True
+    assert _task(tid).status == "ready"
+    assert _guard(tid) is None                                    # continuation: may spawn
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "spawned", {"pid": 1})
+    assert _guard(tid) == "active_pr"                             # consumed by that spawn
+
+
+def test_a_newer_pr_comment_after_the_reroute_is_not_covered(board, monkeypatch):
+    monkeypatch.setattr(kb, "_pr_belongs_to_other_card", lambda *a, **k: False)
+    monkeypatch.setattr(kb, "_pr_needs_its_worker", lambda *a, **k: None)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain")
+    run = _claim(tid)
+    _placed_env(monkeypatch, tid, run)
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-ai")) is True
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "daedalus", "PR: https://github.com/ANG-Ventures/hermes-agent/pull/7")
+    assert _guard(tid) == "active_pr"
+
+
+# -- custody (0e9694bf2944): host-local workspaces, real probe, a fake ssh -------------------------
+
+def _hosts_runner(roots):
+    """Run the probe's remote script locally, against the FAKE filesystem of the ssh target."""
+    import subprocess
+
+    def run(argv, **kw):
+        target, script = argv[-2], argv[-1]
+        root = roots.get(target.split("@")[-1])
+        if root is None:
+            return subprocess.CompletedProcess(argv, 255, "", "ssh: connect refused")
+        return subprocess.run(["bash", "-c", script.replace("/ws/", f"{root}/ws/")], **kw)
+    return run
+
+
+_REAL_PROBE = kwh.remote_workspace_has_content      # bound at import, before any fixture stubs it
+
+
+def _custody(monkeypatch, tmp_path, roots):
+    monkeypatch.setattr(kwh, "remote_workspace_has_content",
+                        lambda raw, runner=None: _REAL_PROBE(raw, _hosts_runner(roots)))
+
+
+def _placed_ws(monkeypatch, tid, run, host, ssh_host, ws="/ws/card"):
+    _placed_env(monkeypatch, tid, run, host=host,
+                record={"env": {"TERMINAL_ENV": "ssh", "TERMINAL_SSH_HOST": ssh_host,
+                                "TERMINAL_SSH_USER": "kanbanw", "TERMINAL_CWD": ws}})
+
+
+def test_midrun_miss_with_work_in_the_source_workspace_parks_for_recovery(board, monkeypatch, tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    (src / "ws/card").mkdir(parents=True)
+    (dst / "ws/card").mkdir(parents=True)
+    (src / "ws/card/draft.patch").write_text("SOURCE_SENTINEL")
+    (dst / "ws/card/other.txt").write_text("DEST_SENTINEL")
+    _custody(monkeypatch, tmp_path, {"10.0.0.1": src, "10.0.0.2": dst})
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="host: ace-ai\nplain")
+    run = _claim(tid)
+    _placed_ws(monkeypatch, tid, run, "ace-ai", "10.0.0.1")
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-ai")) is True
+    t = _task(tid)
+    assert t.status == "blocked" and t.block_kind == "needs_input"
+    assert _events(tid, pff.REROUTE_EVENT) == [] and "requires: browser-session" not in t.body
+    (ev,) = _events(tid, pff.CUSTODY_EVENT)
+    assert (ev["host"], ev["run_id"], ev["workspace"]) == ("ace-ai", run, "/ws/card")
+    with kb.connect_closing() as conn:
+        reason = kb._latest_block_reason(conn, tid)
+    assert "ace-ai" in reason and f"run {run}" in reason and "/ws/card" in reason
+    assert (src / "ws/card/draft.patch").read_text() == "SOURCE_SENTINEL"       # source untouched
+    assert (dst / "ws/card/other.txt").read_text() == "DEST_SENTINEL"
+
+
+def test_proven_empty_source_reroutes_whatever_the_destination_holds(board, monkeypatch, tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    (src / "ws/card").mkdir(parents=True)
+    (dst / "ws/card").mkdir(parents=True)
+    (dst / "ws/card/other.txt").write_text("DEST_SENTINEL")
+    _custody(monkeypatch, tmp_path, {"10.0.0.1": src, "10.0.0.2": dst})
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="host: ace-ai\nplain")
+    run = _claim(tid)
+    _placed_ws(monkeypatch, tid, run, "ace-ai", "10.0.0.1")
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-ai")) is True
+    assert _task(tid).status == "ready" and _events(tid, pff.CUSTODY_EVENT) == []
+    assert len(_events(tid, pff.REROUTE_EVENT)) == 1
+
+
+def test_unprovable_source_workspace_fails_closed(board, monkeypatch, tmp_path):
+    _custody(monkeypatch, tmp_path, {})                          # ssh refused
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain")
+    run = _claim(tid)
+    _placed_ws(monkeypatch, tid, run, "ace-ai", "10.0.0.9")
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-ai")) is True
+    assert _task(tid).block_kind == "needs_input" and _events(tid, pff.REROUTE_EVENT) == []
+
+
+def test_stale_run_with_work_never_mutates_the_card(board, monkeypatch, tmp_path):
+    src = tmp_path / "src"
+    (src / "ws/card").mkdir(parents=True)
+    (src / "ws/card/draft.patch").write_text("x")
+    _custody(monkeypatch, tmp_path, {"10.0.0.1": src})
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain")
+    run = _claim(tid)
+    _placed_ws(monkeypatch, tid, run + 5, "ace-ai", "10.0.0.1")
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-ai")) is False
+    assert _task(tid).status == "running" and _events(tid, pff.CUSTODY_EVENT) == []
+
+
+def test_second_miss_keeps_needs_input_without_a_custody_probe(board, monkeypatch, tmp_path):
+    # first-clean-miss / second-miss-needs_input: the second miss parks on the ledger as before.
+    calls = []
+    monkeypatch.setattr(kwh, "remote_workspace_has_content", lambda raw, runner=None: calls.append(1) or False)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain")
+    run = _claim(tid)
+    _placed_ws(monkeypatch, tid, run, "ace-ai", "10.0.0.1")
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-ai")) is True
+    run2 = _claim(tid)
+    _placed_ws(monkeypatch, tid, run2, "ace-media", "10.0.0.2")
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-media")) is True
+    t = _task(tid)
+    assert t.status == "blocked" and t.block_kind == "needs_input" and calls == [1]
+    with kb.connect_closing() as conn:
+        assert "Second placement miss" in kb._latest_block_reason(conn, tid)

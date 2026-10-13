@@ -577,7 +577,10 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         # preload is folded in, F14).
         from hermes_cli import kanban_placement_failfast as _pff
         from agent.delegation_context import owned_kanban_task
-        if (_task := owned_kanban_task()) and (_absent := _pff.boot_check(_task)) is not None:
+        # The check covers what will actually render: the card's requirements AND the queued
+        # preload (skills.auto_load + --skills), which need not be on the card (fbadb37df1b5).
+        _preloads = list(getattr(cli, "_preload_skills_requested", None) or [])
+        if (_task := owned_kanban_task()) and (_absent := _pff.boot_check(_task, preloads=_preloads)) is not None:
             print(_absent, file=sys.stderr)
             # The same seam as a mid-run rail line: board decision, then Hook A once, then exit.
             from hermes_cli.kanban_worker_exit import block_on_rail_absent
