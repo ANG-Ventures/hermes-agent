@@ -51,7 +51,12 @@ LANE_INCAPABLE_CLASS = "lane_incapable"
 NO_FIRST_BYTE_BUDGET_CLASS = "no_first_byte_budget"
 INVALID_RESPONSE_CLASS = "provider_invalid_response"
 # Classes the sticky writer arms (one clock: _sticky.until_epoch).
-STICKY_CLASSES = frozenset({"conn", "pool_pressure", "quota_seat", "quota_model"})
+# ``no_first_byte_budget`` (t_3e4fa6ef): a wall-budget cut is a primary failure
+# too. Unarmed, the next turn restored the lane that just held the turn 600 s
+# with no byte (alr->dtlr->alr, 2026-10-13 11:47-12:01), churning the warm
+# fallback cache. It borrows conn's cooldown row and the warm-seat return gate.
+STICKY_CLASSES = frozenset({"conn", "pool_pressure", "quota_seat", "quota_model",
+                            NO_FIRST_BYTE_BUDGET_CLASS})
 # Classes that still reach apply_quota_gate / the legacy arm block. On a
 # relay provider quota_seat, conn and pool_pressure skip both (§4.1 plumbing).
 QUOTA_GATE_CLASSES = frozenset({"quota_model", "rate_upstream", "refusal", "unclassified"})
@@ -65,6 +70,10 @@ FALLBACK_FAILED_CLASSES = frozenset({"quota_seat", "quota_model", "rate_upstream
 # warm_seat is unreachable for a non-relay primary and an active user never
 # lets the fallback go cold). Relay primaries keep the warm-seat gate.
 TRANSIENT_CLASSES = frozenset({"conn"})
+# Classes that return on the ``transient`` branch once ``until`` passes on a
+# primary with no seat signal. Unlike TRANSIENT_CLASSES a budget cut still
+# resumes across a rebuild: the lane stalled, it did not drop one connection.
+UNSEATED_RETURN_CLASSES = TRANSIENT_CLASSES | {NO_FIRST_BYTE_BUDGET_CLASS}
 TRANSIENT_BRANCH = "transient"
 USER_ROUTE_BRANCH = "user_route"
 
@@ -97,6 +106,7 @@ COOLDOWN_TABLE: Dict[str, ClassCooldown] = {
     "quota_seat": ClassCooldown(None, 30 * MIN),     # base = max(60 s, retry_after)
     "quota_model": ClassCooldown(6 * HOUR, 24 * HOUR),
 }
+COOLDOWN_TABLE[NO_FIRST_BYTE_BUDGET_CLASS] = COOLDOWN_TABLE["conn"]
 
 _DIRECT_PIN_RE = re.compile(r"^claude-([abc])px-(\d+)$")
 
@@ -790,7 +800,7 @@ def restore_allowed(state: Optional[StickyState], now: float, *, probe: bool = F
         return Decision(True, None, "no active sticky state")
     if now < state.until_epoch:
         return Decision(False, None, f"until: {state.until_epoch - now:.0f}s remaining")
-    if (state.cls in TRANSIENT_CLASSES
+    if (state.cls in UNSEATED_RETURN_CLASSES
             and not has_seat_signal(primary_provider or state.primary_provider)):
         # No warm_seat signal can ever exist for this primary (not a relay,
         # not a direct pin), so without this branch an active user is held on
@@ -1784,7 +1794,9 @@ def format_recovery_rider(row: Mapping[str, Any], *, seat_names: bool = True) ->
         return (f"fallback failed ({row.get('trigger_class') or 'quota'}), primary eligible"
                 f"{on_seat} ({expect}), {dwell}")
     if branch == TRANSIENT_BRANCH:
-        return f"cause was transient (connection); retrying primary ({expect}), {dwell}"
+        cause = ("no first byte" if row.get("trigger_class") == NO_FIRST_BYTE_BUDGET_CLASS
+                 else "connection")
+        return f"cause was transient ({cause}); retrying primary ({expect}), {dwell}"
     if branch == USER_ROUTE_BRANCH:
         return f"cleared by /model ({expect}), {dwell}"
     return f"branch ?{on_seat} ({expect}), {dwell}"
