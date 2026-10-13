@@ -3714,7 +3714,8 @@ def dispatch_once(
             # bounded by journal_size_limit on the writer's natural reset).
             _kbc._maybe_checkpoint_wal(conn, db_path)
     # Outside the dispatch lock: stop resources (VM/container/unit) whose card finished
-    # (t_2df204e5). Only the tick that held the lock sweeps, so two dispatchers never double-stop.
+    # (t_2df204e5). Only the tick that held the lock sweeps; release_finished claims each resource in a
+    # write txn before stopping it, so an overlapping sweep never stops the same one twice.
     if held and not dry_run:
         _release_finished_resources(conn, board)
     # The dispatch lock has been released here. Fire the tick observer

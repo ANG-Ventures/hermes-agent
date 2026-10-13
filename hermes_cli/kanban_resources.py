@@ -7,16 +7,18 @@ GPU unit) now record what they started on the run: ``task_runs.resources`` holds
 tick (:func:`release_finished`) stops every resource still ``started`` with the stop verb for its
 kind, unless the card body carries ``keep-alive: <reason>``. One #logs line per stop.
 
-States: ``started`` (live, ours to stop) -> ``stopped`` | ``kept`` (keep-alive) | ``stop_failed``
+States: ``started`` (live, ours to stop) -> ``stopping`` (claimed by one sweep) -> ``stopped`` | ``kept`` (keep-alive) | ``stop_failed``
 (``MAX_STOP_ATTEMPTS`` tries failed; the closeout check refuses it until someone stops it by hand
 and re-runs ``resource mark``).
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
+import secrets
 import shlex
 import socket
 import subprocess
@@ -41,10 +43,12 @@ STOP_VERBS: dict[str, Callable[[str], list[str]]] = {
     ),
 }
 KINDS = tuple(STOP_VERBS)
-OPEN_STATES = ("started", "stop_failed")
+OPEN_STATES = ("started", "stopping", "stop_failed")
 TERMINAL_CARD = ("done", "archived")
 MAX_STOP_ATTEMPTS = 3
 STOP_TIMEOUT_S = 90
+# A ``stopping`` claim this old belongs to a sweep that died mid-stop; the next sweep may retake it.
+STALE_CLAIM_S = 2 * STOP_TIMEOUT_S + 60
 # A resource id goes through a remote shell (ssh), so only shell-inert characters.
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")
 # A host is a bare fleet name (no user@, no path, no option), and must also be in the fleet registry.
@@ -220,76 +224,134 @@ def _default_notify(board: Optional[str], body: str) -> None:
         _log.warning("kanban resource #logs notify failed (%s: %s)", type(exc).__name__, exc)
 
 
+def _norm_key(res: dict) -> tuple:
+    """(kind, id, host) with this box's own name folded to ``local``, so two cards that recorded
+    one resource under either name are seen as sharing it."""
+    host = str(res.get("host") or "").lower()
+    return (res.get("kind"), res.get("id"), "local" if host and _is_local(host) else host)
+
+
+def _live_keys(conn) -> set[tuple]:
+    """Resources still ``started`` on a card that has not finished: never ours to stop yet."""
+    keys: set[tuple] = set()
+    for row in conn.execute(
+        "SELECT r.resources FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.resources LIKE '%\"state\":\"started\"%' AND t.status NOT IN ('done', 'archived')"
+    ):
+        keys.update(_norm_key(r) for r in _load(row[0]) if r.get("state") == "started")
+    return keys
+
+
 def release_finished(
     conn, *, board: Optional[str] = None, runner: Callable[[list[str]], tuple[int, str]] = _default_runner,
     notify: Callable[[Optional[str], str], None] = _default_notify, dry_run: bool = False,
 ) -> list[dict]:
     """Stop (or mark kept) every ``started`` resource whose card is done/archived. Runs once per
-    dispatcher tick, outside the dispatch lock; the stop commands run with no DB transaction
-    open. Returns one action record per resource touched."""
+    dispatcher tick, outside the dispatch lock. Returns one action record per resource touched.
+
+    Three phases so overlapping sweeps and re-registrations stay safe:
+      1. claim (one write txn): each candidate goes ``started`` -> ``stopping`` with a fresh claim
+         token, so a second sweep never selects it; a resource another live card still has
+         ``started`` is left alone until its last owner finishes; keep-alive/refusals settle here;
+      2. stop (no txn open): one stop per resource, however many finished runs recorded it;
+      3. settle (one write txn): a result lands only on a record still holding our claim token. A
+         record re-registered meanwhile is a new generation and keeps its ``started`` state.
+    A claim older than ``STALE_CLAIM_S`` (its sweep died mid-stop) is claimable again."""
     from hermes_cli import kanban_db as kb
 
-    rows = conn.execute(
-        "SELECT r.id AS run_id, r.task_id, r.resources, t.body, t.status FROM task_runs r "
-        "JOIN tasks t ON t.id = r.task_id "
-        "WHERE r.resources LIKE '%\"state\":\"started\"%' AND t.status IN ('done', 'archived')"
-    ).fetchall()
+    now = int(time.time())
     actions: list[dict] = []
-    registry = fleet_hosts() if rows else frozenset()
-    for row in rows:
-        keep = keep_alive_reason(row["body"])
-        items = _load(row["resources"])
-        changed = False
-        for res in items:
-            if res.get("state") != "started" or res.get("kind") not in STOP_VERBS:
-                continue
-            act = {"task_id": row["task_id"], "run_id": int(row["run_id"]), "kind": res["kind"],
-                   "id": res.get("id"), "host": res.get("host")}
-            if keep:
-                act.update(action="kept", reason=keep)
-                if not dry_run:
-                    res.update(state="kept", kept_reason=keep[:200], released_at=int(time.time()))
-            elif (why := (None if _TOKEN_RE.match(str(res.get("id") or "")) else f"resource id {res.get('id')!r} "
-                          "is not a plain token") or host_refusal(res.get("host"), registry)):
-                # A row planted past registration: never run it, leave it open for closeout.
-                act.update(action="stop_failed", error=f"refused: {why}"[:240])
-                if not dry_run:
+    plans: dict[tuple, dict] = {}
+    txn = contextlib.nullcontext() if dry_run else kb.write_txn(conn)
+    with txn:
+        rows = conn.execute(
+            "SELECT r.id AS run_id, r.task_id, r.resources, t.body FROM task_runs r "
+            "JOIN tasks t ON t.id = r.task_id "
+            "WHERE (r.resources LIKE '%\"state\":\"started\"%' OR r.resources LIKE '%\"state\":\"stopping\"%') "
+            "AND t.status IN ('done', 'archived')"
+        ).fetchall()
+        live = _live_keys(conn) if rows else set()
+        registry = fleet_hosts() if rows else frozenset()
+        for row in rows:
+            run_id, keep = int(row["run_id"]), keep_alive_reason(row["body"])
+            items = _load(row["resources"])
+            settled: list[dict] = []
+            changed = False
+            for res in items:
+                state = res.get("state")
+                if res.get("kind") not in STOP_VERBS or state not in ("started", "stopping"):
+                    continue
+                if state == "stopping" and now - int(res.get("claimed_at") or 0) < STALE_CLAIM_S:
+                    continue  # another sweep holds it
+                act = {"task_id": row["task_id"], "run_id": run_id, "kind": res["kind"],
+                       "id": res.get("id"), "host": res.get("host")}
+                key = _norm_key(res)
+                if keep:
+                    act.update(action="kept", reason=keep)
+                    res.update(state="kept", kept_reason=keep[:200], released_at=now)
+                elif (why := (None if _TOKEN_RE.match(str(res.get("id") or "")) else f"resource id {res.get('id')!r} "
+                              "is not a plain token") or host_refusal(res.get("host"), registry)):
+                    # A row planted past registration: never run it, leave it open for closeout.
+                    act.update(action="stop_failed", error=f"refused: {why}"[:240])
                     res.update(state="stop_failed", last_error=act["error"])
-            else:
-                argv = _stop_argv(res)
-                act["argv"] = argv
-                if dry_run:
-                    act["action"] = "would_stop"
+                elif key in live:
+                    _log.info("kanban resource %s kept running: a live card still owns it", key)
+                    continue
                 else:
-                    rc, tail = runner(argv)
-                    res["stop_attempts"] = int(res.get("stop_attempts") or 0) + 1
+                    token = secrets.token_hex(8)
+                    res.update(state="stopping", claim=token, claimed_at=now)
+                    plan = plans.setdefault(key, {"argv": _stop_argv(res), "members": []})
+                    act["argv"] = plan["argv"]
+                    plan["members"].append((run_id, row["task_id"], token, act))
+                    if dry_run:
+                        act["action"] = "would_stop"
+                        actions.append(act)
+                    changed = True
+                    continue
+                settled.append(act)
+                changed = True
+            actions.extend(settled)
+            if changed and not dry_run:
+                conn.execute("UPDATE task_runs SET resources = ? WHERE id = ?", (_dump(items), run_id))
+                for act in settled:
+                    kb._append_event(conn, act["task_id"], f"resource_{act['action']}",
+                                     {k: act[k] for k in ("kind", "id", "host", "reason", "error") if k in act},
+                                     run_id=run_id)
+    if dry_run:
+        return actions
+
+    results = {key: runner(plan["argv"]) for key, plan in plans.items()}
+
+    stopped_acts: list[dict] = []
+    if plans:
+        with kb.write_txn(conn):
+            for key, plan in plans.items():
+                rc, tail = results[key]
+                for run_id, task_id, token, act in plan["members"]:
+                    items = _load(conn.execute("SELECT resources FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0])
+                    mine = next((r for r in items if r.get("claim") == token), None)
+                    if mine is None:
+                        continue  # re-registered while the stop ran: that generation is not ours to settle
+                    mine.pop("claim", None)
+                    mine.pop("claimed_at", None)
+                    mine["stop_attempts"] = int(mine.get("stop_attempts") or 0) + 1
                     if rc == 0:
-                        res.update(state="stopped", released_at=int(time.time()))
+                        mine.update(state="stopped", released_at=int(time.time()))
                         act["action"] = "stopped"
                     else:
-                        res["last_error"] = f"rc={rc} {tail}"[:240]
-                        if res["stop_attempts"] >= MAX_STOP_ATTEMPTS:
-                            res["state"] = "stop_failed"
-                        act.update(action="stop_failed" if res["state"] == "stop_failed" else "retry",
-                                   error=res["last_error"])
-            actions.append(act)
-            changed = changed or not dry_run
-        if not changed:
-            continue
-        with kb.write_txn(conn):
-            # Re-read under the write lock: a concurrent registration on the same run must survive.
-            cur = _load(conn.execute("SELECT resources FROM task_runs WHERE id = ?", (row["run_id"],)).fetchone()[0])
-            ours = {(r.get("kind"), r.get("id"), r.get("host")): r for r in items}
-            merged = [ours.get((r.get("kind"), r.get("id"), r.get("host")), r)
-                      if r.get("state") == "started" else r for r in cur]
-            conn.execute("UPDATE task_runs SET resources = ? WHERE id = ?", (_dump(merged), row["run_id"]))
-            for act in actions:
-                if act["run_id"] == int(row["run_id"]) and act["action"] != "retry":
-                    kb._append_event(conn, row["task_id"], f"resource_{act['action']}",
-                                     {k: act[k] for k in ("kind", "id", "host", "reason", "error") if k in act},
-                                     run_id=int(row["run_id"]))
+                        mine["last_error"] = f"rc={rc} {tail}"[:240]
+                        mine["state"] = "stop_failed" if mine["stop_attempts"] >= MAX_STOP_ATTEMPTS else "started"
+                        act.update(action="stop_failed" if mine["state"] == "stop_failed" else "retry",
+                                   error=mine["last_error"])
+                    conn.execute("UPDATE task_runs SET resources = ? WHERE id = ?", (_dump(items), run_id))
+                    if act["action"] != "retry":
+                        kb._append_event(conn, task_id, f"resource_{act['action']}",
+                                         {k: act[k] for k in ("kind", "id", "host", "error") if k in act},
+                                         run_id=run_id)
+                    stopped_acts.append(act)
+    actions.extend(stopped_acts)
     for act in actions:
-        if dry_run or act["action"] == "retry":
+        if act["action"] == "retry":
             continue
         what = f"{act['kind']} `{act['id']}` on {act['host']}"
         line = {
