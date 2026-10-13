@@ -101,6 +101,30 @@ def test_served_ultrafast_bills_at_the_ultrafast_row_and_requested_only_does_not
         assert ultra.amount_usd == standard.amount_usd * 6  # every bucket, both context tiers
 
 
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "openai/gpt-6.1-sol", "gpt-6.1-sol-900k"])
+def test_served_ultrafast_gpt_6_1_sol_is_priced_not_unknown(model):
+    # hermes-agent#1965 lets the harness request Ultrafast for gpt-6.1-sol; a served-ultrafast turn must price.
+    for prompt_uncached in (50_000, 400_000):
+        ultra = estimate_usage_cost(model, _usage(prompt_uncached, "ultrafast"), provider="openai-api")
+        assert ultra.status == "estimated", ultra.notes
+        assert ultra.pricing_version == _OPENAI_ULTRAFAST_PRICING["gpt-6.1-sol"].pricing_version
+        assert ultra.amount_usd == estimate_usage_cost(model, _usage(prompt_uncached), provider="openai-api").amount_usd * 6
+
+
+def test_every_ultrafast_row_is_six_times_its_standard_row():
+    # Drift pin: the Standard rows are linted weekly against models.dev (usage-pricing-drift), so a Standard
+    # list-price move that is not mirrored here (or an Ultrafast row edited alone) fails this relationship.
+    from agent.usage_pricing import _OFFICIAL_DOCS_PRICING
+
+    fields = ("input_cost_per_million", "output_cost_per_million", "cache_read_cost_per_million",
+              "cache_write_cost_per_million")
+    for model, ultra in _OPENAI_ULTRAFAST_PRICING.items():
+        standard = _OFFICIAL_DOCS_PRICING[("openai", model)]
+        assert ultra.tier_threshold_tokens == standard.tier_threshold_tokens, model
+        for field in fields + tuple(f"{f}_above" for f in fields):
+            assert getattr(ultra, field) == getattr(standard, field) * 6, (model, field)
+
+
 def test_served_ultrafast_on_a_model_without_a_published_rate_is_unknown():
     assert estimate_usage_cost("gpt-6-sol", _usage(1_000, "ultrafast"), provider="openai-api").status == "unknown"
 
