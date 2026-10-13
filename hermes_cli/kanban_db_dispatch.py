@@ -417,6 +417,11 @@ class DispatchResult:
     """``(task_id, ready_seconds, hold_reason)`` for ready cards past
     ``PRIORITY_STARVATION_SECONDS`` while a lower-priority card was admitted
     since they went ready; see :func:`find_priority_starved`."""
+    placement_rerouted: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, host)`` for capability blocks on a misplaced run that this tick
+    pinned to ``host`` and returned to the queue (:mod:`kanban_placement_block`)."""
+    placement_unroutable: list[str] = field(default_factory=list)
+    """Placement blocks this tick could not re-route; kanban-placement-watch pages them."""
     unwoken_scheduled: list[tuple[str, int]] = field(default_factory=list)
     """``(task_id, parked_seconds)`` for ``scheduled`` cards with NO timed wake
     parked past ``SCHEDULED_UNWOKEN_THRESHOLD_SECONDS`` — nothing will ever
@@ -4004,6 +4009,18 @@ def _run_reclaim_phase(
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
+def _reroute_placement_blocks(conn, result) -> None:
+    """Capability blocks on misplaced runs go back to the queue pinned to a host
+    that has the capability (t_a32116ec). Never breaks a tick."""
+    try:
+        from hermes_cli import kanban_placement_block as _kpb
+        from hermes_cli import kanban_worker_pool as _kwp
+        pool = _kwp.read_pool(_kb.kanban_home() / "fleet")
+        result.placement_rerouted, result.placement_unroutable = _kpb.reroute_placement_blocks(conn, pool)
+    except Exception:
+        _kb._log.warning("kanban dispatch: placement-block re-route failed", exc_info=True)
+
+
 def _native_command_profile(assignee: str, cache: dict) -> bool:
     """The assignee's profile sets ``foreign_lane.worker_command``: its lane
     runs as a LOCAL Popen, so it can never be placed (cached per tick)."""
@@ -5007,6 +5024,7 @@ def _dispatch_once_locked(
     # done is spawnable this tick. Skipped under dry_run (the SAFE probe).
     if not dry_run:
         result.woken_scheduled = _kb.wake_due_scheduled(conn)
+        _reroute_placement_blocks(conn, result)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
     # Explicit human holds whose graph dependencies are already satisfied.
     # Computed after promotion so creation-source dependency holds have left
