@@ -780,6 +780,12 @@ class GatewaySlashCommandsMixin(
                         reason, session_key, len(fallback_keys), ", ".join(fallback_keys))
             return EphemeralReply(t("gateway.stop.stopped"))
 
+        # Idle /stop also blocks future automatic arrivals, without double-cancelling children.
+        from gateway import queue_mgmt
+        self._session_state(session_key).conversation.automatic_turns_paused = True
+        queue_mgmt.hold_user_items(self, session_key, self._delivery_adapter_for(source))
+        await self._mark_user_stopped(session_key)
+
         # Detached delegations can outlive the parent turn, leaving no resident
         # agent even though this session still owns cancellable work.
         try:

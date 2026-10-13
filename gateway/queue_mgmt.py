@@ -95,18 +95,18 @@ def rewrite_active(runner: Any, key: str, adapter: Any, items: List[Any], *, arm
 
 
 def hold_user_items(runner: Any, key: str, adapter: Any) -> int:
-    """D14: move every user item from the active store to ``held_queue`` (order kept); system
-    events stay active exactly where they were. Returns the number of held items now."""
+    """Hold user items, plus automatic events while /stop is latched. Preserve FIFO."""
     # Runs inside /stop: must never raise and never lose an item. Copy into held FIRST, then strip
     # the active store; if the strip fails, roll the copy back so nothing is in both or neither.
     try:
         active = active_items(runner, key, adapter)
-        users = [e for e in active if not is_system_event(runner, e)]
+        paused = runner._session_state(key).conversation.automatic_turns_paused is True
+        users = [e for e in active if paused or not is_system_event(runner, e)]
         if users:
             held_store = runner._session_state(key).conversation.held_queue
             before = len(held_store)
             held_store.extend(users)
-            if not rewrite_active(runner, key, adapter, [e for e in active if is_system_event(runner, e)]):
+            if not rewrite_active(runner, key, adapter, [e for e in active if not paused and is_system_event(runner, e)]):
                 del held_store[before:]
                 return before
             logger.info("queue_mgmt op=hold session=%s moved=%d held=%d", key, len(users), len(held_store))
@@ -114,6 +114,37 @@ def hold_user_items(runner: Any, key: str, adapter: Any) -> int:
     except Exception:
         logger.warning("queue_mgmt hold failed for %s; queue left as-is", key, exc_info=True)
         return 0
+
+
+async def gate_stopped_event(runner: Any, key: str, event: Any, adapter: Any) -> bool:
+    """Park automatic arrivals after /stop; only a human turn resumes automatic work."""
+    state = runner._session_state(key).conversation
+    if state.automatic_turns_paused is None:
+        store = getattr(runner, "session_store", None)
+        if store is not None:
+            entry = await runner.async_session_store.lookup_by_session_key(key)
+            # A concurrent /stop wins over this read.
+            if state.automatic_turns_paused is None:
+                state.automatic_turns_paused = bool(entry and entry.user_stopped_at is not None)
+    if state.automatic_turns_paused is not True:
+        return False
+    if is_system_event(runner, event):
+        state.held_queue.append(event)
+        logger.info("queue_mgmt op=hold_wake session=%s held=%d", key, len(state.held_queue))
+        return True
+    if event.get_command():
+        return False
+    # Clear durable intent before releasing events. A newer stop wins during this await.
+    generation = runner._session_state(key).persistent.run_generation
+    await runner.async_session_store.clear_user_stopped(key)
+    if runner._session_state(key).persistent.run_generation != generation:
+        return False
+    wakes = [e for e in state.held_queue if is_system_event(runner, e)]
+    if wakes and not rewrite_active(runner, key, adapter, active_items(runner, key, adapter) + wakes):
+        raise RuntimeError("Cannot resume held notifications: adapter queue unavailable")
+    state.held_queue[:] = [e for e in state.held_queue if not is_system_event(runner, e)]
+    state.automatic_turns_paused = False
+    return False
 
 
 # --------------------------------------------------------------------------- verbs
@@ -309,12 +340,12 @@ def restage_held(runner: Any, key: str, adapter: Any) -> Optional[int]:
     ``_queue_released`` so the inbound FIFO rescue never reorders the rest ahead of it (D1)."""
     held = held_list(runner, key)
     active = active_items(runner, key, adapter)
-    system = [e for e in active if is_system_event(runner, e)]
-    later_users = [e for e in active if not is_system_event(runner, e)]
-    users = list(held or []) + later_users
-    if not users:
+    combined = list(held or []) + active
+    system = [e for e in combined if is_system_event(runner, e)]
+    users = [e for e in combined if not is_system_event(runner, e)]
+    if not users and not system:
         return 0
-    released = len(users)
+    released = len(users) + len(system)
     if release_mode(runner) == "merged" and len(users) > 1:
         users = [merge_user_events(users)]
     for e in users:
@@ -343,7 +374,15 @@ async def release(runner: Any, key: str, source: Any, adapter: Any, *, busy: boo
         from gateway.run import _INTERRUPT_REASON_STOP
         await runner._interrupt_and_clear_session(
             key, source, interrupt_reason=_INTERRUPT_REASON_STOP, invalidation_reason="queue_run")
+    state = runner._session_state(key).conversation
+    generation = runner._session_state(key).persistent.run_generation
+    if state.automatic_turns_paused is True:
+        await runner.async_session_store.clear_user_stopped(key)
+        if runner._session_state(key).persistent.run_generation != generation:
+            return t("gateway.queue.unavailable")
     count = restage_held(runner, key, adapter)
+    if count is not None:
+        state.automatic_turns_paused = False
     if count is None:
         return t("gateway.queue.unavailable")
     if not count:
@@ -357,9 +396,13 @@ def stop_reply_suffix(runner: Any, key: str, adapter: Any) -> str:
     Part of the /stop reply: never raises (an empty suffix beats a failed /stop)."""
     try:
         held = held_list(runner, key) or []
+        if runner._session_state(key).conversation.automatic_turns_paused is True:
+            return "\nAutomatic work is paused. Send a message or /queue run to resume." + (
+                "\n" + t("gateway.stop.queue_held", count=len(held)) if held else "")
         if not held:
             return ""
-        if getattr(runner, "_stop_releases_queue", False) is True:
+        if (getattr(runner, "_stop_releases_queue", False) is True
+                and runner._session_state(key).conversation.automatic_turns_paused is not True):
             count = restage_held(runner, key, adapter)
             if count:
                 return "\n" + t("gateway.stop.queue_released", count=count)
