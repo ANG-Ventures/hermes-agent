@@ -188,3 +188,29 @@ def test_unusable_configured_fallback_fails_loud_without_retry():
     assert result["final_response"]
     assert call.call_count == 1
     assert sum(sleeps) == 0
+
+
+def test_long_quota_stays_exhausted_when_capacity_policy_widens_ceiling():
+    agent = make_agent([])
+    agent._capacity_retry_attempts = 10
+    agent._capacity_retry_max_wait_s = 3600
+    sleeps = []
+    result, _, call, attempts = run(agent, quota_error(cls="quota_model"), sleeps)
+    assert result["completed"] is True
+    assert [p for p, _ in attempts] == ["claude-alr", "claude-dtlr"]
+    assert call.call_count == 2
+    assert sum(sleeps) == 0
+
+
+@pytest.mark.parametrize("body", [
+    {"relay_error_class": "quota_seat", "error": {"message": "quota"}},
+    {"error": {"relay_error_class": "quota_seat", "message": "quota"}},
+])
+def test_structured_stream_class_with_retry_header_uses_same_handoff(body):
+    agent = make_agent([])
+    sleeps = []
+    result, _, call, attempts = run(agent, RelayError(200, body, {"retry-after": "1783"}), sleeps)
+    assert result["completed"] is True
+    assert [p for p, _ in attempts] == ["claude-alr", "claude-dtlr"]
+    assert call.call_count == 2
+    assert sum(sleeps) == 0
