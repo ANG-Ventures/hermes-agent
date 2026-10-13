@@ -65,6 +65,14 @@ def test_named_host_that_cannot_take_it_is_unroutable(reason, placed, why):
     assert action == "unroutable" and why in detail
 
 
+def test_named_host_that_does_not_serve_the_assignee_is_unroutable():
+    action, detail = kpb.classify(kind="capability", reason=NAMED_AI, placed_host="ci-box", body="x",
+                                  pool=POOL, rerouted_before=False, assignee="beta")
+    assert action == "unroutable" and "does not serve profile beta" in detail
+    assert kpb.classify(kind="capability", reason=NAMED_AI, placed_host="ci-box", body="x",
+                        pool=POOL, rerouted_before=False, assignee="alpha") == ("reroute", "ace-ai")
+
+
 def test_second_capability_block_after_a_reroute_is_unroutable():
     assert _c(CI_BOX_REASON, again=True)[0] == "unroutable"
 
@@ -202,6 +210,20 @@ def test_studio_rerouted_card_blocking_again_with_generic_reason_is_recorded_unr
         assert kb.claim_task(conn, tid, claimer="alpha") is not None
         assert kb.block_task(conn, tid, reason="Required tool is unavailable.", kind="capability")
         assert _tick(conn).placement_unroutable == [tid]
+
+
+def test_failed_unblock_leaves_the_card_blocked_unpinned_and_unmarked(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = _placed_block(conn, "drain", CI_BOX_REASON)
+        before = conn.execute("SELECT body FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        real = kb.unblock_task
+        monkeypatch.setattr(kb, "unblock_task", lambda *a, **kw: False)
+        assert _tick(conn).placement_rerouted == []
+        row = conn.execute("SELECT status, body FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert (row["status"], row["body"]) == ("blocked", before)
+        assert _events(conn, tid, kpb.REROUTED_EVENT) == []
+        monkeypatch.setattr(kb, "unblock_task", real)
+        assert _tick(conn).placement_rerouted == [(tid, "studio")]      # retried, not escalated
 
 
 def test_human_question_blocks_are_untouched(kanban_home):

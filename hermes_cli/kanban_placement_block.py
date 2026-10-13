@@ -60,7 +60,7 @@ def _reason_pin(reason: str, pool) -> Optional[str]:
 
 
 def classify(*, kind: Optional[str], reason: str, placed_host: Optional[str], body: Optional[str],
-             pool, rerouted_before: bool) -> Optional[Tuple[str, str]]:
+             pool, rerouted_before: bool, assignee: Optional[str] = None) -> Optional[Tuple[str, str]]:
     """``("reroute", host)``, ``("unroutable", why)`` or None (not a placement block).
 
     ``placed_host`` is the pool host of the blocked run's ``worker_placed`` event (None = local run).
@@ -90,12 +90,16 @@ def classify(*, kind: Optional[str], reason: str, placed_host: Optional[str], bo
         return "unroutable", f"the reason names host:{want}, the host that already failed"
     if want not in enabled:
         return "unroutable", f"the reason names host:{want}, which is not an enabled pool host"
+    serves = {h.name.lower(): tuple(getattr(h, "profiles", ()) or ()) for h in pool.pool_hosts}
+    if assignee and assignee not in serves.get(want, ()):
+        # PoolPlan.take() would refuse the pin with pin_profile on every tick: stranded in ready.
+        return "unroutable", f"host:{want} does not serve profile {assignee}"
     return "reroute", want
 
 
 def _latest_blocks(conn) -> list:
     return conn.execute(
-        "SELECT t.id, t.body, t.status, b.payload AS blk, b.run_id, b.created_at AS blocked_at, "
+        "SELECT t.id, t.body, t.status, t.assignee, b.payload AS blk, b.run_id, b.created_at AS blocked_at, "
         "(SELECT p.payload FROM task_events p WHERE p.run_id = b.run_id AND p.kind = ? "
         " ORDER BY p.id DESC LIMIT 1) AS placed, "
         "EXISTS(SELECT 1 FROM task_events r WHERE r.task_id = t.id AND r.kind = ?) AS rerouted, "
@@ -125,7 +129,8 @@ def reroute_placement_blocks(conn, pool, *, now: Optional[int] = None) -> Tuple[
         blk = _json(row["blk"])
         placed_host = _json(row["placed"]).get("host") if row["placed"] else None
         verdict = classify(kind=blk.get("kind"), reason=str(blk.get("reason") or ""), placed_host=placed_host,
-                           body=row["body"], pool=pool, rerouted_before=bool(row["rerouted"]))
+                           body=row["body"], pool=pool, rerouted_before=bool(row["rerouted"]),
+                           assignee=row["assignee"])
         if verdict is None:
             continue
         action, arg = verdict
@@ -145,19 +150,26 @@ def reroute_placement_blocks(conn, pool, *, now: Optional[int] = None) -> Tuple[
             continue
         pin_line = f"host: {arg}"
         new_body = f"{pin_line}\n{row['body'] or ''}"
-        with _kb.write_txn(conn):
-            # Compare-and-swap on the body read above: a concurrent edit is never overwritten; the card is
-            # reclassified on the next tick against the edited body.
-            cur = conn.execute("UPDATE tasks SET body = ? WHERE id = ? AND status = 'blocked' AND body IS ?",
-                               (new_body, tid, row["body"]))
-            if cur.rowcount != 1:
-                continue
-            _kb._append_event(conn, tid, REROUTED_EVENT,
-                              {"from_host": placed_host, "to_host": arg, "run_id": row["run_id"]})
         note = (f"placement re-route: run {row['run_id']} ran on {placed_host or 'a host'} and blocked "
                 f"kind=capability, so this card now carries `{pin_line}` (line 1) and is back in the queue. "
                 f"Once only: a second capability block pages #alerts instead. Reason was: "
                 f"{str(blk.get('reason') or '')[:300]}")
-        if _kb.unblock_task(conn, tid, comment=(AUTHOR, note, None, None)):
-            rerouted.append((tid, arg))
+        # Order is the atomicity (unblock_task owns its own write txn and cannot nest): the pin goes in with a
+        # compare-and-swap on the body read above (a concurrent edit is never overwritten), then the unblock,
+        # and the placement_rerouted marker ONLY after the unblock landed. A failed unblock reverts the pin
+        # under the same CAS, so the card stays blocked, unmarked, and is retried next tick, never escalated.
+        with _kb.write_txn(conn):
+            cur = conn.execute("UPDATE tasks SET body = ? WHERE id = ? AND status = 'blocked' AND body IS ?",
+                               (new_body, tid, row["body"]))
+            if cur.rowcount != 1:
+                continue
+        if not _kb.unblock_task(conn, tid, comment=(AUTHOR, note, None, None)):
+            with _kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET body = ? WHERE id = ? AND status = 'blocked' AND body IS ?",
+                             (row["body"], tid, new_body))
+            continue
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, tid, REROUTED_EVENT,
+                              {"from_host": placed_host, "to_host": arg, "run_id": row["run_id"]})
+        rerouted.append((tid, arg))
     return rerouted, unroutable
