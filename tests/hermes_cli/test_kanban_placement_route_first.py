@@ -509,3 +509,50 @@ def test_paused_tick_with_no_plan_still_records_holds(kanban_home):
         res, spawned = _tick(conn, spillover=None, spawn_limit=0, spawn_paused="test")
         assert spawned == []
         assert res.placement_waits == {t: "local_full" for t in ids}
+
+
+# -- wait-episode boundaries (Prism P2 residue of #1907, t_74441abc) ----------
+
+def test_cleared_wait_ends_the_episode_for_flap_detection(kanban_home, monkeypatch):
+    """Prism 5ff168657c9a: the affinity writer's ``{cleared: true}`` ends the
+    episode, so A, B, cleared, A is a new A hold, never a ``flapping`` row."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1)
+        _hold(conn, monkeypatch, tid, "pool_full")
+        _hold(conn, monkeypatch, tid, "local_full")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "placement_wait", {"cleared": True})
+        _hold(conn, monkeypatch, tid, "pool_full")
+        evs = _events(conn, tid, "placement_wait")
+        assert [e.get("code") for e in evs] == ["pool_full", "local_full", None, "pool_full"]
+        assert abs(evs[-1]["since"] - int(__import__("time").time())) <= 2
+
+
+def test_later_gate_clears_the_open_wait(kanban_home, monkeypatch):
+    """Prism 8db25fd42347: a row held local_full that later gets a slot but is
+    stopped by the respawn guard no longer reads as held local_full."""
+    from hermes_cli import kanban_placement_view as kpv
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1)
+        _tick(conn, spillover=None, spawn_limit=0, spawn_paused="test")
+        assert [e["code"] for e in _events(conn, tid, "placement_wait")] == ["local_full"]
+        monkeypatch.setattr(kbd, "check_respawn_guard", lambda *a, **k: "active_pr")
+        res, spawned = _tick(conn, spillover=None, spawn_limit=4)
+        assert spawned == [] and res.respawn_guarded == [(tid, "active_pr")]
+        assert _events(conn, tid, "placement_wait")[-1] == {"cleared": True}
+        assert tid not in {h["task_id"] for h in kpv._held(conn)}
+        _tick(conn, spillover=None, spawn_limit=4)  # guard still on: no second clear
+        assert _count(conn, "placement_wait", [tid]) == 2
+
+
+def test_linked_hold_changing_edge_is_a_new_row(kanban_home, monkeypatch):
+    """Prism 01bdaad47969: ``not_portable:linked(<edge>)`` is held by that
+    edge; a different edge inside the window is a new row, not a duplicate."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1)
+        _hold(conn, monkeypatch, tid, "not_portable:linked(blocks->t_a)")
+        _hold(conn, monkeypatch, tid, "not_portable:linked(blocks->t_a)")
+        _hold(conn, monkeypatch, tid, "not_portable:linked(blocks->t_b)")
+        evs = _events(conn, tid, "placement_wait")
+        assert [e["detail"] for e in evs] == ["blocks->t_a", "blocks->t_b"]
+        assert {e["code"] for e in evs} == {"not_portable:linked"}
