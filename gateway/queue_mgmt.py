@@ -21,6 +21,7 @@ normally; held items keep waiting). ``/queue list`` shows those in a second, unn
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any, List, Optional, Tuple
 
@@ -271,8 +272,17 @@ def release_mode(runner: Any) -> str:
 def merge_user_events(events: List[Any]) -> Any:
     """One event carrying every user prompt of ``events`` in order (follow-up spec D3): texts joined
     by a blank line, media concatenated, the FIRST item's identity/reply anchor kept. The merged
-    event is the first item mutated in place, so its source/thread metadata survive."""
-    head = events[0]
+    event is a shallow copy of the first item (source/thread metadata survive) with fresh media
+    lists, so ``events`` stay untouched until the caller commits the rewrite."""
+    head = copy.copy(events[0])
+    head.media_urls = list(getattr(head, "media_urls", None) or [])
+    head.media_types = list(getattr(head, "media_types", None) or [])
+    if hasattr(head, "media_text_inlined"):
+        head.media_text_inlined = list(head.media_text_inlined or [])
+    # The derived STT cache describes the head alone and dispatch prefers it over ``text``: drop it
+    # so the merged turn re-derives from every item (same rule as the adapter merge in base.py).
+    for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
+        head.__dict__.pop(attr, None)
     texts = [str(getattr(e, "text", "") or "").strip() for e in events]
     head.text = MERGE_SEPARATOR.join(t for t in texts if t)
     for e in events[1:]:
