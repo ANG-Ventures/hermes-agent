@@ -77,6 +77,10 @@ UNSATISFIED = "requires_unsatisfied"
 
 REQUIRES_RE = re.compile(r"^[ \t]*requires:[ \t]*(.*?)[ \t]*\r?$", re.IGNORECASE | re.MULTILINE)
 _WORD_SPLIT_RE = re.compile(r"[,\s]+")
+# A trailing human note on the line (``requires: none — API only``,
+# ``requires: browser-session (cart)``, ``# why``) is not a capability word:
+# without the cut, ``api``/``only`` read as unknown words and hold the card.
+_REQUIRES_NOTE_RE = re.compile(r"\s(?:—|–|--|#)|[(#]")
 _PLAIN_RE = re.compile(r"[a-z][a-z0-9-]{0,62}")
 
 
@@ -379,7 +383,8 @@ def declared_words(body: Optional[str]) -> List[str]:
     """Every word on every line-anchored ``requires:`` line, lower-cased."""
     out: List[str] = []
     for m in REQUIRES_RE.finditer(body or ""):
-        for w in _WORD_SPLIT_RE.split(m.group(1).strip().strip("`").lower()):
+        value = _REQUIRES_NOTE_RE.split(m.group(1), maxsplit=1)[0]
+        for w in _WORD_SPLIT_RE.split(value.strip().strip("`").lower()):
             w = w.strip("`'\".;")
             if w and w not in out:
                 out.append(w)

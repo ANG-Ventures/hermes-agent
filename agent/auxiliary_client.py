@@ -807,7 +807,7 @@ def _is_codex_gpt54_or_gpt55(model: Optional[str], provider: Optional[str] = Non
     Other routes expose a larger window for the same slug and keep the user's threshold.
     Prefix-matched so ``-pro`` and dated snapshots track every 272K-capped family; ``-900k``
     picker variants are excluded. Astra is substring-matched (any slug containing ``astra``
-    without ``900k``). Name kept for the ``compression.codex_gpt55_autoraise`` key.
+    without ``900k``). Consulted only when ``compression.per_model_builtins`` is on.
     """
     bare = _codex_route_bare_model(model, provider)
     if bare is None:
@@ -873,18 +873,32 @@ def _fixed_temperature_for_model(
     return 0.5 if _is_arcee_trinity_thinking(model) else None
 
 
-def _compression_threshold_for_model(
-    model: Optional[str], provider: Optional[str] = None, *,
-    allow_codex_gpt55_autoraise: bool = True,
-) -> Optional[float]:
-    """Per-model/route compression threshold override (fraction of context used), or None.
+def per_model_builtins_enabled(compression_cfg: Any) -> bool:
+    """``compression.per_model_builtins``: whether the built-in per-model thresholds apply.
 
-    Arcee Trinity Large Thinking → 0.75 (preserve reasoning context); Codex-route gpt-5.4/5.5/5.6/Astra
-    → 0.85, gated by ``allow_codex_gpt55_autoraise``; Codex-route gpt-5.3-codex-spark → 0.70, ungated.
+    Default False: every model uses the universal ``compression.threshold`` (Ace ruling
+    2026-10-12, "I want it to be universal"). ``codex_gpt55_autoraise`` is read as a legacy
+    alias when the new key is unset; it now gates every built-in family, not only gpt-5.5.
+    """
+    cfg = compression_cfg if isinstance(compression_cfg, dict) else {}
+    value = cfg.get("per_model_builtins")
+    if value is None:
+        value = cfg.get("codex_gpt55_autoraise")
+    return value is not None and str(value).strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _compression_threshold_for_model(
+    model: Optional[str], provider: Optional[str] = None,
+) -> Optional[float]:
+    """Legacy built-in per-model/route compression threshold (fraction of context used), or None.
+
+    Arcee Trinity Large Thinking → 0.75; Codex-route gpt-5.4/5.5/5.6/Astra → 0.85; Codex-route
+    gpt-5.3-codex-spark → 0.70. Callers consult this table only when
+    ``per_model_builtins_enabled`` is True.
     """
     if _is_arcee_trinity_thinking(model):
         return 0.75
-    if allow_codex_gpt55_autoraise and _is_codex_gpt54_or_gpt55(model, provider):
+    if _is_codex_gpt54_or_gpt55(model, provider):
         return _CODEX_GPT54_GPT55_COMPACTION_THRESHOLD
     if _is_codex_spark(model, provider):
         return _CODEX_SPARK_COMPACTION_THRESHOLD
@@ -897,13 +911,14 @@ def resolve_compression_threshold(
     provider: Optional[str] = None,
     *,
     global_threshold: float = 0.50,
-    allow_codex_gpt55_autoraise: bool = True,
+    per_model_builtins: bool = False,
 ) -> float:
     """Resolve the compression threshold fraction for a model, applying the
     canonical precedence chain (first hit wins):
 
       1. config ``compression.per_model_threshold`` map (user-tunable)
-      2. built-in per-model / route default (``_compression_threshold_for_model``)
+      2. built-in per-model / route default (``_compression_threshold_for_model``), only when
+         ``per_model_builtins`` (config ``compression.per_model_builtins``, default False)
       3. global ``compression.threshold`` (``global_threshold``)
 
     This is the single source of truth shared by ``agent_init`` (session start)
@@ -921,9 +936,7 @@ def resolve_compression_threshold(
     if cfg_thresh is not None:
         return cfg_thresh
 
-    builtin = _compression_threshold_for_model(
-        model, provider, allow_codex_gpt55_autoraise=allow_codex_gpt55_autoraise,
-    )
+    builtin = _compression_threshold_for_model(model, provider) if per_model_builtins else None
     if builtin is not None:
         return builtin
 

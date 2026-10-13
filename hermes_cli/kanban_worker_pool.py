@@ -7,7 +7,8 @@ Hosts come from two files under the fleet root (``<kanban_home>/fleet``):
 * ``fleet-roles.json``: role ``kanban-worker`` = ``{"slots": N}`` (schema 1,
   the same validators as the CI and Prism readers);
 * ``kanban-pool.json``: the kanban sidecar (``priority``, ``capacity_pct``,
-  ``profiles``, ``studio_bound_skills``, ``hosts.<id>.{enabled, absence,
+  ``studio_only`` (deny-list: every other profile is a pool profile) or the
+  legacy ``profiles`` allow-list, ``studio_bound_skills``, ``hosts.<id>.{enabled, absence,
   capacity_pct?, profiles?}``, ``ssh_user`` locked to ``kanbanw``). Written
   only by hermes-home ``scripts/fleet-host``.
 
@@ -75,7 +76,7 @@ _ROLES_ROW = frozenset({"roles", "state"})
 # change); validated by the router's registry, never read for placement here.
 _ROLES_ROW_OPTIONAL = frozenset({"last_change"})
 _SIDECAR_TOP = frozenset({"_doc", "schema", "ssh_user", "capacity_pct", "priority",
-                          "profiles", "studio_bound_skills", "hosts"})
+                          "profiles", "studio_only", "studio_bound_skills", "hosts"})
 _SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles"})
 _ABSENCE = ("required", "optional")
 _STATES = ("active", "draining")
@@ -242,7 +243,7 @@ def validate_sidecar(doc) -> List[str]:
         errs.append(f"ssh_user must be {SSH_USER!r} (locked), not {doc.get('ssh_user')!r}")
     if "capacity_pct" in doc and not _pct(doc["capacity_pct"]):
         errs.append(f"capacity_pct must be in (0, 1], not {doc['capacity_pct']!r}")
-    for key in ("profiles", "studio_bound_skills"):
+    for key in ("profiles", "studio_only", "studio_bound_skills"):
         if key in doc and not _str_list(doc[key]):
             errs.append(f"{key} must be a list of non-empty strings")
     prio = doc.get("priority")
@@ -276,6 +277,19 @@ def _read_json(path: Path):
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def derived_profiles(profiles_dir: Path, studio_only: Iterable[str]) -> Tuple[str, ...]:
+    """Pool profiles under the deny-list (t_7b1eca07): every named profile with a
+    ``config.yaml`` under ``profiles_dir``, minus ``studio_only``, sorted. A
+    native-command lane in the result is still refused by ``portable()``."""
+    deny = {s.strip().lower() for s in studio_only or ()}
+    try:
+        names = sorted(p.name for p in Path(profiles_dir).iterdir()
+                       if not p.name.startswith(".") and (p / "config.yaml").is_file())
+    except OSError:
+        return ()
+    return tuple(n for n in names if n.lower() not in deny)
 
 
 def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolConfig:
@@ -316,6 +330,13 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
     prio: List[str] = sidecar["priority"]
     rows: dict = sidecar["hosts"]
     gprofiles = tuple(sidecar.get("profiles") or ())
+    # studio_only binds EVERY list a host serves, per-host overrides included,
+    # so no row can re-admit a denied profile (Prism 34f523dde2d6).
+    deny = {s.strip().lower() for s in sidecar.get("studio_only") or ()}
+    if "studio_only" in sidecar:
+        # Deny-list (t_7b1eca07): every live profile is a pool profile unless the
+        # sidecar keeps it on the Studio, so a new profile never lands Studio-bound.
+        gprofiles = derived_profiles(fleet_dir.parent / "profiles", sidecar["studio_only"])
     gcap = float(sidecar.get("capacity_pct", DEFAULT_CAPACITY))
     warnings: List[str] = []
     hosts: List[PoolHost] = []
@@ -341,7 +362,8 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         hosts.append(PoolHost(
             name=hid, ssh_host=hid, ssh_user=SSH_USER, slots=role_slots[ROLE],
             capacity_pct=float(row.get("capacity_pct", gcap)), absence=row["absence"],
-            profiles=tuple(row.get("profiles", gprofiles)), state=state, enabled=True,
+            profiles=tuple(p for p in row.get("profiles", gprofiles) if p.lower() not in deny),
+            state=state, enabled=True,
             priority=i,
         ))
     for hid in rows:
@@ -1004,6 +1026,7 @@ class HostSample:
     remote_now: Optional[float] = None
     pressure_text: str = ""
     boards: Optional[frozenset] = None
+    load5: Optional[float] = None
 
 
 # ncpu = online cores (KWLB D-3), not ``nproc``: load1 counts every runnable
@@ -1075,7 +1098,12 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
         remote_now: Optional[float] = float(lines[2].strip())
     except (IndexError, ValueError):
         remote_now = None
-    return HostSample(load1, ncpu, remote_now, "\n".join(lines[3:]).strip(), boards)
+    try:
+        load5: Optional[float] = float(lines[0].split()[1])
+    except (IndexError, ValueError):
+        load5 = None
+    return HostSample(load1, ncpu, remote_now, "\n".join(lines[3:]).strip(), boards,
+                      load5=load5)
 
 
 # -- per-(host, board) workspace faults (t_9fb4d477) --------------------------
@@ -1126,6 +1154,12 @@ class TargetSignal:
     # the memory/band cap is computed and reported only (D1: Ace's yes flips it).
     admit_on_memory: bool = False
     reservation_gb: float = _admission.DEFAULT_RESERVATION_GB
+    # The ONE placement scorer (t_d6ce856e): <root>/config/fleet-hosts.json and
+    # the headroom reservation ledger. None = no table: the band pick below.
+    placement_table: Any = None
+    placement_reservations: Optional[Path] = None
+    # A fixed headroom-ledger read (diagnostics); None = read per pick.
+    placement_live: Optional[Mapping[str, Any]] = None
 
     def kanban_cpu_est(self) -> float:
         if self.cpu_est is not None and self.cpu_est > 0:
@@ -1237,12 +1271,21 @@ class SpilloverPlan:
     config: PoolConfig = field(default_factory=PoolConfig)  # what portable() reads
     band: Optional[str] = None           # the Studio gate band this tick
     spill_reason: Optional[str] = None
-    pins_only: bool = False              # admitting band: remote PINS only (PRD 5.2.5)
+    pins_only: bool = False              # admitting band, worker_pool.overflow off: remote PINS only
     signal: Optional[TargetSignal] = None  # None = KWLB v0.1 (read_signal false)
     taken: Dict[str, int] = field(default_factory=dict)  # this tick's takes, per host
     # host -> why the memory/band cap is below its free slots (t_31350981);
     # filled with the flag off too, so the dry readback has its numbers.
     admission: Dict[str, str] = field(default_factory=dict)
+    last_pick: Optional[str] = None      # hysteresis for placement.choose()
+    last_decision: Any = None            # the placement.Decision behind the last take()
+    last_reservation: Optional[str] = None  # the headroom reservation the last take() wrote
+    dry_run: bool = False                # True = choose() only, never write the ledger
+    # Per pool host, one entry per take, newest last: the reservation id that
+    # take wrote, or None (dry run / no table). release() refunds exactly one.
+    _rids: Dict[str, List[Optional[str]]] = field(default_factory=dict)
+    # Dry-run takes per host: never in the ledger, so choose() adds them.
+    _simulated: Dict[str, int] = field(default_factory=dict)
 
     @property
     def budget(self) -> int:
@@ -1275,7 +1318,19 @@ class SpilloverPlan:
             load1 = float((self.detail.get(n) or {}).get("load1") or 0.0)
             return _ledger.projected(n, load1, res, now=now) + cost * self.taken.get(n, 0)
 
-        return min(names, key=lambda n: (proj(n), self.hosts[n].priority))
+        return min(names, key=lambda n: (proj(n), n))
+
+    def placement_reserved(self) -> Mapping[str, Any]:
+        """Live headroom reservations (other ticks' spawns) per host."""
+        sig = self.signal
+        if sig is None or sig.placement_table is None:
+            return {}
+        if sig.placement_live is not None:
+            return sig.placement_live
+        from hermes_cli import placement as _placement
+        # A corrupt ledger raises LedgerError: take() refuses (never reads it as empty).
+        return _placement.live_reservations(sig.placement_reservations, now=sig.clock(),
+                                            table=sig.placement_table)
 
     def probe(self, name: str) -> Optional[dict]:
         d = self.detail.get(name) or {}
@@ -1325,14 +1380,19 @@ class SpilloverPlan:
 
     def take(self, assignee: Optional[str], pin: Optional[str] = None,
              only: Optional[Collection[str]] = None,
-             board: Optional[str] = None) -> Optional[PoolHost]:
-        """Reserve one slot: on ``pin`` only, else the first host in priority
-        order with a free slot that serves ``assignee``. ``only`` (a host-bound
-        card, t_1e9ea7e9) restricts the unpinned pick to those hosts; an empty
-        ``only`` takes nothing (``host_reach``). ``board`` drops every host
-        that cannot host that board (:meth:`board_refusal`): the card spills
-        to another host or waits ``board_unhostable``. None sets ``refusal``."""
+             board: Optional[str] = None, job: Any = None,
+             job_id: Optional[str] = None) -> Optional[PoolHost]:
+        """Reserve one slot: on ``pin`` only, else (signal + placement table)
+        ``placement.choose()`` over the hosts that serve ``assignee`` with
+        ``job`` overrides (t_d6ce856e); without a table the band pick. ``only``
+        (a host-bound card, t_1e9ea7e9) restricts the unpinned pick to those
+        hosts; an empty ``only`` takes nothing (``host_reach``). ``board`` drops
+        every host that cannot host that board (:meth:`board_refusal`) before
+        the pick: the card spills to another host or waits ``board_unhostable``.
+        None sets ``refusal``."""
         self.refusal = None
+        self.last_decision = None
+        self.last_reservation = None
         # Pins and reach rows are lower-cased; host keys are compared case-
         # folded so a mixed-case pool id still matches (Prism d4be9ccd2c7f).
         fold = {n.lower(): n for n in self.hosts}
@@ -1349,6 +1409,22 @@ class SpilloverPlan:
             if why is not None:
                 self.refusal = f"pin_host_board_unhostable ({pin}: {board} {why})"
                 return None
+            if self.signal is not None and self.signal.placement_table is not None:
+                # A pin keeps its precedence but its footprint is booked like any
+                # take, so later admissions see it (Prism 4609a040ad20 / b8c13f6c2e7a).
+                rid = None
+                if self.dry_run:
+                    self._simulated[pin] = self._simulated.get(pin, 0) + 1
+                else:
+                    from hermes_cli import kanban_headroom as _kh
+                    from hermes_cli import placement as _placement
+                    try:
+                        rid = _kh.book_pin(self, pin, job_id)
+                    except _placement.PlacementError as exc:  # corrupt ledger: fail closed
+                        self.refusal = f"pool_unavailable ({type(exc).__name__}: {exc})"
+                        return None
+                    self.last_reservation = rid
+                self._rids.setdefault(pin, []).append(rid)
             self.slots[pin] -= 1
             self.taken[pin] = self.taken.get(pin, 0) + 1
             return host
@@ -1367,6 +1443,37 @@ class SpilloverPlan:
                 self.refusal = "board_unhostable (" + "; ".join(
                     f"{n}: {board} {w}" for n, w in sorted(unhostable.items())) + ")"
                 return None
+        if self.signal is not None and self.signal.placement_table is not None:
+            from hermes_cli import kanban_headroom as _kh
+            names = [n for n, h in self.hosts.items() if n in allowed and assignee in h.profiles]
+            if not names:
+                self.refusal = "pool_full"
+                return None
+            from hermes_cli import placement as _placement
+            rid = None
+            try:
+                if self.dry_run:
+                    d = _kh.choose(self, names, job)
+                else:
+                    d, rid = _kh.admit(self, names, job, job_id)
+            except _placement.PlacementError as exc:  # LedgerError / ExclusionsError: fail closed
+                self.refusal = f"pool_unavailable ({type(exc).__name__}: {exc})"
+                return None
+            self.last_decision = d
+            key = _kh.pool_key(self.signal.placement_table, names, d.host)
+            if key is None or self.slots.get(key, 0) <= 0:
+                _kh.release_id(self.signal, rid)
+                self.refusal = f"pool_unavailable ({d.reason or 'no_slot'}: " + "; ".join(
+                    f"{r.host} {r.reason}" for r in d.rows if not r.eligible) + ")"
+                return None
+            self.last_reservation = rid
+            self._rids.setdefault(key, []).append(rid)
+            if self.dry_run:
+                self._simulated[key] = self._simulated.get(key, 0) + 1
+            self.slots[key] -= 1
+            self.taken[key] = self.taken.get(key, 0) + 1
+            self.last_pick = key
+            return self.hosts[key]
         if self.signal is not None:
             free = [n for n, h in self.hosts.items()
                     if n in allowed and self.slots.get(n, 0) > 0 and assignee in h.profiles]
@@ -1389,11 +1496,36 @@ class SpilloverPlan:
         self.refusal = "pool_full"
         return None
 
-    def release(self, host: PoolHost) -> None:
+    def release(self, host: PoolHost, reservation: Optional[str] = None) -> None:
+        """Refund a take() whose claim/spawn failed: the slot, and the headroom
+        reservation THAT take wrote. ``reservation`` names it (the dispatcher
+        passes ``last_reservation``); without it the newest take on the host is
+        refunded. Every take, pinned or not, has its own entry, so a failed take
+        never releases an earlier live worker's promise (Prism b711acd04da4).
+        A ``reservation`` this plan does not hold (already refunded, another
+        plan's) is a no-op plus a journal line: never the newest row instead
+        (Prism 8b0ce035f2c1)."""
+        rids = self._rids.get(host.name)
+        if reservation is not None and reservation not in (rids or ()):
+            _log.warning("kanban pool: refund of reservation %s on %s ignored: not held by this plan "
+                         "(already refunded?)", reservation, host.name)
+            return
         if host.name in self.slots:
             self.slots[host.name] += 1
             if self.taken.get(host.name):
                 self.taken[host.name] -= 1
+            if self._simulated.get(host.name):
+                self._simulated[host.name] -= 1
+        if not rids:
+            return
+        if reservation is not None:
+            rids.remove(reservation)
+            rid = reservation
+        else:
+            rid = rids.pop()
+        if rid:
+            from hermes_cli import kanban_headroom as _kh
+            _kh.release_id(self.signal, rid)
 
     def snapshot(self) -> dict:
         """The ``load_gate.json`` ``pool`` block for this tick."""
@@ -1489,6 +1621,10 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
             row["cap"] = _admission.cap(sample.pressure_text, reservation=signal.reservation_gb)
+            if signal.placement_table is not None:
+                from hermes_cli import kanban_headroom as _kh
+                row["placement"] = _kh.sample_fields(sample.load5, sample.remote_now, sample.pressure_text,
+                                                     stale_after_s=policy.stale_after_s, local_now=now)
             kb = policy.kanban_band(h.name)
             got, row["why"] = read_pressure(sample.remote_now, sample.pressure_text,
                                             stale_after_s=policy.stale_after_s, warm=kb.warm, hot=kb.hot)
@@ -1551,6 +1687,8 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
             **({"pressure": why} if why else {}),
             **({"admission": admission[h.name]} if h.name in admission else {}),
             **({"boards": sorted(r["boards"])} if r["boards"] is not None else {}),
+            **(r.get("placement") or ({"sample_status": "absent"} if signal.placement_table is not None
+                                      and r["probed"] else {})),
         }
     plan = _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal)
     plan.admission = admission

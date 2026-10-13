@@ -5176,7 +5176,7 @@ def _dispatch_once_locked(
             return result
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, body, skills, workspace_kind, workspace_path, no_worker "
+        "SELECT id, assignee, body, skills, workspace_kind, workspace_path, no_worker, priority "
         "FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -5200,7 +5200,10 @@ def _dispatch_once_locked(
         if dry_run:
             # Dry run reserves on its own ledger: the shared plan is untouched.
             import dataclasses as _dc
-            spillover = _dc.replace(spillover, slots=dict(spillover.slots))
+            # Real takes already sit in the ledger choose() reads; only this
+            # copy's own takes are simulated (Prism 08bbc332020f).
+            spillover = _dc.replace(spillover, slots=dict(spillover.slots), taken=dict(spillover.taken),
+                                    dry_run=True, _rids={}, _simulated=dict(spillover._simulated))
         _eff_default = (default_assignee or "").strip() or None
         _native: dict = {}
         _lineage = _lineage_pins_mode()  # kanban.placement.lineage_pins, per tick
@@ -6034,12 +6037,15 @@ def _dispatch_once_locked(
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
         placed_host = None
+        _decision = None
+        _rid = None
         _cap_only = _caps_out.get("only", {}).get(row["id"])
         if route == "pin" or (route == "portable" and (not local_free or _cap_only)):
             # A refused take() NEVER falls through to a local spawn (I-11).
             # A host-bound portable card only lands on a host the reach
             # matrix proves (t_1e9ea7e9); None = any pool host.
             _only = None
+            _job = None
             if route == "portable":
                 from hermes_cli import kanban_worker_pool as _kwp_take
                 try:
@@ -6047,9 +6053,12 @@ def _dispatch_once_locked(
                 except (TypeError, ValueError, IndexError, KeyError):
                     _skills = []
                 _skills = tuple(s for s in _skills if isinstance(s, str))
+                _targets = _manifest_targets(_skills, row_assignee) if _skills else {}
                 _only = _kwp_take.reach_allowed_hosts(
-                    body=row["body"], skills=_skills, pool=spillover.config,
-                    targets=_manifest_targets(_skills, row_assignee) if _skills else {})
+                    body=row["body"], skills=_skills, pool=spillover.config, targets=_targets)
+                if getattr(getattr(spillover, "signal", None), "placement_table", None) is not None:
+                    from hermes_cli import kanban_headroom as _kh_job
+                    _job = _kh_job.job_for_row(conn, row, affinity_targets=_targets)
                 # A body naming Studio-only resources lands only on a host
                 # whose caps cover them (t_aea826a9); never widen ``_only``.
                 _need_hosts = _kwp_take.needs_allowed_hosts(row["body"], spillover.config)
@@ -6062,11 +6071,16 @@ def _dispatch_once_locked(
                     _only = tuple(_cap_only) if _only is None else \
                         tuple(h for h in _only if h in _cap_only)
             _board_slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
+            # Scorer-backed takes (pins included) book a reservation for this card.
+            _take_kw = {} if getattr(getattr(spillover, "signal", None), "placement_table", None) is None \
+                else {"job_id": row["id"], **({"job": _job} if _job is not None else {})}
             if _only is None:
                 placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None,
-                                             board=_board_slug)
+                                             board=_board_slug, **_take_kw)
             else:
-                placed_host = spillover.take(row_assignee, only=_only, board=_board_slug)
+                placed_host = spillover.take(row_assignee, only=_only, board=_board_slug, **_take_kw)
+            _decision = getattr(spillover, "last_decision", None)
+            _rid = getattr(spillover, "last_reservation", None)
             if placed_host is None:
                 result.placement_waits[row["id"]] = spillover.refusal or "pool_full"
                 continue
@@ -6090,7 +6104,7 @@ def _dispatch_once_locked(
         claimed = _kb.claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             if placed_host is not None:
-                spillover.release(placed_host)
+                spillover.release(placed_host, _rid)
             continue
         # Route precedence at spawn (both lanes): card pin > active lane
         # override > profile default gives the INTENDED route; then main's
@@ -6135,11 +6149,11 @@ def _dispatch_once_locked(
                 conn, claimed.id, result, str(exc),
             )
             if placed_host is not None:
-                spillover.release(placed_host)  # nothing launched: refund
+                spillover.release(placed_host, _rid)  # nothing launched: refund
             continue
         except Exception as exc:
             if placed_host is not None:
-                spillover.release(placed_host)  # nothing launched: refund
+                spillover.release(placed_host, _rid)  # nothing launched: refund
             # A workspace anchor that can never resolve (bare repo, non-repo
             # path, missing default_workdir) is a capability wall: retrying it
             # re-runs the identical git probe against the identical path. Block
@@ -6168,7 +6182,7 @@ def _dispatch_once_locked(
         if not _kb._claim_still_held(conn, claimed):
             _kb._abort_lost_claim_spawn(conn, claimed, None)
             if placed_host is not None:
-                spillover.release(placed_host)  # nothing launched: refund
+                spillover.release(placed_host, _rid)  # nothing launched: refund
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         launched = False
@@ -6200,15 +6214,20 @@ def _dispatch_once_locked(
                 band = getattr(spillover, "band", None)
                 spill_reason = getattr(spillover, "spill_reason", None)
                 reason = "pin" if route == "pin" else (
-                    "band_paused" if band == "paused" else "band_spilling")
+                    "band_paused" if band == "paused" else
+                    "band_spilling" if band == "spilling" else "overflow")
                 probe = spillover.probe(placed_host.name)
+                from hermes_cli import kanban_headroom as _kh_res
+                # _rid was written by take() under the ledger lock BEFORE launch.
                 _kb._append_event(
                     conn, claimed.id, _kb._kwh.PLACED_EVENT,
                     {"host": placed_host.name, "target": placed_host.target,
                      "workspace": str(workspace), "reason": reason,
                      "band": band, "spill_reason": spill_reason, "probe": probe,
                      "local_gate": str(spawn_paused) if spawn_paused else None,
-                     "pid": pid},
+                     "pid": pid,
+                     **({_kh_res.RESERVATION_KEY: _rid} if _rid else {}),
+                     **({"rule": _decision.rule} if _rid and _decision is not None else {})},
                     run_id=claimed.current_run_id,
                 )
                 _kb._log.info(
@@ -6267,7 +6286,7 @@ def _dispatch_once_locked(
                 )
         except Exception as exc:
             if placed_host is not None and not launched:
-                spillover.release(placed_host)  # pre-launch failure: refund
+                spillover.release(placed_host, _rid)  # pre-launch failure: refund
             # A host that cannot place the worker (no restart-safe scope,
             # eb28bc1bf7; no board mount on a pool host, t_9fb4d477) is not
             # the card's failure: the run is closed with ``infrastructure:

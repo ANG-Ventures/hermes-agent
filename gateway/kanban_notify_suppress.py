@@ -16,10 +16,15 @@ An event is redundant when ALL hold:
 * the actor is the receiving side itself: the event's ``actor_session_id`` is
   the home / subscriber session, or its ``actor_profile`` is the home session's
   operator profile, or it was written by a configured closer (the merge pass
-  landing a card) whose latest ``review_coverage`` APPROVE is the operator's;
+  landing a card) on a card the receiver owns (its home session is one of the
+  receiver's sessions), or by a configured closer on a foreign card whose
+  latest ``review_coverage`` APPROVE is the operator's;
 * the event is within ``self_window_min`` (default 30) of the operator's last
   own action on the card: the event itself for a self actor, the APPROVE record
-  for a closer.
+  for a closer on a foreign card.
+
+Closers identify themselves by stamping ``actor_profile`` (``kanban complete
+--actor <closer>``); the parenthesised summary tag is a logged last resort.
 
 Anything unresolved (no actor, unknown operator, no APPROVE) is NOT redundant:
 the filter fails open to noise, never to silence on a real handback.
@@ -162,7 +167,13 @@ def closer_identity(event: Any) -> str:
     m = _SUMMARY_TAG_RE.search(head)
     if not m:
         return ""
-    return m.group(1).split(",")[0].strip().lower()
+    ident = m.group(1).split(",")[0].strip().lower()
+    # Last resort, and visible: a closer that did not stamp ``actor_profile``
+    # (``kanban complete --actor <closer>``) is guessed from prose, which read
+    # "(CI gate, …)" as the closer on 2026-10-12 and delivered the echo.
+    logger.info("kanban notify-suppress: closer identity from summary prose: %r (event %s, actor_profile unstamped)",
+                ident, getattr(event, "id", None))
+    return ident
 
 
 def is_closer(identity: str, closers: Iterable[str]) -> bool:
@@ -274,6 +285,26 @@ def is_redundant(event: Any, card: Optional[dict], subscription: Optional[dict],
         return False, "unknown-operator"
     ident = closer_identity(event)
     if ident and is_closer(ident, cfg.closers):
+        # A trusted closer acting on a card the receiver OWNS (its home session
+        # is one of the receiver's sessions) is self-operator by construction:
+        # the lander only closes what the operator's lane handed it. The
+        # APPROVE-in-window test gates closers on cards the receiver does NOT
+        # own (second miss, t_fb95da9b 2026-10-12 14:10: the PR landed under the
+        # lander before the attended read, so no APPROVE existed, and the echo
+        # was delivered).
+        #
+        # The shortcut has no window and no APPROVE, so it trusts ONLY a STAMPED
+        # ``actor_profile`` that is EXACTLY a configured closer: never the
+        # summary-prose guess, never the prefix match (Prism #1933 r1: an
+        # unstamped "(merge-pass follow-up) ..." summary would otherwise silence
+        # the owner). Prose/prefix identities keep the APPROVE-gated path below.
+        home_sid = _s(card.get("session_id"))
+        owned = bool(home_sid) and (
+            home_sid in {_s(x) for x in (sub.get("session_ids") or ())}
+            or sub.get("is_home") is True   # the notifier's explicit "this subscription IS the home chat"
+        )
+        if owned and actor_profile.lower() in {_s(c).lower() for c in cfg.closers}:
+            return True, "closer-on-owned-card"
         approve = card.get("latest_approve") or None
         if not approve or not same_operator(approve.get("by"), operator):
             return False, "closer-without-operator-approve"

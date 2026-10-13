@@ -28,6 +28,14 @@ _REMOTE_PIN_SQL = (
     "SELECT body FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
     "AND body LIKE '%host:%'"
 )
+_READY_SQL = "SELECT 1 FROM tasks WHERE status = 'ready' AND claim_lock IS NULL LIMIT 1"
+
+
+def admitting_overflow(pool_cfg) -> bool:
+    """``kanban.worker_pool.overflow`` (default true, t_7b1eca07): in the
+    ``admitting`` band a portable card that finds no local slot goes to the
+    pool. False = remote pins only while admitting (PRD 5.2.5, before)."""
+    return not (isinstance(pool_cfg, dict) and pool_cfg.get("overflow", True) is False)
 
 
 @dataclass(frozen=True)
@@ -86,15 +94,26 @@ def read_signal_enabled(kanban_cfg) -> bool:
 def any_remote_pin(boards, connect, known_hosts=(), aliases=None) -> bool:
     """A ready card on any board pins a KNOWN pool host (``host:<id>`` or a
     registry alias of one, t_cb2b888d)."""
+    return _any_board(boards, connect, lambda conn: any(
+        (pin := kwp.resolve_pin(body, known_hosts, aliases)[0]) is not None
+        and pin not in (kwp.PIN_ANY, kwp.PIN_STUDIO)
+        for (body,) in conn.execute(_REMOTE_PIN_SQL).fetchall()))
+
+
+def any_ready(boards, connect) -> bool:
+    """A ready, unclaimed card on any board: overflow candidates exist."""
+    return _any_board(boards, connect,
+                      lambda conn: conn.execute(_READY_SQL).fetchone() is not None)
+
+
+def _any_board(boards, connect, test) -> bool:
     for b in boards:
         slug = (b.get("slug") if isinstance(b, dict) else None) or "default"
         conn = None
         try:
             conn = connect(board=slug)
-            for (body,) in conn.execute(_REMOTE_PIN_SQL).fetchall():
-                pin, _ignored = kwp.resolve_pin(body, known_hosts, aliases)
-                if pin is not None and pin not in (kwp.PIN_ANY, kwp.PIN_STUDIO):
-                    return True
+            if test(conn):
+                return True
         except Exception:
             continue
         finally:
@@ -122,6 +141,8 @@ class GateTickBuilder:
         self._remote_by_host: Dict[str, int] = {}
         self.running_local: Optional[int] = None   # last build()'s local count
         self._signal: Optional[kwp.TargetSignal] = None
+        self._boards = None                        # last build()'s boards (renewal)
+        self._renewed_at: float = 0.0
 
     def _root(self):
         return self._fleet_dir().parent
@@ -132,6 +153,9 @@ class GateTickBuilder:
             return None
         root = self._root()
         cost = getattr(self.gate, "cost", None)
+        from hermes_cli import kanban_headroom as kh
+        from hermes_cli import placement
+
         return kwp.TargetSignal(
             policy=ppolicy.load(self._fleet_dir()),
             state_path=root / "var" / kwp.TARGET_STATE_FILE,
@@ -139,12 +163,15 @@ class GateTickBuilder:
             cpu_est=float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
             admit_on_memory=kadm.enabled(cfg),
             reservation_gb=kadm.reservation_gb(cfg),
+            placement_table=kh.load_table(root),
+            placement_reservations=root / placement.RESERVATIONS_REL,
         )
 
     def build(self, boards) -> GateTick:
         gate = self.gate
         running_local, remote_by_host = running_split(self._ledger(boards))
         self._remote_by_host = dict(remote_by_host)
+        self._boards = boards
         self.running_local = running_local
         allowance, paused = gate.admit_now(running=running_local if gate.enabled else None)
         if gate.enabled and allowance is None and klg.loadavg_supported():
@@ -159,7 +186,9 @@ class GateTickBuilder:
     def plan_pool(self, boards, remote_by_host: Dict[str, int]) -> Optional[kwp.SpilloverPlan]:
         """The ONE pool plan for this tick, or None. Runs iff
         ``kanban.worker_pool.enabled`` AND ``remote_allowed`` AND (band in
-        {spilling, paused} OR a ready card carries a remote pin)."""
+        {spilling, paused} OR a ready card carries a remote pin OR, with
+        ``worker_pool.overflow`` on, any card is ready: the pool is the
+        overflow for portable cards past the local allowance)."""
         gate = self.gate
         cfg = self._kanban_cfg() or {}
         pool_cfg = cfg.get("worker_pool")
@@ -171,10 +200,11 @@ class GateTickBuilder:
         if not gate.remote_allowed:
             gate.pool = {"planned": False, "reason": "proc_paused"}
             return None
-        pins_only = gate.band not in ("spilling", "paused")
-        if pins_only and not any_remote_pin(boards, self._connect,
-                                            kwp.known_host_ids(self._fleet_dir()),
-                                            kwp.pin_aliases(self._fleet_dir())):
+        pins_only = gate.band not in ("spilling", "paused") and not admitting_overflow(pool_cfg)
+        if gate.band not in ("spilling", "paused") and not (
+                any_ready(boards, self._connect) if not pins_only else
+                any_remote_pin(boards, self._connect, kwp.known_host_ids(self._fleet_dir()),
+                               kwp.pin_aliases(self._fleet_dir()))):
             gate.pool = {"planned": False, "reason": "not_needed"}
             return None
         pool = kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg)
@@ -253,6 +283,31 @@ class GateTickBuilder:
             pledger.update(pledger.ledger_dir(root), "kanban", write)
         except Exception as exc:
             self._log(logger.warning, f"kanban pool: ledger_write_failed: {exc}")
+        self.renew_reservations()
+
+    def renew_reservations(self, *, now: Optional[float] = None) -> Optional[Dict[str, int]]:
+        """Keep every live pool run's headroom reservation from lapsing
+        (Prism 6c6c0c765a1a): at most every ``RENEW_EVERY_S``, over the boards
+        the last ``build()`` read. A lapsed row of a live run is logged as a
+        leak. None = not due / nothing to renew (no build yet, no table)."""
+        from hermes_cli import kanban_headroom as kh
+        from hermes_cli import placement
+
+        now = time.time() if now is None else now
+        if self._boards is None or now - self._renewed_at < kh.RENEW_EVERY_S:
+            return None
+        root = self._root()
+        if not kh.table_path(root).is_file():
+            return None
+        self._renewed_at = now
+        try:
+            got = kh.renew_running(self._boards, self._connect, root / placement.RESERVATIONS_REL, now=now)
+        except Exception as exc:
+            self._log(logger.warning, f"kanban pool: reservation renewal failed: {exc}")
+            return None
+        if got["lapsed"]:
+            logger.warning("kanban pool: %d live run reservation(s) had lapsed before renewal", got["lapsed"])
+        return got
 
 
 def standalone_builder(load_gate, kanban_cfg: Callable) -> GateTickBuilder:

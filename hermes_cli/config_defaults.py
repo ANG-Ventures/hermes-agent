@@ -779,11 +779,12 @@ DEFAULT_CONFIG = {
         # instead of dropping the middle with a "summary unavailable" placeholder; the session
         # freezes at its size until /compress (bypasses the cooldown) or /new.
         "abort_on_summary_failure": False,
-        # (Historical key name.) When True, gpt-5.4/5.5/5.6 and gpt-6 Astra (any slug containing
-        # "astra" without "900k") on the ChatGPT Codex OAuth route raise their compaction trigger to
-        # 85%: Codex hard-caps them at a 272K window, so the global 50% would compact at ~136K. False = global `threshold`. Only that route; the same models via
-        # OpenAI direct, OpenRouter or Copilot keep the global value.
-        "codex_gpt55_autoraise": True,
+        # Built-in per-model thresholds (legacy). False (default) = every model uses the universal
+        # `threshold`. True = Codex-OAuth gpt-5.4/5.5/5.6/gpt-6 Astra raise to 85% (272K cap),
+        # Codex-OAuth gpt-5.3-codex-spark to 70%, Arcee Trinity Large Thinking to 75%.
+        # None (unset) = off, but falls through to the legacy alias `codex_gpt55_autoraise` when
+        # config.yaml sets it; a False default here would shadow that alias after the merge.
+        "per_model_builtins": None,
         # Show the one-time autoraise banner; False keeps the autoraise, hides the notice.
         "codex_gpt55_autoraise_notice": True,
         # Codex app-server thread compaction mode. The codex agent owns the thread context, so
@@ -1040,6 +1041,8 @@ DEFAULT_CONFIG = {
         # Gateway /stop and queued (/queue) prompts: false (default) HOLDS them after /stop until
         # `/queue run` or `/queue clear`; true releases them right after the stop, in order.
         "stop_releases_queue": False,
+        # /queue run: "per_item" = each released prompt is its own turn; "merged" = all in ONE turn.
+        "queue_release_mode": "per_item",
         # steer mode: false hides only the "Steered into current run" bubble; steering itself still
         # happens.
         "busy_steer_ack_enabled": True,
@@ -2353,7 +2356,11 @@ DEFAULT_CONFIG = {
         # plan, every card local. The old kanban.worker_hosts list is
         # retired: set next to a kanban-worker role, the pool places nothing.
         # See kanban_worker_pool.py.
-        "worker_pool": {"enabled": True},
+        # overflow (t_7b1eca07): true = in the admitting band too, a portable
+        # card that finds no local slot is placed on the pool (the pool is
+        # planned whenever a card is ready); false = remote pins only while
+        # admitting (KWLB v0.1 PRD 5.2.5).
+        "worker_pool": {"enabled": True, "overflow": True},
         # Login whose uid runs a LOCAL worker's terminal + file tools (over
         # ssh <user>@localhost, the worker-pool placement path). None/"" or
         # the dispatcher's own login = the dispatcher's uid (today). Read per

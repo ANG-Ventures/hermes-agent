@@ -773,11 +773,11 @@ compression:
   # cap above the window is a no-op. Survives model switches and fallback activations.
   # threshold_tokens: 200000
 
-  # Existing Codex gpt-5.5 behavior: raise Hermes' compaction trigger to 85%
-  # for the ChatGPT Codex OAuth route. Set false to opt back down to threshold.
-  # Slugs that resolve to the large verified window (see
-  # model.codex_context_policy above; default large) are never autoraised.
-  codex_gpt55_autoraise: true
+  # Built-in per-model thresholds (legacy, default false = universal threshold).
+  # true: Codex OAuth gpt-5.4/5.5/5.6/Astra -> 85% (272K cap; large-window slugs
+  # excluded), Codex OAuth gpt-5.3-codex-spark -> 70%, Arcee Trinity Thinking -> 75%.
+  # The old key codex_gpt55_autoraise is read as an alias when this one is unset.
+  per_model_builtins: false
 
   # Large-window Codex sessions (model.codex_context_policy: large) show ONE
   # notice per session the first time a prompt passes 272K tokens: requests

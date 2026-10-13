@@ -42,7 +42,11 @@ class QueueOp:
 
 
 def parse_queue_payload(payload: str) -> QueueOp:
-    """Classify the text after ``/queue``. Empty payload lists; ``add X`` forces a prompt."""
+    """Classify the text after ``/queue``. Empty payload lists; ``add X`` forces a prompt.
+
+    A word is a verb ONLY when the whole payload fits that verb's exact shape (``rm N``,
+    ``move A B``, ``edit N <text>``, bare ``list``/``clear``/``run``/``help``). Anything else —
+    ``clear this thing``, ``rm 3 things``, ``move 1 2 now`` — is a prompt (Ace 2026-10-13 R2)."""
     payload = (payload or "").strip()
     if not payload:
         return QueueOp("list")
@@ -60,13 +64,17 @@ def parse_queue_payload(payload: str) -> QueueOp:
     if not first.isdigit():
         return QueueOp("add", text=payload)
     index = int(first)
-    if kind == "move":
-        bits = rest.split()
-        if len(bits) == 2 and bits[1].isdigit():
-            return QueueOp("move", index=index, to=int(bits[1]), text=rest)
-        return QueueOp("move", index=index, to=None, text=rest)  # handler renders usage_move
+    bits = rest.split()
     if kind == "edit":
         bits = rest.split(None, 1)
         new_text = bits[1] if len(bits) == 2 else ""
         return QueueOp("edit", index=index, text=new_text.strip())  # empty text -> handler renders usage_edit
+    if kind == "move":
+        if len(bits) == 2 and bits[1].isdigit():
+            return QueueOp("move", index=index, to=int(bits[1]), text=rest)
+        if len(bits) == 1:
+            return QueueOp("move", index=index, to=None, text=rest)  # handler renders usage_move
+        return QueueOp("add", text=payload)  # `move 1 2 now`: not the verb's shape -> a prompt
+    if len(bits) != 1:
+        return QueueOp("add", text=payload)  # `rm 3 things`: not the verb's shape -> a prompt
     return QueueOp(kind, index=index, text=rest)

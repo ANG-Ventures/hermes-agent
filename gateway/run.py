@@ -4460,6 +4460,7 @@ class GatewayRunner(
     _busy_input_mode: str = "interrupt"
     _busy_text_mode: str = "interrupt"
     _stop_releases_queue: bool = False
+    _queue_release_mode: str = "per_item"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     _restart_after_turn_timeout: float = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
     _cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
@@ -4602,6 +4603,7 @@ class GatewayRunner(
         self._busy_input_mode = self._load_busy_input_mode()
         self._busy_text_mode = self._load_busy_text_mode()
         self._stop_releases_queue = self._load_stop_releases_queue()
+        self._queue_release_mode = self._load_queue_release_mode()
         # Secondary-profile busy modes snapshotted at multiplex startup; handlers never reread config.
         self._busy_input_modes_by_profile: Dict[str, str] = {}
         self._busy_text_modes_by_profile: Dict[str, str] = {}
@@ -5595,7 +5597,8 @@ class GatewayRunner(
         ("model", "context_length"), ("compression", "enabled"),
         ("compression", "progress_notices"), ("compression", "threshold"),
         ("compression", "model_thresholds"), ("compression", "threshold_tokens"),
-        ("compression", "codex_gpt55_autoraise"), ("compression", "codex_app_server_auto"),
+        ("compression", "codex_gpt55_autoraise"), ("compression", "per_model_builtins"),
+        ("compression", "codex_app_server_auto"),
         ("compression", "codex_responses_native"),
         ("compression", "codex_responses_compact_threshold"), ("compression", "in_place"),
         ("compression", "checkpoint_required"), ("compression", "micro_compact"),

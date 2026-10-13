@@ -467,10 +467,11 @@ def _hermes_codex_gpt55_autoraise_with_source(default: bool) -> tuple[bool, str]
         compression = cfg.get("compression") or {}
         if not isinstance(compression, dict):
             return default, "default"
-        value = compression.get("codex_gpt55_autoraise")
-        if value is None:
-            return default, "default"
-        return (not _config_bool_disabled(value)), "config_yaml:compression.codex_gpt55_autoraise"
+        for key in ("per_model_builtins", "codex_gpt55_autoraise"):  # second = legacy alias
+            value = compression.get(key)
+            if value is not None:
+                return (not _config_bool_disabled(value)), f"config_yaml:compression.{key}"
+        return default, "default"
     except Exception:
         return default, "default"
 
@@ -660,8 +661,9 @@ class LCMConfig:
     context_threshold: float = 0.35
     # Mirror Hermes Agent's Codex gpt-5.5 route-specific threshold auto-raise
     # when LCM is inheriting the host compression threshold. Explicit LCM
-    # threshold overrides remain authoritative.
-    codex_gpt55_autoraise_enabled: bool = True
+    # threshold overrides remain authoritative. Off unless the host sets
+    # compression.per_model_builtins (or legacy codex_gpt55_autoraise) true.
+    codex_gpt55_autoraise_enabled: bool = False
     # Max condensation depth (-1 = unlimited, 0 = leaf only)
     incremental_max_depth: int = 3
     # How many same-depth summaries trigger condensation

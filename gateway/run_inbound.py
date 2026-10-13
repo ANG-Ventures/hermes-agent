@@ -1395,6 +1395,12 @@ class GatewayInboundMixin:
             _orphan_adapter = self._delivery_adapter_for(source)
             if _orphan_adapter is None or getattr(event, "internal", False) or event.get_command():
                 return event, source, is_internal
+            if getattr(event, "_queue_released", False) is True:
+                # /queue run armed this event as item 1 and the adapter drain is dispatching it; the
+                # rest of the release sits in overflow BY DESIGN (next drain promotes it). Treating
+                # it as orphaned ran item 2 ahead of item 1 (live E2E 2026-10-13 01:45, follow-up D1).
+                event._queue_released = False
+                return event, source, is_internal
             _rescued = self._rescue_orphaned_overflow(_quick_key, _orphan_adapter)
             if _rescued is None:
                 return event, source, is_internal

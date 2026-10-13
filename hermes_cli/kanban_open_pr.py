@@ -260,6 +260,11 @@ def branch_is_operators(head_ref: Optional[str]) -> bool:
     return head_ref.split("/", 1)[0].lower() in OPERATOR_PROFILES
 
 
+def branch_names_card(head_ref: Optional[str], task_id: Optional[str]) -> bool:
+    """True when ``head_ref`` carries ``task_id`` among its card ids: this card's own PR."""
+    return bool(task_id) and task_id in _CARD_IN_BRANCH_RE.findall(head_ref or "")
+
+
 def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
                  survivor_pr=None, query_fn: Optional[QueryFn] = None,
                  task_id: Optional[str] = None, unowned: Optional[list] = None) -> list:
@@ -280,7 +285,9 @@ def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
     ``pr_urls`` / ``pr`` / ``--survivor-pr``), the route and the close-on-merged set are exactly those
     refs; an OPEN ref the text merely mentions goes to ``unowned`` (warn, never a gate). The text gates
     only when nothing is declared. t_536b03d9 declared #3918 and was gated on #3853 too because its
-    prose said "the fix is Apollo's #3853".
+    prose said "the fix is Apollo's #3853". One exception (t_287a2872): an OPEN text-only ref whose
+    head branch names THIS card (``<profile>/<task_id>-*``) is the card's own PR even when undeclared
+    (a merged ``pr_url`` plus "follow-up in o/r#N"), so it still gates.
     """
     refs = split_fleet(extract_pr_refs(*texts, metadata=metadata, survivor_pr=survivor_pr))[0]
     if not refs:
@@ -292,9 +299,17 @@ def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
     opened, unverified = unmerged_refs(refs, query_fn=query_fn, primary=primary)
     if primary:
         declared = {(r.repo.lower(), r.number) for r in primary}
-        if unowned is not None:
-            unowned.extend(r for r in opened if (r.repo.lower(), r.number) not in declared)
-        return [r for r in opened + unverified if (r.repo.lower(), r.number) in declared]
+        kept = []
+        for ref in opened:
+            if (ref.repo.lower(), ref.number) not in declared:
+                payload = query_fn(ref.repo, ref.number)  # memoised: no second lookup
+                head_ref = payload.get("head_ref") if isinstance(payload, dict) else None
+                if not branch_names_card(head_ref, task_id):
+                    if unowned is not None:
+                        unowned.append(ref)
+                    continue
+            kept.append(ref)
+        return kept + [r for r in unverified if (r.repo.lower(), r.number) in declared]
     if task_id:
         declared = {(r.repo.lower(), r.number) for r in primary}
         kept = []

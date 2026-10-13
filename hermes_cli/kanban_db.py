@@ -4282,6 +4282,30 @@ def mutation_actor(
         _MUTATION_ACTOR.reset(token)
 
 
+@contextlib.contextmanager
+def event_actor(profile: str):
+    """Stamp ``profile`` as ``task_events.actor_profile`` on every event written
+    inside the block, WITHOUT binding the home-session guard (no caller session).
+
+    For automated closers (``kanban complete --actor kanban-review-merge-pass``):
+    a cron has no chat session, so :func:`_event_actor` resolved to ``(None,
+    None)`` and the notify-suppress filter had to guess the closer from the
+    completion summary's prose (t_7de359d9: "(CI gate, …)" read as the
+    closer, the owner-wake was delivered). The guard's own binding
+    (:func:`mutation_actor`) is untouched: an already-bound actor wins.
+    """
+    name = (str(profile).strip() or None) if profile else None
+    if name is None or _EVENT_ACTOR.get() is not None:
+        yield None
+        return
+    actor = MutationActor(session_ids=(), profile=name)
+    token = _EVENT_ACTOR.set(actor)
+    try:
+        yield actor
+    finally:
+        _EVENT_ACTOR.reset(token)
+
+
 def _caller_session_lineage(session_id: str) -> tuple[str, ...]:
     """Compression lineage of the caller's session (best effort).
 
@@ -8167,6 +8191,13 @@ def _end_run(
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    # A pool run's headroom reservation ends with the run (t_d6ce856e), once
+    # the run row is COMMITTED: a rolled-back end keeps its promise (Prism 441fe743030f).
+    from hermes_cli import kanban_headroom as _kh
+    _rid = _kh.reservation_for_run(conn, task_id, run_id)
+    if _rid is not None:
+        from hermes_cli.kanban_db_connect import on_commit
+        on_commit(conn, lambda: _kh.release_reservation(_rid))
     return run_id
 
 

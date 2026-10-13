@@ -28,7 +28,12 @@ from hermes_cli.queue_verbs import QUEUE_VERB_ALIASES, QueueOp, parse_queue_payl
     ("edit 1", QueueOp("edit", index=1, text="")),            # handler renders usage_edit
     ("move 2 1", QueueOp("move", index=2, to=1, text="2 1")),
     ("move 1", QueueOp("move", index=1, to=None, text="1")),  # handler renders usage_move
-    ("move 1 x", QueueOp("move", index=1, to=None, text="1 x")),
+    # --- exact shape only (Ace 2026-10-13 R2): extra words after a verb's arguments = a prompt ---
+    ("move 1 x", QueueOp("add", text="move 1 x")),
+    ("move 1 2 now", QueueOp("add", text="move 1 2 now")),
+    ("rm 3 things", QueueOp("add", text="rm 3 things")),
+    ("rm 3 and 4", QueueOp("add", text="rm 3 and 4")),
+    ("clear this thing", QueueOp("add", text="clear this thing")),
     # --- prompts, not verbs ---
     ("add rm 2", QueueOp("add", text="rm 2")),
     ("add list", QueueOp("add", text="list")),
