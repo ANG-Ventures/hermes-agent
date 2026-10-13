@@ -854,7 +854,9 @@ def test_cli_dispatch_places_a_pin_through_the_gateway_plan(kanban_home, monkeyp
     from hermes_cli import kanban_load_gate as klg
 
     _write_pool(kanban_home / "fleet")
-    monkeypatch.setattr(_config, "load_config", lambda: {"kanban": V01})
+    # worker_pool.overflow off: the KWLB v0.1 admitting contract (pins only).
+    monkeypatch.setattr(_config, "load_config",
+                        lambda: {"kanban": {**V01, "worker_pool": {"overflow": False}}})
     monkeypatch.setattr(kwp, "probe_host", lambda h, runner=None: (1.0, 16))
     monkeypatch.setattr(klg, "sample_loadavg", lambda: (1.0, 1.0))
     monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (0.1, None))
@@ -1791,3 +1793,85 @@ def test_hostname_pin_runs_local_never_spills(fleet_aliases):
         assert kb.list_comments(conn, tid) == []
     assert spawned == [] and res.placed == []
     assert not res.placement_waits[tid].startswith("pin_unknown_host")
+
+
+# -- overflow (t_7b1eca07) ----------------------------------------------------
+
+def test_studio_only_derives_pool_profiles_from_the_profiles_dir(tmp_path):
+    """Deny-list: every profile with a config.yaml is a pool profile unless
+    studio_only names it; a new profile is admitted with no sidecar edit."""
+    home = tmp_path / ".hermes"
+    for p in ("alpha", "beta", "cadmus", "new-worker"):
+        (home / "profiles" / p).mkdir(parents=True)
+        (home / "profiles" / p / "config.yaml").write_text("{}\n")
+    (home / "profiles" / "shell-only").mkdir()          # no config.yaml: not a profile
+    sidecar = _write_pool(home / "fleet")
+    del sidecar["profiles"]
+    sidecar["studio_only"] = ["cadmus"]
+    _write_pool(home / "fleet", sidecar=sidecar)
+    cfg = kwp.read_pool(home / "fleet")
+    assert cfg.refused is None and cfg.warnings == ()
+    assert cfg.profiles == ("alpha", "beta", "new-worker")
+    assert all(h.profiles == cfg.profiles for h in cfg.pool_hosts)
+    ok, rule, _ = kwp.portable(workspace_kind="scratch", has_links=False, workspace_has_content=False,
+                               assignee="cadmus", body="", pool=cfg)
+    assert (ok, rule) == (False, "profile")
+    assert kwp.portable(workspace_kind="scratch", has_links=False, workspace_has_content=False,
+                        assignee="new-worker", body="", pool=cfg)[0] is True
+
+
+def test_studio_only_must_be_a_string_list(tmp_path):
+    sidecar = _write_pool(tmp_path)
+    sidecar["studio_only"] = "cadmus"
+    _write_pool(tmp_path, sidecar=sidecar)
+    assert kwp.read_pool(tmp_path).refused == "sidecar"
+
+
+def _admitting_builder(fleet, kanban_cfg):
+    from gateway.kanban_gate_tick import GateTickBuilder
+    from hermes_cli.kanban_load_gate import LoadGate
+
+    gate = LoadGate({}, ncpu=32)
+    gate.band, gate.remote_allowed = "admitting", True
+    return gate, GateTickBuilder(gate, fleet_dir=lambda: fleet, kanban_cfg=lambda: kanban_cfg,
+                                 ledger=lambda b: {}, connect=lambda board=None: kb.connect(board=board),
+                                 probe=lambda h: (1.0, 16))
+
+
+def test_admitting_band_plans_the_pool_for_a_bare_ready_card(kanban_home):
+    """Red on base: admitting + a bare card (no host line) planned NO pool, so
+    it could only ever run locally. Overflow plans it and it is not pins-only."""
+    _write_pool(kanban_home / "fleet")
+    with kb.connect_closing() as conn:
+        _make(conn, 1, body="build the thing")
+    gate, b = _admitting_builder(kanban_home / "fleet", V01)
+    plan = b.plan_pool([{"slug": "default"}], {})
+    assert isinstance(plan, kwp.SpilloverPlan) and plan.pins_only is False and plan.budget == 8
+    gate, b = _admitting_builder(kanban_home / "fleet", {**V01, "worker_pool": {"overflow": False}})
+    assert b.plan_pool([{"slug": "default"}], {}) is None
+    assert gate.pool == {"planned": False, "reason": "not_needed"}
+
+
+def test_admitting_band_with_nothing_ready_does_not_probe(kanban_home):
+    _write_pool(kanban_home / "fleet")
+    gate, b = _admitting_builder(kanban_home / "fleet", V01)
+    assert b.plan_pool([{"slug": "default"}], {}) is None
+    assert gate.pool == {"planned": False, "reason": "not_needed"}
+
+
+def test_admitting_overflow_places_a_bare_card_past_the_local_allowance(kanban_home):
+    """A bare scratch card with a pool profile routes to the pool once the
+    local allowance is spent; the first one still runs locally; host: studio
+    never leaves."""
+    plan = _plan(free=2, band="admitting")
+    with kb.connect_closing() as conn:
+        (first,) = _make(conn, 1, body="no host line", priority=9)
+        (second,) = _make(conn, 1, body="no host line", priority=8)
+        (studio,) = _make(conn, 1, body="host: studio", priority=7)
+        res, spawned = _tick(conn, spillover=plan, spawn_limit=1)
+        assert (first, None) in spawned or (studio, None) in spawned
+        assert (second, "ace-ai") in spawned
+        assert all(t != studio or h is None for t, h in spawned)
+        placed = [json.loads(r[0]) for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (second, kwp.PLACED_EVENT))]
+        assert placed and placed[0]["reason"] == "overflow" and placed[0]["band"] == "admitting"

@@ -27,6 +27,14 @@ _REMOTE_PIN_SQL = (
     "SELECT body FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
     "AND body LIKE '%host:%'"
 )
+_READY_SQL = "SELECT 1 FROM tasks WHERE status = 'ready' AND claim_lock IS NULL LIMIT 1"
+
+
+def admitting_overflow(pool_cfg) -> bool:
+    """``kanban.worker_pool.overflow`` (default true, t_7b1eca07): in the
+    ``admitting`` band a portable card that finds no local slot goes to the
+    pool. False = remote pins only while admitting (PRD 5.2.5, before)."""
+    return not (isinstance(pool_cfg, dict) and pool_cfg.get("overflow", True) is False)
 
 
 @dataclass(frozen=True)
@@ -85,15 +93,26 @@ def read_signal_enabled(kanban_cfg) -> bool:
 def any_remote_pin(boards, connect, known_hosts=(), aliases=None) -> bool:
     """A ready card on any board pins a KNOWN pool host (``host:<id>`` or a
     registry alias of one, t_cb2b888d)."""
+    return _any_board(boards, connect, lambda conn: any(
+        (pin := kwp.resolve_pin(body, known_hosts, aliases)[0]) is not None
+        and pin not in (kwp.PIN_ANY, kwp.PIN_STUDIO)
+        for (body,) in conn.execute(_REMOTE_PIN_SQL).fetchall()))
+
+
+def any_ready(boards, connect) -> bool:
+    """A ready, unclaimed card on any board: overflow candidates exist."""
+    return _any_board(boards, connect,
+                      lambda conn: conn.execute(_READY_SQL).fetchone() is not None)
+
+
+def _any_board(boards, connect, test) -> bool:
     for b in boards:
         slug = (b.get("slug") if isinstance(b, dict) else None) or "default"
         conn = None
         try:
             conn = connect(board=slug)
-            for (body,) in conn.execute(_REMOTE_PIN_SQL).fetchall():
-                pin, _ignored = kwp.resolve_pin(body, known_hosts, aliases)
-                if pin is not None and pin not in (kwp.PIN_ANY, kwp.PIN_STUDIO):
-                    return True
+            if test(conn):
+                return True
         except Exception:
             continue
         finally:
@@ -156,7 +175,9 @@ class GateTickBuilder:
     def plan_pool(self, boards, remote_by_host: Dict[str, int]) -> Optional[kwp.SpilloverPlan]:
         """The ONE pool plan for this tick, or None. Runs iff
         ``kanban.worker_pool.enabled`` AND ``remote_allowed`` AND (band in
-        {spilling, paused} OR a ready card carries a remote pin)."""
+        {spilling, paused} OR a ready card carries a remote pin OR, with
+        ``worker_pool.overflow`` on, any card is ready: the pool is the
+        overflow for portable cards past the local allowance)."""
         gate = self.gate
         cfg = self._kanban_cfg() or {}
         pool_cfg = cfg.get("worker_pool")
@@ -168,10 +189,11 @@ class GateTickBuilder:
         if not gate.remote_allowed:
             gate.pool = {"planned": False, "reason": "proc_paused"}
             return None
-        pins_only = gate.band not in ("spilling", "paused")
-        if pins_only and not any_remote_pin(boards, self._connect,
-                                            kwp.known_host_ids(self._fleet_dir()),
-                                            kwp.pin_aliases(self._fleet_dir())):
+        pins_only = gate.band not in ("spilling", "paused") and not admitting_overflow(pool_cfg)
+        if gate.band not in ("spilling", "paused") and not (
+                any_ready(boards, self._connect) if not pins_only else
+                any_remote_pin(boards, self._connect, kwp.known_host_ids(self._fleet_dir()),
+                               kwp.pin_aliases(self._fleet_dir()))):
             gate.pool = {"planned": False, "reason": "not_needed"}
             return None
         pool = kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg)

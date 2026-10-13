@@ -6129,7 +6129,8 @@ def _dispatch_once_locked(
                 band = getattr(spillover, "band", None)
                 spill_reason = getattr(spillover, "spill_reason", None)
                 reason = "pin" if route == "pin" else (
-                    "band_paused" if band == "paused" else "band_spilling")
+                    "band_paused" if band == "paused" else
+                    "band_spilling" if band == "spilling" else "overflow")
                 probe = spillover.probe(placed_host.name)
                 _kb._append_event(
                     conn, claimed.id, _kb._kwh.PLACED_EVENT,
