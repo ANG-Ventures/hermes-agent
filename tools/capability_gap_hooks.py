@@ -1,0 +1,154 @@
+"""The four ``worker_capability_gap`` hook sites (Fleet Host Lanes spec v0.2 §4.3, card t_b1100bf0).
+
+A  rails           ``kanban_worker_exit.block_on_rail_absent`` after ``block_task`` committed -> ``rail_absent``
+B  toolset scope   the ``'<tool>' is not available in this session`` branches (``agent/tool_executor.py``
+                   tool_call unwrap, ``model_tools`` bridge dispatch) -> ``profile_toolset`` when the profile's
+                   toolsets do not select the tool, ``check_fn_unavailable`` when they do and its check_fn fails
+C  terminal        ``<name>: command not found`` for a ``TOOL_REQUIREMENTS`` command -> ``cmd_not_found``
+D  tool_describe   ``not_found`` names that are ``TOOL_REQUIREMENTS`` keys -> ``profile_toolset`` (advisory)
+
+Every hook: only the dispatcher-owned worker (``owned_kanban_task()``) emits; one event per (task, run, tool);
+never raises into the tool call; no notify (the hourly ``fleet-host gaps --escalate`` owns every message).
+"""
+from __future__ import annotations
+
+import logging
+import os
+import re
+import socket
+import threading
+from typing import Iterable, Optional
+
+_log = logging.getLogger(__name__)
+_lock = threading.Lock()
+_emitted: set = set()          # (task_id, run_id, tool) already recorded this process
+_refused_logged: set = set()   # (gap_class, tool) whose ValueError was logged once
+
+_RAIL_RE = re.compile(r"\b(BROWSER|SCREEN)_RAIL_ABSENT: no (?:browser|screen) session on (\S+?)\.(?:\s|$)")
+_RAIL_TOOL = {"BROWSER": "browser_*", "SCREEN": "computer_use"}
+
+
+def _owned_task() -> str:
+    from agent.delegation_context import owned_kanban_task
+    return owned_kanban_task()
+
+
+def _run_id() -> Optional[int]:
+    try:
+        return int(os.environ.get("HERMES_KANBAN_RUN_ID") or "")
+    except ValueError:
+        return None
+
+
+def _placed_host() -> Optional[str]:
+    from tools.rail_preflight import _placed_host as placed
+    return placed()
+
+
+def _profile() -> Optional[str]:
+    from hermes_cli.profiles import current_profile_name
+    return current_profile_name()
+
+
+def _emit(*, gap_class: str, tool: str, requirement_id: Optional[str], host_raw: Optional[str], message: str,
+          hook: str, advisory: bool = False) -> bool:
+    """Record one gap for the owning worker; False when not a worker, a duplicate, refused, or failed."""
+    try:
+        task = _owned_task()
+        if not task:
+            return False
+        run_id = _run_id()
+        key = (task, run_id, tool)
+        with _lock:
+            if key in _emitted:
+                return False
+            _emitted.add(key)
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_capability_gap as gap
+        try:
+            gap.validate(gap_class, requirement_id)
+        except ValueError:
+            if (gap_class, tool) not in _refused_logged:
+                _refused_logged.add((gap_class, tool))
+                _log.warning("capability gap dropped (%s, tool=%s, requirement_id=%r)", gap_class, tool,
+                             requirement_id, exc_info=True)
+            return False
+        conn = kb.connect()
+        try:
+            return gap.record_capability_gap(
+                conn, task, run_id=run_id, host_raw=host_raw, profile=_profile(), gap_class=gap_class,
+                requirement_id=requirement_id, tool=tool, message=message, placed=bool(_placed_host()),
+                advisory=advisory, hook=hook) is not None
+        finally:
+            conn.close()
+    except Exception:
+        _log.warning("capability gap hook %s failed", hook, exc_info=True)
+        return False
+
+
+def on_rail_absent(message: str) -> bool:
+    """Hook A. Called only after ``block_task`` returned True for a ``*_RAIL_ABSENT:`` message."""
+    m = _RAIL_RE.search(str(message or ""))
+    if not m:
+        return False
+    from hermes_cli.kanban_db_capability_gap import requirement_for
+    tool = _RAIL_TOOL[m.group(1)]
+    return _emit(gap_class="rail_absent", tool=tool, requirement_id=requirement_for(tool),
+                 host_raw=m.group(2), message=message, hook="rail")
+
+
+def _classify_scope(tool: str, enabled_toolsets, disabled_toolsets) -> Optional[str]:
+    """``profile_toolset`` when the session's toolsets do not select ``tool``; ``check_fn_unavailable`` when
+    they do and its registry check_fn fails; None otherwise (selected, available, just not reachable here)."""
+    import model_tools
+    from tools.registry import _check_fn_cached, registry
+    selected = model_tools._select_tool_names(
+        list(enabled_toolsets) if enabled_toolsets is not None else None,
+        list(disabled_toolsets) if disabled_toolsets else None, True)
+    if tool not in selected:
+        return "profile_toolset"
+    entry = registry.get_entry(tool)
+    if entry is not None and entry.check_fn is not None and not _check_fn_cached(entry.check_fn):
+        return "check_fn_unavailable"
+    return None
+
+
+def on_scope_block(tool: str, message: str, *, enabled_toolsets=None, disabled_toolsets=None) -> bool:
+    """Hook B: the ``not available in this session`` branch. Classifies BEFORE emitting (Momus N2)."""
+    try:
+        if not _owned_task():
+            return False
+        gap_class = _classify_scope(tool, enabled_toolsets, disabled_toolsets)
+    except Exception:
+        _log.warning("capability gap: scope classification failed for %s", tool, exc_info=True)
+        return False
+    if gap_class is None:
+        return False
+    from hermes_cli.kanban_db_capability_gap import requirement_for
+    requirement_id = None if gap_class == "profile_toolset" else requirement_for(tool)
+    return _emit(gap_class=gap_class, tool=tool, requirement_id=requirement_id,
+                 host_raw=socket.gethostname(), message=message, hook="scope")
+
+
+def on_command_not_found(missing: Optional[str], output: str) -> bool:
+    """Hook C: a terminal command failed with ``<missing>: command not found``."""
+    if not missing:
+        return False
+    from hermes_cli.kanban_db_capability_gap import requirement_for
+    requirement_id = requirement_for(missing)
+    if requirement_id is None:
+        return False
+    return _emit(gap_class="cmd_not_found", tool=missing, requirement_id=requirement_id,
+                 host_raw=_placed_host() or socket.gethostname(), message=output, hook="terminal")
+
+
+def on_describe_not_found(names: Iterable[str]) -> int:
+    """Hook D: ``tool_describe`` could not describe these names. Advisory profile gaps, never escalated."""
+    from hermes_cli.kanban_db_capability_gap import requirement_for
+    n = 0
+    for name in names or ():
+        if requirement_for(name) is None:
+            continue
+        n += _emit(gap_class="profile_toolset", tool=name, requirement_id=None, host_raw=socket.gethostname(),
+                   message=f"tool_describe: {name} not_found", hook="describe", advisory=True)
+    return n

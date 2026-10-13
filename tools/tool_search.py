@@ -523,6 +523,8 @@ def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict
     result: Dict[str, Any] = {"tools": tools}
     if not_found:
         result["not_found"] = not_found
+        from tools.capability_gap_hooks import on_describe_not_found  # Hook D (t_b1100bf0), advisory
+        on_describe_not_found(not_found)
         result["hint"] = "Names in not_found are not currently available. Re-run tool_search to refresh."
     if errors:
         result["errors"] = errors
