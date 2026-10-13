@@ -1004,6 +1004,7 @@ class HostSample:
     remote_now: Optional[float] = None
     pressure_text: str = ""
     boards: Optional[frozenset] = None
+    load5: Optional[float] = None
 
 
 # ncpu = online cores (KWLB D-3), not ``nproc``: load1 counts every runnable
@@ -1075,7 +1076,12 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
         remote_now: Optional[float] = float(lines[2].strip())
     except (IndexError, ValueError):
         remote_now = None
-    return HostSample(load1, ncpu, remote_now, "\n".join(lines[3:]).strip(), boards)
+    try:
+        load5: Optional[float] = float(lines[0].split()[1])
+    except (IndexError, ValueError):
+        load5 = None
+    return HostSample(load1, ncpu, remote_now, "\n".join(lines[3:]).strip(), boards,
+                      load5=load5)
 
 
 # -- per-(host, board) workspace faults (t_9fb4d477) --------------------------
@@ -1126,6 +1132,12 @@ class TargetSignal:
     # the memory/band cap is computed and reported only (D1: Ace's yes flips it).
     admit_on_memory: bool = False
     reservation_gb: float = _admission.DEFAULT_RESERVATION_GB
+    # The ONE placement scorer (t_d6ce856e): <root>/config/fleet-hosts.json and
+    # the headroom reservation ledger. None = no table: the band pick below.
+    placement_table: Any = None
+    placement_reservations: Optional[Path] = None
+    # A fixed headroom-ledger read (diagnostics); None = read per pick.
+    placement_live: Optional[Mapping[str, Any]] = None
 
     def kanban_cpu_est(self) -> float:
         if self.cpu_est is not None and self.cpu_est > 0:
@@ -1243,6 +1255,15 @@ class SpilloverPlan:
     # host -> why the memory/band cap is below its free slots (t_31350981);
     # filled with the flag off too, so the dry readback has its numbers.
     admission: Dict[str, str] = field(default_factory=dict)
+    last_pick: Optional[str] = None      # hysteresis for placement.choose()
+    last_decision: Any = None            # the placement.Decision behind the last take()
+    last_reservation: Optional[str] = None  # the headroom reservation the last take() wrote
+    dry_run: bool = False                # True = choose() only, never write the ledger
+    # Per pool host, one entry per take, newest last: the reservation id that
+    # take wrote, or None (dry run / no table). release() refunds exactly one.
+    _rids: Dict[str, List[Optional[str]]] = field(default_factory=dict)
+    # Dry-run takes per host: never in the ledger, so choose() adds them.
+    _simulated: Dict[str, int] = field(default_factory=dict)
 
     @property
     def budget(self) -> int:
@@ -1275,7 +1296,19 @@ class SpilloverPlan:
             load1 = float((self.detail.get(n) or {}).get("load1") or 0.0)
             return _ledger.projected(n, load1, res, now=now) + cost * self.taken.get(n, 0)
 
-        return min(names, key=lambda n: (proj(n), self.hosts[n].priority))
+        return min(names, key=lambda n: (proj(n), n))
+
+    def placement_reserved(self) -> Mapping[str, Any]:
+        """Live headroom reservations (other ticks' spawns) per host."""
+        sig = self.signal
+        if sig is None or sig.placement_table is None:
+            return {}
+        if sig.placement_live is not None:
+            return sig.placement_live
+        from hermes_cli import placement as _placement
+        # A corrupt ledger raises LedgerError: take() refuses (never reads it as empty).
+        return _placement.live_reservations(sig.placement_reservations, now=sig.clock(),
+                                            table=sig.placement_table)
 
     def probe(self, name: str) -> Optional[dict]:
         d = self.detail.get(name) or {}
@@ -1325,14 +1358,19 @@ class SpilloverPlan:
 
     def take(self, assignee: Optional[str], pin: Optional[str] = None,
              only: Optional[Collection[str]] = None,
-             board: Optional[str] = None) -> Optional[PoolHost]:
-        """Reserve one slot: on ``pin`` only, else the first host in priority
-        order with a free slot that serves ``assignee``. ``only`` (a host-bound
-        card, t_1e9ea7e9) restricts the unpinned pick to those hosts; an empty
-        ``only`` takes nothing (``host_reach``). ``board`` drops every host
-        that cannot host that board (:meth:`board_refusal`): the card spills
-        to another host or waits ``board_unhostable``. None sets ``refusal``."""
+             board: Optional[str] = None, job: Any = None,
+             job_id: Optional[str] = None) -> Optional[PoolHost]:
+        """Reserve one slot: on ``pin`` only, else (signal + placement table)
+        ``placement.choose()`` over the hosts that serve ``assignee`` with
+        ``job`` overrides (t_d6ce856e); without a table the band pick. ``only``
+        (a host-bound card, t_1e9ea7e9) restricts the unpinned pick to those
+        hosts; an empty ``only`` takes nothing (``host_reach``). ``board`` drops
+        every host that cannot host that board (:meth:`board_refusal`) before
+        the pick: the card spills to another host or waits ``board_unhostable``.
+        None sets ``refusal``."""
         self.refusal = None
+        self.last_decision = None
+        self.last_reservation = None
         # Pins and reach rows are lower-cased; host keys are compared case-
         # folded so a mixed-case pool id still matches (Prism d4be9ccd2c7f).
         fold = {n.lower(): n for n in self.hosts}
@@ -1349,6 +1387,22 @@ class SpilloverPlan:
             if why is not None:
                 self.refusal = f"pin_host_board_unhostable ({pin}: {board} {why})"
                 return None
+            if self.signal is not None and self.signal.placement_table is not None:
+                # A pin keeps its precedence but its footprint is booked like any
+                # take, so later admissions see it (Prism 4609a040ad20 / b8c13f6c2e7a).
+                rid = None
+                if self.dry_run:
+                    self._simulated[pin] = self._simulated.get(pin, 0) + 1
+                else:
+                    from hermes_cli import kanban_headroom as _kh
+                    from hermes_cli import placement as _placement
+                    try:
+                        rid = _kh.book_pin(self, pin, job_id)
+                    except _placement.PlacementError as exc:  # corrupt ledger: fail closed
+                        self.refusal = f"pool_unavailable ({type(exc).__name__}: {exc})"
+                        return None
+                    self.last_reservation = rid
+                self._rids.setdefault(pin, []).append(rid)
             self.slots[pin] -= 1
             self.taken[pin] = self.taken.get(pin, 0) + 1
             return host
@@ -1367,6 +1421,37 @@ class SpilloverPlan:
                 self.refusal = "board_unhostable (" + "; ".join(
                     f"{n}: {board} {w}" for n, w in sorted(unhostable.items())) + ")"
                 return None
+        if self.signal is not None and self.signal.placement_table is not None:
+            from hermes_cli import kanban_headroom as _kh
+            names = [n for n, h in self.hosts.items() if n in allowed and assignee in h.profiles]
+            if not names:
+                self.refusal = "pool_full"
+                return None
+            from hermes_cli import placement as _placement
+            rid = None
+            try:
+                if self.dry_run:
+                    d = _kh.choose(self, names, job)
+                else:
+                    d, rid = _kh.admit(self, names, job, job_id)
+            except _placement.PlacementError as exc:  # LedgerError / ExclusionsError: fail closed
+                self.refusal = f"pool_unavailable ({type(exc).__name__}: {exc})"
+                return None
+            self.last_decision = d
+            key = _kh.pool_key(self.signal.placement_table, names, d.host)
+            if key is None or self.slots.get(key, 0) <= 0:
+                _kh.release_id(self.signal, rid)
+                self.refusal = f"pool_unavailable ({d.reason or 'no_slot'}: " + "; ".join(
+                    f"{r.host} {r.reason}" for r in d.rows if not r.eligible) + ")"
+                return None
+            self.last_reservation = rid
+            self._rids.setdefault(key, []).append(rid)
+            if self.dry_run:
+                self._simulated[key] = self._simulated.get(key, 0) + 1
+            self.slots[key] -= 1
+            self.taken[key] = self.taken.get(key, 0) + 1
+            self.last_pick = key
+            return self.hosts[key]
         if self.signal is not None:
             free = [n for n, h in self.hosts.items()
                     if n in allowed and self.slots.get(n, 0) > 0 and assignee in h.profiles]
@@ -1389,11 +1474,29 @@ class SpilloverPlan:
         self.refusal = "pool_full"
         return None
 
-    def release(self, host: PoolHost) -> None:
+    def release(self, host: PoolHost, reservation: Optional[str] = None) -> None:
+        """Refund a take() whose claim/spawn failed: the slot, and the headroom
+        reservation THAT take wrote. ``reservation`` names it (the dispatcher
+        passes ``last_reservation``); without it the newest take on the host is
+        refunded. Every take, pinned or not, has its own entry, so a failed take
+        never releases an earlier live worker's promise (Prism b711acd04da4)."""
         if host.name in self.slots:
             self.slots[host.name] += 1
             if self.taken.get(host.name):
                 self.taken[host.name] -= 1
+            if self._simulated.get(host.name):
+                self._simulated[host.name] -= 1
+        rids = self._rids.get(host.name)
+        if not rids:
+            return
+        if reservation is not None and reservation in rids:
+            rids.remove(reservation)
+            rid = reservation
+        else:
+            rid = rids.pop()
+        if rid:
+            from hermes_cli import kanban_headroom as _kh
+            _kh.release_id(self.signal, rid)
 
     def snapshot(self) -> dict:
         """The ``load_gate.json`` ``pool`` block for this tick."""
@@ -1489,6 +1592,10 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
         if isinstance(sample, HostSample):
             row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
             row["cap"] = _admission.cap(sample.pressure_text, reservation=signal.reservation_gb)
+            if signal.placement_table is not None:
+                from hermes_cli import kanban_headroom as _kh
+                row["placement"] = _kh.sample_fields(sample.load5, sample.remote_now, sample.pressure_text,
+                                                     stale_after_s=policy.stale_after_s, local_now=now)
             kb = policy.kanban_band(h.name)
             got, row["why"] = read_pressure(sample.remote_now, sample.pressure_text,
                                             stale_after_s=policy.stale_after_s, warm=kb.warm, hot=kb.hot)
@@ -1551,6 +1658,8 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
             **({"pressure": why} if why else {}),
             **({"admission": admission[h.name]} if h.name in admission else {}),
             **({"boards": sorted(r["boards"])} if r["boards"] is not None else {}),
+            **(r.get("placement") or ({"sample_status": "absent"} if signal.placement_table is not None
+                                      and r["probed"] else {})),
         }
     plan = _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal)
     plan.admission = admission

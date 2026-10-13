@@ -137,15 +137,34 @@ def pick_rung(pool: kwp.PoolConfig, block: Mapping, tick_hosts: Mapping, *, poli
               for h in hosts}
     signal = None
     if signal_on:
+        from hermes_cli import kanban_headroom as kh
+        from hermes_cli import placement
+
+        table = kh.load_table(root)
+        rpath = root / placement.RESERVATIONS_REL
+        live = None
+        if table is not None:
+            try:
+                live = placement.live_reservations(rpath, now=now, table=table)
+            except placement.PlacementError:
+                live = None  # take() re-reads, refuses and names the error
         signal = kwp.TargetSignal(policy=policy, state_path=root / "var" / kwp.TARGET_STATE_FILE,
                                   ledger_dir=pledger.ledger_dir(root), cpu_est=cost, clock=lambda: now,
-                                  reservations=list(reservations))
+                                  reservations=list(reservations), placement_table=table,
+                                  placement_reservations=rpath, placement_live=live)
     plan = kwp._finish_plan(hosts, slots, detail, pool.disabled, block.get("planned_at"), pool, signal)
+    plan.dry_run = True  # read-only report: never writes the headroom ledger
     free = [n for n, h in plan.hosts.items() if slots.get(n, 0) > 0 and assignee in h.profiles]
     chosen = plan.take(assignee)  # in-memory plan only: nothing is written
+    d = plan.last_decision
+    rows = d.lines(signal.placement_table) if d is not None else []
     if chosen is None:
-        return {"host": None, "assignee": assignee, "why": plan.refusal or "pool_full"}
+        return {"host": None, "assignee": assignee, "why": plan.refusal or "pool_full", "rows": rows}
     name = chosen.name
+    if d is not None:
+        return {"host": name, "assignee": assignee, "rows": rows,
+                "why": f"placement.choose: {d.rule}" + (" (kept, within margin)" if d.kept_previous else "")
+                + f", footprint {d.footprint.ram_gb:g} GB / {d.footprint.threads:g} threads"}
     if signal is None:
         why = "read_signal false (KWLB v0.1): first host in priority order with a free slot"
     else:
@@ -195,4 +214,6 @@ def format_lines(rep: Mapping) -> List[str]:
                        f"ramp={r['ramp_s']:g}s unrealised={r['unrealised']} -> +{r['pending']:.2f}")
     rung = rep.get("rung") or {}
     out.append(f"  rung for @{rung.get('assignee')}: {rung.get('host') or 'none'} ({rung.get('why')})")
+    for line in rung.get("rows") or ():
+        out.append(f"    {line}")
     return out

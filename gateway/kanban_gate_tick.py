@@ -132,6 +132,9 @@ class GateTickBuilder:
             return None
         root = self._root()
         cost = getattr(self.gate, "cost", None)
+        from hermes_cli import kanban_headroom as kh
+        from hermes_cli import placement
+
         return kwp.TargetSignal(
             policy=ppolicy.load(self._fleet_dir()),
             state_path=root / "var" / kwp.TARGET_STATE_FILE,
@@ -139,6 +142,8 @@ class GateTickBuilder:
             cpu_est=float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
             admit_on_memory=kadm.enabled(cfg),
             reservation_gb=kadm.reservation_gb(cfg),
+            placement_table=kh.load_table(root),
+            placement_reservations=root / placement.RESERVATIONS_REL,
         )
 
     def build(self, boards) -> GateTick:

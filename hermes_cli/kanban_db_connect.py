@@ -1389,6 +1389,57 @@ def _main_db_file(conn: sqlite3.Connection) -> Optional[str]:
     return None
 
 
+# Post-commit actions keyed by connection (t_d6ce856e): a side effect outside
+# SQLite (the placement headroom ledger) must happen only once the run row it
+# mirrors is durable, never while the transaction can still roll back. The
+# connection is held strongly so its id cannot be reused while queued.
+_POST_COMMIT: dict = {}
+
+
+def on_commit(conn: sqlite3.Connection, fn) -> None:
+    """Run ``fn()`` after the enclosing ``write_txn`` COMMITs; drop it on
+    ROLLBACK (savepoint rollbacks drop the actions queued inside them). With no
+    open transaction the write is already durable: run it now."""
+    if not getattr(conn, "in_transaction", False):
+        fn()
+        return
+    entry = _POST_COMMIT.get(id(conn))
+    if entry is None or entry[0] is not conn:
+        entry = _POST_COMMIT[id(conn)] = (conn, [])
+    entry[1].append(fn)
+
+
+def _post_commit_mark(conn) -> int:
+    entry = _POST_COMMIT.get(id(conn))
+    return len(entry[1]) if entry is not None and entry[0] is conn else 0
+
+
+def _post_commit_truncate(conn, mark: int) -> None:
+    entry = _POST_COMMIT.get(id(conn))
+    if entry is not None and entry[0] is conn:
+        del entry[1][mark:]
+
+
+def _post_commit_drop(conn) -> None:
+    entry = _POST_COMMIT.pop(id(conn), None)
+    if entry is not None and entry[0] is not conn:
+        _POST_COMMIT[id(conn)] = entry
+
+
+def _post_commit_run(conn) -> None:
+    entry = _POST_COMMIT.pop(id(conn), None)
+    if entry is None:
+        return
+    if entry[0] is not conn:
+        _POST_COMMIT[id(conn)] = entry
+        return
+    for fn in entry[1]:
+        try:
+            fn()
+        except Exception as exc:  # a mirror of committed state, never a gate
+            _kb._log.warning("kanban: post-commit action failed: %s", exc)
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """IMMEDIATE write transaction; a claim CAS inside is atomic — at most one
@@ -1411,12 +1462,14 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             )
         savepoint = f"hermes_nested_{secrets.token_hex(8)}"
         conn.execute(f"SAVEPOINT {savepoint}")
+        mark = _post_commit_mark(conn)
         try:
             yield conn
         except Exception:
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute(f"ROLLBACK TO {savepoint}")
                 conn.execute(f"RELEASE {savepoint}")
+            _post_commit_truncate(conn, mark)
             raise
         else:
             conn.execute(f"RELEASE {savepoint}")
@@ -1434,6 +1487,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         # don't let this secondary failure shadow the real one.
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute("ROLLBACK")
+        _post_commit_drop(conn)
         raise
     else:
         try:
@@ -1443,7 +1497,9 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             # connection isn't poisoned for the next BEGIN IMMEDIATE.
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("ROLLBACK")
+            _post_commit_drop(conn)
             raise
+        _post_commit_run(conn)
         # Post-commit torn-extend check — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
         # Cross-board home index (t_11f2cf60): mirror the cards this commit
