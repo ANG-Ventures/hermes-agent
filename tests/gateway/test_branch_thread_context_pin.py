@@ -328,5 +328,5 @@ async def test_internal_first_child_turn_gets_branch_note_and_keeps_sentinel(mon
 def test_branch_note_scopes_its_override_and_vouches_for_the_rest():
     note = branch_thread_context_note(SessionContext(
         source=_child_thread_source(), connected_platforms=[], home_channels={}))
-    assert "Home Channels and other delivery options are current" in note
+    assert "Home Channels and delivery options still hold" in note
     assert "Current Session Context" not in note, "a blanket override would void the still-true homes"
