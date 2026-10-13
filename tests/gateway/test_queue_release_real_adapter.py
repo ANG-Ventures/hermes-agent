@@ -240,3 +240,32 @@ async def test_plain_message_after_stop_runs_and_held_items_stay_held(monkeypatc
     await asyncio.sleep(0.3)
     assert rig.calls == ["first", "ping"]
     assert [e.text for e in rig.runner._session_state(KEY).conversation.held_queue] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_busy_queue_run_dispatches_when_interrupted_turn_exits_mid_interrupt(monkeypatch, tmp_path):
+    """Prism af8c050c090f: the real interrupt awaits (platform typing RPC) after holding the queue. If
+    the stopped turn unwinds during that await, its drains find nothing and it releases the guard;
+    the released items must still run without another inbound message."""
+    rig = _Rig(monkeypatch, tmp_path)
+    runner, adapter = rig.runner, rig.adapter
+
+    async def interrupt_and_clear(key, source, *, interrupt_reason, invalidation_reason,
+                                  release_running_state=True):
+        runner._invalidate_session_run_generation(key, reason=invalidation_reason)
+        qm.hold_user_items(runner, key, adapter)
+        rig.block_first.set()
+        for _ in range(500):                         # suspended in e.g. Signal's sendTyping RPC
+            if KEY not in adapter._active_sessions:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("interrupted turn never released the guard")
+
+    runner._interrupt_and_clear_session = interrupt_and_clear
+    await rig.start_first_turn()
+    for text in ("/queue a", "/queue b"):
+        await rig.adapter.handle_message(_msg(text))
+    await rig.adapter.handle_message(_msg("/queue run"))
+    await rig.settle(expect=3)
+    assert rig.calls == ["first", "a", "b"]
+    assert rig.max_live == 1

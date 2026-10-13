@@ -5030,6 +5030,13 @@ class BasePlatformAdapter(ABC):
                     logger.debug("[%s] Command '/%s' bypassing active-session guard for %s",
                                  self.name, cmd, session_key)
                     await self._dispatch_inline_reply(event)
+                    # The handler awaits; if the owner task exited meanwhile it found the slot empty
+                    # and released the guard, so nothing drains what the command armed (busy
+                    # `/queue run` restaging held items). Start it, as the busy-handler path does.
+                    if session_key not in self._active_sessions:
+                        orphan = self._pending_messages.pop(session_key, None)
+                        if orphan is not None:
+                            self._start_session_processing(orphan, session_key)
             except Exception as e:
                 logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
             return
