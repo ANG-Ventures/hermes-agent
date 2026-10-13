@@ -468,8 +468,8 @@ def _match_is_quoted_data(text: str, match_start: int, match_str: str) -> bool:
     _line_start = text.rfind("\n", 0, match_start) + 1
     _line_end = text.find("\n", match_start)
     _line = text[_line_start:] if _line_end == -1 else text[_line_start:_line_end]
-    if _PIPE_TO_INTERPRETER.search(_line):
-        return False
+    if _PIPE_TO_INTERPRETER.search(_line) or _feeds_executor(text[_line_start:]):
+        return False   # `| env bash`, `| sudo -u x sh`, a `|` continued on the next line (7bdfbaaa)
 
     # Condition 1: a single/double quote region is OPEN at the match, and it
     # closes somewhere in the suffix (data is bounded, not a trailing dangle).
@@ -1045,6 +1045,50 @@ def _shell_option_noexec(name: str, enable: bool, noexec: bool) -> bool:
     if folded == "exec":
         return False if enable else noexec
     return noexec
+def _shell_noexec_state(arguments: list[str]) -> tuple[bool, int, bool]:
+    """Effective noexec state of a shell's leading options: ``(noexec, operand_index, saw_c)``.
+
+    The ONE option parser for `bash -n` decisions (the referenced-script walk and the
+    write-then-run check both use it), so `+o noexec`, `-n +n`, `-xo errexit` and zsh's
+    `--exec` re-enable execution everywhere alike (Prism 1fc8d7bd on #1917, t_9c269c34).
+    ``saw_c`` is True when a `-c` cluster ended the scan.
+    """
+    arg_index = 0
+    # Track the EFFECTIVE noexec state: the shell applies options left to right, so
+    # `-n +o noexec`, `-n +n` and `-o noexec +o noexec` re-enable execution. In a short
+    # cluster (`-xo`, `+eo`) `-` sets and `+` clears each letter, and every `o`/`O`
+    # letter consumes the next argument as its value (`-xo errexit script`). zsh also
+    # takes `--name` for `-o name` and the inverted `exec` name (`-n -o exec`).
+    noexec = False
+    while arg_index < len(arguments):
+        argument = arguments[arg_index]
+        if argument in {"--", "-", "+"}:
+            arg_index += 1
+            break
+        if argument == "--command":
+            return noexec, arg_index, True
+        if argument.startswith("--"):
+            noexec = _shell_option_noexec(argument[2:], True, noexec)
+            arg_index += 2 if argument in _SHELL_LONG_OPTIONS_WITH_VALUES else 1
+            continue
+        if len(argument) < 2 or argument[0] not in "-+":
+            break
+        letters = argument[1:]
+        if argument[0] == "-" and "c" in letters:
+            return noexec, arg_index, True   # the -c payload is scanned by the sh -c path
+        enable = argument[0] == "-"
+        arg_index += 1
+        for letter in letters:
+            if letter == "n":
+                noexec = enable
+            elif letter in "oO":
+                value = arguments[arg_index] if arg_index < len(arguments) else ""
+                arg_index += 1
+                if letter == "o":
+                    noexec = _shell_option_noexec(value, enable, noexec)
+    return noexec, arg_index, False
+
+
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
@@ -1802,6 +1846,8 @@ def _mask_data_sink_arguments(text: str) -> str:
     plain regex would have blocked — never block one it would have allowed —
     so it runs solely as a second-pass exemption check.
     """
+    if _feeds_executor(text):
+        return text
     lines_out: list[str] = []
     changed = False
     for line in text.splitlines() or [text]:
@@ -1944,6 +1990,61 @@ def _drop_heredoc_bodies(text: str) -> str:
     return "\n".join(out)
 
 
+# Stage heads that execute what is piped (or heredoc'd) into them. Wrappers (`env`, `sudo -u x`,
+# `nohup`, `timeout 5`, `exec`, `command`) are peeled first, so `| env bash` is `| bash`
+# (Prism 7bdfbaaa on #1917, t_9c269c34: the three pipe regexes only knew `| [sudo ]<shell>`).
+_STAGE_EXECUTORS = frozenset({"source", "."})
+_PIPE_CONTINUATION_RE = re.compile(r"(\|&?)[ \t]*(?:#[^\n]*)?\r?\n")
+
+
+def _stage_is_executor(stage: str) -> bool:
+    """The pipeline stage *stage* (its own text, no control operators) runs its stdin."""
+    try:
+        tokens = shlex.split(stage, posix=True)
+    except ValueError:
+        tokens = stage.split()
+    tokens = [t for t in tokens if t and not t.startswith(("<<", "<", ">"))]
+    index = _command_token_index(tokens)
+    if index is None:
+        return False
+    index = _peel_transparent_prefixes(tokens, index)
+    if index >= len(tokens):
+        return _executable_name(tokens[-1]) in _TRANSPARENT_COMMAND_PREFIXES  # `| sudo` alone
+    name = _executable_name(tokens[index]).lower()
+    return bool(name in _ARGUMENT_REPARSERS or name in _STAGE_EXECUTORS or _REPARSER_NAME_RE.match(name))
+
+
+def _feeds_executor(text: str) -> bool:
+    """Some pipe in *text* (a trailing `|` continues the pipeline onto the next line, Prism
+    31197de5) hands its stream to an executor stage. Heredoc bodies are not shell text."""
+    joined = _PIPE_CONTINUATION_RE.sub(r"\1 ", _drop_heredoc_bodies(text))
+    view = _unquoted_view(joined)
+    for match in re.finditer(r"(?<!\|)\|(?!\|)&?", view):
+        rest = view[match.end():]
+        stop = re.search(r"[;&|\n)]", rest)
+        end = match.end() + (stop.start() if stop else len(rest))
+        if _stage_is_executor(joined[match.end():end]):
+            return True
+    return False
+
+
+def _heredoc_receiver_executes(line: str, at: int) -> bool:
+    """The command receiving the heredoc opened at *at* on *line* is a SHELL-like executor
+    (`env bash <<EOF`, `sudo -u x sh <<EOF`). A Python body is not shell text: it is scanned by
+    the AST path in `_contains_unsafe_gateway_action`, so python receivers are left to it."""
+    view = _unquoted_view(line[:at])
+    start = max(view.rfind(c) for c in ";&|(") + 1
+    stage = line[start:at]
+    try:
+        tokens = shlex.split(stage, posix=True)
+    except ValueError:
+        tokens = stage.split()
+    index = _executed_command_index(tokens)
+    if index is not None and re.match(r"^pythonw?[\d.]*$", _executable_name(tokens[index]).lower()):
+        return False
+    return _stage_is_executor(stage)
+
+
 def _writes_then_runs(text: str) -> bool:
     """The command WRITES bytes (a redirect, `tee`, a heredoc to a file, `printf -v`, `read`) and a
     LATER segment executes something that is not an inert reader: the written content may be what
@@ -1973,29 +2074,16 @@ def _writes_then_runs(text: str) -> bool:
             if name == "awk" and any("system(" in t for t in rest):
                 return True
             continue
-        if name in _SHELL_EXECUTABLES and _is_noexec_shell_segment(segment[index:]):
-            continue
+        if name in _SHELL_EXECUTABLES:
+            noexec, _, saw_c = _shell_noexec_state(segment[index + 1:])
+            if noexec and not saw_c:
+                continue
         return True
     return False
 
 
-def _is_noexec_shell_segment(argv: list[str]) -> bool:
-    """`bash -n x.sh`: parses without executing."""
-    noexec = False
-    for w in argv[1:]:
-        if w.startswith("--"):
-            continue
-        if w.startswith("+") and len(w) > 1:
-            if "n" in w[1:]:
-                noexec = False
-            continue
-        if not w.startswith("-"):
-            break
-        if "c" in w[1:]:
-            return False
-        if "n" in w[1:]:
-            noexec = True
-    return noexec
+
+
 _PROGRAM_VALUE_OPTION_RE = re.compile(
     r"(?:^|\s)(?:\+!|-c\b|-e\b|-x\b|-o\s|--to-command|--checkpoint-action|--exec\b|-exec\b|-execdir\b|"
     r"--pre\b|--pager\b|--compress-program|-I\s|-O\b|--ext-diff|--textconv|--filter\b|-S\b|--split-string)"
@@ -2029,7 +2117,41 @@ def _segment_command_reparses(prefix: str) -> Optional[bool]:
             return True
         if token in _REPARSER_OPTION_TOKENS:
             return True
-    return False
+    return not _is_content_argument_command(tokens)
+
+
+# Commands whose quoted multi-word argument is CONTENT handed over as one argv element and never
+# run, stored, matched against processes or deferred: the ONLY segments the quoted-argument view
+# may mask. An allowlist, not a denylist: #1917 masked everything not on `_ARGUMENT_REPARSERS`, and
+# every executor or store missing from that list became a bypass (gdb -ex, pkill -f, trap, for ..
+# in, export/declare/set --, shell functions, git config alias, Prism on #1917, t_9c269c34).
+# An unknown command keeps its quoted text visible, exactly as before #1917.
+_CONTENT_ARGUMENT_COMMANDS = frozenset({
+    "echo", "printf", "grep", "egrep", "fgrep", "rg", "ag", "ack", "jq", "journalctl",
+    "sqlite3", "psql",
+})
+# Multi-word commands: only these subcommands take content (`hermes kanban comment --body`,
+# `git commit -m`, `gh pr create --body`). `git config`, `gh alias set` and the rest store a
+# value something else later runs.
+_CONTENT_ARGUMENT_SUBCOMMANDS = {
+    "hermes": frozenset({"kanban"}),
+    "git": frozenset({"commit", "tag", "log", "show", "grep", "notes"}),
+    "gh": frozenset({"pr", "issue", "release", "api"}),
+}
+
+
+def _is_content_argument_command(tokens: list[str]) -> bool:
+    if not tokens or "/" in tokens[0]:
+        return False
+    name = tokens[0].lower()
+    if name in _CONTENT_ARGUMENT_COMMANDS:
+        # `printf -v NAME '…'` stores the value; `_WRITES_OR_STORES_RE` also refuses it.
+        return not (name == "printf" and any(t == "-v" for t in tokens[1:]))
+    subcommands = _CONTENT_ARGUMENT_SUBCOMMANDS.get(name)
+    if subcommands is None:
+        return False
+    rest = [t for t in tokens[1:] if not t.startswith("-")]
+    return bool(rest) and rest[0] in subcommands
 
 
 def _mask_quoted_argument_data(text: str) -> str:
@@ -2054,6 +2176,8 @@ def _mask_quoted_argument_data(text: str) -> str:
     # Any option that hands its value to a program (`vim '+!cmd'`, `git -c alias.x='!cmd'`,
     # `tar --to-command=`, `rsync -e`, `find -exec`): keep the text whole.
     if _PROGRAM_VALUE_OPTION_RE.search(_unquoted_view(text)):
+        return text
+    if _feeds_executor(text):
         return text
     out: list[str] = []
     i, n = 0, len(text)
@@ -2185,8 +2309,9 @@ def _mask_heredoc_bodies(text: str) -> str:
         terminator = lines[end] if end < len(lines) else None
 
         # Fail-closed conditions: the body may actually be executed.
-        feeds_interpreter = bool(_HEREDOC_TO_INTERPRETER.search(line))
-        piped_to_interpreter = bool(_PIPE_TO_INTERPRETER.search(line))
+        feeds_interpreter = bool(_HEREDOC_TO_INTERPRETER.search(line)) or _heredoc_receiver_executes(
+            line, match.start())
+        piped_to_interpreter = bool(_PIPE_TO_INTERPRETER.search(line)) or _feeds_executor(line)
         expands = (not quoted) and any(
             marker in "\n".join(body) for marker in ("$(", "`")
         )
@@ -2346,39 +2471,7 @@ def _references_at(
 
     if executable_name in _SHELL_EXECUTABLES:
         arguments = segment[index + 1 :]
-        arg_index = 0
-        # Track the EFFECTIVE noexec state: the shell applies options left to right, so
-        # `-n +o noexec`, `-n +n` and `-o noexec +o noexec` re-enable execution. In a short
-        # cluster (`-xo`, `+eo`) `-` sets and `+` clears each letter, and every `o`/`O`
-        # letter consumes the next argument as its value (`-xo errexit script`). zsh also
-        # takes `--name` for `-o name` and the inverted `exec` name (`-n -o exec`).
-        noexec = False
-        while arg_index < len(arguments):
-            argument = arguments[arg_index]
-            if argument in {"--", "-", "+"}:
-                arg_index += 1
-                break
-            if argument == "--command":
-                break
-            if argument.startswith("--"):
-                noexec = _shell_option_noexec(argument[2:], True, noexec)
-                arg_index += 2 if argument in _SHELL_LONG_OPTIONS_WITH_VALUES else 1
-                continue
-            if len(argument) < 2 or argument[0] not in "-+":
-                break
-            letters = argument[1:]
-            if argument[0] == "-" and "c" in letters:
-                break   # the -c payload is scanned by the sh -c path; fail closed here
-            enable = argument[0] == "-"
-            arg_index += 1
-            for letter in letters:
-                if letter == "n":
-                    noexec = enable
-                elif letter in "oO":
-                    value = arguments[arg_index] if arg_index < len(arguments) else ""
-                    arg_index += 1
-                    if letter == "o":
-                        noexec = _shell_option_noexec(value, enable, noexec)
+        noexec, arg_index, _ = _shell_noexec_state(arguments)
         if noexec:
             return
         if arg_index < len(arguments) and arguments[arg_index] not in {
@@ -2896,8 +2989,12 @@ def _python_body_is_mask_safe(tree: ast.AST) -> bool:
     return True
 
 
-def _python_written_paths(body: str) -> set[str]:
-    """Literal paths a (mask-safe) python body opens for WRITING; empty when none or unparsable."""
+def _python_written_paths(body: str) -> Optional[set[str]]:
+    """Literal paths a (mask-safe) python body opens for WRITING; empty when none or unparsable.
+
+    ``None`` when a writable ``open`` names its file through anything but a string literal
+    (`p = "/tmp/x.sh"; open(p, "w")`): the destination is unknown, so it may be what the shell
+    runs next (Prism e63acd19 on #1917, t_9c269c34)."""
     try:
         tree = ast.parse(body)
     except SyntaxError:
@@ -2905,11 +3002,38 @@ def _python_written_paths(body: str) -> set[str]:
     out: set[str] = set()
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open"
-                and len(node.args) >= 2 and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str) and isinstance(node.args[1], ast.Constant)
+                and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
                 and node.args[1].value in _MASK_OPEN_WRITE_MODES):
+            if not (isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+                return None
             out.add(node.args[0].value)
     return out
+
+
+# Files a shell reads on its own at startup (`bash -i`, a login shell, zsh): a write to one runs
+# later without its path ever appearing in the command (Prism 52fa2744 on #1917, t_9c269c34).
+_SHELL_STARTUP_FILE_NAMES = frozenset({
+    ".bashrc", ".bash_profile", ".bash_login", ".profile", ".bash_logout", ".zshrc", ".zshenv",
+    ".zprofile", ".zlogin", ".zlogout", ".kshrc", ".shrc", ".envrc",
+})
+
+
+def _python_write_may_run(body: str, shell_only: str) -> bool:
+    """A file the body WRITES may be executed: the shell text names it again, its path is not a
+    literal, it is a shell startup file, or the body itself runs a process (`subprocess.run`
+    after the write, Prism b963b1c8). Then the strings written are not data."""
+    paths = _python_written_paths(body)
+    if paths is None:
+        return True
+    if not paths:
+        return False
+    if re.search(r"\bsubprocess\s*\.\s*run\b", body):
+        return True
+    return any(
+        p in shell_only or Path(p).name in shell_only or Path(p).name in _SHELL_STARTUP_FILE_NAMES
+        or "/etc/profile" in p or "/etc/bash" in p or "/etc/zsh" in p
+        for p in paths
+    )
 
 
 def _mask_python_data_strings(body: str) -> str:
@@ -3060,9 +3184,7 @@ def _contains_unsafe_gateway_action(
         masked_body = _mask_python_data_strings(body)
         # a file the body WRITES and the shell text names again may be executed next: the
         # strings going into it are not data (write-then-run class, R6)
-        if masked_body != body and any(
-            p in shell_only or Path(p).name in shell_only for p in _python_written_paths(body)
-        ):
+        if masked_body != body and _python_write_may_run(body, shell_only):
             masked_body = body
         hit = _describe_direct_lifecycle_scan(masked_body)
         if hit is not None:
