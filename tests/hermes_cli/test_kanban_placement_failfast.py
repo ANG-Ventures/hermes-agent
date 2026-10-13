@@ -14,6 +14,7 @@ no network, no real spawn. Every board transition goes through the real
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -336,7 +337,7 @@ def test_reroute_of_a_reviewer_run_returns_to_review(board, monkeypatch):
         assert kb.request_review(conn, tid, summary="impl done", expected_run_id=run1)
         assert kb.claim_review_task(conn, tid) is not None
         run2 = kb.latest_run(conn, tid).id
-    _placed_env(monkeypatch, tid, run2, host="studio-local")
+    _placed_env(monkeypatch, tid, run2)
     assert kwe.block_on_rail_absent(RAIL) is True
     assert _task(tid).status == "review"
     assert _events(tid, pff.REROUTE_EVENT)[0]["to"] == "review"
@@ -699,7 +700,7 @@ def test_unknown_hard_requirement_is_kept_and_refused_under_enforcement(board, m
     for record in (rec, None):                                   # fresh stamp, and a stale route
         _placed_env(monkeypatch, tid, 1, record=record)
         line = pff.boot_check(tid)
-        assert line is not None and pff.ABSENT_RE.match(line), line
+        assert line is not None and line.startswith(pff.UNRESOLVED_TOKEN), line
     _placed_env(monkeypatch, tid, 1, caps=json.dumps({"*": "warn"}))
     assert pff.boot_check(tid) is None                           # WARN: inert
     (board / khc.MAP_FILE).write_text("{not json")
@@ -925,3 +926,156 @@ def test_second_miss_keeps_needs_input_without_a_custody_probe(board, monkeypatc
     assert t.status == "blocked" and t.block_kind == "needs_input" and calls == [1]
     with kb.connect_closing() as conn:
         assert "Second placement miss" in kb._latest_block_reason(conn, tid)
+
+
+# -- parent review of 7e4dcce8: four boundary cases -------------------------------------------
+
+def test_local_placement_rail_miss_parks_without_custody_probe_or_reroute(board, monkeypatch, tmp_path):
+    # 03985b00389e: the synthetic local placement is unplaced for every gate AND the exit seam.
+    from hermes_cli.kanban_local_worker_uid import LOCAL_HOST_NAME
+    from tools import rail_preflight as rp
+    calls = []
+    monkeypatch.setattr(kwh, "remote_workspace_has_content", lambda raw, runner=None: calls.append(1) or False)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "unfinished.patch").write_text("SOURCE_WORK")
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain")
+    run = _claim(tid)
+    _placed_env(monkeypatch, tid, run, host=LOCAL_HOST_NAME,
+                record={"env": {"TERMINAL_ENV": "ssh", "TERMINAL_SSH_HOST": "localhost",
+                                "TERMINAL_CWD": str(ws)}})
+    assert kwe.block_on_rail_absent(rp.rail_absent_message("browser", LOCAL_HOST_NAME)) is True
+    t = _task(tid)
+    assert t.status == "blocked" and t.block_kind == "needs_input"
+    assert _events(tid, pff.REROUTE_EVENT) == [] and calls == [] and "requires:" not in t.body
+    assert (ws / "unfinished.patch").read_text() == "SOURCE_WORK"
+
+
+def test_committed_custody_hold_stays_handled_when_its_event_write_fails(board, monkeypatch, tmp_path):
+    # 35b39eb7244e: after block_task committed, a diagnostic event failure is not "unhandled".
+    from unittest.mock import patch
+    hook = []
+    monkeypatch.setattr("tools.capability_gap_hooks.on_rail_absent", lambda m: hook.append(m))
+    monkeypatch.setattr(kwh, "remote_workspace_has_content", lambda raw, runner=None: True)
+    real = kb._append_event
+
+    def failing(conn, task_id, kind, payload=None, **kw):
+        if kind == pff.CUSTODY_EVENT:
+            raise OSError("diagnostic write failed after block commit")
+        return real(conn, task_id, kind, payload, **kw)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain")
+    run = _claim(tid)
+    _placed_ws(monkeypatch, tid, run, "ace-ai", "10.0.0.1")
+    with patch.object(kb, "_append_event", side_effect=failing):
+        assert kwe.block_on_rail_absent(RAIL) is True
+    t = _task(tid)
+    assert t.status == "blocked" and t.block_kind == "needs_input" and len(hook) == 1
+    assert _events(tid, pff.CUSTODY_EVENT) == [] and _events(tid, pff.REROUTE_EVENT) == []
+
+
+def test_custody_block_failure_before_commit_is_unhandled_and_fenced(board, monkeypatch):
+    # The other side of 35b39eb7244e: nothing committed means not handled, card untouched.
+    hook = []
+    monkeypatch.setattr("tools.capability_gap_hooks.on_rail_absent", lambda m: hook.append(m))
+    monkeypatch.setattr(kwh, "remote_workspace_has_content", lambda raw, runner=None: True)
+
+    def boom(*a, **kw):
+        raise OSError("board write failed before commit")
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain")
+    run = _claim(tid)
+    _placed_ws(monkeypatch, tid, run, "ace-ai", "10.0.0.1")
+    monkeypatch.setattr(kb, "block_task", boom)
+    assert kwe.block_on_rail_absent(RAIL) is False
+    assert _task(tid).status == "running" and hook == []
+
+
+def _probe_raw(ws):
+    return json.dumps({"host": "ace-ai", "env": {"TERMINAL_SSH_HOST": "fixture.invalid",
+                                                 "TERMINAL_CWD": str(ws)}})
+
+
+def _local_shell(argv, **kw):
+    import subprocess
+    return subprocess.run(["bash", "-c", argv[-1]], **kw)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root ignores mode bits")
+def test_custody_probe_discriminates_absent_from_unreadable(tmp_path):
+    import subprocess
+    parent = tmp_path / "parent"
+    ws = parent / "workspace"
+    ws.mkdir(parents=True)
+    assert _REAL_PROBE(_probe_raw(ws), _local_shell) is False                   # empty
+    (ws / "unfinished.patch").write_text("SOURCE_WORK")
+    assert _REAL_PROBE(_probe_raw(ws), _local_shell) is True                    # content
+    assert _REAL_PROBE(_probe_raw(parent / "never"), _local_shell) is False     # ENOENT
+    assert _REAL_PROBE(_probe_raw(parent / "a" / "b"), _local_shell) is False   # deep ENOENT
+    refused = lambda argv, **kw: subprocess.CompletedProcess(argv, 255, "", "refused")
+    assert _REAL_PROBE(_probe_raw(parent / "never"), refused) is True           # ssh failure
+    for mode in (0o000, 0o600):                                                 # unsearchable
+        parent.chmod(mode)
+        try:
+            assert _REAL_PROBE(_probe_raw(ws), _local_shell) is True
+            assert _REAL_PROBE(_probe_raw(parent / "never"), _local_shell) is True
+        finally:
+            parent.chmod(0o700)
+    assert (ws / "unfinished.patch").read_text() == "SOURCE_WORK"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root ignores mode bits")
+def test_unsearchable_source_parks_through_the_exit_seam(board, monkeypatch, tmp_path):
+    parent = tmp_path / "parent"
+    ws = parent / "workspace"
+    ws.mkdir(parents=True)
+    (ws / "unfinished.patch").write_text("SOURCE_WORK")
+    monkeypatch.setattr(kwh, "remote_workspace_has_content",
+                        lambda raw, runner=None: _REAL_PROBE(raw, _local_shell))
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain")
+    run = _claim(tid)
+    _placed_ws(monkeypatch, tid, run, "ace-ai", "fixture.invalid", ws=str(ws))
+    parent.chmod(0)
+    try:
+        assert kwe.block_on_rail_absent(RAIL) is True
+    finally:
+        parent.chmod(0o700)
+    t = _task(tid)
+    assert t.status == "blocked" and t.block_kind == "needs_input"
+    assert _events(tid, pff.REROUTE_EVENT) == [] and len(_events(tid, pff.CUSTODY_EVENT)) == 1
+    assert (ws / "unfinished.patch").read_text() == "SOURCE_WORK"
+
+
+@pytest.mark.parametrize("stamp", ["fresh", "stale"])
+@pytest.mark.parametrize("body", ["requires: browser-session, never-defined-cap",
+                                  "requires: never-defined-cap, browser-session",
+                                  "requires: never-defined-cap\nrequires: browser-session"])
+def test_mixed_known_missing_and_unknown_requirement_parks_only(board, monkeypatch, body, stamp):
+    # 470af3484c95: an unresolved word parks before any routable known miss, whatever the order.
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body=body)
+    run = _claim(tid)
+    record = pff.placement_record(_task(tid), board) if stamp == "fresh" else None
+    _placed_env(monkeypatch, tid, run, record=record)
+    line = pff.boot_check(tid)
+    assert line is not None and line.startswith(pff.UNRESOLVED_TOKEN), line
+    assert kwe.block_on_rail_absent(line) is True
+    t = _task(tid)
+    assert t.status == "blocked" and t.block_kind == "needs_input"
+    assert _events(tid, pff.REROUTE_EVENT) == []
+
+
+def test_mixed_requirement_with_preload_unknown_parks_only(board, monkeypatch):
+    # The combined card + preload set: a known miss on the card, an unknown in the preloads' needs.
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="requires: browser-session")
+    _placed_env(monkeypatch, tid, 1)
+    assert pff.boot_check(tid).startswith("BROWSER_RAIL_ABSENT")                 # control
+    monkeypatch.setattr(pff, "hard_requirements",
+                        lambda body, skills, fd, _r=pff.hard_requirements:
+                        ["unknown:never-defined-cap"] if list(skills) == ["odd-skill"] else _r(body, skills, fd))
+    assert pff.boot_check(tid, preloads=["odd-skill"]).startswith(pff.UNRESOLVED_TOKEN)

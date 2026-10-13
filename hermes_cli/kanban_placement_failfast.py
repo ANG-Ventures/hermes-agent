@@ -130,19 +130,19 @@ def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
     parsed = parse_absent(message)
     if parsed is None:
         return None
+    from hermes_cli import kanban_worker_hosts as kwh
     token, cap, host = parsed
     host = host or placed_host
-    if token in _PARK_ONLY_TOKENS:
-        cap = None          # nothing re-routable was proven missing: park with the line
-    if placed_host and cap and placed_host != "studio-local" and prior_reroutes(conn, task_id) == 0:
+    if token in _PARK_ONLY_TOKENS or not kwh.is_pool_host(placed_host):
+        cap = None          # nothing re-routable was proven missing, or not a pool placement: park
+    if cap and prior_reroutes(conn, task_id) == 0:
         # Workspaces are host-local (no sync): a mid-run tool, or an earlier run on this host,
         # may have left work there that a re-route would strand (0e9694bf2944). Re-route only a
         # workspace the host proves empty; anything else parks for recovery, source untouched.
-        from hermes_cli import kanban_worker_hosts as kwh
         if kwh.remote_workspace_has_content(placement_raw):
             return _custody_hold(conn, task_id, int(run_id), message, cap=cap, host=host,
                                  token=token, placement_raw=placement_raw)
-    if placed_host and cap:
+    if cap:
         decided = None
         with kb.write_txn(conn):
             row = conn.execute(
@@ -207,10 +207,16 @@ def _custody_hold(conn, task_id: str, run_id: int, message: str, *, cap: str, ho
     if not kb.block_task(conn, task_id, reason=reason, kind="needs_input",
                          expected_run_id=int(run_id), loop_breaker=False):
         return None
-    with kb.write_txn(conn):
-        kb._append_event(conn, task_id, CUSTODY_EVENT,
-                         {"host": host, "run_id": int(run_id), "workspace": workspace, "cap": cap,
-                          "token": token}, run_id=int(run_id))
+    # The park committed (its reason names host/run/workspace); the event is diagnostic. A
+    # failure here must not report the committed decision as unhandled (35b39eb7244e).
+    try:
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, CUSTODY_EVENT,
+                             {"host": host, "run_id": int(run_id), "workspace": workspace, "cap": cap,
+                              "token": token}, run_id=int(run_id))
+    except Exception:
+        _log.warning("placement custody hold committed; its %s event was not written", CUSTODY_EVENT,
+                     exc_info=True)
     return "needs_input"
 
 
@@ -454,7 +460,7 @@ def boot_check(task_id: str, environ: Optional[Mapping[str, str]] = None, *,
     except ValueError:
         record = None
     host = (record or {}).get("host") if isinstance(record, dict) else None
-    if not host or host == "studio-local":
+    if not kwh.is_pool_host(host):
         return None
     modes = caps_modes(env)
     if not modes:
@@ -487,7 +493,10 @@ def boot_check(task_id: str, environ: Optional[Mapping[str, str]] = None, *,
             reqs = hard_requirements(row["body"], skills, fleet_dir)
         if preloaded:
             reqs = [*reqs, *hard_requirements("", preloaded, fleet_dir)]
-        for cap in dict.fromkeys(reqs):
+        # An unresolved requirement parks before any routable known miss (470af3484c95): a
+        # re-route can never satisfy a word no host serves.
+        from hermes_cli.kanban_host_capabilities import UNKNOWN_PREFIX
+        for cap in sorted(dict.fromkeys(reqs), key=lambda c: not c.startswith(UNKNOWN_PREFIX)):
             if (line := _refusal(cap, have, host, modes)) is not None:
                 return line
         return None
@@ -509,7 +518,7 @@ def skill_gate(name: str) -> Optional[str]:
             return None
         from hermes_cli import kanban_worker_hosts as kwh
         host = kwh.BOOT_PLACED_HOST or kwh._placed_host(os.environ.get(kwh.PLACEMENT_ENV))
-        if not host or host == "studio-local":
+        if not kwh.is_pool_host(host):
             return None
         modes = caps_modes()
         if not modes:

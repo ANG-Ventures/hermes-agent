@@ -168,10 +168,18 @@ def remote_workspace_has_content(placement_raw: Optional[str],
         if str(env.get("TERMINAL_SSH_PORT") or "22") != "22":
             argv += ["-p", str(env["TERMINAL_SSH_PORT"])]
         target = f"{env['TERMINAL_SSH_USER']}@{ssh_host}" if env.get("TERMINAL_SSH_USER") else ssh_host
-        w = shlex.quote(workspace)
-        # rc 0 = empty or absent, rc 3 = has entries; anything else (ssh 255, perms) fails closed.
-        proc = runner(argv + [target, f"[ -e {w} ] || exit 0; [ -d {w} ] || exit 3; "
-                                      f"o=$(ls -A -- {w}) || exit 4; [ -z \"$o\" ] && exit 0; exit 3"],
+        # rc 0 = empty or proven absent, rc 3 = has entries; anything else (ssh 255, perms, I/O)
+        # fails closed. ``[ -e ]`` is false for ENOENT AND for a path under an unsearchable parent,
+        # so absence is proven only when the nearest existing ancestor is a searchable, listable
+        # directory whose listing lacks the next component (t_ecfd5591 parent-custody-permissions).
+        script = (f"w={shlex.quote(workspace)}; p=$w; c=; "
+                  'while [ ! -e "$p" ]; do q=$(dirname -- "$p"); [ "$q" = "$p" ] && exit 5; '
+                  'c=$(basename -- "$p"); p=$q; done; '
+                  'if [ -z "$c" ]; then [ -d "$w" ] || exit 3; o=$(ls -A -- "$w") || exit 4; '
+                  '[ -z "$o" ] && exit 0; exit 3; fi; '
+                  '[ -d "$p" ] && [ -x "$p" ] || exit 5; o=$(ls -A -- "$p") || exit 5; '
+                  'printf "%s\\n" "$o" | grep -Fxq -- "$c" && exit 5; exit 0')
+        proc = runner(argv + [target, script],
                       capture_output=True, text=True, timeout=_PROBE_TIMEOUT_SECONDS,
                       stdin=subprocess.DEVNULL)
         return getattr(proc, "returncode", 1) != 0
@@ -186,6 +194,14 @@ def _placed_host(raw: Optional[str]) -> Optional[str]:
         return str(json.loads(raw or "").get("host") or "") or None
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+def is_pool_host(host: Optional[str]) -> bool:
+    """True for a real pool placement. The synthetic local-worker placement
+    (``studio-local``) runs on the Studio itself, so every placement gate and the
+    exit seam treat it as unplaced: one classification (t_ecfd5591 03985b00389e)."""
+    from hermes_cli.kanban_local_worker_uid import LOCAL_HOST_NAME
+    return bool(host) and host != LOCAL_HOST_NAME
 
 
 # Boot record (RC-9): the placement this worker process was spawned with.

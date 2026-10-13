@@ -139,7 +139,7 @@ def _emit(task: str, message: str) -> str:
     from hermes_cli import kanban_placement_failfast as pff
     from hermes_cli import kanban_worker_hosts as kwh
     placed = kwh.BOOT_PLACED_HOST or kwh._placed_host(os.environ.get(kwh.PLACEMENT_ENV))
-    modes = pff.caps_modes() if placed and placed != "studio-local" else {}
+    modes = pff.caps_modes() if kwh.is_pool_host(placed) else {}
     cap = _RAIL_CAP.get(message.split("_", 1)[0])
     if modes and cap and not pff.enforced(cap, modes):
         pff.note_gate_warn(cap, message, modes)

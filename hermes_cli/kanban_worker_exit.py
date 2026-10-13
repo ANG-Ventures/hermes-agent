@@ -154,7 +154,7 @@ def block_on_rail_absent(message: str) -> bool:
     try:
         from hermes_cli import kanban_worker_hosts as kwh
         placed = kwh.BOOT_PLACED_HOST or kwh._placed_host(os.environ.get(kwh.PLACEMENT_ENV))
-        if placed:
+        if kwh.is_pool_host(placed):
             from hermes_cli import kanban_placement_failfast as pff
             handled = pff.worker_exit_on_absent(str(message or "")) is not None
         else:  # unplaced: #1876 verbatim
