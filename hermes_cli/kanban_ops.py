@@ -329,6 +329,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "spawned_unwatched": spawned_unwatched,
             "placement_affinity": getattr(res, "placement_affinity", None) or {},
             "placement_waits": getattr(res, "placement_waits", None) or {},
+            "placement_caps": getattr(res, "placement_caps", None) or {},
             "skipped_unassigned": res.skipped_unassigned,
             "flagship_refused": res.flagship_refused,
             "skipped_nonspawnable": res.skipped_nonspawnable,
@@ -484,10 +485,27 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
     for tid, aff in (getattr(res, "placement_affinity", None) or {}).items():
         wait = (res.placement_waits or {}).get(tid)
+        why = aff.get("matched_by")
+        if aff.get("term"):  # capability pin (t_8c474c2e): rule + source + term
+            why = f"{aff.get('rule')}, {why} {aff.get('term')!r}, {aff.get('strength')}"
         print(
-            f"Placement affinity: {tid} -> {aff.get('host')} ({aff.get('matched_by')})"
+            f"Placement affinity: {tid} -> {aff.get('host')} ({why})"
             + (f"; waits {wait}, never spills" if wait else "")
         )
+    _caps = getattr(res, "placement_caps", None) or {}
+    if _caps.get("_map_error"):
+        print(f"Placement capabilities: map invalid, every capability warn this tick: {_caps['_map_error']}")
+    for tid, seen in _caps.items():
+        if tid == "_map_error":
+            continue
+        if seen.get("warn"):
+            w = seen["warn"]
+            print(f"Placement capability (warn, no route change): {tid} would need {w.get('rule')} "
+                  f"({w.get('matched_by')} {w.get('term')!r})")
+        if seen.get("unknown"):
+            print(f"Placement capability: {tid} names unknown capability {seen['unknown']!r}; stays local")
+        if seen.get("pin_lacks"):
+            print(f"Placement capability: {tid} {seen['pin_lacks']}; parked needs_input")
     for tid, reason in res.respawn_guarded:
         print(
             f"Deferred (respawn guard {reason}): {tid}"
