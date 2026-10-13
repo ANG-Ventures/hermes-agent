@@ -465,3 +465,182 @@ def test_unplaced_worker_still_parks_on_a_rail_absent_whatever_the_caps_env(boar
     msg = rp.browser_rail_error("http://127.0.0.1:9222")
     assert msg and msg.startswith("BROWSER_RAIL_ABSENT")
     assert rp.take_rail_absent() == msg
+
+
+# -- Apollo review 2026-10-13 on #1963 @274fcd8c ----------------------------------------------
+
+def _churn(monkeypatch, board, *, raise_too=False):
+    """Every load_map rewrites the map (still valid JSON): no two reads ever agree."""
+    m = board / khc.MAP_FILE
+    real = khc.load_map
+    n = {"loads": 0}
+
+    def load(fleet_dir):
+        out = real(fleet_dir)
+        n["loads"] += 1
+        m.write_text(m.read_text() + "\n")
+        if raise_too:
+            raise RuntimeError("index mid-write")
+        return out
+    monkeypatch.setattr(khc, "load_map", load)
+    monkeypatch.setattr(pff, "_SNAPSHOT_BACKOFF_S", 0.0)
+    return n
+
+
+def test_boot_check_refuses_when_every_snapshot_is_torn(board, monkeypatch):
+    # 62b835e510f0: the card needs nothing the host lacks, so every attempt says None (admit).
+    # Five torn reads must still refuse: an unproven admission is not an admission.
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain coding card")
+    _placed_env(monkeypatch, tid, 1)
+    n = _churn(monkeypatch, board)
+    line = pff.boot_check(tid)
+    assert line is not None and line.startswith(pff.INDETERMINATE_TOKEN), line
+    assert pff.ABSENT_RE.match(line)
+    assert n["loads"] >= pff._SNAPSHOT_TRIES
+
+
+@pytest.mark.parametrize("raise_too", [False, True])
+def test_skill_gate_refuses_when_every_snapshot_is_torn(board, monkeypatch, raise_too):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    _placed_env(monkeypatch, tid, 1)
+    _churn(monkeypatch, board, raise_too=raise_too)
+    # a skill this host serves fine: every attempt admits; and attempts that raise
+    line = pff.skill_gate("some-coding-skill")
+    assert line is not None and line.startswith(pff.INDETERMINATE_TOKEN), line
+
+
+def test_torn_snapshots_refuse_nothing_when_nothing_is_enforced(board, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="requires: browser-session")
+    _placed_env(monkeypatch, tid, 1, caps=json.dumps({"*": "warn"}))
+    _churn(monkeypatch, board)
+    assert pff.boot_check(tid) is None
+    assert pff.skill_gate("amazon-cart-ops-local") is None
+
+
+def test_stable_snapshot_control_admits_and_refuses_as_before(board, monkeypatch):
+    with kb.connect_closing() as conn:
+        ok = kb.create_task(conn, title="t", assignee="daedalus", body="plain coding card")
+        bad = kb.create_task(conn, title="t", assignee="daedalus", body="requires: browser-session")
+    _placed_env(monkeypatch, ok, 1)
+    assert pff.boot_check(ok) is None
+    assert pff.skill_gate("some-coding-skill") is None
+    assert pff.boot_check(bad).startswith("BROWSER_RAIL_ABSENT cap=browser-session")
+
+
+def test_indeterminate_line_parks_needs_input_and_never_reroutes(board, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="host: ace-ai\nx")
+    run = _claim(tid)
+    _placed_env(monkeypatch, tid, run)
+    line = pff.indeterminate_line("ace-ai")
+    assert kwe.block_on_rail_absent(line) is True
+    t = _task(tid)
+    assert t.status == "blocked" and t.block_kind == "needs_input"
+    assert _events(tid, pff.REROUTE_EVENT) == []
+    assert "requires:" not in (t.body or "")
+
+
+@pytest.mark.parametrize("spelling", ["browser-access", "media/browser-access", "media:browser-access",
+                                      "Media:Browser-Access"])
+def test_every_skill_spelling_derives_the_same_requirements(board, spelling):
+    # 2972d9d25619: derivation, needs lane lookup and the gates share one normalizer.
+    cmap = khc.load_map(board)
+    reqs, _ = khc.derive("", [spelling], cmap)
+    assert sorted({r.cap for r in reqs if r.strength == khc.HARD}) == ["browser-session", "keychain"]
+    assert pff.hard_requirements("", [spelling], board) == ["browser-session", "keychain"]
+    assert pff._skill_key(spelling) == khc.skill_key(spelling) == "browser-access"
+
+
+@pytest.mark.parametrize("spelling", ["ops:amazon-cart-ops-local", "ops/amazon-cart-ops-local",
+                                      "amazon-cart-ops-local"])
+def test_lane_of_reads_every_skill_spelling(tmp_path, spelling):
+    # 64301a687435: a migrated lane attached as category:name must not resolve to "none".
+    (tmp_path / kn.REGISTRY_FILE).write_text(json.dumps(
+        {"migrated_lanes": ["amazon-cart-ops-local"], "legacy_allowlist": []}))
+    reg = kn.load_registry(tmp_path)
+    assert kn.lane_of([spelling], "", reg) == "amazon-cart-ops-local"
+    assert isinstance(kn.resolve("browser:amazon-alex", kn.lane_of([spelling], "", reg), reg), kn.Refusal)
+
+
+# -- boot seam + preload ordering (77f581ae3801, fbadb37df1b5, 98e899076450) -----------------
+
+class _FakeCli:
+    def __init__(self):
+        self.calls = []
+
+    def start_preloaded_skills(self):
+        self.calls.append("preload")
+
+    def _claim_active_session(self, *_a, **_k):
+        self.calls.append("claim")
+        return False          # stop the one-shot right after the gate
+
+
+def _boot(monkeypatch, line, decided):
+    from hermes_cli import cli_single_query as csq
+    import tools.kanban_tools as kt
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_boot")
+    monkeypatch.setattr(kt, "register_current_worker_from_env", lambda: True)
+    monkeypatch.setattr("agent.delegation_context.owned_kanban_task", lambda: "t_boot")
+    monkeypatch.setattr(pff, "boot_check", lambda task: line)
+    seen = []
+    monkeypatch.setattr(kwe, "block_on_rail_absent", lambda m: seen.append(m) or decided)
+    cli = _FakeCli()
+    with pytest.raises(SystemExit) as exc:
+        csq._run_single_query_mode(cli, "do it", None, True, True)
+    return exc.value.code, seen, cli.calls
+
+
+def test_boot_refusal_goes_through_the_rail_seam_before_any_preload(monkeypatch):
+    line = pff.absent_line("browser-session", "ace-ai")
+    code, seen, calls = _boot(monkeypatch, line, True)
+    assert (code, seen, calls) == (0, [line], [])
+
+
+def test_boot_refusal_that_did_not_commit_is_not_a_clean_exit(monkeypatch):
+    code, _seen, calls = _boot(monkeypatch, pff.absent_line("screen", "ace-ai"), False)
+    assert code == 1 and calls == []
+
+
+def test_boot_pass_starts_the_preload_then_proceeds(monkeypatch):
+    code, seen, calls = _boot(monkeypatch, None, True)
+    assert seen == [] and calls == ["preload", "claim"] and code == 1
+
+
+def test_kanban_worker_preload_does_not_render_before_the_boot_gate(monkeypatch):
+    # fbadb37df1b5: rendering a skill (template vars, inline shell when skills.inline_shell is on)
+    # happens in the preload thread; a kanban worker must not start it before Layer 0.
+    import cli as cli_mod
+    rendered = []
+    monkeypatch.setattr(cli_mod, "build_preloaded_skills_prompt",
+                        lambda names, **kw: rendered.append(list(names)) or ("", list(names), []))
+
+    class _Cli(_FakeCli):
+        session_id = "s"
+        ignore_rules = True
+        _auto_load_skills_result = ("", [], [])
+        _preload_skills_thread = None
+
+        def __init__(self, **kw):
+            super().__init__()
+
+        start_preloaded_skills = cli_mod.HermesCLI.start_preloaded_skills
+    monkeypatch.setattr(cli_mod, "HermesCLI", _Cli)
+    args = dict(model=None, toolsets="terminal", provider=None, reasoning=None, api_key=None, base_url=None,
+                max_turns=None, run_budget=None, verbose=False, compact=False, resume=None, checkpoints=False,
+                pass_session_id=False, ignore_rules=True, skills="amazon-cart-ops-local")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_boot")
+    c = cli_mod._build_cli_from_args(**args)
+    import time
+    time.sleep(0.2)
+    assert c._preload_skills_thread.ident is None and rendered == []
+    c.start_preloaded_skills()
+    c._preload_skills_thread.join(5)
+    assert rendered == [["amazon-cart-ops-local"]]
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    c2 = cli_mod._build_cli_from_args(**args)
+    c2._preload_skills_thread.join(5)
+    assert rendered == [["amazon-cart-ops-local"]] * 2

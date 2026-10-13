@@ -153,10 +153,11 @@ _ORIGIN_RE = re.compile(r"^[ \t]*origin:[ \t]*([^\s·]+)", re.IGNORECASE | re.MU
 
 
 def lane_of(skills: Iterable[str], body: Optional[str], registry: LaneRegistry) -> str:
+    from hermes_cli.kanban_host_capabilities import skill_key
     names = registry.names
     for s in skills or ():
-        if isinstance(s, str) and s.rsplit("/", 1)[-1].strip().lower() in names:
-            return s.rsplit("/", 1)[-1].strip().lower()
+        if isinstance(s, str) and skill_key(s) in names:
+            return skill_key(s)
     m = _ORIGIN_RE.search(body or "")
     if m and m.group(1).strip().lower() in names:
         return m.group(1).strip().lower()

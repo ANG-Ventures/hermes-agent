@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import socket
 import threading
 from typing import Iterable, Optional
@@ -28,8 +27,7 @@ _emitted: dict = {}            # (task_id, run_id, tool) -> rank recorded (or in
 _ADVISORY, _ACTUAL = 1, 2
 _refused_logged: set = set()   # (gap_class, tool) whose ValueError was logged once
 
-_RAIL_RE = re.compile(r"\b(BROWSER|SCREEN)_RAIL_ABSENT: no (?:browser|screen) session on (\S+?)\.(?:\s|$)")
-_RAIL_TOOL = {"BROWSER": "browser_*", "SCREEN": "computer_use"}
+_RAIL_TOOL = {"BROWSER_RAIL_ABSENT": "browser_*", "SCREEN_RAIL_ABSENT": "computer_use"}
 
 
 def _owned_task() -> str:
@@ -110,14 +108,19 @@ def _record(task: str, run_id: Optional[int], *, gap_class: str, tool: str, requ
 
 
 def on_rail_absent(message: str) -> bool:
-    """Hook A. Called only after ``block_task`` returned True for a ``*_RAIL_ABSENT:`` message."""
-    m = _RAIL_RE.search(str(message or ""))
-    if not m:
+    """Hook A. Called only after the board decision for a rail ``*_ABSENT`` line committed.
+
+    One parser for both spellings (t_ecfd5591 review 77f581ae3801): #1876's
+    ``BROWSER_RAIL_ABSENT: no browser session on <host>.`` and the placement gates'
+    ``BROWSER_RAIL_ABSENT cap=browser-session host=<host> ...`` (``kanban_placement_failfast``)."""
+    from hermes_cli.kanban_placement_failfast import parse_absent
+    parsed = parse_absent(message)
+    tool = _RAIL_TOOL.get(parsed[0]) if parsed else None
+    if tool is None:
         return False
     from hermes_cli.kanban_db_capability_gap import requirement_for
-    tool = _RAIL_TOOL[m.group(1)]
     return _emit(gap_class="rail_absent", tool=tool, requirement_id=requirement_for(tool),
-                 host_raw=m.group(2), message=message, hook="rail")
+                 host_raw=parsed[2], message=message, hook="rail")
 
 
 def _classify_scope(tool: str, enabled_toolsets, disabled_toolsets) -> Optional[str]:

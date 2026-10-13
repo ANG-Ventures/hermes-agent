@@ -127,6 +127,8 @@ def reroute_or_park(conn, task_id: str, run_id: int, message: str, *,
         return None
     token, cap, host = parsed
     host = host or placed_host
+    if token == INDETERMINATE_TOKEN:
+        cap = None          # nothing was proven missing: park with the line, never re-route
     if placed_host and cap:
         decided = None
         with kb.write_txn(conn):
@@ -279,29 +281,48 @@ def host_caps(host: str, fleet_dir: Path) -> Optional[frozenset]:
 
 
 def _skill_key(name: str) -> str:
-    """The index key for a skill reference in any spelling the loader accepts:
-    ``name``, ``category/name`` and ``category:name`` (``skills_tool._resolve_plugin_skill``
-    falls a ``category:name`` through to the local ``category/name``) all key on ``name``."""
-    return re.split(r"[/:]", str(name or ""))[-1].strip().lower()
+    from hermes_cli.kanban_host_capabilities import skill_key
+    return skill_key(name)
 
 
 _SNAPSHOT_TRIES = 5
+_SNAPSHOT_BACKOFF_S = 0.05          # attempt n sleeps n * this before re-reading (bounded: <= 0.5 s)
+INDETERMINATE_TOKEN = "PLACEMENT_INDETERMINATE_ABSENT"
 
 
-def _consistent(fleet_dir: Path, check):
+def indeterminate_line(host: str) -> str:
+    """The refusal an ENFORCED gate returns when it could not read one consistent map + index
+    (t_ecfd5591 review 62b835e510f0). Matches :data:`ABSENT_RE`; the board parks it
+    ``needs_input`` and never re-routes on it (no capability was proven missing)."""
+    return (f"{INDETERMINATE_TOKEN} cap=placement-indeterminate host={host}: the fleet capability map "
+            f"kept changing across {_SNAPSHOT_TRIES} reads, so this worker could not prove {host} "
+            f"serves the card's enforced capabilities. Refusing instead of guessing; re-run once "
+            f"fleet/host-capabilities.json and fleet/skill-host-requires.json are settled.")
+
+
+def _consistent(fleet_dir: Path, check, *, on_exhausted):
     """Run ``check(snapshot)`` until the map + index bytes are the same before and after it, so
     the host's capabilities, the requirements and the route hash all come from ONE pair of
     files (#1963 Prism r2: a torn read let a revoked capability pass). ``--sync`` / ``--set``
-    replace the files atomically, so a retry sees a whole file; after ``_SNAPSHOT_TRIES``
-    changing reads the last result stands and is logged."""
-    result = None
-    for _ in range(_SNAPSHOT_TRIES):
+    replace the files atomically, so a retry sees a whole file. Bounded: after
+    ``_SNAPSHOT_TRIES`` changing reads NO attempt's result is trusted, a None (admit) as little
+    as an ABSENT; the caller's ``on_exhausted()`` decides (an enforced gate refuses)."""
+    import time
+    for attempt in range(_SNAPSHOT_TRIES):
+        if attempt:
+            time.sleep(_SNAPSHOT_BACKOFF_S * attempt)
         before = _fleet_bytes(fleet_dir)
         result = check(before)
         if _fleet_bytes(fleet_dir) == before:
             return result
-    _log.warning("placement gate: fleet map kept changing across %d reads; using the last", _SNAPSHOT_TRIES)
-    return result
+    _log.warning("placement gate: fleet map kept changing across %d reads; no consistent snapshot",
+                 _SNAPSHOT_TRIES)
+    return on_exhausted()
+
+
+def _any_enforced(modes: Mapping[str, str]) -> bool:
+    from hermes_cli.kanban_host_capabilities import ENFORCE
+    return any(v == ENFORCE for v in modes.values())
 
 
 # -- Layer 0b: dispatch (F14) -------------------------------------------------------
@@ -402,7 +423,9 @@ def boot_check(task_id: str, environ: Optional[Mapping[str, str]] = None, *,
                 return absent_line(cap, host)
         return None
 
-    return _consistent(fleet_dir, check)
+    # warn/off everywhere: nothing could have refused, so a torn read refuses nothing either.
+    return _consistent(fleet_dir, check,
+                       on_exhausted=lambda: indeterminate_line(host) if _any_enforced(modes) else None)
 
 
 # -- Layer 1: mid-run skill_view (F14) --------------------------------------------------
@@ -425,9 +448,14 @@ def skill_gate(name: str) -> Optional[str]:
         fleet_dir = _fleet_dir()
         from hermes_cli import kanban_host_capabilities as khc
         key = _skill_key(name)
+    except Exception:
+        _log.debug("skill_view placement gate failed open", exc_info=True)
+        return None
 
-        def check(_snapshot):
-            # One load_map: host row and index come from the same parse of the same files.
+    def check(_snapshot):
+        # One load_map: host row and index come from the same parse of the same files.
+        # A read error inside one attempt admits THAT attempt only (the layer is off for it).
+        try:
             cmap = khc.load_map(fleet_dir)
             if cmap is None or not cmap.valid or cmap.index_error is not None:
                 return None
@@ -435,12 +463,13 @@ def skill_gate(name: str) -> Optional[str]:
             for cap in cmap.index.get(key, ()):
                 if cap not in have and enforced(cap, modes):
                     return absent_line(cap, host)
-            return None
+        except Exception:
+            _log.debug("skill_view placement gate attempt failed open", exc_info=True)
+        return None
 
-        return _consistent(fleet_dir, check)
-    except Exception:
-        _log.debug("skill_view placement gate failed open", exc_info=True)
-    return None
+    # Outside every except: the exhaustion refusal can never be swallowed back into None.
+    return _consistent(fleet_dir, check,
+                       on_exhausted=lambda: indeterminate_line(host) if _any_enforced(modes) else None)
 
 
 __all__: List[Any] = [

@@ -391,6 +391,15 @@ def declared_words(body: Optional[str]) -> List[str]:
     return out
 
 
+def skill_key(name: Any) -> str:
+    """The index key for a skill reference in any spelling the loader accepts: ``name``,
+    ``category/name`` and ``category:name`` (``skills_tool._resolve_plugin_skill`` falls a
+    ``category:name`` through to the local ``category/name``) all key on ``name``. The ONE
+    normalizer for derivation, the resource-lane lookup and the dispatch/boot/skill gates
+    (t_ecfd5591 review 2972d9d25619 / 64301a687435)."""
+    return re.split(r"[/:]", str(name or ""))[-1].strip().lower()
+
+
 def _named_skill_re(name: str):
     n = re.escape(name)
     # backticked, "skill X", "load X", and "the X skill" (Apollo r2 repro:
@@ -422,10 +431,10 @@ def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
         if w != NONE_WORD:
             reqs.append(Requirement(cap_of(w), HARD, DECLARED, w))
     attached = [s for s in dict.fromkeys(skills or ()) if isinstance(s, str)]
-    attached_keys = {s.rsplit("/", 1)[-1].strip().lower() for s in attached}
+    attached_keys = {skill_key(s) for s in attached}
     if cmap.index_error is None:
         for s in attached:
-            for c in cmap.index.get(s.rsplit("/", 1)[-1].strip().lower(), ()):
+            for c in cmap.index.get(skill_key(s), ()):
                 reqs.append(Requirement(cap_of(c), HARD, SKILL, s))
         # Skill names are case-insensitive everywhere in the fleet: the cheap
         # prefilter must not drop "use the Browser-Access skill" (Prism eac2f2e68fe7).
