@@ -113,6 +113,23 @@ def _num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
+def _now(now) -> float:
+    """The decision clock: ``time.time()`` when None, else a FINITE epoch. A NaN/inf ``now`` makes every
+    ``until > now`` / ``now - at > stale`` compare false, so a release() would prune the WHOLE ledger and a stale
+    sample or a live exclusion would read as absent (Prism 83b0c929b421): refused before any read or write."""
+    now = time.time() if now is None else now
+    if not _num(now):
+        raise PlacementError(f"now must be a finite epoch number, not {now!r}")
+    return float(now)
+
+
+def _stale_after(v) -> Optional[float]:
+    """``stale_after_s``: None (caller vouches) or a finite number >= 0; NaN would never close a stale sample."""
+    if v is not None and (not _num(v) or v < 0):
+        raise PlacementError(f"stale_after_s must be a finite number >= 0 or None, not {v!r}")
+    return v
+
+
 def _walk_rank_keys(node, path="") -> List[str]:
     hits = []
     if isinstance(node, dict):
@@ -314,6 +331,7 @@ def read_exclusions(path=None, *, now: float) -> Dict[str, str]:
     Document shape, either form: ``{"ace-ai": {"until": 1791900000, "reason": "voice session"}}`` (the operator
     form the skills document) or ``{"hosts": {...same...}}``. A MISSING file = no exclusions; an unreadable or
     malformed one raises ExclusionsError so choose() refuses rather than silently admitting."""
+    now = _now(now)
     p = Path(path) if path is not None else fleet_root() / EXCLUSIONS_REL
     try:
         text = p.read_text(encoding="utf-8")
@@ -374,7 +392,11 @@ def samples_from_pressure(doc: Mapping, *, now: float, stale_after_s: Optional[f
     """Samples from a fleet-pressure.json document (placement-collector output). Every host row is a sample,
     the Studio included (Ace 2026-10-12 18:1x: low default preference, never excluded); whether a host is a
     candidate for a consumer is the table's slots, not the sampler's `targets` flag."""
-    stale = float(stale_after_s if stale_after_s is not None else doc.get("stale_after_s") or DEFAULT_STALE_AFTER_S)
+    now = _now(now)
+    stale = stale_after_s if stale_after_s is not None else doc.get("stale_after_s") or DEFAULT_STALE_AFTER_S
+    if not _num(stale) or stale < 0:
+        raise PlacementError(f"stale_after_s must be a finite number >= 0, not {stale!r}")
+    stale = float(stale)
     # Clock normalization (Prism P1 6e15e2ae): row.at is the PRODUCER's clock; the collector computed age_s
     # against that same clock and stamped the document with its own. Age here = age_s + time elapsed since
     # the document was written, never (local now - a remote host's timestamp): a host clock two minutes
@@ -422,7 +444,7 @@ def sample_from_probe(load1: float, memavail_gb: Optional[float], *, load5: Opti
         return float(v) if _num(v) else None
     # a probe sample is stamped NOW by default so the decision-time freshness check can vouch for it (Prism 6704368b)
     return Sample(mem_available_gb=fin(memavail_gb), load1=fin(load1), load5=fin(load5),
-                  at=time.time() if now is None else now)
+                  at=_now(now))
 
 
 # ── scoring ──────────────────────────────────────────────────────────────────────────────────────
@@ -460,6 +482,9 @@ def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consume
     ``require_axes``: every named Sample field must be a finite number, else the host is closed (unmeasured).
     ``stale_after_s`` (with ``now``): re-check the sample's age at decision time; a sample marked fresh when it
     was read but older than this now is CLOSED (Prism baba105e: admit() can wait on the ledger lock)."""
+    if now is not None:
+        now = _now(now)
+    stale_after_s = _stale_after(stale_after_s)
     h = Headroom(host=spec.name, eligible=False, reason="")
     if excluded:
         h.reason = f"excluded:{excluded}"
@@ -582,6 +607,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     ``stale_after_s`` (default 60 s) re-checks every sample's age against ``now`` at decision time (Prism fda1ea43);
     pass None only when the caller has just produced the samples itself and vouches for their freshness.
     """
+    stale_after_s = _stale_after(stale_after_s)
     fp = table.footprint(consumer, footprint)
     names = list(candidates) if candidates is not None else list(table.hosts)
     folded: Dict[str, Optional[Sample]] = {}
@@ -589,7 +615,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
         hid = table.resolve(k)
         if hid is not None and (hid not in folded or folded[hid] is None):
             folded[hid] = v
-    now = time.time() if now is None else now
+    now = _now(now)
     require_axes = tuple(require_axes)   # a generator would be exhausted by the first candidate (Prism P1 16d4270a)
     # live operator exclusions (var/placement/exclusions.json, TTL rows) ALWAYS apply; the caller's map adds to them
     # (Prism 95afdab6): a caller entry never REPLACES an operator row, and an empty reason still excludes
@@ -761,7 +787,7 @@ def reservations_path(path=None) -> Path:
 def live_reservations(path=None, *, now: Optional[float] = None, table: Optional[HostTable] = None) -> Dict[str, Footprint]:
     """{host: summed Footprint} of every reservation whose TTL has not expired and that was not released.
     With ``table`` the keys are canonical host ids (aliases summed). Raises LedgerError on a corrupt ledger."""
-    now = time.time() if now is None else now
+    now = _now(now)
     doc = _read_ledger(reservations_path(path))
     out: Dict[str, List[float]] = {}
     for row in doc["rows"]:          # every row validated by _read_ledger
@@ -776,7 +802,7 @@ def live_reservations(path=None, *, now: Optional[float] = None, table: Optional
 def live_slots(consumer: str, path=None, *, now: Optional[float] = None, table: Optional[HostTable] = None) -> Dict[str, int]:
     """{host: number of LIVE reservations held by ``consumer``}: what a positive ``consumers.<c>.slots`` caps
     (Prism 696cce63). Same liveness and alias rules as live_reservations(); a row with no consumer is not counted."""
-    now = time.time() if now is None else now
+    now = _now(now)
     doc = _read_ledger(reservations_path(path))
     out: Dict[str, int] = {}
     for row in doc["rows"]:
@@ -796,7 +822,7 @@ def reserve(host: str, consumer: str, fp: Footprint, *, ttl_s: float, job_id: Op
         raise PlacementError(f"ttl_s must be a finite number > 0, not {ttl_s!r}")
     p = reservations_path(path)
     with _locked(p):
-        now = time.time() if now is None else now
+        now = _now(now)
         return _reserve_unlocked(p, host, consumer, fp, ttl_s=ttl_s, job_id=job_id, now=now,
                                  admissions_path=admissions_path, decision=decision)
 
@@ -845,7 +871,7 @@ def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample
     stale_after_s = choose_kw.pop("stale_after_s", DEFAULT_STALE_AFTER_S)
     p = reservations_path(path)
     with _locked(p):
-        now = time.time() if now is None else now
+        now = _now(now)
         resv = live_reservations(p, now=now, table=table)
         used = live_slots(consumer, p, now=now, table=table)     # positive slot caps count live admissions (696cce63)
         d = choose(table, consumer, samples, reservations=resv, slots_used=used, now=now,
@@ -865,7 +891,7 @@ def renew(reservation_id: str, *, ttl_s: float, path=None, now: Optional[float] 
         raise PlacementError(f"ttl_s must be a finite number > 0, not {ttl_s!r}")
     p = reservations_path(path)
     with _locked(p):
-        now = time.time() if now is None else now
+        now = _now(now)
         doc = _read_ledger(p)
         rows = [r for r in doc["rows"] if _row_live(r, now)]
         hit = False
@@ -882,7 +908,7 @@ def release(reservation_id: str, *, path=None, now: Optional[float] = None) -> b
     """Mark a reservation released (the job ended early); True when it was live."""
     p = reservations_path(path)
     with _locked(p):
-        now = time.time() if now is None else now
+        now = _now(now)
         doc = _read_ledger(p)
         hit = False
         rows = []
