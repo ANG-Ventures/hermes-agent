@@ -66,3 +66,27 @@ def test_no_declared_prs_falls_back_to_the_summary_scan(kanban_home):
     assert meta["auto_routed_open_prs"] == [f"{REPO}#{OWN}", f"{REPO}#{MENTIONED}"]
     assert comments == [
         f"survivor PR open; card closes on merged=true ({REPO}#{OWN}, {REPO}#{MENTIONED})"]
+
+
+def test_declared_pr_keeps_a_prose_pr_on_this_cards_branch_gating(kanban_home, monkeypatch):
+    """t_287a2872: a merged declared pr_url plus "follow-up in o/r#N" must not let #N, still open on
+    THIS card's branch, slip to done. Another card's branch, or no card id, stays a mention."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="follow-up route", assignee="daedalus")
+        heads = {OWN: None, MENTIONED: f"daedalus/{tid}-follow-up", 3854: "daedalus/t_0000aaaa-x"}
+
+        def query(repo, number):
+            if number == OWN:
+                return {"state": "MERGED", "merged": True, "head_ref": f"daedalus/{tid}-main"}
+            return {"state": "OPEN", "head_ref": heads.get(number) or f"fix/pr-{number}"}
+
+        monkeypatch.setattr(op, "_default_query", lambda: query)
+        kb.claim_task(conn, tid)
+        summary = (f"Shipped {REPO}#{OWN}; follow-up in {REPO}#{MENTIONED}. "
+                   f"Unrelated: {REPO}#3854, {REPO}#3855.")
+        assert kb.complete_task(conn, tid, summary=summary,
+                                metadata={"pr_url": f"https://github.com/{REPO}/pull/{OWN}"}) is True
+        assert kb.get_task(conn, tid).status == "review"
+        meta = kb.latest_run(conn, tid).metadata
+    assert meta["auto_routed_open_prs"] == [f"{REPO}#{MENTIONED}"]
+    assert meta["mentioned_unowned_prs"] == [f"{REPO}#3854", f"{REPO}#3855"]
