@@ -1984,6 +1984,9 @@ _OPENAI_ULTRAFAST_PRICING: Dict[str, PricingEntry] = {
         cache_write_cost_per_million_above=Decimal("30.00"),
     ),
 }
+# The Hermes-side "-900k" Codex picker variant requests Ultrafast too (model_supports_ultrafast strips it),
+# and is the same model on the wire: alias it so its served-ultrafast turns price.
+_OPENAI_ULTRAFAST_PRICING.update({f"{_m}-900k": _e for _m, _e in list(_OPENAI_ULTRAFAST_PRICING.items())})
 # Anthropic fast mode (``speed: "fast"``): a premium on the whole context window, with the
 # prompt-caching multipliers applied on top. Selected per response by ``usage.speed``.
 _ANTHROPIC_FAST_MODE_PRICING: Dict[str, PricingEntry] = {
