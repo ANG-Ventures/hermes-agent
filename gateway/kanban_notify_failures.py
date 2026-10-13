@@ -171,6 +171,29 @@ def format_timed_out_notice(
     return f"⏱ {board_tag}{tag}Kanban {task_id} timed out{tail}{nxt}"
 
 
+def format_liveness_line(liveness: Optional[dict]) -> str:
+    """One line of the evidence the crash sweep acted on (``liveness`` payload block).
+
+    ``""`` when the event carries none (older dispatcher, non-crash path).
+    """
+    if not isinstance(liveness, dict) or not liveness:
+        return ""
+
+    def _yn(value) -> str:
+        return "?" if value is None else ("yes" if value else "no")
+
+    def _pair(rec, live) -> str:
+        return f"{'-' if rec is None else rec} vs {'-' if live is None else live}"
+
+    return (
+        f"liveness: {liveness.get('decision') or '?'}"
+        f" · pid_exists={_yn(liveness.get('pid_exists'))}"
+        f" · fingerprint {_pair(liveness.get('fingerprint_recorded'), liveness.get('fingerprint_live'))}"
+        f" · start_token {_pair(liveness.get('start_token_recorded'), liveness.get('start_token_live'))}"
+        f" · argv_names_task={_yn(liveness.get('argv_names_task'))}"
+    )
+
+
 def format_failure_notice(
     kind: str,
     payload: Optional[dict],
@@ -185,19 +208,24 @@ def format_failure_notice(
     payload = payload or {}
     classification = directive.get("classification") or ""
     cards = directive.get("cards") or [task_id]
+    evidence = format_liveness_line(payload.get("liveness"))
     if len(cards) > 1:
         lane = assignee or "unassigned"
         shown = ", ".join(cards[:8]) + (f" (+{len(cards) - 8} more)" if len(cards) > 8 else "")
-        return (
+        msg = (
             f"✖ {board_tag}{lane}: {classification} — "
             f"{len(cards)} cards failing: {shown}"
         )
+        # The carrier's evidence, named: the others share the cause, not the readings.
+        return f"{msg}\n{task_id} {evidence}" if evidence else msg
     suffix = f": {classification}" if classification else ""
     if kind == "gave_up":
         failures = payload.get("failures")
         count = f"{int(failures)} " if isinstance(failures, int) and failures > 0 else "repeated "
-        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after {count}spawn failures{suffix}"
-    return (
-        f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); "
-        f"dispatcher will retry{suffix}"
-    )
+        msg = f"✖ {board_tag}{tag}Kanban {task_id} gave up after {count}spawn failures{suffix}"
+    else:
+        msg = (
+            f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); "
+            f"dispatcher will retry{suffix}"
+        )
+    return f"{msg}\n{evidence}" if evidence else msg
