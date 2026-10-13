@@ -24,6 +24,8 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
         monkeypatch.delenv(var, raising=False)
+    # The fixture hosts (ace-ai, ace-media) must read as remote on whichever box runs the suite.
+    monkeypatch.setattr(kres, "_this_host", lambda: "kres-test-box")
     kb.init_db()
     # The fleet registry the sweep binds hosts to (live shape: kanban-reach-matrix.json aliases).
     (home / "fleet").mkdir()
@@ -236,3 +238,146 @@ def test_real_container_is_stopped_by_the_sweep(kanban_home):
         assert ps.stdout.strip() == ""
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+
+def test_a_resource_another_live_card_still_owns_is_not_stopped(kanban_home):
+    """Prism 073bd4651d4b: card B re-ran the idempotent `winvm start` and recorded the same VM."""
+    runner = _Runner()
+    with kbc.connect_closing() as conn:
+        a, _ = _running_card(conn)
+        b, _ = _running_card(conn)
+        kres.kanban_run_resource(conn, a, "vm", "win11-ai", "ace-ai")
+        kres.kanban_run_resource(conn, b, "vm", "win11-ai", "ace-ai")
+        kb.complete_task(conn, a, summary="ok")
+        assert kres.release_finished(conn, runner=runner, notify=_quiet) == []
+        assert runner.calls == [] and kres.list_resources(conn, a)[0]["state"] == "started"
+        kb.complete_task(conn, b, summary="ok")
+        acts = kres.release_finished(conn, runner=runner, notify=_quiet)
+        assert len(runner.calls) == 1  # one stop for the shared VM, both records settled
+        assert [x["action"] for x in acts] == ["stopped", "stopped"]
+        assert kres.outstanding(conn, a) == [] and kres.outstanding(conn, b) == []
+
+
+def test_an_overlapping_sweep_never_stops_a_claimed_resource_twice(kanban_home):
+    """Prism 7eb1a4776d4e: a second sweep running while the first is mid-stop selects nothing."""
+    inner = []
+    with kbc.connect_closing() as conn:
+        tid, _ = _running_card(conn)
+        kres.kanban_run_resource(conn, tid, "container", "c1", "local")
+        kb.complete_task(conn, tid, summary="ok")
+
+        def runner(argv):
+            with kbc.connect_closing() as other:
+                inner.extend(kres.release_finished(other, runner=lambda a: pytest.fail("double stop"),
+                                                   notify=_quiet))
+            return 0, ""
+
+        (act,) = kres.release_finished(conn, runner=runner, notify=_quiet)
+        assert act["action"] == "stopped" and inner == []
+        assert kres.list_resources(conn, tid)[0]["state"] == "stopped"
+
+
+def test_a_stale_claim_is_retaken(kanban_home, monkeypatch):
+    runner = _Runner()
+    with kbc.connect_closing() as conn:
+        tid, run = _running_card(conn)
+        kres.kanban_run_resource(conn, tid, "container", "c1", "local")
+        kb.complete_task(conn, tid, summary="ok")
+        items = kres._load(conn.execute("SELECT resources FROM task_runs WHERE id=?", (run,)).fetchone()[0])
+        items[0].update(state="stopping", claim="dead", claimed_at=1)  # a sweep that died mid-stop
+        conn.execute("UPDATE task_runs SET resources=? WHERE id=?", (kres._dump(items), run))
+        conn.commit()
+        assert kres.outstanding(conn, tid)[0]["state"] == "stopping"
+        (act,) = kres.release_finished(conn, runner=runner, notify=_quiet)
+        assert act["action"] == "stopped" and len(runner.calls) == 1
+
+
+def test_a_reregistration_during_the_stop_keeps_its_started_state(kanban_home):
+    """Prism 8fe56a8f0513: the stale stop result never overwrites the new generation."""
+    with kbc.connect_closing() as conn:
+        tid, run = _running_card(conn)
+        kres.kanban_run_resource(conn, tid, "container", "c1", "local")
+        kb.complete_task(conn, tid, summary="ok")
+
+        def runner(argv):
+            with kbc.connect_closing() as other:
+                other.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))  # reopened
+                other.commit()
+                kres.kanban_run_resource(other, tid, "container", "c1", "local", run_id=run)
+            return 0, ""
+
+        kres.release_finished(conn, runner=runner, notify=_quiet)
+        (rec,) = kres.list_resources(conn, tid)
+        assert rec["state"] == "started" and "claim" not in rec
+        assert kres.outstanding(conn, tid) == [rec]
+
+
+def test_a_slow_batch_renews_each_claim_before_its_stop(kanban_home, monkeypatch):
+    """Prism 275dd68484f0/f906e655a576: stops whose cumulative time exceeds STALE_CLAIM_S never let a
+    later claim go stale, so an overlapping sweep cannot retake it and stop it twice."""
+    clock = [1_000_000]
+    monkeypatch.setattr(kres.time, "time", lambda: clock[0])
+    stops, inner = [], []
+    with kbc.connect_closing() as conn:
+        tid, _ = _running_card(conn)
+        for i in range(4):
+            kres.kanban_run_resource(conn, tid, "container", f"c{i}", "local")
+        kb.complete_task(conn, tid, summary="ok")
+
+        def runner(argv):
+            stops.append(argv)
+            clock[0] += kres.STOP_TIMEOUT_S + 30  # each stop near its timeout: 4 x 120 s > STALE_CLAIM_S
+            with kbc.connect_closing() as other:
+                inner.extend(kres.release_finished(other, runner=lambda a: pytest.fail("double stop"),
+                                                   notify=_quiet))
+            return 0, ""
+
+        acts = kres.release_finished(conn, runner=runner, notify=_quiet)
+        assert len(stops) == 4 and inner == []
+        assert [a["action"] for a in acts] == ["stopped"] * 4
+
+
+def test_a_claim_lost_before_its_stop_skips_the_stop(kanban_home, monkeypatch):
+    with kbc.connect_closing() as conn:
+        tid, run = _running_card(conn)
+        kres.kanban_run_resource(conn, tid, "container", "c0", "local")
+        kb.complete_task(conn, tid, summary="ok")
+        real = kres._renew_claims
+
+        def steal(c, members):
+            items = kres._load(c.execute("SELECT resources FROM task_runs WHERE id=?", (run,)).fetchone()[0])
+            items[0]["claim"] = "other-sweep"
+            c.execute("UPDATE task_runs SET resources=? WHERE id=?", (kres._dump(items), run))
+            c.commit()
+            return real(c, members)
+
+        monkeypatch.setattr(kres, "_renew_claims", steal)
+        acts = kres.release_finished(conn, runner=lambda a: pytest.fail("stopped a claim it lost"), notify=_quiet)
+        assert acts == []
+        assert kres.list_resources(conn, tid)[0]["claim"] == "other-sweep"
+
+
+def test_a_paused_sweep_cannot_resume_a_claim_another_sweep_resolved(kanban_home):
+    """Prism 3e65b63c1c05: a stale ``stopping`` record settled as kept drops its claim, and a claim is only
+    ever renewed or settled while the record is still ``stopping``."""
+    with kbc.connect_closing() as conn:
+        tid, run = _running_card(conn, body="keep-alive: Ace is gaming")
+        kres.kanban_run_resource(conn, tid, "container", "c1", "local")
+        kb.complete_task(conn, tid, summary="ok")
+        items = kres._load(conn.execute("SELECT resources FROM task_runs WHERE id=?", (run,)).fetchone()[0])
+        items[0].update(state="stopping", claim="paused", claimed_at=1)  # sweep A paused mid-stop, claim now stale
+        conn.execute("UPDATE task_runs SET resources=? WHERE id=?", (kres._dump(items), run))
+        conn.commit()
+        (act,) = kres.release_finished(conn, runner=lambda a: pytest.fail("stopped a keep-alive"), notify=_quiet)
+        assert act["action"] == "kept"
+        (rec,) = kres.list_resources(conn, tid)
+        assert rec["state"] == "kept" and "claim" not in rec and "claimed_at" not in rec
+        member = [(run, tid, "paused", {})]
+        assert kres._renew_claims(conn, member) is False  # sweep A resumes: nothing of its own to stop
+        # Even a record that kept the token is not ours once it left ``stopping``.
+        items = kres._load(conn.execute("SELECT resources FROM task_runs WHERE id=?", (run,)).fetchone()[0])
+        items[0]["claim"] = "paused"
+        conn.execute("UPDATE task_runs SET resources=? WHERE id=?", (kres._dump(items), run))
+        conn.commit()
+        assert kres._renew_claims(conn, member) is False
+        assert kres.list_resources(conn, tid)[0]["state"] == "kept"
