@@ -232,3 +232,101 @@ async def test_real_branch_command_seeds_child_pin_with_parent_bytes(tmp_path, m
     runner2_key_state = runner._peek_session_state(parent_key)
     await runner._handle_branch_command(MessageEvent(text="/branch --here again", source=source))
     assert runner2_key_state.conversation.ephemeral_pin is None
+
+
+# ------------------------------------------- routing the inherited bytes do not override (r2)
+# Apollo r2 on #1923 (Prism 89f1a3a47431 / b6bd0d66ca29): the parent's pinned bytes also state
+# Connected Platforms, Home Channels and the non-origin delivery options. The branch note overrides
+# only source/ids/origin, so the parent bytes may be served only while they still say exactly what
+# this thread would render for the rest; and an internal first turn must get the note too.
+
+def _set_homes(runner, *homes):
+    from gateway.config import HomeChannel
+
+    table = {p: HomeChannel(platform=p, chat_id=cid, name=name) for p, cid, name in homes}
+    runner.config.get_connected_platforms = lambda: list(table)
+    runner.config.get_home_channel = lambda p: table.get(p)
+
+
+@pytest.mark.asyncio
+async def test_inherited_pin_survives_when_home_channels_unchanged(monkeypatch):
+    runner = _make_runner(monkeypatch)
+    calls: list[dict] = []
+    _capture(runner, calls)
+    _set_homes(runner, (Platform.DISCORD, "111", "ops"), (Platform.TELEGRAM, "222", "phone"))
+
+    await _turn(runner, _human_source(), KEY)
+    CHILD_KEY = _child_key(runner)
+    runner._inherit_branch_context_pin(KEY, CHILD_KEY)
+    await _turn(runner, _child_thread_source(), CHILD_KEY)
+    assert "**Home Channels" in calls[0]["context_prompt"]
+    assert calls[1]["context_prompt"] == calls[0]["context_prompt"], "unchanged homes must keep the warm prefix"
+
+
+@pytest.mark.parametrize("child_homes", [
+    pytest.param([(Platform.DISCORD, "999", "new-home"), (Platform.TELEGRAM, "222", "phone")], id="sethome"),
+    pytest.param([(Platform.DISCORD, "111", "ops")], id="fewer-homes"),
+])
+@pytest.mark.asyncio
+async def test_home_channel_drift_drops_inherited_pin_and_renders_own_context(monkeypatch, child_homes):
+    runner = _make_runner(monkeypatch)
+    calls: list[dict] = []
+    _capture(runner, calls)
+    staged: list[list[str]] = []
+    orig = runner._set_pending_turn_sidecar_notes
+    runner._set_pending_turn_sidecar_notes = lambda k, notes: (staged.append(list(notes)), orig(k, notes))
+    _set_homes(runner, (Platform.DISCORD, "111", "ops"), (Platform.TELEGRAM, "222", "phone"))
+
+    await _turn(runner, _human_source(), KEY)
+    CHILD_KEY = _child_key(runner)
+    runner._inherit_branch_context_pin(KEY, CHILD_KEY)
+    _set_homes(runner, *child_homes)  # /sethome (or a platform drop) after the parent last rendered
+    staged.clear()
+    await _turn(runner, _child_thread_source(), CHILD_KEY)
+
+    child = calls[1]["context_prompt"]
+    assert child != calls[0]["context_prompt"], "stale parent homes served as current"
+    assert child == runner._peek_session_state(CHILD_KEY).conversation.ephemeral_pin[1]
+    for _p, cid, name in child_homes:
+        assert f'"{name}" (ID: "{cid}")' in child
+    assert not any("[Session context for this branch]" in n for batch in staged for n in batch), \
+        "own render needs no override note"
+
+
+@pytest.mark.asyncio
+async def test_internal_first_child_turn_gets_branch_note_and_keeps_sentinel(monkeypatch):
+    runner = _make_runner(monkeypatch)
+    calls: list[dict] = []
+    _capture(runner, calls)
+    staged: list[list[str]] = []
+    orig = runner._set_pending_turn_sidecar_notes
+    runner._set_pending_turn_sidecar_notes = lambda k, notes: (staged.append(list(notes)), orig(k, notes))
+
+    await _turn(runner, _human_source(), KEY)
+    CHILD_KEY = _child_key(runner)
+    runner._inherit_branch_context_pin(KEY, CHILD_KEY)
+    staged.clear()
+
+    wake = SessionSource(platform=Platform.DISCORD, chat_id=THREAD_ID, chat_type="thread",
+                         thread_id=THREAD_ID, user_id=_human_source().user_id, scope_id=_human_source().scope_id)
+    await runner._handle_message_with_agent(
+        MessageEvent(text="[kanban] wake", source=wake, internal=True), wake, CHILD_KEY, 1)
+    internal_notes = [n for batch in staged for n in batch if "[Session context for this branch]" in n]
+    assert len(internal_notes) == 1, "internal first turn read the parent's channel with no correction"
+    assert f"`{THREAD_ID}`" in internal_notes[0]
+    pin = runner._peek_session_state(CHILD_KEY).conversation.ephemeral_pin
+    assert pin[0] == BRANCH_INHERITED_PIN_KEY, "internal turn must leave adoption to the first human turn"
+    assert calls[1]["context_prompt"] == calls[0]["context_prompt"]
+
+    staged.clear()
+    await _turn(runner, _child_thread_source(), CHILD_KEY)
+    assert len([n for batch in staged for n in batch if "[Session context for this branch]" in n]) == 1
+    assert runner._peek_session_state(CHILD_KEY).conversation.ephemeral_pin[0] != BRANCH_INHERITED_PIN_KEY
+    assert calls[2]["context_prompt"] == calls[0]["context_prompt"]
+
+
+def test_branch_note_scopes_its_override_and_vouches_for_the_rest():
+    note = branch_thread_context_note(SessionContext(
+        source=_child_thread_source(), connected_platforms=[], home_channels={}))
+    assert "Home Channels and other delivery options are current" in note
+    assert "Current Session Context" not in note, "a blanket override would void the still-true homes"

@@ -2317,11 +2317,12 @@ class GatewayTurnMixin:
         )
 
         # Adopt an inherited /branch pin only now, past every early-out: it re-keys the pin and the
-        # thread's own facts ride this turn's user message (Prism d78579970af8 / b6bd0d66ca29).
-        if not event.internal:
-            _branch_context_note = self._adopt_inherited_context_pin(context, _redact_pii, session_key)
-            if _branch_context_note:
-                turn_sidecar_notes.insert(0, _branch_context_note)
+        # thread's own facts ride this turn's user message (Prism d78579970af8). An internal turn
+        # gets the note but leaves the pin for the first human turn (Prism b6bd0d66ca29).
+        _branch_context_note = self._adopt_inherited_context_pin(
+            context, _redact_pii, session_key, internal=event.internal)
+        if _branch_context_note:
+            turn_sidecar_notes.insert(0, _branch_context_note)
 
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.

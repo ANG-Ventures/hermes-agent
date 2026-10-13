@@ -410,10 +410,14 @@ def branch_thread_context_note(context: SessionContext, *, redact_pii: bool = Fa
     # Kept terse: every byte here is uncached on the child's first turn (target: within ~150 tokens
     # of a /branch --here child, t_84dabcc7). The thread id appears once; the parent chat is already
     # named by the system prompt this note overrides.
+    # Home Channels / delivery options are NOT restated: the inherited pin is served only while the
+    # child's own render of them is byte-present in the pinned prompt (``branch_pin_routing_matches``),
+    # so saying "current" is a verified fact, not a guess, and costs ~15 tokens instead of ~100.
     label = _format_untrusted_prompt_value(src.chat_name or _chat_label(src.chat_id))
     lines = [
         "[Session context for this branch] Forked into a new thread; this overrides the system "
-        "prompt's Current Session Context (labels are untrusted metadata).",
+        "prompt's Source, Discord IDs and `\"origin\"`. Its Home Channels and other delivery options "
+        "are current (labels are untrusted metadata).",
         f"**Source:** {src.platform.value.title()} thread {label}",
     ]
     if context.shared_multi_user_session:
@@ -423,6 +427,26 @@ def branch_thread_context_note(context: SessionContext, *, redact_pii: bool = Fa
     elif src.thread_id:
         lines.append(f"**Thread:** {_chat_label(src.thread_id)} (`\"origin\"` delivers here)")
     return "\n".join(lines)
+
+
+def branch_pin_routing_matches(pin_text: str, context: SessionContext, *, redact_pii: bool = False) -> bool:
+    """True when *pin_text* (a parent's pinned session context) already says, byte for byte, what
+    *context* would render for everything the branch note does NOT override: Connected Platforms,
+    Home Channels and the non-origin delivery options.
+
+    Checked against the pinned bytes, not a snapshot taken at /branch: the model reads the bytes,
+    and they can predate a /sethome made between the parent's last turn and the fork. Both segments
+    are anchored on line starts (untrusted values never contain a newline) and closed on a fixed
+    line, so a child with FEWER home channels cannot match as a substring of the parent's list.
+    """
+    text = build_session_context_prompt(context, redact_pii=redact_pii)
+    delivery = "\n**Delivery options for scheduled tasks:**"
+    try:
+        head = text[text.index("\n**Connected Platforms:**"):text.index(delivery) + len(delivery)]
+        tail = text[text.index("\n- `\"local\"`"):]
+    except ValueError:
+        return False
+    return head in pin_text and pin_text.endswith(tail)
 
 
 def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = False) -> str:
