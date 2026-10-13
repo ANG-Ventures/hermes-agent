@@ -86,6 +86,43 @@ def test_prose_pr_still_gates_unless_its_branch_names_a_different_card(head):
     assert _numbers(got) == [7]
 
 
+@pytest.mark.parametrize("head", ["apollo/bash32-bison-no-sudo", "aegis/closeout-0923"])
+def test_prose_pr_on_an_operator_branch_is_a_mention(head):
+    """Operator branches belong to no card (t_472fba2e): a prose ref is recorded, never gates."""
+    q = _oracle({7: "OPEN"}, {7: head})
+    unowned: list = []
+    assert op.open_pr_refs(f"lands behind {REPO}#7", query_fn=q, task_id=CARD, unowned=unowned) == []
+    assert _numbers(unowned) == [7]
+
+
+def test_operator_branch_naming_this_card_still_gates():
+    q = _oracle({7: "OPEN"}, {7: f"aegis/{CARD}-fix"})
+    assert _numbers(op.open_pr_refs(f"see {REPO}#7", query_fn=q, task_id=CARD)) == [7]
+
+
+def test_t02aadead_1408_handoff_gates_on_own_pr_only():
+    """Replay of t_02aadead run 24681 (14:08), routed on #3927 AND Apollo's #3843 (t_472fba2e).
+
+    No declared PRs, so the prose classifier alone decides (declared refs are t_0ecd6506's path)."""
+    run = json.loads((Path(__file__).parent / "fixtures" / "kanban_handoff_t_02aadead.json").read_text())
+    q = _oracle({3927: "OPEN", 3843: "OPEN"}, {int(n): h for n, h in run["heads"].items()})
+    unowned: list = []
+    got = op.open_pr_refs(run["summary"], metadata={}, query_fn=q, task_id=run["task_id"],
+                          unowned=unowned)
+    assert _numbers(got) == [3927]
+    assert _numbers(unowned) == [3843]
+
+
+def test_branch_is_operators():
+    assert op.branch_is_operators("apollo/bash32-bison-no-sudo")
+    assert op.branch_is_operators("aegis/closeout-0923")
+    assert not op.branch_is_operators("aegis/t_2c8822d6-drain-manifest")  # card id decides
+    assert not op.branch_is_operators("feature/no-prefix")
+    assert not op.branch_is_operators("daedalus/whatever")
+    assert not op.branch_is_operators("apollo")
+    assert not op.branch_is_operators(None)
+
+
 def test_unreadable_prose_pr_still_gates():
     q = _oracle({}, {})
     assert _numbers(op.open_pr_refs(f"see {REPO}#7", query_fn=q, task_id=CARD)) == [7]

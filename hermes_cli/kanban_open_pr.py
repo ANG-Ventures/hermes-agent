@@ -246,6 +246,20 @@ def branch_names_other_card(head_ref: Optional[str], task_id: Optional[str]) -> 
     return bool(cards) and task_id not in cards
 
 
+def branch_is_operators(head_ref: Optional[str]) -> bool:
+    """True when ``head_ref`` is an operator branch (``apollo/*``, ``aegis/*``) naming no card at all.
+
+    Operator branches belong to no card by construction (t_472fba2e: hermes-home#3843 on
+    ``apollo/bash32-bison-no-sudo`` gated every card whose prose said "lands behind #3843"). The
+    prefixes are :data:`kanban_db.OPERATOR_PROFILES`. An operator branch that names a card is
+    judged by its card id instead (:func:`branch_names_other_card`)."""
+    from hermes_cli.kanban_db import OPERATOR_PROFILES
+
+    if not head_ref or "/" not in head_ref or _CARD_IN_BRANCH_RE.search(head_ref):
+        return False
+    return head_ref.split("/", 1)[0].lower() in OPERATOR_PROFILES
+
+
 def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
                  survivor_pr=None, query_fn: Optional[QueryFn] = None,
                  task_id: Optional[str] = None, unowned: Optional[list] = None) -> list:
@@ -255,10 +269,12 @@ def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
 
     Prose is not provenance (t_60b39483): t_f1b135a8's handoff said "#1902 and #1903 are not this
     card's" and was gated on both. With ``task_id``, an OPEN ref found only in the handoff TEXT whose
-    head branch names a DIFFERENT card (``<profile>/<other card>-*``) is a mention: it is appended to
-    ``unowned`` and does not gate. Declared refs (``metadata.pr_url`` / ``pr_urls`` / ``pr``,
+    head branch names a DIFFERENT card (``<profile>/<other card>-*``), or is an operator branch naming
+    no card (``apollo/*``, ``aegis/*``; t_472fba2e), is a mention: it is appended to ``unowned`` and
+    does not gate. Declared refs (``metadata.pr_url`` / ``pr_urls`` / ``pr``,
     ``--survivor-pr``) always gate. A prose ref whose head branch names this card, names no card, or
-    is unknown (unreadable) still gates: fail closed, as before (t_1bd02e0b).
+    is unknown (unreadable) still gates: fail closed, as before (t_1bd02e0b). "Names no card" includes
+    a branch with no operator prefix (``feature/x``: a worker branch that lost its id).
 
     Declared beats prose (t_0ecd6506): when the handoff declares its PRs (``own_prs`` / ``pr_url`` /
     ``pr_urls`` / ``pr`` / ``--survivor-pr``), the route and the close-on-merged set are exactly those
@@ -286,7 +302,7 @@ def open_pr_refs(*texts: Optional[str], metadata: Optional[dict] = None,
             if (ref.repo.lower(), ref.number) not in declared:
                 payload = query_fn(ref.repo, ref.number)  # memoised: no second lookup
                 head_ref = payload.get("head_ref") if isinstance(payload, dict) else None
-                if branch_names_other_card(head_ref, task_id):
+                if branch_names_other_card(head_ref, task_id) or branch_is_operators(head_ref):
                     if unowned is not None:
                         unowned.append(ref)
                     continue
