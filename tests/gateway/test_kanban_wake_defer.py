@@ -493,3 +493,138 @@ def test_delegated_child_comment_does_not_cancel_the_wake(board, monkeypatch, ca
     runner._kanban_wake_gate._dispatcher_state = FakeDispatcher("admitting")
     _set_load(runner, 10.0)
     assert asyncio.run(defer.tick(runner)) == 1
+
+
+# --- Apollo review of #1934 @303101e9 ------------------------------------------
+
+
+@pytest.fixture
+def two_boards(tmp_path, monkeypatch):
+    """Two boards under one sandboxed HERMES_HOME: ``default`` and ``other``."""
+    for key in [k for k in list(__import__("os").environ) if k.startswith("HERMES_KANBAN")]:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    kb.init_db()
+    kb.create_board("other")
+    return tmp_path
+
+
+def test_worker_heartbeating_board_a_commenting_on_board_b_does_not_cancel(two_boards, monkeypatch, caplog):
+    """7d9c8fa1f2ee, the two-board shape: a default-profile worker dispatched on
+    board ``other`` (heartbeat there, ``kanban`` session source) comments on a
+    ``human:apollo`` card on board ``default`` via ``kanban_comment(board=...)``.
+    Board ``default`` has no heartbeat for that session; the wake must still fire."""
+    board = two_boards
+    tid, adapter, runner = _deferred_runner(board, monkeypatch, caplog)
+    worker_sid = "20261012_100000_boardaworker"
+    conn = kb.connect(board="other")
+    try:
+        other_tid = kb.create_task(conn, title="board A card", assignee="default")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at, "
+                "actor_profile, actor_session_id) VALUES (?, 1, 'heartbeat', NULL, 0, ?, ?)",
+                (other_tid, "default", worker_sid),
+            )
+    finally:
+        conn.close()
+    _state_session(board, worker_sid, "kanban")
+    conn = kb.connect(board="default")
+    try:
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE actor_session_id = ? AND kind = 'heartbeat'",
+            (worker_sid,),
+        ).fetchone(), "board B sees no heartbeat for the board-A worker"
+        with kb.mutation_actor(session_ids=[worker_sid], profile="default"):
+            kb.add_comment(conn, tid, author="default", body="cross-board final note")
+    finally:
+        conn.close()
+    runner._kanban_wake_gate._dispatcher_state = FakeDispatcher("admitting")
+    _set_load(runner, 10.0)
+    assert asyncio.run(defer.tick(runner)) == 1, "a worker on another board is not the reviewer"
+    assert len(adapter.handled) == 1
+
+
+def _bare_human_review_task():
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="E2 chain slice", assignee="worker",
+                             session_id="agent:main:telegram:dm:chat-1")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+                          chat_type="dm", delivery_mode="notify+wake")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert kb.request_review(conn, tid, summary="PR ready", reviewer="human",
+                                 expected_run_id=run_id) is True
+        return tid
+    finally:
+        conn.close()
+
+
+def test_bare_human_owner_own_session_cancels_the_wake(board, monkeypatch, caplog):
+    """cb8149c5fbc5 follow-up: ``human`` (no name) is not an operator label.
+    The owner's own chat-session comment must drop the row, or a stale wake fires."""
+    home_sid = "20261012_101000_humanhome"
+    _state_session(board, home_sid, "discord")
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="E2 chain slice", assignee="worker", session_id=home_sid)
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+                          chat_type="dm", delivery_mode="notify+wake")
+    finally:
+        conn.close()
+    _comment_as(tid, home_sid, "default", "default")  # the home session, stamped
+    conn = kb.connect()
+    try:
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert kb.request_review(conn, tid, summary="PR ready", reviewer="human",
+                                 expected_run_id=run_id) is True
+    finally:
+        conn.close()
+    adapter = RecordingAdapter()
+    runner = _runner(adapter, 184.0, board, dispatcher=FakeDispatcher("proc_paused"))
+    asyncio.run(_tick(monkeypatch, runner))
+    row = next(iter(_pending(runner).values()))
+    assert row["owner"] == "human" and row["home_sid"] == home_sid, "a bare-human owner's home is verified"
+    _comment_as(tid, home_sid, "default", "default")
+    runner._kanban_wake_gate._dispatcher_state = FakeDispatcher("admitting")
+    _set_load(runner, 10.0)
+    with caplog.at_level("INFO"):
+        assert asyncio.run(defer.tick(runner)) == 0
+    assert adapter.handled == [] and _pending(runner) == {}
+    assert f"kanban wake deferred dropped for {tid} on telegram/chat-1: owner human wrote commented" in caplog.text
+
+
+def test_bare_human_owner_explicit_human_comment_cancels_the_wake(board, monkeypatch, caplog):
+    """A ``human:<anyone>`` comment author (operator token) is the human acting on a bare-``human`` card."""
+    tid = _bare_human_review_task()
+    adapter = RecordingAdapter()
+    runner = _runner(adapter, 184.0, board, dispatcher=FakeDispatcher("proc_paused"))
+    asyncio.run(_tick(monkeypatch, runner))
+    assert next(iter(_pending(runner).values()))["owner"] == "human"
+    conn = kb.connect()
+    try:
+        kb.add_comment(conn, tid, author="human:apollo", body="on it")
+    finally:
+        conn.close()
+    runner._kanban_wake_gate._dispatcher_state = FakeDispatcher("admitting")
+    _set_load(runner, 10.0)
+    assert asyncio.run(defer.tick(runner)) == 0
+    assert adapter.handled == [] and _pending(runner) == {}
+
+
+def test_bare_human_owner_worker_comment_still_does_not_cancel(board, monkeypatch, caplog):
+    """The bare sentinel must not widen the gate: a default-profile worker is still not the human."""
+    tid = _bare_human_review_task()
+    adapter = RecordingAdapter()
+    runner = _runner(adapter, 184.0, board, dispatcher=FakeDispatcher("proc_paused"))
+    asyncio.run(_tick(monkeypatch, runner))
+    worker_sid = "20261012_102000_workersess"
+    _worker_session(tid, worker_sid, "default")
+    _state_session(board, worker_sid, "kanban")
+    _comment_as(tid, worker_sid, "default", "default")
+    runner._kanban_wake_gate._dispatcher_state = FakeDispatcher("admitting")
+    _set_load(runner, 10.0)
+    assert asyncio.run(defer.tick(runner)) == 1
