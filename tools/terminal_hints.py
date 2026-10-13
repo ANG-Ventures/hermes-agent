@@ -37,6 +37,15 @@ _MISSING_COMMAND_HINTS = {
 }
 
 
+_MISSING_COMMAND_RE = re.compile(r"(?:bash: line \d+: |bash: |sh: \d*:? ?)?([\w.+-]+): command not found")
+
+
+def missing_command(output: str) -> Optional[str]:
+    """The command name in the first ``<name>: command not found`` of a failed command's output, or None."""
+    m = _MISSING_COMMAND_RE.search((output or "")[:_SCAN_CHARS])
+    return m.group(1) if m else None
+
+
 def _missing_command_hint(missing: str) -> str:
     return _MISSING_COMMAND_HINTS.get(missing) or (
         f"`{missing}` is not installed or not on PATH. Verify with `which {missing}`; install it "
@@ -53,8 +62,7 @@ _OUTPUT_HINTS: list[Callable[[str, str], Optional[str]]] = [
                 "Git merge conflict. Do not retry this command. Resolve the conflicted files "
                 "listed above (edit, then `git add`), then continue (`git rebase --continue` / "
                 "commit the merge) — or abort with `--abort`.", re.M),
-    _regex_hint(r"(?:bash: line \d+: |bash: |sh: \d*:? ?)?([\w.+-]+): command not found",
-                _missing_command_hint),
+    _regex_hint(_MISSING_COMMAND_RE.pattern, _missing_command_hint),
     # Almost always a venv-activation slip, not a missing dependency.
     _regex_hint(r"(?:ModuleNotFoundError|ImportError): No module named '?([\w.]+)",
                 "Python cannot import '{0}'. Most often the wrong interpreter is running: "
