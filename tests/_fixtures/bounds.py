@@ -446,21 +446,26 @@ def _is_browser_argv(args, executable) -> bool:
 # Runs in the CHILD between fork and the browser's exec: raise this process's own soft
 # RLIMIT_AS (allowed up to the hard limit), then become the browser. The pytest process is
 # never uncapped, so a concurrent spawn or allocation elsewhere keeps the cap (Prism 6ee6a42466dd).
+# ``argv[2]`` is the executable as the caller gave it (``Popen(executable=)`` or ``argv[0]``),
+# resolved HERE with ``execvp``: after ``_execute_child`` applied the child's ``cwd`` and ``env``,
+# so a test that pins a browser through ``env['PATH']`` or a relative ``cwd`` gets that browser,
+# not the parent's (Prism f368ed80a38b). ``-S`` and ``-I`` keep the stub free of site/user code.
 _EXEC_UNCAPPED = (
     "import os, resource, sys\n"
     "soft = int(sys.argv[1]); hard = resource.getrlimit(resource.RLIMIT_AS)[1]\n"
     "resource.setrlimit(resource.RLIMIT_AS, (soft if hard == resource.RLIM_INFINITY else min(soft, hard), hard))\n"
-    "os.execv(sys.argv[2], sys.argv[3:])\n"
+    "os.execvp(sys.argv[2], sys.argv[3:])\n"
 )
+_SHELL_ARG = 10  # ``Popen._execute_child(self, args, executable, preexec_fn, ..., shell, ...)``: index of ``shell``
 
 
 def _exempt_browser_children() -> None:
     """Spawn browser children (and the Playwright node driver) with the pre-harness soft
     RLIMIT_AS. Covers ``subprocess.Popen`` and asyncio subprocesses (both reach
     ``Popen._execute_child``): the argv is wrapped in ``_EXEC_UNCAPPED``, so the pid,
-    process group and exit status are the browser's own."""
-    import shutil
-
+    process group and exit status are the browser's own. ``shell=True`` keeps its meaning:
+    the trampoline execs ``/bin/sh -c <command>`` (or ``executable`` in the shell's place), as
+    ``_execute_child`` itself would have (Prism acd9932c0af8)."""
     real = subprocess.Popen._execute_child
     if getattr(real, "_test_bounds_exempt", False):
         return
@@ -468,12 +473,20 @@ def _exempt_browser_children() -> None:
     def _execute_child(self, args, executable, *rest, **kw):
         if _RLIMIT_AS_SAVED is None or not _is_browser_argv(args, executable):
             return real(self, args, executable, *rest, **kw)
-        argv = [os.fsdecode(a) for a in ([args] if isinstance(args, (str, bytes, os.PathLike)) else args)]
+        shell = kw.get("shell") if "shell" in kw else (rest[_SHELL_ARG - 3] if len(rest) > _SHELL_ARG - 3 else False)
+        if isinstance(args, (str, bytes, os.PathLike)):
+            argv = [os.fsdecode(args)]
+        else:
+            argv = [os.fsdecode(a) for a in args]
+        if shell:
+            argv = ["/bin/sh", "-c", *argv]  # exactly what Popen does for shell=True on POSIX
         target = os.fsdecode(executable) if executable is not None else argv[0]
-        if os.sep not in target:
-            target = shutil.which(target) or target
         soft = _RLIMIT_AS_SAVED[0]
-        wrapped = [sys.executable, "-S", "-c", _EXEC_UNCAPPED, str(soft), target, *argv]
+        wrapped = [sys.executable, "-I", "-S", "-c", _EXEC_UNCAPPED, str(soft), target, *argv]
+        if "shell" in kw:
+            kw = {**kw, "shell": False}
+        elif len(rest) > _SHELL_ARG - 3:
+            rest = (*rest[:_SHELL_ARG - 3], False, *rest[_SHELL_ARG - 2:])
         return real(self, wrapped, sys.executable, *rest, **kw)
 
     _execute_child._test_bounds_exempt = True  # type: ignore[attr-defined]

@@ -357,6 +357,65 @@ def test_a_browser_child_does_not_inherit_the_address_space_cap(tmp_path):
     assert out.returncode == 0, out.stdout + out.stderr
 
 
+@pytest.mark.platforms("linux")
+def test_the_browser_exemption_resolves_through_the_child_env_and_keeps_shell_semantics(tmp_path):
+    """Prism f368ed80a38b: a browser pinned through ``env['PATH']`` (or a relative ``cwd``) must be
+    THAT browser, not the parent PATH's. Prism acd9932c0af8: ``shell=True`` must still run the
+    command through ``/bin/sh -c``. Both go through the trampoline, uncapped."""
+    import resource
+
+    saved = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (saved[1], saved[1]))
+    parent_bin = tmp_path / "parent-bin"
+    child_bin = tmp_path / "child-bin"
+    for d, tag in ((parent_bin, "PARENT"), (child_bin, "CHILD")):
+        d.mkdir()
+        exe = d / "google-chrome"
+        exe.write_text(f"#!/bin/sh\necho {tag} $(ulimit -v) $PWD\n", encoding="utf-8")
+        exe.chmod(0o755)
+    try:
+        out = _run_child(tmp_path, f'''
+            import os, resource, subprocess
+            def test_child_env_wins():
+                assert resource.getrlimit(resource.RLIMIT_AS)[0] == 1024 ** 3
+                env = {{**os.environ, "PATH": {str(child_bin)!r} + os.pathsep + os.environ["PATH"]}}
+                got = subprocess.run(["google-chrome"], capture_output=True, text=True, env=env, cwd={str(child_bin)!r}).stdout.split()
+                assert got == ["CHILD", "unlimited", {str(child_bin)!r}], got
+                # relative executable resolved against the child's cwd
+                got = subprocess.run(["./google-chrome"], capture_output=True, text=True, cwd={str(child_bin)!r}).stdout.split()
+                assert got[:2] == ["CHILD", "unlimited"], got
+                # shell=True: the string is a shell command, with shell syntax honoured
+                got = subprocess.run("google-chrome --flag && echo SHELL-OK", shell=True, capture_output=True, text=True, env=env).stdout.split()
+                assert got[0] == "CHILD" and got[1] == "unlimited" and got[-1] == "SHELL-OK", got
+                assert resource.getrlimit(resource.RLIMIT_AS)[0] == 1024 ** 3
+        ''', env={bounds._RLIMIT_ENV: "1", "PATH": str(parent_bin) + os.pathsep + os.environ["PATH"]})
+    finally:
+        resource.setrlimit(resource.RLIMIT_AS, saved)
+    assert out.returncode == 0, out.stdout + out.stderr
+
+
+def test_a_suite_with_its_own_pytest_ini_still_gets_the_bounds(tmp_path):
+    """Prism 7f79b8c956d0: ``cd optional-skills/creative/comfyui/tests && pytest`` selects that
+    directory's pytest.ini, the root conftest is never loaded, and nothing would bound the run.
+    That conftest registers the harness itself; a 3 s sleep under a 1 s budget must fail by name."""
+    nested = ROOT / "optional-skills" / "creative" / "comfyui" / "tests"
+    probe_dir = nested.parent / f"tests_bounds_probe_{tmp_path.name.lower()}"
+    probe_dir.mkdir()
+    try:
+        for name in ("conftest.py", "pytest.ini"):
+            (probe_dir / name).write_bytes((nested / name).read_bytes())
+        (probe_dir / "test_probe.py").write_text("import time\ndef test_slow():\n    time.sleep(3)\n", encoding="utf-8")
+        out = subprocess.run(
+            [sys.executable, "-m", "pytest", "test_probe.py", "-q", "-p", "no:cacheprovider", "-o", "bounds_wall_seconds=1"],
+            cwd=probe_dir, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+        )
+    finally:
+        import shutil
+
+        shutil.rmtree(probe_dir, ignore_errors=True)
+    assert out.returncode == 1 and "test_slow ran past 1s of wall clock" in out.stdout, out.stdout + out.stderr
+
+
 def test_browser_argv_detection():
     assert bounds._is_browser_argv(["/usr/bin/google-chrome", "--headless"], None)
     assert bounds._is_browser_argv(["/x/chromium_headless_shell-1243/chrome-linux/headless_shell"], None)
