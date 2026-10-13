@@ -336,7 +336,7 @@ if not HOST_LOCK_DIR_AT_CONFTEST_IMPORT:
 # conftest (that is the repo root), and pytest fails a run that loads a
 # non-root conftest carrying ``pytest_plugins`` after startup (e.g. ``pytest .``).
 # Fixtures imported here register exactly as if they were defined here.
-from tests._fixtures.bounds import bounded_call, configure as _configure_test_bounds
+from tests._fixtures.bounds import addoption as _addoption_test_bounds, bounded_call, configure as _configure_test_bounds
 from tests._fixtures.env_filter import _HERMES_BEHAVIORAL_VARS, _looks_like_credential
 from tests._fixtures.kanban_identity import kanban_identity, kanban_pins  # noqa: F401 — fixtures register here
 from tests._fixtures.live_system_guard import (  # noqa: F401 — _live_system_guard registers here
@@ -1502,6 +1502,10 @@ def require_mcp_2_sdk():
 
 def pytest_unconfigure(config):  # noqa: D401 — pytest hook
     _remove_relocated_basetemp(config)
+
+
+def pytest_addoption(parser):  # noqa: D401 — pytest hook
+    _addoption_test_bounds(parser)
 
 
 @pytest.hookimpl(trylast=True)  # after _pytest.tmpdir has built config._tmp_path_factory

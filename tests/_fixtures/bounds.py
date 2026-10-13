@@ -14,14 +14,18 @@ test, not a dead host:
 
 1. **Wall clock per test** (``_TEST_WALL_SECONDS``, 60 s; ``@pytest.mark.slow_test(N)``
    raises it for a named reason). A watchdog thread delivers ``HarnessWallClockExceeded``
-   into the test thread with ``PyThreadState_SetAsyncExc`` and pokes the thread with a
-   harmless ``SIGURG`` so a blocking syscall (``sleep``, ``recv``, ``wait``, a lock)
-   returns and the exception surfaces. Measured on 3.14/macOS: delivery in ~0.1 s for
-   both busy loops and blocking calls. It is NOT ``SIGALRM``: the tree uses
-   ``SIGALRM``/``setitimer`` itself (``kanban_db._cwd_probe_budget``), and the two would
-   clobber each other (verified: pytest-timeout's signal method turned 25 passing tests
-   red in ``test_kanban_workspace_retention.py``). The exception derives from
-   ``BaseException`` so an ``except Exception`` in the code under test cannot eat it.
+   into the test thread with ``PyThreadState_SetAsyncExc`` (ends a busy loop between
+   bytecodes) and sends the main thread ``SIGURG``, whose handler raises the same
+   exception when a watchdog has fired (aborts a blocking ``sleep``/``recv``/``wait``/
+   untimed ``Lock.acquire``: measured, the async exception alone never reaches an untimed
+   acquire). It is NOT ``SIGALRM``: the tree uses ``SIGALRM``/``setitimer`` itself
+   (``kanban_db._cwd_probe_budget``), and the two would clobber each other (verified:
+   pytest-timeout's signal method turned 25 passing tests red in
+   ``test_kanban_workspace_retention.py``). The exception derives from ``BaseException``
+   so an ``except Exception`` in the code under test cannot eat it; a loop that swallows
+   ``BaseException`` gets re-delivered every 0.5 s and, ``_ESCALATE_AFTER_SECONDS`` later,
+   the watchdog writes the named verdict to fd 2 and ``os._exit(70)``s the process: the
+   per-file runner reports that file red with the test named, and the host is untouched.
 
 2. **Address-space ceiling per process** (``_PROCESS_RLIMIT_GB``, 6 GiB): on Linux
    ``RLIMIT_AS`` makes a runaway allocation raise ``MemoryError`` INSIDE the test instead
@@ -43,7 +47,9 @@ test, not a dead host:
    ~2 us.
 
 Opt-outs are markers with a reason, never env vars (root AGENTS.md: behaviour is
-config/markers, ``.env`` is secrets). ``HERMES_TEST_RLIMIT_GB`` is the single env knob
+config/markers, ``.env`` is secrets). The defaults are pytest ini values
+(``bounds_wall_seconds``, ``bounds_rss_growth_gb``; override with ``-o`` for a probe, never
+in pyproject to make one test pass). ``HERMES_TEST_RLIMIT_GB`` is the single env knob
 and exists only because the rlimit is per PROCESS, decided before any test runs.
 """
 from __future__ import annotations
@@ -63,6 +69,11 @@ _TEST_WALL_SECONDS = 60.0
 _TEST_RSS_GROWTH_GB = 1.0
 _PROCESS_RLIMIT_GB = 6.0
 _RSS_POLL_SECONDS = 0.1
+_ESCALATE_AFTER_SECONDS = 3.0
+_ESCALATE_EXIT_CODE = 70
+# The watchdog that has fired and not yet been acknowledged by the hook wrapper; read by
+# the SIGURG handler on the main thread.
+_FIRED: list["_Watchdog"] = []
 _MARK_SLOW = "slow_test"
 _MARK_BIG_MEMORY = "big_memory"
 _RLIMIT_ENV = "HERMES_TEST_RLIMIT_GB"
@@ -99,13 +110,17 @@ def _current_rss() -> int:
     return psutil.Process().memory_info().rss
 
 
+def _on_sigurg(_signum, _frame) -> None:
+    """Raise the fired watchdog's exception inside whatever syscall the main thread is in."""
+    if _FIRED:
+        raise _FIRED[-1].fired[0]  # type: ignore[index]
+
+
 def _interrupt(thread_ident: int, exc_type: type) -> None:
     """Raise ``exc_type`` in the test thread and unblock any syscall it sits in."""
-    state = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+    ctypes.pythonapi.PyThreadState_SetAsyncExc(
         ctypes.c_ulong(thread_ident), ctypes.py_object(exc_type)
     )
-    if state != 1:
-        return
     sigurg = getattr(signal, "SIGURG", None)
     if sigurg is not None and hasattr(signal, "pthread_kill"):
         try:
@@ -160,12 +175,40 @@ class _Watchdog:
                     f"Raise it only with @pytest.mark.{_MARK_SLOW}(<seconds>, reason=...).",
                 )
             if self.fired is not None:
+                _FIRED.append(self)
+                first = time.monotonic()
                 _interrupt(self.target, self.fired[0])
-                # A ``try: ... except BaseException: pass`` in the test can swallow one
-                # delivery; keep re-raising until the test thread leaves the call.
+                # A ``try: ... except BaseException: pass`` in the test swallows a
+                # delivery; keep re-raising, then end the process by name.
                 while not self._stop.wait(0.5):
+                    if time.monotonic() - first > _ESCALATE_AFTER_SECONDS:
+                        self._escalate()
                     _interrupt(self.target, self.fired[0])
                 return
+
+    def _escalate(self) -> None:
+        message = (
+            f"\n{self.fired[1]}\nThe test swallowed the harness stop for "  # type: ignore[index]
+            f"{_ESCALATE_AFTER_SECONDS:.0f}s (an `except BaseException: pass` loop?); "
+            f"ending the pytest process with exit {_ESCALATE_EXIT_CODE} so the host survives.\n"
+        )
+        # pytest's fd capture has dup2'd a temp file onto fd 2 (and ``sys.__stderr__``
+        # wraps fd 2); the capture manager keeps the real terminal fd in
+        # ``targetfd_save``. Write there so the verdict reaches the runner's log.
+        try:
+            os.write(_real_stderr_fd(self.item.config), message.encode("utf-8", "replace"))
+        except OSError:
+            pass
+        os._exit(_ESCALATE_EXIT_CODE)
+
+
+def _real_stderr_fd(config) -> int:
+    capman = config.pluginmanager.getplugin("capturemanager")
+    try:
+        saved = capman._global_capturing.err.targetfd_save  # type: ignore[union-attr]
+    except AttributeError:
+        return 2
+    return saved if isinstance(saved, int) else 2
 
 
 def _apply_process_rlimit() -> str | None:
@@ -193,6 +236,16 @@ def _apply_process_rlimit() -> str | None:
     return None
 
 
+def addoption(parser) -> None:
+    """Called from ``tests/conftest.py::pytest_addoption``."""
+    parser.addini("bounds_wall_seconds", "per-test wall-clock budget (s)", default=str(_TEST_WALL_SECONDS))
+    parser.addini("bounds_rss_growth_gb", "per-test RSS growth budget (GiB)", default=str(_TEST_RSS_GROWTH_GB))
+
+
+def _defaults(config) -> tuple[float, float]:
+    return float(config.getini("bounds_wall_seconds")), float(config.getini("bounds_rss_growth_gb"))
+
+
 def configure(config) -> None:
     """Called from ``tests/conftest.py::pytest_configure`` (hooks register only on the
     conftest module itself; this module is imported, not listed in ``pytest_plugins``)."""
@@ -208,6 +261,8 @@ def configure(config) -> None:
     )
     skipped = _apply_process_rlimit()
     config._hermes_test_bounds_rlimit = skipped  # read by the self-test; None = applied
+    if getattr(signal, "SIGURG", None) is not None and threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGURG, _on_sigurg)
 
 
 @contextlib.contextmanager
@@ -217,8 +272,9 @@ def bounded_call(item):
     Wraps only the CALL phase: fixtures that build 20 s of state are not the hazard,
     and a watchdog across setup would fire inside another fixture's finaliser.
     """
-    wall = _limit_from_marker(item, _MARK_SLOW, _TEST_WALL_SECONDS)
-    growth = _limit_from_marker(item, _MARK_BIG_MEMORY, _TEST_RSS_GROWTH_GB)
+    default_wall, default_growth = _defaults(item.config)
+    wall = _limit_from_marker(item, _MARK_SLOW, default_wall)
+    growth = _limit_from_marker(item, _MARK_BIG_MEMORY, default_growth)
     dog = _Watchdog(item, wall, int(growth * _GIB))
     dog.start()
     try:
@@ -231,5 +287,7 @@ def bounded_call(item):
     finally:
         dog.stop()
         if dog.fired is not None:
+            if dog in _FIRED:
+                _FIRED.remove(dog)
             # Cancel any still-pending async exception so it cannot land in teardown.
             ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(dog.target), None)
