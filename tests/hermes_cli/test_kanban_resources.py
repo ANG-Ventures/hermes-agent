@@ -355,3 +355,29 @@ def test_a_claim_lost_before_its_stop_skips_the_stop(kanban_home, monkeypatch):
         acts = kres.release_finished(conn, runner=lambda a: pytest.fail("stopped a claim it lost"), notify=_quiet)
         assert acts == []
         assert kres.list_resources(conn, tid)[0]["claim"] == "other-sweep"
+
+
+def test_a_paused_sweep_cannot_resume_a_claim_another_sweep_resolved(kanban_home):
+    """Prism 3e65b63c1c05: a stale ``stopping`` record settled as kept drops its claim, and a claim is only
+    ever renewed or settled while the record is still ``stopping``."""
+    with kbc.connect_closing() as conn:
+        tid, run = _running_card(conn, body="keep-alive: Ace is gaming")
+        kres.kanban_run_resource(conn, tid, "container", "c1", "local")
+        kb.complete_task(conn, tid, summary="ok")
+        items = kres._load(conn.execute("SELECT resources FROM task_runs WHERE id=?", (run,)).fetchone()[0])
+        items[0].update(state="stopping", claim="paused", claimed_at=1)  # sweep A paused mid-stop, claim now stale
+        conn.execute("UPDATE task_runs SET resources=? WHERE id=?", (kres._dump(items), run))
+        conn.commit()
+        (act,) = kres.release_finished(conn, runner=lambda a: pytest.fail("stopped a keep-alive"), notify=_quiet)
+        assert act["action"] == "kept"
+        (rec,) = kres.list_resources(conn, tid)
+        assert rec["state"] == "kept" and "claim" not in rec and "claimed_at" not in rec
+        member = [(run, tid, "paused", {})]
+        assert kres._renew_claims(conn, member) is False  # sweep A resumes: nothing of its own to stop
+        # Even a record that kept the token is not ours once it left ``stopping``.
+        items = kres._load(conn.execute("SELECT resources FROM task_runs WHERE id=?", (run,)).fetchone()[0])
+        items[0]["claim"] = "paused"
+        conn.execute("UPDATE task_runs SET resources=? WHERE id=?", (kres._dump(items), run))
+        conn.commit()
+        assert kres._renew_claims(conn, member) is False
+        assert kres.list_resources(conn, tid)[0]["state"] == "kept"

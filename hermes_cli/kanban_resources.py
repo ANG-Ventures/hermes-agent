@@ -242,6 +242,19 @@ def _live_keys(conn) -> set[tuple]:
     return keys
 
 
+def why_refused(res: dict, registry: frozenset[str]) -> Optional[str]:
+    """Why a recorded row must never be run (planted past registration), else None."""
+    if not _TOKEN_RE.match(str(res.get("id") or "")):
+        return f"resource id {res.get('id')!r} is not a plain token"
+    return host_refusal(res.get("host"), registry)
+
+
+def _claimed(items: list[dict], token: str) -> Optional[dict]:
+    """The record our sweep still owns: same claim token AND still ``stopping``. A record another sweep
+    resolved (kept, refused, stopped) is never renewed, stopped or settled by us again."""
+    return next((r for r in items if r.get("claim") == token and r.get("state") == "stopping"), None)
+
+
 def _renew_claims(conn, members: list) -> bool:
     """Refresh ``claimed_at`` on every record in ``members`` still holding our token, so a batch of
     slow stops never lets a queued claim go stale mid-sweep. False when none is ours any more."""
@@ -254,7 +267,7 @@ def _renew_claims(conn, members: list) -> bool:
     with kb.write_txn(conn):
         for run_id, _task_id, token, _act in members:
             items = _load(conn.execute("SELECT resources FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0])
-            mine = next((r for r in items if r.get("claim") == token), None)
+            mine = _claimed(items, token)
             if mine is not None:
                 mine["claimed_at"] = now
                 conn.execute("UPDATE task_runs SET resources = ? WHERE id = ?", (_dump(items), run_id))
@@ -308,11 +321,14 @@ def release_finished(
                 act = {"task_id": row["task_id"], "run_id": run_id, "kind": res["kind"],
                        "id": res.get("id"), "host": res.get("host")}
                 key = _norm_key(res)
+                if keep or why_refused(res, registry):
+                    # Settled here: a stale claim on it is dead, so a paused sweep holding it cannot resume it.
+                    res.pop("claim", None)
+                    res.pop("claimed_at", None)
                 if keep:
                     act.update(action="kept", reason=keep)
                     res.update(state="kept", kept_reason=keep[:200], released_at=now)
-                elif (why := (None if _TOKEN_RE.match(str(res.get("id") or "")) else f"resource id {res.get('id')!r} "
-                              "is not a plain token") or host_refusal(res.get("host"), registry)):
+                elif why := why_refused(res, registry):
                     # A row planted past registration: never run it, leave it open for closeout.
                     act.update(action="stop_failed", error=f"refused: {why}"[:240])
                     res.update(state="stop_failed", last_error=act["error"])
@@ -356,7 +372,7 @@ def release_finished(
         with kb.write_txn(conn):
             for run_id, task_id, token, act in plan["members"]:
                 items = _load(conn.execute("SELECT resources FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0])
-                mine = next((r for r in items if r.get("claim") == token), None)
+                mine = _claimed(items, token)
                 if mine is None:
                     continue  # re-registered while the stop ran: that generation is not ours to settle
                 mine.pop("claim", None)
