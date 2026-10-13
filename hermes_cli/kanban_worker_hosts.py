@@ -157,8 +157,10 @@ def remote_workspace_has_content(placement_raw: Optional[str],
     re-routed elsewhere would leave anything here behind (t_ecfd5591
     0e9694bf2944). Any doubt (no placement, no path, ssh failure) is content.
     """
+    if not placement_raw:
+        return True
     try:
-        env = json.loads(placement_raw or "").get("env") or {}
+        env = json.loads(placement_raw).get("env") or {}
         workspace, ssh_host = env.get("TERMINAL_CWD"), env.get("TERMINAL_SSH_HOST")
         if not workspace or not ssh_host:
             return True
