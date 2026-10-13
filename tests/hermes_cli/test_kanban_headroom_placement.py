@@ -543,3 +543,65 @@ def test_on_commit_never_outlives_an_unmanaged_transaction(home):
             kdc.on_commit(conn, lambda: fired.append("ok"))
         assert fired == ["ok"]
         assert id(conn) not in kdc._POST_COMMIT
+
+
+# -- Prism 83b0c929b421: a non-finite clock never reaches the ledger ---------
+
+_BAD_CLOCKS = [float("nan"), float("inf"), float("-inf")]
+
+
+@pytest.mark.parametrize("bad", _BAD_CLOCKS)
+@pytest.mark.parametrize("call", ["release", "renew", "reserve", "live_reservations", "live_slots"])
+def test_non_finite_now_is_refused_and_the_ledger_survives(tmp_path, call, bad):
+    """``release(now=nan)`` read every row as expired and rewrote the ledger
+    EMPTY, even for an unknown id; the same clock made live rows vanish from
+    every reader. Any non-finite ``now`` is refused before the ledger is read,
+    and the file is byte-identical afterwards."""
+    led = tmp_path / "r.json"
+    rid = placement.reserve("ci-box", "kanban", placement.Footprint(3, 2), ttl_s=600, path=led, now=T0,
+                            admissions_path=tmp_path / "a.jsonl")
+    before = led.read_bytes()
+    calls = {
+        "release": lambda: placement.release("unknown", path=led, now=bad),
+        "renew": lambda: placement.renew(rid, ttl_s=600, path=led, now=bad),
+        "reserve": lambda: placement.reserve("ci-box", "kanban", placement.Footprint(3, 2), ttl_s=600,
+                                             path=led, now=bad, admissions_path=tmp_path / "a.jsonl"),
+        "live_reservations": lambda: placement.live_reservations(led, now=bad),
+        "live_slots": lambda: placement.live_slots("kanban", led, now=bad),
+    }
+    with pytest.raises(placement.PlacementError, match="now must be a finite"):
+        calls[call]()
+    assert led.read_bytes() == before
+    assert placement.live_slots("kanban", led, now=T0 + 1) == {"ci-box": 1}
+
+
+@pytest.mark.parametrize("bad", _BAD_CLOCKS)
+def test_non_finite_now_never_lifts_an_operator_exclusion(tmp_path, bad):
+    """``until > nan`` is False: a live exclusion row read as absent (same class)."""
+    ex = tmp_path / "exclusions.json"
+    ex.write_text(json.dumps({"ci-box": {"until": T0 + 3600, "reason": "voice session"}}), encoding="utf-8")
+    assert placement.read_exclusions(ex, now=T0) == {"ci-box": "voice session"}
+    with pytest.raises(placement.PlacementError, match="now must be a finite"):
+        placement.read_exclusions(ex, now=bad)
+    (tmp_path / "hosts.json").write_text(json.dumps(TABLE), encoding="utf-8")
+    table = placement.load_hosts(tmp_path / "hosts.json")
+    with pytest.raises(placement.PlacementError, match="now must be a finite"):
+        placement.choose(table, "kanban", {}, now=bad, exclusions_path=ex)
+    with pytest.raises(placement.PlacementError, match="stale_after_s"):
+        placement.choose(table, "kanban", {}, now=T0, exclusions_path=ex, stale_after_s=bad)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_non_finite_clock_never_reads_a_stale_sample_as_fresh(bad):
+    """``age > stale`` is False for a NaN age or a NaN threshold: a 10-minute-old
+    pressure row came back ``fresh`` (same class: a non-finite clock fails open)."""
+    doc = {"at": T0 - 600, "hosts": {"ci-box": {"at": T0 - 600, "age_s": 0, "load1": 1.0, "load5": 1.0,
+                                                "mem_available_gb": 100.0, "psi_cpu_some10": 0.0,
+                                                "psi_mem_some10": 0.0, "system_pct": 1.0}}}
+    assert placement.samples_from_pressure(doc, now=T0)["ci-box"].status == "stale"
+    with pytest.raises(placement.PlacementError, match="now must be a finite"):
+        placement.samples_from_pressure(doc, now=bad)
+    with pytest.raises(placement.PlacementError, match="stale_after_s"):
+        placement.samples_from_pressure(doc, now=T0, stale_after_s=bad)
+    with pytest.raises(placement.PlacementError, match="now must be a finite"):
+        placement.sample_from_probe(1.0, 100.0, now=bad)
