@@ -93,3 +93,42 @@ def test_config_get_model_survives_a_string_model_config(monkeypatch):
     out = server._CONFIG_GETTERS["model"]({"session_id": ""})
     assert isinstance(out, dict), out
     assert out["model"] == "some/vendor-model"
+
+
+def test_config_get_model_reports_session_model_during_voice_route(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="voice-model", provider="voice-provider",
+        _voice_route_state={
+            "snapshot": {"model": "chat-model", "provider": "chat-provider"},
+            "reasoning_config": {"enabled": True, "effort": "high"},
+        },
+    )
+    monkeypatch.setitem(server._sessions, "voice-sid", _session(agent=agent))
+    result = server._CONFIG_GETTERS["model"]({"session_id": "voice-sid"})
+    assert result == {"model": "chat-model", "provider": "chat-provider", "scope": "session"}
+
+
+def test_config_get_reasoning_preserves_session_effort_during_voice_route(monkeypatch):
+    agent = types.SimpleNamespace(
+        reasoning_config={"enabled": False},
+        _voice_route_state={
+            "snapshot": {"model": "chat-model", "provider": "chat-provider"},
+            "reasoning_config": {"enabled": True, "effort": "high"},
+        },
+    )
+    monkeypatch.setitem(server._sessions, "voice-sid", _session(agent=agent))
+    monkeypatch.setattr(server, "_load_cfg", dict)
+    result = server._CONFIG_GETTERS["reasoning"]({"session_id": "voice-sid"})
+    assert result["value"] == "high"
+
+
+def test_non_live_session_pick_is_refused_before_any_persist(monkeypatch):
+    # Current upstream binds scoped RPCs to a live session; a detached row
+    # must be resumed before changing it, rather than borrowing launch scope.
+    monkeypatch.delitem(server._sessions, "sid", raising=False)
+    writes = []
+    monkeypatch.setattr(server, "_persist_session_row_override", lambda *a, **k: writes.append("row"))
+    monkeypatch.setattr(server, "_save_cfg", lambda *a, **k: writes.append("profile"))
+    response = _config_set_model("vendor/model --session")
+    assert response.get("error", {}).get("code") == 4001, response
+    assert writes == []
