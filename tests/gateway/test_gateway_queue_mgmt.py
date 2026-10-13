@@ -493,6 +493,24 @@ def test_merged_release_builds_one_event_in_order_and_marks_it(rig):
     assert _held(runner) == []
 
 
+def test_merged_release_without_slot_storage_leaves_held_items_untouched(rig):
+    runner, adapter = rig
+    runner._queue_release_mode = "merged"
+    held = runner._session_state(KEY).conversation.held_queue
+    held.extend([_ev("a", media_urls=["u1"], media_types=["image/png"]),
+                 _ev("b", media_urls=["u2"], media_types=["image/png"])])
+    adapter._pending_messages = None                           # rewrite_active refuses
+    assert qm.restage_held(runner, KEY, adapter) is None
+    assert _held(runner) == ["a", "b"]
+    assert [e.media_urls for e in held] == [["u1"], ["u2"]]
+    assert [e.media_types for e in held] == [["image/png"], ["image/png"]]
+    adapter._pending_messages = {}                             # storage back: one clean merged turn
+    assert qm.restage_held(runner, KEY, adapter) == 2
+    merged = adapter._pending_messages[KEY]
+    assert merged.text == "a\n\nb"
+    assert merged.media_urls == ["u1", "u2"]
+
+
 def test_per_item_release_marks_every_released_event(rig):
     runner, adapter = rig
     _seed(runner, adapter, "a", "b")
