@@ -23,6 +23,17 @@ from hermes_cli import kanban_worker_hosts as kwh
 REPO = Path(__file__).resolve().parents[2]
 
 FHO_STUB = '''
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class Col:  # the real module defines a dataclass at import: the loader must survive that
+    id: str
+    fix: Optional[str] = None
+
+
 HOSTS = {
     "studio": {"aliases": ["mac-studio-m3u", "studio"]},
     "ci-box": {"aliases": ["ci", "ci-box"]},

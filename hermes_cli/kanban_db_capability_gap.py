@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -61,7 +62,12 @@ def fleet_host_onboard():
             spec = importlib.util.spec_from_file_location("_hermes_fleet_host_onboard", path)
             if spec is not None and spec.loader is not None and path.is_file():
                 mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
+                # @dataclass resolves annotations through sys.modules[cls.__module__]: register first.
+                sys.modules[spec.name] = mod
+                try:
+                    spec.loader.exec_module(mod)
+                finally:
+                    sys.modules.pop(spec.name, None)
         except Exception:
             _log.warning("capability gap: cannot load %s; events carry host=None", path, exc_info=True)
             mod = None
