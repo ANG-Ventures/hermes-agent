@@ -435,3 +435,35 @@ def test_list_shows_later_active_items_under_held_and_run_restages_oldest_first(
     assert "1. a" in out and "2. b" in out and "Also waiting (1)" in out and "· later" in out
     qm.restage_held(runner, KEY, adapter)
     assert _active(runner, adapter) == ["a", "b", "later"]
+
+
+# --------------------------------------------------------------------------- Momus pass-4 RC-B
+
+def _seed_orphans(runner, adapter, *texts):
+    """Idle orphans: user items in overflow with an EMPTY slot (the eviction/rescue state)."""
+    assert qm.rewrite_active(runner, KEY, adapter, [_ev(t) for t in texts], arm=False)
+
+
+@pytest.mark.parametrize("op", [qm.QueueOp("rm", index=3), qm.QueueOp("edit", index=1, text="A"),
+                                qm.QueueOp("move", index=2, to=1)])
+def test_idle_management_verbs_never_arm_the_slot(rig, op):
+    """Editing an idle queue must not start a turn: the slot (a run-next trigger) stays empty."""
+    runner, adapter = rig
+    _seed_orphans(runner, adapter, "a", "b", "c")
+    qm.apply_management(runner, op, KEY, adapter)
+    assert KEY not in adapter._pending_messages
+
+
+def test_busy_management_verbs_keep_the_slot_armed(rig):
+    runner, adapter = rig
+    _seed(runner, adapter, "a", "b", "c")                    # slot armed (a turn will drain it)
+    qm.apply_management(runner, qm.QueueOp("rm", index=1), KEY, adapter)
+    assert adapter._pending_messages[KEY].text == "b"
+
+
+@pytest.mark.asyncio
+async def test_queue_run_arms_idle_orphans_so_released_is_true(rig):
+    runner, adapter = rig
+    _seed_orphans(runner, adapter, "a", "b")
+    reply = await qm.release(runner, KEY, _source(), adapter, busy=False)
+    assert reply.startswith("Released 2") and adapter._pending_messages[KEY].text == "a"

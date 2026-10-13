@@ -224,3 +224,19 @@ async def test_default_stop_holds_and_nothing_runs(monkeypatch, tmp_path):
     assert rig.calls == ["first"]
     assert [e.text for e in rig.runner._session_state(KEY).conversation.held_queue] == ["a", "b"]
     assert any("2 queued prompt(s) held" in s for s in rig.adapter.sent), rig.adapter.sent
+
+
+@pytest.mark.asyncio
+async def test_plain_message_after_stop_runs_and_held_items_stay_held(monkeypatch, tmp_path):
+    """D14 end to end: after /stop, a plain message runs as its own turn; held items do not run."""
+    rig = _Rig(monkeypatch, tmp_path)
+    await rig.start_first_turn()
+    for text in ("/queue a", "/queue b"):
+        await rig.adapter.handle_message(_msg(text))
+    await rig.adapter.handle_message(_msg("/stop"))
+    await rig.settle(expect=1)
+    await rig.adapter.handle_message(_msg("ping"))
+    await rig.settle(expect=2)
+    await asyncio.sleep(0.3)
+    assert rig.calls == ["first", "ping"]
+    assert [e.text for e in rig.runner._session_state(KEY).conversation.held_queue] == ["a", "b"]

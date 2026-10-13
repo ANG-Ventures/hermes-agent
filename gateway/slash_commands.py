@@ -741,10 +741,13 @@ class GatewaySlashCommandsMixin(
             await self._interrupt_and_clear_session(
                 key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason=invalidation_reason)
-        from gateway import queue_mgmt
-
         def _queue_suffix() -> str:
-            return queue_mgmt.stop_reply_suffix(self, session_key, self._delivery_adapter_for(source))
+            try:  # import here: a queue_mgmt failure must never stop /stop from stopping a hung agent
+                from gateway import queue_mgmt
+                return queue_mgmt.stop_reply_suffix(self, session_key, self._delivery_adapter_for(source))
+            except Exception:
+                logger.warning("queue suffix skipped on /stop for %s", session_key, exc_info=True)
+                return ""
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:  # force-clean the sentinel so the session is unlocked
             await _stop(session_key, "stop_command_pending")

@@ -1044,8 +1044,12 @@ class GatewayBusySessionMixin:
             quick_key, source, interrupt_reason=_INTERRUPT_REASON_STOP, invalidation_reason="stop_command",
         )
         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
-        from gateway import queue_mgmt
-        suffix = queue_mgmt.stop_reply_suffix(self, quick_key, self._delivery_adapter_for(source))
+        suffix = ""
+        try:  # never let the queue reminder break /stop
+            from gateway import queue_mgmt
+            suffix = queue_mgmt.stop_reply_suffix(self, quick_key, self._delivery_adapter_for(source))
+        except Exception:
+            logger.warning("queue suffix skipped on /stop for %s", quick_key, exc_info=True)
         return EphemeralReply(t("gateway.stop.stopped") + suffix)
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):

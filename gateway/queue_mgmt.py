@@ -69,18 +69,27 @@ def user_depth(runner: Any, key: str, adapter: Any) -> int:
     return len(held) + len(active)
 
 
-def rewrite_active(runner: Any, key: str, adapter: Any, items: List[Any]) -> bool:
-    """Replace the active store with ``items`` in order. Slot = item 1 (I2). Mutates the overflow
-    list in place (I5b). Refuses, mutating nothing, when the adapter has no slot dict."""
+def rewrite_active(runner: Any, key: str, adapter: Any, items: List[Any], *, arm: Optional[bool] = True) -> bool:
+    """Replace the active store with ``items`` in order; mutates the overflow list in place (I5b).
+    Refuses, mutating nothing, when the adapter has no slot dict.
+
+    ``arm`` decides whether item 1 goes into the adapter slot, which is a RUN-NEXT TRIGGER (the
+    adapter's end-of-task drain dispatches it). ``True``: slot = item 1 (release paths, hold).
+    ``None``: keep whatever the slot state was (management verbs: editing the queue must never start
+    a turn on an idle session; Momus p4 RC-B). ``False``: everything into overflow."""
     slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
     if not isinstance(slot, dict):
         return False
+    if arm is None:
+        arm = slot.get(key) is not None
     overflow = runner._session_state(key).conversation.queued_events
     slot.pop(key, None)
     del overflow[:]
-    if items:
+    if items and arm:
         slot[key] = items[0]
         overflow.extend(items[1:])
+    else:
+        overflow.extend(items)
     return True
 
 
@@ -121,7 +130,7 @@ def _write_store(runner: Any, key: str, adapter: Any, which: str, items: List[An
         del held[:]
         held.extend(items)
         return True
-    return rewrite_active(runner, key, adapter, items)
+    return rewrite_active(runner, key, adapter, items, arm=None)
 
 
 def format_list(runner: Any, key: str, adapter: Any) -> str:
@@ -255,14 +264,17 @@ def restage_held(runner: Any, key: str, adapter: Any) -> Optional[int]:
     (spec D16/I9: single door); this function never starts a task. None = no slot storage."""
     held = held_list(runner, key)
     active = active_items(runner, key, adapter)
-    if held:
-        system = [e for e in active if is_system_event(runner, e)]
-        later_users = [e for e in active if not is_system_event(runner, e)]
-        if not rewrite_active(runner, key, adapter, system + list(held) + later_users):
+    system = [e for e in active if is_system_event(runner, e)]
+    later_users = [e for e in active if not is_system_event(runner, e)]
+    if held or later_users:
+        # Always arm: release means "run next", including idle orphans whose slot was empty.
+        if not rewrite_active(runner, key, adapter, system + list(held or []) + later_users, arm=True):
             return None
-        moved = len(held)
-        del held[:]
-        logger.info("queue_mgmt op=release session=%s moved=%d", key, moved)
+        moved = len(held or [])
+        if held:
+            del held[:]
+        logger.info("queue_mgmt op=release session=%s moved=%d armed=%d", key, moved,
+                    moved + len(later_users))
     return len([e for e in active_items(runner, key, adapter) if not is_system_event(runner, e)])
 
 
