@@ -859,7 +859,8 @@ class GatewayAgentCacheMixin:
         # bytes still state this thread's own Home Channels / delivery options; the branch note only
         # overrides source/ids/origin. Any routing drift drops it and renders this thread's own
         # context: one cold prefix is the price of never stating a stale home (Prism 89f1a3a47431).
-        # The sentinel is re-keyed only once a human turn commits (``_adopt_inherited_context_pin``).
+        # The sentinel is re-keyed only once a human turn has persisted its annotated user row
+        # (``_commit_inherited_context_pin``).
         if _eph_pin is not None and _eph_pin[0] == BRANCH_INHERITED_PIN_KEY:
             if branch_pin_routing_matches(_eph_pin[1], context, redact_pii=redact_pii):
                 return _eph_pin[1]
@@ -881,8 +882,8 @@ class GatewayAgentCacheMixin:
         of the tool schemas and that history in the cached prefix. Rendering it fresh from the thread
         source (``thread: <id>``, ``Multi-user thread``) re-wrote everything behind it on the child's
         first turn: 61% prefix hit vs 99% for ``/branch --here`` (t_1908b8bc). The inherited pin is
-        adopted on the child's first human turn (``_adopt_inherited_context_pin``), which moves the
-        thread facts to that turn's user message. Call AFTER the child's agent eviction (eviction
+        adopted once the child's first human turn persists (``_commit_inherited_context_pin``); the
+        note moves the thread facts to that turn's user message. Call AFTER the child's agent eviction (eviction
         clears the pin). Returns True when a parent pin was available."""
         state = self._peek_session_state(parent_key) if parent_key else None
         pin = state.conversation.ephemeral_pin if state else None
