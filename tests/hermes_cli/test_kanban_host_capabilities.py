@@ -498,3 +498,20 @@ def test_requires_line_trailing_note_is_not_a_word(home, fleet, monkeypatch):
         assert _route(conn, tid)[0] == ("portable", None)
         bad = _card(conn, body="requires: browser_session (typo)\nlog in")   # F4 still holds
         assert _route(conn, bad)[0] == ("local", "studio_affinity:requires:unknown:browser_session")
+
+
+def test_requires_line_note_cut_never_empties_a_declaration(home, fleet, monkeypatch):
+    # Prism 303c33bfe408: the note cut emptied `requires: (browser-session)`
+    # to [], so the declaration vanished and the card read as unrestricted.
+    _mode(monkeypatch)
+    for line in ("requires: (browser-session)", "requires: #browser-session",
+                 "requires: `(browser-session)`", "requires: ( browser-session )",
+                 "requires: , (browser-session)"):
+        words = khc.declared_words(line)
+        assert words and all(w != "none" for w in words), (line, words)
+    assert khc.declared_words("requires:") == []
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="requires: (browser-session)\nlog in")
+        route = _route(conn, tid)[0]
+        assert route[0] == "local", route
+        assert route[1].startswith("studio_affinity:requires:unknown:"), route
