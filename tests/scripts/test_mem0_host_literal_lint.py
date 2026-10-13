@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 LINT = Path(__file__).resolve().parents[2] / "scripts" / "mem0_host_literal_lint.py"
 LAN = ".".join(["192", "168", "1", "18"])   # assembled so this file never reads as a literal itself
 
@@ -97,6 +99,63 @@ def test_no_git_tree_is_graded_by_walk_not_parent_checkout(tmp_path):
                        capture_output=True, text=True, encoding="utf-8", errors="replace", env=_env())
     assert r.returncode == 1, r.stdout + r.stderr
     assert "scripts/bad.py" in r.stdout, r.stdout
+
+
+def _unreadable(path):
+    """A tracked file whose read fails with an OSError other than not-found, as root too: a symlink to
+    itself (ELOOP). chmod 000 would not do, root reads through it."""
+    os.symlink(path.name, path)
+
+
+@pytest.mark.platforms("posix")
+def test_unreadable_tracked_file_is_an_error_not_ok(tmp_path):
+    """Prism 1b16ed63fb04 (t_8b70c8bb): a read error was swallowed and the tree certified clean."""
+    repo = _repo(tmp_path, {"svc/clean.py": "HOST = 'https://mem0.ace'\n"})
+    _unreadable(repo / "svc" / "mem0_client.py")
+    r = _run(repo)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "MEM0_HOST_LITERAL=error" in r.stderr, r.stderr
+    assert "MEM0_HOST_LITERAL=ok" not in r.stdout, r.stdout
+
+
+def test_tracked_but_deleted_file_is_still_skipped(tmp_path):
+    repo = _repo(tmp_path, {"svc/clean.py": "HOST = 'https://mem0.ace'\n", "svc/gone.py": "x = 1\n"})
+    a = repo / "allow.txt"
+    a.write_text("", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, env=_env())
+    (repo / "svc" / "gone.py").unlink()
+    r = subprocess.run([sys.executable, str(LINT), "--repo", str(repo), "--allow", str(a)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", env=_env())
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "MEM0_HOST_LITERAL=ok" in r.stdout, r.stdout
+
+
+@pytest.mark.platforms("posix")
+def test_no_git_tree_unreadable_file_or_dir_is_an_error(tmp_path):
+    """Walk fallback: an unreadable file errors (ELOOP), and an unreadable directory is not dropped by
+    os.walk's default silent onerror."""
+    tree = tmp_path / "tree"
+    (tree / "scripts").mkdir(parents=True)
+    a = tree / "allow.txt"
+    a.write_text("", encoding="utf-8")
+    _unreadable(tree / "scripts" / "mem0_client.py")
+    r = subprocess.run([sys.executable, str(LINT), "--repo", str(tree), "--allow", str(a)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", env=_env())
+    assert r.returncode == 2, r.stdout + r.stderr
+    (tree / "scripts" / "mem0_client.py").unlink()
+    if os.geteuid() == 0:
+        return   # root lists a 000 directory; the file arm above already ran
+    locked = tree / "locked"
+    locked.mkdir()
+    (locked / "c.py").write_text("MEM0_HOST = 'http://127.0.0.1:8888'\n", encoding="utf-8")
+    locked.chmod(0)
+    try:
+        r = subprocess.run([sys.executable, str(LINT), "--repo", str(tree), "--allow", str(a)],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", env=_env())
+    finally:
+        locked.chmod(0o755)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "MEM0_HOST_LITERAL=error" in r.stderr, r.stderr
 
 
 def test_this_repo_is_green():

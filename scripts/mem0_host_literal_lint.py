@@ -16,7 +16,7 @@ Skipped: tests/, fixtures/, test_*.py / *_test.py, this lint and its allow file.
 has no hit any more is reported so it gets removed.
 
 Run: python3 scripts/mem0_host_literal_lint.py [--repo DIR] [--allow FILE]
-Exit 0 clean, 1 on a finding, 2 on a bad allow file. Last line: MEM0_HOST_LITERAL=ok|fail <n>.
+Exit 0 clean, 1 on a finding, 2 on a bad allow file or a tracked file it cannot read. Last line: MEM0_HOST_LITERAL=ok|fail <n>.
 Same file in hermes-agent and pipecat-house-voice; the deploy repo runs stack-tools/portability_lint.py.
 """
 from __future__ import annotations
@@ -54,7 +54,10 @@ def tracked(repo: Path) -> list[str]:
     if "not a git repository" not in r.stderr.lower():
         raise RuntimeError(f"git ls-files rc={r.returncode}: {r.stderr.strip()[:200]}")
     out: list[str] = []
-    for dirpath, dirnames, filenames in os.walk(repo):
+    def _raise(e: OSError) -> None:   # os.walk drops an unreadable directory silently by default
+        raise e
+
+    for dirpath, dirnames, filenames in os.walk(repo, onerror=_raise):
         dirnames[:] = sorted(d for d in dirnames if d not in WALK_SKIP)
         for f in filenames:
             out.append(str((Path(dirpath) / f).relative_to(repo)))
@@ -74,10 +77,13 @@ def scan(repo: Path, own: set[str]) -> dict[str, list[tuple[int, str]]]:
         if skipped(rel, own):
             continue
         p = repo / rel
+        if p.is_dir():   # submodule gitlink: its own repo runs its own lint
+            continue
         try:
             raw = p.read_bytes()
-        except OSError:
+        except FileNotFoundError:   # tracked but deleted in the worktree (or a dangling symlink)
             continue
+        # Any other read error propagates: an unread file must not be certified clean.
         if b"\0" in raw[:4096]:
             continue
         mem0_path = bool(MEM0_RE.search(rel))
