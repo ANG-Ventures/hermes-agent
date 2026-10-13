@@ -2609,6 +2609,24 @@ def detect_crashed_workers(
     return crashed
 
 
+def _host_fault(exc: BaseException) -> Optional[dict]:
+    """Run metadata for a spawn the HOST refused, or None for a card fault.
+
+    ``RestartSafeScopeUnavailable`` (#114720) and a pool host that cannot
+    create the workspace (t_9fb4d477) never charge the card's retries. The
+    latter also quarantines the (host, board) pair and pages once, and skips
+    the infrastructure cooldown: placement already routes around the pair,
+    so the card spills on the next tick instead of waiting."""
+    from tools.process_registry import RestartSafeScopeUnavailable
+
+    if isinstance(exc, RestartSafeScopeUnavailable):
+        return {}
+    if isinstance(exc, _kb._kwh.RemoteWorkspaceUnavailable):
+        _kb._kwh.note_board_fault(exc.host, exc.board, str(exc))
+        return {"board_fault": {"host": exc.host, "board": exc.board}}
+    return None
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2622,6 +2640,7 @@ def _record_task_failure(
     event_payload_extra: Optional[dict] = None,
     block_kind: Optional[str] = None,
     infrastructure: bool = False,
+    run_metadata_extra: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -2850,6 +2869,7 @@ def _record_task_failure(
                         "failures": failures,
                         "retry_status": retry_status,
                         **({"infrastructure": True} if infrastructure else {}),
+                        **(run_metadata_extra or {}),
                     },
                 )
                 _kb._append_event(
@@ -3181,7 +3201,14 @@ def check_respawn_guard(
     # condition is not the card's, so it retries forever, spaced, and never
     # reaches the breaker.
     if latest_outcome == "spawn_failed":
-        if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
+        _meta = _kb._json_dict(latest_run["metadata"])
+        if _meta.get("board_fault"):
+            # A pool host could not create the workspace (t_9fb4d477): the
+            # planner already skips that (host, board) pair, so the card may
+            # spill on the very next tick. Its "Permission denied" text is a
+            # host fact, never an auth blocker on the card.
+            return None
+        if rl_cooldown > 0 and _meta.get("infrastructure"):
             if failed_at is not None and (now - failed_at) < rl_cooldown:
                 if detail is not None:
                     detail.update(recorded_at=failed_at, eligible_at=failed_at + rl_cooldown)
@@ -3905,17 +3932,17 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
-        from tools.process_registry import RestartSafeScopeUnavailable
-
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
+        # The host refused the spawn (no restart-safe scope, no workspace
+        # mount): nothing about the card ran, so it must not spend the card's
+        # retry budget (#114720, t_9fb4d477).
+        host_fault = _host_fault(exc)
+        infrastructure = host_fault is not None
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure,
+            infrastructure=infrastructure, run_metadata_extra=host_fault or None,
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -6034,10 +6061,12 @@ def _dispatch_once_locked(
                     # intersected with the reach proof when both apply.
                     _only = tuple(_cap_only) if _only is None else \
                         tuple(h for h in _only if h in _cap_only)
+            _board_slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
             if _only is None:
-                placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None)
+                placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None,
+                                             board=_board_slug)
             else:
-                placed_host = spillover.take(row_assignee, only=_only)
+                placed_host = spillover.take(row_assignee, only=_only, board=_board_slug)
             if placed_host is None:
                 result.placement_waits[row["id"]] = spillover.refusal or "pool_full"
                 continue
@@ -6239,11 +6268,12 @@ def _dispatch_once_locked(
         except Exception as exc:
             if placed_host is not None and not launched:
                 spillover.release(placed_host)  # pre-launch failure: refund
-            from tools.process_registry import RestartSafeScopeUnavailable
             # A host that cannot place the worker (no restart-safe scope,
-            # eb28bc1bf7) is not the card's failure: the run is closed with
-            # ``infrastructure: true`` and the breaker is never charged.
-            infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
+            # eb28bc1bf7; no board mount on a pool host, t_9fb4d477) is not
+            # the card's failure: the run is closed with ``infrastructure:
+            # true`` and the breaker is never charged.
+            host_fault = _host_fault(exc)
+            infrastructure = host_fault is not None
             if infrastructure:
                 _kb._log.warning(
                     "kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s",
@@ -6253,6 +6283,7 @@ def _dispatch_once_locked(
                 conn, claimed.id, str(exc),
                 outcome="spawn_failed", release_claim=True, end_run=True,
                 failure_limit=failure_limit, infrastructure=infrastructure,
+                run_metadata_extra=host_fault or None,
             )
             # Record EVERY spawn failure (not just breaker trips) so a
             # pre-circuit-breaker stall is visible to health telemetry.
@@ -6476,11 +6507,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
-            from tools.process_registry import RestartSafeScopeUnavailable
             # A host that cannot place the worker (no restart-safe scope,
-            # eb28bc1bf7) is not the card's failure: the run is closed with
-            # ``infrastructure: true`` and the breaker is never charged.
-            infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
+            # eb28bc1bf7; no board mount on a pool host, t_9fb4d477) is not
+            # the card's failure: the run is closed with ``infrastructure:
+            # true`` and the breaker is never charged.
+            host_fault = _host_fault(exc)
+            infrastructure = host_fault is not None
             if infrastructure:
                 _kb._log.warning(
                     "kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s",
@@ -6490,6 +6522,7 @@ def _dispatch_once_locked(
                 conn, claimed.id, str(exc),
                 outcome="spawn_failed", release_claim=True, end_run=True,
                 failure_limit=failure_limit, infrastructure=infrastructure,
+                run_metadata_extra=host_fault or None,
             )
             # Record EVERY spawn failure (not just breaker trips) so a
             # pre-circuit-breaker stall is visible to health telemetry.
@@ -7169,6 +7202,9 @@ def _default_spawn(
     # Worker-pool placement (kanban_worker_pool): same process, same grant,
     # tools on the worker host. Never inherit a placement from our own env.
     env.pop(_kb._kwh.PLACEMENT_ENV, None)
+    # Only a POOL placement's mkdir failure is a (host, board) fault the
+    # planner can route around; the local-uid hop below is not (t_9fb4d477).
+    pool_board = resolved_board if placement is not None else None
     if placement is None:
         # kanban.local_worker_uid (Q8 (a), t_405acdf0): a local worker's tools
         # run as a dedicated non-sudo uid over ssh to localhost. Unset = 502.
@@ -7184,7 +7220,7 @@ def _default_spawn(
     except Exception:
         env[_khc.CAPS_ENV] = _khc.env_value(_khc.WARN, ())
     if placement is not None:
-        _kb._kwh.prepare_remote_workspace(placement, workspace)
+        _kb._kwh.prepare_remote_workspace(placement, workspace, board=pool_board)
         _kb._kwh.apply_placement(
             env, placement, workspace, run_id=task.current_run_id,
             log_file=str(_kb.worker_log_path(task.id, board=board)))

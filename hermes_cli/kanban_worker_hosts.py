@@ -65,8 +65,22 @@ def apply_placement(env: Dict[str, str], host: PoolHost, workspace: str, *,
     return values
 
 
+class RemoteWorkspaceUnavailable(RuntimeError):
+    """The pool host answered but could not create the card's workspace (no
+    board mount, a root-owned parent): a HOST fault, never the card's
+    (t_9fb4d477). The dispatcher closes the run ``infrastructure: true``."""
+
+    def __init__(self, host: str, board: Optional[str], message: str):
+        super().__init__(message)
+        self.host, self.board = host, board
+
+
+_SSH_TRANSPORT_RC = 255
+
+
 def prepare_remote_workspace(host: PoolHost, workspace: str,
-                             runner: Callable = subprocess.run) -> None:
+                             runner: Callable = subprocess.run, *,
+                             board: Optional[str] = None) -> None:
     """Create the card's workspace at the same absolute path on the host."""
     proc = runner(
         _ssh_argv(host, f"mkdir -p -- {shlex.quote(workspace)}"),
@@ -74,11 +88,39 @@ def prepare_remote_workspace(host: PoolHost, workspace: str,
         timeout=_PROBE_TIMEOUT_SECONDS,
         stdin=subprocess.DEVNULL,
     )
-    if getattr(proc, "returncode", 1) != 0:
-        raise RuntimeError(
-            f"worker host {host.name}: mkdir {workspace} failed: "
-            f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}"
-        )
+    rc = getattr(proc, "returncode", 1)
+    if rc != 0:
+        msg = (f"worker host {host.name}: mkdir {workspace} failed: "
+               f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+        if rc == _SSH_TRANSPORT_RC or not board:
+            raise RuntimeError(msg)  # ssh itself failed, or no pool board: not a board fact
+        raise RemoteWorkspaceUnavailable(host.name, board, msg)
+
+
+def note_board_fault(host: str, board: Optional[str], why: str) -> bool:
+    """Quarantine the (host, board) pair for ``BOARD_FAULT_SECONDS`` and page
+    ONCE per quarantine episode (#alerts, warn). True when a page was sent."""
+    from hermes_cli import kanban_worker_pool as _kwp
+
+    if not board:
+        return False
+    fresh = _kwp.board_fault(host, board) is None
+    _kwp.mark_board_fault(host, board, why[:200])
+    _log.warning("kanban pool: %s cannot host board %s for %ds (no retry charged): %s",
+                 host, board, _kwp.BOARD_FAULT_SECONDS, why)
+    if not fresh:
+        return False
+    from hermes_cli import kanban_budget as _kbudget
+
+    script = _kbudget._notify_script_path()
+    if script is None:
+        return False  # a hermetic home never pages
+    body = (f"🧱 Kanban pool host {host} cannot host board '{board}': {why[:200]}. "
+            f"Placement skips {host} for that board for {_kwp.BOARD_FAULT_SECONDS // 60} min and the card "
+            f"keeps its retries. Fix: `fleet-host board-mounts {host} --apply` (creates the per-board "
+            f"workspace mount).")
+    import sys
+    return _kbudget._run_notify([sys.executable, script, "--sev", "warn", "--send", body]) is not False
 
 
 def local_workspace_has_content(path: Optional[str]) -> bool:

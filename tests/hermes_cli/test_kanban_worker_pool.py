@@ -320,7 +320,7 @@ def _claimed(conn, ids):
 
 def test_ac11_refused_take_never_falls_through_to_local(kanban_home):
     class Refusing(kwp.SpilloverPlan):
-        def take(self, assignee, pin=None):
+        def take(self, assignee, pin=None, board=None):
             self.refusal = "pool_full"
             return None
 
