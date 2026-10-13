@@ -114,6 +114,14 @@ def split_reason(reason) -> "tuple[str, str | None]":
     return text, None
 
 
+def keyed_detail(code: str, detail) -> "str | None":
+    """The part of ``detail`` that IS the reason, for the dedup key (Prism
+    01bdaad47969): ``not_portable:linked(blocks->t_x)`` is held by that edge,
+    so a different edge is a new hold, never a 900 s duplicate. Grouping
+    still reads the code alone (``not_portable:linked``)."""
+    return detail or None if code == not_portable(LINKED) else None
+
+
 def named_hosts(code: str, detail) -> "str | None":
     """The pool host(s) a reason names, for the dedup key (Momus R-B): a
     host change is a new hold even when the code is the same. Only the

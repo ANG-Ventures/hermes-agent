@@ -4052,21 +4052,24 @@ def _lineage_pins_mode() -> str:
 
 
 def _wait_key(payload: dict) -> tuple:
-    """``(code, route, host)`` of a placement_wait payload: the dedup key
-    (I-S6 + Momus R-B). ``detail`` is never compared; a payload from before
-    Phase 2a has no ``code`` and is split from its ``reason``."""
+    """``(code, route, host, keyed detail)`` of a placement_wait payload: the
+    dedup key (I-S6 + Momus R-B). ``detail`` is compared only where it names
+    the holding edge (``_pr.keyed_detail``); a payload from before Phase 2a
+    has no ``code`` and is split from its ``reason``."""
     from hermes_cli import kanban_placement_reasons as _pr
-    code = payload.get("code")
+    code, detail = payload.get("code"), payload.get("detail")
     if code is None:
-        code = _pr.split_reason(payload.get("reason"))[0]
-    return (code, payload.get("route"), payload.get("host"))
+        code, detail = _pr.split_reason(payload.get("reason"))
+    return (code, payload.get("route"), payload.get("host"), _pr.keyed_detail(code, detail))
 
 
 def _wait_history(conn, tids: list, since_ts: int) -> "tuple[dict, dict]":
     """One batched read per tick for the held cards: ``({tid: [(id,
     created_at, payload)] newest first}, {tid: last episode-end event id})``.
     The history holds each card's latest placement_wait plus every one inside
-    the refresh window (the flap check needs those, nothing older).
+    the refresh window (the flap check needs those, nothing older). A
+    ``{cleared: true}`` placement_wait is an episode end, never a wait
+    (Prism 5ff168657c9a): a hold after it is a new episode, not a flap.
     One SELECT per 400 cards over ``idx_events_task``; payloads are decoded
     only for the rows kept."""
     from hermes_cli import kanban_placement_reasons as _pr
@@ -4085,17 +4088,22 @@ def _wait_history(conn, tids: list, since_ts: int) -> "tuple[dict, dict]":
             if kind != _pr.PLACEMENT_WAIT_EVENT:
                 ends.setdefault(tid, eid)
                 continue
-            if tid in hist and int(created or 0) < since_ts:
-                continue
+            if tid in ends or (tid in hist and int(created or 0) < since_ts):
+                continue  # older than the episode end, or than the window
             try:
                 pl = json.loads(payload or "{}")
             except (TypeError, ValueError):
                 pl = {}
-            hist.setdefault(tid, []).append((eid, int(created or 0), pl if isinstance(pl, dict) else {}))
+            pl = pl if isinstance(pl, dict) else {}
+            if pl.get("cleared"):
+                ends.setdefault(tid, eid)
+                continue
+            hist.setdefault(tid, []).append((eid, int(created or 0), pl))
     return hist, ends
 
 
-def _record_placement_waits(conn, result, row_route: dict, dry_run: bool) -> None:
+def _record_placement_waits(conn, result, row_route: dict, dry_run: bool,
+                            reached=()) -> None:
     """One ``placement_wait`` task_event per held ready card
     ``{code, detail, reason, route, host, since}`` (spec §4.2).
 
@@ -4111,6 +4119,11 @@ def _record_placement_waits(conn, result, row_route: dict, dry_run: bool) -> Non
     ``since`` = now. ``reason`` = code + detail, kept one release for readers
     of the #1880 shape.
 
+    ``reached``: rows that had a slot this tick. One that spawned nothing
+    and holds no wait was stopped by a later gate (respawn guard, provider
+    admission, ...): its open wait gets ``{cleared: true}``, because the
+    reason it named has ended (Prism 8db25fd42347).
+
     Cost (Momus R-G): one batched SELECT per tick (per 400 held cards),
     outside any transaction; the write transaction opens only when there is
     something to write. Never on a dry run. Best-effort.
@@ -4122,18 +4135,22 @@ def _record_placement_waits(conn, result, row_route: dict, dry_run: bool) -> Non
     from hermes_cli import kanban_placement_reasons as _pr
     bound = result.placement_affinity or {}
     waits = {t: r for t, r in (result.placement_waits or {}).items() if t not in bound}
-    if dry_run or not waits:
+    spawned = {s[0] for s in result.spawned}
+    gated = [t for t in dict.fromkeys(reached)
+             if t not in waits and t not in bound and t not in spawned]
+    if dry_run or not (waits or gated):
         return
     now = int(time.time())
     window = _pr.PLACEMENT_WAIT_REFRESH_SECONDS
     try:
-        hist, ends = _wait_history(conn, list(waits), now - window)
-        writes: list = []
+        hist, ends = _wait_history(conn, [*waits, *gated], now - window)
+        writes: list = [(t, {"cleared": True}) for t in gated
+                        if any(h[0] > ends.get(t, 0) for h in hist.get(t, ()))]
         for tid, reason in waits.items():
             code, detail = _pr.split_reason(reason)
             route, arg = row_route.get(tid, ("local", None))
             host = arg if route == "pin" else _pr.named_hosts(code, detail)
-            key = (code, route, host)
+            key = (code, route, host, _pr.keyed_detail(code, detail))
             episode = [h for h in hist.get(tid, ()) if h[0] > ends.get(tid, 0)]
             since = now
             if episode:
@@ -5149,6 +5166,7 @@ def _dispatch_once_locked(
     # spawn loop reached: the affinity event log reconciles against both.
     _affinity_evaluated: list = []
     _affinity_reached: set = set()
+    _wait_reached: list = []  # rows that had a slot (placement_wait clear)
     _caps = None
     _caps_out: dict = {}
     if spillover is not None:
@@ -5828,6 +5846,7 @@ def _dispatch_once_locked(
         if wait is not None:
             result.placement_waits[row["id"]] = wait
             continue
+        _wait_reached.append(row["id"])
         if row["id"] in result.placement_affinity:
             _affinity_reached.add(row["id"])
         row_assignee = row["assignee"]
@@ -6249,7 +6268,7 @@ def _dispatch_once_locked(
         record_affinity_events(conn, result, _affinity_evaluated, _affinity_reached)
         _khc.record_capability_events(conn, result, _caps, _caps_out, _affinity_evaluated,
                                       _cap_comments)
-    _record_placement_waits(conn, result, row_route, dry_run)
+    _record_placement_waits(conn, result, row_route, dry_run, _wait_reached)
     result.rows_routed = len(ready_rows)
     result.portable_waiting = sum(
         1 for tid in result.placement_waits
