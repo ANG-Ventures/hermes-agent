@@ -423,6 +423,9 @@ def _apply_process_rlimit() -> str | None:
 # ci-box, Linux 7.0, Chromium 1243, t_4a3eba50). The cap is for THIS interpreter, so a
 # browser child (and the Playwright node driver, which spawns the browser) is started with
 # the soft limit the process had before the harness lowered it (Prism c8672c954293).
+# Not every browser death is the cap: ``rc -6`` (SIGABRT) with "Failed to move to new
+# namespace" on stderr is the zygote sandbox refused by the container's seccomp profile
+# (t_8351434e), identical with the harness off; measured in the ci-runner image 2026-10-13.
 _BROWSER_EXES = frozenset({
     "chrome", "chromium", "chromium-browser", "google-chrome", "google-chrome-stable",
     "google-chrome-beta", "google-chrome-unstable", "chrome-headless-shell", "headless_shell",
