@@ -2885,20 +2885,38 @@ class GatewayKanbanWatchersMixin:
                             # wake; kanban_wake_defer.tick fires it when the
                             # gate clears or the ceiling passes. The passive
                             # line above was delivered as usual.
-                            _defer.record(
-                                self, board=board_slug, sub=sub,
-                                sub_profile=sub_profile or None,
-                                cursor=int(d["cursor"]), kinds=_wake_kinds,
-                                text=_synth, reason=str(wake_downgrade),
-                                owner=str(_defer_owner),
-                                home_sid=getattr(task, "session_id", None) if task else None,
-                                session_key=_session_key,
-                                event_ts=max((ev.created_at for ev in d["events"]), default=None),
-                                comment_cursor=await asyncio.to_thread(
-                                    _defer.latest_comment_id, _kb, board_slug, sub["task_id"],
-                                ),
-                            )
-                            await asyncio.to_thread(_defer._state(self).write)  # noqa: SLF001
+                            try:
+                                await _defer.record(
+                                    self, board=board_slug, sub=sub,
+                                    sub_profile=sub_profile or None,
+                                    cursor=int(d["cursor"]), kinds=_wake_kinds,
+                                    text=_synth, reason=str(wake_downgrade),
+                                    owner=str(_defer_owner),
+                                    # Only a session verified to be the human
+                                    # owner's; the creator may be the agent.
+                                    home_sid=await asyncio.to_thread(
+                                        _defer.read_verified_home_sid, _kb, board_slug,
+                                        str(_defer_owner),
+                                        getattr(task, "session_id", None) if task else None,
+                                    ),
+                                    session_key=_session_key,
+                                    event_ts=max((ev.created_at for ev in d["events"]), default=None),
+                                )
+                            except OSError as _persist_exc:
+                                # The deferred wake is not durable: do not
+                                # acknowledge the events. Rewind the claim so
+                                # the next tick retries; the passive line may
+                                # post again, which beats a lost wake.
+                                logger.warning(
+                                    "kanban wake deferred for %s on %s/%s not persisted (%s); "
+                                    "claim rewound for retry",
+                                    sub["task_id"], platform_str, sub["chat_id"], _persist_exc,
+                                )
+                                await _to_thread_process_service(
+                                    self._kanban_rewind, sub, d["cursor"],
+                                    d.get("old_cursor", 0), board_slug,
+                                )
+                                continue
                             _wake_kinds = set()
 
                         if not _is_push_adapter and _wake_kinds and _session_key:

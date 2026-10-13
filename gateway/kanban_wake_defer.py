@@ -17,13 +17,19 @@ first. The fired wake carries the ORIGINAL synthetic handoff text (#70752
 contract) plus one line ``(deferred Nm under <reason>)``.
 
 Dedup: a row whose card is now done/archived, or whose owner acted on the card
-after the deferred cursor (an event or comment by the owner's session /
-operator label), is dropped with a log line: the wake already happened in
-effect. A delivery failure keeps the row for the next poll.
+after the deferred cursor, is dropped with a log line: the wake already happened
+in effect. "Owner acted" needs an event written from a HUMAN session, proven by the
+session's chat source in the owner profile's state.db (see
+:func:`_human_session`): a worker running under the owner's profile (any
+board), a delegate child, a cron, or a session-less script is not the owner
+taking a turn (Prism 1a09cf36846b, 7d9c8fa1f2ee, cb8149c5fbc5). A
+delivery failure keeps the row for the next poll.
 
 State: ``<HERMES_HOME>/gateway/kanban_pending_wakes.json`` (the same durable
 gateway state dir as the owner-wake ledger; fsync + rename), so a restart
-between the downgrade and the fire still fires.
+between the downgrade and the fire still fires. :func:`record` raises when the
+row cannot be made durable, so the notifier rewinds its claim instead of
+advancing the cursor past a wake that lives only in memory (Prism ac41fdbadf47).
 
 Log lines (grep ``kanban wake deferred``):
 
@@ -35,6 +41,7 @@ Log lines (grep ``kanban wake deferred``):
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -46,6 +53,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from gateway import kanban_notify_suppress as _ns
 from gateway import kanban_wake_freshness as _fresh
+from hermes_cli.kanban_db import SUBAGENT_AUTHOR_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +127,9 @@ class PendingWakes:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.rows: dict[str, dict] = {}
+        # True while the in-memory rows differ from disk after a failed write;
+        # :func:`tick` retries the write every poll until it lands.
+        self.unsaved = False
         self._load()
 
     def _load(self) -> None:
@@ -131,8 +142,13 @@ class PendingWakes:
             self.rows = {str(k): v for k, v in rows.items() if isinstance(v, dict)}
 
     def write(self) -> None:
-        """Blocking (fsync + rename): call via ``asyncio.to_thread`` from the loop."""
+        """Blocking (fsync + rename): call via ``asyncio.to_thread`` from the loop.
+
+        Raises ``OSError`` when the state is not durable: callers must not
+        acknowledge (advance a cursor past) an event whose wake is only in memory.
+        """
         data = {"pending": self.rows}
+        tmp = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=".pending-wakes-", dir=str(self.path.parent))
@@ -142,12 +158,17 @@ class PendingWakes:
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)
         except OSError as exc:
+            self.unsaved = True
+            if tmp is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
             logger.warning("kanban wake deferred: cannot persist state %s: %s", self.path, exc)
+            raise
+        self.unsaved = False
 
     def add(self, *, board: Optional[str], sub: dict, sub_profile: Optional[str], cursor: int,
             kinds: Iterable[str], text: str, reason: str, owner: str, home_sid: Optional[str],
-            session_key: str, event_ts: Any, comment_cursor: int = 0,
-            now: Optional[float] = None) -> dict:
+            session_key: str, event_ts: Any, now: Optional[float] = None) -> dict:
         now = time.time() if now is None else now
         key = row_key(board, sub)
         existing = self.rows.get(key)
@@ -162,10 +183,9 @@ class PendingWakes:
                 "user_id_alt", "scope_id", "notifier_profile", "delivery_metadata", "delivery_mode",
             )},
             "sub_profile": sub_profile or "",
+            # Owner events (comments included: each writes a ``commented``
+            # event) after this id count as "acted".
             "cursor": int(cursor),
-            # Comments by the owner after this id count as "acted" (an id
-            # cursor: a same-second comment is not lost to a timestamp compare).
-            "comment_cursor": int(comment_cursor or 0),
             "kinds": sorted(set(kinds)),
             "text": text,
             "reason": reason,
@@ -181,43 +201,148 @@ class PendingWakes:
         return row
 
 
-def _owner_labels(owner: str, home_sid: Optional[str]) -> tuple[str, set[str]]:
-    return _ns._operator_label(owner), {s for s in (home_sid,) if s}  # noqa: SLF001
+# ``sessions.source`` values written by autonomous runs: a dispatched worker
+# (``kanban``), a delegate child (``subagent``), cron, one-shot / agent runs and
+# recovery replays. Anything else in the owner profile's state.db is a chat
+# surface (cli, tui, discord, telegram, ...) a human drives.
+_MACHINE_SOURCES = frozenset({
+    "kanban", "subagent", "cron", "oneshot", "agent", "batch", "cache-probe",
+    "gateway_recovery", "recovered", "api_server", "webhook", "msgraph_webhook",
+    "unknown",
+})
+
+
+def _session_source(profile: Any, sid: str) -> Optional[str]:
+    """``sessions.source`` of ``sid`` in ``profile``'s own state.db, else None.
+
+    Read-only, one primary-key lookup. Unknown profile, missing DB or row ->
+    None (callers treat that as "not provably human").
+    """
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        path = get_profile_dir(_ns._operator_label(profile) or "default") / "state.db"  # noqa: SLF001
+    except Exception:
+        return None
+    if not path.is_file():
+        return None
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return None
+    try:
+        row = db.execute("SELECT source FROM sessions WHERE id = ?", (sid,)).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        db.close()
+    return str(row[0] or "") if row else None
+
+
+def _human_session(conn: sqlite3.Connection, sid: Any, profile: Any) -> bool:
+    """True only with POSITIVE evidence that ``sid`` is a human chat session.
+
+    The session must be recorded in ``profile``'s own state.db with a chat
+    source (not :data:`_MACHINE_SOURCES`). A board-local absence of worker
+    signals is not evidence: a worker heartbeats its own board and can comment
+    on another (Prism 7d9c8fa1f2ee), and a delegate child never heartbeats
+    (Prism cb8149c5fbc5). A worker heartbeat on this board still disqualifies.
+    """
+    from hermes_cli.kanban_db import is_operator_home, is_unhomed
+
+    sid = str(sid or "").strip()
+    if not sid or sid.startswith("cron_") or is_unhomed(sid) or is_operator_home(sid):
+        return False
+    if conn.execute(
+        "SELECT 1 FROM task_events WHERE actor_session_id = ? AND kind = 'heartbeat' LIMIT 1",
+        (sid,),
+    ).fetchone():
+        return False
+    source = _session_source(profile, sid)
+    return bool(source) and source not in _MACHINE_SOURCES
+
+
+def _session_is_owner(conn: sqlite3.Connection, sid: Any, profile: Any, owner: str,
+                      home_sid: Optional[str], cache: dict[tuple, bool]) -> bool:
+    """A human session (:func:`_human_session`) that is the owner's: its profile
+    is the owner's operator label, or, for a bare ``human`` owner with no label,
+    it is the card's verified home session."""
+    label = _ns._operator_label(owner)  # noqa: SLF001
+    if label:
+        if not _ns.same_operator(profile, label):
+            return False
+    elif not (home_sid and str(sid or "") == home_sid):
+        return False
+    key = (str(sid or ""), _ns._operator_label(profile))  # noqa: SLF001
+    if key not in cache:
+        cache[key] = _human_session(conn, sid, profile)
+    return cache[key]
+
+
+def verified_home_sid(conn: sqlite3.Connection, owner: str, home_sid: Any) -> Optional[str]:
+    """Sync: ``home_sid`` when it is verified to belong to ``owner``, else None.
+
+    ``tasks.session_id`` is the card's CREATOR session, which is often the
+    originating agent (a worker) rather than the human reviewer; recording it
+    would let that agent's later events read as the owner acting (Prism
+    dfc7f883625d). Verified = a human session whose own events carry the
+    owner's operator label (any profile for a bare ``human`` owner), recorded
+    as a chat session in that profile's state.db.
+    """
+    sid = str(home_sid or "").strip()
+    if not sid:
+        return None
+    label = _ns._operator_label(owner)  # noqa: SLF001
+    for (profile,) in conn.execute(
+        "SELECT DISTINCT actor_profile FROM task_events WHERE actor_session_id = ?", (sid,),
+    ):
+        if label and not _ns.same_operator(profile, label):
+            continue
+        if _human_session(conn, sid, profile):
+            return sid
+    return None
 
 
 def owner_acted(conn: sqlite3.Connection, row: dict) -> Optional[str]:
     """Why the owner has already acted on the card since the deferred cursor, else None.
 
-    Evidence: a ``task_events`` row after the cursor whose actor is the card's
-    home session or the owner's operator label, or a ``task_comments`` row by
-    that operator newer than ``first_seen``. A table or column the board does
-    not carry is not evidence.
+    Evidence: a ``task_events`` row after the cursor written from the owner's
+    own human session (:func:`_session_is_owner`), or a non-subagent ``commented`` event
+    whose author is the explicit ``human:<name>`` label of the owner (a label
+    a worker cannot write: ``--author`` needs the operator token). A worker,
+    cron or session-less write under the owner's PROFILE label is not evidence
+    (Prism 1a09cf36846b), nor is the card's home session unless it passes the
+    same check (Prism dfc7f883625d).
     """
     owner = str(row.get("owner") or "")
-    label, sids = _owner_labels(owner, row.get("home_sid"))
+    home_sid = str(row.get("home_sid") or "") or None
     task_id = row["task_id"]
     try:
-        for r in conn.execute(
-            "SELECT id, kind, actor_profile, actor_session_id FROM task_events "
+        events = conn.execute(
+            "SELECT id, kind, payload, actor_profile, actor_session_id FROM task_events "
             "WHERE task_id = ? AND id > ? ORDER BY id",
             (task_id, int(row.get("cursor") or 0)),
-        ):
-            sid = str(r["actor_session_id"] or "")
-            if sid and sid in sids:
-                return f"owner session wrote {r['kind']} (event {r['id']})"
-            if label and _ns.same_operator(r["actor_profile"], label):
+        ).fetchall()
+        human: dict[tuple, bool] = {}  # one provenance probe per (sid, profile)
+        for r in events:
+            sid = r["actor_session_id"]
+            profiles = [r["actor_profile"]]
+            if r["kind"] == "commented":
+                try:
+                    payload = json.loads(r["payload"] or "{}")
+                except ValueError:
+                    payload = {}
+                author = payload.get("author") if isinstance(payload, dict) else None
+                if str(author or "").rstrip().endswith(SUBAGENT_AUTHOR_MARKER.strip()):
+                    continue  # a delegate child's comment is never the owner (cb8149c5fbc5)
+                if _is_human(author) and _ns.same_operator(author, owner):
+                    return f"owner {owner} commented (event {r['id']})"
+                if author:
+                    profiles.append(author)
+            if any(_session_is_owner(conn, sid, p, owner, home_sid, human) for p in profiles):
                 return f"owner {owner} wrote {r['kind']} (event {r['id']})"
     except sqlite3.Error as exc:
         logger.debug("kanban wake deferred: event read for %s failed: %s", task_id, exc)
-    try:
-        for r in conn.execute(
-            "SELECT id, author FROM task_comments WHERE task_id = ? AND id > ? ORDER BY id",
-            (task_id, int(row.get("comment_cursor") or 0)),
-        ):
-            if label and _ns.same_operator(r["author"], label):
-                return f"owner {owner} commented (comment {r['id']})"
-    except sqlite3.Error as exc:
-        logger.debug("kanban wake deferred: comment read for %s failed: %s", task_id, exc)
     return None
 
 
@@ -247,25 +372,43 @@ def _state(runner: Any) -> PendingWakes:
     return state
 
 
-def latest_comment_id(kb: Any, board: Optional[str], task_id: str) -> int:
-    """Sync: the card's newest ``task_comments.id`` (0 when none / unreadable)."""
+def read_verified_home_sid(kb: Any, board: Optional[str], owner: str,
+                           home_sid: Any) -> Optional[str]:
+    """Sync: :func:`verified_home_sid` on the board (None when unreadable)."""
+    if not home_sid:
+        return None
     try:
         conn = kb.connect_readonly(board=board or None)
     except Exception:
-        return 0
+        return None
     try:
-        row = conn.execute("SELECT MAX(id) FROM task_comments WHERE task_id = ?", (task_id,)).fetchone()
-        return int(row[0] or 0) if row else 0
+        return verified_home_sid(conn, owner, home_sid)
     except sqlite3.Error:
-        return 0
+        return None
     finally:
         conn.close()
 
 
-def record(runner: Any, **fields: Any) -> dict:
-    """Persist one pending row (call from the loop; the write is offloaded by the caller)."""
+async def record(runner: Any, **fields: Any) -> dict:
+    """Add one pending row and make it durable before returning.
+
+    Raises ``OSError`` when the write fails; the row is rolled back first so a
+    retried claim does not leave a memory-only twin that fires later.
+    """
+    import asyncio
+
     state = _state(runner)
+    key = row_key(fields.get("board"), fields["sub"])
+    previous = state.rows.get(key)
     row = state.add(**fields)
+    try:
+        await asyncio.to_thread(state.write)
+    except OSError:
+        if previous is None:
+            state.rows.pop(key, None)
+        else:
+            state.rows[key] = previous
+        raise
     logger.info(
         "kanban wake deferred for %s on %s/%s: %s (cursor %d); fires when the gate clears "
         "or after %ds",
@@ -293,7 +436,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
     state = getattr(runner, "_kanban_pending_wakes", None)
     if state is None:
         state = _state(runner)
-    if not state.rows:
+    if not state.rows and not state.unsaved:
         return 0
     now = time.time() if now is None else now
     ceiling = ceiling_seconds()
@@ -370,6 +513,6 @@ async def tick(runner: Any, *, now: Optional[float] = None,
                     task_id, platform_str, chat_id, int(age // 60), why)
         state.rows.pop(key, None)
         dirty = True
-    if dirty:
+    if dirty or state.unsaved:
         await asyncio.to_thread(state.write)
     return fired
