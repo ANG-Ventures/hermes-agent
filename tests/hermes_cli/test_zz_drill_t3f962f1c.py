@@ -192,3 +192,16 @@ def test_kill_switch(home, fleet, monkeypatch, mode):
             amazon_aff=res.placement_affinity.get(c), amazon_wait=res.placement_waits.get(c),
             comments=_comments(conn, a) + _comments(conn, c),
             env=khc.spawn_env(fleet, kbd._root_kanban_cfg()))
+
+
+@pytest.mark.parametrize("cfg", [{}, {"placement": {"capabilities": "enforce"}}])
+def test_live_default_mode_pin_order(home, fleet, monkeypatch, cfg):
+    """Live root config has no kanban.placement.capabilities key (= warn)."""
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: cfg)
+    with kb.connect_closing() as conn:
+        a = _card(conn, body=f"host: ace-ai\n{DRILL}", skills=["amazon-cart-ops-local"])
+        b = _card(conn, body=f"host: any\n{DRILL}", skills=["amazon-cart-ops-local"])
+        res, spawned, _ = _tick(conn)
+        rec(f"F3 under cfg={cfg or 'ABSENT (live)'}", spawned=spawned, a_status=_status(conn, a),
+            b_status=_status(conn, b), b_wait=res.placement_waits.get(b),
+            env=khc.spawn_env(fleet, cfg))
