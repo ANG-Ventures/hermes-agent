@@ -68,10 +68,11 @@ def classify(*, kind: Optional[str], reason: str, placed_host: Optional[str], bo
     from hermes_cli import kanban_worker_pool as _kwp
     if kind != "capability":
         return None
+    if rerouted_before:
+        # Any capability block after a re-route escalates, whatever its wording: the re-routed run is local.
+        return "unroutable", f"re-routed once already and blocked again: {(reason or '')[:160]}"
     if placed_host is None and not PLACEMENT_REASON_RE.search(reason or ""):
         return None
-    if rerouted_before:
-        return "unroutable", f"re-routed once already and blocked again: {(reason or '')[:160]}"
     card_pin, _ign = _kwp.resolve_pin(body, getattr(pool, "hosts", ()) or (),
                                       getattr(pool, "pin_aliases", None))
     if card_pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO):
@@ -81,6 +82,8 @@ def classify(*, kind: Optional[str], reason: str, placed_host: Optional[str], bo
         if placed_host is None and card_pin == _kwp.PIN_STUDIO:
             return None                      # already ran on the Studio: a real capability block
         return "reroute", _kwp.PIN_STUDIO
+    if card_pin == _kwp.PIN_STUDIO:
+        return "unroutable", f"operator pin host:studio conflicts with the reason's host:{want}; not overridden"
     enabled = {h.name.lower() for h in (getattr(pool, "pool_hosts", ()) or ())
                if getattr(h, "enabled", False) and getattr(h, "state", "active") == "active"}
     if want == (placed_host or "").lower():
@@ -143,7 +146,10 @@ def reroute_placement_blocks(conn, pool, *, now: Optional[int] = None) -> Tuple[
         pin_line = f"host: {arg}"
         new_body = f"{pin_line}\n{row['body'] or ''}"
         with _kb.write_txn(conn):
-            cur = conn.execute("UPDATE tasks SET body = ? WHERE id = ? AND status = 'blocked'", (new_body, tid))
+            # Compare-and-swap on the body read above: a concurrent edit is never overwritten; the card is
+            # reclassified on the next tick against the edited body.
+            cur = conn.execute("UPDATE tasks SET body = ? WHERE id = ? AND status = 'blocked' AND body IS ?",
+                               (new_body, tid, row["body"]))
             if cur.rowcount != 1:
                 continue
             _kb._append_event(conn, tid, REROUTED_EVENT,

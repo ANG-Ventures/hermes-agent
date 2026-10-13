@@ -69,6 +69,15 @@ def test_second_capability_block_after_a_reroute_is_unroutable():
     assert _c(CI_BOX_REASON, again=True)[0] == "unroutable"
 
 
+def test_operator_studio_pin_is_not_overridden_by_a_remote_host_in_the_reason():
+    action, detail = _c(NAMED_AI, body="host: studio\nwork")
+    assert action == "unroutable" and "host:studio" in detail
+
+
+def test_rerouted_card_blocking_again_locally_with_generic_wording_is_unroutable():
+    assert _c("Required tool is unavailable.", placed=None, body="host: studio\nx", again=True)[0] == "unroutable"
+
+
 def test_operator_pin_to_another_host_is_never_overridden():
     action, detail = _c(CI_BOX_REASON, body="host: ci-box\nwork")
     assert action == "unroutable" and "host:ci-box" in detail
@@ -163,6 +172,36 @@ def test_a_rerouted_card_that_blocks_again_is_unroutable_not_rerouted_again(kanb
         assert res.placement_rerouted == [] and res.placement_unroutable == [tid]
         body = conn.execute("SELECT body FROM tasks WHERE id=?", (tid,)).fetchone()[0]
         assert body.count("host: studio") == 1
+
+
+def test_concurrent_body_edit_is_not_overwritten(kanban_home, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = _placed_block(conn, "drain", CI_BOX_REASON)
+        real = kpb._latest_blocks
+
+        def edit_after_read(c):
+            rows = real(c)
+            c.execute("UPDATE tasks SET body = 'operator edit' WHERE id = ?", (tid,))
+            c.commit()
+            return rows
+        monkeypatch.setattr(kpb, "_latest_blocks", edit_after_read)
+        res = _tick(conn)
+        assert res.placement_rerouted == []
+        row = conn.execute("SELECT status, body FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert (row["status"], row["body"]) == ("blocked", "operator edit")
+        monkeypatch.setattr(kpb, "_latest_blocks", real)
+        assert _tick(conn).placement_rerouted == [(tid, "studio")]       # next tick, against the edit
+        body = conn.execute("SELECT body FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        assert body == "host: studio\noperator edit"
+
+
+def test_studio_rerouted_card_blocking_again_with_generic_reason_is_recorded_unroutable(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = _placed_block(conn, "drain", CI_BOX_REASON)
+        _tick(conn)
+        assert kb.claim_task(conn, tid, claimer="alpha") is not None
+        assert kb.block_task(conn, tid, reason="Required tool is unavailable.", kind="capability")
+        assert _tick(conn).placement_unroutable == [tid]
 
 
 def test_human_question_blocks_are_untouched(kanban_home):
