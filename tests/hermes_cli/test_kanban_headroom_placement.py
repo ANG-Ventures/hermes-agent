@@ -457,3 +457,89 @@ def test_negative_or_non_numeric_reservation_quantity_refuses(home, bad):
     plan = _plan(home, Fleet(), now=now)
     assert plan.take("alpha", job_id="t_x") is None and "LedgerError" in plan.refusal
     assert ledger.read_text(encoding="utf-8") == body
+
+
+
+def test_refund_with_unknown_reservation_is_a_noop(home):
+    """A refund naming a reservation this plan no longer holds (a double
+    refund) frees nothing: neither the newest live row nor a slot (Prism
+    8b0ce035f2c1)."""
+    import time as _t
+    plan = _plan(home, Fleet(), now=_t.time())
+    first = plan.take("alpha", job=placement.Job(), job_id="t_first")
+    first_rid = plan.last_reservation
+    plan.take("alpha", job=placement.Job(), job_id="t_live")
+    plan.release(first, first_rid)
+    assert [r["job_id"] for r in _ledger_rows(home)] == ["t_live"]
+    slots = dict(plan.slots)
+    plan.release(first, first_rid)                       # the same refund again
+    assert [r["job_id"] for r in _ledger_rows(home)] == ["t_live"]
+    assert plan.slots == slots
+    plan.release(first, "not-a-rid")
+    assert [r["job_id"] for r in _ledger_rows(home)] == ["t_live"] and plan.slots == slots
+
+
+def test_live_run_reservation_is_renewed_past_the_admission_ttl(home):
+    """A pool run longer than RESERVE_TTL_S stays counted: the tick renews its
+    row while the run is live (Prism 6c6c0c765a1a); an ended run's row is not
+    renewed, and a row that lapsed under a live run is reported as a leak."""
+    import time as _t
+    now = _t.time()
+    plan = _plan(home, Fleet(), now=now)
+    with kb.connect_closing() as conn:
+        ids = [kb.create_task(conn, title=f"c{i}", assignee="alpha") for i in range(2)]
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242, max_spawn=8, spawn_paused=None, spawn_limit=0,
+                          spillover=plan, reconcile_orphans=False)
+    ledger = home / placement.RESERVATIONS_REL
+    assert sorted(r["job_id"] for r in _ledger_rows(home)) == sorted(ids)
+    gate = SimpleNamespace(band="spilling", spill_reason="load", remote_allowed=True, pool=None, cost=2.0)
+    b = kgt.GateTickBuilder(gate, fleet_dir=lambda: home / "fleet", kanban_cfg=lambda: {},
+                            ledger=lambda boards: {}, connect=lambda board=None: kb.connect(board=board))
+    boards = [{"slug": "default"}]
+    b._boards = boards
+    later = now + kh.RESERVE_TTL_S - 60                  # one minute before the admission TTL
+    assert b.renew_reservations(now=later) == {"renewed": 2, "lapsed": 0}
+    past = now + kh.RESERVE_TTL_S + 600                  # well past the original TTL
+    assert set(placement.live_reservations(ledger, now=past)) == {"ci-box"}
+    assert placement.live_slots("kanban", ledger, now=past)["ci-box"] == 2
+    assert b.renew_reservations(now=later + 1) is None   # not due yet
+    # Without renewal both rows would lapse; a lapsed row of a live run is a leak.
+    with kb.connect_closing() as conn:
+        assert kb.complete_task(conn, ids[0], summary="done")
+    far = later + 2 * kh.RESERVE_TTL_S
+    assert b.renew_reservations(now=far) == {"renewed": 0, "lapsed": 1}
+
+
+def test_diagnostics_slot_count_reads_the_ledger_with_a_fixed_live_snapshot(home):
+    """With placement_live set (pick_rung's snapshot) the slot cap still counts
+    the ledger's live rows, so --placement agrees with admit() (Prism
+    404998a66d0e)."""
+    import time as _t
+    now = _t.time()
+    table = json.loads(json.dumps(TABLE))
+    table["hosts"]["ci-box"]["consumers"]["kanban"]["slots"] = 1
+    (home / "config" / "fleet-hosts.json").write_text(json.dumps(table), encoding="utf-8")
+    placement.reserve("ci-box", "kanban", placement.Footprint(3, 2), ttl_s=600,
+                      path=home / placement.RESERVATIONS_REL, now=now)
+    plan = _plan(home, Fleet(), now=now)
+    plan.signal.placement_live = {}                      # a snapshot taken before that row
+    plan.dry_run = True
+    plan.take("alpha", job=placement.Job())
+    assert not _row(plan, "ci-box").eligible
+
+
+def test_on_commit_never_outlives_an_unmanaged_transaction(home):
+    """A callback queued inside a transaction write_txn did not open (ended by
+    conn.rollback()) never fires on a later, unrelated commit (Prism
+    907d56fc45e5)."""
+    from hermes_cli import kanban_db_connect as kdc
+    fired = []
+    with kb.connect_closing() as conn:
+        conn.execute("BEGIN")
+        with kdc.write_txn(conn, allow_nested=True):
+            kdc.on_commit(conn, lambda: fired.append("stale"))
+        conn.rollback()
+        with kdc.write_txn(conn):
+            kdc.on_commit(conn, lambda: fired.append("ok"))
+        assert fired == ["ok"]
+        assert id(conn) not in kdc._POST_COMMIT

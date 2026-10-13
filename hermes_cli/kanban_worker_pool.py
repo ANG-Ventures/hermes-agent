@@ -1479,17 +1479,24 @@ class SpilloverPlan:
         reservation THAT take wrote. ``reservation`` names it (the dispatcher
         passes ``last_reservation``); without it the newest take on the host is
         refunded. Every take, pinned or not, has its own entry, so a failed take
-        never releases an earlier live worker's promise (Prism b711acd04da4)."""
+        never releases an earlier live worker's promise (Prism b711acd04da4).
+        A ``reservation`` this plan does not hold (already refunded, another
+        plan's) is a no-op plus a journal line: never the newest row instead
+        (Prism 8b0ce035f2c1)."""
+        rids = self._rids.get(host.name)
+        if reservation is not None and reservation not in (rids or ()):
+            _log.warning("kanban pool: refund of reservation %s on %s ignored: not held by this plan "
+                         "(already refunded?)", reservation, host.name)
+            return
         if host.name in self.slots:
             self.slots[host.name] += 1
             if self.taken.get(host.name):
                 self.taken[host.name] -= 1
             if self._simulated.get(host.name):
                 self._simulated[host.name] -= 1
-        rids = self._rids.get(host.name)
         if not rids:
             return
-        if reservation is not None and reservation in rids:
+        if reservation is not None:
             rids.remove(reservation)
             rid = reservation
         else:

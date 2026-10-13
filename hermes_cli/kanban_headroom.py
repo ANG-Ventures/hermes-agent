@@ -17,8 +17,9 @@ still name them.
 Samples come from the per-tick probe (``/proc/loadavg`` + the host's
 ``host-pressure.json`` in one ssh round-trip, age = remote clock - ``at``).
 Every take, pinned or scored, is a ledger row for ``RESERVE_TTL_S`` written
-BEFORE launch (``placement.admit`` / ``book_pin``) and released after the run
-end COMMITS (``_end_run`` -> ``on_commit``). A dry run writes nothing and adds
+BEFORE launch (``placement.admit`` / ``book_pin``), renewed by the tick every
+``RENEW_EVERY_S`` while its run is live (``renew_running``), and released after
+the run end COMMITS (``_end_run`` -> ``on_commit``). A dry run writes nothing and adds
 only its own simulated takes, so N picks see N headrooms there too.
 
 No table (hermes-home not yet deployed) = the previous pick, logged once.
@@ -31,7 +32,7 @@ import logging
 import math
 import time
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from hermes_cli import placement
 
@@ -41,6 +42,9 @@ CONSUMER = "kanban"
 # Expected run length of a pool worker: measured over 244 ended worker_placed
 # runs on the default board 2026-10-12 (p50 11 min, p75 34, p90 73).
 RESERVE_TTL_S = 30 * 60
+# A live run's reservation is renewed to now + RESERVE_TTL_S at most this often
+# (renew_running), so it never lapses while the run is live.
+RENEW_EVERY_S = 5 * 60
 # Card priority (higher = more urgent; P0 lanes run at >= 100) -> Job.priority
 # (placement: 0/1 claim the fastest eligible core class).
 JOB_PRIORITY_BANDS = ((100, 0), (90, 1))
@@ -188,7 +192,9 @@ def choose(plan, names, job: Optional[placement.Job]) -> placement.Decision:
     for h, f in dict(plan.placement_reserved()).items():
         _add(resv, table.resolve(h) or h, f)
     used: Dict[str, float] = {}
-    if sig.placement_live is None and sig.placement_reservations is not None:
+    # Slot use is read even when the footprints come from a fixed placement_live
+    # snapshot, so --placement never shows eligible where admit() refuses (Prism 404998a66d0e).
+    if sig.placement_reservations is not None:
         for h, k in placement.live_slots(CONSUMER, sig.placement_reservations, now=now, table=table).items():
             used[h] = used.get(h, 0.0) + k
     for n, k in plan._simulated.items():
@@ -277,3 +283,58 @@ def release_for_run(conn, task_id: str, run_id: Optional[int], root: Optional[Pa
     """Release the reservation the run's ``worker_placed`` event carries, now."""
     rid = reservation_for_run(conn, task_id, run_id)
     return False if rid is None else release_reservation(rid, root)
+
+
+def running_reservations(conn) -> List[Tuple[str, str]]:
+    """``(task_id, reservation id)`` for every RUNNING card whose current run's
+    ``worker_placed`` event carries a headroom reservation."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    out: List[Tuple[str, str]] = []
+    for tid, payload in conn.execute(
+            "SELECT t.id, e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
+            "WHERE t.status = 'running' AND e.kind = ? AND e.run_id IS NOT NULL "
+            "AND e.run_id = t.current_run_id", (_pr.WORKER_PLACED_EVENT,)).fetchall():
+        try:
+            rid = json.loads(payload or "{}").get(RESERVATION_KEY)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if isinstance(rid, str) and rid:
+            out.append((tid, rid))
+    return out
+
+
+def renew_running(boards, connect, path, *, now: Optional[float] = None) -> Dict[str, int]:
+    """Renew the reservation of every live pool run to ``now + RESERVE_TTL_S``
+    (Prism 6c6c0c765a1a): a run longer than the admission TTL stays in the
+    scorer's headroom and slot count. A live run whose row already lapsed is a
+    LEAK (the scorer under-counted it until now): logged, never resurrected.
+    Returns ``{"renewed": n, "lapsed": n}``."""
+    counts = {"renewed": 0, "lapsed": 0}
+    for b in boards or ():
+        slug = (b.get("slug") if isinstance(b, dict) else None) or "default"
+        conn = None
+        try:
+            conn = connect(board=slug)
+            rows = running_reservations(conn)
+        except Exception as exc:
+            _log.warning("kanban pool: reservation renewal could not read board %s: %s", slug, exc)
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        for tid, rid in rows:
+            try:
+                ok = placement.renew(rid, ttl_s=RESERVE_TTL_S, path=path, now=now)
+            except placement.PlacementError as exc:
+                _log.warning("kanban pool: renewal of reservation %s (%s) failed: %s", rid, tid, exc)
+                continue
+            if ok:
+                counts["renewed"] += 1
+            else:
+                counts["lapsed"] += 1
+                _log.warning("kanban pool: headroom reservation LEAK: %s (%s on board %s) expired while its "
+                             "run is live; the scorer did not count it", rid, tid, slug)
+    return counts

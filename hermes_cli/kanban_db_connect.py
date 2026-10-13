@@ -1391,22 +1391,33 @@ def _main_db_file(conn: sqlite3.Connection) -> Optional[str]:
 
 # Post-commit actions keyed by connection (t_d6ce856e): a side effect outside
 # SQLite (the placement headroom ledger) must happen only once the run row it
-# mirrors is durable, never while the transaction can still roll back. The
-# connection is held strongly so its id cannot be reused while queued.
+# mirrors is durable, never while the transaction can still roll back. An entry
+# exists ONLY while an outer ``write_txn`` is open on that connection (created
+# at BEGIN, popped at COMMIT/ROLLBACK), so nothing can outlive the transaction
+# it was queued in (Prism 907d56fc45e5). The connection is held strongly so its
+# id cannot be reused while the entry exists.
 _POST_COMMIT: dict = {}
 
 
 def on_commit(conn: sqlite3.Connection, fn) -> None:
-    """Run ``fn()`` after the enclosing ``write_txn`` COMMITs; drop it on
+    """Run ``fn()`` after the enclosing outer ``write_txn`` COMMITs; drop it on
     ROLLBACK (savepoint rollbacks drop the actions queued inside them). With no
-    open transaction the write is already durable: run it now."""
+    open transaction the write is already durable: run it now. Inside a
+    transaction ``write_txn`` does not own (a bare BEGIN, ``conn.rollback()``
+    can end it unseen) ``fn`` is DROPPED with a warning, never run early or on
+    a later unrelated commit; a dropped headroom release lapses on its TTL."""
     if not getattr(conn, "in_transaction", False):
         fn()
         return
     entry = _POST_COMMIT.get(id(conn))
     if entry is None or entry[0] is not conn:
-        entry = _POST_COMMIT[id(conn)] = (conn, [])
+        _kb._log.warning("kanban: post-commit action dropped: transaction not opened by write_txn")
+        return
     entry[1].append(fn)
+
+
+def _post_commit_open(conn) -> None:
+    _POST_COMMIT[id(conn)] = (conn, [])
 
 
 def _post_commit_mark(conn) -> int:
@@ -1476,6 +1487,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         return
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    _post_commit_open(conn)
     try:
         _kb._recheck_pending_operator_gate(conn)
         guarded_before = _kb._recheck_pending_home_session(conn)
