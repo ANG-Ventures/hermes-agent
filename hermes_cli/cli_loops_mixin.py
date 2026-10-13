@@ -431,6 +431,19 @@ class CLILoopsMixin:
         if not items:
             _cprint(f"  {t('cli.queue.empty')}")
             return
+        merged = self._queue_release_mode() == "merged" and len(items) > 1
+        if merged:
+            # One turn carrying every queued prompt, in order (follow-up spec D3/D6).
+            from gateway.queue_mgmt import MERGE_SEPARATOR
+            joined = MERGE_SEPARATOR.join(str(i).strip() for i in items if str(i).strip())
+            if not getattr(self, "_agent_running", False):
+                self._mutate_pending_input(lambda q: [joined])
+                _cprint(f"  {t('cli.queue.released', count=len(items))}")
+                return
+            self._mutate_pending_input(lambda q: [])
+            self._interrupt_queue.put(joined)
+            _cprint(f"  {t('cli.queue.released_interrupting', count=len(items))}")
+            return
         if not getattr(self, "_agent_running", False):
             _cprint(f"  {t('cli.queue.released', count=len(items))}")
             return
@@ -439,6 +452,16 @@ class CLILoopsMixin:
         if head:
             self._interrupt_queue.put(head[0])
         _cprint(f"  {t('cli.queue.released_interrupting', count=len(items))}")
+
+    @staticmethod
+    def _queue_release_mode() -> str:
+        """``display.queue_release_mode`` for the CLI (same knob as the gateway)."""
+        try:
+            from hermes_cli.config import load_config_readonly
+            mode = str((load_config_readonly().get("display") or {}).get("queue_release_mode") or "per_item")
+            return "merged" if mode.strip().lower() == "merged" else "per_item"
+        except Exception:
+            return "per_item"
 
     def _cmd_steer(self, cmd_original: str):
         # Inject a message after the next tool call without interrupting: while the

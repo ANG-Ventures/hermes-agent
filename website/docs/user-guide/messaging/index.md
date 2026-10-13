@@ -475,7 +475,7 @@ If you find the busy acknowledgment noisy, set `display.busy_ack_enabled: false`
 | `/queue run` | Release the queue now. If a turn is running it is interrupted first; then the queued prompts run in order. |
 | `/queue add <prompt>` | Queue a prompt that starts with one of the words above. |
 
-A word is a command only when its arguments fit: `/queue clear` clears, `/queue clear the cache` queues the prompt "clear the cache". Numbers refer to the list as it is when you send the command; every change replies with the item it touched, so a stale number is visible immediately. The queue holds at most 32 prompts. A slash command can't be queued (`/queue /model x` is refused); send it on its own.
+A word is a command only when the whole message fits that command's shape: `/queue clear` clears, but `/queue clear the cache` queues the prompt "clear the cache", and `/queue rm 3 things` queues "rm 3 things". Only `/queue add` is needed when you want to queue a bare word that is also a command (`/queue add clear`). Numbers refer to the list as it is when you send the command; every change replies with the item it touched, so a stale number is visible immediately. The queue holds at most 32 prompts. A slash command can't be queued (`/queue /model x` is refused); send it on its own.
 
 **What `/stop` does to the queue.** `/stop` halts the current turn and **holds** every queued prompt: nothing is dropped and nothing runs until you say so. The reply says how many are held. While held:
 
@@ -491,7 +491,16 @@ display:
   stop_releases_queue: true   # default false: /stop holds the queue
 ```
 
-The setting is read when the gateway starts.
+**One turn or one turn each.** By default each released prompt runs as its own turn with its own answer. To have `/queue run` (and a releasing `/stop`) send every queued prompt together as ONE turn, joined in order by a blank line, set:
+
+```yaml
+display:
+  queue_release_mode: merged   # default per_item
+```
+
+Background items (`[system]`) are never merged; they run first, on their own.
+
+Both settings are read when the gateway starts.
 
 **Other events.** `/new`, `/reset` and `/resume` start a different conversation, so they drop the queue and say how many prompts they dropped. An automatic reset (idle timeout, context exhaustion) keeps held prompts. A gateway restart keeps the queue: queued prompts run after the restart, and held prompts come back held.
 
