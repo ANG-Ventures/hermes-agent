@@ -1112,6 +1112,10 @@ class GatewaySessionCommandsMixin:
         if not in_place:
             with contextlib.suppress(Exception):
                 self._release_running_agent_state(dest_key)
+            # The thread child replays the parent's history behind the session-context paragraph;
+            # keeping the parent's bytes keeps that prefix warm (t_84dabcc7).
+            with contextlib.suppress(Exception):
+                self._inherit_branch_context_pin(session_key, dest_key)
         # The parent's /model + /reasoning overrides follow the fork (default) so the child's FIRST turn
         # runs at the parent's effort/model; ``--fresh`` leaves the child on the config default. The
         # snapshot is taken from the PARENT entry captured above: in place, ``switch_session`` has just
