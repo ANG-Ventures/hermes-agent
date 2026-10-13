@@ -996,12 +996,14 @@ def _ssh_argv(host: PoolHost, remote_cmd: str) -> List[str]:
 @dataclass(frozen=True)
 class HostSample:
     """One probe round-trip: ``/proc/loadavg``, the online core count, the
-    remote clock and the raw pressure file text ("" when unreadable)."""
+    remote clock, the raw pressure file text ("" when unreadable) and the
+    boards the host can host (None = not asked)."""
 
     load1: float
     ncpu: int
     remote_now: Optional[float] = None
     pressure_text: str = ""
+    boards: Optional[frozenset] = None
 
 
 # ncpu = online cores (KWLB D-3), not ``nproc``: load1 counts every runnable
@@ -1011,22 +1013,40 @@ class HostSample:
 _NCPU_CMD = "getconf _NPROCESSORS_ONLN"
 
 
-def _probe_cmd(pressure_path: Optional[str]) -> str:
+# Separates the board list (t_9fb4d477) from the load/pressure lines.
+BOARDS_MARKER = "@@hermes-hostable-boards"
+
+
+def _boards_cmd(workspaces_root: str) -> str:
+    """The board dirs under ``workspaces_root`` that exist AND that the probing
+    uid (the worker's ``kanbanw``) can create a workspace in."""
+    import shlex
+    root = shlex.quote(str(workspaces_root).rstrip("/") or "/")
+    return (f"echo {BOARDS_MARKER}; for d in {root}/*/; do "
+            f'[ -d "$d" ] && [ -w "$d" ] && [ -x "$d" ] && basename "$d"; done; true')
+
+
+def _probe_cmd(pressure_path: Optional[str], workspaces_root: Optional[str] = None) -> str:
+    tail = f"; {_boards_cmd(workspaces_root)}" if workspaces_root else ""
     if pressure_path is None:
-        return f"cat /proc/loadavg; {_NCPU_CMD}"
+        return f"cat /proc/loadavg; {_NCPU_CMD}{tail}"
     import shlex
     # ONE round-trip (RC9): the age is remote_now - at, both from this host.
-    return f"cat /proc/loadavg; {_NCPU_CMD}; date +%s; cat {shlex.quote(pressure_path)} 2>/dev/null; true"
+    return (f"cat /proc/loadavg; {_NCPU_CMD}; date +%s; cat {shlex.quote(pressure_path)} 2>/dev/null; true"
+            f"{tail}")
 
 
 def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
-               pressure_path: Optional[str] = None) -> Union[None, Tuple[float, int], HostSample]:
+               pressure_path: Optional[str] = None,
+               workspaces_root: Optional[str] = None) -> Union[None, Tuple[float, int], HostSample]:
     """``(load1, ncpu)`` from one ssh call, or None (fail closed: 0 slots).
     With ``pressure_path`` the same call also returns the remote clock and
-    the pressure file as a :class:`HostSample`."""
+    the pressure file as a :class:`HostSample`. With ``workspaces_root`` it
+    also lists the boards the host can host (``HostSample.boards``,
+    t_9fb4d477): a board whose root is missing or unwritable is absent."""
     try:
         proc = runner(
-            _ssh_argv(h, _probe_cmd(pressure_path)),
+            _ssh_argv(h, _probe_cmd(pressure_path, workspaces_root)),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=PROBE_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
         )
@@ -1034,7 +1054,14 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
         return None
     if getattr(proc, "returncode", 1) != 0:
         return None
-    lines = (proc.stdout or "").split("\n")
+    out = proc.stdout or ""
+    boards: Optional[frozenset] = None
+    if workspaces_root:
+        out, sep, listed = out.partition(BOARDS_MARKER + "\n")
+        if not sep:
+            return None  # the board list never printed: fail closed
+        boards = frozenset(b.strip() for b in listed.split("\n") if b.strip())
+    lines = out.split("\n")
     try:
         load1 = float(lines[0].split()[0])
         ncpu = int(lines[1].strip())
@@ -1043,12 +1070,38 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     if ncpu <= 0:
         return None
     if pressure_path is None:
-        return (load1, ncpu)
+        return (load1, ncpu) if boards is None else HostSample(load1, ncpu, boards=boards)
     try:
         remote_now: Optional[float] = float(lines[2].strip())
     except (IndexError, ValueError):
         remote_now = None
-    return HostSample(load1, ncpu, remote_now, "\n".join(lines[3:]).strip())
+    return HostSample(load1, ncpu, remote_now, "\n".join(lines[3:]).strip(), boards)
+
+
+# -- per-(host, board) workspace faults (t_9fb4d477) --------------------------
+# A spawn whose remote ``mkdir`` failed is a HOST fault: the pair takes no
+# card for BOARD_FAULT_SECONDS. In-process on purpose: the dispatcher is the
+# one long-lived reader, and after a restart the probe's board list re-proves
+# (or refuses) the pair on the first tick.
+BOARD_FAULT_SECONDS = 600
+_board_faults: Dict[Tuple[str, str], Tuple[float, str]] = {}
+
+
+def mark_board_fault(host: str, board: str, why: str, *, now: Optional[float] = None) -> None:
+    now = time.monotonic() if now is None else now
+    _board_faults[(host.lower(), board)] = (now + BOARD_FAULT_SECONDS, why)
+
+
+def board_fault(host: str, board: str, *, now: Optional[float] = None) -> Optional[str]:
+    """Why the pair is quarantined, or None."""
+    got = _board_faults.get((host.lower(), board))
+    if got is None:
+        return None
+    now = time.monotonic() if now is None else now
+    if now >= got[0]:
+        _board_faults.pop((host.lower(), board), None)
+        return None
+    return got[1]
 
 
 # -- target pressure + hysteresis (Placement PRD Phase 1b) -------------------
@@ -1255,12 +1308,30 @@ class SpilloverPlan:
             return f"pin_host_{'hot' if d.get('hot') else 'unknown'} ({d['pressure']})"
         return "pin_host_unreachable" if d.get("reachable") is False else "pin_host_full"
 
+    def board_refusal(self, name: str, board: Optional[str]) -> Optional[str]:
+        """Why host ``name`` cannot host ``board``'s workspaces, or None
+        (t_9fb4d477). The probe lists the boards whose workspace root exists
+        and is writable by the worker uid; a host the probe did not ask
+        (no ``kanban.workspaces_root``) is not filtered."""
+        if not board:
+            return None
+        fault = board_fault(name, board)
+        if fault is not None:
+            return f"board_fault: {fault}"
+        boards = (self.detail.get(name) or {}).get("boards")
+        if boards is not None and board not in boards:
+            return "no_board_root"
+        return None
+
     def take(self, assignee: Optional[str], pin: Optional[str] = None,
-             only: Optional[Collection[str]] = None) -> Optional[PoolHost]:
+             only: Optional[Collection[str]] = None,
+             board: Optional[str] = None) -> Optional[PoolHost]:
         """Reserve one slot: on ``pin`` only, else the first host in priority
         order with a free slot that serves ``assignee``. ``only`` (a host-bound
         card, t_1e9ea7e9) restricts the unpinned pick to those hosts; an empty
-        ``only`` takes nothing (``host_reach``). None sets ``refusal``."""
+        ``only`` takes nothing (``host_reach``). ``board`` drops every host
+        that cannot host that board (:meth:`board_refusal`): the card spills
+        to another host or waits ``board_unhostable``. None sets ``refusal``."""
         self.refusal = None
         # Pins and reach rows are lower-cased; host keys are compared case-
         # folded so a mixed-case pool id still matches (Prism d4be9ccd2c7f).
@@ -1274,6 +1345,10 @@ class SpilloverPlan:
             self.refusal = self.pin_host_refusal(pin)
             if self.refusal is not None:
                 return None
+            why = self.board_refusal(pin, board)
+            if why is not None:
+                self.refusal = f"pin_host_board_unhostable ({pin}: {board} {why})"
+                return None
             self.slots[pin] -= 1
             self.taken[pin] = self.taken.get(pin, 0) + 1
             return host
@@ -1284,6 +1359,14 @@ class SpilloverPlan:
                 return None
         else:
             allowed = set(self.hosts)
+        unhostable = {n: w for n in allowed if n in self.hosts
+                      for w in [self.board_refusal(n, board)] if w is not None}
+        if unhostable:
+            allowed = allowed - set(unhostable)
+            if not allowed:
+                self.refusal = "board_unhostable (" + "; ".join(
+                    f"{n}: {board} {w}" for n, w in sorted(unhostable.items())) + ")"
+                return None
         if self.signal is not None:
             free = [n for n, h in self.hosts.items()
                     if n in allowed and self.slots.get(n, 0) > 0 and assignee in h.profiles]
@@ -1352,10 +1435,14 @@ def plan(hosts: List[PoolHost], running_by_host: Mapping[str, int], *,
         sample = probe(h) if probed else None
         load1: Optional[float] = None
         ncpu: Optional[int] = None
+        boards = None
         if sample is None:
             free = 0
         else:
-            load1, ncpu = sample
+            if isinstance(sample, HostSample):
+                load1, ncpu, boards = sample.load1, sample.ncpu, sample.boards
+            else:
+                load1, ncpu = sample
             if load1 >= host_threshold(ncpu, h.capacity_pct):
                 free = 0
         slots[h.name] = free
@@ -1364,6 +1451,7 @@ def plan(hosts: List[PoolHost], running_by_host: Mapping[str, int], *,
             "state": h.state, "enabled": h.enabled,
             # None = not probed this tick (full, draining): unknown, not down.
             "reachable": (sample is not None) if probed else None,
+            **({"boards": sorted(boards)} if boards is not None else {}),
         }
     return _finish_plan(hosts, slots, detail, disabled, planned_at, config)
 
@@ -1397,9 +1485,9 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
         free = max(0, h.slots - running) if (h.enabled and h.state == "active") else 0
         sample = probe(h) if free > 0 else None
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
-               "band": None, "why": "", "probed": free > 0, "cap": (None, "")}
+               "band": None, "why": "", "probed": free > 0, "cap": (None, ""), "boards": None}
         if isinstance(sample, HostSample):
-            row["load1"], row["ncpu"] = sample.load1, sample.ncpu
+            row["load1"], row["ncpu"], row["boards"] = sample.load1, sample.ncpu, sample.boards
             row["cap"] = _admission.cap(sample.pressure_text, reservation=signal.reservation_gb)
             kb = policy.kanban_band(h.name)
             got, row["why"] = read_pressure(sample.remote_now, sample.pressure_text,
@@ -1462,6 +1550,7 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
             "band": band, "hot": hot,
             **({"pressure": why} if why else {}),
             **({"admission": admission[h.name]} if h.name in admission else {}),
+            **({"boards": sorted(r["boards"])} if r["boards"] is not None else {}),
         }
     plan = _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal)
     plan.admission = admission

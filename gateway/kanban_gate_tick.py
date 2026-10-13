@@ -190,11 +190,18 @@ class GateTickBuilder:
             return None
         signal = self.target_signal(cfg)
         probe = self._probe or kwp.probe_host
-        if signal is not None and probe is kwp.probe_host:
-            path = signal.policy.pressure_path
-
-            def probe(h, _path=path):
-                return kwp.probe_host(h, pressure_path=_path)
+        if probe is kwp.probe_host:
+            kw = {}
+            if signal is not None:
+                kw["pressure_path"] = signal.policy.pressure_path
+            # The same round-trip lists the boards each host can host
+            # (t_9fb4d477); without a configured root nothing is filtered.
+            root = cfg.get("workspaces_root")
+            if isinstance(root, str) and root.startswith("/"):
+                kw["workspaces_root"] = root
+            if kw:
+                def probe(h, _kw=kw):
+                    return kwp.probe_host(h, **_kw)
         plan = kwp.plan(list(pool.pool_hosts), remote_by_host, probe=probe,
                         disabled=pool.disabled, config=pool, signal=signal)
         plan.band, plan.spill_reason, plan.pins_only = gate.band, gate.spill_reason, pins_only
