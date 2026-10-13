@@ -598,12 +598,14 @@ class GatewayAgentCacheMixin:
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
         )
         _reason = str(invalidation_reason or "")
+        if _reason.startswith("stop_command"):
+            self._session_state(session_key).conversation.automatic_turns_paused = True
         if _reason.startswith("stop_command") or _reason == "queue_run":
             # /stop never drops a queued user prompt (spec 2026-10-12 D14). Move every user item out of
             # the slot (a run-next trigger the post-command drain consumes) and the overflow into the
             # held store, which no drain reads. Done BEFORE any await so no drain can run between the
-            # generation bump above and the hold. System events stay put for the wake-preserving block
-            # below. /new and /reset keep their reset semantics.
+            # generation bump above and the hold. /stop holds internal wakes too; queue_run
+            # preserves its explicit release semantics. /new and /reset stay separate.
             try:  # fail open: a queue_mgmt failure must never break /stop
                 from gateway import queue_mgmt
                 _hold_adapter = self._delivery_adapter_for(source)
@@ -665,7 +667,12 @@ class GatewayAgentCacheMixin:
                 await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
-        if adapter and hasattr(adapter, "get_pending_message"):
+        if (adapter and _reason.startswith("stop_command")
+                and self._session_state(session_key).persistent.run_generation == _generation_at_interrupt):
+            # Catch arrivals during the interrupt awaits; no runnable wake survives /stop.
+            from gateway import queue_mgmt
+            queue_mgmt.hold_user_items(self, session_key, adapter)
+        elif adapter and not _reason.startswith("stop_command") and hasattr(adapter, "get_pending_message"):
             # Discard a stale human follow-up (the slot held only user text when /stop started doing
             # this, 59575d6a917) — but an internal wake (async-delegation completion, notify+wake)
             # shares the slot now and was claim-settled on admission, so dropping it loses it for

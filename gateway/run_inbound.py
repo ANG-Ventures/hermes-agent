@@ -1449,6 +1449,10 @@ class GatewayInboundMixin:
                 return _orphan_reply
 
         _quick_key = self._session_key_for_source(source)
+        if is_internal:
+            from gateway import queue_mgmt
+            if await queue_mgmt.gate_stopped_event(self, _quick_key, event, self._delivery_adapter_for(source)):
+                return None
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
             return _reply

@@ -504,6 +504,9 @@ class GatewayTurnMixin:
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
+        from gateway import queue_mgmt
+        if await queue_mgmt.gate_stopped_event(self, session_key, event, self._delivery_adapter_for(source)):
+            return
         # A real inbound user message supersedes any /stop marker: the user resumed by hand, so a
         # LATER interruption of this session must auto-resume normally. Internal/synthetic events
         # (boot resumes, kanban wakes) are not the user speaking. Best-effort — the boot gate
