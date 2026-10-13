@@ -1,0 +1,4 @@
+# scripts/mem0_host_literal_lint.py allow-list: <path> <reason>. Whole files only; every entry needs a reason.
+# A line-level exception is `noqa: mem0-host-literal` on that line instead.
+plugins/memory/mem0/README.md generic self-host setup example for plugin users (localhost:8888 is the upstream mem0 server default), not a fleet store address
+website/docs/user-guide/features/memory-providers.md generic self-host setup example in the public user guide (localhost:8888 is the upstream mem0 server default), not a fleet store address
