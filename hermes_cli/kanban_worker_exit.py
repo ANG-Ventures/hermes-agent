@@ -156,8 +156,11 @@ def block_on_rail_absent(message: str) -> bool:
             return False
         parked = _park_needs_input(str(message))
         if parked:  # Hook A (t_b1100bf0): the gap event is its own transaction, after block_task committed
-            from tools.capability_gap_hooks import on_rail_absent
-            on_rail_absent(str(message))
+            try:  # best-effort: a hook failure must never turn a committed park into "not parked"
+                from tools.capability_gap_hooks import on_rail_absent
+                on_rail_absent(str(message))
+            except Exception:
+                logging.getLogger(__name__).warning("rail-absent capability gap hook failed", exc_info=True)
         return parked
     except Exception:
         logging.getLogger(__name__).warning("rail-absent block failed", exc_info=True)

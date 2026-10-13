@@ -7,8 +7,11 @@ B  toolset scope   the ``'<tool>' is not available in this session`` branches (`
 C  terminal        ``<name>: command not found`` for a ``TOOL_REQUIREMENTS`` command -> ``cmd_not_found``
 D  tool_describe   ``not_found`` names that are ``TOOL_REQUIREMENTS`` keys -> ``profile_toolset`` (advisory)
 
-Every hook: only the dispatcher-owned worker (``owned_kanban_task()``) emits; one event per (task, run, tool);
-never raises into the tool call; no notify (the hourly ``fleet-host gaps --escalate`` owns every message).
+Every hook: only the dispatcher-owned worker (``owned_kanban_task()``) emits; one event per (task, run, tool),
+except that an actionable occurrence supersedes an earlier advisory one (Hook D first, then a real block: the
+real block is recorded too, because advisory rows are never escalated); a slot is held only while its write is
+in flight and released when the write fails, so a transient DB error never loses the gap for the rest of the
+run; never raises into the tool call; no notify (the hourly ``fleet-host gaps --escalate`` owns every message).
 """
 from __future__ import annotations
 
@@ -21,7 +24,8 @@ from typing import Iterable, Optional
 
 _log = logging.getLogger(__name__)
 _lock = threading.Lock()
-_emitted: set = set()          # (task_id, run_id, tool) already recorded this process
+_emitted: dict = {}            # (task_id, run_id, tool) -> rank recorded (or in flight) this process
+_ADVISORY, _ACTUAL = 1, 2
 _refused_logged: set = set()   # (gap_class, tool) whose ValueError was logged once
 
 _RAIL_RE = re.compile(r"\b(BROWSER|SCREEN)_RAIL_ABSENT: no (?:browser|screen) session on (\S+?)\.(?:\s|$)")
@@ -59,31 +63,50 @@ def _emit(*, gap_class: str, tool: str, requirement_id: Optional[str], host_raw:
             return False
         run_id = _run_id()
         key = (task, run_id, tool)
+        rank = _ADVISORY if advisory else _ACTUAL
         with _lock:
-            if key in _emitted:
+            prior = _emitted.get(key, 0)
+            if prior >= rank:
                 return False
-            _emitted.add(key)
-        from hermes_cli import kanban_db as kb
-        from hermes_cli import kanban_db_capability_gap as gap
+            _emitted[key] = rank   # in-flight reservation: a concurrent same-rank call drops
+        ok = False
         try:
-            gap.validate(gap_class, requirement_id)
-        except ValueError:
-            if (gap_class, tool) not in _refused_logged:
-                _refused_logged.add((gap_class, tool))
-                _log.warning("capability gap dropped (%s, tool=%s, requirement_id=%r)", gap_class, tool,
-                             requirement_id, exc_info=True)
-            return False
-        conn = kb.connect()
-        try:
-            return gap.record_capability_gap(
-                conn, task, run_id=run_id, host_raw=host_raw, profile=_profile(), gap_class=gap_class,
-                requirement_id=requirement_id, tool=tool, message=message, placed=bool(_placed_host()),
-                advisory=advisory, hook=hook) is not None
+            ok = _record(task, run_id, gap_class=gap_class, tool=tool, requirement_id=requirement_id,
+                         host_raw=host_raw, message=message, hook=hook, advisory=advisory)
         finally:
-            conn.close()
+            if not ok:
+                with _lock:
+                    if _emitted.get(key) == rank:
+                        if prior:
+                            _emitted[key] = prior
+                        else:
+                            _emitted.pop(key, None)
+        return ok
     except Exception:
         _log.warning("capability gap hook %s failed", hook, exc_info=True)
         return False
+
+
+def _record(task: str, run_id: Optional[int], *, gap_class: str, tool: str, requirement_id: Optional[str],
+            host_raw: Optional[str], message: str, hook: str, advisory: bool) -> bool:
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_capability_gap as gap
+    try:
+        gap.validate(gap_class, requirement_id)
+    except ValueError:
+        if (gap_class, tool) not in _refused_logged:
+            _refused_logged.add((gap_class, tool))
+            _log.warning("capability gap dropped (%s, tool=%s, requirement_id=%r)", gap_class, tool,
+                         requirement_id, exc_info=True)
+        return False
+    conn = kb.connect()
+    try:
+        return gap.record_capability_gap(
+            conn, task, run_id=run_id, host_raw=host_raw, profile=_profile(), gap_class=gap_class,
+            requirement_id=requirement_id, tool=tool, message=message, placed=bool(_placed_host()),
+            advisory=advisory, hook=hook) is not None
+    finally:
+        conn.close()
 
 
 def on_rail_absent(message: str) -> bool:
@@ -130,8 +153,9 @@ def on_scope_block(tool: str, message: str, *, enabled_toolsets=None, disabled_t
                  host_raw=socket.gethostname(), message=message, hook="scope")
 
 
-def on_command_not_found(missing: Optional[str], output: str) -> bool:
-    """Hook C: a terminal command failed with ``<missing>: command not found``."""
+def on_command_not_found(missing: Optional[str]) -> bool:
+    """Hook C: a terminal command failed with ``<missing>: command not found``. Only the command name is
+    persisted: the terminal buffer can carry secrets and must never reach the board or the ledger."""
     if not missing:
         return False
     from hermes_cli.kanban_db_capability_gap import requirement_for
@@ -139,7 +163,8 @@ def on_command_not_found(missing: Optional[str], output: str) -> bool:
     if requirement_id is None:
         return False
     return _emit(gap_class="cmd_not_found", tool=missing, requirement_id=requirement_id,
-                 host_raw=_placed_host() or socket.gethostname(), message=output, hook="terminal")
+                 host_raw=_placed_host() or socket.gethostname(), message=f"{missing}: command not found",
+                 hook="terminal")
 
 
 def on_describe_not_found(names: Iterable[str]) -> int:

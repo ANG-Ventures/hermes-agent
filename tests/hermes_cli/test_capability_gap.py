@@ -56,6 +56,7 @@ def fleet(tmp_path, monkeypatch):
     (root / "scripts" / "fleet_host_onboard.py").write_text(FHO_STUB)
     monkeypatch.setattr(gap, "fleet_root", lambda: root)
     gap._fho_cache.clear()
+    gap._fho_failed.clear()
     hooks._emitted.clear()
     hooks._refused_logged.clear()
     rp._emitted.clear()
@@ -318,6 +319,203 @@ def test_unresolvable_host_is_kept_with_host_none(fleet, monkeypatch):
         conn.close()
     (e,) = _events(tid)
     assert e["host"] is None and e["host_raw"] == "zzz"
+
+
+# ── Prism 5090d1ec75eb: a failed emission releases its dedup slot ──────────────────────────────────
+def test_transient_db_failure_does_not_burn_the_dedup_slot(fleet, monkeypatch):
+    tid, _ = _card(monkeypatch)
+    real_connect = kb.connect
+    calls = {"n": 0}
+
+    def flaky_connect(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("database is locked (transient)")
+        return real_connect(*a, **k)
+
+    monkeypatch.setattr(kb, "connect", flaky_connect)
+    assert hooks.on_scope_block("computer_use", "x", enabled_toolsets=["terminal"]) is False
+    assert hooks.on_scope_block("computer_use", "x", enabled_toolsets=["terminal"]) is True
+    assert hooks.on_scope_block("computer_use", "x", enabled_toolsets=["terminal"]) is False  # now deduped
+    assert len(_events(tid)) == 1 and len(_ledger(fleet)) == 1
+
+
+def test_event_row_write_failure_does_not_burn_the_dedup_slot(fleet, monkeypatch):
+    tid, _ = _card(monkeypatch)
+    real = kb._append_event
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("disk I/O error")
+        return real(*a, **k)
+
+    monkeypatch.setattr(kb, "_append_event", flaky)
+    from tools.terminal_tool_result import _failure_hint
+    _failure_hint("op-cached-read", 127, "op-cached-read: command not found", None)
+    assert _events(tid) == []
+    _failure_hint("op-cached-read", 127, "op-cached-read: command not found", None)
+    assert len(_events(tid)) == 1
+
+
+# ── Prism 858bd830ca46: an actionable occurrence supersedes an advisory one ─────────────────────────
+def test_actual_scope_block_after_advisory_describe_is_recorded(fleet, monkeypatch):
+    from tools import tool_search as ts
+    tid, _ = _card(monkeypatch)
+    ts.dispatch_tool_describe({"names": ["computer_use"]}, current_tool_defs=[])
+    assert hooks.on_scope_block("computer_use", "x", enabled_toolsets=["terminal"]) is True
+    assert hooks.on_scope_block("computer_use", "x", enabled_toolsets=["terminal"]) is False
+    ev = sorted(_events(tid), key=lambda e: e["advisory"])
+    assert [e["advisory"] for e in ev] == [False, True]
+    assert ev[0]["hook"] == "scope"
+
+
+def test_advisory_after_actual_is_still_deduped(fleet, monkeypatch):
+    from tools import tool_search as ts
+    tid, _ = _card(monkeypatch)
+    assert hooks.on_scope_block("computer_use", "x", enabled_toolsets=["terminal"]) is True
+    ts.dispatch_tool_describe({"names": ["computer_use"]}, current_tool_defs=[])
+    ts.dispatch_tool_describe({"names": ["computer_use"]}, current_tool_defs=[])
+    (e,) = _events(tid)
+    assert e["advisory"] is False
+
+
+def test_failed_supersede_keeps_the_advisory_slot(fleet, monkeypatch):
+    from tools import tool_search as ts
+    tid, run_id = _card(monkeypatch)
+    ts.dispatch_tool_describe({"names": ["computer_use"]}, current_tool_defs=[])
+    monkeypatch.setattr(kb, "connect", lambda *a, **k: (_ for _ in ()).throw(OSError("transient")))
+    assert hooks.on_scope_block("computer_use", "x", enabled_toolsets=["terminal"]) is False
+    assert hooks._emitted[(tid, run_id, "computer_use")] == hooks._ADVISORY
+    ts.dispatch_tool_describe({"names": ["computer_use"]}, current_tool_defs=[])  # still deduped: no write tried
+
+
+# ── Prism 7e51fe22e18a: the ledger gets whole lines or nothing ──────────────────────────────────────
+_REAL_WRITE = os.write
+
+
+def _short_writes(monkeypatch, chunk=7):
+    real = _REAL_WRITE
+
+    def short(fd, data):
+        return real(fd, bytes(data[:chunk]))
+
+    monkeypatch.setattr(gap.os, "write", short)
+
+
+def test_short_write_is_completed_not_left_as_a_fragment(fleet, monkeypatch):
+    tid, run_id = _card(monkeypatch)
+    _short_writes(monkeypatch)
+    for i in range(3):
+        gap._append_ledger({"task_id": tid, "i": i})
+    monkeypatch.setattr(gap.os, "write", _REAL_WRITE)
+    raw = (fleet / "state" / "fleet-host-gap" / "gaps.jsonl").read_text()
+    assert raw.endswith("\n")
+    assert [json.loads(l)["i"] for l in raw.splitlines()] == [0, 1, 2]
+
+
+def test_failed_append_rolls_back_its_fragment(fleet, monkeypatch):
+    gap._append_ledger({"i": 0})
+    real = os.write
+    state = {"n": 0}
+
+    def half_then_enospc(fd, data):
+        state["n"] += 1
+        if state["n"] == 1:
+            return real(fd, bytes(data[:5]))
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(gap.os, "write", half_then_enospc)
+    with pytest.raises(OSError):
+        gap._append_ledger({"i": 1})
+    monkeypatch.setattr(gap.os, "write", real)
+    gap._append_ledger({"i": 2})
+    lines = (fleet / "state" / "fleet-host-gap" / "gaps.jsonl").read_text().splitlines()
+    assert [json.loads(l)["i"] for l in lines] == [0, 2]
+
+
+@pytest.mark.platforms("posix")
+def test_concurrent_short_writers_never_interleave(fleet, monkeypatch):
+    import threading
+    _short_writes(monkeypatch, chunk=3)
+    threads = [threading.Thread(target=lambda n=n: [gap._append_ledger({"w": n, "j": j, "pad": "x" * 40})
+                                                    for j in range(10)]) for n in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    monkeypatch.setattr(gap.os, "write", _REAL_WRITE)
+    lines = (fleet / "state" / "fleet-host-gap" / "gaps.jsonl").read_text().splitlines()
+    assert sorted((d["w"], d["j"]) for d in map(json.loads, lines)) == [(n, j) for n in range(6) for j in range(10)]
+
+
+# ── Prism 6f40dacff8d0: a hook failure never masks a committed park ─────────────────────────────────
+def test_hook_a_failure_still_reports_the_park(fleet, monkeypatch):
+    from hermes_cli import kanban_worker_exit as kwe
+    tid, _ = _card(monkeypatch)
+    monkeypatch.setattr(hooks, "on_rail_absent", lambda m: (_ for _ in ()).throw(RuntimeError("bad table")))
+    assert kwe.block_on_rail_absent(BROWSER) is True
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "blocked"
+    finally:
+        conn.close()
+
+
+# ── Prism d4e5f47a3c6a / 09008d9e183c: a NAMED scope reason is recorded too ─────────────────────────
+_NAMED = "'computer_use' needs a desktop-app session with a GUI surface."
+
+
+def test_named_scope_reason_is_recorded_through_tool_executor(fleet, monkeypatch):
+    from types import SimpleNamespace
+    from tools import tool_search as ts
+    from agent.tool_executor import _unwrap_tool_search_call
+    tid, _ = _card(monkeypatch)
+    monkeypatch.setattr(ts, "out_of_scope_reason", lambda name: _NAMED)
+    agent = SimpleNamespace(enabled_toolsets=["terminal", "file", "todo"], disabled_toolsets=None)
+    _, _, block = _unwrap_tool_search_call(agent, "tool_call",
+                                           {"name": "computer_use", "arguments": {"action": "capture"}})
+    assert block == _NAMED
+    (e,) = _events(tid)
+    assert (e["gap_class"], e["message"]) == ("profile_toolset", _NAMED)
+
+
+def test_named_scope_reason_is_recorded_through_bridge_dispatch(fleet, monkeypatch):
+    import model_tools
+    from tools import tool_search as ts
+    tid, _ = _card(monkeypatch)
+    monkeypatch.setattr(ts, "out_of_scope_reason", lambda name: _NAMED)
+    out = model_tools._dispatch_bridge_tool("tool_call", {"name": "computer_use", "arguments": {"action": "capture"}},
+                                            ["terminal", "file", "todo"], None)
+    assert _NAMED in out[0]
+    (e,) = _events(tid)
+    assert e["message"] == _NAMED
+
+
+# ── Prism 7012c86f40c7: the terminal buffer never leaves the transcript ─────────────────────────────
+def test_hook_c_persists_only_the_command_name(fleet, monkeypatch):
+    from tools.terminal_tool_result import _failure_hint
+    tid, _ = _card(monkeypatch)
+    secret = "API_TOKEN=sk-live-DO-NOT-PERSIST-0123456789"
+    out = f"{secret}\n" + "noise\n" * 200 + "bash: op-cached-read: command not found\n"
+    _failure_hint("op-cached-read x", 127, out, None)
+    (e,) = _events(tid)
+    assert e["message"] == "op-cached-read: command not found"
+    raw = (fleet / "state" / "fleet-host-gap" / "gaps.jsonl").read_text()
+    assert "DO-NOT-PERSIST" not in raw and "noise" not in raw
+
+
+# ── Prism 3a92b672df75: a failed onboard-module load is retried, not cached for life ────────────────
+def test_failed_onboard_load_is_retried(fleet, monkeypatch):
+    script = fleet / "scripts" / "fleet_host_onboard.py"
+    script.write_text("raise RuntimeError('half-written file')\n")
+    assert gap.requirement_for("op-cached-read") is None
+    script.write_text(FHO_STUB)
+    assert gap.requirement_for("op-cached-read") is None          # inside the retry window: no hammering
+    monkeypatch.setattr(gap, "_FHO_RETRY_S", 0.0)
+    assert gap.requirement_for("op-cached-read") == "C5"          # recovered without a process restart
+    assert gap.resolve_host("mac-studio-m3u") == "studio"
 
 
 # ── I3: one emitter, four hook sites ─────────────────────────────────────────────────────────────

@@ -533,9 +533,9 @@ def _unwrap_tool_search_call(
             reason = _ts.out_of_scope_reason(underlying)
             if reason is None:
                 reason = f"'{underlying}' is not available in this session. Use tool_search to find tools you can call."
-                from tools.capability_gap_hooks import on_scope_block  # Hook B (t_b1100bf0)
-                on_scope_block(underlying, reason, enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                               disabled_toolsets=getattr(agent, "disabled_toolsets", None))
+            from tools.capability_gap_hooks import on_scope_block  # Hook B (t_b1100bf0): every scope block
+            on_scope_block(underlying, reason, enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                           disabled_toolsets=getattr(agent, "disabled_toolsets", None))
             return function_name, function_args, reason
         # Validate before unwrapping: the generic bridge hides the concrete
         # parameter schema from provider-native tool-call validation.

@@ -747,9 +747,9 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
         if reason is None:
             reason = (f"'{underlying_name}' is not available in this session. "
                       "Use tool_search to find tools you can call.")
-            from tools.capability_gap_hooks import on_scope_block  # Hook B (t_b1100bf0)
-            on_scope_block(underlying_name, reason, enabled_toolsets=enabled_toolsets,
-                           disabled_toolsets=disabled_toolsets)
+        from tools.capability_gap_hooks import on_scope_block  # Hook B (t_b1100bf0): every scope block
+        on_scope_block(underlying_name, reason, enabled_toolsets=enabled_toolsets,
+                       disabled_toolsets=disabled_toolsets)
         return tool_error(reason), None
     # Validate against the deferred tool's concrete schema — the generic
     # ``arguments: object`` bridge schema can't enforce it.

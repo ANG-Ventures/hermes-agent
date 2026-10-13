@@ -27,6 +27,11 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    import fcntl
+except ImportError:  # Windows: no flock; whole-line + rollback still hold for a single writer
+    fcntl = None
+
 _log = logging.getLogger(__name__)
 
 EVENT_KIND = "worker_capability_gap"
@@ -37,7 +42,9 @@ GAP_CLASSES = HOST_CLASSES | PROFILE_CLASSES
 _MESSAGE_MAX = 400
 
 _fho_lock = threading.Lock()
-_fho_cache: dict[str, Any] = {}
+_fho_cache: dict[str, Any] = {}       # fleet root script path -> loaded module (successes only)
+_fho_failed: dict[str, float] = {}    # path -> monotonic time of the last failed load
+_FHO_RETRY_S = 60.0
 
 
 def fleet_root() -> Path:
@@ -51,12 +58,16 @@ def ledger_path() -> Path:
 
 def fleet_host_onboard():
     """hermes-home's ``scripts/fleet_host_onboard.py`` (the single encoding of HOSTS / TOOL_REQUIREMENTS),
-    loaded once per fleet root; None when absent or when its import-time validator refuses the table."""
+    loaded once per fleet root; None when absent or when its import-time validator refuses the table. A failed
+    load is retried after ``_FHO_RETRY_S`` so a transient error never blinds the process for its lifetime."""
     path = fleet_root() / "scripts" / "fleet_host_onboard.py"
     key = str(path)
     with _fho_lock:
         if key in _fho_cache:
             return _fho_cache[key]
+        failed_at = _fho_failed.get(key)
+        if failed_at is not None and time.monotonic() - failed_at < _FHO_RETRY_S:
+            return None
         mod = None
         try:
             spec = importlib.util.spec_from_file_location("_hermes_fleet_host_onboard", path)
@@ -71,7 +82,11 @@ def fleet_host_onboard():
         except Exception:
             _log.warning("capability gap: cannot load %s; events carry host=None", path, exc_info=True)
             mod = None
-        _fho_cache[key] = mod
+        if mod is None:
+            _fho_failed[key] = time.monotonic()
+        else:
+            _fho_failed.pop(key, None)
+            _fho_cache[key] = mod
         return mod
 
 
@@ -106,14 +121,33 @@ def validate(gap_class: str, requirement_id: Optional[str]) -> None:
 
 
 def _append_ledger(line: dict) -> None:
+    """Append one whole line or nothing. Writers serialize on an exclusive flock of the ledger itself; a short
+    ``os.write`` is continued, and any failure truncates back to the pre-append size, so a fragment never
+    survives to be joined onto the next record."""
     path = ledger_path()
     data = (json.dumps(line, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
-        os.write(fd, data)
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        start = os.fstat(fd).st_size
+        try:
+            view = memoryview(data)
+            while view:
+                n = os.write(fd, view)
+                if n <= 0:
+                    raise OSError(f"short write to {path}: {n} of {len(view)} bytes")
+                view = view[n:]
+        except BaseException:
+            try:
+                os.ftruncate(fd, start)
+            except OSError:
+                _log.warning("capability gap: could not roll back a partial ledger append at %s", path,
+                             exc_info=True)
+            raise
     finally:
-        os.close(fd)
+        os.close(fd)   # closing the fd releases the flock
 
 
 def record_capability_gap(

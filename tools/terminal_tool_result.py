@@ -165,7 +165,7 @@ def _failure_hint(command: str, returncode: int, output: str, exit_note) -> Opti
         missing = terminal_hints.missing_command(output)
         if missing:  # Hook C (t_b1100bf0): a TOOL_REQUIREMENTS command missing on this host
             from tools.capability_gap_hooks import on_command_not_found
-            on_command_not_found(missing, output)
+            on_command_not_found(missing)
         if not exit_note:
             return terminal_hints.annotate_failure(command, returncode, output)
     return None
