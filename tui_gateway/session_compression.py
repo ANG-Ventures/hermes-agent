@@ -61,11 +61,13 @@ def _derived_default_threshold_percent(agent: Any, compression: dict) -> float:
         pct = 0.50
     try:
         from agent.agent_init import _resolve_compression_threshold
-        from agent.auxiliary_client import _compression_threshold_for_model, _is_codex_gpt54_or_gpt55, _is_codex_spark
+        from agent.auxiliary_client import (
+            _compression_threshold_for_model, _is_codex_gpt54_or_gpt55, _is_codex_spark, per_model_builtins_enabled,
+        )
         model, provider = getattr(agent, "model", "") or "", getattr(agent, "provider", "") or ""
-        autoraise_enabled = str(compression.get("codex_gpt55_autoraise", True)).lower() in {"true", "1", "yes"}
+        builtin = _compression_threshold_for_model(model, provider) if per_model_builtins_enabled(compression) else None
         pct, _notice = _resolve_compression_threshold(
-            pct, _compression_threshold_for_model(model, provider, allow_codex_gpt55_autoraise=autoraise_enabled),
+            pct, builtin,
             model=model, is_codex_autoraise=_is_codex_gpt54_or_gpt55(model, provider) or _is_codex_spark(model, provider),
         )
     except Exception:

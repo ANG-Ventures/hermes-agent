@@ -137,7 +137,7 @@ def _bare_compressor(model, summary_model, config_pinned):
     cc.summary_target_ratio = 0.2
     cc._per_model_threshold_cfg = None
     cc._global_threshold_percent = None
-    cc._codex_gpt55_autoraise = True
+    cc._per_model_builtins = True
     cc.summary_model = summary_model
     cc._summary_model_is_config_pinned = config_pinned
     return cc

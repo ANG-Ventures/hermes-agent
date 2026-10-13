@@ -2859,7 +2859,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     def _config_percent_for(self, model: str, provider: str) -> float:
         """The config-level threshold for ``model``: the fork's ``resolve_compression_threshold`` chain
-        (config ``per_model_threshold`` map + built-in / Codex gpt-5.5 autoraise + global) when agent_init
+        (config ``per_model_threshold`` map + built-ins when ``per_model_builtins`` + global) when agent_init
         threaded those inputs, else the raw snapshotted percent. Upstream's substring ``model_thresholds``
         map then overrides on top (same precedence as __init__), so a mid-session fallback re-resolves the
         DESTINATION model's threshold instead of re-applying the old model's (2026-06-19 compaction-thrash
@@ -2874,7 +2874,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                 self._global_threshold_percent if self._global_threshold_percent is not None
                 else config_percent
             ),
-            allow_codex_gpt55_autoraise=self._codex_gpt55_autoraise,
+            per_model_builtins=self._per_model_builtins,
         )
 
     def _effective_threshold_cap(self, context_length: int) -> int | None:
@@ -3035,7 +3035,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         base_url: str = "", api_key: str = "", config_context_length: int | None = None, provider: str = "",
         api_mode: str = "", abort_on_summary_failure: bool = False,
         per_model_threshold: "dict | None" = None, global_threshold_percent: "float | None" = None,
-        codex_gpt55_autoraise: bool = True, skew_floor: "float | None" = None,
+        per_model_builtins: bool = False, skew_floor: "float | None" = None,
         calibration_hard_frac: "float | None" = None,
         max_tokens: int | None = None,
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
@@ -3048,7 +3048,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # update_model keeps the legacy "re-apply stored percent" behavior.
         self._per_model_threshold_cfg = per_model_threshold
         self._global_threshold_percent = global_threshold_percent
-        self._codex_gpt55_autoraise = codex_gpt55_autoraise
+        self._per_model_builtins = per_model_builtins
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
