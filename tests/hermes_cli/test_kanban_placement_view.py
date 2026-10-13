@@ -218,7 +218,7 @@ def test_live_boards_ignore_the_worker_db_pin(home, boards, monkeypatch):
     """Prism 26668b7a99a1: under the dispatcher's HERMES_KANBAN_DB pin every
     slug must still resolve to its OWN board, or counts multiply by N boards."""
     want = _report(home, _gate())
-    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # conftest neutralises pins
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)  # kanban-sandbox: off — the pin under test; `home` keeps HERMES_HOME on tmp_path
     monkeypatch.setenv("HERMES_KANBAN_DB", str(kb._board_db_path_ignoring_pin("default")))
     assert kb.kanban_db_path() == kb._board_db_path_ignoring_pin("default")  # the pin is live
     paths = [p for _, p in kpv.live_boards()]
