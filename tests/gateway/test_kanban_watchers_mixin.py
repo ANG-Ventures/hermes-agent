@@ -480,6 +480,52 @@ def test_guard_stuck_notifier_pages_each_guard_reason_of_one_card():
     assert sent == ["prior_worker_still_alive", "active_pr"]
 
 
+def test_prior_worker_cohort_pages_once_per_tick(tmp_path, monkeypatch):
+    """t_8d571321: one dispatcher cohort death stranded 30 cards; each paged on
+    its own (43 #alerts lines). Due prior_worker_still_alive cards go out as one
+    page, every card is recorded, and a failed send records none."""
+    from gateway.kanban_watchers import _GuardStuckNotifier, _send_guard_stuck_alert
+
+    cards = [(b, {"task_id": f"t_{i:04x}", "reason": "prior_worker_still_alive",
+                  "status": "ready", "prev_pid": 1000 + i, "guarded_since": 50,
+                  "clear_verb": f"hermes kanban show t_{i:04x}"})
+             for i, b in enumerate(["default"] * 20 + ["house-voice"] * 12)]
+    pr = ("default", {"task_id": "t_pr", "reason": "active_pr", "clear_verb": "x"})
+    sent = []
+    fail = {"on": True}
+
+    def send(board, row):
+        sent.append(row)
+        return not fail["on"]
+
+    notifier = _GuardStuckNotifier(tmp_path / "g.json")
+    assert notifier.observe(cards + [pr], send, now=10_000.0) == 0
+    assert len(sent) == 2  # one active_pr page + one cohort page, both failed
+    fail["on"] = False
+    sent.clear()
+    assert notifier.observe(cards + [pr], send, now=10_060.0) == 2  # retried, still one cohort page
+    batch_pages = [row for row in sent if row.get("batch")]
+    assert len(batch_pages) == 1 and len(batch_pages[0]["batch"]) == 32
+    assert notifier.observe(cards + [pr], send, now=10_120.0) == 0  # every card recorded
+    assert _GuardStuckNotifier(tmp_path / "g.json").observe(cards, send, now=10_180.0) == 0
+
+    script = tmp_path / "home" / "scripts" / "notify.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("", encoding="utf-8")
+    monkeypatch.setattr("gateway.kanban_watchers._alert_notify_script", lambda: script)
+    argvs = []
+    monkeypatch.setattr("gateway.kanban_watchers.subprocess.run",
+                        lambda argv, **kw: argvs.append(argv) or type("P", (), {"returncode": 0})())
+    assert _send_guard_stuck_alert("default", batch_pages[0])
+    message = argvs[-1][argvs[-1].index("--send") + 1]
+    assert "32 cards" in message and "22 more" in message
+    assert "hermes kanban show t_0000" in message and "requeue alone cannot bypass" in message
+    # A lone due card keeps the single-card page.
+    single = dict(cards[0][1])
+    assert _send_guard_stuck_alert("default", single)
+    assert "READY card: prior_worker_still_alive" in argvs[-1][argvs[-1].index("--send") + 1]
+
+
 
 def test_active_pr_is_one_episode_per_card_and_pr(tmp_path):
     """r19 (t_f1af5dcd): a restarted streak on the SAME open PR is the same
