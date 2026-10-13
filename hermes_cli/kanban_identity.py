@@ -207,11 +207,11 @@ def worker_ancestor_profile() -> Optional[str]:
     found, _complete = _worker_rows(chain)
     if not found:
         return None
-    from hermes_cli.kanban_db_dispatch import _process_fingerprint
+    from hermes_cli.kanban_db_dispatch import _fingerprints_agree, _process_fingerprint
 
     for pid in chain:  # nearest worker ancestor wins; the session id is last
         for profile, started in found.get(pid, ()):
-            if "|" in started and _process_fingerprint(pid) == started:
+            if "|" in started and _fingerprints_agree(started, _process_fingerprint(pid)):
                 return profile
     return None
 
@@ -318,12 +318,14 @@ def _runs_under_operator_gateway(name: str) -> bool:
         return True
     from hermes_cli.kanban_db_dispatch import (
         UNVERIFIED_WORKER_FINGERPRINT,
+        _fingerprints_agree,
         _process_fingerprint,
     )
 
     for pid, rows in found.items():
         for _profile, started in rows:
-            if started == UNVERIFIED_WORKER_FINGERPRINT or _process_fingerprint(pid) == started:
+            if started == UNVERIFIED_WORKER_FINGERPRINT or (
+                "|" in started and _fingerprints_agree(started, _process_fingerprint(pid))):
                 return False
     return True
 
