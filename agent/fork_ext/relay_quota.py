@@ -30,8 +30,12 @@ def relay_quota_outlasts_retry_window(agent, error, classified) -> bool:
     if relay_class not in (None, "upstream_passthrough") or getattr(error, "status_code", None) != 429:
         return False
     return any(
-        str(name).lower().startswith("anthropic-ratelimit-unified-")
-        and str(name).lower().endswith("-status")
+        str(name).lower() in {
+            "anthropic-ratelimit-unified-5h-status",
+            "anthropic-ratelimit-unified-7d-status",
+            "anthropic-ratelimit-unified-7d_oi-status",
+            "anthropic-ratelimit-unified-7d_sonnet-status",
+        }
         and str(value).strip().lower() == "rejected"
         for name, value in (headers.items() if headers is not None else ())
     )

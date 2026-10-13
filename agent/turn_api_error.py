@@ -229,7 +229,7 @@ def handle_api_error(
     conversation_history = _ce.conversation_history
     retry_count = _ce.retry_count
     max_retries = _ce.max_retries
-    if _relay_quota_exhausted:
+    if _relay_quota_exhausted and _ce.action == "fallthrough":
         retry_count = max_retries
     compression_attempts = _ce.compression_attempts
     is_rate_limited = _ce.is_rate_limited
