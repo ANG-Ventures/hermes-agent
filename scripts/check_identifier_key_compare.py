@@ -42,7 +42,10 @@ _KEY_WORDS = {
     "base_sha", "head", "commit", "lane", "lanes", "assignee", "assignees", "profile", "profiles",
     "board", "boards", "repo", "card", "card_id", "parent_id", "child_id", "slug", "agent_id",
     "session_id", "pool", "reviewer", "branch",
+    # `<key>_override` / `_pin` / `_name` columns carry the same key (Prism r2 ea1314c14c2f:
+    # `task.model_override.lower()` slipped past the suffix match)
 }
+_KEY_SUFFIXES = ("_override", "_overrides", "_pin", "_name", "_key")
 _KEY_RE = re.compile(r"(?:^|_)(?:%s)$" % "|".join(sorted((re.escape(w) for w in _KEY_WORDS), key=len, reverse=True)))
 _TEXT_RE = re.compile(r"(?:^|_)(?:body|text|summary|title|comment|comments|message|msg|line|lines|output|"
                       r"stdout|stderr|reason|note|notes|content|description|desc|blob|payload|raw|s)$")
@@ -79,7 +82,14 @@ def _subject(node: ast.AST) -> str | None:
 
 
 def _is_key(name: str | None) -> bool:
-    return bool(name) and bool(_KEY_RE.search(name.lower())) and name.lower() not in {"head", "s"}
+    if not name:
+        return False
+    low = name.lower()
+    for suffix in _KEY_SUFFIXES:
+        if low.endswith(suffix) and len(low) > len(suffix):
+            low = low[: -len(suffix)]
+            break
+    return bool(_KEY_RE.search(low)) and low not in {"head", "s"}
 
 
 def _is_text(node: ast.AST) -> bool:
@@ -125,11 +135,25 @@ class _Scan(ast.NodeVisitor):
             left = right
         self.generic_visit(node)
 
+    def _sql(self, node: ast.AST, text: str) -> None:
+        m = _SQL_RE.search(text)
+        if m and re.match(r"\s*(?:SELECT|UPDATE|DELETE|INSERT|WITH)\b", text, re.I):
+            self._add(node, "sql", re.sub(r"\s+", " ", m.group(0)))
+
     def visit_Constant(self, node: ast.Constant) -> None:
         if isinstance(node.value, str):
-            m = _SQL_RE.search(node.value)
-            if m and re.match(r"\s*(?:SELECT|UPDATE|DELETE|INSERT|WITH)\b", node.value, re.I):
-                self._add(node, "sql", re.sub(r"\s+", " ", m.group(0)))
+            self._sql(node, node.value)
+
+    def visit_JoinedStr(self, node: ast.JoinedStr) -> None:
+        # f"SELECT id FROM {table} WHERE model LIKE ?": judge the WHOLE statement, each
+        # interpolation kept as a placeholder word (Prism r2 85a0850c718b). Its constant parts are
+        # not visited on their own, so one statement yields one site.
+        text = "".join(v.value if isinstance(v, ast.Constant) and isinstance(v.value, str) else " _x_ "
+                       for v in node.values)
+        self._sql(node, text)
+        for v in node.values:
+            if isinstance(v, ast.FormattedValue):
+                self.visit(v)
 
 
 def scan_source(rel: str, src: str) -> list[dict]:

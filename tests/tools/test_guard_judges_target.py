@@ -111,6 +111,9 @@ def test_remote_pkill_replay_is_not_a_host_interpreter_kill():
     "ssh ci 'pkill -f 18765'; pk'ill' python3",
     "ssh ci 'pkill x'; pk\"\"ill -f python3",
     "ssh ci 'pkill x'; p\\kill python3",
+    # Prism r2 on #1958 (88d6dcb1882e): an escaped / commented apostrophe must not hide a local kill
+    "ssh ci echo it\\'s; pkill python3",
+    "ssh ci uptime # don't\npkill python3",
 ])
 def test_local_interpreter_kill_still_blocks(command):
     assert contains_host_interpreter_kill(command) is True

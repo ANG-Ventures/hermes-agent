@@ -27,6 +27,9 @@ PLANTED = {
     "affix": "def f(assignee):\n    return assignee.startswith('daedalus')\n",
     "substr": "def f(head_sha, body):\n    return head_sha in body\n",
     "sql_nocase": 'Q = "SELECT id FROM tasks WHERE assignee = ? COLLATE NOCASE"\n',
+    # Prism r2 on #1958
+    "fold_override_only": 'def f(task):\n    return task.model_override.lower() == "custommodel"\n',   # ea1314c14c2f
+    "sql_fstring": 'def f(conn, table):\n    return conn.execute(f"SELECT id FROM {table} WHERE model LIKE ?", ("x",))\n',  # 85a0850c718b
 }
 
 
