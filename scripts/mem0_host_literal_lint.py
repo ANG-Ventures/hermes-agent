@@ -38,13 +38,27 @@ NOQA = "noqa: mem0-host-literal"
 SKIP_DIRS = {"tests", "test", "fixtures", "__tests__"}
 
 
+WALK_SKIP = {".git", "node_modules", "venv", ".venv", "__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache", "dist", "build"}
+
+
 def tracked(repo: Path) -> list[str]:
+    """Tracked files of `repo`. Falls back to a filesystem walk when `repo` is not a git checkout
+    (off-box CI ships the tree as `git archive | tar`, with no .git: the lint must still grade it, and
+    it must grade THAT tree, never a parent checkout git happens to find above it)."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_CEILING_DIRECTORIES"] = str(repo.resolve().parent)
     r = subprocess.run(["git", "-C", str(repo), "ls-files", "-z"], capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
                        timeout=120)
-    if r.returncode:
+    if r.returncode == 0:
+        return [p for p in r.stdout.split("\0") if p]
+    if "not a git repository" not in r.stderr.lower():
         raise RuntimeError(f"git ls-files rc={r.returncode}: {r.stderr.strip()[:200]}")
-    return [p for p in r.stdout.split("\0") if p]
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = sorted(d for d in dirnames if d not in WALK_SKIP)
+        for f in filenames:
+            out.append(str((Path(dirpath) / f).relative_to(repo)))
+    return sorted(out)
 
 
 def skipped(rel: str, own: set[str]) -> bool:

@@ -77,6 +77,28 @@ def test_allow_list_needs_a_reason_and_reports_stale_entries(tmp_path):
     assert r.returncode == 0 and "INFO allow entry gone.py has no hit" in r.stdout
 
 
+def test_no_git_tree_is_graded_by_walk_not_parent_checkout(tmp_path):
+    """Off-box CI ships `git archive | tar`: no .git. The lint must grade that tree (a planted literal
+    is red) and must not borrow a parent checkout's ls-files (GIT_CEILING_DIRECTORIES)."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    subprocess.run(["git", "init", "-q", str(outer)], check=True, env=_env())
+    inner = outer / "tree"
+    (inner / "scripts").mkdir(parents=True)
+    (inner / "scripts" / "clean.py").write_text("HOST = os.environ['MEM0_HOST']\n", encoding="utf-8")
+    a = inner / "allow.txt"
+    a.write_text("", encoding="utf-8")
+    r = subprocess.run([sys.executable, str(LINT), "--repo", str(inner), "--allow", str(a)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", env=_env())
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "MEM0_HOST_LITERAL=ok" in r.stdout, r.stdout
+    (inner / "scripts" / "bad.py").write_text("MEM0_HOST = 'http://192.168.1.18:8890'\n", encoding="utf-8")
+    r = subprocess.run([sys.executable, str(LINT), "--repo", str(inner), "--allow", str(a)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", env=_env())
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "scripts/bad.py" in r.stdout, r.stdout
+
+
 def test_this_repo_is_green():
     r = subprocess.run([sys.executable, str(LINT)], capture_output=True, text=True, encoding="utf-8", errors="replace", env=_env())
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr
