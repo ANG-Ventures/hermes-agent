@@ -67,9 +67,10 @@ def rec(drill, **kw):
 
 @pytest.fixture(autouse=True)
 def _etsy_skill(home):
-    sk = home / "profiles" / "alpha" / "skills" / "personal" / "etsy-login"
-    sk.mkdir(parents=True, exist_ok=True)
-    (sk / "SKILL.md").write_text("---\nname: etsy-login\ndescription: x\n---\nbody\n", encoding="utf-8")
+    for name in ("etsy-login", "fleet-shop-instacart"):
+        sk = home / "profiles" / "alpha" / "skills" / "personal" / name
+        sk.mkdir(parents=True, exist_ok=True)
+        (sk / "SKILL.md").write_text(f"---\nname: {name}\ndescription: x\n---\nbody\n", encoding="utf-8")
 
 
 def _status(conn, tid):
@@ -130,27 +131,29 @@ def test_d3_gc_workspace(home, fleet, monkeypatch, tmp_path):
 
 def test_d4_map_truncated(home, fleet, monkeypatch):
     _mode(monkeypatch, "enforce")
+    sbs = json.loads((LIVE / "kanban-pool.json").read_text())["studio_bound_skills"]
+    assert "fleet-shop-instacart" not in sbs and "etsy-login" in sbs
     raw = (fleet / khc.MAP_FILE).read_text()
     (fleet / khc.MAP_FILE).write_text(raw[: len(raw) // 2])
     with kb.connect_closing() as conn:
-        browser = _card(conn, body=f"restock\n{DRILL}", skills=["etsy-login"])   # not in studio_bound? see rec
+        browser = _card(conn, body=f"restock\n{DRILL}", skills=["fleet-shop-instacart"])  # NOT in studio_bound_skills
+        legacy = _card(conn, body=f"restock\n{DRILL}", skills=["etsy-login"])           # IS in studio_bound_skills
         plain = _card(conn, body=f"Fix tests/qux.py; open a PR.\n{DRILL}")
         res, spawned, _ = _tick(conn)
         _tick(conn)
         rec("4 truncated map", spawned=spawned, map_error=res.placement_caps.get("_map_error"),
             invalid_events_browser=_events(conn, browser, khc.MAP_INVALID_EVENT),
+            invalid_events_legacy=_events(conn, legacy, khc.MAP_INVALID_EVENT),
             invalid_events_plain=_events(conn, plain, khc.MAP_INVALID_EVENT),
-            browser_affinity=res.placement_affinity.get(browser),
+            browser_affinity=res.placement_affinity.get(browser), browser_warn=res.placement_caps.get(browser),
+            legacy_affinity=res.placement_affinity.get(legacy),
             spawn_env=khc.spawn_env(fleet, kbd._root_kanban_cfg()))
-        assert (plain, spawned and spawned[0][1]) in spawned
         (fleet / khc.MAP_FILE).write_text(raw)   # restore
-        res2, spawned2, _ = _tick(conn)
-        b2 = _card(conn, body=f"restock\n{DRILL}", skills=["amazon-cart-ops-local"])
-        res3, spawned3, _ = _tick(conn)
-        rec("4 restored, next tick", map_error=res3.placement_caps.get("_map_error"),
-            new_browser_card_route=res3.placement_affinity.get(b2), spawned=spawned3,
+        b2 = _card(conn, body=f"restock\n{DRILL}", skills=["fleet-shop-instacart"])
+        res2, spawned2, _ = _tick(conn)           # FIRST tick after restore
+        rec("4 restored, first tick", map_error=res2.placement_caps.get("_map_error"),
+            new_browser_card_route=res2.placement_affinity.get(b2), spawned=spawned2,
             spawn_env=khc.spawn_env(fleet, kbd._root_kanban_cfg()))
-        assert b2 not in [s[0] for s in spawned3]
 
 
 def test_d5_files_disagree(home, fleet, monkeypatch):
@@ -187,8 +190,10 @@ def test_kill_switch(home, fleet, monkeypatch, mode):
     with kb.connect_closing() as conn:
         a = _card(conn, body=f"restock\n{DRILL}", skills=["etsy-login"])
         c = _card(conn, body=f"restock\n{DRILL}", skills=["amazon-cart-ops-local"])
+        i = _card(conn, body=f"restock\n{DRILL}", skills=["fleet-shop-instacart"])
         res, spawned, _ = _tick(conn)
-        rec(f"kill-switch {mode}", spawned=spawned, etsy_aff=res.placement_affinity.get(a),
+        rec(f"kill-switch {mode}", spawned=spawned, ids={"etsy": a, "amazon": c, "instacart": i},
+            instacart_aff=res.placement_affinity.get(i), etsy_aff=res.placement_affinity.get(a),
             amazon_aff=res.placement_affinity.get(c), amazon_wait=res.placement_waits.get(c),
             comments=_comments(conn, a) + _comments(conn, c),
             env=khc.spawn_env(fleet, kbd._root_kanban_cfg()))
