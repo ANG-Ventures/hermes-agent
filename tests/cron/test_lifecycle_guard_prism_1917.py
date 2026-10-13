@@ -144,3 +144,36 @@ def test_grouped_pipe_reader_still_passes(command):
 ])
 def test_content_arguments_still_pass(command):
     assert not _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
+    # b74a2fa3 r2: a redirection before the executor word in a pipe stage
+    f"echo '{BOOTOUT}' | 2>/dev/null bash",
+    f"echo '{BOOTOUT}' | > /tmp/o bash",
+    f"echo '{BOOTOUT}' | 2> /tmp/err env bash",
+    f"echo '{BOOTOUT}' | (2>/dev/null bash)",
+    # a3c0cfc0: heredoc whose `|` continues past the terminator
+    f"cat <<'EOF' |\n{BOOTOUT}\nEOF\nbash",
+    f"cat <<EOF |\n{RESTART}\nEOF\nenv sh",
+    # 7f7a1d3f: executor in the body of a compound command after a pipe
+    f"echo '{BOOTOUT}' | if true; then bash; fi",
+    f"echo '{BOOTOUT}' | if false; then :; else sh; fi",
+    f"echo '{BOOTOUT}' | until false; do bash; break; done",
+    f"echo '{BOOTOUT}' | case x in x) bash;; esac",
+    # 5d269848: a comment does not close a pipe group
+    f"echo '{BOOTOUT}' | {{ # }}\n bash; }}",
+    f"echo '{BOOTOUT}' | ( # )\n bash )",
+])
+def test_pipe_stage_parser_r2_shapes_block(command):
+    assert _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
+    # compounds / redirects / comments that never reach an executor stay allowed
+    f"echo '{LABEL}' | if true; then cat; fi",
+    f"echo '{LABEL}' | 2>/dev/null grep x",
+    f"grep '{LABEL}' /tmp/f | {{ # bash\n head -1; }}",
+    f"cat <<'EOF' |\n{LABEL}\nEOF\nwc -l",
+])
+def test_pipe_stage_parser_r2_controls_pass(command):
+    assert not _blocked(command)

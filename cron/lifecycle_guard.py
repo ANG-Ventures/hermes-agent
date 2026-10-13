@@ -1997,13 +1997,43 @@ _STAGE_EXECUTORS = frozenset({"source", "."})
 _PIPE_CONTINUATION_RE = re.compile(r"(\|&?)[ \t]*(?:#[^\n]*)?\r?\n")
 
 
+# A redirection word: `[n]>f`, `>>f`, `&>f`, `2>&1`, `<f`, `<>f`, `>|f`, or the bare operator whose
+# target is the NEXT word (`> /tmp/o`). It may precede the command word (`| 2>/dev/null bash`).
+_REDIRECTION_WORD_RE = re.compile(r"^(?:\d+|&)?(?:>>|>&|>\||<>|<<<|<<-?|<&|>|<)(?P<target>.*)$", re.DOTALL)
+# Reserved words that open or continue a compound command; the command they run follows them
+# (`| if true; then bash; fi`, Prism 7f7a1d3f on #1954).
+_COMPOUND_LEAD_WORDS = frozenset({"if", "then", "else", "elif", "while", "until", "do", "!", "time", "{", "("})
+_COMPOUND_OPENERS = frozenset({"if", "while", "until", "for", "case", "select"})
+_COMPOUND_CLOSERS = frozenset({"fi", "done", "esac"})
+
+
+def _strip_redirections(tokens: list[str]) -> list[str]:
+    """*tokens* without redirection words (and the separate target of a bare operator)."""
+    out: list[str] = []
+    skip = False
+    for token in tokens:
+        if skip:
+            skip = False
+            continue
+        match = _REDIRECTION_WORD_RE.match(token) if token else None
+        if match is not None:
+            skip = not match.group("target")
+            continue
+        if token:
+            out.append(token)
+    return out
+
+
 def _stage_is_executor(stage: str) -> bool:
-    """The pipeline stage *stage* (its own text, no control operators) runs its stdin."""
+    """The pipeline stage *stage* (its own text, no control operators) runs its stdin. Leading
+    redirections (Prism b74a2fa3 r2: `| 2>/dev/null bash`) and compound reserved words are skipped."""
     try:
         tokens = shlex.split(stage, posix=True)
     except ValueError:
         tokens = stage.split()
-    tokens = [t for t in tokens if t and not t.startswith(("<<", "<", ">"))]
+    tokens = _strip_redirections(tokens)
+    while tokens and tokens[0] in _COMPOUND_LEAD_WORDS:
+        tokens = tokens[1:]
     index = _command_token_index(tokens)
     if index is None:
         return False
@@ -2032,9 +2062,10 @@ def _group_extent(view: str, start: int) -> int:
 def _group_body_executes(body: str) -> bool:
     """Some command inside a grouped stage runs the shared stdin: every command in `( … )` or
     `{ …; }` reads the pipe, so `| (bash)`, `| { cd /tmp; bash; }` execute it (Prism b74a2fa3,
-    Apollo r1 on agent#1954). Group punctuation is blanked; each segment is a stage."""
-    view = _unquoted_view(body)
-    flat = "".join(" " if v in "(){}" else c for c, v in zip(body, view))
+    Apollo r1 on agent#1954). Braces are blanked; a paren ends a stage, so a case pattern's `)`
+    starts one (`| case x in x) bash;; esac`, Prism 7f7a1d3f)."""
+    body, view = _blank_comments(body, _unquoted_view(body))
+    flat = "".join(" " if v in "{}" else "\n" if v in "()" else c for c, v in zip(body, view))
     pos = 0
     for stop in [*(m.start() for m in re.finditer(r"[;&|\n]", _unquoted_view(flat))), len(flat)]:
         if _stage_is_executor(flat[pos:stop]):
@@ -2043,18 +2074,46 @@ def _group_body_executes(body: str) -> bool:
     return False
 
 
+def _blank_comments(text: str, view: str) -> tuple[str, str]:
+    """*text* and its unquoted *view* with every shell comment (`#` at a word start, outside quotes,
+    to end of line) blanked, same length: a `# }` must not close a group (Prism 5d269848 on #1954)."""
+    chars, vchars = list(text), list(view)
+    for match in re.finditer(r"(?:(?<=^)|(?<=[\s;&|()]))#[^\n]*", view, re.MULTILINE):
+        for k in range(match.start(), match.end()):
+            chars[k] = vchars[k] = " "
+    return "".join(chars), "".join(vchars)
+
+
+def _compound_extent(view: str, start: int) -> int:
+    """End index (exclusive) of the compound command (`if … fi`, `while … done`, `case … esac`)
+    whose opening reserved word starts at *view*[start]; the end of *view* when it never closes."""
+    depth = 0
+    for match in re.finditer(r"[^\s;&|()]+", view[start:]):
+        word = match.group()
+        if word in _COMPOUND_OPENERS:
+            depth += 1
+        elif word in _COMPOUND_CLOSERS:
+            depth -= 1
+            if depth <= 0:
+                return start + match.end()
+    return len(view)
+
+
 def _feeds_executor(text: str) -> bool:
     """Some pipe in *text* (a trailing `|` continues the pipeline onto the next line, Prism
-    31197de5) hands its stream to an executor stage, bare or inside a `( … )` / `{ …; }` group.
-    Heredoc bodies are not shell text."""
+    31197de5) hands its stream to an executor stage: bare, inside a `( … )` / `{ …; }` group, or
+    in the body of a compound command (`| if …; then bash; fi`). Heredoc bodies and comments are
+    not shell text."""
     joined = _PIPE_CONTINUATION_RE.sub(r"\1 ", _drop_heredoc_bodies(text))
-    view = _unquoted_view(joined)
+    joined, view = _blank_comments(joined, _unquoted_view(joined))
     for match in re.finditer(r"(?<!\|)\|(?!\|)&?", view):
         rest = view[match.end():]
         lead = len(rest) - len(rest.lstrip(" \t"))
-        if rest[lead:lead + 1] in ("(", "{"):
-            start = match.end() + lead
-            end = _group_extent(view, start)
+        start = match.end() + lead
+        first = re.match(r"[^\s;&|()]+", rest[lead:])
+        if rest[lead:lead + 1] in ("(", "{") or (first and first.group() in _COMPOUND_OPENERS):
+            end = (_group_extent(view, start) if rest[lead:lead + 1] in ("(", "{")
+                   else _compound_extent(view, start))
             if _group_body_executes(joined[start:end]):
                 return True
             continue
@@ -2349,7 +2408,12 @@ def _mask_heredoc_bodies(text: str) -> str:
         # Fail-closed conditions: the body may actually be executed.
         feeds_interpreter = bool(_HEREDOC_TO_INTERPRETER.search(line)) or _heredoc_receiver_executes(
             line, match.start())
-        piped_to_interpreter = bool(_PIPE_TO_INTERPRETER.search(line)) or _feeds_executor(line)
+        # A `|` after the opener continues the pipeline on the line AFTER the terminator
+        # (`cat <<'EOF' |` … `EOF` / `bash`, Prism a3c0cfc0 on #1954): judge the whole rest.
+        pipeline = line
+        if re.search(r"\|&?\s*$", _blank_comments(line, _unquoted_view(line))[1]):
+            pipeline = "\n".join(lines[i - 1:])
+        piped_to_interpreter = bool(_PIPE_TO_INTERPRETER.search(line)) or _feeds_executor(pipeline)
         expands = (not quoted) and any(
             marker in "\n".join(body) for marker in ("$(", "`")
         )
