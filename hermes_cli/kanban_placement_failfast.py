@@ -278,6 +278,32 @@ def host_caps(host: str, fleet_dir: Path) -> Optional[frozenset]:
     return cmap.hosts.get(host.lower(), frozenset())
 
 
+def _skill_key(name: str) -> str:
+    """The index key for a skill reference in any spelling the loader accepts:
+    ``name``, ``category/name`` and ``category:name`` (``skills_tool._resolve_plugin_skill``
+    falls a ``category:name`` through to the local ``category/name``) all key on ``name``."""
+    return re.split(r"[/:]", str(name or ""))[-1].strip().lower()
+
+
+_SNAPSHOT_TRIES = 5
+
+
+def _consistent(fleet_dir: Path, check):
+    """Run ``check(snapshot)`` until the map + index bytes are the same before and after it, so
+    the host's capabilities, the requirements and the route hash all come from ONE pair of
+    files (#1963 Prism r2: a torn read let a revoked capability pass). ``--sync`` / ``--set``
+    replace the files atomically, so a retry sees a whole file; after ``_SNAPSHOT_TRIES``
+    changing reads the last result stands and is logged."""
+    result = None
+    for _ in range(_SNAPSHOT_TRIES):
+        before = _fleet_bytes(fleet_dir)
+        result = check(before)
+        if _fleet_bytes(fleet_dir) == before:
+            return result
+    _log.warning("placement gate: fleet map kept changing across %d reads; using the last", _SNAPSHOT_TRIES)
+    return result
+
+
 # -- Layer 0b: dispatch (F14) -------------------------------------------------------
 
 def attached_skill_gap(skills: Iterable[str], host: str, caps) -> Optional[str]:
@@ -292,7 +318,7 @@ def attached_skill_gap(skills: Iterable[str], host: str, caps) -> Optional[str]:
     for s in dict.fromkeys(skills or ()):
         if not isinstance(s, str):
             continue
-        for cap in caps.cmap.index.get(s.rsplit("/", 1)[-1].strip().lower(), ()):
+        for cap in caps.cmap.index.get(_skill_key(s), ()):
             if cap not in have and caps.mode_of(cap) == khc.ENFORCE:
                 return cap
     return None
@@ -347,9 +373,6 @@ def boot_check(task_id: str, environ: Optional[Mapping[str, str]] = None, *,
     if not modes:
         return None
     fleet_dir = Path(fleet_dir) if fleet_dir is not None else _fleet_dir()
-    have = host_caps(host, fleet_dir)
-    if have is None:
-        return None
     own = conn is None
     conn = kb.connect() if own else conn
     try:
@@ -364,14 +387,22 @@ def boot_check(task_id: str, environ: Optional[Mapping[str, str]] = None, *,
     except (ValueError, TypeError):
         skills = []
     stamped = record.get(REQUIRES_KEY)
-    if record.get(ROUTE_HASH_KEY) == route_hash(row["body"], skills, fleet_dir) and isinstance(stamped, list):
-        reqs = [c for c in stamped if isinstance(c, str)]
-    else:
-        reqs = hard_requirements(row["body"], skills, fleet_dir)
-    for cap in reqs:
-        if cap not in have and enforced(cap, modes):
-            return absent_line(cap, host)
-    return None
+
+    def check(snapshot):
+        have = host_caps(host, fleet_dir)
+        if have is None:
+            return None
+        if (record.get(ROUTE_HASH_KEY) == route_hash(row["body"], skills, fleet_dir, snapshot=snapshot)
+                and isinstance(stamped, list)):
+            reqs = [c for c in stamped if isinstance(c, str)]
+        else:
+            reqs = hard_requirements(row["body"], skills, fleet_dir)
+        for cap in reqs:
+            if cap not in have and enforced(cap, modes):
+                return absent_line(cap, host)
+        return None
+
+    return _consistent(fleet_dir, check)
 
 
 # -- Layer 1: mid-run skill_view (F14) --------------------------------------------------
@@ -392,17 +423,21 @@ def skill_gate(name: str) -> Optional[str]:
         if not modes:
             return None
         fleet_dir = _fleet_dir()
-        have = host_caps(host, fleet_dir)
-        if have is None:
-            return None
         from hermes_cli import kanban_host_capabilities as khc
-        cmap = khc.load_map(fleet_dir)
-        if cmap is None or cmap.index_error is not None:
+        key = _skill_key(name)
+
+        def check(_snapshot):
+            # One load_map: host row and index come from the same parse of the same files.
+            cmap = khc.load_map(fleet_dir)
+            if cmap is None or not cmap.valid or cmap.index_error is not None:
+                return None
+            have = cmap.hosts.get(host.lower(), frozenset())
+            for cap in cmap.index.get(key, ()):
+                if cap not in have and enforced(cap, modes):
+                    return absent_line(cap, host)
             return None
-        key = str(name or "").rsplit("/", 1)[-1].strip().lower()
-        for cap in cmap.index.get(key, ()):
-            if cap not in have and enforced(cap, modes):
-                return absent_line(cap, host)
+
+        return _consistent(fleet_dir, check)
     except Exception:
         _log.debug("skill_view placement gate failed open", exc_info=True)
     return None

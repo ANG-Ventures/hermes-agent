@@ -151,15 +151,25 @@ def block_on_rail_absent(message: str) -> bool:
     with the line verbatim. Never raises.
     """
     try:
-        from hermes_cli import kanban_placement_failfast as pff
-        outcome = pff.worker_exit_on_absent(str(message or ""))
-        if outcome is not None:  # Hook A (t_b1100bf0): its own transaction, after the board decision committed
+        from hermes_cli import kanban_worker_hosts as kwh
+        placed = kwh.BOOT_PLACED_HOST or kwh._placed_host(os.environ.get(kwh.PLACEMENT_ENV))
+        if placed:
+            from hermes_cli import kanban_placement_failfast as pff
+            handled = pff.worker_exit_on_absent(str(message or "")) is not None
+        else:  # unplaced: #1876 verbatim
+            if "_RAIL_ABSENT:" not in str(message or ""):
+                return False
+            from agent.delegation_context import owned_kanban_task
+            if not owned_kanban_task():  # in-process cron / delegate child: never park the worker's card
+                return False
+            handled = _park_needs_input(str(message))
+        if handled:  # Hook A (t_b1100bf0): its own transaction, after the board decision committed
             try:  # best-effort: a hook failure must never turn a committed decision into "not handled"
                 from tools.capability_gap_hooks import on_rail_absent
                 on_rail_absent(str(message))
             except Exception:
                 logging.getLogger(__name__).warning("rail-absent capability gap hook failed", exc_info=True)
-        return outcome is not None
+        return handled
     except Exception:
         logging.getLogger(__name__).warning("rail-absent block failed", exc_info=True)
         return False

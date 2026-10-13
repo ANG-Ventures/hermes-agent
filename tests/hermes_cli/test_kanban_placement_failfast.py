@@ -93,7 +93,8 @@ def test_reroute_then_needs_input_never_triage(board, monkeypatch):
     assert t.status == "ready"
     assert t.body.rstrip().endswith("requires: browser-session")
     ev = _events(tid, pff.REROUTE_EVENT)
-    assert ev == [{"from": "ace-ai", "cap": "browser-session", "run_id": run1, "token": "BROWSER_RAIL_ABSENT"}]
+    assert ev == [{"from": "ace-ai", "cap": "browser-session", "run_id": run1, "token": "BROWSER_RAIL_ABSENT",
+                   "to": "ready"}]
     with kb.connect_closing() as conn:
         assert any(c.body.startswith("re-routed: browser-session, ran on ace-ai")
                    for c in kb.list_comments(conn, tid))
@@ -382,3 +383,85 @@ def test_background_review_fork_never_gates_or_queues(board, monkeypatch, tmp_pa
     finally:
         _write_origin.reset(tok)
     assert rp.take_rail_absent() is None
+
+
+# -- Prism round 2 on #1963 ---------------------------------------------------------------
+
+def _revoke_on_read(monkeypatch, board, host="ace-ai", cap="browser-session", after=1):
+    """Give ``host`` the capability, then revoke it (atomic rewrite) right after the
+    ``after``-th host-capability read: the torn-snapshot race Prism r2 described."""
+    m = board / khc.MAP_FILE
+    doc = json.loads(m.read_text())
+    doc["hosts"].setdefault(host, {})["capabilities"] = sorted(
+        set(doc["hosts"][host].get("capabilities") or []) | {cap})
+    m.write_text(json.dumps(doc))
+    revoked = dict(doc)
+    revoked["hosts"] = {**doc["hosts"], host: {**doc["hosts"][host],
+                        "capabilities": [c for c in doc["hosts"][host]["capabilities"] if c != cap]}}
+    real = khc.load_map
+    calls = {"n": 0}
+
+    def load(fleet_dir):
+        out = real(fleet_dir)
+        calls["n"] += 1
+        if calls["n"] == after:
+            m.write_text(json.dumps(revoked))
+        return out
+    monkeypatch.setattr(khc, "load_map", load)
+    return calls
+
+
+def test_boot_check_rereads_when_the_map_changes_under_it(board, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="requires: browser-session")
+    _placed_env(monkeypatch, tid, 1)
+    _revoke_on_read(monkeypatch, board)
+    assert (pff.boot_check(tid) or "").startswith("BROWSER_RAIL_ABSENT cap=browser-session host=ace-ai")
+
+
+def test_skill_gate_rereads_when_the_map_changes_under_it(board, monkeypatch):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    _placed_env(monkeypatch, tid, 1)
+    _revoke_on_read(monkeypatch, board)
+    assert (pff.skill_gate("amazon-cart-ops-local") or "").startswith("BROWSER_RAIL_ABSENT")
+
+
+@pytest.mark.parametrize("spelling", ["personal:amazon-cart-ops-local", "personal/amazon-cart-ops-local",
+                                      "Amazon-Cart-Ops-Local"])
+def test_skill_gate_normalizes_qualified_names(board, monkeypatch, spelling):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    _placed_env(monkeypatch, tid, 1)
+    assert (pff.skill_gate(spelling) or "").startswith("BROWSER_RAIL_ABSENT"), spelling
+
+
+def test_midrun_qualified_skill_view_is_gated_through_the_registry(board, monkeypatch, tmp_path):
+    _skills_home(monkeypatch, tmp_path)
+    from tools import rail_preflight as rp
+    from tools.registry import registry
+    import model_tools  # noqa: F401
+    rp._emitted.clear()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    _placed_env(monkeypatch, tid, 1)
+    out = json.loads(registry.dispatch("skill_view", {"name": "personal:amazon-cart-ops-local"}, task_id="t"))
+    assert out["error"].startswith("BROWSER_RAIL_ABSENT cap=browser-session host=ace-ai")
+    assert rp.take_rail_absent() == out["error"]
+
+
+@pytest.mark.parametrize("caps", [json.dumps({"*": "off"}), json.dumps({"*": "warn"})])
+def test_unplaced_worker_still_parks_on_a_rail_absent_whatever_the_caps_env(board, monkeypatch, caps):
+    # #1876: the dispatcher sets KANBAN_PLACEMENT_CAPS on EVERY spawn (off when the layer is
+    # off). An unplaced worker missing the rail must still record the line so the turn loop parks.
+    from tools import rail_preflight as rp
+    rp._emitted.clear()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.delenv(kwh.PLACEMENT_ENV, raising=False)
+    monkeypatch.setenv(khc.CAPS_ENV, caps)
+    monkeypatch.setattr(rp, "_endpoint_answers", lambda url: False)   # hermetic: no live :9222 probe
+    msg = rp.browser_rail_error("http://127.0.0.1:9222")
+    assert msg and msg.startswith("BROWSER_RAIL_ABSENT")
+    assert rp.take_rail_absent() == msg

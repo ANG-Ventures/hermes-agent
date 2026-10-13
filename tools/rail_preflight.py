@@ -128,13 +128,18 @@ _RAIL_CAP = {"BROWSER": "browser-session", "SCREEN": "screen"}
 def _emit(task: str, message: str) -> str:
     """Record ``message`` for the owning worker's turn loop to act on (park or re-route).
 
-    ``KANBAN_PLACEMENT_CAPS`` (F5, t_ecfd5591): when the dispatcher set it and this
-    rail's capability is not ``enforce``, the tool call is still refused (the operator's
-    browser/screen is not on this host either way) but nothing is recorded, so a
-    warn/off capability never blocks or re-routes the card. Absent = enforce (#1876).
+    ``KANBAN_PLACEMENT_CAPS`` (F5, t_ecfd5591): for a PLACED worker (spawned onto a pool
+    host) whose rail capability is not ``enforce``, the tool call is still refused (the
+    operator's browser/screen is not on this host either way) but nothing is recorded, so
+    a warn/off capability never blocks or re-routes the card. An unplaced worker always
+    records and parks, as in #1876: the dispatcher sets the caps env on every spawn (``off``
+    when the capability layer is off), so the env alone must not switch #1876 off
+    (#1963 Prism r2).
     """
     from hermes_cli import kanban_placement_failfast as pff
-    modes = pff.caps_modes()
+    from hermes_cli import kanban_worker_hosts as kwh
+    placed = kwh.BOOT_PLACED_HOST or kwh._placed_host(os.environ.get(kwh.PLACEMENT_ENV))
+    modes = pff.caps_modes() if placed and placed != "studio-local" else {}
     cap = _RAIL_CAP.get(message.split("_", 1)[0])
     if modes and cap and not pff.enforced(cap, modes):
         pff.note_gate_warn(cap, message, modes)
