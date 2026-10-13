@@ -2389,8 +2389,15 @@ DEFAULT_CONFIG = {
         # worker_reservation_gb) new workers per tick and none while its
         # sampler publishes band.kanban hot. false = computed and logged per
         # tick ("kanban admission (dry ...): would-refuse N"), never applied.
+        # local_only_tools_refused (t_a2817825, read per spawn): tool or toolset
+        # names a PLACED worker (pool host, or studio-local under local_worker_uid)
+        # refuses at registration, on top of the fixed allow-list in
+        # hermes_cli/kanban_placement_tools.py. Malformed = the allow-list alone.
         "placement": {"read_signal": True, "route_first": True,
-                      "admit_on_memory": False, "worker_reservation_gb": 6},
+                      "admit_on_memory": False, "worker_reservation_gb": 6,
+                      "local_only_tools_refused": ["browser", "browser-cdp", "browser-use",
+                                                   "checkpoints", "code_execution", "computer_use",
+                                                   "delegation", "mcp-stdio"]},
         "dispatch_load_gate": {
             "enabled": True,
             "pause_above": None,

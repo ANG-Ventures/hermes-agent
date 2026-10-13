@@ -11,6 +11,7 @@ import importlib
 import inspect
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -433,6 +434,16 @@ def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
     return cached[1] if cached is not None and now - cached[0] < _CHECK_FN_TTL_SECONDS else None
 
 
+def _refused_by_kanban_placement(name: str, toolset: str) -> bool:
+    """A placed kanban worker registers only placement-routed tools (t_a2817825). One env
+    lookup for every other process; the policy lives in ``hermes_cli.kanban_placement_tools``."""
+    hosts = sys.modules.get("hermes_cli.kanban_worker_hosts")
+    if not os.environ.get("KANBAN_WORKER_PLACEMENT") and not getattr(hosts, "BOOT_PLACED_HOST", None):
+        return False
+    from hermes_cli.kanban_placement_tools import gate_registration
+    return gate_registration(name, toolset)
+
+
 class ToolRegistry:
     """Singleton registry that collects tool schemas + handlers from tool files."""
 
@@ -693,6 +704,8 @@ class ToolRegistry:
             raise ValueError(
                 f"Tool {name!r}: schema['parameters'] must be an object (JSON Schema dict), "
                 f"got {type(params).__name__}")
+        if _refused_by_kanban_placement(name, toolset):
+            return
         handler_owner = self._plugin_owner_of(handler)
         caller_owner = self._plugin_namespace_of_module(self._caller_module())
         owner = caller_owner or handler_owner

@@ -438,6 +438,16 @@ def _portable_mcp_servers(safe_servers: Dict[str, dict]) -> None:
         logger.debug("Failed to load portable MCP servers", exc_info=True)
 
 
+def _refuse_stdio_when_placed(servers: Dict[str, dict]) -> Dict[str, dict]:
+    """A placed kanban worker spawns no stdio MCP server: it would run as the dispatcher's uid,
+    outside the placement (t_a2817825). HTTP servers pass."""
+    if not servers or not (os.environ.get("KANBAN_WORKER_PLACEMENT")
+                           or getattr(sys.modules.get("hermes_cli.kanban_worker_hosts"), "BOOT_PLACED_HOST", None)):
+        return servers
+    from hermes_cli.kanban_placement_tools import refuse_stdio_mcp_servers
+    return refuse_stdio_mcp_servers(servers)
+
+
 def _load_mcp_config() -> Dict[str, dict]:
     """``mcp_servers`` from config.yaml as ``{name: config}`` (empty on error / safe mode), ``${VAR}`` interpolated."""
     try:
@@ -458,7 +468,7 @@ def _load_mcp_config() -> Dict[str, dict]:
                 _warn_hidden_whitespace(name, interpolated)
                 safe_servers[name] = interpolated
         _portable_mcp_servers(safe_servers)
-        return safe_servers
+        return _refuse_stdio_when_placed(safe_servers)
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
         return {}

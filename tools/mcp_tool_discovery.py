@@ -522,7 +522,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     if not _core._ensure_mcp_sdk():
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
-    servers = _config._filter_suspicious_mcp_servers(servers)
+    servers = _config._refuse_stdio_when_placed(_config._filter_suspicious_mcp_servers(servers))
     try:
         return _register_mcp_servers(servers)
     finally:

@@ -7327,6 +7327,11 @@ def _default_spawn(
             _pff.stamp_placement(env, task, _kb.kanban_home() / "fleet")
         except Exception:
             _kb._log.debug("kanban dispatch: placement record stamp failed", exc_info=True)
+        # Placed workers register only placement-routed tools (t_a2817825).
+        from hermes_cli import kanban_placement_tools as _kpt
+        env[_kpt.REFUSED_ENV] = _kpt.spawn_env_value(_root_kanban_cfg())
+    else:
+        env.pop("KANBAN_PLACEMENT_TOOLS_REFUSED", None)
 
     cmd = [
         *_resolve_hermes_argv(),
