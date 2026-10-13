@@ -1971,7 +1971,22 @@ _OPENAI_ULTRAFAST_PRICING: Dict[str, PricingEntry] = {
         cache_read_cost_per_million_above=Decimal("12.00"),
         cache_write_cost_per_million_above=Decimal("150.00"),
     ),
+    # "Ultrafast pricing data" table, developers.openai.com/api/docs/pricing (checked 2026-10-13):
+    # 6x the gpt-6.1-sol Standard row on every bucket, both context tiers.
+    "gpt-6.1-sol": _snap(
+        "12.00", "60.00", "0.60", "15.00",
+        url="https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast",
+        version="openai-ultrafast-2026-10",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("24.00"),
+        output_cost_per_million_above=Decimal("90.00"),
+        cache_read_cost_per_million_above=Decimal("1.20"),
+        cache_write_cost_per_million_above=Decimal("30.00"),
+    ),
 }
+# The Hermes-side "-900k" Codex picker variant requests Ultrafast too (model_supports_ultrafast strips it),
+# and is the same model on the wire: alias it so its served-ultrafast turns price.
+_OPENAI_ULTRAFAST_PRICING.update({f"{_m}-900k": _e for _m, _e in list(_OPENAI_ULTRAFAST_PRICING.items())})
 # Anthropic fast mode (``speed: "fast"``): a premium on the whole context window, with the
 # prompt-caching multipliers applied on top. Selected per response by ``usage.speed``.
 _ANTHROPIC_FAST_MODE_PRICING: Dict[str, PricingEntry] = {
