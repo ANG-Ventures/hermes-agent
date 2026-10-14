@@ -19,6 +19,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from cli import HermesCLI
+
+# Captured at import: a test may monkeypatch ``cli.HermesCLI`` with a double before reading it.
+_REAL_START_PRELOADED_SKILLS = HermesCLI.start_preloaded_skills
+
 from agent.kanban_turn_recovery import (
     DEFAULT_MAX_RECOVERY_ATTEMPTS,
     RECOVERY_DELAYS_SECONDS,
@@ -489,6 +494,9 @@ def cli_harness(monkeypatch):
                 return result.get("final_response", "") if isinstance(result, dict) else ""
 
             # route plumbing
+            # The real (idempotent) preload start: a no-op here, no preload thread was built.
+            start_preloaded_skills = _REAL_START_PRELOADED_SKILLS
+
             def _claim_active_session(self, surface, *, stderr=False):
                 return True
 

@@ -66,6 +66,12 @@ def rail_absent_message(rail: str, host: str) -> str:
 
 
 def _owned_task() -> str:
+    """The card this context may act for. A background-review fork runs in the worker's
+    process with the parent's task, but its reads are housekeeping, not the card's work:
+    it never queues (or drains) a rail/ABSENT line for the parent run (t_ecfd5591)."""
+    from tools.skill_provenance import is_background_review
+    if is_background_review():
+        return ""
     from agent.delegation_context import owned_kanban_task
     return owned_kanban_task()
 
@@ -116,7 +122,39 @@ def _endpoint_answers(cdp_url: str) -> bool:
     return ok
 
 
+_RAIL_CAP = {"BROWSER": "browser-session", "SCREEN": "screen"}
+
+
 def _emit(task: str, message: str) -> str:
+    """Record ``message`` for the owning worker's turn loop to act on (park or re-route).
+
+    ``KANBAN_PLACEMENT_CAPS`` (F5, t_ecfd5591): for a PLACED worker (spawned onto a pool
+    host) whose rail capability is not ``enforce``, the tool call is still refused (the
+    operator's browser/screen is not on this host either way) but nothing is recorded, so
+    a warn/off capability never blocks or re-routes the card. An unplaced worker always
+    records and parks, as in #1876: the dispatcher sets the caps env on every spawn (``off``
+    when the capability layer is off), so the env alone must not switch #1876 off
+    (#1963 Prism r2).
+    """
+    from hermes_cli import kanban_placement_failfast as pff
+    from hermes_cli import kanban_worker_hosts as kwh
+    placed = kwh.BOOT_PLACED_HOST or kwh._placed_host(os.environ.get(kwh.PLACEMENT_ENV))
+    modes = pff.caps_modes() if kwh.is_pool_host(placed) else {}
+    cap = _RAIL_CAP.get(message.split("_", 1)[0])
+    if modes and cap and not pff.enforced(cap, modes):
+        pff.note_gate_warn(cap, message, modes)
+        return message
+    with _lock:
+        _emitted.setdefault(task, message)
+    return message
+
+
+def record_absent(message: str) -> Optional[str]:
+    """Record a ``<CAP>_ABSENT`` line from another gate (the mid-run skill_view gate) for the
+    owning worker's turn loop; None outside a dispatcher-owned worker."""
+    task = _owned_task()
+    if not task:
+        return None
     with _lock:
         _emitted.setdefault(task, message)
     return message

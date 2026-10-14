@@ -8102,7 +8102,7 @@ def _append_event(
     run_id: Optional[int] = None,
 ) -> None:
     """Insert an event row inside the caller's txn; ``run_id`` groups it by attempt (NULL = task-scoped)."""
-    if kind in _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS or (
+    if kind in _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS or kind in _RESPAWN_GUARD_CONTINUATION_KINDS or (
         kind == "dependency_wait" and (payload or {}).get("kind") == "dependency"
     ) or (kind == "reclaimed" and (payload or {}).get("manual") is True):
         # Snapshot comment causality in the same transaction as operator intent.
@@ -12219,8 +12219,13 @@ def block_task(
     expected_run_id: Optional[int] = None,
     until: Optional[int] = None,
     require_unclaimed_ready: bool = False,
+    loop_breaker: bool = True,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+
+    ``loop_breaker=False``: the caller already decided this block from its own
+    ledger (the placement re-route, t_ecfd5591 F1), so a recurrence never
+    routes the card to ``triage``; it lands ``blocked`` like a first block.
 
     ``require_unclaimed_ready`` fences a caller acting on a stale snapshot
     (the dispatcher's post-loop parking, t_8c474c2e): the block happens only
@@ -12427,7 +12432,7 @@ def block_task(
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
 
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
+        if loop_breaker and recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
             cur = conn.execute(
@@ -16107,6 +16112,15 @@ _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
     "requeued",
 )
 
+# Board-committed continuations that are not operator verbs: the placement
+# re-route (``kanban_placement_failfast.REROUTE_EVENT``, t_ecfd5591 review
+# 360354deb8ab) closes the run on a host that lacked a capability and returns
+# the card to its queue for a capable host. Its open PR is that work's
+# continuation, not a duplicate: one spawn after the newest PR comment
+# consumes it, like an operator requeue. Deliberately NOT in the operator
+# tuple above (overlap-hold release and failure staleness stay operator-only).
+_RESPAWN_GUARD_CONTINUATION_KINDS: tuple[str, ...] = ("placement_reroute",)
+
 # Event kinds that make a stamped failure STALE for the ``blocker_auth`` and
 # ``rate_limit_cooldown`` rules when they land at/after the failing run ended:
 # the operator-intent verbs above, the requeue events ``recent_success``
@@ -18182,9 +18196,11 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
     # Pre-upgrade intent events have no marker; an equal-second tie resumes:
     # one duplicate worker is recoverable, an indefinite guard is not.
     kinds = ",".join("?" * len(_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS))
+    cont = ",".join("?" * len(_RESPAWN_GUARD_CONTINUATION_KINDS))
     return conn.execute(
         "SELECT 1 FROM task_events i WHERE i.task_id = ? "
         f"AND (i.kind IN ({kinds}) OR "
+        f"i.kind IN ({cont}) OR "
         "(i.kind = 'reclaimed' AND json_extract(i.payload, '$.manual') = 1) OR "
         "(i.kind = 'dependency_wait' AND json_extract(i.payload, '$.kind') = 'dependency' "
         "AND EXISTS (SELECT 1 FROM task_events p WHERE p.task_id = i.task_id "
@@ -18192,9 +18208,14 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
         "AND (json_extract(i.payload, '$.after_comment_id') >= ? OR "
         "(json_type(i.payload, '$.after_comment_id') IS NULL AND i.created_at >= ?)) "
         "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = i.task_id "
-        "AND s.kind = 'spawned' AND s.id > i.id) LIMIT 1",
-        (task_id, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS,
-         pr_comment["id"], pr_comment["created_at"]),
+        "AND s.kind = 'spawned' AND s.id > i.id "
+        # A continuation is consumed by a genuine SUCCESSOR spawn only: the re-routed run's own
+        # late-spawn audit (same run, claim lost) is not one (t_ecfd5591 c9e6038b0137).
+        # Operator intents keep "any later spawn consumes".
+        f"AND NOT (i.kind IN ({cont}) AND (IFNULL(s.run_id = i.run_id, 0) "
+        "OR IFNULL(json_extract(s.payload, '$.claim_lost'), 0) = 1))) LIMIT 1",
+        (task_id, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS, *_RESPAWN_GUARD_CONTINUATION_KINDS,
+         pr_comment["id"], pr_comment["created_at"], *_RESPAWN_GUARD_CONTINUATION_KINDS),
     ).fetchone() is not None
 
 def _reassign_stale_pr_owners(

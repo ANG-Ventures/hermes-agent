@@ -22,6 +22,12 @@ def _no_inherited_kanban_env(monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
 
 
+def _with_real_preload_start(stub):
+    """Bind the real (idempotent) preload start; a no-op here, no preload thread was built."""
+    stub.start_preloaded_skills = cli.HermesCLI.start_preloaded_skills.__get__(stub)
+    return stub
+
+
 def _run_non_quiet(monkeypatch, turn_result):
     """Drive ``_run_single_query_mode`` down the non-quiet tail; return the exit code (None = fell through)."""
     monkeypatch.setattr(cli, "_should_seed_interactive", lambda *a, **k: False)
@@ -38,7 +44,7 @@ def _run_non_quiet(monkeypatch, turn_result):
         _last_turn_result=turn_result,
     )
     try:
-        cli._run_single_query_mode(stub, "do the thing", None, False, True)
+        cli._run_single_query_mode(_with_real_preload_start(stub), "do the thing", None, False, True)
     except SystemExit as exc:
         return exc.code
     return None
@@ -105,5 +111,5 @@ def test_quiet_kanban_worker_exits_tempfail_when_credentials_are_rate_limited(mo
         model="gpt-x",
     )
     with pytest.raises(SystemExit) as exc:
-        cli._run_single_query_mode(stub, "do the thing", None, True, True)
+        cli._run_single_query_mode(_with_real_preload_start(stub), "do the thing", None, True, True)
     assert exc.value.code == expected

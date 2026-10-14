@@ -23,10 +23,10 @@ import pwd
 import re
 from typing import Any, Mapping, Optional
 
+from hermes_cli.kanban_worker_hosts import LOCAL_HOST_NAME
 from hermes_cli.kanban_worker_pool import PoolHost
 
 KNOB = "local_worker_uid"
-LOCAL_HOST_NAME = "studio-local"
 LOCAL_SSH_HOST = "localhost"
 
 # A POSIX login, the hidden ``_name`` form included. Anything else is refused, not guessed.

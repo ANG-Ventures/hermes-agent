@@ -144,6 +144,74 @@ def test_hook_a_no_event_when_block_did_not_happen(fleet, monkeypatch):
     assert _events(tid) == []
 
 
+# ── Hook A, both rail spellings through the one seam (t_ecfd5591 review 77f581ae3801) ───────────────
+def _placed(monkeypatch, host="ace-ai"):
+    monkeypatch.setenv(kwh.PLACEMENT_ENV, json.dumps({"host": host, "env": {}}))
+    # Hook A is under test, not custody: the host proved the run's workspace empty (no ssh).
+    monkeypatch.setattr(kwh, "remote_workspace_has_content", lambda raw, runner=None: False)
+
+
+@pytest.mark.parametrize("cap,tool,req", [("browser-session", "browser_*", "K23"), ("screen", "computer_use", "K21")])
+def test_hook_a_new_gate_spelling_emits_once_after_the_board_decision(fleet, monkeypatch, cap, tool, req):
+    from hermes_cli import kanban_placement_failfast as pff
+    from hermes_cli import kanban_worker_exit as kwe
+    tid, run_id = _card(monkeypatch)
+    _placed(monkeypatch)
+    line = pff.absent_line(cap, "ace-ai")
+    assert kwe.block_on_rail_absent(line) is True          # placed: re-route, committed
+    hooks.on_rail_absent(line)                              # same run again: deduped
+    (e,) = _events(tid)
+    assert (e["gap_class"], e["tool"], e["requirement_id"], e["host_raw"], e["_run_id"]) == (
+        "rail_absent", tool, req, "ace-ai", run_id)
+    assert len([r for r in _ledger(fleet) if r["task_id"] == tid]) == 1
+
+
+def test_hook_a_old_spelling_still_emits(fleet, monkeypatch):
+    tid, _ = _card(monkeypatch)
+    from hermes_cli import kanban_worker_exit as kwe
+    assert kwe.block_on_rail_absent(BROWSER) is True
+    assert [e["tool"] for e in _events(tid)] == ["browser_*"]
+
+
+def test_hook_a_non_rail_absent_line_emits_nothing(fleet, monkeypatch):
+    from hermes_cli import kanban_placement_failfast as pff
+    from hermes_cli import kanban_worker_exit as kwe
+    tid, _ = _card(monkeypatch)
+    _placed(monkeypatch)
+    assert kwe.block_on_rail_absent(pff.absent_line("imessage", "ace-ai")) is True
+    tid2, _ = _card(monkeypatch)
+    _placed(monkeypatch)
+    assert kwe.block_on_rail_absent(pff.indeterminate_line("ace-ai")) is True
+    assert _events(tid) == [] and _events(tid2) == []
+
+
+def test_hook_a_stale_owner_and_unowned_emit_nothing(fleet, monkeypatch):
+    from hermes_cli import kanban_placement_failfast as pff
+    from hermes_cli import kanban_worker_exit as kwe
+    tid, run_id = _card(monkeypatch)
+    _placed(monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id + 7))          # a stale run
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-ai")) is False
+    tid2, _ = _card(monkeypatch, owned=False)                             # no owned task
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-ai")) is False
+    assert _events(tid) == [] and _events(tid2) == []
+
+
+def test_hook_a_ledger_failure_keeps_the_committed_decision(fleet, monkeypatch):
+    from hermes_cli import kanban_placement_failfast as pff
+    from hermes_cli import kanban_worker_exit as kwe
+    tid, _ = _card(monkeypatch)
+    _placed(monkeypatch)
+    monkeypatch.setattr(gap, "_append_ledger", lambda line: (_ for _ in ()).throw(OSError("disk full")))
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-ai")) is True
+    assert len(_events(tid)) == 1 and _ledger(fleet) == []
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "ready"
+    finally:
+        conn.close()
+
+
 # ── Hook B: toolset scope (classification is the key, never requirement_id null-ness) ─────────────
 def test_hook_b_out_of_scope_is_profile_toolset_with_null_requirement(fleet, monkeypatch):
     tid, _ = _card(monkeypatch)

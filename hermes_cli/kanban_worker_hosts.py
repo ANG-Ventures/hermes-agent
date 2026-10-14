@@ -26,6 +26,10 @@ from typing import Callable, Dict, MutableMapping, Optional
 from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv  # noqa: F401
 
 PLACEMENT_ENV = "KANBAN_WORKER_PLACEMENT"
+# The synthetic placement of a Studio-local worker (``kanban_local_worker_uid``). Defined here,
+# in the platform-independent module, so classifying a host never imports the POSIX uid code
+# (t_ecfd5591 f6dcfd6d5efb).
+LOCAL_HOST_NAME = "studio-local"
 REAPPLY_FAILED_KEY = "placement_reapply_failed"
 
 _PROBE_TIMEOUT_SECONDS = 8
@@ -149,11 +153,61 @@ def local_workspace_has_content(path: Optional[str]) -> bool:
         return True
 
 
+def remote_workspace_has_content(placement_raw: Optional[str],
+                                 runner: Callable = subprocess.run) -> bool:
+    """True unless the placed host PROVES this run's workspace empty or absent.
+
+    Workspaces are host-local (``TERMINAL_SSH_SYNC_FILES=false``), so a run
+    re-routed elsewhere would leave anything here behind (t_ecfd5591
+    0e9694bf2944). Any doubt (no placement, no path, ssh failure) is content.
+    """
+    if not placement_raw:
+        return True
+    try:
+        env = json.loads(placement_raw).get("env") or {}
+        workspace, ssh_host = env.get("TERMINAL_CWD"), env.get("TERMINAL_SSH_HOST")
+        if not workspace or not ssh_host:
+            return True
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
+        if str(env.get("TERMINAL_SSH_PORT") or "22") != "22":
+            argv += ["-p", str(env["TERMINAL_SSH_PORT"])]
+        target = f"{env['TERMINAL_SSH_USER']}@{ssh_host}" if env.get("TERMINAL_SSH_USER") else ssh_host
+        # rc 0 = empty or proven absent, rc 3 = has entries; anything else (ssh 255, perms, I/O)
+        # fails closed. ``[ -e ]`` is false for ENOENT, for a dangling link AND for a path under
+        # an unsearchable parent, so absence is proven only when the nearest existing ancestor is
+        # a searchable, readable directory (t_ecfd5591 parent-custody-permissions); a dangling
+        # link stops the climb and counts as content. Presence is ``find``'s first entry printed
+        # with its "$w/" prefix, so no filename (newline, blank) can read as empty, and a listing
+        # error is find's own nonzero exit (24a15e048a61).
+        script = (f"w={shlex.quote(workspace)}; p=$w; c=; "
+                  'while [ ! -e "$p" ] && [ ! -L "$p" ]; do q=$(dirname -- "$p"); '
+                  '[ "$q" = "$p" ] && exit 5; c=$(basename -- "$p"); p=$q; done; '
+                  'if [ -z "$c" ]; then [ -d "$w" ] && [ ! -L "$w" ] || exit 3; '
+                  'o=$(find "$w" -mindepth 1 -maxdepth 1 -print -quit) || exit 4; '
+                  '[ -z "$o" ] && exit 0; exit 3; fi; '
+                  '[ -d "$p" ] && [ -x "$p" ] && [ -r "$p" ] || exit 5; exit 0')
+        proc = runner(argv + [target, script],
+                      capture_output=True, text=True, timeout=_PROBE_TIMEOUT_SECONDS,
+                      stdin=subprocess.DEVNULL)
+        return getattr(proc, "returncode", 1) != 0
+    except Exception:
+        _log.warning("placement custody probe failed; treating the workspace as holding work",
+                     exc_info=True)
+        return True
+
+
 def _placed_host(raw: Optional[str]) -> Optional[str]:
     try:
         return str(json.loads(raw or "").get("host") or "") or None
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+def is_pool_host(host: Optional[str]) -> bool:
+    """True for a real pool placement. The synthetic local-worker placement
+    (``studio-local``) runs on the Studio itself, so every placement gate and the
+    exit seam treat it as unplaced: one classification (t_ecfd5591 03985b00389e)."""
+    return bool(host) and host != LOCAL_HOST_NAME
 
 
 # Boot record (RC-9): the placement this worker process was spawned with.

@@ -142,26 +142,35 @@ def _park_needs_input(reason: str) -> bool:
 
 
 def block_on_rail_absent(message: str) -> bool:
-    """Park the card ``needs_input`` with a ``*_RAIL_ABSENT:`` tool error verbatim.
+    """End this worker's run on a ``^[A-Z_]+_ABSENT`` line (rail tool, skill_view gate).
 
-    t_db491366: a worker that needs the operator's browser/screen but runs where
-    neither exists must not retry; the fix is re-pinning the card, which the
-    message names. Never raises.
+    t_db491366: a worker that needs a capability its host lacks must not retry.
+    t_ecfd5591 (F1): a PLACED worker's card is re-routed once by its own
+    ``placement_reroute`` ledger (``requires: <cap>`` appended to the body) and a
+    second miss parks it ``needs_input``; an unplaced worker parks ``needs_input``
+    with the line verbatim. A first miss whose host-local workspace may hold work parks
+    instead (custody, 0e9694bf2944). Never raises.
     """
     try:
-        if "_RAIL_ABSENT:" not in str(message or ""):
-            return False
-        from agent.delegation_context import owned_kanban_task
-        if not owned_kanban_task():  # in-process cron / delegate child: never park the worker's card
-            return False
-        parked = _park_needs_input(str(message))
-        if parked:  # Hook A (t_b1100bf0): the gap event is its own transaction, after block_task committed
-            try:  # best-effort: a hook failure must never turn a committed park into "not parked"
+        from hermes_cli import kanban_worker_hosts as kwh
+        placed = kwh.BOOT_PLACED_HOST or kwh._placed_host(os.environ.get(kwh.PLACEMENT_ENV))
+        if kwh.is_pool_host(placed):
+            from hermes_cli import kanban_placement_failfast as pff
+            handled = pff.worker_exit_on_absent(str(message or "")) is not None
+        else:  # unplaced: #1876 verbatim
+            if "_RAIL_ABSENT:" not in str(message or ""):
+                return False
+            from agent.delegation_context import owned_kanban_task
+            if not owned_kanban_task():  # in-process cron / delegate child: never park the worker's card
+                return False
+            handled = _park_needs_input(str(message))
+        if handled:  # Hook A (t_b1100bf0): its own transaction, after the board decision committed
+            try:  # best-effort: a hook failure must never turn a committed decision into "not handled"
                 from tools.capability_gap_hooks import on_rail_absent
                 on_rail_absent(str(message))
             except Exception:
                 logging.getLogger(__name__).warning("rail-absent capability gap hook failed", exc_info=True)
-        return parked
+        return handled
     except Exception:
         logging.getLogger(__name__).warning("rail-absent block failed", exc_info=True)
         return False

@@ -33,6 +33,8 @@ def test_credential_resolution_exit(monkeypatch, quiet, worker, kind, worker_exi
     shell.session_id = "fixture-session"
     shell._last_turn_result = None
     shell._claim_active_session = lambda *a, **k: True
+    # The real (idempotent) preload start: a no-op here, no preload thread was built.
+    shell.start_preloaded_skills = cli.HermesCLI.start_preloaded_skills.__get__(shell)
     shell._show_security_advisories = lambda: None
     shell._print_exit_summary = lambda **k: None
     shell.console = SimpleNamespace(print=lambda *a, **k: None)
