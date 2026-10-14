@@ -117,7 +117,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Resolve the original conversation owner on each operation after reconnect."""
         resolver = getattr(self, "_adapter_resolver", None)
         if resolver is not None:
-            return resolver()
+            replacement = resolver()
+            if replacement is not None:
+                return replacement
         return self._initial_adapter
 
     @adapter.setter
