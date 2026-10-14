@@ -54,6 +54,23 @@ async def test_missing_replacement_does_not_borrow_another_bot():
     consumer = GatewayStreamConsumer(old, "thread", adapter_resolver=lambda: None)
     assert not await consumer._send_commentary("not delivered")
     assert consumer._delivered_commentary_texts == []
+    assert consumer.adapter is old
+
+
+def test_explicit_secondary_gap_does_not_resolve_shared_primary(tmp_path):
+    from gateway.authz_mixin import GatewayAuthorizationMixin
+    from gateway.session_identity import RoutingIdentity
+    runner = GatewayAuthorizationMixin()
+    primary, secondary = transport(), transport()
+    runner.adapters = {Platform.DISCORD: primary}
+    runner._profile_adapters = {"secondary": {}}
+    runner._transport_owner = lambda source: None
+    runner._is_shared_bot_satellite = lambda profile: True
+    source = SimpleNamespace(platform=Platform.DISCORD, _identity=RoutingIdentity(
+        "secondary", "secondary", tmp_path, tmp_path))
+    assert runner._delivery_adapter_for(source) is None
+    runner._profile_adapters["secondary"][Platform.DISCORD] = secondary
+    assert runner._delivery_adapter_for(source) is secondary
 
 
 @pytest.mark.asyncio

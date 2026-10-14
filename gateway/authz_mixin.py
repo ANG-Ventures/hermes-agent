@@ -277,6 +277,10 @@ class GatewayAuthorizationMixin:
         from gateway.session_identity import identity_of
         identity = identity_of(source)
         if identity is not None and identity.multiplexed:
+            # An explicit receiving profile is not a shared-bot routing hint. During
+            # teardown its empty slot must not fall through to the primary bot.
+            if identity.transport_profile not in (None, "", "default") and not identity.transport_inferred:
+                return self._profile_adapters_map().get(identity.transport_profile, {}).get(platform)
             return self._adapters_for_profile(identity.transport_profile).get(platform) if platform else None
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return self._primary_adapters().get(platform) if platform else None
