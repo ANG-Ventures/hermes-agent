@@ -50,11 +50,27 @@ async def test_existing_preview_final_edit_uses_replacement():
 
 @pytest.mark.asyncio
 async def test_missing_replacement_does_not_borrow_another_bot():
-    old = transport(False)
+    old = transport(True)
     consumer = GatewayStreamConsumer(old, "thread", adapter_resolver=lambda: None)
     assert not await consumer._send_commentary("not delivered")
     assert consumer._delivered_commentary_texts == []
-    assert consumer.adapter is old
+    assert consumer.adapter is None
+    old.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_native_seed_survives_unavailable_owner_then_replacement():
+    old, new = transport(), transport()
+    old.send_stream_frame = AsyncMock(return_value=True)
+    new.send_stream_frame = AsyncMock(return_value=True)
+    current = [old]
+    consumer = GatewayStreamConsumer(old, "thread", adapter_resolver=lambda: current[0])
+    current[0] = None
+    assert not await consumer._try_seed_frame("seed failed: %s")
+    old.send_stream_frame.assert_not_called()
+    current[0] = new
+    assert await consumer._try_seed_frame("seed failed: %s")
+    new.send_stream_frame.assert_awaited_once()
 
 
 def test_explicit_secondary_gap_does_not_resolve_shared_primary(tmp_path):
