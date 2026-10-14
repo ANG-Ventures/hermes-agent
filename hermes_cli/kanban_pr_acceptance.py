@@ -159,7 +159,10 @@ def collect_acceptance(contract: str, published_pr: str | None,
                            profile_home=profile_home).get("protection") or {})
         checks_cfg = protection.get("required_status_checks") or {}
         required = {(r["context"], r.get("app_id")) for r in checks_cfg.get("checks", [])}
-        required.update((c, None) for c in checks_cfg.get("contexts", []) if c not in {r[0] for r in required})
+        if set(checks_cfg.get("contexts", [])) - {c for c, _ in required}:
+            # A context listed without its ``checks`` entry has an undeterminable app binding;
+            # treating it as unpinned would let any producer's same-named check satisfy it.
+            raise ValueError("required context without an app binding in branch protection")
         stage = "read branch rulesets"
         rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
                      paginate=True, profile_home=profile_home)
@@ -258,8 +261,11 @@ def _break_glass_waiver(repo: str, canonical: str, number: int, sha: str, curren
     waiver (the card stays ``missing``):
     - GitHub says the PR is merged at this head, by ``merged_by``;
     - that same account posted the fleet-merge attribution comment (``🤖 merged-by:``) naming
-      ``offbox-security-receipt: <path>`` and listing each waived context as
-      ``<ctx> (required, ABSENT on head)`` in ``red-ci allowed [...]``;
+      ``offbox-security-receipt: <path>`` and listing each waived context as a whole
+      ``<ctx> (required, ABSENT on head)`` element of ``red-ci allowed [...]``;
+    - fleet-merge's landing ledger (``<hermes root>/state/merge-ledger.jsonl``) has a ``merge`` row
+      for the canonical OWNER/REPO, this PR and head, naming that same receipt: the receipt file
+      carries only the repo basename, so the ledger row is what binds the owner;
     - the receipt lives under ``<hermes root>/var/ci-box/``, names this head and
       ``<repo-name>-<pr>-<head12>``, and every gate rung is rc=0.
     Failed, pending and stale checks are never waived: only absence on an operator break-glass merge.
@@ -269,33 +275,80 @@ def _break_glass_waiver(repo: str, canonical: str, number: int, sha: str, curren
     if not merger or current["head"]["sha"] != sha:
         return None
     absent = {c["name"] for c in checks if c["classification"] == "missing"}
+    if any(" (required, ABSENT on head)" in c["name"] or ")]: " in c["name"] for c in checks):
+        # A context name carrying the list's own delimiters makes the attribution list ambiguous.
+        return None
     pages = _api(f"repos/{repo}/issues/{number}/comments?per_page=100", paginate=True, profile_home=profile_home)
-    root = (Path(get_default_hermes_root()) / "var" / "ci-box").resolve()
+    hermes_root = Path(get_default_hermes_root())
+    root = (hermes_root / "var" / "ci-box").resolve()
     for comment in (c for page in pages for c in page):
         body = comment.get("body") or ""
         if (comment.get("user") or {}).get("login") != merger or not body.startswith("\U0001f916 merged-by:"):
             continue
         path = re.search(r"offbox-security-receipt: (\S+)", body)
-        allowed = re.search(r"red-ci allowed \[([^\]]*)\]", body)
-        if not path or not allowed:
+        start = body.find("red-ci allowed [")
+        if not path or start < 0:
             continue
-        waivable = {m.strip() for m in re.findall(r"([^,\[]+?) \(required, ABSENT on head\)", allowed[1])}
-        if not absent <= waivable:
+        # fleet-merge writes "red-ci allowed [<e1>,<e2>]: <reason>"; every element ends in ")",
+        # so the list ends at the first ")]: " and the free-text reason can never supply an element.
+        allowed = body[start + len("red-ci allowed ["):]
+        end = allowed.find(")]: ")
+        if end < 0:
+            continue
+        listed = allowed[:end + 1]
+        # An element starts the list or follows a previous ABSENT element's ")," — so a comma inside
+        # another name ("lint,<ctx> (required, ...)") can never read as a listing of <ctx>.
+        if not all(re.search(r"(?:^|\),)" + re.escape(ctx + " (required, ABSENT on head)") + r"(?=,|$)", listed)
+                   for ctx in absent):
             continue
         evidence = _read_offbox_receipt(Path(path[1]), root, canonical.split("/")[1], number, sha)
-        if evidence:
+        if not evidence:
+            continue
+        landing = _landing_record(hermes_root / "state" / "merge-ledger.jsonl", canonical, number, sha,
+                                  evidence["receipt"])
+        if landing:
             return {"kind": "break-glass-offbox", "merged_by": merger, "comment_id": comment.get("id"),
-                    "comment_url": comment.get("html_url"), "contexts": sorted(absent), **evidence}
+                    "comment_url": comment.get("html_url"), "contexts": sorted(absent), **evidence, **landing}
     return None
+
+
+def _landing_record(ledger: Path, canonical: str, number: int, sha: str, receipt: str) -> dict | None:
+    """fleet-merge's ``merge`` ledger row for exactly OWNER/REPO#number@sha naming ``receipt``."""
+    try:
+        with ledger.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if sha not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(row, dict) and row.get("action") == "merge" and row.get("head") == sha
+                        and row.get("pr") == number and str(row.get("repo", "")).lower() == canonical.lower()
+                        and _resolved(row.get("receipt_path")) == receipt):
+                    return {"ledger_repo": row["repo"], "ledger_attempt_id": row.get("attempt_id"),
+                            "ledger_ts": row.get("ts")}
+    except OSError:
+        return None
+    return None
+
+
+def _resolved(path) -> str | None:
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        return str(Path(path).expanduser().resolve(strict=True))
+    except (OSError, RuntimeError):
+        return None
 
 
 def _read_offbox_receipt(path: Path, root: Path, repo_name: str, number: int, sha: str) -> dict | None:
     import hashlib
     try:
-        resolved = path.resolve(strict=True)
+        resolved = path.expanduser().resolve(strict=True)
         resolved.relative_to(root)
         raw = resolved.read_bytes()
-    except (OSError, ValueError):
+    except (OSError, RuntimeError, ValueError):
         return None
     fields = {}
     for line in raw.decode("utf-8", "replace").splitlines():

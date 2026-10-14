@@ -95,9 +95,13 @@ never ran (absent, not failed/pending/stale) is accepted when, and only when, th
 account GitHub reports as `merged_by` posted the `fleet-merge` attribution comment
 naming `offbox-security-receipt: <path>` and listing each such context as
 `<ctx> (required, ABSENT on head)`, and that receipt sits under
-`<hermes root>/var/ci-box/`, names this head and `<repo>-<pr>-<head12>`, with
-every gate rung `rc=0`. The receipt records a `waiver` (comment id, receipt path
-and sha256) and marks those checks `waived`. A transferred repository is accepted
+`<hermes root>/var/ci-box/` (a `~` path is expanded first), names this head and
+`<repo>-<pr>-<head12>`, with every gate rung `rc=0`, and fleet-merge's
+`state/merge-ledger.jsonl` holds a `merge` row for the full OWNER/REPO, PR and head
+naming that same receipt (a fork with the same name, number and head is refused).
+Required contexts must carry their app binding in branch protection; one without it
+fails closed. The receipt records a `waiver` (comment id, receipt path and sha256,
+ledger row) and marks those checks `waived`. A transferred repository is accepted
 only when GitHub resolves the bound URL to the same PR; the canonical name is
 recorded as `canonical_repo`, the contract is never rewritten. Design and measured
 cause: `docs/kanban/pr-acceptance-bookkeeping.md`.
