@@ -348,15 +348,20 @@ def test_stamp_is_dropped_when_the_files_change_during_derivation(board, monkeyp
         tid = kb.create_task(conn, title="t", assignee="daedalus", body="plain")
     real = pff.hard_requirements
 
-    def racing(body, skills, fleet_dir):
-        out = real(body, skills, fleet_dir)
-        idx = Path(fleet_dir) / khc.INDEX_FILE
+    def racing(cmap, body, skills):
+        out = real(cmap, body, skills)
+        idx = board / khc.INDEX_FILE
         idx.write_bytes(idx.read_bytes() + b"\n")          # the index changes mid-derivation
         return out
     monkeypatch.setattr(pff, "hard_requirements", racing)
-    assert pff.placement_record(_task(tid), board) == {}
-    monkeypatch.setattr(pff, "hard_requirements", real)
     task = _task(tid)
+    snap = pff._fleet_bytes(board)
+    rec = pff.placement_record(task, board)
+    # The stamp describes the bytes it derived from, never the files written meanwhile
+    # (23e10f0f6800): its hash is of the captured pair, so the boot check sees a stale route.
+    assert rec[pff.ROUTE_HASH_KEY] == pff.route_hash(task.body, task.skills or (), board, snapshot=snap)
+    assert rec[pff.ROUTE_HASH_KEY] != pff.route_hash(task.body, task.skills or (), board)
+    monkeypatch.setattr(pff, "hard_requirements", real)
     rec = pff.placement_record(task, board)
     assert rec[pff.ROUTE_HASH_KEY] == pff.route_hash(task.body, task.skills or (), board)
 
@@ -403,16 +408,16 @@ def _revoke_on_read(monkeypatch, board, host="ace-ai", cap="browser-session", af
     revoked = dict(doc)
     revoked["hosts"] = {**doc["hosts"], host: {**doc["hosts"][host],
                         "capabilities": [c for c in doc["hosts"][host]["capabilities"] if c != cap]}}
-    real = khc.load_map
+    real = pff.snapshot_map
     calls = {"n": 0}
 
-    def load(fleet_dir):
-        out = real(fleet_dir)
+    def load(snapshot):
+        out = real(snapshot)
         calls["n"] += 1
         if calls["n"] == after:
             m.write_text(json.dumps(revoked))
         return out
-    monkeypatch.setattr(khc, "load_map", load)
+    monkeypatch.setattr(pff, "snapshot_map", load)
     return calls
 
 
@@ -475,19 +480,19 @@ def test_unplaced_worker_still_parks_on_a_rail_absent_whatever_the_caps_env(boar
 # -- Apollo review 2026-10-13 on #1963 @274fcd8c ----------------------------------------------
 
 def _churn(monkeypatch, board, *, raise_too=False):
-    """Every load_map rewrites the map (still valid JSON): no two reads ever agree."""
+    """Every snapshot parse rewrites the map (still valid JSON): no two reads ever agree."""
     m = board / khc.MAP_FILE
-    real = khc.load_map
+    real = pff.snapshot_map
     n = {"loads": 0}
 
-    def load(fleet_dir):
-        out = real(fleet_dir)
+    def load(snapshot):
+        out = real(snapshot)
         n["loads"] += 1
         m.write_text(m.read_text() + "\n")
         if raise_too:
             raise RuntimeError("index mid-write")
         return out
-    monkeypatch.setattr(khc, "load_map", load)
+    monkeypatch.setattr(pff, "snapshot_map", load)
     monkeypatch.setattr(pff, "_SNAPSHOT_BACKOFF_S", 0.0)
     return n
 
@@ -555,7 +560,7 @@ def test_every_skill_spelling_derives_the_same_requirements(board, spelling):
     cmap = khc.load_map(board)
     reqs, _ = khc.derive("", [spelling], cmap)
     assert sorted({r.cap for r in reqs if r.strength == khc.HARD}) == ["browser-session", "keychain"]
-    assert pff.hard_requirements("", [spelling], board) == ["browser-session", "keychain"]
+    assert pff.hard_requirements(cmap, "", [spelling]) == ["browser-session", "keychain"]
     assert pff._skill_key(spelling) == khc.skill_key(spelling) == "browser-access"
 
 
@@ -694,7 +699,7 @@ def test_unknown_hard_requirement_is_kept_and_refused_under_enforcement(board, m
     # 470af3484c95: an unresolved hard requirement is a requirement, never "needs nothing".
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="t", assignee="daedalus", body=body)
-    assert "unknown:never-defined-cap" in pff.hard_requirements(body, [], board)
+    assert "unknown:never-defined-cap" in pff.hard_requirements(khc.load_map(board), body, [])
     rec = pff.placement_record(_task(tid), board)
     assert "unknown:never-defined-cap" in rec[pff.REQUIRES_KEY]
     for record in (rec, None):                                   # fresh stamp, and a stale route
@@ -1076,6 +1081,243 @@ def test_mixed_requirement_with_preload_unknown_parks_only(board, monkeypatch):
     _placed_env(monkeypatch, tid, 1)
     assert pff.boot_check(tid).startswith("BROWSER_RAIL_ABSENT")                 # control
     monkeypatch.setattr(pff, "hard_requirements",
-                        lambda body, skills, fd, _r=pff.hard_requirements:
-                        ["unknown:never-defined-cap"] if list(skills) == ["odd-skill"] else _r(body, skills, fd))
+                        lambda cmap, body, skills, _r=pff.hard_requirements:
+                        ["unknown:never-defined-cap"] if list(skills) == ["odd-skill"] else _r(cmap, body, skills))
     assert pff.boot_check(tid, preloads=["odd-skill"]).startswith(pff.UNRESOLVED_TOKEN)
+
+
+# -- parent review of 3d52e02b: combined correction A1-A6 (residual-probe.py) ------------------
+
+def test_boot_check_uses_the_captured_placement_when_the_env_record_changes(board, monkeypatch):
+    # A1 0c0e383033ed: the runtime path reads the placement captured at process start.
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="requires: browser-session")
+    _placed_env(monkeypatch, tid, 1)
+    monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", None)
+    assert kwh.capture_boot_placement() == "ace-ai"
+    control = pff.boot_check(tid)
+    assert control.startswith("BROWSER_RAIL_ABSENT cap=browser-session host=ace-ai")
+    monkeypatch.delenv(kwh.PLACEMENT_ENV)
+    assert pff.boot_check(tid) == control                                  # env record dropped
+    monkeypatch.setenv(kwh.PLACEMENT_ENV, json.dumps({"host": "studio-local"}))
+    assert pff.boot_check(tid) == control                                  # env record rewritten
+
+
+def test_boot_check_rederives_when_the_stamp_names_another_placement(board, monkeypatch):
+    # A1: a stamp for another host is not trusted; the current card decides.
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="requires: browser-session")
+    monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", "ace-ai")
+    lie = {"host": "studio", pff.REQUIRES_KEY: [],
+           pff.ROUTE_HASH_KEY: pff.route_hash("requires: browser-session", [], board)}
+    monkeypatch.setenv(kwh.PLACEMENT_ENV, json.dumps(lie))
+    monkeypatch.setenv(khc.CAPS_ENV, ENFORCE_BROWSER)
+    assert pff.boot_check(tid).startswith("BROWSER_RAIL_ABSENT cap=browser-session host=ace-ai")
+    # Controls: an explicit environ is a complete fixture; genuinely unplaced stays inert.
+    assert pff.boot_check(tid, environ={kwh.PLACEMENT_ENV: json.dumps({"host": "studio-local"}),
+                                        khc.CAPS_ENV: ENFORCE_BROWSER}) is None
+    monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", None)
+    monkeypatch.delenv(kwh.PLACEMENT_ENV)
+    assert pff.boot_check(tid) is None
+
+
+def _typo_index(board, skill="typo-skill", cap="browser_sesion"):
+    idxp = board / khc.INDEX_FILE
+    idx = json.loads(idxp.read_text())
+    idx["skills"][skill] = [cap]
+    idx["source_hash"] = khc.index_hash(idx["skills"])
+    idxp.write_text(json.dumps(idx))
+    assert khc.load_map(board).index_error is None
+
+
+@pytest.mark.parametrize("spelling", ["typo-skill", "personal/typo-skill", "personal:typo-skill"])
+def test_preload_and_midrun_refuse_an_unresolved_skill_prerequisite_alike(board, monkeypatch, spelling):
+    # A2 682bd83da2ba / 289d1155b74d: one normalization, one unresolved-first decision.
+    _typo_index(board)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    _placed_env(monkeypatch, tid, 1)
+    boot = pff.boot_check(tid, preloads=[spelling])
+    mid = pff.skill_gate(spelling)
+    assert boot is not None and boot.startswith(pff.UNRESOLVED_TOKEN), boot
+    assert mid == boot
+    # Controls: a known missing skill refuses as before, a served skill admits, WARN is inert.
+    assert pff.skill_gate("amazon-cart-ops-local").startswith("BROWSER_RAIL_ABSENT")
+    assert pff.skill_gate("some-coding-skill") is None
+    _placed_env(monkeypatch, tid, 1, caps=json.dumps({"*": "warn"}))
+    assert pff.skill_gate(spelling) is None and pff.boot_check(tid, preloads=[spelling]) is None
+
+
+def test_midrun_unresolved_parks_before_a_known_miss(board, monkeypatch):
+    # A2: a skill needing both a known missing cap and an unknown word parks unresolved first.
+    _typo_index(board, skill="mixed-skill", cap="browser_sesion")
+    idxp = board / khc.INDEX_FILE
+    idx = json.loads(idxp.read_text())
+    idx["skills"]["mixed-skill"] = ["browser-session", "browser_sesion"]
+    idx["source_hash"] = khc.index_hash(idx["skills"])
+    idxp.write_text(json.dumps(idx))
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="x")
+    _placed_env(monkeypatch, tid, 1)
+    assert pff.skill_gate("mixed-skill").startswith(pff.UNRESOLVED_TOKEN)
+    assert pff.boot_check(tid, preloads=["mixed-skill"]).startswith(pff.UNRESOLVED_TOKEN)
+
+
+def test_a_map_replaced_and_restored_during_evaluation_is_never_read(board, monkeypatch):
+    # A3 23e10f0f6800: the evaluation parses the captured bytes; a granting map written and
+    # restored around any file read inside it cannot reach the decision.
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="requires: browser-session")
+    _placed_env(monkeypatch, tid, 1)
+    mp = board / khc.MAP_FILE
+    before = mp.read_bytes()
+    relaxed = json.loads(before)
+    relaxed["hosts"]["ace-ai"]["capabilities"].append("browser-session")
+    control = pff.boot_check(tid)
+    assert control.startswith("BROWSER_RAIL_ABSENT")
+    real_load, real_parse = khc.load_map, khc.map_from_bytes
+
+    def flip(real):
+        def inner(*a, **kw):
+            mp.write_text(json.dumps(relaxed))
+            try:
+                return real(*a, **kw) if real is real_parse else real(*a, **kw)
+            finally:
+                mp.write_bytes(before)
+        return inner
+    monkeypatch.setattr(khc, "load_map", flip(real_load))
+    monkeypatch.setattr(khc, "map_from_bytes", flip(real_parse))
+    assert pff.boot_check(tid) == control
+    assert pff.skill_gate("amazon-cart-ops-local").startswith("BROWSER_RAIL_ABSENT")
+    assert mp.read_bytes() == before
+    # Control: a map that really grants the capability admits.
+    mp.write_text(json.dumps(relaxed))
+    monkeypatch.setattr(khc, "load_map", real_load)
+    monkeypatch.setattr(khc, "map_from_bytes", real_parse)
+    assert pff.boot_check(tid) is None
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root ignores mode bits")
+@pytest.mark.parametrize("name", ["\n", "\n\n", " ", "\t", ".hidden", "ordinary.patch", "-n", "a\nb"])
+def test_custody_probe_sees_every_legal_filename(tmp_path, name):
+    # A4 24a15e048a61: presence never goes through a lossy line listing.
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    assert _REAL_PROBE(_probe_raw(ws), _local_shell) is False                   # empty control
+    (ws / name).write_text("SOURCE_WORK")
+    assert _REAL_PROBE(_probe_raw(ws), _local_shell) is True
+    assert (ws / name).read_text() == "SOURCE_WORK"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root ignores mode bits")
+def test_custody_probe_fails_closed_on_every_unprovable_path(tmp_path):
+    # A4: the error side stays closed: unreadable workspace, file parent, dangling link.
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "x").write_text("SOURCE_WORK")
+    ws.chmod(0o300)                                                          # searchable, unlistable
+    try:
+        assert _REAL_PROBE(_probe_raw(ws), _local_shell) is True
+    finally:
+        ws.chmod(0o700)
+    f = tmp_path / "file"
+    f.write_text("x")
+    assert _REAL_PROBE(_probe_raw(f), _local_shell) is True                     # not a directory
+    assert _REAL_PROBE(_probe_raw(f / "child"), _local_shell) is True            # non-directory parent
+    (tmp_path / "dangling").symlink_to(tmp_path / "nowhere")
+    assert _REAL_PROBE(_probe_raw(tmp_path / "dangling"), _local_shell) is True
+    assert _REAL_PROBE(_probe_raw(tmp_path / "deep" / "absent"), _local_shell) is False   # control
+
+
+def _dead_pid():
+    import subprocess
+    import sys
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+_DEAD = _dead_pid()
+
+
+def _late_spawn_card(board, monkeypatch, tmp_path):
+    # The original worker has exited (a dead pid), so a genuine successor may be claimed;
+    # a live original pid is the late-spawn owner guard's case, not this one.
+    from hermes_cli import kanban_db_dispatch as kdd
+    monkeypatch.setattr(kb, "_pr_belongs_to_other_card", lambda *a, **k: False)
+    monkeypatch.setattr(kb, "_pr_needs_its_worker", lambda *a, **k: None)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus", body="host: ace-ai\nplain")
+    run = _claim(tid)
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "daedalus", "PR: https://github.com/ANG-Ventures/hermes-agent/pull/1963")
+        assert kdd.adopt_worker_pid(conn, tid, run, _DEAD)
+    assert _guard(tid) == "active_pr"
+    return kdd, tid, run
+
+
+@pytest.mark.parametrize("order", ["late_spawn_after_reroute", "reroute_after_late_spawn"])
+def test_reroute_continuation_survives_the_original_runs_late_spawn(board, monkeypatch, tmp_path, order):
+    # A5 c9e6038b0137: the original run's late-spawn audit (real _set_worker_pid, same run id,
+    # claim lost) is not a successor and must not consume the continuation.
+    kdd, tid, run = _late_spawn_card(board, monkeypatch, tmp_path)
+    _placed_env(monkeypatch, tid, run)
+    monkeypatch.setattr("tools.capability_gap_hooks.on_rail_absent", lambda m: None)
+    if order == "reroute_after_late_spawn":
+        # The audit lands while the run still owns the card: it is a normal spawn row then;
+        # the reroute comes after it, so it cannot consume the later continuation either.
+        with kb.connect_closing() as conn:
+            assert kdd._set_worker_pid(conn, tid, _DEAD, run_id=run) is True
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-ai")) is True
+    assert _guard(tid) is None
+    if order == "late_spawn_after_reroute":
+        with kb.connect_closing() as conn:
+            assert kdd._set_worker_pid(conn, tid, _DEAD, run_id=run) is False
+            assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='spawned' "
+                                "AND json_extract(payload,'$.claim_lost')=1", (tid,)).fetchone()[0] == 1
+    assert _guard(tid) is None                                     # still one continuation owed
+    # A genuine successor consumes it once.
+    run2 = _claim(tid)
+    with kb.connect_closing() as conn:
+        assert kdd._set_worker_pid(conn, tid, _DEAD, run_id=run2) is True
+    assert _guard(tid) == "active_pr"
+    # A second miss parks; it never re-routes again.
+    _placed_env(monkeypatch, tid, run2, host="ace-media")
+    monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", None)
+    assert kwe.block_on_rail_absent(pff.absent_line("browser-session", "ace-media")) is True
+    t = _task(tid)
+    assert t.status == "blocked" and t.block_kind == "needs_input"
+    assert len(_events(tid, pff.REROUTE_EVENT)) == 1
+
+
+def test_operator_requeue_is_still_consumed_by_any_later_spawn(board, monkeypatch, tmp_path):
+    # A5 control: operator intent keeps its established "a later spawn consumes it" semantics.
+    kdd, tid, run = _late_spawn_card(board, monkeypatch, tmp_path)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "requeued", {"by": "operator"}, run_id=run)
+    assert _guard(tid) is None
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "spawned", {"pid": 1, "late_spawn": True, "claim_lost": True}, run_id=run)
+    assert _guard(tid) == "active_pr"
+
+
+def test_host_classification_does_not_need_the_posix_uid_module(monkeypatch):
+    # A6 f6dcfd6d5efb: simulated unavailable ``pwd`` at the import seam (NOT native Windows E2E).
+    import builtins
+    import importlib
+    import sys
+    orig = builtins.__import__
+
+    def no_pwd(name, *a, **kw):
+        if name == "pwd":
+            raise ModuleNotFoundError("No module named 'pwd' (simulated)")
+        return orig(name, *a, **kw)
+    monkeypatch.delitem(sys.modules, "hermes_cli.kanban_local_worker_uid", raising=False)
+    monkeypatch.setattr(builtins, "__import__", no_pwd)
+    assert kwh.is_pool_host(None) is False
+    assert kwh.is_pool_host(kwh.LOCAL_HOST_NAME) is False
+    assert kwh.is_pool_host("ace-ai") is True
+    with pytest.raises(ModuleNotFoundError):                         # control: the seam is real
+        importlib.import_module("hermes_cli.kanban_local_worker_uid")

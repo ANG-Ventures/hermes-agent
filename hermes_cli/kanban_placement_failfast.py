@@ -306,26 +306,37 @@ def route_hash(body: Optional[str], skills: Iterable[str], fleet_dir: Path, *,
     return h.hexdigest()
 
 
-def hard_requirements(body: Optional[str], skills: Iterable[str], fleet_dir: Path) -> List[str]:
-    """Declared + attached-skill capabilities (HARD, s2.2), from the files now. A word the map
+def snapshot_map(snapshot: Tuple[Optional[bytes], Optional[bytes]]):
+    """The capability map parsed from one captured (map, index) byte pair, never from the
+    files again: every gate evaluates exactly the bytes it hashed (23e10f0f6800)."""
+    from hermes_cli import kanban_host_capabilities as khc
+    return khc.map_from_bytes(*snapshot)
+
+
+def hard_requirements(cmap, body: Optional[str], skills: Iterable[str]) -> List[str]:
+    """Declared + attached-skill capabilities (HARD, s2.2) under ``cmap``. A word the map
     does not define stays ``unknown:<word>`` (F4): an unresolved requirement is still a
     requirement, never read as "needs nothing" (470af3484c95). [] for an absent/invalid map."""
     from hermes_cli import kanban_host_capabilities as khc
-    cmap = khc.load_map(fleet_dir)
     if cmap is None or not cmap.valid:
         return []
     reqs, _none = khc.derive(body, skills, cmap)
     return sorted({r.cap for r in reqs if r.strength == khc.HARD})
 
 
-def host_caps(host: str, fleet_dir: Path) -> Optional[frozenset]:
-    """The host's advertised capabilities, None when the map is absent/invalid
-    (the layer is off: nothing gates)."""
-    from hermes_cli import kanban_host_capabilities as khc
-    cmap = khc.load_map(fleet_dir)
+def decide(cmap, host: str, requirements: Iterable[str], modes: Mapping[str, str]) -> Optional[str]:
+    """THE refusal decision for boot, preload and mid-run (t_ecfd5591 682bd83da2ba): the first
+    refusal line for ``requirements`` on ``host`` under ``cmap``, else None. An unresolved
+    ``unknown:<word>`` parks before any routable known miss (470af3484c95): a re-route can never
+    satisfy a word no host serves. An absent/invalid map gates nothing (F11)."""
+    from hermes_cli.kanban_host_capabilities import UNKNOWN_PREFIX
     if cmap is None or not cmap.valid:
         return None
-    return cmap.hosts.get(host.lower(), frozenset())
+    have = cmap.hosts.get(host.lower(), frozenset())
+    for cap in sorted(dict.fromkeys(requirements), key=lambda c: not c.startswith(UNKNOWN_PREFIX)):
+        if (line := _refusal(cap, have, host, modes)) is not None:
+            return line
+    return None
 
 
 def _skill_key(name: str) -> str:
@@ -368,10 +379,11 @@ def indeterminate_line(host: str) -> str:
 
 
 def _consistent(fleet_dir: Path, check, *, on_exhausted):
-    """Run ``check(snapshot)`` until the map + index bytes are the same before and after it, so
-    the host's capabilities, the requirements and the route hash all come from ONE pair of
-    files (#1963 Prism r2: a torn read let a revoked capability pass). ``--sync`` / ``--set``
-    replace the files atomically, so a retry sees a whole file. Bounded: after
+    """Run ``check(snapshot)`` on one captured (map, index) byte pair. ``check`` parses only
+    those bytes (:func:`snapshot_map`), so no file replaced during the evaluation can reach it
+    (23e10f0f6800). The re-read afterwards only detects a pair torn between the two file reads
+    or republished meanwhile (#1963 Prism r2); ``--sync`` / ``--set`` replace each file
+    atomically, so a retry sees whole files. Not a transaction with other writers. Bounded: after
     ``_SNAPSHOT_TRIES`` changing reads NO attempt's result is trusted, a None (admit) as little
     as an ABSENT; the caller's ``on_exhausted()`` decides (an enforced gate refuses)."""
     import time
@@ -419,14 +431,12 @@ def placement_record(task, fleet_dir: Path) -> dict:
     the card's HARD requirements and the hash of what they were derived from."""
     skills = tuple(s for s in (getattr(task, "skills", None) or ()) if isinstance(s, str))
     body = getattr(task, "body", None)
-    # Bytes before and after derivation must agree; else the files changed under us and a
-    # stamp would pair old requirements with a new hash (#1963 Prism). No stamp then: the
-    # worker re-derives at boot from the files it sees.
-    before = _fleet_bytes(fleet_dir)
-    reqs = hard_requirements(body, skills, fleet_dir)
-    if _fleet_bytes(fleet_dir) != before:
-        return {}
-    return {REQUIRES_KEY: reqs, ROUTE_HASH_KEY: route_hash(body, skills, fleet_dir, snapshot=before)}
+    # Requirements and hash come from ONE captured byte pair, so the stamp can never pair
+    # requirements with a hash of other files (#1963 Prism, 23e10f0f6800). Files that change
+    # after the capture change the hash, and the worker re-derives at boot.
+    snapshot = _fleet_bytes(fleet_dir)
+    reqs = hard_requirements(snapshot_map(snapshot), body, skills)
+    return {REQUIRES_KEY: reqs, ROUTE_HASH_KEY: route_hash(body, skills, fleet_dir, snapshot=snapshot)}
 
 
 def stamp_placement(env: dict, task, fleet_dir: Path) -> None:
@@ -459,9 +469,15 @@ def boot_check(task_id: str, environ: Optional[Mapping[str, str]] = None, *,
         record = json.loads(raw) if raw else None
     except ValueError:
         record = None
-    host = (record or {}).get("host") if isinstance(record, dict) else None
+    record = record if isinstance(record, dict) else {}
+    # The runtime path uses the placement captured at process start, like the mid-run gate and
+    # the exit seam; the env record may since have been dropped or rewritten (0c0e383033ed). An
+    # explicit ``environ`` is a complete fixture and speaks for itself.
+    host = (kwh.BOOT_PLACED_HOST if environ is None else None) or record.get("host")
     if not kwh.is_pool_host(host):
         return None
+    if record.get("host") != host:
+        record = {}         # a stamp for another (or no) placement is not trusted: re-derive
     modes = caps_modes(env)
     if not modes:
         return None
@@ -483,23 +499,13 @@ def boot_check(task_id: str, environ: Optional[Mapping[str, str]] = None, *,
     preloaded = [s for s in dict.fromkeys(preloads or ()) if isinstance(s, str)]
 
     def check(snapshot):
-        have = host_caps(host, fleet_dir)
-        if have is None:
-            return None
-        if (record.get(ROUTE_HASH_KEY) == route_hash(row["body"], skills, fleet_dir, snapshot=snapshot)
-                and isinstance(stamped, list)):
+        cmap = snapshot_map(snapshot)
+        if (isinstance(stamped, list) and record.get(ROUTE_HASH_KEY)
+                == route_hash(row["body"], skills, fleet_dir, snapshot=snapshot)):
             reqs = [c for c in stamped if isinstance(c, str)]
         else:
-            reqs = hard_requirements(row["body"], skills, fleet_dir)
-        if preloaded:
-            reqs = [*reqs, *hard_requirements("", preloaded, fleet_dir)]
-        # An unresolved requirement parks before any routable known miss (470af3484c95): a
-        # re-route can never satisfy a word no host serves.
-        from hermes_cli.kanban_host_capabilities import UNKNOWN_PREFIX
-        for cap in sorted(dict.fromkeys(reqs), key=lambda c: not c.startswith(UNKNOWN_PREFIX)):
-            if (line := _refusal(cap, have, host, modes)) is not None:
-                return line
-        return None
+            reqs = hard_requirements(cmap, row["body"], skills)
+        return decide(cmap, host, [*reqs, *hard_requirements(cmap, "", preloaded)], modes)
 
     # warn/off everywhere: nothing could have refused, so a torn read refuses nothing either.
     return _consistent(fleet_dir, check,
@@ -524,23 +530,17 @@ def skill_gate(name: str) -> Optional[str]:
         if not modes:
             return None
         fleet_dir = _fleet_dir()
-        from hermes_cli import kanban_host_capabilities as khc
-        key = _skill_key(name)
     except Exception:
         _log.debug("skill_view placement gate failed open", exc_info=True)
         return None
 
-    def check(_snapshot):
-        # One load_map: host row and index come from the same parse of the same files.
-        # A read error inside one attempt admits THAT attempt only (the layer is off for it).
+    def check(snapshot):
+        # The skill's requirements and the host row come from the captured bytes, through the
+        # same normalization and decision as boot (682bd83da2ba). A failure inside one attempt
+        # admits THAT attempt only (the layer is off for it).
         try:
-            cmap = khc.load_map(fleet_dir)
-            if cmap is None or not cmap.valid or cmap.index_error is not None:
-                return None
-            have = cmap.hosts.get(host.lower(), frozenset())
-            for cap in cmap.index.get(key, ()):
-                if cap not in have and enforced(cap, modes):
-                    return absent_line(cap, host)
+            cmap = snapshot_map(snapshot)
+            return decide(cmap, host, hard_requirements(cmap, "", [name]), modes)
         except Exception:
             _log.debug("skill_view placement gate attempt failed open", exc_info=True)
         return None

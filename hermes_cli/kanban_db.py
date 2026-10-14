@@ -18208,9 +18208,14 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
         "AND (json_extract(i.payload, '$.after_comment_id') >= ? OR "
         "(json_type(i.payload, '$.after_comment_id') IS NULL AND i.created_at >= ?)) "
         "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = i.task_id "
-        "AND s.kind = 'spawned' AND s.id > i.id) LIMIT 1",
+        "AND s.kind = 'spawned' AND s.id > i.id "
+        # A continuation is consumed by a genuine SUCCESSOR spawn only: the re-routed run's own
+        # late-spawn audit (same run, claim lost) is not one (t_ecfd5591 c9e6038b0137).
+        # Operator intents keep "any later spawn consumes".
+        f"AND NOT (i.kind IN ({cont}) AND (IFNULL(s.run_id = i.run_id, 0) "
+        "OR IFNULL(json_extract(s.payload, '$.claim_lost'), 0) = 1))) LIMIT 1",
         (task_id, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS, *_RESPAWN_GUARD_CONTINUATION_KINDS,
-         pr_comment["id"], pr_comment["created_at"]),
+         pr_comment["id"], pr_comment["created_at"], *_RESPAWN_GUARD_CONTINUATION_KINDS),
     ).fetchone() is not None
 
 def _reassign_stale_pr_owners(

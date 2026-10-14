@@ -223,12 +223,6 @@ def env_value(mode: str, enforce: Iterable[str]) -> str:
 
 # -- the files --------------------------------------------------------------
 
-def _read(path: Path):
-    if not path.exists():
-        return None
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
 def _parse_map(doc) -> Tuple[Tuple[str, ...], Tuple[Tuple[str, Any], ...], Dict[str, frozenset],
                              Dict[str, bool], frozenset]:
     if not isinstance(doc, dict) or doc.get("schema") != 1 or isinstance(doc.get("schema"), bool):
@@ -303,16 +297,39 @@ def _parse_index(doc) -> Dict[str, Tuple[str, ...]]:
     return out
 
 
+def _read_bytes(path: Path) -> Optional[bytes]:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
 def load_map(fleet_dir: Path) -> Optional[CapabilityMap]:
     """The map, or None when ``host-capabilities.json`` is absent (layer off).
     Never raises: a bad file is a map with ``error`` set (F11)."""
     fleet_dir = Path(fleet_dir)
     try:
-        doc = _read(fleet_dir / MAP_FILE)
-    except (OSError, ValueError) as exc:
+        map_bytes = _read_bytes(fleet_dir / MAP_FILE)
+    except OSError as exc:
         return CapabilityMap(error=f"{MAP_FILE}: unreadable: {exc}")
-    if doc is None:
+    try:
+        index_bytes, index_read_error = _read_bytes(fleet_dir / INDEX_FILE), None
+    except OSError as exc:
+        index_bytes, index_read_error = None, f"{INDEX_FILE}: {exc}"
+    return map_from_bytes(map_bytes, index_bytes, index_read_error=index_read_error)
+
+
+def map_from_bytes(map_bytes: Optional[bytes], index_bytes: Optional[bytes], *,
+                   index_read_error: Optional[str] = None) -> Optional[CapabilityMap]:
+    """:func:`load_map` over bytes already read (None = file absent). The placement gates parse
+    the ONE byte pair they captured, so host capabilities, requirements and the route hash all
+    describe the same files (t_ecfd5591 23e10f0f6800). Never raises."""
+    if map_bytes is None:
         return None
+    try:
+        doc = json.loads(map_bytes.decode("utf-8-sig"))
+    except ValueError as exc:
+        return CapabilityMap(error=f"{MAP_FILE}: unreadable: {exc}")
     try:
         names, sniff, hosts, soft, identity_only = _parse_map(doc)
         error = None
@@ -320,17 +337,18 @@ def load_map(fleet_dir: Path) -> Optional[CapabilityMap]:
         names, sniff, hosts, error = (), (), {}, f"{MAP_FILE}: {exc}"
         soft, identity_only = {}, frozenset()
     index: Dict[str, Tuple[str, ...]] = {}
-    index_error = None
+    index_error = index_read_error
     unverified = None
-    try:
-        idoc = _read(fleet_dir / INDEX_FILE)
-        index = _parse_index(idoc) if idoc is not None else {}
-        if idoc is None:
-            index_error = f"{INDEX_FILE}: absent"
-        else:
-            unverified = _index_unverified(idoc)
-    except (OSError, ValueError) as exc:
-        index_error = f"{INDEX_FILE}: {exc}"
+    if index_error is None:
+        try:
+            idoc = json.loads(index_bytes.decode("utf-8-sig")) if index_bytes is not None else None
+            index = _parse_index(idoc) if idoc is not None else {}
+            if idoc is None:
+                index_error = f"{INDEX_FILE}: absent"
+            else:
+                unverified = _index_unverified(idoc)
+        except ValueError as exc:
+            index_error = f"{INDEX_FILE}: {exc}"
     return CapabilityMap(capabilities=names, sniff=sniff, hosts=hosts, index=index,
                          error=error, index_error=index_error, soft=soft,
                          identity_only=identity_only,
