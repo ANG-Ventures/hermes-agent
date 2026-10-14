@@ -397,14 +397,22 @@ def tick(fleet_dir: Path, kanban_cfg: Any, pool_hosts: Iterable[str]) -> Optiona
 
 # -- derivation (s2.2) ------------------------------------------------------
 
+def _line_words(value: str) -> List[str]:
+    return [w for w in (w.strip("`'\".;") for w in
+                        _WORD_SPLIT_RE.split(value.strip().strip("`").lower())) if w]
+
+
 def declared_words(body: Optional[str]) -> List[str]:
     """Every word on every line-anchored ``requires:`` line, lower-cased."""
     out: List[str] = []
     for m in REQUIRES_RE.finditer(body or ""):
-        value = _REQUIRES_NOTE_RE.split(m.group(1), maxsplit=1)[0]
-        for w in _WORD_SPLIT_RE.split(value.strip().strip("`").lower()):
-            w = w.strip("`'\".;")
-            if w and w not in out:
+        raw = m.group(1)
+        words = _line_words(_REQUIRES_NOTE_RE.split(raw, maxsplit=1)[0])
+        # The note cut only trims AFTER a declaration. When it would leave
+        # nothing (``requires: (browser-session)``), keep the raw words so
+        # they fail closed as ``unknown:`` instead of vanishing (Prism 303c33bfe408).
+        for w in words or _line_words(raw):
+            if w not in out:
                 out.append(w)
     return out
 
