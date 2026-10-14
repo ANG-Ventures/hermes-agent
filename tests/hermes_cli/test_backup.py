@@ -2014,7 +2014,54 @@ class TestSafeCopyDb:
 
         assert backup_mod._safe_copy_db(src, dst) is True
 
+    def test_concurrent_writes_do_not_restart_the_copy(self, tmp_path, monkeypatch):
+        """A real WAL DB written between EVERY backup step still copies (t_99b7d4e9).
 
+        Unpinned, each foreign commit restarts sqlite's backup from page 0, so this
+        never converges and the budget kills it — exactly the 2026-10-14 01:50
+        fleet-backup-local failure on the live state.db. The safe-copy holds a read
+        snapshot on the source, so the copy finishes and holds the pre-copy rows.
+        """
+        import time as real_time
+
+        from hermes_cli import backup_sqlite
+
+        src = tmp_path / "hot.db"
+        dst = tmp_path / "copy.db"
+        seed = sqlite3.connect(src)
+        seed.execute("PRAGMA journal_mode=wal")
+        seed.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB)")
+        seed.executemany(
+            "INSERT INTO t(b) VALUES (?)", ((b"x" * 4000,) for _ in range(2000))
+        )
+        seed.commit()
+        seed.close()
+
+        writer = sqlite3.connect(src)
+        ticks = {"n": 0}
+
+        def clock():
+            # Called once per backup step by the progress callback: commit a write
+            # there, and advance 1s so an unconverging copy hits its 60s budget.
+            ticks["n"] += 1
+            writer.execute("INSERT INTO t(b) VALUES (?)", (b"y",))
+            writer.commit()
+            return float(ticks["n"])
+
+        monkeypatch.setattr(backup_sqlite.time, "monotonic", clock)
+        try:
+            ok = backup_sqlite._safe_copy_db(src, dst)
+        finally:
+            monkeypatch.setattr(backup_sqlite.time, "monotonic", real_time.monotonic)
+            writer.close()
+
+        assert ok is True
+        copy = sqlite3.connect(dst)
+        try:
+            assert copy.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert copy.execute("SELECT count(*) FROM t").fetchone()[0] >= 2000
+        finally:
+            copy.close()
 
 
     def test_is_zeroed_sqlite_file_detects_nul_header(self, tmp_path):
