@@ -663,11 +663,15 @@ def recover_after_classification(
             _vlines(agent, "🔐 Nous paid access verified — refreshed runtime credentials and retrying request...")
             return True, False
 
-    recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
-        status_code=status_code, has_retried_429=_retry.has_retried_429,
-        classified_reason=classified.reason, error_context=error_context,
-        billing_unverified=classified.billing_unverified,
-    )
+    # A cpa transient 429 retries on the same healthy proxy key: never bench it (t_28826b21).
+    if _is_cpa_transient_429(classified):
+        recovered_with_pool = False
+    else:
+        recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
+            status_code=status_code, has_retried_429=_retry.has_retried_429,
+            classified_reason=classified.reason, error_context=error_context,
+            billing_unverified=classified.billing_unverified,
+        )
     if recovered_with_pool:
         return True, recovered_with_pool
 
@@ -1816,6 +1820,29 @@ def _wait_for_local_relay(base_url: str, budget_s: float, *, should_abort: Any) 
     return getattr(_cl, "wait_for_local_relay", _default)(base_url, budget_s, should_abort=should_abort)
 
 
+# cpa transient upstream 429 (t_28826b21): the longest cpa Retry-After we wait out inside a turn.
+CPA_TRANSIENT_429_MAX_WAIT_S = 20.0
+
+
+def _is_cpa_transient_429(classified: Any) -> bool:
+    from agent.error_classifier import CPA_TRANSIENT_429
+
+    ctx = getattr(classified, "error_context", None)
+    return isinstance(ctx, dict) and bool(ctx.get(CPA_TRANSIENT_429))
+
+
+def _cpa_transient_429_retries_in_place(api_error: Exception, classified: Any) -> bool:
+    """True for a cpa transient 429 whose Retry-After is absent or within
+    ``CPA_TRANSIENT_429_MAX_WAIT_S``: back off on the same route, fall back only once the
+    retry budget is spent. A longer Retry-After falls back now instead of sleeping minutes."""
+    if not _is_cpa_transient_429(classified):
+        return False
+    from agent.retry_utils import parse_retry_after_seconds
+
+    retry_after = parse_retry_after_seconds(getattr(getattr(api_error, "response", None), "headers", None))
+    return retry_after is None or retry_after <= CPA_TRANSIENT_429_MAX_WAIT_S
+
+
 def _eager_fallback_status(classified: Any, is_upstream: bool, is_transport_failure: bool) -> str:
     """Status line announcing an eager fallback switch."""
     if is_upstream:
@@ -2187,7 +2214,8 @@ def route_classified_error(
                 return _verdict("continue")
 
     _should_fallback = (
-        (is_rate_limited and _wrapped_output_cap_budget is None)
+        (is_rate_limited and _wrapped_output_cap_budget is None
+         and not _cpa_transient_429_retries_in_place(api_error, classified))
         or (_is_transport_failure and retry_count >= 2)
     )
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
@@ -2206,6 +2234,11 @@ def route_classified_error(
                 display_reason=classified.display_reason, error_context=error_context,
             ):
                 return _fallback_break()
+
+    # cpa transient 429 whose Retry-After exceeds the in-turn cap and no fallback took it:
+    # spend the budget now (max-retries path) instead of sleeping minutes (t_28826b21).
+    if _is_cpa_transient_429(classified) and not _cpa_transient_429_retries_in_place(api_error, classified):
+        retry_count = max_retries
 
     # A 401/403 surviving credential refresh means a broken credential or endpoint:
     # escalate to the fallback chain once; False -> terminal handling.
