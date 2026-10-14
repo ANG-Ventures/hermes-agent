@@ -2019,8 +2019,9 @@ _LEX_COMPOUND_CLOSERS = frozenset({"fi", "done", "esac", "}"})
 _LEX_LEAD_WORDS = frozenset({"then", "do", "else", "elif", "!", "time"})
 
 
-def _skip_balanced(text: str, i: int) -> int:
-    """Index just past the `)` matching the `(` at *text*[i], quotes respected; len(text) if none."""
+def _skip_balanced(text: str, i: int, opener: str = "(", closer: str = ")") -> int:
+    """Index just past the *closer* matching the *opener* at *text*[i], quotes respected;
+    len(text) if none."""
     depth, quote = 0, None
     while i < len(text):
         c = text[i]
@@ -2033,9 +2034,9 @@ def _skip_balanced(text: str, i: int) -> int:
             quote = c
         elif c == "\\":
             i += 1
-        elif c == "(":
+        elif c == opener:
             depth += 1
-        elif c == ")":
+        elif c == closer:
             depth -= 1
             if depth == 0:
                 return i + 1
@@ -2075,6 +2076,10 @@ def _lex_word(text: str, i: int) -> tuple[str, int]:
             end = _skip_balanced(text, i + 1)
             buf.append(text[i:end])
             i = end
+        elif text.startswith("$[", i):   # legacy arithmetic: `$[1<<2]` is a shift, not a heredoc
+            end = _skip_balanced(text, i + 1, "[", "]")
+            buf.append(text[i:end])
+            i = end
         elif c == "`":
             end = text.find("`", i + 1)
             end = n if end == -1 else end
@@ -2084,6 +2089,16 @@ def _lex_word(text: str, i: int) -> tuple[str, int]:
             buf.append(c)
             i += 1
     return "".join(buf), i
+
+
+def _arithmetic_command_end(text: str, i: int) -> Optional[int]:
+    """Index just past the `))` when *text*[i] opens an arithmetic command `(( … ))`, else None.
+    Bash's own rule: after `((`, the `)` that balances the second `(` must be followed at once by
+    `)`; `((cat <<EOF) )` and `((a)+(b))` are nested subshells, not arithmetic."""
+    if not text.startswith("((", i):
+        return None
+    end = _skip_balanced(text, i + 1)
+    return end + 1 if text.startswith(")", end) else None
 
 
 def _lex_shell(text: str) -> list[tuple[str, str]]:
@@ -2116,6 +2131,11 @@ def _lex_shell(text: str) -> list[tuple[str, str]]:
             end = _skip_balanced(text, i + 1)
             tokens.append(("word", text[i:end]))
             i = end
+        elif text.startswith("((", i) and (arith_end := _arithmetic_command_end(text, i)) is not None:
+            # `(( y = 1 << 2 ))` is arithmetic, one word: its `<<` is a shift, not a heredoc
+            # opener that would swallow every later line (Prism 91a25b0a on #1954).
+            tokens.append(("word", text[i:arith_end]))
+            i = arith_end
         else:
             fd = _LEX_FD_PREFIX_RE.match(text, i)
             at = fd.end() if fd else i
