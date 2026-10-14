@@ -73,6 +73,29 @@ async def test_native_seed_survives_unavailable_owner_then_replacement():
     new.send_stream_frame.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_drain_loop_preserves_commentary_during_owner_gap():
+    import asyncio
+    old, new = transport(), transport()
+    current = [old]
+    consumer = GatewayStreamConsumer(old, "thread", adapter_resolver=lambda: current[0])
+    consumer._start_transports = AsyncMock()
+    current[0] = None
+    consumer.on_commentary("queued during reconnect")
+    task = asyncio.create_task(consumer.run())
+    await asyncio.sleep(0.1)
+    assert not task.done()
+    old.send.assert_not_called()
+    current[0] = new
+    for _ in range(20):
+        if new.send.await_count:
+            break
+        await asyncio.sleep(0.05)
+    assert new.send.await_count == 1
+    consumer.finish()
+    await asyncio.wait_for(task, 1)
+
+
 def test_explicit_secondary_gap_does_not_resolve_shared_primary(tmp_path):
     from gateway.authz_mixin import GatewayAuthorizationMixin
     from gateway.session_identity import RoutingIdentity
