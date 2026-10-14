@@ -115,9 +115,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     @property
     def adapter(self):
         """Resolve the original conversation owner on each operation after reconnect."""
-        if self._adapter_resolver is not None:
-            return self._adapter_resolver()
+        resolver = getattr(self, "_adapter_resolver", None)
+        if resolver is not None:
+            return resolver()
         return self._initial_adapter
+
+    @adapter.setter
+    def adapter(self, value):
+        self._initial_adapter = value
 
     _MAX_FLOOD_STRIKES = 3  # consecutive flood failures before edits are disabled
 

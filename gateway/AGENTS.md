@@ -51,7 +51,15 @@ re-creates a duplicate or frozen stream:
    `message_id`; plain `send()` only when no editable message exists. A sealed native stream is a
    regular message — `chat.update` works (live-verified).
 
-Contract tests: `tests/gateway/test_stream_final_contract.py` (mutation-checked). Slack ground
+Contract tests: `tests/gateway/test_stream_final_contract.py` (mutation-checked).
+
+A stream consumer outlives a transport reconnect. Gateway construction supplies an
+`adapter_resolver` bound to the conversation source; sends and edits resolve the current
+owner rather than retaining a disconnected transport. Buffered lifecycle digests rebind
+both primary and fallback references by retired-object identity on reconnect, keeping
+other profiles untouched. Regression: `tests/gateway/test_reconnect_output_consumers.py`.
+
+Slack ground
 truth: `chat.*Stream` speaks STANDARD markdown, not mrkdwn; `stopStream.markdown_text` APPENDS;
 `startStream`/`stopStream` are Tier 2 (~20/min). Check `draft_stream_is_message is True` —
 MagicMock adapters in older tests auto-create truthy attributes.
