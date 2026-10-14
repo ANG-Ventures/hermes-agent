@@ -685,6 +685,10 @@ _SPECS = [
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _arg("--expect-block-event", type=int, metavar="EVENT_ID",
+             help="Compare-and-swap: unblock only if the card is still blocked by this latest 'blocked' event id"),
+        _arg("--expect-last-comment", type=int, metavar="COMMENT_ID",
+             help="Compare-and-swap: unblock only if this is still the card's latest comment id (0 = none)"),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("workspace", children=("workspace_action", _WORKSPACE_SPECS),
