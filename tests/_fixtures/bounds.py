@@ -213,21 +213,33 @@ def _level_max(base: str) -> int | None:
 
 
 def _level_used(base: str) -> int | None:
-    """``memory.current`` minus ``inactive_file``: the working set the OOM killer weighs, for the
-    WHOLE cgroup (other pytest workers, children, active cache), not this process alone."""
+    """``memory.current`` minus CLEAN page cache: the working set the OOM killer weighs, for the
+    WHOLE cgroup (other pytest workers, children), not this process alone.
+
+    Clean file pages are reclaimed before ``memory.max`` OOM-kills, active or not. Subtracting only
+    ``inactive_file`` (t_123bafee) counted a CI runner's git/pip cache as used: under MGLRU the
+    kernel reports it as ``active_file`` (measured on ci-box, 4 GiB containers: active_file ~3 GiB,
+    inactive_file 0, anon ~150 MiB), so the clamp left no room above the 35 % headroom and every
+    test got the 16 MiB floor ("grew 0.02 GiB of RSS (limit 0.02 GiB)" on unrelated tests).
+    ``shmem`` (counted inside ``file``), dirty and writeback pages are not freely reclaimable and
+    stay counted."""
     try:
         current = int(_read(f"{base}/memory.current").decode().strip())
     except (OSError, ValueError):
         return None
-    inactive = 0
+    stat: dict[str, int] = {}
     try:
         for ln in _read(f"{base}/memory.stat").decode().splitlines():
-            if ln.startswith("inactive_file "):
-                inactive = int(ln.split()[1])
-                break
-    except (OSError, ValueError, IndexError):
+            key, _, val = ln.partition(" ")
+            if key in ("file", "shmem", "file_dirty", "file_writeback", "inactive_file"):
+                stat[key] = int(val)
+    except (OSError, ValueError):
         pass
-    return max(current - inactive, 0)
+    if "file" in stat:
+        clean = stat["file"] - stat.get("shmem", 0) - stat.get("file_dirty", 0) - stat.get("file_writeback", 0)
+    else:  # no ``file`` row: fall back to what is surely reclaimable
+        clean = stat.get("inactive_file", 0)
+    return max(current - max(clean, 0), 0)
 
 
 def _cgroup_room(own_rss: int) -> tuple[int, int] | None:
