@@ -509,7 +509,6 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         if _current_page_origin(effective_task_id) != page_origin:
             return json.dumps({"success": False, "error_type": "origin_changed",
                                "error": f"Refused: the page left {page_origin} while the approval was open. Nothing was written."})
-        allowed = [page_origin]  # the approval covers this one page, not every site saved on the card
 
     # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
