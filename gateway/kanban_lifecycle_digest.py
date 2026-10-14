@@ -182,6 +182,15 @@ class LifecycleDigest:
             del b["folds"][:over]
             b["dropped"] += over
 
+    def replace_adapter(self, retired: Any, replacement: Any) -> None:
+        """Rebind buffered output by object identity, never by platform alone."""
+        for batch in self._held.values():
+            if batch["adapter"] is retired:
+                batch["adapter"] = replacement
+            fallback = batch.get("fallback")
+            if fallback is not None and fallback[1] is retired:
+                batch["fallback"] = (fallback[0], replacement, fallback[2])
+
     def due(self, now: float) -> list[tuple[str, str, str]]:
         return [t for t, b in self._held.items() if b["lines"] and now - b["first"] >= b["window"]]
 

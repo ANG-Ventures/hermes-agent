@@ -112,6 +112,13 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     Usage: ``agent.stream_delta_callback = consumer.on_delta``; ``create_task(consumer.run())``;
     after the agent finishes ``consumer.finish()`` then ``await task`` for the final edit."""
 
+    @property
+    def adapter(self):
+        """Resolve the original conversation owner on each operation after reconnect."""
+        if self._adapter_resolver is not None:
+            return self._adapter_resolver()
+        return self._initial_adapter
+
     _MAX_FLOOD_STRIKES = 3  # consecutive flood failures before edits are disabled
 
     # Class-wide monotonic draft-id counter (Telegram animates a draft only when the
@@ -129,8 +136,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
-        run_still_current: Optional[Callable[[], bool]] = None):
-        self.adapter = adapter
+        run_still_current: Optional[Callable[[], bool]] = None,
+        adapter_resolver: Optional[Callable[[], Any]] = None):
+        self._initial_adapter = adapter
+        self._adapter_resolver = adapter_resolver
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
