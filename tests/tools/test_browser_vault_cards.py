@@ -252,3 +252,45 @@ def test_formatted_card_number_readback_is_redacted(number, shown):
         assert shown not in redact.redact_sensitive_text(f"field value: {shown}")
     finally:
         redact.clear_vault_redaction_values()
+
+
+# ---------------------------------------------------------------------------
+# vault.payment_fill_confirm — the per-fill prompt is a config knob (Ace ruling 2026-10-14)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("value, prompts_expected", [
+    (False, 0),      # literal false: no prompt, the fill proceeds on the operator's instruction
+    (True, 1),       # explicit true: prompt
+    (None, 1),       # key absent / null: prompt (fail closed)
+    ("false", 1),    # a string is not the literal false: prompt
+    (0, 1),          # 0 is not False here on purpose: only the literal boolean disables it
+])
+def test_payment_fill_confirm_knob_only_literal_false_skips_the_prompt(monkeypatch, value, prompts_expected):
+    cfg = {"vault": {}} if value is None else {"vault": {"payment_fill_confirm": value}}
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: cfg)
+    backend = _Backend(_meta())
+    out, raw, seen = _run(backend, origins=["https://checkout.example"] * 3, consent="decline")
+    assert len(seen["prompts"]) == prompts_expected
+    if prompts_expected == 0:
+        # No prompt, yet every mechanical guard still ran: card resolved once, https page, PAN never in output.
+        assert out.get("success") is True and backend.resolved == 1 and PAN not in raw
+    else:
+        assert out["error_type"] == "payment_declined" and backend.resolved == 0
+
+
+def test_payment_fill_confirm_unreadable_config_fails_closed_to_prompt(monkeypatch):
+    def boom():
+        raise RuntimeError("config unreadable")
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", boom)
+    backend = _Backend(_meta())
+    out, raw, seen = _run(backend, origins=["https://checkout.example"] * 3, consent="decline")
+    assert len(seen["prompts"]) == 1 and out["error_type"] == "payment_declined" and backend.resolved == 0
+
+
+def test_payment_fill_confirm_off_still_refuses_http_and_origin_change(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {"vault": {"payment_fill_confirm": False}})
+    backend = _Backend(_meta())
+    out, raw, seen = _run(backend, origins=["http://checkout.example"] * 3)
+    assert out["error_type"] == "origin_mismatch" and backend.resolved == 0 and seen["prompts"] == []
+    backend = _Backend(_meta())
+    out, raw, seen = _run(backend, origins=["https://checkout.example", "https://evil.example", "https://evil.example"])
+    assert out["error_type"] == "origin_changed" and backend.resolved == 0

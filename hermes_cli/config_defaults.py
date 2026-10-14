@@ -3125,6 +3125,10 @@ DEFAULT_CONFIG = {
     # External password managers are unlocked per session with a masked master-password prompt;
     # headless sessions (cron, webhook, API) never prompt and see them as locked.
     "vault": {
+        # Ask the user (gateway button / CLI panel) before a saved payment card is written into a page.
+        # false = the user's own instruction to pay is the consent; the https-only + exact-page-origin
+        # guards and the card-bytes redaction still apply. Only a literal false disables the prompt.
+        "payment_fill_confirm": True,
         "onepassword": {
             # Detected managers are login sources unless the user opts out (vault.<name>.enabled: false).
             "enabled": True,        # `op` CLI: Login items with a website URL become fillable handles.

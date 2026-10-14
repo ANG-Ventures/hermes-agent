@@ -643,7 +643,14 @@ def _fill_path(meta) -> Optional[str]:
 def _confirm_payment_fill(label: str, origin: str) -> bool:
     """Human confirmation before a card is written into a page: a prompt injection that reaches a checkout
     must not be able to spend. Routes through the approval surface of the active session (gateway button
-    round-trip or CLI panel); headless sessions cannot confirm and the fill is refused."""
+    round-trip or CLI panel); headless sessions cannot confirm and the fill is refused.
+
+    ``vault.payment_fill_confirm: false`` skips the prompt: the operator's own instruction to pay is the
+    consent, and the mechanical guards (https-only, exact page-origin binding re-asserted at fill time,
+    card bytes registered for redaction) still apply. Anything but an explicit ``false`` keeps the prompt."""
+    if not _payment_fill_confirm_enabled():
+        logger.info("vault fill: payment prompt skipped by config (vault.payment_fill_confirm=false) for %s", origin)
+        return True
     from tools.approval_prompt import request_elicitation_consent
 
     return request_elicitation_consent(
@@ -651,6 +658,20 @@ def _confirm_payment_fill(label: str, origin: str) -> bool:
         f"The agent wants to enter your saved card details into the page at {origin}, once. The card number "
         "and CVC never enter the conversation. Approve only if you intend to pay on this exact site.",
         surface="vault-payment", title="Confirm payment card fill?") == "accept"
+
+
+def _payment_fill_confirm_enabled() -> bool:
+    """``vault.payment_fill_confirm`` from config.yaml; only a literal ``false`` disables the prompt.
+    A missing block, an unreadable config or any other value fails closed to prompting."""
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config() or {}
+        vault = cfg.get("vault") if isinstance(cfg, dict) else None
+        value = vault.get("payment_fill_confirm", True) if isinstance(vault, dict) else True
+    except Exception as exc:  # pragma: no cover -- defensive: never let a config error waive the prompt
+        logger.debug("vault fill: payment_fill_confirm read failed (%s); prompting", type(exc).__name__)
+        return True
+    return value is not False
 
 
 # ---------------------------------------------------------------------------
