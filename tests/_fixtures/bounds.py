@@ -222,7 +222,10 @@ def _level_used(base: str) -> int | None:
     inactive_file 0, anon ~150 MiB), so the clamp left no room above the 35 % headroom and every
     test got the 16 MiB floor ("grew 0.02 GiB of RSS (limit 0.02 GiB)" on unrelated tests).
     ``shmem`` (counted inside ``file``), dirty and writeback pages are not freely reclaimable and
-    stay counted."""
+    stay counted. So do ``unevictable`` pages (Prism 2d3bf87e12ba): clean file pages a sibling
+    ``mlock()``ed sit in ``file`` but cannot be reclaimed before ``memory.max`` OOM-kills. The kernel
+    does not split ``unevictable`` by type (mlocked anon and SHM_LOCKed shmem land there too), so the
+    whole of it is subtracted from ``clean``: over-counting used is the safe direction here."""
     try:
         current = int(_read(f"{base}/memory.current").decode().strip())
     except (OSError, ValueError):
@@ -231,12 +234,13 @@ def _level_used(base: str) -> int | None:
     try:
         for ln in _read(f"{base}/memory.stat").decode().splitlines():
             key, _, val = ln.partition(" ")
-            if key in ("file", "shmem", "file_dirty", "file_writeback", "inactive_file"):
+            if key in ("file", "shmem", "file_dirty", "file_writeback", "unevictable", "inactive_file"):
                 stat[key] = int(val)
     except (OSError, ValueError):
         pass
     if "file" in stat:
-        clean = stat["file"] - stat.get("shmem", 0) - stat.get("file_dirty", 0) - stat.get("file_writeback", 0)
+        clean = (stat["file"] - stat.get("shmem", 0) - stat.get("file_dirty", 0) - stat.get("file_writeback", 0)
+                 - stat.get("unevictable", 0))
     else:  # no ``file`` row: fall back to what is surely reclaimable
         clean = stat.get("inactive_file", 0)
     return max(current - max(clean, 0), 0)
