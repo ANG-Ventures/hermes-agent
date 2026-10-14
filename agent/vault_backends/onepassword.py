@@ -247,7 +247,10 @@ def parse_card_fields(fields) -> Dict[str, str]:
         raise CardDataError("verification number is missing or not 3-4 digits")
     month, year = _parse_expiry(by_id.get("expiry", ""))
     out = {"card_number": number, "cvc": cvc, "exp_month": month, "exp_year": year}
-    name = by_id.get("cardholder", "").strip()
+    # Real items carry editor residue (a trailing newline, a tab between first and last name, a soft
+    # wrap). The name is a non-secret display field, so normalise whitespace instead of refusing the
+    # whole card; only a name that is still non-printable after that, or absurdly long, is refused.
+    name = " ".join(by_id.get("cardholder", "").split())
     if name:
         if len(name) > 100 or any(ord(c) < 32 or ord(c) == 127 for c in name):
             raise CardDataError("cardholder name is malformed")
