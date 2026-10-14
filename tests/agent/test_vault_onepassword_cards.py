@@ -180,19 +180,35 @@ def test_every_category_is_listed_with_two_tiers_and_no_summary_leaks(op_env):
     assert all(argv[:2] == ["item", "list"] and "--categories" not in argv for argv in calls())
 
 
-def test_listing_is_cached_per_credential_and_secret_reads_relist_fresh(op_env):
+def test_listing_is_cached_for_discovery_only_and_fill_metadata_is_fresh(op_env):
     backend, tmp, calls = op_env
-    backend.list_items(); backend.get_meta("op:card1"); backend.get_meta("op:pw1")
-    assert sum(argv[:2] == ["item", "list"] for argv in calls()) == 1
+    lists = lambda: sum(argv[:2] == ["item", "list"] for argv in calls())  # noqa: E731
+    backend.list_items(); backend.list_items()
+    assert lists() == 1                                          # discovery shares one listing within the TTL
     backend._service_token = "a-different-token"                # another credential never sees the cached list
     backend.list_items()
-    assert sum(argv[:2] == ["item", "list"] for argv in calls()) == 2
-    # the cached listing still shows card1; it has since been removed from 1Password: the read refuses
+    assert lists() == 2
+    # Prism 855923d1a39c: the login's website moves from shop.example.com to new.example.com while the
+    # discovery listing is cached. Fill-time metadata must authorize the NEW site only.
+    moved = [dict(i, urls=[{"href": "https://new.example.com"}]) if i["id"] == "login1" else i for i in _ITEMS]
+    (tmp / "items.json").write_text(json.dumps(moved), encoding="utf-8")
+    assert {m.id: m for m in backend.list_items()}["op:login1"].origin == "https://shop.example.com"  # cached view
+    assert backend.get_meta("op:login1").allowed_origins == ("https://new.example.com",)
+    # an item removed from 1Password is gone for the fill path at once, and its secret read refuses
     (tmp / "items.json").write_text(json.dumps([i for i in _ITEMS if i["id"] != "card1"]), encoding="utf-8")
-    assert backend.get_meta("op:card1") is not None
+    assert backend.get_meta("op:card1") is None
     with pytest.raises(RuntimeError, match="not listed"):
         backend.resolve_secret("op:card1")
     assert not [a for a in calls() if a[:2] == ["item", "get"]]
+
+
+def test_card_bound_only_to_http_keeps_its_binding(op_env):
+    """Prism 0fe3929b519b: a card whose only saved website is http:// is bound to it, never unbound."""
+    backend, tmp, _ = op_env
+    rows = _ITEMS + [_row("card4", "CREDIT_CARD", "Http card", info="*1111", urls=["http://merchant.example/pay"])]
+    (tmp / "items.json").write_text(json.dumps(rows), encoding="utf-8")
+    meta = backend.get_meta("op:card4")
+    assert meta.origin == "http://merchant.example" and meta.allowed_origins == ("http://merchant.example",)
 
 
 # ── secret reads ───────────────────────────────────────────────────────────

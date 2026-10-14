@@ -45,10 +45,10 @@ _MASKED_LAST4 = re.compile(r"^[\s*•·.xX-]*(\d{4})$")
 _ACCESS_DENIED = ("isn't an item in", "is not an item in", "forbidden", "403", "permission", "not authorized",
                   "doesn't have access", "does not have access")
 
-# Listing cache: `get_meta` runs on every fill and status read, and an all-category `op item list` draws
-# on the account's shared rate budget. Keyed by profile home + a hash of the credential, so a lock, a
-# token change or another profile never reads another's listing. Metadata only: every secret read
-# re-resolves the owning vault from a fresh listing.
+# Listing cache for discovery (`list_items`: browser_vault_list, vault.list): an all-category
+# `op item list` draws on the account's shared rate budget. Keyed by profile home + a hash of the
+# credential, so a lock, a token change or another profile never reads another's listing. Never used to
+# authorize: `get_meta` (fill-time origins) and every secret read list fresh.
 _LIST_TTL_S = 60.0
 _LIST_CACHE: Dict[Tuple[str, str], Tuple[float, List[Dict]]] = {}
 _LIST_LOCK = threading.Lock()
@@ -132,15 +132,21 @@ class OnePasswordLoginBackend(LoginBackend):
             return []
         out: List[VaultItemMeta] = []
         for item in self._list_cached():
-            category = str(item.get("category") or "").upper()
-            meta = (_login_meta if category == _LOGIN else _card_meta if category == _CARD else _reference_meta)(
-                self.prefix, item)
+            meta = _meta_for(self.prefix, item)
             if meta is not None:
                 out.append(meta)
         return out
 
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
-        return next((m for m in self.list_items() if m.id == handle), None)
+        """Fresh metadata for ONE item. The fill path authorizes against these origins, so this never reads
+        the listing cache: a website changed in 1Password moments ago must not still authorize the old one."""
+        if not self.is_unlocked():
+            return None
+        item_id = handle[len(self.prefix):] if handle.startswith(self.prefix) else ""
+        matches = [i for i in self._list_raw() if item_id and str(i.get("id") or "") == item_id]
+        if len(matches) != 1:
+            return None
+        return _meta_for(self.prefix, matches[0])
 
     def _list_raw(self) -> List[Dict]:
         raw = json.loads(self._run("item", "list", "--format", "json") or "[]")
@@ -274,6 +280,11 @@ def _luhn_ok(number: str) -> bool:
     return total % 10 == 0
 
 
+def _meta_for(prefix: str, item: Dict) -> Optional[VaultItemMeta]:
+    category = str(item.get("category") or "").upper()
+    return (_login_meta if category == _LOGIN else _card_meta if category == _CARD else _reference_meta)(prefix, item)
+
+
 def _vault_name(item: Dict) -> Optional[str]:
     vault = item.get("vault")
     name = str(vault.get("name") or "").strip() if isinstance(vault, dict) else ""
@@ -297,15 +308,15 @@ def _login_meta(prefix: str, item: Dict) -> Optional[VaultItemMeta]:
 
 
 def _card_meta(prefix: str, item: Dict) -> VaultItemMeta:
-    """A card binds to its saved websites when it has any (exact match, as for logins); a card with
-    none is filled only on the page the user approves for that one fill."""
+    """A card binds to its saved websites when it has any (exact match, as for logins, whatever their
+    scheme); only a card with NO saved website is filled on the page the user approves for that one fill."""
     origins = _all_origins(_item_urls(item))
-    web = tuple(o for o in origins if o.startswith("https://"))
+    bound = _web_origins(origins) if origins else ()
     m = _MASKED_LAST4.match(str(item.get("additional_information") or "").strip())
     return VaultItemMeta(
         id=f"{prefix}{item.get('id')}", kind="payment", label=str(item.get("title") or "Credit card"),
-        origin=web[0] if web else None, created_at=str(item.get("created_at") or ""),
-        allowed_origins=web, category=_CARD, vault=_vault_name(item), last4=m.group(1) if m else None)
+        origin=bound[0] if bound else None, created_at=str(item.get("created_at") or ""),
+        allowed_origins=bound, category=_CARD, vault=_vault_name(item), last4=m.group(1) if m else None)
 
 
 def _reference_meta(prefix: str, item: Dict) -> VaultItemMeta:

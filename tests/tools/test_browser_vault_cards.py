@@ -210,3 +210,45 @@ def test_combined_expiry_field_gets_mm_yy():
                 {"index": 2, "type": "text", "autocomplete": "cc-csc"}]
     out, _, seen = _run(_Backend(_meta()), origins=["https://c.example"] * 2, controls=controls)
     assert out["fields"] == ["cc-csc", "cc-exp", "cc-number"] and '"07/29"' in seen["secret_exprs"][0]
+
+
+def test_multi_site_card_approval_narrows_the_fill_to_the_approved_page():
+    """Prism 531673770839: the fill script is pinned to the approved origin, not to every saved site."""
+    backend = _Backend(_meta(origin="https://a.example", allowed=("https://a.example", "https://b.example")))
+    out, _, seen = _run(backend, origins=["https://b.example"] * 2)
+    assert out["success"] is True and out["origin"] == "https://b.example"
+    expr = seen["secret_exprs"][0]
+    assert 'const expectedOrigin = "https://b.example"' in expr and "https://a.example" not in expr
+
+
+def test_http_bound_card_fills_only_on_its_saved_page():
+    backend = _Backend(_meta(origin="http://merchant.example", allowed=("http://merchant.example",)))
+    other, _, seen = _run(backend, origins=["https://unrelated.example"] * 3)
+    assert other["error_type"] == "origin_mismatch" and seen["prompts"] == [] and backend.resolved == 0
+
+
+@pytest.mark.parametrize("number,shown", [("4111111111111111", "4111 1111 1111 1111"),
+                                          ("4111111111111111", "4111-1111-1111-1111"),
+                                          ("378282246310005", "3782 822463 10005")])
+def test_formatted_card_number_readback_is_redacted(number, shown):
+    """Prism dc738de7e461: a checkout that re-formats the number must not leak it through a later read."""
+    from agent import redact
+    from tools.browser_cdp_tool import _redact_cdp_output
+
+    redact.clear_vault_redaction_values()
+    backend = _Backend(_meta(), secret=dict(CARD, card_number=number))
+    try:
+        from tools import browser_vault_tool as t
+        controls = LINKTECH_CONTROLS
+        with patch("agent.vault_backends.backend_for_handle", return_value=backend), \
+             patch.object(t, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(t, "_current_page_origin", return_value="https://c.example"), \
+             patch.object(t, "_eval_js", return_value={"success": True, "result": json.dumps(controls)}), \
+             patch.object(t, "_eval_js_secret", return_value={"success": True, "result": json.dumps({"filled": 5})}), \
+             patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
+            assert json.loads(t.browser_vault_fill("op:card1", task_id="t"))["success"] is True
+        echoed = _redact_cdp_output({"result": {"type": "string", "value": shown}})
+        assert shown not in json.dumps(echoed)
+        assert shown not in redact.redact_sensitive_text(f"field value: {shown}")
+    finally:
+        redact.clear_vault_redaction_values()

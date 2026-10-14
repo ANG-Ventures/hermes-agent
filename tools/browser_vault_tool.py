@@ -509,6 +509,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         if _current_page_origin(effective_task_id) != page_origin:
             return json.dumps({"success": False, "error_type": "origin_changed",
                                "error": f"Refused: the page left {page_origin} while the approval was open. Nothing was written."})
+        allowed = [page_origin]  # the approval covers this one page, not every site saved on the card
 
     # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
@@ -563,6 +564,11 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # Address values are not secrets but the card fields are: register every payment value.
     for value in (secret.values() if meta.kind == "payment" else [secret.get("password", "")]):
         register_vault_redaction_value(value)
+    if meta.kind == "payment":
+        # Checkout inputs commonly re-insert separators as the number is typed; a later read of the field
+        # returns the formatted form, which an exact-value registration would miss.
+        for formatted in _formatted_card_numbers(str(secret.get("card_number") or "")):
+            register_vault_redaction_value(formatted)
 
     try:
         fill_result = _eval_js_secret(
@@ -609,6 +615,18 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
 
 _FILLABLE_KINDS = ("login", "payment", "address")
+
+
+def _formatted_card_numbers(number: str) -> list:
+    """The display forms of a card number a checkout input may produce: 4-4-4-4(-3) groups and the
+    Amex 4-6-5 grouping, each joined by a space or a hyphen."""
+    digits = "".join(ch for ch in number if ch.isdigit())
+    if len(digits) < 12:
+        return []
+    groupings = [[digits[i:i + 4] for i in range(0, len(digits), 4)]]
+    if len(digits) == 15:
+        groupings.append([digits[:4], digits[4:10], digits[10:]])
+    return [sep.join(g) for g in groupings for sep in (" ", "-")]
 
 
 def _fill_path(meta) -> Optional[str]:
