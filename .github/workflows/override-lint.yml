@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   override_lint:
-    uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/override-lint.yml@b701cc0171ab91c92237672b8fcee9efe2e6af5d
+    uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/override-lint.yml@68136b520946bc9ec073e130fd77c5654bf27979
     with:
       runner: ubuntu-latest
       # Repos whose skills live elsewhere: pass the dirs grepped for the named override (warning only).
