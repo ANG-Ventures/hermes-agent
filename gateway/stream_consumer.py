@@ -117,9 +117,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Resolve the original conversation owner on each operation after reconnect."""
         resolver = getattr(self, "_adapter_resolver", None)
         if resolver is not None:
-            replacement = resolver()
-            if replacement is not None:
-                return replacement
+            return resolver()
         return self._initial_adapter
 
     @adapter.setter
@@ -171,6 +169,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._max_fallback_flood_retry_seconds = 5.0
 
         self._queue: queue.Queue = queue.Queue()
+        self._finish_requested = False
         # Every real preview id on screen this response (fresh-final deletes them all);
         # the per-segment set holds only the active segment so failure recovery never
         # deletes an earlier finalized preamble/commentary.
@@ -576,6 +575,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if final_text is not None:
             self._queue.put((_FINAL_TEXT, final_text))
         self._queue.put(_DONE)
+        self._finish_requested = True
 
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
@@ -587,6 +587,13 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 if not self._run_still_current():
                     await self._abandon_native_stream()
                     return
+                if self.adapter is None:
+                    # Keep queued content and native framing intact across the reconnect
+                    # gap. The gateway owns final redelivery if the turn ends offline.
+                    if self._finish_requested:
+                        return
+                    await asyncio.sleep(0.05)
+                    continue
                 tick = self._drain_queue()
 
                 # A flush barrier (clarify poll ordering) or an approval boundary must put

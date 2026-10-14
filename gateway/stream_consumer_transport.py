@@ -47,7 +47,10 @@ class StreamTransportMixin:
         """Open a native stream with an empty seed frame (typing indicator before any token) as a
         bool; a raise logs ``fail_log`` at DEBUG (error formatted in, or the traceback when
         ``exc_info``) and reads as False."""
-        seed = self.adapter.send_stream_frame(
+        adapter = self.adapter
+        if adapter is None:
+            return False
+        seed = adapter.send_stream_frame(
             "", chat_id=self.chat_id, reply_to=self._initial_reply_to_id, turn_id=self._turn_id)
         return await self._try_frame(seed, fail_log, exc_info=exc_info)
 
