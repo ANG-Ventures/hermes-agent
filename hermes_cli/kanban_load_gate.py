@@ -318,7 +318,7 @@ class LoadGate:
                 tail = f" and load5 below {self.pause_above:.1f} (load5={load5:.1f})"
             self.reason = (
                 f"load1={load1:.1f} > pause_above={self.pause_above:.1f} "
-                f"(ncpu={self.ncpu}; load {load1:.1f} tasks / {_denom(self.ncpu)}); resumes below {self.resume_below:.1f}{tail}"
+                f"(ncpu={self.ncpu}); resumes below {self.resume_below:.1f}{tail}"
             )
         return self.reason
 

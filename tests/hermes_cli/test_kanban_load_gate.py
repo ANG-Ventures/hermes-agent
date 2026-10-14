@@ -187,11 +187,16 @@ def test_log_line_on_state_change_and_five_minute_summary(caplog):
     assert re.search(r"\(load 40\.0 tasks / (?:\d+c\u00b7)?32t\)", summaries[0]), summaries[0]
 
 
-def test_paused_reason_names_the_load_denominator():
+def test_paused_transition_line_names_the_load_denominator(caplog):
+    # admit()'s reason stays byte-equal to the recorded sample (test_kanban_load_gate_band); the
+    # human-facing paused transition line carries the denominator instead.
     g = LoadGate({}, ncpu=32)
     g.admit(146.0, now=0)
-    assert re.search(r"load 146\.0 tasks / (?:\d+c\u00b7)?32t", g.last_reason or g.reason or ""), (
-        g.last_reason, g.reason)
+    log = logging.getLogger("t_load_gate_paused")
+    with caplog.at_level(logging.INFO, logger="t_load_gate_paused"):
+        g.log_tick(log, now=0)
+    paused = [r.getMessage() for r in caplog.records if "paused" in r.getMessage()]
+    assert paused and re.search(r"\(load 146\.0 tasks / (?:\d+c\u00b7)?32t\)", paused[0]), paused
 
 
 def test_state_file_round_trip_and_diagnostics_line(tmp_path):
