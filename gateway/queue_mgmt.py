@@ -134,18 +134,39 @@ async def gate_stopped_event(runner: Any, key: str, event: Any, adapter: Any) ->
         return True
     if event.get_command():
         return False
-    # Clear durable intent before releasing events. A newer stop wins during this await.
+    # Clear durable intent before releasing events. While this await is pending the human sits in
+    # the held store, so whatever invalidates the generation meanwhile disposes of it like any other
+    # queued item: a newer /stop keeps it held, /queue run restages it (FIFO) for a fresh turn,
+    # /new|/reset drops and counts it (D21). The caller's turn must then end: its session_entry
+    # predates the invalidation and must never reach the model.
     generation = runner._session_state(key).persistent.run_generation
-    await runner.async_session_store.clear_user_stopped(key)
+    state.held_queue.append(event)
+    try:
+        await runner.async_session_store.clear_user_stopped(key, generation=generation)
+    except BaseException:
+        _unpark(runner, key, event)
+        raise
     if runner._session_state(key).persistent.run_generation != generation:
-        # The newer stop owns admission; retain the accepted human message.
-        state.held_queue.append(event)
+        logger.info("queue_mgmt op=resume_invalidated session=%s", key)
         return True
+    if not _unpark(runner, key, event):
+        return True  # a /queue verb removed or rewrote it meanwhile; that verb owns it now
+    state = runner._session_state(key).conversation
     wakes = [e for e in state.held_queue if is_system_event(runner, e)]
     if wakes and not rewrite_active(runner, key, adapter, active_items(runner, key, adapter) + wakes):
         raise RuntimeError("Cannot resume held notifications: adapter queue unavailable")
     state.held_queue[:] = [e for e in state.held_queue if not is_system_event(runner, e)]
     state.automatic_turns_paused = False
+    return False
+
+
+def _unpark(runner: Any, key: str, event: Any) -> bool:
+    """Remove ``event`` (by identity) from the held store; False when it is no longer there."""
+    held = runner._session_state(key).conversation.held_queue
+    for i, e in enumerate(held):
+        if e is event:
+            del held[i]
+            return True
     return False
 
 
@@ -387,7 +408,7 @@ async def release(runner: Any, key: str, source: Any, adapter: Any, *, busy: boo
             return t("gateway.queue.unavailable")
         state.automatic_turns_paused = paused
     if state.automatic_turns_paused is True:
-        await runner.async_session_store.clear_user_stopped(key)
+        await runner.async_session_store.clear_user_stopped(key, generation=generation)
         if runner._session_state(key).persistent.run_generation != generation:
             return t("gateway.queue.unavailable")
     count = restage_held(runner, key, adapter)

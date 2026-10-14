@@ -513,7 +513,8 @@ class GatewayTurnMixin:
         # independently supersedes the marker by rowid.
         if not getattr(event, "internal", False) and getattr(session_entry, "user_stopped_at", None) is not None:
             try:
-                await self.async_session_store.clear_user_stopped(session_key)
+                await self.async_session_store.clear_user_stopped(
+                    session_key, generation=self._current_session_run_generation(session_key))
             except Exception:
                 logger.debug("clear_user_stopped failed for %s", session_key, exc_info=True)
         # SPEC scope B: a Telegram hard-kill re-delivery whose answer is already durably in the
