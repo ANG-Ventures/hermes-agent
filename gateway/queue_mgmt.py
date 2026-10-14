@@ -138,7 +138,9 @@ async def gate_stopped_event(runner: Any, key: str, event: Any, adapter: Any) ->
     generation = runner._session_state(key).persistent.run_generation
     await runner.async_session_store.clear_user_stopped(key)
     if runner._session_state(key).persistent.run_generation != generation:
-        return False
+        # The newer stop owns admission; retain the accepted human message.
+        state.held_queue.append(event)
+        return True
     wakes = [e for e in state.held_queue if is_system_event(runner, e)]
     if wakes and not rewrite_active(runner, key, adapter, active_items(runner, key, adapter) + wakes):
         raise RuntimeError("Cannot resume held notifications: adapter queue unavailable")

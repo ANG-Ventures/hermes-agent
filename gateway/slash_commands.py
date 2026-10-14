@@ -782,6 +782,7 @@ class GatewaySlashCommandsMixin(
 
         # Idle /stop also blocks future automatic arrivals, without double-cancelling children.
         from gateway import queue_mgmt
+        self._session_state(session_key).persistent.run_generation += 1
         self._session_state(session_key).conversation.automatic_turns_paused = True
         queue_mgmt.hold_user_items(self, session_key, self._delivery_adapter_for(source))
         await self._mark_user_stopped(session_key)
