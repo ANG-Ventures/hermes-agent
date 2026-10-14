@@ -6319,7 +6319,13 @@ class TelegramAdapter(BasePlatformAdapter):
         bot_username = self._current_bot_username()
         if not text or not bot_username:
             return text
-        cleaned = re.sub(rf"(?i)@{re.escape(bot_username)}\b[,:\-]*\s*", "", text).strip()
+        handle = re.escape(bot_username)
+        if text.lstrip().startswith("/"):
+            # ``/cmd@bot args``: drop only the handle suffix on the command token. Eating the
+            # trailing whitespace too glued command to args (``/queuealpha`` -> unknown command).
+            cleaned = re.sub(rf"(?i)^(\s*/[^\s@]+)@{handle}\b", r"\1", text).strip()
+            return cleaned or text
+        cleaned = re.sub(rf"(?i)@{handle}\b[,:\-]*\s*", "", text).strip()
         return cleaned or text
 
     def _topic_gates_pass(self, thread_id, *, warn_non_numeric: bool) -> Optional[bool]:
