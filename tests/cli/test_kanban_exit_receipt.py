@@ -8,6 +8,9 @@ import pytest
 import cli
 from hermes_cli import kanban_db as kb
 
+# Captured at import: the tests monkeypatch ``cli.HermesCLI`` with the double below.
+_REAL_START_PRELOADED_SKILLS = cli.HermesCLI.start_preloaded_skills
+
 
 @pytest.fixture
 def cli_worker(tmp_path, monkeypatch):
@@ -34,6 +37,9 @@ def fake_cli(result):
             self._active_agent_route_signature = "same"
             self.agent = SimpleNamespace(session_id=self.session_id,
                                          run_conversation=lambda **kw: result)
+
+        # The real (idempotent) preload start: a no-op here, no preload thread was built.
+        start_preloaded_skills = _REAL_START_PRELOADED_SKILLS
 
         def _claim_active_session(self, *a, **kw):
             return True
