@@ -2804,12 +2804,12 @@ class SessionStore(
         return count
 
     def _user_stop_fence_locked(self, session_key: str) -> list:
-        """``[mark_generation, resume_generation]`` for ``session_key``. Lock held.
+        """``[mark_generation, resume_generation]`` for ``session_key`` (-1: no resume yet). Lock held.
 
         Process-local on purpose: run generations restart with the process, and a marker loaded
         from disk has mark generation 0, so any resume in this process may clear it."""
         fences = self.__dict__.setdefault("_user_stop_fences", {})
-        return fences.setdefault(session_key, [0, 0])
+        return fences.setdefault(session_key, [0, -1])
 
     def clear_user_stopped(self, session_key: str, *, generation: Optional[int] = None) -> bool:
         """Retire the ``/stop`` marker once the user speaks again.
