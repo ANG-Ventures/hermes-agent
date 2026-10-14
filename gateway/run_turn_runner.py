@@ -1172,6 +1172,7 @@ class TurnRunner:
                     consumer_cfg.internal_event = ctx.persist_user_display_kind == "internal_notification"
                     stream_consumer = GatewayStreamConsumer(
                         adapter=adapter, chat_id=ctx.source.chat_id, config=consumer_cfg,
+                        adapter_resolver=lambda: self._runner._delivery_adapter_for(ctx.source),
                         metadata=ctx._status_thread_metadata,
                         on_new_message=(
                             (lambda: ctx.progress_queue.put(("__reset__",))) if ctx.progress_queue is not None else None
