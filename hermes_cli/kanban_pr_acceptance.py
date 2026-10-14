@@ -296,9 +296,11 @@ def _break_glass_waiver(repo: str, canonical: str, number: int, sha: str, curren
         if end < 0:
             continue
         listed = allowed[:end + 1]
-        # An element starts the list or follows a previous ABSENT element's ")," — so a comma inside
-        # another name ("lint,<ctx> (required, ...)") can never read as a listing of <ctx>.
-        if not all(re.search(r"(?:^|\),)" + re.escape(ctx + " (required, ABSENT on head)") + r"(?=,|$)", listed)
+        # An element starts the list or follows the COMPLETE previous element suffix
+        # "(required, ABSENT on head),", so punctuation inside another name ("lint,<ctx>",
+        # "lint),<ctx>") can never read as a listing of <ctx>.
+        if not all(re.search(r"(?:^|\(required, ABSENT on head\),)"
+                             + re.escape(ctx + " (required, ABSENT on head)") + r"(?=,|$)", listed)
                    for ctx in absent):
             continue
         evidence = _read_offbox_receipt(Path(path[1]), root, canonical.split("/")[1], number, sha)

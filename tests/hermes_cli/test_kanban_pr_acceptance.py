@@ -581,6 +581,21 @@ def test_comma_bearing_context_name_does_not_waive_its_suffix(github, tmp_path):
 
 
 @pytest.mark.platforms("posix")
+def test_paren_comma_context_name_does_not_waive_its_suffix(github, tmp_path):
+    """Listing only ``lint),sast`` must not read as a listing of a required, absent ``sast``."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    github.update(conclusion="success", head=_HEAD, missing=True, pr_state="MERGED",
+                  protection={"required_status_checks": {
+                      "checks": [{"context": "sast", "app_id": 1}, {"context": "lint),sast", "app_id": 1}],
+                      "contexts": ["sast", "lint),sast"]}},
+                  comments=_breakglass(tmp_path, contexts=("lint),sast",)))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False and "waiver" not in receipt, receipt
+    github.update(comments=_breakglass(tmp_path, contexts=("lint),sast", "sast")))
+    assert acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")["ok"] is True
+
+
+@pytest.mark.platforms("posix")
 def test_bracket_bearing_context_is_parsed_as_one_element(github, tmp_path):
     from hermes_cli import kanban_pr_acceptance as acc
     name = "ci [linux] gate"
