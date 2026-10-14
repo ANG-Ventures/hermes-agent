@@ -1,7 +1,7 @@
 """Login-backend contract + registry for the browser credential vault.
 
-A ``LoginBackend`` lists login metadata (never secrets) and resolves ONE
-password at fill time. External managers (1Password, Bitwarden) additionally
+A ``LoginBackend`` lists item metadata (never secrets) and resolves ONE
+password (login) or card/address payload (``resolve_secret``) at fill time. External managers (1Password, Bitwarden) additionally
 need a per-session unlock; ``resolve_password`` raises ``UnlockRequired``
 while locked so the tool can ask the surface to prompt. Handles are
 namespaced by ``prefix`` so ``backend_for_handle`` needs no lookup table.
@@ -23,6 +23,10 @@ class UnlockRequired(Exception):
     def __init__(self, backend: "LoginBackend"):
         super().__init__(f"{backend.display_name} is locked")
         self.backend = backend
+
+
+class VaultAccessDenied(RuntimeError):
+    """The manager refused the read: the credential cannot see the item's vault."""
 
 
 class LoginBackend(ABC):
@@ -54,9 +58,10 @@ class LoginBackend(ABC):
         return None
 
     def resolve_secret(self, handle: str) -> Dict[str, str]:
-        """Full payload of a payment/address item (server-side only). External managers list only
-        logins, so the base returns the password-only shape."""
-        return {"password": self.resolve_password(handle)}
+        """Full payload of a payment/address item, keyed by ``PAYMENT_FIELDS``/``ADDRESS_FIELDS``
+        (server-side only). Per kind: a backend implements it only for the kinds it can fill and
+        raises for every other item; the base fills none."""
+        raise RuntimeError(f"{self.display_name} does not fill this item")
 
 
 def run_with_stdin_secret(argv: Sequence[str], *, env: Dict[str, str], secret: str, timeout: float,
