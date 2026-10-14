@@ -161,7 +161,7 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
         emit(
             f"Load gate: load1={load1:.1f} pause_above={gate.pause_above:.1f} "
             f"OVERRIDE by {profile} (--ignore-load-gate; gate state={gate.state}, "
-            f"would have allowed {allowance})"
+            f"would have allowed {allowance}; load {load1:.1f} tasks / {_klg._denom(gate.ncpu)})"
         )
         out["override"] = {
             "source": "cli dispatch --ignore-load-gate",
@@ -180,6 +180,7 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
         emit(
             f"Load gate: {label} load1={load1:.1f} (pause_above={gate.pause_above:.1f}) - "
             + (f"local allowance 0: {reason}" if defer else f"spawning 0 this call: {reason}")
+            + f" [load {load1:.1f} tasks / {_klg._denom(gate.ncpu)}]"
         )
         out["spawn_paused"] = reason
         out["spawn_limit"] = 0
@@ -188,7 +189,7 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
     emit(
         f"Load gate: admitting load1={load1:.1f} pending_ramp={gate.pending_ramp:.1f} "
         f"allowance={allowance} (pause_above={gate.pause_above:.1f}, "
-        f"max_spawn_per_tick={gate.max_spawn_per_tick})"
+        f"max_spawn_per_tick={gate.max_spawn_per_tick}; load {load1:.1f} tasks / {_klg._denom(gate.ncpu)})"
     )
     if allowance is not None and (additive is None or allowance < additive):
         out["spawn_limit"] = allowance

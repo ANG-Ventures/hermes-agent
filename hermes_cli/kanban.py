@@ -4310,7 +4310,8 @@ def _cmd_notify_status(args: argparse.Namespace) -> int:
     age = int(time.time()) - int(state.get("updated_at") or 0)
     load1 = state.get("load1")
     load = f"{load1:.1f}" if isinstance(load1, (int, float)) else "?"
-    print(f"wake gate: mode={state.get('mode')}  load1={load}  "
+    from hermes_cli.kanban_load_gate import _denom
+    print(f"wake gate: mode={state.get('mode')}  load1={load} (load {load} tasks / {_denom()})  "
           f"pause_above={state.get('pause_above')}  "
           f"resume_below={state.get('resume_below')}  (updated {age}s ago)")
     for prof, reason in (state.get("lanes_capped") or {}).items():

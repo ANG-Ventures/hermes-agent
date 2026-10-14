@@ -324,7 +324,7 @@ def self_caused_event_ids(sub: dict, events, origin_of=None) -> set[int]:
 
 # LoadGate moved to hermes_cli.kanban_load_gate (shared with the standalone
 # `hermes kanban daemon` loop); re-exported here for existing importers.
-from hermes_cli.kanban_load_gate import LoadGate  # noqa: E402,F401
+from hermes_cli.kanban_load_gate import LoadGate, _denom  # noqa: E402,F401
 
 
 def _format_spawn_routes(routes, sources=None) -> str:
@@ -595,7 +595,7 @@ def _host_recovery_note(gate) -> Optional[str]:
         return None
     l1 = "?" if gate.load1 is None else f"{gate.load1:.1f}"
     return (
-        f"dispatcher load gate {gate.state}, load1={l1}, "
+        f"dispatcher load gate {gate.state}, load1={l1} (load {l1} tasks / {_denom(gate.ncpu)}), "
         f"procs={gate.procs if gate.procs is not None else '?'}"
         f"/{gate.proc_limit or '?'}"
     )
