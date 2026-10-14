@@ -15,7 +15,7 @@ async def test_new_stop_blocks_and_preserves_resuming_human():
     state.conversation.automatic_turns_paused = True
     runner._async_session_store = AsyncMock()
     runner.session_store = runner._async_session_store._store
-    async def newer_stop(_key):
+    async def newer_stop(_key, **_kw):
         state.persistent.run_generation += 1
     runner._async_session_store.clear_user_stopped.side_effect = newer_stop
     human = _event(source, 'continue', internal=False)
@@ -39,7 +39,7 @@ async def test_idle_stop_invalidates_inflight_queue_release():
     runner._same_chat_runs = lambda *args: []
     runner._sibling_thread_run_keys = lambda *args: []
     runner._chat_scoped_run_keys = lambda *args: []
-    async def stop_during_clear(_key):
+    async def stop_during_clear(_key, **_kw):
         await runner._handle_stop_command(_event(source, '/stop', internal=False))
     runner._async_session_store.clear_user_stopped.side_effect = stop_during_clear
     generation = state.persistent.run_generation

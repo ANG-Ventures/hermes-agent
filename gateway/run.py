@@ -8052,6 +8052,8 @@ class GatewayRunner(
         through ``clear_user_stopped`` on the inbound path.
         """
         last_message_id: Optional[int] = None
+        # Claimed before any await: a resume racing this write is compared against it.
+        generation = self._current_session_run_generation(session_key)
         entry = None
         try:
             entry = self.session_store._entries.get(session_key)  # noqa: SLF001
@@ -8084,6 +8086,7 @@ class GatewayRunner(
             session_key,
             boot_id=boot_id,
             last_message_id=last_message_id,
+            generation=generation,
         )
         logger.info(
             "PHASE=user_stopped key=%s boot=%s last_message_id=%s marked=%s",

@@ -2286,8 +2286,13 @@ class SessionStore(
         *,
         boot_id: Optional[str] = None,
         last_message_id: Optional[int] = None,
+        generation: Optional[int] = None,
     ) -> bool:
         """Persist "the user ended this turn with /stop" and retire the hedge.
+
+        ``generation`` is the gateway run generation this stop claimed. If a resume already
+        cleared at that generation or later, this stop lost the race and is skipped, so a stop
+        write that lands after the user resumed never re-latches the session.
 
         Durability is the whole point: the marker must be on disk before
         ``/stop`` acknowledges, or a SIGKILL in that window leaves a stopped
@@ -2308,6 +2313,13 @@ class SessionStore(
             entry = self._entries.get(session_key)
             if entry is None:
                 return False
+            fence = self._user_stop_fence_locked(session_key)
+            if generation is not None:
+                if generation <= fence[1]:
+                    return False
+                fence[0] = int(generation)
+            else:
+                fence[0] = 0
             entry.user_stopped_at = _now()
             entry.user_stopped_boot_id = boot_id
             entry.user_stopped_message_id = (
@@ -2791,16 +2803,34 @@ class SessionStore(
                 self._save()
         return count
 
-    def clear_user_stopped(self, session_key: str) -> bool:
+    def _user_stop_fence_locked(self, session_key: str) -> list:
+        """``[mark_generation, resume_generation]`` for ``session_key`` (-1: no resume yet). Lock held.
+
+        Process-local on purpose: run generations restart with the process, and a marker loaded
+        from disk has mark generation 0, so any resume in this process may clear it."""
+        fences = self.__dict__.setdefault("_user_stop_fences", {})
+        return fences.setdefault(session_key, [0, -1])
+
+    def clear_user_stopped(self, session_key: str, *, generation: Optional[int] = None) -> bool:
         """Retire the ``/stop`` marker once the user speaks again.
 
         Called when a real inbound user message lands. The boot gate also
         supersedes the marker by rowid, so this clear is an optimisation that
         keeps the entry tidy, not the mechanism the correctness rests on.
+
+        ``generation`` makes this compare-and-clear: it is the run generation the resumer
+        observed. A stop marked at a NEWER generation is kept (an older resume never erases a
+        newer stop), and a stop still in flight at this generation or older is fenced out when
+        its write lands.
         """
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
+            if generation is not None:
+                fence = self._user_stop_fence_locked(session_key)
+                fence[1] = max(fence[1], int(generation))
+                if fence[0] > generation:
+                    return False
             if entry is None or entry.user_stopped_at is None:
                 return False
             entry.user_stopped_at = None
