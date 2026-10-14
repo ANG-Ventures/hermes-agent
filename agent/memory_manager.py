@@ -143,7 +143,9 @@ def inject_memory_provider_tools(agent: Any) -> int:
         agent.valid_tool_names = set()
     existing_tool_names = {_tool_name(tool) for tool in tools if isinstance(tool, dict)}
     added = 0
-    for raw_schema in get_schemas():
+    from hermes_cli.kanban_placement_tools import MEMORY_PROVIDER_TOOLSET, refuse_injected_schemas
+    for raw_schema in refuse_injected_schemas(
+            [normalize_tool_schema(s) or s for s in get_schemas()], MEMORY_PROVIDER_TOOLSET):
         schema = normalize_tool_schema(raw_schema)
         if schema is None:
             logger.warning(

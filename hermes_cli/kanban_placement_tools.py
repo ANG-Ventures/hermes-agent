@@ -32,11 +32,26 @@ REFUSED_ENV = "KANBAN_PLACEMENT_TOOLS_REFUSED"
 EVENT = "tool_refused_by_placement"
 MALFORMED = "!malformed"
 
-# Toolsets whose tools run over the placement (terminal, file) or are pure API / in-process calls.
+# Toolsets whose tools run over the placement (terminal, file) or whose handlers, including every
+# lazy backend/plugin fallback, start no local process. Checked handler by handler (t_a2817825):
+#   terminal, file      placement-routed (ssh as the placement user)
+#   kanban              kanban DB in-process (completion-side git/gh: see the card handback)
+#   memory              built-in MEMORY.md store, file I/O only
+#   skills              file I/O; the one spawn branch (skills.inline_shell) is forced off below
+#   todo, clarify, session_search   in-process
+#   homeassistant, image_gen, moa, x_search   HTTP API clients, no subprocess in handler or plugin
+# Withheld because a reachable backend spawns locally as the dispatcher's uid:
+#   web             ddgs search worker (Python), local PDF read (pdftotext)
+#   vision          SVG rasterizer fallback (rsvg-convert, inkscape)
+#   context_engine  lcm_status/lcm_doctor git identity probe; injected outside the registry
+#   memory_write    mem0 provider init builds the capture router (`op read`)
 ALLOWED_TOOLSETS = frozenset({
-    "terminal", "file", "kanban", "memory", "memory_write", "skills", "web", "vision", "todo",
-    "clarify", "session_search", "context_engine", "homeassistant", "image_gen", "moa", "x_search",
+    "terminal", "file", "kanban", "memory", "skills", "todo", "clarify", "session_search",
+    "homeassistant", "image_gen", "moa", "x_search",
 })
+# Pseudo-toolset for memory-provider plugin tools (honcho git, byterover brv, openviking server):
+# never on the floor, so a placed worker never gets them.
+MEMORY_PROVIDER_TOOLSET = "memory-provider"
 # Named for the operator; everything off ALLOWED_TOOLSETS is refused whatever this says.
 DEFAULT_REFUSED = ("browser", "browser-cdp", "browser-use", "code_execution", "computer_use",
                    "delegation", "mcp-stdio", "checkpoints")
@@ -121,6 +136,23 @@ def gate_feature(name: str) -> bool:
         return False
     record(name, name, host, "local_spawner")
     return True
+
+
+def refuse_injected_schemas(schemas: List[dict], toolset: str) -> List[dict]:
+    """Same refusal for tool schemas a caller injects straight into an agent's tool surface
+    (context engine, memory providers): those never pass ``registry.register``."""
+    host = placed_host()
+    if host is None:
+        return schemas
+    kept = []
+    for schema in schemas:
+        name = (schema.get("name") if isinstance(schema, dict) else "") or ""
+        reason = refusal_reason(name, toolset)
+        if reason is None:
+            kept.append(schema)
+        else:
+            record(name, toolset, host, reason)
+    return kept
 
 
 def refuse_stdio_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:

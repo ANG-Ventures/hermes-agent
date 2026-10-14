@@ -95,6 +95,13 @@ def expand_inline_shell(content: str, skill_dir: Path | None, timeout: int) -> s
     return _INLINE_SHELL_RE.sub(_replace, content)
 
 
+def _placed_kanban_worker() -> bool:
+    """A placed kanban worker never runs inline shell: ``bash -c`` would run locally as the
+    dispatcher's uid, outside the placement (t_a2817825)."""
+    from hermes_cli.kanban_placement_tools import placed_host
+    return placed_host() is not None
+
+
 def preprocess_skill_content(
     content: str,
     skill_dir: Path | None,
@@ -107,6 +114,6 @@ def preprocess_skill_content(
     cfg = skills_cfg if isinstance(skills_cfg, dict) else load_skills_config()
     if cfg.get("template_vars", True):
         content = substitute_template_vars(content, skill_dir, session_id)
-    if cfg.get("inline_shell", False):
+    if cfg.get("inline_shell", False) and not _placed_kanban_worker():
         content = expand_inline_shell(content, skill_dir, int(cfg.get("inline_shell_timeout", 10) or 10))
     return content

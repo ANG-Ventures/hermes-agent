@@ -2320,7 +2320,10 @@ def _inject_context_engine_tools(agent):
             t.get("function", {}).get("name") for t in agent.tools if isinstance(t, dict)
         }
         from agent.memory_manager import normalize_tool_schema
-        for _raw_schema in agent.context_compressor.get_tool_schemas():
+        from hermes_cli.kanban_placement_tools import refuse_injected_schemas
+        for _raw_schema in refuse_injected_schemas(
+                [normalize_tool_schema(s) or s for s in agent.context_compressor.get_tool_schemas()],
+                "context_engine"):
             _schema = normalize_tool_schema(_raw_schema)
             if _schema is None:
                 # A nameless tool makes strict providers 400 and disables the whole toolset.
