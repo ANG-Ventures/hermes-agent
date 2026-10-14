@@ -85,6 +85,22 @@ infrastructure checks or wait, then retry completion. Use `kanban_block` when
 human action is needed. Generic GitHub `failure` cannot establish whether a test
 or artifact upload failed; inspect its retained URL. Explicit infrastructure
 conclusions and API failures are classified separately. No extra worker is spawned.
+Every refusal records the failing `stage` (and `error_type` for infra), and a
+refused `hermes kanban complete` prints that receipt instead of a concurrency guess.
+Branch protection is read over REST (`GET /repos/O/R/branches/B`), which a GitHub
+App token can read; GraphQL's protection field needs Administration permission.
+
+**Break-glass landings.** A MERGED PR whose only gap is required contexts that
+never ran (absent, not failed/pending/stale) is accepted when, and only when, the
+account GitHub reports as `merged_by` posted the `fleet-merge` attribution comment
+naming `offbox-security-receipt: <path>` and listing each such context as
+`<ctx> (required, ABSENT on head)`, and that receipt sits under
+`<hermes root>/var/ci-box/`, names this head and `<repo>-<pr>-<head12>`, with
+every gate rung `rc=0`. The receipt records a `waiver` (comment id, receipt path
+and sha256) and marks those checks `waived`. A transferred repository is accepted
+only when GitHub resolves the bound URL to the same PR; the canonical name is
+recorded as `canonical_repo`, the contract is never rewritten. Design and measured
+cause: `docs/kanban/pr-acceptance-bookkeeping.md`.
 
 Receipt persistence and the terminal write recheck run/status/contract ownership
 under one SQLite lock: a reclaimed worker cannot complete or attach acceptance to
