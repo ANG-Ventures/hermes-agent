@@ -13,7 +13,7 @@ import httpx
 import openai
 
 from agent import fallback_events as fbe
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import CPA_TRANSIENT_429, FailoverReason, classify_api_error
 
 CPA = "http://127.0.0.1:18812/v1"
 MSG = "auth_unavailable: no auth available (providers=kimi, model=kimi-k3)"
@@ -107,7 +107,10 @@ def test_capacity_variants_map_to_their_class():
         c = classify_api_error(_cpa_503_with(msg), provider="cpa", model="m")
         assert not c.is_auth, msg
         assert c.reason is FailoverReason.rate_limit, msg
-        assert c.should_fallback is True, msg
+        assert c.should_rotate_credential is False, msg
+        # t_28826b21: a transient upstream 429 retries in place; a quota wall falls back now.
+        assert c.should_fallback is (cls == "quota_seat"), msg
+        assert bool(c.error_context.get(CPA_TRANSIENT_429)) is (cls == "rate_upstream"), msg
 
 
 def test_non_capacity_upstream_error_stays_auth():

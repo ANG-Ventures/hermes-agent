@@ -1074,10 +1074,23 @@ def _is_read_phase_stall(c: _Ctx) -> bool:
 def _no_auth_available_verdict(msg: str) -> Verdict:
     """cpa ``auth_unavailable``: bare = no credential loaded (auth_permanent); with a capacity
     ``last upstream error:`` / cooldown = the relay capacity verdict for that class (t_03fb601f).
-    One helper with the fallback_events ledger so the two classifiers cannot drift."""
+    One helper with the fallback_events ledger so the two classifiers cannot drift.
+
+    ``rate_upstream`` (a transient upstream 429 cpa already retried) is split out of
+    ``_V_RELAY_RATE_LIMIT``: retry in place on the healthy proxy key and fall back only once the
+    retry budget is spent (t_28826b21). ``quota_seat`` (cooldown / credential_quota / quota) keeps
+    the eager fallback: a multi-day wall does not clear inside a turn."""
     from agent.fallback_events import cpa_auth_unavailable_class
 
-    return _RELAY_CLASS_VERDICTS.get(cpa_auth_unavailable_class(msg) or "", _V_NO_AUTH_AVAILABLE)
+    cls = cpa_auth_unavailable_class(msg)
+    if cls == "rate_upstream":
+        return _v(_R.rate_limit, should_rotate_credential=False, should_fallback=False,
+                  error_context={CPA_TRANSIENT_429: True})
+    return _RELAY_CLASS_VERDICTS.get(cls or "", _V_NO_AUTH_AVAILABLE)
+
+
+# ``error_context`` marker on the cpa transient-429 verdict; turn_recovery reads it (t_28826b21).
+CPA_TRANSIENT_429 = "cpa_transient_429"
 
 
 # Fork pool/relay bodies checked BEFORE status classification: each reaches the classifier two
