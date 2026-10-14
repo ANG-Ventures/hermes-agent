@@ -20570,6 +20570,21 @@ def explain_complete_refusal(
         )
     if not _parents_satisfied(conn, task_id):
         return "a parent task is not done"
+    # The PR acceptance gate refuses by recording a receipt as the card's newest event;
+    # name it instead of guessing at a race (t_b5b407c8).
+    last = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last is not None and last["kind"] == "pr_acceptance":
+        try:
+            receipt = json.loads(last["payload"] or "{}")
+        except (TypeError, ValueError):
+            receipt = {}
+        if not receipt.get("ok"):
+            stage = f" at stage '{receipt['stage']}'" if receipt.get("stage") else ""
+            return (f"PR acceptance refused ({receipt.get('classification', 'unknown')}{stage}): "
+                    f"{receipt.get('detail') or ''} {receipt.get('recovery') or ''}").strip()
     return f"refused while status is {task.status!r} (state changed concurrently?)"
 
 
