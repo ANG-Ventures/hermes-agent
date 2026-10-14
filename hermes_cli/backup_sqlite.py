@@ -58,6 +58,24 @@ def _close_quietly(conn: Optional[sqlite3.Connection]) -> None:
             conn.close()
 
 
+def _pin_read_snapshot(conn: sqlite3.Connection) -> None:
+    """Hold a read transaction on the backup SOURCE so the copy reads one WAL snapshot.
+
+    Without it, every write by another connection restarts the backup from page 0; a hot
+    multi-GB state.db then never converges (2026-10-14 01:50 fleet-backup-local: 507s budget
+    spent, 892542/976766 pages still remaining). Inside an open read transaction, other writers
+    land in the WAL beyond this connection's snapshot, so the backup never restarts. Best-effort:
+    if the source is locked right now, fall back to the unpinned copy and its busy/stall guards.
+    """
+    try:
+        conn.execute("BEGIN")
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except Exception as exc:  # best-effort: never let the pin itself fail the copy
+        logger.debug("safe-copy: could not pin a read snapshot (%s); copying unpinned", exc)
+        with suppress(Exception):
+            conn.rollback()
+
+
 def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> bool:
     """Copy a SQLite database with the backup() API (WAL-safe consistent snapshot).
 
@@ -87,6 +105,7 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
         # timeout=0.0 disables sqlite3's implicit busy wait so the progress callback owns the
         # full locked-source deadline instead of adding the default timeout before each callback.
         conn = sqlite3.connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=0.0)
+        _pin_read_snapshot(conn)
         backup_conn = sqlite3.connect(str(dst))
         now0 = time.monotonic()
         busy_deadline = now0 + max(0.0, timeout_seconds)
