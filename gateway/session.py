@@ -2320,7 +2320,10 @@ class SessionStore(
                 if generation < fence[0]:
                     # Writes land out of order: a newer stop already marked. Lowering the fence
                     # would let an older resume erase it, and its older rowid would weaken the
-                    # boot gate, so the late write changes nothing.
+                    # boot gate, so the late write changes nothing in memory. Its caller still
+                    # acknowledges /stop, so persist the newer marker first: that write may be
+                    # deferred behind the save lock or may have failed.
+                    self._save()
                     return True
                 fence[0] = int(generation)
             # An untracked stop (no generation) leaves the fence as is: never lowered.

@@ -72,3 +72,73 @@ async def test_failed_clear_without_invalidation_still_unparks():
     with pytest.raises(OSError):
         await qm.gate_stopped_event(runner, key, human, adapter)
     assert human not in state.conversation.held_queue
+
+
+def _durable_stop(db, store, key) -> bool:
+    """Whether state.db's routing row for ``key`` carries a stop marker."""
+    import json
+
+    raw = db.load_gateway_routing_entries(scope=store._routing_scope()).get(key)
+    return raw is not None and json.loads(raw).get("user_stopped_at") is not None
+
+
+def test_late_older_stop_waits_for_blocked_newer_write(tmp_path, monkeypatch):
+    """The older stop's True is a /stop ack: it must not return while the newer marker is unwritten."""
+    import threading
+
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    store = runner.session_store
+    key = store.get_or_create_session(_source()).session_key
+    real_replace = db.replace_gateway_routing_entries
+    entered, release = threading.Event(), threading.Event()
+
+    def blocking_replace(*args, **kwargs):
+        if not release.is_set():
+            entered.set()
+            release.wait(10)
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(db, "replace_gateway_routing_entries", blocking_replace)
+    newer = threading.Thread(target=store.mark_user_stopped, args=(key,), kwargs={"generation": 6})
+    newer.start()
+    assert entered.wait(10)
+    seen = {}
+
+    def older():
+        seen["ok"] = store.mark_user_stopped(key, generation=5)
+        seen["durable"] = _durable_stop(db, store, key)
+
+    late = threading.Thread(target=older)
+    late.start()
+    late.join(0.5)
+    release.set()
+    late.join(10)
+    newer.join(10)
+    assert seen == {"ok": True, "durable": True}
+    db.close()
+
+
+def test_late_older_stop_persists_after_newer_write_failed(tmp_path, monkeypatch):
+    runner, _adapter, db = _runner(tmp_path, monkeypatch)
+    store = runner.session_store
+    key = store.get_or_create_session(_source()).session_key
+    real_replace = db.replace_gateway_routing_entries
+    real_json = store._save_sessions_json
+    failing = {"on": True}
+
+    def maybe_fail(real):
+        def wrapper(*args, **kwargs):
+            if failing["on"]:
+                raise OSError("disk full")
+            return real(*args, **kwargs)
+        return wrapper
+
+    monkeypatch.setattr(db, "replace_gateway_routing_entries", maybe_fail(real_replace))
+    monkeypatch.setattr(store, "_save_sessions_json", maybe_fail(real_json))
+    with pytest.raises(OSError):
+        store.mark_user_stopped(key, generation=6)
+    assert not _durable_stop(db, store, key)
+    failing["on"] = False
+    assert store.mark_user_stopped(key, generation=5) is True
+    assert _durable_stop(db, store, key)
+    db.close()
