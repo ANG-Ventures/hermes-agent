@@ -50,3 +50,70 @@ def test_plain_503_overload_still_overloaded():
     resp = httpx.Response(503, json={"error": body}, request=req)
     err = openai.InternalServerError("Error code: 503", response=resp, body=body)
     assert classify_api_error(err, provider="cpa", model="kimi-k3").reason is FailoverReason.overloaded
+
+
+# t_03fb601f: cpa sends the same token when credentials EXIST but are all
+# overloaded / cooling down. Wire text from agent.log 2026-10-13 23:53 (codex,
+# gpt-6-astra): zero 401s at cpa, 2 creds upstream 502 server_is_overloaded,
+# the 3rd in quota cooldown. It rendered "OAuth revoked (401)".
+OVERLOADED_MSG = (
+    "auth_unavailable: no auth available (providers=codex, model=gpt-6-astra; "
+    "last upstream error: server_is_overloaded: Our servers are currently "
+    "overloaded. Please try again later.)")
+
+
+def _cpa_503_with(msg: str) -> openai.InternalServerError:
+    body = {"message": msg, "type": "server_error", "code": "internal_server_error"}
+    req = httpx.Request("POST", f"{CPA}/chat/completions")
+    resp = httpx.Response(503, json={"error": body}, request=req)
+    return openai.InternalServerError(
+        f"Error code: 503 - {{'error': {body}}}", response=resp, body=body)
+
+
+def test_overloaded_upstream_is_capacity_not_auth():
+    assert fbe.classify_text(OVERLOADED_MSG, http_status=503) == "pool_pressure"
+    err = _cpa_503_with(OVERLOADED_MSG)
+    assert fbe.classify_trigger(text=str(err), http_status=503,
+                                headers=err.response.headers) == ("pool_pressure", "text")
+    c = classify_api_error(err, provider="cpa", model="gpt-6-astra")
+    assert not c.is_auth
+    assert c.reason is FailoverReason.overloaded
+    assert c.retryable is True
+    assert c.should_rotate_credential is False
+
+
+def test_overloaded_banner_cause_is_not_oauth_revoked():
+    from agent.fallback_policy import _cause_phrase
+
+    cause = _cause_phrase({"trigger_class": fbe.classify_text(OVERLOADED_MSG, http_status=503),
+                           "err_head": OVERLOADED_MSG, "http_status": 503})
+    assert "OAuth revoked" not in cause
+    assert cause == "upstream overloaded"
+    # The bare no-credential body still renders as auth.
+    assert _cause_phrase({"trigger_class": fbe.classify_text(MSG, http_status=503),
+                          "err_head": MSG}) == "OAuth revoked (401)"
+
+
+def test_capacity_variants_map_to_their_class():
+    base = "auth_unavailable: no auth available (providers=codex, model=m; "
+    cases = {
+        base + "last upstream error: 429 Too Many Requests)": "rate_upstream",
+        base + "last upstream error: rate_limit_exceeded)": "rate_upstream",
+        base + "last upstream error: usage quota exceeded)": "quota_seat",
+        base + "cooldown: credential_quota until 2026-10-19)": "quota_seat",
+    }
+    for msg, cls in cases.items():
+        assert fbe.classify_text(msg, http_status=503) == cls, msg
+        c = classify_api_error(_cpa_503_with(msg), provider="cpa", model="m")
+        assert not c.is_auth, msg
+        assert c.reason is FailoverReason.rate_limit, msg
+        assert c.should_fallback is True, msg
+
+
+def test_non_capacity_upstream_error_stays_auth():
+    # "access_terminated_error" is the account being cut off, not capacity.
+    msg = ("auth_unavailable: no auth available (providers=kimi, model=kimi-k3; "
+           "last upstream error: access_terminated_error: You have been terminated)")
+    assert fbe.classify_text(msg, http_status=503) == "auth"
+    assert classify_api_error(_cpa_503_with(msg), provider="cpa",
+                              model="kimi-k3").reason is FailoverReason.auth_permanent

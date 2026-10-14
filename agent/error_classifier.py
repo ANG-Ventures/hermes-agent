@@ -1071,6 +1071,15 @@ def _is_read_phase_stall(c: _Ctx) -> bool:
     return any(p in c.msg for p in _POOL_STALLED_PATTERNS)
 
 
+def _no_auth_available_verdict(msg: str) -> Verdict:
+    """cpa ``auth_unavailable``: bare = no credential loaded (auth_permanent); with a capacity
+    ``last upstream error:`` / cooldown = the relay capacity verdict for that class (t_03fb601f).
+    One helper with the fallback_events ledger so the two classifiers cannot drift."""
+    from agent.fallback_events import cpa_auth_unavailable_class
+
+    return _RELAY_CLASS_VERDICTS.get(cpa_auth_unavailable_class(msg) or "", _V_NO_AUTH_AVAILABLE)
+
+
 # Fork pool/relay bodies checked BEFORE status classification: each reaches the classifier two
 # ways (status code extractable → the 503/504/403 bucket; code only in the message → the unknown
 # floor) and must classify identically on both. Ordered: pool exhaustion, read-phase stall,
@@ -1079,7 +1088,7 @@ def _is_read_phase_stall(c: _Ctx) -> bool:
 _POOL_RELAY_RULES = (
     (_POOL_EXHAUSTED_PATTERNS, _V_POOL_EXHAUSTED), (_POOL_STALLED_PATTERNS, _V_POOL_STALLED),
     (_ACCOUNT_BLOCKED_PATTERNS, _V_ACCOUNT_BLOCKED), (_EXTRA_USAGE_ONLY_PATTERNS, _V_EXTRA_USAGE_ONLY),
-    (_NO_AUTH_AVAILABLE_PATTERNS, _V_NO_AUTH_AVAILABLE),
+    (_NO_AUTH_AVAILABLE_PATTERNS, _no_auth_available_verdict),
 )
 
 
