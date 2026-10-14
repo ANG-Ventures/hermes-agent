@@ -1981,19 +1981,22 @@ _INERT_AFTER_WRITE = frozenset({
 
 
 def _drop_heredoc_bodies(text: str) -> str:
-    """*text* without heredoc body lines (every heredoc, inert or not): for the segment scan only."""
+    """*text* without heredoc body lines (every heredoc, inert or not): for the segment scan only.
+    Only a `<<` the lexer reads as an opener counts: `(( n = 1 << x ))` is a shift, and taking it
+    as an opener dropped every later line, a write-then-run included (Prism c1ca725b on #1954)."""
+    openers = _heredoc_openers(text) if "<<" in text else {}
     out: list[str] = []
     pending: list[str] = []
+    line_start = 0
     for line in text.split("\n"):
+        start, line_start = line_start, line_start + len(line) + 1
         if pending:
             if line.strip() == pending[0]:
                 pending.pop(0)
             continue
         out.append(line)
-        view = _unquoted_view(line)
-        for at in (m.start() for m in re.finditer(r"<<(?!<)", view)):
-            raw = _HEREDOC_OPEN_RE.match(line, at)
-            if raw is not None:
+        for raw in _HEREDOC_OPEN_RE.finditer(line):
+            if start + raw.start() in openers:
                 pending.append(_heredoc_delimiter(raw))
     return "\n".join(out)
 
@@ -2101,8 +2104,10 @@ def _arithmetic_command_end(text: str, i: int) -> Optional[int]:
     return end + 1 if text.startswith(")", end) else None
 
 
-def _lex_shell(text: str) -> list[tuple[str, str]]:
-    """*text* as shell tokens (see `_LEX_CONTROL_OPS`)."""
+def _lex_shell(text: str, heredocs: Optional[list[tuple[int, int]]] = None) -> list[tuple[str, str]]:
+    """*text* as shell tokens (see `_LEX_CONTROL_OPS`). When *heredocs* is given, every REAL
+    heredoc opener is appended to it as (offset of its `<<`, index of its redir token): a `<<`
+    inside quotes, a comment, a heredoc body or arithmetic is not one (Prism 91a25b0a, c1ca725b)."""
     tokens: list[tuple[str, str]] = []
     pending: list[tuple[str, bool]] = []   # heredoc (delimiter, strip tabs) awaiting a body
     heredoc_op: Optional[str] = None
@@ -2142,8 +2147,10 @@ def _lex_shell(text: str) -> list[tuple[str, str]]:
             redirect = next((o for o in _LEX_REDIRECT_OPS if text.startswith(o, at)), None)
             control = None if redirect else next((o for o in _LEX_CONTROL_OPS if text.startswith(o, i)), None)
             if redirect is not None:
-                tokens.append(("redir", text[i:at] + redirect))
                 heredoc_op = redirect if redirect in ("<<", "<<-") else None
+                if heredoc_op is not None and heredocs is not None:
+                    heredocs.append((at, len(tokens)))
+                tokens.append(("redir", text[i:at] + redirect))
                 i = at + len(redirect)
             elif control is not None:
                 tokens.append(("op", control))
@@ -2320,25 +2327,56 @@ def _ends_in_pipe(line: str) -> bool:
     return bool(tokens) and tokens[-1][0] == "op" and tokens[-1][1] in ("|", "|&")
 
 
-def _heredoc_receiver_executes(text: str, at: int) -> bool:
-    """The command receiving the heredoc opened at *at* on *line* is a SHELL-like executor
-    (`env bash <<EOF`, `sudo -u x sh <<EOF`, `bash 2>&1 <<EOF`). A Python body is not shell text:
-    it is scanned by the AST path in `_contains_unsafe_gateway_action`, so python receivers are
-    left to it."""
-    tokens = _lex_shell(text[:at])
-    # The receiver is the WHOLE last element before the `<<`: `(bash; :) <<EOF` feeds the group,
-    # whose first command reads the body (Prism af4c69a0 on #1954), not just the `:` after the `;`.
+def _heredoc_receiver_executes(tokens: list[tuple[str, str]], redir: int) -> bool:
+    """The command receiving the heredoc whose `<<` is *tokens*[redir] is a SHELL-like executor
+    (`env bash <<EOF`, `sudo -u x sh <<EOF`, `bash 2>&1 <<EOF`, `<<EOF bash`). A Python body is
+    not shell text: it is scanned by the AST path in `_contains_unsafe_gateway_action`, so python
+    receivers are left to it."""
+    # The receiver is the WHOLE element owning the `<<`, words AFTER the redirection included:
+    # `<<'EOF' bash` runs bash (Prism 22612976 P0 on #1954), and `(bash; :) <<EOF` feeds the group,
+    # whose first command reads the body (Prism af4c69a0), not just the `:` after the `;`.
     start, commands = 0, []
     while start < len(tokens):
         commands, end = _element_span(tokens, start)
-        if end >= len(tokens):
+        if end > redir or end >= len(tokens):
             break
         start, commands = end + 1, []
     if len(commands) == 1:
         index = _executed_command_index(commands[0])
         if index is not None and re.match(r"^pythonw?[\d.]*$", _executable_name(commands[0][index]).lower()):
             return False
-    return _commands_execute(commands, _shell_functions(_lex_shell(text)))
+    return _commands_execute(commands, _shell_functions(tokens))
+
+
+def _heredoc_openers(text: str) -> dict[int, tuple[list[tuple[str, str]], int]]:
+    """Every REAL heredoc opener in *text*: offset of its `<<` -> (the token list it was lexed in,
+    index of its redir token). A `$( … )` body is lexed on its own, so the receiver of
+    `git commit -m "$(cat <<'EOF' … )"` is `cat` inside the substitution."""
+    openers: dict[int, tuple[list[tuple[str, str]], int]] = {}
+    _collect_heredoc_openers(text, 0, openers)
+    return openers
+
+
+def _collect_heredoc_openers(text: str, base: int, openers: dict) -> None:
+    found: list[tuple[int, int]] = []
+    tokens = _lex_shell(text, found)
+    for at, index in found:
+        openers[base + at] = (tokens, index)
+    i, in_double = 0, False
+    while i < len(text):
+        c = text[i]
+        if c == "'" and not in_double:
+            end = text.find("'", i + 1)
+            i = len(text) if end == -1 else end + 1
+            continue
+        if c == '"':
+            in_double = not in_double
+        elif text.startswith("$(", i) and not text.startswith("$((", i):
+            end = _skip_balanced(text, i + 1)
+            _collect_heredoc_openers(text[i + 2:max(end - 1, i + 2)], base + i + 2, openers)
+            i = end
+            continue
+        i += 2 if c == "\\" else 1
 
 
 def _writes_then_runs(text: str) -> bool:
@@ -2583,15 +2621,24 @@ def _mask_heredoc_bodies(text: str) -> str:
     """
     if "<<" not in text:
         return text
+    # Only a `<<` the lexer reads as a heredoc opener starts a body: not one in arithmetic
+    # (`(( n = 1 << EOF ))`, `$[1<<EOF]`), quotes or a comment (Prism 91a25b0a, c1ca725b on #1954).
+    openers = _heredoc_openers(text)
     lines = text.splitlines()
+    starts, offset = [], 0
+    for raw in lines:
+        starts.append(offset)
+        offset += len(raw) + 1
     out: list[str] = []
     changed = False
     i = 0
     while i < len(lines):
         line = lines[i]
+        line_start = starts[i]
         out.append(line)
         i += 1
-        match = _HEREDOC_OPEN_RE.search(line)
+        match = next((m for m in _HEREDOC_OPEN_RE.finditer(line)
+                      if line_start + m.start() in openers), None)
         if not match:
             continue
         quoted = bool(match.group("q1") or match.group("q2"))
@@ -2607,11 +2654,10 @@ def _mask_heredoc_bodies(text: str) -> str:
             end += 1
         terminator = lines[end] if end < len(lines) else None
 
-        # Fail-closed conditions: the body may actually be executed.
-        # Lex from the top so a function defined on an earlier line is known to the receiver.
-        before = "\n".join(lines[:i - 1] + [""])
+        # Fail-closed conditions: the body may actually be executed. The receiver is the whole
+        # element owning the `<<`, read from the lexed text so functions defined earlier count.
         feeds_interpreter = bool(_HEREDOC_TO_INTERPRETER.search(line)) or _heredoc_receiver_executes(
-            before + line, len(before) + match.start())
+            *openers[line_start + match.start()])
         # A `|` after the opener continues the pipeline on the line AFTER the terminator
         # (`cat <<'EOF' |` … `EOF` / `bash`, Prism a3c0cfc0 on #1954): judge the whole rest.
         pipeline = "\n".join(lines[i - 1:]) if _ends_in_pipe(line) else line

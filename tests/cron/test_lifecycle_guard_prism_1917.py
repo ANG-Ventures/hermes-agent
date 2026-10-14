@@ -240,3 +240,45 @@ def test_executable_compound_r4_shapes_block(command):
 ])
 def test_executable_compound_r4_controls_pass(command):
     assert not _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
+    # 22612976 (P0): words AFTER a leading heredoc redirection are the receiver
+    f"<<'EOF' bash\n{BOOTOUT}\nEOF",
+    f"<<EOF bash\n{BOOTOUT}\nEOF",
+    f"<<-EOF env bash\n{BOOTOUT}\nEOF",
+    f"2>&1 <<'EOF' sh\n{BOOTOUT}\nEOF",
+    f"cd /tmp; <<'EOF' bash\n{BOOTOUT}\nEOF",
+    f"<<'EOF' sudo -u root bash -s\n{BOOTOUT}\nEOF",
+    f"f() {{ bash; }}\n<<'EOF' f\n{BOOTOUT}\nEOF",
+    # 91a25b0a / c1ca725b: an arithmetic `<<` is a shift, never a heredoc opener
+    f"(( y = 1 << 2 ))\necho '{BOOTOUT}' | env bash",
+    f"(( y = 1 << x ))\necho '{BOOTOUT}' | env bash",
+    f"x=$[1<<2]\necho '{BOOTOUT}' | env bash",
+    f"x=$[1<<x]\necho '{BOOTOUT}' | env bash",
+    f"y=$((1<<x))\necho '{BOOTOUT}' | env bash",
+    f"true=0; ((n = 1 << true))\n{BOOTOUT}\ntrue",
+    f"x=$[1<<EOF]\n{BOOTOUT}\nEOF",
+    f"(( y = 1 << x ))\nprintf '{BOOTOUT}' > /tmp/x.sh; bash /tmp/x.sh",
+    # a `<<` in quotes or a comment is not an opener either
+    f"echo 'a <<X'\necho '{BOOTOUT}' | env bash",
+    f"echo hi # a <<X\necho '{BOOTOUT}' | env bash",
+    # `((cat <<EOF))` is arithmetic; its "body" is commands
+    f"((cat <<'EOF'))\n{BOOTOUT}\nEOF",
+    # a heredoc inside `$( … )` is received by the substitution's own command
+    f"x=$(bash <<'EOF'\n{BOOTOUT}\nEOF\n)",
+])
+def test_heredoc_opener_r5_shapes_block(command):
+    assert _blocked(command)
+
+
+@pytest.mark.parametrize("command", [
+    f"<<'EOF' cat\n{BOOTOUT}\nEOF",
+    f"<<'EOF' cat > /tmp/notes.md\n{BOOTOUT}\nEOF",
+    f"(( y = 1 << 2 ))\ncat <<'EOF'\n{BOOTOUT}\nEOF",
+    f"( (cat <<'EOF') )\n{BOOTOUT}\nEOF",
+    "<<'EOF' python3 -\ns = 'you may need to " + "re" + "start the gateway'\nEOF",
+    f"git commit -m \"$(cat <<'EOF'\nit's: {RESTART} later\nEOF\n)\"",
+])
+def test_heredoc_opener_r5_controls_pass(command):
+    assert not _blocked(command)
