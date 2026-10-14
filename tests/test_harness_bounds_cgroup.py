@@ -54,3 +54,20 @@ def test_a_real_anon_squeeze_still_clamps_to_the_floor(tmp_path):
 def test_without_a_file_row_only_inactive_file_is_subtracted(tmp_path):
     base = _cgroup(tmp_path, current=1000 * MiB, inactive_file=400 * MiB, active_file=300 * MiB)
     assert pytest_bounds._level_used(base) == 600 * MiB
+
+
+def test_mlocked_clean_file_pages_stay_counted(tmp_path):
+    # Prism 2d3bf87e12ba (t_72c6bce7): 3 GiB of clean file pages mlock()ed by a sibling sit in
+    # ``file`` AND ``unevictable``; the kernel cannot reclaim them before memory.max OOM-kills.
+    base = _cgroup(tmp_path, current=3172 * MiB, anon=100 * MiB, file=3072 * MiB, shmem=0,
+                   active_file=0, inactive_file=0, unevictable=3072 * MiB, file_dirty=0, file_writeback=0)
+    assert pytest_bounds._level_used(base) == 3172 * MiB
+    assert _budget(base) == pytest_bounds._MIN_GROWTH  # 4 GiB - 3.1 GiB leaves less than the headroom
+
+
+def test_unevictable_never_drives_clean_negative(tmp_path):
+    # ``unevictable`` also counts mlocked anon and SHM_LOCKed shmem (one LRU, no file-only split),
+    # so file - shmem - unevictable can go below 0; used must never exceed current.
+    base = _cgroup(tmp_path, current=2000 * MiB, anon=1500 * MiB, file=400 * MiB, shmem=100 * MiB,
+                   unevictable=1200 * MiB, file_dirty=0, file_writeback=0)
+    assert pytest_bounds._level_used(base) == 2000 * MiB
