@@ -2317,9 +2317,13 @@ class SessionStore(
             if generation is not None:
                 if generation <= fence[1]:
                     return False
+                if generation < fence[0]:
+                    # Writes land out of order: a newer stop already marked. Lowering the fence
+                    # would let an older resume erase it, and its older rowid would weaken the
+                    # boot gate, so the late write changes nothing.
+                    return True
                 fence[0] = int(generation)
-            else:
-                fence[0] = 0
+            # An untracked stop (no generation) leaves the fence as is: never lowered.
             entry.user_stopped_at = _now()
             entry.user_stopped_boot_id = boot_id
             entry.user_stopped_message_id = (

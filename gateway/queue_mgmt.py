@@ -144,7 +144,10 @@ async def gate_stopped_event(runner: Any, key: str, event: Any, adapter: Any) ->
     try:
         await runner.async_session_store.clear_user_stopped(key, generation=generation)
     except BaseException:
-        _unpark(runner, key, event)
+        # Only reclaim the human if nothing invalidated the generation meanwhile; a newer /stop
+        # (or /queue run, /new) owns the held store now and disposes of it.
+        if runner._session_state(key).persistent.run_generation == generation:
+            _unpark(runner, key, event)
         raise
     if runner._session_state(key).persistent.run_generation != generation:
         logger.info("queue_mgmt op=resume_invalidated session=%s", key)
