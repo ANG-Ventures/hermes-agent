@@ -3573,9 +3573,12 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             if reason:
                 _run_id, _sess_ref = safe_comment_provenance(tid)
                 comment = (author, f"UNBLOCK: {reason}", _run_id, _sess_ref)
-            if not kb.unblock_task(conn, tid, comment=comment):
+            expect = {k: getattr(args, k, None) for k in ("expect_block_event", "expect_last_comment")}
+            if not kb.unblock_task(conn, tid, comment=comment, **expect):
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                why = ("blocking state changed since the caller read it"
+                       if any(v is not None for v in expect.values()) else "not blocked/scheduled?")
+                print(f"cannot unblock {tid} ({why})", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
