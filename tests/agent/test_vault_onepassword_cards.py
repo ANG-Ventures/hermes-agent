@@ -139,7 +139,7 @@ def test_card_number_spacing_is_normalised_and_cardholder_optional():
     ({"expiry": "202900"}, "expiry"),
     ({"expiry": "29/07"}, "expiry"),                   # two-digit year is not a 1Password wire format
     ({"expiry": ""}, "expiry"),
-    ({"cardholder": "A\nB"}, "cardholder"),
+    ({"cardholder": "A\x07B"}, "cardholder"),  # a newline is editor residue and is normalised (see below); a BEL is not
 ])
 def test_malformed_card_values_are_refused_without_echoing_them(kw, match):
     with pytest.raises(CardDataError, match=match) as exc:
@@ -280,3 +280,21 @@ def test_browser_list_marks_reference_items_unavailable(op_env):
     assert items["op:login1"]["available"] is True
     for sentinel in (SENTINEL_NOTE, SENTINEL_ACCT, SENTINEL_KEY, PAN):
         assert sentinel not in raw
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("Alex Example\n", "Alex Example"),            # trailing newline (seen on a real item, 2026-10-14)
+    ("Alex\tExample", "Alex Example"),              # tab between names
+    ("  Alex   Example  ", "Alex Example"),         # runs of spaces
+    ("Alex\r\nExample", "Alex Example"),            # soft wrap
+])
+def test_cardholder_whitespace_residue_is_normalised_not_refused(raw, expected):
+    out = op_mod.parse_card_fields(_card("x", cardholder=raw)["fields"])
+    assert out["cardholder_name"] == expected
+
+
+def test_cardholder_still_refused_when_nonprintable_after_normalising():
+    with pytest.raises(op_mod.CardDataError, match="cardholder"):
+        op_mod.parse_card_fields(_card("x", cardholder="Alex\x07Example")["fields"])
+    with pytest.raises(op_mod.CardDataError, match="cardholder"):
+        op_mod.parse_card_fields(_card("x", cardholder="A" * 101)["fields"])
