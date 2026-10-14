@@ -28,6 +28,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 from agent.error_classifier import (
     _BILLING_PATTERNS,
     _OVERLOADED_PATTERNS,
+    _POOL_EXHAUSTED_PATTERNS,
     UNSUPPORTED_PARAM_MARKERS,
     is_reasoning_field_rejection,
     is_reasoning_required_rejection,
@@ -3703,6 +3704,15 @@ def _is_connection_error(exc: Exception) -> bool:
         "incomplete chunked read", "peer closed connection", "response ended prematurely",
         "unexpected eof", "remoteprotocolerror", "localprotocolerror",
     ))
+
+
+def _is_pool_exhausted_error(exc: Exception) -> bool:
+    """Local sub-pool relay 503 ``no eligible sub`` (every sub capped for this model): the route
+    cannot serve the request, so it falls back like a quota error. A deploy drain is excluded; it
+    has its own same-provider wait."""
+    if _exc_http_status(exc) not in (None, 503) or _is_relay_drain(exc):
+        return False
+    return _contains_any(str(exc).lower(), _POOL_EXHAUSTED_PATTERNS)
 
 
 def _exc_http_status(exc: Exception) -> Any:
@@ -8281,7 +8291,8 @@ class _LadderStep(NamedTuple):
 # wins, so a payment-flavoured 429 reads as "payment error", not "rate limit".
 _FALLBACK_REASONS: Tuple[Tuple[Callable[[Exception], bool], str], ...] = (
     (_is_auth_error, "auth error"), (_is_payment_error, "payment error"),
-    (_is_rate_limit_error, "rate limit"), (_is_model_incompatible_error, "model incompatible with route"),
+    (_is_rate_limit_error, "rate limit"), (_is_pool_exhausted_error, "sub pool exhausted"),
+    (_is_model_incompatible_error, "model incompatible with route"),
     (_is_invalid_aux_response_error, "invalid provider response"),
     # A status-less in-stream ``error`` event (SSE committed 200) is a route failure (#101538).
     (_is_statusless_structured_provider_error, "structured provider error"),
