@@ -745,5 +745,118 @@
       "gateway",
       "voice"
     ]
+  },
+  {
+    "feature": "per-turn no-first-byte wall budget across the fallback chain (#1890 933500a32)",
+    "tests": [
+      "tests/run_agent/test_fallback_wall_budget.py",
+      "tests/fork_canaries/test_fork_canary_fallback_recovery.py"
+    ],
+    "paths": [
+      "agent/fallback_wall_budget.py",
+      "agent/chat_completion_helpers.py",
+      "agent/chat_completion_stream_monitor.py",
+      "agent/error_classifier.py",
+      "agent/turn_api_request.py",
+      "agent/turn_context.py",
+      "hermes_cli/config_defaults.py"
+    ],
+    "why": "2026-10-11 01:59-02:34 PT (the 02:14 cascade): a fable turn walked alr -> dtlr -> btpr -> bpr and the user got zero bytes for 34 minutes, because every lane kept its own clock (relay per_attempt_timeout_s 420 s, stale floor 600-840 s) and nothing spanned the chain. One clock now arms when a call starts waiting, posts a still-waiting line every fallback.still_waiting_notice_seconds (120) and cuts the attempt once fallback.no_first_byte_budget_seconds (600) is spent with a usable lane ahead. Upstream has none of these modules; a parity merge resolving chat_completion_helpers.py / turn_api_request.py / error_classifier.py toward upstream drops the arm/cut/classify call sites with no import error. Canaries d-cut, f-credit, g-field in tests/fork_canaries/test_fork_canary_fallback_recovery.py.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_fallback_recovery.py (RED-proven 2026-10-14 t_58010601: _lane_ahead restricted to other-model lanes; FallbackWallBudgetExceeded drops elapsed_s)"
+  },
+  {
+    "feature": "relay deploy-drain sleep is credited against the no-first-byte wall budget (#1894 d4f54eae5)",
+    "tests": [
+      "tests/run_agent/test_fallback_wall_budget.py::test_relay_drain_wait_is_credited_not_counted",
+      "tests/run_agent/test_fallback_wall_budget.py::test_turn_recovery_drain_sleep_credits_the_wall_clock_for_the_real_wait",
+      "tests/fork_canaries/test_fork_canary_fallback_recovery.py"
+    ],
+    "paths": [
+      "agent/fallback_wall_budget.py",
+      "agent/turn_recovery.py"
+    ],
+    "why": "2026-10-11 16:37 PT: merging claude-pool#249 drained the alr relay for 126 s (503 draining-for-deploy + Retry-After, x47); the harness waited in place as designed and the wall clock posted 'still waiting for a first reply: 124s' into a healthy session, and would have spent the budget on a wait the relay asked for. note_excused_wait() moves the clock forward by the real slept span. The call site lives in the fork's relay_draining branch of turn_recovery.py (draining-for-deploy is our relay's protocol), so fork-permanent. Canaries f-credit (module) and f-callsite (turn_recovery call site) in tests/fork_canaries/test_fork_canary_fallback_recovery.py.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_fallback_recovery.py (RED-proven 2026-10-14 t_58010601: note_excused_wait ignores the credit; turn_recovery drops the note_excused_wait call)"
+  },
+  {
+    "feature": "same-model wall-budget skip removed; budget cut carries lane/elapsed_s/pool_headers and banner class no_first_byte_budget (#1920 9c3d78e1f)",
+    "tests": [
+      "tests/agent/test_route_notice_contract.py",
+      "tests/run_agent/test_fallback_wall_budget.py",
+      "tests/fork_canaries/test_fork_canary_fallback_recovery.py"
+    ],
+    "paths": [
+      "agent/fallback_wall_budget.py",
+      "agent/chat_completion_helpers.py",
+      "agent/fallback_policy.py",
+      "agent/fallback_events.py"
+    ],
+    "why": "2026-10-11 23:16-23:26 PT: alr held a 378k-token fable turn 600 s with no byte, then the same-model skip passed claude-dtlr, claude-btpr and claude-bpr (healthy, next in the chain) and sent the turn to cpa/gpt-6.1-sol at ~2x price; the banner said 'unclassified error' with no lane or seat. Ace ruling 2026-10-12 01:43 + 02:43 PT (t_778185f3): every lane in the chain is tried, in order. skip_lane()/has_other_model_ahead() are deleted; re-adding either (a merge restoring the pre-#1920 walker or cut rule) is the regression. The cut exception names lane, elapsed_s and pool_headers, and fallback_events classifies it no_first_byte_budget/harness. Canaries d-walker, d-cut, g-field, g-class in tests/fork_canaries/test_fork_canary_fallback_recovery.py.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_fallback_recovery.py (RED-proven 2026-10-14 t_58010601: same-model skip re-added in try_activate_fallback; other-model filter in _lane_ahead; classify_trigger budget branch removed)"
+  },
+  {
+    "feature": "a no-first-byte budget cut arms the sticky fallback episode (#1977 6ebfcbe67)",
+    "tests": [
+      "tests/agent/test_fallback_budget_cut_sticky.py",
+      "tests/fork_canaries/test_fork_canary_fallback_recovery.py"
+    ],
+    "paths": [
+      "agent/fallback_policy.py"
+    ],
+    "why": "2026-10-13 11:47-12:01 PT: alr held a fable turn 606 s with no byte, the budget cut moved it to dtlr, dtlr answered, and the next turn restored alr in the same second ('no active sticky state'), churning the warm fallback cache and re-entering the stalled lane. NO_FIRST_BYTE_BUDGET_CLASS is in STICKY_CLASSES (conn's cooldown row, warm-seat return gate) and UNSEATED_RETURN_CLASSES. A merge that rewrites STICKY_CLASSES from an older copy drops the arm silently. Canary e in tests/fork_canaries/test_fork_canary_fallback_recovery.py.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_fallback_recovery.py (RED-proven 2026-10-14 t_58010601: NO_FIRST_BYTE_BUDGET_CLASS removed from STICKY_CLASSES)"
+  },
+  {
+    "feature": "confirmed long relay quota exhaustion advances the native fallback chain instead of sleeping (#1979 4c80b2a9b)",
+    "tests": [
+      "tests/agent/test_relay_quota_retry_handoff.py",
+      "tests/fork_canaries/test_fork_canary_fallback_recovery.py"
+    ],
+    "paths": [
+      "agent/fork_ext/relay_quota.py",
+      "agent/turn_api_error.py"
+    ],
+    "why": "2026-10-12/13: ALR turns waited 10+ minutes on a relay quota 429/503 (x-relay-error-class quota_seat/quota_model, Retry-After ~1783 s) - the retry loop slept the 600 s Retry-After cap and retried the exhausted lane while dtlr/btpr/bpr sat untouched in the chain. A proven long quota on a pool relay now exhausts the attempt block on THIS error and the native walker takes the next lane; short/unproven waits, deploy drain and non-relay providers keep the in-place retry; with no usable fallback the turn fails loud after one call. Keyed on our relay's x-relay-error-class header and _POOL_CAPABILITY_PROVIDERS, so fork-permanent. turn_api_error.py exists upstream: resolving its handle_api_error hunk toward upstream restores the 600 s sleep with every other test green. The two exhaustion pins (~L174 retry_count = max_retries - 1, ~L233 fallthrough retry_count = max_retries) are redundant on the no-fallback path: dropping one alone stays green (measured), so a merge must keep at least one. Canaries a, b-short, b-unproven, c-pins, c-revert in tests/fork_canaries/test_fork_canary_fallback_recovery.py.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_fallback_recovery.py (RED-proven 2026-10-14 t_58010601: relay quota check forced False; quota class widened to any Retry-After / unproven text; both exhaustion pins dropped)"
   }
 ]
