@@ -66,8 +66,15 @@ def _pin_read_snapshot(conn: sqlite3.Connection) -> None:
     spent, 892542/976766 pages still remaining). Inside an open read transaction, other writers
     land in the WAL beyond this connection's snapshot, so the backup never restarts. Best-effort:
     if the source is locked right now, fall back to the unpinned copy and its busy/stall guards.
+
+    WAL only. In a rollback-journal mode (``database.journal_mode: delete`` and friends) an open
+    read transaction holds a SHARED lock for the whole copy, so no writer can ever commit; the
+    unpinned ``backup_step`` releases it between steps and lets writers in.
     """
     try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()
+        if not mode or str(mode[0]).lower() != "wal":
+            return
         conn.execute("BEGIN")
         conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
     except Exception as exc:  # best-effort: never let the pin itself fail the copy
