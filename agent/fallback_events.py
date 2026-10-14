@@ -206,12 +206,49 @@ def _lower_headers(headers: Any) -> Dict[str, str]:
     return out
 
 
+_CPA_NO_AUTH = ("auth_unavailable", "no auth available")
+_CPA_LAST_UPSTREAM = "last upstream error:"
+# cpa sends the same "no auth available" when its credentials EXIST but are all
+# cooling down / overloaded, appending the last upstream error (t_03fb601f:
+# codex "server_is_overloaded" rendered "OAuth revoked (401)"). Ordered.
+_CPA_CAPACITY_UPSTREAM: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("pool_pressure", ("overloaded",)),
+    # Not a bare "rate": it is inside "generate"/"accurate".
+    ("rate_upstream", ("429", "rate limit", "rate_limit", "ratelimit", "too many requests")),
+    ("quota_seat", ("quota",)),
+)
+_CPA_COOLDOWN = ("cooldown", "credential_quota")
+
+
+def cpa_auth_unavailable_class(text: Optional[str]) -> Optional[str]:
+    """Trigger class of a CLIProxyAPI ``auth_unavailable`` body, else None.
+
+    Bare (no credential loaded) is ``auth``. With a capacity-flavoured
+    ``last upstream error:`` or a cooldown reason it is the matching capacity
+    class. Shared by ``classify_text`` and ``agent.error_classifier`` so the
+    ledger class and the runtime verdict cannot drift."""
+    t = (text or "").lower()
+    if not any(n in t for n in _CPA_NO_AUTH):
+        return None
+    _, sep, upstream = t.partition(_CPA_LAST_UPSTREAM)
+    if sep:
+        for cls, needles in _CPA_CAPACITY_UPSTREAM:
+            if any(n in upstream for n in needles):
+                return cls
+    if any(n in t for n in _CPA_COOLDOWN):
+        return "quota_seat"
+    return "auth"
+
+
 def classify_text(text: Optional[str], *, http_status: Optional[int] = None,
                   exc_name: Optional[str] = None,
                   reason: Optional[str] = None) -> str:
     """§4.1 text table. Total: always returns a member of TRIGGER_CLASSES."""
     if reason == "content_policy_blocked":
         return "refusal"
+    cpa = cpa_auth_unavailable_class(text)
+    if cpa is not None:
+        return cpa
     t = (text or "").lower()
     for cls, needles in _TEXT_TABLE:
         if any(n in t for n in needles):
