@@ -239,9 +239,16 @@ def browser_vault_list() -> str:
             continue
         for meta in metas:
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
-                     "origin": meta.origin, "available": meta.kind == "login" or bool(meta.origin)}
+                     "origin": meta.origin, "available": _fill_path(meta) is not None}
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
+            for key in ("category", "vault", "last4"):
+                if getattr(meta, key, None):
+                    entry[key] = getattr(meta, key)
+            if not meta.fill_supported:
+                entry["fill_supported"] = False
+            elif meta.kind == "payment" and not meta.origin:
+                entry["origin_binding"] = "the user approves the exact https page for each fill"
             if meta.has_otp or backend.needs_unlock:
                 entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
             if meta.identifier:
@@ -398,9 +405,10 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
 
 def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
-    """Fill the current page's password field from a vault handle.
+    """Fill the current page from a vault handle: the password of a login, card fields of a payment
+    item (one human approval per fill, naming the page), address fields of a local address item.
 
-    Password-only: the identifier is agent-visible metadata (see
+    For a login the identifier is agent-visible metadata (see
     browser_vault_list) and is typed by the agent via normal input tools.
     The password is resolved server-side and injected via in-page JS over
     the supervisor CDP WebSocket; the result reports only counts/metadata.
@@ -417,6 +425,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         select_password_fill,
     )
     from agent.vault_backends import UnlockRequired, backend_for_handle
+    from agent.vault_backends.base import VaultAccessDenied
     from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
 
     effective_task_id = task_id or "default"
@@ -442,29 +451,41 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
-    if meta.kind != "login" and not meta.origin:
+    path = _fill_path(meta)
+    if path is None and meta.kind in _FILLABLE_KINDS and meta.fill_supported:
         return json.dumps({"success": False, "error_type": "no_origin",
                            "error": f"Vault item {handle!r} has no bound origin; {meta.kind} items are filled only on the site they were saved for."})
-    if meta.kind == "payment" and not _confirm_payment_fill(meta.label, str(meta.origin)):
-        return json.dumps({"success": False, "error_type": "payment_declined",
-                           "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
+    if path is None:
+        # Before any secret read: only the three fill paths below exist. A metadata-only manager item
+        # (kind ``reference``: password, document, SSH key...) or any unknown kind stops here.
+        return json.dumps({"success": False, "error_type": "not_fillable",
+                           "error": (f"Vault item {handle!r} ({meta.category or meta.kind}) is listed for reference "
+                                     "only; only logins and payment cards (and local address items) can be filled.")})
 
     # ── Origin binding pre-check (cheap early exit; the authoritative check
     # runs synchronously inside the fill script itself) ──────────────────────
     # Manager items can bind several websites (e.g. amazon.co.uk + www.amazon.co.uk);
     # every saved origin is a valid fill target. Matching stays exact-origin —
-    # nothing wildcard/parent-domain is ever inferred.
+    # nothing wildcard/parent-domain is ever inferred. A payment card with no saved
+    # website has no allowed list: the user approves the one https page it may fill.
     allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
     page_origin = None
     for candidate in allowed:
         page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
         if page_origin:
             break
+    if path == "approved_page":
+        _focus_bound_origin(effective_task_id, "", meta.kind)  # the tab holding a card form, any https site
     page_origin = page_origin or _current_page_origin(effective_task_id)
     if not page_origin:
         return json.dumps(
             {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
         )
+    if path == "approved_page":
+        if not page_origin.startswith("https://"):
+            return json.dumps({"success": False, "error_type": "origin_mismatch",
+                               "error": f"Refused: {page_origin} is not an https page. A card is filled only on https checkouts."})
+        allowed = [page_origin]
     if page_origin not in allowed:
         return json.dumps(
             {
@@ -477,6 +498,17 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
+    if meta.kind == "payment":
+        # One approval per fill, naming the page that will receive the card. Nothing is resolved before it,
+        # and the page is re-read afterwards: a navigation while the prompt was open refuses here, and one
+        # after this read is refused by the fill script's own origin assert.
+        card = meta.label + (f" ending {meta.last4}" if meta.last4 else "")
+        if not _confirm_payment_fill(card, page_origin):
+            return json.dumps({"success": False, "error_type": "payment_declined",
+                               "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
+        if _current_page_origin(effective_task_id) != page_origin:
+            return json.dumps({"success": False, "error_type": "origin_changed",
+                               "error": f"Refused: the page left {page_origin} while the approval was open. Nothing was written."})
 
     # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
@@ -513,6 +545,13 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+    except VaultAccessDenied:
+        return json.dumps({"success": False, "error_type": "vault_access_denied",
+                           "error": f"{backend.display_name} does not let this agent read that item's vault. Nothing was filled."})
+    except Exception as exc:  # backend messages name fields, never values; nothing was written
+        logger.info("vault fill: resolving %s failed (%s)", handle, type(exc).__name__)
+        return json.dumps({"success": False, "error_type": "resolve_failed",
+                           "error": f"Could not read the saved {meta.kind} item: {str(exc)[:200]}. Nothing was filled."})
     if not fills:
         return json.dumps(
             {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
@@ -569,6 +608,21 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     return json.dumps(out)
 
 
+_FILLABLE_KINDS = ("login", "payment", "address")
+
+
+def _fill_path(meta) -> Optional[str]:
+    """How an item may be filled, or None. ``bound``: exact match against its saved origin(s).
+    ``approved_page``: a password-manager card (1Password ``CREDIT_CARD``; cards there carry no website)
+    with no saved website, filled only on the https page the user approves for that single fill.
+    Everything else (``reference`` items, unknown kinds, a local item with no origin) has no fill path."""
+    if meta.kind not in _FILLABLE_KINDS or not getattr(meta, "fill_supported", True):
+        return None
+    if meta.kind == "login" or meta.origin or meta.allowed_origins:
+        return "bound"
+    return "approved_page" if meta.kind == "payment" and meta.category == "CREDIT_CARD" else None
+
+
 def _confirm_payment_fill(label: str, origin: str) -> bool:
     """Human confirmation before a card is written into a page: a prompt injection that reaches a checkout
     must not be able to spend. Routes through the approval surface of the active session (gateway button
@@ -577,8 +631,8 @@ def _confirm_payment_fill(label: str, origin: str) -> bool:
 
     return request_elicitation_consent(
         f"Fill payment card '{label}' on {origin}",
-        "The agent wants to enter your saved card details into this checkout page. The card number and "
-        "CVC never enter the conversation. Approve only if you intend to pay here.",
+        f"The agent wants to enter your saved card details into the page at {origin}, once. The card number "
+        "and CVC never enter the conversation. Approve only if you intend to pay on this exact site.",
         surface="vault-payment", title="Confirm payment card fill?") == "accept"
 
 
@@ -591,9 +645,11 @@ BROWSER_VAULT_LIST_SCHEMA = {
     "description": (
         "ALWAYS call this first when a page asks for a password, card or address. Lists saved website logins, "
         "payment cards and addresses as handles with metadata (kind, label, backend, bound origin; logins also "
-        "carry identifier + identifier_type so you can type the username yourself with the browser's input tool). "
-        "Secret values are NEVER returned. Sources: the local agent vault plus any installed password manager "
-        "(1Password, Bitwarden are detected automatically). A locked manager appears under `locked`; call "
+        "carry identifier + identifier_type so you can type the username yourself with the browser's input tool; "
+        "1Password cards carry vault and last4 when available). 1Password items of every other category (passwords, "
+        "notes, documents, keys...) are listed as kind `reference` with `available: false`: metadata only, they can "
+        "never be filled or read. Secret values are NEVER returned. Sources: the local agent vault plus any installed "
+        "password manager (1Password, Bitwarden are detected automatically). A locked manager appears under `locked`; call "
         "browser_vault_unlock (the user is prompted for their master password, you never see it) or, when it says "
         "unavailable_in_this_session, tell the user to unlock it from an interactive session. Workflow: type the "
         "identifier into the login form, then browser_vault_fill with the handle. No item for this origin: call "
@@ -623,10 +679,12 @@ BROWSER_VAULT_FILL_SCHEMA = {
     "description": (
         "Fill the CURRENT browser page from a vault handle (see browser_vault_list): a login item fills ONLY "
         "the password field (type the identifier/username yourself first with the browser's input tool); a "
-        "payment item fills card number/name/expiry/CVC after the user confirms in their UI; an address item "
-        "fills the address fields. Values are resolved server-side and never appear in the conversation. "
-        "Refused unless the page origin exactly matches the item's bound origin (re-checked atomically at "
-        "fill time). If a password manager is locked the user is prompted to unlock first. Never retry a "
+        "payment item fills card number/name/expiry/CVC after the user approves that one fill for the exact page "
+        "shown to them; an address item fills the address fields. `reference` items are refused (not_fillable). "
+        "Values are resolved server-side and never appear in the conversation. Refused unless the page origin "
+        "exactly matches the item's bound origin; a card with no saved website is bound to the https page the user "
+        "approved (re-checked atomically at fill time). Card fields inside a cross-origin payment iframe are not "
+        "reached. If a password manager is locked the user is prompted to unlock first. Never retry a "
         "payment_declined result."
     ),
     "parameters": {

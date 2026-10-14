@@ -201,13 +201,13 @@ def test_onepassword_multi_url_item_binds_every_saved_web_origin():
 
     backend = OnePasswordLoginBackend({"enabled": True})
     items_json = json.dumps([{
-        "id": "multi", "title": "Amazon", "created_at": "2026-01-01T00:00:00Z",
+        "id": "multi", "title": "Amazon", "created_at": "2026-01-01T00:00:00Z", "category": "LOGIN",
         "additional_information": "jane@example.com",
         "urls": [{"href": "https://amazon.co.uk"}, {"href": "https://www.amazon.co.uk"},
                  {"href": "https://eu.account.amazon.com"}, {"href": "androidapp://com.amazon.shopping"},
                  {"href": "::not parseable::"}],
     }, {
-        "id": "single", "title": "Shop", "created_at": "2026-01-01T00:00:00Z",
+        "id": "single", "title": "Shop", "created_at": "2026-01-01T00:00:00Z", "category": "LOGIN",
         "urls": [{"href": "https://shop.example.com"}],
     }])
     with patch.object(OnePasswordLoginBackend, "is_unlocked", return_value=True), \

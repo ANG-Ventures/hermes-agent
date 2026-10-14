@@ -49,7 +49,7 @@ sys.exit(2)
 
 
 def _item(item_id, vault_id, title, url="https://example.com/login"):
-    return {"id": item_id, "title": title, "created_at": "2026-01-01T00:00:00Z",
+    return {"id": item_id, "title": title, "created_at": "2026-01-01T00:00:00Z", "category": "LOGIN",
             "additional_information": "jane@example.com", "urls": [{"href": url}],
             "vault": {"id": vault_id, "name": vault_id.upper()}}
 

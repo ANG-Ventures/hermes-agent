@@ -171,6 +171,14 @@ class VaultItemMeta:
     # ``origin`` is the first/primary one). Fill matching stays exact-origin against
     # this list — no wildcard or subdomain inference is ever derived from it.
     allowed_origins: tuple = ()
+    # Password-manager metadata. ``category`` is the manager's own item type (1Password ``CREDIT_CARD``,
+    # ``SSH_KEY``...), ``vault`` the owning vault's name, ``last4`` a card's last four digits when the
+    # manager exposes them in a strictly masked form. ``fill_supported=False`` marks a listed-for-
+    # discovery item (kind ``reference``) that no fill path may ever resolve.
+    category: Optional[str] = None
+    vault: Optional[str] = None
+    last4: Optional[str] = None
+    fill_supported: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         out = {
@@ -187,6 +195,11 @@ class VaultItemMeta:
             out["has_otp"] = True
         if len(self.allowed_origins) > 1:
             out["allowed_origins"] = list(self.allowed_origins)
+        for key in ("category", "vault", "last4"):
+            if getattr(self, key):
+                out[key] = getattr(self, key)
+        if not self.fill_supported:
+            out["fill_supported"] = False
         return out
 
 
