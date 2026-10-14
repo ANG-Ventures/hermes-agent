@@ -64,6 +64,8 @@ _CANDIDATE_QUARANTINE_TTL: dict[str, Optional[float]] = {
     "rate limit": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
     "connection error": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
     "invalid provider response": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
+    # Relay pool caps are per MODEL; the hold is per endpoint, so keep it short.
+    "sub pool exhausted": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
 }
 
 
