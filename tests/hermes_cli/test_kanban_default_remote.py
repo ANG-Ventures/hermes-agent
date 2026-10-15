@@ -391,6 +391,22 @@ def test_i0_red_when_null_inputs_eat_coverage():
     assert not out["green"] and out["null_ticks"] == 5
 
 
+def test_i0_null_or_non_numeric_records_are_not_coverage():
+    """Prism P1: a null I-0 counter or a non-bool pool_planned measured nothing;
+    it must not count as coverage nor read as 0."""
+    lines = [_line(1000 + 60 * i) for i in range(60)]
+    for r in lines:
+        r["portable_waiting_with_room"] = None
+    out = gates.check_i0(lines, since=1000, until=1000 + 3600, interval=60)
+    assert not out["green"] and out["null_ticks"] == 60 and out["coverage"] == 0
+    assert any(r.startswith("invalid: 60") for r in out["red"]), out["red"]
+    lines = [_line(1000 + 60 * i) for i in range(60)]
+    lines[3]["pool_planned"] = None
+    lines[4]["stranded_allowance"] = "0"
+    out = gates.check_i0(lines, since=1000, until=1000 + 3600, interval=60)
+    assert out["null_ticks"] == 2 and any(r.startswith("invalid: 2") for r in out["red"])
+
+
 def test_i0_red_on_an_empty_series():
     out = gates.check_i0([], since=1000, until=1000 + 3600, interval=60)
     assert not out["green"] and out["gaps"]
@@ -452,3 +468,6 @@ def test_r10_counts_failed_and_half_done_remote_runs(home):
         for _ in range(gates.ROLLBACK_TRIGGER_PER_DAY):
             _run(conn, c, outcome="gave_up", summary="sudo: a password is required")
         assert not gates.r10_report(conn, days=1, now=time.time() + 1, baseline_daily=0)["green"]
+        # Prism P1: no pre-flip baseline -> fail closed, never a self-derived trigger.
+        rep = gates.r10_report(conn, days=1, now=time.time() + 1)
+        assert not rep["green"] and rep["trigger"] is None and rep["red"]

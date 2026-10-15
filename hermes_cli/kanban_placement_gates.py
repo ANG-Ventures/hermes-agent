@@ -157,6 +157,12 @@ def read_series(paths: Iterable[Path]) -> List[dict]:
 
 I0_FIELDS = ("portable_waiting", "allowance_unused", "portable_waiting_with_room",
              "stranded_allowance", "pool_planned")
+_I0_COUNTERS = I0_FIELDS[:4]
+
+
+def _i0_valid(r: dict) -> bool:
+    return (all(isinstance(r[f], (int, float)) and not isinstance(r[f], bool) for f in _I0_COUNTERS)
+            and isinstance(r["pool_planned"], bool))
 
 
 def check_i0(lines: List[dict], *, since: float, until: float, interval: float) -> dict:
@@ -176,7 +182,11 @@ def check_i0(lines: List[dict], *, since: float, until: float, interval: float) 
                    f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(a))} and "
                    f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(b))}")
     missing = [r for r in window if any(f not in r for f in I0_FIELDS)]
-    nulls = [r for r in window if r.get("portable_waiting") is None or r.get("allowance_unused") is None]
+    # A record whose invariant inputs are not numbers (or pool_planned not a
+    # bool) measured nothing: it is not coverage and never reads as 0.
+    bad = {id(r) for r in missing}
+    nulls = [r for r in window if id(r) not in bad and not _i0_valid(r)]
+    bad |= {id(r) for r in nulls}
     # Coverage is TIME-based: the share of the window not inside a > MAX_GAP_TICKS gap,
     # times the share of lines with non-null inputs. A tick-COUNT ratio against the nominal
     # interval reads ~0.85 on a gap-free live series (ticks land every interval + tick
@@ -191,13 +201,17 @@ def check_i0(lines: List[dict], *, since: float, until: float, interval: float) 
     if coverage < MIN_COVERAGE:
         red.append(f"coverage: {coverage:.3f} < {MIN_COVERAGE} ({good} usable tick(s), "
                    f"{gap_time:.0f}s of {span:.0f}s in gaps, {len(nulls)} null)")
+    if nulls:
+        red.append(f"invalid: {len(nulls)} tick line(s) with a null/non-numeric I-0 counter "
+                   f"or a non-bool pool_planned")
     if corrupt:
         red.append(f"corrupt: {corrupt} unparseable line(s)")
-    violations = [r for r in window if (r.get("portable_waiting_with_room") or 0) > 0]
+    valid = [r for r in window if id(r) not in bad]
+    violations = [r for r in valid if r["portable_waiting_with_room"] > 0]
     if violations:
         red.append(f"i0: {len(violations)} tick(s) where a pool-refused portable row waited "
                    f"with room on its own board")
-    stranded = [r for r in window if (r.get("stranded_allowance") or 0) > 0]
+    stranded = [r for r in valid if r["stranded_allowance"] > 0]
     return {
         "green": not red, "red": red, "ticks": len(window), "expected": expected,
         "coverage": round(coverage, 4), "gaps": gaps, "violations": len(violations),
@@ -256,8 +270,12 @@ def r10_report(conn: sqlite3.Connection, *, days: int, now: Optional[float] = No
         per_day.append({"day": time.strftime("%Y-%m-%d", time.localtime(a)), "n": len(hits),
                         "runs": [h["run_id"] for h in hits]})
     mean = sum(p["n"] for p in per_day) / max(1, days)
-    trigger = max(ROLLBACK_TRIGGER_PER_DAY,
-                  2 * (baseline_daily if baseline_daily is not None else mean))
+    if baseline_daily is None:
+        # The trigger must come from the PRE-flip window; deriving it from the
+        # window under test lets a steady bad rate set its own bar.
+        return {"days": per_day, "mean": round(mean, 3), "trigger": None, "tripped": [],
+                "green": False, "red": ["no pre-flip baseline: pass --baseline-daily"]}
+    trigger = max(ROLLBACK_TRIGGER_PER_DAY, 2 * baseline_daily)
     tripped = [p for p in per_day if p["n"] > trigger]
     return {"days": per_day, "mean": round(mean, 3), "trigger": trigger,
             "tripped": [p["day"] for p in tripped], "green": not tripped}
@@ -283,7 +301,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p0.add_argument("--root", help="kanban home holding var/gate-ticks*.jsonl")
     p10 = sub.add_parser("r10")
     p10.add_argument("--days", type=int, default=14)
-    p10.add_argument("--baseline-daily", type=float)
+    p10.add_argument("--baseline-daily", type=float, required=True,
+                     help="pre-flip daily mean (r10 over the pre-flip window)")
     p10.add_argument("--board-db")
     args = ap.parse_args(argv)
     try:
