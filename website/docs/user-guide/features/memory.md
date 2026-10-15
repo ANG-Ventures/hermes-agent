@@ -325,6 +325,22 @@ staged before this pinning existed has no verifiable target and is refused too:
 reject it and recreate the change. `/memory approve` lists the full text of
 every entry it overwrote or removed.
 
+### Keeping the background review out of MEMORY.md/USER.md (`background_review_flat_file_writes`)
+
+If your `MEMORY.md`/`USER.md` are generated from somewhere else, review edits to
+them are overwritten anyway and the staged proposals are noise. Turn them off:
+
+```yaml
+memory:
+  background_review_flat_file_writes: false   # default: true
+```
+
+With `false`, an unattended background review refuses every `memory` tool call
+(add, replace, remove, batch): nothing is written and nothing is staged. A
+`mem0_remember` tool the review already has stays available, and the review
+prompt says it is the only memory sink. Foreground turns and `/refine` keep the
+full operation set.
+
 ## Background review notifications (`display.memory_notifications`)
 
 After a turn, the background self-improvement review may quietly save a memory

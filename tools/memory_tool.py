@@ -204,6 +204,36 @@ def _background_delete_gate(store, action, operations, target="memory", content=
             "batch); 'add' is still available.", success=False)
 
 
+FLAT_FILE_REVIEW_CONFIG_KEY = "background_review_flat_file_writes"
+FLAT_FILE_REVIEW_REFUSAL = ("Background review does not edit MEMORY.md/USER.md on this profile (rendered pointer "
+                            "files). Save durable facts with mem0_remember.")
+
+
+def background_review_flat_file_writes_enabled() -> bool:
+    """``memory.background_review_flat_file_writes`` (default true). Only an explicit false-ish
+    value turns it off, so a missing key or a typo keeps today's add-applies/stage-deletes gate."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+        value = cfg_get(load_config_readonly(), "memory", FLAT_FILE_REVIEW_CONFIG_KEY, default=True)
+    except Exception:
+        logger.debug("Could not read %s; keeping flat-file review writes on", FLAT_FILE_REVIEW_CONFIG_KEY,
+                     exc_info=True)
+        return True
+    if value is False:
+        return False
+    return not (isinstance(value, str) and value.strip().lower() in {"false", "0", "no", "off"})
+
+
+def _flat_file_review_gate() -> Optional[str]:
+    """Refuse EVERY memory-tool op in an unattended review when the profile turned flat-file review
+    writes off: nothing applied, nothing staged. Attended reviews and foreground turns pass."""
+    from tools.skill_provenance import is_unattended_review
+
+    if not is_unattended_review() or background_review_flat_file_writes_enabled():
+        return None
+    return tool_error(FLAT_FILE_REVIEW_REFUSAL, success=False)
+
+
 def memory_tool(action: str = None, target: str = "memory", content: str = None, old_text: str = None,
                 new_text: str = None, operations: Optional[List[Dict[str, Any]]] = None,
                 store: Optional[MemoryStore] = None) -> str:
@@ -225,6 +255,8 @@ def _applied(result: Dict[str, Any]) -> Tuple[str, str]:
 
 def _memory_tool(action, target, content, old_text, new_text, operations, store) -> Tuple[str, str]:
     """``(outcome, result_json)``: ``rejected`` when refused or held before touching the store."""
+    if (refused := _flat_file_review_gate()) is not None:
+        return "rejected", refused
     if content is None and new_text is not None:
         content = new_text
     # Strict providers send JSON null for optional fields; treat as omitted.

@@ -468,6 +468,19 @@ _MEMORY_REVIEW_MEM0_CLAUSE = (
     "when in doubt, do not save."
 )
 
+# Replaces _MEMORY_REVIEW_MEM0_CLAUSE when memory.background_review_flat_file_writes is false: the
+# memory tool refuses every op in an unattended review there, so say so up front instead of letting
+# the reviewer spend a call on the refusal every pass.
+_MEMORY_REVIEW_MEM0_ONLY_CLAUSE = (
+    "\n\nLong-term memory on this profile: MEMORY.md and USER.md are NOT writable from this review "
+    "(they are rendered files; the memory tool will refuse every add, replace and remove). Ignore the "
+    "memory-tool instructions above. mem0_remember is the only memory sink: a DURABLE fact about the "
+    "user or their environment (a preference, a standing decision or correction, an "
+    "account/device/topology pointer, a long-lived plan or constraint) goes there, one fact per call. "
+    "Never save work-narration, status, speculation, one-off requests or anything stale within a "
+    "week; when in doubt, do not save."
+)
+
 # Shared shape contract for anything written into a skill. The failure mode this prevents is the
 # hoarding library: one references/ file per session, incident narration instead of rules, PR numbers
 # and quotes as content, and duplicating what the repo's AGENTS.md / the tool schemas already teach.
@@ -1283,9 +1296,11 @@ def _review_tool_whitelist(
     # starved the loop (read_file also registers the read with the read-before-write guard).
     # Write tools stay denied — autonomous maintenance goes through skill_manage's validation.
     whitelist |= {"read_file", "search_files"}
-    # mem0_remember (opt-in, memory.background_review_mem0_write): admitted only on a memory-reviewing
-    # pass, and only when its check_fn put it in the inherited tools[] (else the model cannot see it).
-    if "memory" in whitelist and _mem0_remember_resident(review_agent):
+    # mem0_remember (opt-in, memory.background_review_mem0_write): admitted on any memory-reviewing
+    # pass where its check_fn put it in the inherited tools[] (else the model cannot see it). Not tied
+    # to the flat-file ``memory`` tool: a profile can switch those writes off (or both built-in stores)
+    # and still keep mem0 as the review's memory sink.
+    if review_memory and _mem0_remember_resident(review_agent):
         whitelist.add("mem0_remember")
     # ``extra_tools`` admits named parent tools (e.g. a human-gated proposal tool). The whitelist
     # can only admit, never advertise: a listed tool must already exist in the inherited schema.
@@ -1557,7 +1572,9 @@ def spawn_background_review_thread(
     name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
     prompt = getattr(agent, name, globals()[name])
     if review_memory and _mem0_remember_resident(agent):
-        prompt += _MEMORY_REVIEW_MEM0_CLAUSE
+        from tools.memory_tool import background_review_flat_file_writes_enabled
+        prompt += (_MEMORY_REVIEW_MEM0_CLAUSE if background_review_flat_file_writes_enabled()
+                   else _MEMORY_REVIEW_MEM0_ONLY_CLAUSE)
     if focus := (focus or "").strip():
         prompt = (
             f"{prompt}\n\nThe user explicitly requested this review with the following "

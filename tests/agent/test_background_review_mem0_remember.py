@@ -248,3 +248,35 @@ def test_provider_switched_away_from_mem0_refuses(mem0_home, tmp_path):
         "memory:\n  provider: holographic\n  background_review_mem0_write: true\n")
     out = _dispatch("Ace prefers tea.")
     assert "error" in out and fake.rows == []
+
+
+def test_flat_file_writes_off_keeps_mem0_remember_and_swaps_prompt_clause(mem0_home, tmp_path):
+    """memory.background_review_flat_file_writes: false — the review keeps mem0_remember as its only
+    memory sink (whitelisted, even with both flat-file stores disabled) and the prompt says so."""
+    fake = mem0_home(knob=True)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(cfg.read_text() + "  background_review_flat_file_writes: false\n")
+    from tools.registry import invalidate_check_fn_cache
+    invalidate_check_fn_cache()
+    fork = _fork_from(_parent_tools())
+    assert "mem0_remember" in _names(fork.tools)
+
+    from agent.background_review import (
+        _MEMORY_REVIEW_MEM0_CLAUSE, _MEMORY_REVIEW_MEM0_ONLY_CLAUSE, _review_tool_whitelist,
+        spawn_background_review_thread)
+    whitelist, _ = _review_tool_whitelist(fork, None, review_memory=True)
+    assert {"mem0_remember", "memory"} <= whitelist  # memory stays: the tool gate refuses, tools[] unchanged
+    fork._memory_enabled = fork._user_profile_enabled = False
+    no_flat, _ = _review_tool_whitelist(fork, None, review_memory=True)
+    assert "mem0_remember" in no_flat and "memory" not in no_flat
+    skill_only, _ = _review_tool_whitelist(fork, None, review_memory=False)
+    assert "mem0_remember" not in skill_only
+
+    _, prompt = spawn_background_review_thread(
+        SimpleNamespace(tools=[{"function": {"name": "mem0_remember"}}], session_id="s"), [],
+        review_memory=True, task_cfg={})
+    assert prompt.endswith(_MEMORY_REVIEW_MEM0_ONLY_CLAUSE)
+    assert _MEMORY_REVIEW_MEM0_CLAUSE not in prompt
+
+    assert _dispatch("Ace keeps MEMORY.md rendered from templates.")["verdict"] == "stored"
+    assert fake.rows[0]["memory"] == "Ace keeps MEMORY.md rendered from templates."

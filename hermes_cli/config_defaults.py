@@ -1553,6 +1553,10 @@ DEFAULT_CONFIG = {
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review; 0 when an external provider auto-extracts.
         "nudge_interval": 10,
+        # false = an unattended background review refuses every memory-tool op (add, replace,
+        # remove, batch) with nothing staged; foreground and /refine are unaffected. For profiles
+        # whose MEMORY.md/USER.md are rendered elsewhere. Read by tools/memory_tool.py.
+        "background_review_flat_file_writes": True,
         # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",
         # "mem0", "holographic", "retaindb", "byterover", or a catalog-installed one ("hindsight").
         "provider": "",
