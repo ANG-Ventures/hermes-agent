@@ -226,7 +226,11 @@ class GateTickBuilder:
         if not gate.remote_allowed:
             gate.pool = {"planned": False, "reason": "proc_paused"}
             return None
-        pins_only = gate.band not in ("spilling", "paused") and not admitting_overflow(pool_cfg)
+        # kanban.placement.default (spec v0.3 §3.1), read per tick: remote
+        # offers every portable row to the pool first, so pins_only is off.
+        default_remote = kwp.placement_default(cfg) == kwp.PLACEMENT_DEFAULT_REMOTE
+        pins_only = (gate.band not in ("spilling", "paused") and not default_remote
+                     and not admitting_overflow(pool_cfg))
         from hermes_cli import kanban_continuation as kc
         # Live continuation origins (ready, running, review) need the plan's
         # probe whatever else is ready: HOST_LOST and origin waits read it.
@@ -268,6 +272,7 @@ class GateTickBuilder:
                         disabled=pool.disabled, config=pool, signal=signal,
                         workspace_paths=paths)
         plan.band, plan.spill_reason, plan.pins_only = gate.band, gate.spill_reason, pins_only
+        plan.default_remote = default_remote
         gate.pool = plan.snapshot()
         if signal is not None:
             # WARNING (one per message per 5 min): a host with no sampler reads

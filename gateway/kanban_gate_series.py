@@ -36,6 +36,14 @@ FIELDS = (
     "portable_waiting", "allowance", "allowance_unused", "pool_budget",
     "pool_free_by_host", "tick_ms_cpu", "tick_ms_wall", "boards",
     "rows_routed", "queries",
+    # Momus pass 3 on spec v0.3 (t_667f1f6a). R1: the I-0 gate key is
+    # per board (``portable_waiting_with_room``); host residual left while a
+    # portable row waited is reported apart (``stranded_allowance``). R2:
+    # every line says whether a pool plan ran (``pool_planned`` /
+    # ``pool_reason``) so an unplanned tick is counted, never silently passed.
+    # ``placement_default`` is the flag the tick ran under.
+    "portable_waiting_with_room", "stranded_allowance", "pool_planned",
+    "pool_reason", "placement_default",
 )
 
 
@@ -148,6 +156,12 @@ def tick_record(*, ts: float, gate, tick, builder, allowance: Optional[int],
     ``taken``), None without a plan.
     ``running_last_resort`` is None until Phase 2 records a ``last-resort``
     spawn reason (there is no such spawn before the flip).
+    ``portable_waiting_with_room`` = portable rows the pool refused that then
+    waited while their OWN board's local allowance had room (the I-0 gate
+    key, Momus pass 3 R1: must be 0). ``stranded_allowance`` = host
+    ``allowance_unused`` left while other portable rows waited without room on
+    their board (quota stranded by the forward-only ``_spare`` split): a
+    defect to report, not the I-0 violation.
     """
     running_local = getattr(builder, "running_local", None)
     remote = dict(getattr(builder, "_remote_by_host", {}) or {})
@@ -160,6 +174,10 @@ def tick_record(*, ts: float, gate, tick, builder, allowance: Optional[int],
     else:
         unused = max(0, int(allowance) - int(local_spawned))
     res = [r for _slug, r in (results or []) if r is not None]
+    waiting = sum(int(getattr(r, "portable_waiting", 0) or 0) for r in res)
+    with_room = sum(int(getattr(r, "portable_waiting_with_room", 0) or 0) for r in res)
+    pool = getattr(gate, "pool", None)
+    pool = pool if isinstance(pool, dict) else {}
     rec = {
         "ts": round(ts, 3),
         "path": "gateway",
@@ -171,7 +189,7 @@ def tick_record(*, ts: float, gate, tick, builder, allowance: Optional[int],
         "running_local": running_local,
         "running_remote_by_host": remote,
         "running_last_resort": None,
-        "portable_waiting": sum(int(getattr(r, "portable_waiting", 0) or 0) for r in res),
+        "portable_waiting": waiting,
         "allowance": allowance,
         "allowance_unused": unused,
         "pool_budget": pool_budget,
@@ -181,6 +199,11 @@ def tick_record(*, ts: float, gate, tick, builder, allowance: Optional[int],
         "boards": boards,
         "rows_routed": sum(int(getattr(r, "rows_routed", 0) or 0) for r in res),
         "queries": queries,
+        "portable_waiting_with_room": with_room,
+        "stranded_allowance": (unused or 0) if waiting > with_room else 0,
+        "pool_planned": plan is not None,
+        "pool_reason": None if plan is not None else pool.get("reason"),
+        "placement_default": "remote" if getattr(plan, "default_remote", False) else "local",
     }
     pcore = getattr(gate, "pcore_busy", None)
     if pcore is not None:
