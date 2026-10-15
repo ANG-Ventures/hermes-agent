@@ -129,6 +129,7 @@ def validate(needs: Sequence[Mapping]) -> List[str]:
 class LaneRegistry:
     migrated: Tuple[str, ...] = ()
     legacy: Tuple[str, ...] = ()
+    mode: str = "off"   # browsers.mode (AC-1.13 kill switch); absent = off
 
     @property
     def names(self) -> frozenset:
@@ -136,17 +137,25 @@ class LaneRegistry:
 
 
 def load_registry(fleet_dir: Path) -> LaneRegistry:
-    """``migrated_lanes`` / ``legacy_allowlist`` from ``browser-hosts.json``.
-    Absent file or keys = empty registry (nothing migrated)."""
+    """``browsers.{migrated_lanes, legacy_allowlist, mode}`` from ``browser-hosts.json``, read per
+    call (never cached: a flip takes effect on the next tick). The lists live under ``browsers``
+    (the schema browserd reads); a top-level copy is read as a fallback. Absent file or keys =
+    empty registry, mode off (nothing migrated)."""
     try:
         doc = json.loads((Path(fleet_dir) / REGISTRY_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return LaneRegistry()
+    doc = doc if isinstance(doc, dict) else {}
+    raw_sect = doc.get("browsers")
+    sect: dict = raw_sect if isinstance(raw_sect, dict) else {}
+
     def _list(key):
-        v = doc.get(key) if isinstance(doc, dict) else None
+        v = sect.get(key, doc.get(key))
         return tuple(str(x).strip().lower() for x in v if isinstance(x, str) and x.strip()) \
             if isinstance(v, list) else ()
-    return LaneRegistry(migrated=_list("migrated_lanes"), legacy=_list("legacy_allowlist"))
+    mode = sect.get("mode")
+    return LaneRegistry(migrated=_list("migrated_lanes"), legacy=_list("legacy_allowlist"),
+                        mode=str(mode).strip().lower() if isinstance(mode, str) else "off")
 
 
 _ORIGIN_RE = re.compile(r"^[ \t]*origin:[ \t]*([^\s·]+)", re.IGNORECASE | re.MULTILINE)
