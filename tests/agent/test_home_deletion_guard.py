@@ -351,3 +351,37 @@ def test_empty_ifs_joins_an_unquoted_default_word_with_blanks(tmp_path: Path):
     assert command_deletes_protected_home(cmd, env=dict(env, IFS=""), cwd=str(user))
     # IFS set to something that does not contain a blank: still one field
     assert command_deletes_protected_home(cmd, env=dict(env, IFS=":"), cwd=str(user))
+
+
+@pytest.mark.parametrize("name", ["hermes  home", "hermes;home", "hermes|home", "hermes&home",
+                                  "hermes(home)", "hermes<home>", "hermes#home"])
+def test_default_word_keeps_literal_whitespace_and_metacharacters(tmp_path: Path, name: str):
+    """Prism fb6e5bf412c4: the default word of ``${U:-word}`` is one shell word, not command
+    source. Bash keeps the two spaces and the ``;``/``|``/``(`` literally inside it, so the
+    analyzer must resolve exactly that path, not a re-tokenized one."""
+    user = tmp_path / "u"
+    root = user / name
+    (root / "profiles" / "aegis").mkdir(parents=True)
+    env = {"HOME": str(user), "HERMES_HOME": str(root), "PATH": os.environ.get("PATH", "")}
+    for cmd in ("IFS=; rm -rf ${UNSET:-%s}" % root,
+                'rm -rf "${UNSET:-%s}"' % root,
+                'rm -rf "${UNSET:-"%s"}"' % root,
+                "rm -rf ${UNSET:-'%s'}" % root,
+                'rm -rf ${UNSET:-"%s"}' % root):
+        assert command_deletes_protected_home(cmd, env=env, cwd=str(user)), cmd
+    if " " not in name:  # no blank to split on: the bare unquoted default is the root itself
+        assert command_deletes_protected_home("rm -rf ${UNSET:-%s}" % root, env=env, cwd=str(user))
+
+
+def test_default_word_literal_text_is_split_on_ifs(tmp_path: Path):
+    """The default's unquoted literal text is field-split on IFS like a variable value:
+    ``IFS=:`` turns ``/nope:<root>`` into two fields, the second being the protected root."""
+    user = tmp_path / "u"
+    root = user / ".hermes"
+    (root / "profiles").mkdir(parents=True)
+    env = {"HOME": str(user), "HERMES_HOME": str(root), "PATH": os.environ.get("PATH", "")}
+    cmd = "rm -rf ${UNSET:-/nope:%s}" % root
+    assert not command_deletes_protected_home(cmd, env=env, cwd=str(user))  # one field, not a root
+    assert command_deletes_protected_home("IFS=:; " + cmd, env=env, cwd=str(user))
+    # a quoted or escaped separator is not split
+    assert not command_deletes_protected_home("IFS=:; rm -rf ${UNSET:-'/nope:'%s}" % root, env=env, cwd=str(user))
