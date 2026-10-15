@@ -4586,7 +4586,7 @@ def _pin_host(route) -> str:
 
 
 def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
-                  default_assignee: Optional[str] = None) -> None:
+                  default_assignee: Optional[str] = None, *, park: bool = True) -> None:
     """The Browser Sandboxes resolution gate for this tick (t_42728faf; spec v1.2 s3.3, AC-1.13/1.15).
 
     The live tick and ``--dry-run`` both come through here and both call
@@ -4643,7 +4643,7 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
         if v.refusal is not None:
             caps["browser_refused"] = dict(v.refusal_payload or {}, exit=v.refusal.exit)
             row_route[tid] = ("wait", f"browser_refused:{v.refusal.token}")
-            if not dry_run:
+            if not dry_run and park:
                 try:
                     if _kb.block_task(conn, tid, reason=v.refusal.line(), kind="needs_input",
                                       require_unclaimed_ready=True):
@@ -4660,6 +4660,22 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
         elif v.plans:
             caps["browser_lease_plan"] = [p.as_dict() for p in v.plans]
             row_route[tid] = ("wait", _kbg.WAIT_JOIN_OFF)
+
+
+def _browser_hold_review_rows(conn, review_rows, result, dry_run: bool) -> list:
+    """Review spawns go through the SAME browser gate (Prism 1d0c5e1cc25d): a reviewer keeps the card's skills, so a
+    review row whose browser need is refused, waiting, a lease plan, or a gate fault is not spawned this tick. It is
+    never parked: the card's own lane decides that, not its reviewer. Rows with no browser need pass unchanged."""
+    if not review_rows:
+        return review_rows
+    ids = [r["id"] for r in review_rows]
+    marks = ",".join("?" * len(ids))
+    full = conn.execute(f"SELECT id, assignee, body, skills FROM tasks WHERE id IN ({marks})", ids).fetchall()
+    held: dict = {}
+    _browser_gate(conn, full, result, held, dry_run, park=False)
+    for tid, (_route, why) in held.items():
+        result.placement_waits[tid] = why
+    return [r for r in review_rows if r["id"] not in held]
 
 
 def _attached_skill_gap(row, host: str, caps) -> Optional[str]:
@@ -5401,6 +5417,7 @@ def _dispatch_once_locked(
         review_rows = _kb._drop_no_worker_rows(
             conn, review_rows, result, dry_run=dry_run,
         )
+        review_rows = _browser_hold_review_rows(conn, review_rows, result, dry_run)
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work

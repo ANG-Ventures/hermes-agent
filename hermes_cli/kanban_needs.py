@@ -140,12 +140,15 @@ def load_registry(fleet_dir: Path) -> LaneRegistry:
     """``browsers.{migrated_lanes, legacy_allowlist, mode}`` from ``browser-hosts.json``, read per
     call (never cached: a flip takes effect on the next tick). The lists live under ``browsers``
     (the schema browserd reads); a top-level copy is read as a fallback. Absent file or keys =
-    empty registry, mode off (nothing migrated)."""
-    try:
-        doc = json.loads((Path(fleet_dir) / REGISTRY_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    empty registry, mode off (nothing migrated); an existing unreadable/malformed file RAISES."""
+    path = Path(fleet_dir) / REGISTRY_FILE
+    if not path.exists():
         return LaneRegistry()
-    doc = doc if isinstance(doc, dict) else {}
+    # An EXISTING file that cannot be read or parsed raises (Prism da4f556e96bb): the dispatcher's browser gate
+    # holds every browser card on that fault instead of treating the registry as "mode off".
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path}: top level is not an object")
     raw_sect = doc.get("browsers")
     sect: dict = raw_sect if isinstance(raw_sect, dict) else {}
 

@@ -358,3 +358,30 @@ def test_5acdd292d27b_unassigned_card_is_judged_as_the_default_assignee(home, le
         assert "browser_refused" not in res.placement_caps[tid]
         assert res.placement_caps[tid]["browser_lease_plan"][0]["identity"] == "id-amazon-alex"
         assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "ready"
+
+
+# -- Prism round 2 on #2002 ----------------------------------------------------------------------
+
+def test_da4f556e96bb_malformed_existing_registry_holds_browser_cards(home, ledger):
+    (home / "fleet" / kn.REGISTRY_FILE).write_text("{not json")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, assignee=SOAK_PROFILE, skills=["browser-soak-amazon"], body="needs: browser:amazon-alex\n")
+        res, spawned = _live(conn)
+        assert tid not in spawned and res.placement_waits[tid] == kbg.WAIT_GATE_ERROR
+    (home / "fleet" / kn.REGISTRY_FILE).unlink()
+    assert kn.load_registry(home / "fleet") == kn.LaneRegistry()     # absent = documented default (mode off)
+
+
+def test_1d0c5e1cc25d_review_spawn_is_gated_too(home, ledger, monkeypatch):
+    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True, raising=False)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, assignee=OTHER, skills=["browser-soak-amazon"], body="needs: browser:amazon-alex\n")
+        plain = _card(conn, assignee=OTHER, body="fix a typo\n")
+        conn.execute("UPDATE tasks SET status='review' WHERE id IN (?,?)", (tid, plain))
+        conn.commit()
+        rows = conn.execute("SELECT id, assignee, no_worker FROM tasks WHERE status='review'").fetchall()
+        res = kbd.DispatchResult()
+        kept = kbd._browser_hold_review_rows(conn, rows, res, dry_run=False)
+        assert [r["id"] for r in kept] == [plain]
+        assert res.placement_waits[tid] == "browser_refused:BROWSER_CLASS_REFUSED"
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "review"   # never parked
