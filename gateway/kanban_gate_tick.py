@@ -28,6 +28,8 @@ _REMOTE_PIN_SQL = (
     "SELECT body FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
     "AND body LIKE '%host:%'"
 )
+_ORIGIN_SQL = ("SELECT 1 FROM tasks WHERE origin_host IS NOT NULL "
+               "AND status IN ('ready','running','review') LIMIT 1")
 _READY_SQL = "SELECT 1 FROM tasks WHERE status = 'ready' AND claim_lock IS NULL LIMIT 1"
 
 
@@ -91,10 +93,12 @@ def read_signal_enabled(kanban_cfg) -> bool:
     return not (isinstance(pl, dict) and pl.get("read_signal", True) is False)
 
 
-def any_remote_pin(boards, connect, known_hosts=(), aliases=None) -> bool:
+def any_remote_pin(boards, connect, known_hosts=(), aliases=None, *, continuation=False) -> bool:
     """A ready card on any board pins a KNOWN pool host (``host:<id>`` or a
-    registry alias of one, t_cb2b888d)."""
-    return _any_board(boards, connect, lambda conn: any(
+    registry alias of one, t_cb2b888d), or, with continuation enforced, a live
+    card carries an ``origin_host`` (t_8bfdcc07)."""
+    return _any_board(boards, connect, lambda conn: (
+        continuation and conn.execute(_ORIGIN_SQL).fetchone() is not None) or any(
         (pin := kwp.resolve_pin(body, known_hosts, aliases)[0]) is not None
         and pin not in (kwp.PIN_ANY, kwp.PIN_STUDIO)
         for (body,) in conn.execute(_REMOTE_PIN_SQL).fetchall()))
@@ -201,10 +205,12 @@ class GateTickBuilder:
             gate.pool = {"planned": False, "reason": "proc_paused"}
             return None
         pins_only = gate.band not in ("spilling", "paused") and not admitting_overflow(pool_cfg)
+        from hermes_cli import kanban_continuation as kc
         if gate.band not in ("spilling", "paused") and not (
                 any_ready(boards, self._connect) if not pins_only else
                 any_remote_pin(boards, self._connect, kwp.known_host_ids(self._fleet_dir()),
-                               kwp.pin_aliases(self._fleet_dir()))):
+                               kwp.pin_aliases(self._fleet_dir()),
+                               continuation=kc.mode(cfg) == "enforce")):
             gate.pool = {"planned": False, "reason": "not_needed"}
             return None
         pool = kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg)

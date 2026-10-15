@@ -242,6 +242,11 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                 kind, task_id, path,
             )
             return
+        from hermes_cli.kanban_continuation import remote_cleanup_host
+        remote_host = remote_cleanup_host(conn, task_id)
+        if remote_host is not None:
+            _kb.safe_remove_workspace_dir(Path(path), task_id=task_id, reason='complete_task',
+                                          conn=conn, remote_host=remote_host)
         # Kill the (dead) tmux worker session BEFORE removing a worktree so a
         # lingering worker never has its cwd deleted from under it.
         if kind == "worktree":

@@ -3934,6 +3934,9 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
+        from hermes_cli.kanban_continuation import record_placement
+        if not record_placement(conn, claimed.id, claimed.current_run_id, None):
+            return False
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
@@ -4202,7 +4205,12 @@ def _record_placement_waits(conn, result, row_route: dict, dry_run: bool,
         for tid, reason in waits.items():
             code, detail = _pr.split_reason(reason)
             route, arg = row_route.get(tid, ("local", None))
-            host = arg if route == "pin" else _pr.named_hosts(code, detail)
+            if route in ("pin", "origin"):
+                host = arg
+            elif code == "origin_host_absent":
+                host = conn.execute("SELECT origin_host FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+            else:
+                host = _pr.named_hosts(code, detail)
             key = (code, route, host, _pr.keyed_detail(code, detail))
             episode = [h for h in hist.get(tid, ()) if h[0] > ends.get(tid, 0)]
             since = now
@@ -4381,6 +4389,14 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     unknown ``requires:`` word land in ``caps_out``.
     """
     from hermes_cli import kanban_worker_pool as _kwp
+    from hermes_cli import kanban_continuation as _kcont
+    _origin = _kcont.origin_route(
+        conn, row, plan.config, config=_root_kanban_cfg(),
+        states=getattr(plan, "continuation_states", {}), caps=caps,
+        dry_run=getattr(plan, "continuation_dry_run", False),
+    )
+    if _origin is not None:
+        return _origin
 
     try:
         skills = json.loads(row["skills"] or "[]") or []
@@ -5455,8 +5471,15 @@ def _dispatch_once_locked(
                 _record_total_hold(conn, result, _pr.TOTAL_MAX_NEW, dry_run)
             return result
 
+    from hermes_cli import kanban_continuation as _kcont_lost
+    if not dry_run and _kcont_lost.mode(_root_kanban_cfg()) == 'enforce':
+        from hermes_cli import kanban_worker_pool as _kwp_lost
+        _pool_lost = spillover.config if spillover is not None else _kwp_lost.read_pool(
+            _kb.kanban_home() / 'fleet', kanban_cfg=_root_kanban_cfg())
+        _states_lost = _kcont_lost.probe_states(conn, _pool_lost)
+        _kcont_lost.interrupt_lost_hosts(conn, _states_lost)
     ready_rows = conn.execute(
-        "SELECT id, assignee, body, skills, workspace_kind, workspace_path, no_worker, priority "
+        "SELECT id, assignee, body, skills, workspace_kind, workspace_path, no_worker, priority, origin_host "
         "FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -5489,6 +5512,13 @@ def _dispatch_once_locked(
         _lineage = _lineage_pins_mode()  # kanban.placement.lineage_pins, per tick
         _linked = _linked_ids(conn, [r["id"] for r in ready_rows], _lineage)
         _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
+        from hermes_cli import kanban_continuation as _kcont
+        spillover.continuation_dry_run = dry_run
+        spillover.continuation_states = (
+            _states_lost if not dry_run and _kcont.mode(_root_kanban_cfg()) == 'enforce'
+            else _kcont.probe_states(conn, spillover.config)
+            if _kcont.mode(_root_kanban_cfg()) != "off" else {}
+        )
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
                                          _lineage, result.placement_affinity,
                                          unknown_out=result.unknown_pins,
@@ -5497,7 +5527,7 @@ def _dispatch_once_locked(
                      for r in ready_rows}
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
-        _rank = {"pin": 0, "wait": 1, "local": 1, "portable": 2}
+        _rank = {"origin": 0, "pin": 0, "wait": 1, "local": 1, "portable": 2}
         ready_rows = sorted(ready_rows, key=lambda r: _rank[row_route[r["id"]][0]])
     else:
         # No plan this tick (pool disabled, refused, no hosts, proc_paused,
@@ -5544,6 +5574,20 @@ def _dispatch_once_locked(
                 "plan this tick (pool disabled/refused/no hosts, proc_paused, or a "
                 "standalone daemon, which never places remotely)", _unplanned,
             )
+    # An absent pool plan must not send a sticky continuation to Studio.
+    from hermes_cli import kanban_continuation as _kcont_unplanned
+    if spillover is None and _kcont_unplanned.mode(_root_kanban_cfg()) == "enforce":
+        # Resolve every origin even without a pool plan: registry failures
+        # refuse immediately and absent-host waits retain their timeout.
+        from hermes_cli import kanban_worker_pool as _kwp_origin
+        _unplanned_pool = _kwp_origin.read_pool(_kb.kanban_home() / 'fleet', kanban_cfg=_root_kanban_cfg())
+        for r in ready_rows:
+            if r["origin_host"]:
+                _origin_route = _kcont_unplanned.origin_route(
+                    conn, r, _unplanned_pool, config=_root_kanban_cfg(), states={}, dry_run=dry_run,
+                    caps=_capability_tick(_unplanned_pool),
+                )
+                row_route[r["id"]] = _origin_route or ('local', None)
     # Browser Sandboxes resolution gate (t_42728faf): after every route is known, before any spawn.
     _browser_gate(conn, ready_rows, result, row_route, dry_run, default_assignee)
     # Review rows are enumerated up front (not after the ready loop) so the
@@ -5552,7 +5596,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee, no_worker FROM tasks "
+            "SELECT id, assignee, no_worker, body, skills, workspace_path, workspace_kind, origin_host FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -6147,7 +6191,7 @@ def _dispatch_once_locked(
                 result.placement_waits[row["id"]] = (
                     _route_wait(route, route_arg, False, spillover)
                     or ((spillover.pin_host_refusal(route_arg) or "pin_host_full")
-                        if route == "pin" else spillover.full_reason())
+                        if route in ("pin", "origin") else spillover.full_reason())
                 )
                 # Host-bound cards behind the wall still say why (t_3e6c9b2b).
                 for rest in ready_rows[row_index + 1:]:
@@ -6323,7 +6367,7 @@ def _dispatch_once_locked(
         _decision = None
         _rid = None
         _cap_only = _caps_out.get("only", {}).get(row["id"])
-        if route == "pin" or (route == "portable" and (not local_free or _cap_only)):
+        if route in ("pin", "origin") or (route == "portable" and (not local_free or _cap_only)):
             # A refused take() NEVER falls through to a local spawn (I-11).
             # A host-bound portable card only lands on a host the reach
             # matrix proves (t_1e9ea7e9); None = any pool host.
@@ -6358,7 +6402,7 @@ def _dispatch_once_locked(
             _take_kw = {} if getattr(getattr(spillover, "signal", None), "placement_table", None) is None \
                 else {"job_id": row["id"], **({"job": _job} if _job is not None else {})}
             if _only is None:
-                placed_host = spillover.take(row_assignee, pin=route_arg if route == "pin" else None,
+                placed_host = spillover.take(row_assignee, pin=route_arg if route in ("pin", "origin") else None,
                                              board=_board_slug, **_take_kw)
             else:
                 placed_host = spillover.take(row_assignee, only=_only, board=_board_slug, **_take_kw)
@@ -6522,12 +6566,21 @@ def _dispatch_once_locked(
                     continue
                 spawn_kwargs["browser_env"] = _benv
                 _joined = (_join, _benv)
+            from hermes_cli.kanban_continuation import record_placement
+            if not record_placement(conn, claimed.id, claimed.current_run_id,
+                                    placed_host.name if placed_host else None):
+                # The run no longer owns the card: nothing launched, refund.
+                if _join is not None:
+                    _browser_release_joined(conn, claimed, _join, spawn_kwargs.get("browser_env"), "claim_lost")
+                if placed_host is not None:
+                    spillover.release(placed_host, _rid)
+                continue
             pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             launched = True
             if placed_host is not None:
                 band = getattr(spillover, "band", None)
                 spill_reason = getattr(spillover, "spill_reason", None)
-                reason = "pin" if route == "pin" else (
+                reason = "pin" if route in ("pin", "origin") else (
                     "band_paused" if band == "paused" else
                     "band_spilling" if band == "spilling" else "overflow")
                 probe = spillover.probe(placed_host.name)
@@ -6680,8 +6733,24 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
-        if local_budget is not None and local_spawned >= local_budget:
-            break  # review rows are always local
+        _review_origin_host = None
+        if row['origin_host'] and _kcont_lost.mode(_root_kanban_cfg()) == 'enforce':
+            if spillover is None:
+                result.placement_waits[row['id']] = 'origin_host_absent'
+                continue
+            _rr = _kcont_lost.origin_route(conn, row, spillover.config, config=_root_kanban_cfg(),
+                                           states=spillover.continuation_states, caps=_caps, dry_run=dry_run)
+            if _rr and _rr[0] == 'wait':
+                result.placement_waits[row['id']] = _rr[1]
+                continue
+            if _rr and _rr[0] == 'origin':
+                _review_origin_host = next((h for h in spillover.config.pool_hosts if h.name == _rr[1]), None)
+                _refusal = spillover.pin_host_refusal(_rr[1])
+                if _review_origin_host is None or _refusal:
+                    result.placement_waits[row['id']] = _refusal or 'origin_host_absent'
+                    continue
+        if _review_origin_host is None and local_budget is not None and local_spawned >= local_budget:
+            break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -6724,11 +6793,16 @@ def _dispatch_once_locked(
             continue
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
+        if _review_origin_host is not None:
+            _review_origin_host = spillover.take(row['assignee'], pin=_review_origin_host.name)
+            if _review_origin_host is None:
+                result.placement_waits[row['id']] = spillover.refusal
+                continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             charge_pool(row["id"])
             spawned += 1
-            local_spawned += 1
+            local_spawned += 0 if _review_origin_host else 1
             if _per_profile_cap is not None:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
@@ -6813,14 +6887,22 @@ def _dispatch_once_locked(
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
+            from hermes_cli.kanban_continuation import record_placement
+            if not record_placement(conn, claimed.id, claimed.current_run_id,
+                                    _review_origin_host.name if _review_origin_host else None):
+                continue
+            if _review_origin_host:
+                _kb._kwh.prepare_remote_workspace(_review_origin_host, str(workspace))
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                kwargs = {'placement': _review_origin_host} if _review_origin_host else {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    kwargs['board'] = board
+                pid = _spawn(claimed, str(workspace), **kwargs)
             except (TypeError, ValueError):
+                if _review_origin_host:
+                    raise
                 pid = _spawn(claimed, str(workspace))
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,

@@ -961,6 +961,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 priority=args.priority,
                 parents=tuple(args.parent or ()),
                 parents_kind=getattr(args, "parent_kind", None),
+                continues=getattr(args, "continues", None),
                 triage=bool(getattr(args, "triage", False)),
                 idempotency_key=getattr(args, "idempotency_key", None),
                 max_runtime_seconds=max_runtime,
@@ -3664,7 +3665,8 @@ def _cmd_workspace(args: argparse.Namespace) -> int:
 def _cmd_requeue(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip()
     with kb.connect_closing() as conn:
-        ok, err = kb.requeue_task(conn, args.task_id, actor=_profile_author(), reason=reason)
+        ok, err = kb.requeue_task(conn, args.task_id, actor=_profile_author(), reason=reason,
+                                 drop_origin=bool(getattr(args, 'drop_origin', False)))
     if not ok:
         print(f"cannot requeue {args.task_id}: {err}", file=sys.stderr)
         return 1

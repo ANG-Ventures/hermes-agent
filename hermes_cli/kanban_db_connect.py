@@ -987,6 +987,8 @@ _TASK_RUN_COLUMNS = (
     ("worker_started_at", "worker_started_at INTEGER"),
     # Resources the run started (kanban_resources); legacy rows read as [].
     ("resources", "resources TEXT NOT NULL DEFAULT '[]'"),
+    # Where the run executed (t_8bfdcc07): pool host id or 'studio'.
+    ("host", "host TEXT"),
 )
 
 
@@ -1145,6 +1147,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "body" in cols:
             _kb._backfill_no_worker_from_body(conn)
 
+    if "origin_host" not in cols:
+        # After no_worker: a migrated legacy table keeps the fresh column order.
+        if _add_column_if_missing(conn, "tasks", "origin_host", "origin_host TEXT"):
+            from hermes_cli import kanban_continuation as _kcont
+            _kcont.backfill_origin_hosts(conn)
+
     _rebuild_drifted_tables(conn)
     # After the rebuild: a rebuilt kanban_notify_subs drops extra indexes.
     _kb._ensure_single_waker_index(conn)
@@ -1238,7 +1246,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT, resources TEXT NOT NULL DEFAULT '[]')",
+        " error TEXT, resources TEXT NOT NULL DEFAULT '[]', host TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
