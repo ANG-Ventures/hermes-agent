@@ -91,7 +91,7 @@ def resolve_text(args, verb: str, *, words_attr: Optional[str] = None,
         sources.append((f"--{alias_attr.replace('_', '-')}", alias))
     if len(sources) > 1:
         return None, ("text given twice (" + " and ".join(name for name, _ in sources)
-                      + "); pass it ONE way")
+                      + "); pass it ONE way, not both")
     if not sources:
         return None, None
     return sources[0][1].strip(), None

@@ -2836,7 +2836,7 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     if error:
         return kvi.refuse("comment", error)
     if body is None:
-        return kvi.refuse("comment", "comment body required (TEXT, --body or --body-file)")
+        return kvi.refuse("comment", "comment body required (TEXT or --body-file) or --body TEXT")
     if not body:
         return kvi.refuse("comment", "comment body is empty")
     if args.max_len is not None:
