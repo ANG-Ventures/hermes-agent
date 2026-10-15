@@ -37,6 +37,7 @@ from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
+from hermes_cli import kanban_verb_input as kvi
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
@@ -670,6 +671,17 @@ def _stripped_or_none(value: Optional[str]) -> Optional[str]:
     return None if value is None else (value.strip() or None)
 
 
+def _json_alias(args: argparse.Namespace, legacy_attr: str) -> tuple[Optional[dict], Optional[str]]:
+    """``--json`` (inline / @PATH / -) as the verb's structured input; refused next to its
+    legacy flag (``--metadata`` / ``--coverage``) so one value never silently wins."""
+    raw = getattr(args, "json_input", None)
+    if raw is None:
+        return None, None
+    if getattr(args, legacy_attr, None) is not None:
+        return None, f"--json and --{legacy_attr} are the same input; pass one"
+    return kvi.resolve_json(raw)
+
+
 def _ok_or_err(ok, fail: str, done: str) -> int:
     """Single-mutation handlers: print ``done`` (rc 0) or ``fail`` to stderr (rc 1)."""
     if not ok:
@@ -884,13 +896,20 @@ def _cmd_create(args: argparse.Namespace) -> int:
     body_file = getattr(args, "body_file", None)
     if body_file is not None:
         if args.body is not None:
-            print("kanban: --body and --body-file are mutually exclusive", file=sys.stderr)
-            return 2
+            return kvi.refuse("create", "--body and --body-file are mutually exclusive")
         try:
             args.body = _read_body_file(body_file)
         except OSError as exc:
-            print(f"kanban: --body-file: {exc}", file=sys.stderr)
-            return 2
+            return kvi.refuse("create", f"--body-file: {exc}")
+    if getattr(args, "why", False):
+        problems = [] if (args.title or "").strip() else ["title: missing or empty"]
+        if not getattr(args, "assignee", None):
+            problems.append("assignee: none (the card sits in ready until assigned)")
+        with kbc.connect_closing() as conn:
+            print(kvi.why_report(conn, "create", None, problems))
+        return 0
+    if not (args.title or "").strip():
+        return kvi.refuse("create", "title is empty")
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         print(
@@ -2808,24 +2827,18 @@ def _cmd_comment(args: argparse.Namespace) -> int:
       Saying "unknown" is the honest answer, and it is what the tri-state
       contract elsewhere in this codebase already does.
     """
-    body_file = getattr(args, "body_file", None)
-    if body_file is not None and args.text:
-        print("kanban: pass the comment as TEXT or --body-file, not both", file=sys.stderr)
-        return 2
-    if body_file is None and not args.text:
-        print("kanban: comment body required (TEXT or --body-file)", file=sys.stderr)
-        return 2
-    if body_file is not None:
-        try:
-            body = _read_body_file(body_file).strip()
-        except OSError as exc:
-            print(f"kanban: --body-file: {exc}", file=sys.stderr)
-            return 2
-    else:
-        body = " ".join(args.text).strip()
+    body, error = kvi.resolve_text(args, "comment", words_attr="text")
+    if getattr(args, "why", False):
+        with kbc.connect_closing() as conn:
+            print(kvi.why_report(conn, "comment", args.task_id,
+                                 [error] if error else ([] if body else ["body: missing or empty"])))
+        return 0
+    if error:
+        return kvi.refuse("comment", error)
+    if body is None:
+        return kvi.refuse("comment", "comment body required (TEXT, --body or --body-file)")
     if not body:
-        print("kanban: comment body is empty", file=sys.stderr)
-        return 2
+        return kvi.refuse("comment", "comment body is empty")
     if args.max_len is not None:
         if args.max_len < 1:
             return _err("kanban: --max-len must be positive", 2)
@@ -3125,7 +3138,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     ids, rc = _require_ids(args)
     if rc:
         return rc
-    summary = getattr(args, "summary", None)
+    summary, text_error = kvi.resolve_text(args, "complete", alias_attr="summary")
+    json_meta, json_error = _json_alias(args, "metadata")
+    if getattr(args, "why", False):
+        problems = [e for e in (text_error, json_error) if e]
+        if not (summary or getattr(args, "result", None) or getattr(args, "superseded_by", None)
+                or getattr(args, "external", None)):
+            problems.append("summary: missing (pass --body/--body-file/--summary, or "
+                            "--superseded-by <card|PR|sha> when the work landed elsewhere)")
+        with kbc.connect_closing() as conn:
+            print("\n\n".join(kvi.why_report(conn, "complete", tid, problems) for tid in ids))
+        return 0
+    if text_error or json_error:
+        return kvi.refuse("complete", text_error or json_error)
+    if json_meta is not None:
+        args.metadata = json.dumps(json_meta)
     superseded_by = getattr(args, "superseded_by", None)
     draft_ok = getattr(args, "draft_ok", None)
     external = getattr(args, "external", None)
@@ -3164,9 +3191,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if not isinstance(metadata, dict):
                 raise ValueError("must be a JSON object")
         except (ValueError, json.JSONDecodeError) as exc:
-            return _err(
-                f"kanban: --metadata wants a JSON object, e.g. "
-                f"--metadata '{{\"base_guard_override\": \"<reason>\"}}' ({exc})", 2)
+            return kvi.refuse("complete", f"--metadata wants a JSON object ({exc})")
     failed: list[str] = []
     no_receipt = False
     with kbc.connect_closing() as conn:
@@ -3213,8 +3238,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 continue
             except kb.EmptyCompletionError as empty_err:
                 failed.append(tid)
-                print(f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
-                      f"describing what was done (an empty completion is not evidence).", file=sys.stderr)
+                print(f"cannot complete {tid}: {empty_err}. Pass --body/--body-file/--summary "
+                      f"describing what was done (an empty completion is not evidence).\n"
+                      f"{kvi.schema_text('complete')}", file=sys.stderr)
                 continue
             except ReceiptRequiredError as receipt_err:
                 failed.append(tid)
@@ -3419,7 +3445,15 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 
 
 def _cmd_block(args: argparse.Namespace) -> int:
-    reason = _joined_words(args.reason)
+    reason, text_error = kvi.resolve_text(args, "block", words_attr="reason")
+    if getattr(args, "why", False):
+        with kbc.connect_closing() as conn:
+            print("\n\n".join(kvi.why_report(conn, "block", tid, [text_error] if text_error else [])
+                               for tid in _bulk_ids(args)))
+        return 0
+    if text_error:
+        return kvi.refuse("block", text_error)
+    reason = reason or None
     kind = getattr(args, "kind", None)
     until: Optional[int] = None
     if getattr(args, "until", None):
@@ -3676,7 +3710,17 @@ def _cmd_reopen(args: argparse.Namespace) -> int:
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
-    summary = _stripped_or_none(getattr(args, "summary", None))
+    summary, text_error = kvi.resolve_text(args, "request-review", alias_attr="summary")
+    summary = summary or None
+    json_meta, json_error = _json_alias(args, "metadata")
+    if getattr(args, "why", False):
+        with kbc.connect_closing() as conn:
+            print(kvi.why_report(conn, "request-review", tid, [e for e in (text_error, json_error) if e]))
+        return 0
+    if text_error or json_error:
+        return kvi.refuse("request-review", text_error or json_error)
+    if json_meta is not None:
+        args.metadata = json.dumps(json_meta)
     raw_metadata = getattr(args, "metadata", None)
     metadata = None
     if raw_metadata:
@@ -3685,9 +3729,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             if not isinstance(metadata, dict):
                 raise ValueError("must be a JSON object")
         except (ValueError, json.JSONDecodeError) as exc:
-            return _err(
-                f"kanban: --metadata wants a JSON object, e.g. "
-                f"--metadata '{{\"base_guard_override\": \"<reason>\"}}' ({exc})", 2)
+            return kvi.refuse("request-review", f"--metadata wants a JSON object ({exc})")
     reviewer = getattr(args, "reviewer", None)
     with kbc.connect_closing() as conn:
         gate_err = _goal_gate_error(
@@ -3729,12 +3771,17 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
 
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
-    reason = " ".join(args.reason).strip()
+    reason, text_error = kvi.resolve_text(args, "request-changes", words_attr="reason")
+    reason = reason or ""
     operator = (getattr(args, "operator", None) or "").strip() or None
+    rc = _resolve_change_coverage(args, tid, reason, text_error, operator)
+    if rc is not None:
+        return rc
     if args.coverage is not None:
         # Before any write (claim release, comment, transition): a refused
         # record must not land on the card (t_c5bfb48b).
-        coverage_error = kb.review_coverage_text_error(args.coverage)
+        coverage_error = kb.review_coverage_text_error(
+            kb.redact_review_coverage_text(args.coverage.strip()))
         if coverage_error:
             print(f"cannot request changes for {tid}: {coverage_error}", file=sys.stderr)
             return 1
@@ -3841,6 +3888,55 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             + (f"; routed to {detail}" if detail else "")
         )
     return 0
+
+
+def _resolve_change_coverage(args, tid: str, reason: str, text_error: Optional[str],
+                             operator: Optional[str]) -> Optional[int]:
+    """Fold ``--json`` / ``--finding`` / ``--lens`` into ``args.coverage`` (the built record), or
+    refuse / answer ``--why``. ``None`` = continue with the send-back."""
+    json_cov, json_error = _json_alias(args, "coverage")
+    findings = list(getattr(args, "finding", None) or [])
+    lens_specs = list(getattr(args, "lens", None) or [])
+    problems = [e for e in (text_error, json_error) if e]
+    if not reason:
+        problems.append("reason: missing (positional text, --body or --body-file)")
+    built = None
+    if not problems and (findings or lens_specs or json_cov is not None):
+        legacy = None
+        if args.coverage is not None:
+            legacy, legacy_error = kvi.resolve_json(args.coverage, "--coverage")
+            if legacy_error:
+                problems.append(legacy_error)
+        if not problems:
+            with kbc.connect_closing() as conn:
+                built, build_error = kvi.build_coverage(
+                    conn, tid, findings=findings, lens_specs=lens_specs,
+                    overrides=json_cov if json_cov is not None else legacy)
+            if build_error:
+                problems.append(build_error)
+    candidate = built if built is not None else args.coverage
+    if candidate is not None and not problems:
+        cov_error = kb.review_coverage_text_error(kb.redact_review_coverage_text(candidate.strip()))
+        if cov_error:
+            problems.append(cov_error)
+    elif candidate is None and operator is None and not problems:
+        problems.append("coverage: none given (--finding TEXT [--finding ...] --lens all=done, or "
+                        "--json @FILE, or --operator \"<who: why>\" for a non-review send-back)")
+    if getattr(args, "why", False):
+        with kbc.connect_closing() as conn:
+            print(kvi.why_report(conn, "request-changes", tid, problems))
+            if built is not None:
+                print(f"built review_coverage: {built}")
+        return 0
+    hard = [p for p in problems if not p.startswith("coverage: none given")]
+    if hard:
+        print(f"cannot request changes for {tid}: " + "; ".join(hard)
+              + ("" if "review_coverage schema:" in " ".join(hard)
+                 else "\n" + kvi.schema_text("request-changes")), file=sys.stderr)
+        return 2 if (text_error or not reason) else 1
+    if built is not None:
+        args.coverage = built
+    return None
 
 
 def _cmd_reopen_review(args: argparse.Namespace) -> int:
