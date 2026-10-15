@@ -30,6 +30,8 @@ _REMOTE_PIN_SQL = (
 )
 _ORIGIN_SQL = ("SELECT 1 FROM tasks WHERE origin_host IS NOT NULL "
                "AND status IN ('ready','running','review') LIMIT 1")
+_ORIGIN_PATHS_SQL = ("SELECT DISTINCT origin_host, workspace_path FROM tasks "
+                     "WHERE origin_host IS NOT NULL AND status NOT IN ('done','archived')")
 _READY_SQL = "SELECT 1 FROM tasks WHERE status = 'ready' AND claim_lock IS NULL LIMIT 1"
 
 
@@ -102,6 +104,21 @@ def any_remote_pin(boards, connect, known_hosts=(), aliases=None, *, continuatio
         (pin := kwp.resolve_pin(body, known_hosts, aliases)[0]) is not None
         and pin not in (kwp.PIN_ANY, kwp.PIN_STUDIO)
         for (body,) in conn.execute(_REMOTE_PIN_SQL).fetchall()))
+
+
+def origin_workspaces(boards, connect) -> Dict[str, list]:
+    """host -> workspace paths of every live card holding continuation state
+    on it, across boards (t_8bfdcc07). The pool probe reads their state."""
+    out: Dict[str, list] = {}
+
+    def collect(conn) -> bool:
+        for host, path in conn.execute(_ORIGIN_PATHS_SQL).fetchall():
+            if host and path and path not in out.setdefault(host, []):
+                out[host].append(path)
+        return False
+
+    _any_board(boards, connect, collect)
+    return out
 
 
 def any_ready(boards, connect) -> bool:
@@ -235,11 +252,14 @@ class GateTickBuilder:
             root = cfg.get("workspaces_root")
             if isinstance(root, str) and root.startswith("/"):
                 kw["workspaces_root"] = root
-            if kw:
-                def probe(h, _kw=kw):
-                    return kwp.probe_host(h, **_kw)
+            def probe(h, _kw=kw, **extra):
+                return kwp.probe_host(h, **_kw, **extra)
+        # Continuation state (t_8bfdcc07) rides this same round-trip.
+        paths = (origin_workspaces(boards, self._connect)
+                 if kc.mode(cfg) != "off" else None)
         plan = kwp.plan(list(pool.pool_hosts), remote_by_host, probe=probe,
-                        disabled=pool.disabled, config=pool, signal=signal)
+                        disabled=pool.disabled, config=pool, signal=signal,
+                        workspace_paths=paths)
         plan.band, plan.spill_reason, plan.pins_only = gate.band, gate.spill_reason, pins_only
         gate.pool = plan.snapshot()
         if signal is not None:

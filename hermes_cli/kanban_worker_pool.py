@@ -45,7 +45,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Collection, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Collection, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from hermes_cli import kanban_admission as _admission
 from hermes_cli import kanban_placement_reasons as _reasons
@@ -1056,6 +1056,9 @@ class HostSample:
     pressure_text: str = ""
     boards: Optional[frozenset] = None
     load5: Optional[float] = None
+    # Continuation affinity (t_8bfdcc07): path -> empty/nonempty/unknown for
+    # the workspaces asked about in the same round-trip. None = not asked.
+    workspace_states: Optional[Mapping[str, str]] = None
 
 
 # ncpu = online cores (KWLB D-3), not ``nproc``: load1 counts every runnable
@@ -1078,8 +1081,40 @@ def _boards_cmd(workspaces_root: str) -> str:
             f'[ -d "$d" ] && [ -w "$d" ] && [ -x "$d" ] && basename "$d"; done; true')
 
 
-def _probe_cmd(pressure_path: Optional[str], workspaces_root: Optional[str] = None) -> str:
+# Separates the workspace-state JSON (t_8bfdcc07) from everything before it.
+STATES_MARKER = "@@hermes-workspace-states"
+WORKSPACE_STATES = ("empty", "nonempty", "unknown")
+
+# Paths arrive as argv (shlex-quoted), never inside the script text. Absence
+# counts as ``empty`` only when the board dir above it exists: an unmounted
+# workspace root must read ``unknown``, not "state lost".
+_STATES_SCRIPT = (
+    "import os,sys,json\n"
+    "o={}\n"
+    "for p in sys.argv[1:]:\n"
+    " try:\n"
+    "  with os.scandir(p) as it: o[p]='nonempty' if next(it,None) is not None else 'empty'\n"
+    " except FileNotFoundError: o[p]='empty' if os.path.isdir(os.path.dirname(p.rstrip('/'))) else 'unknown'\n"
+    " except OSError: o[p]='unknown'\n"
+    "print(json.dumps(o))\n"
+)
+
+
+class HostKeyChanged(Exception):
+    """ssh refused the host key: the host may have been re-imaged (F17)."""
+
+
+def _states_cmd(paths: Sequence[str]) -> str:
+    import shlex
+    args = " ".join(shlex.quote(str(p)) for p in paths)
+    return f"echo {STATES_MARKER}; python3 -c {shlex.quote(_STATES_SCRIPT)} {args}; true"
+
+
+def _probe_cmd(pressure_path: Optional[str], workspaces_root: Optional[str] = None,
+               workspace_paths: Sequence[str] = ()) -> str:
     tail = f"; {_boards_cmd(workspaces_root)}" if workspaces_root else ""
+    if workspace_paths:
+        tail += f"; {_states_cmd(workspace_paths)}"
     if pressure_path is None:
         return f"cat /proc/loadavg; {_NCPU_CMD}{tail}"
     import shlex
@@ -1090,23 +1125,44 @@ def _probe_cmd(pressure_path: Optional[str], workspaces_root: Optional[str] = No
 
 def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
                pressure_path: Optional[str] = None,
-               workspaces_root: Optional[str] = None) -> Union[None, Tuple[float, int], HostSample]:
+               workspaces_root: Optional[str] = None,
+               workspace_paths: Sequence[str] = ()) -> Union[None, Tuple[float, int], HostSample]:
     """``(load1, ncpu)`` from one ssh call, or None (fail closed: 0 slots).
     With ``pressure_path`` the same call also returns the remote clock and
     the pressure file as a :class:`HostSample`. With ``workspaces_root`` it
     also lists the boards the host can host (``HostSample.boards``,
-    t_9fb4d477): a board whose root is missing or unwritable is absent."""
+    t_9fb4d477): a board whose root is missing or unwritable is absent.
+    With ``workspace_paths`` the same call reports each path's state
+    (``HostSample.workspace_states``, t_8bfdcc07) and a changed host key
+    raises :class:`HostKeyChanged` instead of reading as plain unreachable."""
     try:
         proc = runner(
-            _ssh_argv(h, _probe_cmd(pressure_path, workspaces_root)),
+            _ssh_argv(h, _probe_cmd(pressure_path, workspaces_root, workspace_paths)),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=PROBE_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError):
         return None
     if getattr(proc, "returncode", 1) != 0:
+        err = (getattr(proc, "stderr", "") or "").lower()
+        if workspace_paths and getattr(proc, "returncode", 1) == 255 and (
+                "host key verification failed" in err
+                or "remote host identification has changed" in err):
+            raise HostKeyChanged(h.name)
         return None
     out = proc.stdout or ""
+    states: Optional[Dict[str, str]] = None
+    if workspace_paths:
+        out, sep, listed = out.partition(STATES_MARKER + "\n")
+        if not sep:
+            return None  # the state list never printed: fail closed
+        states = {}
+        try:
+            got = json.loads(listed.strip().split("\n")[0] or "null")
+        except ValueError:
+            got = None
+        if isinstance(got, dict):
+            states = {p: got[p] for p in workspace_paths if got.get(p) in WORKSPACE_STATES}
     boards: Optional[frozenset] = None
     if workspaces_root:
         out, sep, listed = out.partition(BOARDS_MARKER + "\n")
@@ -1122,7 +1178,9 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     if ncpu <= 0:
         return None
     if pressure_path is None:
-        return (load1, ncpu) if boards is None else HostSample(load1, ncpu, boards=boards)
+        if boards is None and states is None:
+            return (load1, ncpu)
+        return HostSample(load1, ncpu, boards=boards, workspace_states=states)
     try:
         remote_now: Optional[float] = float(lines[2].strip())
     except (IndexError, ValueError):
@@ -1132,7 +1190,7 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
     except (IndexError, ValueError):
         load5 = None
     return HostSample(load1, ncpu, remote_now, "\n".join(lines[3:]).strip(), boards,
-                      load5=load5)
+                      load5=load5, workspace_states=states)
 
 
 # -- per-(host, board) workspace faults (t_9fb4d477) --------------------------
@@ -1320,6 +1378,11 @@ class SpilloverPlan:
     _rids: Dict[str, List[Optional[str]]] = field(default_factory=dict)
     # Dry-run takes per host: never in the ledger, so choose() adds them.
     _simulated: Dict[str, int] = field(default_factory=dict)
+    # Continuation affinity (t_8bfdcc07): (host, workspace) -> state, read in
+    # this tick's probe round-trip. ``continuation_probed`` = the paths were
+    # asked for, so an absent pair means the host did not answer.
+    continuation_states: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    continuation_probed: bool = False
 
     @property
     def budget(self) -> int:
@@ -1581,24 +1644,60 @@ def plan(hosts: List[PoolHost], running_by_host: Mapping[str, int], *,
          probe: Callable[[PoolHost], Any] = probe_host,
          disabled: Collection[str] = (), planned_at: Optional[float] = None,
          config: Optional[PoolConfig] = None,
-         signal: Optional[TargetSignal] = None) -> SpilloverPlan:
+         signal: Optional[TargetSignal] = None,
+         workspace_paths: Optional[Mapping[str, Sequence[str]]] = None) -> SpilloverPlan:
     """ONE plan per gateway tick. A host takes work only when it is active,
     enabled, under its slots and probed under ``capacity_pct x ncpu`` (I-3).
     A host with no free slot or not active is not probed.
 
     With ``signal`` the load bar is the host's pressure band instead: the
     per-host streak advances here, once per new remote ``at`` (F-5), and a
-    host is refused when its streak says hot or its pressure is UNKNOWN."""
+    host is refused when its streak says hot or its pressure is UNKNOWN.
+
+    ``workspace_paths`` (host -> paths, t_8bfdcc07) rides the same probe: a
+    host holding continuation state is probed even with no free slot, and
+    the states land on ``plan.continuation_states``."""
+    states: Dict[Tuple[str, str], str] = {}
     if signal is not None:
-        return _plan_with_signal(hosts, running_by_host, probe=probe, disabled=disabled,
-                                 planned_at=planned_at, config=config, signal=signal)
+        out = _plan_with_signal(hosts, running_by_host, probe=probe, disabled=disabled,
+                                planned_at=planned_at, config=config, signal=signal,
+                                workspace_paths=workspace_paths or {}, states=states)
+    else:
+        out = _plan_v01(hosts, running_by_host, probe=probe, disabled=disabled,
+                        planned_at=planned_at, config=config,
+                        workspace_paths=workspace_paths or {}, states=states)
+    out.continuation_states = states
+    out.continuation_probed = workspace_paths is not None
+    return out
+
+
+def _probe_states(probe, h: PoolHost, probed: bool, paths: Sequence[str],
+                  states: Dict[Tuple[str, str], str]):
+    """One probe call: the load sample when ``probed`` (a host with a free
+    slot), and the workspace states when ``paths``. A host probed only for
+    its states never gains a slot from that sample."""
+    if not (probed or paths):
+        return None
+    try:
+        sample = probe(h, workspace_paths=tuple(paths)) if paths else probe(h)
+    except HostKeyChanged:
+        states.update({(h.name, p): "host_key_mismatch" for p in paths})
+        return None
+    got = getattr(sample, "workspace_states", None)
+    if paths and isinstance(got, Mapping):
+        states.update({(h.name, p): got[p] for p in paths if got.get(p) in WORKSPACE_STATES})
+    return sample if probed else None
+
+
+def _plan_v01(hosts, running_by_host, *, probe, disabled, planned_at, config,
+              workspace_paths, states) -> SpilloverPlan:
     slots: Dict[str, int] = {}
     detail: Dict[str, dict] = {}
     for h in sorted(hosts, key=lambda x: x.priority):
         running = int(running_by_host.get(h.name, 0) or 0)
         free = max(0, h.slots - running) if (h.enabled and h.state == "active") else 0
         probed = free > 0
-        sample = probe(h) if probed else None
+        sample = _probe_states(probe, h, probed, workspace_paths.get(h.name, ()), states)
         load1: Optional[float] = None
         ncpu: Optional[int] = None
         boards = None
@@ -1638,7 +1737,9 @@ def _finish_plan(hosts, slots, detail, disabled, planned_at, config, signal=None
 
 
 def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, config,
-                      signal: TargetSignal) -> SpilloverPlan:
+                      signal: TargetSignal, workspace_paths=None, states=None) -> SpilloverPlan:
+    workspace_paths = workspace_paths or {}
+    states = {} if states is None else states
     policy = signal.policy
     now = signal.clock()
     discard_after = policy.stale_after_s * 3
@@ -1649,7 +1750,7 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
     for h in ordered:
         running = int(running_by_host.get(h.name, 0) or 0)
         free = max(0, h.slots - running) if (h.enabled and h.state == "active") else 0
-        sample = probe(h) if free > 0 else None
+        sample = _probe_states(probe, h, free > 0, workspace_paths.get(h.name, ()), states)
         row = {"running": running, "free": free, "load1": None, "ncpu": None,
                "band": None, "why": "", "probed": free > 0, "cap": (None, ""), "boards": None}
         if isinstance(sample, HostSample):

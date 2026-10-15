@@ -180,54 +180,6 @@ def origin_route(conn, row, pool, *, config: dict, states: dict, caps=None,
     return "origin", host
 
 
-def probe_states(conn, pool, runner=None) -> dict:
-    """One bounded SSH scan per origin host; failures never prove empty.
-
-    JSON framing avoids treating banners, truncated output, or permission
-    errors as an empty workspace. Filesystem paths never enter shell syntax.
-    """
-    import shlex
-    import subprocess
-    from hermes_cli.kanban_worker_pool import _ssh_argv
-    runner = subprocess.run if runner is None else runner
-    grouped = {}
-    for host, path in conn.execute(
-        "SELECT DISTINCT origin_host,workspace_path FROM tasks "
-        "WHERE origin_host IS NOT NULL AND status NOT IN ('done','archived')"
-    ):
-        if path:
-            grouped.setdefault(host, []).append(path)
-    states = {}
-    for name, paths in grouped.items():
-        host = next((h for h in pool.pool_hosts if h.name == name), None)
-        if host is None:
-            continue
-        script = (
-            "import os,json; out={}\n"
-            "for p in " + repr(paths) + ":\n"
-            " try:\n"
-            "  with os.scandir(p) as it: out[p]='nonempty' if next(it,None) is not None else 'empty'\n"
-            " except FileNotFoundError: out[p]='empty'\n"
-            " except OSError: out[p]='unknown'\n"
-            "print(json.dumps(out))\n"
-        )
-        try:
-            proc = runner(_ssh_argv(host, "python3 -c " + shlex.quote(script)),
-                          capture_output=True, text=True, timeout=8, stdin=subprocess.DEVNULL)
-            if proc.returncode == 0:
-                data = json.loads(proc.stdout)
-                if isinstance(data, dict):
-                    for path in paths:
-                        if data.get(path) in ('empty', 'nonempty', 'unknown'):
-                            states[name, path] = data[path]
-            elif proc.returncode == 255 and any(s in (proc.stderr or '').lower() for s in
-                    ('host key verification failed', 'remote host identification has changed')):
-                states.update({(name, p): 'host_key_mismatch' for p in paths})
-        except (OSError, subprocess.SubprocessError, ValueError):
-            pass
-    return states
-
-
 def remote_cleanup_host(conn, task_id):
     """Terminal origin is cleared; execution history still owns remote GC."""
     from hermes_cli import kanban_db as kb
@@ -262,11 +214,13 @@ def transfer_workspace(conn, parent_id: str, child_id: str) -> None:
     kb._append_event(conn, child_id, "continues", {"parent": parent_id, "host": parent["origin_host"]})
 
 
-def interrupt_lost_hosts(conn, states: dict, *, now=None) -> list:
+def interrupt_lost_hosts(conn, states: dict, *, hosts=None, now=None) -> list:
     """Three distinct tick failures interrupt through the fenced timeout path.
 
-    The counter lives on the run; restart cannot reset it. A successful SSH
-    filesystem scan (including an empty dir) proves reachability.
+    ``states`` is this tick's pool-probe answer (``plan.continuation_states``).
+    The counter lives on the run; restart cannot reset it. A state read from
+    the host (including an empty dir) proves reachability. ``hosts`` limits
+    the count to hosts the probe asked about (None = every host).
     """
     from hermes_cli import kanban_db as kb
     now = int(time.time()) if now is None else int(now)
@@ -278,11 +232,13 @@ def interrupt_lost_hosts(conn, states: dict, *, now=None) -> list:
     for row in rows:
         if not (row['claim_lock'] or '').startswith(kb._host_prefix()):
             continue
+        if hosts is not None and row['host'] not in hosts:
+            continue
         metadata = kb._json_dict(row['metadata'])
         last = int(metadata.get('origin_probe_at') or 0)
         if now - last < 45:
             continue
-        reachable = states.get((row['host'], row['workspace_path'])) in ('empty', 'nonempty')
+        reachable = states.get((row['host'], row['workspace_path'])) in ('empty', 'nonempty', 'unknown')
         failures = 0 if reachable else int(metadata.get('origin_probe_failures') or 0) + 1
         kb.merge_run_metadata(conn, row['current_run_id'],
                               {'origin_probe_at': now, 'origin_probe_failures': failures})

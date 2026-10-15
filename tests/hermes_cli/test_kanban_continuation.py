@@ -160,20 +160,88 @@ def test_host_lost_three_ticks_uses_termination_fence(db, monkeypatch):
     assert kc.interrupt_lost_hosts(db, {}, now=100) == []
     assert kc.interrupt_lost_hosts(db, {}, now=100) == []
     assert kc.interrupt_lost_hosts(db, {}, now=160) == []
+    assert kc.interrupt_lost_hosts(db, {}, hosts={'ace-ai'}, now=220) == []
     assert kc.interrupt_lost_hosts(db, {}, now=220) == [row['id']]
     assert len(calls) == 1
     assert db.execute('SELECT origin_host FROM tasks').fetchone()[0] == 'ace-media'
     assert db.execute('SELECT outcome FROM task_runs').fetchone()[0] == 'host_lost'
 
 
-def test_probe_failure_and_host_key_do_not_prove_empty(db):
-    row = card(db)
-    host = SimpleNamespace(name='ace-media', target='kanbanw@example', ssh_port=22)
-    pool = SimpleNamespace(pool_hosts=(host,))
+def _pool_host(name='ace-media', slots=2):
+    from hermes_cli import kanban_worker_pool as kwp
+    return kwp.PoolHost(name, 'example', 'kanbanw', slots, .8, 'optional', ('alpha',), 'active', True, 1)
+
+
+def test_host_key_change_rides_pool_probe_and_never_proves_empty(db):
+    from hermes_cli import kanban_worker_pool as kwp
+    calls = []
+
     def runner(argv, **kw):
-        assert "python3 -c" in argv[-1]
+        calls.append(argv[-1])
         return SimpleNamespace(returncode=255, stdout='', stderr='REMOTE HOST IDENTIFICATION HAS CHANGED')
-    assert kc.probe_states(db, pool, runner=runner) == {('ace-media', '/missing'): 'host_key_mismatch'}
+    host = _pool_host()
+    plan = kwp.plan([host], {}, probe=lambda h, **kw: kwp.probe_host(h, runner, **kw),
+                    workspace_paths={'ace-media': ['/missing']})
+    assert len(calls) == 1 and kwp.STATES_MARKER in calls[0] and 'loadavg' in calls[0]
+    assert plan.continuation_states == {('ace-media', '/missing'): 'host_key_mismatch'}
+    assert plan.slots['ace-media'] == 0
+    assert 're-imaged' in route(db, card(db), state=plan.continuation_states[('ace-media', '/missing')])[1]
+
+
+def test_unreachable_probe_leaves_state_unknown(db):
+    from hermes_cli import kanban_worker_pool as kwp
+    plan = kwp.plan([_pool_host()], {}, probe=lambda h, **kw: None,
+                    workspace_paths={'ace-media': ['/missing']})
+    assert plan.continuation_probed and plan.continuation_states == {}
+    row = card(db)
+    assert kc.origin_route(db, row, plan.config, config={'placement': {'continuation': 'enforce'}},
+                           states=plan.continuation_states, dry_run=True, now=10000) == ('wait', 'origin_host_absent')
+
+
+def test_full_host_is_probed_for_state_but_gains_no_slot():
+    from hermes_cli import kanban_worker_pool as kwp
+    seen = []
+
+    def probe(h, workspace_paths=()):
+        seen.append(tuple(workspace_paths))
+        return kwp.HostSample(0.1, 32, workspace_states={p: 'nonempty' for p in workspace_paths})
+    plan = kwp.plan([_pool_host(slots=1)], {'ace-media': 1}, probe=probe,
+                    workspace_paths={'ace-media': ['/ws/a']})
+    assert seen == [('/ws/a',)]
+    assert plan.slots['ace-media'] == 0
+    assert plan.continuation_states == {('ace-media', '/ws/a'): 'nonempty'}
+
+
+def test_state_script_classifies_real_paths(tmp_path):
+    """Run the exact shell payload the probe sends (states half) locally."""
+    import subprocess
+    from hermes_cli import kanban_worker_pool as kwp
+    board = tmp_path / "board root"
+    board.mkdir()
+    full = board / "t_full 'q'"
+    full.mkdir()
+    (full / 'sentinel').write_text('x')
+    empty = board / 't_empty'
+    empty.mkdir()
+    gone = board / 't_gone'
+    unmounted = tmp_path / 'no-board' / 't_x'
+    paths = [str(full), str(empty), str(gone), str(unmounted)]
+    proc = subprocess.run(['/bin/sh', '-c', kwp._states_cmd(paths)], capture_output=True, text=True)
+    marker, _, body = proc.stdout.partition('\n')
+    assert marker == kwp.STATES_MARKER
+    assert json.loads(body) == {str(full): 'nonempty', str(empty): 'empty',
+                                str(gone): 'empty', str(unmounted): 'unknown'}
+
+
+def test_probe_host_parses_states_in_one_round_trip():
+    from hermes_cli import kanban_worker_pool as kwp
+
+    def runner(argv, **kw):
+        out = '0.5 0.4 0.3 1/2 3\n32\n' + kwp.STATES_MARKER + '\n' + json.dumps({'/ws/a': 'empty', '/ws/b': 'bogus'})
+        return SimpleNamespace(returncode=0, stdout=out, stderr='')
+    got = kwp.probe_host(_pool_host(), runner, workspace_paths=('/ws/a', '/ws/b'))
+    assert (got.load1, got.ncpu) == (0.5, 32)
+    assert got.workspace_states == {'/ws/a': 'empty'}
 
 
 def test_dispatcher_origin_precedes_linked_classifier(db, monkeypatch):
@@ -217,8 +285,10 @@ def test_full_dispatch_retry_uses_remote_origin(tmp_path, monkeypatch):
     monkeypatch.setattr(kbd, '_system_memory_sample', lambda: {}, raising=False)
     host = kwp.PoolHost('ace-media', 'example', 'kanbanw', 2, .8, 'optional', ('alpha',), 'active', True, 1)
     pool = kwp.PoolConfig(hosts=('ace-media',), profiles=('alpha',), pool_hosts=(host,))
-    plan = kwp.plan([host], {}, probe=lambda h: (1, 8), config=pool)
-    monkeypatch.setattr(kc, 'probe_states', lambda *a: {('ace-media', str(tmp_path / 'workspace')): 'nonempty'})
+    ws = str(tmp_path / 'workspace')
+    plan = kwp.plan([host], {}, probe=lambda h, workspace_paths=(): kwp.HostSample(
+        1, 8, workspace_states={p: 'nonempty' for p in workspace_paths}), config=pool,
+        workspace_paths={'ace-media': [ws]})
     monkeypatch.setattr(kb._kwh, 'prepare_remote_workspace', lambda *a: None)
     seen = []
     def spawn(task, workspace, *, placement=None, board=None):

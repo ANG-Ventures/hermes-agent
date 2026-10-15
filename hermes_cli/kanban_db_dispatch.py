@@ -5472,12 +5472,13 @@ def _dispatch_once_locked(
             return result
 
     from hermes_cli import kanban_continuation as _kcont_lost
-    if not dry_run and _kcont_lost.mode(_root_kanban_cfg()) == 'enforce':
-        from hermes_cli import kanban_worker_pool as _kwp_lost
-        _pool_lost = spillover.config if spillover is not None else _kwp_lost.read_pool(
-            _kb.kanban_home() / 'fleet', kanban_cfg=_root_kanban_cfg())
-        _states_lost = _kcont_lost.probe_states(conn, _pool_lost)
-        _kcont_lost.interrupt_lost_hosts(conn, _states_lost)
+    # HOST_LOST (F18) counts only ticks whose pool probe asked about the
+    # running workspaces; a planless CLI dispatch is no evidence either way.
+    if (not dry_run and spillover is not None and spillover.continuation_probed
+            and _kcont_lost.mode(_root_kanban_cfg()) == 'enforce'):
+        _kcont_lost.interrupt_lost_hosts(
+            conn, spillover.continuation_states,
+            hosts={h.name for h in spillover.config.pool_hosts})
     ready_rows = conn.execute(
         "SELECT id, assignee, body, skills, workspace_kind, workspace_path, no_worker, priority, origin_host "
         "FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
@@ -5512,13 +5513,7 @@ def _dispatch_once_locked(
         _lineage = _lineage_pins_mode()  # kanban.placement.lineage_pins, per tick
         _linked = _linked_ids(conn, [r["id"] for r in ready_rows], _lineage)
         _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
-        from hermes_cli import kanban_continuation as _kcont
         spillover.continuation_dry_run = dry_run
-        spillover.continuation_states = (
-            _states_lost if not dry_run and _kcont.mode(_root_kanban_cfg()) == 'enforce'
-            else _kcont.probe_states(conn, spillover.config)
-            if _kcont.mode(_root_kanban_cfg()) != "off" else {}
-        )
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
                                          _lineage, result.placement_affinity,
                                          unknown_out=result.unknown_pins,
