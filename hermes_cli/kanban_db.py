@@ -41,6 +41,7 @@ import unicodedata  # noqa: E402
 from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as _REVIEW_LENSES  # noqa: E402
 from hermes_cli.kanban_review_schema import HEAD_SHA_PATTERN as _HEAD_SHA_PATTERN  # noqa: E402
 from hermes_cli.kanban_review_schema import validate_v2_fields as _validate_review_v2  # noqa: E402
+from hermes_cli import kanban_review_schema as _review_schema  # noqa: E402
 _log = logging.getLogger(__name__)
 
 
@@ -13528,8 +13529,8 @@ def _latest_review_coverage(rows: list) -> tuple[Optional[dict], Optional[str]]:
         for payload in reversed(payloads):
             try:
                 coverage = json.loads(payload)
-            except (ValueError, TypeError):
-                first_error = first_error or "invalid review_coverage JSON"
+            except (ValueError, TypeError) as exc:
+                first_error = first_error or _review_json_error_text(payload, exc)
                 continue
             if isinstance(coverage, dict):
                 return coverage, None
@@ -13537,7 +13538,8 @@ def _latest_review_coverage(rows: list) -> tuple[Optional[dict], Optional[str]]:
     return None, first_error or "missing review_coverage JSON line"
 _REVIEW_COVERAGE_MISSING = (
     "missing review_coverage comment on this review run "
-    "(use kanban_block(kind=capability) if a lens cannot run)"
+    "(use kanban_block(kind=capability) if a lens cannot run). "
+    + _review_schema.coverage_schema_text()
 )
 
 
@@ -13556,7 +13558,7 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
         return _REVIEW_COVERAGE_MISSING
     coverage, error = _latest_review_coverage(rows)
     if coverage is None:
-        return error
+        return _with_coverage_schema(error)
     return _review_coverage_record_error(coverage)
 
 
@@ -13571,53 +13573,113 @@ def review_coverage_text_error(text: Any) -> Optional[str]:
         [{"body": "review_coverage: " + str(text or "").strip()}]
     )
     if coverage is None:
-        return error
+        return _with_coverage_schema(error)
     return _review_coverage_record_error(coverage)
 
 
-def _review_coverage_record_error(coverage: dict) -> Optional[str]:
-    """Field checks for one parsed review_coverage record; None when valid."""
+def _with_coverage_schema(error: Optional[str]) -> Optional[str]:
+    """Every coverage refusal carries the full schema, exactly once."""
+    if not error or "review_coverage schema:" in error:
+        return error
+    return f"{error}. " + _review_schema.coverage_schema_text()
+
+
+def _review_json_error_text(payload: str, exc: Exception) -> str:
+    """``invalid review_coverage JSON`` plus WHERE it broke and the schema (t_cd1bcea4)."""
+    pos = getattr(exc, "pos", None)
+    where = ""
+    if isinstance(pos, int):
+        where = f" at char {pos} near {payload[max(0, pos - 30):pos + 10]!r}"
+    detail = getattr(exc, "msg", None) or str(exc)
+    return (
+        f"invalid review_coverage JSON ({detail}{where}). Pass it with --json @FILE "
+        f"(or - for stdin) so the shell never touches it, or use the flat form. "
+        + _review_schema.coverage_schema_text()
+    )
+
+
+def review_coverage_problems(coverage: dict) -> list:
+    """EVERY field problem in one parsed review_coverage record ([] when valid).
+
+    One pass over the whole record: an operator fixes everything in one retry
+    instead of discovering one field per refusal (t_cd1bcea4, plan P2).
+    """
+    problems: list = []
     lenses = coverage.get("lenses")
     if not isinstance(lenses, dict):
-        return "missing lenses object"
-    lenses = {
-        _review_normalize(key).casefold(): value
-        for key, value in lenses.items() if isinstance(key, str)
-    }
-    for lens in _REVIEW_LENSES:
-        state = lenses.get(lens.casefold())
-        if _review_lens_state(state) == "done":
-            continue
-        if _review_na_reason_ok(state):
-            continue
-        return f"missing/invalid lens {lens}: use 'done' or 'n/a: <applicability reason>'; inability to run requires kanban_block(kind=capability)"
+        problems.append(
+            "lenses must be an object {" + ", ".join(f'"{lens}": "done"' for lens in _REVIEW_LENSES) + "}"
+        )
+    else:
+        lenses = {
+            _review_normalize(key).casefold(): value
+            for key, value in lenses.items() if isinstance(key, str)
+        }
+        bad = [
+            lens for lens in _REVIEW_LENSES
+            if not (_review_lens_state(lenses.get(lens.casefold())) == "done"
+                    or _review_na_reason_ok(lenses.get(lens.casefold())))
+        ]
+        if bad:
+            problems.append(
+                f"missing/invalid lens {', '.join(bad)}: use 'done' or 'n/a: <applicability reason>'; "
+                "inability to run requires kanban_block(kind=capability)"
+            )
     count = coverage.get("findings")
-    if type(count) is not int or count < 1:
-        return "findings must be an integer >= 1"
+    count_ok = type(count) is int and count >= 1
+    if not count_ok:
+        problems.append("findings must be an integer >= 1")
     items = coverage.get("items")
-    if (not isinstance(items, list) or len(items) != count
+    if (not isinstance(items, list) or (count_ok and len(items) != count)
             or not all(_review_item_ok(item) for item in items)):
-        return (
+        got = f" (got {len(items)} for findings={count})" if isinstance(items, list) and count_ok else ""
+        problems.append(
             "items must list exactly findings findings, each at least "
-            f"{_REVIEW_ITEM_MIN_CHARS} visible characters with a letter or digit"
+            f"{_REVIEW_ITEM_MIN_CHARS} visible characters with a letter or digit{got}"
         )
     minutes = coverage.get("review_minutes")
     if type(minutes) is not int or minutes < 0 or minutes > _REVIEW_MINUTES_MAX:
-        return f"review_minutes must be an integer from 0 to {_REVIEW_MINUTES_MAX}"
+        problems.append(f"review_minutes must be an integer from 0 to {_REVIEW_MINUTES_MAX}")
     # Optional (per-card batteries are being retired; CI owns suites). When
     # given it must still be a real value, not an empty placeholder.
     battery = coverage.get("battery")
     if battery is not None and (not isinstance(battery, str) or not battery.strip()):
-        return "battery, when given, must be a nonempty string (attachment name, 'seeded' or 'n/a: <reason>')"
+        problems.append("battery, when given, must be a nonempty string (attachment name, 'seeded' or 'n/a: <reason>')")
     batch = coverage.get("batch_id")
     if not isinstance(batch, str) or not batch.strip():
-        return "batch_id must identify the single delegate_task batch in this comment"
+        problems.append("batch_id must identify the single delegate_task batch in this comment")
     head = coverage.get("head_sha")
     if not (isinstance(head, str) and (_REVIEW_HEAD_SHA_RE.fullmatch(head.strip())
                                         or _review_na_reason_ok(head))):
-        return "head_sha must be the reviewed PR head (7-40 hex) or 'n/a: <reason>' for a card with no PR"
+        problems.append("head_sha must be the reviewed PR head (7-40 hex) or 'n/a: <reason>' for a card with no PR")
     # review_coverage v2 (additive): records with no v2 key pass untouched.
-    return _validate_review_v2(coverage, surface="board")
+    v2 = _validate_review_v2(coverage, surface="board")
+    if v2:
+        problems.append(v2)
+    return problems
+
+
+def _review_coverage_record_error(coverage: dict) -> Optional[str]:
+    """All field problems of one parsed record plus the full schema; None when valid."""
+    problems = review_coverage_problems(coverage)
+    if not problems:
+        return None
+    return "; ".join(problems) + ". " + _review_schema.coverage_schema_text()
+
+
+def redact_review_coverage_text(text: str) -> str:
+    """Redact a coverage JSON's VALUES, never its text (t_cd1bcea4).
+
+    Redacting the raw JSON text rewrote ``KEY="value"`` inside an item into
+    ``KEY=***`` and ate the closing quote, so a record ``json.loads`` accepted
+    was refused as invalid JSON. Parse first, redact the object, re-serialize;
+    text that does not parse is returned redacted as text (it is refused anyway).
+    """
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return str(redact_review_value(text)).strip()
+    return json.dumps(redact_review_value(parsed), ensure_ascii=False)
 
 
 def _operator_caller_profiles() -> frozenset[str]:
@@ -13744,7 +13806,7 @@ def request_changes(
         refusal = _operator_send_back_refusal(task_id, operator_reason)
         if refusal is not None:
             return False, refusal
-    coverage_text = str(redact_review_value(coverage or "")).strip()
+    coverage_text = redact_review_coverage_text(str(coverage or "").strip()) if coverage else ""
     if coverage_text:
         # Validate the whole record before any write (t_c5bfb48b), so no
         # rejected call can leave it behind.
