@@ -22,6 +22,8 @@ from hermes_constants import get_hermes_home
 
 HOME_SID = "20261011_000000_home"
 CHAT = "chat-home"
+THREAD_SID = "20261011_000000_thread"
+THREAD = "1558761637211803680"
 
 
 class Adapter:
@@ -58,7 +60,12 @@ def board(tmp_path, monkeypatch):
     # the home session's state.db row: a discord group chat on the default profile
     rows = {HOME_SID: {"session_key": f"agent:main:discord:group:{CHAT}:u1", "profile_name": "default",
                        "origin_json": json.dumps({"platform": "discord", "chat_id": CHAT, "chat_type": "group",
-                                                  "user_id": "u1"})}}
+                                                  "user_id": "u1"})},
+            # t_d654c294: a Discord thread session; origin and sub rows both carry thread_id == chat_id
+            THREAD_SID: {"session_key": f"agent:main:discord:thread:{THREAD}:{THREAD}", "profile_name": "default",
+                         "origin_json": json.dumps({"platform": "discord", "chat_id": THREAD,
+                                                    "thread_id": THREAD, "chat_type": "thread",
+                                                    "user_id": "u1"})}}
     monkeypatch.setattr(hr, "read_session_row", lambda sid: rows.get(sid))
     return tmp_path
 
@@ -220,3 +227,71 @@ def test_receipt_failure_keeps_the_event_deliverable(board, monkeypatch):
     adapter = Adapter()
     asyncio.run(_one_tick(monkeypatch, _runner(adapter)))
     assert len(adapter.sent) == 1 and len(adapter.handled) == 1
+
+
+def _thread_card(conn, *, chat=THREAD, thread=THREAD):
+    tid = kb.create_task(conn, title="thread self close", assignee="worker", session_id=THREAD_SID)
+    kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=chat, thread_id=thread,
+                       chat_type="thread", user_id="u1", delivery_mode="notify+wake")
+    return tid
+
+
+def test_thread_home_operator_self_close_is_suppressed(board, monkeypatch):
+    """t_d654c294: a Discord-thread sub keeps thread_id == chat_id while the home target
+    normalises it to ""; the home check must still see the sub as the home chat."""
+    conn = kbc.connect()
+    try:
+        tid = _thread_card(conn)
+        with kb.mutation_actor(session_ids=[THREAD_SID], profile="default", surface="gateway"):
+            kb.complete_task(conn, tid, summary="closed from the thread session")
+    finally:
+        conn.close()
+    adapter = Adapter()
+    asyncio.run(_one_tick(monkeypatch, _runner(adapter)))
+    assert adapter.sent == [], adapter.sent
+    assert adapter.handled == []
+    conn = kbc.connect()
+    try:
+        receipts = _events(conn, tid, ns.EVENT_KIND)
+        assert len(receipts) == 1
+        assert receipts[0].payload["reason"] == "self-session"
+        assert receipts[0].payload["path"] == "notifier"
+    finally:
+        conn.close()
+
+
+def test_thread_home_foreign_actor_close_is_delivered(board, monkeypatch):
+    conn = kbc.connect()
+    try:
+        tid = _thread_card(conn)
+        with kb.mutation_actor(session_ids=["20261011_000001_worker"], profile="worker", surface="worker"):
+            kb.complete_task(conn, tid, summary="worker finished")
+    finally:
+        conn.close()
+    adapter = Adapter()
+    asyncio.run(_one_tick(monkeypatch, _runner(adapter)))
+    assert len(adapter.sent) == 1 and len(adapter.handled) == 1
+    conn = kbc.connect()
+    try:
+        assert _events(conn, tid, ns.EVENT_KIND) == []
+    finally:
+        conn.close()
+
+
+def test_thread_home_close_still_reaches_a_foreign_thread_subscriber(board, monkeypatch):
+    """Prism 03f8b8156055 holds for threads: a different thread is not the home."""
+    conn = kbc.connect()
+    try:
+        tid = _thread_card(conn, chat="1558761637211800000", thread="1558761637211800000")
+        with kb.mutation_actor(session_ids=[THREAD_SID], profile="default", surface="gateway"):
+            kb.complete_task(conn, tid, summary="closed by the home operator")
+    finally:
+        conn.close()
+    adapter = Adapter()
+    asyncio.run(_one_tick(monkeypatch, _runner(adapter)))
+    assert len(adapter.sent) == 1
+    conn = kbc.connect()
+    try:
+        assert _events(conn, tid, ns.EVENT_KIND) == []
+    finally:
+        conn.close()

@@ -502,3 +502,18 @@ def test_lookup_failure_leaves_event_unacked_then_routes_home(tmp_path, monkeypa
     sent = ad[Platform.DISCORD].sent
     assert [m["chat_id"] for m in sent] == [APOLLO], sent
     assert f"{tid} done" in sent[0]["text"]
+
+
+def test_same_chat_treats_thread_equal_to_chat_as_no_thread():
+    """t_d654c294: home targets drop thread_id == chat_id; sub rows keep it."""
+    home = hr.HomeTarget("discord", "T1", "")
+    assert hr.same_chat(home, "discord", "T1", "T1")
+    assert hr.same_chat(home, "discord", "T1", "")
+    assert hr.same_chat(hr.HomeTarget("discord", "T1", "T1"), "discord", "T1", "")
+    assert hr.same_chat(hr.HomeTarget("discord", "G1", ""), "discord", "G1", None)
+    # a real thread inside a channel is distinct from the channel and from other threads
+    assert not hr.same_chat(hr.HomeTarget("telegram", "G1", "7"), "telegram", "G1", "8")
+    assert not hr.same_chat(hr.HomeTarget("telegram", "G1", "7"), "telegram", "G1", "")
+    assert not hr.same_chat(home, "discord", "T2", "T2")
+    assert not hr.same_chat(home, "slack", "T1", "T1")
+    assert not hr.same_chat(None, "discord", "T1", "T1")

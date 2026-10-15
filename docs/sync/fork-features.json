@@ -858,5 +858,25 @@
       "cron"
     ],
     "proposed_canary": "tests/fork_canaries/test_fork_canary_fallback_recovery.py (RED-proven 2026-10-14 t_58010601: relay quota check forced False; quota class widened to any Retry-After / unproven text; both exhaustion pins dropped)"
+  },
+  {
+    "feature": "kanban notify_suppress: withhold the home session's own close echo, incl. Discord threads (t_4c7da648 #1901, t_d654c294)",
+    "tests": [
+      "tests/gateway/test_kanban_notify_suppress.py",
+      "tests/gateway/test_kanban_notify_suppress_paths.py",
+      "tests/gateway/test_kanban_home_route.py::test_same_chat_treats_thread_equal_to_chat_as_no_thread"
+    ],
+    "paths": [
+      "gateway/kanban_notify_suppress.py",
+      "gateway/kanban_watchers.py",
+      "gateway/kanban_home_route.py"
+    ],
+    "why": "A completed/blocked/review line for a card the home session closed itself is withheld from the home chat (receipt event notify_suppressed, reason self-session/self-operator); a foreign subscriber still gets it (Prism P1 03f8b8156055). 2026-10-15 (t_d654c294): the home check compared home_from_row's target (thread_id == chat_id normalised to '') with the raw kanban_notify_subs row (Discord threads keep thread_id == chat_id), so it was never True in a thread and every thread-homed self-close echoed. kanban_home_route.same_chat normalises both sides; the _sub_is_home site in the notifier routes through it.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
   }
 ]

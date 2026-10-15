@@ -83,6 +83,27 @@ def home_from_row(session_id: Optional[str], row: Optional[dict]) -> HomeResolut
     return HomeResolution(HomeTarget(platform, chat_id, thread_id))
 
 
+def same_chat(target: Optional[HomeTarget], platform: Any, chat_id: Any, thread_id: Any) -> bool:
+    """True when ``target`` is the chat named by a sub row (t_d654c294).
+
+    :func:`home_from_row` drops ``thread_id == chat_id`` (a Discord thread IS the
+    chat) but ``kanban_notify_subs`` rows keep it, so both sides are normalised
+    the same way here before comparing."""
+    if target is None:
+        return False
+    chat = str(chat_id or "").strip()
+
+    def _thread(t: Any, c: str) -> str:
+        t = str(t or "").strip()
+        return "" if t == c else t
+
+    return (
+        target.platform == str(platform or "").strip().lower()
+        and str(target.chat_id) == chat
+        and _thread(target.thread_id, str(target.chat_id)) == _thread(thread_id, chat)
+    )
+
+
 def read_session_row(session_id: str) -> Optional[dict]:
     """Blocking, READ-ONLY state.db lookup (FleetReview #987); worker thread only.
 
