@@ -498,8 +498,19 @@ _SCP_RE = re.compile(rf"(?:^|[\s@'\"])({_HOST_TOKEN}):(?=[~/.$A-Za-z_])")
 _REMOTE_OPERAND_RE = re.compile(
     rf"^(?:rsync://)?(?:[^\s@/]+@)?({_HOST_TOKEN})(?:::?(?=[~/.$A-Za-z_]|$)|(?<=\w)/)")
 _DASH_H_RE = re.compile(rf"(?:^|\s)-H[ \t]*[\"']?(?:ssh://)?(?:[\w.-]+@)?({_HOST_TOKEN})")
-# Options that consume the NEXT token (``ssh -o BatchMode=yes host``).
-_SSH_ARG_OPTS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+# Per verb: (short options that take a value, long options that take a SEPARATE
+# value). A letter not in its verb's set is a FLAG: misreading a flag as
+# arg-taking swallows the target (``sftp -p host``: -p is preserve), which
+# fails open; the reverse at worst binds a value that is no alias.
+#   ssh(1):  -B -b -c -D -E -e -F -I -i -J -L -l -m -O -o -P -p -Q -R -S -W -w
+#   sftp(1): -B -b -c -D -F -i -J -l -o -P -R -S -s -X
+#   mosh(1): -p, and Getopt::Long ``--port 60001`` / ``--ssh CMD`` ...
+_VERB_ARG_OPTS: Dict[str, Tuple[frozenset, frozenset]] = {
+    "ssh": (frozenset("BbcDEeFIiJLlmOoPpQRSWw"), frozenset()),
+    "sftp": (frozenset("BbcDFiJloPRSsX"), frozenset()),
+    "mosh": (frozenset("p"), frozenset({"client", "server", "ssh", "predict", "family", "port",
+                                        "bind-server", "experimental-remote-ip"})),
+}
 _CMD_BREAK = frozenset({";", "&&", "||", "|", "&"})
 _WORD_ALIAS_RE = re.compile(r"[a-z]+")
 _ssh_config_cache: Dict[str, Tuple[Tuple[float, ...], Optional[frozenset]]] = {}
@@ -509,8 +520,9 @@ def _strip_token(tok: str) -> str:
     return tok.strip("`'\"()[]{}<>,;")
 
 
-def _ssh_target(rest: str) -> Optional[str]:
+def _ssh_target(rest: str, verb: str = "ssh") -> Optional[str]:
     """``[user@]host`` of the first non-option operand of ssh/sftp/mosh."""
+    short_args, long_args = _VERB_ARG_OPTS[verb]
     toks = rest.split()
     i = 0
     while i < len(toks):
@@ -523,11 +535,13 @@ def _ssh_target(rest: str) -> Optional[str]:
         if tok == "--":
             continue
         if tok.startswith("--"):
-            continue           # mosh/long option; ``--x=y`` carries its value
+            if "=" not in tok and tok[2:] in long_args:
+                i += 1         # ``--port 60001``; ``--x=y`` carries its value
+            continue
         if tok.startswith("-") and len(tok) > 1:
             flags = tok[1:]
             for j, ch in enumerate(flags):
-                if ch in _SSH_ARG_OPTS:
+                if ch in short_args:
                     if j == len(flags) - 1:
                         i += 1     # value is the next token
                     break          # else the value is attached (-p22, -oX=y)
@@ -567,7 +581,7 @@ def _ssh_shaped_hosts(line: str) -> List[str]:
         if verb in ("scp", "rsync"):
             out += _remote_operands(rest)
         else:
-            t = _ssh_target(rest)
+            t = _ssh_target(rest, verb)
             if t:
                 out.append(t)
     # A verbless ``ace-ai:/path`` still binds a separator-bearing alias; the
@@ -584,7 +598,22 @@ def word_shaped_alias(alias: str) -> bool:
     return _WORD_ALIAS_RE.fullmatch(alias.lower()) is not None
 
 
-def _ssh_config_files(path: Path, depth: int = 0) -> List[Path]:
+# ssh_config(5): ``Keyword value`` or ``Keyword=value`` (optional whitespace
+# around exactly one ``=``).
+_SSH_CFG_KV_RE = re.compile(r"\s*([A-Za-z]+)(?:\s*=\s*|\s+)(\S.*)")
+
+
+def _ssh_config_kv(line: str) -> Tuple[str, str]:
+    m = _SSH_CFG_KV_RE.match(line)
+    return (m.group(1).lower(), m.group(2)) if m else ("", "")
+
+
+def _ssh_config_files(path: Path, depth: int = 0,
+                      base_dir: Optional[Path] = None) -> List[Path]:
+    """``path`` plus its Includes. A relative Include resolves against
+    ``base_dir`` (the top-level user config's directory, ~/.ssh) at every
+    depth, never the including file's directory (ssh_config(5))."""
+    base_dir = path.parent if base_dir is None else base_dir
     files = [path]
     if depth > 4:
         return files
@@ -593,14 +622,14 @@ def _ssh_config_files(path: Path, depth: int = 0) -> List[Path]:
     except OSError:
         return files
     for line in text.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) == 2 and parts[0].lower() == "include":
-            for pat in parts[1].split():
+        key, val = _ssh_config_kv(line)
+        if key == "include":
+            for pat in val.split():
                 pat = str(Path(pat).expanduser())
                 if not pat.startswith("/"):
-                    pat = str(path.parent / pat)
+                    pat = str(base_dir / pat)
                 for inc in sorted(Path("/").glob(pat.lstrip("/"))):
-                    files += _ssh_config_files(inc, depth + 1)
+                    files += _ssh_config_files(inc, depth + 1, base_dir)
     return files
 
 
@@ -623,9 +652,9 @@ def ssh_config_hosts(path: Optional[Path] = None) -> Optional[frozenset]:
     try:
         for f in files:
             for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
-                parts = line.strip().split(None, 1)
-                if len(parts) == 2 and parts[0].lower() == "host":
-                    names += [n.lower() for n in parts[1].split()
+                key, val = _ssh_config_kv(line)
+                if key == "host":
+                    names += [n.lower() for n in val.split()
                               if not any(c in n for c in "*?!")]
     except OSError:
         return None
