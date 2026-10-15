@@ -527,6 +527,38 @@ def test_prior_worker_cohort_pages_once_per_tick(tmp_path, monkeypatch):
 
 
 
+def test_prior_worker_cohort_is_not_starved_by_slow_sends(tmp_path, monkeypatch):
+    """Prism 6b448981a5fc on #1972: active_pr sends that eat the tick budget must
+    not starve the cohort page every tick. The cohort goes out first."""
+    import gateway.kanban_watchers as kw
+    from gateway.kanban_watchers import _GuardStuckNotifier
+
+    cards = [("default", {"task_id": f"t_{i:04x}", "reason": "prior_worker_still_alive",
+                          "status": "ready", "prev_pid": 1000 + i, "guarded_since": 50,
+                          "clear_verb": f"hermes kanban show t_{i:04x}"}) for i in range(3)]
+    prs = [("default", {"task_id": f"t_pr{i}", "reason": "active_pr", "clear_verb": "x"}) for i in range(4)]
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(kw.time, "monotonic", lambda: clock["t"])
+    sent = []
+
+    def send(board, row):
+        sent.append(row.get("reason"))
+        if row.get("reason") == "active_pr":
+            clock["t"] += kw._GUARD_STUCK_PAGE_BUDGET_S   # one slow send spends the whole budget
+            return False
+        return True
+
+    notifier = _GuardStuckNotifier(tmp_path / "g.json")
+    # cards listed AFTER the PRs: on the old code the budget was gone before the batch
+    assert notifier.observe(prs + cards, send, now=10_000.0) == 1
+    assert sent[0] == "prior_worker_still_alive"
+    assert sent.count("prior_worker_still_alive") == 1
+    # every cohort card recorded, nothing re-pages next tick
+    sent.clear()
+    assert notifier.observe(cards, send, now=10_060.0) == 0
+    assert sent == []
+
+
 def test_active_pr_is_one_episode_per_card_and_pr(tmp_path):
     """r19 (t_f1af5dcd): a restarted streak on the SAME open PR is the same
     episode (6h reminder only); a different PR is a new one."""

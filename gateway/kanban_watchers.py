@@ -788,8 +788,12 @@ class _GuardStuckNotifier:
         delivered = 0
         # prior_worker_still_alive episodes due this tick go out as ONE page:
         # one dispatcher death strands every card it held at once (2026-10-12
-        # 19:27Z: 43 per-card pages for one cohort death, t_8d571321).
+        # 19:27Z: 43 per-card pages for one cohort death, t_8d571321). The
+        # cohort page is sent FIRST, before the per-card sends, so slow or
+        # failing active_pr sends cannot spend the tick budget and starve it
+        # every tick (Prism 6b448981a5fc).
         alive_due: list[tuple[str, dict, str]] = []
+        rest: list[tuple[str, dict, str, Optional[float]]] = []
         for board, item in cards:
             key = self._key(board, item)
             last = self._last_sent(key, item)
@@ -806,6 +810,18 @@ class _GuardStuckNotifier:
             if item.get("reason") == "prior_worker_still_alive":
                 alive_due.append((board, item, key))
                 continue
+            rest.append((board, item, key, last))
+        if alive_due:
+            board, item, _ = alive_due[0]
+            probe = dict(item)
+            if len(alive_due) > 1:
+                probe["batch"] = [{**it, "board": b} for b, it, _ in alive_due]
+            if send(board, probe):
+                for _, _, key in alive_due:
+                    self._sent[key] = now
+                delivered += 1
+        for board, item, key, last in rest:
+            land_only = last is not None and "|active_pr|pr=" in key
             if time.monotonic() >= deadline:
                 break
             land_key = f"{key}|land"
@@ -826,15 +842,6 @@ class _GuardStuckNotifier:
                 elif probe.get("land_request") != "pending":
                     self._sent[key] = now
                     delivered += 1
-        if alive_due and time.monotonic() < deadline:
-            board, item, _ = alive_due[0]
-            probe = dict(item)
-            if len(alive_due) > 1:
-                probe["batch"] = [{**it, "board": b} for b, it, _ in alive_due]
-            if send(board, probe):
-                for _, _, key in alive_due:
-                    self._sent[key] = now
-                delivered += 1
         if self._sent != before:
             self._save()
         return delivered
