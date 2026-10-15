@@ -194,15 +194,79 @@ def test_still_waiting_notice_once_per_interval_names_lanes():
     with patch("hermes_cli.config.load_config_readonly",
                return_value={"fallback": {"still_waiting_notice_seconds": 120}}):
         a = _bare()
+        a.provider = "openai-codex"  # non-relay lane: relay lanes get the t_e35032e2 wording
         wb.arm(a, now=0.0)
         assert wb.notice_due(a, now=119.0) is None
         wb.note_lane_switch(a)
         text = wb.notice_due(a, now=121.0)
-        assert text and "121s" in text and "2 lanes tried" in text and "claude-dtlr" in text
+        assert text and "121s" in text and "2 lanes tried" in text and "openai-codex" in text
         # It names what is left: the fable faces ahead and the other model behind them.
         assert "ahead: claude-btpr, claude-bpr [claude-fable-5-1] + cpa [gpt-6.1-sol]" in text
         assert wb.notice_due(a, now=200.0) is None
         assert wb.notice_due(a, now=241.0) is not None
+
+
+def test_relay_lane_notice_says_turn_in_progress_not_no_first_reply():
+    """t_e35032e2: the claude relays buffer the whole upstream body, so the harness sees no
+    byte until the turn ends. On alr 2026-10-15 06:40-06:50 every turn had upstream ttfb
+    1-7 s and ran 90-257 s; "still waiting for a first reply" was wrong on almost every one."""
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly",
+               return_value={"fallback": {"still_waiting_notice_seconds": 120,
+                                          "no_first_byte_budget_seconds": 600}}):
+        a = _bare(index=0)
+        a.provider = "claude-alr"
+        wb.arm(a, now=0.0)
+        text = wb.notice_due(a, now=120.5)
+    assert text == (
+        "⏳ turn in progress on claude-alr/claude-fable-5-1 (buffering lane, first byte not "
+        "visible until the turn ends): 120s elapsed; long outputs run 2–4 min; cut at 600s; "
+        "ahead: claude-dtlr, claude-btpr, claude-bpr [claude-fable-5-1] + cpa [gpt-6.1-sol]")
+
+
+def test_relay_lane_notice_cut_number_is_the_live_budget():
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly",
+               return_value={"fallback": {"still_waiting_notice_seconds": 120,
+                                          "no_first_byte_budget_seconds": 900}}):
+        a = _bare()  # claude-dtlr, a relay face
+        wb.arm(a, now=0.0)
+        text = wb.notice_due(a, now=121.0)
+    assert text and "cut at 900s" in text and "cut at 600s" not in text
+
+
+def test_non_relay_lane_notice_keeps_the_original_wording():
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly",
+               return_value={"fallback": {"still_waiting_notice_seconds": 120}}):
+        for provider in ("cpa", "openai-codex", "xai-oauth"):
+            a = _bare(model="gpt-6.1-sol", index=4)
+            a.provider = provider
+            wb.arm(a, now=0.0)
+            assert wb.notice_due(a, now=121.0) == (
+                f"⏳ still waiting for a first reply: 121s, 1 lane tried "
+                f"(now on {provider}/gpt-6.1-sol); nothing left in the fallback chain")
+
+
+def test_relay_wording_changes_no_clock_or_cut_behaviour():
+    """Wording only: the same wait on a relay lane and a non-relay lane gives identical
+    elapsed/spent/should_cut_attempt answers and the same notice cadence."""
+    from agent import fallback_wall_budget as wb
+    cfg = {"fallback": {"still_waiting_notice_seconds": 120, "no_first_byte_budget_seconds": 600}}
+    probes = [0.0, 119.0, 121.0, 200.0, 241.0, 599.0, 601.0, 700.0]
+
+    def trace(provider):
+        a = _bare()
+        a.provider = provider
+        out = []
+        with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+            wb.arm(a, now=0.0)
+            for t in probes:
+                out.append((wb.elapsed(a, now=t), wb.spent(a, now=t),
+                            wb.should_cut_attempt(a, now=t), wb.notice_due(a, now=t) is None))
+        return out, {k: v for k, v in a._wall_budget.items()}
+
+    assert trace("claude-alr") == trace("cpa")
 
 
 def test_relay_drain_wait_is_credited_not_counted():
