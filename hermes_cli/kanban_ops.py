@@ -237,8 +237,9 @@ def _route_line(entry: dict, dry_run: bool, reason=None) -> str:
         verdict = "skipped (see below)"
     if entry.get("route") is None:
         return f"  {entry['task_id']}  -> {verdict}"
+    tail = f" take_refusal={entry['take_refusal']}" if entry.get("take_refusal") else ""
     return (f"  {entry['task_id']}  route={entry['route']} host={entry.get('host') or '-'} "
-            f"rule={entry.get('rule') or '-'}  -> {verdict}")
+            f"rule={entry.get('rule') or '-'}  -> {verdict}{tail}")
 
 
 def _dispatch_limit_notes(res, gate, max_spawn_source):

@@ -2394,7 +2394,12 @@ DEFAULT_CONFIG = {
         # worker_reservation_gb) new workers per tick and none while its
         # sampler publishes band.kanban hot. false = computed and logged per
         # tick ("kanban admission (dry ...): would-refuse N"), never applied.
-        "placement": {"read_signal": True, "route_first": True,
+        # default (Control-Plane Protection spec v0.3 §3.1, t_667f1f6a; read
+        # per tick, no restart): remote = every portable card is offered to
+        # the worker pool first and spawns on this host only as the last
+        # resort after the pool refused it (no cap: the load gate is the only
+        # local limit); local = today's local-first order. Kill switch: local.
+        "placement": {"read_signal": True, "route_first": True, "default": "local",
                       "admit_on_memory": False, "worker_reservation_gb": 6},
         "dispatch_load_gate": {
             "enabled": True,

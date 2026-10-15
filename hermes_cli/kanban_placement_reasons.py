@@ -66,6 +66,23 @@ PROVENANCE_LINK_KINDS = frozenset({"derived-from"})
 # Phase 2a (t_7133e03d): hold codes written by the dispatcher itself.
 LOCAL_FULL = "local_full"
 POOL_UNAVAILABLE = "pool_unavailable"
+POOL_FULL = "pool_full"
+BOARD_UNHOSTABLE = "board_unhostable"
+
+# The ONE vocabulary of ``SpilloverPlan.take()`` refusals for an UNPINNED row
+# (Control-Plane Protection spec v0.3, Momus pass 3 R4). The placement record's
+# ``take_refusal`` carries one of these codes (plus an optional ``(detail)``),
+# and the I-1 closeout query (kanban_placement_gates) is generated from these
+# sets: a code outside them is a violation, never silently allowed. Capacity =
+# no free slot that serves the row; structural = no pool host may take this row
+# at all (reach, board root). "Profile served on no free host" is reported as
+# capacity (``pool_full`` / ``pool_unavailable``): take() has no code for it.
+TAKE_CAPACITY = frozenset({POOL_FULL, POOL_UNAVAILABLE})
+TAKE_STRUCTURAL = frozenset({HOST_REACH, BOARD_UNHOSTABLE})
+TAKE_REFUSALS = TAKE_CAPACITY | TAKE_STRUCTURAL
+# ``placement.reason`` of a portable row the Studio spawned after take()
+# refused it this tick (spec v0.3 I-2: last resort means after the pool).
+LAST_RESORT = "last-resort"
 UNASSIGNED = "unassigned"
 PER_PROFILE_CAP = "per_profile_cap"
 # One placement_wait row replaces an A->B->A reason flap inside one refresh
@@ -145,6 +162,12 @@ def route_first(kanban_cfg: Any) -> bool:
     if isinstance(val, bool):
         return val
     return str(val).strip().lower() not in ("false", "off", "no", "0")
+
+
+def take_refusal_code(refusal) -> "str | None":
+    """The vocabulary code of a take() refusal string, or None for no refusal."""
+    code = split_reason(refusal)[0] if refusal else ""
+    return code or None
 
 
 def not_portable(rule: str) -> str:

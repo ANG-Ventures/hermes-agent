@@ -22,7 +22,9 @@ from tests.hermes_cli.test_kanban_worker_pool import (  # noqa: F401  (fixtures 
     _make, _no_real_spawn, _plan, _tick, kanban_home,
 )
 
-PLACEMENT_KEYS = {"run_id", "route", "rule", "host", "considered", "gate", "plan_at", "entry"}
+PLACEMENT_KEYS = {"run_id", "route", "rule", "host", "considered", "gate", "plan_at", "entry",
+                  # Control-Plane Protection v0.3 §3.1 (t_667f1f6a): the I-1 / AC-2 fields.
+                  "route_class", "placement_default", "reason", "take_refusal", "pool_free_at_spawn"}
 
 
 def _events(conn, tid, kind):

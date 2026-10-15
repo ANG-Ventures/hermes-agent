@@ -302,6 +302,14 @@ class DispatchResult:
     portable_waiting: int = 0
     """Rows routed ``portable`` still in ``placement_waits`` at the end of the
     ready section (the I-0 query's input, spec v0.3 §3.6)."""
+    portable_waiting_with_room: int = 0
+    """Portable rows the pool refused that then WAITED although this board's
+    local allowance had room at their turn (spec v0.3 I-0 per-board key, Momus
+    pass 3 R1). Any cap on the last-resort spawn makes this non-zero; quota
+    stranded by the board split does not (that is ``stranded_allowance``)."""
+    take_refusals: dict = field(default_factory=dict)
+    """task id -> the take() refusal of a portable row spawned locally as the
+    last resort this tick (dry run included), for the printer and the record."""
     placement_affinity: dict = field(default_factory=dict)
     """task id -> ``{host, rule, matched_by}`` for ready cards whose work is
     bound to one host's state (t_3e6c9b2b): they run there or wait, never spill."""
@@ -4313,8 +4321,19 @@ def _placement_rule(route: str, arg: Optional[str], rule: Optional[str], placed:
 
 
 def _placement_payload(*, run_id, route: str, arg: Optional[str], rule: Optional[str],
-                       placed_host, plan, entry: str, gate: dict) -> dict:
-    """The ``placement`` event payload, every key present (spec §4.1)."""
+                       placed_host, plan, entry: str, gate: dict,
+                       take_refusal: Optional[str] = None) -> dict:
+    """The ``placement`` event payload, every key present (spec §4.1).
+
+    Control-Plane Protection v0.3 §3.1 adds the fields the I-1 / AC-2 queries
+    read: ``route_class`` (the dispatcher's own route: ``portable`` | ``pin`` |
+    ``local`` | ``wait``), ``placement_default`` (``remote`` | ``local`` this
+    tick), ``reason`` (``pool`` placed, ``last-resort`` = local after take()
+    refused, ``local-first`` = local without asking the pool), ``take_refusal``
+    (the take() refusal behind a last-resort spawn, else None) and
+    ``pool_free_at_spawn`` (display only, never the I-1 predicate)."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    from hermes_cli import kanban_worker_pool as _kwp_pd
     placed = placed_host is not None
     considered = []
     if plan is not None:
@@ -4325,6 +4344,7 @@ def _placement_payload(*, run_id, route: str, arg: Optional[str], rule: Optional
                 "pressure": d.get("pressure"), "load1": d.get("load1"),
                 "ncpu": d.get("ncpu"), "reachable": d.get("reachable"),
             })
+    remote = bool(getattr(plan, "default_remote", False))
     return {
         "run_id": run_id,
         "route": _spec_route(route, placed, not placed),
@@ -4334,6 +4354,11 @@ def _placement_payload(*, run_id, route: str, arg: Optional[str], rule: Optional
         "gate": gate,
         "plan_at": getattr(plan, "planned_at", None) if plan is not None else None,
         "entry": entry,
+        "route_class": route,
+        "placement_default": _kwp_pd.PLACEMENT_DEFAULT_REMOTE if remote else _kwp_pd.PLACEMENT_DEFAULT_LOCAL,
+        "reason": "pool" if placed else (_pr.LAST_RESORT if take_refusal else "local-first"),
+        "take_refusal": take_refusal,
+        "pool_free_at_spawn": plan.budget if plan is not None else 0,
     }
 
 
@@ -4358,6 +4383,8 @@ def _tick_routes(result, ready_rows, row_route: dict, row_rules: dict, planned: 
         if tid in spawned:
             entry["outcome"] = "would_place" if dry_run else "spawned"
             entry["host"] = placed.get(tid) or local_host
+            if tid in (result.take_refusals or {}):
+                entry["take_refusal"] = result.take_refusals[tid]
         elif tid in (result.placement_waits or {}):
             entry["outcome"] = "held"
             entry["code"], entry["detail"] = _pr.split_reason(result.placement_waits[tid])
@@ -4971,6 +4998,30 @@ def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optio
         if plan.budget <= 0:
             return plan.full_reason()
     return None
+
+
+def _i0_counts(reason) -> bool:
+    """Does a portable row's wait reason count toward the I-0 per-board key?
+    Fail closed: every code counts except the per-row holds that are not about
+    capacity (no assignee, the profile's own in-flight cap, a layer-0b
+    capability gap on the chosen host). A cap added on the last-resort spawn,
+    under any code, counts."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    code = _pr.take_refusal_code(reason) or ""
+    return not (code in _I0_EXEMPT or code.startswith("requires:"))
+
+
+_I0_EXEMPT = frozenset({"unassigned", "per_profile_cap"})
+
+
+def _last_resort_allowed(route: str, local_free: bool, cap_only, plan) -> bool:
+    """Spawn a pool-refused row locally this tick? Only a ``portable`` row
+    under ``kanban.placement.default: remote`` with local allowance left and no
+    capability ``only`` set (a docker card never drifts onto the Studio, §3.4).
+    No count, no cap (spec v0.3 I-0 / I-2): the pool having refused IS the
+    last-resort condition."""
+    return (route == "portable" and local_free and not cap_only
+            and bool(getattr(plan, "default_remote", False)))
 
 
 def _wall_reason(route: str, arg: Optional[str], plan) -> str:
@@ -6159,6 +6210,10 @@ def _dispatch_once_locked(
     # every slot is used, the loop keeps walking the remaining rows and
     # records why each one waits instead of stopping silently.
     record_only: Optional[str] = None
+    # Portable rows that reached their turn with local allowance left on THIS
+    # board (spec v0.3 I-0 per-board key, Momus pass 3 R1); capability-``only``
+    # rows are excluded (they never take a local slot, §3.4).
+    _portable_room: set = set()
     for row_index, row in enumerate(ready_rows):
         route, route_arg = row_route.get(row["id"], ("local", None))
         if record_only is not None:
@@ -6174,6 +6229,8 @@ def _dispatch_once_locked(
                 continue
             break
         local_free = ready_local is None or local_spawned < ready_local
+        if route == "portable" and local_free and not _caps_out.get("only", {}).get(row["id"]):
+            _portable_room.add(row["id"])
         pool_free = spillover is not None and spillover.budget > 0
         if not local_free and not pool_free:
             ready_scan_complete = False
@@ -6363,9 +6420,18 @@ def _dispatch_once_locked(
         placed_host = None
         _decision = None
         _rid = None
+        _take_refusal = None
         _cap_only = _caps_out.get("only", {}).get(row["id"])
-        if route in ("pin", "origin") or (route == "portable" and (not local_free or _cap_only)):
-            # A refused take() NEVER falls through to a local spawn (I-11).
+        # A browser join is cut for the host _browser_gate saw (the Studio for a
+        # portable row): remote-first would move it and the lease refuses
+        # BROWSER_JOIN_HOST_MOVED every tick, so a joined row keeps that host.
+        _remote_first = (getattr(spillover, "default_remote", False)
+                         and row["id"] not in result.browser_joins)
+        if route in ("pin", "origin") or (route == "portable" and (
+                not local_free or _cap_only or _remote_first)):
+            # A refused take() NEVER falls through to a local spawn (I-11),
+            # except a portable row under kanban.placement.default: remote,
+            # which spawns locally as the LAST RESORT (spec v0.3 §3.1 step 2).
             # A host-bound portable card only lands on a host the reach
             # matrix proves (t_1e9ea7e9); None = any pool host.
             _only = None
@@ -6406,11 +6472,15 @@ def _dispatch_once_locked(
             _decision = getattr(spillover, "last_decision", None)
             _rid = getattr(spillover, "last_reservation", None)
             if placed_host is None:
-                result.placement_waits[row["id"]] = spillover.refusal or "pool_full"
-                continue
+                _refusal = spillover.refusal or _pr.POOL_FULL
+                if route == "portable":
+                    _take_refusal = _refusal
+                if not _last_resort_allowed(route, local_free, _cap_only, spillover):
+                    result.placement_waits[row["id"]] = _refusal
+                    continue
             # Layer 0b (t_ecfd5591, F14): never spawn a card whose ATTACHED skills need
             # an enforced capability the chosen host lacks (a stale route's belt).
-            _gap = _attached_skill_gap(row, placed_host.name, _caps)
+            _gap = _attached_skill_gap(row, placed_host.name, _caps) if placed_host is not None else None
             if _gap is not None:
                 spillover.release(placed_host, _rid)
                 result.placement_waits[row["id"]] = f"requires:{_gap}+layer0b:{placed_host.name}"
@@ -6420,6 +6490,8 @@ def _dispatch_once_locked(
                         _kb._append_event(conn, row["id"], "placement_gate_refused",
                                           {"layer": "0b", "host": placed_host.name, "cap": _gap})
                 continue
+        if _take_refusal is not None and placed_host is None:
+            result.take_refusals[row["id"]] = _take_refusal
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             charge_pool(row["id"])
@@ -6603,7 +6675,7 @@ def _dispatch_once_locked(
             placement_record = _placement_payload(
                 run_id=claimed.current_run_id, route=route, arg=route_arg,
                 rule=row_rules.get(claimed.id), placed_host=placed_host, plan=spillover,
-                entry=entry, gate=tick_gate,
+                entry=entry, gate=tick_gate, take_refusal=_take_refusal,
             )
             if pid and not _set_worker_pid(
                 conn, claimed.id, int(pid), run_id=claimed.current_run_id,
@@ -6691,6 +6763,9 @@ def _dispatch_once_locked(
     result.portable_waiting = sum(
         1 for tid in result.placement_waits
         if row_route.get(tid, ("local", None))[0] == "portable")
+    result.portable_waiting_with_room = sum(
+        1 for tid in _portable_room
+        if tid in result.placement_waits and _i0_counts(result.placement_waits[tid]))
     if not dry_run and result.placement_waits:
         try:
             from hermes_cli.kanban_drained_pin import notify_drained_pins

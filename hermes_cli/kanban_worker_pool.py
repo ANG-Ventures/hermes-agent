@@ -89,6 +89,21 @@ HOST_PIN_RE = re.compile(r"^[ \t]*host:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*\
 PIN_ANY = "any"
 PIN_STUDIO = "studio"
 STUDIO_HOST = "mac-studio"
+# kanban.placement.default (Control-Plane Protection spec v0.3 §3.1, read per
+# tick): ``remote`` offers every portable row to the pool before a local slot;
+# anything else, or the key absent, keeps today's local-first order.
+PLACEMENT_DEFAULT_REMOTE = "remote"
+PLACEMENT_DEFAULT_LOCAL = "local"
+
+
+def placement_default(kanban_cfg: Any) -> str:
+    """``kanban.placement.default``: ``remote`` only when the key says so."""
+    pl = kanban_cfg.get("placement") if isinstance(kanban_cfg, Mapping) else None
+    val = pl.get("default") if isinstance(pl, Mapping) else None
+    if isinstance(val, str) and val.strip().lower() == PLACEMENT_DEFAULT_REMOTE:
+        return PLACEMENT_DEFAULT_REMOTE
+    return PLACEMENT_DEFAULT_LOCAL
+
 # Words that name the dispatcher's own machine (resolve to PIN_STUDIO); the
 # live ``socket.gethostname()`` short form joins them at call time.
 _STUDIO_PIN_WORDS = frozenset({PIN_STUDIO, STUDIO_HOST, "local"})
@@ -1367,6 +1382,9 @@ class SpilloverPlan:
     band: Optional[str] = None           # the Studio gate band this tick
     spill_reason: Optional[str] = None
     pins_only: bool = False              # admitting band, worker_pool.overflow off: remote PINS only
+    # kanban.placement.default == remote this tick (spec v0.3 §3.1): every
+    # portable row is offered to take() before a local slot.
+    default_remote: bool = False
     signal: Optional[TargetSignal] = None  # None = KWLB v0.1 (read_signal false)
     taken: Dict[str, int] = field(default_factory=dict)  # this tick's takes, per host
     # host -> why the memory/band cap is below its free slots (t_31350981);
