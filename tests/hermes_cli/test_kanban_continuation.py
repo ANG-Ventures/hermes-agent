@@ -469,3 +469,62 @@ def test_browser_gate_reads_origin_route_as_remote():
     from hermes_cli import kanban_db_dispatch as kbd
     assert kbd._pin_host(('origin', 'ace-ai')) == 'ace-ai'
     assert kbd._pin_host(('portable', None)) == 'studio'
+
+
+@pytest.fixture
+def mounted_home(tmp_path, monkeypatch):
+    """A real board under the live config shape: workspaces_root_require_mount=true."""
+    import os
+    from pathlib import Path
+    import yaml
+    for key in tuple(os.environ):
+        if key.startswith('HERMES_KANBAN_'):
+            monkeypatch.delenv(key)
+    monkeypatch.delenv('HERMES_SESSION_ID', raising=False)
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    root = tmp_path / 'volume' / 'kanban-workspaces'
+    root.mkdir(parents=True)
+    (tmp_path / 'config.yaml').write_text(yaml.safe_dump({'kanban': {
+        'workspaces_root': str(root), 'workspaces_root_require_mount': True}}))
+    monkeypatch.setattr('os.path.ismount', lambda p: Path(p) == root.parent)
+    kb.init_db()
+    return root
+
+
+def _spawned(conn, task_id):
+    from hermes_cli import kanban_db_dispatch as kbd
+    calls = []
+    result = kbd.dispatch_once(conn, spawn_fn=lambda task, ws, **kw: calls.append((task.id, ws)))
+    assert not result.stranded_by_mount_loss, result.stranded_by_mount_loss
+    assert not result.workspace_refused, result.workspace_refused
+    return dict(calls).get(task_id)
+
+
+def test_drop_origin_fresh_path_spawns_under_require_mount(mounted_home):
+    """Prism 999501f3822b: the fresh path must exist, or admission strands it."""
+    old = mounted_home / 'default' / 't_old'
+    old.mkdir(parents=True)
+    (old / 'sentinel').write_text('left behind')
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title='drop origin', assignee='default',
+                             workspace_kind='scratch', workspace_path=str(old))
+        conn.execute("UPDATE tasks SET origin_host='ace-media' WHERE id=?", (tid,))
+        assert kc.drop_origin(conn, tid, actor='operator', files=['sentinel'])
+        fresh = conn.execute('SELECT workspace_path FROM tasks WHERE id=?', (tid,)).fetchone()[0]
+        assert fresh != str(old)
+        assert _spawned(conn, tid) == fresh
+    assert (old / 'sentinel').read_text() == 'left behind'
+
+
+def test_continues_source_fresh_path_spawns_under_require_mount(mounted_home):
+    shared = mounted_home / 'default' / 't_src'
+    shared.mkdir(parents=True)
+    with kb.connect_closing() as conn:
+        src = kb.create_task(conn, title='source', assignee='default',
+                             workspace_kind='scratch', workspace_path=str(shared))
+        child = kb.create_task(conn, title='successor', assignee='default', continues=src)
+        rows = dict(conn.execute('SELECT id,workspace_path FROM tasks').fetchall())
+        assert rows[child] == str(shared) and rows[src] != str(shared)
+        assert _spawned(conn, src) == rows[src]

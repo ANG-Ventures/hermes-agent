@@ -199,6 +199,30 @@ def _fresh_path(path: str, tag: str) -> str:
     return f"{os.path.normpath(path)}.{tag}"
 
 
+def _materialize_fresh(conn, path: str) -> None:
+    """Create a fresh path under the mount-guarded root before it is persisted.
+
+    Admission refuses a persisted path that is not a directory
+    (``stranded_by_mount_loss``), so a never-created fresh path would strand
+    the very run it was minted for. A path outside the guarded root is left
+    to ``resolve_workspace``, which creates it on spawn.
+    """
+    from pathlib import Path
+    from hermes_cli.kanban_workspace_policy import (
+        configured_root, create_scratch, validate_mount,
+    )
+    root, require_mount = configured_root()
+    if root is None or not require_mount:
+        return
+    target = Path(path).expanduser()
+    if not target.is_relative_to(root):
+        return
+    row = conn.execute("SELECT mount_path FROM workspace_mount_roots WHERE root=?",
+                       (str(root),)).fetchone()
+    mount = validate_mount(root, expected_mount=Path(row[0]) if row else None)
+    create_scratch(root, target, expected_mount=mount)
+
+
 def transfer_workspace(conn, parent_id: str, child_id: str) -> None:
     """Called inside create's transaction; no sharing and no live-owner theft."""
     from hermes_cli import kanban_db as kb
@@ -218,8 +242,10 @@ def transfer_workspace(conn, parent_id: str, child_id: str) -> None:
     # The source keeps running (it may be ready/blocked/review), so it gets a
     # fresh path, no branch and no origin: it can never re-resolve to the
     # directory it just gave away, nor wait on state it no longer owns.
+    source_fresh = _fresh_path(parent["workspace_path"], f"after-{child_id}")
+    _materialize_fresh(conn, source_fresh)
     conn.execute("UPDATE tasks SET workspace_path=?,branch_name=NULL,origin_host=NULL WHERE id=?",
-                 (_fresh_path(parent["workspace_path"], f"after-{child_id}"), parent_id))
+                 (source_fresh, parent_id))
     conn.execute("INSERT OR IGNORE INTO task_links VALUES(?,?,'derived-from')", (parent_id, child_id))
     kb._append_event(conn, parent_id, "workspace_transferred", {"to": child_id, "path": parent["workspace_path"]})
     kb._append_event(conn, child_id, "continues", {"parent": parent_id, "host": parent["origin_host"]})
@@ -314,6 +340,8 @@ def drop_origin(conn, task_id: str, *, actor: str, files: list) -> bool:
         # Start fresh means a new directory: the abandoned one stays behind
         # untouched, and a later placement on the same host never reuses it.
         fresh = _fresh_path(path, f"fresh-{int(time.time())}") if path else None
+        if fresh:
+            _materialize_fresh(conn, fresh)
         conn.execute('UPDATE tasks SET origin_host=NULL,workspace_path=? WHERE id=?', (fresh, task_id))
         kb._append_event(conn, task_id, 'origin_dropped', {'by': actor, 'host': host})
         kb.add_comment(conn, task_id, actor, f'origin {host} dropped; next run uses {fresh}; '
