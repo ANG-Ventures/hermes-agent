@@ -160,8 +160,11 @@ def _requote(parts: list) -> list:
 
 
 def _default_parts(text: str, quoted: bool) -> list:
-    """Lex the default word of ``${X:-word}`` with the shell's quoting rules; inside
-    double quotes the result is neither split nor globbed."""
+    """Lex the default word of ``${X:-word}`` with the shell's quoting rules. Inside double
+    quotes the word is one literal-preserving string (exact whitespace, no splitting, no
+    globbing); unquoted, its blanks are field breaks."""
+    if quoted:
+        return _requote([p for w in _lex('"' + text + '"') if w is not None for p in w])
     parts: list = []
     for w in _lex(text):
         if w is None:
@@ -169,7 +172,7 @@ def _default_parts(text: str, quoted: bool) -> list:
         if parts:
             parts.append(("s",))
         parts.extend(w)
-    return _requote(parts) if quoted else parts
+    return parts
 
 
 def _lex(s: str) -> list:
@@ -347,6 +350,8 @@ def _expand_fields(parts: list, table: Mapping, home: str, *, split: bool = True
                 if value is _UNKNOWN:
                     return False
                 if isinstance(value, list):  # the default word: expanded with its own quoting
+                    if part[3]:
+                        state["content"] = True  # `"${UNSET:-}"` is still one (empty) field
                     if not walk(value, at_start):
                         return False
                     continue
@@ -982,14 +987,23 @@ def snapshot_exports(path: str) -> dict:
     if not src:
         return {}
     out: dict = {}
+    in_array = False  # inside `declare -ax A=([0]="x" ...)`: the lexer splits it at the parens
     try:
         for seg in _segments(_lex(src)):
             head = seg[0]
             if not (len(head) == 1 and head[0][0] == "u" and head[0][1] in ("declare", "export", "typeset")):
+                if in_array:
+                    in_array = False  # the one `[0]="x" [1]="y"` element segment
+                    continue
                 break  # past the export dump (functions/aliases follow)
+            in_array = False
             for parts in seg[1:]:
                 a = _assignment(parts)
                 if a is None:
+                    continue
+                if not a[1]:  # `A=(`: an array initializer follows; its value is opaque
+                    out[a[0]] = _UNKNOWN
+                    in_array = True
                     continue
                 literal = all(p[0] in ("u", "q") for p in a[1])
                 out[a[0]] = "".join(p[1] for p in a[1]) if literal else _UNKNOWN

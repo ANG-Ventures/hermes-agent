@@ -296,6 +296,28 @@ def test_snapshot_exports_reads_only_the_export_dump(tmp_path):
     assert snapshot_exports(str(tmp_path / "missing.sh")) == {}
 
 
+def test_snapshot_exports_continue_past_exported_arrays(tmp_path):
+    from agent.home_deletion_guard import _UNKNOWN, snapshot_exports
+
+    snap = tmp_path / "snap.sh"
+    snap.write_text('declare -ax A=([0]="x" [1]="y z")\ndeclare -ax E=()\ndeclare -x D="/x/runtime"\n'
+                    "f () \n{ \n    declare -x LATE=/nope\n}\n")
+    out = snapshot_exports(str(snap))
+    assert out["A"] is _UNKNOWN and out["D"] == "/x/runtime" and "LATE" not in out
+
+
+def test_quoted_default_keeps_exact_whitespace(home, tmp_path):
+    spaced = tmp_path / "hermes  home"
+    spaced.mkdir()
+    env = {"HERMES_HOME": str(spaced)}
+    assert check(home, f'rm -rf "${{TARGET:-{spaced}}}"', env=env, cwd="/tmp") is not None
+
+
+def test_quoted_empty_default_is_an_empty_argument(home):
+    # Git treats `-C ""` as "stay here", so cwd = the home and the clean is real.
+    assert check(home, 'git -C "${UNSET:-}" clean -fdx', cwd=str(home["root"])) is not None
+
+
 # ── cost ───────────────────────────────────────────────────────────────────────────────
 
 def test_ordinary_commands_stay_well_under_50ms(home):
