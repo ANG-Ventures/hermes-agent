@@ -173,3 +173,48 @@ def test_json_and_legacy_flag_together_refused(board, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_ID", SESSION)
     out = cli.run_slash(f"complete {board} --body x --metadata '{{}}' --json '{{}}'")
     assert "same input" in out, out
+
+
+# Prism #2011 follow-ups (t_83f9b892).
+_PLAIN_SECRET = "hunter2hunter2xyz"
+
+
+def test_coverage_redaction_keeps_key_based_rule():
+    """Prism 0464d61148aa: a secret under a secret-named key has no recognizable prefix, so only
+    the key rule (the serialized path's _JSON_FIELD_RE) can mask it."""
+    record = {"lenses": {lens: "done" for lens in REQUIRED_REVIEW_LENSES}, "findings": 1,
+              "items": ["one finding"], "review_minutes": 3, "batch_id": "n/a: solo", "head_sha": HEAD,
+              "password": _PLAIN_SECRET, "extra": {"token": _PLAIN_SECRET}}
+    redacted = kb.redact_review_coverage_text(json.dumps(record))
+    assert _PLAIN_SECRET not in redacted, redacted
+    assert kb.review_coverage_text_error(redacted) is None, redacted
+
+
+def test_why_preview_prints_redacted_coverage(board, monkeypatch):
+    """Prism eeae9238333f: --why must not echo a credential the write path would redact."""
+    monkeypatch.setenv("HERMES_SESSION_ID", SESSION)
+    secret = "sk-proj-" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4"
+    out = cli.run_slash(
+        f"request-changes {board} --body fix --finding {shlex.quote('leaked ' + secret)} "
+        f"--lens all=done --json '{{\"head_sha\": \"{HEAD}\", \"password\": \"{_PLAIN_SECRET}\"}}' --why")
+    assert "built review_coverage:" in out, out
+    assert secret not in out and _PLAIN_SECRET not in out, out
+
+
+def test_flat_form_head_reads_legacy_routed_pr(board, monkeypatch):
+    """Prism d9a21feebf71: a legacy routed run (auto_routed_open_prs, no own_prs) still routes a PR."""
+    from hermes_cli import kanban_handback_head as hh
+    seen = []
+
+    def reader(repo, number):
+        seen.append((repo, number))
+        return {"head": HEAD}
+
+    monkeypatch.setattr(hh, "_default_reader", lambda: reader)
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, board)
+        conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                     (json.dumps({"auto_routed_open_prs": ["ANG-Ventures/hermes-agent#41"]}), run.id))
+        conn.commit()
+        assert kvi._routed_pr_head(conn, board) == (HEAD, "ANG-Ventures/hermes-agent#41")
+    assert seen == [("ANG-Ventures/hermes-agent", 41)]

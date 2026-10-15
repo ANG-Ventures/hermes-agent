@@ -143,12 +143,13 @@ def _routed_pr_head(conn, task_id: str) -> tuple[Optional[str], Optional[str]]:
     """``(head_sha, pr)`` of the card's routed/declared PR; ``(None, None)`` when it has none,
     ``(None, pr)`` when it has one whose head could not be read."""
     from hermes_cli import kanban_db as kb
-    from hermes_cli.kanban_open_pr import extract_pr_refs, split_fleet
+    from hermes_cli.kanban_open_pr import extract_pr_refs, recorded_pr_refs, split_fleet
 
     refs = []
     for run in reversed(kb.list_runs(conn, task_id)):
-        md = run.metadata if isinstance(run.metadata, dict) else None
-        refs = split_fleet(extract_pr_refs(metadata=md))[0]
+        # recorded_pr_refs: every key a run persists its own PR under, incl. a legacy
+        # routed run's auto_routed_open_prs (Prism d9a21feebf71).
+        refs = split_fleet(extract_pr_refs(*recorded_pr_refs(run.metadata)))[0]
         if refs:
             break
     if not refs:

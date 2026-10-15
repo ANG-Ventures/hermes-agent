@@ -12603,18 +12603,17 @@ def _route_block(
 
 
 def redact_review_value(value: Any) -> Any:
-    """Redact secrets at the domain boundary for durable review handoffs."""
-    if isinstance(value, str):
-        from agent.redact import redact_sensitive_text
+    """Redact secrets at the domain boundary for durable review handoffs.
 
-        return redact_sensitive_text(value, force=True)
-    if isinstance(value, dict):
-        return {key: redact_review_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact_review_value(item) for item in value]
+    Per leaf, keys included, with the key rule kept: a string under a secret-named
+    key (``"password"``, ``"token"``) is masked whole even with no recognizable
+    prefix (Prism 0464d61148aa).
+    """
+    from agent.redact import redact_sensitive_json
+
     if isinstance(value, tuple):
         return tuple(redact_review_value(item) for item in value)
-    return value
+    return redact_sensitive_json(value, force=True)
 HUMAN_REVIEWER_SENTINEL = "human"
 
 
