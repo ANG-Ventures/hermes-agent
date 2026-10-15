@@ -316,7 +316,11 @@ def test_migration_backfills_once_and_drop_survives_reconnect(db):
     from hermes_cli import kanban_db_connect as kbc
     row = card(db, origin=None)
     kb._append_event(db, row['id'], 'worker_placed', {'host': 'ace-media'})
-    db.execute('ALTER TABLE tasks DROP COLUMN origin_host')
+    # Rebuild a legacy table without the column. DROP COLUMN fails on
+    # SQLite < 3.47 ("incomplete input") for this schema's last column.
+    cols = ','.join(r[1] for r in db.execute('PRAGMA table_info(tasks)') if r[1] != 'origin_host')
+    db.executescript(f'CREATE TABLE legacy AS SELECT {cols} FROM tasks; DROP TABLE tasks; '
+                     'ALTER TABLE legacy RENAME TO tasks;')
     kbc._migrate_add_optional_columns(db)
     assert db.execute('SELECT origin_host FROM tasks').fetchone()[0] == 'ace-media'
     db.execute('UPDATE tasks SET origin_host=NULL')
