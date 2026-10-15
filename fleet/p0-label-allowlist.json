@@ -1,0 +1,42 @@
+{
+ "_doc": "p0-label allowlist for p0-label-lint.py (Router Core spec v5 \u00a74.1, card t_8b05b16b). Each row grandfathers one push:main / merge_group job that runs on the fleet pool without requesting p0, until `expires`. The seeded rows are the Card B migration inventory. Never add a row for a new job; a stale row fails the lint, so the list only shrinks.",
+ "schema": 1,
+ "jobs": [
+  {
+   "path": ".github/workflows/ci-local.yaml",
+   "job": "tests/e2e",
+   "reason": "grandfathered when p0-label-lint landed (t_8b05b16b); Card B migration inventory: request runs-on p0 for push:main / merge_group (PR events keep the ordinary pool), then delete this row",
+   "expires": "2027-01-15"
+  },
+  {
+   "path": ".github/workflows/ci-local.yaml",
+   "job": "tests/e2e-upgrade",
+   "reason": "grandfathered when p0-label-lint landed (t_8b05b16b); Card B migration inventory: request runs-on p0 for push:main / merge_group (PR events keep the ordinary pool), then delete this row",
+   "expires": "2027-01-15"
+  },
+  {
+   "path": ".github/workflows/ci-local.yaml",
+   "job": "tests/test",
+   "reason": "grandfathered when p0-label-lint landed (t_8b05b16b); Card B migration inventory: request runs-on p0 for push:main / merge_group (PR events keep the ordinary pool), then delete this row",
+   "expires": "2027-01-15"
+  },
+  {
+   "path": ".github/workflows/ci.yaml",
+   "job": "tests/e2e",
+   "reason": "grandfathered when p0-label-lint landed (t_8b05b16b); Card B migration inventory: request runs-on p0 for push:main / merge_group (PR events keep the ordinary pool), then delete this row",
+   "expires": "2027-01-15"
+  },
+  {
+   "path": ".github/workflows/ci.yaml",
+   "job": "tests/e2e-upgrade",
+   "reason": "grandfathered when p0-label-lint landed (t_8b05b16b); Card B migration inventory: request runs-on p0 for push:main / merge_group (PR events keep the ordinary pool), then delete this row",
+   "expires": "2027-01-15"
+  },
+  {
+   "path": ".github/workflows/ci.yaml",
+   "job": "tests/test",
+   "reason": "grandfathered when p0-label-lint landed (t_8b05b16b); Card B migration inventory: request runs-on p0 for push:main / merge_group (PR events keep the ordinary pool), then delete this row",
+   "expires": "2027-01-15"
+  }
+ ]
+}

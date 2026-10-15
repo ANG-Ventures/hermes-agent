@@ -1,0 +1,21 @@
+{
+ "_doc": "Byte-identical copies of ANG-Ventures/hermes-home lints (Router Core spec v5 \u00a74.1/\u00a77.1, card t_8b05b16b). hermes-home is private, so CI here cannot fetch them: change the lint THERE, re-copy, re-pin. check_pin.py enforces the bytes. hermes-home#4308 (spawn-site) and #4319 (p0-label, queue-loops) carry the source; re-pin to their merge commits once merged.",
+ "source_repo": "ANG-Ventures/hermes-home",
+ "files": {
+  "lint-spawn-site.py": {
+   "source_sha": "57fc0649a80ea49faa83e94b7b57ae9a6076febf",
+   "source_path": "scripts/lint-spawn-site.py",
+   "sha256": "f03a8026e35e3d238ca2bdc11079a187a9e756d626c38ed6fff92b79674f7ac1"
+  },
+  "p0-label-lint.py": {
+   "source_sha": "edf7c6d3d89588a61567c514a4239820c2f7459a",
+   "source_path": "scripts/p0-label-lint.py",
+   "sha256": "a513957343eb5c6015e4dbba2a93ac4dcb96b9988aacb9ba84c293fb65cfedbd"
+  },
+  "lint-queue-loops.py": {
+   "source_sha": "edf7c6d3d89588a61567c514a4239820c2f7459a",
+   "source_path": "scripts/lint-queue-loops.py",
+   "sha256": "0686adb31cdb2a0330d65ea5d7a44e72642a551b9df387027b3d9a0c8cd67606"
+  }
+ }
+}
