@@ -583,3 +583,18 @@ def test_375e680b84c1_claim_lost_during_the_relay_is_never_cleaned_up_as_ours(ho
             assert tuple(row) == ("running", state["run"])          # the successor's claim is untouched
             assert _events(conn, tid, "browser_dispatch_refused") == []
             assert released == want_release
+
+
+def test_606e8aff45d3_failure_transition_is_fenced_to_the_run_in_its_own_txn(home):
+    """The run fence is read inside _record_task_failure's write txn: a mismatched run is a no-op (None)."""
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="x\n")
+        claimed = kb.claim_task(conn, tid, ttl_seconds=60)
+        run = claimed.current_run_id
+        assert kbd._record_task_failure(conn, tid, "e", outcome="spawn_failed", release_claim=True, end_run=True,
+                                        infrastructure=True, expected_run_id=run + 1) is None
+        row = conn.execute("SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row[0] == "running" and row[1] == run and row[2] is not None
+        assert kbd._record_task_failure(conn, tid, "e", outcome="spawn_failed", release_claim=True, end_run=True,
+                                        infrastructure=True, expected_run_id=run) is False
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "ready"

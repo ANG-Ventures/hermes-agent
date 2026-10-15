@@ -2649,6 +2649,7 @@ def _record_task_failure(
     block_kind: Optional[str] = None,
     infrastructure: bool = False,
     run_metadata_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -2704,6 +2705,11 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        # ``expected_run_id``: the caller's claimed run must still own the card, checked inside this write
+        # transaction, so a successor run that claimed it meanwhile is never reset (Prism 606e8aff45d3).
+        if expected_run_id is not None and (row["status"] != "running"
+                                            or row["current_run_id"] != int(expected_run_id)):
+            return None
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -4787,12 +4793,13 @@ def _browser_join_refused(conn, claimed, token: str, result, failure_limit) -> N
     task_id = claimed.id
     _kb._log.warning("kanban dispatch: browser join refused for %s: %s", task_id, token)
     result.placement_waits[task_id] = f"browser_refused:{token}"
-    if not _kb._claim_still_held(conn, claimed):
+    fenced = _record_task_failure(conn, task_id, f"browser lease: {token}", outcome="spawn_failed",
+                                  release_claim=True, end_run=True, failure_limit=failure_limit, infrastructure=True,
+                                  run_metadata_extra={"browser_refused": token},
+                                  expected_run_id=claimed.current_run_id)
+    if fenced is None:
         _kb._abort_lost_claim_spawn(conn, claimed, None)
         return
-    _record_task_failure(conn, task_id, f"browser lease: {token}", outcome="spawn_failed", release_claim=True,
-                         end_run=True, failure_limit=failure_limit, infrastructure=True,
-                         run_metadata_extra={"browser_refused": token})
     with _kbc.write_txn(conn):
         _kb._append_event(conn, task_id, _kbl.REFUSED_EVENT, {"token": token, "join": True})
 
