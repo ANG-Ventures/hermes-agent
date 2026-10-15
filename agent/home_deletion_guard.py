@@ -200,8 +200,46 @@ def _default_parts(text: str, quoted: bool) -> list:
     return parts
 
 
+def _join_continuations(s: str) -> str:
+    """Drop every backslash-newline outside single quotes and comments, as the shell does
+    before it tokenizes (Prism eabfb3a4f752). Without this a continuation splitting a name,
+    a word or a ``${X:-word}`` default resolves to a path the shell never builds."""
+    if "\\\n" not in s:
+        return s
+    out: list[str] = []
+    i, n = 0, len(s)
+    sq = dq = False
+    while i < n:
+        c = s[i]
+        if sq:
+            j = s.find("'", i)
+            j = n if j < 0 else j + 1
+            out.append(s[i:j])
+            i, sq = j, False
+            continue
+        if c == "\\":
+            if s[i + 1:i + 2] != "\n":
+                out.append(s[i:i + 2])
+            i += 2
+            continue
+        if c == '"':
+            dq = not dq
+        elif c == "'" and not dq:
+            sq = True
+        elif c == "#" and not dq and (not out or out[-1][-1:] in " \t\r\n;&|()<>"):
+            j = s.find("\n", i)
+            j = n if j < 0 else j
+            out.append(s[i:j])
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _lex(s: str) -> list:
     """Words (part lists) and ``None`` separators. Redirection targets are dropped."""
+    s = _join_continuations(s)
     out: list = []
     cur: Optional[list] = None
     drop_next = False
@@ -351,6 +389,20 @@ def _expand_fields(parts: list, table: Mapping, home: str, *, split: bool = True
         pattern.clear()
         state["globbed"] = state["content"] = False
 
+    def add_quoted(chunk: str):
+        state["content"] = True
+        text.append(chunk)
+        pattern.append(_escape_glob(chunk))
+
+    def tilde(chunk: str, at_start: bool, any_user: bool = False) -> str:
+        """Expand a leading ``~`` into quoted content: the shell never field-splits or globs
+        a tilde-expansion result (Prism 40715861ef6b). Returns the remaining unquoted text."""
+        if at_start and home and (chunk == "~" or chunk.startswith("~/") or
+                                  (any_user and chunk.startswith("~"))):
+            add_quoted(home)
+            return chunk[1:]
+        return chunk
+
     def add_unquoted(chunk: str):
         if _GLOB_CHARS.search(chunk):
             state["globbed"] = True
@@ -367,9 +419,7 @@ def _expand_fields(parts: list, table: Mapping, home: str, *, split: bool = True
                 # Unquoted literal text of a default word: field-split on IFS exactly like an
                 # unquoted variable value, never re-lexed as shell source (Prism fb6e5bf412c4,
                 # d0b8d9a3d9eb). Whitespace and metacharacters inside a field are preserved.
-                chunk = part[1]
-                if at_start and (chunk == "~" or chunk.startswith("~/")) and home:
-                    chunk = home + chunk[1:]
+                chunk = tilde(part[1], at_start)
                 if not split:
                     add_unquoted(chunk)
                     continue
@@ -410,15 +460,11 @@ def _expand_fields(parts: list, table: Mapping, home: str, *, split: bool = True
                 continue
             chunk = part[1]
             if kind == "u":
-                if at_start and (chunk == "~" or chunk.startswith("~/")) and home:
-                    chunk = home + chunk[1:]
-                if assignment_value and at_start and chunk.startswith("~") and home:
-                    chunk = home + chunk[1:]
-                add_unquoted(chunk)
+                chunk = tilde(chunk, at_start, assignment_value)
+                if chunk:
+                    add_unquoted(chunk)
             else:
-                state["content"] = True
-                text.append(chunk)
-                pattern.append(_escape_glob(chunk))
+                add_quoted(chunk)
         return True
 
     if not walk(parts, True):
@@ -754,7 +800,7 @@ def _python_target(args: list[_Word]) -> tuple[Optional[str], Optional[str]]:
 def _analyze_shell(text: str, table: dict, cwd: str, ctx: _Ctx, depth: int) -> Optional[str]:
     from tools.shell_heredoc import strip_inert_heredoc_bodies
 
-    if not _RELEVANT_RE.search(text):
+    if not _RELEVANT_RE.search(_join_continuations(text)):  # `r\<newline>m` is `rm`
         return None
     try:
         text = strip_inert_heredoc_bodies(text)
