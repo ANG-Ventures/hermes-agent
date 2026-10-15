@@ -4570,38 +4570,123 @@ def _capability_tick(pool_config):
         return None
 
 
-def _record_legacy_routes(conn, rows, result) -> None:
-    """``legacy_route {need, lane, reason}`` once per (card, need, lane) for every
-    ``browser:*`` need this tick (t_ecfd5591, browser spec v1.2 s3.3). With
-    ``migrated_lanes = []`` every browser need is one; the route is unchanged.
-    Best-effort: never breaks a tick."""
+def _browser_lookup():
+    """The identity lookup the gate uses this tick: browserd's read-only ``identity`` verb over the
+    local socket (the ledger is ``_browserd``-owned; the dispatcher never opens it). Tests replace it."""
+    from hermes_cli import kanban_browser_gate as _kbg
+    return _kbg.socket_lookup(_kbg.DEFAULT_SOCKET)
+
+
+def _pin_host(route) -> str:
+    """The host a browser card's worker runs on: the pool host of a ``("pin", host)`` route, else the
+    Studio (every other route spawns locally on the dispatcher host), keyed as browser-hosts.json does."""
+    if isinstance(route, tuple) and len(route) == 2 and route[0] == "pin" and route[1]:
+        return route[1]
+    return "studio"
+
+
+def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
+                  default_assignee: Optional[str] = None, *, park: bool = True) -> None:
+    """The Browser Sandboxes resolution gate for this tick (t_42728faf; spec v1.2 s3.3, AC-1.13/1.15).
+
+    The live tick and ``--dry-run`` both come through here and both call
+    ``kanban_browser_gate.gate_rows`` (one code path, pass-3 lens). ``browsers.mode`` and
+    ``migrated_lanes`` are read from ``fleet/browser-hosts.json`` on every tick (no restart to flip).
+    A card with no ``browser:*`` need is untouched. Per card:
+
+    * ``legacy_route`` (mode off, lane not migrated, identity unsealed): today's placement, one event
+      per (card, need, lane), never a ``BROWSER_*`` token, never a browserd call while mode is off.
+    * a refusal: the card parks ``needs_input`` with the token as the first line (dry run: reported).
+    * a lease plan: held ``ready`` with ``browser_join_off`` (the s7 join that leases is P1-8's) and
+      NEVER spawned onto a legacy profile; a ledger wait holds it the same way.
+    FAIL CLOSED (Prism 671171332677): a gate fault holds every browser card this tick (``browser_gate_error``)
+    and never lets it spawn on a legacy profile; cards with no browser need are untouched. An unassigned card is
+    judged as ``kanban.default_assignee`` (the profile the ready loop will assign), never as nobody.
+    """
+    from hermes_cli import kanban_browser_gate as _kbg
+    from hermes_cli import kanban_needs as _kn
+    rows = [r for r in ready_rows if _kn.declared_resources(r["body"])]
+    if not rows:
+        return
+    _dflt = _resolve_default_assignee(default_assignee)
     try:
-        from hermes_cli import kanban_needs as _kn
-        reg = None
-        with _kbc.write_txn(conn):
-            for row in rows:
-                needs = _kn.declared_resources(row["body"])
-                if not needs:
-                    continue
-                if reg is None:
-                    reg = _kn.load_registry(_kb.kanban_home() / "fleet")
-                try:
-                    skills = json.loads(row["skills"] or "[]") or []
-                except (TypeError, ValueError):
-                    skills = []
-                lane = _kn.lane_of(skills, row["body"], reg)
-                for need in needs:
-                    verdict = _kn.resolve(need, lane, reg)
-                    if isinstance(verdict, _kn.Refusal):
-                        continue   # resolution is P1-4's (t_42728faf); this card resolves nothing
-                    result.placement_caps.setdefault(row["id"], {})["legacy_route"] = verdict
-                    if conn.execute(
-                            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
-                            "AND json_extract(payload, '$.need') = ? AND json_extract(payload, '$.lane') = ? LIMIT 1",
-                            (row["id"], _kn.LEGACY_ROUTE_EVENT, need, lane)).fetchone() is None:
-                        _kb._append_event(conn, row["id"], _kn.LEGACY_ROUTE_EVENT, verdict)
+        reg = _kn.load_registry(_kb.kanban_home() / "fleet")
+        lookup = _browser_lookup() if reg.mode == _kbg.MODE_ON else (lambda name: None)
+        eff = [r if r["assignee"] or not _dflt else dict(dict(zip(r.keys(), tuple(r))), assignee=_dflt)
+               for r in rows]
+        verdicts = _kbg.gate_rows(eff, registry=reg, lookup=lookup,
+                                  minted_by=_kbg.minted_by_of(conn, [r["id"] for r in rows]),
+                                  worker_host=lambda r: _pin_host(row_route.get(r["id"])))
     except Exception:
-        _kb._log.warning("kanban dispatch: could not record legacy_route events", exc_info=True)
+        _kb._log.warning("kanban dispatch: browser gate failed; browser cards held this tick", exc_info=True)
+        for r in rows:
+            result.placement_caps.setdefault(r["id"], {})["browser_wait"] = {"reason": _kbg.WAIT_GATE_ERROR}
+            row_route[r["id"]] = ("wait", _kbg.WAIT_GATE_ERROR)
+        return
+    # Ownership before persistence (Prism 2a0c67315e6c / d702aef9bd19): only a row this home would itself
+    # spawn (an effective assignee that passes the ready loop's _profile_exists_fn / dispatch_profiles
+    # predicate) may get a persisted event, a status change or a wait route. A foreign row keeps a dry
+    # verdict in placement_caps only and is left to the ready loop exactly as today (it never spawns it).
+    _exists = _profile_exists_fn()
+    owned = {r["id"] for r in eff if r["assignee"] and (_exists is None or _exists(r["assignee"]))}
+    for tid, v in verdicts.items():
+        caps = result.placement_caps.setdefault(tid, {})
+        if tid not in owned:
+            caps.update({"browser_foreign": True, **({"legacy_route": v.legacy[-1]} if v.legacy else {}),
+                         **({"browser_refused": dict(v.refusal_payload or {}, exit=v.refusal.exit)}
+                            if v.refusal is not None else {})})
+            continue
+        for payload in v.legacy:
+            caps["legacy_route"] = payload
+            if dry_run:
+                continue
+            try:
+                if conn.execute(
+                        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+                        "AND json_extract(payload, '$.need') = ? AND json_extract(payload, '$.lane') = ? "
+                        "AND json_extract(payload, '$.reason') = ? LIMIT 1",
+                        (tid, _kn.LEGACY_ROUTE_EVENT, payload["need"], payload["lane"],
+                         payload["reason"])).fetchone() is None:
+                    with _kbc.write_txn(conn):
+                        _kb._append_event(conn, tid, _kn.LEGACY_ROUTE_EVENT, payload)
+            except Exception:
+                _kb._log.warning("kanban dispatch: could not record legacy_route for %s", tid, exc_info=True)
+        if v.refusal is not None:
+            caps["browser_refused"] = dict(v.refusal_payload or {}, exit=v.refusal.exit)
+            row_route[tid] = ("wait", f"browser_refused:{v.refusal.token}")
+            if not dry_run and park:
+                try:
+                    if _kb.block_task(conn, tid, reason=v.refusal.line(), kind="needs_input",
+                                      require_unclaimed_ready=True):
+                        with _kbc.write_txn(conn):
+                            _kb._append_event(conn, tid, _kbg.REFUSED_EVENT, v.refusal_payload)
+                        caps["action"] = "needs_input"
+                except Exception:
+                    _kb._log.warning("kanban dispatch: could not park %s on %s", tid, v.refusal.token,
+                                     exc_info=True)
+            continue
+        if v.wait is not None:
+            caps["browser_wait"] = {"reason": v.wait.reason, "need": v.wait.need, "lane": v.wait.lane}
+            row_route[tid] = ("wait", v.wait.reason)
+        elif v.plans:
+            caps["browser_lease_plan"] = [p.as_dict() for p in v.plans]
+            row_route[tid] = ("wait", _kbg.WAIT_JOIN_OFF)
+
+
+def _browser_hold_review_rows(conn, review_rows, result, dry_run: bool) -> list:
+    """Review spawns go through the SAME browser gate (Prism 1d0c5e1cc25d): a reviewer keeps the card's skills, so a
+    review row whose browser need is refused, waiting, a lease plan, or a gate fault is not spawned this tick. It is
+    never parked: the card's own lane decides that, not its reviewer. Rows with no browser need pass unchanged."""
+    if not review_rows:
+        return review_rows
+    ids = [r["id"] for r in review_rows]
+    marks = ",".join("?" * len(ids))
+    full = conn.execute(f"SELECT id, assignee, body, skills FROM tasks WHERE id IN ({marks})", ids).fetchall()
+    held: dict = {}
+    _browser_gate(conn, full, result, held, dry_run, park=False)
+    for tid, (_route, why) in held.items():
+        result.placement_waits[tid] = why
+    return [r for r in review_rows if r["id"] not in held]
 
 
 def _attached_skill_gap(row, host: str, caps) -> Optional[str]:
@@ -5328,6 +5413,8 @@ def _dispatch_once_locked(
                 "plan this tick (pool disabled/refused/no hosts, proc_paused, or a "
                 "standalone daemon, which never places remotely)", _unplanned,
             )
+    # Browser Sandboxes resolution gate (t_42728faf): after every route is known, before any spawn.
+    _browser_gate(conn, ready_rows, result, row_route, dry_run, default_assignee)
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all. The
     # review lane is never offered to the pool: its rows are always local.
@@ -5341,6 +5428,7 @@ def _dispatch_once_locked(
         review_rows = _kb._drop_no_worker_rows(
             conn, review_rows, result, dry_run=dry_run,
         )
+        review_rows = _browser_hold_review_rows(conn, review_rows, result, dry_run)
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work
@@ -6394,7 +6482,6 @@ def _dispatch_once_locked(
         record_affinity_events(conn, result, _affinity_evaluated, _affinity_reached)
         _khc.record_capability_events(conn, result, _caps, _caps_out, _affinity_evaluated,
                                       _cap_comments)
-        _record_legacy_routes(conn, ready_rows, result)
     _record_placement_waits(conn, result, row_route, dry_run, _wait_reached)
     result.rows_routed = len(ready_rows)
     result.portable_waiting = sum(
