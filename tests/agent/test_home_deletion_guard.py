@@ -385,3 +385,42 @@ def test_default_word_literal_text_is_split_on_ifs(tmp_path: Path):
     assert command_deletes_protected_home("IFS=:; " + cmd, env=env, cwd=str(user))
     # a quoted or escaped separator is not split
     assert not command_deletes_protected_home("IFS=:; rm -rf ${UNSET:-'/nope:'%s}" % root, env=env, cwd=str(user))
+
+
+
+def test_tilde_in_a_default_word_is_not_field_split(tmp_path: Path):
+    """Prism 40715861ef6b: the result of tilde expansion is never field-split, so with a
+    blank in ``HOME`` ``${UNSET:-~/.hermes}`` is still ONE argument (bash 5) naming the
+    protected root. The analyzer must not split the expanded home into unrelated paths."""
+    user = tmp_path / "user name"
+    root = user / ".hermes"
+    (root / "profiles" / "aegis").mkdir(parents=True)
+    env = {"HOME": str(user), "HERMES_HOME": str(root), "PATH": os.environ.get("PATH", "")}
+    for cmd in ("rm -rf ${UNSET:-~/.hermes}", "rm -rf ${UNSET:-~}/.hermes", "rm -rf ~/.hermes",
+                'D=~/.hermes; rm -rf "$D/"'):
+        assert command_deletes_protected_home(cmd, env=env, cwd="/tmp"), cmd
+    # only the text AFTER the home prefix is split: `/a b` past the tilde still breaks
+    assert not command_deletes_protected_home("rm -rf ${UNSET:-~/.hermes/x y}", env=env, cwd="/tmp")
+
+
+@pytest.mark.parametrize("template", [
+    "rm -rf ${UNSET:-%s\\\n%s}",
+    'rm -rf "${UNSET:-%s\\\n%s}"',
+    'rm -rf ${UNSET:-"%s\\\n%s"}',
+    "rm -rf %s\\\n%s",
+    'rm -rf "%s\\\n%s"',
+])
+def test_backslash_newline_is_a_line_continuation(home, template):
+    """Prism eabfb3a4f752: the shell deletes a backslash-newline pair before tokenizing,
+    inside and outside double quotes and inside a ``${X:-word}`` default. Splitting the
+    protected path with one must still resolve to the protected path."""
+    root = str(home["root"])
+    assert check(home, template % (root[:-3], root[-3:]), cwd="/tmp") is not None
+
+
+def test_backslash_newline_inside_names_and_commands(home):
+    for cmd in ('rm -rf "${HERMES\\\n_HOME}"', "r\\\nm -rf $HERMES_HOME", "rm -\\\nrf $HERMES_HOME"):
+        assert check(home, cmd) is not None, cmd
+    # inside single quotes the pair is literal; in a comment it ends the comment
+    assert check(home, "rm -rf '%s\\\n'" % home["root"]) is None
+    assert check(home, "# rm -rf \\\necho %s" % home["root"]) is None
