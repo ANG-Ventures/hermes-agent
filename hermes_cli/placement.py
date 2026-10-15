@@ -1,7 +1,7 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
-VENDORED from hermes-home ``scripts/lib/placement.py`` @ aa1241fc4b (ANG-Ventures/hermes-home#3945 merge commit, t_499e107f;
-sha256 547d606f539c357ff9e39c770db6f16b3ff589104e3d48b4f61641d7ee8b7e75) for the kanban dispatcher (t_d6ce856e):
+VENDORED from hermes-home ``scripts/lib/placement.py`` @ 80e074a6ac (t_08de4ba5 branch over #3917 dc97f387;
+sha256 f1daa30a9d4996109796a6941c625a4f633061db9c705f744d59ecf2770d6188) for the kanban dispatcher (t_d6ce856e):
 the fork may not import hermes-home code. The ONLY local changes are ``fleet_root()`` plus ``encoding="utf-8"``
 on two ``open()`` calls (the fork's PLW1514 lint); ``tests/hermes_cli/test_kanban_headroom_placement.py``
 checks the rest against the canonical file.
@@ -57,6 +57,19 @@ expected duration (``ttl_s``) in var/placement/headroom-reservations.json; ``liv
 subtracted from every host's available memory and cores by ``choose(..., reservations=...)``, and every pick
 is appended to var/placement/admissions.jsonl (the per-host "what I admitted" ledger the 07:10 incident lacked).
 
+The admissions ledger (allocation 2.3, t_08de4ba5): one JSON line per decision, ``{at, host, consumer, job_id,
+footprint{ram_gb,threads,scratch_gb,gpu_mb}, band, decision, reason, ...}``. ``decision`` is ``admitted`` (a
+reservation was written), ``deferred`` (admit() refused: no host fits; the caller queues), ``released`` (the
+holder ended the lease) or ``expired`` (the TTL lapsed without renew/release: the reaper, like
+task_runs.claim_expires). ``band`` is the chosen host's band at decision time WITH live reservations (ok = room
+for one more, warm = room for this one only); each ``hosts.<h>`` row carries its own. A job waiting on the same
+refusal writes one ``deferred`` line, then again only when the reason changes or every DEFERRED_REEMIT_S.
+
+Footprint axes: ram_gb and threads gate every pick; scratch_gb gates when the sample measures
+``scratch_free_gb`` (host-pressure.json does; a direct probe does not) and is otherwise only reserved; gpu_mb is
+declared and reserved, never gated (no sampler publishes free GPU memory yet). A job overrides its class default
+with ``Job(footprint={...})``; ``footprint_from_text()`` reads a card/body line ``footprint: ram_gb=8 threads=4``.
+
 Notation (Ace 2026-10-12 08:21): every human-facing line prints the load as `N / Cc.Tt` (tasks over
 physical cores and threads) and the headroom in GB.
 
@@ -69,6 +82,7 @@ import dataclasses
 import json
 import math
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -84,6 +98,8 @@ RANK_KEYS = frozenset({"prio", "ladder", "order", "rank", "last", "last_pick", "
 DEFAULT_SATURATE_TO = 1.0   # the default-first host is "comfortable" while load <= saturate_to x physical cores
 DEFAULT_STALE_AFTER_S = 60.0
 DEFAULT_MARGIN = 0.10
+DEFERRED_REEMIT_S = 900.0    # a job still deferred for the same reason is re-logged at most this often
+FOOTPRINT_KEYS = ("ram_gb", "threads", "scratch_gb", "gpu_mb")
 # A host whose sample trips any of these is CLOSED for the tick (the signals that predicted 10-12 07:20:
 # %system 6 -> 33 with CPU 45 % idle; psi mem is the collapse itself).
 DEFAULT_CLOSED_WHEN = {"psi_mem_some10": 10.0, "psi_cpu_some10": 40.0, "system_pct": 25.0}
@@ -148,16 +164,21 @@ def _walk_rank_keys(node, path="") -> List[str]:
 class Footprint:
     ram_gb: float
     threads: float
+    scratch_gb: float = 0.0
+    gpu_mb: float = 0.0
 
     def __post_init__(self):
-        for k in ("ram_gb", "threads"):
+        for k in FOOTPRINT_KEYS:
             v = getattr(self, k)
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
                 raise PlacementError(f"footprint.{k} must be a finite number >= 0, not {v!r}")
 
     @classmethod
     def of(cls, d: Mapping) -> "Footprint":
-        return cls(float(d.get("ram_gb", 0.0)), float(d.get("threads", 0.0)))
+        return cls(*(float(d.get(k, 0.0)) for k in FOOTPRINT_KEYS))
+
+    def plus(self, other: "Footprint") -> "Footprint":
+        return Footprint(*(getattr(self, k) + getattr(other, k) for k in FOOTPRINT_KEYS))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -204,10 +225,11 @@ class HostTable:
             raise PlacementError(f"no default footprint for consumer {consumer!r}")
         if not override:
             return base
-        ram, thr = override.get("ram_gb", base.ram_gb), override.get("threads", base.threads)
-        if not _num(ram) or not _num(thr):
-            raise PlacementError(f"footprint override must be finite numbers, not {override!r}")
-        return Footprint(float(ram), float(thr))
+        bad = sorted(set(override) - set(FOOTPRINT_KEYS))
+        vals = {k: override.get(k, getattr(base, k)) for k in FOOTPRINT_KEYS}
+        if bad or not all(_num(v) for v in vals.values()):
+            raise PlacementError(f"footprint override must be finite numbers for {list(FOOTPRINT_KEYS)}, not {override!r}")
+        return Footprint(**{k: float(v) for k, v in vals.items()})
 
 
 def validate(doc) -> List[str]:
@@ -228,6 +250,8 @@ def validate(doc) -> List[str]:
             if not isinstance(fp, dict) or not _num(fp.get("ram_gb")) or not _num(fp.get("threads")) \
                     or fp["ram_gb"] < 0 or fp["threads"] < 0:
                 errs.append(f"footprints.{c} needs ram_gb >= 0 and threads >= 0")
+            elif any(k in fp and (not _num(fp[k]) or fp[k] < 0) for k in ("scratch_gb", "gpu_mb")):
+                errs.append(f"footprints.{c}: scratch_gb / gpu_mb must be numbers >= 0 when present")
     hosts = doc.get("hosts")
     if not isinstance(hosts, dict) or not hosts:
         errs.append("hosts must be a non-empty object")
@@ -381,6 +405,7 @@ class Sample:
     at: Optional[float] = None
     status: str = "fresh"          # fresh | absent | stale (anything but fresh = closed)
     note: str = ""
+    scratch_free_gb: Optional[float] = None   # gates footprint.scratch_gb when measured
 
     @property
     def load(self) -> Optional[float]:
@@ -415,6 +440,7 @@ def samples_from_pressure(doc: Mapping, *, now: float, stale_after_s: Optional[f
             psi_mem_some10=row.get("psi_mem_some10") if _num(row.get("psi_mem_some10")) else None,
             system_pct=row.get("system_pct") if _num(row.get("system_pct")) else None,
             at=float(row["at"]) if _num(row.get("at")) else None,
+            scratch_free_gb=row.get("scratch_free_gb") if _num(row.get("scratch_free_gb")) else None,
         )
         if row.get("status") not in (None, "fresh"):
             s.status, s.note = "absent", str(row.get("status"))
@@ -461,6 +487,7 @@ class Headroom:
     mem_available_gb: Optional[float] = None
     reserved_gb: float = 0.0          # live reservations already promised on the host
     reserved_threads: float = 0.0
+    scratch_gb: Optional[float] = None   # scratch_free - reserved - footprint, when the sample measured scratch
 
     def line(self, spec: HostSpec) -> str:
         """`<host> load N / Cc.Tt, avail X GB, headroom Y GB / Z cores (binding axis), score S` or the refusal."""
@@ -533,6 +560,8 @@ def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consume
     h.reserved_gb, h.reserved_threads = r_mem, r_thr
     h.mem_gb = h.mem_available_gb - spec.mem_reserve_gb - r_mem - fp.ram_gb
     h.cores = spec.cores - spec.cores_reserve - h.load - r_thr - fp.threads
+    if fp.scratch_gb > 0 and _num(sample.scratch_free_gb):
+        h.scratch_gb = float(sample.scratch_free_gb) - (reserved.scratch_gb if reserved else 0.0) - fp.scratch_gb
     mem_frac = h.mem_gb / spec.mem_total_gb
     cpu_frac = h.cores / spec.cores
     h.score, h.binding = (mem_frac, "mem") if mem_frac <= cpu_frac else (cpu_frac, "cpu")
@@ -542,8 +571,79 @@ def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consume
     if h.cores < 0:
         h.reason = f"no_headroom:cpu {h.cores:.1f} cores"
         return h
+    if h.scratch_gb is not None and h.scratch_gb < 0:
+        h.reason = f"no_headroom:scratch {h.scratch_gb:.1f} GB"
+        return h
     h.eligible = True
     return h
+
+
+# ── bands: a NAME for the admission vector, never a second scorer (allocation §2.2, t_260e8379) ──────
+BAND_ORDER = (None, "ok", "warm", "hot")    # None = UNKNOWN (stale / absent / unmeasured, nothing measured is hot)
+
+
+def band(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: str,
+         closed_when: Mapping[str, float], reserved: Optional[Footprint] = None,
+         require_axes: Iterable[str] = REQUIRED_AXES) -> tuple:
+    """(band, reasons) DERIVED from headroom(): hot = headroom() refuses the footprint, warm = it admits this one
+    footprint but not a second, ok = room for two, None = the sample cannot be read (absent/stale/unmeasured) and
+    no measured axis already refuses. ``reasons`` names EVERY axis that fails, not only the first headroom()
+    returns (10-12 07:10:18 tripped psi_mem, %system and memory at once). The load axis is headroom()'s
+    max(load1, load5): enter on load1, clear only when load5 has (the 07:19:26 false ok, load5 154 on 16c).
+    Exclusions and slot caps are admission state, not host pressure, and are not part of the band."""
+    if sample is None or sample.status != "fresh":
+        return None, ["no sample" if sample is None else f"{sample.status}" + (f" ({sample.note})" if sample.note else "")]
+    # pressure only: slot caps / slots 0 are admission policy, not host pressure (Prism bfc9d97abdd5)
+    spec = dataclasses.replace(spec, slots={})
+    req = tuple(a for a in require_axes if a not in spec.unmeasurable_axes)
+    measured = tuple(a for a in req if _num(getattr(sample, a, None)))
+    missing = [f"{a} unmeasured" for a in req if a not in measured]
+    tripped = [f"{a} {float(getattr(sample, a)):g} >= {thr:g}" for a, thr in closed_when.items()
+               if _num(getattr(sample, a, None)) and float(getattr(sample, a)) >= thr]
+    if sample.load is None or sample.mem_available_gb is None:
+        # a measured refusal stays hot even with load/memory missing (Prism b30ecb4466e4)
+        return ("hot", tripped + missing) if tripped else (None, missing or ["load/memory unmeasured"])
+    # the scorer itself, over what was measured: an unmeasured axis is declared unavailable, never read as 0
+    h = headroom(spec, sample, fp, consumer=consumer, closed_when=closed_when, reserved=reserved,
+                 require_axes=measured)
+    # headroom on both axes even when a closed_when axis already refused (reasons list every failing axis)
+    room = h if h.mem_gb is not None else headroom(spec, sample, fp, consumer=consumer, closed_when={},
+                                                   reserved=reserved, require_axes=measured)
+    if room.mem_gb is not None and room.mem_gb < 0:
+        tripped.append(f"headroom mem {room.mem_gb:.1f} GB < 0 (avail {sample.mem_available_gb:g} - reserve "
+                       f"{spec.mem_reserve_gb:g} - {consumer} {fp.ram_gb:g})")
+    if room.cores is not None and room.cores < 0:
+        tripped.append(f"headroom cpu {room.cores:.1f} cores < 0 (at {fmt_load(sample.load, spec.cores, spec.threads)})")
+    if not h.eligible:
+        return "hot", (tripped + missing) or [h.reason]
+    if missing:
+        return None, missing
+    if h.mem_gb is None or h.cores is None:            # unreachable: an eligible Headroom carries both
+        return None, ["headroom unmeasured"]
+    if h.mem_gb < fp.ram_gb or h.cores < fp.threads:
+        return "warm", [f"room for one {consumer} job: headroom {h.mem_gb:.1f} GB / {h.cores:.1f} cores "
+                        f"< 2 x {fp.ram_gb:g} GB / {fp.threads:g} threads"]
+    return "ok", [f"headroom {h.mem_gb:.1f} GB / {h.cores:.1f} cores"]
+
+
+def bands_from_pressure(table: HostTable, doc: Mapping, *, now: float,
+                        consumers: Optional[Iterable[str]] = None) -> Dict[str, dict]:
+    """{host: {"band": {consumer: band}, "reason": {consumer: "a; b"}}} for every host row of a fleet-pressure.json
+    document that the table knows, over the table's footprints (or ``consumers``). Same sample read and the same
+    staleness rule as choose(), so a published band can never say ok where choose() would refuse."""
+    samples = samples_from_pressure(doc, now=now)
+    names = [c for c in (consumers or table.footprints) if c in table.footprints]
+    out: Dict[str, dict] = {}
+    for key, s in samples.items():
+        hid = table.resolve(key)
+        if hid is None:
+            continue
+        spec, row = table.hosts[hid], {"band": {}, "reason": {}}
+        for c in names:
+            b, why = band(spec, s, table.footprint(c), consumer=c, closed_when=table.closed_when)
+            row["band"][c], row["reason"][c] = b, "; ".join(why)
+        out[key] = row
+    return out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -554,6 +654,46 @@ class Job:
     continuity: Optional[str] = None    # the previous run of this card ran there (warm workspace/caches)
     priority: Optional[int] = None      # 0/1 = may claim the fastest eligible core class
     core_class: Optional[str] = None    # "fast" (highest single-core clock) | "wide" (most threads) | None
+    footprint: Optional[Mapping] = None  # overrides the class default (card/body ``footprint:`` line)
+
+
+_FOOTPRINT_LINE = re.compile(r"^[ \t>*-]*footprint\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def footprint_from_text(text: Optional[str]) -> Optional[Dict[str, object]]:
+    """The ``footprint: ram_gb=8 threads=4 scratch_gb=20 gpu_mb=0`` line of a card/body, or None. Values that are
+    not numbers are kept as given so ``HostTable.footprint()`` REFUSES them (a typo never silently means the
+    default); an unknown key is refused the same way."""
+    if not isinstance(text, str):
+        return None
+    m = _FOOTPRINT_LINE.search(text)
+    if not m:
+        return None
+    out: Dict[str, object] = {}
+    for tok in m.group(1).replace(",", " ").split():
+        k, sep, v = tok.partition("=")
+        if not sep:
+            out[tok] = None
+            continue
+        try:
+            out[k.strip().lower()] = float(v)
+        except ValueError:
+            out[k.strip().lower()] = v
+    return out or None
+
+
+def band_of(row: "Headroom", fp: Footprint) -> Optional[str]:
+    """A decision row's band, the same names as band(): hot = measured and refused (no headroom, or a closed_when
+    axis tripped), warm = admits this footprint only, ok = room for one more, None = unknown / not a pressure
+    verdict (stale, absent, unmeasured, excluded, slot cap)."""
+    if not row.eligible:
+        r = row.reason or ""
+        return "hot" if r.startswith("no_headroom") or (r.startswith("closed:") and " >= " in r) else None
+    if row.mem_gb is None or row.cores is None:
+        return None
+    roomy = row.mem_gb >= fp.ram_gb and row.cores >= fp.threads \
+        and (row.scratch_gb is None or row.scratch_gb >= fp.scratch_gb)
+    return "ok" if roomy else "warm"
 
 
 @dataclasses.dataclass
@@ -579,6 +719,7 @@ class Decision:
         return {"picked": self.host, "why": self.reason or None, "rule": self.rule or None, "kept_previous": self.kept_previous,
                 "consumer": self.consumer, "footprint": dataclasses.asdict(self.footprint),
                 "hosts": {r.host: {"eligible": r.eligible, "reason": r.reason or None, "load": r.load,
+                                   "band": band_of(r, self.footprint),
                                    "memavail_gb": r.mem_available_gb,
                                    "reserved_gb": r.reserved_gb, "reserved_threads": r.reserved_threads,
                                    "headroom_gb": None if r.mem_gb is None else round(r.mem_gb, 1),
@@ -608,7 +749,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     pass None only when the caller has just produced the samples itself and vouches for their freshness.
     """
     stale_after_s = _stale_after(stale_after_s)
-    fp = table.footprint(consumer, footprint)
+    fp = table.footprint(consumer, footprint if footprint is not None else (job.footprint if job else None))
     names = list(candidates) if candidates is not None else list(table.hosts)
     folded: Dict[str, Optional[Sample]] = {}
     for k, v in samples.items():
@@ -628,7 +769,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     for k, v in (reservations or {}).items():      # aliases of one host SUM, never overwrite (Prism P1 8b7fd838)
         hid = table.resolve(k) or k
         prev = resv.get(hid)
-        resv[hid] = Footprint(prev.ram_gb + v.ram_gb, prev.threads + v.threads) if prev else v
+        resv[hid] = prev.plus(v) if prev else v
     used: Dict[str, float] = {}
     for k, v in (slots_used or {}).items():           # per-consumer live admissions, aliases summed likewise
         hid = table.resolve(k) or k
@@ -743,6 +884,9 @@ def _ledger_row_error(row) -> str:
     for k in ("ram_gb", "threads"):
         if not _num(row.get(k)) or row[k] < 0:
             return f"{k} must be a finite number >= 0, not {row.get(k)!r}"
+    for k in ("scratch_gb", "gpu_mb"):       # optional: rows written before 2.3 carry neither
+        if k in row and (not _num(row[k]) or row[k] < 0):
+            return f"{k} must be a finite number >= 0, not {row[k]!r}"
     if not _num(row.get("until")):
         return f"until must be a finite epoch number, not {row.get('until')!r}"
     if "at" in row and row["at"] is not None and not _num(row["at"]):
@@ -784,19 +928,62 @@ def reservations_path(path=None) -> Path:
     return Path(path) if path is not None else fleet_root() / RESERVATIONS_REL
 
 
+def admissions_path_for(ledger: Path, admissions_path=None) -> Path:
+    """The admissions ledger: as given, else next to the reservation ledger (the default ledger's sibling is
+    var/placement/admissions.jsonl), so a reservation and its ledger lines share one state root."""
+    return Path(admissions_path) if admissions_path is not None else Path(ledger).parent / ADMISSIONS_REL.name
+
+
+def _row_footprint(row: Mapping) -> Footprint:
+    return Footprint(*(float(row.get(k) or 0.0) for k in FOOTPRINT_KEYS))
+
+
+def _append_admissions(ap: Path, lines: List[dict]) -> None:
+    if not lines:
+        return
+    try:
+        ap.parent.mkdir(parents=True, exist_ok=True)
+        with open(ap, "a", encoding="utf-8") as fh:
+            fh.write("".join(json.dumps(x, sort_keys=True) + "\n" for x in lines))
+    except OSError:
+        pass
+
+
+def _ledger_line(*, at: float, host, consumer: str, job_id, fp: Footprint, decision: str, reason: Optional[str],
+                 band: Optional[str] = None, reservation: Optional[str] = None, **extra) -> dict:
+    """ONE admissions.jsonl row (allocation 2.3): at, host, consumer, job id, footprint, band at admission,
+    decision, reason. ``ram_gb`` / ``threads`` stay top-level for rows read before 2.3."""
+    return {"at": at, "host": host, "consumer": consumer, "job_id": job_id, "footprint": dataclasses.asdict(fp),
+            "ram_gb": fp.ram_gb, "threads": fp.threads, "band": band, "decision": decision, "reason": reason,
+            "reservation": reservation, **extra}
+
+
+def _prune(rows: List[dict], now: float) -> tuple:
+    """(live rows, ``expired`` ledger lines for rows whose TTL lapsed unreleased): the reaper, like claim_expires.
+    A released row was already logged by release()."""
+    live, gone = [], []
+    for r in rows:
+        if _row_live(r, now):
+            live.append(r)
+        elif not r.get("released"):
+            gone.append(_ledger_line(at=now, host=r["host"], consumer=r["consumer"], job_id=r.get("job_id"),
+                                     fp=_row_footprint(r), decision="expired", reservation=r["id"],
+                                     reason=f"ttl lapsed at {float(r['until']):.0f} without renew/release"))
+    return live, gone
+
+
 def live_reservations(path=None, *, now: Optional[float] = None, table: Optional[HostTable] = None) -> Dict[str, Footprint]:
     """{host: summed Footprint} of every reservation whose TTL has not expired and that was not released.
     With ``table`` the keys are canonical host ids (aliases summed). Raises LedgerError on a corrupt ledger."""
     now = _now(now)
     doc = _read_ledger(reservations_path(path))
-    out: Dict[str, List[float]] = {}
+    out: Dict[str, Footprint] = {}
     for row in doc["rows"]:          # every row validated by _read_ledger
         if _row_live(row, now):
             key = (table.resolve(row["host"]) or row["host"]) if table else row["host"]
-            acc = out.setdefault(key, [0.0, 0.0])
-            acc[0] += float(row["ram_gb"])
-            acc[1] += float(row["threads"])
-    return {h: Footprint(a[0], a[1]) for h, a in out.items()}
+            prev = out.get(key)
+            out[key] = prev.plus(_row_footprint(row)) if prev else _row_footprint(row)
+    return out
 
 
 def live_slots(consumer: str, path=None, *, now: Optional[float] = None, table: Optional[HostTable] = None) -> Dict[str, int]:
@@ -835,26 +1022,43 @@ def _reserve_unlocked(p: Path, host: str, consumer: str, fp: Footprint, *, ttl_s
         raise PlacementError("fp must be a Footprint")
     rid = uuid.uuid4().hex[:12]
     doc = _read_ledger(p)
-    rows = [r for r in doc["rows"] if _row_live(r, now)]
+    rows, expired = _prune(doc["rows"], now)
     row = {"id": rid, "host": host, "consumer": consumer, "job_id": job_id, "ram_gb": fp.ram_gb,
-           "threads": fp.threads, "at": now, "until": now + float(ttl_s)}
+           "threads": fp.threads, "scratch_gb": fp.scratch_gb, "gpu_mb": fp.gpu_mb, "at": now, "until": now + float(ttl_s)}
     bad = _ledger_row_error(row)
     if bad:
         # never write a row the reader would reject: that would wedge every later admit/renew/release (Prism 0824b4b2)
         raise PlacementError(f"invalid reservation ({bad}); ledger left unchanged")
     rows.append(row)
     _write_ledger(p, {"schema": SCHEMA, "rows": rows})
-    ap = Path(admissions_path) if admissions_path is not None else fleet_root() / ADMISSIONS_REL
-    try:
-        ap.parent.mkdir(parents=True, exist_ok=True)
-        with open(ap, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"at": now, "host": host, "consumer": consumer, "job_id": job_id, "reservation": rid,
-                                 "ram_gb": fp.ram_gb, "threads": fp.threads, "ttl_s": float(ttl_s),
-                                 **({"rule": decision.rule, "hosts": decision.as_row()["hosts"]} if decision else {})},
-                                sort_keys=True) + "\n")
-    except OSError:
-        pass
+    chosen = next((r for r in decision.rows if r.host == host), None) if decision else None
+    extra = {"rule": decision.rule, "hosts": decision.as_row()["hosts"]} if decision else {}
+    _append_admissions(admissions_path_for(p, admissions_path), expired + [_ledger_line(
+        at=now, host=host, consumer=consumer, job_id=job_id, fp=fp, decision="admitted", reservation=rid,
+        band=band_of(chosen, fp) if chosen else None, ttl_s=float(ttl_s),
+        reason=(f"{decision.rule}: fits with live reservations" if decision else "booked without a decision (pin)"),
+        **extra)])
     return rid
+
+
+# job -> (reason signature, at) of its last ``deferred`` line, per admissions file (one dispatcher = one process)
+_DEFERRED_SEEN: Dict[tuple, tuple] = {}
+
+
+def _deferred_line(ap: Path, d: Decision, *, job_id, now: float) -> List[dict]:
+    """The ``deferred`` line for a refusal, or [] when this job already logged the same refusal within
+    DEFERRED_REEMIT_S (a card waiting through 60 ticks is one line, not 60)."""
+    why = "; ".join(f"{r.host} {r.reason}" for r in d.rows if not r.eligible)
+    reason = f"{d.reason}: {why}" if why else d.reason
+    key, sig = (str(ap), d.consumer, job_id), reason
+    seen = _DEFERRED_SEEN.get(key)
+    if job_id is not None and seen and seen[0] == sig and now - seen[1] < DEFERRED_REEMIT_S:
+        return []
+    if len(_DEFERRED_SEEN) > 4096:       # bounded: a long-lived dispatcher forgets, at worst re-logs once
+        _DEFERRED_SEEN.clear()
+    _DEFERRED_SEEN[key] = (sig, now)
+    return [_ledger_line(at=now, host=None, consumer=d.consumer, job_id=job_id, fp=d.footprint, decision="deferred",
+                         reason=reason, hosts=d.as_row()["hosts"])]
 
 
 def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample]], *, ttl_s: float,
@@ -877,13 +1081,15 @@ def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample
         d = choose(table, consumer, samples, reservations=resv, slots_used=used, now=now,
                    stale_after_s=stale_after_s, **choose_kw)
         if not d.host:
+            ap = admissions_path_for(p, admissions_path)
+            _append_admissions(ap, _deferred_line(ap, d, job_id=job_id, now=now))
             return d, None
         rid = _reserve_unlocked(p, d.host, consumer, d.footprint, ttl_s=ttl_s, job_id=job_id, now=now,
                                 admissions_path=admissions_path, decision=d)
     return d, rid
 
 
-def renew(reservation_id: str, *, ttl_s: float, path=None, now: Optional[float] = None) -> bool:
+def renew(reservation_id: str, *, ttl_s: float, path=None, now: Optional[float] = None, admissions_path=None) -> bool:
     """Extend a LIVE reservation to ``now + ttl_s`` (a lease the holder keeps renewing while its job runs, so a
     run longer than any fixed TTL stays counted; a holder that dies stops renewing and the row lapses; Prism
     796aae4f). False when the row is gone, expired or released (it is never resurrected)."""
@@ -893,34 +1099,50 @@ def renew(reservation_id: str, *, ttl_s: float, path=None, now: Optional[float] 
     with _locked(p):
         now = _now(now)
         doc = _read_ledger(p)
-        rows = [r for r in doc["rows"] if _row_live(r, now)]
+        rows, expired = _prune(doc["rows"], now)
         hit = False
         for r in rows:
             if r["id"] == reservation_id:
                 r["until"] = max(float(r["until"]), now + float(ttl_s))
                 hit = True
-        if hit:
+        if hit or expired:
             _write_ledger(p, {"schema": SCHEMA, "rows": rows})
+            _append_admissions(admissions_path_for(p, admissions_path), expired)
     return hit
 
 
-def release(reservation_id: str, *, path=None, now: Optional[float] = None) -> bool:
-    """Mark a reservation released (the job ended early); True when it was live."""
+def release(reservation_id: str, *, path=None, now: Optional[float] = None, admissions_path=None) -> bool:
+    """End a reservation (the job ended); True when it was live. Logged as a ``released`` ledger line."""
     p = reservations_path(path)
     with _locked(p):
         now = _now(now)
         doc = _read_ledger(p)
-        hit = False
+        live, lines = _prune(doc["rows"], now)
         rows = []
-        for r in doc["rows"]:
-            if not _row_live(r, now):
-                continue
+        for r in live:
             if r.get("id") == reservation_id:
-                hit = True
+                lines.append(_ledger_line(at=now, host=r["host"], consumer=r["consumer"], job_id=r.get("job_id"),
+                                          fp=_row_footprint(r), decision="released", reservation=r["id"],
+                                          reason=f"held {now - float(r.get('at') or now):.0f}s"))
                 continue
             rows.append(r)
         _write_ledger(p, {"schema": SCHEMA, "rows": rows})
-    return hit
+        _append_admissions(admissions_path_for(p, admissions_path), lines)
+    return len(rows) < len(live)
+
+
+def reap(*, path=None, now: Optional[float] = None, admissions_path=None) -> int:
+    """Drop every reservation whose TTL lapsed (its holder died without release) and log each as ``expired``;
+    the number reaped. Idle ledgers are reaped by the holder's tick, not only by the next admit."""
+    p = reservations_path(path)
+    with _locked(p):
+        now = _now(now)
+        doc = _read_ledger(p)
+        rows, expired = _prune(doc["rows"], now)
+        if len(rows) != len(doc["rows"]):
+            _write_ledger(p, {"schema": SCHEMA, "rows": rows})
+            _append_admissions(admissions_path_for(p, admissions_path), expired)
+    return len(expired)
 
 
 def fmt_load(load: Optional[float], cores: int, threads: int) -> str:

@@ -54,7 +54,7 @@ class Fleet:
         self.age = {h: 5.0 for h in HOSTS}
 
     def text(self, h):
-        return json.dumps({"host": h, "at": self.now[h] - self.age[h], "load_ratio": 0.1,
+        return json.dumps({"host": h, "at": self.now[h] - self.age[h], "load_ratio": 0.1, "band": {"kanban": "ok"},
                            "mem_available_gb": self.mem[h], "psi_cpu_some10": 1.0, "psi_mem_some10": 0.0})
 
     def runner(self, argv, **kw):
@@ -498,7 +498,7 @@ def test_live_run_reservation_is_renewed_past_the_admission_ttl(home):
     boards = [{"slug": "default"}]
     b._boards = boards
     later = now + kh.RESERVE_TTL_S - 60                  # one minute before the admission TTL
-    assert b.renew_reservations(now=later) == {"renewed": 2, "lapsed": 0}
+    assert b.renew_reservations(now=later) == {"renewed": 2, "lapsed": 0, "reaped": 0}
     past = now + kh.RESERVE_TTL_S + 600                  # well past the original TTL
     assert set(placement.live_reservations(ledger, now=past)) == {"ci-box"}
     assert placement.live_slots("kanban", ledger, now=past)["ci-box"] == 2
@@ -507,7 +507,12 @@ def test_live_run_reservation_is_renewed_past_the_admission_ttl(home):
     with kb.connect_closing() as conn:
         assert kb.complete_task(conn, ids[0], summary="done")
     far = later + 2 * kh.RESERVE_TTL_S
-    assert b.renew_reservations(now=far) == {"renewed": 0, "lapsed": 1}
+    # ... and that lapsed row is pruned on the same pass, ledgered once as ``expired`` (allocation 2.3)
+    assert b.renew_reservations(now=far) == {"renewed": 0, "lapsed": 1, "reaped": 0}
+    adm = [json.loads(x) for x in (ledger.parent / placement.ADMISSIONS_REL.name).read_text(
+        encoding="utf-8").splitlines()]
+    assert [r["job_id"] for r in adm if r["decision"] == "expired"] == [ids[1]]
+    assert not _ledger_rows(home)
 
 
 def test_diagnostics_slot_count_reads_the_ledger_with_a_fixed_live_snapshot(home):

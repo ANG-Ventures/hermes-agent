@@ -1167,13 +1167,16 @@ class TargetSignal:
         return float(self.policy.consumer("kanban", "cpu_est_prior") or 0.0)
 
 
-def read_pressure(remote_now: Optional[float], text: str, *, stale_after_s: float,
-                  warm: float, hot: float) -> Tuple[Optional[Tuple[float, str]], str]:
+def read_pressure(remote_now: Optional[float], text: str, *,
+                  stale_after_s: float) -> Tuple[Optional[Tuple[float, str]], str]:
     """``((at, band), "")`` or ``(None, reason)`` = UNKNOWN (I-3).
 
     ``age = remote_now - at``, both read on the target in one round-trip, so
-    the reader's clock is never involved (RC9). The band is the file's
-    ``load_ratio`` against the policy's kanban warm/hot lines (one encoding).
+    the reader's clock is never involved (RC9). The band is the one the host's
+    sampler PUBLISHED for kanban (``band.kanban`` in host-pressure.json,
+    ``scripts/host-pressure.py``); it is consumed, never recomputed from
+    ``load_ratio`` here (allocation 2.3, t_08de4ba5: the gap #3917 named). A
+    file with no ``band.kanban``, or one the sampler left null, is UNKNOWN.
     """
     if not text:
         return None, "pressure unreadable"
@@ -1193,10 +1196,12 @@ def read_pressure(remote_now: Optional[float], text: str, *, stale_after_s: floa
     age = remote_now - float(at)
     if age > stale_after_s:
         return None, f"pressure unknown (stale {age:.0f}s)"
-    ratio = doc.get("load_ratio")
-    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio):
-        return None, "pressure has no load_ratio"
-    band = BAND_HOT if ratio >= hot else BAND_WARM if ratio >= warm else BAND_OK
+    bands = doc.get("band")
+    band = bands.get("kanban") if isinstance(bands, dict) else None
+    if band not in (BAND_OK, BAND_WARM, BAND_HOT):
+        reasons = doc.get("band_reason")
+        why = reasons.get("kanban") if isinstance(reasons, dict) else None
+        return None, "pressure has no band.kanban" + (f" ({why})" if why else "")
     return (float(at), band), ""
 
 
@@ -1419,7 +1424,7 @@ class SpilloverPlan:
                     from hermes_cli import kanban_headroom as _kh
                     from hermes_cli import placement as _placement
                     try:
-                        rid = _kh.book_pin(self, pin, job_id)
+                        rid = _kh.book_pin(self, pin, job_id, job)
                     except _placement.PlacementError as exc:  # corrupt ledger: fail closed
                         self.refusal = f"pool_unavailable ({type(exc).__name__}: {exc})"
                         return None
@@ -1625,9 +1630,8 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
                 from hermes_cli import kanban_headroom as _kh
                 row["placement"] = _kh.sample_fields(sample.load5, sample.remote_now, sample.pressure_text,
                                                      stale_after_s=policy.stale_after_s, local_now=now)
-            kb = policy.kanban_band(h.name)
             got, row["why"] = read_pressure(sample.remote_now, sample.pressure_text,
-                                            stale_after_s=policy.stale_after_s, warm=kb.warm, hot=kb.hot)
+                                            stale_after_s=policy.stale_after_s)
             at, row["band"] = (None, BAND_UNKNOWN) if got is None else got
             samples[h.name] = (at, row["band"])
         elif sample is not None:  # a v0.1-shape probe: no pressure read

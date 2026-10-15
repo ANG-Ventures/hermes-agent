@@ -307,6 +307,12 @@ class GateTickBuilder:
             return None
         if got["lapsed"]:
             logger.warning("kanban pool: %d live run reservation(s) had lapsed before renewal", got["lapsed"])
+        # The reaper (allocation 2.3): rows whose holder died without a release
+        # lapse at TTL, like claim_expires; each is ledgered as ``expired``.
+        try:
+            got["reaped"] = placement.reap(path=root / placement.RESERVATIONS_REL, now=now)
+        except placement.PlacementError as exc:
+            self._log(logger.warning, f"kanban pool: reservation reap failed: {exc}")
         return got
 
 
