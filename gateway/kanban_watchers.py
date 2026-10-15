@@ -786,6 +786,14 @@ class _GuardStuckNotifier:
             or now - at < self._remind
         }
         delivered = 0
+        # prior_worker_still_alive episodes due this tick go out as ONE page:
+        # one dispatcher death strands every card it held at once (2026-10-12
+        # 19:27Z: 43 per-card pages for one cohort death, t_8d571321). The
+        # cohort page is sent FIRST, before the per-card sends, so slow or
+        # failing active_pr sends cannot spend the tick budget and starve it
+        # every tick (Prism 6b448981a5fc).
+        alive_due: list[tuple[str, dict, str]] = []
+        rest: list[tuple[str, dict, str, Optional[float]]] = []
         for board, item in cards:
             key = self._key(board, item)
             last = self._last_sent(key, item)
@@ -799,6 +807,21 @@ class _GuardStuckNotifier:
                 continue
             if not land_only and last is not None and now - last < self._remind:
                 continue
+            if item.get("reason") == "prior_worker_still_alive":
+                alive_due.append((board, item, key))
+                continue
+            rest.append((board, item, key, last))
+        if alive_due:
+            board, item, _ = alive_due[0]
+            probe = dict(item)
+            if len(alive_due) > 1:
+                probe["batch"] = [{**it, "board": b} for b, it, _ in alive_due]
+            if send(board, probe):
+                for _, _, key in alive_due:
+                    self._sent[key] = now
+                delivered += 1
+        for board, item, key, last in rest:
+            land_only = last is not None and "|active_pr|pr=" in key
             if time.monotonic() >= deadline:
                 break
             land_key = f"{key}|land"
@@ -995,6 +1018,28 @@ def _land_candidate(item: dict) -> bool:
             and item.get("pr_owned") is True)
 
 
+_PRIOR_WORKER_BATCH_SHOWN = 10
+
+
+def _prior_worker_batch_message(batch: list) -> str:
+    """One page for every prior_worker_still_alive card due in one tick."""
+    shown = batch[:_PRIOR_WORKER_BATCH_SHOWN]
+    lines = [
+        f"🛑 **Kanban dispatcher** · {len(batch)} cards: prior_worker_still_alive "
+        "claim rejected >15 min",
+        "Verify each previous owner before intervening; requeue alone cannot bypass the claim guard.",
+    ]
+    lines += [
+        f"- `{row.get('board')}` `{row['task_id']}` {str(row.get('status') or 'ready').upper()} "
+        f"· PID `{row.get('prev_pid')}` · `{row['clear_verb']}`"
+        for row in shown
+    ]
+    if len(batch) > len(shown):
+        lines.append(f"- … {len(batch) - len(shown)} more")
+    lines.append("-# One page per tick for all due cards; each card reminds every 6h.")
+    return "\n".join(lines)
+
+
 def _send_guard_stuck_alert(board: str, item: dict) -> bool:
     """Land a finished card's mergeable PR, else page #alerts with the verb.
 
@@ -1008,21 +1053,24 @@ def _send_guard_stuck_alert(board: str, item: dict) -> bool:
     if script is None:
         logger.error("kanban dispatcher: notify.py unavailable; guard-stuck page not delivered")
         return False
-    if item.get("reason") == "prior_worker_still_alive":
-        # Both the ready and review claim doors refuse; name the card's lane.
-        lane = str(item.get("status") or "ready").upper()
-        detail = (
-            f"{lane} card: prior_worker_still_alive claim rejected >15 min\n"
-            f"Prior PID: `{item.get('prev_pid')}` · Inspect: `{item['clear_verb']}`\n"
-            "Verify the previous owner before intervening; requeue alone cannot bypass the claim guard."
-        )
+    if item.get("batch"):
+        message = _prior_worker_batch_message(item["batch"])
     else:
-        detail = _active_pr_detail(board, item)
-    message = (
-        f"🛑 **Kanban dispatcher** · {detail}\n"
-        f"Board: `{board}` · Card: `{item['task_id']}`\n"
-        "-# Pages once per stuck episode (active_pr: once per card + PR; other holds remind every 6h)."
-    )
+        if item.get("reason") == "prior_worker_still_alive":
+            # Both the ready and review claim doors refuse; name the card's lane.
+            lane = str(item.get("status") or "ready").upper()
+            detail = (
+                f"{lane} card: prior_worker_still_alive claim rejected >15 min\n"
+                f"Prior PID: `{item.get('prev_pid')}` · Inspect: `{item['clear_verb']}`\n"
+                "Verify the previous owner before intervening; requeue alone cannot bypass the claim guard."
+            )
+        else:
+            detail = _active_pr_detail(board, item)
+        message = (
+            f"🛑 **Kanban dispatcher** · {detail}\n"
+            f"Board: `{board}` · Card: `{item['task_id']}`\n"
+            "-# Pages once per stuck episode (active_pr: once per card + PR; other holds remind every 6h)."
+        )
     try:
         proc = subprocess.run(
             [sys.executable, str(script), "--send", message, "--channel", "discord",
