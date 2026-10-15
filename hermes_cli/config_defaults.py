@@ -2366,6 +2366,11 @@ DEFAULT_CONFIG = {
         # the dispatcher's own login = the dispatcher's uid (today). Read per
         # spawn, so a flip and its rollback are one edit. Q8 (a), t_405acdf0.
         "local_worker_uid": None,
+        # Browser Sandboxes s7 join (P1-4b, t_2828292d): true = a ready card whose browser gate verdict is a
+        # ``browser:ephemeral`` lease on another host (ci-box for an ace-ai worker) gets that lease from
+        # hermes-home scripts/browsers/dispatch_relay.py at spawn, into the worker's BROWSER_LEASE_* env only.
+        # false = every lease plan waits ``browser_join_off``. Read per tick from the ROOT config.
+        "browser_join": False,
         # Placement PRD Phase 1b (t_1e4b9684): read_signal true = the pool probe
         # also reads each host's host-pressure.json (same ssh round-trip), a
         # host turns hot after 2 hot samples and clears after 3 (state in

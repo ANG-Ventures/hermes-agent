@@ -24,6 +24,7 @@ from hermes_cli import kanban_worker_pool as kwp
 PHASE1 = ["browser-soak-amazon", "browser-phase1-ephemeral", "browser-phase1-read"]
 LEGACY = ["amazon-cart-ops-local", "amazon-login", "browser-access", "ebay-seller-ops"]
 SOAK_PROFILE = "soak-reader"
+_REAL_SPAWN = kbd._default_spawn   # captured before the autouse fixture replaces it
 OTHER = "alpha"
 
 AMAZON = {"name": "id-amazon-alex", "app": "amazon", "account": "alex", "host": "studio",
@@ -411,3 +412,119 @@ def test_2a0c67315e6c_foreign_assignee_is_never_parked(home, ledger):
         assert res.placement_caps[foreign]["browser_refused"]["token"] == "BROWSER_CLASS_REFUSED"  # dry verdict only
         assert res.placement_caps[foreign]["browser_foreign"] is True
         assert conn.execute("SELECT status FROM tasks WHERE id=?", (owned,)).fetchone()[0] == "blocked"
+
+
+# -- P1-4b s7 join (t_2828292d): kanban.browser_join takes the ci-box ephemeral at spawn ---------------
+
+LEASE = {"ok": True, "name": "eph-ci-box-x", "host": "ci-box", "owner_card": "t", "lease_id": 9,
+         "lease_token": "L" * 64, "lease_class": "act", "lease_expires_at": 1792050000.5,
+         "lease_url": "wss://cdp.browsers.ace/eph-ci-box-x"}
+# the lane by ``origin:`` (no attached skill: the spawn's skill check would refuse an uninstalled one)
+EPH_BODY = 'origin: browser-phase1-ephemeral\nhost: ace-ai\nneeds: [{kind: resource, name: "browser:ephemeral"}]\n'
+
+
+@pytest.fixture
+def join(home, monkeypatch):
+    (home / "config.yaml").write_text("kanban:\n  browser_join: true\n")
+    calls = []
+
+    def relay(host, card, run, source_host):
+        calls.append({"host": host, "card": card, "run": run, "source_host": source_host})
+        return dict(relay.reply)
+    relay.reply = LEASE
+    monkeypatch.setattr(kbd, "_browser_relay_create", relay)
+    return calls, relay
+
+
+def _live_env(conn, plan=None):
+    got = {}
+
+    def spawn(task, workspace, *, board=None, placement=None, browser_env=None):
+        got[task.id] = {"placement": getattr(placement, "name", None), "env": dict(browser_env or {})}
+        return 4242
+    res = kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=64, spawn_limit=4, spawn_paused="test",
+                            spillover=plan if plan is not None else _pool(), reconcile_orphans=False)
+    return res, got
+
+
+def test_join_spawns_the_ace_ai_ephemeral_with_the_lease_env_only(home, ledger, join):
+    calls, _ = join
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=EPH_BODY)
+        dry = _dry(conn)
+        assert dry.placement_caps[tid]["browser_join"]["source_host"] == "ace-ai" and calls == []   # dry: no lease
+        res, got = _live_env(conn)
+        assert got[tid]["placement"] == "ace-ai"
+        run = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        assert calls == [{"host": "ci-box", "card": tid, "run": str(run), "source_host": "ace-ai"}]
+        assert got[tid]["env"] == {"BROWSER_LEASE_URL": LEASE["lease_url"], "BROWSER_LEASE_TOKEN": "L" * 64,
+                                   "BROWSER_LEASE_CLASS": "act", "BROWSER_LEASE_EXPIRES_AT": "1792050000"}
+        # the token is in the env and nowhere durable
+        dump = json.dumps([tuple(r) for r in conn.execute("SELECT * FROM task_events")]) + \
+            json.dumps([tuple(r) for r in conn.execute("SELECT * FROM task_runs")])
+        assert "L" * 64 not in dump
+        (ev,) = _events(conn, tid, "browser_lease_joined")
+        assert ev["host"] == "ci-box" and ev["source_host"] == "ace-ai" and ev["name"] == "eph-ci-box-x"
+
+
+def test_join_off_holds_the_same_card(home, ledger, join):
+    calls, _ = join
+    (home / "config.yaml").write_text("kanban:\n  browser_join: false\n")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=EPH_BODY)
+        res, got = _live_env(conn)
+        assert tid not in got and res.placement_waits[tid] == kbg.WAIT_JOIN_OFF and calls == []
+
+
+def test_join_never_takes_an_identity_lease(home, ledger, join):
+    calls, _ = join
+    with kb.connect_closing() as conn:
+        tid = _card(conn, assignee=SOAK_PROFILE, skills=["browser-soak-amazon"], body="needs: browser:amazon-alex\n")
+        res, got = _live_env(conn)
+        assert tid not in got and res.placement_waits[tid] == kbg.WAIT_JOIN_OFF and calls == []
+
+
+def test_join_refusal_releases_the_claim_and_never_spawns(home, ledger, join):
+    calls, relay = join
+    relay.reply = {"ok": False, "refusal": "BROWSER_DISPATCH_PEER_UNKNOWN"}
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=EPH_BODY)
+        res, got = _live_env(conn)
+        assert tid not in got and len(calls) == 1
+        row = conn.execute("SELECT status, consecutive_failures, claim_lock FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert tuple(row) == ("ready", 0, None)          # infrastructure: the breaker is never charged
+        assert [e["token"] for e in _events(conn, tid, "browser_dispatch_refused")] == ["BROWSER_DISPATCH_PEER_UNKNOWN"]
+        assert res.placement_waits[tid] == "browser_refused:BROWSER_DISPATCH_PEER_UNKNOWN"
+
+
+def test_join_refuses_a_spawn_fn_that_cannot_carry_the_lease(home, ledger, join):
+    calls, _ = join
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=EPH_BODY)
+        res, spawned = _live(conn)            # spawn(task, workspace, *, board, placement): no browser_env
+        assert tid not in spawned and calls == []
+        assert res.placement_waits[tid] == "browser_refused:BROWSER_JOIN_SPAWN_UNSUPPORTED"
+
+
+def test_default_spawn_forwards_only_the_lease_this_spawn_took(home, monkeypatch, tmp_path):
+    """An inherited BROWSER_LEASE_* never rides into a worker; the joined lease does, by the named allowlist."""
+    monkeypatch.setenv("BROWSER_LEASE_TOKEN", "inherited")
+    monkeypatch.setenv("BROWSER_LEASE_URL", "wss://stale")
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            self.pid = 4242
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
+    task = kb.Task(id="t_join_env", title="x", body=None, assignee=OTHER, status="ready", priority=0,
+                   created_by=None, created_at=0, started_at=None, completed_at=None, workspace_kind="scratch",
+                   workspace_path=str(tmp_path / "ws"), claim_lock=None, claim_expires=None, tenant=None)
+    _REAL_SPAWN(task, str(tmp_path / "ws"))
+    lease_like = ("BROWSER_LEASE_", "BROWSER_RUN_", "BROWSER_DISPATCH_")
+    assert not [k for k in captured["env"] if k.startswith(lease_like)]
+    lease = {"BROWSER_LEASE_URL": "wss://cdp.browsers.ace/eph", "BROWSER_LEASE_TOKEN": "T" * 64,
+             "BROWSER_DISPATCH_TOKEN": "never"}
+    _REAL_SPAWN(task, str(tmp_path / "ws"), browser_env=lease)
+    got = {k: v for k, v in captured["env"].items() if k.startswith(lease_like)}
+    assert got == {"BROWSER_LEASE_URL": "wss://cdp.browsers.ace/eph", "BROWSER_LEASE_TOKEN": "T" * 64}
