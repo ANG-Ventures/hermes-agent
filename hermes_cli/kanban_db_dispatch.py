@@ -308,6 +308,9 @@ class DispatchResult:
     unknown_pins: dict = field(default_factory=dict)
     """task id -> the ``host:`` word that names no host (t_cb2b888d): the card
     is held local-only and gets one latched comment per (task, word)."""
+    browser_joins: dict = field(default_factory=dict)
+    """task id -> ``{"plans": [...], "source_host": <worker host>}`` for a ready card whose
+    ``browser:ephemeral`` lease the s7 join takes at spawn (``kanban.browser_join``, t_2828292d)."""
     placement_caps: dict = field(default_factory=dict)
     """task id -> what the capability layer (t_8c474c2e) saw on a ready card
     without changing its route: ``{"warn": <payload>}`` (warn mode),
@@ -2646,6 +2649,7 @@ def _record_task_failure(
     block_kind: Optional[str] = None,
     infrastructure: bool = False,
     run_metadata_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -2701,6 +2705,11 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        # ``expected_run_id``: the caller's claimed run must still own the card, checked inside this write
+        # transaction, so a successor run that claimed it meanwhile is never reset (Prism 606e8aff45d3).
+        if expected_run_id is not None and (row["status"] != "running"
+                                            or row["current_run_id"] != int(expected_run_id)):
+            return None
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -4585,8 +4594,63 @@ def _pin_host(route) -> str:
     return "studio"
 
 
+def _browser_join_on() -> bool:
+    """``kanban.browser_join`` from the ROOT config, read per tick (default off; P1-4b t_2828292d)."""
+    return _root_kanban_cfg().get("browser_join") is True
+
+
+def _relay_joinable(plans, worker_host: str) -> bool:
+    """The s7 join this build takes: every plan is a ``browser:ephemeral`` on a browserd host that is NOT
+    the worker's own (ci-box for an ace-ai worker). Identity leases and same-host ephemerals stay held."""
+    from hermes_cli import kanban_browser_gate as _kbg
+    from hermes_cli import kanban_needs as _kn
+    return bool(plans) and all(p.need == _kn.EPHEMERAL and p.identity is None and p.host == _kbg.EPHEMERAL_HOST
+                               and p.host != worker_host for p in plans)
+
+
+def _browser_relay_create(host: str, card: str, run: str, source_host: str) -> dict:
+    """``scripts/browsers/dispatch_relay.py create-ephemeral`` (hermes-home, t_f48d777e): mint, create and
+    revoke happen on ``host``; the reply carries only the worker's lease. Tests replace this seam."""
+    script = _kb.kanban_home() / "scripts" / "browsers" / "dispatch_relay.py"
+    try:
+        out = subprocess.run([sys.executable, str(script), "create-ephemeral", "--host", host, "--card", card,
+                              "--run", run, "--source-host", source_host],
+                             capture_output=True, text=True, timeout=260, stdin=subprocess.DEVNULL)
+        resp = json.loads(((out.stdout or "").strip().splitlines() or ["{}"])[-1])
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "refusal": "BROWSER_RELAY_TRANSPORT", "detail": type(exc).__name__}
+    return resp if isinstance(resp, dict) else {"ok": False, "refusal": "BROWSER_RELAY_TRANSPORT"}
+
+
+def _browser_join_lease(conn, claimed, join: dict, placed_host) -> tuple:
+    """Take the joined lease for a claimed card: ``(env, None)`` or ``(None, refusal_token)``.
+
+    The worker's host must be the one the plan was cut for (``source_host`` is the lease row's tool host).
+    The reply goes into ``lease_env`` (the LEASE_ENV_NAMES allowlist) and nowhere else: no event, no log
+    line and no run metadata carries the token."""
+    from hermes_cli import kanban_browser_lease as _kbl
+    source = placed_host.name if placed_host is not None else "studio"
+    if source != join["source_host"]:
+        return None, "BROWSER_JOIN_HOST_MOVED"
+    (plan,) = join["plans"]
+    resp = _browser_relay_create(plan["host"], claimed.id, str(claimed.current_run_id or ""), source)
+    if not resp.get("ok"):
+        return None, str(resp.get("refusal") or "BROWSER_REFUSED")
+    try:
+        env = _kbl.lease_env(resp, None)
+    except (KeyError, TypeError, ValueError):
+        return None, "BROWSER_RELAY_REPLY_MALFORMED"
+    with _kbc.write_txn(conn):
+        _kb._append_event(conn, claimed.id, "browser_lease_joined",
+                          {"host": plan["host"], "name": resp.get("name"), "lease_id": resp.get("lease_id"),
+                           "lease_class": resp.get("lease_class"), "source_host": source,
+                           "lease_expires_at": resp.get("lease_expires_at")},
+                          run_id=claimed.current_run_id)
+    return env, None
+
+
 def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
-                  default_assignee: Optional[str] = None, *, park: bool = True) -> None:
+                  default_assignee: Optional[str] = None, *, park: bool = True, join: bool = True) -> None:
     """The Browser Sandboxes resolution gate for this tick (t_42728faf; spec v1.2 s3.3, AC-1.13/1.15).
 
     The live tick and ``--dry-run`` both come through here and both call
@@ -4597,8 +4661,10 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
     * ``legacy_route`` (mode off, lane not migrated, identity unsealed): today's placement, one event
       per (card, need, lane), never a ``BROWSER_*`` token, never a browserd call while mode is off.
     * a refusal: the card parks ``needs_input`` with the token as the first line (dry run: reported).
-    * a lease plan: held ``ready`` with ``browser_join_off`` (the s7 join that leases is P1-8's) and
-      NEVER spawned onto a legacy profile; a ledger wait holds it the same way.
+    * a lease plan: held ``ready`` with ``browser_join_off`` and NEVER spawned onto a legacy profile; a
+      ledger wait holds it the same way. Exception (s7 join, ``kanban.browser_join: true``, t_2828292d): a
+      ``browser:ephemeral`` on another host's browserd is recorded in ``result.browser_joins`` and spawned;
+      the spawn loop takes the lease through ``dispatch_relay.py`` first (``_browser_join_lease``).
     FAIL CLOSED (Prism 671171332677): a gate fault holds every browser card this tick (``browser_gate_error``)
     and never lets it spawn on a legacy profile; cards with no browser need are untouched. An unassigned card is
     judged as ``kanban.default_assignee`` (the profile the ready loop will assign), never as nobody.
@@ -4611,6 +4677,7 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
     _dflt = _resolve_default_assignee(default_assignee)
     try:
         reg = _kn.load_registry(_kb.kanban_home() / "fleet")
+        join_on = join and reg.mode == _kbg.MODE_ON and _browser_join_on()
         lookup = _browser_lookup() if reg.mode == _kbg.MODE_ON else (lambda name: None)
         eff = [r if r["assignee"] or not _dflt else dict(dict(zip(r.keys(), tuple(r))), assignee=_dflt)
                for r in rows]
@@ -4670,7 +4737,71 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
             row_route[tid] = ("wait", v.wait.reason)
         elif v.plans:
             caps["browser_lease_plan"] = [p.as_dict() for p in v.plans]
-            row_route[tid] = ("wait", _kbg.WAIT_JOIN_OFF)
+            wh = _pin_host(row_route.get(tid))
+            if join and join_on and _relay_joinable(v.plans, wh):
+                result.browser_joins[tid] = {"plans": [p.as_dict() for p in v.plans], "source_host": wh}
+                caps["browser_join"] = dict(result.browser_joins[tid])
+            else:
+                row_route[tid] = ("wait", _kbg.WAIT_JOIN_OFF)
+
+
+def _accepts_kw(fn, name: str) -> bool:
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+
+
+def _browser_release_lease(host: str, token: str) -> dict:
+    """Release a joined lease by its token on ``host`` (``browserctl --lease-token-stdin release`` over ssh, the
+    ctl_api remote path; the token rides stdin, never argv). Tests replace this seam."""
+    try:
+        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+                              "/usr/local/bin/browserctl --lease-token-stdin --json release"],
+                             input=token + "\n", capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "refusal": "BROWSER_RELAY_TRANSPORT", "detail": type(exc).__name__}
+    return {"ok": out.returncode == 0, "rc": out.returncode}
+
+
+def _browser_release_joined(conn, claimed, join: dict, env: Mapping[str, str], why: str) -> None:
+    """A lease the join took for a worker that never ran (spawn failed, claim lost): release it now so a
+    retry does not strand one ci-box ephemeral per failed spawn. Best effort; the reaper's TTL is the floor."""
+    (plan,) = join["plans"]
+    try:
+        r = _browser_release_lease(plan["host"], env["BROWSER_LEASE_TOKEN"])
+    except Exception as exc:  # never break the tick on cleanup
+        r = {"ok": False, "detail": type(exc).__name__}
+    try:
+        with _kbc.write_txn(conn):
+            _kb._append_event(conn, claimed.id, "browser_lease_released",
+                              {"host": plan["host"], "why": why, "ok": bool(r.get("ok"))},
+                              run_id=claimed.current_run_id)
+    except Exception:
+        _kb._log.warning("kanban dispatch: could not record browser lease release for %s", claimed.id, exc_info=True)
+
+
+def _browser_join_refused(conn, claimed, token: str, result, failure_limit) -> None:
+    """R3(c)'s one exit shape for a lease the join could not take: the claim is released, the card goes back
+    to ``ready`` (the run closes ``spawn_failed`` with ``infrastructure: true``, so the breaker is never
+    charged), one ``browser_dispatch_refused {token}`` event. Never a re-route, never a spawn without it.
+    Fenced to the claimed run (Prism 375e680b84c1): a successor run that claimed the card while the relay
+    was out is never touched."""
+    from hermes_cli import kanban_browser_lease as _kbl
+    task_id = claimed.id
+    _kb._log.warning("kanban dispatch: browser join refused for %s: %s", task_id, token)
+    result.placement_waits[task_id] = f"browser_refused:{token}"
+    fenced = _record_task_failure(conn, task_id, f"browser lease: {token}", outcome="spawn_failed",
+                                  release_claim=True, end_run=True, failure_limit=failure_limit, infrastructure=True,
+                                  run_metadata_extra={"browser_refused": token},
+                                  expected_run_id=claimed.current_run_id)
+    if fenced is None:
+        _kb._abort_lost_claim_spawn(conn, claimed, None)
+        return
+    with _kbc.write_txn(conn):
+        _kb._append_event(conn, task_id, _kbl.REFUSED_EVENT, {"token": token, "join": True})
 
 
 def _browser_hold_review_rows(conn, review_rows, result, dry_run: bool) -> list:
@@ -4683,7 +4814,7 @@ def _browser_hold_review_rows(conn, review_rows, result, dry_run: bool) -> list:
     marks = ",".join("?" * len(ids))
     full = conn.execute(f"SELECT id, assignee, body, skills FROM tasks WHERE id IN ({marks})", ids).fetchall()
     held: dict = {}
-    _browser_gate(conn, full, result, held, dry_run, park=False)
+    _browser_gate(conn, full, result, held, dry_run, park=False, join=False)
     for tid, (_route, why) in held.items():
         result.placement_waits[tid] = why
     return [r for r in review_rows if r["id"] not in held]
@@ -6350,6 +6481,7 @@ def _dispatch_once_locked(
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         launched = False
+        _joined = None  # (join, lease env) once the s7 join took a lease for this claim
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -6372,6 +6504,24 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 if placed_host is not None:
                     raise
+            _join = result.browser_joins.get(claimed.id)
+            if _join is not None:
+                _benv, _btok = ((None, "BROWSER_JOIN_SPAWN_UNSUPPORTED") if not _accepts_kw(_spawn, "browser_env")
+                                else _browser_join_lease(conn, claimed, _join, placed_host))
+                if _btok is None and not _kb._claim_still_held(conn, claimed):
+                    # The relay can take minutes: a claim lost meanwhile is not ours to clean up (Prism 375e680b84c1).
+                    _browser_release_joined(conn, claimed, _join, _benv, "claim_lost")
+                    _kb._abort_lost_claim_spawn(conn, claimed, None)
+                    if placed_host is not None:
+                        spillover.release(placed_host, _rid)
+                    continue
+                if _btok is not None:
+                    if placed_host is not None:
+                        spillover.release(placed_host, _rid)  # nothing launched: refund
+                    _browser_join_refused(conn, claimed, _btok, result, failure_limit)
+                    continue
+                spawn_kwargs["browser_env"] = _benv
+                _joined = (_join, _benv)
             pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             launched = True
             if placed_host is not None:
@@ -6410,6 +6560,8 @@ def _dispatch_once_locked(
                 pool=admitted_routes.get(claimed.id), placement=placement_record,
             ):
                 _kb._abort_lost_claim_spawn(conn, claimed, int(pid))
+                if _joined is not None:
+                    _browser_release_joined(conn, claimed, *_joined, "claim_lost_after_spawn")
                 continue
             if not pid:
                 # No pid reported (no ``spawned`` event): still one record.
@@ -6451,6 +6603,8 @@ def _dispatch_once_locked(
         except Exception as exc:
             if placed_host is not None and not launched:
                 spillover.release(placed_host, _rid)  # pre-launch failure: refund
+            if _joined is not None and not launched:
+                _browser_release_joined(conn, claimed, *_joined, "spawn_failed")  # Prism d598b2a71104
             # A host that cannot place the worker (no restart-safe scope,
             # eb28bc1bf7; no board mount on a pool host, t_9fb4d477) is not
             # the card's failure: the run is closed with ``infrastructure:
@@ -7159,6 +7313,7 @@ def _default_spawn(
     *,
     board: Optional[str] = None,
     placement=None,
+    browser_env: Optional[Mapping[str, str]] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -7385,6 +7540,12 @@ def _default_spawn(
     # Worker-pool placement (kanban_worker_pool): same process, same grant,
     # tools on the worker host. Never inherit a placement from our own env.
     env.pop(_kb._kwh.PLACEMENT_ENV, None)
+    # Browser lease (s7 join, t_2828292d): only the lease THIS spawn took, never one inherited from our env.
+    from hermes_cli.kanban_browser_lease import LEASE_ENV_NAMES
+    for _name in LEASE_ENV_NAMES:
+        env.pop(_name, None)
+    if browser_env:
+        env.update({k: v for k, v in browser_env.items() if k in LEASE_ENV_NAMES})
     # Only a POOL placement's mkdir failure is a (host, board) fault the
     # planner can route around; the local-uid hop below is not (t_9fb4d477).
     pool_board = resolved_board if placement is not None else None
