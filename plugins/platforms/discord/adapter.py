@@ -1871,6 +1871,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         try:
             if not await self._acquire_platform_lock_async('discord-bot-token', self.config.token, 'Discord bot token'):
                 return False
+            # Re-read discord_threads.json (merge, never replace): IDs persisted since construction
+            # (a restore, another writer) must be live before the first inbound mention gate.
+            try:
+                await self._threads.reload_async()
+            except Exception:
+                logger.warning("[%s] thread-registry reload on connect failed", self.name, exc_info=True)
             # Snapshot gate env inside the owning profile's scope (immune to the first-writer-wins bridge).
             # Snapshot this profile's gate env vars (issue #72348): connect() runs inside the owning
             # profile's runtime scope under multiplex, so the snapshot holds THIS adapter's values, immune
