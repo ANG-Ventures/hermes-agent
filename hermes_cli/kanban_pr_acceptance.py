@@ -267,7 +267,9 @@ def _break_glass_waiver(repo: str, canonical: str, number: int, sha: str, curren
       for the canonical OWNER/REPO, this PR and head, naming that same receipt: the receipt file
       carries only the repo basename, so the ledger row is what binds the owner;
     - the receipt lives under ``<hermes root>/var/ci-box/``, names this head and
-      ``<repo-name>-<pr>-<head12>``, and every gate rung is rc=0.
+      ``<repo-name>-<pr>-<head12>``, and every gate rung is rc=0 -- except a red pytest rung when
+      that ledger row carries fleet-merge's ``accept_red_receipt`` naming a 40-hex base sha
+      (kind ``break-glass-offbox-accepted-red``); ruff/semgrep/gitleaks are never overridable.
     Failed, pending and stale checks are never waived: only absence on an operator break-glass merge.
     """
     from hermes_constants import get_default_hermes_root
@@ -308,9 +310,19 @@ def _break_glass_waiver(repo: str, canonical: str, number: int, sha: str, curren
             continue
         landing = _landing_record(hermes_root / "state" / "merge-ledger.jsonl", canonical, number, sha,
                                   evidence["receipt"])
-        if landing:
-            return {"kind": "break-glass-offbox", "merged_by": merger, "comment_id": comment.get("id"),
-                    "comment_url": comment.get("html_url"), "contexts": sorted(absent), **evidence, **landing}
+        if not landing:
+            continue
+        kind = "break-glass-offbox"
+        override = landing.pop("accept_red_receipt", None)
+        if "receipt_pytest_rc" in evidence:
+            # fleet-merge --accept-red-receipt: a red pytest rung only, overridden on THIS ledger row
+            # by text naming the 40-hex base sha where the same red already stands.
+            base = re.search(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])", override if isinstance(override, str) else "")
+            if not base:
+                continue
+            kind, evidence = "break-glass-offbox-accepted-red", {**evidence, "accepted_red_base": base[0]}
+        return {"kind": kind, "merged_by": merger, "comment_id": comment.get("id"),
+                "comment_url": comment.get("html_url"), "contexts": sorted(absent), **evidence, **landing}
     return None
 
 
@@ -329,7 +341,7 @@ def _landing_record(ledger: Path, canonical: str, number: int, sha: str, receipt
                         and row.get("pr") == number and str(row.get("repo", "")).lower() == canonical.lower()
                         and _resolved(row.get("receipt_path")) == receipt):
                     return {"ledger_repo": row["repo"], "ledger_attempt_id": row.get("attempt_id"),
-                            "ledger_ts": row.get("ts")}
+                            "ledger_ts": row.get("ts"), "accept_red_receipt": row.get("accept_red_receipt")}
     except OSError:
         return None
     return None
@@ -359,9 +371,17 @@ def _read_offbox_receipt(path: Path, root: Path, repo_name: str, number: int, sh
             fields[key] = value.strip()
     if fields.get("head") != sha or fields.get("tree") != f"{repo_name}-{number}-{sha[:12]}":
         return None
-    if any(fields.get(rc) != "0" for rc in _RECEIPT_RCS):
+    # Security rungs are never overridable; a red pytest rung is reported for the caller to bind
+    # to a fleet-merge --accept-red-receipt ledger override (fleet-merge.sh step 1a0).
+    if any(fields.get(rc) != "0" for rc in _RECEIPT_RCS if rc != "pytest_rc"):
         return None
-    return {"receipt": str(resolved), "receipt_sha256": hashlib.sha256(raw).hexdigest()}
+    evidence = {"receipt": str(resolved), "receipt_sha256": hashlib.sha256(raw).hexdigest()}
+    pytest_rc = fields.get("pytest_rc") or ""
+    if not pytest_rc.isdigit():
+        return None
+    if pytest_rc != "0":
+        evidence["receipt_pytest_rc"] = pytest_rc
+    return evidence
 
 
 def _status_app_id(status: dict, cache: dict, profile_home: str | None) -> int | None:
