@@ -3928,7 +3928,7 @@ def _resolve_change_coverage(args, tid: str, reason: str, text_error: Optional[s
         with kbc.connect_closing() as conn:
             print(kvi.why_report(conn, "request-changes", tid, problems))
             if built is not None:
-                print(f"built review_coverage: {built}")
+                print(f"built review_coverage: {kb.redact_review_coverage_text(built)}")
         return 0
     hard = [p for p in problems if not p.startswith("coverage: none given")]
     if hard:
