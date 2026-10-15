@@ -385,3 +385,29 @@ def test_1d0c5e1cc25d_review_spawn_is_gated_too(home, ledger, monkeypatch):
         assert [r["id"] for r in kept] == [plain]
         assert res.placement_waits[tid] == "browser_refused:BROWSER_CLASS_REFUSED"
         assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "review"   # never parked
+
+
+# -- Apollo review r3 on #2002 (Prism 2a0c67315e6c / d702aef9bd19): ownership before persistence --------
+
+def test_2a0c67315e6c_foreign_assignee_is_never_parked(home, ledger):
+    """A home whose ``kanban.dispatch_profiles`` excludes the assignee must not transition the card: after a
+    live tick it stays ``ready`` and carries exactly the events a foreign card with NO browser need gets (the
+    gate writes nothing: no block, no refusal, no legacy_route, no browser wait). The owned twin is parked."""
+    (home / "config.yaml").write_text(f"kanban:\n  dispatch_profiles: [{OTHER}]\n")
+    with kb.connect_closing() as conn:
+        plain = _card(conn, assignee="beta", body="fix a typo\n")
+        foreign = _card(conn, assignee="beta", skills=["browser-soak-amazon"], body="needs: browser:amazon-alex\n")
+        legacy = _card(conn, assignee="beta", skills=["ebay-login"], body="needs: browser:ebay-ace\n")
+        owned = _card(conn, assignee=OTHER, skills=["browser-soak-amazon"], body="needs: browser:amazon-alex\n")
+        res, spawned = _live(conn)
+
+        def evts(t):
+            return [(k, json.loads(p or "{}").get("code")) for k, p in conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id", (t,))]
+        for t in (foreign, legacy):
+            assert conn.execute("SELECT status FROM tasks WHERE id=?", (t,)).fetchone()[0] == "ready"
+            assert t not in spawned
+            assert evts(t) == evts(plain)
+        assert res.placement_caps[foreign]["browser_refused"]["token"] == "BROWSER_CLASS_REFUSED"  # dry verdict only
+        assert res.placement_caps[foreign]["browser_foreign"] is True
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (owned,)).fetchone()[0] == "blocked"

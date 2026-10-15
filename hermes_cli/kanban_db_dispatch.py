@@ -4623,8 +4623,19 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
             result.placement_caps.setdefault(r["id"], {})["browser_wait"] = {"reason": _kbg.WAIT_GATE_ERROR}
             row_route[r["id"]] = ("wait", _kbg.WAIT_GATE_ERROR)
         return
+    # Ownership before persistence (Prism 2a0c67315e6c / d702aef9bd19): only a row this home would itself
+    # spawn (an effective assignee that passes the ready loop's _profile_exists_fn / dispatch_profiles
+    # predicate) may get a persisted event, a status change or a wait route. A foreign row keeps a dry
+    # verdict in placement_caps only and is left to the ready loop exactly as today (it never spawns it).
+    _exists = _profile_exists_fn()
+    owned = {r["id"] for r in eff if r["assignee"] and (_exists is None or _exists(r["assignee"]))}
     for tid, v in verdicts.items():
         caps = result.placement_caps.setdefault(tid, {})
+        if tid not in owned:
+            caps.update({"browser_foreign": True, **({"legacy_route": v.legacy[-1]} if v.legacy else {}),
+                         **({"browser_refused": dict(v.refusal_payload or {}, exit=v.refusal.exit)}
+                            if v.refusal is not None else {})})
+            continue
         for payload in v.legacy:
             caps["legacy_route"] = payload
             if dry_run:

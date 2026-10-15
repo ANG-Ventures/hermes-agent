@@ -34,6 +34,9 @@ ARMS = [  # (name, file, old line, new line, the test that must go red)
      "    _browser_gate(conn, ready_rows, result, row_route, dry_run, default_assignee)\n",
      "    _browser_gate(conn, ready_rows, result, row_route, dry_run, default_assignee) if not dry_run else None\n",
      "test_dry_run_and_live_tick_call_the_same_placement_function"),
+    ("r3_park_foreign_assignee", "hermes_cli/kanban_db_dispatch.py",
+     "        if tid not in owned:\n", "        if False:\n",
+     "test_2a0c67315e6c_foreign_assignee_is_never_parked"),
 ]
 
 
