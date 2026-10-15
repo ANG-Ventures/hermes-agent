@@ -184,3 +184,68 @@ def test_save_waits_for_the_cross_process_file_lock(state):
     saver.join(5)
     holder.join(5)
     assert _disk(state) == ["a"]
+
+
+def test_re_mark_of_an_id_trimmed_while_pending_is_kept(state):
+    """Pending a,b,c + a reload trims a; re-marking a must persist it as newest."""
+    tracker = ThreadParticipationTracker("discord", max_tracked=2)
+    for thread_id in ("a", "b", "c"):
+        tracker._remember(thread_id)  # accepted, persist still owed
+    tracker.reload()
+    assert "a" not in tracker
+
+    tracker.mark("a")
+
+    assert _disk(state) == ["c", "a"]
+    assert "a" in tracker
+
+
+def test_re_mark_during_an_in_flight_write_stays_owed(state, monkeypatch):
+    """A discard + re-mark of x while x's write is landing must not be cleared by it."""
+    import gateway.platforms.helpers as helpers
+
+    tracker = ThreadParticipationTracker("discord", max_tracked=2)
+    real_write = helpers.atomic_json_write
+    fired = []
+
+    def write_with_interleaved_marks(*args, **kwargs):
+        real_write(*args, **kwargs)
+        if not fired:
+            fired.append(True)
+            for thread_id in ("y", "z"):
+                tracker._remember(thread_id)
+            with tracker._lock:  # discard_async's in-memory half
+                del tracker._threads["x"]
+                tracker._fresh.pop("x", None)
+                tracker._discarded.add("x")
+            tracker._remember("x")
+
+    monkeypatch.setattr(helpers, "atomic_json_write", write_with_interleaved_marks)
+    tracker.mark("x")
+    monkeypatch.setattr(helpers, "atomic_json_write", real_write)
+
+    tracker.mark("w")  # next persist carries every still-owed mark
+
+    persisted = _disk(state)
+    assert persisted[-2:] == ["x", "w"], persisted
+
+
+def test_failed_persist_is_retried_by_the_next_mark(state, monkeypatch):
+    """A lock timeout / write error must not leave the mark accepted but never saved."""
+    import gateway.platforms.helpers as helpers
+
+    tracker = ThreadParticipationTracker("discord")
+    real_write = helpers.atomic_json_write
+
+    def failing_write(*args, **kwargs):
+        raise OSError(36, "Resource deadlock avoided")  # msvcrt LK_LOCK timeout shape
+
+    monkeypatch.setattr(helpers, "atomic_json_write", failing_write)
+    with pytest.raises(OSError):
+        asyncio.run(tracker.mark_async("a"))
+    assert not state.exists()
+    monkeypatch.setattr(helpers, "atomic_json_write", real_write)
+
+    asyncio.run(tracker.mark_async("a"))  # same thread, next message
+
+    assert _disk(state) == ["a"]

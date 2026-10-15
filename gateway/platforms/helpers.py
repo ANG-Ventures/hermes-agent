@@ -375,9 +375,13 @@ class ThreadParticipationTracker:
         # IDs discarded in memory but possibly still on disk; the merge must not
         # resurrect them.  Cleared once a write that excluded them lands.
         self._discarded: set[str] = set()
-        # IDs marked since the last write landed, in mark order; the merge puts
-        # them last so the trim cannot drop a mark it was asked to record.
-        self._fresh: dict[str, None] = {}
+        # IDs marked but not yet durably written, in mark order, each with the
+        # generation of its latest mark.  The merge puts them last so the trim
+        # cannot drop a mark it was asked to record; a write clears only the
+        # generations it snapshotted, so a re-mark during that write (or a write
+        # that failed, e.g. a Windows lock timeout) stays owed.
+        self._fresh: dict[str, int] = {}
+        self._mark_gen = itertools.count(1)
         self._threads: dict[str, None] = dict.fromkeys(str(t) for t in self._load())
 
     def _state_path(self) -> Path:
@@ -439,12 +443,13 @@ class ThreadParticipationTracker:
             with self._lock:
                 thread_list = self._merge_locked(on_disk)
                 written_discards = set(self._discarded)
-                written_fresh = set(self._fresh)
+                written_fresh = dict(self._fresh)
             atomic_json_write(self._state_path(), thread_list, indent=None, mode=0o600)
             with self._lock:
                 self._discarded -= written_discards
-                for thread_id in written_fresh:
-                    self._fresh.pop(thread_id, None)
+                for thread_id, gen in written_fresh.items():
+                    if self._fresh.get(thread_id) == gen:
+                        del self._fresh[thread_id]
 
     def _remember(self, thread_id: str) -> bool:
         """Record *thread_id* in memory; ``True`` when a persist is still owed.
@@ -455,10 +460,14 @@ class ThreadParticipationTracker:
         """
         with self._lock:
             self._discarded.discard(thread_id)
-            if thread_id in self._threads:
+            if thread_id in self._threads and thread_id not in self._fresh:
                 return False
+            # A mark that is new, or whose persist is still owed (in flight or
+            # failed), moves to the newest slot and asks for a save.
+            self._threads.pop(thread_id, None)
             self._threads[thread_id] = None
-            self._fresh[thread_id] = None
+            self._fresh.pop(thread_id, None)
+            self._fresh[thread_id] = next(self._mark_gen)
             return True
 
     def mark(self, thread_id: str) -> None:
