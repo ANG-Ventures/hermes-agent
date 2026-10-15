@@ -89,8 +89,8 @@ _OPAQUE_CWD = "\x00unknown"  # cwd after `cd <opaque>`: only absolute targets re
 
 # ── lexer ──────────────────────────────────────────────────────────────────────────────
 # A word is a list of parts: ("u", text) unquoted literal, ("q", text) quoted literal,
-# ("v", name, default_parts_or_None, quoted) variable, ("x",) opaque, ("s",) a field break
-# inside an unquoted ``${X:-a b}`` default. Separators are None.
+# ("v", name, default_parts_or_None, quoted) variable, ("x",) opaque, ("w", text) unquoted
+# literal text of a ``${X:-word}`` default (field-split on IFS at expansion). Separators are None.
 
 def _match_close(s: str, i: int, open_c: str, close_c: str) -> int:
     """Index just past the ``close_c`` balancing ``s[i] == open_c`` (quote-aware)."""
@@ -144,34 +144,59 @@ def _dollar(s: str, i: int, quoted: bool) -> tuple[tuple, int]:
     return (("q" if quoted else "u"), "$"), i + 1
 
 
-def _requote(parts: list) -> list:
-    """Parts as they behave inside double quotes: no field splitting, no globbing."""
-    out = []
-    for p in parts:
-        if p[0] == "u":
-            out.append(("q", p[1]))
-        elif p[0] == "s":
-            out.append(("q", " "))
-        elif p[0] == "v":
-            out.append(("v", p[1], _requote(p[2]) if p[2] is not None else None, True))
-        else:
-            out.append(p)
-    return out
-
-
 def _default_parts(text: str, quoted: bool) -> list:
-    """Lex the default word of ``${X:-word}`` with the shell's quoting rules. Inside double
-    quotes the word is one literal-preserving string (exact whitespace, no splitting, no
-    globbing); unquoted, its blanks are field breaks."""
-    if quoted:
-        return _requote([p for w in _lex('"' + text + '"') if w is not None for p in w])
+    """Lex the default word of ``${X:-word}``. It is ONE word, never command source: blanks
+    and ``; | & ( ) < > #`` are literal characters (Prism fb6e5bf412c4). Unquoted literal
+    text becomes ``("w", text)``, which the expander field-splits on IFS like an unquoted
+    variable value; quoted/escaped text stays literal. Inside double quotes nothing splits,
+    single quotes are literal characters, and inner double quotes are removed (bash)."""
     parts: list = []
-    for w in _lex(text):
-        if w is None:
-            continue
-        if parts:
-            parts.append(("s",))
-        parts.extend(w)
+    buf: list = []
+    i, n = 0, len(text)
+    in_dq = False
+
+    def flush(kind: str):
+        if buf:
+            parts.append((kind, "".join(buf)))
+            buf.clear()
+
+    lit = "q" if quoted else "w"
+    while i < n:
+        c = text[i]
+        dq = quoted or in_dq
+        if c == '"':
+            flush("q" if dq else lit)
+            in_dq = not in_dq
+            if in_dq and not quoted:
+                parts.append(("q", ""))  # `${U:-""}` is still one (empty) field
+            i += 1
+        elif c == "\\":
+            if dq and (i + 1 >= n or text[i + 1] not in '$`"\\\n'):
+                buf.append(c)
+                i += 1
+                continue
+            flush("q" if dq else lit)
+            parts.append(("q", text[i + 1:i + 2]))
+            i += 2
+        elif c == "'" and not dq:
+            flush(lit)
+            j = text.find("'", i + 1)
+            j = n if j < 0 else j
+            parts.append(("q", text[i + 1:j]))
+            i = j + 1
+        elif c == "$":
+            flush("q" if dq else lit)
+            part, i = _dollar(text, i, dq)
+            parts.append(part)
+        elif c == "`":
+            flush("q" if dq else lit)
+            j = text.find("`", i + 1)
+            i = n if j < 0 else j + 1
+            parts.append(("x",))
+        else:
+            buf.append(c)
+            i += 1
+    flush("q" if (quoted or in_dq) else lit)
     return parts
 
 
@@ -338,21 +363,25 @@ def _expand_fields(parts: list, table: Mapping, home: str, *, split: bool = True
             at_start = word_start and idx == 0
             if kind == "x":
                 return False
-            if kind == "s":
-                # A blank inside an unquoted default word is a field break ONLY under the
-                # shell's IFS rules: ``IFS=; rm -rf ${U:-/tmp/hermes home}`` passes ONE path
-                # (Prism d0b8d9a3d9eb). Empty IFS joins; opaque IFS is opaque.
+            if kind == "w":
+                # Unquoted literal text of a default word: field-split on IFS exactly like an
+                # unquoted variable value, never re-lexed as shell source (Prism fb6e5bf412c4,
+                # d0b8d9a3d9eb). Whitespace and metacharacters inside a field are preserved.
+                chunk = part[1]
+                if at_start and (chunk == "~" or chunk.startswith("~/")) and home:
+                    chunk = home + chunk[1:]
                 if not split:
-                    text.append(" ")
-                    pattern.append(" ")
+                    add_unquoted(chunk)
                     continue
                 splitter = _ifs_split_re(table)
                 if splitter is None:
                     return False
-                if splitter and splitter.match(" "):
-                    emit()
-                else:
-                    add_unquoted(" ")
+                pieces = splitter.split(chunk) if splitter else [chunk]
+                for k, piece in enumerate(pieces):
+                    if k:
+                        emit()
+                    if piece:
+                        add_unquoted(piece)
                 continue
             if kind == "v":
                 value = _lookup(table, part[1], part[2])
