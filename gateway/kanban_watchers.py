@@ -689,6 +689,8 @@ class _GuardStuckNotifier:
         self._state_path = state_path
         self._remind = int(remind_seconds)
         self._sent: dict[str, float] = self._load()
+        self._attempted: dict[str, int] = {}
+        self._attempt_seq = 0
 
     @staticmethod
     def _key(board: str, item: dict) -> str:
@@ -767,9 +769,8 @@ class _GuardStuckNotifier:
     def observe(self, cards, send, observed_boards=None, now: Optional[float] = None) -> int:
         """Page due episodes. Sends run serially (each up to 30 s) inside the
         dispatcher tick, so one call spends at most ``_GUARD_STUCK_PAGE_BUDGET_S``
-        on them (FleetReview #79); an unsent page is not recorded and goes
-        out on a later tick."""
-        deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
+        on them (FleetReview #79), plus one cohort send ahead of that budget;
+        an unsent page is not recorded and goes out on a later tick."""
         now = time.time() if now is None else float(now)
         current = {self._key(board, item) for board, item in cards}
         # A land-request is tracked apart from the page (``<key>|land``) so an
@@ -820,10 +821,21 @@ class _GuardStuckNotifier:
                 for _, _, key in alive_due:
                     self._sent[key] = now
                 delivered += 1
+        # The per-card sends get their own budget, started AFTER the cohort
+        # page: a cohort send that hits notify.py's 30 s timeout must not spend
+        # it, or the land-requests behind it never run while notify is down
+        # (Prism a6b3974d616e). Least-recently-attempted first: a failing send
+        # stays due, and in list order it would hold the head and spend the
+        # budget every tick, starving every card behind it.
+        deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
+        self._attempted = {k: at for k, at in self._attempted.items() if k in current}
+        rest.sort(key=lambda row: self._attempted.get(row[2], -1))
         for board, item, key, last in rest:
             land_only = last is not None and "|active_pr|pr=" in key
             if time.monotonic() >= deadline:
                 break
+            self._attempt_seq += 1
+            self._attempted[key] = self._attempt_seq
             land_key = f"{key}|land"
             land_at = self._sent.get(land_key)
             probe = dict(item)

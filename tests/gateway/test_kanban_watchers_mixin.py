@@ -559,6 +559,63 @@ def test_prior_worker_cohort_is_not_starved_by_slow_sends(tmp_path, monkeypatch)
     assert sent == []
 
 
+def test_timed_out_cohort_page_does_not_starve_land_requests(tmp_path, monkeypatch):
+    """Prism a6b3974d616e on #1972: a cohort notify.py send that hits its 30 s
+    timeout spent the whole tick budget, so the active_pr land-request behind
+    it never ran, every tick, for as long as notify was down. Land-requests get
+    their own budget; the cohort still goes out first."""
+    import gateway.kanban_watchers as kw
+    from gateway.kanban_watchers import _GuardStuckNotifier
+
+    cohort = [("default", {"task_id": f"t_{i:04x}", "reason": "prior_worker_still_alive",
+                           "status": "ready", "prev_pid": 1000 + i, "guarded_since": 50,
+                           "clear_verb": f"hermes kanban show t_{i:04x}"}) for i in range(3)]
+    land = ("default", _mergeable_hold(guarded_since=100))
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(kw.time, "monotonic", lambda: clock["t"])
+    sent = []
+
+    def send(board, row):
+        sent.append(row.get("reason"))
+        if row.get("reason") == "prior_worker_still_alive":
+            clock["t"] += kw._GUARD_STUCK_PAGE_BUDGET_S  # notify.py timed out
+            return False
+        row["land_request"] = "enqueued"
+        return True
+
+    notifier = _GuardStuckNotifier(tmp_path / "g.json")
+    for tick in range(2):  # the failed cohort stays due; the land-request still runs
+        sent.clear()
+        notifier.observe(cohort + [land], send, now=10_000.0 + 60 * tick)
+        assert sent[0] == "prior_worker_still_alive"
+        if tick == 0:
+            assert sent == ["prior_worker_still_alive", "active_pr"]
+    assert any(k.endswith("|land") for k in notifier._sent)
+
+
+def test_failing_head_page_does_not_starve_later_cards(monkeypatch):
+    """Same class, per-card: a failing send stays due, so without rotation the
+    card at the head of the list spends the budget every tick and the cards
+    behind it never get a turn (the needs-input pager already rotates)."""
+    import gateway.kanban_watchers as kw
+    from gateway.kanban_watchers import _GuardStuckNotifier
+
+    items = [("default", {"task_id": f"t_{i}", "clear_verb": "x"}) for i in range(3)]
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(kw.time, "monotonic", lambda: clock["t"])
+    sent = []
+
+    def send(board, row):
+        sent.append(row["task_id"])
+        clock["t"] += kw._GUARD_STUCK_PAGE_BUDGET_S
+        return row["task_id"] != "t_0"
+
+    notifier = _GuardStuckNotifier()
+    for tick in range(3):
+        notifier.observe(items, send, now=10_000.0 + tick)
+    assert {"t_1", "t_2"} <= set(sent)
+
+
 def test_active_pr_is_one_episode_per_card_and_pr(tmp_path):
     """r19 (t_f1af5dcd): a restarted streak on the SAME open PR is the same
     episode (6h reminder only); a different PR is a new one."""
