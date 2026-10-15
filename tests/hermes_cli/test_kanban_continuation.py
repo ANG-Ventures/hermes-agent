@@ -120,7 +120,9 @@ def test_transfer_clears_parent_path_atomically(db):
     child = card(db, "t_22222222", origin=None)
     with kb.write_txn(db):
         kc.transfer_workspace(db, parent["id"], child["id"])
-    assert db.execute("SELECT workspace_path FROM tasks WHERE id=?", (parent["id"],)).fetchone()[0] is None
+    src = db.execute("SELECT workspace_path,origin_host FROM tasks WHERE id=?", (parent["id"],)).fetchone()
+    # The source can never re-resolve to the path it gave away, nor wait on its origin.
+    assert src[0] not in (None, '/missing') and src[1] is None
     assert db.execute("SELECT origin_host FROM tasks WHERE id=?", (child["id"],)).fetchone()[0] == 'ace-media'
     assert db.execute("SELECT kind FROM task_links").fetchone()[0] == 'derived-from'
 
@@ -241,7 +243,7 @@ def test_probe_host_parses_states_in_one_round_trip():
         return SimpleNamespace(returncode=0, stdout=out, stderr='')
     got = kwp.probe_host(_pool_host(), runner, workspace_paths=('/ws/a', '/ws/b'))
     assert (got.load1, got.ncpu) == (0.5, 32)
-    assert got.workspace_states == {'/ws/a': 'empty'}
+    assert got.workspace_states == {'/ws/a': 'empty', '/ws/b': 'unknown'}
 
 
 def test_dispatcher_origin_precedes_linked_classifier(db, monkeypatch):
@@ -266,7 +268,8 @@ def test_create_continues_real_kernel(tmp_path, monkeypatch):
         conn.execute('UPDATE tasks SET workspace_path=?,origin_host=? WHERE id=?',
                      (str(tmp_path / 'state'), 'ace-media', parent))
         child = kb.create_task(conn, title='successor', assignee='alpha', continues=parent)
-        assert kb.get_task(conn, parent).workspace_path is None
+        assert kb.get_task(conn, parent).workspace_path not in (None, str(tmp_path / 'state'))
+        assert kb.get_task(conn, parent).origin_host is None
         task = kb.get_task(conn, child)
         assert task.workspace_path == str(tmp_path / 'state')
         assert task.origin_host == 'ace-media'
@@ -346,6 +349,7 @@ def test_remote_deleter_holds_unpreserved_file_and_removes_empty(db, tmp_path, m
 def test_drop_origin_is_not_resurrected_by_local_spawn(db):
     row = card(db)
     assert kc.drop_origin(db, row['id'], actor='operator', files=['sentinel'])
+    assert db.execute('SELECT workspace_path FROM tasks').fetchone()[0].startswith('/missing.fresh-')
     db.execute("UPDATE tasks SET status='running',current_run_id=1")
     db.execute("INSERT INTO task_runs(id,task_id,status,started_at) VALUES(1,?,'running',1)", (row['id'],))
     assert kc.record_placement(db, row['id'], 1, None)
@@ -391,3 +395,77 @@ def test_gateway_plan_pool_reads_origin_state_in_the_load_probe(tmp_path, monkey
     assert plan.continuation_probed and plan.continuation_states == {('ace-media', ws): 'nonempty'}
     cfg['placement']['continuation'] = 'off'
     assert builder.plan_pool([{'slug': 'default'}], {}) is None
+    # Overflow admission on and NOTHING ready: a running origin card alone
+    # still gets its host probed (HOST_LOST reads this plan).
+    cfg['placement']['continuation'] = 'enforce'
+    cfg['worker_pool'] = {'overflow': True}
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
+    asked.clear()
+    plan = builder.plan_pool([{'slug': 'default'}], {})
+    assert plan is not None and asked == [('ace-media', (ws,))], gate.pool
+
+
+def test_state_script_symlink_and_failed_interpreter(tmp_path):
+    """A dangling symlink is not proof of loss; a host that answered but whose
+    state script failed reads unknown (never unreachable, never empty)."""
+    import subprocess
+    from hermes_cli import kanban_worker_pool as kwp
+    board = tmp_path / 'board'
+    board.mkdir()
+    link = board / 't_link'
+    link.symlink_to(tmp_path / 'not-mounted')
+    proc = subprocess.run(['/bin/sh', '-c', kwp._states_cmd([str(link)])], capture_output=True, text=True)
+    assert json.loads(proc.stdout.partition('\n')[2]) == {str(link): 'unknown'}
+
+    def runner(argv, **kw):
+        return SimpleNamespace(returncode=0, stdout='0.5 0.4 0.3 1/2 3\n32\n' + kwp.STATES_MARKER + '\n', stderr='')
+    got = kwp.probe_host(_pool_host(), runner, workspace_paths=('/ws/a',))
+    assert got.workspace_states == {'/ws/a': 'unknown'}
+
+
+def test_host_lost_not_counted_while_host_answers_unknown(db, monkeypatch):
+    row = card(db, status='running')
+    lock = kb._host_prefix() + 'fixture'
+    db.execute("INSERT INTO task_runs(id,task_id,status,started_at,host) VALUES(1,?,'running',1,'ace-media')", (row['id'],))
+    db.execute('UPDATE tasks SET current_run_id=1,worker_pid=12345,claim_lock=?', (lock,))
+    monkeypatch.setattr(kb, '_terminate_reclaimed_worker', lambda *a, **kw: pytest.fail('must not terminate'))
+    for now in (100, 160, 220, 280):
+        assert kc.interrupt_lost_hosts(db, {('ace-media', '/missing'): 'unknown'}, now=now) == []
+
+
+def test_remote_owner_check_refuses_ancestor_workspace(db, tmp_path, monkeypatch):
+    from hermes_cli import kanban_survivor as ks
+    root = tmp_path / 'root'
+    card(db, 't_11111111', status='done')
+    db.execute("UPDATE tasks SET workspace_path=? WHERE id='t_11111111'", (str(root / 'outer' / 'inner'),))
+    card(db, 't_22222222', status='blocked')
+    db.execute("UPDATE tasks SET workspace_path=? WHERE id='t_22222222'", (str(root / 'outer'),))
+    monkeypatch.setattr(kb, '_is_managed_scratch_path', lambda p: True)
+    monkeypatch.setattr(ks, 'remove_workspace_dir', lambda *a, **kw: pytest.fail('must not reach the deleter'))
+    host = SimpleNamespace(name='fixture', target='unused', ssh_port=22)
+    assert not kb.safe_remove_workspace_dir(root / 'outer' / 'inner', task_id='t_11111111', reason='t',
+                                            conn=db, remote_host=host)
+
+
+def test_remote_deleter_holds_stash_and_unpushed_branch(db, tmp_path, monkeypatch):
+    import shlex
+    import subprocess
+    from pathlib import Path
+    from hermes_cli import kanban_survivor as ks
+    card(db, status='done')
+    ws = tmp_path / 'ws'
+    fixture = Path(__file__).with_name('fixtures_continuation_unpushed.sh')
+    subprocess.run(['/bin/sh', str(fixture), str(tmp_path / 'origin.git'), str(ws)], check=True,
+                   capture_output=True)
+    actual = subprocess.run
+    monkeypatch.setattr(ks.subprocess, 'run', lambda argv, **kw: actual(shlex.split(argv[-1]), **kw))
+    host = SimpleNamespace(name='fixture', target='unused', ssh_port=22)
+    assert not ks.remove_workspace_dir(db, 't_11111111', ws, remote_host=host)
+    assert (ws / 'f').exists()
+
+
+def test_browser_gate_reads_origin_route_as_remote():
+    from hermes_cli import kanban_db_dispatch as kbd
+    assert kbd._pin_host(('origin', 'ace-ai')) == 'ace-ai'
+    assert kbd._pin_host(('portable', None)) == 'studio'

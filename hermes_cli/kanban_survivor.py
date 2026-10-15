@@ -3258,6 +3258,8 @@ def prove(d):
  if (d/'.git').exists():
   if (d/'.git').is_file(): raise RuntimeError('registered worktree requires git worktree remove')
   if git(d,'status','--porcelain','--untracked-files=all','--ignored'): raise RuntimeError('dirty, ignored or untracked work')
+  if git(d,'stash','list'): raise RuntimeError('stashes')
+  if git(d,'rev-list','--branches','--tags','--not','--remotes'): raise RuntimeError('local commits not on any remote')
   sha=git(d,'rev-parse','HEAD')
   remotes=git(d,'remote').splitlines()
   if not any(any(line.split()[0]==sha for line in git(d,'ls-remote',remote).splitlines()) for remote in remotes):

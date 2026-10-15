@@ -4607,7 +4607,7 @@ def _browser_lookup():
 def _pin_host(route) -> str:
     """The host a browser card's worker runs on: the pool host of a ``("pin", host)`` route, else the
     Studio (every other route spawns locally on the dispatcher host), keyed as browser-hosts.json does."""
-    if isinstance(route, tuple) and len(route) == 2 and route[0] == "pin" and route[1]:
+    if isinstance(route, tuple) and len(route) == 2 and route[0] in ("pin", "origin") and route[1]:
         return route[1]
     return "studio"
 

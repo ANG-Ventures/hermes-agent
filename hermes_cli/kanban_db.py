@@ -12122,7 +12122,10 @@ def safe_remove_workspace_dir(
         target = os.path.normpath(str(path))
         for owner in conn.execute('SELECT id,workspace_path FROM tasks WHERE workspace_path IS NOT NULL'):
             stored = os.path.normpath(owner['workspace_path'])
-            if owner['id'] != task_id and (stored == target or stored.startswith(target + os.sep)):
+            # Overlap in either direction: equal, inside the target, or
+            # containing it (a nested workspace belongs to its ancestor too).
+            if owner['id'] != task_id and (stored == target or stored.startswith(target + os.sep)
+                                           or target.startswith(stored + os.sep)):
                 return False
         from hermes_cli.kanban_survivor import remove_workspace_dir
         _audit_workspace_deletion(Path(path), task_id=task_id, reason=reason, outcome=AUDIT_ATTEMPT,

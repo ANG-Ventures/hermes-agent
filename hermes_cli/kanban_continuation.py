@@ -192,6 +192,13 @@ def remote_cleanup_host(conn, task_id):
     return next((h for h in pool.pool_hosts if h.name == row[0]), None)
 
 
+def _fresh_path(path: str, tag: str) -> str:
+    """A sibling path no card owns: a NULL path is no fresh start, because a
+    scratch card's NULL path re-resolves to ``<root>/<id>``, the old dir."""
+    import os
+    return f"{os.path.normpath(path)}.{tag}"
+
+
 def transfer_workspace(conn, parent_id: str, child_id: str) -> None:
     """Called inside create's transaction; no sharing and no live-owner theft."""
     from hermes_cli import kanban_db as kb
@@ -208,7 +215,11 @@ def transfer_workspace(conn, parent_id: str, child_id: str) -> None:
         "UPDATE tasks SET workspace_path=?,workspace_kind=?,branch_name=?,origin_host=? WHERE id=?",
         (parent["workspace_path"], parent["workspace_kind"], parent["branch_name"], parent["origin_host"], child_id),
     )
-    conn.execute("UPDATE tasks SET workspace_path=NULL WHERE id=?", (parent_id,))
+    # The source keeps running (it may be ready/blocked/review), so it gets a
+    # fresh path, no branch and no origin: it can never re-resolve to the
+    # directory it just gave away, nor wait on state it no longer owns.
+    conn.execute("UPDATE tasks SET workspace_path=?,branch_name=NULL,origin_host=NULL WHERE id=?",
+                 (_fresh_path(parent["workspace_path"], f"after-{child_id}"), parent_id))
     conn.execute("INSERT OR IGNORE INTO task_links VALUES(?,?,'derived-from')", (parent_id, child_id))
     kb._append_event(conn, parent_id, "workspace_transferred", {"to": child_id, "path": parent["workspace_path"]})
     kb._append_event(conn, child_id, "continues", {"parent": parent_id, "host": parent["origin_host"]})
@@ -299,9 +310,14 @@ def drop_origin(conn, task_id: str, *, actor: str, files: list) -> bool:
         if kb._task_has_live_run(conn, task_id):
             raise ValueError('cannot drop origin while a worker owns the workspace')
         host = row[0]
-        conn.execute('UPDATE tasks SET origin_host=NULL WHERE id=?', (task_id,))
+        path = conn.execute('SELECT workspace_path FROM tasks WHERE id=?', (task_id,)).fetchone()[0]
+        # Start fresh means a new directory: the abandoned one stays behind
+        # untouched, and a later placement on the same host never reuses it.
+        fresh = _fresh_path(path, f"fresh-{int(time.time())}") if path else None
+        conn.execute('UPDATE tasks SET origin_host=NULL,workspace_path=? WHERE id=?', (fresh, task_id))
         kb._append_event(conn, task_id, 'origin_dropped', {'by': actor, 'host': host})
-        kb.add_comment(conn, task_id, actor, f'origin {host} dropped; files left behind: ' + ', '.join(files))
+        kb.add_comment(conn, task_id, actor, f'origin {host} dropped; next run uses {fresh}; '
+                       f'files left behind in {path}: ' + ', '.join(files))
     return True
 
 

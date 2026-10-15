@@ -1094,7 +1094,7 @@ _STATES_SCRIPT = (
     "for p in sys.argv[1:]:\n"
     " try:\n"
     "  with os.scandir(p) as it: o[p]='nonempty' if next(it,None) is not None else 'empty'\n"
-    " except FileNotFoundError: o[p]='empty' if os.path.isdir(os.path.dirname(p.rstrip('/'))) else 'unknown'\n"
+    " except FileNotFoundError: o[p]='empty' if not os.path.lexists(p) and os.path.isdir(os.path.dirname(p.rstrip('/'))) else 'unknown'\n"
     " except OSError: o[p]='unknown'\n"
     "print(json.dumps(o))\n"
 )
@@ -1161,8 +1161,11 @@ def probe_host(h: PoolHost, runner: Callable = subprocess.run, *,
             got = json.loads(listed.strip().split("\n")[0] or "null")
         except ValueError:
             got = None
-        if isinstance(got, dict):
-            states = {p: got[p] for p in workspace_paths if got.get(p) in WORKSPACE_STATES}
+        # The host answered (the marker printed); a state script that failed
+        # (no python3, bad output) proves nothing about the files: unknown,
+        # never "unreachable" (HOST_LOST) and never "empty" (state lost).
+        got = got if isinstance(got, dict) else {}
+        states = {p: got[p] if got.get(p) in WORKSPACE_STATES else "unknown" for p in workspace_paths}
     boards: Optional[frozenset] = None
     if workspaces_root:
         out, sep, listed = out.partition(BOARDS_MARKER + "\n")
