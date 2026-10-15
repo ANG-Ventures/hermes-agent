@@ -71,3 +71,52 @@ def test_mutation_control_without_the_guard_the_incident_command_passes(fake_hom
     pre-exec chain stops the incident command, so the refusal above is this guard's."""
     monkeypatch.setattr(terminal_module, "home_deletion_block", lambda **_k: None)
     _run('rm -rf "$HERMES_HOME"')  # no exception
+
+
+@pytest.mark.platforms("posix")
+def test_a_variable_exported_in_an_earlier_call_is_seen(fake_home, tmp_path):
+    """Prism #2006: the guard analyzes the env the command really runs with, including the
+    session snapshot that restores exports from earlier terminal calls."""
+    from tools.environments.local import LocalEnvironment
+
+    (fake_home / "runtime").mkdir(exist_ok=True)
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        assert env._snapshot_ready
+        env.execute('export D="$HERMES_HOME/runtime"')
+        assert str(fake_home / "runtime") in env.execute('printf %s "$D"')["output"]
+        cwd = str(tmp_path)
+        with pytest.raises(terminal_module._Rejected):
+            terminal_module._pre_exec_block('rm -rf "$D"', env=env, env_type="local", cwd=cwd,
+                                            workdir=None, session_key="")
+        terminal_module._pre_exec_block('rm -rf "$D/sub"', env=env, env_type="local", cwd=cwd,
+                                        workdir=None, session_key="")  # below a root: allowed
+    finally:
+        env.cleanup()
+
+
+
+def test_background_launch_does_not_see_the_foreground_snapshot(fake_home, tmp_path):
+    """Prism 3f7b14131e14: a background spawn (``ProcessRegistry.spawn_local``) starts a fresh login
+    shell from the process env + overlay and never sources the foreground snapshot. An earlier
+    foreground ``export D=/tmp/cache`` must NOT be used to approve a background ``rm -rf "$D"`` when
+    the inherited env says D is the live home."""
+    import os
+    from tools.environments.local import LocalEnvironment
+
+    (fake_home / "runtime").mkdir(exist_ok=True)
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        assert env._snapshot_ready
+        env.execute('export D="%s"' % str(tmp_path / "cache"))     # foreground snapshot: harmless D
+        env.env["D"] = str(fake_home / "runtime")                   # inherited overlay: the live home
+        cwd = str(tmp_path)
+        # foreground: the snapshot wins (restored last by the wrapper): D=/tmp/cache, allowed
+        terminal_module._pre_exec_block('rm -rf "$D"', env=env, env_type="local", cwd=cwd,
+                                        workdir=None, session_key="")
+        # background: no snapshot, D is the live home: refused
+        with pytest.raises(terminal_module._Rejected):
+            terminal_module._pre_exec_block('rm -rf "$D"', env=env, env_type="local", cwd=cwd,
+                                            workdir=None, session_key="", background=True)
+    finally:
+        env.cleanup()

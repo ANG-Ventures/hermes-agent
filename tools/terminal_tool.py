@@ -1488,7 +1488,7 @@ _PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
 
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
-    workdir: Optional[str], session_key: str,
+    workdir: Optional[str], session_key: str, background: bool = False,
 ) -> None:
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
@@ -1509,6 +1509,7 @@ def _pre_exec_block(
             raise _Rejected(_error_json(workdir_error, status="blocked"))
     blocked = home_deletion_block(
         command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+        background=background,
     )
     if blocked:
         raise _Rejected(blocked)
@@ -1620,6 +1621,9 @@ def terminal_tool(
             bounded_guard = run_bounded_sync(
                 lambda: _pre_exec_block(
                     command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+                    # the launch path the guard must model: an explicit background call OR a
+                    # foreground call the timeout cap promotes (decided in the plan, above)
+                    background=bool(background) or plan.promoted_from_foreground_timeout is not None,
                 ),
                 guard_timeout,
                 label="terminal.pre-exec-guard",

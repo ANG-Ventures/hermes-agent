@@ -247,6 +247,77 @@ def test_nested_script_is_not_followed_past_depth_one(home, tmp_path):
     assert check(home, f"bash {outer}") is None
 
 
+# ── Prism #2006 findings: shell word semantics the analyzer must follow ───────────────
+
+@pytest.mark.parametrize("command", [
+    # An opaque cwd hides relative targets only; absolute ones still resolve.
+    'cd "$(mktemp -d)" && rm -rf "$HERMES_HOME"',
+    'cd "$(mktemp -d)" && git -C "$HERMES_HOME" clean -fdx',
+    # Unquoted expansions are field-split: the second field is the home.
+    'TARGETS="/tmp/cache $HERMES_HOME"; rm -rf $TARGETS',
+    # `-e PAT` / `--exclude PAT` are option arguments, not pathspecs.
+    "git -C \"$HERMES_HOME\" clean -fdx -e '*.log'",
+    "git -C \"$HERMES_HOME\" clean -fdx --exclude '*.log'",
+    "git -C \"$HERMES_HOME\" clean -fdxe '*.log'",
+    "git -C \"$HERMES_HOME\" clean -fdx -e*.log",
+    # A default word is expanded with the same rules as any other word.
+    'unset SCRATCH; rm -rf "${SCRATCH:-$HERMES_HOME}"',
+    "rm -rf ${SCRATCH:-$HERMES_HOME}",
+    "rm -rf ${SCRATCH:-~/.hermes}",
+])
+def test_prism_2006_shapes_are_refused(home, command):
+    hit = check(home, command, cwd="/tmp")
+    assert hit is not None
+    assert str(home["root"].resolve()) in hit
+
+
+@pytest.mark.parametrize("command", [
+    'cd "$(mktemp -d)" && rm -rf .hermes',              # relative under an opaque cwd: unknown
+    'T="/tmp/cache $HERMES_HOME"; rm -rf "$T"',          # quoted: one nonexistent path
+    'SCRATCH=/tmp/x; rm -rf "${SCRATCH:-$HERMES_HOME}"',  # the variable is set: default unused
+    'rm -rf "${S:-~}/.hermes"',                          # quoted default: no tilde expansion
+    "git -C \"$HERMES_HOME\" clean -fdx -e '*.log' cache",  # a real pathspec below the home
+    "git -C \"$HERMES_HOME\" clean -ndx -e '*.log'",     # dry run
+])
+def test_prism_2006_neighbours_stay_allowed(home, command):
+    assert check(home, command, cwd="/tmp") is None
+
+
+def test_snapshot_exports_reads_only_the_export_dump(tmp_path):
+    from agent.home_deletion_guard import _UNKNOWN, snapshot_exports
+
+    snap = tmp_path / "snap.sh"
+    snap.write_text(
+        'declare -x D="/x/runtime"\ndeclare -x Q=\'a b\'\ndeclare -x OP="$(id)"\ndeclare -x FLAG\n'
+        "f () \n{ \n    declare -x LATE=/nope\n}\nalias ll='ls -l'\n")
+    out = snapshot_exports(str(snap))
+    assert out["D"] == "/x/runtime" and out["Q"] == "a b" and out["OP"] is _UNKNOWN
+    assert "LATE" not in out and "FLAG" not in out
+    assert snapshot_exports(str(tmp_path / "missing.sh")) == {}
+
+
+def test_snapshot_exports_continue_past_exported_arrays(tmp_path):
+    from agent.home_deletion_guard import _UNKNOWN, snapshot_exports
+
+    snap = tmp_path / "snap.sh"
+    snap.write_text('declare -ax A=([0]="x" [1]="y z")\ndeclare -ax E=()\ndeclare -x D="/x/runtime"\n'
+                    "f () \n{ \n    declare -x LATE=/nope\n}\n")
+    out = snapshot_exports(str(snap))
+    assert out["A"] is _UNKNOWN and out["D"] == "/x/runtime" and "LATE" not in out
+
+
+def test_quoted_default_keeps_exact_whitespace(home, tmp_path):
+    spaced = tmp_path / "hermes  home"
+    spaced.mkdir()
+    env = {"HERMES_HOME": str(spaced)}
+    assert check(home, f'rm -rf "${{TARGET:-{spaced}}}"', env=env, cwd="/tmp") is not None
+
+
+def test_quoted_empty_default_is_an_empty_argument(home):
+    # Git treats `-C ""` as "stay here", so cwd = the home and the clean is real.
+    assert check(home, 'git -C "${UNSET:-}" clean -fdx', cwd=str(home["root"])) is not None
+
+
 # ── cost ───────────────────────────────────────────────────────────────────────────────
 
 def test_ordinary_commands_stay_well_under_50ms(home):
@@ -261,3 +332,22 @@ def test_ordinary_commands_stay_well_under_50ms(home):
         check(home, cmd)
     per_call_ms = (time.perf_counter() - start) * 1000 / len(commands)
     assert per_call_ms < 50, per_call_ms
+
+
+
+def test_empty_ifs_joins_an_unquoted_default_word_with_blanks(tmp_path: Path):
+    """Prism d0b8d9a3d9eb: with ``IFS=`` the blank inside ``${U:-/x/hermes home}`` is NOT a field
+    break; the shell passes one path. A home whose path contains a space must still be refused."""
+    user = tmp_path / "user x"
+    root = user / "hermes home"
+    (root / "profiles" / "aegis").mkdir(parents=True)
+    (root / "state.db").write_bytes(b"")
+    env = {"HOME": str(user), "HERMES_HOME": str(root), "PATH": os.environ.get("PATH", "")}
+    cmd = "rm -rf ${UNSET:-%s}" % str(root)
+    # default IFS: the blank splits, the two halves are not protected roots: allowed (shell behaviour)
+    assert not command_deletes_protected_home(cmd, env=env, cwd=str(user))
+    # IFS empty: one field = the protected root: refused
+    assert command_deletes_protected_home("IFS=; " + cmd, env=env, cwd=str(user))
+    assert command_deletes_protected_home(cmd, env=dict(env, IFS=""), cwd=str(user))
+    # IFS set to something that does not contain a blank: still one field
+    assert command_deletes_protected_home(cmd, env=dict(env, IFS=":"), cwd=str(user))
