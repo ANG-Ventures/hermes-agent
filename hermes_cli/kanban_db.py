@@ -2560,6 +2560,8 @@ class Task:
     # profile without an explicit ``worker_ok``. See :func:`set_no_worker`.
     no_worker: bool = False
     completion_contract: Optional[str] = None
+    # Pool host holding this card's workspace state (t_8bfdcc07); None = none.
+    origin_host: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2597,7 +2599,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "origin_host",
 )
 
 # Text columns where "" is stored/read as "not set".
@@ -2628,6 +2630,7 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    host: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -2642,6 +2645,7 @@ class Run:
             started_at=int(row["started_at"]),
             ended_at=_opt_int(row["ended_at"]),
             metadata=_json_or(_lossy_text(row["metadata"])),
+            host=_row_get(row, "host"),
         )
 
 
@@ -2840,7 +2844,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- flagged card and assign/reassign refuse a worker profile unless the
     -- same call passes worker_ok (which clears the flag). Prose such as
     -- "do not dispatch a worker" in the body is not a guard; this is.
-    no_worker            INTEGER NOT NULL DEFAULT 0
+    no_worker            INTEGER NOT NULL DEFAULT 0,
+    -- Fleet Work Placement Phase 3 (t_8bfdcc07): the pool host that may hold this
+    -- card's workspace state. Set at placement, cleared only by a positive empty
+    -- probe, a terminal status or ``requeue --drop-origin``. NULL = no remote state.
+    origin_host          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2921,7 +2929,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- Resources (VM / container / GPU-resident unit) this run started, JSON list of
     -- {kind, id, host, started_at, state}. The dispatcher stops each one after the card
     -- is done/archived unless the body carries `keep-alive: <reason>` (kanban_resources).
-    resources           TEXT NOT NULL DEFAULT '[]'
+    resources           TEXT NOT NULL DEFAULT '[]',
+    -- Where this run executed (t_8bfdcc07): a pool host id, or 'studio' for a
+    -- local run. NULL = legacy row or a run that never spawned.
+    host                TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -3505,6 +3516,11 @@ def _ensure_status_audit(conn: sqlite3.Connection) -> None:
     """Create the audit table + trigger. Runs after the additive column
     migrations so every column the trigger names exists on legacy DBs."""
     conn.executescript(_STATUS_AUDIT_SQL)
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_tasks_terminal_origin "
+        "AFTER UPDATE OF status ON tasks WHEN NEW.status IN ('done','archived') "
+        "BEGIN UPDATE tasks SET origin_host=NULL WHERE id=NEW.id; END"
+    )
 
 
 def _install_status_audit_marker(conn: sqlite3.Connection) -> None:
@@ -5889,6 +5905,7 @@ def create_task(
     until: Optional[int] = None,
     time_gate_guard: bool = False,
     i_mean_blocks: bool = False,
+    continues: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -6031,6 +6048,12 @@ def create_task(
     # (CLI, kanban tool, swarm, dashboard, library callers) flows through, so
     # no card can land without a home (never NULL) or without an origin line.
     parents = tuple(parents or ())
+    if continues:
+        # Birth lineage is provenance; it must not gate on the old card.
+        if parents and parents != (continues,):
+            raise ValueError('--continues cannot be combined with different explicit parents')
+        parents = (continues,)
+        parents_kind = LINK_KIND_DERIVED_FROM
     created_by = created_by or _ambient_session_env("HERMES_SESSION_PROFILE") or None
     requested_session_id, unstamped_body = session_id, body
     birth = _resolve_birth_session(
@@ -6066,6 +6089,21 @@ def create_task(
         body,
         inherited_origin or format_origin_line(session_id, created_by=created_by),
     )
+    # Only hard parent declarations inherit; body sniffs never do.
+    from hermes_cli.kanban_host_capabilities import declared_words
+    _inherited_requires = set()
+    for _parent in parents:
+        _prow = conn.execute('SELECT body,skills FROM tasks WHERE id=?', (_parent,)).fetchone()
+        if _prow:
+            _inherited_requires.update(w for w in declared_words(_prow[0]) if w != 'none')
+            from hermes_cli import kanban_host_capabilities as _khc_inherit
+            _cmap = _khc_inherit.load_map(kanban_home() / 'fleet')
+            if _cmap is not None:
+                _reqs, _none = _khc_inherit.derive(_prow[0], _json_or(_prow[1]) or [], _cmap)
+                _inherited_requires.update(r.cap.removeprefix('unknown:') for r in _reqs if r.strength == 'hard')
+    if _inherited_requires:
+        body = (body or '') + '\nrequires: ' + ', '.join(sorted(_inherited_requires))
+
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -6381,6 +6419,10 @@ def create_task(
                         "(parent_id, child_id, kind) VALUES (?, ?, ?)",
                         (pid, task_id, parents_kind),
                     )
+                from hermes_cli import kanban_continuation as _kcont_create
+                if continues:
+                    _kcont_create.transfer_workspace(conn, continues, task_id)
+                _kcont_create.create_hints(conn, task_id, body, continues=continues)
                 # Notify-sub inheritance (ACK-edge: the originating channel
                 # still hears about a child that BLOCKs, not just the final
                 # fan-in) is handled by the single-owner helper below —
@@ -12051,6 +12093,7 @@ def safe_remove_workspace_dir(
     task_id: Optional[str] = None,
     reason: str,
     conn: Optional[sqlite3.Connection] = None,
+    remote_host=None,
 ) -> bool:
     """THE choke point for removing a kanban-managed scratch workspace.
 
@@ -12070,6 +12113,28 @@ def safe_remove_workspace_dir(
 
     Returns True iff the directory was removed.
     """
+    if remote_host is not None:
+        if conn is None or not task_id or not _is_managed_scratch_path(Path(path)):
+            return False
+        if _task_has_live_run(conn, task_id) or _has_active_children(conn, task_id):
+            return False
+        # Remote lexical ownership: never consult the Studio's inode identity.
+        target = os.path.normpath(str(path))
+        for owner in conn.execute('SELECT id,workspace_path FROM tasks WHERE workspace_path IS NOT NULL'):
+            stored = os.path.normpath(owner['workspace_path'])
+            # Overlap in either direction: equal, inside the target, or
+            # containing it (a nested workspace belongs to its ancestor too).
+            if owner['id'] != task_id and (stored == target or stored.startswith(target + os.sep)
+                                           or target.startswith(stored + os.sep)):
+                return False
+        from hermes_cli.kanban_survivor import remove_workspace_dir
+        _audit_workspace_deletion(Path(path), task_id=task_id, reason=reason, outcome=AUDIT_ATTEMPT,
+                                  detail='remote=' + remote_host.name)
+        removed = remove_workspace_dir(conn, task_id, path, remote_host=remote_host)
+        _audit_workspace_deletion(Path(path), task_id=task_id, reason=reason,
+                                  outcome=AUDIT_DELETE if removed else AUDIT_FAILED,
+                                  detail='remote=' + remote_host.name)
+        return removed
     try:
         resolved = Path(path).resolve(strict=False)
     except OSError:
@@ -13990,6 +14055,7 @@ def requeue_task(
     *,
     actor: str,
     reason: str,
+    drop_origin: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Record operator intent to run a READY card now (``requeued`` event).
 
@@ -14004,18 +14070,29 @@ def requeue_task(
     """
     if not (reason or "").strip():
         return False, "a reason is required to requeue a task"
+    _origin_files = []
+    if drop_origin:
+        from hermes_cli import kanban_continuation as kc
+        _origin_files = kc.inventory(conn, task_id)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if row is None:
             return False, f"task {task_id} not found"
-        if row["status"] != "ready":
+        if drop_origin and row['status'] == 'blocked':
+            # Dropping state does not waive incomplete blocking parents.
+            target_status = 'todo' if unsatisfied_parents(conn, task_id) else 'ready'
+            conn.execute("UPDATE tasks SET status=? WHERE id=?", (target_status, task_id))
+        elif row["status"] != "ready":
             return False, (
                 f"task {task_id} is {row['status']!r}; requeue only applies to "
                 f"'ready' tasks (use unblock/reopen/triage-resolve/promote "
                 f"for other states)"
             )
+        if drop_origin:
+            from hermes_cli import kanban_continuation as kc
+            kc.drop_origin(conn, task_id, actor=actor, files=_origin_files)
         _append_event(
             conn, task_id, "requeued", {"actor": actor, "reason": reason},
         )

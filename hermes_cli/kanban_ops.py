@@ -760,6 +760,15 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 def _gc_remove_workspaces(rows, scratch_root: Path) -> int:
     removed_ws = 0
     for row in rows:
+        if row['workspace_kind'] in ('scratch', 'worktree') and row['workspace_path']:
+            from hermes_cli.kanban_continuation import remote_cleanup_host
+            with kbc.connect_closing() as conn:
+                host = remote_cleanup_host(conn, row['id'])
+                if host and kb.safe_remove_workspace_dir(
+                    Path(row['workspace_path']), task_id=row['id'], reason='gc_archived',
+                    conn=conn, remote_host=host,
+                ):
+                    removed_ws += 1
         if row["workspace_kind"] == "worktree":
             # Backstop for worktrees that escaped the completion/archive hook.
             # Same safety predicate: only clean, fully-pushed worktrees go;

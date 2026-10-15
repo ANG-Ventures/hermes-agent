@@ -408,6 +408,7 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "links. The assigned worker reads this as part of "
                 "its context."
         )),
+        "continues": _prop("string", "Transfer an inactive source card's workspace and origin host; source workspace path is cleared."),
         "parents": {
             "type": "array",
             "items": {"type": "string"},

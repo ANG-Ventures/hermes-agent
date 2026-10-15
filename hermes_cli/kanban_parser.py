@@ -277,6 +277,7 @@ _SPECS = [
         _WHY,
         _arg("--assignee", help="Profile name to assign"),
         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
+        _arg("--continues", help="Transfer an inactive card's workspace and origin host"),
         _arg("--parent-kind", default=kb.DEFAULT_LINK_KIND, choices=sorted(kb.VALID_LINK_KINDS),
              help="Semantics for every --parent edge. 'blocks' (default) holds this "
                   "task until the parents are done; 'derived-from' records that a "
@@ -710,7 +711,8 @@ _SPECS = [
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("workspace", children=("workspace_action", _WORKSPACE_SPECS),
          help="Workspace maintenance (recover scratch cards stranded by mount loss)"),
-    _cmd("requeue", [_TASK_ID, _arg("reason", nargs="+", help="Required operator reason")],
+    _cmd("requeue", [_TASK_ID, _arg("reason", nargs="+", help="Required operator reason"),
+                     _arg("--drop-origin", action="store_true", help="Start fresh; leave remote files behind")],
          help="Explicitly retry a READY card held by the respawn guard"),
     _cmd("reopen", [
         _TASK_ID,
