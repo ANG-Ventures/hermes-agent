@@ -33,6 +33,16 @@ _ORIGIN_SQL = ("SELECT 1 FROM tasks WHERE origin_host IS NOT NULL "
 _ORIGIN_PATHS_SQL = ("SELECT DISTINCT origin_host, workspace_path FROM tasks "
                      "WHERE origin_host IS NOT NULL AND status NOT IN ('done','archived')")
 _READY_SQL = "SELECT 1 FROM tasks WHERE status = 'ready' AND claim_lock IS NULL LIMIT 1"
+# Cards dispatch_once itself makes ready this tick, before its ready loop: a
+# timed wake that is due (wake_due_scheduled) and a todo card whose blocks
+# parents are all terminal (recompute_ready).
+_WAKING_SQL = (
+    "SELECT 1 FROM tasks t WHERE (t.status = 'scheduled' AND t.next_eligible_at IS NOT NULL "
+    "AND t.next_eligible_at <= CAST(strftime('%s','now') AS INTEGER)) "
+    "OR (t.status = 'todo' AND NOT EXISTS (SELECT 1 FROM task_links l JOIN tasks p "
+    "ON p.id = l.parent_id WHERE l.child_id = t.id AND COALESCE(l.kind,'blocks') = 'blocks' "
+    "AND p.status NOT IN ('done','archived'))) LIMIT 1"
+)
 
 
 def admitting_overflow(pool_cfg) -> bool:
@@ -130,6 +140,14 @@ def any_ready(boards, connect) -> bool:
     """A ready, unclaimed card on any board: overflow candidates exist."""
     return _any_board(boards, connect,
                       lambda conn: conn.execute(_READY_SQL).fetchone() is not None)
+
+
+def any_waking(boards, connect) -> bool:
+    """A card dispatch_once will make ready this tick (a due timed wake or a
+    promotable todo) on any board: under ``placement.default: remote`` it
+    needs the plan, or it is placed local-first with no plan."""
+    return _any_board(boards, connect,
+                      lambda conn: conn.execute(_WAKING_SQL).fetchone() is not None)
 
 
 def _any_board(boards, connect, test) -> bool:
@@ -236,7 +254,9 @@ class GateTickBuilder:
         # probe whatever else is ready: HOST_LOST and origin waits read it.
         if gate.band not in ("spilling", "paused") and not (
                 (kc.mode(cfg) == "enforce" and any_origin(boards, self._connect)) or (
-                    any_ready(boards, self._connect) if not pins_only else
+                    (any_ready(boards, self._connect)
+                     or (default_remote and any_waking(boards, self._connect)))
+                    if not pins_only else
                     any_remote_pin(boards, self._connect, kwp.known_host_ids(self._fleet_dir()),
                                    kwp.pin_aliases(self._fleet_dir())))):
             gate.pool = {"planned": False, "reason": "not_needed"}

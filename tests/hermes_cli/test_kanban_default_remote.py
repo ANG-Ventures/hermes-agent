@@ -456,7 +456,9 @@ def _run(conn, tid, *, outcome, summary="", event=None, host="ace-ai", ended=Non
 def test_r10_counts_failed_and_half_done_remote_runs(home):
     with kb.connect_closing() as conn:
         a, b, c, d = _cards(conn, PORTABLE, 4)
-        half = _run(conn, a, outcome="completed", summary="done except the turns.db check (not on this host)")
+        half = _run(conn, a, outcome="completed", summary="done except one check")
+        conn.execute("UPDATE task_runs SET error = ? WHERE id = ?", ("turns.db not on this host", half))
+        conn.commit()
         gap = _run(conn, b, outcome="blocked", event="worker_capability_gap")
         _run(conn, c, outcome="completed", summary="all green")
         rail = _run(conn, d, outcome="blocked", summary="BROWSER_RAIL_ABSENT: no browser session on ace-ai")
@@ -471,3 +473,122 @@ def test_r10_counts_failed_and_half_done_remote_runs(home):
         # Prism P1: no pre-flip baseline -> fail closed, never a self-derived trigger.
         rep = gates.r10_report(conn, days=1, now=time.time() + 1)
         assert not rep["green"] and rep["trigger"] is None and rep["red"]
+
+
+def test_r10_a_healthy_completed_summary_is_not_evidence(home):
+    """Apollo review a1d1bdcb2f76 / Prism 0a23381c00c5: a completed run whose
+    SUMMARY names kanban.db is healthy; only an event or the error field makes
+    a completed run half-done."""
+    with kb.connect_closing() as conn:
+        a, b, c, d = _cards(conn, PORTABLE, 4)
+        _run(conn, a, outcome="completed", summary="Updated kanban.db; all tests passed")
+        gap = _run(conn, b, outcome="completed", summary="Updated kanban.db", event="worker_capability_gap")
+        crash = _run(conn, c, outcome="crashed")
+        conn.execute("UPDATE task_runs SET error = ? WHERE id = ?", ("docker: command not found", crash))
+        err = _run(conn, d, outcome="completed", summary="partial")
+        conn.execute("UPDATE task_runs SET error = ? WHERE id = ?", ("turns.db not on this host", err))
+        conn.commit()
+        hits = {h["run_id"]: h for h in gates.missing_capability_runs(conn, time.time() - 3600, time.time() + 1)}
+        assert sorted(hits) == sorted([gap, crash, err])
+        assert hits[gap]["half_done"] and hits[err]["half_done"] and not hits[crash]["half_done"]
+        for _ in range(gates.ROLLBACK_TRIGGER_PER_DAY + 2):
+            _run(conn, a, outcome="completed", summary="Updated kanban.db; all tests passed")
+        rep = gates.r10_report(conn, days=1, now=time.time() + 1, baseline_daily=0)
+        assert rep["green"], rep
+
+
+def test_i1_records_without_placement_default_are_red(home):
+    """Apollo review 8111932ced7d: a field-less (half-migrated) record is
+    counted invalid, never silently excluded by the remote-only filters."""
+    with kb.connect_closing() as conn:
+        (tid,) = _cards(conn, PORTABLE)
+        _event(conn, tid, _rec())
+        assert gates.check_i1(conn, 0)["green"]
+        for _ in range(3):
+            _event(conn, tid, {k: v for k, v in _rec(reason="local-first", take_refusal=None).items()
+                               if k != "placement_default"})
+        out = gates.check_i1(conn, 0)
+        assert not out["green"] and out["missing_placement_default"] == 3
+        assert any("3 record(s) missing placement_default" in r for r in out["red"]), out["red"]
+
+
+def _builder(home, cfg, connect):
+    fleet = home / "fleet"
+    fleet.mkdir(exist_ok=True)
+    (fleet / kwp.ROLES_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {"slots": 4}}, "state": "active"}}}))
+    (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
+        "schema": 1, "ssh_user": "kanbanw", "priority": ["ace-ai"], "profiles": ["alpha"],
+        "hosts": {"ace-ai": {"enabled": True, "absence": "optional"}}}))
+    gate = SimpleNamespace(band="admitting", spill_reason=None, remote_allowed=True, pool=None)
+    return kgt.GateTickBuilder(gate, fleet_dir=lambda: fleet, kanban_cfg=lambda: cfg,
+                               ledger=lambda boards: {}, connect=connect,
+                               probe=lambda h: (1.0, 16)), gate
+
+
+@pytest.mark.parametrize("remote", [True, False])
+def test_a_scheduled_card_woken_inside_dispatch_gets_the_plan(home, remote):
+    """Apollo review cafa4cce2458: no ready card, one portable card whose timed
+    wake is due. Under default: remote the tick still plans, and dispatch_once
+    (which wakes it) places it on the pool; under local nothing changes."""
+    with kb.connect_closing() as conn:
+        (tid,) = _cards(conn, PORTABLE)
+        assert kb.schedule_task(conn, tid, reason="later")
+        conn.execute("UPDATE tasks SET next_eligible_at = ? WHERE id = ?", (int(time.time()) - 5, tid))
+        conn.commit()
+        assert conn.execute("SELECT count(*) FROM tasks WHERE status='ready'").fetchone()[0] == 0
+    cfg = {"placement": {"read_signal": False, "default": "remote" if remote else "local"},
+           "worker_pool": {"overflow": False}}
+    b, gate = _builder(home, cfg, lambda board=None: kb.connect(board=board))
+    plan = b.plan_pool([{"slug": "default"}], {})
+    if not remote:
+        assert plan is None and gate.pool["reason"] == "not_needed"
+        return
+    assert plan is not None and plan.default_remote is True
+    with kb.connect_closing() as conn:
+        res, spawned = _tick(conn, plan)
+        assert tid in res.woken_scheduled
+        assert spawned == [(tid, "ace-ai")], spawned
+        (rec,) = _placements(conn, tid)
+        assert rec["reason"] == "pool" and rec["placement_default"] == "remote"
+
+
+def test_a_promotable_todo_card_also_gets_the_plan(home):
+    with kb.connect_closing() as conn:
+        (parent,) = _cards(conn, PORTABLE)
+        child = kb.create_task(conn, title="child", assignee="alpha", body=PORTABLE, parents=[parent])
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+        conn.commit()
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (child,)).fetchone()[0] == "todo"
+    cfg = {"placement": {"read_signal": False, "default": "remote"}, "worker_pool": {"overflow": False}}
+    b, _gate = _builder(home, cfg, lambda board=None: kb.connect(board=board))
+    assert b.plan_pool([{"slug": "default"}], {}) is not None
+
+
+def test_a_browser_joined_row_keeps_its_host_under_remote(home, monkeypatch):
+    """Prism 6341bf7d12fb: a browser join is cut for the Studio (the portable
+    row's host at gate time). Remote-first must not move it, or the lease
+    refuses BROWSER_JOIN_HOST_MOVED every tick."""
+    leased = []
+
+    def gate(conn, ready_rows, result, row_route, dry_run, default_assignee=None, **kw):
+        for r in ready_rows:
+            result.browser_joins[r["id"]] = {"plans": [{"host": "ci-box"}], "source_host": "studio"}
+
+    def lease(conn, claimed, join, placed_host):
+        leased.append(placed_host.name if placed_host is not None else "studio")
+        return ({}, None) if leased[-1] == join["source_host"] else (None, "BROWSER_JOIN_HOST_MOVED")
+
+    monkeypatch.setattr(kbd, "_browser_gate", gate)
+    monkeypatch.setattr(kbd, "_browser_join_lease", lease)
+    spawned = []
+
+    def spawn(task, workspace, *, board=None, placement=None, browser_env=None):
+        spawned.append((task.id, placement.name if placement else "studio"))
+        return 4242
+
+    with kb.connect_closing() as conn:
+        (tid,) = _cards(conn, PORTABLE)
+        kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=64, spawn_limit=4, spawn_paused=None,
+                          spillover=_plan(), reconcile_orphans=False)
+        assert leased == ["studio"] and spawned == [(tid, "studio")]

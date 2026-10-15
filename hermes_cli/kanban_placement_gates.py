@@ -90,6 +90,12 @@ FIELD_GUARD_SQL = (
     "OR json_extract(payload,'$.reason') IS NULL OR json_extract(payload,'$.pool_free_at_spawn') IS NULL "
     "OR (json_extract(payload,'$.reason') = 'last-resort' AND json_extract(payload,'$.take_refusal') IS NULL))"
 )
+# A record with no placement_default in the window is half-migrated: it is
+# invisible to the remote-only queries above, so it is counted, never excluded.
+NO_DEFAULT_SQL = (
+    "SELECT count(*) FROM task_events WHERE kind = :kind AND created_at >= :since "
+    "AND json_extract(payload,'$.placement_default') IS NULL"
+)
 KIND_GUARD_SQL = (
     "SELECT count(DISTINCT kind) FROM task_events WHERE kind IN ('placement','spawned') "
     "AND created_at >= :since AND json_extract(payload,'$.route_class') IS NOT NULL"
@@ -108,6 +114,7 @@ def check_i1(conn: sqlite3.Connection, since: float) -> dict:
                   for r in conn.execute(i1_violation_sql(), args)]
     kinds = conn.execute(KIND_GUARD_SQL, args).fetchone()[0]
     incomplete = conn.execute(FIELD_GUARD_SQL, args).fetchone()[0]
+    no_default = conn.execute(NO_DEFAULT_SQL, args).fetchone()[0]
     hist: dict = {}
     for (refusal,) in conn.execute(LAST_RESORT_SQL, args):
         code = _pr.take_refusal_code(refusal) or "null"
@@ -122,11 +129,13 @@ def check_i1(conn: sqlite3.Connection, since: float) -> dict:
         red.append(f"kind guard: {kinds} record kinds carry route_class (must be 1)")
     if incomplete:
         red.append(f"field guard: {incomplete} placement record(s) missing a queried field")
+    if no_default:
+        red.append(f"field guard: {no_default} record(s) missing placement_default")
     if remote_rows == 0:
         red.append("no placement record under default: remote in the window (nothing proven)")
     return {"green": not red, "red": red, "violations": violations,
             "last_resort": sum(hist.values()), "last_resort_by_refusal": hist,
-            "remote_records": remote_rows}
+            "remote_records": remote_rows, "missing_placement_default": no_default}
 
 
 def series_files(root: Path) -> List[Path]:
@@ -239,15 +248,19 @@ _R10_EVENTS = ("worker_capability_gap", "placement_reroute", "placement_custody_
 
 def missing_capability_runs(conn: sqlite3.Connection, since: float, until: float) -> List[dict]:
     """Remote runs ended in [since, until) that failed, or completed half-done,
-    for a missing capability (R10): a rail/capability event on the run, or the
-    run's error/summary carrying a missing-capability string."""
+    for a missing capability (R10): a rail/capability event on the run, or a
+    missing-capability string in a failed run's error/summary or a completed
+    run's error (never a completed run's summary)."""
     out = []
     marks = ",".join("?" * len(_R10_EVENTS))
     for rid, tid, outcome, ended, err, summary, host in conn.execute(
             _R10_SQL, {"since": int(since), "until": int(until)}):
         ev = conn.execute(f"SELECT kind FROM task_events WHERE run_id = ? AND kind IN ({marks}) LIMIT 1",
                           (rid, *_R10_EVENTS)).fetchone()
-        text = f"{err}\n{summary}"
+        # A COMPLETED run is half-done only on positive evidence: a capability
+        # event on the run or its ERROR field. Its summary is never evidence:
+        # healthy runs say "Updated kanban.db; all tests passed".
+        text = err if outcome == "completed" else f"{err}\n{summary}"
         hit = MISSING_CAPABILITY_RE.search(text)
         if ev is None and hit is None:
             continue

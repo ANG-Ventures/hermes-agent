@@ -6422,8 +6422,13 @@ def _dispatch_once_locked(
         _rid = None
         _take_refusal = None
         _cap_only = _caps_out.get("only", {}).get(row["id"])
+        # A browser join is cut for the host _browser_gate saw (the Studio for a
+        # portable row): remote-first would move it and the lease refuses
+        # BROWSER_JOIN_HOST_MOVED every tick, so a joined row keeps that host.
+        _remote_first = (getattr(spillover, "default_remote", False)
+                         and row["id"] not in result.browser_joins)
         if route in ("pin", "origin") or (route == "portable" and (
-                not local_free or _cap_only or getattr(spillover, "default_remote", False))):
+                not local_free or _cap_only or _remote_first)):
             # A refused take() NEVER falls through to a local spawn (I-11),
             # except a portable row under kanban.placement.default: remote,
             # which spawns locally as the LAST RESORT (spec v0.3 §3.1 step 2).
