@@ -320,3 +320,41 @@ def test_a_card_without_a_browser_need_is_untouched(home, ledger):
         res = _dry(conn)
         assert tid not in res.placement_caps or not any(
             k.startswith(("browser", "legacy")) for k in res.placement_caps[tid])
+
+
+# -- Prism round 1 on #2002 ----------------------------------------------------------------------
+
+def test_671171332677_gate_fault_holds_browser_cards_and_never_spawns_them(home, monkeypatch):
+    bad = Ledger(rows=[dict(AMAZON, policy=json.dumps({"read": True}))])   # malformed policy shape
+    monkeypatch.setattr(kbd, "_browser_lookup", lambda: bad)
+    with kb.connect_closing() as conn:
+        tid = _card(conn, assignee=SOAK_PROFILE, skills=["browser-soak-amazon"], body="needs: browser:amazon-alex\n")
+        res = _dry(conn)
+        assert res.placement_caps[tid]["browser_refused"]["token"] == "BROWSER_CLASS_REFUSED"  # true grants nobody
+
+    def boom(*a, **k):
+        raise TypeError("gate fault")
+    monkeypatch.setattr(kbg, "gate_rows", boom)
+    with kb.connect_closing() as conn:
+        plain = _card(conn, body="fix a typo\n")
+        res, spawned = _live(conn)
+        assert tid not in spawned and res.placement_waits[tid] == kbg.WAIT_GATE_ERROR
+        assert plain not in res.placement_waits or res.placement_waits[plain] != kbg.WAIT_GATE_ERROR
+
+
+def test_2a0c67315e6c_a_studio_local_ephemeral_plans_the_studio(home, ledger):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, skills=["browser-phase1-ephemeral"], body="needs: browser:ephemeral\n")
+        res = _dry(conn)
+        assert res.placement_caps[tid]["browser_lease_plan"][0]["host"] == "studio"
+    assert kbd._pin_host(("pin", "ace-ai")) == "ace-ai" and kbg.ephemeral_host("ace-ai") == "ci-box"
+
+
+def test_5acdd292d27b_unassigned_card_is_judged_as_the_default_assignee(home, ledger):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, assignee=None, skills=["browser-soak-amazon"], body="needs: browser:amazon-alex\n")
+        res = kbd.dispatch_once(conn, dry_run=True, spawn_fn=lambda *a, **k: 1, max_spawn=64, spawn_limit=4,
+                                spillover=_pool(), reconcile_orphans=False, default_assignee=SOAK_PROFILE)
+        assert "browser_refused" not in res.placement_caps[tid]
+        assert res.placement_caps[tid]["browser_lease_plan"][0]["identity"] == "id-amazon-alex"
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "ready"

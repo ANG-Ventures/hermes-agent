@@ -4577,12 +4577,16 @@ def _browser_lookup():
     return _kbg.socket_lookup(_kbg.DEFAULT_SOCKET)
 
 
-def _pin_host(route) -> Optional[str]:
-    """The pool host a ``("pin", host)`` route names, else None (the worker runs on the Studio)."""
-    return route[1] if isinstance(route, tuple) and len(route) == 2 and route[0] == "pin" else None
+def _pin_host(route) -> str:
+    """The host a browser card's worker runs on: the pool host of a ``("pin", host)`` route, else the
+    Studio (every other route spawns locally on the dispatcher host), keyed as browser-hosts.json does."""
+    if isinstance(route, tuple) and len(route) == 2 and route[0] == "pin" and route[1]:
+        return route[1]
+    return "studio"
 
 
-def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool) -> None:
+def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
+                  default_assignee: Optional[str] = None) -> None:
     """The Browser Sandboxes resolution gate for this tick (t_42728faf; spec v1.2 s3.3, AC-1.13/1.15).
 
     The live tick and ``--dry-run`` both come through here and both call
@@ -4595,21 +4599,29 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool) -> N
     * a refusal: the card parks ``needs_input`` with the token as the first line (dry run: reported).
     * a lease plan: held ``ready`` with ``browser_join_off`` (the s7 join that leases is P1-8's) and
       NEVER spawned onto a legacy profile; a ledger wait holds it the same way.
-    Best-effort: a gate fault never breaks the tick (the card then takes today's path, as before).
+    FAIL CLOSED (Prism 671171332677): a gate fault holds every browser card this tick (``browser_gate_error``)
+    and never lets it spawn on a legacy profile; cards with no browser need are untouched. An unassigned card is
+    judged as ``kanban.default_assignee`` (the profile the ready loop will assign), never as nobody.
     """
+    from hermes_cli import kanban_browser_gate as _kbg
+    from hermes_cli import kanban_needs as _kn
+    rows = [r for r in ready_rows if _kn.declared_resources(r["body"])]
+    if not rows:
+        return
+    _dflt = _resolve_default_assignee(default_assignee)
     try:
-        from hermes_cli import kanban_browser_gate as _kbg
-        from hermes_cli import kanban_needs as _kn
-        rows = [r for r in ready_rows if _kn.declared_resources(r["body"])]
-        if not rows:
-            return
         reg = _kn.load_registry(_kb.kanban_home() / "fleet")
         lookup = _browser_lookup() if reg.mode == _kbg.MODE_ON else (lambda name: None)
-        verdicts = _kbg.gate_rows(rows, registry=reg, lookup=lookup,
+        eff = [r if r["assignee"] or not _dflt else dict(dict(zip(r.keys(), tuple(r))), assignee=_dflt)
+               for r in rows]
+        verdicts = _kbg.gate_rows(eff, registry=reg, lookup=lookup,
                                   minted_by=_kbg.minted_by_of(conn, [r["id"] for r in rows]),
                                   worker_host=lambda r: _pin_host(row_route.get(r["id"])))
     except Exception:
-        _kb._log.warning("kanban dispatch: browser gate failed; browser cards take today's path", exc_info=True)
+        _kb._log.warning("kanban dispatch: browser gate failed; browser cards held this tick", exc_info=True)
+        for r in rows:
+            result.placement_caps.setdefault(r["id"], {})["browser_wait"] = {"reason": _kbg.WAIT_GATE_ERROR}
+            row_route[r["id"]] = ("wait", _kbg.WAIT_GATE_ERROR)
         return
     for tid, v in verdicts.items():
         caps = result.placement_caps.setdefault(tid, {})
@@ -5375,7 +5387,7 @@ def _dispatch_once_locked(
                 "standalone daemon, which never places remotely)", _unplanned,
             )
     # Browser Sandboxes resolution gate (t_42728faf): after every route is known, before any spawn.
-    _browser_gate(conn, ready_rows, result, row_route, dry_run)
+    _browser_gate(conn, ready_rows, result, row_route, dry_run, default_assignee)
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all. The
     # review lane is never offered to the pool: its rows are always local.

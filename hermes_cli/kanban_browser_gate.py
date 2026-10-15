@@ -48,6 +48,7 @@ LEASE_PLAN_EVENT = "browser_lease_plan"
 REFUSED_EVENT = "browser_refused"
 WAIT_JOIN_OFF = "browser_join_off"
 WAIT_LEDGER = "browser_ledger_unreadable"
+WAIT_GATE_ERROR = "browser_gate_error"
 
 
 class LedgerUnreadable(Exception):
@@ -99,6 +100,11 @@ def identity_name(need: str) -> str:
     return "id-" + need[len(kn.BROWSER_PREFIX):]
 
 
+def _names(v) -> frozenset:
+    """A policy list as a set of profile names; any other shape (a typo'd ``true``, a string) grants nobody."""
+    return frozenset(x for x in v if isinstance(x, str)) if isinstance(v, (list, tuple)) else frozenset()
+
+
 def _policy(row: Mapping) -> dict:
     p = row.get("policy")
     if isinstance(p, str):
@@ -134,11 +140,11 @@ def decide(need: str, *, lane: str, registry: kn.LaneRegistry, assignee: Optiona
         return {"need": need, "lane": lane, "reason": "unsealed"}
     klass = derive_class(body)
     pol = _policy(row)
-    if (minted_by or {}).get("class") == "worker" and "worker" not in (pol.get("creators") or []):
+    if (minted_by or {}).get("class") == "worker" and "worker" not in _names(pol.get("creators")):
         return kn.refusal("BROWSER_CLASS_REFUSED",
                           f"reason=creator_provenance {name} class={klass}: card minted by a worker run "
                           f"({(minted_by or {}).get('task') or '?'})")
-    if not assignee or assignee not in (pol.get(klass) or []):
+    if not assignee or assignee not in _names(pol.get(klass)):
         return kn.refusal("BROWSER_CLASS_REFUSED",
                           f"reason=policy {name} class={klass}: profile {assignee or '(none)'} is not allowed")
     return Plan(need, lane, klass, identity=name, host=row.get("host"))
