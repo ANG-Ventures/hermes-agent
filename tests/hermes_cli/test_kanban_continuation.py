@@ -348,3 +348,43 @@ def test_drop_origin_is_not_resurrected_by_local_spawn(db):
     assert kc.record_placement(db, row['id'], 1, None)
     assert db.execute('SELECT origin_host FROM tasks').fetchone()[0] is None
     assert db.execute('SELECT host FROM task_runs').fetchone()[0] == 'studio'
+
+
+def test_gateway_plan_pool_reads_origin_state_in_the_load_probe(tmp_path, monkeypatch):
+    """The tick's ONE pool plan asks origin hosts for their live workspaces,
+    and a ready origin card alone justifies the plan under enforce."""
+    from gateway.kanban_gate_tick import GateTickBuilder
+    from hermes_cli.kanban_load_gate import LoadGate
+    from hermes_cli import kanban_worker_pool as kwp
+    home = tmp_path / 'home'
+    home.mkdir()
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr('hermes_cli.profiles.profile_exists', lambda name: True)
+    fleet = home / 'kanban' / 'fleet'
+    fleet.mkdir(parents=True)
+    (fleet / kwp.ROLES_FILE).write_text(json.dumps({'schema': 1, 'hosts': {
+        'ace-media': {'roles': {'kanban-worker': {'slots': 4}}, 'state': 'active'}}}))
+    (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
+        'schema': 1, 'ssh_user': 'kanbanw', 'capacity_pct': 0.8, 'priority': ['ace-media'],
+        'profiles': ['alpha'], 'hosts': {'ace-media': {'enabled': True, 'absence': 'optional'}}}))
+    ws = str(tmp_path / 'ws')
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title='origin', assignee='alpha', body='requires: none')
+        conn.execute('UPDATE tasks SET origin_host=?,workspace_path=? WHERE id=?', ('ace-media', ws, tid))
+    asked = []
+
+    def probe(h, workspace_paths=()):
+        asked.append((h.name, tuple(workspace_paths)))
+        return kwp.HostSample(1.0, 16, workspace_states={p: 'nonempty' for p in workspace_paths})
+    cfg = {'placement': {'read_signal': False, 'continuation': 'enforce'},
+           'worker_pool': {'overflow': False}}
+    gate = LoadGate({}, ncpu=32)
+    gate.band, gate.remote_allowed = 'admitting', True
+    builder = GateTickBuilder(gate, fleet_dir=lambda: fleet, kanban_cfg=lambda: cfg, ledger=lambda b: {},
+                              connect=lambda board=None: kb.connect(board=board), probe=probe)
+    plan = builder.plan_pool([{'slug': 'default'}], {})
+    assert plan is not None, gate.pool
+    assert asked == [('ace-media', (ws,))]
+    assert plan.continuation_probed and plan.continuation_states == {('ace-media', ws): 'nonempty'}
+    cfg['placement']['continuation'] = 'off'
+    assert builder.plan_pool([{'slug': 'default'}], {}) is None
