@@ -4748,18 +4748,53 @@ def _accepts_kw(fn, name: str) -> bool:
     return any(p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
 
 
-def _browser_join_refused(conn, task_id: str, token: str, result, failure_limit) -> None:
+def _browser_release_lease(host: str, token: str) -> dict:
+    """Release a joined lease by its token on ``host`` (``browserctl --lease-token-stdin release`` over ssh, the
+    ctl_api remote path; the token rides stdin, never argv). Tests replace this seam."""
+    try:
+        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+                              "/usr/local/bin/browserctl --lease-token-stdin --json release"],
+                             input=token + "\n", capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "refusal": "BROWSER_RELAY_TRANSPORT", "detail": type(exc).__name__}
+    return {"ok": out.returncode == 0, "rc": out.returncode}
+
+
+def _browser_release_joined(conn, claimed, join: dict, env: Mapping[str, str], why: str) -> None:
+    """A lease the join took for a worker that never ran (spawn failed, claim lost): release it now so a
+    retry does not strand one ci-box ephemeral per failed spawn. Best effort; the reaper's TTL is the floor."""
+    (plan,) = join["plans"]
+    try:
+        r = _browser_release_lease(plan["host"], env["BROWSER_LEASE_TOKEN"])
+    except Exception as exc:  # never break the tick on cleanup
+        r = {"ok": False, "detail": type(exc).__name__}
+    try:
+        with _kbc.write_txn(conn):
+            _kb._append_event(conn, claimed.id, "browser_lease_released",
+                              {"host": plan["host"], "why": why, "ok": bool(r.get("ok"))},
+                              run_id=claimed.current_run_id)
+    except Exception:
+        _kb._log.warning("kanban dispatch: could not record browser lease release for %s", claimed.id, exc_info=True)
+
+
+def _browser_join_refused(conn, claimed, token: str, result, failure_limit) -> None:
     """R3(c)'s one exit shape for a lease the join could not take: the claim is released, the card goes back
     to ``ready`` (the run closes ``spawn_failed`` with ``infrastructure: true``, so the breaker is never
-    charged), one ``browser_dispatch_refused {token}`` event. Never a re-route, never a spawn without it."""
+    charged), one ``browser_dispatch_refused {token}`` event. Never a re-route, never a spawn without it.
+    Fenced to the claimed run (Prism 375e680b84c1): a successor run that claimed the card while the relay
+    was out is never touched."""
     from hermes_cli import kanban_browser_lease as _kbl
+    task_id = claimed.id
     _kb._log.warning("kanban dispatch: browser join refused for %s: %s", task_id, token)
+    result.placement_waits[task_id] = f"browser_refused:{token}"
+    if not _kb._claim_still_held(conn, claimed):
+        _kb._abort_lost_claim_spawn(conn, claimed, None)
+        return
     _record_task_failure(conn, task_id, f"browser lease: {token}", outcome="spawn_failed", release_claim=True,
                          end_run=True, failure_limit=failure_limit, infrastructure=True,
                          run_metadata_extra={"browser_refused": token})
     with _kbc.write_txn(conn):
         _kb._append_event(conn, task_id, _kbl.REFUSED_EVENT, {"token": token, "join": True})
-    result.placement_waits[task_id] = f"browser_refused:{token}"
 
 
 def _browser_hold_review_rows(conn, review_rows, result, dry_run: bool) -> list:
@@ -6439,6 +6474,7 @@ def _dispatch_once_locked(
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         launched = False
+        _joined = None  # (join, lease env) once the s7 join took a lease for this claim
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -6465,12 +6501,20 @@ def _dispatch_once_locked(
             if _join is not None:
                 _benv, _btok = ((None, "BROWSER_JOIN_SPAWN_UNSUPPORTED") if not _accepts_kw(_spawn, "browser_env")
                                 else _browser_join_lease(conn, claimed, _join, placed_host))
+                if _btok is None and not _kb._claim_still_held(conn, claimed):
+                    # The relay can take minutes: a claim lost meanwhile is not ours to clean up (Prism 375e680b84c1).
+                    _browser_release_joined(conn, claimed, _join, _benv, "claim_lost")
+                    _kb._abort_lost_claim_spawn(conn, claimed, None)
+                    if placed_host is not None:
+                        spillover.release(placed_host, _rid)
+                    continue
                 if _btok is not None:
                     if placed_host is not None:
                         spillover.release(placed_host, _rid)  # nothing launched: refund
-                    _browser_join_refused(conn, claimed.id, _btok, result, failure_limit)
+                    _browser_join_refused(conn, claimed, _btok, result, failure_limit)
                     continue
                 spawn_kwargs["browser_env"] = _benv
+                _joined = (_join, _benv)
             pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             launched = True
             if placed_host is not None:
@@ -6509,6 +6553,8 @@ def _dispatch_once_locked(
                 pool=admitted_routes.get(claimed.id), placement=placement_record,
             ):
                 _kb._abort_lost_claim_spawn(conn, claimed, int(pid))
+                if _joined is not None:
+                    _browser_release_joined(conn, claimed, *_joined, "claim_lost_after_spawn")
                 continue
             if not pid:
                 # No pid reported (no ``spawned`` event): still one record.
@@ -6550,6 +6596,8 @@ def _dispatch_once_locked(
         except Exception as exc:
             if placed_host is not None and not launched:
                 spillover.release(placed_host, _rid)  # pre-launch failure: refund
+            if _joined is not None and not launched:
+                _browser_release_joined(conn, claimed, *_joined, "spawn_failed")  # Prism d598b2a71104
             # A host that cannot place the worker (no restart-safe scope,
             # eb28bc1bf7; no board mount on a pool host, t_9fb4d477) is not
             # the card's failure: the run is closed with ``infrastructure:

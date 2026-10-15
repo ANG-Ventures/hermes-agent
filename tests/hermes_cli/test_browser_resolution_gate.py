@@ -528,3 +528,58 @@ def test_default_spawn_forwards_only_the_lease_this_spawn_took(home, monkeypatch
     _REAL_SPAWN(task, str(tmp_path / "ws"), browser_env=lease)
     got = {k: v for k, v in captured["env"].items() if k.startswith(lease_like)}
     assert got == {"BROWSER_LEASE_URL": "wss://cdp.browsers.ace/eph", "BROWSER_LEASE_TOKEN": "T" * 64}
+
+
+# -- Prism round 1 on #2009 ------------------------------------------------------------------------
+
+@pytest.fixture
+def released(monkeypatch):
+    out = []
+    monkeypatch.setattr(kbd, "_browser_release_lease", lambda host, token: out.append((host, token)) or {"ok": True})
+    return out
+
+
+def test_d598b2a71104_a_failed_spawn_releases_the_joined_lease(home, ledger, join, released):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=EPH_BODY)
+
+        def spawn(task, workspace, *, board=None, placement=None, browser_env=None):
+            raise OSError("exec failed")
+        kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=64, spawn_limit=4, spawn_paused="test",
+                          spillover=_pool(), reconcile_orphans=False)
+        assert released == [("ci-box", "L" * 64)]
+        assert [e["why"] for e in _events(conn, tid, "browser_lease_released")] == ["spawn_failed"]
+        assert "L" * 64 not in json.dumps([tuple(r) for r in conn.execute("SELECT * FROM task_events")])
+
+
+def test_d598b2a71104_a_spawn_that_succeeds_keeps_its_lease(home, ledger, join, released):
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=EPH_BODY)
+        _, got = _live_env(conn)
+        assert tid in got and released == []
+
+
+def test_375e680b84c1_claim_lost_during_the_relay_is_never_cleaned_up_as_ours(home, ledger, join, released,
+                                                                             monkeypatch):
+    calls, relay = join
+    state = {}
+
+    def slow_relay(host, card, run, source_host):
+        # while the relay is out, someone else takes the card: a successor run now owns it
+        with kb.connect_closing() as c2:
+            c2.execute("UPDATE tasks SET current_run_id = current_run_id + 1000 WHERE id=?", (card,))
+            c2.commit()
+            state["run"] = c2.execute("SELECT current_run_id FROM tasks WHERE id=?", (card,)).fetchone()[0]
+        return dict(slow_relay.reply)
+    for reply, want_release in ((LEASE, [("ci-box", "L" * 64)]), ({"ok": False, "refusal": "BROWSER_SYSTEM_OFF"}, [])):
+        released.clear()
+        slow_relay.reply = reply
+        monkeypatch.setattr(kbd, "_browser_relay_create", slow_relay)
+        with kb.connect_closing() as conn:
+            tid = _card(conn, body=EPH_BODY)
+            _, got = _live_env(conn)
+            row = conn.execute("SELECT status, current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()
+            assert tid not in got
+            assert tuple(row) == ("running", state["run"])          # the successor's claim is untouched
+            assert _events(conn, tid, "browser_dispatch_refused") == []
+            assert released == want_release
