@@ -299,3 +299,46 @@ def self_repo_block(
         return None
     logger.warning("Blocked self-repo git mutation (command: %s)", _safe_command_preview(command))
     return _blocked_json(msg, "blocked")
+
+
+def home_deletion_block(
+    *,
+    command: str,
+    env: Any,
+    env_type: str,
+    cwd: str,
+    workdir: Optional[str],
+    session_key: str,
+) -> Optional[str]:
+    """Refuse a command that would recursively delete the Hermes home's protected roots.
+
+    Static analysis only (``agent.home_deletion_guard``): ``$VAR`` references expand against
+    the env the command will run with (process env + the backend's overlay), and a local
+    script invoked by path is read one level deep. Local backend only: other backends run
+    on a filesystem whose paths this process cannot see. Independent of the lifecycle
+    guard's scan budget: it carries its own size/depth bounds and fails open on analyzer
+    errors. Returns the JSON error string when blocked, else None.
+    """
+    if env_type != "local":
+        return None
+    import os
+
+    from agent.home_deletion_guard import BLOCK_MARKER, command_deletes_protected_home, refusal_message
+    from tools.terminal_tool import _resolve_command_cwd
+
+    run_env = dict(os.environ)
+    overlay = getattr(env, "env", None)
+    if isinstance(overlay, dict):
+        run_env.update({k: v for k, v in overlay.items() if isinstance(v, str)})
+    try:
+        guard_cwd = _resolve_command_cwd(
+            workdir=workdir, default_cwd=getattr(env, "cwd", None) or cwd,
+            session_key=session_key, env_type=env_type,
+        )
+    except Exception:
+        guard_cwd = cwd
+    hit = command_deletes_protected_home(command, env=run_env, cwd=guard_cwd)
+    if not hit:
+        return None
+    logger.warning("Blocked protected-home delete: %s (command: %s)", hit, _safe_command_preview(command))
+    return _blocked_json(refusal_message(hit), "blocked", blocked_by=BLOCK_MARKER)
