@@ -294,7 +294,7 @@ def test_full_dispatch_retry_uses_remote_origin(tmp_path, monkeypatch):
     def spawn(task, workspace, *, placement=None, board=None):
         seen.append(placement.name if placement else None)
         assert kb.get_task(conn, task.id).origin_host == 'ace-media'
-        return None
+        return 4242
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title='origin retry', assignee='alpha', body='requires: none')
         conn.execute('UPDATE tasks SET origin_host=?,workspace_path=? WHERE id=?',
@@ -304,6 +304,9 @@ def test_full_dispatch_retry_uses_remote_origin(tmp_path, monkeypatch):
         assert seen == ['ace-media'], result
         assert kb.get_task(conn, tid).origin_host == 'ace-media'
         assert conn.execute('SELECT host FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == 'ace-media'
+        placement = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='placement'", (tid,)).fetchone()[0])
+        assert (placement['route'], placement['rule'], placement['host']) == ('remote-pin', 'origin', 'ace-media')
 
 
 def test_migration_backfills_once_and_drop_survives_reconnect(db):

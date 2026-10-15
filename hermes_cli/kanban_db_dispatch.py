@@ -4286,7 +4286,7 @@ _ROUTE_HOLD = "hold"
 def _spec_route(route: Optional[str], placed: bool, spawned_local: bool) -> Optional[str]:
     """The spec §4.1 route name for an internal ``_route_row`` route."""
     from hermes_cli import kanban_placement_reasons as _pr
-    if route == "pin":
+    if route in ("pin", "origin"):
         return _ROUTE_REMOTE_PIN
     if route == "portable":
         return _ROUTE_LOCAL if spawned_local else _ROUTE_REMOTE_POLICY
@@ -4307,6 +4307,8 @@ def _placement_rule(route: str, arg: Optional[str], rule: Optional[str], placed:
         return _pr.RULE_UNPLANNED
     if route == "portable" and not placed:
         return _pr.RULE_DEFAULT
+    if route == "origin":
+        return _pr.RULE_ORIGIN
     return rule or (_pr.RULE_PIN if route == "pin" else _pr.RULE_DEFAULT)
 
 
@@ -4345,7 +4347,7 @@ def _tick_routes(result, ready_rows, row_route: dict, row_rules: dict, planned: 
     for row in ready_rows:
         tid = row["id"]
         route, arg = row_route.get(tid, ("local", None))
-        host = placed.get(tid) or (arg if route == "pin" else None)
+        host = placed.get(tid) or (arg if route in ("pin", "origin") else None)
         # ``default`` names a portable card the Studio TOOK; a held one keeps
         # the rule it was routed by.
         rule = _placement_rule(route, arg, row_rules.get(tid), tid in placed, planned) \
@@ -4978,7 +4980,7 @@ def _wall_reason(route: str, arg: Optional[str], plan) -> str:
         return arg if route == "wait" and arg else (arg or _pr.LOCAL_FULL)
     return (_route_wait(route, arg, False, plan)
             or ((plan.pin_host_refusal(arg) or "pin_host_full")
-                if route == "pin" else plan.full_reason()))
+                if route in ("pin", "origin") else plan.full_reason()))
 
 
 def _tick_spawn_budget(

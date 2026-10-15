@@ -86,6 +86,7 @@ TOTAL_READY_BUDGET = "ready_budget"
 # above are the rest): ``default`` = portable by policy, placed locally
 # because the Studio had allowance; ``unplanned`` = no pool plan this tick.
 RULE_PIN = "pin"
+RULE_ORIGIN = "origin"  # continuation affinity: the card's state is on that host (t_8bfdcc07)
 RULE_POLICY = "policy"
 RULE_DEFAULT = "default"
 RULE_UNPLANNED = "unplanned"
