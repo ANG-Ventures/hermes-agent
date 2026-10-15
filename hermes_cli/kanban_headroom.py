@@ -19,7 +19,9 @@ Samples come from the per-tick probe (``/proc/loadavg`` + the host's
 Every take, pinned or scored, is a ledger row for ``RESERVE_TTL_S`` written
 BEFORE launch (``placement.admit`` / ``book_pin``), renewed by the tick every
 ``RENEW_EVERY_S`` while its run is live (``renew_running``), and released after
-the run end COMMITS (``_end_run`` -> ``on_commit``). A dry run writes nothing and adds
+the run end COMMITS (``_end_run`` -> ``on_commit``); an orphan (holder gone, no
+release) is reaped at TTL by the same tick. Every admit, refusal, release and
+reap is a row in ``var/placement/admissions.jsonl`` (allocation 2.3). A dry run writes nothing and adds
 only its own simulated takes, so N picks see N headrooms there too.
 
 No table (hermes-home not yet deployed) = the previous pick, logged once.
@@ -149,8 +151,16 @@ def job_for_row(conn, row, *, affinity_targets: Optional[Mapping[str, str]] = No
     except (IndexError, KeyError):
         prio = None
     targets = {h.lower() for h in (affinity_targets or {}).values() if h}
+    try:
+        body = row["body"]
+    except (IndexError, KeyError):
+        body = None
+    # A card may override the kanban class footprint with a body line
+    # ``footprint: ram_gb=8 threads=4`` (allocation 2.3); a malformed one is
+    # refused by the scorer, never read as the default.
     return placement.Job(affinity=next(iter(targets)) if len(targets) == 1 else None,
-                         continuity=previous_host(conn, row["id"]), priority=job_priority(prio))
+                         continuity=previous_host(conn, row["id"]), priority=job_priority(prio),
+                         footprint=placement.footprint_from_text(body))
 
 
 def _add(acc: Dict[str, placement.Footprint], key: str, fp: placement.Footprint) -> None:
@@ -222,14 +232,15 @@ def admit(plan, names, job: Optional[placement.Job], job_id: Optional[str]):
                            admissions_path=rpath.parent / placement.ADMISSIONS_REL.name, job=job, **kw)
 
 
-def book_pin(plan, name: str, job_id: Optional[str]) -> str:
+def book_pin(plan, name: str, job_id: Optional[str], job: Optional[placement.Job] = None) -> str:
     """Book a PINNED take's footprint in the ledger (no scorer: a pin keeps its
     precedence), so the next unpinned admit() and other boards' dispatchers see
     it (Prism 4609a040ad20 / b8c13f6c2e7a / 9b1349450aff). Returns the id."""
     sig = plan.signal
     table = sig.placement_table
     rpath = Path(sig.placement_reservations)
-    return placement.reserve(table.resolve(name) or name, CONSUMER, table.footprint(CONSUMER),
+    fp = table.footprint(CONSUMER, job.footprint if job is not None else None)
+    return placement.reserve(table.resolve(name) or name, CONSUMER, fp,
                              ttl_s=RESERVE_TTL_S, job_id=job_id, path=rpath,
                              now=None if sig.clock is time.time else sig.clock(),
                              admissions_path=rpath.parent / placement.ADMISSIONS_REL.name)

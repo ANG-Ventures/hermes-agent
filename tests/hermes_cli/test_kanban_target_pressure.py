@@ -38,7 +38,12 @@ HOSTS = [_host("ace-ai", 1), _host("ace-media", 2)]
 
 
 def _pressure(host, at, ratio):
-    return json.dumps({"host": host, "at": at, "ncpu": 24, "load1": ratio * 24, "load_ratio": ratio})
+    """A host-pressure.json as the sampler writes it: the kanban band is PUBLISHED
+    (scripts/host-pressure.py, policy lines warm 0.70 / hot 0.80); the reader
+    consumes ``band.kanban`` and never recomputes it from ``load_ratio``."""
+    band = "hot" if ratio >= 0.8 else "warm" if ratio >= 0.7 else "ok"
+    return json.dumps({"host": host, "at": at, "ncpu": 24, "load1": ratio * 24, "load_ratio": ratio,
+                       "band": {"kanban": band}, "band_reason": {"kanban": f"load/thread {ratio:g}"}})
 
 
 class Fleet:
@@ -74,13 +79,13 @@ def _plan(fleet, sig, running=None):
 # -- I-3 / AC-4: stale or unreadable = UNKNOWN, never hot ---------------------
 
 def test_read_pressure_uses_the_remote_clock_and_120s_bound():
-    ok, why = kwp.read_pressure(T0 + 119, _pressure("a", T0, 0.9), stale_after_s=120, warm=0.7, hot=0.8)
+    ok, why = kwp.read_pressure(T0 + 119, _pressure("a", T0, 0.9), stale_after_s=120)
     assert ok == (T0, kwp.BAND_HOT) and why == ""
-    stale, why = kwp.read_pressure(T0 + 121, _pressure("a", T0, 0.9), stale_after_s=120, warm=0.7, hot=0.8)
+    stale, why = kwp.read_pressure(T0 + 121, _pressure("a", T0, 0.9), stale_after_s=120)
     assert stale is None and why == "pressure unknown (stale 121s)"
-    assert kwp.read_pressure(T0, "", stale_after_s=120, warm=0.7, hot=0.8)[0] is None
-    assert kwp.read_pressure(None, _pressure("a", T0, 0.1), stale_after_s=120, warm=0.7, hot=0.8)[0] is None
-    assert kwp.read_pressure(T0, "{nope", stale_after_s=120, warm=0.7, hot=0.8)[0] is None
+    assert kwp.read_pressure(T0, "", stale_after_s=120)[0] is None
+    assert kwp.read_pressure(None, _pressure("a", T0, 0.1), stale_after_s=120)[0] is None
+    assert kwp.read_pressure(T0, "{nope", stale_after_s=120)[0] is None
 
 
 def test_stale_pressure_is_unknown_not_hot(sig):
@@ -149,11 +154,25 @@ def test_unknown_past_the_discard_window_starts_over(sig):
 
 def test_non_finite_pressure_is_unknown():
     """JSON NaN/Infinity (Python's decoder accepts them) never reads as a band."""
-    for doc in ('{"at": %r, "load_ratio": NaN}' % T0, '{"at": Infinity, "load_ratio": 0.1}',
-                '{"at": NaN, "load_ratio": 0.1}', '{"at": %r, "load_ratio": Infinity}' % T0):
-        assert kwp.read_pressure(T0, doc, stale_after_s=120, warm=0.7, hot=0.8)[0] is None, doc
+    for doc in ('{"at": Infinity, "band": {"kanban": "ok"}}', '{"at": NaN, "band": {"kanban": "ok"}}'):
+        assert kwp.read_pressure(T0, doc, stale_after_s=120)[0] is None, doc
     assert kwp.read_pressure(float("nan"), _pressure("a", T0, 0.1),
-                             stale_after_s=120, warm=0.7, hot=0.8)[0] is None
+                             stale_after_s=120)[0] is None
+
+
+def test_read_pressure_consumes_the_published_band_never_load_ratio():
+    """Allocation 2.3 (t_08de4ba5): the kanban band is the sampler's ``band.kanban``.
+    A load_ratio that the old reader would have called hot does not override a
+    published ok, and a file with no ``band.kanban`` is UNKNOWN, never derived."""
+    doc = {"at": T0, "load_ratio": 0.99, "band": {"kanban": "ok"}}
+    assert kwp.read_pressure(T0, json.dumps(doc), stale_after_s=120) == ((T0, kwp.BAND_OK), "")
+    doc = {"at": T0, "load_ratio": 0.01, "band": {"kanban": "hot"}}
+    assert kwp.read_pressure(T0, json.dumps(doc), stale_after_s=120)[0] == (T0, kwp.BAND_HOT)
+    got, why = kwp.read_pressure(T0, json.dumps({"at": T0, "load_ratio": 0.99}), stale_after_s=120)
+    assert got is None and why == "pressure has no band.kanban"
+    nulled = {"at": T0, "band": {"kanban": None}, "band_reason": {"kanban": "load/thread unmeasured"}}
+    got, why = kwp.read_pressure(T0, json.dumps(nulled), stale_after_s=120)
+    assert got is None and why == "pressure has no band.kanban (load/thread unmeasured)"
 
 
 def test_non_finite_ledger_row_does_not_hide_other_consumers(tmp_path):
