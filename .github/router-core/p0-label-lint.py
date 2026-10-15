@@ -20,6 +20,8 @@ closed). Hosted labels (ubuntu-*, macos-*, windows-*, blacksmith-*) are not the 
   R2 main-not-p0         a push:main / merge_group outcome is the pool without a p0 label. RED unless allowlisted.
   R3 studio-not-mac-arm  a job requesting STUDIO_LABEL whose matrix/labels do not include macos + arm.
   R4 p0-on-macos         a job requesting bare `p0` together with a macOS label (the Linux p0 runners cannot run it).
+  R6 p0-unsatisfiable    a job requesting a p0 label plus any other label ([self-hosted, p0]): the p0 runners carry
+                         exactly that one label, so no runner can take it and main CI queues forever.
 REGISTRATION (fleet-ops-scripts ci-runners/host-config/<host>/*.conf, only where such files exist): a pool conf whose
 LABELS carries a p0 label must set NO_DEFAULT_LABELS=1 (-> --no-default-labels), LABELS exactly `p0` (or exactly
 STUDIO_LABEL on mac-studio), and POOL_SIZE = the ruling's count for that host (R5).
@@ -59,14 +61,12 @@ P0_LABELS = (P0, STUDIO_LABEL)
 POOL_SIZES = {"ci-box": 2, "ace-media": 1, "ace-ai": 1, "mac-studio": 1}   # Ace ruling 2026-10-15 01:15
 HOSTED = re.compile(r"^(ubuntu|macos|windows|blacksmith)-[\w.-]+$", re.I)
 EVENTS = {
-    "pr": {"github.event_name": "pull_request", "github.ref": "refs/pull/1/merge", "github.base_ref": "main",
-           "github.head_ref": "feature"},
-    "pr_target": {"github.event_name": "pull_request_target", "github.ref": "refs/heads/main",
-                  "github.base_ref": "main", "github.head_ref": "feature"},
+    # PR refs / branch names vary per PR: opaque (only the event name is a fact), so both outcomes are checked.
+    "pr": {"github.event_name": "pull_request"},
+    "pr_target": {"github.event_name": "pull_request_target"},
     "push": {"github.event_name": "push", "github.ref": "refs/heads/main", "github.ref_name": "main",
              "github.base_ref": "", "github.head_ref": ""},
-    "merge_group": {"github.event_name": "merge_group", "github.ref": "refs/heads/gh-readonly-queue/main/pr-1-abc",
-                    "github.base_ref": "", "github.head_ref": ""},
+    "merge_group": {"github.event_name": "merge_group", "github.base_ref": "", "github.head_ref": ""},
 }
 PR_EVENTS = ("pr", "pr_target")
 OPAQUE_LABEL = "<opaque>"   # an unknown component of a runs-on array; the known labels beside it are kept
@@ -77,6 +77,16 @@ OPAQUE_T = ("opaque", "truthy")   # an opaque value kept by `a || b` only when t
 
 
 # ---------------------------------------------------------------- expression evaluation
+def _gh_truthy(v) -> bool:
+    """GitHub Actions truthiness: false, 0, -0, '', null and NaN are falsy; everything else (incl. [] and {})
+    is truthy."""
+    if v is None or v is False or v == "":
+        return False
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return not (v == 0 or v != v)
+    return True
+
+
 def _eval(expr: str, known: dict, matrix_vals: dict) -> list:
     """Every possible value of one ${{ }} body: str / list / bool / None literals, or OPAQUE."""
     toks = TOKEN.findall(expr)
@@ -101,7 +111,7 @@ def _eval(expr: str, known: dict, matrix_vals: dict) -> list:
             take(")")
             return v
         if t == "!":
-            return [OPAQUE if isinstance(v, tuple) else (not v) for v in atom()]
+            return [OPAQUE if isinstance(v, tuple) else (not _gh_truthy(v)) for v in atom()]
         if t.startswith("'"):
             return [t[1:-1].replace("''", "'")]
         if t in ("true", "false"):
@@ -170,7 +180,7 @@ def _eval(expr: str, known: dict, matrix_vals: dict) -> list:
     def truthy(v):
         if v is OPAQUE_T:
             return True
-        return None if isinstance(v, tuple) else bool(v)
+        return None if isinstance(v, tuple) else _gh_truthy(v)
 
     def combine(vs, ws, keep_left_when):
         out = []
@@ -395,6 +405,12 @@ def scan(root: Path) -> tuple[int, list, list]:
                             if "macos" not in txt or not re.search(r"arm|aarch64", txt):
                                 findings.append(f"{rel}: {tname}: requests {STUDIO_LABEL} but its matrix/labels do "
                                                 f"not include macos + arm (R3)")
+                        known_l = [x for x in low if x != OPAQUE_LABEL.lower()]
+                        for want in P0_LABELS:
+                            if want in known_l and set(known_l) != {want}:
+                                findings.append(f"{rel}: {tname}: requests {list(o)}: the {want} runners register "
+                                                f"with exactly {{{want}}} (--no-default-labels), so no runner can "
+                                                f"take it; request [{want}] alone (R6)")
                         if P0 in low and any("macos" in lab for lab in low):
                             findings.append(f"{rel}: {tname}: requests bare p0 with a macOS label {list(o)}: the Linux "
                                             f"p0 runners cannot run it; use {STUDIO_LABEL} (R4)")
@@ -404,7 +420,7 @@ def scan(root: Path) -> tuple[int, list, list]:
 def _expand(docs: dict, jname: str, job: dict, stack: tuple, findings: list, rel: str) -> list:
     """[(qualified name, job)] with local reusable callees expanded recursively under the caller's events."""
     uses = job.get("uses")
-    if not (isinstance(uses, str) and uses.startswith("./.github/workflows/") and _job_runs_on(job) is None):
+    if not (isinstance(uses, str) and uses.startswith("./.github/workflows/")):
         return [(jname, job)]
     cname = uses.rsplit("/", 1)[-1].split("@")[0]
     if cname in stack:
@@ -415,11 +431,52 @@ def _expand(docs: dict, jname: str, job: dict, stack: tuple, findings: list, rel
         findings.append(f"{rel}: {jname}: local callee {uses} missing or unparseable: cannot prove its labels "
                         f"(fail closed)")
         return []
+    given = job.get("with") if isinstance(job.get("with"), dict) else {}
+    defaults = {}
+    wc = _triggers(callee).get("workflow_call")
+    if isinstance(wc, dict) and isinstance(wc.get("inputs"), dict):
+        for k, spec in wc["inputs"].items():
+            if isinstance(spec, dict) and "default" in spec:
+                defaults[k] = spec["default"]
+    vals = {**defaults, **given}
     out = []
     for cj, cjob in (callee.get("jobs") or {}).items():
         if isinstance(cjob, dict):
-            out += _expand(docs, f"{jname}/{cj}", cjob, stack + (cname,), findings, rel)
+            out += _expand(docs, f"{jname}/{cj}", _bind_inputs(cjob, vals), stack + (cname,), findings, rel)
     return out
+
+
+def _input_expr(v) -> str:
+    """A caller's `with:` value as an expression operand: a full ${{ }} keeps its body, a literal is quoted."""
+    if isinstance(v, str):
+        m = EXPR.fullmatch(v.strip())
+        if m:
+            return "(" + m.group(1).strip() + ")"
+        if EXPR.search(v):
+            return "inputs.__opaque__"
+        return "'" + v.replace("'", "''") + "'"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return "inputs.__opaque__"
+
+
+def _bind_inputs(cjob: dict, vals: dict) -> dict:
+    """The callee job with `inputs.X` in its runs-on replaced by the caller's value (unknown inputs stay opaque)."""
+    ro = cjob.get("runs-on")
+    if ro is None:
+        return cjob
+
+    def sub(x):
+        if isinstance(x, list):
+            return [sub(e) for e in x]
+        if isinstance(x, str) and "inputs." in x:
+            return EXPR.sub(lambda m: "${{ " + re.sub(r"\binputs\.([A-Za-z_][\w-]*)",
+                                                      lambda i: _input_expr(vals[i.group(1)]) if i.group(1) in vals
+                                                      else i.group(0), m.group(1)) + " }}", x)
+        return x
+    return {**cjob, "runs-on": sub(ro)}
 
 
 def _fmt(outs) -> str:
@@ -452,6 +509,8 @@ def check_registration(root: Path) -> list[str]:
             except ValueError:
                 out.append(f"{conf.relative_to(root)}: unparseable Environment= line: {ln.strip()}")
                 continue
+            if not parts:
+                env = {}   # systemd: an empty Environment= resets every earlier assignment
             for part in parts:
                 k, sep, v = part.partition("=")
                 if sep and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
@@ -573,6 +632,17 @@ CONTAINS_CASE = ("name: x\non: [pull_request]\njobs:\n  t:\n    runs-on: ${{ con
 PR_P0_UPPER = PR_P0.replace("runs-on: p0", "runs-on: P0")
 PR_P0_OPAQUE_ARRAY = PR_P0.replace("runs-on: p0", "runs-on: [p0, '${{ inputs.label }}']")
 REG_MULTI = '[Service]\nEnvironment="LABELS=p0" "NO_DEFAULT_LABELS=0" "POOL_SIZE=2"\n'
+HEAD_REF = PR_P0.replace("runs-on: p0", "runs-on: ${{ github.head_ref == 'release' && 'p0' || 'hermes-ci' }}")
+CALLER_WITH = ("name: x\non: [pull_request]\njobs:\n  call:\n    uses: ./.github/workflows/cw.yml\n"
+               "    with:\n      runner: ubuntu-latest\n")
+CALLEE_WITH = ("name: cw\non:\n  workflow_call:\n    inputs:\n      runner: {type: string}\njobs:\n"
+               "  a:\n    runs-on: ${{ inputs.runner }}\n    steps: []\n  b:\n    runs-on: p0\n    steps: []\n")
+CALLEE_WITH_OK = CALLEE_WITH.replace("    runs-on: p0\n", "    runs-on: ${{ inputs.runner }}\n")
+EMPTY_ARRAY = PR_P0.replace("runs-on: p0", "runs-on: ${{ fromJSON('[]') && 'p0' || 'hermes-ci' }}")
+SELFHOSTED_P0 = POOL_MAIN.replace("${{ vars.CI_RUNNER || vars.CI_FALLBACK_RUNNER || 'hermes-ci' }}",
+                                  "[self-hosted, p0]")
+REG_RESET = ("[Service]\nEnvironment=NO_DEFAULT_LABELS=1\nEnvironment=\nEnvironment=LABELS=p0\n"
+             "Environment=POOL_SIZE=2\n")
 REG_GOOD = ("[Service]\nEnvironment=LABELS=p0\nEnvironment=NO_DEFAULT_LABELS=1\nEnvironment=POOL_SIZE=2\n")
 REG_BAD = ("[Service]\nEnvironment=LABELS=self-hosted,p0\nEnvironment=POOL_SIZE=3\n")
 
@@ -625,6 +695,15 @@ def selftest() -> int:
         ("[p0, <opaque>] on a PR is RED (known label kept)", {"w.yml": PR_P0_OPAQUE_ARRAY}, None, None, 1),
         ("multi-assignment Environment= with NO_DEFAULT_LABELS=0 is RED (R5)", {"w.yml": GOOD_SPLIT}, None,
          {"ci-runners/host-config/ci-box/override-p0.conf": REG_MULTI}, 1),
+        ("PR head_ref is opaque (release -> p0 is RED)", {"w.yml": HEAD_REF}, None, None, 1),
+        ("callee with a runner input still expanded: its hard p0 job is RED",
+         {"w.yml": CALLER_WITH, "cw.yml": CALLEE_WITH}, None, None, 1),
+        ("callee runner input bound to the caller's hosted value is GREEN",
+         {"w.yml": CALLER_WITH, "cw.yml": CALLEE_WITH_OK}, None, None, 0),
+        ("fromJSON('[]') is truthy (PR -> p0 is RED)", {"w.yml": EMPTY_ARRAY}, None, None, 1),
+        ("[self-hosted, p0] on main is RED (R6: unsatisfiable)", {"w.yml": SELFHOSTED_P0}, None, None, 1),
+        ("empty Environment= resets NO_DEFAULT_LABELS (R5 RED)", {"w.yml": GOOD_SPLIT}, None,
+         {"ci-runners/host-config/ci-box/override-p0.conf": REG_RESET}, 1),
         ("p0 pool conf with default labels / wrong size is RED (R5)", {"w.yml": GOOD_SPLIT}, None,
          {"ci-runners/host-config/ace-ai/override-p0.conf": REG_BAD}, 1),
     ]

@@ -67,6 +67,22 @@
    "expires": "2027-01-15"
   },
   {
+   "path": "scripts/lcm_reset_aegis_store.sh",
+   "scope": "start_gateway",
+   "kind": "kickstart",
+   "count": 1,
+   "reason": "grandfathered when the spawn-site lint landed (t_3ca3dbc6); Card B cutover inventory: route it through alloc_client.admit / placement.admit (or ALLOC_RESERVATION from alloc-admit), then delete",
+   "expires": "2027-01-15"
+  },
+  {
+   "path": "scripts/release.py",
+   "scope": "dispatch_desktop_build",
+   "kind": "workflow-run",
+   "count": 1,
+   "reason": "grandfathered when the spawn-site lint landed (t_3ca3dbc6); Card B cutover inventory: route it through alloc_client.admit / placement.admit (or ALLOC_RESERVATION from alloc-admit), then delete",
+   "expires": "2027-01-15"
+  },
+  {
    "path": "scripts/termux/assembly_permissions.sh",
    "scope": "prepare_assembly",
    "kind": "docker-run",
@@ -119,6 +135,14 @@
    "scope": "SSHEnvironment._ssh_bulk_upload",
    "kind": "ssh",
    "count": 2,
+   "reason": "grandfathered when the spawn-site lint landed (t_3ca3dbc6); Card B cutover inventory: route it through alloc_client.admit / placement.admit (or ALLOC_RESERVATION from alloc-admit), then delete",
+   "expires": "2027-01-15"
+  },
+  {
+   "path": "tools/environments/ssh.py",
+   "scope": "SSHEnvironment.cleanup",
+   "kind": "ssh",
+   "count": 1,
    "reason": "grandfathered when the spawn-site lint landed (t_3ca3dbc6); Card B cutover inventory: route it through alloc_client.admit / placement.admit (or ALLOC_RESERVATION from alloc-admit), then delete",
    "expires": "2027-01-15"
   }

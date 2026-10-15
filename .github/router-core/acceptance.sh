@@ -8,8 +8,10 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(git -C "$here" rev-parse --show-toplevel)
 read -ra PY <<< "${PYTHON:-python3}"   # may be a multi-word launcher (uv run ... python)
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d) || { echo "acceptance: mktemp failed; refusing to run" >&2; exit 2; }
+case "$tmp" in /?*/*) ;; *) echo "acceptance: unsafe temp dir '$tmp'" >&2; exit 2 ;; esac
+[ -d "$tmp" ] || { echo "acceptance: temp dir '$tmp' missing" >&2; exit 2; }
+trap 'rm -rf -- "$tmp"' EXIT
 fail=0
 
 expect() {   # expect <want-rc> <label> <cmd...>
@@ -27,7 +29,7 @@ expect() {   # expect <want-rc> <label> <cmd...>
 }
 
 fresh_copy() {   # the index's files only, no .git: the lints walk the copy (one process, no xargs split)
-  rm -rf "$tmp/tree"
+  rm -rf -- "${tmp:?}/tree"
   git -C "$root" checkout-index -a -f --prefix="$tmp/tree/" || { echo "FAIL could not copy the tree"; fail=1; }
 }
 

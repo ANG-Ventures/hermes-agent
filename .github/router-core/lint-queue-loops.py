@@ -103,6 +103,18 @@ def _over_ready(it) -> bool:
             and len(it.args) == 1 and isinstance(it.args[0], ast.Name) and it.args[0].id == READY)
 
 
+EAGER = frozenset(("list", "dict", "set", "tuple", "sorted", "frozenset"))
+
+
+def _eager_parent(fn, gen) -> bool:
+    """A GeneratorExp runs only when consumed: accept it as the direct sole argument of list/dict/set/... ."""
+    for n in ast.walk(fn):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in EAGER
+                and len(n.args) == 1 and n.args[0] is gen):
+            return True
+    return False
+
+
 def _route_calls(node) -> list:
     return [c for c in ast.walk(node) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
             and c.func.id == ROUTE_FN]
@@ -151,6 +163,9 @@ def check_dispatcher(root: Path) -> list[str]:
                 if gens[0].ifs:
                     out.append(f"{rel}:{n.lineno}: {ROUTE_FN} comprehension over {READY} carries a filter: "
                                f"every ready row must be routed each tick")
+                elif isinstance(n, ast.GeneratorExp) and not _eager_parent(fn, n):
+                    out.append(f"{rel}:{n.lineno}: {ROUTE_FN} in an unconsumed generator over {READY}: creating it "
+                               f"routes nothing; use a list/dict comprehension")
                 elif all(_conditional_inside(n, c) for c in calls):
                     out.append(f"{rel}:{n.lineno}: {ROUTE_FN} in the comprehension over {READY} is conditional: "
                                f"every ready row must be routed each tick")
@@ -181,7 +196,9 @@ def check_dispatcher(root: Path) -> list[str]:
 # ---------------------------------------------------------------- pool (bash text)
 SLOT_LOOP = re.compile(r'^\s*while\b.*"\$i"\s+-le\s+"\$effective_pool".*;\s*do\s*(?:#.*)?$')
 OPEN_KW = re.compile(r"(?:^|[\s;])(?:do|then)\s*(?:#.*)?$|^\s*(?:while|until|for|if|case)\b")
-EXIT_KW = re.compile(r"(?:^|[\s;&|(])(break|return|exit)(?:\s+(\S+?))?\s*(?:;|$|#|\))")
+SH_TOKEN = re.compile(r"&&|\|\||;;|[;&|()]|[^\s;&|()]+")
+SH_OPS = frozenset(("&&", "||", ";;", ";", "&", "|", "(", ")"))
+SH_PREFIX = frozenset(("!", "{", "}", "then", "else", "elif", "do", "time"))
 
 
 def _strip(line: str) -> str:
@@ -203,32 +220,39 @@ def check_pool(root: Path) -> list[str]:
                 f"inspects nothing (S6)"]
     out = []
     for s in starts:
-        depth = 1
+        depth = 1   # 1 = the slot loop's own body; each `do` opens a level, each `done` closes one
         end = None
         for j in range(s + 1, len(lines)):
-            t = _strip(lines[j]).strip()
-            if not t:
-                continue
-            opens = bool(re.search(r"(?:^|[\s;])do\s*$", t) or re.match(r"^(?:while|until|for)\b.*;\s*do\b", t))
-            closes = bool(re.match(r"^done\b", t) or re.search(r";\s*done\b", t))
-            one_liner = opens and closes   # `for k in ..; do ..; break; done`: its break is its own
-            if opens:
-                depth += 1
-            if closes:
-                depth -= 1
-                if depth == 0:
-                    end = j
-                    break
-            # nested loops may break themselves; only depth-1 statements end the slot loop
-            m = EXIT_KW.search(t)
-            # `break N` leaves N enclosing loops: it ends the slot loop when N >= its depth inside the slot loop
-            # (1 = the slot loop's own body; a one-line nested loop is one deeper). A non-numeric N fails closed.
-            eff = depth + (1 if one_liner else 0)
-            lvl = m.group(2) if m else None
-            n_lvl = int(lvl) if lvl and lvl.isdigit() else (1 if not lvl else 10 ** 6)
-            if m and (m.group(1) != "break" or n_lvl >= eff):
-                out.append(f"{rel}:{j + 1}: `{m.group(1)}` inside the slot loop ends the tick early: a refused slot "
-                           f"must be `i=$((i + 1)); continue` so every slot is presented (§4.2)")
+            cmd_pos = True
+            toks = SH_TOKEN.findall(_strip(lines[j]))
+            k = 0
+            while k < len(toks):
+                tok = toks[k]
+                if tok in SH_OPS:
+                    cmd_pos = True
+                elif cmd_pos and tok in SH_PREFIX:
+                    pass   # `! cmd`, `{ cmd`, `then cmd`, `do cmd`: the next word is still a command
+                elif cmd_pos:
+                    cmd_pos = False
+                    if tok == "done":
+                        depth -= 1
+                        if depth == 0:
+                            end = j
+                            break
+                    elif tok in ("break", "return", "exit"):
+                        arg = toks[k + 1] if k + 1 < len(toks) and toks[k + 1] not in SH_OPS else None
+                        # `break N` leaves N loops: it ends the slot loop when N >= the current depth.
+                        # A non-numeric N fails closed; return/exit always end it.
+                        n_lvl = 1 if arg is None else (int(arg) if arg.isdigit() else 10 ** 6)
+                        if tok != "break" or n_lvl >= depth:
+                            out.append(f"{rel}:{j + 1}: `{tok}` inside the slot loop ends the tick early: a refused "
+                                       f"slot must be `i=$((i + 1)); continue` so every slot is presented (§4.2)")
+                if tok == "do":
+                    depth += 1
+                    cmd_pos = True
+                k += 1
+            if end is not None:
+                break
         if end is None:
             out.append(f"{rel}:{s + 1}: slot loop has no matching `done`: cannot inspect it (S6)")
     return out
@@ -296,11 +320,17 @@ DISPATCH_IFEXP_ROUTE = DISPATCH_OK.replace("_route_row(conn, r) for r", "(_route
 DISPATCH_GUARD_BODY_BREAK = DISPATCH_OK.replace(
     '                record_only = "budget"\n', '                if refused(row):\n                    break\n'
     '                record_only = "budget"\n')
+DISPATCH_LAZY_GEN = DISPATCH_OK.replace('{r["id"]: _route_row(conn, r) for r in ready_rows}',
+                                        '(_route_row(conn, r) for r in ready_rows)')
+DISPATCH_EAGER_GEN = DISPATCH_OK.replace('{r["id"]: _route_row(conn, r) for r in ready_rows}',
+                                         'list(_route_row(conn, r) for r in ready_rows)')
 POOL_409_BREAK = POOL_OK.replace("        i=$((i + 1))\n        continue\n", "        break\n")
 POOL_BREAK2 = POOL_OK.replace('[ "$k" = 2 ] && break; done', '[ "$k" = 2 ] && break 2; done')
 POOL_BREAK2_NESTED = POOL_OK.replace('      for k in 1 2; do [ "$k" = 2 ] && break; done\n',
                                      '      for k in 1 2; do\n        [ "$k" = 2 ] && break 2\n      done\n')
 POOL_BREAK1_NESTED = POOL_BREAK2_NESTED.replace("break 2", "break")
+POOL_EXIT_AFTER_NESTED = POOL_OK.replace('[ "$k" = 2 ] && break; done', '[ "$k" = 2 ] && break; done; exit 1')
+POOL_BREAK_OR_TRUE = POOL_OK.replace("        i=$((i + 1))\n        continue\n", "        break || true\n")
 POOL_EXIT = POOL_OK.replace('      spawn "$i" &\n', '      spawn "$i" || exit 1\n')
 
 
@@ -326,6 +356,10 @@ def selftest() -> int:
         ("dispatcher: _route_row behind an IfExp is RED", {D: DISPATCH_IFEXP_ROUTE}, ["dispatcher"], 1),
         ("dispatcher: break INSIDE the route_first guard body is RED", {D: DISPATCH_GUARD_BODY_BREAK},
          ["dispatcher"], 1),
+        ("dispatcher: _route_row in an unconsumed generator is RED", {D: DISPATCH_LAZY_GEN}, ["dispatcher"], 1),
+        ("dispatcher: list(<generator>) routing is GREEN", {D: DISPATCH_EAGER_GEN}, ["dispatcher"], 0),
+        ("pool: exit after a one-line nested loop on the same line is RED", {P: POOL_EXIT_AFTER_NESTED}, ["pool"], 1),
+        ("pool: `break || true` is RED", {P: POOL_BREAK_OR_TRUE}, ["pool"], 1),
         ("pool: `break 2` in a one-line nested loop is RED", {P: POOL_BREAK2}, ["pool"], 1),
         ("pool: `break 2` in a multi-line nested loop is RED", {P: POOL_BREAK2_NESTED}, ["pool"], 1),
         ("pool: plain `break` in a multi-line nested loop is GREEN", {P: POOL_BREAK1_NESTED}, ["pool"], 0),

@@ -73,13 +73,23 @@ EXCLUDE = re.compile(r"(^|/)(tests?|fixtures|\.venv|venv|node_modules|retired|_a
 # cheap pre-filter: a file with none of these cannot hold a spawn
 PREFILTER = re.compile(r"ssh|docker|systemd-run|kickstart|workflow|jitconfig|registration-token|kanban|"
                        r"_default_spawn|start_arm|open_session")
+# Extensionless shebang scripts are scanned only under these top-level dirs. The CI trigger (.github/ci/suites.json
+# lf_spawn_site_lint) and the autocommit gate (scripts/lib/main-gate-set.json spawn-site-lint#2) must list
+# `<dir>/**` for each, plus **/*.py **/*.sh **/*.bash; lint() checks that parity, so scan surface == trigger surface.
+EXTLESS_DIRS = ("scripts", "fleet", "bin", "profiles", "skills-shared", "var", "cron", "hooks")
+TRIGGER_GLOBS = ("**/*.py", "**/*.sh", "**/*.bash") + tuple(f"{d}/**" for d in EXTLESS_DIRS)
 NAMED_SPAWNS = frozenset(("_default_spawn", "start_arm", "open_session"))
 NON_FLEET = re.compile(r"^(?:[\w.-]+@)?(?:github\.com|gitlab\.com|localhost|127\.0\.0\.1|::1)$")
 
 SUBP_ATTR = frozenset(("run", "Popen", "call", "check_call", "check_output"))
 SUBP_MOD = frozenset(("subprocess", "sp", "_sp", "_subprocess"))
-OS_ATTR = frozenset(("system", "popen", "execvp", "execv", "execvpe", "spawnvp", "posix_spawnp", "posix_spawn"))
+OS_ATTR = frozenset(("system", "popen", "execv", "execvp", "execve", "execvpe", "execl", "execlp", "execle",
+                     "execlpe", "spawnv", "spawnvp", "spawnve", "spawnvpe", "spawnl", "spawnlp", "spawnle", "spawnlpe",
+                     "posix_spawn", "posix_spawnp"))
 ASYNC_ATTR = frozenset(("create_subprocess_exec", "create_subprocess_shell"))
+BARE_SUBP = frozenset(("run", "call", "check_call", "check_output", "Popen", "getoutput", "getstatusoutput"))
+EXEC_V = re.compile(r"^(?:execv|execvp|execve|execvpe|spawnv|spawnvp|spawnve|spawnvpe|posix_spawn|posix_spawnp)$")
+EXEC_L = re.compile(r"^(?:execl|execlp|execle|execlpe|spawnl|spawnlp|spawnle|spawnlpe)$")
 
 # shell-text kinds, ordered; the ssh rule is the generic one, so it is checked LAST
 SHELL_KINDS = (
@@ -111,7 +121,7 @@ def scan_files(root: Path) -> list[str]:
             continue
         if f.endswith(SCAN_EXT):
             out.append(f)
-        elif "." not in f.rsplit("/", 1)[-1]:
+        elif "." not in f.rsplit("/", 1)[-1] and f.split("/", 1)[0] in EXTLESS_DIRS and "/" in f:
             try:
                 with open(root / f, "rb") as fh:
                     head = fh.readline(200)
@@ -162,7 +172,7 @@ def _all_text(node) -> str:
     return "\n".join(parts)
 
 
-def _is_subprocess_call(call: ast.Call) -> bool:
+def _is_subprocess_call(call: ast.Call, bare: frozenset = frozenset()) -> bool:
     f = call.func
     if isinstance(f, ast.Attribute):
         r = _recv(f)
@@ -172,31 +182,67 @@ def _is_subprocess_call(call: ast.Call) -> bool:
             return True
         if f.attr in ASYNC_ATTR:
             return True
-    if isinstance(f, ast.Name) and f.id in ("Popen", "check_output", "check_call", "create_subprocess_exec"):
+    if isinstance(f, ast.Name) and (f.id in ("Popen", "check_output", "check_call", "create_subprocess_exec",
+                                             "create_subprocess_shell") or f.id in bare):
         return True
     return False
 
 
-def _argv_head(node) -> list:
-    """The leading argv tokens: str for a literal, 'SSH' for an ssh helper, None for unknown."""
+def _call_argv(call: ast.Call) -> list:
+    """The node(s) that hold the spawned argv: positional or `args=`; exec-style calls (os.execl*, spawnl*,
+    create_subprocess_exec) pass one token per positional argument, os.execv*/spawnv*/posix_spawn* pass a list."""
+    attr = _name(call.func)
+    pos = list(call.args)
+    if not pos:
+        kw = next((k.value for k in call.keywords if k.arg in ("args", "cmd", "command")), None)
+        return [kw] if kw is not None else []
+    if EXEC_V.match(attr):
+        idx = 2 if attr.startswith("spawn") else 1
+        return [pos[idx]] if len(pos) > idx else pos[:1]
+    if EXEC_L.match(attr):
+        return pos[2:] if attr.startswith("spawn") else pos[1:]
+    if attr == "create_subprocess_exec":
+        return pos
+    return pos[:1]
+
+
+def _head_of(nodes: list, known: dict) -> list:
+    if len(nodes) == 1:
+        n = nodes[0]
+        return _argv_head(n.value if isinstance(n, ast.Starred) else n, known)
+    head = []
+    for n in nodes:
+        if isinstance(n, ast.Starred):
+            head += _argv_head(n.value, known)
+        else:
+            t = _literal_text(n)
+            head.append(t if t is not None and "\x00" not in t else
+                        ("SSH" if not head and "ssh" in _name(n).lower() else None))
+    return head
+
+
+def _argv_head(node, known: dict | None = None) -> list:
+    """The FULL argv tokens (never truncated: an endpoint can sit after the 4th token): str for a literal, 'SSH' for
+    an ssh helper, None for unknown. ``known`` maps a local name to the argv it was bound to (`cmd = [...]`)."""
+    known = known or {}
+    if isinstance(node, ast.Name) and node.id in known:
+        return list(known[node.id])
     if isinstance(node, (ast.List, ast.Tuple)):
         out = []
         for e in node.elts:
             t = _literal_text(e)
             if t is not None and "\x00" not in t:
                 out.append(t)
-            elif isinstance(e, ast.Starred) and "ssh" in _name(e.value).lower():
-                out.append("SSH")
-            elif "ssh" in _name(e).lower() and not isinstance(e, ast.Constant):
+            elif isinstance(e, ast.Starred):
+                sub = _argv_head(e.value, known)
+                out += sub if sub else [None]
+            elif "ssh" in _name(e).lower() and not isinstance(e, ast.Constant) and not out:
                 out.append("SSH")
             else:
                 out.append(None)
-            if len(out) >= 4:
-                break
         return out
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _argv_head(node.left)
-        return left + _argv_head(node.right) if len(left) < 4 else left
+        return _argv_head(node.left, known) + _argv_head(node.right, known)
     if isinstance(node, (ast.Call, ast.Name, ast.Attribute)) and "ssh" in _name(node).lower():
         return ["SSH"]
     t = _literal_text(node)
@@ -250,32 +296,51 @@ def _classify_shell_text(text: str) -> str | None:
 class _PyScope:
     def __init__(self, name: str, node):
         self.name, self.node = name, node
-        self.admit_names: set[str] = set()
-        self.env_names: set[str] = set()
+        self.admit_names: dict[str, int] = {}   # name -> line it was FIRST bound from an admit call
+        self.env_names: dict[str, int] = {}     # name -> line it FIRST carried ALLOC_RESERVATION
         self.docker_names: set[str] = set()   # names bound to a 'docker run' script
         self.mint_names: set[str] = set()
+        self.argv: dict[str, list] = {}       # local name -> argv head it was bound to (`cmd = ["ssh", ...]`)
 
 
 def _scope_facts(sc: _PyScope) -> None:
-    for n in _walk_own(sc.node):
-        if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None:
+    assigns = sorted((n for n in _walk_own(sc.node) if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign))),
+                     key=lambda n: (n.lineno, n.col_offset))
+    for n in assigns:
+        if isinstance(n, ast.AugAssign):   # cmd += [...]
+            if isinstance(n.target, ast.Name) and n.target.id in sc.argv and isinstance(n.op, ast.Add):
+                sc.argv[n.target.id] = sc.argv[n.target.id] + _argv_head(n.value, sc.argv)
+            continue
+        if n.value is not None:
             targets = n.targets if isinstance(n, ast.Assign) else [n.target]
             names = {t.id for tg in targets for t in ast.walk(tg) if isinstance(t, ast.Name)}
             v = n.value
+            if isinstance(v, (ast.List, ast.Tuple, ast.BinOp, ast.Constant, ast.JoinedStr)) or (
+                    isinstance(v, ast.Name) and v.id in sc.argv):
+                head = _argv_head(v, sc.argv)
+                for tg in targets:
+                    if isinstance(tg, ast.Name):
+                        if head:
+                            sc.argv[tg.id] = head
+                        else:
+                            sc.argv.pop(tg.id, None)
             if isinstance(v, ast.Call) and _name(v.func) in ("admit", "alloc_admit") and (
                     isinstance(v.func, ast.Name) or re.search(r"alloc|placement|^pl$", _recv(v.func))):
-                sc.admit_names |= names
+                for nm in names:
+                    sc.admit_names.setdefault(nm, n.lineno)
             txt = _all_text(v)
             if "ALLOC_RESERVATION" in txt or any(isinstance(k, ast.keyword) and k.arg == "ALLOC_RESERVATION"
                                                   for k in ast.walk(v)):
-                sc.env_names |= names
+                for nm in names:
+                    sc.env_names.setdefault(nm, n.lineno)
             if re.search(r"\bdocker\s+(?:container\s+)?run\b", txt):
                 sc.docker_names |= names
             if re.search(r"generate-jitconfig|runners/registration-token", txt):
                 sc.mint_names |= names
             for tg in targets:   # env["ALLOC_RESERVATION"] = rid
                 if isinstance(tg, ast.Subscript) and "ALLOC_RESERVATION" in _all_text(tg.slice):
-                    sc.env_names |= {t.id for t in ast.walk(tg.value) if isinstance(t, ast.Name)}
+                    for nm in {t.id for t in ast.walk(tg.value) if isinstance(t, ast.Name)}:
+                        sc.env_names.setdefault(nm, n.lineno)
 
 
 def _walk_own(node):
@@ -289,8 +354,10 @@ def _walk_own(node):
 
 
 def _gated(call: ast.Call, sc: _PyScope) -> bool:
+    # flow rule: the reservation must be bound BEFORE the spawn (a binding on a later line cannot reach it)
     names = {n.id for n in ast.walk(call) if isinstance(n, ast.Name)}
-    if names & (sc.admit_names | sc.env_names):
+    if any(sc.admit_names.get(nm, 1 << 30) < call.lineno or sc.env_names.get(nm, 1 << 30) < call.lineno
+           for nm in names):
         return True
     if any(k.arg in ("reservation_id", "ALLOC_RESERVATION") for k in call.keywords):
         return True
@@ -306,29 +373,41 @@ def py_sites(path: str, text: str) -> list[tuple[str, str, int, bool]]:
         except (SyntaxError, ValueError):
             return [("<module>", "unparseable", 1, False)]
     scopes = [_PyScope("<module>", tree)]
+    # `from subprocess import run` makes a bare run(...) a subprocess call
+    bare = frozenset(a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                     and n.module in ("subprocess", "os", "asyncio") for a in n.names if a.name in BARE_SUBP | OS_ATTR
+                     | ASYNC_ATTR)
 
     def collect(node, prefix):
+        # every function, class body and lambda is its own scope (none inherits another's admission facts)
         for ch in ast.iter_child_nodes(node):
             if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 q = f"{prefix}.{ch.name}" if prefix else ch.name
-                if not isinstance(ch, ast.ClassDef):
-                    scopes.append(_PyScope(q, ch))
+                scopes.append(_PyScope(q, ch))
+                collect(ch, q)
+            elif isinstance(ch, ast.Lambda):
+                q = f"{prefix}.<lambda>" if prefix else "<lambda>"
+                scopes.append(_PyScope(q, ch))
                 collect(ch, q)
             else:
                 collect(ch, prefix)
     collect(tree, "")
     out = []
-    for sc in scopes:
-        _scope_facts(sc)
-        seen_mint = False
+    _scope_facts(scopes[0])
+    module_argv = dict(scopes[0].argv)   # module-level argv constants (BASE = ["ssh", ...]) are visible everywhere;
+    for sc in scopes:                    # admission facts are never shared between scopes
+        if sc is not scopes[0]:
+            sc.argv = dict(module_argv)
+            _scope_facts(sc)
         for n in _walk_own(sc.node):
             if not isinstance(n, ast.Call):
                 continue
             kind = None
-            if _is_subprocess_call(n) and n.args:
-                kind = _classify_argv(_argv_head(n.args[0]))
+            argv = _call_argv(n) if _is_subprocess_call(n, bare) else []
+            if argv:
+                kind = _classify_argv(_head_of(argv, sc.argv))
                 if kind is None:
-                    names = {x.id for x in ast.walk(n.args[0]) if isinstance(x, ast.Name)}
+                    names = {x.id for a in argv for x in ast.walk(a) if isinstance(x, ast.Name)}
                     if names & sc.mint_names:
                         kind = "runner-mint"
             elif "ssh" in _name(n.func).lower() and not isinstance(n.func, ast.Attribute) or \
@@ -340,16 +419,49 @@ def py_sites(path: str, text: str) -> list[tuple[str, str, int, bool]]:
                     kind = "docker-run"
             elif _name(n.func) in NAMED_SPAWNS:
                 kind = "named"
-            elif not seen_mint and _name(n.func) in ("run", "check_output", "gh", "_gh", "gh_api", "api") and (
-                    re.search(r"generate-jitconfig|runners/registration-token", _all_text(n))
-                    or {x.id for x in ast.walk(n) if isinstance(x, ast.Name)} & sc.mint_names):
-                kind, seen_mint = "runner-mint", True
+            elif _name(n.func) in ("run", "check_output", "gh", "_gh", "gh_api", "api") and (
+                    any(re.search(r"generate-jitconfig|runners/registration-token", _all_text(a))
+                        for a in [*n.args, *(k.value for k in n.keywords)])
+                    or {x.id for a in [*n.args, *(k.value for k in n.keywords)] for x in ast.walk(a)
+                        if isinstance(x, ast.Name)} & sc.mint_names):
+                kind = "runner-mint"   # every mint call counts (no per-scope suppression)
             if kind:
                 out.append((sc.name, kind, n.lineno, _gated(n, sc)))
     return out
 
 
 # ---------------------------------------------------------------- shell
+def _sh_commands(s: str) -> list[str]:
+    """Split one shell line into its commands on unquoted ; & | (&&, || included). A quoted remote command
+    (ssh h 'a; b') stays one command; an unquoted `#` after whitespace starts a comment."""
+    out, cur, q, i = [], [], None, 0
+    while i < len(s):
+        c = s[i]
+        if q:
+            cur.append(c)
+            if c == q:
+                q = None
+            elif c == "\\" and q == '"' and i + 1 < len(s):
+                cur.append(s[i + 1])
+                i += 1
+        elif c in "'\"":
+            q = c
+            cur.append(c)
+        elif c == "\\" and i + 1 < len(s):
+            cur.append(s[i:i + 2])
+            i += 1
+        elif c in ";&|":
+            out.append("".join(cur))
+            cur = []
+        elif c == "#" and (not cur or cur[-1].isspace()):
+            break
+        else:
+            cur.append(c)
+        i += 1
+    out.append("".join(cur))
+    return [x for x in out if x.strip()]
+
+
 def sh_sites(text: str) -> list[tuple[str, str, int, bool]]:
     out = []
     stack: list[tuple[str, str]] = []           # (function name, indent)
@@ -370,16 +482,23 @@ def sh_sites(text: str) -> list[tuple[str, str, int, bool]]:
             continue
         scope = stack[-1][0] if stack else "<top>"
         s = line.lstrip()
-        if not s or s.startswith("#") or SH_NOISE.match(s):
+        if not s or s.startswith("#"):
             continue
         hd = re.search(r"<<-?\s*['\"]?(\w+)['\"]?", s)
         if hd and not heredoc:
             heredoc = hd.group(1)
         if SH_GATE.search(s):
             gated_in[scope] = True
-        kind = _classify_shell_text(s)
-        if kind:
-            out.append((scope, kind, i, gated_in[scope] or "ALLOC_RESERVATION=" in s and "alloc-admit" in s))
+        gated = gated_in[scope] or "ALLOC_RESERVATION=" in s and "alloc-admit" in s
+        cmds = _sh_commands(s)
+        for sub in re.findall(r"\$\(([^()]*)\)|`([^`]*)`", s):   # $(...) / `...` run even inside echo/printf
+            cmds += _sh_commands(sub[0] or sub[1])
+        for cmd in cmds:   # one site per command (pipeline stages included): `a | ssh h x` is classified per stage
+            if SH_NOISE.match(cmd.lstrip()):
+                continue
+            kind = _classify_shell_text(cmd)
+            if kind:
+                out.append((scope, kind, i, gated))
     return out
 
 
@@ -418,6 +537,27 @@ def load_allowlist(path: Path) -> list[dict]:
     return rows
 
 
+def trigger_findings(root: Path) -> list[str]:
+    """The CI trigger and the autocommit gate must cover the scan surface (else a change the lint would flag never
+    runs it). Checked only when the files exist (fixture trees have neither)."""
+    out = []
+    s = root / ".github/ci/suites.json"
+    if s.exists():
+        doc = json.loads(s.read_text(encoding="utf-8"))
+        paths = (doc.get("suites") or doc).get("lf_spawn_site_lint", {}).get("paths", [])
+        miss = [g for g in TRIGGER_GLOBS if g not in paths]
+        if miss:
+            out.append(f".github/ci/suites.json: lf_spawn_site_lint paths miss {miss} (the scan surface)")
+    m = root / "scripts/lib/main-gate-set.json"
+    if m.exists():
+        g = next((g for g in json.loads(m.read_text(encoding="utf-8")).get("gates", [])
+                  if g.get("id") == "spawn-site-lint#2"), None)
+        miss = [x for x in TRIGGER_GLOBS if g is None or x not in g.get("paths", [])]
+        if miss:
+            out.append(f"scripts/lib/main-gate-set.json: spawn-site-lint#2 paths miss {miss} (the scan surface)")
+    return out
+
+
 def lint(root: Path, allowlist: Path, today: dt.date) -> list[str]:
     read, sites = collect_sites(root)
     if read == 0:
@@ -429,7 +569,7 @@ def lint(root: Path, allowlist: Path, today: dt.date) -> list[str]:
         if not g:
             lines[(p, s, k)].append(ln)
     allowed = {}
-    findings = []
+    findings = trigger_findings(root)
     for r in rows:
         key = (r["path"], r["scope"], r["kind"])
         if key in allowed:
@@ -456,7 +596,10 @@ def lint(root: Path, allowlist: Path, today: dt.date) -> list[str]:
 
 
 def seed(root: Path, allowlist: Path) -> int:
-    _, sites = collect_sites(root)
+    read, sites = collect_sites(root)
+    if read == 0:   # never overwrite an inventory from a scan that read nothing
+        print(f"lint-spawn-site: scanned 0 files under {root}; refusing to write {allowlist}", file=sys.stderr)
+        return 1
     old = {}
     if allowlist.exists():
         old = {(r["path"], r["scope"], r["kind"]): r for r in json.loads(allowlist.read_text())["sites"]}
@@ -493,11 +636,33 @@ POOL_SHAPE = ("import subprocess\n\ndef ssh(alias, script):\n    return run_it(a
               "        script = f\"docker run -d --rm --name {name} img\"\n        ssh(host, script)\n")
 HELPER_SSH = ("import subprocess\nSSH_OPTS=['-o','BatchMode=yes']\n\ndef _ssh_cmd():\n    return ['ssh'] + SSH_OPTS\n\n"
               "def go(h, r):\n    subprocess.Popen(_ssh_cmd() + [h, r])\n")
-NOT_SPAWNS = ("#!/bin/bash\n# ssh ci-box 'docker run x'\necho \"run: ssh ace-ai uptime\"\n"
+NOT_SPAWNS = ("#!/bin/bash\n# ssh ci-box 'docker run x'\necho \"run: ssh ci-box uptime\"\n"
               "git push git@github.com:o/r.git\nssh -T git@github.com\nssh-keygen -t ed25519\n")
 RUNNER_MINT = ("class Gh:\n    def jit(self, name):\n"
                "        args = ['-X', 'POST', f'orgs/{self.org}/actions/runners/generate-jitconfig', '-f', name]\n"
                "        return self._gh(args)\n")
+# Prism round 1 (#4308) false negatives, one fixture each
+PR1_KW_ARGS = "import subprocess\n\ndef go(h):\n    subprocess.run(args=['ssh', h, 'make test'])\n"
+PR1_LATE_ENDPOINT = ("import subprocess\n\ndef go():\n    subprocess.run(['gh', 'api', '--method', 'POST', "
+                     "'orgs/acme/actions/runners/registration-token'])\n")
+PR1_TWO_MINTS = ("class Gh:\n    def jit(self, a, b):\n"
+                 "        self._gh(['-X', 'POST', 'orgs/o/actions/runners/generate-jitconfig', a])\n"
+                 "        self._gh(['-X', 'POST', 'orgs/o/actions/runners/generate-jitconfig', b])\n")
+PR1_CLASS_BODY = "import subprocess\n\nclass Worker:\n    process = subprocess.Popen(['ssh', 'ci-box', 'job'])\n"
+PR1_LAMBDA = "import subprocess\n\ndef mk(h):\n    return lambda: subprocess.run(['ssh', h, 'job'])\n"
+PR1_TWO_ON_LINE = "#!/bin/bash\nstart() {\n  docker run image; docker run another-image\n}\n"
+PR1_LOCAL_ARGV = ("import subprocess\n\ndef go(box):\n    cmd = ['ssh', '-o', 'BatchMode=yes', box, 'uptime']\n"
+                  "    subprocess.run(cmd, capture_output=True)\n")
+PR1_BARE_RUN = "from subprocess import run\n\ndef go(h):\n    run(['ssh', h, 'job'])\n"
+PR1_EXEC_STYLE = ("import asyncio, os\n\nasync def go():\n    await asyncio.create_subprocess_exec('docker', 'run', 'img')\n\n"
+                  "def go2(h):\n    os.execvp('ssh', ['ssh', h, 'job'])\n")
+PR1_STARRED = "import subprocess\nBASE = ['ssh', 'ci-box']\n\ndef go():\n    subprocess.run([*BASE, 'job'])\n"
+# Prism round 2 (#4308)
+PR2_LATE_ENV = ("import os, subprocess\n\ndef go(h, rid):\n    env = dict(os.environ)\n"
+                "    subprocess.run(['ssh', h, 'start'], env=env)\n    env['ALLOC_RESERVATION'] = rid\n")
+PR2_ASYNC = "import asyncio\n\nasync def go():\n    await asyncio.create_subprocess_exec('docker', 'run', 'img')\n"
+PR2_PRINTF_PIPE = "#!/bin/bash\nmint() {\n  printf '%s' \"$JIT\" | ssh ci-box 'docker run --rm runner:latest'\n}\n"
+PR2_ECHO_SUBST = "#!/bin/bash\necho \"up: $(ssh ci-box uptime)\"\n"
 PY_NOT = "import subprocess\nsubprocess.run(['ssh-keygen', '-t', 'ed25519'])\nsubprocess.run(['git', 'push'])\n"
 
 
@@ -524,6 +689,25 @@ def selftest() -> int:
         ("ssh via a *ssh* helper (`_ssh_cmd() + [...]`) is RED", {"h.py": HELPER_SSH}, [], 1),
         ("pool shape: docker-run script handed to ssh() is RED", {"p.py": POOL_SHAPE}, [], 1),
         ("CI runner mint (generate-jitconfig via a built argv) is RED", {"m.py": RUNNER_MINT}, [], 1),
+        ("Prism r1: argv via args= keyword is RED", {"k.py": PR1_KW_ARGS}, [], 1),
+        ("Prism r1: runner-mint endpoint after the 4th token is RED", {"e.py": PR1_LATE_ENDPOINT}, [], 1),
+        ("Prism r1: second mint in an allowlisted function is RED", {"m.py": PR1_TWO_MINTS},
+         [row("m.py", "Gh.jit", "runner-mint")], 1),
+        ("Prism r1: spawn in a class body is RED", {"c.py": PR1_CLASS_BODY}, [], 1),
+        ("Prism r1: spawn in a lambda is RED", {"l.py": PR1_LAMBDA}, [], 1),
+        ("Prism r1: two docker runs on one line vs count 1 is RED", {"t.sh": PR1_TWO_ON_LINE},
+         [row("t.sh", "start", "docker-run")], 1),
+        ("Prism r1: argv bound to a local name (cmd = [...]) is RED", {"v.py": PR1_LOCAL_ARGV}, [], 1),
+        ("Prism r1: bare run() from `from subprocess import run` is RED", {"b.py": PR1_BARE_RUN}, [], 1),
+        ("Prism r1: exec-style create_subprocess_exec/os.execvp is RED (2 sites)", {"x.py": PR1_EXEC_STYLE},
+         [row("x.py", "go", "docker-run")], 1),
+        ("Prism r1: exec-style both allowlisted is GREEN", {"x.py": PR1_EXEC_STYLE},
+         [row("x.py", "go", "docker-run"), row("x.py", "go2", "ssh")], 0),
+        ("Prism r1: Starred module-level argv is RED", {"s.py": PR1_STARRED}, [], 1),
+        ("Prism r2: ALLOC_RESERVATION set AFTER the spawn does not gate -> RED", {"f.py": PR2_LATE_ENV}, [], 1),
+        ("Prism r2: await create_subprocess_exec('docker','run',...) is RED", {"a.py": PR2_ASYNC}, [], 1),
+        ("Prism r2: printf ... | ssh h 'docker run' is RED", {"p.sh": PR2_PRINTF_PIPE}, [], 1),
+        ("Prism r2: echo \"$(ssh h ...)\" is RED", {"e.sh": PR2_ECHO_SUBST}, [], 1),
         ("admit in ANOTHER function does not gate (same-scope rule) -> RED", {"a.py": ADMIT_ELSEWHERE}, [], 1),
         ("bash ALLOC_RESERVATION from alloc-admit in scope is GREEN", {"pool.sh": GATED_DOCKER}, [], 0),
         ("python alloc_client.admit -> env ALLOC_RESERVATION is GREEN", {"go.py": GATED_PY}, [], 0),
@@ -532,7 +716,7 @@ def selftest() -> int:
         ("allowlist row past expires is RED", {"pool.sh": UNGATED_DOCKER},
          [row("pool.sh", "start", "docker-run", exp="2026-10-14")], 1),
         ("a second spawn in an allowlisted function is RED (count ratchet)",
-         {"pool.sh": UNGATED_DOCKER.replace("}\n", "  ssh ace-ai 'docker run -d img2'\n}\n")},
+         {"pool.sh": UNGATED_DOCKER.replace("}\n", "  ssh ci-box 'docker run -d img2'\n}\n")},
          [row("pool.sh", "start", "docker-run")], 1),
         ("stale row (site now gated) is RED", {"pool.sh": GATED_DOCKER}, [row("pool.sh", "start", "docker-run")], 1),
     ]
@@ -547,6 +731,13 @@ def selftest() -> int:
         ok = got == want
         bad += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name} (rc {got}, want {want})" + ("" if ok else f": {got_f}"))
+    # --seed-allowlist from an empty tree refuses and leaves the existing inventory untouched
+    d = tree({}, [row("pool.sh", "start", "docker-run")])
+    before = (d / ALLOWLIST).read_text()
+    rc = main(["--root", str(d), "--seed-allowlist"])
+    ok = rc == 1 and (d / ALLOWLIST).read_text() == before
+    print(f"{'ok  ' if ok else 'FAIL'} Prism r1: seed from an empty tree refuses, allowlist unchanged (rc {rc}, want 1)")
+    bad += not ok
     # unreadable allowlist is blind (rc 2), never clean
     d = tree({"pool.sh": GATED_DOCKER}, None)
     (d / "fleet").mkdir()
@@ -554,7 +745,7 @@ def selftest() -> int:
     rc = main(["--root", str(d), "--today", "2026-10-15"])
     print(f"{'ok  ' if rc == 2 else 'FAIL'} unreadable allowlist is blind (rc {rc}, want 2)")
     bad += rc != 2
-    print(f"selftest: {len(cases) + 1 - bad}/{len(cases) + 1} pass")
+    print(f"selftest: {len(cases) + 2 - bad}/{len(cases) + 2} pass")
     return 1 if bad else 0
 
 
