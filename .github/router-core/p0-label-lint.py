@@ -599,7 +599,7 @@ def seed(root: Path, allowlist: Path) -> int:
                     "new job; a stale row fails the lint, so the list only shrinks."),
            "schema": 1, "jobs": jobs}
     allowlist.parent.mkdir(parents=True, exist_ok=True)
-    allowlist.write_text(json.dumps(doc, indent=1) + "\n")
+    allowlist.write_text(json.dumps(doc, indent=1) + "\n", encoding="utf-8")
     print(f"seeded {len(jobs)} rows -> {allowlist}")
     return 0
 

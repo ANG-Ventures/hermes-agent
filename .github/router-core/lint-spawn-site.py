@@ -602,7 +602,7 @@ def seed(root: Path, allowlist: Path) -> int:
         return 1
     old = {}
     if allowlist.exists():
-        old = {(r["path"], r["scope"], r["kind"]): r for r in json.loads(allowlist.read_text())["sites"]}
+        old = {(r["path"], r["scope"], r["kind"]): r for r in json.loads(allowlist.read_text(encoding="utf-8"))["sites"]}
     c = Counter((p, s, k) for p, s, k, _, g in sites if not g)
     rows = []
     for (p, s, k), n in sorted(c.items()):
@@ -615,7 +615,7 @@ def seed(root: Path, allowlist: Path) -> int:
                     "inventory. Never add a row for new code; the lint fails a stale row, so the list only shrinks."),
            "schema": 1, "sites": rows}
     allowlist.parent.mkdir(parents=True, exist_ok=True)
-    allowlist.write_text(json.dumps(doc, indent=1) + "\n")
+    allowlist.write_text(json.dumps(doc, indent=1) + "\n", encoding="utf-8")
     print(f"seeded {len(rows)} rows ({sum(c.values())} spawns) -> {allowlist}")
     return 0
 
