@@ -5020,7 +5020,12 @@ def _run_slash(rest: str) -> str:
         body = err or out
         return f"⚠ /kanban usage error\n{body}" if body else "⚠ /kanban usage error"
     except argparse.ArgumentError as exc:
-        return f"⚠ /kanban usage error\n{_usage_for_error()}\n{exc}"
+        # py>=3.12 raises here (exit_on_error=False) without calling error(), so the
+        # schema-on-miss hook in kanban_parser never runs on this path (t_cd1bcea4).
+        schema = ""
+        if tokens and tokens[0] in kvi.VERB_SCHEMAS and "input: required" not in str(exc):
+            schema = "\n" + kvi.schema_text(tokens[0])
+        return f"⚠ /kanban usage error\n{_usage_for_error()}\n{exc}{schema}"
 
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
         try:
