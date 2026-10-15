@@ -208,6 +208,9 @@ class HostTable:
     path: Optional[Path]
     default_first: Optional[str] = None
     saturate_to: float = DEFAULT_SATURATE_TO
+    # {consumer: {profile: Footprint}}: per-PROFILE classes (``footprints.<c>.profiles``, t_edc220cc); a profile not
+    # listed keeps the consumer's own class
+    profile_footprints: Mapping[str, Mapping[str, Footprint]] = dataclasses.field(default_factory=dict)
 
     def resolve(self, name: str) -> Optional[str]:
         """Canonical host id for ``name`` or one of its aliases (case-folded), else None."""
@@ -219,10 +222,11 @@ class HostTable:
                 return hid
         return None
 
-    def footprint(self, consumer: str, override: Optional[Mapping] = None) -> Footprint:
+    def footprint(self, consumer: str, override: Optional[Mapping] = None, profile: Optional[str] = None) -> Footprint:
         base = self.footprints.get(consumer)
         if base is None:
             raise PlacementError(f"no default footprint for consumer {consumer!r}")
+        base = (self.profile_footprints.get(consumer) or {}).get(profile or "", base)
         if not override:
             return base
         bad = sorted(set(override) - set(FOOTPRINT_KEYS))
@@ -252,6 +256,16 @@ def validate(doc) -> List[str]:
                 errs.append(f"footprints.{c} needs ram_gb >= 0 and threads >= 0")
             elif any(k in fp and (not _num(fp[k]) or fp[k] < 0) for k in ("scratch_gb", "gpu_mb")):
                 errs.append(f"footprints.{c}: scratch_gb / gpu_mb must be numbers >= 0 when present")
+            elif "profiles" in fp:
+                profs = fp["profiles"]
+                if not isinstance(profs, dict):
+                    errs.append(f"footprints.{c}.profiles must map profile -> footprint")
+                    continue
+                for pn, pf in profs.items():
+                    if pn.startswith("_"):
+                        continue
+                    if not isinstance(pf, dict) or not all(_num(pf.get(k)) and pf[k] >= 0 for k in FOOTPRINT_KEYS):
+                        errs.append(f"footprints.{c}.profiles.{pn} needs all of {list(FOOTPRINT_KEYS)} as numbers >= 0")
     hosts = doc.get("hosts")
     if not isinstance(hosts, dict) or not hosts:
         errs.append("hosts must be a non-empty object")
@@ -339,10 +353,12 @@ def load_hosts(path=None) -> HostTable:
             default_preference=str(h.get("default_preference", "normal")),
             unmeasurable_axes=tuple(h.get("unmeasurable_axes", [])))
     fps = {c: Footprint.of(fp) for c, fp in doc["footprints"].items() if not c.startswith("_")}
+    pfps = {c: {pn: Footprint.of(pf) for pn, pf in fp["profiles"].items() if not pn.startswith("_")}
+            for c, fp in doc["footprints"].items() if not c.startswith("_") and isinstance(fp.get("profiles"), dict)}
     cw = dict(DEFAULT_CLOSED_WHEN)
     cw.update({k: float(v) for k, v in (doc.get("closed_when") or {}).items() if not k.startswith("_")})
     return HostTable(hosts=hosts, footprints=fps, closed_when=cw, path=p, default_first=doc.get("default_first"),
-                     saturate_to=float(doc.get("saturate_to", DEFAULT_SATURATE_TO)))
+                     saturate_to=float(doc.get("saturate_to", DEFAULT_SATURATE_TO)), profile_footprints=pfps)
 
 
 class ExclusionsError(PlacementError):
@@ -655,6 +671,7 @@ class Job:
     priority: Optional[int] = None      # 0/1 = may claim the fastest eligible core class
     core_class: Optional[str] = None    # "fast" (highest single-core clock) | "wide" (most threads) | None
     footprint: Optional[Mapping] = None  # overrides the class default (card/body ``footprint:`` line)
+    profile: Optional[str] = None        # picks the consumer's per-profile class when the table has one (t_edc220cc)
 
 
 _FOOTPRINT_LINE = re.compile(r"^[ \t>*-]*footprint\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
@@ -749,7 +766,8 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     pass None only when the caller has just produced the samples itself and vouches for their freshness.
     """
     stale_after_s = _stale_after(stale_after_s)
-    fp = table.footprint(consumer, footprint if footprint is not None else (job.footprint if job else None))
+    fp = table.footprint(consumer, footprint if footprint is not None else (job.footprint if job else None),
+                         profile=job.profile if job else None)
     names = list(candidates) if candidates is not None else list(table.hosts)
     folded: Dict[str, Optional[Sample]] = {}
     for k, v in samples.items():
