@@ -168,6 +168,8 @@ _WRITER_PATH_LOCKS: "dict[str, threading.Lock]" = {}
 # writer must stay superseded after its replacement is collected.
 _WRITER_PATH_OWNERS: "dict[str, int]" = {}
 _WRITER_GENERATION = itertools.count(1)
+# One lock per participation-registry file, shared by every tracker on it.
+_THREAD_REGISTRY_PATH_LOCKS: "dict[str, threading.Lock]" = {}
 
 
 class CoalescingJsonWriter:
@@ -344,7 +346,12 @@ class ThreadParticipationTracker:
     snapshot it had read at construction; an ID another writer (a restore, a
     sibling process) put on disk must survive this process's next mark.  Order
     is recency (the trim keeps the newest ``max_tracked``): on-disk order first,
-    then IDs first seen in memory.  The file is written tmp+rename at 0600.
+    then IDs first seen in memory, then marks not yet persisted (so a fresh mark
+    of an ID already old on disk is the newest, never the first trimmed).  The
+    read+merge+write runs under a lock shared by path: a process-wide threading
+    lock plus a cross-process file lock on ``<file>.lock``, so two trackers or
+    two processes cannot both merge the old file and overwrite each other.  The
+    file is written tmp+rename at 0600.
     """
 
     _MAX_TRACKED = 500
@@ -358,21 +365,35 @@ class ThreadParticipationTracker:
         #   ``_lock``    guards ONLY the in-memory state (``_remember``,
         #                ``__contains__``, ``clear`` and the merge in
         #                ``_save``/``reload``); held for microseconds, safe on the loop.
-        #   ``_io_lock`` worker-only; serializes read+merge+write in ``_save`` so
-        #                two persists cannot interleave and lose an entry.
+        #   ``_io_lock()`` worker-only; per-PATH (threads + processes), serializes
+        #                read+merge+write so two persists cannot interleave and
+        #                lose an entry.
         # ``_save`` must NOT hold ``_lock`` across the disk read or ``os.replace``:
         # the adapters' ``thread_id in tracker`` gate runs on the loop thread and
         # would stall for the whole rename.
         self._lock = threading.Lock()
-        self._io_lock = threading.Lock()
         # IDs discarded in memory but possibly still on disk; the merge must not
         # resurrect them.  Cleared once a write that excluded them lands.
         self._discarded: set[str] = set()
+        # IDs marked since the last write landed, in mark order; the merge puts
+        # them last so the trim cannot drop a mark it was asked to record.
+        self._fresh: dict[str, None] = {}
         self._threads: dict[str, None] = dict.fromkeys(str(t) for t in self._load())
 
     def _state_path(self) -> Path:
         from hermes_constants import get_hermes_home
         return get_hermes_home() / f"{self._platform}_threads.json"
+
+    @contextlib.contextmanager
+    def _io_lock(self):
+        path = self._state_path()
+        key = os.path.abspath(os.fspath(path))
+        with _WRITER_REGISTRY_LOCK:
+            thread_lock = _THREAD_REGISTRY_PATH_LOCKS.setdefault(key, threading.Lock())
+        from tools.skill_usage import skill_file_lock
+
+        with thread_lock, skill_file_lock(Path(key + ".lock")):
+            yield
 
     def _load(self) -> list[str]:
         try:
@@ -386,9 +407,12 @@ class ThreadParticipationTracker:
 
     def _merge_locked(self, on_disk: list[str]) -> list[str]:
         """Union *on_disk* into memory (caller holds ``_lock``); return the trimmed list."""
-        merged = dict.fromkeys(t for t in on_disk if t not in self._discarded)
+        fresh = self._fresh
+        merged = dict.fromkeys(t for t in on_disk if t not in self._discarded and t not in fresh)
         for thread_id in self._threads:
-            merged.setdefault(thread_id, None)
+            if thread_id not in fresh:
+                merged.setdefault(thread_id, None)
+        merged.update(dict.fromkeys(t for t in fresh if t in self._threads))
         thread_list = list(merged)
         if len(thread_list) > self._max_tracked:
             thread_list = thread_list[-self._max_tracked:]
@@ -401,7 +425,7 @@ class ThreadParticipationTracker:
         Adapters call this on connect so a long-lived process picks up IDs another
         writer persisted since construction.
         """
-        with self._io_lock:
+        with self._io_lock():
             on_disk = self._load()
             with self._lock:
                 self._merge_locked(on_disk)
@@ -410,14 +434,17 @@ class ThreadParticipationTracker:
         await _to_thread(self.reload)
 
     def _save(self) -> None:
-        with self._io_lock:
+        with self._io_lock():
             on_disk = self._load()
             with self._lock:
                 thread_list = self._merge_locked(on_disk)
                 written_discards = set(self._discarded)
+                written_fresh = set(self._fresh)
             atomic_json_write(self._state_path(), thread_list, indent=None, mode=0o600)
             with self._lock:
                 self._discarded -= written_discards
+                for thread_id in written_fresh:
+                    self._fresh.pop(thread_id, None)
 
     def _remember(self, thread_id: str) -> bool:
         """Record *thread_id* in memory; ``True`` when a persist is still owed.
@@ -431,6 +458,7 @@ class ThreadParticipationTracker:
             if thread_id in self._threads:
                 return False
             self._threads[thread_id] = None
+            self._fresh[thread_id] = None
             return True
 
     def mark(self, thread_id: str) -> None:
@@ -463,6 +491,7 @@ class ThreadParticipationTracker:
             if thread_id not in self._threads:
                 return
             del self._threads[thread_id]
+            self._fresh.pop(thread_id, None)
             self._discarded.add(thread_id)
         await _to_thread(self._save)
 

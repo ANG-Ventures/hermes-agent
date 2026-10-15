@@ -116,3 +116,71 @@ def test_discord_connect_reloads_the_registry():
     src = inspect.getsource(DiscordAdapter.connect)
     assert "self._threads.reload_async()" in src
     assert src.index("reload_async") < src.index("intents = Intents.default()")
+
+
+def test_fresh_mark_of_an_old_disk_id_is_not_trimmed(state):
+    """A new mark of an ID near the head of the restored file must land as newest."""
+    state.write_text(json.dumps(["m"]))
+    tracker = ThreadParticipationTracker("discord", max_tracked=3)
+    state.write_text(json.dumps(["t", "u", "v"]))
+
+    tracker.mark("t")
+
+    assert _disk(state)[-1] == "t"
+    assert "t" in tracker
+
+
+def test_overlapping_saves_from_two_trackers_keep_both_ids(state, monkeypatch):
+    """Both persists read the old file first unless the transaction is serialized per path."""
+    import threading
+
+    import gateway.platforms.helpers as helpers
+
+    state.write_text("[]")
+    one = ThreadParticipationTracker("discord")
+    two = ThreadParticipationTracker("discord")
+    both_merged = threading.Barrier(2, timeout=1)
+    real_write = helpers.atomic_json_write
+
+    def write_after_both_merged(*args, **kwargs):
+        try:
+            both_merged.wait()
+        except threading.BrokenBarrierError:
+            pass  # serialized: the other save cannot reach here until this one lands
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(helpers, "atomic_json_write", write_after_both_merged)
+
+    async def main():
+        await asyncio.gather(one.mark_async("x"), two.mark_async("y"))
+
+    asyncio.run(main())
+    assert set(_disk(state)) == {"x", "y"}
+
+
+def test_save_waits_for_the_cross_process_file_lock(state):
+    """A sibling process holding ``<file>.lock`` must hold this tracker's persist off."""
+    import threading
+
+    from tools.skill_usage import skill_file_lock
+
+    tracker = ThreadParticipationTracker("discord")
+    lock_path = state.parent / (state.name + ".lock")
+    holding, release = threading.Event(), threading.Event()
+
+    def sibling():
+        with skill_file_lock(lock_path):
+            holding.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=sibling)
+    holder.start()
+    assert holding.wait(5)
+    saver = threading.Thread(target=tracker.mark, args=("a",))
+    saver.start()
+    saver.join(0.3)
+    assert saver.is_alive() and not state.exists(), "persist ran while another holder had the file lock"
+    release.set()
+    saver.join(5)
+    holder.join(5)
+    assert _disk(state) == ["a"]
