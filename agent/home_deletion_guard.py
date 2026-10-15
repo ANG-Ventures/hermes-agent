@@ -339,11 +339,20 @@ def _expand_fields(parts: list, table: Mapping, home: str, *, split: bool = True
             if kind == "x":
                 return False
             if kind == "s":
-                if split:
-                    emit()
-                else:
+                # A blank inside an unquoted default word is a field break ONLY under the
+                # shell's IFS rules: ``IFS=; rm -rf ${U:-/tmp/hermes home}`` passes ONE path
+                # (Prism d0b8d9a3d9eb). Empty IFS joins; opaque IFS is opaque.
+                if not split:
                     text.append(" ")
                     pattern.append(" ")
+                    continue
+                splitter = _ifs_split_re(table)
+                if splitter is None:
+                    return False
+                if splitter and splitter.match(" "):
+                    emit()
+                else:
+                    add_unquoted(" ")
                 continue
             if kind == "v":
                 value = _lookup(table, part[1], part[2])

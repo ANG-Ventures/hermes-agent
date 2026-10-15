@@ -332,3 +332,22 @@ def test_ordinary_commands_stay_well_under_50ms(home):
         check(home, cmd)
     per_call_ms = (time.perf_counter() - start) * 1000 / len(commands)
     assert per_call_ms < 50, per_call_ms
+
+
+
+def test_empty_ifs_joins_an_unquoted_default_word_with_blanks(tmp_path: Path):
+    """Prism d0b8d9a3d9eb: with ``IFS=`` the blank inside ``${U:-/x/hermes home}`` is NOT a field
+    break; the shell passes one path. A home whose path contains a space must still be refused."""
+    user = tmp_path / "user x"
+    root = user / "hermes home"
+    (root / "profiles" / "aegis").mkdir(parents=True)
+    (root / "state.db").write_bytes(b"")
+    env = {"HOME": str(user), "HERMES_HOME": str(root), "PATH": os.environ.get("PATH", "")}
+    cmd = "rm -rf ${UNSET:-%s}" % str(root)
+    # default IFS: the blank splits, the two halves are not protected roots: allowed (shell behaviour)
+    assert not command_deletes_protected_home(cmd, env=env, cwd=str(user))
+    # IFS empty: one field = the protected root: refused
+    assert command_deletes_protected_home("IFS=; " + cmd, env=env, cwd=str(user))
+    assert command_deletes_protected_home(cmd, env=dict(env, IFS=""), cwd=str(user))
+    # IFS set to something that does not contain a blank: still one field
+    assert command_deletes_protected_home(cmd, env=dict(env, IFS=":"), cwd=str(user))

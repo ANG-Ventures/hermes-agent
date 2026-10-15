@@ -301,19 +301,34 @@ def self_repo_block(
     return _blocked_json(msg, "blocked")
 
 
-def _effective_local_run_env(env: Any) -> dict:
+def _effective_local_run_env(env: Any, *, background: bool = False) -> dict:
     """The environment a local command's ``rm`` actually sees, for static analysis.
 
-    Mirrors ``LocalEnvironment._run_bash`` + ``_wrap_command_script``: the Popen env is
-    ``_make_run_env(env.env)`` (profile-home override, passthrough, scrub), then the wrapper
+    Foreground mirrors ``LocalEnvironment._run_bash`` + ``_wrap_command_script``: the Popen env
+    is ``_make_run_env(env.env)`` (profile-home override, passthrough, scrub), then the wrapper
     sources the session snapshot, whose ``export -p`` dump restores variables earlier calls
     exported, and finally restores the profile-scoped passthrough names from the Popen env.
-    The snapshot is parsed, never sourced. Falls back to process env + overlay on error.
+    The snapshot is parsed, never sourced.
+
+    Background (``ProcessRegistry.spawn_local``, incl. a foreground call promoted by its
+    timeout) launches a fresh login shell from ``_sanitize_subprocess_env(os.environ, env.env)``
+    and NEVER sources the snapshot: an ``export D=/tmp/x`` from an earlier foreground call is
+    not visible there, so the guard must not overlay it (Prism 3f7b14131e14). Falls back to
+    process env + overlay on error.
     """
     import os
 
     overlay = getattr(env, "env", None)
     overlay = {k: v for k, v in overlay.items() if isinstance(v, str)} if isinstance(overlay, dict) else {}
+    if background:
+        try:
+            from tools.process_registry import _sanitize_subprocess_env
+            return dict(_sanitize_subprocess_env(os.environ, overlay))
+        except Exception:
+            logger.debug("home deletion guard: background env build failed; using process env", exc_info=True)
+            run_env = dict(os.environ)
+            run_env.update(overlay)
+            return run_env
     try:
         from tools.environments.local import _make_run_env
         run_env = _make_run_env(dict(overlay))
@@ -342,6 +357,7 @@ def home_deletion_block(
     cwd: str,
     workdir: Optional[str],
     session_key: str,
+    background: bool = False,
 ) -> Optional[str]:
     """Refuse a command that would recursively delete the Hermes home's protected roots.
 
@@ -357,7 +373,7 @@ def home_deletion_block(
     from agent.home_deletion_guard import BLOCK_MARKER, command_deletes_protected_home, refusal_message
     from tools.terminal_tool import _resolve_command_cwd
 
-    run_env = _effective_local_run_env(env)
+    run_env = _effective_local_run_env(env, background=background)
     try:
         guard_cwd = _resolve_command_cwd(
             workdir=workdir, default_cwd=getattr(env, "cwd", None) or cwd,
