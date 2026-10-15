@@ -249,3 +249,23 @@ def test_failed_persist_is_retried_by_the_next_mark(state, monkeypatch):
     asyncio.run(tracker.mark_async("a"))  # same thread, next message
 
     assert _disk(state) == ["a"]
+
+
+
+def test_fresh_mark_trimmed_from_memory_does_not_delete_it_from_disk(state):
+    """Prism 2cac297da412 on #2007: an ID can sit in ``_fresh`` (its persist is still owed) while a
+    trim or reload already dropped it from ``_threads``. The merge must then leave it in the on-disk
+    order, not exclude it: it is excluded from disk only when memory will re-append it. Oracle: the
+    durable file. State is set up directly (the shape is reached via a failed save + trim)."""
+    state.write_text(json.dumps(["p", "r", "s"]))      # a sibling writer persisted p; r, s are live
+    tracker = ThreadParticipationTracker("discord", max_tracked=3)
+    assert set(tracker._threads) == {"p", "r", "s"}
+    # the owed mark of `p` survived a trim that dropped `p` from memory (failed persist, then marks
+    # of r, s, t with capacity 3 is one way there); reproduce that memory state exactly:
+    tracker._fresh = {"p": 1}
+    tracker._threads = dict.fromkeys(["r", "s"])
+    tracker._save()                                    # merge disk [p,r,s] + memory [r,s], capacity 3
+    persisted = _disk(state)
+    assert "p" in persisted, f"`p` was on disk with capacity to spare and memory never re-appended it: {persisted}"
+    assert persisted == ["p", "r", "s"]
+    assert "p" not in tracker._fresh, "a dropped fresh mark is no longer owed"

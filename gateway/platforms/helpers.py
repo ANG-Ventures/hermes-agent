@@ -412,11 +412,17 @@ class ThreadParticipationTracker:
     def _merge_locked(self, on_disk: list[str]) -> list[str]:
         """Union *on_disk* into memory (caller holds ``_lock``); return the trimmed list."""
         fresh = self._fresh
+        # A fresh ID is pulled out of the on-disk order ONLY when memory will re-append it (it is
+        # still in ``_threads``).  An owed mark that a trim or reload already dropped from memory
+        # keeps its on-disk slot instead of being deleted (Prism 2cac297da412), and stops being owed.
+        appended = [t for t in fresh if t in self._threads]
+        for thread_id in [t for t in fresh if t not in self._threads]:
+            del fresh[thread_id]
         merged = dict.fromkeys(t for t in on_disk if t not in self._discarded and t not in fresh)
         for thread_id in self._threads:
             if thread_id not in fresh:
                 merged.setdefault(thread_id, None)
-        merged.update(dict.fromkeys(t for t in fresh if t in self._threads))
+        merged.update(dict.fromkeys(appended))
         thread_list = list(merged)
         if len(thread_list) > self._max_tracked:
             thread_list = thread_list[-self._max_tracked:]
