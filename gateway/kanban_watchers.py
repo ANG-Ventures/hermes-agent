@@ -2122,11 +2122,9 @@ class GatewayKanbanWatchersMixin:
                                         # Home-side evidence (home session, its operator,
                                         # its APPROVE) applies only when THIS subscription
                                         # is the home chat (Prism P1 03f8b8156055).
-                                        _home_t = getattr(home_res, "target", None)
-                                        _sub_is_home = bool(_home_t) and (
-                                            _home_t.platform == platform
-                                            and str(_home_t.chat_id) == str(sub.get("chat_id") or "")
-                                            and str(_home_t.thread_id or "") == str(sub.get("thread_id") or "")
+                                        _sub_is_home = _hr.same_chat(
+                                            getattr(home_res, "target", None), platform,
+                                            sub.get("chat_id"), sub.get("thread_id"),
                                         )
                                         _ctx = _ns.card_context(
                                             conn, sub["task_id"], _home_sid,
