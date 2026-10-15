@@ -225,7 +225,8 @@ async def test_chat_scope_fallback_is_authorization_gated():
     interrupted, result = await _stop(stop_source, running_key, authorized=False)
 
     assert interrupted == []
-    assert result == t("gateway.stop.no_active")
+    # An idle /stop latches automatic work off (#1978) and says so after the no-active line.
+    assert str(result).startswith(t("gateway.stop.no_active"))
 
 
 @pytest.mark.asyncio
@@ -237,7 +238,8 @@ async def test_pending_sentinel_is_never_interrupted():
     interrupted, result = await _stop(stop_source, {pending: _AGENT_PENDING_SENTINEL})
 
     assert interrupted == []
-    assert result == t("gateway.stop.no_active")
+    # An idle /stop latches automatic work off (#1978) and says so after the no-active line.
+    assert str(result).startswith(t("gateway.stop.no_active"))
 
 
 @pytest.mark.asyncio
@@ -283,7 +285,8 @@ async def test_chat_scope_fallback_does_not_fold_in_a_prefix_of_the_chat_id():
     interrupted, result = await _stop(stop_source, foreign)
 
     assert interrupted == []
-    assert result == t("gateway.stop.no_active")
+    # An idle /stop latches automatic work off (#1978) and says so after the no-active line.
+    assert str(result).startswith(t("gateway.stop.no_active"))
 
 
 @pytest.mark.asyncio

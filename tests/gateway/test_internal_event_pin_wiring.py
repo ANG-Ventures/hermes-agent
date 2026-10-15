@@ -90,6 +90,8 @@ def _make_runner(
         platform=Platform.DISCORD,
         chat_type="group",
     )
+    # No durable /stop marker: a bare MagicMock entry would fabricate a truthy user_stopped_at.
+    store.lookup_by_session_key.return_value = None
     store.load_transcript.return_value = []
     store.has_platform_message_id.return_value = False
     if durable_prompt_pin is not None:

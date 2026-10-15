@@ -85,6 +85,8 @@ def _authoritative_route_store(*, ensure_loaded, entry_for):
     store = object.__new__(SessionStore)
     store._ensure_loaded = ensure_loaded
     store.entry_for = entry_for
+    # The /stop gate reads the durable marker first; this fixture models a store with none.
+    store.lookup_by_session_key = lambda session_key: None
     return store
 
 

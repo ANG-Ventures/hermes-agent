@@ -120,6 +120,8 @@ def _make_runner(session_db=None):
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
     runner.session_store.reset_session = MagicMock(return_value=None)
+    # No durable /stop marker: a bare MagicMock entry would fabricate a truthy user_stopped_at.
+    runner.session_store.lookup_by_session_key.return_value = None
 
     # Default switch_session impl: returns a SessionEntry carrying the target
     # session_id. Mirrors SessionStore.switch_session semantics for tests that
