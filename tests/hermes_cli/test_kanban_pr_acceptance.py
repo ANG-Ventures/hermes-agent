@@ -385,7 +385,7 @@ _HEAD = "a" * 40
 
 def _breakglass(tmp_path, *, head=_HEAD, rcs=None, tree=None, body_extra="", author="operator",
                 path=None, contexts=("required",), ledger_repo="acme/repo", ledger_receipt=None,
-                comment_path=None):
+                comment_path=None, ledger_extra=None):
     """A fleet-merge break-glass attribution comment, an off-box receipt under the hermes root,
     and fleet-merge's ``merge`` ledger row binding OWNER/REPO#7@head to that receipt."""
     receipt = path or (tmp_path / "home" / "var" / "ci-box" / "offbox-repo-7.receipt")
@@ -398,7 +398,8 @@ def _breakglass(tmp_path, *, head=_HEAD, rcs=None, tree=None, body_extra="", aut
     if ledger_repo:
         with ledger.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps({"repo": ledger_repo, "pr": 7, "head": head, "action": "merge",
-                                 "attempt_id": "att1", "receipt_path": str(ledger_receipt or receipt)}) + "\n")
+                                 "attempt_id": "att1", "receipt_path": str(ledger_receipt or receipt),
+                                 **(ledger_extra or {})}) + "\n")
     absent = ",".join(f"{c} (required, ABSENT on head)" for c in contexts)
     body = (f"\U0001f916 merged-by: apollo \u00b7 lane: operator \u00b7 gate: ADVISORY \u00b7 why: x"
             f" \u00b7 offbox-security-receipt: {comment_path or receipt} \u00b7 red-ci allowed [{absent}]: green receipt{body_extra}")
@@ -516,6 +517,50 @@ def test_breakglass_waiver_negatives_stay_closed(github, tmp_path, case):
     receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
     assert receipt["ok"] is False and "waiver" not in receipt, receipt
     assert receipt["classification"] == ("failure" if case == "failed_check" else "missing")
+
+
+_BASE = "e11a385679f8eb4debe5a697256ebe5a8c4a44cc"
+_ACCEPT_RED = {"accept_red_receipt": f"35 tests fail identically on main base {_BASE} (inherited)"}
+
+
+@pytest.mark.platforms("posix")
+def test_breakglass_accept_red_receipt_waives_red_pytest_rung(github, tmp_path):
+    """fleet-merge --accept-red-receipt landed a pytest_rc=1 receipt (PR #2000 shape): the ledger
+    row for the same repo/PR/head/receipt carries the override naming the 40-hex base sha.
+    RED on main: any rc!=0 refuses the receipt, so the card stays ``missing``."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    github.update(conclusion="success", head=_HEAD, missing=True, pr_state="MERGED",
+                  comments=_breakglass(tmp_path, rcs={"pytest_rc": "1"}, ledger_extra=_ACCEPT_RED))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "success", receipt
+    waiver = receipt["waiver"]
+    assert waiver["kind"] == "break-glass-offbox-accepted-red"
+    assert waiver["accepted_red_base"] == _BASE and waiver["receipt_pytest_rc"] == "1"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("case", ["no_override", "override_without_sha", "ruff_red", "semgrep_red",
+                                  "gitleaks_red", "override_on_other_receipt_row"])
+def test_breakglass_accept_red_negatives_stay_closed(github, tmp_path, case):
+    """Only pytest_rc is overridable, only by the matching ledger row's 40-hex-sha override."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    rcs, extra, kw = {"pytest_rc": "1"}, dict(_ACCEPT_RED), {}
+    if case == "no_override":
+        extra = {}
+    elif case == "override_without_sha":
+        extra = {"accept_red_receipt": "inherited from main, same failures on the base tip"}
+    elif case in ("ruff_red", "semgrep_red", "gitleaks_red"):
+        rcs = {case.replace("_red", "_rc"): "1"}
+    elif case == "override_on_other_receipt_row":
+        other = tmp_path / "home" / "var" / "ci-box" / "offbox-other.receipt"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text("x")
+        kw["ledger_receipt"] = other
+    github.update(conclusion="success", head=_HEAD, missing=True, pr_state="MERGED",
+                  comments=_breakglass(tmp_path, rcs=rcs, ledger_extra=extra, **kw))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False and "waiver" not in receipt, receipt
+    assert receipt["classification"] == "missing"
 
 
 @pytest.mark.platforms("posix")
