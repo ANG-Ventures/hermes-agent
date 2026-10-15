@@ -610,3 +610,27 @@ def test_non_finite_clock_never_reads_a_stale_sample_as_fresh(bad):
         placement.samples_from_pressure(doc, now=T0, stale_after_s=bad)
     with pytest.raises(placement.PlacementError, match="now must be a finite"):
         placement.sample_from_probe(1.0, 100.0, now=bad)
+
+
+# -- per-profile kanban classes (t_edc220cc) ---------------------------------
+
+def test_dispatch_books_the_assignees_profile_class(home):
+    """``job_for_row`` carries the assignee, so a profile with a measured row in
+    ``footprints.kanban.profiles`` is admitted and booked at ITS class; a profile
+    without a row keeps the pooled kanban class."""
+    table = json.loads((home / "config" / "fleet-hosts.json").read_text(encoding="utf-8"))
+    table["footprints"]["kanban"]["profiles"] = {
+        "alpha": {"ram_gb": 7.5, "threads": 1, "scratch_gb": 1, "gpu_mb": 0}}
+    (home / "config" / "fleet-hosts.json").write_text(json.dumps(table), encoding="utf-8")
+    plan = _plan(home, Fleet(), now=__import__("time").time())
+    with kb.connect_closing() as conn:
+        a = kb.create_task(conn, title="a", assignee="alpha")
+        b = kb.create_task(conn, title="b", assignee="beta")
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (a,)).fetchone()
+        assert kh.job_for_row(conn, row).profile == "alpha"
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242, max_spawn=64, spawn_paused=None, spawn_limit=0,
+                          spillover=plan, reconcile_orphans=False)
+    rows = json.loads((home / placement.RESERVATIONS_REL).read_text(encoding="utf-8"))["rows"]
+    booked = {r["job_id"]: r["ram_gb"] for r in rows}
+    assert booked.get(a) == 7.5
+    assert b not in booked or booked[b] == TABLE["footprints"]["kanban"]["ram_gb"]

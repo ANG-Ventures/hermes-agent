@@ -145,7 +145,8 @@ def previous_host(conn, task_id: str) -> Optional[str]:
 def job_for_row(conn, row, *, affinity_targets: Optional[Mapping[str, str]] = None) -> placement.Job:
     """``Job`` for a ready row: affinity = the one remote host a skill manifest
     targets (``host_affinity: <host>``), continuity = the previous placed run's
-    host, priority = the card priority band."""
+    host, priority = the card priority band, profile = the assignee (its
+    measured per-profile kanban class when the table has one, t_edc220cc)."""
     try:
         prio = row["priority"]
     except (IndexError, KeyError):
@@ -155,12 +156,16 @@ def job_for_row(conn, row, *, affinity_targets: Optional[Mapping[str, str]] = No
         body = row["body"]
     except (IndexError, KeyError):
         body = None
+    try:
+        profile = row["assignee"] or None
+    except (IndexError, KeyError):
+        profile = None
     # A card may override the kanban class footprint with a body line
     # ``footprint: ram_gb=8 threads=4`` (allocation 2.3); a malformed one is
     # refused by the scorer, never read as the default.
     return placement.Job(affinity=next(iter(targets)) if len(targets) == 1 else None,
                          continuity=previous_host(conn, row["id"]), priority=job_priority(prio),
-                         footprint=placement.footprint_from_text(body))
+                         footprint=placement.footprint_from_text(body), profile=profile)
 
 
 def _add(acc: Dict[str, placement.Footprint], key: str, fp: placement.Footprint) -> None:
@@ -239,7 +244,8 @@ def book_pin(plan, name: str, job_id: Optional[str], job: Optional[placement.Job
     sig = plan.signal
     table = sig.placement_table
     rpath = Path(sig.placement_reservations)
-    fp = table.footprint(CONSUMER, job.footprint if job is not None else None)
+    fp = table.footprint(CONSUMER, job.footprint if job is not None else None,
+                         profile=job.profile if job is not None else None)
     return placement.reserve(table.resolve(name) or name, CONSUMER, fp,
                              ttl_s=RESERVE_TTL_S, job_id=job_id, path=rpath,
                              now=None if sig.clock is time.time else sig.clock(),
