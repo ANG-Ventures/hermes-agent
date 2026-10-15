@@ -116,3 +116,156 @@ def test_discord_connect_reloads_the_registry():
     src = inspect.getsource(DiscordAdapter.connect)
     assert "self._threads.reload_async()" in src
     assert src.index("reload_async") < src.index("intents = Intents.default()")
+
+
+def test_fresh_mark_of_an_old_disk_id_is_not_trimmed(state):
+    """A new mark of an ID near the head of the restored file must land as newest."""
+    state.write_text(json.dumps(["m"]))
+    tracker = ThreadParticipationTracker("discord", max_tracked=3)
+    state.write_text(json.dumps(["t", "u", "v"]))
+
+    tracker.mark("t")
+
+    assert _disk(state)[-1] == "t"
+    assert "t" in tracker
+
+
+def test_overlapping_saves_from_two_trackers_keep_both_ids(state, monkeypatch):
+    """Both persists read the old file first unless the transaction is serialized per path."""
+    import threading
+
+    import gateway.platforms.helpers as helpers
+
+    state.write_text("[]")
+    one = ThreadParticipationTracker("discord")
+    two = ThreadParticipationTracker("discord")
+    both_merged = threading.Barrier(2, timeout=1)
+    real_write = helpers.atomic_json_write
+
+    def write_after_both_merged(*args, **kwargs):
+        try:
+            both_merged.wait()
+        except threading.BrokenBarrierError:
+            pass  # serialized: the other save cannot reach here until this one lands
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(helpers, "atomic_json_write", write_after_both_merged)
+
+    async def main():
+        await asyncio.gather(one.mark_async("x"), two.mark_async("y"))
+
+    asyncio.run(main())
+    assert set(_disk(state)) == {"x", "y"}
+
+
+def test_save_waits_for_the_cross_process_file_lock(state):
+    """A sibling process holding ``<file>.lock`` must hold this tracker's persist off."""
+    import threading
+
+    from tools.skill_usage import skill_file_lock
+
+    tracker = ThreadParticipationTracker("discord")
+    lock_path = state.parent / (state.name + ".lock")
+    holding, release = threading.Event(), threading.Event()
+
+    def sibling():
+        with skill_file_lock(lock_path):
+            holding.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=sibling)
+    holder.start()
+    assert holding.wait(5)
+    saver = threading.Thread(target=tracker.mark, args=("a",))
+    saver.start()
+    saver.join(0.3)
+    assert saver.is_alive() and not state.exists(), "persist ran while another holder had the file lock"
+    release.set()
+    saver.join(5)
+    holder.join(5)
+    assert _disk(state) == ["a"]
+
+
+def test_re_mark_of_an_id_trimmed_while_pending_is_kept(state):
+    """Pending a,b,c + a reload trims a; re-marking a must persist it as newest."""
+    tracker = ThreadParticipationTracker("discord", max_tracked=2)
+    for thread_id in ("a", "b", "c"):
+        tracker._remember(thread_id)  # accepted, persist still owed
+    tracker.reload()
+    assert "a" not in tracker
+
+    tracker.mark("a")
+
+    assert _disk(state) == ["c", "a"]
+    assert "a" in tracker
+
+
+def test_re_mark_during_an_in_flight_write_stays_owed(state, monkeypatch):
+    """A discard + re-mark of x while x's write is landing must not be cleared by it."""
+    import gateway.platforms.helpers as helpers
+
+    tracker = ThreadParticipationTracker("discord", max_tracked=2)
+    real_write = helpers.atomic_json_write
+    fired = []
+
+    def write_with_interleaved_marks(*args, **kwargs):
+        real_write(*args, **kwargs)
+        if not fired:
+            fired.append(True)
+            for thread_id in ("y", "z"):
+                tracker._remember(thread_id)
+            with tracker._lock:  # discard_async's in-memory half
+                del tracker._threads["x"]
+                tracker._fresh.pop("x", None)
+                tracker._discarded.add("x")
+            tracker._remember("x")
+
+    monkeypatch.setattr(helpers, "atomic_json_write", write_with_interleaved_marks)
+    tracker.mark("x")
+    monkeypatch.setattr(helpers, "atomic_json_write", real_write)
+
+    tracker.mark("w")  # next persist carries every still-owed mark
+
+    persisted = _disk(state)
+    assert persisted[-2:] == ["x", "w"], persisted
+
+
+def test_failed_persist_is_retried_by_the_next_mark(state, monkeypatch):
+    """A lock timeout / write error must not leave the mark accepted but never saved."""
+    import gateway.platforms.helpers as helpers
+
+    tracker = ThreadParticipationTracker("discord")
+    real_write = helpers.atomic_json_write
+
+    def failing_write(*args, **kwargs):
+        raise OSError(36, "Resource deadlock avoided")  # msvcrt LK_LOCK timeout shape
+
+    monkeypatch.setattr(helpers, "atomic_json_write", failing_write)
+    with pytest.raises(OSError):
+        asyncio.run(tracker.mark_async("a"))
+    assert not state.exists()
+    monkeypatch.setattr(helpers, "atomic_json_write", real_write)
+
+    asyncio.run(tracker.mark_async("a"))  # same thread, next message
+
+    assert _disk(state) == ["a"]
+
+
+
+def test_fresh_mark_trimmed_from_memory_does_not_delete_it_from_disk(state):
+    """Prism 2cac297da412 on #2007: an ID can sit in ``_fresh`` (its persist is still owed) while a
+    trim or reload already dropped it from ``_threads``. The merge must then leave it in the on-disk
+    order, not exclude it: it is excluded from disk only when memory will re-append it. Oracle: the
+    durable file. State is set up directly (the shape is reached via a failed save + trim)."""
+    state.write_text(json.dumps(["p", "r", "s"]))      # a sibling writer persisted p; r, s are live
+    tracker = ThreadParticipationTracker("discord", max_tracked=3)
+    assert set(tracker._threads) == {"p", "r", "s"}
+    # the owed mark of `p` survived a trim that dropped `p` from memory (failed persist, then marks
+    # of r, s, t with capacity 3 is one way there); reproduce that memory state exactly:
+    tracker._fresh = {"p": 1}
+    tracker._threads = dict.fromkeys(["r", "s"])
+    tracker._save()                                    # merge disk [p,r,s] + memory [r,s], capacity 3
+    persisted = _disk(state)
+    assert "p" in persisted, f"`p` was on disk with capacity to spare and memory never re-appended it: {persisted}"
+    assert persisted == ["p", "r", "s"]
+    assert "p" not in tracker._fresh, "a dropped fresh mark is no longer owed"
