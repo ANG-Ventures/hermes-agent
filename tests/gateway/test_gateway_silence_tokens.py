@@ -68,6 +68,8 @@ def _runner(monkeypatch, tmp_path):
     runner.session_store.load_transcript.return_value = []
     runner.session_store.append_to_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
+    # No durable /stop marker: a bare MagicMock entry would fabricate a truthy user_stopped_at.
+    runner.session_store.lookup_by_session_key.return_value = None
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(

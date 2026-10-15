@@ -785,7 +785,13 @@ class GatewaySlashCommandsMixin(
         self._session_state(session_key).persistent.run_generation += 1
         self._session_state(session_key).conversation.automatic_turns_paused = True
         queue_mgmt.hold_user_items(self, session_key, self._delivery_adapter_for(source))
-        await self._mark_user_stopped(session_key)
+        # Same contract as the busy path (run_agent_cache): a marker write failure must not abort
+        # /stop before detached delegations are cancelled and the typing status is cleared.
+        try:
+            await self._mark_user_stopped(session_key)
+        except Exception:
+            logger.warning("Failed to persist user_stopped marker for idle-stopped session %s",
+                           session_key, exc_info=True)
 
         # Detached delegations can outlive the parent turn, leaving no resident
         # agent even though this session still owns cancellable work.

@@ -1786,6 +1786,8 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     runner._busy_ack_ts = {}
     runner._post_turn_goal_continuation = AsyncMock()
     runner.session_store.get_or_create_session.return_value = None
+    # Read the durable /stop marker from the real entry, not a MagicMock that fabricates one.
+    runner.session_store.lookup_by_session_key.side_effect = runner.session_store._entries.get
 
     # Count how many times an actual agent run is started for this session.
     agent_runs: list[str] = []
