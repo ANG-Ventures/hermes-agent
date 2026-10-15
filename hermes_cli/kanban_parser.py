@@ -107,6 +107,17 @@ def _base_check_setup(p: argparse.ArgumentParser) -> None:
 
 
 _TASK_ID = _arg("task_id")
+# Operator-Surface S2 (t_cd1bcea4): ONE convention on every lifecycle verb that takes prose /
+# structured input / can refuse. Mapping to each verb's historic field is in the handler.
+_BODY = _arg("--body", metavar="TEXT", help="The verb's text (comment / summary / reason).")
+_BODY_FILE = _arg("--body-file", metavar="PATH",
+                  help="Read the text from PATH ('-' = stdin): backticks, $(...), quotes and "
+                       "newlines reach the board byte-exact. Exclusive with --body.")
+_JSON_IN = _arg("--json", dest="json_input", metavar="JSON|@PATH|-",
+                help="Structured input as a JSON object: inline, @PATH, or '-' for stdin.")
+_WHY = _arg("--why", action="store_true",
+            help="Print what would refuse this call (card state + every input problem) and the "
+                 "command that clears it, then exit 0 without acting.")
 _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
@@ -263,6 +274,7 @@ _SPECS = [
              help="Read the opening post from a file ('-' = stdin), so bodies with embedded "
                   "newlines, backticks, $(...) or flag-like lines survive shell quoting. "
                   "Mutually exclusive with --body."),
+        _WHY,
         _arg("--assignee", help="Profile name to assign"),
         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
         _arg("--parent-kind", default=kb.DEFAULT_LINK_KIND, choices=sorted(kb.VALID_LINK_KINDS),
@@ -522,12 +534,14 @@ _SPECS = [
     ], help="Atomically claim a ready task (prints resolved workspace path)"),
     _cmd("comment", [
         _TASK_ID,
-        _arg("text", nargs="*", help="Comment body (or use --body-file)"),
+        _arg("text", nargs="*", help="Comment body (or use --body / --body-file)"),
+        _BODY,
         _arg("--body-file", metavar="PATH",
              help="Read the comment body from PATH ('-' = stdin). Use this for "
                   "text with backticks or $(...): the shell never sees it."),
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
+        _WHY,
     ], help="Append a comment"),
     _cmd("attach", [
         _TASK_ID,
@@ -543,9 +557,11 @@ _SPECS = [
         _arg("--result", help="Result summary"),
         _arg("--summary",
              help="Structured handoff summary for downstream tasks. Falls back to --result if omitted."),
+        _BODY, _BODY_FILE,
         _arg("--metadata",
              help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
-                  '"tests_run": 12}\'). Stored on the closing run.'),
+                  '"tests_run": 12}\'). Stored on the closing run. Same as --json.'),
+        _JSON_IN, _WHY,
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
                   "even without owning its run (closes the worker's run)."),
@@ -651,7 +667,8 @@ _SPECS = [
        help="Edit task fields or recovery fields on an already-completed task, or (re)stamp its home session with --session"),
     _cmd("block", [
         _TASK_ID,
-        _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
+        _arg("reason", nargs="*", help="Reason (also appended as a comment; or --body / --body-file)"),
+        _BODY, _BODY_FILE, _WHY,
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
@@ -715,17 +732,29 @@ _SPECS = [
         _arg("--allow-same-actor", action="store_true",
              help="Permit the implementer to review their own work (normally refused). "
                   "Recorded on the review_requested event."),
-        _arg("--metadata", help="JSON object with structured reviewer handoff facts."),
+        _BODY, _BODY_FILE,
+        _arg("--metadata", help="JSON object with structured reviewer handoff facts. Same as --json."),
+        _JSON_IN, _WHY,
         _arg("--force", action="store_true",
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
     _cmd("request-changes", [
         _TASK_ID,
-        _arg("reason", nargs="+",
-             help="Concrete changes required; first post a current-run review_coverage JSON comment"),
+        _arg("reason", nargs="*",
+             help="Concrete changes required (or --body / --body-file)"),
+        _BODY, _BODY_FILE,
+        _arg("--finding", action="append", default=[], metavar="TEXT",
+             help="One finding (repeatable). Builds the review_coverage JSON: findings=count, "
+                  "items, head_sha from the card's routed PR, review_minutes from the review "
+                  "run, batch_id. No hand-written JSON."),
+        _arg("--lens", action="append", default=[], metavar="NAME=STATE",
+             help="Lens state for the built record (repeatable): contract=done, "
+                  "mutation='n/a: docs only', or all=done for every lens not named."),
         _arg("--coverage",
-             help="Review coverage JSON; records a run-attributed comment before transition (human CLI)"),
+             help="Review coverage JSON; records a run-attributed comment before transition (human CLI). "
+                  "Same as --json; with --finding its keys override the built ones."),
+        _JSON_IN, _WHY,
         _arg("--operator-kind", dest="operator_kind", choices=list(kb.OPERATOR_KINDS), default=None,
              help="With --operator: who sent it back, recorded on the changes_requested event "
                   "(default human; automation passes machine so landing gates never treat it as a "
@@ -1124,4 +1153,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     _add_home_guard_flags(sub)
     _add_verb_board_flag(sub)
     _intermix_optional_positionals(kanban_parser)
+    _schema_on_usage_error(sub)
     return kanban_parser
+
+
+def _schema_on_usage_error(sub: argparse._SubParsersAction) -> None:
+    """An argparse refusal on a lifecycle verb prints that verb's full schema too (S2, t_cd1bcea4):
+    "the following arguments are required: task_id" alone is the one-field-per-refusal shape."""
+    from hermes_cli.kanban_verb_input import VERB_SCHEMAS, schema_text
+
+    for name, p in sub.choices.items():
+        if name not in VERB_SCHEMAS:
+            continue
+        base = type(p)
+
+        class _SchemaOnError(base):  # type: ignore[misc, valid-type]
+            _verb = name
+
+            def error(self, message):
+                super().error(f"{message}\n{schema_text(self._verb)}")
+
+        p.__class__ = _SchemaOnError
