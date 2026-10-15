@@ -84,11 +84,13 @@ _TRANSPARENT = frozenset({
 _FIND_FILTERS = frozenset({"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename",
                            "-regex", "-iregex", "-lname", "-ilname"})
 _UNKNOWN = object()  # an opaque value (command substitution, positional args, ...)
+_OPAQUE_CWD = "\x00unknown"  # cwd after `cd <opaque>`: only absolute targets resolve
 
 
 # ── lexer ──────────────────────────────────────────────────────────────────────────────
 # A word is a list of parts: ("u", text) unquoted literal, ("q", text) quoted literal,
-# ("v", name, default_or_None, quoted) variable, ("x",) opaque. Separators are None.
+# ("v", name, default_parts_or_None, quoted) variable, ("x",) opaque, ("s",) a field break
+# inside an unquoted ``${X:-a b}`` default. Separators are None.
 
 def _match_close(s: str, i: int, open_c: str, close_c: str) -> int:
     """Index just past the ``close_c`` balancing ``s[i] == open_c`` (quote-aware)."""
@@ -132,7 +134,7 @@ def _dollar(s: str, i: int, quoted: bool) -> tuple[tuple, int]:
             return ("v", body, None, quoted), end
         if m and body[m.end():m.end() + 2] in (":-", ":=") or (m and body[m.end():m.end() + 1] in ("-", "=")):
             op_len = 2 if body[m.end()] == ":" else 1
-            return ("v", m.group(0), body[m.end() + op_len:], quoted), end
+            return ("v", m.group(0), _default_parts(body[m.end() + op_len:], quoted), quoted), end
         return ("x",), end
     m = _NAME_RE.match(s, i + 1)
     if m:
@@ -140,6 +142,34 @@ def _dollar(s: str, i: int, quoted: bool) -> tuple[tuple, int]:
     if nxt and (nxt.isdigit() or nxt in "@*#?$!-"):
         return ("x",), i + 2
     return (("q" if quoted else "u"), "$"), i + 1
+
+
+def _requote(parts: list) -> list:
+    """Parts as they behave inside double quotes: no field splitting, no globbing."""
+    out = []
+    for p in parts:
+        if p[0] == "u":
+            out.append(("q", p[1]))
+        elif p[0] == "s":
+            out.append(("q", " "))
+        elif p[0] == "v":
+            out.append(("v", p[1], _requote(p[2]) if p[2] is not None else None, True))
+        else:
+            out.append(p)
+    return out
+
+
+def _default_parts(text: str, quoted: bool) -> list:
+    """Lex the default word of ``${X:-word}`` with the shell's quoting rules; inside
+    double quotes the result is neither split nor globbed."""
+    parts: list = []
+    for w in _lex(text):
+        if w is None:
+            continue
+        if parts:
+            parts.append(("s",))
+        parts.extend(w)
+    return _requote(parts) if quoted else parts
 
 
 def _lex(s: str) -> list:
@@ -259,43 +289,106 @@ def _escape_glob(text: str) -> str:
     return re.sub(r"([*?\[])", r"[\1]", text)
 
 
-def _lookup(table: Mapping, name: str, default: Optional[str]):
+def _lookup(table: Mapping, name: str, default: Optional[list]):
+    """The variable's value, or its default word's parts (a list) when unset/empty."""
     value = table.get(name)
     if value is None or value == "":
         return default if default is not None else ("" if value is None else value)
     return value
 
 
-def _expand(parts: list, table: Mapping, home: str, *, assignment_value: bool = False) -> _Word:
+def _ifs_split_re(table: Mapping):
+    ifs = table.get("IFS", " \t\n")
+    if not isinstance(ifs, str):
+        return None  # opaque IFS: the caller treats the expansion as opaque
+    return re.compile("[" + re.escape(ifs) + "]+") if ifs else False
+
+
+def _expand_fields(parts: list, table: Mapping, home: str, *, split: bool = True,
+                   assignment_value: bool = False) -> list:
+    """Expand one shell word into the fields the shell would pass. With ``split``, unquoted
+    variable values are field-split on IFS and stay subject to pathname expansion (quoted
+    values are neither); without it (assignment values) the word is always one field.
+    Any opaque part makes the whole word a single opaque field."""
+    fields: list[_Word] = []
     text: list[str] = []
     pattern: list[str] = []
-    globbed = False
-    for idx, part in enumerate(parts):
-        kind = part[0]
-        if kind == "x":
-            return _Word(None)
-        if kind == "v":
-            value = _lookup(table, part[1], part[2])
-            if value is _UNKNOWN:
-                return _Word(None)
-            text.append(value)
-            pattern.append(_escape_glob(value))
-            continue
-        chunk = part[1]
-        if kind == "u":
-            if idx == 0 and (chunk == "~" or chunk.startswith("~/")) and home:
-                chunk = home + chunk[1:]
-            if assignment_value and idx == 0 and chunk.startswith("~") and home:
-                chunk = home + chunk[1:]
-            if _GLOB_CHARS.search(chunk):
-                globbed = True
-            text.append(chunk)
-            pattern.append(chunk)
-        else:
-            text.append(chunk)
-            pattern.append(_escape_glob(chunk))
-    joined = "".join(text)
-    return _Word(joined, "".join(pattern) if globbed else None)
+    state = {"globbed": False, "content": False}
+
+    def emit():
+        if state["content"] or text:
+            joined = "".join(text)
+            fields.append(_Word(joined, "".join(pattern) if state["globbed"] else None))
+        text.clear()
+        pattern.clear()
+        state["globbed"] = state["content"] = False
+
+    def add_unquoted(chunk: str):
+        if _GLOB_CHARS.search(chunk):
+            state["globbed"] = True
+        text.append(chunk)
+        pattern.append(chunk)
+
+    def walk(seq: list, word_start: bool) -> bool:
+        for idx, part in enumerate(seq):
+            kind = part[0]
+            at_start = word_start and idx == 0
+            if kind == "x":
+                return False
+            if kind == "s":
+                if split:
+                    emit()
+                else:
+                    text.append(" ")
+                    pattern.append(" ")
+                continue
+            if kind == "v":
+                value = _lookup(table, part[1], part[2])
+                if value is _UNKNOWN:
+                    return False
+                if isinstance(value, list):  # the default word: expanded with its own quoting
+                    if not walk(value, at_start):
+                        return False
+                    continue
+                if part[3] or not split:
+                    state["content"] = state["content"] or part[3]
+                    text.append(value)
+                    pattern.append(_escape_glob(value))
+                    continue
+                splitter = _ifs_split_re(table)
+                if splitter is None:
+                    return False
+                pieces = splitter.split(value) if splitter else [value]
+                for k, piece in enumerate(pieces):
+                    if k:
+                        emit()
+                    if piece:
+                        add_unquoted(piece)
+                continue
+            chunk = part[1]
+            if kind == "u":
+                if at_start and (chunk == "~" or chunk.startswith("~/")) and home:
+                    chunk = home + chunk[1:]
+                if assignment_value and at_start and chunk.startswith("~") and home:
+                    chunk = home + chunk[1:]
+                add_unquoted(chunk)
+            else:
+                state["content"] = True
+                text.append(chunk)
+                pattern.append(_escape_glob(chunk))
+        return True
+
+    if not walk(parts, True):
+        return [_Word(None)]
+    emit()
+    if not split and not fields:
+        fields.append(_Word(""))
+    return fields
+
+
+def _expand(parts: list, table: Mapping, home: str, *, assignment_value: bool = False) -> _Word:
+    """One unsplit field (assignment values, heads of declarations)."""
+    return _expand_fields(parts, table, home, split=False, assignment_value=assignment_value)[0]
 
 
 def _assignment(parts: list) -> Optional[tuple[str, list]]:
@@ -360,9 +453,11 @@ class _Roots:
 
 def _protected_roots(env: Mapping[str, str]) -> _Roots:
     roots = _Roots()
-    home = env.get("HOME") or os.path.expanduser("~")
+    home = env.get("HOME")
+    home = (home if isinstance(home, str) else "") or os.path.expanduser("~")
     bases: list[str] = []
-    hermes_home = (env.get("HERMES_HOME") or "").strip()
+    hermes_home = env.get("HERMES_HOME")
+    hermes_home = hermes_home.strip() if isinstance(hermes_home, str) else ""
     if hermes_home:
         vh = _real(os.path.expanduser(hermes_home))
         bases.append(vh)
@@ -443,6 +538,8 @@ def _refusal(target: str, root: str) -> str:
 def _check_target(word: _Word, cwd: str, ctx: _Ctx, recursive: bool) -> Optional[str]:
     if word.text is None or word.text == "":
         return None
+    if cwd == _OPAQUE_CWD and not os.path.isabs(word.text):
+        return None  # a relative target under an opaque cwd cannot be resolved
     ctx.checks += 1
     if ctx.checks > _MAX_TARGET_CHECKS:
         raise _Budget()
@@ -503,7 +600,8 @@ def _check_git(args: list[_Word], cwd: str, ctx: _Ctx) -> Optional[str]:
             sub_dir = texts[i + 1]
             if sub_dir is None:
                 return None
-            cwd = os.path.join(cwd, sub_dir)
+            if cwd != _OPAQUE_CWD or os.path.isabs(sub_dir):
+                cwd = os.path.join(cwd, sub_dir)
             i += 2
         elif t in ("-c", "--git-dir", "--work-tree", "--namespace") and i + 1 < len(texts):
             i += 2
@@ -513,13 +611,37 @@ def _check_git(args: list[_Word], cwd: str, ctx: _Ctx) -> Optional[str]:
             break
     if i >= len(texts) or texts[i] != "clean":
         return None
-    sub = texts[i + 1:]
-    if not any(t and t.startswith("-") and not t.startswith("--") and ("x" in t or "X" in t) for t in sub):
+    # Parse clean's own options first: `-e <pattern>` / `--exclude <pattern>` take an
+    # argument that is NOT a pathspec (and that may itself start with `-`).
+    shorts, longs, pathspec_words = "", [], []
+    k, sub_args = 0, args[i + 1:]
+    while k < len(sub_args):
+        t = sub_args[k].text
+        if t is None:
+            pass  # an opaque pathspec: fall back to the cwd-wide check below
+        elif t == "--":
+            pathspec_words.extend(w for w in sub_args[k + 1:] if w.text is not None)
+            break
+        elif t.startswith("--"):
+            longs.append(t.split("=", 1)[0])
+            if t == "--exclude":
+                k += 1
+        elif t.startswith("-") and len(t) > 1:
+            cluster = t[1:]
+            e_at = cluster.find("e")
+            if e_at >= 0:
+                cluster = cluster[:e_at]
+                if e_at == len(t) - 2:
+                    k += 1  # `-e PAT` / `-xe PAT`: the next word is the pattern
+            shorts += cluster
+        else:
+            pathspec_words.append(sub_args[k])
+        k += 1
+    if "x" not in shorts and "X" not in shorts:
         return None
-    if any(t and t.startswith("-") and not t.startswith("--") and "n" in t for t in sub) or "--dry-run" in sub:
+    if "n" in shorts or "--dry-run" in longs:
         return None
-    pathspecs = [args[i + 1 + k] for k, t in enumerate(sub) if t is not None and not t.startswith("-")]
-    for w in pathspecs or [_Word(cwd)]:
+    for w in pathspec_words or [_Word(cwd)]:
         hit = _check_target(_Word(w.text, w.pattern), cwd, ctx, True)
         if hit:
             return hit
@@ -617,7 +739,7 @@ def _analyze_segment(seg: list, table: dict, cwd: str, ctx: _Ctx, depth: int):
             w = _expand(parts, table, ctx.home, assignment_value=True)
             table[name] = _UNKNOWN if w.text is None else w.text
         return None
-    words = [_expand(p, table, ctx.home) for p in seg[idx:]]
+    words = [f for p in seg[idx:] for f in _expand_fields(p, table, ctx.home)]
     child_env = dict(table)
     for name, parts in prefix:
         w = _expand(parts, child_env, ctx.home, assignment_value=True)
@@ -675,10 +797,15 @@ def _analyze_segment(seg: list, table: dict, cwd: str, ctx: _Ctx, depth: int):
         if target is None:
             return ("cd", ctx.home or cwd)
         if target.text is None:
-            return ("cd", "\x00unknown")
+            return ("cd", _OPAQUE_CWD)
+        if os.path.isabs(target.text):
+            return ("cd", os.path.normpath(target.text))
+        if cwd == _OPAQUE_CWD:
+            return None
         return ("cd", os.path.normpath(os.path.join(cwd, target.text)))
-    if cwd.startswith("\x00"):
-        return None  # cwd is opaque: relative targets cannot be resolved
+    # An opaque cwd (``cd "$(mktemp -d)"``) only hides RELATIVE targets: every check
+    # below resolves an absolute target without it, and ``_resolve`` refuses to join a
+    # relative one onto the opaque marker (fails open for that target only).
     if name in ("rm", "unlink"):
         return _check_rm(args, cwd, ctx)
     if name == "find":
@@ -843,6 +970,35 @@ def _analyze_python(code: str, env: Mapping, cwd: str, ctx: _Ctx) -> Optional[st
 
 # ── entry point ────────────────────────────────────────────────────────────────────────
 
+def snapshot_exports(path: str) -> dict:
+    """Exported variables a session snapshot will restore before the next command runs.
+
+    The snapshot starts with an ``export -p`` dump (``declare -x NAME="value"`` lines, then
+    functions and aliases). Only that leading block is read, with this module's lexer:
+    nothing is sourced or evaluated. A value that is not a plain literal is recorded as
+    opaque. Missing, oversized or unreadable files yield ``{}``.
+    """
+    src = _read_script(path, os.sep) if path else None
+    if not src:
+        return {}
+    out: dict = {}
+    try:
+        for seg in _segments(_lex(src)):
+            head = seg[0]
+            if not (len(head) == 1 and head[0][0] == "u" and head[0][1] in ("declare", "export", "typeset")):
+                break  # past the export dump (functions/aliases follow)
+            for parts in seg[1:]:
+                a = _assignment(parts)
+                if a is None:
+                    continue
+                literal = all(p[0] in ("u", "q") for p in a[1])
+                out[a[0]] = "".join(p[1] for p in a[1]) if literal else _UNKNOWN
+    except Exception:
+        logger.debug("home deletion guard: snapshot parse failed", exc_info=True)
+        return {}
+    return out
+
+
 def command_deletes_protected_home(
     command: str, *, env: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None,
     local_files: bool = True,
@@ -857,7 +1013,8 @@ def command_deletes_protected_home(
         return None
     try:
         env = dict(os.environ if env is None else env)
-        home = env.get("HOME") or ""
+        home = env.get("HOME")
+        home = home if isinstance(home, str) else ""
         ctx = _Ctx(roots=_protected_roots(env), home=home, local_files=local_files)
         return _analyze_shell(command, dict(env), cwd or os.getcwd(), ctx, 0)
     except _Budget:

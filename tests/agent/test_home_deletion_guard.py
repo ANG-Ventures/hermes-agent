@@ -247,6 +247,55 @@ def test_nested_script_is_not_followed_past_depth_one(home, tmp_path):
     assert check(home, f"bash {outer}") is None
 
 
+# ── Prism #2006 findings: shell word semantics the analyzer must follow ───────────────
+
+@pytest.mark.parametrize("command", [
+    # An opaque cwd hides relative targets only; absolute ones still resolve.
+    'cd "$(mktemp -d)" && rm -rf "$HERMES_HOME"',
+    'cd "$(mktemp -d)" && git -C "$HERMES_HOME" clean -fdx',
+    # Unquoted expansions are field-split: the second field is the home.
+    'TARGETS="/tmp/cache $HERMES_HOME"; rm -rf $TARGETS',
+    # `-e PAT` / `--exclude PAT` are option arguments, not pathspecs.
+    "git -C \"$HERMES_HOME\" clean -fdx -e '*.log'",
+    "git -C \"$HERMES_HOME\" clean -fdx --exclude '*.log'",
+    "git -C \"$HERMES_HOME\" clean -fdxe '*.log'",
+    "git -C \"$HERMES_HOME\" clean -fdx -e*.log",
+    # A default word is expanded with the same rules as any other word.
+    'unset SCRATCH; rm -rf "${SCRATCH:-$HERMES_HOME}"',
+    "rm -rf ${SCRATCH:-$HERMES_HOME}",
+    "rm -rf ${SCRATCH:-~/.hermes}",
+])
+def test_prism_2006_shapes_are_refused(home, command):
+    hit = check(home, command, cwd="/tmp")
+    assert hit is not None
+    assert str(home["root"].resolve()) in hit
+
+
+@pytest.mark.parametrize("command", [
+    'cd "$(mktemp -d)" && rm -rf .hermes',              # relative under an opaque cwd: unknown
+    'T="/tmp/cache $HERMES_HOME"; rm -rf "$T"',          # quoted: one nonexistent path
+    'SCRATCH=/tmp/x; rm -rf "${SCRATCH:-$HERMES_HOME}"',  # the variable is set: default unused
+    'rm -rf "${S:-~}/.hermes"',                          # quoted default: no tilde expansion
+    "git -C \"$HERMES_HOME\" clean -fdx -e '*.log' cache",  # a real pathspec below the home
+    "git -C \"$HERMES_HOME\" clean -ndx -e '*.log'",     # dry run
+])
+def test_prism_2006_neighbours_stay_allowed(home, command):
+    assert check(home, command, cwd="/tmp") is None
+
+
+def test_snapshot_exports_reads_only_the_export_dump(tmp_path):
+    from agent.home_deletion_guard import _UNKNOWN, snapshot_exports
+
+    snap = tmp_path / "snap.sh"
+    snap.write_text(
+        'declare -x D="/x/runtime"\ndeclare -x Q=\'a b\'\ndeclare -x OP="$(id)"\ndeclare -x FLAG\n'
+        "f () \n{ \n    declare -x LATE=/nope\n}\nalias ll='ls -l'\n")
+    out = snapshot_exports(str(snap))
+    assert out["D"] == "/x/runtime" and out["Q"] == "a b" and out["OP"] is _UNKNOWN
+    assert "LATE" not in out and "FLAG" not in out
+    assert snapshot_exports(str(tmp_path / "missing.sh")) == {}
+
+
 # ── cost ───────────────────────────────────────────────────────────────────────────────
 
 def test_ordinary_commands_stay_well_under_50ms(home):

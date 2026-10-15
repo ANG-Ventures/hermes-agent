@@ -301,6 +301,39 @@ def self_repo_block(
     return _blocked_json(msg, "blocked")
 
 
+def _effective_local_run_env(env: Any) -> dict:
+    """The environment a local command's ``rm`` actually sees, for static analysis.
+
+    Mirrors ``LocalEnvironment._run_bash`` + ``_wrap_command_script``: the Popen env is
+    ``_make_run_env(env.env)`` (profile-home override, passthrough, scrub), then the wrapper
+    sources the session snapshot, whose ``export -p`` dump restores variables earlier calls
+    exported, and finally restores the profile-scoped passthrough names from the Popen env.
+    The snapshot is parsed, never sourced. Falls back to process env + overlay on error.
+    """
+    import os
+
+    overlay = getattr(env, "env", None)
+    overlay = {k: v for k, v in overlay.items() if isinstance(v, str)} if isinstance(overlay, dict) else {}
+    try:
+        from tools.environments.local import _make_run_env
+        run_env = _make_run_env(dict(overlay))
+    except Exception:
+        logger.debug("home deletion guard: run env build failed; using process env", exc_info=True)
+        run_env = dict(os.environ)
+        run_env.update(overlay)
+    snap = getattr(env, "_snapshot_path", None)
+    if getattr(env, "_snapshot_ready", False) and isinstance(snap, str):
+        from agent.home_deletion_guard import snapshot_exports
+        try:
+            keep = set(env._snapshot_excluded_passthrough_names())
+        except Exception:
+            keep = set()
+        # The dump never carries HERMES_HOME (unset before ``export -p``); the Popen value wins.
+        keep.add("HERMES_HOME")
+        run_env.update({k: v for k, v in snapshot_exports(snap).items() if k not in keep})
+    return run_env
+
+
 def home_deletion_block(
     *,
     command: str,
@@ -321,15 +354,10 @@ def home_deletion_block(
     """
     if env_type != "local":
         return None
-    import os
-
     from agent.home_deletion_guard import BLOCK_MARKER, command_deletes_protected_home, refusal_message
     from tools.terminal_tool import _resolve_command_cwd
 
-    run_env = dict(os.environ)
-    overlay = getattr(env, "env", None)
-    if isinstance(overlay, dict):
-        run_env.update({k: v for k, v in overlay.items() if isinstance(v, str)})
+    run_env = _effective_local_run_env(env)
     try:
         guard_cwd = _resolve_command_cwd(
             workdir=workdir, default_cwd=getattr(env, "cwd", None) or cwd,
