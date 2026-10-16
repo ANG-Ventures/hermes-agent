@@ -1,6 +1,6 @@
 # SCHEDULE: manual   (a library consumers import; never scheduled; card t_552773f1)
-# VENDORED from hermes-home ``scripts/lib/alloc_client.py`` @ 31c9d15171 (hermes-home#4462 on #4422, t_dc9a0f9a;
-# sha256 72da740bb4de1a5427a14e110cc385e7ad707898ecf6e6362e4e8a5f317cdc4b) for the kanban dispatcher (t_4187c8f1): the fork may not import hermes-home code. The ONLY
+# VENDORED from hermes-home ``scripts/lib/alloc_client.py`` @ 2fe117cbcb (hermes-home#4462 merge, t_dc9a0f9a + t_314b3ea5;
+# sha256 fbbd8a806628a79acc2d0ff981d75c29b48d3eb5c9f2333a51efa88519971cb3) for the kanban dispatcher (t_4187c8f1): the fork may not import hermes-home code. The ONLY
 # local change is the placement import (hermes_cli.placement, not sys.path + import placement); tests/hermes_cli/test_kanban_allocd_route.py checks
 # the rest against the canonical file (ALLOC_CLIENT_CANONICAL).
 """alloc_client -- the thin library every work generator calls to get a host (Router Core Card A, t_552773f1).
@@ -152,6 +152,9 @@ def _protected(consumer: str) -> bool:
         return True
 
 
+_DURABLE_MARKERS: set = set()         # marker paths THIS process fsync'd (file + dir); a visible marker is not proof
+
+
 def mark_protected(consumer: str) -> None:
     """Record that ``consumer`` uses a token, so a later MISSING token file is refused, never "no auth"."""
     d = placement.fleet_root() / PROTECTED_REL
@@ -168,6 +171,7 @@ def mark_protected(consumer: str) -> None:
         os.fsync(dfd)
     finally:
         os.close(dfd)
+    _DURABLE_MARKERS.add(str(d / consumer))
 
 
 def _token(consumer: str) -> Optional[str]:
@@ -188,7 +192,9 @@ def _token(consumer: str) -> Optional[str]:
         raise TokenUnreadable(f"{p}: unreadable: {exc}") from exc
     if not tok:
         raise TokenUnreadable(f"{p}: empty")
-    if not _protected(consumer):
+    # an EXISTING marker is not enough (Prism 768d6f7d34aa): one left visible by a failed fsync is not durable, so
+    # re-commit until THIS process has seen both fsyncs succeed for it
+    if str(placement.fleet_root() / PROTECTED_REL / consumer) not in _DURABLE_MARKERS:
         try:
             mark_protected(consumer)       # first use protects it: a token removed later never reads as "no auth"
         except OSError as exc:

@@ -1,6 +1,6 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
-VENDORED from hermes-home ``scripts/lib/placement.py`` @ 31c9d15171 (hermes-home#4462 on #4422, t_dc9a0f9a;
+VENDORED from hermes-home ``scripts/lib/placement.py`` @ 2fe117cbcb (hermes-home#4462 merge, t_dc9a0f9a + t_314b3ea5;
 sha256 8ae48f3b603d7c20507575e533fe0d7d7bdc3812422428a5390a6a1c57e09070) for the kanban dispatcher (t_d6ce856e) and its
 alloc_client route (t_4187c8f1): the fork may not import hermes-home code. The ONLY local changes are
 ``fleet_root()`` plus ``encoding="utf-8"`` on two ``open()`` calls (the fork's PLW1514 lint);
