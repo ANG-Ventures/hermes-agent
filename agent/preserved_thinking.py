@@ -82,13 +82,19 @@ def _provider_entry(provider: Optional[str], requested_provider: Optional[str] =
     ``custom`` only, e.g. the compressor, which holds no requested identity) the unique entry on
     ``base_url``.
     """
-    identities = [str(i).strip() for i in (provider, requested_provider) if i and str(i).strip()]
+    # The explicit requested identity first: a route resolved as provider="custom" with the key in
+    # requested_provider must not pick up a ``providers.custom`` block (Prism 3e5ff74fe83d). A bare
+    # ``custom`` is a transport class, never a config key to match.
+    identities = [str(i).strip() for i in (requested_provider, provider) if i and str(i).strip()]
     if not identities:
         return {}
     try:
         providers = _load_providers_config()
-        entry = next((e for e in (_match_identity(i, providers) for i in identities) if e is not None), None)
-        if entry is None and base_url and identities[0].lower() == "custom":
+        entry = next(
+            (e for e in (_match_identity(i, providers) for i in identities if i.lower() != "custom") if e is not None),
+            None,
+        )
+        if entry is None and base_url and any(i.lower() == "custom" for i in identities):
             entry = _match_base_url(base_url, providers)
     except Exception:  # noqa: BLE001 — an unreadable config is flag-off, never a dead turn
         logger.debug("preserve_thinking: providers config unreadable; treating as off", exc_info=True)

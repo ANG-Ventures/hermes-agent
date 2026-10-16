@@ -931,7 +931,13 @@ def build_anthropic_kwargs(
         extra_betas.append(_BINDING_CONTROLS_BETA)
     if extra_betas:
         betas = _common_betas_for_base_url(base_url, drop_context_1m_beta=drop_context_1m_beta)
-        kwargs["extra_headers"] = _beta_header(betas + (_OAUTH_ONLY_BETAS if is_oauth else []) + extra_betas)
+        betas = betas + (_OAUTH_ONLY_BETAS if is_oauth else []) + extra_betas
+        # A per-request header REPLACES the client's anthropic-beta, which carried the route's
+        # ``providers.<name>.extra_headers`` beta list (``_new_sdk_client``): keep those values too.
+        configured = _custom_provider_extra_headers(base_url).get("anthropic-beta")
+        if configured:
+            betas += [b.strip() for b in str(configured).split(",") if b.strip() and b.strip() not in betas]
+        kwargs["extra_headers"] = _beta_header(betas)
     return kwargs
 
 

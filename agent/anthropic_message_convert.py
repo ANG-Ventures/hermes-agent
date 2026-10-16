@@ -612,7 +612,9 @@ def _manage_thinking_signatures(
         elif is_third_party or (idx != last_assistant_idx and not contiguous):
             m["content"] = _strip_thinking(m["content"]) or [_text_block("(thinking elided)")]
         elif idx != last_assistant_idx:
-            m["content"] = _keep_signed_thinking_only(m["content"]) or [_text_block("(thinking elided)")]
+            # Orphan-stripping mutated THIS turn: every signature on it is dead, same as the latest-turn rule.
+            keep = [] if m.get("_thinking_signature_invalidated") else _keep_signed_thinking_only(m["content"])
+            m["content"] = (keep or _strip_thinking(m["content"])) or [_text_block("(thinking elided)")]
         else:
             new_content = _keep_valid_latest_thinking(m["content"], bool(m.get("_thinking_signature_invalidated")))
             m["content"] = new_content or [_text_block("(empty)")]

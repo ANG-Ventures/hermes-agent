@@ -241,3 +241,48 @@ def test_input_transformations_absent_is_silent(caplog):
     with caplog.at_level(logging.DEBUG, logger=pt.logger.name):
         assert pt.log_input_transformations(SimpleNamespace(), {"messages": []}, log_prefix="") is None
     assert not [r for r in caplog.records if r.levelno >= logging.INFO]
+
+
+# ── Prism round 1 on #2036 ────────────────────────────────────────────────────────────────────────
+
+def test_requested_identity_beats_a_providers_custom_block(providers_cfg):
+    """provider="custom" + requested_provider="relay" is the relay's route, never ``providers.custom``
+    (Prism 3e5ff74fe83d: conflicting settings on the two entries)."""
+    providers_cfg({
+        "custom": {"base_url": "https://other.example/v1", "preserve_thinking": True, "preserve_thinking_window": "contiguous"},
+        "relay": {"base_url": RELAY, "preserve_thinking": False},
+    })
+    assert pt.preserve_thinking_enabled("custom", "relay", RELAY) is False
+    providers_cfg({
+        "custom": {"base_url": "https://other.example/v1", "preserve_thinking": False},
+        "relay": {"base_url": RELAY, "preserve_thinking": True},
+    })
+    assert pt.preserve_thinking_enabled("custom", "relay", RELAY) is True
+    assert pt.preserve_thinking_window("custom", "relay", RELAY) == "latest"
+    # bare "custom" with no requested identity: only the unique base_url match, never providers.custom
+    assert pt.preserve_thinking_enabled("custom", None, RELAY) is True
+    assert pt.preserve_thinking_enabled("custom", None, "https://nowhere.example") is False
+
+
+def test_binding_beta_keeps_the_providers_configured_anthropic_beta(monkeypatch):
+    """The per-request header replaces the client's; a ``providers.<name>.extra_headers`` beta must
+    survive the rebuild (Prism c0968ddaec03)."""
+    import agent.anthropic_adapter as ad
+    monkeypatch.setattr(ad, "_custom_provider_extra_headers",
+                        lambda route: {"anthropic-beta": "relay-only-2026-01-01,interleaved-thinking-2025-05-14"})
+    kw = _kwargs(preserve_thinking=True)
+    betas = kw["extra_headers"]["anthropic-beta"].split(",")
+    assert "relay-only-2026-01-01" in betas and _BINDING_CONTROLS_BETA in betas
+    assert betas.count("interleaved-thinking-2025-05-14") == 1
+
+
+def test_contiguous_window_honours_invalidated_marker_on_older_turn():
+    """An older turn orphan-stripping mutated carries a dead signature: drop it, do not replay it
+    (Prism 014a88989ff0)."""
+    conv = _conversation()
+    # a tool call whose tool_result is missing -> _strip_orphaned_tool_blocks flags the turn
+    conv[1]["tool_calls"] = [{"id": "toolu_x", "type": "function", "function": {"name": "t", "arguments": "{}"}}]
+    _, out = convert_messages_to_anthropic(
+        conv, base_url=RELAY, model="claude-fable-5-1", preserve_thinking=True, thinking_window="contiguous",
+    )
+    assert _thinking_sigs(out) == ["sig-2"]
