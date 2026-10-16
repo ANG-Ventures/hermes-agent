@@ -3706,6 +3706,24 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _release_after_merge_edges(conn: sqlite3.Connection) -> None:
+    """Drop the gate of every ``after-merge`` edge whose parent PR merged, so
+    this tick's recompute_ready promotes the child. Its GitHub reads run here,
+    before the tick lock, like the PR-gate prefetch. Never breaks a tick."""
+    try:
+        from hermes_cli import kanban_after_merge
+
+        released = kanban_after_merge.release_merged_edges(conn)
+        if released:
+            _kb._log.info("kanban dispatch: after-merge edges released: %s",
+                          ", ".join(f"{p}->{c}" for p, c in released))
+    except Exception as exc:
+        if type(exc).__name__ == "SandboxEscape":
+            raise  # a stubbed oracle on a live board is never absorbed
+        _kb._log.warning("kanban dispatch: after-merge release failed (%s: %s); "
+                         "continuing this tick", type(exc).__name__, exc)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -3744,6 +3762,8 @@ def dispatch_once(
     cross-process / cross-platform mechanics.
     """
     pr_gate_prefetch = _kb._prefetch_pr_gates_for_tick(conn, dry_run=dry_run)
+    if not dry_run:
+        _release_after_merge_edges(conn)
     try:
         db_path = _kb.kanban_db_path(board=board)
     except Exception:

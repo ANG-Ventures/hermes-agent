@@ -779,13 +779,16 @@ _FORK_PROPERTIES: dict[str, dict[str, Any]] = {'KANBAN_LIST_SCHEMA': {'all': {'t
                                                          'prefer kanban_comment on foreign '
                                                          'cards.'}},
  'KANBAN_LINK_SCHEMA': {'kind': {'type': 'string',
-                                 'enum': ['blocks', 'derived-from'],
+                                 'enum': ['blocks', 'derived-from', 'after-merge'],
                                  'description': "Edge semantics. 'blocks' (default) = real "
                                                 "dependency, the child waits. 'derived-from' = "
                                                 'provenance only, the child is independently '
                                                 'dispatchable. A DEPLOY must never be gated on a '
-                                                'DISCOVERY. Re-linking an existing pair updates '
-                                                'its kind.'},
+                                                'DISCOVERY. \'after-merge\' = the child waits for '
+                                                "the parent's PR to MERGE, not for the parent "
+                                                'to close; use it when the child is part of the '
+                                                "parent's close condition ('blocks' deadlocks). "
+                                                'Re-linking an existing pair updates its kind.'},
                         'foreign_ok': {'type': 'string',
                                        'description': "Only when the card's home session is "
                                                       'ANOTHER session and you are not its '

@@ -902,8 +902,8 @@ def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
     rows = conn.execute(
         "SELECT t.id, t.title, t.status FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ? AND t.status != 'done'",
-        (task_id, kanban_db.DEFAULT_LINK_KIND, kanban_db.LINK_KIND_BLOCKS)).fetchall()
+        "WHERE l.child_id = ? AND COALESCE(l.kind, ?) IN (?, ?) AND t.status != 'done'",
+        (task_id, kanban_db.DEFAULT_LINK_KIND, *kanban_db.GATING_LINK_KINDS)).fetchall()
     return [{"id": r["id"], "title": r["title"], "status": r["status"]} for r in rows]
 
 
@@ -954,8 +954,8 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
         if effective_status == "ready":
             parent_statuses = conn.execute(
                 "SELECT t.status FROM tasks t JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ?",
-                (task_id, kanban_db.DEFAULT_LINK_KIND, kanban_db.LINK_KIND_BLOCKS)).fetchall()
+                "WHERE l.child_id = ? AND COALESCE(l.kind, ?) IN (?, ?)",
+                (task_id, kanban_db.DEFAULT_LINK_KIND, *kanban_db.GATING_LINK_KINDS)).fetchall()
             if parent_statuses and not all(p["status"] in {"done", "archived"} for p in parent_statuses):
                 return False
         was_running = prev["status"] == "running"

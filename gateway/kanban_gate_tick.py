@@ -40,7 +40,7 @@ _WAKING_SQL = (
     "SELECT 1 FROM tasks t WHERE (t.status = 'scheduled' AND t.next_eligible_at IS NOT NULL "
     "AND t.next_eligible_at <= CAST(strftime('%s','now') AS INTEGER)) "
     "OR (t.status = 'todo' AND NOT EXISTS (SELECT 1 FROM task_links l JOIN tasks p "
-    "ON p.id = l.parent_id WHERE l.child_id = t.id AND COALESCE(l.kind,'blocks') = 'blocks' "
+    "ON p.id = l.parent_id WHERE l.child_id = t.id AND COALESCE(l.kind,'blocks') IN ('blocks','after-merge') "
     "AND p.status NOT IN ('done','archived'))) LIMIT 1"
 )
 

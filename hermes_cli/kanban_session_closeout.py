@@ -151,7 +151,7 @@ def load_cards(root: Path, sids: list[str]) -> tuple[list[dict], list[str]]:
                     waits[r["task_id"]].add(str(payload["parent"]))
             parents = collections.defaultdict(list)
             for r in _chunked(conn, "SELECT l.child_id AS task_id, l.parent_id, p.status FROM task_links l "
-                                    "LEFT JOIN tasks p ON p.id = l.parent_id WHERE l.kind='blocks' "
+                                    "LEFT JOIN tasks p ON p.id = l.parent_id WHERE l.kind IN ('blocks','after-merge') "
                                     "AND l.child_id IN ({}) ORDER BY l.parent_id", ids, order="parent_id"):
                 if (r["status"] or "") not in TERMINAL:
                     parents[r["task_id"]].append(r["parent_id"])

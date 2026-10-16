@@ -233,6 +233,14 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 #                        remediation work). The child is independently
 #                        dispatchable the moment it is defined and is NEVER
 #                        gated on the parent.
+#   * ``after-merge``  — the child waits for the parent's PR, not its close.
+#                        It gates like ``blocks`` until every PR the parent
+#                        recorded reads MERGED (or the parent is done); the
+#                        dispatcher then rewrites the edge to ``derived-from``
+#                        (kanban_after_merge.py). Use it for a child that is
+#                        itself part of the parent's close condition (Prism
+#                        residue, an acceptance drill after merge), where a
+#                        ``blocks`` edge deadlocks (t_a0afd4d7, 2026-10-16).
 #
 # The motivating incident (2026-08-08): a DEPLOY card was created as a child of
 # an "audit all 37 protocol fields" card to record where it came from. The audit
@@ -241,8 +249,12 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 # gated on a DISCOVERY; the link was right, the edge type was wrong.
 LINK_KIND_BLOCKS = "blocks"
 LINK_KIND_DERIVED_FROM = "derived-from"
-VALID_LINK_KINDS = {LINK_KIND_BLOCKS, LINK_KIND_DERIVED_FROM}
+LINK_KIND_AFTER_MERGE = "after-merge"
+VALID_LINK_KINDS = {LINK_KIND_BLOCKS, LINK_KIND_DERIVED_FROM, LINK_KIND_AFTER_MERGE}
 DEFAULT_LINK_KIND = LINK_KIND_BLOCKS
+# Kinds that hold the child while the parent is open. An ``after-merge`` edge
+# stops gating when the dispatcher releases it, so every gate reads one list.
+GATING_LINK_KINDS = (LINK_KIND_BLOCKS, LINK_KIND_AFTER_MERGE)
 
 
 def normalize_link_kind(kind: Optional[str]) -> str:
@@ -260,8 +272,8 @@ def normalize_link_kind(kind: Optional[str]) -> str:
         return DEFAULT_LINK_KIND
     # Accept the underscore spelling as an alias; the canonical stored form
     # is the hyphenated one used by the CLI flag.
-    if normalized == "derived_from":
-        normalized = LINK_KIND_DERIVED_FROM
+    if normalized in ("derived_from", "after_merge"):
+        normalized = normalized.replace("_", "-")
     if normalized not in VALID_LINK_KINDS:
         raise ValueError(
             f"unknown link kind {kind!r}; expected one of "
@@ -5626,9 +5638,9 @@ def needs_input_page_candidates(
             "SELECT id, title, body, priority, status, block_kind FROM tasks t "
             "WHERE status IN ('todo', 'blocked') AND block_kind = 'dependency' "
             "AND EXISTS (SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
-            "            WHERE l.child_id = t.id AND COALESCE(l.kind, ?) = ? "
+            "            WHERE l.child_id = t.id AND COALESCE(l.kind, ?) IN (?, ?) "
             "            AND p.status = 'blocked') ORDER BY id",
-            (DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+            (DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
         ))
     out: list[dict] = []
     for row in rows:
@@ -5650,9 +5662,9 @@ def needs_input_page_candidates(
                 (r["id"], _latest_block_reason(conn, r["id"]))
                 for r in conn.execute(
                     "SELECT p.id AS id FROM task_links l JOIN tasks p ON p.id = l.parent_id "
-                    "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ? "
+                    "WHERE l.child_id = ? AND COALESCE(l.kind, ?) IN (?, ?) "
                     "AND p.status = 'blocked' ORDER BY p.id",
-                    (row["id"], DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+                    (row["id"], DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
                 )
             ]
             reason = "; ".join(
@@ -6260,7 +6272,7 @@ def create_task(
                         # If any parent is not yet done, we're todo — but only
                         # a 'blocks' edge gates. A 'derived-from' parent is
                         # provenance, so the task stays immediately dispatchable.
-                        if parents_kind == LINK_KIND_BLOCKS:
+                        if parents_kind in GATING_LINK_KINDS:
                             rows = conn.execute(
                                 "SELECT status FROM tasks WHERE id IN "
                                 "(" + ",".join("?" * len(parents)) + ")",
@@ -7569,6 +7581,9 @@ def link_tasks(
         # data-modelling error regardless of whether it can deadlock.
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
+        if kind == LINK_KIND_BLOCKS:
+            from hermes_cli import kanban_after_merge as _am
+            _am.refuse_close_condition_deadlock(conn, parent_id, child_id)
         conn.execute(
             "INSERT INTO task_links (parent_id, child_id, kind) VALUES (?, ?, ?) "
             "ON CONFLICT(parent_id, child_id) DO UPDATE SET kind = excluded.kind",
@@ -7578,7 +7593,7 @@ def link_tasks(
         # provenance: the child stays dispatchable. If child was ready but parent
         # is not yet terminal, demote child to todo (archived counts as terminal,
         # matching _parents_satisfied/recompute_ready).
-        if kind == LINK_KIND_BLOCKS and _task_status(conn, parent_id) not in ("done", "archived"):
+        if kind in GATING_LINK_KINDS and _task_status(conn, parent_id) not in ("done", "archived"):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
@@ -7597,7 +7612,7 @@ def link_tasks(
         )
         _inherit_notify_subs(conn, child_id, (parent_id,))
 
-    if kind != LINK_KIND_BLOCKS:
+    if kind not in GATING_LINK_KINDS:
         # Converting a blocking edge to provenance can release a child that
         # was parked in ``todo`` solely because of it. Matches the contract of
         # ``unlink_tasks``: don't make the operator wait for a dispatcher tick.
@@ -8439,14 +8454,14 @@ def find_parent_satisfied_sticky_blocks(conn: sqlite3.Connection) -> list[str]:
         "WHERE t.status = 'blocked' "
         "AND EXISTS ("
         "  SELECT 1 FROM task_links l WHERE l.child_id = t.id "
-        "  AND COALESCE(l.kind, ?) = ?"
+        "  AND COALESCE(l.kind, ?) IN (?, ?)"
         ") "
         "AND NOT EXISTS ("
         "  SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
-        "  WHERE l.child_id = t.id AND COALESCE(l.kind, ?) = ? "
+        "  WHERE l.child_id = t.id AND COALESCE(l.kind, ?) IN (?, ?) "
         "  AND p.status NOT IN ('done', 'archived')"
         ") ORDER BY t.id",
-        (DEFAULT_LINK_KIND, LINK_KIND_BLOCKS, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+        (DEFAULT_LINK_KIND, *GATING_LINK_KINDS, DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
     ).fetchall()
     return [
         row["id"] for row in rows
@@ -8480,9 +8495,9 @@ def find_stranded_by_triage(
         "JOIN tasks c ON c.id = l.child_id "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE c.status = 'todo' AND p.status IN ('triage', 'blocked') "
-        "AND COALESCE(l.kind, ?) = ? "
+        "AND COALESCE(l.kind, ?) IN (?, ?) "
         "ORDER BY l.child_id, l.parent_id",
-        (DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+        (DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
     ).fetchall()
     return [(r["child"], r["parent"]) for r in rows]
 
@@ -8569,8 +8584,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ?",
-                (task_id, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+                "WHERE l.child_id = ? AND COALESCE(l.kind, ?) IN (?, ?)",
+                (task_id, DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
             ).fetchall()
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 block_source = _latest_block_source(conn, task_id)
@@ -8623,9 +8638,9 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ? "
+        "WHERE l.child_id = ? AND COALESCE(l.kind, ?) IN (?, ?) "
         "AND p.status NOT IN ('done', 'archived') LIMIT 1",
-        (task_id, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+        (task_id, DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
     ).fetchone() is None
 
 
@@ -12549,10 +12564,10 @@ def block_task(
                     "SELECT c.id AS id FROM task_links l "
                     "JOIN tasks c ON c.id = l.child_id "
                     "WHERE l.parent_id = ? "
-                    "AND COALESCE(l.kind, ?) = ? "
+                    "AND COALESCE(l.kind, ?) IN (?, ?) "
                     "AND c.status NOT IN ('done', 'archived') "
                     "ORDER BY c.id",
-                    (task_id, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+                    (task_id, DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
                 )
             ]
             if stranded_children:
@@ -14198,8 +14213,8 @@ def reopen_task(
         children = conn.execute(
             "SELECT t.id, t.status, t.current_run_id, t.claim_lock FROM tasks t "
             "JOIN task_links l ON l.child_id = t.id "
-            "WHERE l.parent_id = ? AND COALESCE(l.kind, ?) = ?",
-            (task_id, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+            "WHERE l.parent_id = ? AND COALESCE(l.kind, ?) IN (?, ?)",
+            (task_id, DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
         ).fetchall()
         for child in children:
             if (
@@ -14263,8 +14278,8 @@ def promote_task(
     parents = conn.execute(
         "SELECT t.id, t.status FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND COALESCE(l.kind, ?) = ?",
-        (task_id, DEFAULT_LINK_KIND, LINK_KIND_BLOCKS),
+        "WHERE l.child_id = ? AND COALESCE(l.kind, ?) IN (?, ?)",
+        (task_id, DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
     ).fetchall()
     unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
     if unsatisfied:
