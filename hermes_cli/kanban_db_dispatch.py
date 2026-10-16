@@ -6663,6 +6663,8 @@ def _dispatch_once_locked(
                      "local_gate": str(spawn_paused) if spawn_paused else None,
                      "pid": pid,
                      **({_kh_res.RESERVATION_KEY: _rid} if _rid else {}),
+                     **({_kh_res.RESERVATION_VIA_KEY: _kh_res.VIA_ALLOC_CLIENT}
+                        if _rid and spillover.reservation_via(_rid) else {}),
                      **({"rule": _decision.rule} if _rid and _decision is not None else {})},
                     run_id=claimed.current_run_id,
                 )

@@ -1265,6 +1265,8 @@ class TargetSignal:
     placement_reservations: Optional[Path] = None
     # A fixed headroom-ledger read (diagnostics); None = read per pick.
     placement_live: Optional[Mapping[str, Any]] = None
+    # kanban.placement.allocd (t_4187c8f1): off | shadow | on, read per tick.
+    allocd: str = "off"
 
     def kanban_cpu_est(self) -> float:
         if self.cpu_est is not None and self.cpu_est > 0:
@@ -1399,6 +1401,9 @@ class SpilloverPlan:
     _rids: Dict[str, List[Optional[str]]] = field(default_factory=dict)
     # Dry-run takes per host: never in the ledger, so choose() adds them.
     _simulated: Dict[str, int] = field(default_factory=dict)
+    # Reservations alloc_client booked (kanban.placement.allocd on): rid -> whether
+    # that take debited ``slots`` (a band-closed host has none to debit).
+    _alloc: Dict[str, bool] = field(default_factory=dict)
     # Continuation affinity (t_8bfdcc07): (host, workspace) -> state, read in
     # this tick's probe round-trip. ``continuation_probed`` = the paths were
     # asked for, so an absent pair means the host did not answer.
@@ -1407,6 +1412,11 @@ class SpilloverPlan:
 
     @property
     def budget(self) -> int:
+        """Free pool slots this tick. With kanban.placement.allocd on, the band /
+        memory cap is allocd's call, so only the structural slots count here."""
+        from hermes_cli import kanban_headroom as _kh
+        if _kh.plan_allocd_mode(self) == _kh.ALLOCD_ON:
+            return sum(_kh.structural_free(self, n) for n in self.hosts)
         return sum(self.slots.values())
 
     def full_reason(self) -> str:
@@ -1567,31 +1577,14 @@ class SpilloverPlan:
             if not names:
                 self.refusal = "pool_full"
                 return None
-            from hermes_cli import placement as _placement
-            rid = None
-            try:
-                if self.dry_run:
-                    d = _kh.choose(self, names, job)
-                else:
-                    d, rid = _kh.admit(self, names, job, job_id)
-            except _placement.PlacementError as exc:  # LedgerError / ExclusionsError: fail closed
-                self.refusal = f"pool_unavailable ({type(exc).__name__}: {exc})"
-                return None
-            self.last_decision = d
-            key = _kh.pool_key(self.signal.placement_table, names, d.host)
-            if key is None or self.slots.get(key, 0) <= 0:
-                _kh.release_id(self.signal, rid)
-                self.refusal = f"pool_unavailable ({d.reason or 'no_slot'}: " + "; ".join(
-                    f"{r.host} {r.reason}" for r in d.rows if not r.eligible) + ")"
-                return None
-            self.last_reservation = rid
-            self._rids.setdefault(key, []).append(rid)
-            if self.dry_run:
-                self._simulated[key] = self._simulated.get(key, 0) + 1
-            self.slots[key] -= 1
-            self.taken[key] = self.taken.get(key, 0) + 1
-            self.last_pick = key
-            return self.hosts[key]
+            mode = _kh.plan_allocd_mode(self)
+            if mode == _kh.ALLOCD_ON:
+                return self._take_allocd(names, job, job_id)
+            ask = _kh.shadow_ask(self, names, job, job_id) if mode == _kh.ALLOCD_SHADOW else None
+            host = self._take_scored(names, job, job_id)
+            if ask is not None:
+                _kh.shadow_record(self, ask, host, job_id)
+            return host
         if self.signal is not None:
             free = [n for n, h in self.hosts.items()
                     if n in allowed and self.slots.get(n, 0) > 0 and assignee in h.profiles]
@@ -1614,6 +1607,74 @@ class SpilloverPlan:
         self.refusal = "pool_full"
         return None
 
+    def _take_scored(self, names: List[str], job: Any, job_id: Optional[str]) -> Optional[PoolHost]:
+        """The in-process scorer take (kanban.placement.allocd off / shadow): one
+        locked ``placement.admit`` (``choose`` on a dry run) over ``names``."""
+        from hermes_cli import kanban_headroom as _kh
+        from hermes_cli import placement as _placement
+        rid = None
+        try:
+            if self.dry_run:
+                d = _kh.choose(self, names, job)
+            else:
+                d, rid = _kh.admit(self, names, job, job_id)
+        except _placement.PlacementError as exc:  # LedgerError / ExclusionsError: fail closed
+            self.refusal = f"pool_unavailable ({type(exc).__name__}: {exc})"
+            return None
+        self.last_decision = d
+        key = _kh.pool_key(self.signal.placement_table, names, d.host)
+        if key is None or self.slots.get(key, 0) <= 0:
+            _kh.release_id(self.signal, rid)
+            self.refusal = f"pool_unavailable ({d.reason or 'no_slot'}: " + "; ".join(
+                f"{r.host} {r.reason}" for r in d.rows if not r.eligible) + ")"
+            return None
+        self.last_reservation = rid
+        self._rids.setdefault(key, []).append(rid)
+        if self.dry_run:
+            self._simulated[key] = self._simulated.get(key, 0) + 1
+        self.slots[key] -= 1
+        self.taken[key] = self.taken.get(key, 0) + 1
+        self.last_pick = key
+        return self.hosts[key]
+
+    def _take_allocd(self, names: List[str], job: Any, job_id: Optional[str]) -> Optional[PoolHost]:
+        """kanban.placement.allocd on (t_4187c8f1): ``alloc_client.admit`` picks AND
+        books among ``names`` that still have a structural pool slot; the pressure
+        band is allocd's. A refusal is final this tick (never a local spill)."""
+        from hermes_cli import kanban_headroom as _kh
+        cands = [n for n in names if _kh.structural_free(self, n) > 0]
+        if not cands:
+            self.refusal = "pool_full"
+            return None
+        try:
+            r = _kh.allocd_admit(self, cands, job, job_id)
+        except Exception as exc:  # alloc_client.Refused, or the fallback's PlacementError: fail closed
+            self.refusal = f"pool_unavailable (allocd {type(exc).__name__}: {exc})"
+            return None
+        self.last_decision = r
+        if not r.host or not r.reservation_id:
+            self.refusal = f"pool_unavailable (allocd: {r.reason or 'refused'})"
+            return None
+        key = _kh.pool_key(self.signal.placement_table, cands, r.host)
+        if key is None:
+            _kh.release_alloc(r.reservation_id)
+            self.refusal = f"pool_unavailable (allocd picked {r.host}, not a candidate)"
+            return None
+        debit = self.slots.get(key, 0) > 0
+        if debit:
+            self.slots[key] -= 1
+        self._alloc[r.reservation_id] = debit
+        self.last_reservation = r.reservation_id
+        self._rids.setdefault(key, []).append(r.reservation_id)
+        self.taken[key] = self.taken.get(key, 0) + 1
+        self.last_pick = key
+        return self.hosts[key]
+
+    def reservation_via(self, rid: Optional[str]) -> Optional[str]:
+        """``alloc_client`` when ``rid`` was booked by :meth:`_take_allocd`, else None."""
+        from hermes_cli import kanban_headroom as _kh
+        return _kh.VIA_ALLOC_CLIENT if rid and rid in self._alloc else None
+
     def release(self, host: PoolHost, reservation: Optional[str] = None) -> None:
         """Refund a take() whose claim/spawn failed: the slot, and the headroom
         reservation THAT take wrote. ``reservation`` names it (the dispatcher
@@ -1628,8 +1689,13 @@ class SpilloverPlan:
             _log.warning("kanban pool: refund of reservation %s on %s ignored: not held by this plan "
                          "(already refunded?)", reservation, host.name)
             return
+        rid = reservation if reservation is not None else (rids[-1] if rids else None)
+        via_alloc = bool(rid) and rid in self._alloc
+        # an allocd take on a band-closed host debited no slot, so it refunds none
+        debited = self._alloc.pop(rid) if via_alloc else True
         if host.name in self.slots:
-            self.slots[host.name] += 1
+            if debited:
+                self.slots[host.name] += 1
             if self.taken.get(host.name):
                 self.taken[host.name] -= 1
             if self._simulated.get(host.name):
@@ -1638,12 +1704,14 @@ class SpilloverPlan:
             return
         if reservation is not None:
             rids.remove(reservation)
-            rid = reservation
         else:
-            rid = rids.pop()
+            rids.pop()
         if rid:
             from hermes_cli import kanban_headroom as _kh
-            _kh.release_id(self.signal, rid)
+            if via_alloc:
+                _kh.release_alloc(rid)
+            else:
+                _kh.release_id(self.signal, rid)
 
     def snapshot(self) -> dict:
         """The ``load_gate.json`` ``pool`` block for this tick."""

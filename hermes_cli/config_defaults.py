@@ -2400,7 +2400,14 @@ DEFAULT_CONFIG = {
         # resort after the pool refused it (no cap: the load gate is the only
         # local limit); local = today's local-first order. Kill switch: local.
         "placement": {"read_signal": True, "route_first": True, "default": "local",
-                      "admit_on_memory": False, "worker_reservation_gb": 6},
+                      "admit_on_memory": False, "worker_reservation_gb": 6,
+                      # allocd (Router Core Card B1, t_4187c8f1; read per tick): off | shadow | on.
+                      # off = the in-process scorer, allocd never consulted. shadow = allocd also
+                      # scores each unpinned pool take (nothing booked), the in-process pick acts,
+                      # and <root>/var/alloc/shadow/kanban.jsonl gets one line per decision
+                      # (promotion gate: n >= 50 answered, 0 disagreements). on = alloc_client.admit
+                      # picks and books; release/renew go through alloc_client.
+                      "allocd": "off"},
         "dispatch_load_gate": {
             "enabled": True,
             "pause_above": None,

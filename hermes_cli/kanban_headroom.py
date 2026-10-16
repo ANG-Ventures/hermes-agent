@@ -25,10 +25,23 @@ reap is a row in ``var/placement/admissions.jsonl`` (allocation 2.3). A dry run 
 only its own simulated takes, so N picks see N headrooms there too.
 
 No table (hermes-home not yet deployed) = the previous pick, logged once.
+
+Router Core Card B1 (t_4187c8f1): ``kanban.placement.allocd`` (off | shadow |
+on, default off, read per tick) routes the UNPINNED scorer take through allocd
+(``alloc_client``, vendored). off = the path above, unchanged, allocd never
+consulted. shadow = allocd scores the same row first (``shadow: true``, nothing
+booked), the old path acts, and one line per decision lands in
+``<root>/var/alloc/shadow/kanban.jsonl``. on = ``alloc_client.admit`` decides
+and books; release / renew of that reservation go through ``alloc_client``.
+allocd is given the candidates AFTER pins, reach / capability ``only``, board
+roots and the assignee's profile list, and after the pool's structural limits
+(host state, reachability, pool slots); the local pressure band is allocd's to
+decide. A dry run never consults allocd.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import math
@@ -55,6 +68,13 @@ RESERVATION_KEY = "placement_reservation"
 # collector's file carries no %system, so that axis is declared unavailable
 # rather than closing every host as unmeasured (placement.REQUIRED_AXES).
 PROBE_AXES = tuple(a for a in placement.REQUIRED_AXES if a != "system_pct")
+# kanban.placement.allocd (t_4187c8f1).
+ALLOCD_OFF, ALLOCD_SHADOW, ALLOCD_ON = "off", "shadow", "on"
+ALLOCD_MODES = (ALLOCD_OFF, ALLOCD_SHADOW, ALLOCD_ON)
+# worker_placed key naming who booked the reservation; absent = the in-process ledger.
+RESERVATION_VIA_KEY = "placement_reservation_via"
+VIA_ALLOC_CLIENT = "alloc_client"
+SHADOW_REL = Path("var") / "alloc" / "shadow" / f"{CONSUMER}.jsonl"
 
 
 def table_path(root: Path) -> Path:
@@ -261,6 +281,142 @@ def release_id(sig, rid: Optional[str]) -> None:
         _log.warning("kanban pool: refund of reservation %s failed (TTL bounds it): %s", rid, exc)
 
 
+# -- kanban.placement.allocd (Router Core Card B1, t_4187c8f1) ---------------
+
+def allocd_mode(kanban_cfg: Any) -> str:
+    """``kanban.placement.allocd``: off | shadow | on (default off). YAML's bare
+    ``off`` / ``on`` arrive as booleans and mean the same; anything else is off."""
+    pl = kanban_cfg.get("placement") if isinstance(kanban_cfg, Mapping) else None
+    v = pl.get("allocd", ALLOCD_OFF) if isinstance(pl, Mapping) else ALLOCD_OFF
+    if v is False or v is None:
+        return ALLOCD_OFF
+    if v is True:
+        return ALLOCD_ON
+    if isinstance(v, str) and v.strip().lower() in ALLOCD_MODES:
+        return v.strip().lower()
+    _log.warning("kanban pool: kanban.placement.allocd=%r is not off|shadow|on; off", v)
+    return ALLOCD_OFF
+
+
+def plan_allocd_mode(plan) -> str:
+    """The mode THIS take runs under: a dry run never consults allocd."""
+    if plan.dry_run or plan.signal is None or plan.signal.placement_table is None:
+        return ALLOCD_OFF
+    return getattr(plan.signal, "allocd", ALLOCD_OFF)
+
+
+def structural_free(plan, name: str) -> int:
+    """Pool slots left on ``name`` from the pool's STRUCTURAL limits only (enabled,
+    ``state`` active, the probe answered, slots - running - this tick's takes).
+    The local pressure band and memory cap are not applied: on the allocd path
+    they are allocd's decision."""
+    h = plan.hosts.get(name)
+    d = plan.detail.get(name) or {}
+    if h is None or not (h.enabled and h.state == "active") or d.get("load1") is None:
+        return 0
+    return max(0, h.slots - int(d.get("running") or 0) - plan.taken.get(name, 0))
+
+
+def _job_kw(job: Optional[placement.Job]) -> Dict[str, Any]:
+    return {} if job is None else {k: v for k, v in dataclasses.asdict(job).items() if v is not None}
+
+
+def allocd_request(plan, names, job: Optional[placement.Job]) -> Dict[str, Any]:
+    """The admit fields every allocd ask carries (on and shadow alike): the
+    filtered candidates as table ids, the Job overrides, the hysteresis pick."""
+    table = plan.signal.placement_table
+    return {"candidates": [table.resolve(n) or n for n in names], "job": _job_kw(job),
+            "previous": table.resolve(plan.last_pick) if plan.last_pick else None}
+
+
+def allocd_admit(plan, names, job: Optional[placement.Job], job_id: Optional[str]):
+    """``alloc_client.admit`` for an unpinned take (mode on). Returns AdmitResult;
+    raises alloc_client.Refused on a terminal answer (never bypassed)."""
+    from hermes_cli import alloc_client
+    return alloc_client.admit(CONSUMER, job_id=job_id, ttl_s=RESERVE_TTL_S, **allocd_request(plan, names, job))
+
+
+def release_alloc(rid: str) -> bool:
+    """Release a reservation alloc_client booked (allocd, or its in-process fallback)."""
+    from hermes_cli import alloc_client
+    try:
+        return alloc_client.release(rid, consumer=CONSUMER)
+    except Exception as exc:  # Refused / an unreadable ledger: the TTL bounds the row
+        _log.warning("kanban pool: alloc_client release of %s failed (TTL bounds it): %s", rid, exc)
+        return False
+
+
+def _renew_alloc(rid: str) -> bool:
+    """Renew a reservation alloc_client booked; a terminal refusal is a failed renewal."""
+    from hermes_cli import alloc_client
+    try:
+        return alloc_client.renew(rid, ttl_s=RESERVE_TTL_S, consumer=CONSUMER)
+    except Exception as exc:  # Refused / an unreadable ledger
+        raise placement.PlacementError(f"alloc_client renew: {exc}") from exc
+
+
+def shadow_ask(plan, names, job: Optional[placement.Job], job_id: Optional[str]) -> Dict[str, Any]:
+    """What allocd WOULD answer for this take (mode shadow), asked BEFORE the old
+    path books: ``/admit`` with ``shadow: true`` (scored, nothing reserved) over the
+    candidates mode on would send. Never the in-process fallback, never a write."""
+    from hermes_cli import alloc_client
+    cands = [n for n in names if structural_free(plan, n) > 0]
+    req = allocd_request(plan, cands, job)
+    out: Dict[str, Any] = {"candidates": req["candidates"], "answered": False, "new_host": None,
+                           "new_rule": None, "new_reason": ""}
+    if not cands:
+        out.update(answered=True, new_reason="no_candidates")
+        return out
+    body = {"consumer": CONSUMER, "job_id": job_id or "shadow", "ttl_s": RESERVE_TTL_S, "class": None,
+            "footprint": None, "shadow": True, **req}
+    try:
+        if (placement.fleet_root() / alloc_client.ROUTER_OFF_REL).exists():
+            raise alloc_client.Unreachable("router-off file present")
+        code, ans = alloc_client._call("/admit", body, timeout=alloc_client.TIMEOUT_S)
+    except alloc_client.Unreachable as exc:
+        out["new_reason"] = f"allocd_unreachable: {exc}"
+        return out
+    except alloc_client.Refused as exc:
+        out["new_reason"] = f"allocd_refused: {exc}"
+        return out
+    if code != 200 or not isinstance(ans, dict) or ans.get("shadow") is not True:
+        out["new_reason"] = f"allocd_unexpected_reply: {code}"
+        return out
+    out.update(answered=True, new_host=ans.get("host") or None, new_rule=ans.get("rule") or None,
+               new_reason=ans.get("reason") or "")
+    return out
+
+
+def shadow_record(plan, ask: Mapping[str, Any], host, job_id: Optional[str]) -> Dict[str, Any]:
+    """Append one decision to ``<root>/var/alloc/shadow/kanban.jsonl``:
+    ``{at, consumer, job_id, old_host, new_host, agree, reason, old_rule, new_rule, candidates}``.
+    ``agree`` is null when allocd gave no answer (not a comparison: never counted
+    toward the n >= 50 promotion gate). Hosts are table ids."""
+    sig = plan.signal
+    table = sig.placement_table
+    old = (table.resolve(host.name) or host.name) if host is not None else None
+    new = ask.get("new_host")
+    d = plan.last_decision
+    old_rule = getattr(d, "rule", None) if host is not None else None
+    if not ask.get("answered"):
+        agree, reason = None, ask.get("new_reason") or "allocd gave no answer"
+    else:
+        agree = old == new
+        reason = "agree" if agree else (
+            f"old {old or 'refused: ' + (plan.refusal or '?')} vs new {new or 'refused: ' + (ask.get('new_reason') or '?')}")
+    line = {"at": time.time(), "consumer": CONSUMER, "job_id": job_id, "old_host": old, "new_host": new,
+            "agree": agree, "reason": reason, "old_rule": old_rule or None, "new_rule": ask.get("new_rule"),
+            "candidates": list(ask.get("candidates") or ())}
+    p = Path(sig.placement_reservations).parents[2] / SHADOW_REL
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, sort_keys=True) + "\n")
+    except OSError as exc:
+        _log.warning("kanban pool: shadow line not written (%s): %s", p, exc)
+    return line
+
+
 def pool_key(table, names, host: Optional[str]) -> Optional[str]:
     """The pool host id behind the scorer's canonical ``host`` (Prism 5c776514232a)."""
     if host is None:
@@ -271,20 +427,34 @@ def pool_key(table, names, host: Optional[str]) -> Optional[str]:
     return None
 
 
-def reservation_for_run(conn, task_id: str, run_id: Optional[int]) -> Optional[str]:
-    """The headroom reservation id the run's ``worker_placed`` event carries."""
+def run_reservation(conn, task_id: str, run_id: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
+    """``(reservation id, via)`` the run's ``worker_placed`` event carries; ``via``
+    is ``alloc_client`` for an allocd-path take, else None (the in-process ledger)."""
     if run_id is None:
-        return None
+        return None, None
     from hermes_cli import kanban_placement_reasons as _pr
     try:
         row = conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? "
             "ORDER BY id DESC LIMIT 1", (task_id, run_id, _pr.WORKER_PLACED_EVENT)).fetchone()
-        rid = json.loads(row[0] or "{}").get(RESERVATION_KEY) if row else None
+        doc = json.loads(row[0] or "{}") if row else {}
     except Exception as exc:
         _log.warning("kanban pool: placement reservation lookup failed for %s run %s: %s", task_id, run_id, exc)
-        return None
-    return rid if isinstance(rid, str) and rid else None
+        return None, None
+    rid = doc.get(RESERVATION_KEY)
+    if not (isinstance(rid, str) and rid):
+        return None, None
+    return rid, (VIA_ALLOC_CLIENT if doc.get(RESERVATION_VIA_KEY) == VIA_ALLOC_CLIENT else None)
+
+
+def reservation_for_run(conn, task_id: str, run_id: Optional[int]) -> Optional[str]:
+    """The headroom reservation id the run's ``worker_placed`` event carries."""
+    return run_reservation(conn, task_id, run_id)[0]
+
+
+def release_run_reservation(rid: str, via: Optional[str]) -> bool:
+    """End a run's reservation through whoever booked it."""
+    return release_alloc(rid) if via == VIA_ALLOC_CLIENT else release_reservation(rid)
 
 
 def release_reservation(rid: str, root: Optional[Path] = None) -> bool:
@@ -302,9 +472,10 @@ def release_for_run(conn, task_id: str, run_id: Optional[int], root: Optional[Pa
     return False if rid is None else release_reservation(rid, root)
 
 
-def running_reservations(conn) -> List[Tuple[str, str]]:
-    """``(task_id, reservation id)`` for every RUNNING card whose current run's
-    ``worker_placed`` event carries a headroom reservation."""
+def running_reservations(conn) -> List[Tuple[str, str, Optional[str]]]:
+    """``(task_id, reservation id, via)`` for every RUNNING card whose current run's
+    ``worker_placed`` event carries a headroom reservation (``via`` as in
+    :func:`run_reservation`)."""
     from hermes_cli import kanban_placement_reasons as _pr
     out: List[Tuple[str, str]] = []
     for tid, payload in conn.execute(
@@ -312,11 +483,12 @@ def running_reservations(conn) -> List[Tuple[str, str]]:
             "WHERE t.status = 'running' AND e.kind = ? AND e.run_id IS NOT NULL "
             "AND e.run_id = t.current_run_id", (_pr.WORKER_PLACED_EVENT,)).fetchall():
         try:
-            rid = json.loads(payload or "{}").get(RESERVATION_KEY)
+            doc = json.loads(payload or "{}")
+            rid = doc.get(RESERVATION_KEY)
         except (TypeError, ValueError, AttributeError):
             continue
         if isinstance(rid, str) and rid:
-            out.append((tid, rid))
+            out.append((tid, rid, VIA_ALLOC_CLIENT if doc.get(RESERVATION_VIA_KEY) == VIA_ALLOC_CLIENT else None))
     return out
 
 
@@ -342,9 +514,12 @@ def renew_running(boards, connect, path, *, now: Optional[float] = None) -> Dict
                     conn.close()
                 except Exception:
                     pass
-        for tid, rid in rows:
+        for tid, rid, via in rows:
             try:
-                ok = placement.renew(rid, ttl_s=RESERVE_TTL_S, path=path, now=now)
+                if via == VIA_ALLOC_CLIENT:
+                    ok = _renew_alloc(rid)
+                else:
+                    ok = placement.renew(rid, ttl_s=RESERVE_TTL_S, path=path, now=now)
             except placement.PlacementError as exc:
                 _log.warning("kanban pool: renewal of reservation %s (%s) failed: %s", rid, tid, exc)
                 continue
