@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from hermes_cli.kanban_placement_reasons import ACCESS_CONTROL_PLANE_READ as _ACCESS_CONTROL_PLANE_READ
+
 MAP_FILE = "host-capabilities.json"
 INDEX_FILE = "skill-host-requires.json"
 CAPS_ENV = "KANBAN_PLACEMENT_CAPS"
@@ -455,7 +457,9 @@ def derive(body: Optional[str], skills: Iterable[str], cmap: CapabilityMap
     words = declared_words(body)
     none = NONE_WORD in words
     for w in words:
-        if w != NONE_WORD:
+        # ``requires: control-plane-read`` is the access-bound declaration
+        # (spec §2.6), owned by portable(), not a capability of the map.
+        if w != NONE_WORD and w != _ACCESS_CONTROL_PLANE_READ:
             reqs.append(Requirement(cap_of(w), HARD, DECLARED, w))
     attached = [s for s in dict.fromkeys(skills or ()) if isinstance(s, str)]
     attached_keys = {skill_key(s) for s in attached}

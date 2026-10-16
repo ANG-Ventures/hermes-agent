@@ -25,6 +25,28 @@ HOST_REACH = "host_reach"  # host-bound card, no pool host with a proven ssh rou
 PIN_UNKNOWN_HOST = "pin_unknown_host"
 
 
+# Access-bound (spec v1.2 §2.6, Phase 2c, t_e99ef75c): the WORK is about host X
+# or the board, the ACCESS exists only on the Studio. Local, named, never spills.
+ACCESS_BOUND = "access_bound"
+ACCESS_SSH_ROOT = "ssh-root"                      # ``ssh <alias> ... sudo ...``
+ACCESS_CONTROL_PLANE_READ = "control-plane-read"  # board DBs, gateway.log, load gate, pool file
+
+
+def access_bound(cap: str) -> str:
+    """``access_bound:<cap>``."""
+    return f"{ACCESS_BOUND}:{cap}"
+
+
+def ssh_root(host: str) -> str:
+    """``ssh-root:<host>``."""
+    return f"{ACCESS_SSH_ROOT}:{host}"
+
+
+def access_pin_contradiction(cap: str, pin: str) -> str:
+    """The §5 contradiction comment for an access-bound card pinned to a pool host."""
+    return f"access {cap} is Studio-only; remove host:{pin} or run it from the Studio"
+
+
 def pin_unknown_host(word: str, suggestions=()) -> str:
     """``pin_unknown_host:<word>`` plus `` (did you mean: a, b)``."""
     tail = f" (did you mean: {', '.join(suggestions)})" if suggestions else ""

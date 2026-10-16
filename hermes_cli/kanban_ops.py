@@ -566,6 +566,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(f"Placement capability: {tid} names unknown capability {seen['unknown']!r}; stays local")
         if seen.get("pin_lacks"):
             print(f"Placement capability: {tid} {seen['pin_lacks']}; parked needs_input")
+    for tid, line in (getattr(res, "access_contradictions", None) or {}).items():
+        print(f"Access-bound: {tid} {line}; "
+              + ("would park needs_input" if args.dry_run else "parked needs_input"))
     for tid, reason in res.respawn_guarded:
         print(
             f"Deferred (respawn guard {reason}): {tid}"

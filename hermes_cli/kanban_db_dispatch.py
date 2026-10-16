@@ -316,6 +316,9 @@ class DispatchResult:
     unknown_pins: dict = field(default_factory=dict)
     """task id -> the ``host:`` word that names no host (t_cb2b888d): the card
     is held local-only and gets one latched comment per (task, word)."""
+    access_contradictions: dict = field(default_factory=dict)
+    """task id -> the §5 line of an access-bound card (spec §2.6) pinned to a
+    pool host: parked ``needs_input`` after the loop (dry run: reported)."""
     browser_joins: dict = field(default_factory=dict)
     """task id -> ``{"plans": [...], "source_host": <worker host>}`` for a ready card whose
     ``browser:ephemeral`` lease the s7 join takes at spawn (``kanban.browser_join``, t_2828292d)."""
@@ -4466,11 +4469,14 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                affinity_out: Optional[dict] = None,
                unknown_out: Optional[dict] = None,
                caps=None, caps_out: Optional[dict] = None,
-               rules_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+               rules_out: Optional[dict] = None,
+               access_out: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
     ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
-    portable) for the ``placement`` record (spec §4.1).
+    portable) for the ``placement`` record (spec §4.1). ``access_out[id]``
+    gets the §5 contradiction line of an access-bound card pinned to a pool
+    host (parked ``needs_input`` after the loop).
 
     ``portable()`` is THE classifier; a remote pin on a card that fails
     ``hard_ok`` waits ``not_portable:<rule>`` and is never spawned locally.
@@ -4587,6 +4593,15 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         rule = _pr.linked(*link)  # name the edge that holds it (t_ae87edff)
     if rules_out is not None:
         rules_out[row["id"]] = rule
+    if rule.startswith(_pr.ACCESS_BOUND + ":"):
+        # Access-bound (spec §2.6): local, named, never spilled. A pool pin
+        # contradicts it: park needs_input (§5), never wait on that host.
+        if pin is not None and pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
+            if access_out is not None:
+                access_out[row["id"]] = _pr.access_pin_contradiction(
+                    rule.split(":", 1)[1], pin)
+            return "wait", rule
+        return "local", rule
     if rule == _pr.HOST_REACH:
         # A host-bound card (ssh skill / fleet alias in the body) with no
         # worker host proven to reach its target: local, never spilled.
@@ -4631,6 +4646,26 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
 
 _STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "studio_body",
                                     "studio_needs"})
+
+
+def _park_access_contradictions(conn, result, dry_run: bool) -> None:
+    """Park every access-bound card pinned to a pool host ``needs_input``
+    with the §5 line (spec §2.6): it cannot run there, so it must not wait
+    there. Fenced like the pin-lacks park: a card claimed since the snapshot
+    is left alone. A dry run only reports."""
+    for tid, line in (result.access_contradictions or {}).items():
+        if dry_run:
+            continue
+        try:
+            if _kb.block_task(conn, tid, reason=line, kind="needs_input",
+                              require_unclaimed_ready=True):
+                _kb.add_comment(conn, tid, "dispatcher", line)
+                (result.placement_waits or {}).pop(tid, None)
+            else:
+                _kb._log.info("kanban dispatch: %s no longer ready+unclaimed; access park skipped", tid)
+        except Exception:
+            _kb._log.warning("kanban dispatch: could not park %s needs_input (%s)", tid, line,
+                             exc_info=True)
 
 
 def _identity_only_needed(verdict, caps, any_pin: bool = False) -> bool:
@@ -5635,7 +5670,8 @@ def _dispatch_once_locked(
                                          _lineage, result.placement_affinity,
                                          unknown_out=result.unknown_pins,
                                          caps=_caps, caps_out=_caps_out,
-                                         rules_out=row_rules)
+                                         rules_out=row_rules,
+                                         access_out=result.access_contradictions)
                      for r in ready_rows}
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
@@ -6824,6 +6860,7 @@ def _dispatch_once_locked(
         record_affinity_events(conn, result, _affinity_evaluated, _affinity_reached)
         _khc.record_capability_events(conn, result, _caps, _caps_out, _affinity_evaluated,
                                       _cap_comments)
+    _park_access_contradictions(conn, result, dry_run)
     _record_placement_waits(conn, result, row_route, dry_run, _wait_reached)
     result.rows_routed = len(ready_rows)
     result.portable_waiting = sum(
