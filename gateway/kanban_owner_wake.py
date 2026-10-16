@@ -83,6 +83,8 @@ STUCK_KINDS = frozenset({"stalled", "crashed", "gave_up", "timed_out"})
 # card with such a sub on the owner's chat gets its plain wake from there;
 # this module adds only (d) children-ready and (e) red/dirty PR.
 SUB_WAKE_KINDS = frozenset({"blocked", "crashed", "gave_up", "timed_out"})
+# (e) red handback: the notifier's wake carries the red-PR state itself and
+# marks the event (mark_carried); only an uncarried one wakes from here.
 
 TRIGGER_NEEDS_INPUT = "needs_input"
 TRIGGER_PRECONDITION = "blocked_precondition"
@@ -848,6 +850,39 @@ def has_wake_sub(kb: Any, board: str, task_id: str, origin: Any, profile: str) -
     return False
 
 
+def mark_carried(runner: Any, board: str, task_id: str, event_ids: Iterable[int],
+                 platform: Any, chat_id: Any, thread_id: Any = "",
+                 now: Optional[float] = None) -> None:
+    """t_b1d26df7: the notifier's DELIVERED wake into this chat already carried the
+    red-PR state of these ``review_requested`` events, so the owner-wake must not
+    wake that chat again. In-memory: a restart loses it (cost: one duplicate turn)."""
+    now = time.time() if now is None else now
+    seen = getattr(runner, "_kanban_red_carried", None)
+    if seen is None:
+        seen = {}
+        runner._kanban_red_carried = seen
+    for k in [k for k, t in seen.items() if now - t > PENDING_MAX_AGE_SECONDS]:
+        seen.pop(k, None)
+    for eid in event_ids:
+        seen[_carried_key(board, task_id, eid, platform, chat_id, thread_id)] = now
+
+
+def _carried_key(board: Any, task_id: Any, event_id: Any, platform: Any, chat_id: Any,
+                 thread_id: Any) -> str:
+    plat = str(getattr(platform, "value", platform) or "").strip().lower()
+    chat = str(chat_id or "").strip()
+    thread = str(thread_id or "").strip()
+    if thread == chat:
+        thread = ""
+    return f"{board}|{task_id}|{int(event_id)}|{plat}|{chat}|{thread}"
+
+
+def is_carried(runner: Any, board: str, task_id: str, event_id: Any, origin: Any) -> bool:
+    seen = getattr(runner, "_kanban_red_carried", None) or {}
+    return _carried_key(board, task_id, event_id, getattr(origin, "platform", ""),
+                        getattr(origin, "chat_id", ""), getattr(origin, "thread_id", "")) in seen
+
+
 def _owner_home(runner: Any, entry: Any, owner_profile: str) -> Optional[Path]:
     """The owner profile's HERMES_HOME under multiplex (its config.yaml holds its
     policy), else None (= this process's own home)."""
@@ -1035,7 +1070,12 @@ async def tick(runner: Any, *, now: Optional[float] = None,
                     _drop_redundant, kb, card, items, own, owner_profile, suppress_cfgs[owner_profile])
         if items and await asyncio.to_thread(has_wake_sub, kb, card["board"], card["task_id"],
                                              entry.origin, owner_profile):
-            items = [i for i in items if i["kind"] not in SUB_WAKE_KINDS]
+            # t_b1d26df7: a red handback the notifier's wake already carried
+            # (same event id, delivered) is one wake, not two.
+            items = [i for i in items if i["kind"] not in SUB_WAKE_KINDS
+                     and not (i["kind"] == "review_requested"
+                              and is_carried(runner, card["board"], card["task_id"], i["event_id"],
+                                             entry.origin))]
         if not items:
             state.pending.pop(key, None)
             continue
