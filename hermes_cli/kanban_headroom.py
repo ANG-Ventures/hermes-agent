@@ -46,6 +46,7 @@ import json
 import logging
 import math
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -74,6 +75,11 @@ ALLOCD_MODES = (ALLOCD_OFF, ALLOCD_SHADOW, ALLOCD_ON)
 # worker_placed key naming who booked the reservation; absent = the in-process ledger.
 RESERVATION_VIA_KEY = "placement_reservation_via"
 VIA_ALLOC_CLIENT = "alloc_client"
+# Run event: alloc_client renewed a run's reservation by RE-ADMITTING it under a new
+# id (``{"from": old, "to": new}``). Its alias map is process-local, so the run's
+# reservation id after the replacement lives here, read back by run_reservation /
+# running_reservations after a restart (Prism 43f676a1839e).
+RESERVATION_REPLACED_EVENT = "placement_reservation_replaced"
 SHADOW_REL = Path("var") / "alloc" / "shadow" / f"{CONSUMER}.jsonl"
 
 
@@ -333,7 +339,16 @@ def allocd_admit(plan, names, job: Optional[placement.Job], job_id: Optional[str
     """``alloc_client.admit`` for an unpinned take (mode on). Returns AdmitResult;
     raises alloc_client.Refused on a terminal answer (never bypassed)."""
     from hermes_cli import alloc_client
-    return alloc_client.admit(CONSUMER, job_id=job_id, ttl_s=RESERVE_TTL_S, **allocd_request(plan, names, job))
+    return alloc_client.admit(CONSUMER, job_id=admission_key(job_id), ttl_s=RESERVE_TTL_S,
+                              **allocd_request(plan, names, job))
+
+
+def admission_key(job_id: Optional[str]) -> Optional[str]:
+    """The idempotency key for ONE admission: ``<card id>#<nonce>`` (Prism 2de4f2d22204).
+    alloc_client and allocd ``reuse_job`` on it, so it must be stable across that one
+    admission's allocd -> fallback replay (one ``alloc_client.admit`` call) and fresh
+    per take: a retried card must never be handed the previous run's live row."""
+    return None if job_id is None else f"{job_id}#{uuid.uuid4().hex[:12]}"
 
 
 def release_alloc(rid: str) -> bool:
@@ -353,6 +368,28 @@ def _renew_alloc(rid: str) -> bool:
         return alloc_client.renew(rid, ttl_s=RESERVE_TTL_S, consumer=CONSUMER)
     except Exception as exc:  # Refused / an unreadable ledger
         raise placement.PlacementError(f"alloc_client renew: {exc}") from exc
+
+
+def _alloc_current(rid: str) -> str:
+    """The id alloc_client now tracks for ``rid`` (its process-local re-admit alias)."""
+    from hermes_cli import alloc_client
+    return alloc_client._current(rid)
+
+
+def _persist_replacement(connect, slug: str, task_id: str, old: str, new: str) -> None:
+    conn = None
+    try:
+        conn = connect(board=slug)
+        record_replacement(conn, task_id, old, new)
+    except Exception as exc:
+        _log.warning("kanban pool: reservation replacement %s -> %s (%s on board %s) not recorded: %s",
+                     old, new, task_id, slug, exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def shadow_ask(plan, names, job: Optional[placement.Job], job_id: Optional[str]) -> Dict[str, Any]:
@@ -444,7 +481,49 @@ def run_reservation(conn, task_id: str, run_id: Optional[int]) -> Tuple[Optional
     rid = doc.get(RESERVATION_KEY)
     if not (isinstance(rid, str) and rid):
         return None, None
-    return rid, (VIA_ALLOC_CLIENT if doc.get(RESERVATION_VIA_KEY) == VIA_ALLOC_CLIENT else None)
+    via = VIA_ALLOC_CLIENT if doc.get(RESERVATION_VIA_KEY) == VIA_ALLOC_CLIENT else None
+    return (_replaced_rid(conn, task_id, run_id, rid) if via else rid), via
+
+
+def _replaced_rid(conn, task_id: str, run_id: int, rid: str) -> str:
+    """``rid`` after the run's persisted :data:`RESERVATION_REPLACED_EVENT` hops (oldest
+    first), so a reservation alloc_client re-admitted under a new id is still the
+    run's after a gateway restart (Prism 43f676a1839e)."""
+    try:
+        rows = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? ORDER BY id",
+            (task_id, run_id, RESERVATION_REPLACED_EVENT)).fetchall()
+    except Exception as exc:
+        _log.warning("kanban pool: reservation replacement lookup failed for %s run %s: %s", task_id, run_id, exc)
+        return rid
+    for (payload,) in rows:
+        try:
+            doc = json.loads(payload or "{}")
+        except (TypeError, ValueError):
+            continue
+        to = doc.get("to") if isinstance(doc, dict) else None
+        if doc.get("from") == rid and isinstance(to, str) and to:
+            rid = to
+    return rid
+
+
+def record_replacement(conn, task_id: str, old: str, new: str) -> bool:
+    """Persist alloc_client's ``old -> new`` re-admission on the card's CURRENT run
+    (still running), so run_reservation / running_reservations follow it across a
+    restart. False (logged) when the run is gone or the write fails."""
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_connect as _kbc
+    try:
+        with _kbc.write_txn(conn):
+            row = conn.execute("SELECT current_run_id FROM tasks WHERE id = ? AND status = 'running'",
+                               (task_id,)).fetchone()
+            if not row or row[0] is None:
+                return False
+            _kb._append_event(conn, task_id, RESERVATION_REPLACED_EVENT, {"from": old, "to": new}, run_id=row[0])
+        return True
+    except Exception as exc:
+        _log.warning("kanban pool: reservation replacement %s -> %s (%s) not recorded: %s", old, new, task_id, exc)
+        return False
 
 
 def reservation_for_run(conn, task_id: str, run_id: Optional[int]) -> Optional[str]:
@@ -477,9 +556,9 @@ def running_reservations(conn) -> List[Tuple[str, str, Optional[str]]]:
     ``worker_placed`` event carries a headroom reservation (``via`` as in
     :func:`run_reservation`)."""
     from hermes_cli import kanban_placement_reasons as _pr
-    out: List[Tuple[str, str]] = []
-    for tid, payload in conn.execute(
-            "SELECT t.id, e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
+    out: List[Tuple[str, str, Optional[str]]] = []
+    for tid, run_id, payload in conn.execute(
+            "SELECT t.id, e.run_id, e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
             "WHERE t.status = 'running' AND e.kind = ? AND e.run_id IS NOT NULL "
             "AND e.run_id = t.current_run_id", (_pr.WORKER_PLACED_EVENT,)).fetchall():
         try:
@@ -488,7 +567,10 @@ def running_reservations(conn) -> List[Tuple[str, str, Optional[str]]]:
         except (TypeError, ValueError, AttributeError):
             continue
         if isinstance(rid, str) and rid:
-            out.append((tid, rid, VIA_ALLOC_CLIENT if doc.get(RESERVATION_VIA_KEY) == VIA_ALLOC_CLIENT else None))
+            if doc.get(RESERVATION_VIA_KEY) == VIA_ALLOC_CLIENT:
+                out.append((tid, _replaced_rid(conn, tid, run_id, rid), VIA_ALLOC_CLIENT))
+            else:
+                out.append((tid, rid, None))
     return out
 
 
@@ -518,6 +600,9 @@ def renew_running(boards, connect, path, *, now: Optional[float] = None) -> Dict
             try:
                 if via == VIA_ALLOC_CLIENT:
                     ok = _renew_alloc(rid)
+                    new = _alloc_current(rid) if ok else rid
+                    if new != rid:
+                        _persist_replacement(connect, slug, tid, rid, new)
                 else:
                     ok = placement.renew(rid, ttl_s=RESERVE_TTL_S, path=path, now=now)
             except placement.PlacementError as exc:
