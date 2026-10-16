@@ -2174,6 +2174,22 @@ class GatewayKanbanWatchersMixin:
                                                 _bad = None
                                             if _bad:
                                                 red_state[_ev.id] = _bad
+                                    # t_f3323c8a W8c: the children a completed close
+                                    # unblocked ride THIS wake too (owner-wake's
+                                    # last_blocker_done), one turn not two.
+                                    ready_state: dict = {}
+                                    if (sub.get("delivery_mode") or "notify") in ("notify+wake", "wake"):
+                                        for _ev in events:
+                                            if _ev.kind != "completed":
+                                                continue
+                                            try:
+                                                _kids = _ow.gated_ready_children(_kb, conn, sub["task_id"])
+                                            except Exception as _rc_exc:
+                                                logger.debug("kanban notifier: ready children of %s unread: %s",
+                                                             sub["task_id"], _rc_exc)
+                                                _kids = []
+                                            if _kids:
+                                                ready_state[_ev.id] = _kids
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -2189,6 +2205,7 @@ class GatewayKanbanWatchersMixin:
                                         "home_res": home_res,
                                         "close_gates": close_gates,
                                         "red_state": red_state,
+                                        "ready_state": ready_state,
                                         "self_event_ids": _self_ids,
                                         "suppressed": suppressed,
                                     })
@@ -2916,6 +2933,8 @@ class GatewayKanbanWatchersMixin:
                                 _owner_wake_mod.mark_carried(
                                     self, board_slug, sub["task_id"], _red_ids,
                                     sub.get("platform"), sub.get("chat_id"), sub.get("thread_id"),
+                                    who=(sub.get("user_id"), sub.get("user_id_alt")),
+                                    profile=sub.get("notifier_profile"),
                                 )
                         if _wake_kinds:
                             if _is_push_adapter:
@@ -2984,6 +3003,18 @@ class GatewayKanbanWatchersMixin:
                                     "\nHanded back for review but the PR cannot land ("
                                     f"{d['red_state'][_rid]}). Fix the PR before the merge pass."
                                 )
+                            _ready = d.get("ready_state") or {}
+                            _ready_ids = [
+                                ev.id for ev in d["events"]
+                                if ev.kind == "completed" and "completed" in _wake_kinds and ev.id in _ready
+                            ]
+                            for _rid in _ready_ids:
+                                _kids = ", ".join(f"{c['id']} [{c['status']}]" for c in _ready[_rid])
+                                _synth += (
+                                    f"\nIt was the last blocker of {_kids}; those children are now "
+                                    "unblocked: arm or dispatch them."
+                                )
+                            _red_ids = _red_ids + _ready_ids
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
                             )
