@@ -271,26 +271,27 @@ def test_w8_last_blocker_done_wakes_even_when_the_operator_closed_it(env):
     assert parent in turns[0].text and child in turns[0].text
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING t_0ea2883c: kanban_owner_wake.tick drops items whose actor_sid is the home "
-    "session (own-session pre-filter) BEFORE is_redundant sees NEVER_SUPPRESS_TRIGGERS, so "
-    "the home session closing the last blocker gets 0 turns. Strict: goes red when fixed."))
 def test_w8b_last_blocker_done_wakes_when_the_home_session_closed_it(env):
+    """Decided (t_f3323c8a): 'children ready' is news even to the session that
+    closed the last blocker, so the home session's own close wakes it once.
+
+    RED-PROVABLE: let the own-session cut drop protected triggers -> 0 turns."""
     parent, _child = _gated(env)
     _close(parent, sid=env["group"].session_id, summary="operator closed the last blocker")
     turns = _tick(env)
     assert _paths(turns) == ["owner-wake"], _msg("W8b", "home-session close of last blocker", turns)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "FINDING t_0ea2883c: a WORKER completing the last blocker on a card whose home chat "
-    "holds a notify+wake sub wakes twice (notifier 'completed' + owner-wake "
-    "last_blocker_done), the t_b1d26df7 class. Strict: goes red when fixed."))
 def test_w8c_worker_closing_last_blocker_with_wake_sub_is_one_turn(env):
-    parent, _child = _gated(env)
+    """The notifier's 'completed' wake carries the children-ready line, so the
+    owner-wake's last_blocker_done does not add a second turn (t_f3323c8a).
+
+    RED-PROVABLE: drop the ready ids from mark_carried -> two turns."""
+    parent, child = _gated(env)
     _close(parent, sid=WORKER_SID, profile="worker", summary="worker finished")
     turns = _tick(env)
     assert len(turns) == 1, _msg("W8c", "one completed event must be one turn", turns)
+    assert child in turns[0].text, _msg("W8c", "the one turn must name the unblocked child", turns)
 
 
 def test_w9_wake_only_sub_is_never_suppressed(env):

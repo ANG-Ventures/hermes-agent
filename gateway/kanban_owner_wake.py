@@ -85,6 +85,8 @@ STUCK_KINDS = frozenset({"stalled", "crashed", "gave_up", "timed_out"})
 SUB_WAKE_KINDS = frozenset({"blocked", "crashed", "gave_up", "timed_out"})
 # (e) red handback: the notifier's wake carries the red-PR state itself and
 # marks the event (mark_carried); only an uncarried one wakes from here.
+# (d) children-ready rides the notifier's ``completed`` wake the same way.
+CARRIED_KINDS = frozenset({"review_requested", "completed"})
 
 TRIGGER_NEEDS_INPUT = "needs_input"
 TRIGGER_PRECONDITION = "blocked_precondition"
@@ -852,19 +854,25 @@ def has_wake_sub(kb: Any, board: str, task_id: str, origin: Any, profile: str) -
 
 def mark_carried(runner: Any, board: str, task_id: str, event_ids: Iterable[int],
                  platform: Any, chat_id: Any, thread_id: Any = "",
-                 now: Optional[float] = None) -> None:
+                 now: Optional[float] = None, who: Iterable[Any] = (),
+                 profile: Any = "") -> None:
     """t_b1d26df7: the notifier's DELIVERED wake into this chat already carried the
-    red-PR state of these ``review_requested`` events, so the owner-wake must not
-    wake that chat again. In-memory: a restart loses it (cost: one duplicate turn)."""
+    red-PR state (or, t_f3323c8a, the ready children) of these events, so the
+    owner-wake must not wake that chat again. ``who``/``profile`` are the sub's
+    participant ids and notifier profile: the same proof :func:`has_wake_sub` asks
+    for, kept here because a terminal ``completed`` unsubscribes the sub before the
+    owner-wake runs. In-memory: a restart loses it (cost: one duplicate turn)."""
     now = time.time() if now is None else now
     seen = getattr(runner, "_kanban_red_carried", None)
     if seen is None:
         seen = {}
         runner._kanban_red_carried = seen
-    for k in [k for k, t in seen.items() if now - t > PENDING_MAX_AGE_SECONDS]:
+    for k in [k for k, v in seen.items() if now - v[0] > PENDING_MAX_AGE_SECONDS]:
         seen.pop(k, None)
+    ids = frozenset(str(w or "").strip() for w in who) - {""}
+    prof = str(profile or "").strip() or "default"
     for eid in event_ids:
-        seen[_carried_key(board, task_id, eid, platform, chat_id, thread_id)] = now
+        seen[_carried_key(board, task_id, eid, platform, chat_id, thread_id)] = (now, ids, prof)
 
 
 def _carried_key(board: Any, task_id: Any, event_id: Any, platform: Any, chat_id: Any,
@@ -877,10 +885,19 @@ def _carried_key(board: Any, task_id: Any, event_id: Any, platform: Any, chat_id
     return f"{board}|{task_id}|{int(event_id)}|{plat}|{chat}|{thread}"
 
 
-def is_carried(runner: Any, board: str, task_id: str, event_id: Any, origin: Any) -> bool:
+def is_carried(runner: Any, board: str, task_id: str, event_id: Any, origin: Any,
+               profile: Any = "") -> bool:
+    """Carried into the OWNER's session: same chat, a participant id shared with
+    ``origin`` and the owner's profile. An identity-less mark never counts (a
+    duplicate turn is the safe failure, a lost one is not)."""
     seen = getattr(runner, "_kanban_red_carried", None) or {}
-    return _carried_key(board, task_id, event_id, getattr(origin, "platform", ""),
-                        getattr(origin, "chat_id", ""), getattr(origin, "thread_id", "")) in seen
+    hit = seen.get(_carried_key(board, task_id, event_id, getattr(origin, "platform", ""),
+                                getattr(origin, "chat_id", ""), getattr(origin, "thread_id", "")))
+    if hit is None:
+        return False
+    _t, ids, prof = hit
+    owner_ids = {str(getattr(origin, a, "") or "").strip() for a in ("user_id", "user_id_alt")} - {""}
+    return bool(ids & owner_ids) and prof == (str(profile or "").strip() or "default")
 
 
 def _owner_home(runner: Any, entry: Any, owner_profile: str) -> Optional[Path]:
@@ -1057,7 +1074,11 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             state.pending.pop(key, None)
             continue
         own = {str(card.get("home_sid") or ""), str(getattr(entry, "session_id", "") or "")}
-        items = [i for i in card["items"] if not (i.get("actor_sid") and i["actor_sid"] in own)]
+        # t_f3323c8a W8b: "children ready" is news even to the session that closed
+        # the last blocker, so protected triggers skip the own-session cut too.
+        items = [i for i in card["items"]
+                 if i.get("trigger") in _ns.NEVER_SUPPRESS_TRIGGERS
+                 or not (i.get("actor_sid") and i["actor_sid"] in own)]
         # t_4c7da648: the shared redundancy predicate (operator profile / closer
         # after the operator's APPROVE). Protected triggers never drop here.
         if items:
@@ -1068,14 +1089,16 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             if suppress_cfgs[owner_profile].enabled:
                 items = await asyncio.to_thread(
                     _drop_redundant, kb, card, items, own, owner_profile, suppress_cfgs[owner_profile])
+        # t_b1d26df7 / t_f3323c8a W8c: a red handback or a children-ready close
+        # the notifier's wake already carried into the owner's session (same
+        # event id, delivered) is one wake, not two.
+        items = [i for i in items
+                 if not (i["kind"] in CARRIED_KINDS
+                         and is_carried(runner, card["board"], card["task_id"], i["event_id"],
+                                        entry.origin, owner_profile))]
         if items and await asyncio.to_thread(has_wake_sub, kb, card["board"], card["task_id"],
                                              entry.origin, owner_profile):
-            # t_b1d26df7: a red handback the notifier's wake already carried
-            # (same event id, delivered) is one wake, not two.
-            items = [i for i in items if i["kind"] not in SUB_WAKE_KINDS
-                     and not (i["kind"] == "review_requested"
-                              and is_carried(runner, card["board"], card["task_id"], i["event_id"],
-                                             entry.origin))]
+            items = [i for i in items if i["kind"] not in SUB_WAKE_KINDS]
         if not items:
             state.pending.pop(key, None)
             continue
