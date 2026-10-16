@@ -26,6 +26,10 @@ from typing import Callable, Dict, MutableMapping, Optional
 from hermes_cli.kanban_worker_pool import PLACED_EVENT, PoolHost, _ssh_argv  # noqa: F401
 
 PLACEMENT_ENV = "KANBAN_WORKER_PLACEMENT"
+# The synthetic placement of a Studio-local worker (``kanban_local_worker_uid``). Defined here,
+# in the platform-independent module, so classifying a host never imports the POSIX uid code
+# (t_ecfd5591 f6dcfd6d5efb).
+LOCAL_HOST_NAME = "studio-local"
 REAPPLY_FAILED_KEY = "placement_reapply_failed"
 
 _PROBE_TIMEOUT_SECONDS = 8
@@ -65,20 +69,70 @@ def apply_placement(env: Dict[str, str], host: PoolHost, workspace: str, *,
     return values
 
 
+class RemoteWorkspaceUnavailable(RuntimeError):
+    """The pool host answered but could not create the card's workspace (no
+    board mount, a root-owned parent): a HOST fault, never the card's
+    (t_9fb4d477). The dispatcher closes the run ``infrastructure: true``."""
+
+    def __init__(self, host: str, board: Optional[str], message: str):
+        super().__init__(message)
+        self.host, self.board = host, board
+
+
+_BOARD_ROOT_RC = 86
+
+
 def prepare_remote_workspace(host: PoolHost, workspace: str,
-                             runner: Callable = subprocess.run) -> None:
+                             runner: Callable = subprocess.run, *,
+                             board: Optional[str] = None) -> None:
     """Create the card's workspace at the same absolute path on the host."""
+    # rc _BOARD_ROOT_RC only when the BOARD root itself is unusable (missing,
+    # unwritable): a card-specific failure (its path exists as a file) stays a
+    # card failure and is charged (Prism d72c091b628d).
+    w, b = shlex.quote(workspace), shlex.quote(os.path.dirname(workspace.rstrip("/")) or "/")
     proc = runner(
-        _ssh_argv(host, f"mkdir -p -- {shlex.quote(workspace)}"),
+        # The root is proven by CREATING under it (ENOSPC / inodes / quota pass
+        # an access test; Prism d762ee26a639), then the probe dir is removed.
+        _ssh_argv(host, f"mkdir -p -- {w} && exit 0; "
+                        f"t=$(mktemp -d {b}/.hermes-root-probe.XXXXXX 2>/dev/null) && "
+                        f"{{ rmdir -- \"$t\"; exit 1; }}; exit {_BOARD_ROOT_RC}"),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=_PROBE_TIMEOUT_SECONDS,
         stdin=subprocess.DEVNULL,
     )
-    if getattr(proc, "returncode", 1) != 0:
-        raise RuntimeError(
-            f"worker host {host.name}: mkdir {workspace} failed: "
-            f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}"
-        )
+    rc = getattr(proc, "returncode", 1)
+    if rc != 0:
+        msg = (f"worker host {host.name}: mkdir {workspace} failed: "
+               f"{(getattr(proc, 'stderr', '') or '').strip()[:200]}")
+        if rc != _BOARD_ROOT_RC or not board:
+            raise RuntimeError(msg)  # ssh failed, a card-path fault, or no pool board: not a board fact
+        raise RemoteWorkspaceUnavailable(host.name, board, msg)
+
+
+def note_board_fault(host: str, board: Optional[str], why: str) -> bool:
+    """Quarantine the (host, board) pair for ``BOARD_FAULT_SECONDS`` and page
+    ONCE per quarantine episode (#alerts, warn). True when a page was sent."""
+    from hermes_cli import kanban_worker_pool as _kwp
+
+    if not board:
+        return False
+    fresh = _kwp.board_fault(host, board) is None
+    _kwp.mark_board_fault(host, board, why[:200])
+    _log.warning("kanban pool: %s cannot host board %s for %ds (no retry charged): %s",
+                 host, board, _kwp.BOARD_FAULT_SECONDS, why)
+    if not fresh:
+        return False
+    from hermes_cli import kanban_budget as _kbudget
+
+    script = _kbudget._notify_script_path()
+    if script is None:
+        return False  # a hermetic home never pages
+    body = (f"🧱 Kanban pool host {host} cannot host board '{board}': {why[:200]}. "
+            f"Placement skips {host} for that board for {_kwp.BOARD_FAULT_SECONDS // 60} min and the card "
+            f"keeps its retries. Fix: `fleet-host board-mounts {host} --apply` (creates the per-board "
+            f"workspace mount).")
+    import sys
+    return _kbudget._run_notify([sys.executable, script, "--sev", "warn", "--send", body]) is not False
 
 
 def local_workspace_has_content(path: Optional[str]) -> bool:
@@ -99,11 +153,61 @@ def local_workspace_has_content(path: Optional[str]) -> bool:
         return True
 
 
+def remote_workspace_has_content(placement_raw: Optional[str],
+                                 runner: Callable = subprocess.run) -> bool:
+    """True unless the placed host PROVES this run's workspace empty or absent.
+
+    Workspaces are host-local (``TERMINAL_SSH_SYNC_FILES=false``), so a run
+    re-routed elsewhere would leave anything here behind (t_ecfd5591
+    0e9694bf2944). Any doubt (no placement, no path, ssh failure) is content.
+    """
+    if not placement_raw:
+        return True
+    try:
+        env = json.loads(placement_raw).get("env") or {}
+        workspace, ssh_host = env.get("TERMINAL_CWD"), env.get("TERMINAL_SSH_HOST")
+        if not workspace or not ssh_host:
+            return True
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4"]
+        if str(env.get("TERMINAL_SSH_PORT") or "22") != "22":
+            argv += ["-p", str(env["TERMINAL_SSH_PORT"])]
+        target = f"{env['TERMINAL_SSH_USER']}@{ssh_host}" if env.get("TERMINAL_SSH_USER") else ssh_host
+        # rc 0 = empty or proven absent, rc 3 = has entries; anything else (ssh 255, perms, I/O)
+        # fails closed. ``[ -e ]`` is false for ENOENT, for a dangling link AND for a path under
+        # an unsearchable parent, so absence is proven only when the nearest existing ancestor is
+        # a searchable, readable directory (t_ecfd5591 parent-custody-permissions); a dangling
+        # link stops the climb and counts as content. Presence is ``find``'s first entry printed
+        # with its "$w/" prefix, so no filename (newline, blank) can read as empty, and a listing
+        # error is find's own nonzero exit (24a15e048a61).
+        script = (f"w={shlex.quote(workspace)}; p=$w; c=; "
+                  'while [ ! -e "$p" ] && [ ! -L "$p" ]; do q=$(dirname -- "$p"); '
+                  '[ "$q" = "$p" ] && exit 5; c=$(basename -- "$p"); p=$q; done; '
+                  'if [ -z "$c" ]; then [ -d "$w" ] && [ ! -L "$w" ] || exit 3; '
+                  'o=$(find "$w" -mindepth 1 -maxdepth 1 -print -quit) || exit 4; '
+                  '[ -z "$o" ] && exit 0; exit 3; fi; '
+                  '[ -d "$p" ] && [ -x "$p" ] && [ -r "$p" ] || exit 5; exit 0')
+        proc = runner(argv + [target, script],
+                      capture_output=True, text=True, timeout=_PROBE_TIMEOUT_SECONDS,
+                      stdin=subprocess.DEVNULL)
+        return getattr(proc, "returncode", 1) != 0
+    except Exception:
+        _log.warning("placement custody probe failed; treating the workspace as holding work",
+                     exc_info=True)
+        return True
+
+
 def _placed_host(raw: Optional[str]) -> Optional[str]:
     try:
         return str(json.loads(raw or "").get("host") or "") or None
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+def is_pool_host(host: Optional[str]) -> bool:
+    """True for a real pool placement. The synthetic local-worker placement
+    (``studio-local``) runs on the Studio itself, so every placement gate and the
+    exit seam treat it as unplaced: one classification (t_ecfd5591 03985b00389e)."""
+    return bool(host) and host != LOCAL_HOST_NAME
 
 
 # Boot record (RC-9): the placement this worker process was spawned with.

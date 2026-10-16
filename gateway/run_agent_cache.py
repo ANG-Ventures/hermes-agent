@@ -14,7 +14,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from agent.interrupt_compat import _accepts_keyword
 from gateway.config import Platform
-from gateway.session import SessionSource, build_session_context_prompt
+from gateway.session import (
+    BRANCH_INHERITED_PIN_KEY, SessionSource, branch_pin_routing_matches, branch_thread_context_note,
+    build_session_context_prompt,
+)
 from gateway.session_prompt_pin import PROMPT_PIN_VERSION, sanitize_prompt_pin
 from gateway.run_shutdown import _log_suppressed
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
@@ -460,8 +463,16 @@ class GatewayAgentCacheMixin:
         if not session_key:
             return
         state = self._peek_session_state(session_key)
+        _carry_held = None
+        try:  # spec D21; fail open: the boundary clear below must always run
+            from gateway import queue_mgmt
+            _carry_held = queue_mgmt.before_scope_clear(self, session_key, reason)
+        except Exception:
+            logger.warning("queue carry skipped for %s (%s)", session_key, reason, exc_info=True)
         if state is not None:
             state.conversation.clear()
+            if _carry_held:
+                state.conversation.held_queue.extend(_carry_held)
         # Legacy plain-dict stores still in _CONVERSATION_SCOPED_STATE (not yet folded into
         # SessionState), e.g. _pending_model_notes. SessionState-backed names resolve to MutableMapping
         # views (not dict), so the isinstance(dict) guard skips them — already handled above.
@@ -586,6 +597,22 @@ class GatewayAgentCacheMixin:
         _generation_at_interrupt = self._interrupt_running_turn(
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
         )
+        _reason = str(invalidation_reason or "")
+        if _reason.startswith("stop_command"):
+            self._session_state(session_key).conversation.automatic_turns_paused = True
+        if _reason.startswith("stop_command") or _reason == "queue_run":
+            # /stop never drops a queued user prompt (spec 2026-10-12 D14). Move every user item out of
+            # the slot (a run-next trigger the post-command drain consumes) and the overflow into the
+            # held store, which no drain reads. Done BEFORE any await so no drain can run between the
+            # generation bump above and the hold. /stop holds internal wakes too; queue_run
+            # preserves its explicit release semantics. /new and /reset stay separate.
+            try:  # fail open: a queue_mgmt failure must never break /stop
+                from gateway import queue_mgmt
+                _hold_adapter = self._delivery_adapter_for(source)
+                if _hold_adapter is not None:
+                    queue_mgmt.hold_user_items(self, session_key, _hold_adapter)
+            except Exception:
+                logger.warning("queue hold skipped on /stop for %s", session_key, exc_info=True)
         from gateway.run import _AGENT_PENDING_SENTINEL
         # The turn's hard interrupt reaches only its in-turn children; background delegations were
         # detached at dispatch and would otherwise run to completion and wake the session later.
@@ -640,7 +667,12 @@ class GatewayAgentCacheMixin:
                 await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
-        if adapter and hasattr(adapter, "get_pending_message"):
+        if (adapter and _reason.startswith("stop_command")
+                and self._session_state(session_key).persistent.run_generation == _generation_at_interrupt):
+            # Catch arrivals during the interrupt awaits; no runnable wake survives /stop.
+            from gateway import queue_mgmt
+            queue_mgmt.hold_user_items(self, session_key, adapter)
+        elif adapter and not _reason.startswith("stop_command") and hasattr(adapter, "get_pending_message"):
             # Discard a stale human follow-up (the slot held only user text when /stop started doing
             # this, 59575d6a917) — but an internal wake (async-delegation completion, notify+wake)
             # shares the slot now and was claim-settled on admission, so dropping it loses it for
@@ -650,6 +682,25 @@ class GatewayAgentCacheMixin:
             # against a session /new just closed is decided where it is processed
             # (_resolve_async_delegation_session fails closed), not here.
             parked = adapter.get_pending_message(session_key)
+            _reseated = False
+            _is_user_item = parked is not None and not getattr(parked, "internal", False) \
+                and not self._is_goal_continuation_event(parked)
+            if _is_user_item and (_reason.startswith("stop_command") or _reason == "queue_run"):
+                # The hold above should have moved it; if it did not (hold failed), never drop it:
+                # put it back so it still runs (spec D5: queued prompts are never dropped by /stop).
+                # Re-seat via the overflow HEAD (not the slot): the wake promotion below may claim the
+                # slot, and a direct slot write here would be overwritten by it.
+                logger.warning("queue item still in slot after /stop hold for %s; re-seating it", session_key)
+                self._session_state(session_key).conversation.queued_events.insert(0, parked)
+                parked = None
+                _reseated = True
+            elif _is_user_item:
+                # /new | /reset drop it with the conversation; count it for the reply (spec D21/I8).
+                try:
+                    from gateway import queue_mgmt as _qm
+                    _qm.note_reset_drop(self, session_key, 1)
+                except Exception:
+                    logger.warning("reset-drop count skipped for %s", session_key, exc_info=True)
             wake = parked if getattr(parked, "internal", False) else None
             if wake is None:
                 overflow = self._overflow_queue(session_key) or []
@@ -658,6 +709,11 @@ class GatewayAgentCacheMixin:
                     overflow.remove(wake)
             if wake is not None:
                 adapter._pending_messages[session_key] = wake
+            elif _reseated and session_key not in adapter._pending_messages:
+                # Hold-failure fallback only: keep slot = item 1 for the re-seated user item.
+                _ov = self._overflow_queue(session_key) or []
+                if _ov:
+                    adapter._pending_messages[session_key] = _ov.pop(0)
         if state is not None:
             state.persistent.pending_command_text = None
         if release_running_state:
@@ -806,6 +862,16 @@ class GatewayAgentCacheMixin:
         _eph_pin = _pin_state.conversation.ephemeral_pin if _pin_state else None
         if _eph_pin is not None and _eph_pin[2] != redact_pii:
             _eph_pin = None
+        # An inherited /branch pin is served verbatim (human AND internal turns) while the parent's
+        # bytes still state this thread's own Home Channels / delivery options; the branch note only
+        # overrides source/ids/origin. Any routing drift drops it and renders this thread's own
+        # context: one cold prefix is the price of never stating a stale home (Prism 89f1a3a47431).
+        # The sentinel is re-keyed only once a human turn has persisted its annotated user row
+        # (``_commit_inherited_context_pin``).
+        if _eph_pin is not None and _eph_pin[0] == BRANCH_INHERITED_PIN_KEY:
+            if branch_pin_routing_matches(_eph_pin[1], context, redact_pii=redact_pii):
+                return _eph_pin[1]
+            _pin_state.conversation.ephemeral_pin = _eph_pin = None
         if internal and _eph_pin is not None:
             return _eph_pin[1]
         _eph_key = self._ephemeral_change_key(context, redact_pii)
@@ -815,6 +881,64 @@ class GatewayAgentCacheMixin:
         if session_key:
             self._session_state(session_key).conversation.ephemeral_pin = (_eph_key, text, redact_pii)
         return text
+
+    def _inherit_branch_context_pin(self, parent_key: str, child_key: str) -> bool:
+        """``/branch`` into a NEW thread: seed the child's pin with the parent's session-context bytes.
+
+        The child replays the parent's whole transcript, and the session-context paragraph sits ahead
+        of the tool schemas and that history in the cached prefix. Rendering it fresh from the thread
+        source (``thread: <id>``, ``Multi-user thread``) re-wrote everything behind it on the child's
+        first turn: 61% prefix hit vs 99% for ``/branch --here`` (t_1908b8bc). The inherited pin is
+        adopted once the child's first human turn persists (``_commit_inherited_context_pin``); the
+        note moves the thread facts to that turn's user message. Call AFTER the child's agent eviction (eviction
+        clears the pin). Returns True when a parent pin was available."""
+        state = self._peek_session_state(parent_key) if parent_key else None
+        pin = state.conversation.ephemeral_pin if state else None
+        if pin is None:
+            with suppress(Exception):
+                durable = sanitize_prompt_pin(self.session_store.get_prompt_pin(parent_key))
+                if durable is not None:
+                    pin = (durable["context_key"], durable["context_prompt"], durable["redact_pii"])
+        if pin is None or not child_key:
+            return False
+        self._session_state(child_key).conversation.ephemeral_pin = (
+            BRANCH_INHERITED_PIN_KEY, pin[1], pin[2])
+        return True
+
+    def _stage_inherited_context_pin(
+        self, context, redact_pii: bool, session_key: Optional[str],
+    ) -> Optional[str]:
+        """The per-turn note carrying the thread's own session facts for a turn that serves an
+        inherited ``/branch`` pin (``None`` when the pin is not the sentinel). Read-only on the pin:
+        the sentinel is re-keyed by ``_commit_inherited_context_pin`` once the turn that carried the
+        note has persisted its transcript, so every turn that serves the parent's bytes before then
+        (an aborted or cancelled first turn, an internal wake, a turn whose run failed) stages the
+        note again instead of losing it for good (Prism d78579970af8, b6bd0d66ca29, 80879ea93439).
+        Called right after the pin is served and BEFORE session hygiene: hygiene's agent eviction
+        clears the sentinel, and the captured parent bytes must never go out without their
+        correction (Prism eb4a633bdc78)."""
+        state = self._peek_session_state(session_key) if session_key else None
+        pin = state.conversation.ephemeral_pin if state else None
+        if pin is None or pin[0] != BRANCH_INHERITED_PIN_KEY:
+            return None
+        if pin[2] != redact_pii:
+            state.conversation.ephemeral_pin = None  # never reuse bytes from another privacy policy
+            return None
+        return branch_thread_context_note(context, redact_pii=redact_pii)
+
+    def _commit_inherited_context_pin(self, context, redact_pii: bool, session_key: Optional[str]) -> bool:
+        """Re-key an inherited ``/branch`` pin to this session's own render key, keeping the parent's
+        bytes. Called only once a human turn that carried the branch note persisted its transcript
+        (the note rides that user row's ``api_content``, so later replays keep the correction).
+        After adoption the usual pin rules apply: a later real metadata change (rename, /sethome)
+        re-renders once. Returns True when a sentinel was adopted; a sentinel evicted mid-turn
+        (hygiene, model switch) leaves nothing to adopt and the next turn renders its own context."""
+        state = self._peek_session_state(session_key) if session_key else None
+        pin = state.conversation.ephemeral_pin if state else None
+        if pin is None or pin[0] != BRANCH_INHERITED_PIN_KEY or pin[2] != redact_pii:
+            return False
+        state.conversation.ephemeral_pin = (self._ephemeral_change_key(context, redact_pii), pin[1], pin[2])
+        return True
 
     def _pinned_channel_inputs(
         self, session_key: Optional[str], channel_prompt: Optional[str], source: SessionSource, *, internal: bool,

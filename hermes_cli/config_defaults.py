@@ -779,11 +779,12 @@ DEFAULT_CONFIG = {
         # instead of dropping the middle with a "summary unavailable" placeholder; the session
         # freezes at its size until /compress (bypasses the cooldown) or /new.
         "abort_on_summary_failure": False,
-        # (Historical key name.) When True, gpt-5.4/5.5/5.6 and gpt-6 Astra (any slug containing
-        # "astra" without "900k") on the ChatGPT Codex OAuth route raise their compaction trigger to
-        # 85%: Codex hard-caps them at a 272K window, so the global 50% would compact at ~136K. False = global `threshold`. Only that route; the same models via
-        # OpenAI direct, OpenRouter or Copilot keep the global value.
-        "codex_gpt55_autoraise": True,
+        # Built-in per-model thresholds (legacy). False (default) = every model uses the universal
+        # `threshold`. True = Codex-OAuth gpt-5.4/5.5/5.6/gpt-6 Astra raise to 85% (272K cap),
+        # Codex-OAuth gpt-5.3-codex-spark to 70%, Arcee Trinity Large Thinking to 75%.
+        # None (unset) = off, but falls through to the legacy alias `codex_gpt55_autoraise` when
+        # config.yaml sets it; a False default here would shadow that alias after the merge.
+        "per_model_builtins": None,
         # Show the one-time autoraise banner; False keeps the autoraise, hides the notice.
         "codex_gpt55_autoraise_notice": True,
         # Codex app-server thread compaction mode. The codex agent owns the thread context, so
@@ -1037,6 +1038,11 @@ DEFAULT_CONFIG = {
         # calls: ...]` lines; False shows them inline.
         "resume_skip_tool_only": True,
         "busy_input_mode": "interrupt",  # interrupt | queue | steer
+        # Gateway /stop and queued (/queue) prompts: false (default) HOLDS them after /stop until
+        # `/queue run` or `/queue clear`; true releases them right after the stop, in order.
+        "stop_releases_queue": False,
+        # /queue run: "per_item" = each released prompt is its own turn; "merged" = all in ONE turn.
+        "queue_release_mode": "per_item",
         # steer mode: false hides only the "Steered into current run" bubble; steering itself still
         # happens.
         "busy_steer_ack_enabled": True,
@@ -2350,12 +2356,21 @@ DEFAULT_CONFIG = {
         # plan, every card local. The old kanban.worker_hosts list is
         # retired: set next to a kanban-worker role, the pool places nothing.
         # See kanban_worker_pool.py.
-        "worker_pool": {"enabled": True},
+        # overflow (t_7b1eca07): true = in the admitting band too, a portable
+        # card that finds no local slot is placed on the pool (the pool is
+        # planned whenever a card is ready); false = remote pins only while
+        # admitting (KWLB v0.1 PRD 5.2.5).
+        "worker_pool": {"enabled": True, "overflow": True},
         # Login whose uid runs a LOCAL worker's terminal + file tools (over
         # ssh <user>@localhost, the worker-pool placement path). None/"" or
         # the dispatcher's own login = the dispatcher's uid (today). Read per
         # spawn, so a flip and its rollback are one edit. Q8 (a), t_405acdf0.
         "local_worker_uid": None,
+        # Browser Sandboxes s7 join (P1-4b, t_2828292d): true = a ready card whose browser gate verdict is a
+        # ``browser:ephemeral`` lease on another host (ci-box for an ace-ai worker) gets that lease from
+        # hermes-home scripts/browsers/dispatch_relay.py at spawn, into the worker's BROWSER_LEASE_* env only.
+        # false = every lease plan waits ``browser_join_off``. Read per tick from the ROOT config.
+        "browser_join": False,
         # Placement PRD Phase 1b (t_1e4b9684): read_signal true = the pool probe
         # also reads each host's host-pressure.json (same ssh round-trip), a
         # host turns hot after 2 hot samples and clears after 3 (state in
@@ -2374,7 +2389,25 @@ DEFAULT_CONFIG = {
         # and every held row gets a placement_wait, including rows a total
         # gate or an exhausted budget holds; false restores the silent early
         # returns and the old one-shot gate line.
-        "placement": {"read_signal": True, "route_first": True},
+        # admit_on_memory (t_31350981, Saturation spec 4.2; D1: off until
+        # Ace's yes): a pool host takes at most floor(mem_available_gb /
+        # worker_reservation_gb) new workers per tick and none while its
+        # sampler publishes band.kanban hot. false = computed and logged per
+        # tick ("kanban admission (dry ...): would-refuse N"), never applied.
+        # default (Control-Plane Protection spec v0.3 §3.1, t_667f1f6a; read
+        # per tick, no restart): remote = every portable card is offered to
+        # the worker pool first and spawns on this host only as the last
+        # resort after the pool refused it (no cap: the load gate is the only
+        # local limit); local = today's local-first order. Kill switch: local.
+        "placement": {"read_signal": True, "route_first": True, "default": "local",
+                      "admit_on_memory": False, "worker_reservation_gb": 6,
+                      # allocd (Router Core Card B1, t_4187c8f1; read per tick): off | shadow | on.
+                      # off = the in-process scorer, allocd never consulted. shadow = allocd also
+                      # scores each unpinned pool take (nothing booked), the in-process pick acts,
+                      # and <root>/var/alloc/shadow/kanban.jsonl gets one line per decision
+                      # (promotion gate: n >= 50 answered, 0 disagreements). on = alloc_client.admit
+                      # picks and books; release/renew go through alloc_client.
+                      "allocd": "off"},
         "dispatch_load_gate": {
             "enabled": True,
             "pause_above": None,
@@ -3109,6 +3142,10 @@ DEFAULT_CONFIG = {
     # External password managers are unlocked per session with a masked master-password prompt;
     # headless sessions (cron, webhook, API) never prompt and see them as locked.
     "vault": {
+        # Ask the user (gateway button / CLI panel) before a saved payment card is written into a page.
+        # false = the user's own instruction to pay is the consent; the https-only + exact-page-origin
+        # guards and the card-bytes redaction still apply. Only a literal false disables the prompt.
+        "payment_fill_confirm": True,
         "onepassword": {
             # Detected managers are login sources unless the user opts out (vault.<name>.enabled: false).
             "enabled": True,        # `op` CLI: Login items with a website URL become fillable handles.

@@ -1007,7 +1007,31 @@ class GatewayInboundMixin:
     # /queue and /steer on the idle path: no agent is running, so strip the prefix and send the
     # payload as a regular user turn; an empty payload surfaces the usage hint.
     async def _hm_cmd_queue(self, event, source, _quick_key):
-        return self._hm_send_payload_as_turn(event, t("gateway.queue.usage"))
+        # Idle /queue: management verbs (list/edit/rm/move/clear/run/help) are handled here; a prompt
+        # joins the held store if one exists (D14), else it is sent as a normal turn (unchanged).
+        from gateway import queue_mgmt
+        adapter = self._delivery_adapter_for(source)
+        op = queue_mgmt.classify(event)
+        if op.kind == "run":
+            return True, await queue_mgmt.release(self, _quick_key, source, adapter, busy=False)
+        if op.is_management:
+            return True, queue_mgmt.apply_management(self, op, _quick_key, adapter)
+        has_media = bool(getattr(event, "media_urls", None))
+        if not op.text and not has_media:
+            return True, t("gateway.queue.usage")
+        refused = queue_mgmt.refuse_command_prompt(op.text)
+        if refused:
+            return True, refused
+        if queue_mgmt.held_list(self, _quick_key):
+            cap = queue_mgmt.cap_reply(self, _quick_key, adapter)
+            if cap:
+                return True, cap
+            with suppress(Exception):
+                event.text = op.text
+            return True, queue_mgmt.append_if_held(self, _quick_key, event)
+        with suppress(Exception):
+            event.text = op.text  # strips the /queue prefix (and an explicit `add`)
+        return False, None
 
     async def _hm_cmd_steer(self, event, source, _quick_key):
         return self._hm_send_payload_as_turn(event, t("gateway.steer.usage_idle"))
@@ -1371,6 +1395,12 @@ class GatewayInboundMixin:
             _orphan_adapter = self._delivery_adapter_for(source)
             if _orphan_adapter is None or getattr(event, "internal", False) or event.get_command():
                 return event, source, is_internal
+            if getattr(event, "_queue_released", False) is True:
+                # /queue run armed this event as item 1 and the adapter drain is dispatching it; the
+                # rest of the release sits in overflow BY DESIGN (next drain promotes it). Treating
+                # it as orphaned ran item 2 ahead of item 1 (live E2E 2026-10-13 01:45, follow-up D1).
+                event._queue_released = False
+                return event, source, is_internal
             _rescued = self._rescue_orphaned_overflow(_quick_key, _orphan_adapter)
             if _rescued is None:
                 return event, source, is_internal
@@ -1419,6 +1449,10 @@ class GatewayInboundMixin:
                 return _orphan_reply
 
         _quick_key = self._session_key_for_source(source)
+        if is_internal:
+            from gateway import queue_mgmt
+            if await queue_mgmt.gate_stopped_event(self, _quick_key, event, self._delivery_adapter_for(source)):
+                return None
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
             return _reply

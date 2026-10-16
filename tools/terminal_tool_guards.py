@@ -299,3 +299,90 @@ def self_repo_block(
         return None
     logger.warning("Blocked self-repo git mutation (command: %s)", _safe_command_preview(command))
     return _blocked_json(msg, "blocked")
+
+
+def _effective_local_run_env(env: Any, *, background: bool = False) -> dict:
+    """The environment a local command's ``rm`` actually sees, for static analysis.
+
+    Foreground mirrors ``LocalEnvironment._run_bash`` + ``_wrap_command_script``: the Popen env
+    is ``_make_run_env(env.env)`` (profile-home override, passthrough, scrub), then the wrapper
+    sources the session snapshot, whose ``export -p`` dump restores variables earlier calls
+    exported, and finally restores the profile-scoped passthrough names from the Popen env.
+    The snapshot is parsed, never sourced.
+
+    Background (``ProcessRegistry.spawn_local``, incl. a foreground call promoted by its
+    timeout) launches a fresh login shell from ``_sanitize_subprocess_env(os.environ, env.env)``
+    and NEVER sources the snapshot: an ``export D=/tmp/x`` from an earlier foreground call is
+    not visible there, so the guard must not overlay it (Prism 3f7b14131e14). Falls back to
+    process env + overlay on error.
+    """
+    import os
+
+    overlay = getattr(env, "env", None)
+    overlay = {k: v for k, v in overlay.items() if isinstance(v, str)} if isinstance(overlay, dict) else {}
+    if background:
+        try:
+            from tools.process_registry import _sanitize_subprocess_env
+            return dict(_sanitize_subprocess_env(os.environ, overlay))
+        except Exception:
+            logger.debug("home deletion guard: background env build failed; using process env", exc_info=True)
+            run_env = dict(os.environ)
+            run_env.update(overlay)
+            return run_env
+    try:
+        from tools.environments.local import _make_run_env
+        run_env = _make_run_env(dict(overlay))
+    except Exception:
+        logger.debug("home deletion guard: run env build failed; using process env", exc_info=True)
+        run_env = dict(os.environ)
+        run_env.update(overlay)
+    snap = getattr(env, "_snapshot_path", None)
+    if getattr(env, "_snapshot_ready", False) and isinstance(snap, str):
+        from agent.home_deletion_guard import snapshot_exports
+        try:
+            keep = set(env._snapshot_excluded_passthrough_names())
+        except Exception:
+            keep = set()
+        # The dump never carries HERMES_HOME (unset before ``export -p``); the Popen value wins.
+        keep.add("HERMES_HOME")
+        run_env.update({k: v for k, v in snapshot_exports(snap).items() if k not in keep})
+    return run_env
+
+
+def home_deletion_block(
+    *,
+    command: str,
+    env: Any,
+    env_type: str,
+    cwd: str,
+    workdir: Optional[str],
+    session_key: str,
+    background: bool = False,
+) -> Optional[str]:
+    """Refuse a command that would recursively delete the Hermes home's protected roots.
+
+    Static analysis only (``agent.home_deletion_guard``): ``$VAR`` references expand against
+    the env the command will run with (process env + the backend's overlay), and a local
+    script invoked by path is read one level deep. Local backend only: other backends run
+    on a filesystem whose paths this process cannot see. Independent of the lifecycle
+    guard's scan budget: it carries its own size/depth bounds and fails open on analyzer
+    errors. Returns the JSON error string when blocked, else None.
+    """
+    if env_type != "local":
+        return None
+    from agent.home_deletion_guard import BLOCK_MARKER, command_deletes_protected_home, refusal_message
+    from tools.terminal_tool import _resolve_command_cwd
+
+    run_env = _effective_local_run_env(env, background=background)
+    try:
+        guard_cwd = _resolve_command_cwd(
+            workdir=workdir, default_cwd=getattr(env, "cwd", None) or cwd,
+            session_key=session_key, env_type=env_type,
+        )
+    except Exception:
+        guard_cwd = cwd
+    hit = command_deletes_protected_home(command, env=run_env, cwd=guard_cwd)
+    if not hit:
+        return None
+    logger.warning("Blocked protected-home delete: %s (command: %s)", hit, _safe_command_preview(command))
+    return _blocked_json(refusal_message(hit), "blocked", blocked_by=BLOCK_MARKER)

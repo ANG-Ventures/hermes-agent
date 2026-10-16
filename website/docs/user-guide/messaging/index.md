@@ -461,6 +461,49 @@ The first time you message a busy agent on any platform, Hermes appends a one-li
 
 If you find the busy acknowledgment noisy, set `display.busy_ack_enabled: false`. Input handling is unchanged; only the confirmation message is hidden.
 
+### Managing the queue
+
+`/queue <prompt>` parks a prompt to run as its own turn after the current one. Queued prompts run in the order you queued them, one turn each. The same commands work in the CLI and on every messaging platform:
+
+| Command | What it does |
+|---|---|
+| `/queue` or `/queue list` | Show the queue, numbered. `[system]` items (a background task finishing, a goal step) are listed but can't be edited. |
+| `/queue rm N` | Remove item N. |
+| `/queue edit N <prompt>` | Replace item N's text. An attached image or file stays attached. |
+| `/queue move A B` | Move item A to position B. |
+| `/queue clear` | Drop every queued prompt (system items stay). |
+| `/queue run` | Release the queue now. If a turn is running it is interrupted first; then the queued prompts run in order. |
+| `/queue add <prompt>` | Queue a prompt that starts with one of the words above. |
+
+A word is a command only when the whole message fits that command's shape: `/queue clear` clears, but `/queue clear the cache` queues the prompt "clear the cache", and `/queue rm 3 things` queues "rm 3 things". Only `/queue add` is needed when you want to queue a bare word that is also a command (`/queue add clear`). Numbers refer to the list as it is when you send the command; every change replies with the item it touched, so a stale number is visible immediately. The queue holds at most 32 prompts. A slash command can't be queued (`/queue /model x` is refused); send it on its own.
+
+**What `/stop` does to the queue.** `/stop` halts the current turn and **holds** every queued prompt: nothing is dropped and nothing runs until you say so. The reply says how many are held. While held:
+
+- `/queue list` shows them under "held after /stop".
+- A new `/queue <prompt>` joins the held queue, so the order is kept.
+- A normal message runs as usual; the held prompts keep waiting.
+- `/queue run` releases them; `/queue clear` drops them.
+
+To have `/stop` release the queue instead (stop the current turn, then run the queued prompts straight away), set:
+
+```yaml
+display:
+  stop_releases_queue: true   # default false: /stop holds the queue
+```
+
+**One turn or one turn each.** By default each released prompt runs as its own turn with its own answer. To have `/queue run` (and a releasing `/stop`) send every queued prompt together as ONE turn, joined in order by a blank line, set:
+
+```yaml
+display:
+  queue_release_mode: merged   # default per_item
+```
+
+Background items (`[system]`) are never merged; they run first, on their own.
+
+Both settings are read when the gateway starts.
+
+**Other events.** `/new`, `/reset` and `/resume` start a different conversation, so they drop the queue and say how many prompts they dropped. An automatic reset (idle timeout, context exhaustion) keeps held prompts. A gateway restart keeps the queue: queued prompts run after the restart, and held prompts come back held.
+
 ## Clarify Questions (Multi-Select)
 
 When the agent uses the `clarify` tool to ask you a question, the gateway renders the choices as a numbered prompt (or native buttons on platforms that support them). Clarify supports **multi-select** questions too — the agent can let you pick several options at once:

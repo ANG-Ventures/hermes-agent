@@ -66,6 +66,23 @@ PROVENANCE_LINK_KINDS = frozenset({"derived-from"})
 # Phase 2a (t_7133e03d): hold codes written by the dispatcher itself.
 LOCAL_FULL = "local_full"
 POOL_UNAVAILABLE = "pool_unavailable"
+POOL_FULL = "pool_full"
+BOARD_UNHOSTABLE = "board_unhostable"
+
+# The ONE vocabulary of ``SpilloverPlan.take()`` refusals for an UNPINNED row
+# (Control-Plane Protection spec v0.3, Momus pass 3 R4). The placement record's
+# ``take_refusal`` carries one of these codes (plus an optional ``(detail)``),
+# and the I-1 closeout query (kanban_placement_gates) is generated from these
+# sets: a code outside them is a violation, never silently allowed. Capacity =
+# no free slot that serves the row; structural = no pool host may take this row
+# at all (reach, board root). "Profile served on no free host" is reported as
+# capacity (``pool_full`` / ``pool_unavailable``): take() has no code for it.
+TAKE_CAPACITY = frozenset({POOL_FULL, POOL_UNAVAILABLE})
+TAKE_STRUCTURAL = frozenset({HOST_REACH, BOARD_UNHOSTABLE})
+TAKE_REFUSALS = TAKE_CAPACITY | TAKE_STRUCTURAL
+# ``placement.reason`` of a portable row the Studio spawned after take()
+# refused it this tick (spec v0.3 I-2: last resort means after the pool).
+LAST_RESORT = "last-resort"
 UNASSIGNED = "unassigned"
 PER_PROFILE_CAP = "per_profile_cap"
 # One placement_wait row replaces an A->B->A reason flap inside one refresh
@@ -86,6 +103,7 @@ TOTAL_READY_BUDGET = "ready_budget"
 # above are the rest): ``default`` = portable by policy, placed locally
 # because the Studio had allowance; ``unplanned`` = no pool plan this tick.
 RULE_PIN = "pin"
+RULE_ORIGIN = "origin"  # continuation affinity: the card's state is on that host (t_8bfdcc07)
 RULE_POLICY = "policy"
 RULE_DEFAULT = "default"
 RULE_UNPLANNED = "unplanned"
@@ -114,6 +132,14 @@ def split_reason(reason) -> "tuple[str, str | None]":
     return text, None
 
 
+def keyed_detail(code: str, detail) -> "str | None":
+    """The part of ``detail`` that IS the reason, for the dedup key (Prism
+    01bdaad47969): ``not_portable:linked(blocks->t_x)`` is held by that edge,
+    so a different edge is a new hold, never a 900 s duplicate. Grouping
+    still reads the code alone (``not_portable:linked``)."""
+    return detail or None if code == not_portable(LINKED) else None
+
+
 def named_hosts(code: str, detail) -> "str | None":
     """The pool host(s) a reason names, for the dedup key (Momus R-B): a
     host change is a new hold even when the code is the same. Only the
@@ -136,6 +162,12 @@ def route_first(kanban_cfg: Any) -> bool:
     if isinstance(val, bool):
         return val
     return str(val).strip().lower() not in ("false", "off", "no", "0")
+
+
+def take_refusal_code(refusal) -> "str | None":
+    """The vocabulary code of a take() refusal string, or None for no refusal."""
+    code = split_reason(refusal)[0] if refusal else ""
+    return code or None
 
 
 def not_portable(rule: str) -> str:

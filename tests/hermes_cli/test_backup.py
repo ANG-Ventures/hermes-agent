@@ -1,5 +1,6 @@
 """Tests for hermes backup and import commands."""
 
+import contextlib
 import json
 import logging
 import os
@@ -2014,7 +2015,112 @@ class TestSafeCopyDb:
 
         assert backup_mod._safe_copy_db(src, dst) is True
 
+    def test_concurrent_writes_do_not_restart_the_copy(self, tmp_path, monkeypatch):
+        """A real WAL DB written between EVERY backup step still copies (t_99b7d4e9).
 
+        Unpinned, each foreign commit restarts sqlite's backup from page 0, so this
+        never converges and the budget kills it — exactly the 2026-10-14 01:50
+        fleet-backup-local failure on the live state.db. The safe-copy holds a read
+        snapshot on the source, so the copy finishes and holds the pre-copy rows.
+        """
+        import time as real_time
+
+        from hermes_cli import backup_sqlite
+
+        src = tmp_path / "hot.db"
+        dst = tmp_path / "copy.db"
+        seed = sqlite3.connect(src)
+        seed.execute("PRAGMA journal_mode=wal")
+        seed.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB)")
+        seed.executemany(
+            "INSERT INTO t(b) VALUES (?)", ((b"x" * 4000,) for _ in range(2000))
+        )
+        seed.commit()
+        seed.close()
+
+        writer = sqlite3.connect(src)
+        ticks = {"n": 0}
+
+        def clock():
+            # Called once per backup step by the progress callback: commit a write
+            # there, and advance 1s so an unconverging copy hits its 60s budget.
+            ticks["n"] += 1
+            writer.execute("INSERT INTO t(b) VALUES (?)", (b"y",))
+            writer.commit()
+            return float(ticks["n"])
+
+        monkeypatch.setattr(backup_sqlite.time, "monotonic", clock)
+        try:
+            ok = backup_sqlite._safe_copy_db(src, dst)
+        finally:
+            monkeypatch.setattr(backup_sqlite.time, "monotonic", real_time.monotonic)
+            writer.close()
+
+        assert ok is True
+        copy = sqlite3.connect(dst)
+        try:
+            assert copy.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert copy.execute("SELECT count(*) FROM t").fetchone()[0] >= 2000
+        finally:
+            copy.close()
+
+    def test_rollback_journal_copy_lets_writers_commit(self, tmp_path, monkeypatch):
+        """A journal_mode=delete source is NOT pinned: writers commit mid-copy (t_dfb0e8a2).
+
+        In a rollback-journal DB the pinned read transaction would hold a SHARED lock for
+        the whole copy, so every writer gets 'database is locked'. The unpinned
+        backup_step releases the lock between steps.
+        """
+        import time as real_time
+
+        from hermes_cli import backup_sqlite
+
+        src = tmp_path / "cold.db"
+        dst = tmp_path / "copy.db"
+        seed = sqlite3.connect(src)
+        seed.execute("PRAGMA journal_mode=delete")
+        seed.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB)")
+        seed.executemany(
+            "INSERT INTO t(b) VALUES (?)", ((b"x" * 4000,) for _ in range(2000))
+        )
+        seed.commit()
+        seed.close()
+
+        writer = sqlite3.connect(src, timeout=0.0)
+        outcomes = []
+        ticks = {"n": 0}
+
+        def clock():
+            # Called between backup steps: a foreign write must be able to commit here.
+            # Only the first steps write: an unpinned copy restarts on each commit, so a
+            # write on every step would never converge (the WAL test covers that case).
+            ticks["n"] += 1
+            if ticks["n"] > 5:
+                return float(ticks["n"])
+            try:
+                writer.execute("INSERT INTO t(b) VALUES (?)", (b"y",))
+                writer.commit()
+                outcomes.append("ok")
+            except sqlite3.OperationalError as exc:
+                with contextlib.suppress(Exception):
+                    writer.rollback()
+                outcomes.append(str(exc))
+            return float(ticks["n"])
+
+        monkeypatch.setattr(backup_sqlite.time, "monotonic", clock)
+        try:
+            ok = backup_sqlite._safe_copy_db(src, dst)
+        finally:
+            monkeypatch.setattr(backup_sqlite.time, "monotonic", real_time.monotonic)
+            writer.close()
+
+        assert ok is True
+        assert outcomes and all(o == "ok" for o in outcomes), outcomes
+        copy = sqlite3.connect(dst)
+        try:
+            assert copy.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            copy.close()
 
 
     def test_is_zeroed_sqlite_file_detects_nul_header(self, tmp_path):

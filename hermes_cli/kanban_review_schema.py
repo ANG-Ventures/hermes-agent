@@ -29,6 +29,33 @@ HEAD_SHA_PATTERN = r"[0-9a-fA-F]{7,40}"
 OPTIONAL_COVERAGE_FIELDS: tuple[str, ...] = ("battery",)
 
 
+def coverage_example() -> dict:
+    """A valid v1 record: printed whole on every refusal (schema-on-miss, t_cd1bcea4)."""
+    return {
+        "lenses": {lens: "done" for lens in REQUIRED_REVIEW_LENSES},
+        "findings": 1,
+        "items": ["<one line per finding, >= 3 visible chars>"],
+        "review_minutes": 12,
+        "batch_id": "n/a: <why no delegate_task batch>",
+        "head_sha": "<reviewed PR head, 7-40 hex, or 'n/a: <reason>'>",
+    }
+
+
+def coverage_schema_text() -> str:
+    """One paragraph: every field, its rule, a full example, and the flat CLI form."""
+    import json as _json
+
+    return (
+        "review_coverage schema: lenses{" + ", ".join(REQUIRED_REVIEW_LENSES)
+        + "} each 'done' or 'n/a: <applicability reason>'; findings int >= 1; "
+        "items list of exactly <findings> strings; review_minutes int 0-1440; "
+        "batch_id nonempty string; head_sha 7-40 hex or 'n/a: <reason>'; optional battery. "
+        "Example: " + _json.dumps(coverage_example())
+        + " | Flat form (builds this JSON): hermes kanban request-changes <task_id> "
+        "--body \"<reason>\" --finding \"<text>\" [--finding ...] --lens all=done"
+    )
+
+
 def lens_list_text() -> str:
     """Human-readable lens list, e.g. ``contract, execution and mutation``."""
     lenses = list(REQUIRED_REVIEW_LENSES)

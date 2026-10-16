@@ -156,12 +156,23 @@ def handle_api_error(
         reason=classified.reason.value,
     )
 
-    _recovered, recovered_with_pool = recover_after_classification(
-        agent, api_error, classified, _retry, status_code=status_code, error_context=error_context,
-        messages=messages, api_messages=api_messages,
-    )
-    if _recovered:
-        return _verdict("continue")
+    from agent.fork_ext.relay_quota import relay_quota_outlasts_retry_window
+
+    _relay_quota_exhausted = relay_quota_outlasts_retry_window(agent, api_error, classified)
+    recovered_with_pool = False
+    if not _relay_quota_exhausted:
+        _recovered, recovered_with_pool = recover_after_classification(
+            agent, api_error, classified, _retry, status_code=status_code, error_context=error_context,
+            messages=messages, api_messages=api_messages,
+        )
+        if _recovered:
+            return _verdict("continue")
+    else:
+        # The relay's key can be healthy while every remote seat is exhausted.
+        # Enter the native fallback/terminal path on THIS error, not after a
+        # capped sleep followed by another request before the stated recovery.
+        retry_count = max_retries - 1
+        logger.warning("Relay quota recovery exceeds the retry wait policy — exhausting this lane")
 
     # Whole-body byte overflow is distinct from token/context overflow: never text compaction.
     # One remediated retry when retained images can be shrunk/evicted, else fail actionably.
@@ -218,6 +229,8 @@ def handle_api_error(
     conversation_history = _ce.conversation_history
     retry_count = _ce.retry_count
     max_retries = _ce.max_retries
+    if _relay_quota_exhausted and _ce.action == "fallthrough":
+        retry_count = max_retries
     compression_attempts = _ce.compression_attempts
     is_rate_limited = _ce.is_rate_limited
     _wrapped_output_cap_budget = _ce.wrapped_output_cap_budget

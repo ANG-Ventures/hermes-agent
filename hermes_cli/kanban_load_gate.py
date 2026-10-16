@@ -119,6 +119,17 @@ SUMMARY_INTERVAL_SECONDS = 300.0
 STATE_FILENAME = "load_gate.json"
 
 
+def _denom(ncpu: Any = None) -> str:
+    """This host's load denominator, house form ``24c·32t`` (Ace ruling 2026-10-12: a load figure is
+    never bare; it names physical cores and hardware threads)."""
+    from hermes_platform.host.facts import load_denominator
+
+    try:
+        return load_denominator(int(ncpu) if ncpu else None)
+    except (TypeError, ValueError):
+        return load_denominator()
+
+
 def _num(value: Any, default: float) -> float:
     try:
         f = float(value)
@@ -762,6 +773,7 @@ class LoadGate:
         l5 = "?" if self.load5 is None else f"{self.load5:.1f}"
         return (
             f"state={self.state} load1={l1} load5={l5} "
+            f"(load {l1} tasks / {_denom(self.ncpu)}) "
             f"pending_ramp={self.pending_ramp:.1f} ramp_workers={self.ramp_workers()} "
             f"allowance={self.allowance} admitted={self.admitted_last_tick} "
             f"pause_above={self.pause_above:.1f} cost={self.cost:.2f}/{self.cost_source} "
@@ -1033,10 +1045,12 @@ def format_state_line(state: Optional[dict], now: Optional[float] = None) -> str
     age = now - float(state.get("updated_at") or 0)
     l1 = state.get("load1")
     l5 = state.get("load5")
+    l1_txt = "?" if l1 is None else f"{float(l1):.1f}"
     return (
         f"Load gate: {state.get('state')} "
-        f"load1={'?' if l1 is None else f'{float(l1):.1f}'} "
+        f"load1={l1_txt} "
         f"load5={'?' if l5 is None else f'{float(l5):.1f}'} "
+        f"(load {l1_txt} tasks / {_denom(state.get('ncpu'))}) "
         f"pending_ramp={state.get('pending_ramp')} "
         f"allowance={state.get('allowance')} "
         f"admitted_last_tick={state.get('admitted_last_tick')} "

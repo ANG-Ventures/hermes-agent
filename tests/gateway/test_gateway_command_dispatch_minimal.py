@@ -62,6 +62,8 @@ def _make_runner():
     runner.session_store.get_or_create_session.return_value = _session_entry()
     runner.session_store.load_transcript.return_value = []
     runner.session_store.has_any_sessions.return_value = True
+    # No durable /stop marker: a bare MagicMock entry would fabricate a truthy user_stopped_at.
+    runner.session_store.lookup_by_session_key.return_value = None
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._pending_messages = {}

@@ -1001,7 +1001,7 @@ def _command_requires_pipe_stdin(command: str) -> bool:
 
 from tools.terminal_tool_guards import (
     _foreground_background_guidance, _safe_command_preview, _validate_workdir,
-    gateway_lifecycle_block, self_repo_block,
+    gateway_lifecycle_block, home_deletion_block, self_repo_block,
 )
 from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
 from tools.terminal_tool_result import finalize_foreground_result
@@ -1488,12 +1488,13 @@ _PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
 
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
-    workdir: Optional[str], session_key: str,
+    workdir: Optional[str], session_key: str, background: bool = False,
 ) -> None:
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
     Order matters: gateway lifecycle first (protects the running gateway),
-    then the dangerous-workdir check, then the self-repo guard (local only).
+    then the dangerous-workdir check, then the protected-home delete guard and the
+    self-repo guard (both local only).
     """
     blocked = gateway_lifecycle_block(
         command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
@@ -1506,6 +1507,12 @@ def _pre_exec_block(
             logger.warning("Blocked dangerous workdir: %s (command: %s)",
                            workdir[:200], _safe_command_preview(command))
             raise _Rejected(_error_json(workdir_error, status="blocked"))
+    blocked = home_deletion_block(
+        command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+        background=background,
+    )
+    if blocked:
+        raise _Rejected(blocked)
     if env_type == "local":
         blocked = self_repo_block(command=command, cwd=cwd, workdir=workdir, session_key=session_key)
         if blocked:
@@ -1614,6 +1621,9 @@ def terminal_tool(
             bounded_guard = run_bounded_sync(
                 lambda: _pre_exec_block(
                     command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+                    # the launch path the guard must model: an explicit background call OR a
+                    # foreground call the timeout cap promotes (decided in the plan, above)
+                    background=bool(background) or plan.promoted_from_foreground_timeout is not None,
                 ),
                 guard_timeout,
                 label="terminal.pre-exec-guard",

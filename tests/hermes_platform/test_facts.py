@@ -45,6 +45,26 @@ def test_windows_native_arch_precedence(
     )
 
 @pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # 2 sockets x 2 cores x 2 SMT siblings -> 4 physical cores
+        ("".join(f"processor : {i}\nphysical id : {i // 4}\ncore id : {(i // 2) % 2}\n\n" for i in range(8)), 4),
+        ("processor : 0\nmodel name : x\n", None),
+        ("", None),
+    ],
+)
+def test_parse_cpuinfo_cores(text: str, expected: int | None) -> None:
+    assert facts.parse_cpuinfo_cores(text) == expected
+
+
+def test_load_denominator_names_cores_and_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(facts, "physical_cores", lambda: 24)
+    assert facts.load_denominator(32) == "24c\u00b732t"
+    monkeypatch.setattr(facts, "physical_cores", lambda: None)
+    assert facts.load_denominator(32) == "32t"
+
+
+@pytest.mark.parametrize(
     ("text", "device_tree_model", "expected"),
     [
         (

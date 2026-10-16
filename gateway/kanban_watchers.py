@@ -324,7 +324,7 @@ def self_caused_event_ids(sub: dict, events, origin_of=None) -> set[int]:
 
 # LoadGate moved to hermes_cli.kanban_load_gate (shared with the standalone
 # `hermes kanban daemon` loop); re-exported here for existing importers.
-from hermes_cli.kanban_load_gate import LoadGate  # noqa: E402,F401
+from hermes_cli.kanban_load_gate import LoadGate, _denom  # noqa: E402,F401
 
 
 def _format_spawn_routes(routes, sources=None) -> str:
@@ -595,7 +595,7 @@ def _host_recovery_note(gate) -> Optional[str]:
         return None
     l1 = "?" if gate.load1 is None else f"{gate.load1:.1f}"
     return (
-        f"dispatcher load gate {gate.state}, load1={l1}, "
+        f"dispatcher load gate {gate.state}, load1={l1} (load {l1} tasks / {_denom(gate.ncpu)}), "
         f"procs={gate.procs if gate.procs is not None else '?'}"
         f"/{gate.proc_limit or '?'}"
     )
@@ -689,6 +689,8 @@ class _GuardStuckNotifier:
         self._state_path = state_path
         self._remind = int(remind_seconds)
         self._sent: dict[str, float] = self._load()
+        self._attempted: dict[str, int] = {}
+        self._attempt_seq = 0
 
     @staticmethod
     def _key(board: str, item: dict) -> str:
@@ -767,9 +769,8 @@ class _GuardStuckNotifier:
     def observe(self, cards, send, observed_boards=None, now: Optional[float] = None) -> int:
         """Page due episodes. Sends run serially (each up to 30 s) inside the
         dispatcher tick, so one call spends at most ``_GUARD_STUCK_PAGE_BUDGET_S``
-        on them (FleetReview #79); an unsent page is not recorded and goes
-        out on a later tick."""
-        deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
+        on them (FleetReview #79), plus one cohort send ahead of that budget;
+        an unsent page is not recorded and goes out on a later tick."""
         now = time.time() if now is None else float(now)
         current = {self._key(board, item) for board, item in cards}
         # A land-request is tracked apart from the page (``<key>|land``) so an
@@ -786,6 +787,14 @@ class _GuardStuckNotifier:
             or now - at < self._remind
         }
         delivered = 0
+        # prior_worker_still_alive episodes due this tick go out as ONE page:
+        # one dispatcher death strands every card it held at once (2026-10-12
+        # 19:27Z: 43 per-card pages for one cohort death, t_8d571321). The
+        # cohort page is sent FIRST, before the per-card sends, so slow or
+        # failing active_pr sends cannot spend the tick budget and starve it
+        # every tick (Prism 6b448981a5fc).
+        alive_due: list[tuple[str, dict, str]] = []
+        rest: list[tuple[str, dict, str, Optional[float]]] = []
         for board, item in cards:
             key = self._key(board, item)
             last = self._last_sent(key, item)
@@ -799,8 +808,34 @@ class _GuardStuckNotifier:
                 continue
             if not land_only and last is not None and now - last < self._remind:
                 continue
+            if item.get("reason") == "prior_worker_still_alive":
+                alive_due.append((board, item, key))
+                continue
+            rest.append((board, item, key, last))
+        if alive_due:
+            board, item, _ = alive_due[0]
+            probe = dict(item)
+            if len(alive_due) > 1:
+                probe["batch"] = [{**it, "board": b} for b, it, _ in alive_due]
+            if send(board, probe):
+                for _, _, key in alive_due:
+                    self._sent[key] = now
+                delivered += 1
+        # The per-card sends get their own budget, started AFTER the cohort
+        # page: a cohort send that hits notify.py's 30 s timeout must not spend
+        # it, or the land-requests behind it never run while notify is down
+        # (Prism a6b3974d616e). Least-recently-attempted first: a failing send
+        # stays due, and in list order it would hold the head and spend the
+        # budget every tick, starving every card behind it.
+        deadline = time.monotonic() + _GUARD_STUCK_PAGE_BUDGET_S
+        self._attempted = {k: at for k, at in self._attempted.items() if k in current}
+        rest.sort(key=lambda row: self._attempted.get(row[2], -1))
+        for board, item, key, last in rest:
+            land_only = last is not None and "|active_pr|pr=" in key
             if time.monotonic() >= deadline:
                 break
+            self._attempt_seq += 1
+            self._attempted[key] = self._attempt_seq
             land_key = f"{key}|land"
             land_at = self._sent.get(land_key)
             probe = dict(item)
@@ -995,6 +1030,28 @@ def _land_candidate(item: dict) -> bool:
             and item.get("pr_owned") is True)
 
 
+_PRIOR_WORKER_BATCH_SHOWN = 10
+
+
+def _prior_worker_batch_message(batch: list) -> str:
+    """One page for every prior_worker_still_alive card due in one tick."""
+    shown = batch[:_PRIOR_WORKER_BATCH_SHOWN]
+    lines = [
+        f"🛑 **Kanban dispatcher** · {len(batch)} cards: prior_worker_still_alive "
+        "claim rejected >15 min",
+        "Verify each previous owner before intervening; requeue alone cannot bypass the claim guard.",
+    ]
+    lines += [
+        f"- `{row.get('board')}` `{row['task_id']}` {str(row.get('status') or 'ready').upper()} "
+        f"· PID `{row.get('prev_pid')}` · `{row['clear_verb']}`"
+        for row in shown
+    ]
+    if len(batch) > len(shown):
+        lines.append(f"- … {len(batch) - len(shown)} more")
+    lines.append("-# One page per tick for all due cards; each card reminds every 6h.")
+    return "\n".join(lines)
+
+
 def _send_guard_stuck_alert(board: str, item: dict) -> bool:
     """Land a finished card's mergeable PR, else page #alerts with the verb.
 
@@ -1008,21 +1065,24 @@ def _send_guard_stuck_alert(board: str, item: dict) -> bool:
     if script is None:
         logger.error("kanban dispatcher: notify.py unavailable; guard-stuck page not delivered")
         return False
-    if item.get("reason") == "prior_worker_still_alive":
-        # Both the ready and review claim doors refuse; name the card's lane.
-        lane = str(item.get("status") or "ready").upper()
-        detail = (
-            f"{lane} card: prior_worker_still_alive claim rejected >15 min\n"
-            f"Prior PID: `{item.get('prev_pid')}` · Inspect: `{item['clear_verb']}`\n"
-            "Verify the previous owner before intervening; requeue alone cannot bypass the claim guard."
-        )
+    if item.get("batch"):
+        message = _prior_worker_batch_message(item["batch"])
     else:
-        detail = _active_pr_detail(board, item)
-    message = (
-        f"🛑 **Kanban dispatcher** · {detail}\n"
-        f"Board: `{board}` · Card: `{item['task_id']}`\n"
-        "-# Pages once per stuck episode (active_pr: once per card + PR; other holds remind every 6h)."
-    )
+        if item.get("reason") == "prior_worker_still_alive":
+            # Both the ready and review claim doors refuse; name the card's lane.
+            lane = str(item.get("status") or "ready").upper()
+            detail = (
+                f"{lane} card: prior_worker_still_alive claim rejected >15 min\n"
+                f"Prior PID: `{item.get('prev_pid')}` · Inspect: `{item['clear_verb']}`\n"
+                "Verify the previous owner before intervening; requeue alone cannot bypass the claim guard."
+            )
+        else:
+            detail = _active_pr_detail(board, item)
+        message = (
+            f"🛑 **Kanban dispatcher** · {detail}\n"
+            f"Board: `{board}` · Card: `{item['task_id']}`\n"
+            "-# Pages once per stuck episode (active_pr: once per card + PR; other holds remind every 6h)."
+        )
     try:
         proc = subprocess.run(
             [sys.executable, str(script), "--send", message, "--channel", "discord",
@@ -1862,6 +1922,10 @@ class GatewayKanbanWatchersMixin:
                     from hermes_cli import kanban_open_pr as _open_pr
 
                     _cg_query = getattr(self, "_kanban_close_gate_query", None) or _open_pr.memo_query()
+                    from gateway import kanban_owner_wake as _ow
+
+                    _red_health = _ow.default_pr_health()
+                    _red_memo: dict = {}
                     include_unowned = self._owns_kanban_dispatcher_lock()
                     notifier_profiles = {notifier_profile}
                     notifier_profiles.update(
@@ -2062,11 +2126,9 @@ class GatewayKanbanWatchersMixin:
                                         # Home-side evidence (home session, its operator,
                                         # its APPROVE) applies only when THIS subscription
                                         # is the home chat (Prism P1 03f8b8156055).
-                                        _home_t = getattr(home_res, "target", None)
-                                        _sub_is_home = bool(_home_t) and (
-                                            _home_t.platform == platform
-                                            and str(_home_t.chat_id) == str(sub.get("chat_id") or "")
-                                            and str(_home_t.thread_id or "") == str(sub.get("thread_id") or "")
+                                        _sub_is_home = _hr.same_chat(
+                                            getattr(home_res, "target", None), platform,
+                                            sub.get("chat_id"), sub.get("thread_id"),
                                         )
                                         _ctx = _ns.card_context(
                                             conn, sub["task_id"], _home_sid,
@@ -2091,6 +2153,43 @@ class GatewayKanbanWatchersMixin:
                                             _g = None
                                         if _g:
                                             close_gates[_ev.id] = _g
+                                    # t_b1d26df7: a red/dirty PR on a review_requested
+                                    # rides THIS wake, so the owner-wake does not send
+                                    # a second turn for the same event.
+                                    red_state: dict = {}
+                                    if (sub.get("delivery_mode") or "notify") in ("notify+wake", "wake"):
+                                        for _ev in events:
+                                            if _ev.kind != "review_requested":
+                                                continue
+                                            try:
+                                                _bad = _ow.handback_pr_state(
+                                                    _kb, conn, {"result": getattr(task, "result", None)},
+                                                    _ev.payload, _ev.run_id, _red_health, _red_memo,
+                                                )
+                                            except Exception as _rs_exc:
+                                                # Unknown health: leave it to the owner-wake,
+                                                # which retries until GitHub answers.
+                                                logger.debug("kanban notifier: PR state for %s unread: %s",
+                                                             sub["task_id"], _rs_exc)
+                                                _bad = None
+                                            if _bad:
+                                                red_state[_ev.id] = _bad
+                                    # t_f3323c8a W8c: the children a completed close
+                                    # unblocked ride THIS wake too (owner-wake's
+                                    # last_blocker_done), one turn not two.
+                                    ready_state: dict = {}
+                                    if (sub.get("delivery_mode") or "notify") in ("notify+wake", "wake"):
+                                        for _ev in events:
+                                            if _ev.kind != "completed":
+                                                continue
+                                            try:
+                                                _kids = _ow.gated_ready_children(_kb, conn, sub["task_id"])
+                                            except Exception as _rc_exc:
+                                                logger.debug("kanban notifier: ready children of %s unread: %s",
+                                                             sub["task_id"], _rc_exc)
+                                                _kids = []
+                                            if _kids:
+                                                ready_state[_ev.id] = _kids
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -2105,6 +2204,8 @@ class GatewayKanbanWatchersMixin:
                                         "home": home_line,
                                         "home_res": home_res,
                                         "close_gates": close_gates,
+                                        "red_state": red_state,
+                                        "ready_state": ready_state,
                                         "self_event_ids": _self_ids,
                                         "suppressed": suppressed,
                                     })
@@ -2821,6 +2922,20 @@ class GatewayKanbanWatchersMixin:
                         _is_push_adapter = _adapter_push_ok(adapter)
                         _session_key = ""
                         _synth = ""
+                        _red_ids: list = []
+
+                        def _mark_red_carried() -> None:
+                            # t_b1d26df7: only after a DELIVERED wake; the owner-wake
+                            # then drops its separate red_handback turn for these ids.
+                            if _red_ids:
+                                from gateway import kanban_owner_wake as _owner_wake_mod
+
+                                _owner_wake_mod.mark_carried(
+                                    self, board_slug, sub["task_id"], _red_ids,
+                                    sub.get("platform"), sub.get("chat_id"), sub.get("thread_id"),
+                                    who=(sub.get("user_id"), sub.get("user_id_alt")),
+                                    profile=sub.get("notifier_profile"),
+                                )
                         if _wake_kinds:
                             if _is_push_adapter:
                                 _session_key = getattr(task, "session_id", None) or ""
@@ -2876,6 +2991,30 @@ class GatewayKanbanWatchersMixin:
                                     "gateway.kanban.wake.review_detail",
                                     reason=wake_review_detail,
                                 )
+                            # t_b1d26df7: the owner-wake's red-PR enrichment rides
+                            # this one turn (same English text the owner-wake uses).
+                            _red_ids = [
+                                ev.id for ev in d["events"]
+                                if ev.kind == "review_requested" and "review_requested" in _wake_kinds
+                                and ev.id in (d.get("red_state") or {})
+                            ]
+                            for _rid in _red_ids:
+                                _synth += (
+                                    "\nHanded back for review but the PR cannot land ("
+                                    f"{d['red_state'][_rid]}). Fix the PR before the merge pass."
+                                )
+                            _ready = d.get("ready_state") or {}
+                            _ready_ids = [
+                                ev.id for ev in d["events"]
+                                if ev.kind == "completed" and "completed" in _wake_kinds and ev.id in _ready
+                            ]
+                            for _rid in _ready_ids:
+                                _kids = ", ".join(f"{c['id']} [{c['status']}]" for c in _ready[_rid])
+                                _synth += (
+                                    f"\nIt was the last blocker of {_kids}; those children are now "
+                                    "unblocked: arm or dispatch them."
+                                )
+                            _red_ids = _red_ids + _ready_ids
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
                             )
@@ -2938,6 +3077,7 @@ class GatewayKanbanWatchersMixin:
                                         session_id=_session_key,
                                         profile=_served_profile,
                                     )
+                                _mark_red_carried()
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
@@ -3016,6 +3156,7 @@ class GatewayKanbanWatchersMixin:
                                     _synth,
                                 )]},
                             )
+                            _mark_red_carried()
                             logger.info(
                                 "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                 sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,

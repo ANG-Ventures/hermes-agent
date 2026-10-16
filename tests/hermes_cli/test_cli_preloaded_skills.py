@@ -21,6 +21,10 @@ class _DummyCLI:
     def run(self):
         return None
 
+    def start_preloaded_skills(self):
+        # The real method: main() calls it to start the background preload (t_ecfd5591).
+        return _REAL_START(self)
+
 def _real_finalize(cli_obj):
     """Call the real HermesCLI.finalize_preloaded_skills on a dummy object."""
     return _REAL_FINALIZE(cli_obj)
@@ -30,6 +34,12 @@ def _capture_real_finalize():
     return cli_mod.HermesCLI.__dict__["finalize_preloaded_skills"]
 
 _REAL_FINALIZE = _capture_real_finalize()
+
+def _capture_real_start():
+    import cli as cli_mod
+    return cli_mod.HermesCLI.__dict__["start_preloaded_skills"]
+
+_REAL_START = _capture_real_start()
 
 def test_main_applies_preloaded_skills_to_system_prompt(monkeypatch):
     import cli as cli_mod

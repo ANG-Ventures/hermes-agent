@@ -289,6 +289,24 @@ class GatewayConfigLoadersMixin:
         from gateway.run import _load_gateway_config
         return is_truthy_value(cfg_get(_load_gateway_config(), "display", "show_reasoning"), default=False)
 
+    @staticmethod
+    def _load_queue_release_mode() -> str:
+        """``display.queue_release_mode``: ``per_item`` (default) or ``merged``; anything else falls
+        back to ``per_item`` with a warning (follow-up spec D3/D7)."""
+        from gateway.run import _load_gateway_config
+        raw = cfg_get(_load_gateway_config(), "display", "queue_release_mode")
+        mode = str(raw or "per_item").strip().lower()
+        if mode not in ("per_item", "merged"):
+            logger.warning("display.queue_release_mode=%r is not per_item|merged; using per_item", raw)
+            return "per_item"
+        return mode
+
+    @staticmethod
+    def _load_stop_releases_queue() -> bool:
+        """``display.stop_releases_queue``: absent/null/false -> /stop HOLDS queued prompts (default)."""
+        from gateway.run import _load_gateway_config
+        return is_truthy_value(cfg_get(_load_gateway_config(), "display", "stop_releases_queue"), default=False)
+
     @classmethod
     def _load_busy_input_mode(cls) -> str:
         """Gateway drain-time busy-input behavior from env/config (default ``interrupt``)."""

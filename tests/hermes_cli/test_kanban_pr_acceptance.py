@@ -1,8 +1,10 @@
 """Two lifecycle invariants, using real SQLite and a local GitHub HTTP contract."""
 import json
 import os
+import subprocess
 import sys
 import threading
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -20,10 +22,28 @@ def github(tmp_path, monkeypatch):
             state["requests"].append(self.path)
             sha = state["head"]
             if self.path == "/graphql":
-                value = {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                query = self.headers.get("X-Query", "")
+                if "branchProtectionRule" in query and state.get("app_token"):
+                    # The fleet's GitHub App token lacks Administration:read: GitHub answers
+                    # HTTP 200 with a FORBIDDEN field error (measured, t_b5b407c8).
+                    value = {"data": {"repository": {"pullRequest": {"baseRef": {"branchProtectionRule": None}}}},
+                             "errors": [{"type": "FORBIDDEN", "message": "Resource not accessible by integration"}]}
+                else:
+                    value = {"data": {"repository": {"pullRequest": {
+                        "headRefOid": sha, "baseRefName": "main", "state": state.get("pr_state", "OPEN"),
+                        "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
+                            {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+            elif self.path.endswith("/branches/main"):
+                if state.get("protection_denied"):
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(b'{"message": "Resource not accessible by integration"}')
+                    return
+                value = {"name": "main", "protection": state.get("protection") or {"required_status_checks": {
+                    "checks": [{"context": "required", "app_id": state.get("app_id", 1)}],
+                    "contexts": ["required"]}}}
+            elif "/issues/" in self.path and self.path.split("?")[0].endswith("/comments"):
+                value = [state.get("comments", [])]
             elif "/rules/branches/" in self.path:
                 value = [[]]
             elif "/check-runs" in self.path:
@@ -46,7 +66,10 @@ def github(tmp_path, monkeypatch):
                 # GET /apps/{slug}: the bot login's app id (public endpoint).
                 value = {"id": state.get("apps", {}).get(self.path[len("/apps/"):]), "slug": self.path[6:]}
             elif "/pulls/" in self.path:
-                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+                merged = state.get("pr_state") == "MERGED"
+                value = {"head": {"sha": sha}, "state": "closed" if merged else "open", "merged": merged,
+                         "merged_by": {"login": state.get("merged_by", "operator")} if merged else None,
+                         "base": {"ref": "main", "repo": {"full_name": state.get("canonical", "acme/repo")}}}
             else:
                 self.send_error(404)
                 return
@@ -63,9 +86,19 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    # Behaves like gh at the boundary the gate sees: an HTTP error or a GraphQL ``errors``
+    # payload exits 1 with gh's own stderr line.
+    gh.write_text(f"#!{sys.executable}\nimport json,sys,urllib.request,urllib.error\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "q=next((a[6:] for a in sys.argv if a.startswith('query=')), '')\n"
+                  "req=urllib.request.Request(u, headers={'X-Query': ' '.join(q.split())})\n"
+                  "try:\n    body=urllib.request.urlopen(req).read().decode()\n"
+                  "except urllib.error.HTTPError as e:\n"
+                  "    msg=json.loads(e.read().decode()).get('message','')\n"
+                  "    sys.stderr.write(f'gh: {msg} (HTTP {e.code})\\n'); sys.exit(1)\n"
+                  "print(body)\n"
+                  "errs=json.loads(body).get('errors') if body.startswith('{') else None\n"
+                  "if errs:\n    sys.stderr.write('gh: '+errs[0]['message']+'\\n'); sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -331,9 +364,8 @@ def test_unpinned_context_still_accepts_any_status(github, monkeypatch):
 
     def unpinned(endpoint, **kw):
         value = real(endpoint, **kw)
-        if endpoint == "graphql":
-            value["data"]["repository"]["pullRequest"]["baseRef"]["branchProtectionRule"][
-                "requiredStatusChecks"][0]["app"] = None
+        if endpoint.endswith("/branches/main"):
+            value["protection"]["required_status_checks"]["checks"][0]["app_id"] = None
         return value
     monkeypatch.setattr(acc, "_api", unpinned)
     github.update(conclusion="success", head="a" * 40, missing=True,
@@ -342,3 +374,296 @@ def test_unpinned_context_still_accepts_any_status(github, monkeypatch):
     assert receipt["classification"] == "success", receipt
     # no app lookup is needed for an unpinned context
     assert not any(r.startswith("/apps/") for r in github["requests"])
+
+
+# --- t_b5b407c8: required checks via REST, stage-named refusals, audited break-glass waiver ---
+# Measured on t_f9dc8aad: the fleet App token is refused GraphQL ``branchProtectionRule``
+# (HTTP 200 + FORBIDDEN), gh exits 1 without "HTTP 403", and the gate filed it as ``infra``.
+
+_HEAD = "a" * 40
+
+
+def _breakglass(tmp_path, *, head=_HEAD, rcs=None, tree=None, body_extra="", author="operator",
+                path=None, contexts=("required",), ledger_repo="acme/repo", ledger_receipt=None,
+                comment_path=None, ledger_extra=None):
+    """A fleet-merge break-glass attribution comment, an off-box receipt under the hermes root,
+    and fleet-merge's ``merge`` ledger row binding OWNER/REPO#7@head to that receipt."""
+    receipt = path or (tmp_path / "home" / "var" / "ci-box" / "offbox-repo-7.receipt")
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    rc = {"ruff_rc": "0", "pytest_rc": "0", "semgrep_rc": "0", "gitleaks_rc": "0", **(rcs or {})}
+    receipt.write_text(f"head={head}\ntree={tree or 'repo-7-' + head[:12]}\n"
+                       + "".join(f"{k}={v}\n" for k, v in rc.items()), encoding="utf-8")
+    ledger = tmp_path / "home" / "state" / "merge-ledger.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    if ledger_repo:
+        with ledger.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"repo": ledger_repo, "pr": 7, "head": head, "action": "merge",
+                                 "attempt_id": "att1", "receipt_path": str(ledger_receipt or receipt),
+                                 **(ledger_extra or {})}) + "\n")
+    absent = ",".join(f"{c} (required, ABSENT on head)" for c in contexts)
+    body = (f"\U0001f916 merged-by: apollo \u00b7 lane: operator \u00b7 gate: ADVISORY \u00b7 why: x"
+            f" \u00b7 offbox-security-receipt: {comment_path or receipt} \u00b7 red-ci allowed [{absent}]: green receipt{body_extra}")
+    return [{"id": 99, "user": {"login": author}, "body": body, "html_url": "https://github.com/acme/repo/pull/7#c99"}]
+
+
+@pytest.mark.platforms("posix")
+def test_app_token_without_admin_read_still_reads_required_checks(github):
+    """RED on main (``infra``): required checks come from REST branch protection, which the
+    App token can read; the GraphQL protection field it cannot read is no longer queried."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    github.update(conclusion="success", head=_HEAD, app_token=True)
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "success", receipt
+    assert receipt["required"] == [{"context": "required", "app_id": 1}]
+
+
+@pytest.mark.platforms("posix")
+def test_permission_refusal_is_auth_naming_the_stage_not_infra(github):
+    from hermes_cli import kanban_pr_acceptance as acc
+    github.update(conclusion="success", head=_HEAD, protection_denied=True)
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "auth", receipt
+    assert receipt["stage"] == "read branch protection"
+    assert "read branch protection" in receipt["detail"] and "gh:" not in receipt["detail"]
+
+
+@pytest.mark.platforms("posix")
+def test_infra_failure_names_stage_and_error_type(github, monkeypatch):
+    from hermes_cli import kanban_pr_acceptance as acc
+    real = acc._api
+
+    def broken(endpoint, **kw):
+        if "/check-runs" in endpoint:
+            raise subprocess.TimeoutExpired("gh", 30)
+        return real(endpoint, **kw)
+    monkeypatch.setattr(acc, "_api", broken)
+    github.update(conclusion="success", head=_HEAD)
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "infra"
+    assert receipt["stage"] == "read check runs and statuses"
+    assert receipt["error_type"] == "TimeoutExpired"
+
+
+@pytest.mark.platforms("posix")
+def test_transferred_repo_same_pr_is_accepted_and_recorded_without_retargeting(github):
+    """The old owner's URL resolves (GitHub redirect) to the canonical repository; the
+    receipt records it and the bound contract is left as written."""
+    github.update(conclusion="success", head=_HEAD, canonical="newowner/repo")
+    with connect() as conn:
+        tid = kb.create_task(conn, title="moved", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+        assert receipt["canonical_repo"] == "newowner/repo"
+        assert kb.get_task(conn, tid).completion_contract == "https://github.com/acme/repo/pull/7"
+        # A different PR is still refused against the bound contract.
+        other = kb.create_task(conn, title="other", completion_contract="https://github.com/acme/repo/pull/7")
+        assert not kb.complete_task(conn, other, result="done", metadata={"published_pr": "https://github.com/newowner/repo/pull/7"})
+
+
+@pytest.mark.platforms("posix")
+def test_merged_breakglass_with_green_receipt_waives_only_absent_checks(github, tmp_path):
+    from hermes_cli import kanban_pr_acceptance as acc
+    github.update(conclusion="success", head=_HEAD, missing=True, pr_state="MERGED",
+                  comments=_breakglass(tmp_path))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "success", receipt
+    assert receipt["checks"][0]["classification"] == "waived"
+    waiver = receipt["waiver"]
+    assert waiver["kind"] == "break-glass-offbox" and waiver["merged_by"] == "operator"
+    assert waiver["contexts"] == ["required"] and len(waiver["receipt_sha256"]) == 64
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("case", ["open_pr", "wrong_head", "red_rung", "wrong_tree", "not_merger",
+                                  "outside_root", "context_not_listed", "failed_check", "no_comment",
+                                  "no_ledger_row", "ledger_other_owner", "ledger_other_receipt",
+                                  "listed_only_in_reason"])
+def test_breakglass_waiver_negatives_stay_closed(github, tmp_path, case):
+    from hermes_cli import kanban_pr_acceptance as acc
+    kw = {}
+    state = {"conclusion": "success", "head": _HEAD, "missing": True, "pr_state": "MERGED"}
+    if case == "open_pr":
+        state["pr_state"] = "OPEN"
+    elif case == "wrong_head":
+        kw["head"] = "b" * 40
+    elif case == "red_rung":
+        kw["rcs"] = {"pytest_rc": "1"}
+    elif case == "wrong_tree":
+        kw["tree"] = "other-7-" + _HEAD[:12]
+    elif case == "not_merger":
+        kw["author"] = "mallory"
+    elif case == "outside_root":
+        kw["path"] = tmp_path / "elsewhere" / "offbox.receipt"
+    elif case == "context_not_listed":
+        kw["contexts"] = ("sast",)
+    elif case == "failed_check":
+        state.update(missing=False, conclusion="failure")
+    elif case == "no_ledger_row":
+        kw["ledger_repo"] = None
+    elif case == "ledger_other_owner":
+        # Same basename/PR/head under another owner (a fork shares the head): the receipt's
+        # ``tree`` cannot tell them apart, the ledger row's full OWNER/REPO does.
+        kw["ledger_repo"] = "other/repo"
+    elif case == "ledger_other_receipt":
+        other = tmp_path / "home" / "var" / "ci-box" / "offbox-other.receipt"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text("x")
+        kw["ledger_receipt"] = other
+    elif case == "listed_only_in_reason":
+        # The free-text reason after "]: " is not the list, whatever it says.
+        kw.update(contexts=("sast",), body_extra=" ,required (required, ABSENT on head)")
+    github.update(state, comments=[] if case == "no_comment" else _breakglass(tmp_path, **kw))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False and "waiver" not in receipt, receipt
+    assert receipt["classification"] == ("failure" if case == "failed_check" else "missing")
+
+
+_BASE = "e11a385679f8eb4debe5a697256ebe5a8c4a44cc"
+_ACCEPT_RED = {"accept_red_receipt": f"35 tests fail identically on main base {_BASE} (inherited)"}
+
+
+@pytest.mark.platforms("posix")
+def test_breakglass_accept_red_receipt_waives_red_pytest_rung(github, tmp_path):
+    """fleet-merge --accept-red-receipt landed a pytest_rc=1 receipt (PR #2000 shape): the ledger
+    row for the same repo/PR/head/receipt carries the override naming the 40-hex base sha.
+    RED on main: any rc!=0 refuses the receipt, so the card stays ``missing``."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    github.update(conclusion="success", head=_HEAD, missing=True, pr_state="MERGED",
+                  comments=_breakglass(tmp_path, rcs={"pytest_rc": "1"}, ledger_extra=_ACCEPT_RED))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "success", receipt
+    waiver = receipt["waiver"]
+    assert waiver["kind"] == "break-glass-offbox-accepted-red"
+    assert waiver["accepted_red_base"] == _BASE and waiver["receipt_pytest_rc"] == "1"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("case", ["no_override", "override_without_sha", "ruff_red", "semgrep_red",
+                                  "gitleaks_red", "override_on_other_receipt_row"])
+def test_breakglass_accept_red_negatives_stay_closed(github, tmp_path, case):
+    """Only pytest_rc is overridable, only by the matching ledger row's 40-hex-sha override."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    rcs, extra, kw = {"pytest_rc": "1"}, dict(_ACCEPT_RED), {}
+    if case == "no_override":
+        extra = {}
+    elif case == "override_without_sha":
+        extra = {"accept_red_receipt": "inherited from main, same failures on the base tip"}
+    elif case in ("ruff_red", "semgrep_red", "gitleaks_red"):
+        rcs = {case.replace("_red", "_rc"): "1"}
+    elif case == "override_on_other_receipt_row":
+        other = tmp_path / "home" / "var" / "ci-box" / "offbox-other.receipt"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text("x")
+        kw["ledger_receipt"] = other
+    github.update(conclusion="success", head=_HEAD, missing=True, pr_state="MERGED",
+                  comments=_breakglass(tmp_path, rcs=rcs, ledger_extra=extra, **kw))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False and "waiver" not in receipt, receipt
+    assert receipt["classification"] == "missing"
+
+
+@pytest.mark.platforms("posix")
+def test_tampered_receipt_after_comment_is_not_trusted(github, tmp_path):
+    from hermes_cli import kanban_pr_acceptance as acc
+    comments = _breakglass(tmp_path)
+    receipt_path = tmp_path / "home" / "var" / "ci-box" / "offbox-repo-7.receipt"
+    receipt_path.write_text(receipt_path.read_text().replace("pytest_rc=0", "pytest_rc=1"))
+    github.update(conclusion="success", head=_HEAD, missing=True, pr_state="MERGED", comments=comments)
+    assert acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")["ok"] is False
+
+
+@pytest.mark.platforms("posix")
+def test_cli_names_the_acceptance_refusal_not_a_concurrency_guess(github, tmp_path):
+    """The real ``hermes kanban complete`` subprocess prints the gate's classification/stage.
+    RED on main: "refused while status is 'ready' (state changed concurrently?)"."""
+    github.update(conclusion="success", head=_HEAD, protection_denied=True)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="cli", completion_contract="https://github.com/acme/repo/pull/7")
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).parents[2]))
+    for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_OWNER_PID"):
+        env.pop(name, None)
+    proc = subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", "complete", tid,
+                           "--summary", "done", "--metadata",
+                           json.dumps({"published_pr": "https://github.com/acme/repo/pull/7"})],
+                          env=env, cwd=Path(__file__).parents[2], capture_output=True, text=True, timeout=120)
+    assert proc.returncode != 0
+    assert "PR acceptance refused (auth at stage 'read branch protection')" in proc.stderr, proc.stderr
+    assert "changed concurrently" not in proc.stderr
+
+
+@pytest.mark.platforms("posix")
+def test_tilde_receipt_path_in_comment_is_expanded_then_contained(github, tmp_path, monkeypatch):
+    """fleet-merge comments may name ``~/...``; it must expand before strict resolution, and
+    a ``~`` path outside ``<root>/var/ci-box`` stays refused."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    github.update(conclusion="success", head=_HEAD, missing=True, pr_state="MERGED",
+                  comments=_breakglass(tmp_path, comment_path="~/var/ci-box/offbox-repo-7.receipt"))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "success", receipt
+    assert receipt["waiver"]["receipt"] == str((tmp_path / "home" / "var" / "ci-box" / "offbox-repo-7.receipt").resolve())
+    monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
+    escaped = tmp_path / "elsewhere" / "var" / "ci-box" / "offbox-repo-7.receipt"
+    github.update(comments=_breakglass(tmp_path, path=escaped, comment_path="~/var/ci-box/offbox-repo-7.receipt"))
+    assert acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")["ok"] is False
+
+
+@pytest.mark.platforms("posix")
+def test_comma_bearing_context_name_does_not_waive_its_suffix(github, tmp_path):
+    """Listing ``lint,required`` must not read as a listing of ``required``."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    github.update(conclusion="success", head=_HEAD, missing=True, pr_state="MERGED",
+                  protection={"required_status_checks": {
+                      "checks": [{"context": "required", "app_id": 1}, {"context": "lint,required", "app_id": 1}],
+                      "contexts": ["required", "lint,required"]}},
+                  comments=_breakglass(tmp_path, contexts=("lint,required",)))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False and "waiver" not in receipt, receipt
+    # Listing both, each as a whole element, is a real listing.
+    github.update(comments=_breakglass(tmp_path, contexts=("lint,required", "required")))
+    assert acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")["ok"] is True
+
+
+@pytest.mark.platforms("posix")
+def test_paren_comma_context_name_does_not_waive_its_suffix(github, tmp_path):
+    """Listing only ``lint),sast`` must not read as a listing of a required, absent ``sast``."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    github.update(conclusion="success", head=_HEAD, missing=True, pr_state="MERGED",
+                  protection={"required_status_checks": {
+                      "checks": [{"context": "sast", "app_id": 1}, {"context": "lint),sast", "app_id": 1}],
+                      "contexts": ["sast", "lint),sast"]}},
+                  comments=_breakglass(tmp_path, contexts=("lint),sast",)))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False and "waiver" not in receipt, receipt
+    github.update(comments=_breakglass(tmp_path, contexts=("lint),sast", "sast")))
+    assert acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")["ok"] is True
+
+
+@pytest.mark.platforms("posix")
+def test_bracket_bearing_context_is_parsed_as_one_element(github, tmp_path):
+    from hermes_cli import kanban_pr_acceptance as acc
+    name = "ci [linux] gate"
+    github.update(conclusion="success", head=_HEAD, missing=True, pr_state="MERGED",
+                  protection={"required_status_checks": {
+                      "checks": [{"context": name, "app_id": 1}], "contexts": [name]}},
+                  comments=_breakglass(tmp_path, contexts=(name,)))
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "success" and receipt["waiver"]["contexts"] == [name], receipt
+
+
+@pytest.mark.platforms("posix")
+def test_context_without_app_binding_fails_closed_and_impostor_cannot_satisfy_pinned_app(github):
+    """REST ``contexts`` with no ``checks`` entry has an unknown app binding: never read as
+    unpinned. A same-named check from another app never satisfies a pinned context."""
+    from hermes_cli import kanban_pr_acceptance as acc
+    github.update(conclusion="success", head=_HEAD,
+                  protection={"required_status_checks": {"checks": [], "contexts": ["required"]}})
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False and receipt["classification"] == "infra", receipt
+    assert receipt["stage"] == "read branch protection"
+    # Pinned to app 2; the only "required" check run comes from app 1 (the fixture's producer).
+    github.update(protection={"required_status_checks": {
+        "checks": [{"context": "required", "app_id": 2}], "contexts": ["required"]}})
+    receipt = acc.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False and receipt["classification"] == "missing", receipt

@@ -987,6 +987,8 @@ _TASK_RUN_COLUMNS = (
     ("worker_started_at", "worker_started_at INTEGER"),
     # Resources the run started (kanban_resources); legacy rows read as [].
     ("resources", "resources TEXT NOT NULL DEFAULT '[]'"),
+    # Where the run executed (t_8bfdcc07): pool host id or 'studio'.
+    ("host", "host TEXT"),
 )
 
 
@@ -1145,6 +1147,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "body" in cols:
             _kb._backfill_no_worker_from_body(conn)
 
+    if "origin_host" not in cols:
+        # After no_worker: a migrated legacy table keeps the fresh column order.
+        if _add_column_if_missing(conn, "tasks", "origin_host", "origin_host TEXT"):
+            from hermes_cli import kanban_continuation as _kcont
+            _kcont.backfill_origin_hosts(conn)
+
     _rebuild_drifted_tables(conn)
     # After the rebuild: a rebuilt kanban_notify_subs drops extra indexes.
     _kb._ensure_single_waker_index(conn)
@@ -1238,7 +1246,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT, resources TEXT NOT NULL DEFAULT '[]')",
+        " error TEXT, resources TEXT NOT NULL DEFAULT '[]', host TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -1389,6 +1397,68 @@ def _main_db_file(conn: sqlite3.Connection) -> Optional[str]:
     return None
 
 
+# Post-commit actions keyed by connection (t_d6ce856e): a side effect outside
+# SQLite (the placement headroom ledger) must happen only once the run row it
+# mirrors is durable, never while the transaction can still roll back. An entry
+# exists ONLY while an outer ``write_txn`` is open on that connection (created
+# at BEGIN, popped at COMMIT/ROLLBACK), so nothing can outlive the transaction
+# it was queued in (Prism 907d56fc45e5). The connection is held strongly so its
+# id cannot be reused while the entry exists.
+_POST_COMMIT: dict = {}
+
+
+def on_commit(conn: sqlite3.Connection, fn) -> None:
+    """Run ``fn()`` after the enclosing outer ``write_txn`` COMMITs; drop it on
+    ROLLBACK (savepoint rollbacks drop the actions queued inside them). With no
+    open transaction the write is already durable: run it now. Inside a
+    transaction ``write_txn`` does not own (a bare BEGIN, ``conn.rollback()``
+    can end it unseen) ``fn`` is DROPPED with a warning, never run early or on
+    a later unrelated commit; a dropped headroom release lapses on its TTL."""
+    if not getattr(conn, "in_transaction", False):
+        fn()
+        return
+    entry = _POST_COMMIT.get(id(conn))
+    if entry is None or entry[0] is not conn:
+        _kb._log.warning("kanban: post-commit action dropped: transaction not opened by write_txn")
+        return
+    entry[1].append(fn)
+
+
+def _post_commit_open(conn) -> None:
+    _POST_COMMIT[id(conn)] = (conn, [])
+
+
+def _post_commit_mark(conn) -> int:
+    entry = _POST_COMMIT.get(id(conn))
+    return len(entry[1]) if entry is not None and entry[0] is conn else 0
+
+
+def _post_commit_truncate(conn, mark: int) -> None:
+    entry = _POST_COMMIT.get(id(conn))
+    if entry is not None and entry[0] is conn:
+        del entry[1][mark:]
+
+
+def _post_commit_drop(conn) -> None:
+    entry = _POST_COMMIT.pop(id(conn), None)
+    if entry is not None and entry[0] is not conn:
+        _POST_COMMIT[id(conn)] = entry
+
+
+def _post_commit_run(conn) -> None:
+    entry = _POST_COMMIT.pop(id(conn), None)
+    if entry is None:
+        return
+    if entry[0] is not conn:
+        _POST_COMMIT[id(conn)] = entry
+        return
+    for fn in entry[1]:
+        try:
+            fn()
+        except Exception as exc:  # a mirror of committed state, never a gate
+            _kb._log.warning("kanban: post-commit action failed: %s", exc)
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """IMMEDIATE write transaction; a claim CAS inside is atomic — at most one
@@ -1411,18 +1481,21 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             )
         savepoint = f"hermes_nested_{secrets.token_hex(8)}"
         conn.execute(f"SAVEPOINT {savepoint}")
+        mark = _post_commit_mark(conn)
         try:
             yield conn
         except Exception:
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute(f"ROLLBACK TO {savepoint}")
                 conn.execute(f"RELEASE {savepoint}")
+            _post_commit_truncate(conn, mark)
             raise
         else:
             conn.execute(f"RELEASE {savepoint}")
         return
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    _post_commit_open(conn)
     try:
         _kb._recheck_pending_operator_gate(conn)
         guarded_before = _kb._recheck_pending_home_session(conn)
@@ -1434,6 +1507,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         # don't let this secondary failure shadow the real one.
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute("ROLLBACK")
+        _post_commit_drop(conn)
         raise
     else:
         try:
@@ -1443,7 +1517,9 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             # connection isn't poisoned for the next BEGIN IMMEDIATE.
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("ROLLBACK")
+            _post_commit_drop(conn)
             raise
+        _post_commit_run(conn)
         # Post-commit torn-extend check — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
         # Cross-board home index (t_11f2cf60): mirror the cards this commit

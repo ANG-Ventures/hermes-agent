@@ -243,6 +243,7 @@ class GatewayAdapterLifecycleMixin:
             "credential_claim": self._adapter_credential_claim(platform, adapter),
             "listener_claim": self._adapter_listener_claim(platform, adapter),
             "inbound_dedup": inbound_dedup_caches(adapter),
+            "retired_adapter": adapter,
         }
 
     def _queue_retryable_fatal_platform(self, adapter: BasePlatformAdapter) -> bool:
@@ -859,7 +860,11 @@ class GatewayAdapterLifecycleMixin:
 
     async def _install_reconnected_adapter(self, platform, adapter) -> None:
         """Publish a freshly reconnected primary adapter and replay what it missed while down."""
+        retired = self._failed_platforms.get(platform, {}).get("retired_adapter")
         self._publish_primary_adapter(platform, adapter)
+        digest = getattr(self, "_kanban_lifecycle_digest", None)
+        if retired is not None and digest is not None:
+            digest.replace_adapter(retired, adapter)
         self.delivery_router.adapters = self.adapters
         del self._failed_platforms[platform]
         # connect() returning True does not mean the receive path is confirmed -- Telegram's degraded

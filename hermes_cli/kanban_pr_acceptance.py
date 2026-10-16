@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_INTEGRATION_DENIED = "Resource not accessible by integration"
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 
 
@@ -46,11 +47,17 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
         denied = re.search(r"HTTP (40[134])", exc.stderr or "")
         if denied:
             raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
+        if _INTEGRATION_DENIED in (exc.stderr or ""):
+            # GraphQL answers a field-level permission refusal with HTTP 200 + errors, so
+            # gh exits 1 without an "HTTP 403" marker: still a login/permission problem.
+            raise _GateAuthError(f"integration permission refused on {endpoint.split('?')[0]}") from None
         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
             raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
         raise
     value = json.loads(result.stdout)
     if isinstance(value, dict) and value.get("errors"):
+        if any((e or {}).get("type") == "FORBIDDEN" for e in value["errors"]):
+            raise _GateAuthError(f"integration permission refused on {endpoint.split('?')[0]}")
         raise ValueError("GitHub returned incomplete GraphQL evidence")
     return value
 
@@ -121,6 +128,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
     human_lane = bool(assignee) and _is_human_lane(assignee)
     if human_lane:
         receipt["login"] = "ambient (human lane)"
+    stage = "resolve login"
     try:
         profile_home = _assignee_profile_home(assignee)
         declared = _PR.fullmatch(contract)
@@ -132,9 +140,11 @@ def collect_acceptance(contract: str, published_pr: str | None,
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")
-        query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
-            baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
+        # Branch protection is read over REST below: GraphQL's branchProtectionRule needs
+        # Administration:read, which the fleet's GitHub App token does not hold (t_b5b407c8).
+        query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state}}}''' % (
                 json.dumps(owner), json.dumps(name), number)
+        stage = "read pull request (graphql)"
         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
         if repository is None:
             # A private repo the login cannot read resolves to null, not an error.
@@ -144,8 +154,16 @@ def collect_acceptance(contract: str, published_pr: str | None,
         receipt["head_sha"] = sha
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
-        protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
-        required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
+        stage = "read branch protection"
+        protection = (_api(f"repos/{repo}/branches/{quote(branch, safe='')}",
+                           profile_home=profile_home).get("protection") or {})
+        checks_cfg = protection.get("required_status_checks") or {}
+        required = {(r["context"], r.get("app_id")) for r in checks_cfg.get("checks", [])}
+        if set(checks_cfg.get("contexts", [])) - {c for c, _ in required}:
+            # A context listed without its ``checks`` entry has an undeterminable app binding;
+            # treating it as unpinned would let any producer's same-named check satisfy it.
+            raise ValueError("required context without an app binding in branch protection")
+        stage = "read branch rulesets"
         rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
                      paginate=True, profile_home=profile_home)
         for page in rules:
@@ -157,6 +175,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         if not required:
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
+        stage = "read check runs and statuses"
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)
         runs = [run for page in pages for run in page["check_runs"]]
@@ -190,24 +209,179 @@ def collect_acceptance(contract: str, published_pr: str | None,
                     entry["satisfied_by"] = f"status({(check.get('creator') or {}).get('login')})"
                 receipt["checks"].append(entry)
         # Re-read after all pages: old-head successes are never transferable.
+        stage = "re-read pull request"
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
             return receipt
+        canonical = ((current.get("base") or {}).get("repo") or {}).get("full_name")
+        if canonical and canonical.lower() != repo.lower():
+            # Transferred/renamed repo: GitHub resolved the contract's name to this repository.
+            # Recorded for audit only; the contract itself is never rewritten.
+            receipt["canonical_repo"] = canonical
+        if current.get("merged") and "missing" in outcomes and set(outcomes) <= {"success", "missing"}:
+            stage = "verify break-glass landing evidence"
+            waiver = _break_glass_waiver(repo, canonical or repo, number, sha, current, receipt["checks"], profile_home)
+            if waiver:
+                receipt["waiver"] = waiver
+                for entry in receipt["checks"]:
+                    if entry["classification"] == "missing" and entry["name"] in waiver["contexts"]:
+                        entry["classification"] = "waived"
+                outcomes = ["success" if x == "missing" else x for x in outcomes]
         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
         receipt["ok"] = receipt["classification"] == "success"
+        if receipt["classification"] == "missing" and not receipt.get("detail"):
+            absent = [c["name"] for c in receipt["checks"] if c["classification"] == "missing"]
+            receipt["detail"] = (f"Required checks absent on head {sha[:12]}: {', '.join(absent)}. Run them on this head, "
+                                 "or land through fleet-merge --break-glass with a green off-box receipt for this head.")
         return receipt
     except _GateAuthError as exc:
         login = (f"assignee profile {assignee!r}'s gh login" if assignee and not human_lane
                  else "the ambient gh login")
-        receipt.update(classification="auth",
-                       detail=f"GitHub refused the acceptance read ({exc}) as {login}; "
+        receipt.update(classification="auth", stage=stage,
+                       detail=f"GitHub refused the acceptance read at stage '{stage}' ({exc}) as {login}; "
                               "fix that profile's GitHub credentials/access to the repository, then retry completion.")
         return receipt
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
-        # Never persist gh stderr (credentials/host details); the failed phase is actionable.
-        receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError) as exc:
+        # Never persist gh stderr (credentials/host details); the failed stage + error type are actionable.
+        receipt.update(classification="infra", stage=stage, error_type=type(exc).__name__,
+                       detail=f"GitHub acceptance evidence unavailable or incomplete at stage '{stage}' "
+                              f"({type(exc).__name__}); check gh authentication/API access and retry.")
         return receipt
+
+
+_RECEIPT_RCS = ("ruff_rc", "pytest_rc", "semgrep_rc", "gitleaks_rc")
+
+
+def _break_glass_waiver(repo: str, canonical: str, number: int, sha: str, current: dict,
+                        checks: list, profile_home: str | None) -> dict | None:
+    """Waive required contexts ABSENT on a MERGED head, only on audited break-glass landing evidence.
+
+    Every link is bound to this exact repository/PR/head; anything short of all of them is no
+    waiver (the card stays ``missing``):
+    - GitHub says the PR is merged at this head, by ``merged_by``;
+    - that same account posted the fleet-merge attribution comment (``🤖 merged-by:``) naming
+      ``offbox-security-receipt: <path>`` and listing each waived context as a whole
+      ``<ctx> (required, ABSENT on head)`` element of ``red-ci allowed [...]``;
+    - fleet-merge's landing ledger (``<hermes root>/state/merge-ledger.jsonl``) has a ``merge`` row
+      for the canonical OWNER/REPO, this PR and head, naming that same receipt: the receipt file
+      carries only the repo basename, so the ledger row is what binds the owner;
+    - the receipt lives under ``<hermes root>/var/ci-box/``, names this head and
+      ``<repo-name>-<pr>-<head12>``, and every gate rung is rc=0 -- except a red pytest rung when
+      that ledger row carries fleet-merge's ``accept_red_receipt`` naming a 40-hex base sha
+      (kind ``break-glass-offbox-accepted-red``); ruff/semgrep/gitleaks are never overridable.
+    Failed, pending and stale checks are never waived: only absence on an operator break-glass merge.
+    """
+    from hermes_constants import get_default_hermes_root
+    merger = (current.get("merged_by") or {}).get("login")
+    if not merger or current["head"]["sha"] != sha:
+        return None
+    absent = {c["name"] for c in checks if c["classification"] == "missing"}
+    if any(" (required, ABSENT on head)" in c["name"] or ")]: " in c["name"] for c in checks):
+        # A context name carrying the list's own delimiters makes the attribution list ambiguous.
+        return None
+    pages = _api(f"repos/{repo}/issues/{number}/comments?per_page=100", paginate=True, profile_home=profile_home)
+    hermes_root = Path(get_default_hermes_root())
+    root = (hermes_root / "var" / "ci-box").resolve()
+    for comment in (c for page in pages for c in page):
+        body = comment.get("body") or ""
+        if (comment.get("user") or {}).get("login") != merger or not body.startswith("\U0001f916 merged-by:"):
+            continue
+        path = re.search(r"offbox-security-receipt: (\S+)", body)
+        start = body.find("red-ci allowed [")
+        if not path or start < 0:
+            continue
+        # fleet-merge writes "red-ci allowed [<e1>,<e2>]: <reason>"; every element ends in ")",
+        # so the list ends at the first ")]: " and the free-text reason can never supply an element.
+        allowed = body[start + len("red-ci allowed ["):]
+        end = allowed.find(")]: ")
+        if end < 0:
+            continue
+        listed = allowed[:end + 1]
+        # An element starts the list or follows the COMPLETE previous element suffix
+        # "(required, ABSENT on head),", so punctuation inside another name ("lint,<ctx>",
+        # "lint),<ctx>") can never read as a listing of <ctx>.
+        if not all(re.search(r"(?:^|\(required, ABSENT on head\),)"
+                             + re.escape(ctx + " (required, ABSENT on head)") + r"(?=,|$)", listed)
+                   for ctx in absent):
+            continue
+        evidence = _read_offbox_receipt(Path(path[1]), root, canonical.split("/")[1], number, sha)
+        if not evidence:
+            continue
+        landing = _landing_record(hermes_root / "state" / "merge-ledger.jsonl", canonical, number, sha,
+                                  evidence["receipt"])
+        if not landing:
+            continue
+        kind = "break-glass-offbox"
+        override = landing.pop("accept_red_receipt", None)
+        if "receipt_pytest_rc" in evidence:
+            # fleet-merge --accept-red-receipt: a red pytest rung only, overridden on THIS ledger row
+            # by text naming the 40-hex base sha where the same red already stands.
+            base = re.search(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])", override if isinstance(override, str) else "")
+            if not base:
+                continue
+            kind, evidence = "break-glass-offbox-accepted-red", {**evidence, "accepted_red_base": base[0]}
+        return {"kind": kind, "merged_by": merger, "comment_id": comment.get("id"),
+                "comment_url": comment.get("html_url"), "contexts": sorted(absent), **evidence, **landing}
+    return None
+
+
+def _landing_record(ledger: Path, canonical: str, number: int, sha: str, receipt: str) -> dict | None:
+    """fleet-merge's ``merge`` ledger row for exactly OWNER/REPO#number@sha naming ``receipt``."""
+    try:
+        with ledger.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if sha not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(row, dict) and row.get("action") == "merge" and row.get("head") == sha
+                        and row.get("pr") == number and str(row.get("repo", "")).lower() == canonical.lower()
+                        and _resolved(row.get("receipt_path")) == receipt):
+                    return {"ledger_repo": row["repo"], "ledger_attempt_id": row.get("attempt_id"),
+                            "ledger_ts": row.get("ts"), "accept_red_receipt": row.get("accept_red_receipt")}
+    except OSError:
+        return None
+    return None
+
+
+def _resolved(path) -> str | None:
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        return str(Path(path).expanduser().resolve(strict=True))
+    except (OSError, RuntimeError):
+        return None
+
+
+def _read_offbox_receipt(path: Path, root: Path, repo_name: str, number: int, sha: str) -> dict | None:
+    import hashlib
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+        resolved.relative_to(root)
+        raw = resolved.read_bytes()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    fields = {}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key and not key.startswith(" ") and key not in fields:
+            fields[key] = value.strip()
+    if fields.get("head") != sha or fields.get("tree") != f"{repo_name}-{number}-{sha[:12]}":
+        return None
+    # Security rungs are never overridable; a red pytest rung is reported for the caller to bind
+    # to a fleet-merge --accept-red-receipt ledger override (fleet-merge.sh step 1a0).
+    if any(fields.get(rc) != "0" for rc in _RECEIPT_RCS if rc != "pytest_rc"):
+        return None
+    evidence = {"receipt": str(resolved), "receipt_sha256": hashlib.sha256(raw).hexdigest()}
+    pytest_rc = fields.get("pytest_rc") or ""
+    if not pytest_rc.isdigit():
+        return None
+    if pytest_rc != "0":
+        evidence["receipt_pytest_rc"] = pytest_rc
+    return evidence
 
 
 def _status_app_id(status: dict, cache: dict, profile_home: str | None) -> int | None:

@@ -745,5 +745,175 @@
       "gateway",
       "voice"
     ]
+  },
+  {
+    "feature": "per-turn no-first-byte wall budget across the fallback chain (#1890 933500a32)",
+    "tests": [
+      "tests/run_agent/test_fallback_wall_budget.py",
+      "tests/fork_canaries/test_fork_canary_fallback_recovery.py"
+    ],
+    "paths": [
+      "agent/fallback_wall_budget.py",
+      "agent/chat_completion_helpers.py",
+      "agent/chat_completion_stream_monitor.py",
+      "agent/error_classifier.py",
+      "agent/turn_api_request.py",
+      "agent/turn_context.py",
+      "hermes_cli/config_defaults.py"
+    ],
+    "why": "2026-10-11 01:59-02:34 PT (the 02:14 cascade): a fable turn walked alr -> dtlr -> btpr -> bpr and the user got zero bytes for 34 minutes, because every lane kept its own clock (relay per_attempt_timeout_s 420 s, stale floor 600-840 s) and nothing spanned the chain. One clock now arms when a call starts waiting, posts a still-waiting line every fallback.still_waiting_notice_seconds (120) and cuts the attempt once fallback.no_first_byte_budget_seconds (600) is spent with a usable lane ahead. Upstream has none of these modules; a parity merge resolving chat_completion_helpers.py / turn_api_request.py / error_classifier.py toward upstream drops the arm/cut/classify call sites with no import error. Canaries d-cut, f-credit, g-field in tests/fork_canaries/test_fork_canary_fallback_recovery.py. t_e35032e2 (2026-10-15): on the buffering claude relay lanes (agent.fork_ext.relay_headers._POOL_CAPABILITY_PROVIDERS: alr/dtlr/btpr/bpr faces) the notice reads 'turn in progress on <lane> (buffering lane, first byte not visible until the turn ends): Ns elapsed; long outputs run 2-4 min; cut at <budget>s; ahead: ...' because the relay holds the whole body and a healthy 4k-19k token turn ran 90-257 s with upstream ttfb 1-7 s. Wording only: clock, cadence, cut and banner class are unchanged; other lanes keep the 'still waiting for a first reply' text.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_fallback_recovery.py (RED-proven 2026-10-14 t_58010601: _lane_ahead restricted to other-model lanes; FallbackWallBudgetExceeded drops elapsed_s)"
+  },
+  {
+    "feature": "relay deploy-drain sleep is credited against the no-first-byte wall budget (#1894 d4f54eae5)",
+    "tests": [
+      "tests/run_agent/test_fallback_wall_budget.py::test_relay_drain_wait_is_credited_not_counted",
+      "tests/run_agent/test_fallback_wall_budget.py::test_turn_recovery_drain_sleep_credits_the_wall_clock_for_the_real_wait",
+      "tests/fork_canaries/test_fork_canary_fallback_recovery.py"
+    ],
+    "paths": [
+      "agent/fallback_wall_budget.py",
+      "agent/turn_recovery.py"
+    ],
+    "why": "2026-10-11 16:37 PT: merging claude-pool#249 drained the alr relay for 126 s (503 draining-for-deploy + Retry-After, x47); the harness waited in place as designed and the wall clock posted 'still waiting for a first reply: 124s' into a healthy session, and would have spent the budget on a wait the relay asked for. note_excused_wait() moves the clock forward by the real slept span. The call site lives in the fork's relay_draining branch of turn_recovery.py (draining-for-deploy is our relay's protocol), so fork-permanent. Canaries f-credit (module) and f-callsite (turn_recovery call site) in tests/fork_canaries/test_fork_canary_fallback_recovery.py.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_fallback_recovery.py (RED-proven 2026-10-14 t_58010601: note_excused_wait ignores the credit; turn_recovery drops the note_excused_wait call)"
+  },
+  {
+    "feature": "same-model wall-budget skip removed; budget cut carries lane/elapsed_s/pool_headers and banner class no_first_byte_budget (#1920 9c3d78e1f)",
+    "tests": [
+      "tests/agent/test_route_notice_contract.py",
+      "tests/run_agent/test_fallback_wall_budget.py",
+      "tests/fork_canaries/test_fork_canary_fallback_recovery.py"
+    ],
+    "paths": [
+      "agent/fallback_wall_budget.py",
+      "agent/chat_completion_helpers.py",
+      "agent/fallback_policy.py",
+      "agent/fallback_events.py"
+    ],
+    "why": "2026-10-11 23:16-23:26 PT: alr held a 378k-token fable turn 600 s with no byte, then the same-model skip passed claude-dtlr, claude-btpr and claude-bpr (healthy, next in the chain) and sent the turn to cpa/gpt-6.1-sol at ~2x price; the banner said 'unclassified error' with no lane or seat. Ace ruling 2026-10-12 01:43 + 02:43 PT (t_778185f3): every lane in the chain is tried, in order. skip_lane()/has_other_model_ahead() are deleted; re-adding either (a merge restoring the pre-#1920 walker or cut rule) is the regression. The cut exception names lane, elapsed_s and pool_headers, and fallback_events classifies it no_first_byte_budget/harness. Canaries d-walker, d-cut, g-field, g-class in tests/fork_canaries/test_fork_canary_fallback_recovery.py.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_fallback_recovery.py (RED-proven 2026-10-14 t_58010601: same-model skip re-added in try_activate_fallback; other-model filter in _lane_ahead; classify_trigger budget branch removed)"
+  },
+  {
+    "feature": "a no-first-byte budget cut arms the sticky fallback episode (#1977 6ebfcbe67)",
+    "tests": [
+      "tests/agent/test_fallback_budget_cut_sticky.py",
+      "tests/fork_canaries/test_fork_canary_fallback_recovery.py"
+    ],
+    "paths": [
+      "agent/fallback_policy.py"
+    ],
+    "why": "2026-10-13 11:47-12:01 PT: alr held a fable turn 606 s with no byte, the budget cut moved it to dtlr, dtlr answered, and the next turn restored alr in the same second ('no active sticky state'), churning the warm fallback cache and re-entering the stalled lane. NO_FIRST_BYTE_BUDGET_CLASS is in STICKY_CLASSES (conn's cooldown row, warm-seat return gate) and UNSEATED_RETURN_CLASSES. A merge that rewrites STICKY_CLASSES from an older copy drops the arm silently. Canary e in tests/fork_canaries/test_fork_canary_fallback_recovery.py.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_fallback_recovery.py (RED-proven 2026-10-14 t_58010601: NO_FIRST_BYTE_BUDGET_CLASS removed from STICKY_CLASSES)"
+  },
+  {
+    "feature": "confirmed long relay quota exhaustion advances the native fallback chain instead of sleeping (#1979 4c80b2a9b)",
+    "tests": [
+      "tests/agent/test_relay_quota_retry_handoff.py",
+      "tests/fork_canaries/test_fork_canary_fallback_recovery.py"
+    ],
+    "paths": [
+      "agent/fork_ext/relay_quota.py",
+      "agent/turn_api_error.py"
+    ],
+    "why": "2026-10-12/13: ALR turns waited 10+ minutes on a relay quota 429/503 (x-relay-error-class quota_seat/quota_model, Retry-After ~1783 s) - the retry loop slept the 600 s Retry-After cap and retried the exhausted lane while dtlr/btpr/bpr sat untouched in the chain. A proven long quota on a pool relay now exhausts the attempt block on THIS error and the native walker takes the next lane; short/unproven waits, deploy drain and non-relay providers keep the in-place retry; with no usable fallback the turn fails loud after one call. Keyed on our relay's x-relay-error-class header and _POOL_CAPABILITY_PROVIDERS, so fork-permanent. turn_api_error.py exists upstream: resolving its handle_api_error hunk toward upstream restores the 600 s sleep with every other test green. The two exhaustion pins (~L174 retry_count = max_retries - 1, ~L233 fallthrough retry_count = max_retries) are redundant on the no-fallback path: dropping one alone stays green (measured), so a merge must keep at least one. Canaries a, b-short, b-unproven, c-pins, c-revert in tests/fork_canaries/test_fork_canary_fallback_recovery.py.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_fallback_recovery.py (RED-proven 2026-10-14 t_58010601: relay quota check forced False; quota class widened to any Retry-After / unproven text; both exhaustion pins dropped)"
+  },
+  {
+    "feature": "kanban notify_suppress: withhold the home session's own close echo, incl. Discord threads (t_4c7da648 #1901, t_d654c294)",
+    "tests": [
+      "tests/gateway/test_kanban_notify_suppress.py",
+      "tests/gateway/test_kanban_notify_suppress_paths.py",
+      "tests/gateway/test_kanban_home_route.py::test_same_chat_treats_thread_equal_to_chat_as_no_thread"
+    ],
+    "paths": [
+      "gateway/kanban_notify_suppress.py",
+      "gateway/kanban_watchers.py",
+      "gateway/kanban_home_route.py"
+    ],
+    "why": "Cross-path contract: see row kanban-wake-contract (tests/fork_canaries/test_fork_canary_kanban_wake_contract.py). A completed/blocked/review line for a card the home session closed itself is withheld from the home chat (receipt event notify_suppressed, reason self-session/self-operator); a foreign subscriber still gets it (Prism P1 03f8b8156055). 2026-10-15 (t_d654c294): the home check compared home_from_row's target (thread_id == chat_id normalised to '') with the raw kanban_notify_subs row (Discord threads keep thread_id == chat_id), so it was never True in a thread and every thread-homed self-close echoed. kanban_home_route.same_chat normalises both sides; the _sub_is_home site in the notifier routes through it.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "kanban owner-wake: kanban events give the owning operator session a turn; one wake per event with the notifier (t_1ae0c35b, t_b1d26df7)",
+    "tests": [
+      "tests/gateway/test_kanban_owner_wake.py"
+    ],
+    "paths": [
+      "gateway/kanban_owner_wake.py",
+      "gateway/kanban_watchers.py"
+    ],
+    "why": "Cross-path contract: see row kanban-wake-contract (tests/fork_canaries/test_fork_canary_kanban_wake_contract.py). needs_input / precondition blocks, stuck workers, last-blocker-done, red/dirty handbacks and scheduled wakes on non-spawnable cards wake the card's home operator session (the lifecycle line alone notified only a human). 2026-10-15 (t_b1d26df7): a red handback on a card whose home chat holds a notify+wake sub woke twice (notifier review_requested + owner-wake red_handback, 2 s apart). The notifier now computes the red-PR state for review_requested on wake subs, appends it to its one wake turn and marks the event carried (kanban_owner_wake.mark_carried, keyed on board/task/event/chat) only after the wake was accepted; the owner-wake drops a carried review_requested. With no wake sub, an unread PR health, or a failed notifier wake, the owner-wake still fires alone.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
+  },
+  {
+    "feature": "kanban-wake-contract: one kanban event -> exactly N owner turns across notifier + owner-wake + notify_suppress (t_0ea2883c; #1901, #2019, #2021)",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_kanban_wake_contract.py"
+    ],
+    "paths": [
+      "gateway/kanban_watchers.py",
+      "gateway/kanban_owner_wake.py",
+      "gateway/kanban_notify_suppress.py",
+      "gateway/kanban_home_route.py"
+    ],
+    "why": "Cross-path contract over the two rows above (kanban notify_suppress, kanban owner-wake). Three wake defects shipped in four days with every per-feature test green: self-close echoes (t_4c7da648 #1901), the suppressor never firing in Discord threads (t_d654c294 #2019), a red handback waking twice (t_b1d26df7 #2021). The canary drives one real notifier tick (owner-wake tick at its tail) per event and counts turns at adapter.handle_message, the path read from metadata.kanban_owner_wake: W1 green handback 1 notifier; W2 red handback + wake sub 1 notifier naming the red; W3 red handback, no sub, 1 owner-wake; W4/W5 home-session self-close in a group chat / Discord thread 0 turns + self-session receipt; W6 foreign close on a thread-homed card 1; W7 needs_input block + wake sub 1 notifier; W8 operator-profile close of the last blocker 1 owner-wake (NEVER_SUPPRESS_TRIGGERS); W9 wake-only sub never suppressed. W8b home-session close of the last blocker 1 owner-wake (the own-session pre-filter honours NEVER_SUPPRESS_TRIGGERS, t_f3323c8a); W8c worker close of the last blocker with a notify+wake sub 1 notifier turn naming the ready children (marked carried, so the owner-wake drops its last_blocker_done, t_f3323c8a).",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_kanban_wake_contract.py (RED-proven 2026-10-15 t_0ea2883c: #2019 reverted -> W5; #2021 reverted -> W2 (2 turns); is_redundant forced False -> W4 W5 W8; NEVER_SUPPRESS_TRIGGERS emptied -> W8)"
   }
 ]

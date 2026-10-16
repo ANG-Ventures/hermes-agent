@@ -112,6 +112,18 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     Usage: ``agent.stream_delta_callback = consumer.on_delta``; ``create_task(consumer.run())``;
     after the agent finishes ``consumer.finish()`` then ``await task`` for the final edit."""
 
+    @property
+    def adapter(self):
+        """Resolve the original conversation owner on each operation after reconnect."""
+        resolver = getattr(self, "_adapter_resolver", None)
+        if resolver is not None:
+            return resolver()
+        return self._initial_adapter
+
+    @adapter.setter
+    def adapter(self, value):
+        self._initial_adapter = value
+
     _MAX_FLOOD_STRIKES = 3  # consecutive flood failures before edits are disabled
 
     # Class-wide monotonic draft-id counter (Telegram animates a draft only when the
@@ -129,8 +141,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
-        run_still_current: Optional[Callable[[], bool]] = None):
-        self.adapter = adapter
+        run_still_current: Optional[Callable[[], bool]] = None,
+        adapter_resolver: Optional[Callable[[], Any]] = None):
+        self._initial_adapter = adapter
+        self._adapter_resolver = adapter_resolver
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
@@ -155,6 +169,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._max_fallback_flood_retry_seconds = 5.0
 
         self._queue: queue.Queue = queue.Queue()
+        self._finish_requested = False
         # Every real preview id on screen this response (fresh-final deletes them all);
         # the per-segment set holds only the active segment so failure recovery never
         # deletes an earlier finalized preamble/commentary.
@@ -560,6 +575,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if final_text is not None:
             self._queue.put((_FINAL_TEXT, final_text))
         self._queue.put(_DONE)
+        self._finish_requested = True
 
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
@@ -571,6 +587,13 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 if not self._run_still_current():
                     await self._abandon_native_stream()
                     return
+                if self.adapter is None:
+                    # Keep queued content and native framing intact across the reconnect
+                    # gap. The gateway owns final redelivery if the turn ends offline.
+                    if self._finish_requested:
+                        return
+                    await asyncio.sleep(0.05)
+                    continue
                 tick = self._drain_queue()
 
                 # A flush barrier (clarify poll ordering) or an approval boundary must put

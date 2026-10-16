@@ -1,0 +1,48 @@
+# Router Core lints (spec v5 §4.1 / §7.1, card t_8b05b16b): spawn-site ratchet, p0 label pool, queue loops.
+# The lints are pinned byte-identical copies of ANG-Ventures/hermes-home scripts (hermes-home is private, so
+# this job cannot fetch them): .github/router-core/PIN.json + check_pin.py. Allowlists live in fleet/ (seeded
+# once, expire 2027-01-15, only shrink). acceptance.sh proves on THIS tree: planted docker run / ssh spawn red,
+# expired rows red, empty scan root rc 1, and (where the repo owns one) a planted queue-loop break red.
+name: router-core-lints
+
+# path-filter-exempt: the spawn-site lint scans every tracked .py/.sh, so any code change can add an ungated spawn.
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: router-core-lints-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  router-core-lints:
+    name: router-core-lints
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - uses: ./.github/actions/setup-pm
+      - name: vendored lints match the pinned hermes-home bytes
+        run: uv run --no-project --python 3.11 --with pyyaml==6.0.3 python .github/router-core/check_pin.py
+      - name: selftests
+        run: |
+          uv run --no-project --python 3.11 --with pyyaml==6.0.3 python .github/router-core/lint-spawn-site.py --selftest
+          uv run --no-project --python 3.11 --with pyyaml==6.0.3 python .github/router-core/p0-label-lint.py --selftest
+          uv run --no-project --python 3.11 --with pyyaml==6.0.3 python .github/router-core/lint-queue-loops.py --selftest
+      - name: spawn-site lint (every spawn via alloc_client or an unexpired fleet/spawn-allowlist.json row)
+        run: uv run --no-project --python 3.11 --with pyyaml==6.0.3 python .github/router-core/lint-spawn-site.py --root .
+      - name: p0-label lint (main/merge-queue on the pool request p0, PR never)
+        run: uv run --no-project --python 3.11 --with pyyaml==6.0.3 python .github/router-core/p0-label-lint.py --root .
+      - name: queue-loop lint (dispatcher presents every ready item each tick)
+        run: uv run --no-project --python 3.11 --with pyyaml==6.0.3 python .github/router-core/lint-queue-loops.py --root . --check dispatcher
+      - name: acceptance on this tree (planted spawn / expired row / empty root / planted break)
+        env:
+          PYTHON: uv run --no-project --python 3.11 --with pyyaml==6.0.3 python
+        run: bash .github/router-core/acceptance.sh dispatcher

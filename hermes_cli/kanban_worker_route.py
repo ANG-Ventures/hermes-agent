@@ -186,8 +186,8 @@ _SIBLING_POOL = {"claude-bpr": "claude-apr", "claude-apr": "claude-bpr"}
 def _is_sibling_pool_same_model(pinned, to_provider, from_model, to_model) -> bool:
     if _SIBLING_POOL.get(pinned) != str(to_provider or "").strip().lower():
         return False
-    src = str(from_model or "").strip().lower()
-    return bool(src) and src == str(to_model or "").strip().lower()
+    src = _model_key(from_model)
+    return bool(src) and src == _model_key(to_model)
 
 
 def card_pinned_route() -> tuple:
@@ -246,6 +246,13 @@ def _norm(value) -> str:
     return str(value or "").strip().lower()
 
 
+def _model_key(value) -> str:
+    """A model id compared as a KEY: byte-exact after trimming whitespace (t_75fdedd4). Provider
+    ids are canonical lower-case aliases (``_norm``); model ids are not: ``custommodel`` is not
+    ``CustomModel`` (Prism 20f583066d18, #1921), so a pin on one must not admit the other."""
+    return str(value or "").strip()
+
+
 def refuse_runtime_failover(agent, to_provider, to_model, reason=None) -> bool:
     """True when a card-pinned worker must NOT fail over to ``to_provider``.
 
@@ -276,11 +283,11 @@ def refuse_runtime_failover(agent, to_provider, to_model, reason=None) -> bool:
     # Only while the run actually serves the pinned model; a run spawned on
     # another model (dispatch rung) is off the model pin, like the provider
     # check above, and keeps the provider-only rule.
-    if pinned_model and _norm(serving_model) != _norm(pinned_model):
+    if pinned_model and _model_key(serving_model) != _model_key(pinned_model):
         if not pinned:
             return False
         pinned_model = None
-    model_ok = not pinned_model or _norm(to_model) == _norm(pinned_model)
+    model_ok = not pinned_model or _model_key(to_model) == _model_key(pinned_model)
     if model_ok:
         if not pinned:
             return False  # model-only pin: the same model on any provider

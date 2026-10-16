@@ -26,6 +26,7 @@ def _clean(monkeypatch):
     monkeypatch.setattr(kwh, "BOOT_PLACED_HOST", None)
     monkeypatch.delenv(kwh.PLACEMENT_ENV, raising=False)
     monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+    monkeypatch.delenv("KANBAN_PLACEMENT_CAPS", raising=False)  # absent = enforce (a real worker carries one)
     yield
     rp._emitted.clear()
 

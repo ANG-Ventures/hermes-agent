@@ -27,9 +27,11 @@ on:
 permissions:
   contents: read
 
+# The default branch keys per run and never cancels: a push:main backstop (or a caller running on
+# main) is never cancelled or replaced by the next merge. Every other ref keeps its old group (R18, t_7458370e).
 concurrency:
-  group: lockfile-diff-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: lockfile-diff-${{ github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   diff:

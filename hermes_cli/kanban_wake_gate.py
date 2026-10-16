@@ -46,7 +46,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
-from hermes_cli.kanban_load_gate import LoadGate
+from hermes_cli.kanban_load_gate import LoadGate, _denom
 
 _log = logging.getLogger(__name__)
 
@@ -222,9 +222,9 @@ class WakeGate:
             if self._last_written is not None:
                 _log.info(
                     "kanban wake gate: mode %s -> %s (load1=%s, pause_above=%.0f, "
-                    "resume_below=%.0f)",
+                    "resume_below=%.0f; load %s tasks / %s)",
                     self._last_written, snap["mode"], snap["load1"],
-                    self.pause_above, self.resume_below,
+                    self.pause_above, self.resume_below, snap["load1"], _denom(self._gate.ncpu),
                 )
             self._last_written = snap["mode"]
 

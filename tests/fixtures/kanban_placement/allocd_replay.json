@@ -1,0 +1,4801 @@
+{
+ "_doc": "Router Core Card B1 (t_4187c8f1) replay fixture: every worker_placed event on the live default board whose placement_reservation matches an admitted kanban row of var/placement/admissions.jsonl (the scorer path, t_d6ce856e), read-only on 2026-10-15. Per decision: the placement table in force (config/fleet-hosts.json at the hermes-home commit named, _-keys and router stripped), the per-host rows the scorer logged (load, MemAvailable, live reservations, eligibility + reason), the Job inputs (assignee, card priority, previous placed host) and the old path's decision {host, rule}. Built by a one-off script; not regenerated in CI.",
+ "decisions": [
+  {
+   "assignee": "human:apollo",
+   "at": 1791898948.621589,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.81,
+     "memavail_gb": 75.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 8.61,
+     "memavail_gb": 58.9,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 64.14,
+     "memavail_gb": 189.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_cac667f2",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791899171.822604,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.33,
+     "memavail_gb": 72.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 7.49,
+     "memavail_gb": 58.9,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 54.81,
+     "memavail_gb": 189.0,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_12d8a6fc",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791906343.62323,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "excluded:band hot (streak 2, ok now)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 5.41,
+     "memavail_gb": 84.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 74.31,
+     "memavail_gb": 181.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_f2ca4ba1",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791910020.438635,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.1,
+     "memavail_gb": 78.9,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 5.28,
+     "memavail_gb": 84.7,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 45.98,
+     "memavail_gb": 186.9,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_c9355449",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791911766.9382012,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.56,
+     "memavail_gb": 77.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.91,
+     "memavail_gb": 85.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": false,
+     "load": 15.08,
+     "memavail_gb": 186.7,
+     "reason": "closed:stale (sample 66s old at decision time)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_de922562",
+   "old": {
+    "host": "ace-media",
+    "rule": "headroom"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791911767.153942,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.56,
+     "memavail_gb": 77.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.91,
+     "memavail_gb": 85.0,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    },
+    "ci-box": {
+     "eligible": false,
+     "load": 15.08,
+     "memavail_gb": 186.7,
+     "reason": "closed:stale (sample 66s old at decision time)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_4b5793f7",
+   "old": {
+    "host": "ace-media",
+    "rule": "headroom"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791912401.832217,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.03,
+     "memavail_gb": 74.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.06,
+     "memavail_gb": 84.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 89.28,
+     "memavail_gb": 181.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_5a841a2b",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791912402.368756,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.03,
+     "memavail_gb": 74.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.06,
+     "memavail_gb": 84.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 89.28,
+     "memavail_gb": 181.3,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_da45b935",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791912402.898716,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.03,
+     "memavail_gb": 74.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.06,
+     "memavail_gb": 84.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 89.28,
+     "memavail_gb": 181.3,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    }
+   },
+   "job_id": "t_3dc1a4a0",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791912956.393844,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.48,
+     "memavail_gb": 77.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.66,
+     "memavail_gb": 82.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 70.23,
+     "memavail_gb": 174.0,
+     "reason": null,
+     "reserved_gb": 16.0,
+     "reserved_threads": 4.0
+    }
+   },
+   "job_id": "t_d5a51fb2",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791912956.984916,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.48,
+     "memavail_gb": 77.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.66,
+     "memavail_gb": 82.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 70.23,
+     "memavail_gb": 174.0,
+     "reason": null,
+     "reserved_gb": 19.0,
+     "reserved_threads": 6.0
+    }
+   },
+   "job_id": "t_dfe18323",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791913278.336807,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 6.88,
+     "memavail_gb": 74.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.71,
+     "memavail_gb": 82.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 81.94,
+     "memavail_gb": 175.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_cf0da5e4",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791913278.9110038,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 6.88,
+     "memavail_gb": 74.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.71,
+     "memavail_gb": 82.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 81.94,
+     "memavail_gb": 175.6,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_95dac123",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791919311.923171,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 4.18,
+     "memavail_gb": 76.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 5.19,
+     "memavail_gb": 80.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 87.72,
+     "memavail_gb": 178.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_3e4fa6ef",
+   "old": {
+    "host": "ace-media",
+    "rule": "priority"
+   },
+   "priority": 90,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791919314.992651,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 4.18,
+     "memavail_gb": 76.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 5.19,
+     "memavail_gb": 80.6,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 87.72,
+     "memavail_gb": 178.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_95c92d0e",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791919478.2638762,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.42,
+     "memavail_gb": 76.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.54,
+     "memavail_gb": 81.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 72.14,
+     "memavail_gb": 178.8,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_c4fbf040",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus-opus",
+   "at": 1791922754.693027,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.15,
+     "memavail_gb": 75.7,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 5.55,
+     "memavail_gb": 79.9,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 62.38,
+     "memavail_gb": 176.5,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_5f7d689f",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 1,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791946524.87317,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.84,
+     "memavail_gb": 75.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 2.19,
+     "memavail_gb": 82.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 53.24,
+     "memavail_gb": 181.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_5271e2a6",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791947645.722282,
+   "continuity": "ci-box",
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 4.64,
+     "memavail_gb": 75.5,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 2.81,
+     "memavail_gb": 83.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 82.04,
+     "memavail_gb": 175.3,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_95c92d0e",
+   "old": {
+    "host": "ci-box",
+    "rule": "continuity"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791948756.304451,
+   "continuity": "ci-box",
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.56,
+     "memavail_gb": 73.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.27,
+     "memavail_gb": 85.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 62.79,
+     "memavail_gb": 178.4,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    }
+   },
+   "job_id": "t_5271e2a6",
+   "old": {
+    "host": "ci-box",
+    "rule": "continuity"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791955520.049462,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": 21.28,
+     "memavail_gb": 62.2,
+     "reason": "closed:psi_cpu_some10 97.9 >= 40",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 2.57,
+     "memavail_gb": 82.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 74.1,
+     "memavail_gb": 178.3,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_65b57cd4",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791955520.800428,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": 21.28,
+     "memavail_gb": 62.2,
+     "reason": "closed:psi_cpu_some10 97.9 >= 40",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 2.57,
+     "memavail_gb": 82.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 74.1,
+     "memavail_gb": 178.3,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    }
+   },
+   "job_id": "t_35bed194",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791955521.3170319,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": 21.28,
+     "memavail_gb": 62.2,
+     "reason": "closed:psi_cpu_some10 97.9 >= 40",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 2.57,
+     "memavail_gb": 82.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 74.1,
+     "memavail_gb": 178.3,
+     "reason": null,
+     "reserved_gb": 9.0,
+     "reserved_threads": 6.0
+    }
+   },
+   "job_id": "t_a7cb8d4b",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791956454.890207,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "excluded:band hot (streak 2, hot now)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.26,
+     "memavail_gb": 85.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 70.18,
+     "memavail_gb": 180.6,
+     "reason": null,
+     "reserved_gb": 9.0,
+     "reserved_threads": 6.0
+    }
+   },
+   "job_id": "t_c2dc9cc8",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791968493.433753,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 7.86,
+     "memavail_gb": 71.9,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.35,
+     "memavail_gb": 85.9,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 72.23,
+     "memavail_gb": 177.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_77030635",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791969149.784657,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 8.51,
+     "memavail_gb": 68.9,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 5.13,
+     "memavail_gb": 83.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 63.38,
+     "memavail_gb": 181.5,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_d8db2f0d",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791969599.966026,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 6.01,
+     "memavail_gb": 73.4,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 6.74,
+     "memavail_gb": 80.7,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 64.3,
+     "memavail_gb": 183.9,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    }
+   },
+   "job_id": "t_28826b21",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791969761.825405,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 4.81,
+     "memavail_gb": 75.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 6.61,
+     "memavail_gb": 81.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 61.27,
+     "memavail_gb": 180.3,
+     "reason": null,
+     "reserved_gb": 9.0,
+     "reserved_threads": 6.0
+    }
+   },
+   "job_id": "t_c071bc00",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791969762.436666,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 4.81,
+     "memavail_gb": 75.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 6.61,
+     "memavail_gb": 81.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 61.27,
+     "memavail_gb": 180.3,
+     "reason": null,
+     "reserved_gb": 12.0,
+     "reserved_threads": 8.0
+    }
+   },
+   "job_id": "t_df6de904",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791969913.603072,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.68,
+     "memavail_gb": 74.5,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 5.14,
+     "memavail_gb": 77.5,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 58.38,
+     "memavail_gb": 178.2,
+     "reason": null,
+     "reserved_gb": 15.0,
+     "reserved_threads": 10.0
+    }
+   },
+   "job_id": "t_497479d5",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 40,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus-opus",
+   "at": 1791969991.431979,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.41,
+     "memavail_gb": 74.7,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.62,
+     "memavail_gb": 77.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 67.38,
+     "memavail_gb": 176.4,
+     "reason": null,
+     "reserved_gb": 18.0,
+     "reserved_threads": 12.0
+    }
+   },
+   "job_id": "t_422c5e8a",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 2,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791970216.080253,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.68,
+     "memavail_gb": 73.7,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.05,
+     "memavail_gb": 79.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 58.83,
+     "memavail_gb": 177.5,
+     "reason": null,
+     "reserved_gb": 34.0,
+     "reserved_threads": 16.0
+    }
+   },
+   "job_id": "t_68638095",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 50,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791970604.070194,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 4.01,
+     "memavail_gb": 72.8,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 5.74,
+     "memavail_gb": 79.2,
+     "reason": null,
+     "reserved_gb": 9.0,
+     "reserved_threads": 6.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 89.62,
+     "memavail_gb": 178.9,
+     "reason": null,
+     "reserved_gb": 15.0,
+     "reserved_threads": 10.0
+    }
+   },
+   "job_id": "t_debb8d37",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791970904.3656,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": 7.08,
+     "memavail_gb": 72.6,
+     "reason": "no_headroom:cpu -1.1 cores",
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 7.87,
+     "memavail_gb": 79.8,
+     "reason": null,
+     "reserved_gb": 9.0,
+     "reserved_threads": 6.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 79.28,
+     "memavail_gb": 177.5,
+     "reason": null,
+     "reserved_gb": 31.0,
+     "reserved_threads": 14.0
+    }
+   },
+   "job_id": "t_0e1adccf",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791977490.947505,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.87,
+     "memavail_gb": 76.4,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.49,
+     "memavail_gb": 76.5,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 76.27,
+     "memavail_gb": 172.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_44296e01",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791977492.9151711,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.87,
+     "memavail_gb": 76.4,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.49,
+     "memavail_gb": 76.5,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 76.27,
+     "memavail_gb": 172.8,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_c79fb7cc",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791977634.051399,
+   "continuity": "ci-box",
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.36,
+     "memavail_gb": 76.3,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.09,
+     "memavail_gb": 75.3,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 78.97,
+     "memavail_gb": 177.6,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_c79fb7cc",
+   "old": {
+    "host": "ci-box",
+    "rule": "continuity"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791978393.136883,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.94,
+     "memavail_gb": 76.3,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 2.46,
+     "memavail_gb": 76.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 59.69,
+     "memavail_gb": 182.2,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_7940e9f3",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791984735.857445,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.89,
+     "memavail_gb": 76.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.58,
+     "memavail_gb": 75.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 82.66,
+     "memavail_gb": 176.5,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_1373a0e5",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1791984736.500107,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.89,
+     "memavail_gb": 76.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.58,
+     "memavail_gb": 75.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 82.66,
+     "memavail_gb": 176.5,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_22028ce3",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1791985563.508393,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.8,
+     "memavail_gb": 76.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 2.07,
+     "memavail_gb": 72.5,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 84.86,
+     "memavail_gb": 177.1,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    }
+   },
+   "job_id": "t_94f409dc",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 1,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792013210.0194628,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.04,
+     "memavail_gb": 75.9,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.89,
+     "memavail_gb": 65.4,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 79.49,
+     "memavail_gb": 182.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_3c95c385",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "aa1241fc4b"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792046236.713829,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.39,
+     "memavail_gb": 74.9,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.4,
+     "memavail_gb": 64.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 68.5,
+     "memavail_gb": 179.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_489b72f0",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792050388.631746,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.59,
+     "memavail_gb": 88.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 45.84,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 509s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 68.28,
+     "memavail_gb": 172.4,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_88717812",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 2,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792050389.436613,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.59,
+     "memavail_gb": 88.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 45.84,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 509s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 68.28,
+     "memavail_gb": 172.4,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_ade325ae",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 1,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792050390.231833,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.59,
+     "memavail_gb": 88.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 45.84,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 509s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 68.28,
+     "memavail_gb": 172.4,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    }
+   },
+   "job_id": "t_e70d5f44",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 1,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792050390.987007,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.59,
+     "memavail_gb": 88.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 45.84,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 509s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 68.28,
+     "memavail_gb": 172.4,
+     "reason": null,
+     "reserved_gb": 9.0,
+     "reserved_threads": 6.0
+    }
+   },
+   "job_id": "t_923a78ad",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 1,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792050391.8715231,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.59,
+     "memavail_gb": 88.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 45.84,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 509s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 68.28,
+     "memavail_gb": 172.4,
+     "reason": null,
+     "reserved_gb": 12.0,
+     "reserved_threads": 8.0
+    }
+   },
+   "job_id": "t_b27b03a1",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 1,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "daedalus-fable",
+   "at": 1792050392.532716,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.59,
+     "memavail_gb": 88.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 45.84,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 509s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 68.28,
+     "memavail_gb": 172.4,
+     "reason": null,
+     "reserved_gb": 15.0,
+     "reserved_threads": 10.0
+    }
+   },
+   "job_id": "t_832db31b",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 1,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792050393.683233,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.59,
+     "memavail_gb": 88.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 45.84,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 509s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 68.28,
+     "memavail_gb": 172.4,
+     "reason": null,
+     "reserved_gb": 18.0,
+     "reserved_threads": 12.0
+    }
+   },
+   "job_id": "t_8ee38434",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 1,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792050618.6355789,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.32,
+     "memavail_gb": 88.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 56.46,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 745s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 89.75,
+     "memavail_gb": 174.7,
+     "reason": null,
+     "reserved_gb": 18.0,
+     "reserved_threads": 12.0
+    }
+   },
+   "job_id": "t_b396db38",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 1,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792052480.658489,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.47,
+     "memavail_gb": 88.5,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 88.27,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 2603s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 51.7,
+     "memavail_gb": 180.7,
+     "reason": null,
+     "reserved_gb": 24.0,
+     "reserved_threads": 16.0
+    }
+   },
+   "job_id": "t_b406832b",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 1,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792056117.207958,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "excluded:band hot (streak 2, hot now)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 140.92,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 6243s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 82.04,
+     "memavail_gb": 178.5,
+     "reason": null,
+     "reserved_gb": 12.0,
+     "reserved_threads": 8.0
+    }
+   },
+   "job_id": "t_d4246617",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792056118.600298,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "excluded:band hot (streak 2, hot now)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 140.92,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 6243s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 82.04,
+     "memavail_gb": 178.5,
+     "reason": null,
+     "reserved_gb": 15.0,
+     "reserved_threads": 10.0
+    }
+   },
+   "job_id": "t_19d77d5b",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "daedalus-opus",
+   "at": 1792056119.552997,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "excluded:band hot (streak 2, hot now)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 140.92,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 6243s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 82.04,
+     "memavail_gb": 178.5,
+     "reason": null,
+     "reserved_gb": 18.0,
+     "reserved_threads": 12.0
+    }
+   },
+   "job_id": "t_de3a8ced",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 1,
+   "table": "cffaada8e1"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792066064.7715971,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": 1.32,
+     "memavail_gb": 81.3,
+     "reason": "closed:stale (sample 68s old at decision time)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 271.28,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 16153s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 5.53,
+     "memavail_gb": 188.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_377e5694",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792066065.964533,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": 1.32,
+     "memavail_gb": 81.3,
+     "reason": "closed:stale (sample 69s old at decision time)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 271.28,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 16153s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 5.53,
+     "memavail_gb": 188.8,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_af8d2e26",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792066135.1305711,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.64,
+     "memavail_gb": 81.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 272.32,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 16266s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 16.53,
+     "memavail_gb": 190.4,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    }
+   },
+   "job_id": "t_735d75a0",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792068412.672368,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.78,
+     "memavail_gb": 80.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 281.67,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 18541s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 35.16,
+     "memavail_gb": 176.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_3dbb738e",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792068413.947535,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.78,
+     "memavail_gb": 80.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 281.67,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 18541s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 35.16,
+     "memavail_gb": 176.8,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_1ad66b3d",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792068698.240607,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.79,
+     "memavail_gb": 80.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 281.44,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 18821s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 58.26,
+     "memavail_gb": 177.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_9d9b69a0",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "athena",
+   "at": 1792068699.020158,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.79,
+     "memavail_gb": 80.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": false,
+     "load": 281.44,
+     "memavail_gb": 63.8,
+     "reason": "closed:stale (pressure unknown (stale 18821s))",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 58.26,
+     "memavail_gb": 177.2,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_dad0346d",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792070759.915545,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 4.35,
+     "memavail_gb": 78.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.47,
+     "memavail_gb": 87.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 98.57,
+     "memavail_gb": 173.4,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_651da9e7",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792070969.280426,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 4.05,
+     "memavail_gb": 77.9,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 2.02,
+     "memavail_gb": 87.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 87.28,
+     "memavail_gb": 174.4,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    }
+   },
+   "job_id": "t_154bb9e2",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 1,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "daedalus-opus",
+   "at": 1792071058.849844,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 4.22,
+     "memavail_gb": 75.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 2.17,
+     "memavail_gb": 85.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 85.8,
+     "memavail_gb": 174.4,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 4.0
+    }
+   },
+   "job_id": "t_e081970f",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 2,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792071153.232358,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.66,
+     "memavail_gb": 76.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.51,
+     "memavail_gb": 86.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 87.46,
+     "memavail_gb": 173.3,
+     "reason": null,
+     "reserved_gb": 9.0,
+     "reserved_threads": 6.0
+    }
+   },
+   "job_id": "t_ca048e05",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792071154.3809721,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.66,
+     "memavail_gb": 76.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.51,
+     "memavail_gb": 86.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 87.46,
+     "memavail_gb": 173.3,
+     "reason": null,
+     "reserved_gb": 12.0,
+     "reserved_threads": 8.0
+    }
+   },
+   "job_id": "t_9d45a889",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792071155.311785,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.66,
+     "memavail_gb": 76.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.51,
+     "memavail_gb": 86.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 87.46,
+     "memavail_gb": 173.3,
+     "reason": null,
+     "reserved_gb": 15.0,
+     "reserved_threads": 10.0
+    }
+   },
+   "job_id": "t_f25a846b",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792071156.23169,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.66,
+     "memavail_gb": 76.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.51,
+     "memavail_gb": 86.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 87.46,
+     "memavail_gb": 173.3,
+     "reason": null,
+     "reserved_gb": 18.0,
+     "reserved_threads": 12.0
+    }
+   },
+   "job_id": "t_a4a1d1cc",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792071157.122151,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.66,
+     "memavail_gb": 76.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.51,
+     "memavail_gb": 86.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 87.46,
+     "memavail_gb": 173.3,
+     "reason": null,
+     "reserved_gb": 21.0,
+     "reserved_threads": 14.0
+    }
+   },
+   "job_id": "t_d5b3c3dc",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792071157.725991,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.66,
+     "memavail_gb": 76.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.51,
+     "memavail_gb": 86.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 87.46,
+     "memavail_gb": 173.3,
+     "reason": null,
+     "reserved_gb": 24.0,
+     "reserved_threads": 16.0
+    }
+   },
+   "job_id": "t_ccf1d052",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792071158.404494,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.66,
+     "memavail_gb": 76.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.51,
+     "memavail_gb": 86.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 87.46,
+     "memavail_gb": 173.3,
+     "reason": null,
+     "reserved_gb": 27.0,
+     "reserved_threads": 18.0
+    }
+   },
+   "job_id": "t_8708014f",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792071159.082657,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.66,
+     "memavail_gb": 76.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.51,
+     "memavail_gb": 86.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 87.46,
+     "memavail_gb": 173.3,
+     "reason": null,
+     "reserved_gb": 30.0,
+     "reserved_threads": 20.0
+    }
+   },
+   "job_id": "t_8dfb2e28",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792071159.659298,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 3.66,
+     "memavail_gb": 76.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.51,
+     "memavail_gb": 86.6,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 87.46,
+     "memavail_gb": 173.3,
+     "reason": null,
+     "reserved_gb": 33.0,
+     "reserved_threads": 22.0
+    }
+   },
+   "job_id": "t_e96a0fc9",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "1a19f29ba5"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792078547.307845,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.38,
+     "memavail_gb": 86.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.26,
+     "memavail_gb": 86.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 76.66,
+     "memavail_gb": 172.3,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_2e412db3",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "bb76d7cfac"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792084139.1569479,
+   "continuity": "ci-box",
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.02,
+     "memavail_gb": 83.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 2.07,
+     "memavail_gb": 86.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 94.03,
+     "memavail_gb": 175.8,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_2e412db3",
+   "old": {
+    "host": "ci-box",
+    "rule": "continuity"
+   },
+   "priority": 80,
+   "table": "bb76d7cfac"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792088197.078281,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 1.2,
+     "memavail_gb": 85.5,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.25,
+     "memavail_gb": 86.1,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 99.16,
+     "memavail_gb": 173.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_c0bb6bf4",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 3,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792101424.0944269,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.61,
+     "memavail_gb": 84.9,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.56,
+     "memavail_gb": 86.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 70.93,
+     "memavail_gb": 180.7,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_b2161067",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792102921.402207,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 2.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.18,
+     "memavail_gb": 83.4,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.78,
+     "memavail_gb": 86.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 80.44,
+     "memavail_gb": 174.7,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_7efdd2b7",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792106145.961262,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 1.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "excluded:band hot (streak 2, hot now)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 2.45,
+     "memavail_gb": 80.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ci-box": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "closed:absent (host unreachable)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_2f9bacc3",
+   "old": {
+    "host": "ace-media",
+    "rule": "headroom"
+   },
+   "priority": 80,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792106292.822082,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 1.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "excluded:band hot (streak 2, ok now)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.01,
+     "memavail_gb": 79.2,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 1.0
+    },
+    "ci-box": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "closed:absent (host unreachable)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_9e797a70",
+   "old": {
+    "host": "ace-media",
+    "rule": "headroom"
+   },
+   "priority": 5,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792106439.103503,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 1.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": 20.95,
+     "memavail_gb": 90.8,
+     "reason": "no_headroom:cpu -9.9 cores",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.03,
+     "memavail_gb": 78.3,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 2.0
+    },
+    "ci-box": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "closed:absent (host unreachable)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_de7ac682",
+   "old": {
+    "host": "ace-media",
+    "rule": "headroom"
+   },
+   "priority": 80,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792106439.306137,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 1.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": 20.95,
+     "memavail_gb": 90.8,
+     "reason": "no_headroom:cpu -9.9 cores",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.03,
+     "memavail_gb": 78.3,
+     "reason": null,
+     "reserved_gb": 9.0,
+     "reserved_threads": 3.0
+    },
+    "ci-box": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "closed:absent (host unreachable)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_f194384a",
+   "old": {
+    "host": "ace-media",
+    "rule": "headroom"
+   },
+   "priority": 80,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792106722.469684,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 1.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": 23.1,
+     "memavail_gb": 89.8,
+     "reason": "no_headroom:cpu -12.1 cores",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 4.57,
+     "memavail_gb": 81.4,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 2.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 5.07,
+     "memavail_gb": 209.4,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_f5eb4cb0",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 80,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792106799.5702999,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 1.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": 23.64,
+     "memavail_gb": 90.1,
+     "reason": "no_headroom:cpu -12.6 cores",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.53,
+     "memavail_gb": 84.0,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 2.0
+    },
+    "ci-box": {
+     "eligible": true,
+     "load": 4.98,
+     "memavail_gb": 208.2,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_36bb06f4",
+   "old": {
+    "host": "ci-box",
+    "rule": "default_first"
+   },
+   "priority": 0,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "daedalus-opus",
+   "at": 1792108241.627108,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 1.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "excluded:band hot (streak 2, hot now)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 5.54,
+     "memavail_gb": 84.0,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    }
+   },
+   "job_id": "t_59c833ff",
+   "old": {
+    "host": "ace-media",
+    "rule": "headroom"
+   },
+   "priority": 0,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792108854.1399412,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 1.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "excluded:band hot (streak 2, hot now)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 5.99,
+     "memavail_gb": 82.7,
+     "reason": null,
+     "reserved_gb": 3.0,
+     "reserved_threads": 1.0
+    }
+   },
+   "job_id": "t_6fb33642",
+   "old": {
+    "host": "ace-media",
+    "rule": "headroom"
+   },
+   "priority": 80,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792108854.31818,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 1.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "excluded:band hot (streak 2, hot now)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 5.99,
+     "memavail_gb": 82.7,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_b67e584b",
+   "old": {
+    "host": "ace-media",
+    "rule": "headroom"
+   },
+   "priority": 80,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "daedalus-opus",
+   "at": 1792108854.756186,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 1.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "excluded:band hot (streak 2, hot now)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 5.99,
+     "memavail_gb": 82.7,
+     "reason": null,
+     "reserved_gb": 9.0,
+     "reserved_threads": 3.0
+    }
+   },
+   "job_id": "t_c10db1fe",
+   "old": {
+    "host": "ace-media",
+    "rule": "headroom"
+   },
+   "priority": 1,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "human:apollo",
+   "at": 1792109462.754692,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 1.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": false,
+     "load": null,
+     "memavail_gb": null,
+     "reason": "excluded:band hot (streak 2, hot now)",
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 3.22,
+     "memavail_gb": 85.7,
+     "reason": null,
+     "reserved_gb": 9.0,
+     "reserved_threads": 3.0
+    }
+   },
+   "job_id": "t_17b9274e",
+   "old": {
+    "host": "ace-media",
+    "rule": "headroom"
+   },
+   "priority": 0,
+   "table": "58a2aeb6d3"
+  },
+  {
+   "assignee": "daedalus",
+   "at": 1792111191.80732,
+   "continuity": null,
+   "footprint": {
+    "ram_gb": 3.0,
+    "threads": 1.0
+   },
+   "hosts": {
+    "ace-ai": {
+     "eligible": true,
+     "load": 2.65,
+     "memavail_gb": 88.4,
+     "reason": null,
+     "reserved_gb": 0.0,
+     "reserved_threads": 0.0
+    },
+    "ace-media": {
+     "eligible": true,
+     "load": 1.47,
+     "memavail_gb": 85.6,
+     "reason": null,
+     "reserved_gb": 6.0,
+     "reserved_threads": 2.0
+    }
+   },
+   "job_id": "t_b1d26df7",
+   "old": {
+    "host": "ace-media",
+    "rule": "headroom"
+   },
+   "priority": 2,
+   "table": "58a2aeb6d3"
+  }
+ ],
+ "tables": {
+  "1a19f29ba5": {
+   "default_first": "ci-box",
+   "footprints": {
+    "athena": {
+     "gpu_mb": 0,
+     "ram_gb": 3,
+     "scratch_gb": 1,
+     "threads": 2
+    },
+    "babysit": {
+     "gpu_mb": 0,
+     "ram_gb": 2,
+     "scratch_gb": 0,
+     "threads": 1
+    },
+    "ci": {
+     "gpu_mb": 0,
+     "ram_gb": 4,
+     "scratch_gb": 4,
+     "threads": 4
+    },
+    "kanban": {
+     "gpu_mb": 0,
+     "ram_gb": 3,
+     "scratch_gb": 1,
+     "threads": 2
+    },
+    "prism": {
+     "gpu_mb": 0,
+     "ram_gb": 4,
+     "scratch_gb": 1,
+     "threads": 1
+    },
+    "test-gate": {
+     "gpu_mb": 0,
+     "ram_gb": 16,
+     "scratch_gb": 2,
+     "threads": 4
+    }
+   },
+   "hosts": {
+    "ace-ai": {
+     "aliases": [
+      "aceai",
+      "ace-ai.local"
+     ],
+     "clock_mhz": 5756,
+     "consumers": {
+      "ci": {
+       "slots": 8
+      },
+      "kanban": {
+       "slots": 4
+      },
+      "prism": {
+       "slots": 12
+      },
+      "test-gate": {
+       "slots": 4
+      }
+     },
+     "cores": 16,
+     "cores_reserve": 4,
+     "mem_reserve_gb": 34,
+     "mem_total_gb": 121,
+     "threads": 32
+    },
+    "ace-media": {
+     "aliases": [
+      "ace-media-ubuntu"
+     ],
+     "clock_mhz": 6000,
+     "consumers": {
+      "ci": {
+       "slots": 8
+      },
+      "kanban": {
+       "slots": 4
+      },
+      "prism": {
+       "slots": 8
+      },
+      "test-gate": {
+       "slots": 4
+      }
+     },
+     "cores": 24,
+     "cores_reserve": 4,
+     "mem_reserve_gb": 28,
+     "mem_total_gb": 94,
+     "threads": 32
+    },
+    "ci-box": {
+     "aliases": [
+      "ci",
+      "ci.ace"
+     ],
+     "clock_mhz": 3207,
+     "consumers": {
+      "ci": {
+       "slots": 48
+      },
+      "kanban": {
+       "slots": 24
+      },
+      "prism": {
+       "slots": 24
+      },
+      "test-gate": {
+       "slots": 8
+      }
+     },
+     "cores": 128,
+     "cores_reserve": 0,
+     "mem_reserve_gb": 26,
+     "mem_total_gb": 220,
+     "threads": 256
+    },
+    "mac-studio": {
+     "aliases": [
+      "studio",
+      "mac-studio-m3u",
+      "local"
+     ],
+     "clock_mhz": 4050,
+     "consumers": {
+      "ci": {
+       "slots": 0
+      },
+      "kanban": {
+       "slots": 2
+      },
+      "prism": {
+       "slots": 0
+      },
+      "test-gate": {
+       "slots": 1
+      }
+     },
+     "cores": 24,
+     "cores_reserve": 10,
+     "default_preference": "low",
+     "mem_reserve_gb": 128,
+     "mem_total_gb": 512,
+     "threads": 32,
+     "unmeasurable_axes": [
+      "psi_cpu_some10",
+      "psi_mem_some10",
+      "system_pct"
+     ]
+    }
+   },
+   "saturate_to": 1.0,
+   "schema": 1
+  },
+  "40552ccb9f": {
+   "default_first": "ci-box",
+   "footprints": {
+    "athena": {
+     "gpu_mb": 0,
+     "ram_gb": 3,
+     "scratch_gb": 1,
+     "threads": 2
+    },
+    "babysit": {
+     "gpu_mb": 0,
+     "ram_gb": 2,
+     "scratch_gb": 0,
+     "threads": 1
+    },
+    "ci": {
+     "gpu_mb": 0,
+     "ram_gb": 4,
+     "scratch_gb": 4,
+     "threads": 4
+    },
+    "kanban": {
+     "gpu_mb": 0,
+     "ram_gb": 3,
+     "scratch_gb": 1,
+     "threads": 2
+    },
+    "prism": {
+     "gpu_mb": 0,
+     "ram_gb": 4,
+     "scratch_gb": 1,
+     "threads": 1
+    },
+    "test-gate": {
+     "gpu_mb": 0,
+     "ram_gb": 16,
+     "scratch_gb": 2,
+     "threads": 4
+    }
+   },
+   "hosts": {
+    "ace-ai": {
+     "aliases": [
+      "aceai",
+      "ace-ai.local"
+     ],
+     "clock_mhz": 5756,
+     "consumers": {
+      "ci": {
+       "slots": 8
+      },
+      "kanban": {
+       "slots": 4
+      },
+      "prism": {
+       "slots": 12
+      },
+      "test-gate": {
+       "slots": 4
+      }
+     },
+     "cores": 16,
+     "cores_reserve": 4,
+     "mem_reserve_gb": 24,
+     "mem_total_gb": 121,
+     "threads": 32
+    },
+    "ace-media": {
+     "aliases": [
+      "ace-media-ubuntu"
+     ],
+     "clock_mhz": 6000,
+     "consumers": {
+      "ci": {
+       "slots": 8
+      },
+      "kanban": {
+       "slots": 4
+      },
+      "prism": {
+       "slots": 8
+      },
+      "test-gate": {
+       "slots": 4
+      }
+     },
+     "cores": 24,
+     "cores_reserve": 4,
+     "mem_reserve_gb": 16,
+     "mem_total_gb": 94,
+     "threads": 32
+    },
+    "ci-box": {
+     "aliases": [
+      "ci",
+      "ci.ace"
+     ],
+     "clock_mhz": 3207,
+     "consumers": {
+      "ci": {
+       "slots": 48
+      },
+      "kanban": {
+       "slots": 24
+      },
+      "prism": {
+       "slots": 24
+      },
+      "test-gate": {
+       "slots": 8
+      }
+     },
+     "cores": 128,
+     "cores_reserve": 16,
+     "mem_reserve_gb": 40,
+     "mem_total_gb": 220,
+     "threads": 256
+    },
+    "mac-studio": {
+     "aliases": [
+      "studio",
+      "mac-studio-m3u",
+      "local"
+     ],
+     "clock_mhz": 4050,
+     "consumers": {
+      "ci": {
+       "slots": 0
+      },
+      "kanban": {
+       "slots": 2
+      },
+      "prism": {
+       "slots": 0
+      },
+      "test-gate": {
+       "slots": 1
+      }
+     },
+     "cores": 24,
+     "cores_reserve": 10,
+     "default_preference": "low",
+     "mem_reserve_gb": 128,
+     "mem_total_gb": 512,
+     "threads": 32,
+     "unmeasurable_axes": [
+      "psi_cpu_some10",
+      "psi_mem_some10",
+      "system_pct"
+     ]
+    }
+   },
+   "saturate_to": 1.0,
+   "schema": 1
+  },
+  "58a2aeb6d3": {
+   "default_first": "ci-box",
+   "footprints": {
+    "athena": {
+     "gpu_mb": 0,
+     "ram_gb": 3,
+     "scratch_gb": 1,
+     "threads": 2
+    },
+    "babysit": {
+     "gpu_mb": 0,
+     "ram_gb": 2,
+     "scratch_gb": 0,
+     "threads": 1
+    },
+    "ci": {
+     "gpu_mb": 0,
+     "ram_gb": 4,
+     "scratch_gb": 4,
+     "threads": 4
+    },
+    "kanban": {
+     "gpu_mb": 0,
+     "profiles": {
+      "argus": {
+       "gpu_mb": 0,
+       "ram_gb": 3.5,
+       "scratch_gb": 1,
+       "threads": 1
+      },
+      "athena": {
+       "gpu_mb": 0,
+       "ram_gb": 3.5,
+       "scratch_gb": 1,
+       "threads": 1
+      },
+      "cadmus": {
+       "gpu_mb": 0,
+       "ram_gb": 3.5,
+       "scratch_gb": 1,
+       "threads": 1
+      },
+      "daedalus": {
+       "gpu_mb": 0,
+       "ram_gb": 3.0,
+       "scratch_gb": 1,
+       "threads": 1
+      },
+      "daedalus-fable": {
+       "gpu_mb": 0,
+       "ram_gb": 3.5,
+       "scratch_gb": 1,
+       "threads": 1
+      },
+      "daedalus-opus": {
+       "gpu_mb": 0,
+       "ram_gb": 3.0,
+       "scratch_gb": 1,
+       "threads": 1
+      },
+      "momus": {
+       "gpu_mb": 0,
+       "ram_gb": 3.5,
+       "scratch_gb": 1,
+       "threads": 1
+      }
+     },
+     "ram_gb": 3,
+     "scratch_gb": 1,
+     "threads": 2
+    },
+    "prism": {
+     "gpu_mb": 0,
+     "ram_gb": 4,
+     "scratch_gb": 1,
+     "threads": 1
+    },
+    "test-gate": {
+     "gpu_mb": 0,
+     "ram_gb": 16,
+     "scratch_gb": 2,
+     "threads": 4
+    }
+   },
+   "hosts": {
+    "ace-ai": {
+     "aliases": [
+      "aceai",
+      "ace-ai.local"
+     ],
+     "clock_mhz": 5756,
+     "consumers": {
+      "ci": {
+       "slots": 8
+      },
+      "kanban": {
+       "slots": 4
+      },
+      "prism": {
+       "slots": 12
+      },
+      "test-gate": {
+       "slots": 4
+      }
+     },
+     "cores": 16,
+     "cores_reserve": 4,
+     "mem_reserve_gb": 34,
+     "mem_total_gb": 121,
+     "threads": 32
+    },
+    "ace-media": {
+     "aliases": [
+      "ace-media-ubuntu"
+     ],
+     "clock_mhz": 6000,
+     "consumers": {
+      "ci": {
+       "slots": 8
+      },
+      "kanban": {
+       "slots": 4
+      },
+      "prism": {
+       "slots": 8
+      },
+      "test-gate": {
+       "slots": 4
+      }
+     },
+     "cores": 24,
+     "cores_reserve": 4,
+     "mem_reserve_gb": 28,
+     "mem_total_gb": 94,
+     "threads": 32
+    },
+    "ci-box": {
+     "aliases": [
+      "ci",
+      "ci.ace"
+     ],
+     "clock_mhz": 3207,
+     "consumers": {
+      "ci": {
+       "slots": 48
+      },
+      "kanban": {
+       "slots": 24
+      },
+      "prism": {
+       "slots": 24
+      },
+      "test-gate": {
+       "slots": 8
+      }
+     },
+     "cores": 128,
+     "cores_reserve": 0,
+     "mem_reserve_gb": 26,
+     "mem_total_gb": 220,
+     "threads": 256
+    },
+    "mac-studio": {
+     "aliases": [
+      "studio",
+      "mac-studio-m3u",
+      "local"
+     ],
+     "clock_mhz": 4050,
+     "consumers": {
+      "ci": {
+       "slots": 0
+      },
+      "kanban": {
+       "slots": 2
+      },
+      "prism": {
+       "slots": 0
+      },
+      "test-gate": {
+       "slots": 1
+      }
+     },
+     "cores": 24,
+     "cores_reserve": 10,
+     "default_preference": "low",
+     "mem_reserve_gb": 128,
+     "mem_total_gb": 512,
+     "threads": 32,
+     "unmeasurable_axes": [
+      "psi_cpu_some10",
+      "psi_mem_some10",
+      "system_pct"
+     ]
+    }
+   },
+   "router": {
+    "host": "mac-studio",
+    "p0_reserve": {
+     "ace-ai": {
+      "ram_gb": 8,
+      "threads": 4
+     },
+     "ace-media": {
+      "ram_gb": 8,
+      "threads": 4
+     },
+     "ci-box": {
+      "ram_gb": 12,
+      "threads": 16
+     }
+    },
+    "port": 18850
+   },
+   "saturate_to": 1.0,
+   "schema": 1
+  },
+  "aa1241fc4b": {
+   "default_first": "ci-box",
+   "footprints": {
+    "babysit": {
+     "ram_gb": 2,
+     "threads": 1
+    },
+    "ci": {
+     "ram_gb": 6,
+     "threads": 3
+    },
+    "kanban": {
+     "ram_gb": 3,
+     "threads": 2
+    },
+    "prism": {
+     "ram_gb": 4,
+     "threads": 1
+    },
+    "test-gate": {
+     "ram_gb": 16,
+     "threads": 4
+    }
+   },
+   "hosts": {
+    "ace-ai": {
+     "aliases": [
+      "aceai",
+      "ace-ai.local"
+     ],
+     "clock_mhz": 5756,
+     "consumers": {
+      "ci": {
+       "slots": 8
+      },
+      "kanban": {
+       "slots": 4
+      },
+      "prism": {
+       "slots": 12
+      },
+      "test-gate": {
+       "slots": 4
+      }
+     },
+     "cores": 16,
+     "cores_reserve": 4,
+     "mem_reserve_gb": 24,
+     "mem_total_gb": 121,
+     "threads": 32
+    },
+    "ace-media": {
+     "aliases": [
+      "ace-media-ubuntu"
+     ],
+     "clock_mhz": 6000,
+     "consumers": {
+      "ci": {
+       "slots": 8
+      },
+      "kanban": {
+       "slots": 4
+      },
+      "prism": {
+       "slots": 8
+      },
+      "test-gate": {
+       "slots": 4
+      }
+     },
+     "cores": 24,
+     "cores_reserve": 4,
+     "mem_reserve_gb": 16,
+     "mem_total_gb": 94,
+     "threads": 32
+    },
+    "ci-box": {
+     "aliases": [
+      "ci",
+      "ci.ace"
+     ],
+     "clock_mhz": 3207,
+     "consumers": {
+      "ci": {
+       "slots": 48
+      },
+      "kanban": {
+       "slots": 24
+      },
+      "prism": {
+       "slots": 24
+      },
+      "test-gate": {
+       "slots": 8
+      }
+     },
+     "cores": 128,
+     "cores_reserve": 16,
+     "mem_reserve_gb": 40,
+     "mem_total_gb": 220,
+     "threads": 256
+    },
+    "mac-studio": {
+     "aliases": [
+      "studio",
+      "mac-studio-m3u",
+      "local"
+     ],
+     "clock_mhz": 4050,
+     "consumers": {
+      "ci": {
+       "slots": 0
+      },
+      "kanban": {
+       "slots": 2
+      },
+      "prism": {
+       "slots": 0
+      },
+      "test-gate": {
+       "slots": 1
+      }
+     },
+     "cores": 24,
+     "cores_reserve": 10,
+     "default_preference": "low",
+     "mem_reserve_gb": 128,
+     "mem_total_gb": 512,
+     "threads": 32,
+     "unmeasurable_axes": [
+      "psi_cpu_some10",
+      "psi_mem_some10",
+      "system_pct"
+     ]
+    }
+   },
+   "saturate_to": 1.0,
+   "schema": 1
+  },
+  "bb76d7cfac": {
+   "default_first": "ci-box",
+   "footprints": {
+    "athena": {
+     "gpu_mb": 0,
+     "ram_gb": 3,
+     "scratch_gb": 1,
+     "threads": 2
+    },
+    "babysit": {
+     "gpu_mb": 0,
+     "ram_gb": 2,
+     "scratch_gb": 0,
+     "threads": 1
+    },
+    "ci": {
+     "gpu_mb": 0,
+     "ram_gb": 4,
+     "scratch_gb": 4,
+     "threads": 4
+    },
+    "kanban": {
+     "gpu_mb": 0,
+     "profiles": {
+      "argus": {
+       "gpu_mb": 0,
+       "ram_gb": 3.5,
+       "scratch_gb": 1,
+       "threads": 1
+      },
+      "athena": {
+       "gpu_mb": 0,
+       "ram_gb": 3.5,
+       "scratch_gb": 1,
+       "threads": 1
+      },
+      "cadmus": {
+       "gpu_mb": 0,
+       "ram_gb": 3.5,
+       "scratch_gb": 1,
+       "threads": 1
+      },
+      "daedalus": {
+       "gpu_mb": 0,
+       "ram_gb": 3.0,
+       "scratch_gb": 1,
+       "threads": 1
+      },
+      "daedalus-fable": {
+       "gpu_mb": 0,
+       "ram_gb": 3.5,
+       "scratch_gb": 1,
+       "threads": 1
+      },
+      "daedalus-opus": {
+       "gpu_mb": 0,
+       "ram_gb": 3.0,
+       "scratch_gb": 1,
+       "threads": 1
+      },
+      "momus": {
+       "gpu_mb": 0,
+       "ram_gb": 3.5,
+       "scratch_gb": 1,
+       "threads": 1
+      }
+     },
+     "ram_gb": 3,
+     "scratch_gb": 1,
+     "threads": 2
+    },
+    "prism": {
+     "gpu_mb": 0,
+     "ram_gb": 4,
+     "scratch_gb": 1,
+     "threads": 1
+    },
+    "test-gate": {
+     "gpu_mb": 0,
+     "ram_gb": 16,
+     "scratch_gb": 2,
+     "threads": 4
+    }
+   },
+   "hosts": {
+    "ace-ai": {
+     "aliases": [
+      "aceai",
+      "ace-ai.local"
+     ],
+     "clock_mhz": 5756,
+     "consumers": {
+      "ci": {
+       "slots": 8
+      },
+      "kanban": {
+       "slots": 4
+      },
+      "prism": {
+       "slots": 12
+      },
+      "test-gate": {
+       "slots": 4
+      }
+     },
+     "cores": 16,
+     "cores_reserve": 4,
+     "mem_reserve_gb": 34,
+     "mem_total_gb": 121,
+     "threads": 32
+    },
+    "ace-media": {
+     "aliases": [
+      "ace-media-ubuntu"
+     ],
+     "clock_mhz": 6000,
+     "consumers": {
+      "ci": {
+       "slots": 8
+      },
+      "kanban": {
+       "slots": 4
+      },
+      "prism": {
+       "slots": 8
+      },
+      "test-gate": {
+       "slots": 4
+      }
+     },
+     "cores": 24,
+     "cores_reserve": 4,
+     "mem_reserve_gb": 28,
+     "mem_total_gb": 94,
+     "threads": 32
+    },
+    "ci-box": {
+     "aliases": [
+      "ci",
+      "ci.ace"
+     ],
+     "clock_mhz": 3207,
+     "consumers": {
+      "ci": {
+       "slots": 48
+      },
+      "kanban": {
+       "slots": 24
+      },
+      "prism": {
+       "slots": 24
+      },
+      "test-gate": {
+       "slots": 8
+      }
+     },
+     "cores": 128,
+     "cores_reserve": 0,
+     "mem_reserve_gb": 26,
+     "mem_total_gb": 220,
+     "threads": 256
+    },
+    "mac-studio": {
+     "aliases": [
+      "studio",
+      "mac-studio-m3u",
+      "local"
+     ],
+     "clock_mhz": 4050,
+     "consumers": {
+      "ci": {
+       "slots": 0
+      },
+      "kanban": {
+       "slots": 2
+      },
+      "prism": {
+       "slots": 0
+      },
+      "test-gate": {
+       "slots": 1
+      }
+     },
+     "cores": 24,
+     "cores_reserve": 10,
+     "default_preference": "low",
+     "mem_reserve_gb": 128,
+     "mem_total_gb": 512,
+     "threads": 32,
+     "unmeasurable_axes": [
+      "psi_cpu_some10",
+      "psi_mem_some10",
+      "system_pct"
+     ]
+    }
+   },
+   "saturate_to": 1.0,
+   "schema": 1
+  },
+  "cffaada8e1": {
+   "default_first": "ci-box",
+   "footprints": {
+    "athena": {
+     "gpu_mb": 0,
+     "ram_gb": 3,
+     "scratch_gb": 1,
+     "threads": 2
+    },
+    "babysit": {
+     "gpu_mb": 0,
+     "ram_gb": 2,
+     "scratch_gb": 0,
+     "threads": 1
+    },
+    "ci": {
+     "gpu_mb": 0,
+     "ram_gb": 4,
+     "scratch_gb": 4,
+     "threads": 4
+    },
+    "kanban": {
+     "gpu_mb": 0,
+     "ram_gb": 3,
+     "scratch_gb": 1,
+     "threads": 2
+    },
+    "prism": {
+     "gpu_mb": 0,
+     "ram_gb": 4,
+     "scratch_gb": 1,
+     "threads": 1
+    },
+    "test-gate": {
+     "gpu_mb": 0,
+     "ram_gb": 16,
+     "scratch_gb": 2,
+     "threads": 4
+    }
+   },
+   "hosts": {
+    "ace-ai": {
+     "aliases": [
+      "aceai",
+      "ace-ai.local"
+     ],
+     "clock_mhz": 5756,
+     "consumers": {
+      "ci": {
+       "slots": 8
+      },
+      "kanban": {
+       "slots": 4
+      },
+      "prism": {
+       "slots": 12
+      },
+      "test-gate": {
+       "slots": 4
+      }
+     },
+     "cores": 16,
+     "cores_reserve": 4,
+     "mem_reserve_gb": 40,
+     "mem_total_gb": 121,
+     "threads": 32
+    },
+    "ace-media": {
+     "aliases": [
+      "ace-media-ubuntu"
+     ],
+     "clock_mhz": 6000,
+     "consumers": {
+      "ci": {
+       "slots": 8
+      },
+      "kanban": {
+       "slots": 4
+      },
+      "prism": {
+       "slots": 8
+      },
+      "test-gate": {
+       "slots": 4
+      }
+     },
+     "cores": 24,
+     "cores_reserve": 4,
+     "mem_reserve_gb": 16,
+     "mem_total_gb": 94,
+     "threads": 32
+    },
+    "ci-box": {
+     "aliases": [
+      "ci",
+      "ci.ace"
+     ],
+     "clock_mhz": 3207,
+     "consumers": {
+      "ci": {
+       "slots": 48
+      },
+      "kanban": {
+       "slots": 24
+      },
+      "prism": {
+       "slots": 24
+      },
+      "test-gate": {
+       "slots": 8
+      }
+     },
+     "cores": 128,
+     "cores_reserve": 16,
+     "mem_reserve_gb": 40,
+     "mem_total_gb": 220,
+     "threads": 256
+    },
+    "mac-studio": {
+     "aliases": [
+      "studio",
+      "mac-studio-m3u",
+      "local"
+     ],
+     "clock_mhz": 4050,
+     "consumers": {
+      "ci": {
+       "slots": 0
+      },
+      "kanban": {
+       "slots": 2
+      },
+      "prism": {
+       "slots": 0
+      },
+      "test-gate": {
+       "slots": 1
+      }
+     },
+     "cores": 24,
+     "cores_reserve": 10,
+     "default_preference": "low",
+     "mem_reserve_gb": 128,
+     "mem_total_gb": 512,
+     "threads": 32,
+     "unmeasurable_axes": [
+      "psi_cpu_some10",
+      "psi_mem_some10",
+      "system_pct"
+     ]
+    }
+   },
+   "saturate_to": 1.0,
+   "schema": 1
+  }
+ }
+}

@@ -1403,7 +1403,7 @@ def _handle_create(args: dict, **kw) -> str:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
         new_tid = kb.create_task(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
-            parents=tuple(parents), parents_kind=parents_kind,
+            parents=tuple(parents), parents_kind=parents_kind, continues=args.get("continues"),
             tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,

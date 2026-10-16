@@ -290,6 +290,44 @@ def test_ssh_config_hosts_reads_literal_hosts_and_includes(tmp_path):
     assert kwp.ssh_config_hosts(tmp_path / "missing") is None
 
 
+@pytest.mark.parametrize("body", [
+    "sftp -p ci-box",                              # sftp -p is preserve, a FLAG
+    "sftp -rp ci-box",
+    "sftp -s /usr/libexec/sftp-server ci-box",     # sftp -s / -X take a value
+    "sftp -X buffer=65536 ci-box",
+    "mosh --port 60001 ci-box",                    # mosh long option, separate value
+    "mosh -p 60001 ci-box",
+    "ssh -p 2222 ci-box",                          # regression guard: ssh -p takes a value
+])
+def test_per_verb_option_arity_binds_the_target(body):
+    """Prism 44c13730263b, RED ON ba92ce6c: one ssh(1) arity table was shared
+    by sftp and mosh, so the host was swallowed as an option value."""
+    assert kwp.host_bound_targets(body, (), SHORT, ssh_hosts=SSH_CFG) == (True, ("ci-box",))
+
+
+def test_nested_relative_include_resolves_against_the_ssh_dir(tmp_path):
+    """Prism aa5b13cf2e8a, RED ON ba92ce6c: a relative Include in a nested
+    file resolves against ~/.ssh (ssh_config(5)), not the including file's
+    directory. The single-level test could not see it: both are ~/.ssh."""
+    ssh = tmp_path / "ssh"
+    (ssh / "conf.d").mkdir(parents=True)
+    (ssh / "config").write_text("Include conf.d/fleet\n")
+    (ssh / "conf.d" / "fleet").write_text("Include targets\n")
+    (ssh / "targets").write_text("Host ci\n")
+    (ssh / "conf.d" / "targets").write_text("Host decoy\n")   # the wrong base
+    hosts = kwp.ssh_config_hosts(ssh / "config")
+    assert "ci" in hosts and "decoy" not in hosts
+
+
+def test_ssh_config_keyword_equals_value_syntax(tmp_path):
+    """ssh_config(5) allows ``Keyword=value`` with optional whitespace."""
+    (tmp_path / "x").write_text("Host = media\n")
+    (tmp_path / "y").write_text("Host=unifi\n")
+    cfg = tmp_path / "config"
+    cfg.write_text("Include=x\nInclude = y\nHost=ci\nHost =ai ace-ai\n")
+    assert kwp.ssh_config_hosts(cfg) == frozenset({"ci", "ai", "ace-ai", "media", "unifi"})
+
+
 def test_pool_ssh_hosts_threads_into_reach_allowed_hosts(tmp_path):
     fleet = tmp_path / "fleet"
     _matrix(fleet, {"ci-box": {"at": NOW, "reach": {"ci": 0}}})

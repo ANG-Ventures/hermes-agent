@@ -26,15 +26,11 @@ def _queue_usage() -> str:
     return t("cli.queue.usage")
 
 
-# management verb -> (handler, takes a leading item index). Verbs without an index are
-# only management when they stand alone; index verbs only when a number follows.
-_QUEUE_VERBS: dict[str, tuple[str, bool]] = {
-    "list": ("_queue_list", False), "ls": ("_queue_list", False), "show": ("_queue_list", False),
-    "clear": ("_queue_clear", False),
-    "edit": ("_queue_edit", True), "set": ("_queue_edit", True),
-    "rm": ("_queue_remove", True), "remove": ("_queue_remove", True), "delete": ("_queue_remove", True),
-    "del": ("_queue_remove", True), "pop": ("_queue_remove", True),
-    "move": ("_queue_move", True),
+# /queue verb parsing lives in hermes_cli/queue_verbs.py (shared with every gateway surface);
+# this maps each parsed kind to its CLI handler.
+_QUEUE_HANDLERS: dict[str, str] = {
+    "list": "_queue_list", "clear": "_queue_clear", "edit": "_queue_edit",
+    "rm": "_queue_remove", "move": "_queue_move", "run": "_queue_run",
 }
 
 
@@ -406,26 +402,66 @@ class CLILoopsMixin:
         instead. Anything else — ``clear the logs``, ``edit the config`` — is still a prompt;
         ``/queue add <prompt>`` forces enqueueing."""
         from cli import _cprint, _slash_args
+        from hermes_cli.queue_verbs import parse_queue_payload
         payload = _slash_args(cmd_original)
-        if not payload:
-            self._queue_list("")
-            return
-        verb, _, rest = payload.partition(" ")
-        verb, rest = verb.lower(), rest.strip()
-        if verb == "add":
-            if rest:
-                self._queue_enqueue(rest)
+        op = parse_queue_payload(payload)
+        if op.kind == "add":
+            if op.text:
+                self._queue_enqueue(op.text)
             else:
                 _cprint(f"  {t('cli.queue.usage_add')}")
             return
-        handler, takes_index = _QUEUE_VERBS.get(verb, (None, False))
-        is_management = handler is not None and (
-            rest.split(None, 1)[0].isdigit() if takes_index and rest else not rest
-        )
-        if is_management:
-            getattr(self, handler)(rest)
-        else:
-            self._queue_enqueue(payload)
+        if op.kind == "help":
+            _cprint(f"  {_queue_usage()}")
+            return
+        if op.kind == "list":
+            # bare `/queue` prints the usage hint under an empty list; `/queue list` does not
+            self._queue_list(payload.strip())
+            return
+        # Handlers keep their original string contract: "N" (rm), "N text" (edit), "A B" (move).
+        rest = f"{op.index} {op.text}".strip() if op.kind == "edit" else op.text
+        getattr(self, _QUEUE_HANDLERS[op.kind])(rest)
+
+    def _queue_run(self, rest: str) -> None:
+        """``/queue run`` — release the queue now. Idle: the process loop already drains it.
+        Busy: hand the head to ``_interrupt_queue`` (the same channel as typing mid-turn), which
+        interrupts the current turn with item 1; the process loop drains the rest FIFO after it."""
+        from cli import _cprint
+        items = self._pending_input_items()
+        if not items:
+            _cprint(f"  {t('cli.queue.empty')}")
+            return
+        merged = self._queue_release_mode() == "merged" and len(items) > 1
+        if merged:
+            # One turn carrying every queued prompt, in order (follow-up spec D3/D6).
+            from gateway.queue_mgmt import MERGE_SEPARATOR
+            joined = MERGE_SEPARATOR.join(str(i).strip() for i in items if str(i).strip())
+            if not getattr(self, "_agent_running", False):
+                self._mutate_pending_input(lambda q: [joined])
+                _cprint(f"  {t('cli.queue.released', count=len(items))}")
+                return
+            self._mutate_pending_input(lambda q: [])
+            self._interrupt_queue.put(joined)
+            _cprint(f"  {t('cli.queue.released_interrupting', count=len(items))}")
+            return
+        if not getattr(self, "_agent_running", False):
+            _cprint(f"  {t('cli.queue.released', count=len(items))}")
+            return
+        head: list = []
+        self._mutate_pending_input(lambda q: (head.append(q.pop(0)) or q) if q else q)
+        if head:
+            self._interrupt_queue.put(head[0])
+        _cprint(f"  {t('cli.queue.released_interrupting', count=len(items))}")
+
+    @staticmethod
+    def _queue_release_mode() -> str:
+        """``display.queue_release_mode`` for the CLI (same knob as the gateway)."""
+        try:
+            from hermes_cli.config import load_config_readonly
+            mode = str((load_config_readonly().get("display") or {}).get("queue_release_mode") or "per_item")
+            return "merged" if mode.strip().lower() == "merged" else "per_item"
+        except Exception:
+            return "per_item"
 
     def _cmd_steer(self, cmd_original: str):
         # Inject a message after the next tool call without interrupting: while the

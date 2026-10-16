@@ -51,7 +51,7 @@ def _blocked(command: str) -> bool:
 
 # --- the three original false positives, plus the shapes the card lists as PASS ----------
 
-@pytest.mark.parametrize("command", [
+@pytest.mark.parametrize("command", [  # kanban-identity: ok — strings fed to the guard scanner, never spawned
     # (3) the card about the false positive quoting the incident command in --body
     f"hermes kanban create 'guard false positive' --body 'the incident was {BOOTOUT}; keep it blocked'",
     f'hermes kanban create "guard false positive" --body "the incident was a bare {BOOTOUT}; keep it blocked"',

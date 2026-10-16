@@ -82,7 +82,11 @@ async def test_interrupt_keeps_parked_internal_wake_and_discards_human_followup(
     wake = _event(source, "[ASYNC DELEGATION BATCH COMPLETE] 1 task done", internal=True)
     adapter._pending_messages[key] = wake
     await _run_command(runner, adapter, source, key, reasons)
-    assert adapter.restarted == [wake]
+    if reasons[1].startswith("stop_command"):
+        assert adapter.restarted == []
+        assert wake in runner._session_state(key).conversation.held_queue
+    else:
+        assert adapter.restarted == [wake]
     assert key not in adapter._pending_messages and key not in adapter._active_sessions
 
     adapter.restarted.clear()
@@ -100,5 +104,9 @@ async def test_interrupt_promotes_internal_wake_queued_behind_discarded_human_he
     wake = _event(source, "[ASYNC DELEGATION BATCH COMPLETE] 1 task done", internal=True)
     runner._session_state(key).conversation.queued_events.extend([later_human, wake])
     await _run_command(runner, adapter, source, key, _COMMAND_REASONS[0])
-    assert adapter.restarted == [wake]
-    assert runner._overflow_queue(key) == [later_human]
+    assert adapter.restarted == []
+    # /stop HOLDS human items now (spec 2026-10-12 D12/D14): "second human" moves to held_queue
+    # instead of staying in overflow, and the discarded head "human head" is held too, not dropped.
+    assert runner._overflow_queue(key) == []
+    held = [e.text for e in runner._session_state(key).conversation.held_queue]
+    assert held == ["human head", "second human", wake.text]

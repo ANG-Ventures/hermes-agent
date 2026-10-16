@@ -29,6 +29,18 @@ _SSH_MULTIPLEX = os.name != "nt"
 _load_hermes_env_vars = load_hermes_env_vars
 
 
+def _placed_lease_env_names() -> tuple[str, ...]:
+    """Browser-lease names a dispatcher-placed worker forwards into its placed shell (Browser Sandboxes
+    pass-3 R1(a)): CDP is driven from the placed shell, so the lease must reach it. A NAMED allowlist
+    (``kanban_browser_lease.LEASE_ENV_NAMES``), never ``*``, and only on a placed worker; the
+    dispatcher's own credential is not in the list. Values ride SendEnv; the host's sshd must
+    ``AcceptEnv`` these names (hermes-home ``fleet/ssh/browser-lease-acceptenv.conf``)."""
+    if not os.environ.get("KANBAN_WORKER_PLACEMENT"):
+        return ()
+    from hermes_cli.kanban_browser_lease import LEASE_ENV_NAMES
+    return tuple(n for n in LEASE_ENV_NAMES if os.environ.get(n))
+
+
 def _ensure_ssh_available() -> None:
     """Fail fast with a clear error when the SSH client is unavailable."""
     for tool in ("ssh", "scp"):
@@ -301,7 +313,8 @@ class SSHEnvironment(BaseEnvironment):
         client's env carries the values, so secrets never enter the remote ``bash -c`` argv. The
         remote sshd must ``AcceptEnv`` them (#14091). Profile-scoped names missing from the active
         scope are unset remotely so a shared host cannot serve another profile's value."""
-        values, unset_names = resolve_passthrough_env(hermes_env_loader=_load_hermes_env_vars)
+        values, unset_names = resolve_passthrough_env(explicit_forward=_placed_lease_env_names(),
+                                                      hermes_env_loader=_load_hermes_env_vars)
         cmd = self._build_ssh_command(send_env=values, log_to_file=True) + bash_argv(shlex.quote(prepend_unset(cmd_string, unset_names)), login)
         client_env = client_env_with(values)
         return _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)

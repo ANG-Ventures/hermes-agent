@@ -41,6 +41,7 @@ import unicodedata  # noqa: E402
 from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as _REVIEW_LENSES  # noqa: E402
 from hermes_cli.kanban_review_schema import HEAD_SHA_PATTERN as _HEAD_SHA_PATTERN  # noqa: E402
 from hermes_cli.kanban_review_schema import validate_v2_fields as _validate_review_v2  # noqa: E402
+from hermes_cli import kanban_review_schema as _review_schema  # noqa: E402
 _log = logging.getLogger(__name__)
 
 
@@ -2559,6 +2560,8 @@ class Task:
     # profile without an explicit ``worker_ok``. See :func:`set_no_worker`.
     no_worker: bool = False
     completion_contract: Optional[str] = None
+    # Pool host holding this card's workspace state (t_8bfdcc07); None = none.
+    origin_host: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2596,7 +2599,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "origin_host",
 )
 
 # Text columns where "" is stored/read as "not set".
@@ -2627,6 +2630,7 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    host: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -2641,6 +2645,7 @@ class Run:
             started_at=int(row["started_at"]),
             ended_at=_opt_int(row["ended_at"]),
             metadata=_json_or(_lossy_text(row["metadata"])),
+            host=_row_get(row, "host"),
         )
 
 
@@ -2839,7 +2844,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- flagged card and assign/reassign refuse a worker profile unless the
     -- same call passes worker_ok (which clears the flag). Prose such as
     -- "do not dispatch a worker" in the body is not a guard; this is.
-    no_worker            INTEGER NOT NULL DEFAULT 0
+    no_worker            INTEGER NOT NULL DEFAULT 0,
+    -- Fleet Work Placement Phase 3 (t_8bfdcc07): the pool host that may hold this
+    -- card's workspace state. Set at placement, cleared only by a positive empty
+    -- probe, a terminal status or ``requeue --drop-origin``. NULL = no remote state.
+    origin_host          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2920,7 +2929,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- Resources (VM / container / GPU-resident unit) this run started, JSON list of
     -- {kind, id, host, started_at, state}. The dispatcher stops each one after the card
     -- is done/archived unless the body carries `keep-alive: <reason>` (kanban_resources).
-    resources           TEXT NOT NULL DEFAULT '[]'
+    resources           TEXT NOT NULL DEFAULT '[]',
+    -- Where this run executed (t_8bfdcc07): a pool host id, or 'studio' for a
+    -- local run. NULL = legacy row or a run that never spawned.
+    host                TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -3504,6 +3516,11 @@ def _ensure_status_audit(conn: sqlite3.Connection) -> None:
     """Create the audit table + trigger. Runs after the additive column
     migrations so every column the trigger names exists on legacy DBs."""
     conn.executescript(_STATUS_AUDIT_SQL)
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_tasks_terminal_origin "
+        "AFTER UPDATE OF status ON tasks WHEN NEW.status IN ('done','archived') "
+        "BEGIN UPDATE tasks SET origin_host=NULL WHERE id=NEW.id; END"
+    )
 
 
 def _install_status_audit_marker(conn: sqlite3.Connection) -> None:
@@ -4280,6 +4297,30 @@ def mutation_actor(
     finally:
         _EVENT_ACTOR.reset(ev_token)
         _MUTATION_ACTOR.reset(token)
+
+
+@contextlib.contextmanager
+def event_actor(profile: str):
+    """Stamp ``profile`` as ``task_events.actor_profile`` on every event written
+    inside the block, WITHOUT binding the home-session guard (no caller session).
+
+    For automated closers (``kanban complete --actor kanban-review-merge-pass``):
+    a cron has no chat session, so :func:`_event_actor` resolved to ``(None,
+    None)`` and the notify-suppress filter had to guess the closer from the
+    completion summary's prose (t_7de359d9: "(CI gate, …)" read as the
+    closer, the owner-wake was delivered). The guard's own binding
+    (:func:`mutation_actor`) is untouched: an already-bound actor wins.
+    """
+    name = (str(profile).strip() or None) if profile else None
+    if name is None or _EVENT_ACTOR.get() is not None:
+        yield None
+        return
+    actor = MutationActor(session_ids=(), profile=name)
+    token = _EVENT_ACTOR.set(actor)
+    try:
+        yield actor
+    finally:
+        _EVENT_ACTOR.reset(token)
 
 
 def _caller_session_lineage(session_id: str) -> tuple[str, ...]:
@@ -5864,6 +5905,7 @@ def create_task(
     until: Optional[int] = None,
     time_gate_guard: bool = False,
     i_mean_blocks: bool = False,
+    continues: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -6006,6 +6048,12 @@ def create_task(
     # (CLI, kanban tool, swarm, dashboard, library callers) flows through, so
     # no card can land without a home (never NULL) or without an origin line.
     parents = tuple(parents or ())
+    if continues:
+        # Birth lineage is provenance; it must not gate on the old card.
+        if parents and parents != (continues,):
+            raise ValueError('--continues cannot be combined with different explicit parents')
+        parents = (continues,)
+        parents_kind = LINK_KIND_DERIVED_FROM
     created_by = created_by or _ambient_session_env("HERMES_SESSION_PROFILE") or None
     requested_session_id, unstamped_body = session_id, body
     birth = _resolve_birth_session(
@@ -6041,6 +6089,21 @@ def create_task(
         body,
         inherited_origin or format_origin_line(session_id, created_by=created_by),
     )
+    # Only hard parent declarations inherit; body sniffs never do.
+    from hermes_cli.kanban_host_capabilities import declared_words
+    _inherited_requires = set()
+    for _parent in parents:
+        _prow = conn.execute('SELECT body,skills FROM tasks WHERE id=?', (_parent,)).fetchone()
+        if _prow:
+            _inherited_requires.update(w for w in declared_words(_prow[0]) if w != 'none')
+            from hermes_cli import kanban_host_capabilities as _khc_inherit
+            _cmap = _khc_inherit.load_map(kanban_home() / 'fleet')
+            if _cmap is not None:
+                _reqs, _none = _khc_inherit.derive(_prow[0], _json_or(_prow[1]) or [], _cmap)
+                _inherited_requires.update(r.cap.removeprefix('unknown:') for r in _reqs if r.strength == 'hard')
+    if _inherited_requires:
+        body = (body or '') + '\nrequires: ' + ', '.join(sorted(_inherited_requires))
+
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -6356,6 +6419,10 @@ def create_task(
                         "(parent_id, child_id, kind) VALUES (?, ?, ?)",
                         (pid, task_id, parents_kind),
                     )
+                from hermes_cli import kanban_continuation as _kcont_create
+                if continues:
+                    _kcont_create.transfer_workspace(conn, continues, task_id)
+                _kcont_create.create_hints(conn, task_id, body, continues=continues)
                 # Notify-sub inheritance (ACK-edge: the originating channel
                 # still hears about a child that BLOCKs, not just the final
                 # fan-in) is handled by the single-owner helper below —
@@ -8078,7 +8145,7 @@ def _append_event(
     run_id: Optional[int] = None,
 ) -> None:
     """Insert an event row inside the caller's txn; ``run_id`` groups it by attempt (NULL = task-scoped)."""
-    if kind in _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS or (
+    if kind in _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS or kind in _RESPAWN_GUARD_CONTINUATION_KINDS or (
         kind == "dependency_wait" and (payload or {}).get("kind") == "dependency"
     ) or (kind == "reclaimed" and (payload or {}).get("manual") is True):
         # Snapshot comment causality in the same transaction as operator intent.
@@ -8167,6 +8234,13 @@ def _end_run(
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    # A pool run's headroom reservation ends with the run (t_d6ce856e), once
+    # the run row is COMMITTED: a rolled-back end keeps its promise (Prism 441fe743030f).
+    from hermes_cli import kanban_headroom as _kh
+    _rid, _via = _kh.run_reservation(conn, task_id, run_id)
+    if _rid is not None:
+        from hermes_cli.kanban_db_connect import on_commit
+        on_commit(conn, lambda: _kh.release_run_reservation(_rid, _via))
     return run_id
 
 
@@ -10476,9 +10550,11 @@ def complete_task(
             ])
         _pr_query = _open_pr.memo_query()
         unowned_prs: list = []
+        branch_owned_prs: list = []
         still_open = _open_pr.open_pr_refs(
             result, summary, metadata=metadata, survivor_pr=survivor_pr,
             query_fn=_pr_query, task_id=task_id, unowned=unowned_prs,
+            owned=branch_owned_prs,
         )
         if unowned_prs:
             # Prose is not provenance (t_60b39483): the handoff named open PRs whose head branch
@@ -10535,6 +10611,15 @@ def complete_task(
             # gated on them; prose mentions in auto_routed_open_prs are not (FleetReview #1352).
             own = _open_pr.split_fleet(_open_pr.extract_pr_refs(
                 metadata=metadata, survivor_pr=survivor_pr))[0]
+            # Plus a still-open prose ref whose head branch names THIS card (t_3a606d89): it gates
+            # the route, so a later done/archive must be gated on it too.
+            own_keys = {(r.repo.lower(), r.number) for r in own}
+            routed_keys = {(r.repo.lower(), r.number) for r in still_open}
+            for r in branch_owned_prs:
+                key = (r.repo.lower(), r.number)
+                if key in routed_keys and key not in own_keys:
+                    own_keys.add(key)
+                    own.append(r)
             # Always written (even []): its presence marks the run as post-#1352 (no legacy fallback).
             routed_meta["own_prs"] = [f"{r.repo}#{r.number}" for r in own]
             if freshness.get("prs"):
@@ -12008,6 +12093,7 @@ def safe_remove_workspace_dir(
     task_id: Optional[str] = None,
     reason: str,
     conn: Optional[sqlite3.Connection] = None,
+    remote_host=None,
 ) -> bool:
     """THE choke point for removing a kanban-managed scratch workspace.
 
@@ -12027,6 +12113,28 @@ def safe_remove_workspace_dir(
 
     Returns True iff the directory was removed.
     """
+    if remote_host is not None:
+        if conn is None or not task_id or not _is_managed_scratch_path(Path(path)):
+            return False
+        if _task_has_live_run(conn, task_id) or _has_active_children(conn, task_id):
+            return False
+        # Remote lexical ownership: never consult the Studio's inode identity.
+        target = os.path.normpath(str(path))
+        for owner in conn.execute('SELECT id,workspace_path FROM tasks WHERE workspace_path IS NOT NULL'):
+            stored = os.path.normpath(owner['workspace_path'])
+            # Overlap in either direction: equal, inside the target, or
+            # containing it (a nested workspace belongs to its ancestor too).
+            if owner['id'] != task_id and (stored == target or stored.startswith(target + os.sep)
+                                           or target.startswith(stored + os.sep)):
+                return False
+        from hermes_cli.kanban_survivor import remove_workspace_dir
+        _audit_workspace_deletion(Path(path), task_id=task_id, reason=reason, outcome=AUDIT_ATTEMPT,
+                                  detail='remote=' + remote_host.name)
+        removed = remove_workspace_dir(conn, task_id, path, remote_host=remote_host)
+        _audit_workspace_deletion(Path(path), task_id=task_id, reason=reason,
+                                  outcome=AUDIT_DELETE if removed else AUDIT_FAILED,
+                                  detail='remote=' + remote_host.name)
+        return removed
     try:
         resolved = Path(path).resolve(strict=False)
     except OSError:
@@ -12177,8 +12285,13 @@ def block_task(
     expected_run_id: Optional[int] = None,
     until: Optional[int] = None,
     require_unclaimed_ready: bool = False,
+    loop_breaker: bool = True,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+
+    ``loop_breaker=False``: the caller already decided this block from its own
+    ledger (the placement re-route, t_ecfd5591 F1), so a recurrence never
+    routes the card to ``triage``; it lands ``blocked`` like a first block.
 
     ``require_unclaimed_ready`` fences a caller acting on a stale snapshot
     (the dispatcher's post-loop parking, t_8c474c2e): the block happens only
@@ -12385,7 +12498,7 @@ def block_task(
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
 
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
+        if loop_breaker and recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
             cur = conn.execute(
@@ -12555,18 +12668,17 @@ def _route_block(
 
 
 def redact_review_value(value: Any) -> Any:
-    """Redact secrets at the domain boundary for durable review handoffs."""
-    if isinstance(value, str):
-        from agent.redact import redact_sensitive_text
+    """Redact secrets at the domain boundary for durable review handoffs.
 
-        return redact_sensitive_text(value, force=True)
-    if isinstance(value, dict):
-        return {key: redact_review_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact_review_value(item) for item in value]
+    Per leaf, keys included, with the key rule kept: a string under a secret-named
+    key (``"password"``, ``"token"``) is masked whole even with no recognizable
+    prefix (Prism 0464d61148aa).
+    """
+    from agent.redact import redact_sensitive_json
+
     if isinstance(value, tuple):
         return tuple(redact_review_value(item) for item in value)
-    return value
+    return redact_sensitive_json(value, force=True)
 HUMAN_REVIEWER_SENTINEL = "human"
 
 
@@ -13481,8 +13593,8 @@ def _latest_review_coverage(rows: list) -> tuple[Optional[dict], Optional[str]]:
         for payload in reversed(payloads):
             try:
                 coverage = json.loads(payload)
-            except (ValueError, TypeError):
-                first_error = first_error or "invalid review_coverage JSON"
+            except (ValueError, TypeError) as exc:
+                first_error = first_error or _review_json_error_text(payload, exc)
                 continue
             if isinstance(coverage, dict):
                 return coverage, None
@@ -13490,7 +13602,8 @@ def _latest_review_coverage(rows: list) -> tuple[Optional[dict], Optional[str]]:
     return None, first_error or "missing review_coverage JSON line"
 _REVIEW_COVERAGE_MISSING = (
     "missing review_coverage comment on this review run "
-    "(use kanban_block(kind=capability) if a lens cannot run)"
+    "(use kanban_block(kind=capability) if a lens cannot run). "
+    + _review_schema.coverage_schema_text()
 )
 
 
@@ -13509,7 +13622,7 @@ def _validate_review_coverage(conn: sqlite3.Connection, task_id: str, run_id: in
         return _REVIEW_COVERAGE_MISSING
     coverage, error = _latest_review_coverage(rows)
     if coverage is None:
-        return error
+        return _with_coverage_schema(error)
     return _review_coverage_record_error(coverage)
 
 
@@ -13524,53 +13637,113 @@ def review_coverage_text_error(text: Any) -> Optional[str]:
         [{"body": "review_coverage: " + str(text or "").strip()}]
     )
     if coverage is None:
-        return error
+        return _with_coverage_schema(error)
     return _review_coverage_record_error(coverage)
 
 
-def _review_coverage_record_error(coverage: dict) -> Optional[str]:
-    """Field checks for one parsed review_coverage record; None when valid."""
+def _with_coverage_schema(error: Optional[str]) -> Optional[str]:
+    """Every coverage refusal carries the full schema, exactly once."""
+    if not error or "review_coverage schema:" in error:
+        return error
+    return f"{error}. " + _review_schema.coverage_schema_text()
+
+
+def _review_json_error_text(payload: str, exc: Exception) -> str:
+    """``invalid review_coverage JSON`` plus WHERE it broke and the schema (t_cd1bcea4)."""
+    pos = getattr(exc, "pos", None)
+    where = ""
+    if isinstance(pos, int):
+        where = f" at char {pos} near {payload[max(0, pos - 30):pos + 10]!r}"
+    detail = getattr(exc, "msg", None) or str(exc)
+    return (
+        f"invalid review_coverage JSON ({detail}{where}). Pass it with --json @FILE "
+        f"(or - for stdin) so the shell never touches it, or use the flat form. "
+        + _review_schema.coverage_schema_text()
+    )
+
+
+def review_coverage_problems(coverage: dict) -> list:
+    """EVERY field problem in one parsed review_coverage record ([] when valid).
+
+    One pass over the whole record: an operator fixes everything in one retry
+    instead of discovering one field per refusal (t_cd1bcea4, plan P2).
+    """
+    problems: list = []
     lenses = coverage.get("lenses")
     if not isinstance(lenses, dict):
-        return "missing lenses object"
-    lenses = {
-        _review_normalize(key).casefold(): value
-        for key, value in lenses.items() if isinstance(key, str)
-    }
-    for lens in _REVIEW_LENSES:
-        state = lenses.get(lens.casefold())
-        if _review_lens_state(state) == "done":
-            continue
-        if _review_na_reason_ok(state):
-            continue
-        return f"missing/invalid lens {lens}: use 'done' or 'n/a: <applicability reason>'; inability to run requires kanban_block(kind=capability)"
+        problems.append(
+            "lenses must be an object {" + ", ".join(f'"{lens}": "done"' for lens in _REVIEW_LENSES) + "}"
+        )
+    else:
+        lenses = {
+            _review_normalize(key).casefold(): value
+            for key, value in lenses.items() if isinstance(key, str)
+        }
+        bad = [
+            lens for lens in _REVIEW_LENSES
+            if not (_review_lens_state(lenses.get(lens.casefold())) == "done"
+                    or _review_na_reason_ok(lenses.get(lens.casefold())))
+        ]
+        if bad:
+            problems.append(
+                f"missing/invalid lens {', '.join(bad)}: use 'done' or 'n/a: <applicability reason>'; "
+                "inability to run requires kanban_block(kind=capability)"
+            )
     count = coverage.get("findings")
-    if type(count) is not int or count < 1:
-        return "findings must be an integer >= 1"
+    count_ok = type(count) is int and count >= 1
+    if not count_ok:
+        problems.append("findings must be an integer >= 1")
     items = coverage.get("items")
-    if (not isinstance(items, list) or len(items) != count
+    if (not isinstance(items, list) or (count_ok and len(items) != count)
             or not all(_review_item_ok(item) for item in items)):
-        return (
+        got = f" (got {len(items)} for findings={count})" if isinstance(items, list) and count_ok else ""
+        problems.append(
             "items must list exactly findings findings, each at least "
-            f"{_REVIEW_ITEM_MIN_CHARS} visible characters with a letter or digit"
+            f"{_REVIEW_ITEM_MIN_CHARS} visible characters with a letter or digit{got}"
         )
     minutes = coverage.get("review_minutes")
     if type(minutes) is not int or minutes < 0 or minutes > _REVIEW_MINUTES_MAX:
-        return f"review_minutes must be an integer from 0 to {_REVIEW_MINUTES_MAX}"
+        problems.append(f"review_minutes must be an integer from 0 to {_REVIEW_MINUTES_MAX}")
     # Optional (per-card batteries are being retired; CI owns suites). When
     # given it must still be a real value, not an empty placeholder.
     battery = coverage.get("battery")
     if battery is not None and (not isinstance(battery, str) or not battery.strip()):
-        return "battery, when given, must be a nonempty string (attachment name, 'seeded' or 'n/a: <reason>')"
+        problems.append("battery, when given, must be a nonempty string (attachment name, 'seeded' or 'n/a: <reason>')")
     batch = coverage.get("batch_id")
     if not isinstance(batch, str) or not batch.strip():
-        return "batch_id must identify the single delegate_task batch in this comment"
+        problems.append("batch_id must identify the single delegate_task batch in this comment")
     head = coverage.get("head_sha")
     if not (isinstance(head, str) and (_REVIEW_HEAD_SHA_RE.fullmatch(head.strip())
                                         or _review_na_reason_ok(head))):
-        return "head_sha must be the reviewed PR head (7-40 hex) or 'n/a: <reason>' for a card with no PR"
+        problems.append("head_sha must be the reviewed PR head (7-40 hex) or 'n/a: <reason>' for a card with no PR")
     # review_coverage v2 (additive): records with no v2 key pass untouched.
-    return _validate_review_v2(coverage, surface="board")
+    v2 = _validate_review_v2(coverage, surface="board")
+    if v2:
+        problems.append(v2)
+    return problems
+
+
+def _review_coverage_record_error(coverage: dict) -> Optional[str]:
+    """All field problems of one parsed record plus the full schema; None when valid."""
+    problems = review_coverage_problems(coverage)
+    if not problems:
+        return None
+    return "; ".join(problems) + ". " + _review_schema.coverage_schema_text()
+
+
+def redact_review_coverage_text(text: str) -> str:
+    """Redact a coverage JSON's VALUES, never its text (t_cd1bcea4).
+
+    Redacting the raw JSON text rewrote ``KEY="value"`` inside an item into
+    ``KEY=***`` and ate the closing quote, so a record ``json.loads`` accepted
+    was refused as invalid JSON. Parse first, redact the object, re-serialize;
+    text that does not parse is returned redacted as text (it is refused anyway).
+    """
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return str(redact_review_value(text)).strip()
+    return json.dumps(redact_review_value(parsed), ensure_ascii=False)
 
 
 def _operator_caller_profiles() -> frozenset[str]:
@@ -13697,7 +13870,7 @@ def request_changes(
         refusal = _operator_send_back_refusal(task_id, operator_reason)
         if refusal is not None:
             return False, refusal
-    coverage_text = str(redact_review_value(coverage or "")).strip()
+    coverage_text = redact_review_coverage_text(str(coverage or "").strip()) if coverage else ""
     if coverage_text:
         # Validate the whole record before any write (t_c5bfb48b), so no
         # rejected call can leave it behind.
@@ -13881,6 +14054,7 @@ def requeue_task(
     *,
     actor: str,
     reason: str,
+    drop_origin: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Record operator intent to run a READY card now (``requeued`` event).
 
@@ -13895,18 +14069,29 @@ def requeue_task(
     """
     if not (reason or "").strip():
         return False, "a reason is required to requeue a task"
+    _origin_files = []
+    if drop_origin:
+        from hermes_cli import kanban_continuation as kc
+        _origin_files = kc.inventory(conn, task_id)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if row is None:
             return False, f"task {task_id} not found"
-        if row["status"] != "ready":
+        if drop_origin and row['status'] == 'blocked':
+            # Dropping state does not waive incomplete blocking parents.
+            target_status = 'todo' if unsatisfied_parents(conn, task_id) else 'ready'
+            conn.execute("UPDATE tasks SET status=? WHERE id=?", (target_status, task_id))
+        elif row["status"] != "ready":
             return False, (
                 f"task {task_id} is {row['status']!r}; requeue only applies to "
                 f"'ready' tasks (use unblock/reopen/triage-resolve/promote "
                 f"for other states)"
             )
+        if drop_origin:
+            from hermes_cli import kanban_continuation as kc
+            kc.drop_origin(conn, task_id, actor=actor, files=_origin_files)
         _append_event(
             conn, task_id, "requeued", {"actor": actor, "reason": reason},
         )
@@ -14135,12 +14320,37 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
+def _unblock_expectation_holds(
+    conn: sqlite3.Connection, task_id: str,
+    expect_block_event: Optional[int], expect_last_comment: Optional[int],
+) -> bool:
+    """The CAS read for :func:`unblock_task`; call inside its write txn."""
+    if _task_status(conn, task_id) != "blocked":
+        return False
+    if expect_block_event is not None:
+        row = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+            (task_id,),
+        ).fetchone()
+        if (row[0] or 0) != expect_block_event:
+            return False
+    if expect_last_comment is not None:
+        row = conn.execute(
+            "SELECT MAX(id) FROM task_comments WHERE task_id = ?", (task_id,),
+        ).fetchone()
+        if (row[0] or 0) != expect_last_comment:
+            return False
+    return True
+
+
 @_home_session_guarded("unblock")
 def unblock_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     comment: Optional[tuple] = None,
+    expect_block_event: Optional[int] = None,
+    expect_last_comment: Optional[int] = None,
 ) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -14149,6 +14359,13 @@ def unblock_task(
     lands. A respawned worker can then never read the thread between the
     card becoming dispatchable and the reason appearing, and a refused or
     failed unblock leaves no comment (FleetReview aa67ba1c7513).
+
+    ``expect_block_event`` / ``expect_last_comment`` make the unblock a
+    compare-and-swap for a caller that decided from an EARLIER read (the
+    hermes-home unblock_when sweep, t_12d49eb5): the card must still be
+    ``blocked`` with that latest ``blocked`` event id and that latest comment
+    id (0 = none), checked inside the same IMMEDIATE txn as the flip. A card
+    re-blocked or re-pointed in between returns False and is left alone.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -14159,6 +14376,10 @@ def unblock_task(
     """
     now = int(time.time())
     with write_txn(conn):
+        if (expect_block_event is not None or expect_last_comment is not None) and not (
+            _unblock_expectation_holds(conn, task_id, expect_block_event, expect_last_comment)
+        ):
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) in ("blocked", "scheduled")
@@ -16065,6 +16286,15 @@ _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
     "requeued",
 )
 
+# Board-committed continuations that are not operator verbs: the placement
+# re-route (``kanban_placement_failfast.REROUTE_EVENT``, t_ecfd5591 review
+# 360354deb8ab) closes the run on a host that lacked a capability and returns
+# the card to its queue for a capable host. Its open PR is that work's
+# continuation, not a duplicate: one spawn after the newest PR comment
+# consumes it, like an operator requeue. Deliberately NOT in the operator
+# tuple above (overlap-hold release and failure staleness stay operator-only).
+_RESPAWN_GUARD_CONTINUATION_KINDS: tuple[str, ...] = ("placement_reroute",)
+
 # Event kinds that make a stamped failure STALE for the ``blocker_auth`` and
 # ``rate_limit_cooldown`` rules when they land at/after the failing run ended:
 # the operator-intent verbs above, the requeue events ``recent_success``
@@ -16277,7 +16507,9 @@ _PR_HEAD_REF_CACHE_LIMIT = 1024
 # Owner position only: the card id that OPENS the branch's last path segment
 # (``<assignee>/<card_id>-<topic>``, ``wt/<card_id>``, ``<slug>/<card_id>``).
 # An id elsewhere (``alice/fix-t_11111111``) is a topic mention, not an owner.
-_CARD_ID_OWNER_RE = re.compile(r"t_[0-9a-f]{8}(?![0-9a-z])")
+# Byte-exact (t_75fdedd4): card ids are minted lower-case (`_new_task_id`) and git branch names
+# are case-sensitive, so `T_0000ABCD` in a branch is not card t_0000abcd. No case folding.
+_CARD_ID_OWNER_RE = re.compile(r"t_[0-9a-f]{8}(?![0-9A-Za-z])")
 
 
 def _pr_belongs_to_other_card(repo: str, number: int, task_id: str) -> bool:
@@ -16294,8 +16526,8 @@ def _pr_belongs_to_other_card(repo: str, number: int, task_id: str) -> bool:
     head = _PR_HEAD_REF_CACHE.get((repo.lower(), int(number)))
     if not head:
         return False
-    owner = _CARD_ID_OWNER_RE.match(head.lower().rsplit("/", 1)[-1])
-    return owner is not None and owner.group(0) != task_id.lower()
+    owner = _CARD_ID_OWNER_RE.match(head.rsplit("/", 1)[-1])
+    return owner is not None and owner.group(0) != task_id
 
 
 def _pr_owned_by_card(repo: str, number: int, task_id: str) -> bool:
@@ -16309,8 +16541,8 @@ def _pr_owned_by_card(repo: str, number: int, task_id: str) -> bool:
     head = _PR_HEAD_REF_CACHE.get((repo.lower(), int(number)))
     if not head:
         return False
-    owner = _CARD_ID_OWNER_RE.match(head.lower().rsplit("/", 1)[-1])
-    return owner is not None and owner.group(0) == task_id.lower()
+    owner = _CARD_ID_OWNER_RE.match(head.rsplit("/", 1)[-1])
+    return owner is not None and owner.group(0) == task_id
 
 
 def _query_github_pr_state(repo: str, number: int) -> Optional[str]:
@@ -18138,9 +18370,11 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
     # Pre-upgrade intent events have no marker; an equal-second tie resumes:
     # one duplicate worker is recoverable, an indefinite guard is not.
     kinds = ",".join("?" * len(_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS))
+    cont = ",".join("?" * len(_RESPAWN_GUARD_CONTINUATION_KINDS))
     return conn.execute(
         "SELECT 1 FROM task_events i WHERE i.task_id = ? "
         f"AND (i.kind IN ({kinds}) OR "
+        f"i.kind IN ({cont}) OR "
         "(i.kind = 'reclaimed' AND json_extract(i.payload, '$.manual') = 1) OR "
         "(i.kind = 'dependency_wait' AND json_extract(i.payload, '$.kind') = 'dependency' "
         "AND EXISTS (SELECT 1 FROM task_events p WHERE p.task_id = i.task_id "
@@ -18148,9 +18382,14 @@ def _unused_operator_intent_after_pr(conn: sqlite3.Connection, task_id: str) -> 
         "AND (json_extract(i.payload, '$.after_comment_id') >= ? OR "
         "(json_type(i.payload, '$.after_comment_id') IS NULL AND i.created_at >= ?)) "
         "AND NOT EXISTS (SELECT 1 FROM task_events s WHERE s.task_id = i.task_id "
-        "AND s.kind = 'spawned' AND s.id > i.id) LIMIT 1",
-        (task_id, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS,
-         pr_comment["id"], pr_comment["created_at"]),
+        "AND s.kind = 'spawned' AND s.id > i.id "
+        # A continuation is consumed by a genuine SUCCESSOR spawn only: the re-routed run's own
+        # late-spawn audit (same run, claim lost) is not one (t_ecfd5591 c9e6038b0137).
+        # Operator intents keep "any later spawn consumes".
+        f"AND NOT (i.kind IN ({cont}) AND (IFNULL(s.run_id = i.run_id, 0) "
+        "OR IFNULL(json_extract(s.payload, '$.claim_lost'), 0) = 1))) LIMIT 1",
+        (task_id, *_RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS, *_RESPAWN_GUARD_CONTINUATION_KINDS,
+         pr_comment["id"], pr_comment["created_at"], *_RESPAWN_GUARD_CONTINUATION_KINDS),
     ).fetchone() is not None
 
 def _reassign_stale_pr_owners(
@@ -20469,6 +20708,21 @@ def explain_complete_refusal(
         )
     if not _parents_satisfied(conn, task_id):
         return "a parent task is not done"
+    # The PR acceptance gate refuses by recording a receipt as the card's newest event;
+    # name it instead of guessing at a race (t_b5b407c8).
+    last = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last is not None and last["kind"] == "pr_acceptance":
+        try:
+            receipt = json.loads(last["payload"] or "{}")
+        except (TypeError, ValueError):
+            receipt = {}
+        if not receipt.get("ok"):
+            stage = f" at stage '{receipt['stage']}'" if receipt.get("stage") else ""
+            return (f"PR acceptance refused ({receipt.get('classification', 'unknown')}{stage}): "
+                    f"{receipt.get('detail') or ''} {receipt.get('recovery') or ''}").strip()
     return f"refused while status is {task.status!r} (state changed concurrently?)"
 
 

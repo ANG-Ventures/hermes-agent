@@ -1083,6 +1083,12 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         except Exception:
             logger.debug("browser backend notice failed", exc_info=True)
 
+    def start_preloaded_skills(self) -> None:
+        """Start the background --skills preload if it was built and not yet started (idempotent)."""
+        thread = getattr(self, "_preload_skills_thread", None)
+        if thread is not None and thread.ident is None:
+            thread.start()
+
     def finalize_preloaded_skills(self) -> None:
         """Join the background --skills preload and fold it into the prompt (idempotent).
 
@@ -1094,6 +1100,7 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         if thread is None:
             self._preload_skills_finalized = True
             return
+        self.start_preloaded_skills()
         thread.join(timeout=120)
         self._preload_skills_finalized = True
         err = getattr(self, "_preload_skills_error", None)
@@ -1809,7 +1816,10 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
 
         cli._preload_skills_requested = [*auto_load_names, *(s for s in parsed_skills if s not in auto_load_names)]
         cli._preload_skills_thread = threading.Thread(target=_load_preloaded_skills, name="skills-preload", daemon=True)
-        cli._preload_skills_thread.start()
+        # A kanban worker renders skills (template vars, inline shell) only after its Layer 0
+        # placement gate passed (t_ecfd5591): cli_single_query starts it, finalize is the backstop.
+        if not os.environ.get("HERMES_KANBAN_TASK"):
+            cli.start_preloaded_skills()
     return cli
 
 

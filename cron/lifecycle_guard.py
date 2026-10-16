@@ -182,6 +182,18 @@ _ERE_WILDCARD_ONLY = re.compile(r"^[.*+?$\s]*$")
 _NAME_KILLERS = frozenset({"pkill", "killall", "taskkill", "stop-process"})
 _NAME_ENUMERATORS = frozenset({"pgrep", "pidof", "get-process"})
 _KILL_VERB_RE = re.compile(r"(?i)\b(?:kill|taskkill|stop-process)\b")
+# ssh options that send the connection somewhere a text guard cannot resolve (or run a LOCAL
+# command): such an ssh is never treated as remote.
+_SSH_DEST_REDIRECT_FLAGS = frozenset("FJW")
+_SSH_DEST_REDIRECT_KEYS = frozenset({"hostname", "proxycommand", "proxyjump", "localcommand", "permitlocalcommand",
+                                     "knownhostscommand"})
+# `-o` keys whose value is a command ssh runs on THIS host (ssh_config(5)), whatever the destination.
+_SSH_LOCAL_COMMAND_KEYS = frozenset({"proxycommand", "localcommand", "knownhostscommand"})
+_SSH_CONFIG_OPTION_RE = re.compile(r"^\s*([A-Za-z]+)\s*(?:=\s*|\s+)(.*)$", re.S)
+# ssh(1) single-letter options that take a value (the rest of the word, or the next word).
+_SSH_VALUED_FLAGS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+# Nested substitutions / ssh wrappers deeper than this fail closed rather than recurse further.
+_MAX_BRANCH_E_DEPTH = 8
 # A `-f` pattern that does not start with the interpreter reaches the gateway cmdline
 # (`python -m hermes_cli.main gateway run` / `hermes gateway run`) only through its own tokens;
 # an unrelated script that merely contains "hermes" (`hermes-polis/run.sh`, `my_hermes_bot.py`)
@@ -294,19 +306,169 @@ def contains_host_interpreter_kill(text: str) -> bool:
     name-derived PID feed into one (`pgrep python | xargs kill`, `kill $(pidof python3)`,
     `Get-Process python | Stop-Process`). Segment-tokenized, so quoted/spliced spellings and Python
     argv lists resolve the same way the shell resolves them."""
+    # Judge the TARGET host (t_75fdedd4): a killer inside an ssh remote command runs under the
+    # remote sshd and cannot reach this gateway's interpreter, the same exemption Branches A-D
+    # take. Tokenizing whole lines first made the remote body one segment, so a later `python3` in
+    # it read as a `pkill -f` operand (2026-10-12 04:33, `ssh ci 'pkill -f "18765"; ... python3
+    # -c ...'`). Remoteness is decided on the SAME posix-shlex segments the scan below uses, so
+    # escapes, comments and spliced spellings (`it\'s`, `# don't`, `pk''ill`) resolve exactly as
+    # the shell resolves them (Prism 54ec70a8227c, 8c997d448d77, 88d6dcb1882e): a segment whose
+    # command word is ssh to a non-loopback host carries its remote command as ONE argument, and
+    # is skipped; every other segment gets the full scan.
+    #
+    # Words the tokenizer keeps whole still execute LOCALLY (t_6b04e90d): a `$( )`/backtick body
+    # outside single quotes (`echo "$(pkill python3)"`, `ssh ci "… $(pkill python3)"`), an ssh
+    # ProxyCommand/LocalCommand value, and the remote command of an ssh that is NOT exempt
+    # (loopback, `-F`/`-J`/`-W`, HostName/ProxyJump redirect). Each is re-scanned as shell source.
+    return _contains_host_interpreter_kill(text, depth=0, kill_context=False)
+
+
+def _contains_host_interpreter_kill(text: str, *, depth: int, kill_context: bool) -> bool:
+    if depth > _MAX_BRANCH_E_DEPTH:
+        return True
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    kill_verb_present = bool(_KILL_VERB_RE.search(normalized))
+    kill_verb_present = kill_context or bool(_KILL_VERB_RE.search(normalized))
+
+    def rescan(source: str) -> bool:
+        return _contains_host_interpreter_kill(source, depth=depth + 1, kill_context=kill_verb_present)
+
+    if any(rescan(body) for body in _local_substitution_bodies(normalized)):
+        return True
     for segment in _iter_command_segments(normalized):
+        ssh = _ssh_invocation(segment)
+        if ssh is not None:
+            local_commands, remote_words, exempt = ssh
+            if any(rescan(command) for command in local_commands):
+                return True
+            if exempt:
+                continue
+            if remote_words and rescan(" ".join(remote_words)):
+                return True
         joined = " ".join(segment)
         stripped = _ARGV_LIST_PUNCTUATION.sub(" ", joined)
-        # Python argv lists (`subprocess.run(["taskkill", "/IM", "python.exe"])`) re-split only when
-        # list punctuation was present, so a quoted `-f 'python my_script.py'` stays one operand.
         for tokens in ([segment, stripped.split()] if stripped != joined else [segment]):
             if _segment_names_host_interpreter(tokens, _NAME_KILLERS):
                 return True
             if kill_verb_present and _segment_names_host_interpreter(tokens, _NAME_ENUMERATORS):
                 return True
     return False
+
+
+def _ssh_invocation(segment: list[str]) -> Optional[tuple[list[str], list[str], bool]]:
+    """For a tokenized segment whose executed command is ssh/autossh: (commands ssh runs LOCALLY
+    from `-o ProxyCommand=…`/`LocalCommand=…`, the remote-command words, exempt). *exempt* means
+    `ssh <non-loopback host> '<one remote command>'` with no option that redirects the connection
+    (`-F`/`-J`/`-W`, HostName/ProxyJump/…): only then does the remote command run somewhere other
+    than this host. Options are parsed the way ssh(1) parses them, so bundled short flags
+    (`-voProxyCommand=…`, `-vF cfg`) and attached values are read, not skipped. The remote command
+    itself (it may well mention 127.0.0.1, as the 2026-10-12 replay does) is not part of the target.
+    None when the segment is not an ssh invocation."""
+    index = _executed_command_index(segment)
+    if index is None:
+        return None
+    name = _executable_name(segment[index]).lower()
+    if name not in ("ssh", "autossh"):
+        return None
+    valued = _SSH_VALUED_FLAGS | {"M"} if name == "autossh" else _SSH_VALUED_FLAGS
+    local_commands: list[str] = []
+    redirected = False
+    position = index + 1
+    while position < len(segment) and segment[position].startswith("-") and segment[position] != "-":
+        word = segment[position]
+        position += 1
+        if word == "--":
+            break
+        for offset in range(1, len(word)):
+            flag = word[offset]
+            if flag not in valued:
+                continue
+            value = word[offset + 1:]
+            if not value and position < len(segment):
+                value = segment[position]
+                position += 1
+            redirected = redirected or flag in _SSH_DEST_REDIRECT_FLAGS
+            option = _SSH_CONFIG_OPTION_RE.match(value) if flag == "o" else None
+            if option is not None:
+                key = option.group(1).lower()
+                redirected = redirected or key in _SSH_DEST_REDIRECT_KEYS
+                if key in _SSH_LOCAL_COMMAND_KEYS and option.group(2).strip().lower() != "none":
+                    local_commands.append(option.group(2))
+            break
+    if position >= len(segment):
+        return local_commands, [], False
+    # Exempt only the quoted-remote-command shape: exactly ONE word after the destination. Several
+    # words (`ssh h pkill python3`, or a comment that swallowed a newline: `ssh h up # don't<NL>pkill
+    # python3` tokenizes as one segment) keep the full scan, which is how main judged them.
+    remote_words = [t for t in segment[position + 1:]
+                    if not re.match(r"^\d*(?:[<>]{1,2}|&>{1,2}|>&|<&)$|^\d*[<>].+$|^-$", t)]
+    target = " ".join(segment[index:position + 1])
+    exempt = len(remote_words) == 1 and not redirected and not _LOOPBACK_HOST_RE.search(target)
+    return local_commands, remote_words, exempt
+
+
+def _local_substitution_bodies(text: str) -> list[str]:
+    """Bodies of the `$( … )` and backtick command substitutions the LOCAL shell runs in *text*:
+    outside single quotes (a double-quoted one still executes), not escaped, not in a `#` comment.
+    Top level only; the caller rescans each body, which reaches nested ones."""
+    bodies: list[str] = []
+    in_double = False
+    position = 0
+    while position < len(text):
+        char = text[position]
+        if char == "\\":
+            position += 2
+            continue
+        if char == "'" and not in_double:
+            close = text.find("'", position + 1)
+            position = len(text) if close < 0 else close + 1
+            continue
+        if char == '"':
+            in_double = not in_double
+        elif char == "#" and not in_double and (position == 0 or text[position - 1] in " \t\n;&|("):
+            close = text.find("\n", position)
+            position = len(text) if close < 0 else close
+            continue
+        elif char == "`":
+            close = position + 1
+            while close < len(text) and text[close] != "`":
+                close += 2 if text[close] == "\\" else 1
+            bodies.append(text[position + 1:close])
+            position = close + 1
+            continue
+        elif char == "$" and text.startswith("(", position + 1):
+            close = _substitution_end(text, position + 2)
+            bodies.append(text[position + 2:close])
+            position = close + 1
+            continue
+        position += 1
+    return bodies
+
+
+def _substitution_end(text: str, start: int) -> int:
+    """Index of the `)` closing a `$(` whose body starts at *start* (len(text) when unclosed, so an
+    unbalanced body is scanned to the end rather than dropped)."""
+    depth = 1
+    in_double = False
+    position = start
+    while position < len(text):
+        char = text[position]
+        if char == "\\":
+            position += 2
+            continue
+        if char == "'" and not in_double:
+            close = text.find("'", position + 1)
+            position = len(text) if close < 0 else close + 1
+            continue
+        if char == '"':
+            in_double = not in_double
+        elif not in_double and char == "(":
+            depth += 1
+        elif not in_double and char == ")":
+            depth -= 1
+            if depth == 0:
+                return position
+        position += 1
+    return len(text)
 
 
 _SSH_COMMAND_RE = re.compile(r"(?i)(?:^|\s)(?:/\S*/)?(?:ssh|autossh)\s")
@@ -468,8 +630,8 @@ def _match_is_quoted_data(text: str, match_start: int, match_str: str) -> bool:
     _line_start = text.rfind("\n", 0, match_start) + 1
     _line_end = text.find("\n", match_start)
     _line = text[_line_start:] if _line_end == -1 else text[_line_start:_line_end]
-    if _PIPE_TO_INTERPRETER.search(_line):
-        return False
+    if _PIPE_TO_INTERPRETER.search(_line) or _feeds_executor(text[_line_start:]):
+        return False   # `| env bash`, `| sudo -u x sh`, a `|` continued on the next line (7bdfbaaa)
 
     # Condition 1: a single/double quote region is OPEN at the match, and it
     # closes somewhere in the suffix (data is bounded, not a trailing dangle).
@@ -1045,6 +1207,50 @@ def _shell_option_noexec(name: str, enable: bool, noexec: bool) -> bool:
     if folded == "exec":
         return False if enable else noexec
     return noexec
+def _shell_noexec_state(arguments: list[str]) -> tuple[bool, int, bool]:
+    """Effective noexec state of a shell's leading options: ``(noexec, operand_index, saw_c)``.
+
+    The ONE option parser for `bash -n` decisions (the referenced-script walk and the
+    write-then-run check both use it), so `+o noexec`, `-n +n`, `-xo errexit` and zsh's
+    `--exec` re-enable execution everywhere alike (Prism 1fc8d7bd on #1917, t_9c269c34).
+    ``saw_c`` is True when a `-c` cluster ended the scan.
+    """
+    arg_index = 0
+    # Track the EFFECTIVE noexec state: the shell applies options left to right, so
+    # `-n +o noexec`, `-n +n` and `-o noexec +o noexec` re-enable execution. In a short
+    # cluster (`-xo`, `+eo`) `-` sets and `+` clears each letter, and every `o`/`O`
+    # letter consumes the next argument as its value (`-xo errexit script`). zsh also
+    # takes `--name` for `-o name` and the inverted `exec` name (`-n -o exec`).
+    noexec = False
+    while arg_index < len(arguments):
+        argument = arguments[arg_index]
+        if argument in {"--", "-", "+"}:
+            arg_index += 1
+            break
+        if argument == "--command":
+            return noexec, arg_index, True
+        if argument.startswith("--"):
+            noexec = _shell_option_noexec(argument[2:], True, noexec)
+            arg_index += 2 if argument in _SHELL_LONG_OPTIONS_WITH_VALUES else 1
+            continue
+        if len(argument) < 2 or argument[0] not in "-+":
+            break
+        letters = argument[1:]
+        if argument[0] == "-" and "c" in letters:
+            return noexec, arg_index, True   # the -c payload is scanned by the sh -c path
+        enable = argument[0] == "-"
+        arg_index += 1
+        for letter in letters:
+            if letter == "n":
+                noexec = enable
+            elif letter in "oO":
+                value = arguments[arg_index] if arg_index < len(arguments) else ""
+                arg_index += 1
+                if letter == "o":
+                    noexec = _shell_option_noexec(value, enable, noexec)
+    return noexec, arg_index, False
+
+
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
@@ -1802,6 +2008,8 @@ def _mask_data_sink_arguments(text: str) -> str:
     plain regex would have blocked — never block one it would have allowed —
     so it runs solely as a second-pass exemption check.
     """
+    if _feeds_executor(text):
+        return text
     lines_out: list[str] = []
     changed = False
     for line in text.splitlines() or [text]:
@@ -1879,12 +2087,20 @@ _LINE_FEEDS_EXECUTOR_RE = re.compile(
 
 
 def _unquoted_view(text: str) -> str:
-    """*text* with the inside of every quoted span blanked (same length, quotes kept)."""
+    """*text* with the inside of every quoted span and every comment blanked (same length, quotes
+    kept). A comment is not shell text: its apostrophe (`# it's`) must not open a quote over the
+    commands after it (Prism 707a77ad on #1954)."""
     out: list[str] = []
     q = None
     i = 0
     while i < len(text):
         c = text[i]
+        if not q and c == "#" and (i == 0 or text[i - 1] in " \t\n;&|()"):
+            end = text.find("\n", i)
+            end = len(text) if end == -1 else end
+            out.append(" " * (end - i))
+            i = end
+            continue
         if q:
             if c == q:
                 q = None
@@ -1912,7 +2128,7 @@ def _unquoted_view(text: str) -> str:
 # `>`, `>>`, `1>`, `&>`, `>|` are all file writes; `>&2` / `2>&1` / `> /dev/null` are not.
 _WRITES_OR_STORES_RE = re.compile(
     r"(?<![<])(?:(?<![&\d])|(?<=\s[1&])|(?<=^[1&]))>(?![(&])\|?(?!\s*/dev/null\b)|\btee\b|"
-    r"\bprintf\s+(?:-\S+\s+)*-v\b|\bread\s"
+    r"\bprintf\s+(?:-\S+\s+)*-v|\bread\s"   # `-v NAME` and attached `-vNAME` (Prism ee373214)
 )
 # Command words that only READ or LINT what they are given: a write followed by one of these is
 # not a write-then-run. Anything else at command position after a write (a shell, `source`, an
@@ -1927,21 +2143,402 @@ _INERT_AFTER_WRITE = frozenset({
 
 
 def _drop_heredoc_bodies(text: str) -> str:
-    """*text* without heredoc body lines (every heredoc, inert or not): for the segment scan only."""
+    """*text* without heredoc body lines (every heredoc, inert or not): for the segment scan only.
+    Only a `<<` the lexer reads as an opener counts: `(( n = 1 << x ))` is a shift, and taking it
+    as an opener dropped every later line, a write-then-run included (Prism c1ca725b on #1954)."""
+    openers = _heredoc_openers(text) if "<<" in text else {}
     out: list[str] = []
     pending: list[str] = []
+    line_start = 0
     for line in text.split("\n"):
+        start, line_start = line_start, line_start + len(line) + 1
         if pending:
             if line.strip() == pending[0]:
                 pending.pop(0)
             continue
         out.append(line)
-        view = _unquoted_view(line)
-        for at in (m.start() for m in re.finditer(r"<<(?!<)", view)):
-            raw = _HEREDOC_OPEN_RE.match(line, at)
-            if raw is not None:
+        for raw in _HEREDOC_OPEN_RE.finditer(line):
+            if start + raw.start() in openers:
                 pending.append(_heredoc_delimiter(raw))
     return "\n".join(out)
+
+
+# Stage heads that execute what is piped (or heredoc'd) into them. Wrappers (`env`, `sudo -u x`,
+# `nohup`, `timeout 5`, `exec`, `command`) are peeled first, so `| env bash` is `| bash`
+# (Prism 7bdfbaaa on #1917, t_9c269c34: the three pipe regexes only knew `| [sudo ]<shell>`).
+_STAGE_EXECUTORS = frozenset({"source", "."})
+
+# ONE shell lexer behind every pipe / group / compound / heredoc-receiver rule. Four review rounds
+# on agent#1954 each found a shape a hand-rolled text splitter lost: `2>&1` read as a control `&`,
+# `fi` as an ARGUMENT closing an `if`, an apostrophe in a comment opening a quote, `# }` closing a
+# group (Apollo r3, t_9c269c34). Tokens: ("word", value with quotes removed), ("op", control
+# operator or "\n"), ("redir", redirection operator with its fd prefix; its target is the next
+# word). Comments are dropped; heredoc bodies are skipped at the newline ending their opener.
+_LEX_CONTROL_OPS = (";;&", "&&", "||", "|&", ";;", ";&", ";", "&", "|", "(", ")")
+_LEX_REDIRECT_OPS = ("&>>", "<<<", "<<-", "<<", "<>", "<&", ">>", ">&", ">|", "&>", "<", ">")
+_LEX_WORD_BREAK = frozenset(" \t\r\n;&|()<>")
+_LEX_FD_PREFIX_RE = re.compile(r"\d+(?=[<>])")
+_LEX_CASE_ARM_OPS = frozenset({";;", ";&", ";;&"})
+_LEX_COMPOUND_OPENERS = frozenset({"if", "while", "until", "for", "select", "case", "{"})
+_LEX_COMPOUND_CLOSERS = frozenset({"fi", "done", "esac", "}"})
+_LEX_LEAD_WORDS = frozenset({"then", "do", "else", "elif", "!", "time"})
+
+
+def _skip_balanced(text: str, i: int, opener: str = "(", closer: str = ")") -> int:
+    """Index just past the *closer* matching the *opener* at *text*[i], quotes respected;
+    len(text) if none."""
+    depth, quote = 0, None
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == quote:
+                quote = None
+            elif c == "\\" and quote == '"':
+                i += 1
+        elif c in _OPENING_QUOTES:
+            quote = c
+        elif c == "\\":
+            i += 1
+        elif c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(text)
+
+
+def _lex_word(text: str, i: int) -> tuple[str, int]:
+    """The shell word starting at *text*[i] with its quoting removed, and the index after it."""
+    n, buf = len(text), []
+    while i < n and text[i] not in _LEX_WORD_BREAK:
+        c = text[i]
+        if c == "\\":
+            if i + 1 < n and text[i + 1] != "\n":
+                buf.append(text[i + 1])
+            i += 2
+        elif c == "'":
+            end = text.find("'", i + 1)
+            end = n if end == -1 else end
+            buf.append(text[i + 1:end])
+            i = end + 1
+        elif c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\" and i + 1 < n:
+                    buf.append(text[i + 1])
+                    i += 2
+                elif text.startswith("$(", i):
+                    end = _skip_balanced(text, i + 1)
+                    buf.append(text[i:end])
+                    i = end
+                else:
+                    buf.append(text[i])
+                    i += 1
+            i += 1
+        elif text.startswith("$(", i):
+            end = _skip_balanced(text, i + 1)
+            buf.append(text[i:end])
+            i = end
+        elif text.startswith("$[", i):   # legacy arithmetic: `$[1<<2]` is a shift, not a heredoc
+            end = _skip_balanced(text, i + 1, "[", "]")
+            buf.append(text[i:end])
+            i = end
+        elif c == "`":
+            end = text.find("`", i + 1)
+            end = n if end == -1 else end
+            buf.append(text[i:end + 1])
+            i = end + 1
+        else:
+            buf.append(c)
+            i += 1
+    return "".join(buf), i
+
+
+def _arithmetic_command_end(text: str, i: int) -> Optional[int]:
+    """Index just past the `))` when *text*[i] opens an arithmetic command `(( … ))`, else None.
+    Bash's own rule: after `((`, the `)` that balances the second `(` must be followed at once by
+    `)`; `((cat <<EOF) )` and `((a)+(b))` are nested subshells, not arithmetic."""
+    if not text.startswith("((", i):
+        return None
+    end = _skip_balanced(text, i + 1)
+    return end + 1 if text.startswith(")", end) else None
+
+
+def _lex_shell(text: str, heredocs: Optional[list[tuple[int, int]]] = None) -> list[tuple[str, str]]:
+    """*text* as shell tokens (see `_LEX_CONTROL_OPS`). When *heredocs* is given, every REAL
+    heredoc opener is appended to it as (offset of its `<<`, index of its redir token): a `<<`
+    inside quotes, a comment, a heredoc body or arithmetic is not one (Prism 91a25b0a, c1ca725b)."""
+    tokens: list[tuple[str, str]] = []
+    pending: list[tuple[str, bool]] = []   # heredoc (delimiter, strip tabs) awaiting a body
+    heredoc_op: Optional[str] = None
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r":
+            i += 1
+        elif c == "\\" and text.startswith("\n", i + 1):
+            i += 2
+        elif c == "#":
+            end = text.find("\n", i)
+            i = n if end == -1 else end
+        elif c == "\n":
+            tokens.append(("op", "\n"))
+            i += 1
+            for delimiter, strip_tabs in pending:
+                while i < n:
+                    end = text.find("\n", i)
+                    line = text[i:] if end == -1 else text[i:end]
+                    i = n if end == -1 else end + 1
+                    if (line.lstrip("\t") if strip_tabs else line).strip() == delimiter:
+                        break
+            pending.clear()
+        elif text.startswith(("<(", ">("), i):
+            end = _skip_balanced(text, i + 1)
+            tokens.append(("word", text[i:end]))
+            i = end
+        elif text.startswith("((", i) and (arith_end := _arithmetic_command_end(text, i)) is not None:
+            # `(( y = 1 << 2 ))` is arithmetic, one word: its `<<` is a shift, not a heredoc
+            # opener that would swallow every later line (Prism 91a25b0a on #1954).
+            tokens.append(("word", text[i:arith_end]))
+            i = arith_end
+        else:
+            fd = _LEX_FD_PREFIX_RE.match(text, i)
+            at = fd.end() if fd else i
+            redirect = next((o for o in _LEX_REDIRECT_OPS if text.startswith(o, at)), None)
+            control = None if redirect else next((o for o in _LEX_CONTROL_OPS if text.startswith(o, i)), None)
+            if redirect is not None:
+                heredoc_op = redirect if redirect in ("<<", "<<-") else None
+                if heredoc_op is not None and heredocs is not None:
+                    heredocs.append((at, len(tokens)))
+                tokens.append(("redir", text[i:at] + redirect))
+                i = at + len(redirect)
+            elif control is not None:
+                tokens.append(("op", control))
+                i += len(control)
+            else:
+                word, i = _lex_word(text, i)
+                if heredoc_op is not None:
+                    pending.append((word, heredoc_op == "<<-"))
+                    heredoc_op = None
+                tokens.append(("word", word))
+    return tokens
+
+
+def _function_definition_body(tokens: list[tuple[str, str]], i: int) -> Optional[int]:
+    """Index of the body when *tokens*[i] (at command position) starts a function definition:
+    `name()`, `function name`, `function name()`; None otherwise."""
+    if tokens[i][0] != "word":
+        return None
+    if tokens[i][1] == "function" and i + 1 < len(tokens) and tokens[i + 1][0] == "word":
+        j = i + 2
+        if tokens[j:j + 2] == [("op", "("), ("op", ")")]:
+            j += 2
+    elif tokens[i + 1:i + 3] == [("op", "("), ("op", ")")]:
+        j = i + 3
+    else:
+        return None
+    while j < len(tokens) and tokens[j] == ("op", "\n"):
+        j += 1
+    return j
+
+
+def _shell_functions(tokens: list[tuple[str, str]]) -> dict[str, list[list[str]]]:
+    """Every function defined anywhere in *tokens*: name -> the simple commands of its body. Two
+    definitions of one name are merged; the guard cannot tell which one a call reaches."""
+    functions: dict[str, list[list[str]]] = {}
+    for k, (kind, value) in enumerate(tokens):
+        at_command = k == 0 or tokens[k - 1][0] == "op" or tokens[k - 1][1] in _LEX_LEAD_WORDS
+        body = _function_definition_body(tokens, k) if at_command else None
+        if body is not None:
+            name = tokens[k + 1][1] if value == "function" else value
+            functions.setdefault(name, []).extend(_element_span(tokens, body)[0])
+    return functions
+
+
+def _element_commands(tokens: list[tuple[str, str]], start: int) -> list[list[str]]:
+    return _element_span(tokens, start)[0]
+
+
+def _element_span(tokens: list[tuple[str, str]], start: int) -> tuple[list[list[str]], int]:
+    """Every simple command (words, redirections dropped) of the pipeline element that starts at
+    *tokens*[start], and the index of the token that ends it (the unconsumed control operator, or
+    len(tokens)). An element is one simple command, or a whole `( … )`, `{ …; }`, if / while /
+    until / for / select / case compound with every command in its body, trailing redirections
+    included (Prism 7f7a1d3f, b74a2fa3). Reserved words count only at command position, so
+    `| if true; then echo fi; bash; fi` keeps `bash` inside the `if` (Prism 3a48713a on #1954). A
+    function definition's body is walked as part of the element: `| { f() { bash; }; f; }` runs
+    the pipe through bash (Prism e7cf8c08 on #1954)."""
+    commands: list[list[str]] = []
+    words: list[str] = []
+    stack: list[str] = []
+    command_position, header, pattern, closed = True, False, False, False
+    i = start
+    while i < len(tokens):
+        kind, value = tokens[i]
+        if closed and kind != "redir":   # a closed compound takes only trailing redirections
+            return commands, i
+        i += 1
+        if pattern:   # a case arm's pattern list, up to its `)`; `esac` closes the case
+            if kind == "op" and value == ")":
+                pattern, command_position = False, True
+            elif kind == "word" and value == "esac":
+                pattern = False
+                stack.pop()
+                closed = not stack
+                command_position = False
+            continue
+        if kind == "redir":
+            i += 1   # skip its target word
+            continue
+        if kind == "op":
+            if words:
+                commands.append(words)
+                words = []
+            if value == "(":
+                stack.append("(")
+            elif value == ")":
+                if not stack or stack[-1] != "(":
+                    return commands, i - 1
+                stack.pop()
+                closed = not stack
+                command_position = False
+                continue
+            elif value in _LEX_CASE_ARM_OPS:
+                pattern = bool(stack) and stack[-1] == "case"
+            elif not stack:
+                return commands, i - 1
+            header, command_position = False, True
+            continue
+        if header:   # `for x in a b`, `case x in`: the words are not commands
+            if value == "in" and stack[-1] == "case":
+                header, pattern = False, True
+            continue
+        if command_position:
+            body = _function_definition_body(tokens, i - 1)
+            if body is not None:
+                i = body   # the body (a compound) follows, at command position
+                continue
+            if value in _LEX_COMPOUND_OPENERS:
+                stack.append(value)
+                header = value in ("for", "select", "case")
+                continue
+            if value in _LEX_COMPOUND_CLOSERS:
+                if stack:
+                    stack.pop()
+                closed = not stack
+                command_position = False
+                continue
+            if value in _LEX_LEAD_WORDS:
+                continue
+        words.append(value)
+        command_position = False
+    if words:
+        commands.append(words)
+    return commands, i
+
+
+def _commands_execute(commands: list[list[str]], functions: dict[str, list[list[str]]]) -> bool:
+    """Some command in *commands* runs its stdin: directly, or as a call to a function defined in
+    the same text whose body does (`f() { bash; }; echo … | f`, Prism e7cf8c08 on #1954)."""
+    pending, seen = list(commands), set()
+    while pending:
+        words = pending.pop()
+        if _words_execute(words):
+            return True
+        index = _command_token_index(words)
+        name = words[index] if index is not None else None
+        if name in functions and name not in seen:
+            seen.add(name)
+            pending.extend(functions[name])
+    return False
+
+
+def _words_execute(words: list[str]) -> bool:
+    """The simple command *words* runs its stdin (a shell, an interpreter, `source`, `xargs`)."""
+    index = _command_token_index(words)
+    if index is None:
+        return False
+    index = _peel_transparent_prefixes(words, index)
+    if index >= len(words):
+        return _executable_name(words[-1]) in _TRANSPARENT_COMMAND_PREFIXES  # `| sudo` alone
+    name = _executable_name(words[index]).lower()
+    return bool(name in _ARGUMENT_REPARSERS or name in _STAGE_EXECUTORS or _REPARSER_NAME_RE.match(name))
+
+
+def _feeds_executor(text: str) -> bool:
+    """Some pipe in *text* hands its stream to an executor: a bare stage, a stage behind
+    redirections (`| 2>&1 bash`, Prism 974f0b3f), or any command inside a grouped or compound
+    stage. A pipe continues across newlines and comments (Prism 31197de5, 707a77ad)."""
+    tokens = _lex_shell(text)
+    functions = _shell_functions(tokens)
+    for k, (kind, value) in enumerate(tokens):
+        if kind != "op" or value not in ("|", "|&"):
+            continue
+        j = k + 1
+        while j < len(tokens) and tokens[j] == ("op", "\n"):
+            j += 1
+        if _commands_execute(_element_commands(tokens, j), functions):
+            return True
+    return False
+
+
+def _ends_in_pipe(line: str) -> bool:
+    tokens = _lex_shell(line)
+    return bool(tokens) and tokens[-1][0] == "op" and tokens[-1][1] in ("|", "|&")
+
+
+def _heredoc_receiver_executes(tokens: list[tuple[str, str]], redir: int) -> bool:
+    """The command receiving the heredoc whose `<<` is *tokens*[redir] is a SHELL-like executor
+    (`env bash <<EOF`, `sudo -u x sh <<EOF`, `bash 2>&1 <<EOF`, `<<EOF bash`). A Python body is
+    not shell text: it is scanned by the AST path in `_contains_unsafe_gateway_action`, so python
+    receivers are left to it."""
+    # The receiver is the WHOLE element owning the `<<`, words AFTER the redirection included:
+    # `<<'EOF' bash` runs bash (Prism 22612976 P0 on #1954), and `(bash; :) <<EOF` feeds the group,
+    # whose first command reads the body (Prism af4c69a0), not just the `:` after the `;`.
+    start, commands = 0, []
+    while start < len(tokens):
+        commands, end = _element_span(tokens, start)
+        if end > redir or end >= len(tokens):
+            break
+        start, commands = end + 1, []
+    if len(commands) == 1:
+        index = _executed_command_index(commands[0])
+        if index is not None and re.match(r"^pythonw?[\d.]*$", _executable_name(commands[0][index]).lower()):
+            return False
+    return _commands_execute(commands, _shell_functions(tokens))
+
+
+def _heredoc_openers(text: str) -> dict[int, tuple[list[tuple[str, str]], int]]:
+    """Every REAL heredoc opener in *text*: offset of its `<<` -> (the token list it was lexed in,
+    index of its redir token). A `$( … )` body is lexed on its own, so the receiver of
+    `git commit -m "$(cat <<'EOF' … )"` is `cat` inside the substitution."""
+    openers: dict[int, tuple[list[tuple[str, str]], int]] = {}
+    _collect_heredoc_openers(text, 0, openers)
+    return openers
+
+
+def _collect_heredoc_openers(text: str, base: int, openers: dict) -> None:
+    found: list[tuple[int, int]] = []
+    tokens = _lex_shell(text, found)
+    for at, index in found:
+        openers[base + at] = (tokens, index)
+    i, in_double = 0, False
+    while i < len(text):
+        c = text[i]
+        if c == "'" and not in_double:
+            end = text.find("'", i + 1)
+            i = len(text) if end == -1 else end + 1
+            continue
+        if c == '"':
+            in_double = not in_double
+        elif text.startswith("$(", i) and not text.startswith("$((", i):
+            end = _skip_balanced(text, i + 1)
+            _collect_heredoc_openers(text[i + 2:max(end - 1, i + 2)], base + i + 2, openers)
+            i = end
+            continue
+        i += 2 if c == "\\" else 1
 
 
 def _writes_then_runs(text: str) -> bool:
@@ -1973,29 +2570,16 @@ def _writes_then_runs(text: str) -> bool:
             if name == "awk" and any("system(" in t for t in rest):
                 return True
             continue
-        if name in _SHELL_EXECUTABLES and _is_noexec_shell_segment(segment[index:]):
-            continue
+        if name in _SHELL_EXECUTABLES:
+            noexec, _, saw_c = _shell_noexec_state(segment[index + 1:])
+            if noexec and not saw_c:
+                continue
         return True
     return False
 
 
-def _is_noexec_shell_segment(argv: list[str]) -> bool:
-    """`bash -n x.sh`: parses without executing."""
-    noexec = False
-    for w in argv[1:]:
-        if w.startswith("--"):
-            continue
-        if w.startswith("+") and len(w) > 1:
-            if "n" in w[1:]:
-                noexec = False
-            continue
-        if not w.startswith("-"):
-            break
-        if "c" in w[1:]:
-            return False
-        if "n" in w[1:]:
-            noexec = True
-    return noexec
+
+
 _PROGRAM_VALUE_OPTION_RE = re.compile(
     r"(?:^|\s)(?:\+!|-c\b|-e\b|-x\b|-o\s|--to-command|--checkpoint-action|--exec\b|-exec\b|-execdir\b|"
     r"--pre\b|--pager\b|--compress-program|-I\s|-O\b|--ext-diff|--textconv|--filter\b|-S\b|--split-string)"
@@ -2029,7 +2613,44 @@ def _segment_command_reparses(prefix: str) -> Optional[bool]:
             return True
         if token in _REPARSER_OPTION_TOKENS:
             return True
-    return False
+    return not _is_content_argument_command(tokens)
+
+
+# Commands whose quoted multi-word argument is CONTENT handed over as one argv element and never
+# run, stored, matched against processes or deferred: the ONLY segments the quoted-argument view
+# may mask. An allowlist, not a denylist: #1917 masked everything not on `_ARGUMENT_REPARSERS`, and
+# every executor or store missing from that list became a bypass (gdb -ex, pkill -f, trap, for ..
+# in, export/declare/set --, shell functions, git config alias, Prism on #1917, t_9c269c34).
+# An unknown command keeps its quoted text visible, exactly as before #1917.
+_CONTENT_ARGUMENT_COMMANDS = frozenset({
+    "echo", "printf", "grep", "egrep", "fgrep", "rg", "ag", "ack", "jq", "journalctl",
+    "sqlite3", "psql",
+})
+# Multi-word commands: only these subcommands take content (`hermes kanban comment --body`,
+# `git commit -m`, `gh pr create --body`). `git config`, `gh alias set` and the rest store a
+# value something else later runs.
+_CONTENT_ARGUMENT_SUBCOMMANDS = {
+    "hermes": frozenset({"kanban"}),
+    # `git grep -O<cmd>` / `--open-files-in-pager` (any unique abbreviation) runs a program and
+    # `git log|show --output=` writes a file: not content consumers (Prism 22612976 P0 on #1954).
+    "git": frozenset({"commit", "tag", "notes"}),
+    "gh": frozenset({"pr", "issue", "release", "api"}),
+}
+
+
+def _is_content_argument_command(tokens: list[str]) -> bool:
+    if not tokens or "/" in tokens[0]:
+        return False
+    name = tokens[0].lower()
+    if name in _CONTENT_ARGUMENT_COMMANDS:
+        # `printf -v NAME '…'` / `printf -vNAME '…'` store the value; `_WRITES_OR_STORES_RE`
+        # also refuses both (Prism ee373214: the attached form was masked as content).
+        return not (name == "printf" and any(t.startswith("-v") for t in tokens[1:]))
+    subcommands = _CONTENT_ARGUMENT_SUBCOMMANDS.get(name)
+    if subcommands is None:
+        return False
+    rest = [t for t in tokens[1:] if not t.startswith("-")]
+    return bool(rest) and rest[0] in subcommands
 
 
 def _mask_quoted_argument_data(text: str) -> str:
@@ -2054,6 +2675,8 @@ def _mask_quoted_argument_data(text: str) -> str:
     # Any option that hands its value to a program (`vim '+!cmd'`, `git -c alias.x='!cmd'`,
     # `tar --to-command=`, `rsync -e`, `find -exec`): keep the text whole.
     if _PROGRAM_VALUE_OPTION_RE.search(_unquoted_view(text)):
+        return text
+    if _feeds_executor(text):
         return text
     out: list[str] = []
     i, n = 0, len(text)
@@ -2160,15 +2783,24 @@ def _mask_heredoc_bodies(text: str) -> str:
     """
     if "<<" not in text:
         return text
+    # Only a `<<` the lexer reads as a heredoc opener starts a body: not one in arithmetic
+    # (`(( n = 1 << EOF ))`, `$[1<<EOF]`), quotes or a comment (Prism 91a25b0a, c1ca725b on #1954).
+    openers = _heredoc_openers(text)
     lines = text.splitlines()
+    starts, offset = [], 0
+    for raw in lines:
+        starts.append(offset)
+        offset += len(raw) + 1
     out: list[str] = []
     changed = False
     i = 0
     while i < len(lines):
         line = lines[i]
+        line_start = starts[i]
         out.append(line)
         i += 1
-        match = _HEREDOC_OPEN_RE.search(line)
+        match = next((m for m in _HEREDOC_OPEN_RE.finditer(line)
+                      if line_start + m.start() in openers), None)
         if not match:
             continue
         quoted = bool(match.group("q1") or match.group("q2"))
@@ -2184,9 +2816,14 @@ def _mask_heredoc_bodies(text: str) -> str:
             end += 1
         terminator = lines[end] if end < len(lines) else None
 
-        # Fail-closed conditions: the body may actually be executed.
-        feeds_interpreter = bool(_HEREDOC_TO_INTERPRETER.search(line))
-        piped_to_interpreter = bool(_PIPE_TO_INTERPRETER.search(line))
+        # Fail-closed conditions: the body may actually be executed. The receiver is the whole
+        # element owning the `<<`, read from the lexed text so functions defined earlier count.
+        feeds_interpreter = bool(_HEREDOC_TO_INTERPRETER.search(line)) or _heredoc_receiver_executes(
+            *openers[line_start + match.start()])
+        # A `|` after the opener continues the pipeline on the line AFTER the terminator
+        # (`cat <<'EOF' |` … `EOF` / `bash`, Prism a3c0cfc0 on #1954): judge the whole rest.
+        pipeline = "\n".join(lines[i - 1:]) if _ends_in_pipe(line) else line
+        piped_to_interpreter = bool(_PIPE_TO_INTERPRETER.search(line)) or _feeds_executor(pipeline)
         expands = (not quoted) and any(
             marker in "\n".join(body) for marker in ("$(", "`")
         )
@@ -2346,39 +2983,7 @@ def _references_at(
 
     if executable_name in _SHELL_EXECUTABLES:
         arguments = segment[index + 1 :]
-        arg_index = 0
-        # Track the EFFECTIVE noexec state: the shell applies options left to right, so
-        # `-n +o noexec`, `-n +n` and `-o noexec +o noexec` re-enable execution. In a short
-        # cluster (`-xo`, `+eo`) `-` sets and `+` clears each letter, and every `o`/`O`
-        # letter consumes the next argument as its value (`-xo errexit script`). zsh also
-        # takes `--name` for `-o name` and the inverted `exec` name (`-n -o exec`).
-        noexec = False
-        while arg_index < len(arguments):
-            argument = arguments[arg_index]
-            if argument in {"--", "-", "+"}:
-                arg_index += 1
-                break
-            if argument == "--command":
-                break
-            if argument.startswith("--"):
-                noexec = _shell_option_noexec(argument[2:], True, noexec)
-                arg_index += 2 if argument in _SHELL_LONG_OPTIONS_WITH_VALUES else 1
-                continue
-            if len(argument) < 2 or argument[0] not in "-+":
-                break
-            letters = argument[1:]
-            if argument[0] == "-" and "c" in letters:
-                break   # the -c payload is scanned by the sh -c path; fail closed here
-            enable = argument[0] == "-"
-            arg_index += 1
-            for letter in letters:
-                if letter == "n":
-                    noexec = enable
-                elif letter in "oO":
-                    value = arguments[arg_index] if arg_index < len(arguments) else ""
-                    arg_index += 1
-                    if letter == "o":
-                        noexec = _shell_option_noexec(value, enable, noexec)
+        noexec, arg_index, _ = _shell_noexec_state(arguments)
         if noexec:
             return
         if arg_index < len(arguments) and arguments[arg_index] not in {
@@ -2896,8 +3501,12 @@ def _python_body_is_mask_safe(tree: ast.AST) -> bool:
     return True
 
 
-def _python_written_paths(body: str) -> set[str]:
-    """Literal paths a (mask-safe) python body opens for WRITING; empty when none or unparsable."""
+def _python_written_paths(body: str) -> Optional[set[str]]:
+    """Literal paths a (mask-safe) python body opens for WRITING; empty when none or unparsable.
+
+    ``None`` when a writable ``open`` names its file through anything but a string literal
+    (`p = "/tmp/x.sh"; open(p, "w")`): the destination is unknown, so it may be what the shell
+    runs next (Prism e63acd19 on #1917, t_9c269c34)."""
     try:
         tree = ast.parse(body)
     except SyntaxError:
@@ -2905,11 +3514,38 @@ def _python_written_paths(body: str) -> set[str]:
     out: set[str] = set()
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open"
-                and len(node.args) >= 2 and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str) and isinstance(node.args[1], ast.Constant)
+                and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
                 and node.args[1].value in _MASK_OPEN_WRITE_MODES):
+            if not (isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+                return None
             out.add(node.args[0].value)
     return out
+
+
+# Files a shell reads on its own at startup (`bash -i`, a login shell, zsh): a write to one runs
+# later without its path ever appearing in the command (Prism 52fa2744 on #1917, t_9c269c34).
+_SHELL_STARTUP_FILE_NAMES = frozenset({
+    ".bashrc", ".bash_profile", ".bash_login", ".profile", ".bash_logout", ".zshrc", ".zshenv",
+    ".zprofile", ".zlogin", ".zlogout", ".kshrc", ".shrc", ".envrc",
+})
+
+
+def _python_write_may_run(body: str, shell_only: str) -> bool:
+    """A file the body WRITES may be executed: the shell text names it again, its path is not a
+    literal, it is a shell startup file, or the body itself runs a process (`subprocess.run`
+    after the write, Prism b963b1c8). Then the strings written are not data."""
+    paths = _python_written_paths(body)
+    if paths is None:
+        return True
+    if not paths:
+        return False
+    if re.search(r"\bsubprocess\s*\.\s*run\b", body):
+        return True
+    return any(
+        p in shell_only or Path(p).name in shell_only or Path(p).name in _SHELL_STARTUP_FILE_NAMES
+        or "/etc/profile" in p or "/etc/bash" in p or "/etc/zsh" in p
+        for p in paths
+    )
 
 
 def _mask_python_data_strings(body: str) -> str:
@@ -2921,15 +3557,16 @@ def _mask_python_data_strings(body: str) -> str:
     the one allowlisted execution path and stays visible to the lifecycle scan. Anything the
     allowlist refuses keeps the whole body visible (fail closed).
     """
-    if not body.isascii():
-        return body
+    # AST columns are UTF-8 BYTE offsets: splice the encoded body so a non-ASCII runbook line
+    # (em dash, arrows) masks at the right place instead of failing closed (t_75fdedd4).
     try:
         tree = ast.parse(body)
     except SyntaxError:
         return body
     if not _python_body_is_mask_safe(tree):
         return body
-    lines = body.splitlines(keepends=True)
+    raw = body.encode("utf-8")
+    lines = raw.splitlines(keepends=True)
     offsets = [0]
     for line in lines:
         offsets.append(offsets[-1] + len(line))
@@ -2952,8 +3589,8 @@ def _mask_python_data_strings(body: str) -> str:
             spans.append((offsets[node.lineno - 1] + node.col_offset,
                           offsets[node.end_lineno - 1] + node.end_col_offset))
     for start, end in sorted(spans, reverse=True):
-        body = body[:start] + '"data"' + body[end:]
-    return body
+        raw = raw[:start] + b'"data"' + raw[end:]
+    return raw.decode("utf-8")
 
 
 def _mask_read_only_python_paths(body: str) -> str:
@@ -3060,9 +3697,7 @@ def _contains_unsafe_gateway_action(
         masked_body = _mask_python_data_strings(body)
         # a file the body WRITES and the shell text names again may be executed next: the
         # strings going into it are not data (write-then-run class, R6)
-        if masked_body != body and any(
-            p in shell_only or Path(p).name in shell_only for p in _python_written_paths(body)
-        ):
+        if masked_body != body and _python_write_may_run(body, shell_only):
             masked_body = body
         hit = _describe_direct_lifecycle_scan(masked_body)
         if hit is not None:

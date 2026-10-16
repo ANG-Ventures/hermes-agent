@@ -184,7 +184,7 @@ def _build_codex_gpt5_autoraise_notice(
         f"ℹ Codex {model} caps context at {cap}, so auto-compaction was raised "
         f"to {to_pct}% (from {from_pct}%) to use more of the window before "
         f"summarizing.\n"
-        f"  Opt back out: hermes config set compression.codex_gpt55_autoraise false"
+        f"  Opt back out: hermes config set compression.per_model_builtins false"
     )
 
 
@@ -1603,7 +1603,8 @@ def _compression_threshold(agent, cfg: Dict[str, Any]) -> tuple[float, bool, flo
     model's threshold on a mid-session fallback/switch (2026-06-19 compaction-thrash fix)."""
     threshold = float(cfg.get("threshold", 0.50))
     global_threshold = threshold  # the GLOBAL config tier, captured before any override
-    autoraise = _cfg_flag(cfg, "codex_gpt55_autoraise", True)
+    from agent.auxiliary_client import per_model_builtins_enabled
+    autoraise = per_model_builtins_enabled(cfg)
     notice_enabled = _cfg_flag(cfg, "codex_gpt55_autoraise_notice", True)
     agent._compression_threshold_autoraised = None
     # One-time per-session notice when a large-window Codex prompt first crosses the 272K
@@ -1615,15 +1616,16 @@ def _compression_threshold(agent, cfg: Dict[str, Any]) -> tuple[float, bool, flo
     if cfg_model_thresh is not None:
         # Explicit user config for this model wins over every built-in default.
         return cfg_model_thresh, notice_enabled, global_threshold, per_model, autoraise
+    if not autoraise:
+        # Universal threshold (default): no built-in per-model exception applies.
+        return threshold, notice_enabled, global_threshold, per_model, autoraise
     with suppress(Exception):
         from agent.auxiliary_client import (
             _compression_threshold_for_model as _cthresh_fn,
             _is_codex_gpt54_or_gpt55 as _is_codex_gpt54_or_gpt55_fn,
             _is_codex_spark as _is_codex_spark_fn,
         )
-        _model_cthresh = _cthresh_fn(
-            agent.model, agent.provider, allow_codex_gpt55_autoraise=autoraise,
-        )
+        _model_cthresh = _cthresh_fn(agent.model, agent.provider)
         # Codex autoraises apply only when they RAISE; Arcee Trinity keeps its
         # unconditional override.
         threshold, agent._compression_threshold_autoraised = _resolve_compression_threshold(
@@ -1700,7 +1702,7 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         # Raw threshold inputs for update_model's re-resolution (see _compression_threshold).
         global_threshold=global_threshold,
         per_model_threshold=per_model,
-        codex_gpt55_autoraise=codex_autoraise,
+        per_model_builtins=codex_autoraise,
         # P2 "compact on the truth" calibration knobs. None ⇒ constructor defaults (skew_floor
         # 0.7, calibration_hard_frac 0.95). Read here so config.yaml `compression.skew_floor` /
         # `compression.calibration_hard_frac` take effect (Greptile #111: kwargs were unwired).
@@ -2184,7 +2186,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             # mid-session fallback/switch (2026-06-19 compaction-thrash fix).
             per_model_threshold=cs.per_model_threshold,
             global_threshold_percent=cs.global_threshold,
-            codex_gpt55_autoraise=cs.codex_gpt55_autoraise,
+            per_model_builtins=cs.per_model_builtins,
             skew_floor=cs.skew_floor,
             calibration_hard_frac=cs.calibration_hard_frac,
             max_tokens=_compressor_max_tokens(agent), model_thresholds=cs.model_thresholds,

@@ -161,7 +161,7 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
         emit(
             f"Load gate: load1={load1:.1f} pause_above={gate.pause_above:.1f} "
             f"OVERRIDE by {profile} (--ignore-load-gate; gate state={gate.state}, "
-            f"would have allowed {allowance})"
+            f"would have allowed {allowance}; load {load1:.1f} tasks / {_klg._denom(gate.ncpu)})"
         )
         out["override"] = {
             "source": "cli dispatch --ignore-load-gate",
@@ -180,6 +180,7 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
         emit(
             f"Load gate: {label} load1={load1:.1f} (pause_above={gate.pause_above:.1f}) - "
             + (f"local allowance 0: {reason}" if defer else f"spawning 0 this call: {reason}")
+            + f" [load {load1:.1f} tasks / {_klg._denom(gate.ncpu)}]"
         )
         out["spawn_paused"] = reason
         out["spawn_limit"] = 0
@@ -188,7 +189,7 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
     emit(
         f"Load gate: admitting load1={load1:.1f} pending_ramp={gate.pending_ramp:.1f} "
         f"allowance={allowance} (pause_above={gate.pause_above:.1f}, "
-        f"max_spawn_per_tick={gate.max_spawn_per_tick})"
+        f"max_spawn_per_tick={gate.max_spawn_per_tick}; load {load1:.1f} tasks / {_klg._denom(gate.ncpu)})"
     )
     if allowance is not None and (additive is None or allowance < additive):
         out["spawn_limit"] = allowance
@@ -236,8 +237,9 @@ def _route_line(entry: dict, dry_run: bool, reason=None) -> str:
         verdict = "skipped (see below)"
     if entry.get("route") is None:
         return f"  {entry['task_id']}  -> {verdict}"
+    tail = f" take_refusal={entry['take_refusal']}" if entry.get("take_refusal") else ""
     return (f"  {entry['task_id']}  route={entry['route']} host={entry.get('host') or '-'} "
-            f"rule={entry.get('rule') or '-'}  -> {verdict}")
+            f"rule={entry.get('rule') or '-'}  -> {verdict}{tail}")
 
 
 def _dispatch_limit_notes(res, gate, max_spawn_source):
@@ -759,6 +761,15 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 def _gc_remove_workspaces(rows, scratch_root: Path) -> int:
     removed_ws = 0
     for row in rows:
+        if row['workspace_kind'] in ('scratch', 'worktree') and row['workspace_path']:
+            from hermes_cli.kanban_continuation import remote_cleanup_host
+            with kbc.connect_closing() as conn:
+                host = remote_cleanup_host(conn, row['id'])
+                if host and kb.safe_remove_workspace_dir(
+                    Path(row['workspace_path']), task_id=row['id'], reason='gc_archived',
+                    conn=conn, remote_host=host,
+                ):
+                    removed_ws += 1
         if row["workspace_kind"] == "worktree":
             # Backstop for worktrees that escaped the completion/archive hook.
             # Same safety predicate: only clean, fully-pushed worktrees go;

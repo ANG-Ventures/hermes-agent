@@ -28,6 +28,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 from agent.error_classifier import (
     _BILLING_PATTERNS,
     _OVERLOADED_PATTERNS,
+    _POOL_EXHAUSTED_PATTERNS,
     UNSUPPORTED_PARAM_MARKERS,
     is_reasoning_field_rejection,
     is_reasoning_required_rejection,
@@ -807,7 +808,7 @@ def _is_codex_gpt54_or_gpt55(model: Optional[str], provider: Optional[str] = Non
     Other routes expose a larger window for the same slug and keep the user's threshold.
     Prefix-matched so ``-pro`` and dated snapshots track every 272K-capped family; ``-900k``
     picker variants are excluded. Astra is substring-matched (any slug containing ``astra``
-    without ``900k``). Name kept for the ``compression.codex_gpt55_autoraise`` key.
+    without ``900k``). Consulted only when ``compression.per_model_builtins`` is on.
     """
     bare = _codex_route_bare_model(model, provider)
     if bare is None:
@@ -873,18 +874,32 @@ def _fixed_temperature_for_model(
     return 0.5 if _is_arcee_trinity_thinking(model) else None
 
 
-def _compression_threshold_for_model(
-    model: Optional[str], provider: Optional[str] = None, *,
-    allow_codex_gpt55_autoraise: bool = True,
-) -> Optional[float]:
-    """Per-model/route compression threshold override (fraction of context used), or None.
+def per_model_builtins_enabled(compression_cfg: Any) -> bool:
+    """``compression.per_model_builtins``: whether the built-in per-model thresholds apply.
 
-    Arcee Trinity Large Thinking → 0.75 (preserve reasoning context); Codex-route gpt-5.4/5.5/5.6/Astra
-    → 0.85, gated by ``allow_codex_gpt55_autoraise``; Codex-route gpt-5.3-codex-spark → 0.70, ungated.
+    Default False: every model uses the universal ``compression.threshold`` (Ace ruling
+    2026-10-12, "I want it to be universal"). ``codex_gpt55_autoraise`` is read as a legacy
+    alias when the new key is unset; it now gates every built-in family, not only gpt-5.5.
+    """
+    cfg = compression_cfg if isinstance(compression_cfg, dict) else {}
+    value = cfg.get("per_model_builtins")
+    if value is None:
+        value = cfg.get("codex_gpt55_autoraise")
+    return value is not None and str(value).strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _compression_threshold_for_model(
+    model: Optional[str], provider: Optional[str] = None,
+) -> Optional[float]:
+    """Legacy built-in per-model/route compression threshold (fraction of context used), or None.
+
+    Arcee Trinity Large Thinking → 0.75; Codex-route gpt-5.4/5.5/5.6/Astra → 0.85; Codex-route
+    gpt-5.3-codex-spark → 0.70. Callers consult this table only when
+    ``per_model_builtins_enabled`` is True.
     """
     if _is_arcee_trinity_thinking(model):
         return 0.75
-    if allow_codex_gpt55_autoraise and _is_codex_gpt54_or_gpt55(model, provider):
+    if _is_codex_gpt54_or_gpt55(model, provider):
         return _CODEX_GPT54_GPT55_COMPACTION_THRESHOLD
     if _is_codex_spark(model, provider):
         return _CODEX_SPARK_COMPACTION_THRESHOLD
@@ -897,13 +912,14 @@ def resolve_compression_threshold(
     provider: Optional[str] = None,
     *,
     global_threshold: float = 0.50,
-    allow_codex_gpt55_autoraise: bool = True,
+    per_model_builtins: bool = False,
 ) -> float:
     """Resolve the compression threshold fraction for a model, applying the
     canonical precedence chain (first hit wins):
 
       1. config ``compression.per_model_threshold`` map (user-tunable)
-      2. built-in per-model / route default (``_compression_threshold_for_model``)
+      2. built-in per-model / route default (``_compression_threshold_for_model``), only when
+         ``per_model_builtins`` (config ``compression.per_model_builtins``, default False)
       3. global ``compression.threshold`` (``global_threshold``)
 
     This is the single source of truth shared by ``agent_init`` (session start)
@@ -921,9 +937,7 @@ def resolve_compression_threshold(
     if cfg_thresh is not None:
         return cfg_thresh
 
-    builtin = _compression_threshold_for_model(
-        model, provider, allow_codex_gpt55_autoraise=allow_codex_gpt55_autoraise,
-    )
+    builtin = _compression_threshold_for_model(model, provider) if per_model_builtins else None
     if builtin is not None:
         return builtin
 
@@ -1334,13 +1348,16 @@ def _load_pool_with_credentials(provider: str, note: str = "") -> Optional[Any]:
     return pool if pool and pool.has_credentials() else None
 
 
-def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
-    """Return (pool_exists_for_provider, selected_entry)."""
+def _select_pool_entry(provider: str, model: Optional[str] = None) -> Tuple[bool, Optional[Any]]:
+    """Return (pool_exists_for_provider, selected_entry).
+
+    ``model`` scopes the pick so an entry benched for a different model stays eligible; None keeps
+    the conservative unscoped select (any active model cooldown blocks)."""
     pool = _load_pool_with_credentials(provider)
     if pool is None:
         return False, None
     try:
-        return True, pool.select()
+        return True, pool.select(model=model) if model else pool.select()
     except Exception as exc:
         logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
         return True, None
@@ -2465,13 +2482,14 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     return _creds_pair(creds)
 
 
-def _resolve_codex_credential_and_base() -> Tuple[Optional[str], str]:
+def _resolve_codex_credential_and_base(model: Optional[str] = None) -> Tuple[Optional[str], str]:
     """``(token, base_url)`` taken from ONE authority, so a Codex key is only ever sent to the host
     it belongs to (#121486): the profile-scoped ``HERMES_CODEX_BASE_URL`` wins; otherwise a pooled
     key goes where that pool entry routes (row URL / ``model.base_url``) and the auth.json OAuth
-    token goes to the ChatGPT default. ``(None, <base>)`` without a usable token."""
+    token goes to the ChatGPT default. ``(None, <base>)`` without a usable token. ``model`` scopes the
+    pool pick: an entry benched only for another model (entitlement 400) still serves this one."""
     override = _codex_base_url_override()
-    pool_present, entry = _select_pool_entry("openai-codex")
+    pool_present, entry = _select_pool_entry("openai-codex", model=model)
     if pool_present:
         token = _pool_runtime_api_key(entry)
         if token:
@@ -3331,7 +3349,7 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
             "pass model explicitly (auxiliary.<task>.model in config.yaml)."
         )
         return None, None
-    codex_token, base_url = _resolve_codex_credential_and_base()
+    codex_token, base_url = _resolve_codex_credential_and_base(model)
     if not codex_token:
         return None, None
     logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", model)
@@ -3686,6 +3704,15 @@ def _is_connection_error(exc: Exception) -> bool:
         "incomplete chunked read", "peer closed connection", "response ended prematurely",
         "unexpected eof", "remoteprotocolerror", "localprotocolerror",
     ))
+
+
+def _is_pool_exhausted_error(exc: Exception) -> bool:
+    """Local sub-pool relay 503 ``no eligible sub`` (every sub capped for this model): the route
+    cannot serve the request, so it falls back like a quota error. A deploy drain is excluded; it
+    has its own same-provider wait."""
+    if _exc_http_status(exc) not in (None, 503) or _is_relay_drain(exc):
+        return False
+    return _contains_any(str(exc).lower(), _POOL_EXHAUSTED_PATTERNS)
 
 
 def _exc_http_status(exc: Exception) -> Any:
@@ -5741,7 +5768,7 @@ def _resolve_openai_codex_branch(req: _ResolveRequest) -> _ResolveResult:
     no_token_msg = "resolve_provider_client: openai-codex requested but no Codex OAuth token found (run: hermes model)"
     if req.raw_codex:
         # Raw OpenAI client for callers needing responses.stream() (main agent loop).
-        codex_token, base_url = _resolve_codex_credential_and_base()
+        codex_token, base_url = _resolve_codex_credential_and_base(model)
         if not codex_token:
             logger.warning(no_token_msg)
             return None, None
@@ -8264,7 +8291,8 @@ class _LadderStep(NamedTuple):
 # wins, so a payment-flavoured 429 reads as "payment error", not "rate limit".
 _FALLBACK_REASONS: Tuple[Tuple[Callable[[Exception], bool], str], ...] = (
     (_is_auth_error, "auth error"), (_is_payment_error, "payment error"),
-    (_is_rate_limit_error, "rate limit"), (_is_model_incompatible_error, "model incompatible with route"),
+    (_is_rate_limit_error, "rate limit"), (_is_pool_exhausted_error, "sub pool exhausted"),
+    (_is_model_incompatible_error, "model incompatible with route"),
     (_is_invalid_aux_response_error, "invalid provider response"),
     # A status-less in-stream ``error`` event (SSE committed 200) is a route failure (#101538).
     (_is_statusless_structured_provider_error, "structured provider error"),

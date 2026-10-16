@@ -3231,7 +3231,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         raise _refusal(reason) from exc
 
 
-def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False):
+def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False, remote_host=None):
     """The only Kanban directory deleter: inspect the exact target, then remove.
 
     Board hard-delete may remove only empty workspace/attachment storage. Archive
@@ -3239,6 +3239,49 @@ def remove_workspace_dir(conn, task_id, path, *, worktree_root=None, board=False
     defeat survivorship. Linked worktrees retain Git's no-force dirty check.
     """
     try:
+        if remote_host is not None:
+            import shlex
+            from hermes_cli.kanban_worker_pool import _ssh_argv
+            # Only independently durable CLEAN repositories (or an empty dir)
+            # may be removed remotely. Untracked scratch/dirty work is held,
+            # never mistaken for the Studio's empty copy of the same path.
+            script = '''import os,sys,subprocess,shutil
+from pathlib import Path
+p=Path(sys.argv[1])
+if not p.is_absolute() or str(p.resolve())!=str(p) or p.is_symlink(): sys.exit(12)
+if not p.exists(): sys.exit(0)
+def git(repo,*args):
+ r=subprocess.run(['git','-C',str(repo),*args],capture_output=True,text=True,timeout=12,stdin=subprocess.DEVNULL)
+ if r.returncode: raise RuntimeError('git proof failed')
+ return r.stdout.strip()
+def prove(d):
+ if (d/'.git').exists():
+  if (d/'.git').is_file(): raise RuntimeError('registered worktree requires git worktree remove')
+  if git(d,'status','--porcelain','--untracked-files=all','--ignored'): raise RuntimeError('dirty, ignored or untracked work')
+  if git(d,'stash','list'): raise RuntimeError('stashes')
+  if git(d,'rev-list','--branches','--tags','--not','--remotes'): raise RuntimeError('local commits not on any remote')
+  sha=git(d,'rev-parse','HEAD')
+  remotes=git(d,'remote').splitlines()
+  if not any(any(line.split()[0]==sha for line in git(d,'ls-remote',remote).splitlines()) for remote in remotes):
+   raise RuntimeError('HEAD has no independently durable ref')
+  return
+ for f in d.iterdir():
+  if f.is_symlink() or not f.is_dir(): raise RuntimeError('unpreserved scratch files')
+  prove(f)
+try:
+ prove(p)
+ shutil.rmtree(p)
+ print('removed')
+except Exception as e:
+ print(str(e),file=sys.stderr); sys.exit(13)
+'''
+            proc = subprocess.run(
+                _ssh_argv(remote_host, 'python3 -c ' + shlex.quote(script) + ' ' + shlex.quote(str(path))),
+                capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+            )
+            if proc.returncode != 0:
+                raise SurvivorUnavailable('survivor_unavailable: remote workspace held: ' + (proc.stderr or '')[:200])
+            return True
         if not path:
             raise SurvivorUnavailable("survivor_unavailable: deletion target missing")
         workspace = Path(path).expanduser().resolve(strict=True)
