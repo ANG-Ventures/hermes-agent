@@ -33,7 +33,10 @@ MAX_LOOKUPS_PER_TICK = 10
 # Non-MERGED states are re-read after this long; MERGED is cached for good.
 CACHE_TTL_SECONDS = 300
 
-_CACHE: dict[tuple[str, int], tuple[str, float]] = {}
+# Keyed by (oracle identity, repo, pr): a sandbox/test oracle's synthetic MERGED must never release a live card
+# read through the real oracle in the same interpreter (Prism 50dc72190d84). The oracle key is the query_fn's
+# own identity; two distinct callables never share a row.
+_CACHE: dict[tuple[int, str, int], tuple[str, float]] = {}
 # parent id -> when its PRs were last looked up. Parents are checked oldest
 # first, so a fixed budget cannot starve the parents that sort last.
 _LAST_CHECKED: dict[str, float] = {}
@@ -80,7 +83,7 @@ def _default_query() -> Optional[QueryFn]:
 
 
 def _state(ref, query_fn: QueryFn, now: float, budget: list) -> Optional[str]:
-    key = (ref.repo.lower(), ref.number)
+    key = (id(query_fn), ref.repo.lower(), ref.number)
     hit = _CACHE.get(key)
     if hit is not None and (hit[0] == "MERGED" or now - hit[1] < CACHE_TTL_SECONDS):
         return hit[0]

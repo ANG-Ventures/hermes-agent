@@ -213,3 +213,37 @@ def test_cli_link_prints_gate(kanban_home):
     assert f"Gate: {child} will not start until {parent} is DONE" in out
     out = kanban.run_slash(f"link {parent} {other} --kind after-merge")
     assert f"Gate: {other} will not start until {parent}'s PR is MERGED" in out
+
+
+# Prism 50dc72190d84: a MERGED cached from one oracle is invisible to a different oracle.
+def test_sandbox_merged_does_not_leak_to_live_oracle():
+    if True:
+        import hermes_cli.kanban_after_merge as am
+        am._CACHE.clear()
+        ref = type("R", (), {"repo": "ANG-Ventures/x", "number": 7})()
+        sandbox = lambda repo, n: {"state": "MERGED"}
+        live_calls = []
+
+        def live(repo, n):
+            live_calls.append((repo, n))
+            return {"state": "OPEN"}
+
+        assert am._state(ref, sandbox, 1000.0, [10]) == "MERGED"
+        # the live oracle must be consulted, and must see OPEN, not the sandbox's MERGED
+        assert am._state(ref, live, 1000.0, [10]) == "OPEN"
+        assert live_calls == [("ANG-Ventures/x", 7)]
+
+def test_same_oracle_still_caches_merged_for_good():
+    if True:
+        import hermes_cli.kanban_after_merge as am
+        am._CACHE.clear()
+        ref = type("R", (), {"repo": "ANG-Ventures/x", "number": 8})()
+        calls = []
+
+        def live(repo, n):
+            calls.append(1)
+            return {"state": "MERGED"}
+
+        assert am._state(ref, live, 1000.0, [10]) == "MERGED"
+        assert am._state(ref, live, 99999.0, [10]) == "MERGED"
+        assert len(calls) == 1
