@@ -200,8 +200,8 @@ def test_still_waiting_notice_once_per_interval_names_lanes():
         wb.note_lane_switch(a)
         text = wb.notice_due(a, now=121.0)
         assert text and "121s" in text and "2 lanes tried" in text and "openai-codex" in text
-        # It names what is left: the fable faces ahead and the other model behind them.
-        assert "ahead: claude-btpr, claude-bpr [claude-fable-5-1] + cpa [gpt-6.1-sol]" in text
+        # Ace 2026-10-16: the chain is his own config; the notice no longer repeats it.
+        assert "ahead:" not in text and "claude-btpr" not in text
         assert wb.notice_due(a, now=200.0) is None
         assert wb.notice_due(a, now=241.0) is not None
 
@@ -220,8 +220,7 @@ def test_relay_lane_notice_says_turn_in_progress_not_no_first_reply():
         text = wb.notice_due(a, now=120.5)
     assert text == (
         "⏳ turn in progress on claude-alr/claude-fable-5-1 (buffering lane, first byte not "
-        "visible until the turn ends): 120s elapsed; long outputs run 2–4 min; cut at 600s; "
-        "ahead: claude-dtlr, claude-btpr, claude-bpr [claude-fable-5-1] + cpa [gpt-6.1-sol]")
+        "visible until the turn ends): 120s elapsed; long outputs run 2–4 min; cut at 600s")
 
 
 def test_relay_lane_notice_cut_number_is_the_live_budget():
@@ -426,3 +425,24 @@ def test_streaming_monitor_cuts_silent_attempt_and_posts_notice(monkeypatch):
     assert cut.value.lane == agent.provider
     assert cut.value.elapsed_s is not None and cut.value.elapsed_s >= 0.6
     assert "x-pool-served-by" in cut.value.pool_headers
+
+
+def test_notice_omits_the_chain_but_still_says_when_nothing_is_left():
+    """Ace 2026-10-16 00:29: "omit the fallback chain, I know what it is". The chain text
+    is gone from both wordings; the one state that changes what the cut DOES (nothing to
+    fall to -> the turn ends) is still named."""
+    from agent import fallback_wall_budget as wb
+    with patch("hermes_cli.config.load_config_readonly",
+               return_value={"fallback": {"still_waiting_notice_seconds": 120,
+                                          "no_first_byte_budget_seconds": 600}}):
+        a = _bare(index=0)
+        a.provider = "claude-alr"
+        wb.arm(a, now=0.0)
+        text = wb.notice_due(a, now=121.0)
+        assert text and "ahead" not in text and "[claude-fable-5-1]" not in text
+        assert "nothing left" not in text
+        last = _bare(model="gpt-6.1-sol", index=4)
+        last.provider = "cpa"
+        wb.arm(last, now=0.0)
+        tail = wb.notice_due(last, now=121.0)
+        assert tail and tail.endswith("; nothing left in the fallback chain")

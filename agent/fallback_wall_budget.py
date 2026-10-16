@@ -217,9 +217,9 @@ def notice_due(agent: Any, now: Optional[float] = None) -> Optional[str]:
     if _buffering_lane(agent):
         return (f"⏳ turn in progress on {route} (buffering lane, first byte not visible until "
                 f"the turn ends): {int(waited)}s elapsed; long outputs run 2–4 min; "
-                f"cut at {int(st['budget_s'])}s; {_ahead_text(agent)}")
+                f"cut at {int(st['budget_s'])}s{_ahead_suffix(agent)}")
     return (f"⏳ still waiting for a first reply: {int(waited)}s, "
-            f"{lanes} lane{'s' if lanes != 1 else ''} tried (now on {route}); {_ahead_text(agent)}")
+            f"{lanes} lane{'s' if lanes != 1 else ''} tried (now on {route}){_ahead_suffix(agent)}")
 
 
 def _buffering_lane(agent: Any) -> bool:
@@ -228,6 +228,16 @@ def _buffering_lane(agent: Any) -> bool:
     reads as "no first reply". Wording only; the clock and the cut are unchanged."""
     from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS
     return (getattr(agent, "provider", "") or "").strip().lower() in _POOL_CAPABILITY_PROVIDERS
+
+
+def _ahead_suffix(agent: Any) -> str:
+    """What the notice says about the chain. Ace (2026-10-16 00:29, after three 600 s
+    notices in one thread): "omit the fallback chain, I know what it is". The chain is
+    config he set; repeating it on every notice is noise. The ONE state worth a word is
+    when there is nothing left to fall to, because then the cut ends the turn instead of
+    moving it. So: empty string normally, ``; nothing left in the fallback chain`` when
+    ``_remaining_entries`` is empty. ``_ahead_text`` stays for the cut banner/tests."""
+    return "" if _remaining_entries(agent) else "; nothing left in the fallback chain"
 
 
 def _ahead_text(agent: Any) -> str:
