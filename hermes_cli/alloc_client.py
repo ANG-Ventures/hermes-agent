@@ -1,6 +1,6 @@
 # SCHEDULE: manual   (a library consumers import; never scheduled; card t_552773f1)
-# VENDORED from hermes-home ``scripts/lib/alloc_client.py`` @ 58a2aeb6d3 (#4302, Router Core Card A t_552773f1;
-# sha256 19f4c8ff52e91b0877c60d312a3823855998b7434b1d248ef8be61186fb6b947) for the kanban dispatcher (t_4187c8f1): the fork may not import hermes-home code. The ONLY
+# VENDORED from hermes-home ``scripts/lib/alloc_client.py`` @ 31c9d15171 (hermes-home#4462 on #4422, t_dc9a0f9a;
+# sha256 72da740bb4de1a5427a14e110cc385e7ad707898ecf6e6362e4e8a5f317cdc4b) for the kanban dispatcher (t_4187c8f1): the fork may not import hermes-home code. The ONLY
 # local change is the placement import (hermes_cli.placement, not sys.path + import placement); tests/hermes_cli/test_kanban_allocd_route.py checks
 # the rest against the canonical file (ALLOC_CLIENT_CANONICAL).
 """alloc_client -- the thin library every work generator calls to get a host (Router Core Card A, t_552773f1).
@@ -156,8 +156,18 @@ def mark_protected(consumer: str) -> None:
     """Record that ``consumer`` uses a token, so a later MISSING token file is refused, never "no auth"."""
     d = placement.fleet_root() / PROTECTED_REL
     d.mkdir(parents=True, exist_ok=True)
-    with open(d / consumer, "a", encoding="utf-8"):
-        pass
+    # durable before any token use succeeds (Prism f5e6f9863e5c): a crash that loses the marker while a later token
+    # removal survives would read as "no auth"; fsync the file AND its directory entry (OSError -> caller fails closed)
+    fd = os.open(str(d / consumer), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    dfd = os.open(str(d), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
 def _token(consumer: str) -> Optional[str]:
@@ -269,6 +279,10 @@ def _call(path: str, body: dict, *, timeout: float, token=_UNSET) -> tuple:
             try:
                 return exc.code, json.loads(exc.read() or b"{}")
             except ValueError as e:
+                if exc.code == 409:
+                    # a 409 IS the scorer's refusal whatever its body (Prism 5bebc530350f): never Unreachable, which
+                    # would run the fallback (no P0 reserve) and admit what allocd refused
+                    return 409, {"reason": "refused (unparseable 409 body)"}
                 raise Unreachable(f"HTTP {exc.code} with an unparseable body") from e
         if 400 <= exc.code < 500 and exc.code not in (408, 429):
             # TERMINAL: a token/owner/shape refusal must never be bypassed through the fallback's ledger write
@@ -299,7 +313,10 @@ def _fallback_admit(consumer: str, *, job_id: str, ttl_s: float, klass: Optional
     if rid:
         _OWNER[rid] = consumer
         _FALLBACK_ISSUED[rid] = {"consumer": consumer, "job_id": job_id, "ttl_s": ttl_s, "klass": klass,
-                                 "footprint": footprint, "job": dict(job_kw), "previous": previous, "host": d.host}
+                                 # the footprint actually RESERVED, detached (Prism 5663666bbaac): never the caller's
+                                 # mutable mapping or None (= today's default, which may change before a re-admit)
+                                 "footprint": dataclasses.asdict(d.footprint), "job": dict(job_kw),
+                                 "previous": previous, "host": d.host}
     return AdmitResult(d.host, rid, d.reason, "fallback", d.rule, None, d.as_row() if d.rows else None, consumer)
 
 
@@ -326,7 +343,8 @@ def admit(consumer: str, *, job_id: Optional[str] = None, ttl_s: float = 1800.0,
             rid = out["reservation_id"]          # both non-empty (Prism 5f29877ec7ef): a 200 missing either is garbled
             _OWNER[rid] = consumer
             return AdmitResult(out["host"], rid, "", "allocd", out.get("rule") or "", out.get("band"), out, consumer)
-        if code == 409 and isinstance(out, dict):
+        if code == 409:                    # final whatever the body shape (Prism 5bebc530350f)
+            out = out if isinstance(out, dict) else {}
             return AdmitResult(None, None, str(out.get("reason") or "refused"), "allocd", "", None, out, consumer)
         raise Unreachable(f"unexpected reply {code}")
     except Unreachable as exc:
@@ -336,14 +354,46 @@ def admit(consumer: str, *, job_id: Optional[str] = None, ttl_s: float = 1800.0,
                                job_kw=dict(job or {}), previous=previous, why=str(exc), t0=t0, candidates=candidates)
 
 
+def shadow_admit(consumer: str, *, job_id: Optional[str] = None, klass: Optional[str] = None,
+                 footprint: Optional[Mapping] = None, job: Optional[Mapping] = None, previous: Optional[str] = None,
+                 timeout: float = TIMEOUT_S, candidates: Optional[list] = None) -> dict:
+    """Card B SHADOW stage: ask allocd what it WOULD pick for this job (``shadow: true``: scored against the live
+    ledger, nothing reserved, nothing logged there). Returns allocd's reply ``{shadow, host, reason, rule, reasons}``.
+    NEVER falls back to the in-process scorer: a shadow score exists only to be compared with the old path's
+    decision, and a fallback would compare the scorer with itself. Raises ``Unreachable`` (allocd off / down /
+    garbled) or ``Refused`` (4xx, token) instead; the consumer logs that as a disagreement with a reason."""
+    tok = _token(consumer)
+    body = {"consumer": consumer, "job_id": job_id or f"shadow-{uuid.uuid4().hex[:12]}", "ttl_s": 1.0, "class": klass,
+            "footprint": footprint, "job": dict(job or {}), "previous": previous, "shadow": True}
+    if candidates is not None:
+        body["candidates"] = list(candidates)
+    if (placement.fleet_root() / ROUTER_OFF_REL).exists():
+        raise Unreachable("router-off file present")
+    code, out = _call("/admit", body, timeout=timeout, token=tok)
+    if code == 200 and isinstance(out, dict) and out.get("shadow") is True:
+        # A shadow reply is PROMOTION EVIDENCE for the consumer (old vs new host). A reply missing the decision
+        # fields would compare as host=None and record a false "agree" against an old refusal; fail loud instead.
+        for field, types in (("host", (str, type(None))), ("reason", (str,)), ("rule", (str, type(None)))):
+            if field not in out:
+                raise Unreachable(f"malformed shadow reply: missing {field}")
+            if not isinstance(out[field], types):
+                raise Unreachable(f"malformed shadow reply: bad {field} type {type(out[field]).__name__}")
+        return out
+    raise Unreachable(f"unexpected shadow reply {code}")
+
+
 def _local_ledger_op(op: str, rid: str, consumer: str, why: str, t0: float, fn) -> Optional[bool]:
-    """Run ``fn`` on the local ledger when it IS allocd's (bounded flock); None = not run (remote / wedged lock)."""
+    """Run ``fn`` on the local ledger when it IS allocd's (bounded flock); None = not run (remote / wedged lock).
+    ``fn`` passes ``owner=`` so placement verifies the row's owner UNDER the ledger lock: a mismatch is Refused,
+    never a mutation (Prism dc3cb6019576: _owner() falls back to the caller when its ledger read failed)."""
     if not ledger_is_local():
         log_event("allocd_unreachable_remote", consumer=consumer, reservation=rid, op=op, error=why, url=url())
         return None
     log_event("allocd_unreachable", consumer=consumer, reservation=rid, op=op, error=why)
     try:
         return fn(_budget_left(t0))
+    except placement.OwnerMismatch as exc:
+        raise Refused(str(exc)) from exc
     except placement.LockTimeout as exc:
         log_event("allocd_wedged_lock", consumer=consumer, reservation=rid, op=op, error=str(exc))
         return None
@@ -362,7 +412,7 @@ def release(reservation_id: str, *, consumer: str, timeout: float = TIMEOUT_S) -
         ok = code == 200 and bool(out.get("released"))
     except Unreachable as exc:
         ok = bool(_local_ledger_op("release", rid, consumer, str(exc), t0,
-                                   lambda lt: placement.release(rid, lock_timeout_s=lt)))
+                                   lambda lt: placement.release(rid, lock_timeout_s=lt, owner=owner)))
     _FALLBACK_ISSUED.pop(rid, None)
     if ok:
         _OWNER.pop(rid, None)
@@ -374,8 +424,10 @@ def _readmit(rid: str, consumer: str, ttl_s: float, timeout: float) -> bool:
     ``ttl_s``, PINNED to the host the job runs on; alias old -> new. Another host is never a successful renew: the
     job keeps running where it is, so a pick elsewhere would count capacity on a host it does not use. A LIVE row
     handed back by reuse_job keeps its own ``until``, so it is renewed for ``ttl_s`` too (False +
-    ``renew_not_extended`` when that renew fails)."""
-    kw = _FALLBACK_ISSUED.pop(rid, None)
+    ``renew_not_extended`` when that renew fails). The recovery metadata stays until a replacement is established
+    (Prism 377ac5c1eaf8): a deferred/raised re-admit leaves it for the next renew to retry, and a replacement that
+    could not be extended carries it, so recovery is never lost to one transient failure."""
+    kw = _FALLBACK_ISSUED.get(rid)
     if kw is None:
         return False
     host = kw.get("host")
@@ -390,9 +442,11 @@ def _readmit(rid: str, consumer: str, ttl_s: float, timeout: float) -> bool:
         return False
     if r.reservation_id != rid:
         _REPLACED[rid] = r.reservation_id
+        _FALLBACK_ISSUED.pop(rid, None)
         if r.source == "allocd":
             _FALLBACK_ISSUED.pop(r.reservation_id, None)
     if r.rule == "reuse" and not _extend(r.reservation_id, kw["consumer"], ttl_s, timeout):
+        _FALLBACK_ISSUED.setdefault(r.reservation_id, kw)   # the alias now routes here: keep recovery reachable
         # reuse_job hands back a live row AS IS (its own until): True would claim ttl_s the ledger does not hold
         log_event("renew_not_extended", consumer=kw["consumer"], reservation=rid, replacement=r.reservation_id,
                   host=r.host, ttl_s=ttl_s)
@@ -412,13 +466,19 @@ def _extend(rid: str, owner: str, ttl_s: float, timeout: float) -> bool:
         return code == 200 and bool(out.get("renewed"))
     except Unreachable as exc:
         return bool(_local_ledger_op("renew", rid, owner, str(exc), t0,
-                                     lambda lt: placement.renew(rid, ttl_s=ttl_s, lock_timeout_s=lt)))
+                                     lambda lt: placement.renew(rid, ttl_s=ttl_s, lock_timeout_s=lt, owner=owner)))
 
 
-def renew(reservation_id: str, *, ttl_s: float, consumer: str, timeout: float = TIMEOUT_S) -> bool:
+def renew(reservation_id: str, *, ttl_s: float, consumer: str, timeout: float = TIMEOUT_S,
+          strict: bool = False) -> bool:
     """Extend a reservation. ``consumer`` is required and must be the reservation's owner. A fallback-issued
     reservation found gone is re-admitted for ``ttl_s`` on its own host (True only then; ``renew_host_lost`` and
-    False when that host cannot take it). Raises ``Refused`` on a terminal answer."""
+    False when that host cannot take it). Raises ``Refused`` on a terminal answer.
+
+    False means the row is GONE (allocd 410, or the local ledger says so) EXCEPT when the renew was NOT RUN at all
+    (allocd unreachable from a non-router host, or a wedged local lock): by default that is also False ("the row
+    stands until its TTL"). A lease loop that must tell the two apart passes ``strict=True``: the not-run case then
+    raises ``Unreachable`` so the caller retries instead of giving the lease up (Prism 8a88d52a0e47)."""
     t0 = time.monotonic()
     rid = _current(reservation_id)
     owner = _owner(rid, consumer)
@@ -429,8 +489,10 @@ def renew(reservation_id: str, *, ttl_s: float, consumer: str, timeout: float = 
         ok = code == 200 and bool(out.get("renewed"))
     except Unreachable as exc:
         res = _local_ledger_op("renew", rid, consumer, str(exc), t0,
-                               lambda lt: placement.renew(rid, ttl_s=ttl_s, lock_timeout_s=lt))
+                               lambda lt: placement.renew(rid, ttl_s=ttl_s, lock_timeout_s=lt, owner=owner))
         if res is None:
+            if strict:
+                raise                     # not run: the caller keeps the lease and retries
             return False                  # not run (remote / wedged): the row stands until its TTL
         ok = res
     if not ok and rid in _FALLBACK_ISSUED:

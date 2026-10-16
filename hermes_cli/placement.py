@@ -1,7 +1,7 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
-VENDORED from hermes-home ``scripts/lib/placement.py`` @ 58a2aeb6d3 (#4302, Router Core Card A t_552773f1;
-sha256 2d5cfc215f5e96c18e0355c27b95fad7a5ca7d88cf21fbf325e3b72daa3bcf15) for the kanban dispatcher (t_d6ce856e) and its
+VENDORED from hermes-home ``scripts/lib/placement.py`` @ 31c9d15171 (hermes-home#4462 on #4422, t_dc9a0f9a;
+sha256 8ae48f3b603d7c20507575e533fe0d7d7bdc3812422428a5390a6a1c57e09070) for the kanban dispatcher (t_d6ce856e) and its
 alloc_client route (t_4187c8f1): the fork may not import hermes-home code. The ONLY local changes are
 ``fleet_root()`` plus ``encoding="utf-8"`` on two ``open()`` calls (the fork's PLW1514 lint);
 ``tests/hermes_cli/test_kanban_headroom_placement.py`` checks the rest against the canonical file.
@@ -83,6 +83,7 @@ import json
 import math
 import os
 import re
+import sys
 import tempfile
 import time
 import uuid
@@ -434,7 +435,10 @@ def samples_from_pressure(doc: Mapping, *, now: float, stale_after_s: Optional[f
     the Studio included (Ace 2026-10-12 18:1x: low default preference, never excluded); whether a host is a
     candidate for a consumer is the table's slots, not the sampler's `targets` flag."""
     now = _now(now)
-    stale = stale_after_s if stale_after_s is not None else doc.get("stale_after_s") or DEFAULT_STALE_AFTER_S
+    # an explicit 0 is "expire immediately", never "absent" (Prism 4102b9d1b28a): default only on missing / None
+    stale = stale_after_s if stale_after_s is not None else doc.get("stale_after_s")
+    if stale is None:
+        stale = DEFAULT_STALE_AFTER_S
     if not _num(stale) or stale < 0:
         raise PlacementError(f"stale_after_s must be a finite number >= 0, not {stale!r}")
     stale = float(stale)
@@ -636,9 +640,13 @@ def band(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: s
         return None, missing
     if h.mem_gb is None or h.cores is None:            # unreachable: an eligible Headroom carries both
         return None, ["headroom unmeasured"]
-    if h.mem_gb < fp.ram_gb or h.cores < fp.threads:
-        return "warm", [f"room for one {consumer} job: headroom {h.mem_gb:.1f} GB / {h.cores:.1f} cores "
-                        f"< 2 x {fp.ram_gb:g} GB / {fp.threads:g} threads"]
+    # scratch too, the same test as band_of() (Prism e4e9359966e3): a second job that fits RAM/CPU but not scratch
+    # does not fit, so the published band must not say ok where the admission ledger says warm
+    if h.mem_gb < fp.ram_gb or h.cores < fp.threads or (h.scratch_gb is not None and h.scratch_gb < fp.scratch_gb):
+        scr = "" if h.scratch_gb is None else f" / {h.scratch_gb:.1f} GB scratch"
+        scr_fp = "" if h.scratch_gb is None else f" / {fp.scratch_gb:g} GB scratch"
+        return "warm", [f"room for one {consumer} job: headroom {h.mem_gb:.1f} GB / {h.cores:.1f} cores{scr} "
+                        f"< 2 x {fp.ram_gb:g} GB / {fp.threads:g} threads{scr_fp}"]
     return "ok", [f"headroom {h.mem_gb:.1f} GB / {h.cores:.1f} cores"]
 
 
@@ -851,6 +859,10 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
 
 
 # ── reservation ledger (A3): promises the sample cannot see yet ─────────────────────────────────
+class OwnerMismatch(PlacementError):
+    """renew()/release() with ``owner`` found the row booked by another consumer (checked under the ledger lock)."""
+
+
 class LockTimeout(PlacementError):
     """The ledger flock was not acquired within ``lock_timeout_s`` (a wedged holder; Router Core t_552773f1)."""
 
@@ -974,14 +986,19 @@ def _row_footprint(row: Mapping) -> Footprint:
 
 
 def _append_admissions(ap: Path, lines: List[dict]) -> None:
+    """Append lifecycle lines DURABLY (fsync, Prism d91b204660f6) right after the fsync'd ledger write they describe.
+    A failure is reported on stderr, never raised: the reservation change it describes already committed, and the
+    reservation ledger (not this audit journal) is what admission accounting reads."""
     if not lines:
         return
     try:
         ap.parent.mkdir(parents=True, exist_ok=True)
         with open(ap, "a", encoding="utf-8") as fh:
             fh.write("".join(json.dumps(x, sort_keys=True) + "\n" for x in lines))
-    except OSError:
-        pass
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError as exc:
+        sys.stderr.write(f"placement: admissions journal {ap} not written ({len(lines)} line(s) lost): {exc}\n")
 
 
 def _ledger_line(*, at: float, host, consumer: str, job_id, fp: Footprint, decision: str, reason: Optional[str],
@@ -1139,8 +1156,19 @@ def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample
     return d, rid
 
 
+def _check_owner(rows: List[dict], reservation_id: str, owner: Optional[str]) -> None:
+    """``owner`` given: the row must be that consumer's, verified under the same lock as the mutation (Prism
+    dc3cb6019576: an ownership read that failed earlier must never let alloc_client's fallback touch another
+    consumer's row). An absent row is not a mismatch (the caller sees False)."""
+    if owner is None:
+        return
+    for r in rows:
+        if r.get("id") == reservation_id and r.get("consumer") != owner:
+            raise OwnerMismatch(f"reservation {reservation_id} belongs to {r.get('consumer')!r}, not {owner!r}")
+
+
 def renew(reservation_id: str, *, ttl_s: float, path=None, now: Optional[float] = None, admissions_path=None,
-          lock_timeout_s: Optional[float] = None) -> bool:
+          lock_timeout_s: Optional[float] = None, owner: Optional[str] = None) -> bool:
     """Extend a LIVE reservation to ``now + ttl_s`` (a lease the holder keeps renewing while its job runs, so a
     run longer than any fixed TTL stays counted; a holder that dies stops renewing and the row lapses; Prism
     796aae4f). False when the row is gone, expired or released (it is never resurrected)."""
@@ -1150,6 +1178,7 @@ def renew(reservation_id: str, *, ttl_s: float, path=None, now: Optional[float] 
     with _locked(p, lock_timeout_s):
         now = _now(now)
         doc = _read_ledger(p)
+        _check_owner(doc["rows"], reservation_id, owner)
         rows, expired = _prune(doc["rows"], now)
         hit = False
         for r in rows:
@@ -1163,12 +1192,14 @@ def renew(reservation_id: str, *, ttl_s: float, path=None, now: Optional[float] 
 
 
 def release(reservation_id: str, *, path=None, now: Optional[float] = None, admissions_path=None,
-            lock_timeout_s: Optional[float] = None) -> bool:
-    """End a reservation (the job ended); True when it was live. Logged as a ``released`` ledger line."""
+            lock_timeout_s: Optional[float] = None, owner: Optional[str] = None) -> bool:
+    """End a reservation (the job ended); True when it was live. Logged as a ``released`` ledger line.
+    ``owner``: refuse (OwnerMismatch) a row booked by another consumer, checked under the lock."""
     p = reservations_path(path)
     with _locked(p, lock_timeout_s):
         now = _now(now)
         doc = _read_ledger(p)
+        _check_owner(doc["rows"], reservation_id, owner)
         live, lines = _prune(doc["rows"], now)
         rows = []
         for r in live:
