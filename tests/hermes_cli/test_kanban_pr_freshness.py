@@ -21,6 +21,18 @@ def _fixture_owner_is_fleet(monkeypatch):
     monkeypatch.setattr(op, "FLEET_OWNERS", op.FLEET_OWNERS | {"o"})
 
 
+@pytest.fixture(autouse=True)
+def _profile_v1_unless_set(monkeypatch, tmp_path):
+    """t_7dbacbbc: never read the host's live merge-gate profile; absent file = v1."""
+    monkeypatch.setenv("KANBAN_MERGE_GATE_PROFILE", str(tmp_path / "absent-merge-gate-profile.json"))
+
+
+def _profile(monkeypatch, tmp_path, profile, repos):
+    p = tmp_path / "merge-gate-profile.json"
+    p.write_text(__import__("json").dumps({"profile": profile, "repos": list(repos)}))
+    monkeypatch.setenv("KANBAN_MERGE_GATE_PROFILE", str(p))
+
+
 class FakeGh:
     def __init__(self, *, draft=False, behind=0, checks=("success",), status="success", ms="clean"):
         self.draft, self.behind, self.checks, self.status, self.ms = draft, behind, checks, status, ms
@@ -148,6 +160,78 @@ def test_foreign_pr_is_never_updated_or_armed():
 def test_lookup_failure_fails_open():
     rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=lambda *a: None, arm=None)
     assert "fail-open" in rep["prs"]["o/r#5"]["lookup"]
+
+
+# --- t_7dbacbbc: pipeline v2 merge-gate profile ---------------------------
+
+
+@pytest.mark.parametrize("checks,status,want", [(("failure",), "success", "red: "),
+                                                ((), "success", "no check runs"),
+                                                (("success",), "failure", "commit status failure")])
+def test_v2_not_green_head_is_armed_with_the_state_reported(monkeypatch, tmp_path, checks, status, want):
+    _profile(monkeypatch, tmp_path, "v2", ["O/R"])   # case-insensitive, like merge_gate_profile.py
+    gh, armed = FakeGh(checks=checks, status=status), []
+    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh,
+                   arm=lambda *a: armed.append(a) or "/tmp/log")
+    assert len(armed) == 1 and armed[0][:4] == (REPO, 5, HEAD, "t_x")
+    assert want in armed[0][4]
+    entry = rep["prs"]["o/r#5"]
+    assert want in entry["ci_reported"] and "CI reported not green" in entry["automerge"]
+
+
+def test_v2_pending_head_is_armed_with_pending_reported(monkeypatch, tmp_path):
+    _profile(monkeypatch, tmp_path, "v2", ["o/r"])
+    gh = FakeGh()
+    real = gh.__call__
+
+    def g(*args):
+        if args[-1].endswith("check-runs?per_page=100"):
+            return {"check_runs": [{"name": "ci", "status": "in_progress", "conclusion": None}]}
+        return real(*args)
+    armed = []
+    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=g, arm=lambda *a: armed.append(a) or "/tmp/log")
+    assert len(armed) == 1 and armed[0][4] == "pending: ci"
+
+
+@pytest.mark.parametrize("profile,repos,body", [("v1", ["o/r"], None), ("v2", ["o/other"], None),
+                                                (None, None, "{not json"), (None, None, '{"profile": "v3"}')])
+def test_v1_absent_unknown_or_unlisted_keeps_green_only(monkeypatch, tmp_path, profile, repos, body):
+    if body is None:
+        _profile(monkeypatch, tmp_path, profile, repos)
+    else:
+        p = tmp_path / "mgp.json"
+        p.write_text(body)
+        monkeypatch.setenv("KANBAN_MERGE_GATE_PROFILE", str(p))
+    armed = []
+    rep = fr.check(_refs(), task_id="t_x", allow_arm=True, gh=FakeGh(checks=("failure",)),
+                   arm=lambda *a: armed.append(a))
+    assert armed == [] and rep["prs"]["o/r#5"]["automerge"] == "ci not green; not armed"
+
+
+def test_v2_unreadable_check_runs_is_never_armed(monkeypatch, tmp_path):
+    _profile(monkeypatch, tmp_path, "v2", ["o/r"])
+    gh = FakeGh()
+    real = gh.__call__
+
+    def g(*args):
+        return None if "check-runs" in args[-1] else real(*args)
+    armed = []
+    fr.check(_refs(), task_id="t_x", allow_arm=True, gh=g, arm=lambda *a: armed.append(a))
+    assert armed == []
+
+
+def test_spawn_arm_reason_reports_ci(monkeypatch, tmp_path):
+    fm = tmp_path / "fleet-merge.sh"
+    fm.write_text("")
+    monkeypatch.setenv("KANBAN_HANDOFF_FLEET_MERGE", str(fm))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    seen = []
+    monkeypatch.setattr(fr.subprocess, "Popen", lambda argv, **kw: seen.append(argv))
+    fr.spawn_arm(REPO, 5, HEAD, "t_x", "red: ci")
+    fr.spawn_arm(REPO, 5, HEAD, "t_x")
+    reasons = [a[a.index("--reason") + 1] for a in seen]
+    assert "CI reported not green" in reasons[0] and "red: ci" in reasons[0]
+    assert reasons[1].startswith("handoff freshness gate: CI green on head")
 
 
 def test_default_gh_disabled_under_pytest():
