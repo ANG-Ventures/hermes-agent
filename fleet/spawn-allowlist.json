@@ -51,6 +51,14 @@
    "expires": "2027-01-15"
   },
   {
+   "path": "hermes_cli/kanban_continuation.py",
+   "scope": "inventory",
+   "kind": "ssh",
+   "count": 1,
+   "reason": "grandfathered when the spawn-site lint landed (t_3ca3dbc6); Card B cutover inventory: route it through alloc_client.admit / placement.admit (or ALLOC_RESERVATION from alloc-admit), then delete",
+   "expires": "2027-01-15"
+  },
+  {
    "path": "hermes_cli/kanban_db_dispatch.py",
    "scope": "_browser_release_lease",
    "kind": "ssh",
@@ -59,8 +67,24 @@
    "expires": "2027-01-15"
   },
   {
+   "path": "hermes_cli/kanban_survivor.py",
+   "scope": "remove_workspace_dir",
+   "kind": "ssh",
+   "count": 1,
+   "reason": "grandfathered when the spawn-site lint landed (t_3ca3dbc6); Card B cutover inventory: route it through alloc_client.admit / placement.admit (or ALLOC_RESERVATION from alloc-admit), then delete",
+   "expires": "2027-01-15"
+  },
+  {
    "path": "hermes_cli/setup_terminal.py",
    "scope": "_setup_backend_ssh",
+   "kind": "ssh",
+   "count": 1,
+   "reason": "grandfathered when the spawn-site lint landed (t_3ca3dbc6); Card B cutover inventory: route it through alloc_client.admit / placement.admit (or ALLOC_RESERVATION from alloc-admit), then delete",
+   "expires": "2027-01-15"
+  },
+  {
+   "path": "hermes_cli/ssh_workspace_fs.py",
+   "scope": "SshWorkspaceFs.stream_file",
    "kind": "ssh",
    "count": 1,
    "reason": "grandfathered when the spawn-site lint landed (t_3ca3dbc6); Card B cutover inventory: route it through alloc_client.admit / placement.admit (or ALLOC_RESERVATION from alloc-admit), then delete",
