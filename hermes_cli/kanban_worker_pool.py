@@ -750,6 +750,91 @@ def host_bound_targets(body: Optional[str], skills: Iterable[str], aliases: Iter
     return (bound or bool(found)), tuple(found)
 
 
+# Access-bound derivation (spec v1.2 §2.6, Phase 2c, t_e99ef75c). ``sudo`` is
+# the whole ssh-root trigger (Q9 recommendation (a)); a root-only verb list
+# would be a lint, never a rule. control-plane-read binds on a PATH-shaped
+# mention only (Momus pass 2 R-F): "the kanban.db schema" is prose, while
+# ``~/.hermes/kanban.db`` or ``fleet/kanban-pool.json`` is a file the work opens.
+_SUDO_RE = re.compile(r"(?<![\w-])sudo(?![\w-])")
+_CONTROL_PLANE_PATH_RE = re.compile(
+    r"(?:^|(?<=[\s`'\"(=:,]))(?:~|\.\.?|[\w.@*${}-]+)?(?:/[\w.@*${}-]+)*/"
+    r"(kanban\.db|gateway\.log|load_gate\.json|kanban-pool\.json)(?![\w-])")
+
+
+def _sudo_before_break(remote: str) -> bool:
+    """``sudo`` in the remote command, before a ``;``/``&&``/``|`` outside
+    quotes ends it (``ssh ci uptime && sudo reboot`` runs sudo on the Studio;
+    ``ssh ci 'uptime && sudo dmesg'`` runs it on ci).
+
+    Character scan (Prism 5bdfe1dcf55b): a separator outside quotes ends the
+    remote command even when glued to a word (``uptime;``, ``a&&sudo``) or to
+    a closing quote (``"echo hi"; sudo x``)."""
+    quote = None
+    for i, ch in enumerate(remote):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch in ";&|":
+            if ch == "&" and (remote[i - 1:i] in ("<", ">") or remote[i + 1:i + 2] == ">"):
+                continue  # ``2>&1`` / ``&>f`` is a redirection, not a separator
+            return False
+        if _SUDO_RE.match(remote, i):
+            return True
+    return False
+
+
+def access_bound_cap(body: Optional[str], aliases: Iterable[str], *,
+                     pin_hosts: Iterable[str] = (),
+                     ssh_hosts: Optional[Collection[str]] = None,
+                     canon: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """The Studio-only ACCESS the card needs, or None: ``ssh-root:<host>`` or
+    ``control-plane-read`` (first hit; ssh-root wins on a tie).
+
+    ``ssh-root:<host>``: a body line ``ssh [opts] [user@]<alias> ... sudo ...``
+    for a probed alias, with :func:`host_bound_targets`' discipline: only the
+    ssh TARGET binds, aliases compare whole, a word-shaped alias must be a
+    known ssh host, a ``host:<pin>`` line is never a target. ``<host>`` is the
+    canonical pin of the alias when ``canon`` names one (``ci`` -> ``ci-box``).
+
+    ``control-plane-read``: a path-shaped mention of kanban.db, gateway.log,
+    load_gate.json or kanban-pool.json, or an explicit
+    ``requires: control-plane-read`` line. A bare word never binds.
+    """
+    from hermes_cli import kanban_host_capabilities as _khc
+    alias_set = {a.lower() for a in (aliases or ()) if a}
+    pins = {PIN_ANY, PIN_STUDIO, *(h.lower() for h in (pin_hosts or ()))}
+    known = None if ssh_hosts is None else {h.lower() for h in ssh_hosts}
+    canon = {k.lower(): v for k, v in (canon or {}).items()}
+    cp_read = False
+    for line in (body or "").splitlines():
+        m = HOST_PIN_RE.match(line)
+        if m and m.group(1).lower() in pins:
+            continue
+        verbs = list(_SSH_VERB_RE.finditer(line))
+        for k, v in enumerate(verbs):
+            if v.group(1).lower() != "ssh":
+                continue
+            rest = line[v.end():verbs[k + 1].start() if k + 1 < len(verbs) else len(line)]
+            target = _ssh_target(rest, "ssh")
+            if not target:
+                continue
+            w = target.lower().rstrip("._-")
+            if w not in alias_set:
+                continue
+            if word_shaped_alias(w) and known is not None and w not in known:
+                continue
+            at = re.search(rf"(?<![\w.-]){re.escape(target)}(?![\w-])", rest)
+            if at and _sudo_before_break(rest[at.end():]):
+                return _reasons.ssh_root(canon.get(w, w))
+        if not cp_read and _CONTROL_PLANE_PATH_RE.search(line):
+            cp_read = True
+    if cp_read or _reasons.ACCESS_CONTROL_PLANE_READ in _khc.declared_words(body):
+        return _reasons.ACCESS_CONTROL_PLANE_READ
+    return None
+
+
 def reaching_hosts(reach: Mapping[str, Mapping[str, int]], targets: Iterable[str],
                    aliases: Iterable[str]) -> Tuple[str, ...]:
     """Worker hosts whose fresh row shows ``rc == 0`` for EVERY target (or,
@@ -950,6 +1035,13 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     hard_rule, soft_rule = requires or (None, None)
     if hard_rule:
         return False, hard_rule, None
+    # Access-bound (spec v1.2 §2.6, t_e99ef75c): the ACCESS is Studio-only, so
+    # no pin and no reach matrix can move it. Decided before host_reach (Momus
+    # pass 2 R-F: a stale matrix must not decide the name) and before every pin
+    # branch (a pool pin is a contradiction the dispatcher parks needs_input).
+    access = access_bound_for(body, pool)
+    if access is not None:
+        return False, _reasons.access_bound(access), None
     pin, ignored = resolve_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None))
     if pin == PIN_STUDIO:
         return False, _reasons.HOST_STUDIO, None
@@ -979,6 +1071,17 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     if affinity is not None:
         return False, affinity[0], None
     return True, None, "policy"
+
+
+def access_bound_for(body: Optional[str], pool) -> Optional[str]:
+    """:func:`access_bound_cap` against this pool's alias vocabulary: the
+    reach-matrix aliases plus every known pool host (the same set
+    :func:`reach_allowed_hosts` binds on), canonicalised by ``pin_aliases``."""
+    pool_hosts = tuple(getattr(pool, "hosts", ()) or ())
+    aliases = (*(getattr(pool, "reach_aliases", ()) or ()), *(h.lower() for h in pool_hosts))
+    return access_bound_cap(body, aliases, pin_hosts=pool_hosts,
+                            ssh_hosts=getattr(pool, "ssh_hosts", None),
+                            canon=getattr(pool, "pin_aliases", None))
 
 
 def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,

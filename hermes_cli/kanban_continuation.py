@@ -141,6 +141,15 @@ def origin_route(conn, row, pool, *, config: dict, states: dict, caps=None,
         if any(w != 'none' for w in words):
             reason = f'cannot verify hard requirements on origin {host}: capability map unavailable'
     if reason is None:
+        # Access-bound (spec §2.6, Prism bbd09df624d7): the dispatcher returns
+        # this route before portable() runs, so the access rule is checked
+        # here too, with or without a capability map. A Studio-only access
+        # never runs on the origin host.
+        from hermes_cli import kanban_worker_pool as kwp
+        access = kwp.access_bound_for(row["body"], pool)
+        if access is not None:
+            reason = f"access {access} is Studio-only; state is on {host}"
+    if reason is None:
         for other in conn.execute(
             "SELECT t.id,t.origin_host,t.workspace_path FROM task_links l JOIN tasks t "
             "ON t.id=CASE WHEN l.parent_id=? THEN l.child_id ELSE l.parent_id END "

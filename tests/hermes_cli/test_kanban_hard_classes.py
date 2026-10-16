@@ -124,17 +124,20 @@ def test_kanban_db_body_routes_local_with_a_healthy_pool(home):
     with kb.connect_closing() as conn:
         tid = _card(conn, "Count blocked runs: sqlite3 -readonly ~/.hermes/kanban.db 'select ...'")
         (route, aff, _out) = _route(conn, tid)
-        assert route == ("local", "studio_affinity:requires:studio-state")
+        # A kanban.db PATH is access-bound (traceability spec §2.6, t_e99ef75c):
+        # the more specific name wins over the studio-state soft rule.
+        assert route == ("local", "access_bound:control-plane-read")
         res, spawned = _tick(conn)
         assert spawned == [(tid, "studio")]
         assert not res.placed
 
 
 def test_studio_state_soft_true_spills(home):
-    """Kill switch / negative: the same body under `soft: true` routes portable."""
+    """Kill switch / negative: a studio-state body under `soft: true` routes portable.
+    (turns.db: studio-state, not access-bound; a kanban.db path stays access-bound.)"""
     _map(home, lambda d: d["capabilities"]["studio-state"].update(soft=True))
     with kb.connect_closing() as conn:
-        tid = _card(conn, "Count blocked runs: sqlite3 -readonly ~/.hermes/kanban.db 'select ...'")
+        tid = _card(conn, "Count turns: sqlite3 -readonly ~/.hermes/turns.db 'select ...'")
         assert _route(conn, tid)[0] == ("portable", None)
 
 
@@ -146,7 +149,8 @@ def test_ssh_ci_sudo_is_local_through_both_doors(home):
         (route, _aff, out) = _route(conn, tid)
         assert route[0] == "local"
         reasons = out["reasons"][tid]
-        assert "host_reach" in reasons and "requires:fleet-ssh" in reasons, reasons
+        # Named access_bound, not the host_reach residue (traceability spec §2.6).
+        assert "access_bound:ssh-root:ci" in reasons and "requires:fleet-ssh" in reasons, reasons
 
 
 def test_without_the_matrix_alias_only_the_map_door_holds(home):
@@ -162,7 +166,8 @@ def test_without_the_matrix_alias_only_the_map_door_holds(home):
 def test_fleet_ssh_soft_true_leaves_only_the_matrix(home):
     _map(home, lambda d: d["capabilities"]["fleet-ssh"].update(soft=True))
     with kb.connect_closing() as conn:
-        tid = _card(conn, "Step 1: ssh ci sudo setpci -s 80:01.1 CAP_EXP+30.w=0003:000f")
+        # No sudo: fleet-ssh + matrix only (a sudo body is access-bound, §2.6).
+        tid = _card(conn, "Step 1: ssh ci 'lspci -vv -s 80:01.1'")
         (route, _aff, out) = _route(conn, tid)
         assert route == ("local", None) and tid not in out.get("reasons", {})
 

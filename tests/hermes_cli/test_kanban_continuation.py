@@ -532,3 +532,25 @@ def test_continues_source_fresh_path_spawns_under_require_mount(mounted_home):
         rows = dict(conn.execute('SELECT id,workspace_path FROM tasks').fetchall())
         assert rows[child] == str(shared) and rows[src] != str(shared)
         assert _spawned(conn, src) == rows[src]
+
+
+# Prism bbd09df624d7: the dispatcher returns origin_route before portable(),
+# so the access-bound rule (spec §2.6) must hold on the origin path too.
+@pytest.mark.parametrize("body", [
+    "requires: control-plane-read\nRead the board.\n",
+    "sqlite3 -readonly ~/.hermes/kanban.db 'select 1'\n",
+])
+@pytest.mark.parametrize("with_caps", [True, False])
+def test_access_bound_continuation_never_routes_to_origin(db, body, with_caps):
+    """RED ON BASE (8eb418ee) for every caps arm except requires+no-map."""
+    ctx = khc.CapabilityTick(khc.CapabilityMap(capabilities=("control-plane",),
+                             hosts={"ace-media": frozenset()}), "enforce", (), ("ace-media",)) \
+        if with_caps else None
+    res = route(db, card(db, body=body), caps=ctx)
+    assert res is not None and res[0] == "wait", res
+    assert res != ("origin", "ace-media")
+
+
+def test_access_bound_origin_reason_names_the_access(db):
+    res = route(db, card(db, body="cat ~/.hermes/fleet/kanban-pool.json\n"))
+    assert res[0] == "wait" and "access control-plane-read is Studio-only" in res[1]
