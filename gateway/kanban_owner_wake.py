@@ -537,10 +537,10 @@ def handback_pr_state(kb: Any, conn: Any, task: dict, payload: Optional[dict],
 
 
 def gated_ready_children(kb: Any, conn: Any, task_id: str) -> list[dict]:
-    """Open children whose every ``blocks`` parent is now done/archived."""
+    """Open children whose every gating parent is now done/archived."""
     out = []
     for child_id, kind in kb.child_links(conn, task_id):
-        if kind != kb.LINK_KIND_BLOCKS:
+        if kind not in kb.GATING_LINK_KINDS:
             continue
         row = conn.execute("SELECT status FROM tasks WHERE id = ?", (child_id,)).fetchone()
         if row is None or row["status"] in ("done", "archived", "running", "review"):

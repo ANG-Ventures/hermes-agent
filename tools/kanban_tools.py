@@ -1596,8 +1596,10 @@ def _handle_link(args: dict, **kw) -> str:
         gated = kb.link_tasks(
             conn, parent_id=parent_id, child_id=child_id, kind=kind,
             expected_child_run_id=_worker_run_id(str(child_id)))
-        return _ok(parent_id=parent_id, child_id=child_id, gated=gated,
-                   kind=kb.normalize_link_kind(kind),
+        from hermes_cli import kanban_after_merge
+        kind = kb.normalize_link_kind(kind)
+        return _ok(parent_id=parent_id, child_id=child_id, gated=gated, kind=kind,
+                   gate=kanban_after_merge.describe_gate(parent_id, child_id, kind),
                    **({"gated_by": parent_id} if gated else {}))
 
 

@@ -2754,6 +2754,8 @@ def _cmd_link(args: argparse.Namespace) -> int:
         gated = kb.link_tasks(conn, args.parent_id, args.child_id, kind=kind,
                               expected_child_run_id=expected_child_run_id)
     print(f"Linked {args.parent_id} -> {args.child_id} ({kind})")
+    from hermes_cli import kanban_after_merge
+    print(f"Gate: {kanban_after_merge.describe_gate(args.parent_id, args.child_id, kind)}")
     if gated:
         print(
             f"Note: {args.child_id} was ready and is now todo — parent "
