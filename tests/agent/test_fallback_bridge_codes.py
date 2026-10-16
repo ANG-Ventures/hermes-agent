@@ -215,6 +215,94 @@ def test_live_215226_refusal_line_through_the_real_handler(_home, monkeypatch):
     assert "served_by=sub-vps-11" in log and "category=cyber" in log
 
 
+# t_a123064d: the 2026-10-16 03:39:59 relay-200 refusal (sub-vps-20, route 8dfaf616...).
+# message_delta is verbatim from the sub-vps-20 apx wirelog; the SDK's Delta model does not
+# declare stop_details, so its final-message snapshot drops it.
+_LIVE_0339_EXPL = ("This request triggered restrictions on violative cyber content and was blocked "
+                   "under Anthropic's Usage Policy. To learn more, see "
+                   "https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback.")
+_LIVE_0339_SSE = (
+    'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-fable-5-1",'
+    '"id":"msg_011Cg5mp3HxrsJ3Ee6WQVpe6","type":"message","role":"assistant","content":[],'
+    '"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,'
+    '"usage":{"input_tokens":2,"output_tokens":129}}}\n\n'
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal",'
+    '"stop_sequence":null,"stop_details":{"type":"refusal","category":"cyber","explanation":"'
+    + _LIVE_0339_EXPL.replace('"', '\\"') + '"}},"usage":{"input_tokens":2,"output_tokens":237,'
+    '"cache_read_input_tokens":513863,"cache_creation_input_tokens":364}}\n\n'
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+)
+
+
+def _live_0339_wire_agent():
+    """The real alr agent over the real Anthropic SDK + httpx, served the live SSE bytes."""
+    from tests.agent.test_fallback_dead_letter_cause import _alr_agent
+
+    def _handler(_request):
+        return httpx.Response(200, content=_LIVE_0339_SSE.encode(), headers={
+            "content-type": "text/event-stream", "x-pool-served-by": "sub-vps-20",
+            "x-pool-route-id": "8dfaf616faa84a09aac189472911732b"})
+
+    client = anthropic.Anthropic(api_key="k", base_url="http://127.0.0.1:18810/anthropic",
+                                 http_client=httpx.Client(transport=httpx.MockTransport(_handler)))
+    from run_agent import AIAgent
+
+    real = AIAgent(api_key="k", base_url="http://127.0.0.1:18810/anthropic", model="claude-fable-5-1",
+                   quiet_mode=True, skip_context_files=True, skip_memory=True)
+    real.api_mode, real.provider, real._interrupt_requested = "anthropic_messages", "claude-alr", False
+    real._anthropic_client = client
+    real._create_request_anthropic_client = lambda *a, **k: client
+    return real, _alr_agent()
+
+
+def test_live_0339_stream_keeps_stop_details_without_relay_management(_home):
+    """Unmanaged relay stream (no Relay consumer): on_chunk never fires, so the
+    accumulator is empty and only the event loop sees message_delta.stop_details.
+    Mutation: drop the loop capture in _call_anthropic -> stop_details None -> RED."""
+    real, _ = _live_0339_wire_agent()
+    final = real._interruptible_streaming_api_call(
+        {"model": "claude-fable-5-1", "messages": [{"role": "user", "content": "x"}], "max_tokens": 8})
+    assert final.stop_reason == "refusal"
+    from agent.turn_truncation import normalize_response_for_agent
+
+    sd = (normalize_response_for_agent(real, final).provider_data or {}).get("stop_details")
+    assert sd == {"type": "refusal", "category": "cyber", "explanation": _LIVE_0339_EXPL}, sd
+
+
+def test_live_0339_refusal_banner_and_census_name_the_category(_home, monkeypatch):
+    """Wire -> real stream call -> real normalizer -> refusal handler -> banner + log."""
+    from agent.chat_completion_helpers import try_activate_fallback
+    from agent.turn_retry_state import TurnRetryState
+    from agent.turn_truncation import handle_content_policy_refusal, normalize_response_for_agent
+    from tests.agent.test_fallback_events_ledger import _patch_resolver
+
+    _patch_resolver(monkeypatch)
+    real, a = _live_0339_wire_agent()
+    resp = real._interruptible_streaming_api_call(
+        {"model": "claude-fable-5-1", "messages": [{"role": "user", "content": "x"}], "max_tokens": 8})
+    monkeypatch.setattr("agent.turn_truncation.normalize_response_for_agent",
+                        lambda _agent, r: normalize_response_for_agent(real, r))
+    monkeypatch.setattr("agent.conversation_loop._arm_fallback_restart",
+                        lambda _a, _m, sp, _r: sp)
+    a._extract_reasoning = lambda _m: ""
+    a._invoke_api_request_error_hook = lambda **_kw: None
+    a.thinking_callback = None
+    a._has_pending_fallback = lambda: True
+    a._buffer_diagnostic_status = lambda *_: None
+    a._try_activate_fallback = lambda **kw: try_activate_fallback(a, **kw)
+    verdict = handle_content_policy_refusal(
+        a, resp, TurnRetryState(), thinking_spinner=None, messages=[], api_messages=[],
+        api_kwargs=None, active_system_prompt="sp", conversation_history=[],
+        api_call_count=1, effective_task_id="t", turn_id="t1", api_request_id="r",
+        api_start_time=0.0, retry_count=0, max_retries=3)
+    assert verdict.action == "break"
+    text = _rows(_home)[0]["notice_text"]
+    assert (" — content policy refusal (category=cyber) · hop=relay-200 · sub=sub-vps-20 · "
+            "\"This request triggered restrictions on violative cyber content") in text, text
+    log = (_home / "state" / "model-route-changes.log").read_text()
+    assert "served_by=sub-vps-20" in log and " category=cyber " in log, log
+
+
 # ── B. bridge 409 tui_busy ───────────────────────────────────────────────
 
 def test_tui_busy_classifies_by_code_not_status():

@@ -5507,6 +5507,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self._attempt_request_client = request_client
         _stream_context = {"manager": None, "stream": None}
         base_final_message = None
+        loop_stop_details = None
 
         from agent import relay_llm
         from agent.anthropic_adapter import normalize_stream_usage, sanitize_anthropic_kwargs
@@ -5553,7 +5554,13 @@ class _StreamingCall(StreamingWaitMonitor):
                 if event_type == "message_stop":
                     saw_message_stop = True
                 elif event_type == "message_delta":
-                    self._mark_finish_seen(_diag, getattr(getattr(event, "delta", None), "stop_reason", None))
+                    _delta = getattr(event, "delta", None)
+                    self._mark_finish_seen(_diag, getattr(_delta, "stop_reason", None))
+                    # The accumulator only observes Relay-managed chunks; an unmanaged stream
+                    # reaches only this loop, so keep stop_details here (t_a123064d).
+                    _delta_sd = getattr(_delta, "stop_details", None)
+                    if _delta_sd is not None:
+                        loop_stop_details = _delta_sd
                 elif event_type == "content_block_start":
                     block = getattr(event, "content_block", None)
                     if block and getattr(block, "type", None) == "tool_use":
@@ -5595,8 +5602,9 @@ class _StreamingCall(StreamingWaitMonitor):
                         "Provider returned an empty stream with no events (possible upstream error or malformed event stream).")
                 base_final_message = raw_stream.get_final_message()
                 # The SDK snapshot keeps only stop_reason/stop_sequence from message_delta; the
-                # refusal's stop_details (category/explanation) survives only in our accumulator.
-                _stop_details = accumulator.finalize().get("stop_details")
+                # refusal's stop_details (category/explanation) survives only in our accumulator
+                # (Relay-managed) or the loop capture above (unmanaged).
+                _stop_details = accumulator.finalize().get("stop_details") or loop_stop_details
                 if _stop_details is not None and getattr(base_final_message, "stop_details", None) is None:
                     base_final_message.stop_details = _stop_details
         finally:
