@@ -1275,13 +1275,16 @@ def _compose_inbound_user_turn(
 
 
 def _has_replayable_sidecar(role: Any, content: Any, msg: Dict[str, Any]) -> bool:
-    """True for an assistant row whose reply lives only in the ``api_content`` sidecar.
+    """True for a row whose sent bytes live only in the ``api_content`` sidecar.
 
     A reasoning-only clean stop persists ``content=""`` and the promoted text in ``api_content``
     (agent/turn_final_response.py). Gating replay on ``content`` alone dropped that row, so the
-    next gateway turn lost the assistant's answer and replayed user->user."""
+    next gateway turn lost the assistant's answer and replayed user->user. A resume turn persists
+    the RAW (empty) user text with the recovery note as the sidecar; dropping it made the closer
+    and the resumed reply adjacent, and they merged into the already-sent assistant turn
+    (class C, t_91b6a4c4)."""
     return (
-        role == "assistant"
+        role in ("assistant", "user")
         and not content
         and isinstance(msg.get("api_content"), str)
         and bool(msg.get("api_content"))
@@ -1325,6 +1328,8 @@ def _build_gateway_agent_history(
     Observed context stays out of ``conversation_history`` so consecutive-user repair can't merge it in."""
     from hermes_time import get_timezone as _get_msg_tz
     from agent.compaction_stats import is_standalone_summary_content
+    from agent.message_metadata import MERGED_TURN_PREFIX
+    from agent.prompt_builder import STEER_DISPLAY_KIND
     from gateway.message_timestamps import (
         render_user_content_with_timestamp as _render_msg_ts,
         strip_leading_message_timestamps as _strip_msg_ts,
@@ -1364,23 +1369,31 @@ def _build_gateway_agent_history(
                         content = clean_body
                         if embedded_timestamp is not None:
                             replay_timestamp = embedded_timestamp
-                if not content:
+                # Stored empty with a sidecar (resume turn): replay the sent bytes. Emptied by the
+                # cleanup above: a legacy recovery note, never restored.
+                if not content and not _has_replayable_sidecar(role, msg.get("content"), msg):
                     continue
             # Keep user timestamps for the stale-dangerous-confirmation stripper in agent/replay_cleanup.py.
             entry = _build_replay_entry(role, content, msg, preserve_timestamp=(role == "user"))
             # A compaction summary is synthesized, never received: the compaction turn sends
             # it bare, so a rendered stamp here rewrote msg[0] by +30 B next turn (t_f98bc0c5).
+            # A /steer row is sent bare mid-turn (steer_user_row); stamping it on replay rewrote
+            # it by +30 B on the next request (class A, t_91b6a4c4).
             if (
                 inject_timestamps and role == "user" and isinstance(content, str)
                 and not is_standalone_summary_content(content)
+                and msg.get("display_kind") != STEER_DISPLAY_KIND
+                and content  # a sidecar-only row replays its sidecar as sent, unstamped
             ):
                 rendered = _render_msg_ts(content, replay_timestamp, tz=_msg_tz)
                 # Preserve only a sidecar matching the complete rendered message,
                 # optionally followed by the normal context separator. Cleanup
                 # above already invalidated sidecars containing stripped content.
                 sidecar = entry.get("api_content")
-                if rendered != content and sidecar and not _sidecar_carries_rendered_turn(
-                    sidecar, rendered, content
+                # A row the alternation repair merged carries its parts' sent bytes joined
+                # (_merge_consecutive_users): one stamp over the joined text never matches them.
+                if rendered != content and sidecar and not msg.get(MERGED_TURN_PREFIX) and not (
+                    _sidecar_carries_rendered_turn(sidecar, rendered, content)
                 ):
                     entry.pop("api_content", None)
                 entry["content"] = rendered

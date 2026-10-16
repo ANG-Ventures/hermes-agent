@@ -657,6 +657,7 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
                 (prev_content + "\n\n" + new_content) if prev_content and new_content else (prev_content or new_content)
             )
             had_api_sidecar = "api_content" in prev
+            prev_wire, new_wire = prev.get("api_content"), msg.get("api_content")
             prev["content"] = merged_content
             # The clean-text persist override must replace only the absorbed turn, never the
             # unanswered text before it; kept across replay passes (an empty turn absorbs too).
@@ -664,6 +665,11 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
                 prev[MERGED_TURN_PREFIX] = prev_content
             # Merged content invalidates the api_content sidecar; drop it so replay cannot use stale bytes.
             drop_stale_api_content(prev)
+            # When BOTH parts carry their sent bytes, the merged row's wire form is those bytes joined
+            # the same way: rebuilding it from clean text drops the absorbed turn's timestamp prefix
+            # on replay (class B, t_91b6a4c4).
+            if isinstance(prev_wire, str) and prev_wire and isinstance(new_wire, str) and new_wire:
+                prev["api_content"] = prev_wire + "\n\n" + new_wire
             # A display-marker row (e.g. a model-switch marker persisted as role=user on
             # purpose, #48338) merging with a plain user row must not bury the plain row's
             # addressable identity: keeping the marker's display_kind hides the merged pair

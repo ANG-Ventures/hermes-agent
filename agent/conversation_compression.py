@@ -3559,8 +3559,21 @@ def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
             compressed.append({"role": "user", "content": todo_snapshot, "_todo_snapshot_synthetic": True})
 
 
-def _rebuild_system_prompt_at_boundary(agent: Any, system_message: str) -> str:
-    """Refresh tool schemas and rebuild the system prompt at the commit boundary."""
+def _wire_view(messages: Optional[list]) -> list:
+    """The fields of each message a provider request carries (persistence markers excluded)."""
+    keys = ("role", "content", "api_content", "tool_calls", "tool_call_id", "name")
+    return [tuple(m.get(k) for k in keys) if isinstance(m, dict) else m for m in messages or []]
+
+
+def _rebuild_system_prompt_at_boundary(agent: Any, system_message: str, *, transcript_changed: bool = True) -> str:
+    """Refresh tool schemas and rebuild the system prompt at the commit boundary.
+
+    ``transcript_changed=False`` (a compaction that left every message as it was) keeps the
+    cached prompt and tools: the request prefix is otherwise intact, so a rebuild there is the
+    ONLY break, e.g. the "as of" date line rolling Thursday -> Friday (class G, t_91b6a4c4).
+    The next compaction that does rewrite the transcript refreshes both."""
+    if not transcript_changed and agent._cached_system_prompt:
+        return agent._cached_system_prompt
     if getattr(agent, "_retain_seeded_system_prompt", False) is True:
         # Gateway hygiene / gateway /compress run a detached agent with a reduced toolset and no live
         # surface: its builder output drops the skills index, external provider blocks and tool guidance,
@@ -5225,7 +5238,10 @@ def compress_context(
             )
         _fold_todo_snapshot(agent, compressed)
         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(messages, compressed)
-        new_system_prompt = _rebuild_system_prompt_at_boundary(agent, system_message)
+        new_system_prompt = _rebuild_system_prompt_at_boundary(
+            agent, system_message,
+            transcript_changed=_wire_view(compressed) != _wire_view(messages_before_compression or messages),
+        )
         commit = _commit_compaction(
             agent, messages, compressed, in_place=in_place, lease=lease, new_system_prompt=new_system_prompt,
             system_message=system_message, compressed_user_turn_outcome=compressed_user_turn_outcome,
