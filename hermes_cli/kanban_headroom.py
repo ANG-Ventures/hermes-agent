@@ -599,10 +599,15 @@ def renew_running(boards, connect, path, *, now: Optional[float] = None) -> Dict
         for tid, rid, via in rows:
             try:
                 if via == VIA_ALLOC_CLIENT:
-                    ok = _renew_alloc(rid)
-                    new = _alloc_current(rid) if ok else rid
-                    if new != rid:
-                        _persist_replacement(connect, slug, tid, rid, new)
+                    try:
+                        ok = _renew_alloc(rid)
+                    finally:
+                        # alloc_client._readmit aliases a LIVE replacement before it can still fail
+                        # (renew_not_extended, a Refused out of _extend): persist it on every outcome
+                        # (Prism 82b5db46c257), else a restart loses the row the run-end release needs.
+                        new = _alloc_current(rid)
+                        if new != rid:
+                            _persist_replacement(connect, slug, tid, rid, new)
                 else:
                     ok = placement.renew(rid, ttl_s=RESERVE_TTL_S, path=path, now=now)
             except placement.PlacementError as exc:
