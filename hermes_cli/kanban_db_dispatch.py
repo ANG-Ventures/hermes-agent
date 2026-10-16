@@ -4815,7 +4815,8 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
 
     The live tick and ``--dry-run`` both come through here and both call
     ``kanban_browser_gate.gate_rows`` (one code path, pass-3 lens). ``browsers.mode`` and
-    ``migrated_lanes`` are read from ``fleet/browser-hosts.json`` on every tick (no restart to flip).
+    ``migrated_lanes`` are read on every tick (no restart to flip) from the host-local browser-hosts.json
+    browserd reads (``kanban_browser_gate.registry_path``; the repo file is only the ``mode: off`` seed).
     A card with no ``browser:*`` need is untouched. Per card:
 
     * ``legacy_route`` (mode off, lane not migrated, identity unsealed): today's placement, one event
@@ -4836,7 +4837,7 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
         return
     _dflt = _resolve_default_assignee(default_assignee)
     try:
-        reg = _kn.load_registry(_kb.kanban_home() / "fleet")
+        reg = _kbg.load(_kb.kanban_home() / "fleet", _root_kanban_cfg().get("browser_hosts_file"), log=_kb._log)
         join_on = join and reg.mode == _kbg.MODE_ON and _browser_join_on()
         lookup = _browser_lookup() if reg.mode == _kbg.MODE_ON else (lambda name: None)
         eff = [r if r["assignee"] or not _dflt else dict(dict(zip(r.keys(), tuple(r))), assignee=_dflt)
