@@ -133,7 +133,7 @@ jobs:
           name: windows-install-update-e2e-${{ matrix.leg }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/win-update-e2e
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 2
 
       - name: No leftover Python / Hermes processes
         # Backstop for each journey's teardown: nothing a machine started may outlive it.

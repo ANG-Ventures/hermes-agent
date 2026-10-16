@@ -166,6 +166,8 @@ jobs:
           if [ -f "${{ runner.temp }}/e2e-logs/recording.mkv" ]; then
             ffmpeg -y -hide_banner -loglevel error -i "${{ runner.temp }}/e2e-logs/recording.mkv" \
               -c copy "${{ runner.temp }}/e2e-logs/recording.mp4"
+            # Same stream; playback.html prefers the mp4. set -e keeps the mkv when the remux fails.
+            rm -f "${{ runner.temp }}/e2e-logs/recording.mkv"
           fi
 
       # The leg player: ONE static HTML per run, uploaded up front by the
@@ -183,11 +185,13 @@ jobs:
       # tripped when a real install breaks.
       - name: Upload installer logs
         if: always()
+        # Evidence, not a deliverable: an artifact-quota hit must not red a leg that passed.
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           # Unique per leg: a matrix over releases runs this workflow several
           # times per route, and same-named artifacts collide.
           name: ${{ steps.artifact.outputs.name }}-${{ github.sha }}
           path: ${{ runner.temp }}/e2e-logs
-          retention-days: 14
+          retention-days: 2
           if-no-files-found: ignore
