@@ -4648,6 +4648,23 @@ _STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "st
                                     "studio_needs"})
 
 
+def _drop_foreign(conn, pending: dict, default_assignee: Optional[str] = None) -> None:
+    """Pop every task id from ``pending`` whose effective assignee this home
+    would not itself spawn (``_profile_exists_fn`` / ``dispatch_profiles``, the
+    ready loop's gate). Every post-loop park goes through this first: routing
+    sees the whole shared board, so a park without it blocks another home's
+    card (Prism 229da8245003)."""
+    if not pending:
+        return
+    _exists = _profile_exists_fn()
+    _dflt = _resolve_default_assignee(default_assignee)
+    for tid in list(pending):
+        row = conn.execute("SELECT assignee FROM tasks WHERE id=?", (tid,)).fetchone()
+        eff = (row[0] if row else None) or _dflt
+        if not eff or (_exists is not None and not _exists(eff)):
+            pending.pop(tid)
+
+
 def _park_access_contradictions(conn, result, dry_run: bool,
                                 default_assignee: Optional[str] = None) -> None:
     """Park every access-bound card pinned to a pool host ``needs_input``
@@ -4662,13 +4679,7 @@ def _park_access_contradictions(conn, result, dry_run: bool,
     pending = result.access_contradictions or {}
     if not pending:
         return
-    _exists = _profile_exists_fn()
-    _dflt = _resolve_default_assignee(default_assignee)
-    for tid in list(pending):
-        row = conn.execute("SELECT assignee FROM tasks WHERE id=?", (tid,)).fetchone()
-        eff = (row[0] if row else None) or _dflt
-        if not eff or (_exists is not None and not _exists(eff)):
-            pending.pop(tid)
+    _drop_foreign(conn, pending, default_assignee)
     for tid, line in pending.items():
         if dry_run:
             continue
@@ -6874,6 +6885,8 @@ def _dispatch_once_locked(
         from hermes_cli import kanban_host_capabilities as _khc
         _cap_comments = _khc.pending_comments(conn, result, _caps, _caps_out)
         record_affinity_events(conn, result, _affinity_evaluated, _affinity_reached)
+        # The pin-lacks park blocks the card: ownership first, as for access contradictions.
+        _drop_foreign(conn, _caps_out.get("pin_lacks") or {}, default_assignee)
         _khc.record_capability_events(conn, result, _caps, _caps_out, _affinity_evaluated,
                                       _cap_comments)
     _park_access_contradictions(conn, result, dry_run, default_assignee)
