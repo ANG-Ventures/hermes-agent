@@ -871,7 +871,7 @@
       "gateway/kanban_watchers.py",
       "gateway/kanban_home_route.py"
     ],
-    "why": "A completed/blocked/review line for a card the home session closed itself is withheld from the home chat (receipt event notify_suppressed, reason self-session/self-operator); a foreign subscriber still gets it (Prism P1 03f8b8156055). 2026-10-15 (t_d654c294): the home check compared home_from_row's target (thread_id == chat_id normalised to '') with the raw kanban_notify_subs row (Discord threads keep thread_id == chat_id), so it was never True in a thread and every thread-homed self-close echoed. kanban_home_route.same_chat normalises both sides; the _sub_is_home site in the notifier routes through it.",
+    "why": "Cross-path contract: see row kanban-wake-contract (tests/fork_canaries/test_fork_canary_kanban_wake_contract.py). A completed/blocked/review line for a card the home session closed itself is withheld from the home chat (receipt event notify_suppressed, reason self-session/self-operator); a foreign subscriber still gets it (Prism P1 03f8b8156055). 2026-10-15 (t_d654c294): the home check compared home_from_row's target (thread_id == chat_id normalised to '') with the raw kanban_notify_subs row (Discord threads keep thread_id == chat_id), so it was never True in a thread and every thread-homed self-close echoed. kanban_home_route.same_chat normalises both sides; the _sub_is_home site in the notifier routes through it.",
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
@@ -888,12 +888,32 @@
       "gateway/kanban_owner_wake.py",
       "gateway/kanban_watchers.py"
     ],
-    "why": "needs_input / precondition blocks, stuck workers, last-blocker-done, red/dirty handbacks and scheduled wakes on non-spawnable cards wake the card's home operator session (the lifecycle line alone notified only a human). 2026-10-15 (t_b1d26df7): a red handback on a card whose home chat holds a notify+wake sub woke twice (notifier review_requested + owner-wake red_handback, 2 s apart). The notifier now computes the red-PR state for review_requested on wake subs, appends it to its one wake turn and marks the event carried (kanban_owner_wake.mark_carried, keyed on board/task/event/chat) only after the wake was accepted; the owner-wake drops a carried review_requested. With no wake sub, an unread PR health, or a failed notifier wake, the owner-wake still fires alone.",
+    "why": "Cross-path contract: see row kanban-wake-contract (tests/fork_canaries/test_fork_canary_kanban_wake_contract.py). needs_input / precondition blocks, stuck workers, last-blocker-done, red/dirty handbacks and scheduled wakes on non-spawnable cards wake the card's home operator session (the lifecycle line alone notified only a human). 2026-10-15 (t_b1d26df7): a red handback on a card whose home chat holds a notify+wake sub woke twice (notifier review_requested + owner-wake red_handback, 2 s apart). The notifier now computes the red-PR state for review_requested on wake subs, appends it to its one wake turn and marks the event carried (kanban_owner_wake.mark_carried, keyed on board/task/event/chat) only after the wake was accepted; the owner-wake drops a carried review_requested. With no wake sub, an unread PR health, or a failed notifier wake, the owner-wake still fires alone.",
     "lifecycle": "fork-permanent",
     "upstream_ref": null,
     "absorbed_date": null,
     "surfaces": [
       "gateway"
     ]
+  },
+  {
+    "feature": "kanban-wake-contract: one kanban event -> exactly N owner turns across notifier + owner-wake + notify_suppress (t_0ea2883c; #1901, #2019, #2021)",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_kanban_wake_contract.py"
+    ],
+    "paths": [
+      "gateway/kanban_watchers.py",
+      "gateway/kanban_owner_wake.py",
+      "gateway/kanban_notify_suppress.py",
+      "gateway/kanban_home_route.py"
+    ],
+    "why": "Cross-path contract over the two rows above (kanban notify_suppress, kanban owner-wake). Three wake defects shipped in four days with every per-feature test green: self-close echoes (t_4c7da648 #1901), the suppressor never firing in Discord threads (t_d654c294 #2019), a red handback waking twice (t_b1d26df7 #2021). The canary drives one real notifier tick (owner-wake tick at its tail) per event and counts turns at adapter.handle_message, the path read from metadata.kanban_owner_wake: W1 green handback 1 notifier; W2 red handback + wake sub 1 notifier naming the red; W3 red handback, no sub, 1 owner-wake; W4/W5 home-session self-close in a group chat / Discord thread 0 turns + self-session receipt; W6 foreign close on a thread-homed card 1; W7 needs_input block + wake sub 1 notifier; W8 operator-profile close of the last blocker 1 owner-wake (NEVER_SUPPRESS_TRIGGERS); W9 wake-only sub never suppressed. Two strict xfails record open findings: W8b home-session close of the last blocker gets 0 turns (owner-wake own-session pre-filter runs before NEVER_SUPPRESS_TRIGGERS); W8c worker close of the last blocker with a notify+wake sub gets 2 turns.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_kanban_wake_contract.py (RED-proven 2026-10-15 t_0ea2883c: #2019 reverted -> W5; #2021 reverted -> W2 (2 turns); is_redundant forced False -> W4 W5 W8; NEVER_SUPPRESS_TRIGGERS emptied -> W8)"
   }
 ]
