@@ -551,6 +551,52 @@ def test_replacement_reservation_survives_a_restart(home, allocd, monkeypatch):
     assert not placement.live_reservations(rpath)
 
 
+@pytest.mark.parametrize("outcome", ["false", "raises"])
+def test_replacement_set_on_a_failed_renew_is_persisted(home, allocd, monkeypatch, outcome):
+    """Prism 82b5db46c257: alloc_client._readmit aliases old -> new and THEN can fail
+    (``renew_not_extended`` -> False, or a Refused out of _extend -> PlacementError).
+    The replacement row is live either way, so renew_running persists the alias on every
+    outcome; after a restart the run-end release reaches the replacement, not the dead id."""
+    f = Fleet()
+    _pressure_from_fleet(home, f)
+    plan = _plan(home, f, now=time.time())
+    plan.signal.allocd = kh.ALLOCD_ON
+    rpath = home / placement.RESERVATIONS_REL
+
+    def spawn(task, workspace, *, board=None, placement=None):
+        return 4242
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="c", assignee="alpha")
+        kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=4, spawn_paused=None, spawn_limit=0,
+                          spillover=plan, reconcile_orphans=False)
+        run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+        old, _via = kh.run_reservation(conn, tid, run_id)
+        row = [r for r in placement._read_ledger(rpath)["rows"] if r["id"] == old][0]
+        new = placement.reserve(row["host"], "kanban", placement._row_footprint(row),
+                                ttl_s=60, job_id=row["job_id"], path=rpath)
+        placement.release(old, path=rpath)
+
+        def failing_readmit(rid, **kw):
+            alloc_client._REPLACED[old] = new             # _readmit aliases first ...
+            if outcome == "raises":
+                raise alloc_client.Refused("token unreadable")
+            return False                                  # ... then renew_not_extended
+
+        with monkeypatch.context() as m:
+            m.setattr(alloc_client, "renew", failing_readmit)
+            got = kh.renew_running([{"slug": "default"}], lambda board=None: kb.connect(board=board), rpath)
+        assert got["renewed"] == 0
+        alloc_client._REPLACED.clear()                    # the gateway restarts
+        alloc_client._OWNER.clear()
+        assert kh.run_reservation(conn, tid, run_id) == (new, kh.VIA_ALLOC_CLIENT)
+        assert kh.running_reservations(conn) == [(tid, new, kh.VIA_ALLOC_CLIENT)]
+        allocd.requests.clear()
+        kb.complete_task(conn, tid, summary="done")
+    assert ("/release", {"consumer": "kanban", "reservation_id": new}) in allocd.requests
+    assert not placement.live_reservations(rpath)
+
+
 def test_dispatch_off_worker_placed_has_no_route_marker(home, monkeypatch):
     loud = FakeAllocd(loud=True)
     monkeypatch.setenv("ALLOCD_URL", loud.url)
