@@ -2574,6 +2574,8 @@ class Task:
     completion_contract: Optional[str] = None
     # Pool host holding this card's workspace state (t_8bfdcc07); None = none.
     origin_host: Optional[str] = None
+    # Task whose workspace this card works in (``--workspace-of``, t_6d5bc652).
+    workspace_of: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2612,6 +2614,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract", "origin_host",
+    "workspace_of",
 )
 
 # Text columns where "" is stored/read as "not set".
@@ -2860,7 +2863,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Fleet Work Placement Phase 3 (t_8bfdcc07): the pool host that may hold this
     -- card's workspace state. Set at placement, cleared only by a positive empty
     -- probe, a terminal status or ``requeue --drop-origin``. NULL = no remote state.
-    origin_host          TEXT
+    origin_host          TEXT,
+    -- Traceability-vs-Placement Phase 2b-i (t_6d5bc652): the task whose
+    -- workspace this card works IN (``--workspace-of``; kind + path copied).
+    -- A placement constraint (co-locate via bind_host) and a retention key;
+    -- never an owner of the directory. NULL = its own workspace.
+    workspace_of         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -5872,6 +5880,44 @@ def created_skills_auto_added(
     return list(payload.get("skills_auto_added") or [])
 
 
+def _workspace_of_copy(conn: sqlite3.Connection, of: str, kind: Optional[str],
+                       path: Optional[str], body: Optional[str]) -> tuple[str, str]:
+    """``(workspace_kind, workspace_path)`` copied from card ``of`` for
+    ``--workspace-of``; the four spec §5 refusals, each naming the fix."""
+    from hermes_cli.kanban_db_workspace import bind_host, canon
+    row = conn.execute("SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+                       (of,)).fetchone() if of else None
+    if row is None:
+        raise ValueError(f"--workspace-of {of!r}: no such task on this board; "
+                         "pass the id of the card whose directory this one works in")
+    of_kind, of_path = row["workspace_kind"] or "scratch", row["workspace_path"]
+    if not of_path:
+        raise ValueError(f"--workspace-of {of}: {of} is {of_kind} with no workspace path yet "
+                         "(it has never run); create this card after it has run, or drop "
+                         "--workspace-of and use --parent for the dependency")
+    if kind is not None and kind != of_kind:
+        raise ValueError(f"--workspace-of {of}: --workspace {kind} conflicts with {of}'s "
+                         f"{of_kind} workspace; drop --workspace (it is copied from {of})")
+    if path is not None:
+        try:
+            same = canon(path) == canon(of_path)
+        except (OSError, RuntimeError, ValueError):
+            same = False
+        if not same:
+            raise ValueError(f"--workspace-of {of}: workspace path {path} differs from {of}'s "
+                             f"{of_path}; drop the path (it is copied from {of})")
+    from hermes_cli import kanban_worker_pool as _kwp
+    if _kwp.card_pin(body) not in (None, _kwp.PIN_ANY):
+        fleet = kanban_home() / "fleet"
+        pin, _ignored = _kwp.resolve_pin(body, _kwp.known_host_ids(fleet), _kwp.pin_aliases(fleet))
+        bound = bind_host(conn, of)
+        if pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) and bound and pin != bound:
+            raise ValueError(f"--workspace-of {of}: body pins host:{pin} but {of} ran on "
+                             f"{bound}, where its directory is; remove the host: line "
+                             "(the card co-locates with it) or drop --workspace-of")
+    return of_kind, of_path
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -5918,8 +5964,18 @@ def create_task(
     time_gate_guard: bool = False,
     i_mean_blocks: bool = False,
     continues: Optional[str] = None,
+    workspace_of: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
+
+    New cards are portable unless a constraint says otherwise; a parent link
+    is not a constraint. ``workspace_of`` (``--workspace-of X``) is the
+    constraint for a card that works IN X's directory: it copies X's
+    ``workspace_kind`` + ``workspace_path``, co-locates with X and defers X's
+    workspace GC while it is live; it never owns or removes that directory.
+    Refused (``ValueError``, naming the fix) when X does not exist, X is
+    scratch with no path yet, the caller's workspace kind/path differ from
+    X's, or the body's ``host:`` names a different pool host than X ran on.
 
     Returns the new task id.  Status is ``ready`` when there are no
     parents (or all parents already ``done``), otherwise ``todo``.
@@ -6037,6 +6093,17 @@ def create_task(
 
     if until is not None:
         until = validate_wake_at(until)
+    if workspace_of is not None:
+        # The copied workspace IS the workspace: never re-anchor it on a
+        # board project. ``--continues`` transfers ownership instead (the
+        # source gets a fresh path), so it cannot also make this card a reader.
+        if continues:
+            raise ValueError("--workspace-of cannot be combined with --continues: --continues "
+                             "transfers the workspace (this card then owns it); pick one")
+        workspace_of = str(workspace_of).strip()
+        workspace_kind, workspace_path = _workspace_of_copy(
+            conn, workspace_of, workspace_kind, workspace_path, body)
+        project_id = project_id if project_id is not None else ""
     # ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     # an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     if project_id is None and workspace_kind != "scratch":
@@ -6392,8 +6459,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, pin_sub_reason, pin_sub_fallback,
-                        goal_mode, goal_max_turns, session_id, completion_contract, brain
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract, brain,
+                        workspace_of
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -6423,6 +6491,7 @@ def create_task(
                         session_id,
                         completion_contract,
                         brain,
+                        workspace_of,
                     ),
                 )
                 for pid in parents:
@@ -6452,6 +6521,7 @@ def create_task(
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
+                        **({"workspace_of": workspace_of} if workspace_of else {}),
                         "project_id": project_id,
                         "creator_task_id": creator_task_id,
                         "skills": list(skills_list) if skills_list else None,
@@ -11818,13 +11888,17 @@ def _live_owners_of_path(
                 conns.append(stack.enter_context(connect_closing()))
         except Exception:
             return ["<unreadable-board-db>"] if live_only else []
-        sql = "SELECT id, workspace_path FROM tasks"
+        sql = "SELECT id, workspace_path, workspace_of FROM tasks"
         for c in conns:
             try:
                 rows = c.execute(sql).fetchall()
             except Exception:
                 return ["<unreadable-task-table>"] if live_only else []
             ids = set()
+            # A ``--workspace-of`` card is a READER of the directory it copied,
+            # never an owner (Momus pass 3 R-1): it never makes the owner's
+            # removal ambiguous. A LIVE reader still refuses the removal.
+            readers = set()
             for row in rows:
                 # Convention ownership is a filesystem question, not a
                 # comparison of the candidate's spelling with a task id.
@@ -11851,6 +11925,9 @@ def _live_owners_of_path(
                 path_in = _same_tree(resolved, stored, spelling_memo)
                 if not (stored_in or path_in):
                     continue
+                if row["workspace_of"]:
+                    readers.add(row["id"])
+                    continue
                 if (is_managed and path_in and not stored_in
                         and managed_root is not None
                         and _same_tree(managed_root, stored, spelling_memo)):
@@ -11868,6 +11945,9 @@ def _live_owners_of_path(
             all_owners.update(ids)
             for tid in ids:
                 if not live_only or _task_has_live_run(c, tid):
+                    found.add(tid)
+            for tid in readers:
+                if live_only and _task_has_live_run(c, tid):
                     found.add(tid)
     if live_only and not found:
         if not all_owners:
@@ -12126,8 +12206,18 @@ def safe_remove_workspace_dir(
     3. **Audit.** Both outcomes are appended to the per-board deletion log
        so the next incident names its deleter.
 
+    A ``--workspace-of`` card never removes the directory it borrowed: it is
+    a reader, the directory is its owner's (Momus pass 3 R-1). The owner's
+    own decision removes it once no child under any retention key is live.
+
     Returns True iff the directory was removed.
     """
+    if task_id and conn is not None and _workspace_reader_of(conn, task_id):
+        _audit_workspace_deletion(
+            Path(path), task_id=task_id, reason=reason, allowed=False,
+            detail="workspace-of-reader-not-owner",
+        )
+        return False
     if remote_host is not None:
         if conn is None or not task_id or not _is_managed_scratch_path(Path(path)):
             return False
@@ -12135,12 +12225,15 @@ def safe_remove_workspace_dir(
             return False
         # Remote lexical ownership: never consult the Studio's inode identity.
         target = os.path.normpath(str(path))
-        for owner in conn.execute('SELECT id,workspace_path FROM tasks WHERE workspace_path IS NOT NULL'):
+        for owner in conn.execute('SELECT id,workspace_path,workspace_of FROM tasks '
+                                  'WHERE workspace_path IS NOT NULL'):
             stored = os.path.normpath(owner['workspace_path'])
             # Overlap in either direction: equal, inside the target, or
             # containing it (a nested workspace belongs to its ancestor too).
+            # A --workspace-of reader never co-owns (R-1); only a live one refuses.
             if owner['id'] != task_id and (stored == target or stored.startswith(target + os.sep)
-                                           or target.startswith(stored + os.sep)):
+                                           or target.startswith(stored + os.sep)) and (
+                    not owner['workspace_of'] or _task_has_live_run(conn, owner['id'])):
                 return False
         from hermes_cli.kanban_survivor import remove_workspace_dir
         _audit_workspace_deletion(Path(path), task_id=task_id, reason=reason, outcome=AUDIT_ATTEMPT,
@@ -12191,12 +12284,6 @@ def safe_remove_workspace_dir(
     if not resolved.is_dir():
         return False
 
-    if task_id and _has_active_children(conn, task_id):
-        _audit_workspace_deletion(
-            resolved, task_id=task_id, reason=reason, allowed=False,
-            detail="active-children-need-handoff",
-        )
-        return False
     if _task_has_live_run(conn, task_id):
         _audit_workspace_deletion(
             resolved, task_id=task_id, reason=reason, allowed=False,
@@ -12223,6 +12310,14 @@ def safe_remove_workspace_dir(
             "Refusing to remove workspace %s (caller task %s, reason %s): it "
             "is owned by live card(s) %s",
             resolved, task_id, reason, ",".join(owners),
+        )
+        return False
+    # Retention after ownership: a live owner is the more specific refusal,
+    # and the union key's shared-path arm also counts that owner (t_6d5bc652).
+    if task_id and _has_active_children(conn, task_id):
+        _audit_workspace_deletion(
+            resolved, task_id=task_id, reason=reason, allowed=False,
+            detail="active-children-need-handoff",
         )
         return False
 
@@ -20807,6 +20902,7 @@ from hermes_cli.kanban_db_connect import (  # noqa: E402
 from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _cleanup_workspace,
     _has_active_children,
+    _workspace_reader_of,
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,
