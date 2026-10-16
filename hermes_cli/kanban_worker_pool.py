@@ -764,16 +764,24 @@ _CONTROL_PLANE_PATH_RE = re.compile(
 def _sudo_before_break(remote: str) -> bool:
     """``sudo`` in the remote command, before a ``;``/``&&``/``|`` outside
     quotes ends it (``ssh ci uptime && sudo reboot`` runs sudo on the Studio;
-    ``ssh ci 'uptime && sudo dmesg'`` runs it on ci)."""
+    ``ssh ci 'uptime && sudo dmesg'`` runs it on ci).
+
+    Character scan (Prism 5bdfe1dcf55b): a separator outside quotes ends the
+    remote command even when glued to a word (``uptime;``, ``a&&sudo``) or to
+    a closing quote (``"echo hi"; sudo x``)."""
     quote = None
-    for tok in remote.split():
-        if quote is None and tok in _CMD_BREAK:
+    for i, ch in enumerate(remote):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch in ";&|":
+            if ch == "&" and (remote[i - 1:i] in ("<", ">") or remote[i + 1:i + 2] == ">"):
+                continue  # ``2>&1`` / ``&>f`` is a redirection, not a separator
             return False
-        if _SUDO_RE.search(tok):
+        if _SUDO_RE.match(remote, i):
             return True
-        for ch in tok:
-            if ch in "'\"":
-                quote = None if quote == ch else (ch if quote is None else quote)
     return False
 
 

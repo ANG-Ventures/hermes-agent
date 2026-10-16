@@ -215,3 +215,58 @@ def test_host_studio_pin_on_access_bound_card_is_not_a_contradiction(home):
         res, _spawned = _tick(conn, dry_run=True)
     assert [t for t, _w, _s in res.spawned] == [tid] and not res.placed
     assert res.access_contradictions == {}
+
+
+# -- Prism 5bdfe1dcf55b: separators glued to a word or a closing quote ----------
+
+@pytest.mark.parametrize("body", [
+    "ssh ci uptime; sudo -n true\n",           # ``;`` attached to the word
+    "ssh ci-box uptime&&sudo reboot\n",        # ``&&`` glued on both sides
+    "ssh ci-box x|sudo tee /etc/motd\n",       # ``|`` glued on both sides
+    "ssh ci-box \"echo hi\"; sudo x\n",         # separator right after a closing quote
+    "ssh ci-box uptime ||sudo reboot\n",
+    "ssh ci-box uptime& sudo reboot\n",
+])
+def test_attached_separator_ends_the_remote_command(body):
+    """RED ON BASE (8eb418ee): the whole-token check bound these to ssh-root:ci-box."""
+    ok, rule, _rc = _portable(body)
+    assert not (rule or "").startswith(pr.ACCESS_BOUND), rule
+
+
+@pytest.mark.parametrize("body", [
+    "ssh ci-box 'uptime && sudo dmesg'\n",
+    "ssh ci-box 'uptime;sudo dmesg'\n",
+    "ssh ci-box \"a|sudo tee /x\"\n",
+    "ssh ci-box sudo dmesg 2>&1 | tail\n",     # a redirection is not a separator
+])
+def test_separator_inside_quotes_still_binds(body):
+    assert _portable(body) == (False, "access_bound:ssh-root:ci-box", None)
+
+
+def test_pool_pinned_attached_separator_card_is_not_parked(home):
+    """Prism repro: ``host: ci\\nssh ci uptime; sudo -n true`` must not park needs_input."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="up", assignee="alpha", body="host: ci-box\nssh ci uptime; sudo -n true\n")
+        res, _spawned = _tick(conn, dry_run=True)
+        status = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+    assert tid not in res.access_contradictions
+    assert status == "ready"
+
+
+# -- Prism 229da8245003: ownership before parking -------------------------------
+
+def test_foreign_access_contradiction_is_not_parked(home, monkeypatch):
+    """RED ON BASE: a home whose dispatch_profiles excludes ``alpha`` parked
+    alpha's card blocked/needs_input."""
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: (lambda name: False))
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="p0", assignee="alpha",
+                             body="host: ci-box\nrequires: control-plane-read\n")
+        res, spawned = _tick(conn)
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        n_comments = conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id=?",
+                                  (tid,)).fetchone()[0]
+    assert spawned == []
+    assert row[0] == "ready"
+    assert n_comments == 0
+    assert tid not in res.access_contradictions

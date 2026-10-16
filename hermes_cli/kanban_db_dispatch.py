@@ -4648,12 +4648,28 @@ _STUDIO_AFFINITY_RULES = frozenset({"studio_bound_skill", "studio_manifest", "st
                                     "studio_needs"})
 
 
-def _park_access_contradictions(conn, result, dry_run: bool) -> None:
+def _park_access_contradictions(conn, result, dry_run: bool,
+                                default_assignee: Optional[str] = None) -> None:
     """Park every access-bound card pinned to a pool host ``needs_input``
     with the §5 line (spec §2.6): it cannot run there, so it must not wait
     there. Fenced like the pin-lacks park: a card claimed since the snapshot
-    is left alone. A dry run only reports."""
-    for tid, line in (result.access_contradictions or {}).items():
+    is left alone. A dry run only reports.
+
+    Ownership first (Prism 229da8245003): only a card whose effective assignee
+    passes this home's ``_profile_exists_fn`` / ``dispatch_profiles`` predicate
+    (the ready loop's spawn gate, as in ``_browser_gate``) is parked; a foreign
+    card is dropped from ``access_contradictions`` and left to its owner."""
+    pending = result.access_contradictions or {}
+    if not pending:
+        return
+    _exists = _profile_exists_fn()
+    _dflt = _resolve_default_assignee(default_assignee)
+    for tid in list(pending):
+        row = conn.execute("SELECT assignee FROM tasks WHERE id=?", (tid,)).fetchone()
+        eff = (row[0] if row else None) or _dflt
+        if not eff or (_exists is not None and not _exists(eff)):
+            pending.pop(tid)
+    for tid, line in pending.items():
         if dry_run:
             continue
         try:
@@ -6860,7 +6876,7 @@ def _dispatch_once_locked(
         record_affinity_events(conn, result, _affinity_evaluated, _affinity_reached)
         _khc.record_capability_events(conn, result, _caps, _caps_out, _affinity_evaluated,
                                       _cap_comments)
-    _park_access_contradictions(conn, result, dry_run)
+    _park_access_contradictions(conn, result, dry_run, default_assignee)
     _record_placement_waits(conn, result, row_route, dry_run, _wait_reached)
     result.rows_routed = len(ready_rows)
     result.portable_waiting = sum(
