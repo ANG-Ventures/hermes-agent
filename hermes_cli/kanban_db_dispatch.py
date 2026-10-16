@@ -4177,11 +4177,16 @@ def _workspace_binds(conn, rows, *, dry_run: bool = False) -> dict:
     """``{id: (rule, other_id, host)}`` for ready scratch rows whose workspace
     is bound to another card's (spec §2.4): ``workspace_of`` first (explicit
     beats derived), else the canonical-path ``workspace_shared`` relation.
-    ``host`` is :func:`kanban_db_workspace.bind_host` of the other card. Never
-    reads ``task_links``. One path index per tick. A ``workspace_of`` target
-    that is terminal with no local path drops the bind
-    (``placement_bind_dropped``, once) and the row is routed on. An
-    unresolvable path binds local (fail closed)."""
+    Never reads ``task_links``. One path index per tick. An unresolvable path
+    binds local (fail closed).
+
+    Host-aware (Apollo r1 on #2032): ``other_id`` and ``host`` come from
+    :func:`kanban_db_workspace.resolve_bind`, which follows the reader chain
+    to the directory's owner and its placement record. A directory that lives
+    on a pool host is never judged by a Studio-local fact: its bind holds
+    (spec §2.4: remote path existence is not probed; fail closed: pin). Only
+    a LOCAL directory whose owner is terminal and whose path is gone drops
+    the bind (``placement_bind_dropped``, once); the row then routes on."""
     from hermes_cli import kanban_placement_reasons as _pr
     from hermes_cli import kanban_db_workspace as _kbw
     out: dict = {}
@@ -4193,13 +4198,13 @@ def _workspace_binds(conn, rows, *, dry_run: bool = False) -> dict:
         tid = r["id"]
         of = _kb._row_get(r, "workspace_of")
         if of:
+            owner, host = _kbw.resolve_bind(conn, of)
             prow = conn.execute("SELECT status, workspace_path FROM tasks WHERE id = ?",
-                                (of,)).fetchone()
-            gone = prow is None or (prow[0] in _kbw._TERMINAL_STATUSES and not (
+                                (owner,)).fetchone()
+            gone = prow is None or (host is None and prow[0] in _kbw._TERMINAL_STATUSES and not (
                 prow[1] and os.path.isdir(_kbw.canon(prow[1]))))
             if not gone:
-                out[tid] = (_pr.workspace_bind_rule(_pr.WORKSPACE_OF, of), of,
-                            _kbw.bind_host(conn, of))
+                out[tid] = (_pr.workspace_bind_rule(_pr.WORKSPACE_OF, of), owner, host)
                 continue
             if not dry_run and _kb._latest_event(conn, tid, _pr.PLACEMENT_BIND_DROPPED_EVENT) is None:
                 with _kb.write_txn(conn):
@@ -4216,8 +4221,11 @@ def _workspace_binds(conn, rows, *, dry_run: bool = False) -> dict:
             out[tid] = (_pr.workspace_bind_rule(_pr.WORKSPACE_SHARED, "unresolved"), "", None)
             continue
         if shared:
-            out[tid] = (_pr.workspace_bind_rule(_pr.WORKSPACE_SHARED, shared[0]), shared[0],
-                        _kbw.bind_host(conn, shared[0]))
+            # The sharer whose chain reaches a placed host wins over an unrun
+            # reader that merely sorts first (Prism aabb9c4f4a2f).
+            resolved = [(sid, *_kbw.resolve_bind(conn, sid)) for sid in shared]
+            sid, owner, host = next((x for x in resolved if x[2]), resolved[0])
+            out[tid] = (_pr.workspace_bind_rule(_pr.WORKSPACE_SHARED, sid), owner, host)
     return out
 
 
@@ -4569,9 +4577,10 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         _native_command_profile(assignee, {} if native_cache is None else native_cache)
     # The filesystem scan is the expensive check: only a row every cheaper
     # rule would admit pays for it (non-scratch, linked or non-allowlisted
-    # rows can never place; a non-allowlisted one reports ``profile``).
+    # rows can never place; a non-allowlisted one reports ``profile``). A
+    # bound row never scans: its directory is the bind target's.
     scan = ((row["workspace_kind"] or "scratch") == "scratch" and not linked and allowlisted
-            and not (bind and bind[2] is None))
+            and bind is None)
     skills = tuple(s for s in skills if isinstance(s, str))
     manifest = _manifest_affinity(skills, assignee) if allowlisted and skills else {}
     targets = _manifest_targets(skills, assignee) if allowlisted and skills else {}
@@ -4653,6 +4662,11 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         rule = _pr.linked(*link)  # name the edge that holds it (t_ae87edff)
     if rules_out is not None:
         rules_out[row["id"]] = rule
+    if bind is not None and bind[2]:
+        # Bound to a directory on a pool host, and that host cannot take it
+        # (profile, native command, access, reach, capability): it waits,
+        # named. A local run would read an empty path (Prism f399797453ae).
+        return "wait", _pr.not_portable(rule)
     if rule.startswith(_pr.ACCESS_BOUND + ":"):
         # Access-bound (spec §2.6): local, named, never spilled. A pool pin
         # contradicts it: park needs_input (§5), never wait on that host.

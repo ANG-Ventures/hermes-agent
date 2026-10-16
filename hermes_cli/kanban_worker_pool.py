@@ -1037,9 +1037,14 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     bind_rule, _bind_other, bind_host = workspace_bind or (None, None, None)
     if bind_rule and bind_host is None:
         return False, bind_rule, None
-    if has_links:
+    # A remote bind (Apollo r1 on #2032, Prism f399797453ae): the directory is
+    # on ``bind_host``, so the Studio-local facts (a lineage link, content at
+    # the same path on the Studio) say nothing about it. The rules that ask
+    # whether ANY pool host may run the card still apply; a refusal there is
+    # a wait at the dispatcher, never a local run against an empty path.
+    if has_links and not bind_rule:
         return False, _reasons.LINKED, None
-    if workspace_has_content:
+    if workspace_has_content and not bind_rule:
         return False, _reasons.LOCAL_FILES, None
     if not assignee or assignee not in tuple(pool.profiles or ()):
         return False, _reasons.PROFILE, None

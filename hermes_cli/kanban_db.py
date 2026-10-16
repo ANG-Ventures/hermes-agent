@@ -5883,14 +5883,22 @@ def created_skills_auto_added(
 def _workspace_of_copy(conn: sqlite3.Connection, of: str, kind: Optional[str],
                        path: Optional[str], body: Optional[str]) -> tuple[str, str]:
     """``(workspace_kind, workspace_path)`` copied from card ``of`` for
-    ``--workspace-of``; the four spec §5 refusals, each naming the fix."""
-    from hermes_cli.kanban_db_workspace import bind_host, canon
+    ``--workspace-of``; the four spec §5 refusals, each naming the fix, plus
+    a worktree target: the copy carries no ``branch_name``, so the reader
+    would materialise its own ``wt/<id>`` checkout, not X's (Prism
+    585c20849c68). The host check reads :func:`resolve_bind`, so a target
+    that itself borrows a remote directory answers that host."""
+    from hermes_cli.kanban_db_workspace import canon, resolve_bind
     row = conn.execute("SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
                        (of,)).fetchone() if of else None
     if row is None:
         raise ValueError(f"--workspace-of {of!r}: no such task on this board; "
                          "pass the id of the card whose directory this one works in")
     of_kind, of_path = row["workspace_kind"] or "scratch", row["workspace_path"]
+    if of_kind == "worktree":
+        raise ValueError(f"--workspace-of {of}: {of} is a worktree card; a second card cannot "
+                         "share its checkout. Use --parent for the dependency and read its "
+                         "pushed branch, or --continues to take the worktree over")
     if not of_path:
         raise ValueError(f"--workspace-of {of}: {of} is {of_kind} with no workspace path yet "
                          "(it has never run); create this card after it has run, or drop "
@@ -5910,7 +5918,7 @@ def _workspace_of_copy(conn: sqlite3.Connection, of: str, kind: Optional[str],
     if _kwp.card_pin(body) not in (None, _kwp.PIN_ANY):
         fleet = kanban_home() / "fleet"
         pin, _ignored = _kwp.resolve_pin(body, _kwp.known_host_ids(fleet), _kwp.pin_aliases(fleet))
-        bound = bind_host(conn, of)
+        bound = resolve_bind(conn, of)[1]
         if pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) and bound and pin != bound:
             raise ValueError(f"--workspace-of {of}: body pins host:{pin} but {of} ran on "
                              f"{bound}, where its directory is; remove the host: line "
@@ -12221,7 +12229,13 @@ def safe_remove_workspace_dir(
     if remote_host is not None:
         if conn is None or not task_id or not _is_managed_scratch_path(Path(path)):
             return False
-        if _task_has_live_run(conn, task_id) or _has_active_children(conn, task_id):
+        if _task_has_live_run(conn, task_id):
+            return False
+        # The same retention decision as the local branch, shadow included
+        # (Prism 4ea5f2217fd9): a ready reader or child still needs the dir.
+        if _retention_defers(conn, task_id):
+            _audit_workspace_deletion(Path(path), task_id=task_id, reason=reason, allowed=False,
+                                      detail='active-children-need-handoff remote=' + remote_host.name)
             return False
         # Remote lexical ownership: never consult the Studio's inode identity.
         target = os.path.normpath(str(path))
@@ -12314,7 +12328,8 @@ def safe_remove_workspace_dir(
         return False
     # Retention after ownership: a live owner is the more specific refusal,
     # and the union key's shared-path arm also counts that owner (t_6d5bc652).
-    if task_id and _has_active_children(conn, task_id):
+    if task_id and (_retention_defers(conn, task_id) if conn is not None
+                    else _has_active_children(conn, task_id)):
         _audit_workspace_deletion(
             resolved, task_id=task_id, reason=reason, allowed=False,
             detail="active-children-need-handoff",
@@ -20902,6 +20917,7 @@ from hermes_cli.kanban_db_connect import (  # noqa: E402
 from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _cleanup_workspace,
     _has_active_children,
+    _retention_defers,
     _workspace_reader_of,
     _is_managed_scratch_path,
     _managed_scratch_path_info,

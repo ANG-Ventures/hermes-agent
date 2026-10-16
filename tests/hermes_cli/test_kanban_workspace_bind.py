@@ -207,11 +207,167 @@ def test_ac4_workspace_of_pins_to_bind_host_and_drops_when_terminal_and_gone(hom
         assert _route(conn, c) == ("pin", "ace-ai")
         _set(conn, x, status="done")
         ws.rmdir()
+        # Terminal, and the Studio has no copy of the path: X's directory is
+        # on ace-ai, which the dispatcher cannot see. Never decided by a local
+        # isdir (Prism 81c519d969ef / bcd043ee8789): the bind holds.
+        assert _route(conn, c) == ("pin", "ace-ai")
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+                            (c, kpr.PLACEMENT_BIND_DROPPED_EVENT)).fetchone()[0] == 0
+
+
+def test_ac4_local_target_terminal_and_gone_drops_the_bind_once(home, monkeypatch):
+    _cfg(monkeypatch, lineage="none")
+    with kb.connect_closing() as conn:
+        x = _mk(conn, "X")
+        ws = _scratch(conn, x, content=False)  # X ran here (no worker_placed)
+        c = _mk(conn, "reader", workspace_of=x)
+        _set(conn, c, status="ready")
+        assert _route(conn, c) == ("local", None)
+        _set(conn, x, status="done")
+        ws.rmdir()
         assert _route(conn, c) == ("portable", None)
         kbd._workspace_binds(conn, [_row(conn, c)])  # second tick: no second event
         evs = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
                            (c, kpr.PLACEMENT_BIND_DROPPED_EVENT)).fetchall()
     assert [json.loads(e[0]) for e in evs] == [{"of": x, "why": "path_gone"}]
+
+
+# -- Apollo r1 on #2032: host-aware binds (one resolver, resolve_bind) -------
+
+def test_r1_workspace_of_chain_resolves_to_the_owner_host(home, monkeypatch):
+    """Prism 6913ec20b7a9: R1 borrows X (ran on ci-box) and never ran; R2
+    borrows R1. R2 runs where X's directory is, not locally."""
+    _cfg(monkeypatch, lineage="none")
+    with kb.connect_closing() as conn:
+        x = _mk(conn, "X")
+        _scratch(conn, x, content=False)
+        _placed_on(conn, x, "ci-box")
+        r1 = _mk(conn, "R1", workspace_of=x)
+        r2 = _mk(conn, "R2", workspace_of=r1)
+        _set(conn, r2, status="ready")
+        assert _route(conn, r2) == ("pin", "ci-box")
+        assert kbw.resolve_bind(conn, r1) == (x, "ci-box")
+
+
+def test_r1_workspace_of_cycle_terminates(home, monkeypatch):
+    _cfg(monkeypatch, lineage="none")
+    with kb.connect_closing() as conn:
+        a = _mk(conn, "A")
+        b = _mk(conn, "B")
+        ws = _scratch(conn, a, content=False)
+        _set(conn, b, workspace_kind="scratch", workspace_path=str(ws))
+        _set(conn, a, workspace_of=b)
+        _set(conn, b, workspace_of=a)
+        assert kbw.resolve_bind(conn, a)[1] is None
+        _placed_on(conn, b, "ace-ai")
+        assert kbw.resolve_bind(conn, a)[1] == "ace-ai"
+
+
+def test_r1_workspace_shared_binds_to_the_placed_owner_not_an_unrun_reader(home, monkeypatch):
+    """Prism aabb9c4f4a2f: the sorted-first sharer is an unrun reader; the
+    owner ran on ci-box. The new sharer binds to ci-box."""
+    _cfg(monkeypatch, lineage="none")
+    with kb.connect_closing() as conn:
+        a, b = sorted([_mk(conn, "a"), _mk(conn, "b")])
+        ws = _scratch(conn, b, content=False)
+        _placed_on(conn, b, "ci-box")
+        _set(conn, a, workspace_kind="scratch", workspace_path=str(ws), workspace_of=b)
+        s = _mk(conn, "S")
+        _set(conn, s, workspace_kind="scratch", workspace_path=str(ws), status="ready")
+        rules: dict = {}
+        assert kbd._route_row(conn, _row(conn, s), _plan(), rules_out=rules) == ("pin", "ci-box")
+        # Same with a plain unrun sharer (no workspace_of) sorting first.
+        _set(conn, a, workspace_of=None)
+        assert _route(conn, s) == ("pin", "ci-box")
+
+
+@pytest.mark.parametrize("lineage", ["none", "kinds"])
+def test_r1_remote_bind_beats_local_only_refusals(home, monkeypatch, lineage):
+    """Prism f399797453ae: a card bound to a ci-box directory is routed there
+    even with Studio-side content at the same path and a blocks parent."""
+    _cfg(monkeypatch, lineage=lineage)
+    with kb.connect_closing() as conn:
+        x = _mk(conn, "X")
+        _scratch(conn, x, content=True)  # Studio residue at the same path
+        _placed_on(conn, x, "ci-box")
+        r = _mk(conn, "R", workspace_of=x, parents=[x])
+        _set(conn, r, status="ready")
+        assert _route(conn, r) == ("pin", "ci-box")
+
+
+def test_r1_portable_remote_bind_ignores_studio_content_and_links():
+    """portable() on its own: a remote bind is a pin to the bind host even
+    with Studio content at the path or a lineage link; a local bind is not."""
+    pool = _plan().config
+    bind = ("workspace_of:t_x", "t_x", "ci-box")
+    for kw in ({"workspace_has_content": True}, {"workspace_has_content": False, "has_links": True}):
+        assert kwp.portable(workspace_kind="scratch", assignee="alpha", body=None, pool=pool,
+                            workspace_bind=bind, **kw) == (True, None, "pin")
+    assert kwp.portable(workspace_kind="scratch", assignee="alpha", body=None, pool=pool,
+                        workspace_has_content=True,
+                        workspace_bind=("workspace_of:t_x", "t_x", None))[:2] == (
+        False, "workspace_of:t_x")
+
+
+def test_r1_remote_bind_that_cannot_run_there_waits_never_local(home, monkeypatch):
+    """A remote-bound card a pool host cannot take (profile not allowlisted)
+    waits on the rule; it never runs on the Studio against an empty path."""
+    _cfg(monkeypatch, lineage="none")
+    with kb.connect_closing() as conn:
+        x = _mk(conn, "X")
+        _scratch(conn, x, content=False)
+        _placed_on(conn, x, "ci-box")
+        r = _mk(conn, "R", workspace_of=x, assignee="not-in-pool")
+        _set(conn, r, status="ready")
+        assert _route(conn, r) == ("wait", "not_portable:profile")
+
+
+def _remote_rm(monkeypatch):
+    calls: list = []
+
+    class _P:
+        returncode, stdout, stderr = 0, "removed\n", ""
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return _P()
+    from hermes_cli import kanban_survivor as ks
+    monkeypatch.setattr(ks.subprocess, "run", run)
+    return calls
+
+
+@pytest.mark.parametrize("child", ["reader", "blocks"])
+def test_r1_remote_removal_applies_the_retention_guard(home, monkeypatch, child):
+    """Prism 4ea5f2217fd9: the REAL choke point with a remote_host (gc's
+    path): owner terminal on ace-ai, a ready child => no ssh removal. The
+    link-only child writes the retention_shadow the local branch writes."""
+    _cfg(monkeypatch, retention="union")
+    calls = _remote_rm(monkeypatch)
+    with kb.connect_closing() as conn:
+        p, c, ws = _p_with_child(conn, **({"reader": True} if child == "reader"
+                                          else {"link_kind": "blocks"}))
+        _set(conn, p, status="done")
+        assert kb.safe_remove_workspace_dir(ws, task_id=p, reason="gc_archived", conn=conn,
+                                            remote_host=_host("ace-ai")) is False
+        assert calls == []
+        assert _shadows(conn, p) == ([] if child == "reader" else
+                                     [{"parent": p, "deferred_by": [[c, "blocks"]],
+                                       "new_key_would": "delete"}])
+        _set(conn, c, status="done")
+        assert kb.safe_remove_workspace_dir(ws, task_id=p, reason="gc_archived", conn=conn,
+                                            remote_host=_host("ace-ai")) is True
+    assert len(calls) == 1
+
+
+def test_r1_workspace_of_a_worktree_card_is_refused(home):
+    """Prism 585c20849c68: the copy carries no branch_name, so a worktree
+    reader would get its own wt/<id>. --workspace-of is scratch/dir only."""
+    with kb.connect_closing() as conn:
+        x = _mk(conn, "X")
+        _set(conn, x, workspace_kind="worktree", workspace_path=str(home / "repo" / ".worktrees" / x),
+             branch_name=f"wt/{x}")
+        with pytest.raises(ValueError, match="worktree"):
+            _mk(conn, "c", workspace_of=x)
 
 
 def test_workspace_of_body_pin_contradicting_the_bind_holds_the_card(home, monkeypatch):

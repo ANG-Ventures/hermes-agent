@@ -257,6 +257,32 @@ def bind_host(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     return host.lower() if isinstance(host, str) and host else None
 
 
+_BIND_CHAIN_MAX = 8
+
+
+def resolve_bind(conn: sqlite3.Connection, task_id: str) -> tuple[str, Optional[str]]:
+    """``(owner_id, host)``: THE host-aware answer to "where is ``task_id``'s
+    directory" (Apollo r1 on #2032). Follows ``workspace_of`` to the card that
+    owns the directory (bounded, cycle-safe), then asks :func:`bind_host` of
+    the owner first and of each reader on the chain after it: a reader that
+    ran on a pool host ran where the directory is. ``host`` None = local, or
+    nothing on the chain ever ran remotely. Every placement decision about a
+    borrowed or shared directory reads this, never a Studio-local fact."""
+    chain = [task_id]
+    while len(chain) < _BIND_CHAIN_MAX:
+        row = conn.execute("SELECT workspace_of FROM tasks WHERE id = ?", (chain[-1],)).fetchone()
+        nxt = row[0] if row else None
+        if not nxt or nxt in chain:
+            break
+        chain.append(nxt)
+    owner = chain[-1]
+    for tid in reversed(chain):
+        host = bind_host(conn, tid)
+        if host:
+            return owner, host
+    return owner, None
+
+
 def _workspace_reader_of(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """The card whose directory ``task_id`` borrowed (``--workspace-of``), or
     None. Ownership rule (Momus pass 3 R-1): such a card is a READER of that
