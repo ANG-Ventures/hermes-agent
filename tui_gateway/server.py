@@ -1790,7 +1790,9 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
     try:
         with _session_profile_runtime_scope(session):
             prompt = agent._cached_system_prompt = agent._build_system_prompt(None)
-        db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt)
+        from agent.system_prompt import static_prefix_kwargs
+        db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt,
+                                **static_prefix_kwargs(agent, prompt))
     except Exception:
         logger.warning("failed to persist live session system prompt for session %s", session_key, exc_info=True)
     finally:

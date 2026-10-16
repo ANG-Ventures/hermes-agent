@@ -738,12 +738,16 @@ class SessionSessionsMixin:
             self._recompute_effective_last_active_for_session(conn, session_id)
         self._execute_write(_do)
 
-    def update_system_prompt(self, session_id: str, system_prompt: Optional[str]) -> None:
-        """Store the full assembled system prompt snapshot."""
+    def update_system_prompt(
+        self, session_id: str, system_prompt: Optional[str], *, static_prefix_len: Optional[int] = None,
+    ) -> None:
+        """Store the full assembled system prompt snapshot. ``static_prefix_len`` is where the request
+        splits it into ``[static, suffix]`` cache blocks; a restore reuses it so the split never collapses."""
         def _do(conn):
             conn.execute(
-                "UPDATE sessions SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
-                (self._store_system_prompt(conn, system_prompt), session_id),
+                "UPDATE sessions SET system_prompt_hash = ?, system_prompt = NULL, system_prompt_static_len = ? "
+                "WHERE id = ?",
+                (self._store_system_prompt(conn, system_prompt), static_prefix_len, session_id),
             )
             if system_prompt is None:
                 logger.warning(

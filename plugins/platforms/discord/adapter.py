@@ -6093,7 +6093,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             thread_id = str(interaction.channel_id)
 
         chat_name = ""
-        if not is_dm and hasattr(interaction.channel, "name"):
+        if is_thread:
+            # Same label as the message path: the session-context pin is keyed on chat_name, so a
+            # different spelling here rewrote the system prompt on every slash/message alternation
+            # in one thread (class H, t_91b6a4c4).
+            chat_name = self._format_thread_chat_name(interaction.channel)
+        elif not is_dm and hasattr(interaction.channel, "name"):
             chat_name = interaction.channel.name
             if hasattr(interaction.channel, "guild") and interaction.channel.guild:
                 chat_name = f"{interaction.channel.guild.name} / #{chat_name}"
