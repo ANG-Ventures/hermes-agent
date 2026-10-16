@@ -48,25 +48,64 @@ def _load_providers_config() -> Dict[str, Any]:
     return providers if isinstance(providers, dict) else {}
 
 
-def _provider_entry(provider: Optional[str]) -> Dict[str, Any]:
-    if not provider:
+def _match_identity(identity: str, providers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ``providers:`` entry whose key, display name or ``custom:<name>`` slug is ``identity``."""
+    from hermes_cli.providers import custom_provider_aliases
+
+    norm = identity.strip().lower()
+    entry = providers.get(identity)
+    if isinstance(entry, dict):
+        return entry
+    for key, entry in providers.items():
+        if isinstance(entry, dict) and norm in custom_provider_aliases(str(entry.get("name") or key), str(key)):
+            return entry
+    return None
+
+
+def _match_base_url(base_url: str, providers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ONE ``providers:`` entry serving ``base_url``; two entries on one endpoint is ambiguous, so off."""
+    target = str(base_url or "").strip().rstrip("/").lower()
+    if not target:
+        return None
+    hits = [e for e in providers.values() if isinstance(e, dict)
+            and str(e.get("base_url") or e.get("url") or e.get("api") or "").strip().rstrip("/").lower() == target]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _provider_entry(provider: Optional[str], requested_provider: Optional[str] = None,
+                    base_url: Optional[str] = None) -> Dict[str, Any]:
+    """Resolve the agent's route to its ``providers:`` block.
+
+    A named ``providers:`` relay does not keep its config key in ``agent.provider``: the runtime
+    resolver returns ``provider="custom"`` with the key in ``requested_provider``, and other paths
+    carry the canonical ``custom:<name>`` slug. Match every identity the route carries, then (bare
+    ``custom`` only, e.g. the compressor, which holds no requested identity) the unique entry on
+    ``base_url``.
+    """
+    identities = [str(i).strip() for i in (provider, requested_provider) if i and str(i).strip()]
+    if not identities:
         return {}
     try:
-        entry = _load_providers_config().get(provider)
+        providers = _load_providers_config()
+        entry = next((e for e in (_match_identity(i, providers) for i in identities) if e is not None), None)
+        if entry is None and base_url and identities[0].lower() == "custom":
+            entry = _match_base_url(base_url, providers)
     except Exception:  # noqa: BLE001 — an unreadable config is flag-off, never a dead turn
         logger.debug("preserve_thinking: providers config unreadable; treating as off", exc_info=True)
         return {}
     return entry if isinstance(entry, dict) else {}
 
 
-def preserve_thinking_enabled(provider: Optional[str]) -> bool:
-    """``providers.<provider>.preserve_thinking is True``; anything else (missing, truthy string) is off."""
-    return _provider_entry(provider).get("preserve_thinking") is True
+def preserve_thinking_enabled(provider: Optional[str], requested_provider: Optional[str] = None,
+                              base_url: Optional[str] = None) -> bool:
+    """``providers.<route>.preserve_thinking is True``; anything else (missing, truthy string) is off."""
+    return _provider_entry(provider, requested_provider, base_url).get("preserve_thinking") is True
 
 
-def preserve_thinking_window(provider: Optional[str]) -> str:
+def preserve_thinking_window(provider: Optional[str], requested_provider: Optional[str] = None,
+                             base_url: Optional[str] = None) -> str:
     """``latest`` unless the flag is on AND ``preserve_thinking_window`` is a known value."""
-    entry = _provider_entry(provider)
+    entry = _provider_entry(provider, requested_provider, base_url)
     if entry.get("preserve_thinking") is not True:
         return WINDOW_LATEST
     window = entry.get("preserve_thinking_window")

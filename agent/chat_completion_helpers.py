@@ -2186,8 +2186,9 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
     ephemeral_out = _consume_ephemeral_max_output(agent)
     # ``providers.<name>.preserve_thinking``: resolved here, where the provider name is known, and
     # threaded down as booleans so the converter stays provider-agnostic.
-    provider_name = getattr(agent, "provider", None)
-    preserve_thinking = preserve_thinking_enabled(provider_name)
+    route = (getattr(agent, "provider", None), getattr(agent, "requested_provider", None),
+             getattr(agent, "_anthropic_base_url", None) or getattr(agent, "base_url", None))
+    preserve_thinking = preserve_thinking_enabled(*route)
     anthropic_kwargs = agent._get_transport().build_kwargs(model=agent.model,
         messages=agent._prepare_anthropic_messages_for_api(api_messages), tools=tools_for_api,
         max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
@@ -2198,7 +2199,7 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
         fast_mode=request_overrides.get("speed") == "fast",
         drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
         preserve_thinking=preserve_thinking,
-        thinking_window=preserve_thinking_window(provider_name) if preserve_thinking else "latest")
+        thinking_window=preserve_thinking_window(*route) if preserve_thinking else "latest")
     # Stamp the pool affinity header (per-request, pool-scoped) so the relay's
     # reset-weighted router can pin this conversation to one sub for the prompt
     # cache. Merges into any existing extra_headers (e.g. anthropic-beta).

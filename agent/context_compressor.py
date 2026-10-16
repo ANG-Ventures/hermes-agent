@@ -5847,7 +5847,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         ``input_transformations`` log clean (``agent.preserved_thinking``)."""
         from agent.preserved_thinking import preserve_thinking_enabled, strip_thinking_at_boundary
 
-        strip_thinking = preserve_thinking_enabled(self.provider)
+        strip_thinking = preserve_thinking_enabled(self.provider, base_url=self.base_url)
         tail_messages: List[Dict[str, Any]] = []
         # Start at tail_start, not compress_end: the rehydration scan may have advanced it (#57835).
         for i in range(max(compress_end, tail_start), len(messages)):
