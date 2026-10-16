@@ -878,5 +878,22 @@
     "surfaces": [
       "gateway"
     ]
+  },
+  {
+    "feature": "kanban owner-wake: kanban events give the owning operator session a turn; one wake per event with the notifier (t_1ae0c35b, t_b1d26df7)",
+    "tests": [
+      "tests/gateway/test_kanban_owner_wake.py"
+    ],
+    "paths": [
+      "gateway/kanban_owner_wake.py",
+      "gateway/kanban_watchers.py"
+    ],
+    "why": "needs_input / precondition blocks, stuck workers, last-blocker-done, red/dirty handbacks and scheduled wakes on non-spawnable cards wake the card's home operator session (the lifecycle line alone notified only a human). 2026-10-15 (t_b1d26df7): a red handback on a card whose home chat holds a notify+wake sub woke twice (notifier review_requested + owner-wake red_handback, 2 s apart). The notifier now computes the red-PR state for review_requested on wake subs, appends it to its one wake turn and marks the event carried (kanban_owner_wake.mark_carried, keyed on board/task/event/chat) only after the wake was accepted; the owner-wake drops a carried review_requested. With no wake sub, an unread PR health, or a failed notifier wake, the owner-wake still fires alone.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
   }
 ]

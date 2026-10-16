@@ -294,6 +294,73 @@ def test_notify_wake_sub_on_owner_chat_is_not_doubled(env):
     assert len(handled) == 1, "the existing notify+wake path still wakes once"
 
 
+class AcceptingAdapter(Adapter):
+    """Acknowledges an internal wake the way a live platform adapter does."""
+
+    async def handle_message(self, event):
+        event._gateway_accepted = True
+        self.handled.append(event)
+
+
+def _wake_sub_on_owner_chat(env, tid):
+    accepting = AcceptingAdapter()
+    env["runner"].adapters = {Platform.DISCORD: accepting}
+    env["adapter"] = accepting
+    with kb.connect_closing() as conn:
+        kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=CHAT,
+                           chat_type="group", user_id=HUMAN, delivery_mode="notify+wake")
+
+
+def test_red_handback_with_notify_wake_sub_is_one_turn_carrying_the_red(env):
+    """t_b1d26df7: one review_requested on a red PR = ONE wake, the red check in it."""
+    env["health"][("ANG-Ventures/hermes-agent", 1710)] = {
+        "state": "open", "mergeable_state": "clean", "failing": ["logs-noise-emitters"]}
+    tid = _card(env)
+    _wake_sub_on_owner_chat(env, tid)
+    with kb.connect_closing() as conn:
+        kb.request_review(conn, tid, force=True, summary="PR ANG-Ventures/hermes-agent#1710 ready")
+    handled = _tick(env)
+    assert len(handled) == 1, [e.text for e in handled]
+    assert not (handled[0].metadata or {}).get("kanban_owner_wake"), "the notifier's wake is the one turn"
+    assert "red: logs-noise-emitters" in handled[0].text
+    assert "ANG-Ventures/hermes-agent#1710" in handled[0].text
+
+
+def test_green_handback_with_notify_wake_sub_is_one_plain_turn(env):
+    env["health"][("ANG-Ventures/hermes-agent", 1711)] = {
+        "state": "open", "mergeable_state": "clean", "failing": []}
+    tid = _card(env)
+    _wake_sub_on_owner_chat(env, tid)
+    with kb.connect_closing() as conn:
+        kb.request_review(conn, tid, force=True, summary="PR ANG-Ventures/hermes-agent#1711 green")
+    handled = _tick(env)
+    assert len(handled) == 1, [e.text for e in handled]
+    assert "cannot land" not in handled[0].text
+
+
+def test_red_handback_owner_wake_stays_when_the_notifier_did_not_carry_it(env):
+    """A wake sub alone is not proof: without the notifier's delivered enrichment for
+    THIS event id the owner-wake still fires (a duplicate beats a lost red)."""
+    env["health"][("ANG-Ventures/hermes-agent", 1712)] = {
+        "state": "open", "mergeable_state": "dirty", "failing": []}
+    tid = _card(env)
+    _wake_sub_on_owner_chat(env, tid)
+    with kb.connect_closing() as conn:
+        kb.request_review(conn, tid, force=True, summary="PR ANG-Ventures/hermes-agent#1712")
+    assert asyncio.run(ow.tick(env["runner"], now=1000.0, state=_held_state(env, 0))) == 1
+    assert "cannot land (ANG-Ventures/hermes-agent#1712 dirty" in env["adapter"].handled[-1].text
+
+
+def test_red_handback_without_sub_still_gets_the_owner_wake(env):
+    env["health"][("ANG-Ventures/hermes-agent", 1713)] = {
+        "state": "open", "mergeable_state": "clean", "failing": ["lint"]}
+    tid = _card(env)
+    with kb.connect_closing() as conn:
+        kb.request_review(conn, tid, force=True, summary="PR ANG-Ventures/hermes-agent#1713")
+    text = _one_turn(env, _tick(env))
+    assert "cannot land (ANG-Ventures/hermes-agent#1713 red: lint)" in text
+
+
 def test_restart_does_not_replay_history(env):
     tid = _card(env)
     _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})

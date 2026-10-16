@@ -1922,6 +1922,10 @@ class GatewayKanbanWatchersMixin:
                     from hermes_cli import kanban_open_pr as _open_pr
 
                     _cg_query = getattr(self, "_kanban_close_gate_query", None) or _open_pr.memo_query()
+                    from gateway import kanban_owner_wake as _ow
+
+                    _red_health = _ow.default_pr_health()
+                    _red_memo: dict = {}
                     include_unowned = self._owns_kanban_dispatcher_lock()
                     notifier_profiles = {notifier_profile}
                     notifier_profiles.update(
@@ -2149,6 +2153,27 @@ class GatewayKanbanWatchersMixin:
                                             _g = None
                                         if _g:
                                             close_gates[_ev.id] = _g
+                                    # t_b1d26df7: a red/dirty PR on a review_requested
+                                    # rides THIS wake, so the owner-wake does not send
+                                    # a second turn for the same event.
+                                    red_state: dict = {}
+                                    if (sub.get("delivery_mode") or "notify") in ("notify+wake", "wake"):
+                                        for _ev in events:
+                                            if _ev.kind != "review_requested":
+                                                continue
+                                            try:
+                                                _bad = _ow.handback_pr_state(
+                                                    _kb, conn, {"result": getattr(task, "result", None)},
+                                                    _ev.payload, _ev.run_id, _red_health, _red_memo,
+                                                )
+                                            except Exception as _rs_exc:
+                                                # Unknown health: leave it to the owner-wake,
+                                                # which retries until GitHub answers.
+                                                logger.debug("kanban notifier: PR state for %s unread: %s",
+                                                             sub["task_id"], _rs_exc)
+                                                _bad = None
+                                            if _bad:
+                                                red_state[_ev.id] = _bad
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -2163,6 +2188,7 @@ class GatewayKanbanWatchersMixin:
                                         "home": home_line,
                                         "home_res": home_res,
                                         "close_gates": close_gates,
+                                        "red_state": red_state,
                                         "self_event_ids": _self_ids,
                                         "suppressed": suppressed,
                                     })
@@ -2879,6 +2905,18 @@ class GatewayKanbanWatchersMixin:
                         _is_push_adapter = _adapter_push_ok(adapter)
                         _session_key = ""
                         _synth = ""
+                        _red_ids: list = []
+
+                        def _mark_red_carried() -> None:
+                            # t_b1d26df7: only after a DELIVERED wake; the owner-wake
+                            # then drops its separate red_handback turn for these ids.
+                            if _red_ids:
+                                from gateway import kanban_owner_wake as _owner_wake_mod
+
+                                _owner_wake_mod.mark_carried(
+                                    self, board_slug, sub["task_id"], _red_ids,
+                                    sub.get("platform"), sub.get("chat_id"), sub.get("thread_id"),
+                                )
                         if _wake_kinds:
                             if _is_push_adapter:
                                 _session_key = getattr(task, "session_id", None) or ""
@@ -2933,6 +2971,18 @@ class GatewayKanbanWatchersMixin:
                                 _synth += "\n" + t(
                                     "gateway.kanban.wake.review_detail",
                                     reason=wake_review_detail,
+                                )
+                            # t_b1d26df7: the owner-wake's red-PR enrichment rides
+                            # this one turn (same English text the owner-wake uses).
+                            _red_ids = [
+                                ev.id for ev in d["events"]
+                                if ev.kind == "review_requested" and "review_requested" in _wake_kinds
+                                and ev.id in (d.get("red_state") or {})
+                            ]
+                            for _rid in _red_ids:
+                                _synth += (
+                                    "\nHanded back for review but the PR cannot land ("
+                                    f"{d['red_state'][_rid]}). Fix the PR before the merge pass."
                                 )
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
@@ -2996,6 +3046,7 @@ class GatewayKanbanWatchersMixin:
                                         session_id=_session_key,
                                         profile=_served_profile,
                                     )
+                                _mark_red_carried()
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
@@ -3074,6 +3125,7 @@ class GatewayKanbanWatchersMixin:
                                     _synth,
                                 )]},
                             )
+                            _mark_red_carried()
                             logger.info(
                                 "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                 sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
