@@ -33,10 +33,11 @@ MAX_LOOKUPS_PER_TICK = 10
 # Non-MERGED states are re-read after this long; MERGED is cached for good.
 CACHE_TTL_SECONDS = 300
 
-# Keyed by (oracle identity, repo, pr): a sandbox/test oracle's synthetic MERGED must never release a live card
-# read through the real oracle in the same interpreter (Prism 50dc72190d84). The oracle key is the query_fn's
-# own identity; two distinct callables never share a row.
-_CACHE: dict[tuple[int, str, int], tuple[str, float]] = {}
+# Keyed by (id(oracle), repo, pr): a sandbox/test oracle's synthetic MERGED must never release a live card
+# read through the real oracle in the same interpreter (Prism 50dc72190d84). id() is unique only while the
+# object lives, so each row RETAINS its oracle and a hit counts only when it ``is`` the caller's: a freed
+# sandbox oracle's id reused by a new live one can never inherit its MERGED (Prism 7aaa3acdd804).
+_CACHE: dict[tuple[int, str, int], tuple[QueryFn, str, float]] = {}
 # parent id -> when its PRs were last looked up. Parents are checked oldest
 # first, so a fixed budget cannot starve the parents that sort last.
 _LAST_CHECKED: dict[str, float] = {}
@@ -85,8 +86,8 @@ def _default_query() -> Optional[QueryFn]:
 def _state(ref, query_fn: QueryFn, now: float, budget: list) -> Optional[str]:
     key = (id(query_fn), ref.repo.lower(), ref.number)
     hit = _CACHE.get(key)
-    if hit is not None and (hit[0] == "MERGED" or now - hit[1] < CACHE_TTL_SECONDS):
-        return hit[0]
+    if hit is not None and hit[0] is query_fn and (hit[1] == "MERGED" or now - hit[2] < CACHE_TTL_SECONDS):
+        return hit[1]
     if budget[0] <= 0:
         return None
     budget[0] -= 1
@@ -96,7 +97,7 @@ def _state(ref, query_fn: QueryFn, now: float, budget: list) -> Optional[str]:
         return None
     state = str((payload or {}).get("state") or "").upper() or None
     if state:
-        _CACHE[key] = (state, now)
+        _CACHE[key] = (query_fn, state, now)
     return state
 
 
