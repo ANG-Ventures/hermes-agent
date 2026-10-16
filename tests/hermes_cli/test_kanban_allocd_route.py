@@ -359,7 +359,8 @@ def test_on_honours_allocd_host_and_reservation(home, allocd):
     rid = plan.last_reservation
     assert rid == plan.last_decision.reservation_id and plan.reservation_via(rid) == kh.VIA_ALLOC_CLIENT
     rows = placement._read_ledger(home / placement.RESERVATIONS_REL)["rows"]
-    assert [(r["id"], r["host"], r["job_id"]) for r in rows] == [(rid, host.name, "t_on1")]
+    assert [(r["id"], r["host"]) for r in rows] == [(rid, host.name)]
+    assert rows[0]["job_id"].startswith("t_on1#") and admits[0]["job_id"] == rows[0]["job_id"]
     # refund goes back through alloc_client -> allocd /release
     plan.release(host, rid)
     assert ("/release", {"consumer": "kanban", "reservation_id": rid}) in allocd.requests
@@ -449,6 +450,105 @@ def test_dispatch_on_marks_the_reservation_and_run_end_releases_through_alloc_cl
         kb.complete_task(conn, tid, summary="done")
     assert ("/release", {"consumer": "kanban", "reservation_id": rid}) in allocd.requests
     assert not placement.live_reservations(home / placement.RESERVATIONS_REL)
+
+
+def test_on_retry_of_a_card_never_reuses_the_previous_runs_live_row(home, allocd):
+    """Prism 2de4f2d22204: the idempotency key is per admission, not per card. A card
+    retried while its previous run's reservation is still live (release failed / in
+    flight) books a NEW row; releasing the old one leaves the new one live."""
+    f = Fleet()
+    _pressure_from_fleet(home, f)
+    plan = _plan(home, f, now=time.time())
+    plan.signal.allocd = kh.ALLOCD_ON
+    assert plan.take("alpha", job_id="t_retry") is not None
+    first = plan.last_reservation
+    assert plan.take("alpha", job_id="t_retry") is not None
+    second = plan.last_reservation
+    assert first and second and first != second
+    keys = [r["job_id"] for p, r in allocd.requests if p == "/admit"]
+    assert len(keys) == 2 and keys[0] != keys[1] and all(k.startswith("t_retry#") for k in keys)
+    assert kh.release_alloc(first)                       # the previous run's late release
+    live = placement._read_ledger(home / placement.RESERVATIONS_REL)["rows"]
+    assert [r["id"] for r in live if r["until"] > time.time()] == [second]
+
+
+def test_admission_key_is_stable_inside_one_admit_across_the_fallback(home, monkeypatch):
+    """The one key alloc_client.admit gets is the one its fallback reuses: allocd
+    unreachable -> the fallback books under that same key (one row, no double admit)."""
+    seen = []
+    real = alloc_client._fallback_admit
+
+    def spy(consumer, **kw):
+        seen.append(kw["job_id"])
+        return real(consumer, **kw)
+
+    monkeypatch.setenv("ALLOCD_URL", "http://127.0.0.1:9")          # refused: a liveness fault
+    monkeypatch.setattr(alloc_client, "_fallback_admit", spy)
+    calls = []
+    real_admit = alloc_client.admit
+
+    def admit_spy(consumer, **kw):
+        calls.append(kw["job_id"])
+        return real_admit(consumer, **kw)
+
+    monkeypatch.setattr(alloc_client, "admit", admit_spy)
+    f = Fleet()
+    _pressure_from_fleet(home, f)
+    plan = _plan(home, f, now=time.time())
+    plan.signal.allocd = kh.ALLOCD_ON
+    plan.take("alpha", job_id="t_fb")
+    assert len(calls) == 1 and calls[0].startswith("t_fb#")
+    assert seen == calls                                  # the fallback replays the SAME key
+
+
+def test_replacement_reservation_survives_a_restart(home, allocd, monkeypatch):
+    """Prism 43f676a1839e: alloc_client re-admits an expired fallback row under a NEW id
+    and aliases it only in-process (_REPLACED). renew_running persists old -> new on the
+    run, so after a restart (alias map empty) renewal and the run-end release target the
+    replacement, not the obsolete id."""
+    f = Fleet()
+    _pressure_from_fleet(home, f)
+    plan = _plan(home, f, now=time.time())
+    plan.signal.allocd = kh.ALLOCD_ON
+    rpath = home / placement.RESERVATIONS_REL
+
+    def spawn(task, workspace, *, board=None, placement=None):
+        return 4242
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="c", assignee="alpha")
+        kbd.dispatch_once(conn, spawn_fn=spawn, max_spawn=4, spawn_paused=None, spawn_limit=0,
+                          spillover=plan, reconcile_orphans=False)
+        run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+        old, via = kh.run_reservation(conn, tid, run_id)
+        assert old and via == kh.VIA_ALLOC_CLIENT
+        row = [r for r in placement._read_ledger(rpath)["rows"] if r["id"] == old][0]
+        # what alloc_client._readmit does: the old row is gone, a new one books the job, alias old -> new
+        new = placement.reserve(row["host"], "kanban", placement._row_footprint(row),
+                                ttl_s=60, job_id=row["job_id"], path=rpath)
+        placement.release(old, path=rpath)
+
+        def readmitting_renew(rid, **kw):
+            assert rid == old
+            alloc_client._REPLACED[old] = new
+            return True
+
+        with monkeypatch.context() as m:
+            m.setattr(alloc_client, "renew", readmitting_renew)
+            got = kh.renew_running([{"slug": "default"}], lambda board=None: kb.connect(board=board), rpath)
+        assert got == {"renewed": 1, "lapsed": 0}
+        alloc_client._REPLACED.clear()                    # the gateway restarts: the alias map is gone
+        alloc_client._OWNER.clear()
+        assert kh.run_reservation(conn, tid, run_id) == (new, kh.VIA_ALLOC_CLIENT)
+        assert kh.running_reservations(conn) == [(tid, new, kh.VIA_ALLOC_CLIENT)]
+        allocd.requests.clear()
+        got = kh.renew_running([{"slug": "default"}], lambda board=None: kb.connect(board=board), rpath)
+        assert got == {"renewed": 1, "lapsed": 0}
+        assert ("/renew", {"consumer": "kanban", "reservation_id": new, "ttl_s": kh.RESERVE_TTL_S}) \
+            in allocd.requests
+        kb.complete_task(conn, tid, summary="done")
+    assert ("/release", {"consumer": "kanban", "reservation_id": new}) in allocd.requests
+    assert not placement.live_reservations(rpath)
 
 
 def test_dispatch_off_worker_placed_has_no_route_marker(home, monkeypatch):
