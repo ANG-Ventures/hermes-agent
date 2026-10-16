@@ -413,6 +413,21 @@ def test_pin_lacks_park_skips_a_card_claimed_since_the_snapshot(home, fleet, mon
         assert res.placement_caps[tid].get("action") is None
 
 
+def test_foreign_pin_lacks_card_is_not_parked(home, fleet, monkeypatch):
+    # RED ON BASE (Prism 229da8245003 class, pin-lacks sibling): a home whose
+    # dispatch_profiles excludes ``alpha`` parked alpha's card blocked/needs_input.
+    _mode(monkeypatch)
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: (lambda name: False))
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body="host: ace-ai\nrestock", skills=[WAVE])
+        res, spawned = _tick(conn)
+        status = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        assert spawned == []
+        assert status == "ready"
+        assert _comments(conn, tid, prefix="pin host:ace-ai") == []
+        assert res.placement_caps.get(tid, {}).get("action") is None
+
+
 def test_attached_skill_lookup_is_case_insensitive(home, fleet, monkeypatch):
     # Prism b7a3c37db15e: index keys and attached names fold to lower case.
     doc = _index(fleet)
