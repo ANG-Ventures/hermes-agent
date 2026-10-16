@@ -1,10 +1,10 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
-VENDORED from hermes-home ``scripts/lib/placement.py`` @ 80e074a6ac (t_08de4ba5 branch over #3917 dc97f387;
-sha256 f1daa30a9d4996109796a6941c625a4f633061db9c705f744d59ecf2770d6188) for the kanban dispatcher (t_d6ce856e):
-the fork may not import hermes-home code. The ONLY local changes are ``fleet_root()`` plus ``encoding="utf-8"``
-on two ``open()`` calls (the fork's PLW1514 lint); ``tests/hermes_cli/test_kanban_headroom_placement.py``
-checks the rest against the canonical file.
+VENDORED from hermes-home ``scripts/lib/placement.py`` @ 58a2aeb6d3 (#4302, Router Core Card A t_552773f1;
+sha256 2d5cfc215f5e96c18e0355c27b95fad7a5ca7d88cf21fbf325e3b72daa3bcf15) for the kanban dispatcher (t_d6ce856e) and its
+alloc_client route (t_4187c8f1): the fork may not import hermes-home code. The ONLY local changes are
+``fleet_root()`` plus ``encoding="utf-8"`` on two ``open()`` calls (the fork's PLW1514 lint);
+``tests/hermes_cli/test_kanban_headroom_placement.py`` checks the rest against the canonical file.
 
 Card t_499e107f (Ace 2026-10-12 16:34: "ace ai doesn't need to be last pick, we just need load balancing
 instead"). PR #3925 made ace-ai the last pick for remote test-gate runs and the allocation handoff
@@ -851,8 +851,14 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
 
 
 # ── reservation ledger (A3): promises the sample cannot see yet ─────────────────────────────────
+class LockTimeout(PlacementError):
+    """The ledger flock was not acquired within ``lock_timeout_s`` (a wedged holder; Router Core t_552773f1)."""
+
+
 @contextlib.contextmanager
-def _locked(path: Path):
+def _locked(path: Path, timeout_s: Optional[float] = None):
+    """LOCK_EX on <path>.lock. ``timeout_s`` None = block (every existing caller); a number = LOCK_NB polled until
+    the deadline, then LockTimeout (alloc_client's fallback must answer, never hang behind a wedged allocd)."""
     try:
         import fcntl
     except ImportError:  # pragma: no cover
@@ -860,7 +866,18 @@ def _locked(path: Path):
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(str(path) + ".lock", "a+", encoding="utf-8") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        if timeout_s is None:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + max(0.0, float(timeout_s))
+            while True:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise LockTimeout(f"{path}.lock: held past {timeout_s:.2f}s") from None
+                    time.sleep(0.02)
         try:
             yield
         finally:
@@ -1091,10 +1108,25 @@ def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample
     if not _num(ttl_s) or ttl_s <= 0:
         raise PlacementError(f"ttl_s must be a finite number > 0, not {ttl_s!r}")
     stale_after_s = choose_kw.pop("stale_after_s", DEFAULT_STALE_AFTER_S)
+    # Router Core (t_552773f1), both opt-in, default off = unchanged for every existing caller:
+    # reuse_job: a live row of this (consumer, job_id) is returned as is (an admit whose reply was lost, asked again
+    #   by allocd or by alloc_client's fallback on the same ledger, never books the job twice).
+    # extra_reserved: {host: Footprint} held back for THIS decision only, never written (allocd's P0 reserve).
+    # lock_timeout_s: bounded flock wait (LockTimeout on expiry) for alloc_client's fallback; None = block.
+    reuse_job = bool(choose_kw.pop("reuse_job", False))
+    extra_reserved = choose_kw.pop("extra_reserved", None) or {}
+    lock_timeout_s = choose_kw.pop("lock_timeout_s", None)
     p = reservations_path(path)
-    with _locked(p):
+    with _locked(p, lock_timeout_s):
         now = _now(now)
+        if reuse_job and job_id is not None:
+            for row in _read_ledger(p)["rows"]:
+                if _row_live(row, now) and row["consumer"] == consumer and row.get("job_id") == job_id:
+                    return Decision(row["host"], "", [], consumer, _row_footprint(row), rule="reuse"), row["id"]
         resv = live_reservations(p, now=now, table=table)
+        for k, v in extra_reserved.items():
+            hid = table.resolve(k) or k
+            resv[hid] = resv[hid].plus(v) if hid in resv else v
         used = live_slots(consumer, p, now=now, table=table)     # positive slot caps count live admissions (696cce63)
         d = choose(table, consumer, samples, reservations=resv, slots_used=used, now=now,
                    stale_after_s=stale_after_s, **choose_kw)
@@ -1107,14 +1139,15 @@ def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample
     return d, rid
 
 
-def renew(reservation_id: str, *, ttl_s: float, path=None, now: Optional[float] = None, admissions_path=None) -> bool:
+def renew(reservation_id: str, *, ttl_s: float, path=None, now: Optional[float] = None, admissions_path=None,
+          lock_timeout_s: Optional[float] = None) -> bool:
     """Extend a LIVE reservation to ``now + ttl_s`` (a lease the holder keeps renewing while its job runs, so a
     run longer than any fixed TTL stays counted; a holder that dies stops renewing and the row lapses; Prism
     796aae4f). False when the row is gone, expired or released (it is never resurrected)."""
     if not _num(ttl_s) or ttl_s <= 0:
         raise PlacementError(f"ttl_s must be a finite number > 0, not {ttl_s!r}")
     p = reservations_path(path)
-    with _locked(p):
+    with _locked(p, lock_timeout_s):
         now = _now(now)
         doc = _read_ledger(p)
         rows, expired = _prune(doc["rows"], now)
@@ -1129,10 +1162,11 @@ def renew(reservation_id: str, *, ttl_s: float, path=None, now: Optional[float] 
     return hit
 
 
-def release(reservation_id: str, *, path=None, now: Optional[float] = None, admissions_path=None) -> bool:
+def release(reservation_id: str, *, path=None, now: Optional[float] = None, admissions_path=None,
+            lock_timeout_s: Optional[float] = None) -> bool:
     """End a reservation (the job ended); True when it was live. Logged as a ``released`` ledger line."""
     p = reservations_path(path)
-    with _locked(p):
+    with _locked(p, lock_timeout_s):
         now = _now(now)
         doc = _read_ledger(p)
         live, lines = _prune(doc["rows"], now)

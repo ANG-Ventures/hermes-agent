@@ -209,6 +209,7 @@ class GateTickBuilder:
             reservation_gb=kadm.reservation_gb(cfg),
             placement_table=kh.load_table(root),
             placement_reservations=root / placement.RESERVATIONS_REL,
+            allocd=kh.allocd_mode(cfg),
         )
 
     def build(self, boards) -> GateTick:
