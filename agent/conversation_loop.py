@@ -703,7 +703,10 @@ def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool =
     if not agent._session_db:
         return
     try:
-        agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+        from agent.system_prompt import static_prefix_kwargs
+        agent._session_db.update_system_prompt(
+            agent.session_id, agent._cached_system_prompt,
+            **static_prefix_kwargs(agent, agent._cached_system_prompt))
         if persist_tools:
             from tools.mcp_tool_agent import persist_agent_tool_names
             persist_agent_tool_names(agent)
@@ -834,8 +837,11 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # prefix is not persisted either; rebuild it for the early cache breakpoint or
         # fresh-per-turn gateway agents fall back to the single-breakpoint layout
         # (reconstruct_static_prefix gates on _use_prompt_caching, fails open to legacy).
-        from agent.system_prompt import reconstruct_static_prefix, restore_plugin_prompt_sections
+        from agent.system_prompt import (
+            reconstruct_static_prefix, restore_plugin_prompt_sections, restore_static_prefix,
+        )
         restore_plugin_prompt_sections(agent, stored_prompt)
+        restore_static_prefix(agent, stored_prompt, (session_row or {}).get("system_prompt_static_len"))
         reconstruct_static_prefix(agent, system_message=system_message)
         return
     if stored_prompt:

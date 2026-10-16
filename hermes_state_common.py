@@ -522,6 +522,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_turn_cache_write_tokens_unknown INTEGER,
     last_turn_usage_unknown INTEGER,
     tool_names TEXT,
+    system_prompt_static_len INTEGER,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );

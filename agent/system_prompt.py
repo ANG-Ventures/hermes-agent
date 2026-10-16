@@ -890,6 +890,30 @@ def invalidate_system_prompt(agent: Any) -> None:
         agent._memory_store.load_from_disk()
 
 
+def static_prefix_len(agent: Any, prompt: Any) -> Optional[int]:
+    """Length of the ``[static, suffix]`` split ``prompt`` is sent with, for persistence; ``None`` when the
+    request sends it as one block."""
+    static = getattr(agent, "_cached_system_prompt_static", None)
+    if isinstance(prompt, str) and isinstance(static, str) and static and prompt.startswith(static) \
+            and len(static) < len(prompt):
+        return len(static)
+    return None
+
+
+def static_prefix_kwargs(agent: Any, prompt: Any) -> Dict[str, int]:
+    """``update_system_prompt`` kwargs carrying the split; empty when there is none."""
+    split = static_prefix_len(agent, prompt)
+    return {} if split is None else {"static_prefix_len": split}
+
+
+def restore_static_prefix(agent: Any, stored: str, split_len: Any) -> None:
+    """Re-adopt the split the conversation was sent with. Re-deriving it from today's builder fails once the
+    stable tier changed (deploy, SOUL/skills edit), and the request then collapses ``[static, suffix]`` into
+    one block — a rewrite of already-sent system bytes (class I, t_91b6a4c4)."""
+    if isinstance(split_len, int) and not isinstance(split_len, bool) and 0 < split_len < len(stored or ""):
+        agent._cached_system_prompt_static = stored[:split_len]
+
+
 def reconstruct_static_prefix(agent: Any, system_message: Optional[str] = None, *, log_label: str = "restore") -> None:
     """Reconstruct ``_cached_system_prompt_static`` for a stored prompt.
     Only the full prompt is persisted, so restore / keep-prompt compression /

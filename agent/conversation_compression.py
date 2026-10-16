@@ -3788,6 +3788,7 @@ def _publish_rotated_compaction(
     new_session_id = mint_session_id()
     from agent.chat_completion_helpers import prompt_for_persistence
     from agent.context_compressor import _DB_PERSISTED_MARKER
+    from agent.system_prompt import static_prefix_kwargs
     agent._session_db.publish_compression_child(
         parent_session_id=old_session_id, child_session_id=new_session_id,
         source=_compression_child_source(agent, old_session_id), model=agent.model,
@@ -3796,6 +3797,7 @@ def _publish_rotated_compaction(
         # right in memory, but the stored row must carry the primary identity or the next turn
         # rejects it as stale and rebuilds (cold prefix cache).
         system_prompt=prompt_for_persistence(agent, new_system_prompt), messages=compressed,
+        **static_prefix_kwargs(agent, prompt_for_persistence(agent, new_system_prompt)),
         cwd=getattr(agent, "working_directory", None), profile_name=_profile_for_child,
         compression_lock_holder=lease.holder, require_compression_lease=lease.holder is not None,
         require_lease_refresh=lease.holder is not None, lease_ttl_seconds=lease.ttl,
@@ -4226,8 +4228,10 @@ def _commit_compaction(
                 compacted_in_place = True
                 # In-place still updates the current row's prompt; rotation published it atomically above.
                 from agent.chat_completion_helpers import prompt_for_persistence
+                from agent.system_prompt import static_prefix_kwargs
+                _persisted_prompt = prompt_for_persistence(agent, new_system_prompt)
                 agent._session_db.update_system_prompt(
-                    agent.session_id, prompt_for_persistence(agent, new_system_prompt)
+                    agent.session_id, _persisted_prompt, **static_prefix_kwargs(agent, _persisted_prompt),
                 )
                 agent._last_flushed_db_idx = 0
             else:
