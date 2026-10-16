@@ -5839,7 +5839,15 @@ Write only the summary body. Do not include any preamble or prefix."""
     def _assemble_tail(
         self, messages: List[Dict[str, Any]], compress_end: int, tail_start: int, summary_indices: set,
     ) -> List[Dict[str, Any]]:
-        """Protected tail with already-folded handoff rows dropped and merged handoffs unwrapped."""
+        """Protected tail with already-folded handoff rows dropped and merged handoffs unwrapped.
+
+        On a ``preserve_thinking`` provider the kept rows also lose their thinking blocks (copy
+        only): the compaction rewrites the prefix they were signed against, so the API would
+        ``drop_block`` each one anyway; stripping here is deterministic and keeps the per-turn
+        ``input_transformations`` log clean (``agent.preserved_thinking``)."""
+        from agent.preserved_thinking import preserve_thinking_enabled, strip_thinking_at_boundary
+
+        strip_thinking = preserve_thinking_enabled(self.provider)
         tail_messages: List[Dict[str, Any]] = []
         # Start at tail_start, not compress_end: the rehydration scan may have advanced it (#57835).
         for i in range(max(compress_end, tail_start), len(messages)):
@@ -5847,6 +5855,8 @@ Write only the summary body. Do not include any preamble or prefix."""
                 continue  # already folded into _previous_summary; don't re-emit
             stripped = self._strip_context_summary_handoff_message(_fresh_compaction_message_copy(messages[i]))
             if stripped is not None:
+                if strip_thinking and stripped.get("role") == "assistant":
+                    stripped = strip_thinking_at_boundary(stripped)
                 tail_messages.append(stripped)
         return tail_messages
 
