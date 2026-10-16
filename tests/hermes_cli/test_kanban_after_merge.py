@@ -34,6 +34,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HERMES_KANBAN_SANDBOX", "1")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     am._CACHE.clear()
+    am._LAST_CHECKED.clear()
     kb.init_db()
     return home
 
@@ -49,13 +50,13 @@ def _oracle(state: str | None):
     return q
 
 
-def _parent_with_pr(conn) -> str:
+def _parent_with_pr(conn, pr: str = PR) -> str:
     """A parent whose run recorded its PR and that is now in ``review`` (open)."""
     parent = kb.create_task(conn, title="ship the fix", assignee="daedalus")
     kb.claim_task(conn, parent)
     run_id = kb.get_task(conn, parent).current_run_id
     conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
-                 (f'{{"pr_url": "{PR}"}}', run_id))
+                 (f'{{"pr_url": "{pr}"}}', run_id))
     conn.execute("UPDATE tasks SET status = 'review', claim_lock = NULL WHERE id = ?", (parent,))
     conn.commit()
     return parent
@@ -104,6 +105,46 @@ def test_after_merge_holds_while_pr_not_merged(kanban_home, state):
         assert q.calls == [("ANG-Ventures/hermes-agent", 4242)]
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "todo"
+
+
+def test_lookup_budget_rotates_across_parents(kanban_home):
+    """One lookup per tick still reaches every parent: oldest-checked first."""
+    with kb.connect() as conn:
+        pairs = []
+        for n in (1, 2, 3):
+            parent = _parent_with_pr(conn, pr=f"{PR[:-4]}{n}")
+            child = kb.create_task(conn, title=f"drill {n}", assignee="daedalus")
+            kb.link_tasks(conn, parent, child, kind="after-merge")
+            pairs.append((parent, child))
+        def q(repo, number):  # parent 1's PR stays OPEN and is re-read each tick
+            return {"state": "OPEN" if str(number).endswith("1") else "MERGED"}
+
+        released = []
+        for tick in range(3):  # ticks past the TTL, so OPEN is never a cache hit
+            released += am.release_merged_edges(
+                conn, query_fn=q, max_lookups=1, now=1000.0 + tick * 1000)
+        assert sorted(released) == sorted(pairs[1:])
+
+
+def test_release_skips_parent_whose_pr_set_changed_mid_tick(kanban_home, monkeypatch):
+    """The lookup ran outside the txn: a PR recorded meanwhile is not released on."""
+    with kb.connect() as conn:
+        parent = _parent_with_pr(conn)
+        child = kb.create_task(conn, title="drill", assignee="daedalus")
+        kb.link_tasks(conn, parent, child, kind="after-merge")
+        real = am._fleet_refs
+        seen = []
+
+        def refs(c, pid):
+            seen.append(pid)
+            out = real(c, pid)
+            if len(seen) > 1:  # the re-read under the txn sees a second PR
+                out = out + [type(out[0])("ANG-Ventures/hermes-agent", 7)]
+            return out
+
+        monkeypatch.setattr(am, "_fleet_refs", refs)
+        assert am.release_merged_edges(conn, query_fn=_oracle("MERGED")) == []
+        assert kb.parent_links(conn, child) == [(parent, kb.LINK_KIND_AFTER_MERGE)]
 
 
 def test_after_merge_without_recorded_pr_waits_for_parent_done(kanban_home):

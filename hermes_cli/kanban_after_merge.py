@@ -34,6 +34,9 @@ MAX_LOOKUPS_PER_TICK = 10
 CACHE_TTL_SECONDS = 300
 
 _CACHE: dict[tuple[str, int], tuple[str, float]] = {}
+# parent id -> when its PRs were last looked up. Parents are checked oldest
+# first, so a fixed budget cannot starve the parents that sort last.
+_LAST_CHECKED: dict[str, float] = {}
 
 
 def describe_gate(parent_id: str, child_id: str, kind: str) -> str:
@@ -94,6 +97,14 @@ def _state(ref, query_fn: QueryFn, now: float, budget: list) -> Optional[str]:
     return state
 
 
+def _fleet_refs(conn: sqlite3.Connection, parent_id: str) -> list:
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_open_pr as _open_pr
+
+    return _open_pr.split_fleet(_open_pr.extract_pr_refs(
+        survivor_pr=kb._card_recorded_pr_refs(conn, parent_id)))[0]
+
+
 def release_merged_edges(
     conn: sqlite3.Connection,
     *,
@@ -104,9 +115,9 @@ def release_merged_edges(
     """Rewrite every ``after-merge`` edge whose parent's recorded fleet PRs all
     read MERGED to ``derived-from``; return the released ``(parent, child)``
     pairs. A parent with no recorded PR, an OPEN/CLOSED PR or an unreadable one
-    keeps the gate. Lookups happen before the short write txn."""
+    keeps the gate. Lookups happen before the short write txn, which re-reads
+    the parent's PR set and skips any parent whose set changed meanwhile."""
     from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_open_pr as _open_pr
 
     edges = conn.execute(
         "SELECT l.parent_id, l.child_id FROM task_links l "
@@ -127,10 +138,18 @@ def release_merged_edges(
     now = time.time() if now is None else now
     budget = [max(0, int(max_lookups))]
     merged_prs: dict[str, list[str]] = {}
-    for parent_id in dict.fromkeys(e["parent_id"] for e in edges):
-        refs = _open_pr.split_fleet(_open_pr.extract_pr_refs(
-            survivor_pr=kb._card_recorded_pr_refs(conn, parent_id)))[0]
-        if refs and all(_state(r, query_fn, now, budget) == "MERGED" for r in refs):
+    parents = sorted(dict.fromkeys(e["parent_id"] for e in edges),
+                     key=lambda pid: (_LAST_CHECKED.get(pid, 0.0), pid))
+    for parent_id in parents:
+        if budget[0] <= 0:
+            break
+        refs = _fleet_refs(conn, parent_id)
+        if not refs:
+            continue
+        _LAST_CHECKED[parent_id] = now
+        # No short-circuit: every ref is read, so the cache fills evenly.
+        states = [_state(r, query_fn, now, budget) for r in refs]
+        if all(st == "MERGED" for st in states):
             merged_prs[parent_id] = [str(r) for r in refs]
     released: list[tuple[str, str]] = []
     if not merged_prs:
@@ -140,9 +159,16 @@ def release_merged_edges(
             parent_id, child_id = edge["parent_id"], edge["child_id"]
             if parent_id not in merged_prs:
                 continue
+            # The lookups ran outside the txn: a parent that recorded a new PR,
+            # or closed/reopened since, is re-judged next tick, never released
+            # on the stale read.
+            if [str(r) for r in _fleet_refs(conn, parent_id)] != merged_prs[parent_id]:
+                continue
             cur = conn.execute(
-                "UPDATE task_links SET kind = ? WHERE parent_id = ? AND child_id = ? AND kind = ?",
-                (kb.LINK_KIND_DERIVED_FROM, parent_id, child_id, kb.LINK_KIND_AFTER_MERGE),
+                "UPDATE task_links SET kind = ? WHERE parent_id = ? AND child_id = ? AND kind = ? "
+                "AND EXISTS (SELECT 1 FROM tasks c WHERE c.id = ? "
+                "            AND c.status NOT IN ('done', 'archived'))",
+                (kb.LINK_KIND_DERIVED_FROM, parent_id, child_id, kb.LINK_KIND_AFTER_MERGE, child_id),
             )
             if cur.rowcount == 1:
                 kb._append_event(conn, child_id, "after_merge_released",

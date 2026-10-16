@@ -35,12 +35,14 @@ _ORIGIN_PATHS_SQL = ("SELECT DISTINCT origin_host, workspace_path FROM tasks "
 _READY_SQL = "SELECT 1 FROM tasks WHERE status = 'ready' AND claim_lock IS NULL LIMIT 1"
 # Cards dispatch_once itself makes ready this tick, before its ready loop: a
 # timed wake that is due (wake_due_scheduled) and a todo card whose blocks
-# parents are all terminal (recompute_ready).
+# parents are all terminal (recompute_ready). An open ``after-merge`` parent
+# counts as waking on purpose: the same tick may release it (PR merged), and
+# an extra plan costs less than a released child placed with none.
 _WAKING_SQL = (
     "SELECT 1 FROM tasks t WHERE (t.status = 'scheduled' AND t.next_eligible_at IS NOT NULL "
     "AND t.next_eligible_at <= CAST(strftime('%s','now') AS INTEGER)) "
     "OR (t.status = 'todo' AND NOT EXISTS (SELECT 1 FROM task_links l JOIN tasks p "
-    "ON p.id = l.parent_id WHERE l.child_id = t.id AND COALESCE(l.kind,'blocks') IN ('blocks','after-merge') "
+    "ON p.id = l.parent_id WHERE l.child_id = t.id AND COALESCE(l.kind,'blocks') = 'blocks' "
     "AND p.status NOT IN ('done','archived'))) LIMIT 1"
 )
 
