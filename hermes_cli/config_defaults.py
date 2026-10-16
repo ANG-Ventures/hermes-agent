@@ -2371,6 +2371,11 @@ DEFAULT_CONFIG = {
         # hermes-home scripts/browsers/dispatch_relay.py at spawn, into the worker's BROWSER_LEASE_* env only.
         # false = every lease plan waits ``browser_join_off``. Read per tick from the ROOT config.
         "browser_join": False,
+        # Browser Sandboxes registry the dispatcher's browser gate reads per tick (t_458bbb42): the SAME host-local
+        # file browserd reads. None = this OS's default (/usr/local/etc/browsers/browser-hosts.json on darwin,
+        # /opt/browsers/browser-hosts.json on linux); neither present = the repo seed fleet/browser-hosts.json
+        # (committed mode off), logged once per process as browser_registry_fallback.
+        "browser_hosts_file": None,
         # Placement PRD Phase 1b (t_1e4b9684): read_signal true = the pool probe
         # also reads each host's host-pressure.json (same ssh round-trip), a
         # host turns hot after 2 hot samples and clears after 3 (state in

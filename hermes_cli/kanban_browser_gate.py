@@ -8,7 +8,8 @@ and ``kanban dispatch --dry-run`` both reach it through :func:`gate_rows` (one c
 Order of the checks is load-bearing:
 
 1. ``browsers.mode`` != ``on`` -> ``legacy_route {reason: mode_off}``. Read per tick from
-   ``fleet/browser-hosts.json``; nothing is cached across ticks, so a flip needs no restart (AC-1.13).
+   the host-local browser-hosts.json browserd reads (:func:`registry_path`); nothing is cached across
+   ticks, so a flip needs no restart (AC-1.13).
 2. the card's lane (``lane_of``) is not in ``migrated_lanes`` -> ``legacy_route {reason:
    lane_not_migrated}``. No ledger read, no ``BROWSER_*`` token: an unmigrated lane is placed exactly
    as today (AC-1.15 (i)/(ii)).
@@ -232,5 +233,39 @@ def gate_rows(rows, *, registry: kn.LaneRegistry, lookup, minted_by: Mapping, wo
     return out
 
 
-def load(fleet_dir: Path) -> kn.LaneRegistry:
-    return kn.load_registry(fleet_dir)
+# The host-local registry browserd reads on each host (fleet/browsers/install-studio.sh, install-linux.sh).
+HOST_LOCAL_REGISTRY = {"darwin": "/usr/local/etc/browsers/browser-hosts.json",
+                       "linux": "/opt/browsers/browser-hosts.json"}
+FALLBACK_EVENT = "browser_registry_fallback"
+_fallback_logged: set = set()
+
+
+def registry_path(fleet_dir: Path, configured=None, *, platform: Optional[str] = None) -> tuple:
+    """``(path, source)``: the browser-hosts.json the gate reads this tick (t_458bbb42).
+
+    Order: ``kanban.browser_hosts_file`` (root config) when that file exists, then this OS's host-local
+    copy (the one browserd reads), then the repo seed ``<fleet_dir>/browser-hosts.json`` (source
+    ``fallback``). The repo file is committed ``mode: off``, so the kill switch lives on the host."""
+    if platform is None:
+        from hermes_platform.host.facts import os_family
+        platform = os_family()
+    for source, p in (("config", configured), ("host_local", HOST_LOCAL_REGISTRY.get(platform))):
+        if isinstance(p, str) and p.strip() and Path(p).expanduser().exists():
+            return Path(p).expanduser(), source
+    return Path(fleet_dir) / kn.REGISTRY_FILE, "fallback"
+
+
+def load(fleet_dir: Path, configured=None, *, platform: Optional[str] = None, log=None) -> kn.LaneRegistry:
+    """The lane registry, read per tick from :func:`registry_path`. A fallback to the repo seed logs one
+    ``browser_registry_fallback`` warning per process and path (visible, never per tick)."""
+    if platform is None:
+        from hermes_platform.host.facts import os_family
+        platform = os_family()
+    path, source = registry_path(fleet_dir, configured, platform=platform)
+    if source == "fallback" and str(path) not in _fallback_logged:
+        _fallback_logged.add(str(path))
+        if log is not None:
+            log.warning("%s: no host-local browser-hosts.json (kanban.browser_hosts_file=%r, %s); "
+                        "reading the repo seed %s", FALLBACK_EVENT, configured,
+                        HOST_LOCAL_REGISTRY.get(platform) or "no default for this OS", path)
+    return kn.load_registry_file(path)

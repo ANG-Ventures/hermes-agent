@@ -47,6 +47,10 @@ def home(tmp_path: Path, monkeypatch):
     kb.init_db()
     monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
+    # Hermetic: never the real host-local registry (/usr/local/etc/browsers on the Studio); tests that need one
+    # point HOST_LOCAL_REGISTRY at a temp file (t_458bbb42).
+    monkeypatch.setattr(kbg, "HOST_LOCAL_REGISTRY", {})
+    monkeypatch.setattr(kbg, "_fallback_logged", set())
     for p in (OTHER, SOAK_PROFILE):
         (h / "profiles" / p).mkdir(parents=True, exist_ok=True)
     with kb.connect_closing():
@@ -598,3 +602,78 @@ def test_606e8aff45d3_failure_transition_is_fenced_to_the_run_in_its_own_txn(hom
         assert kbd._record_task_failure(conn, tid, "e", outcome="spawn_failed", release_claim=True, end_run=True,
                                         infrastructure=True, expected_run_id=run) is False
         assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "ready"
+
+
+# -- t_458bbb42: the dispatcher reads the HOST-LOCAL registry browserd reads, not the repo seed ----------------
+
+def _hosts_file(path: Path, mode: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"browsers": {"mode": mode, "migrated_lanes": PHASE1, "legacy_allowlist": LEGACY}}))
+    return path
+
+
+@pytest.mark.parametrize("present,expect", [
+    (("config", "host_local", "repo"), "config"),
+    (("host_local", "repo"), "host_local"),
+    (("config", "repo"), "config"),
+    (("repo",), "fallback"),
+    ((), "fallback"),
+])
+def test_registry_resolution_order(tmp_path, monkeypatch, present, expect):
+    files = {"config": tmp_path / "cfg" / "bh.json", "host_local": tmp_path / "etc" / "bh.json",
+             "repo": tmp_path / "fleet" / kn.REGISTRY_FILE}
+    for k in present:
+        _hosts_file(files[k], "on")
+    monkeypatch.setattr(kbg, "HOST_LOCAL_REGISTRY", {"darwin": str(files["host_local"])})
+    path, source = kbg.registry_path(tmp_path / "fleet", str(files["config"]), platform="darwin")
+    assert source == expect
+    assert path == (files["repo"] if expect == "fallback" else files[expect])
+    # unset knob and a blank knob both fall through to the host-local default
+    for knob in (None, "", "  "):
+        assert kbg.registry_path(tmp_path / "fleet", knob, platform="darwin")[1] == \
+            ("host_local" if "host_local" in present else "fallback")
+    # an OS with no default (win32) never reads a host-local path
+    assert kbg.registry_path(tmp_path / "fleet", None, platform="win32")[1] == "fallback"
+
+
+def test_fallback_is_logged_once_per_process_and_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(kbg, "HOST_LOCAL_REGISTRY", {"linux": str(tmp_path / "absent.json")})
+    monkeypatch.setattr(kbg, "_fallback_logged", set())
+    _hosts_file(tmp_path / "fleet" / kn.REGISTRY_FILE, "off")
+    lines = []
+
+    class Log:
+        def warning(self, fmt, *a):
+            lines.append(fmt % a)
+    for _ in range(3):
+        assert kbg.load(tmp_path / "fleet", None, platform="linux", log=Log()).mode == "off"
+    assert len(lines) == 1 and lines[0].startswith(kbg.FALLBACK_EVENT + ":") and "absent.json" in lines[0]
+    # the host-local file appears: no fallback line, its mode wins
+    _hosts_file(tmp_path / "absent.json", "on")
+    assert kbg.load(tmp_path / "fleet", None, platform="linux", log=Log()).mode == "on" and len(lines) == 1
+
+
+def test_dispatcher_reads_host_local_mode_over_the_repo_seed(home, ledger, monkeypatch):
+    """The repo seed says off (the committed default); the host-local copy says on -> the gate plans a lease.
+    Flipping the HOST-LOCAL file off is the kill switch: the next tick is legacy_route, no restart."""
+    write_hosts(home, mode="off")
+    local = _hosts_file(home.parent / "etc" / "browser-hosts.json", "on")
+    monkeypatch.setattr(kbg, "HOST_LOCAL_REGISTRY", {"darwin": str(local), "linux": str(local)})
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=EPH_BODY)
+        res = _dry(conn)
+        assert "browser_lease_plan" in res.placement_caps[tid], res.placement_caps[tid]
+        _hosts_file(local, "off")
+        res = _dry(conn)
+        assert res.placement_caps[tid]["legacy_route"]["reason"] == "mode_off"
+
+
+def test_root_config_browser_hosts_file_wins(home, ledger, monkeypatch):
+    write_hosts(home, mode="off")
+    local = _hosts_file(home.parent / "etc" / "browser-hosts.json", "off")
+    monkeypatch.setattr(kbg, "HOST_LOCAL_REGISTRY", {"darwin": str(local), "linux": str(local)})
+    knob = _hosts_file(home.parent / "knob" / "browser-hosts.json", "on")
+    (home / "config.yaml").write_text(f"kanban:\n  browser_hosts_file: {knob}\n")
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=EPH_BODY)
+        assert "browser_lease_plan" in _dry(conn).placement_caps[tid]
