@@ -33,12 +33,33 @@ def _path_key(path: Path | str | None) -> str:
     """
     return unicodedata.normalize("NFC", str(path)) if path is not None else ""
 
+def canon(path: Path | str) -> str:
+    """THE canonical key of a workspace path (spec §2.4.1): ``~`` expanded,
+    resolved without requiring existence, NFC. ``~/x`` on an unspawned card
+    and ``/Users/u/x`` on its spawned twin get the same key. Raises OSError /
+    RuntimeError on an unresolvable path; callers fail closed."""
+    return _path_key(Path(path).expanduser().resolve(strict=False))
+
+
+def _canon_within(child: str, owner: str) -> bool:
+    """``child`` is ``owner`` or strictly under it (canonical keys)."""
+    return child == owner or child.startswith(owner.rstrip(os.sep) + os.sep)
+
+
 # Statuses after which a child no longer needs its parent's workspace artifacts.
-_ACTIVE_CHILDREN_SQL = (
-    "SELECT 1 FROM task_links l "
+_TERMINAL_STATUSES = ("done", "archived", "failed", "cancelled")
+_TERMINAL_SQL = "('done', 'archived', 'failed', 'cancelled')"
+# The link key (any kind; main before Phase 2b-i), its deferrers named for
+# the retention_shadow payload.
+_LINK_DEFERRERS_SQL = (
+    "SELECT l.child_id, l.kind FROM task_links l "
     "JOIN tasks t ON t.id = l.child_id "
-    "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
-    "LIMIT 1"
+    f"WHERE l.parent_id = ? AND t.status NOT IN {_TERMINAL_SQL} "
+    "ORDER BY l.child_id"
+)
+# The workspace_of key (spec §2.5 item 2): a declared reader of this card's dir.
+_WORKSPACE_OF_ACTIVE_SQL = (
+    f"SELECT 1 FROM tasks c WHERE c.workspace_of = ? AND c.status NOT IN {_TERMINAL_SQL} LIMIT 1"
 )
 _WORKSPACE_ROW_SQL = "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?"
 
@@ -53,20 +74,224 @@ def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProce
         check=False,
     )
 
+# kanban.workspace.retention_key (read per GC decision, spec §6, D-S3).
+# ``links`` = main before Phase 2b-i (task_links, any kind); ``union`` (the
+# default) = links OR workspace_of OR the canonical-path shared set;
+# ``workspace_of`` = the link key retired (Phase 2b-ii owns the flip and its
+# ``retention_dropped`` event). Unknown -> ``union``: retain more.
+RETENTION_LINKS = "links"
+RETENTION_UNION = "union"
+RETENTION_WORKSPACE_OF = "workspace_of"
+RETENTION_KEYS = (RETENTION_LINKS, RETENTION_UNION, RETENTION_WORKSPACE_OF)
+RETENTION_DEFAULT = RETENTION_UNION
+RETENTION_SHADOW_EVENT = "retention_shadow"
 
-def _has_active_children(conn: Optional[sqlite3.Connection], task_id: str) -> bool:
-    """Fail closed if a linked child still needs its parent's handoff."""
+
+def retention_key(kanban_cfg=None) -> str:
+    """``kanban.workspace.retention_key``. Placement's ``lineage_pins`` never
+    feeds this (AC-25): the two switches are independent."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+            kanban_cfg = (load_config_readonly() or {}).get("kanban")
+        except Exception:
+            kanban_cfg = None
+    ws = kanban_cfg.get("workspace") if isinstance(kanban_cfg, dict) else None
+    raw = ws.get("retention_key") if isinstance(ws, dict) else None
+    if raw is None:
+        return RETENTION_DEFAULT
+    key = str(raw).strip().lower()
+    if key in RETENTION_KEYS:
+        return key
+    _pr.note_unknown_switch("kanban.workspace.retention_key", key, RETENTION_UNION)
+    return RETENTION_UNION
+
+
+def live_path_index(conn: sqlite3.Connection) -> list:
+    """``[(id, workspace_kind, workspace_path, canon)]`` of every non-terminal
+    card with a path: computed once per dispatcher tick and handed to
+    :func:`workspace_shared`, so canonicalisation is O(N) per tick, not per row."""
+    return [(r["id"], r["workspace_kind"], r["workspace_path"], canon(r["workspace_path"]))
+            for r in conn.execute(
+                "SELECT id, workspace_kind, workspace_path FROM tasks "
+                "WHERE workspace_path IS NOT NULL AND workspace_path != '' "
+                f"AND status NOT IN {_TERMINAL_SQL}")]
+
+
+def workspace_shared(conn: sqlite3.Connection, task_id: str, path: Optional[str], *,
+                     role: str, index: Optional[list] = None) -> list[str]:
+    """THE canonical-path sharing relation (spec §2.4.1), one function for
+    placement and retention. Non-terminal cards other than ``task_id``:
+
+    * ``role="reader"`` (placement): cards whose path EQUALS this card's, or a
+      task-owned scratch/worktree path this card's path is nested under (never
+      a ``dir:`` ancestor nor a managed workspaces root, Momus R-E);
+    * ``role="owner"`` (retention): cards whose path equals this card's or is
+      nested under it.
+
+    Sorted ids; ``[]`` for a card with no path. Path errors propagate (the
+    retention reader fails closed on them)."""
+    if not path:
+        return []
+    mine = canon(path)
+    out: list[str] = []
+    for oid, okind, opath, other in (index if index is not None else live_path_index(conn)):
+        if oid == task_id:
+            continue
+        if other == mine:
+            out.append(oid)
+        elif role == "owner" and _canon_within(other, mine):
+            out.append(oid)
+        elif (role == "reader" and _canon_within(mine, other)
+              and (okind or "scratch") in _REMOVABLE_KINDS
+              and (okind == "worktree" or _is_managed_scratch_path(Path(opath)))):
+            out.append(oid)
+    return sorted(out)
+
+
+def _retention_verdict(conn: sqlite3.Connection, task_id: str, key: str) -> tuple[bool, list]:
+    """``(defers, link_only_deferrers)``: whether ``key`` keeps ``task_id``'s
+    directory, and the link-key deferrers the ``workspace_of`` key would NOT
+    keep it for (non-empty only in ``union`` mode, the shadow population)."""
+    links = [(r[0], r[1]) for r in conn.execute(_LINK_DEFERRERS_SQL, (task_id,))]
+    if key == RETENTION_LINKS:
+        return bool(links), []
+    new_key = conn.execute(_WORKSPACE_OF_ACTIVE_SQL, (task_id,)).fetchone() is not None
+    if not new_key:
+        row = conn.execute("SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        new_key = bool(row and workspace_shared(conn, task_id, row[0], role="owner"))
+    if key == RETENTION_WORKSPACE_OF:
+        return new_key, []
+    return (bool(links) or new_key), ([] if new_key else links)
+
+
+def _has_active_children(conn: Optional[sqlite3.Connection], task_id: str,
+                         key: Optional[str] = None) -> bool:
+    """Fail closed if a child still needs its parent's handoff: THE one
+    reader of ``kanban.workspace.retention_key`` (spec I-S7). Every site
+    (completion, worktree lane, parent pass, the deletion choke point) calls
+    it without a key, so none can pin a stale default. Any error defers."""
     if conn is None:
         try:
             from hermes_cli.kanban_db_connect import connect_closing
             with connect_closing() as own:
-                return _has_active_children(own, task_id)
+                return _has_active_children(own, task_id, key)
         except Exception:
             return True
     try:
-        return conn.execute(_ACTIVE_CHILDREN_SQL, (task_id,)).fetchone() is not None
-    except sqlite3.Error:
+        return _retention_verdict(conn, task_id, key or retention_key())[0]
+    except Exception:
         return True
+
+
+def _retention_defers(conn: sqlite3.Connection, task_id: str) -> bool:
+    """:func:`_has_active_children` at a GC DECISION site, plus the
+    ``retention_shadow`` record (spec §2.5 item 4): in ``union`` mode, a
+    deferral held ONLY by the link key is written once per (parent, deferral
+    episode). A new episode starts when the deferring set changes or when a
+    deferring child has a lifecycle event after the latest shadow
+    (``PLACEMENT_WAIT_EPISODE_END_KINDS``). Never raises; errors defer."""
+    try:
+        key = retention_key()
+        defers, link_only = _retention_verdict(conn, task_id, key)
+    except Exception:
+        return True
+    if defers and link_only:
+        try:
+            _note_retention_shadow(conn, task_id, link_only)
+        except Exception:
+            _kb._log.debug("kanban: retention_shadow write failed for %s", task_id, exc_info=True)
+    return defers
+
+
+def _note_retention_shadow(conn: sqlite3.Connection, parent: str, deferrers: list) -> None:
+    import json
+    from hermes_cli import kanban_placement_reasons as _pr
+    deferred_by = [[c, k] for c, k in deferrers]
+    last = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+        (parent, RETENTION_SHADOW_EVENT),
+    ).fetchone()
+    if last is not None:
+        try:
+            prev = json.loads(last[1] or "{}").get("deferred_by")
+        except (TypeError, ValueError):
+            prev = None
+        if prev == deferred_by:
+            ids = [c for c, _k in deferrers]
+            kinds = sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)
+            boundary = conn.execute(
+                f"SELECT 1 FROM task_events WHERE id > ? "
+                f"AND task_id IN ({','.join('?' * len(ids))}) "
+                f"AND kind IN ({','.join('?' * len(kinds))}) LIMIT 1",
+                (last[0], *ids, *kinds),
+            ).fetchone()
+            if boundary is None:
+                return
+    with _kb.write_txn(conn, allow_nested=True):
+        _kb._append_event(conn, parent, RETENTION_SHADOW_EVENT, {
+            "parent": parent, "deferred_by": deferred_by, "new_key_would": "delete",
+        })
+
+
+def bind_host(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """THE host a workspace bind co-locates with (spec §2.4.2): the pool host
+    of ``task_id``'s most recent run, from that run's latest ``worker_placed``
+    event; None = local (never ran, or ran on the Studio). One function, so
+    the swap to ``origin_host`` (affinity spec Phase 3) is one edit."""
+    import json
+    from hermes_cli import kanban_placement_reasons as _pr
+    row = conn.execute(
+        "SELECT e.payload FROM task_events e WHERE e.task_id = ? AND e.kind = ? "
+        "AND e.run_id = (SELECT MAX(id) FROM task_runs WHERE task_id = ?) "
+        "ORDER BY e.id DESC LIMIT 1",
+        (task_id, _pr.WORKER_PLACED_EVENT, task_id),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        host = json.loads(row[0] or "{}").get("host")
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return host.lower() if isinstance(host, str) and host else None
+
+
+_BIND_CHAIN_MAX = 8
+
+
+def resolve_bind(conn: sqlite3.Connection, task_id: str) -> tuple[str, Optional[str]]:
+    """``(owner_id, host)``: THE host-aware answer to "where is ``task_id``'s
+    directory" (Apollo r1 on #2032). Follows ``workspace_of`` to the card that
+    owns the directory (bounded, cycle-safe), then asks :func:`bind_host` of
+    the owner first and of each reader on the chain after it: a reader that
+    ran on a pool host ran where the directory is. ``host`` None = local, or
+    nothing on the chain ever ran remotely. Every placement decision about a
+    borrowed or shared directory reads this, never a Studio-local fact."""
+    chain = [task_id]
+    while len(chain) < _BIND_CHAIN_MAX:
+        row = conn.execute("SELECT workspace_of FROM tasks WHERE id = ?", (chain[-1],)).fetchone()
+        nxt = row[0] if row else None
+        if not nxt or nxt in chain:
+            break
+        chain.append(nxt)
+    owner = chain[-1]
+    for tid in reversed(chain):
+        host = bind_host(conn, tid)
+        if host:
+            return owner, host
+    return owner, None
+
+
+def _workspace_reader_of(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The card whose directory ``task_id`` borrowed (``--workspace-of``), or
+    None. Ownership rule (Momus pass 3 R-1): such a card is a READER of that
+    directory, never its owner, and never removes it."""
+    try:
+        row = conn.execute("SELECT workspace_of FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return (row[0] or None) if row else None
 
 
 def _lexical_path(path: Path | str) -> Path:
@@ -227,15 +452,17 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
         from hermes_cli.kanban_survivor import remove_workspace_dir
-        if kind not in ("scratch", "worktree") or not path:
-            # This task's own workspace isn't a removable scratch dir, but its
-            # completion may still unblock a deferred parent scratch cleanup
-            # (e.g. a 'dir' child whose scratch parent was waiting on it). #33774
+        if kind not in ("scratch", "worktree") or not path or _workspace_reader_of(conn, task_id):
+            # This task's own workspace isn't a removable scratch dir (or it is
+            # a --workspace-of READER: the directory is its owner's, R-1), but
+            # its completion may still unblock a deferred parent scratch
+            # cleanup (e.g. a 'dir' child whose scratch parent was waiting on
+            # it). #33774
             _try_cleanup_parent_workspaces(conn, task_id)
             return
         # Defer while any child is not yet terminal so it can still read
         # handoff artifacts from this workspace.
-        if _has_active_children(conn, task_id):
+        if _retention_defers(conn, task_id):
             _kb._log.debug(
                 "Deferring %s workspace cleanup for task %s: "
                 "active children still need workspace at %s",
@@ -314,7 +541,7 @@ def _cleanup_worktree_workspace(
         wp = Path(path).expanduser()
         if not wp.is_dir():
             return
-        if _has_active_children(conn, task_id):
+        if _retention_defers(conn, task_id) if conn is not None else _has_active_children(conn, task_id):
             _kb._audit_workspace_deletion(
                 wp, task_id=task_id, reason=reason, allowed=False,
                 detail="active-children-need-handoff",
@@ -435,20 +662,30 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
     children are now all done/archived/failed/cancelled (called after each
     child completes).
 
+    Candidate parents come from BOTH keys, ``task_links.parent_id`` and
+    ``tasks.workspace_of``, so a parent deferred under either is found when
+    its child finishes (Momus pass 2 N1 2(ii): no leak across the deploy).
+    A parent that is not itself terminal keeps its directory: it is still in
+    use, and its own completion runs this cleanup (Momus pass 3 R-1 (a)).
+
     See #33774.
     """
     try:
-        parents = conn.execute(
-            "SELECT parent_id FROM task_links WHERE child_id = ?",
-            (task_id,),
-        ).fetchall()
-        for (parent_id,) in parents:
+        parents = [r[0] for r in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? "
+            "UNION SELECT workspace_of FROM tasks WHERE id = ? AND workspace_of IS NOT NULL "
+            "ORDER BY 1",
+            (task_id, task_id),
+        ).fetchall()]
+        for parent_id in parents:
             row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
+            status = conn.execute("SELECT status FROM tasks WHERE id = ?", (parent_id,)).fetchone()
             if (
                 not row
+                or status is None or status[0] not in _TERMINAL_STATUSES
                 or row["workspace_kind"] not in _REMOVABLE_KINDS
                 or not row["workspace_path"]
-                or _has_active_children(conn, parent_id)
+                or _retention_defers(conn, parent_id)
             ):
                 continue
             from hermes_cli.kanban_survivor import remove_workspace_dir  # noqa: F401 (choke point below)

@@ -393,7 +393,9 @@ KANBAN_CREATE_SCHEMA = _schema(
         "orchestrator workers to fan out — decompose work into child "
         "tasks with specific assignees, link them into a pipeline, "
         "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "tasks on its next tick and spawns the assigned profiles. "
+        "New cards are portable unless a constraint says otherwise; a "
+        "parent link is not a constraint (use workspace_of for that)."
     ),
     {
         "title": _prop("string", "Short task title (required)."),
@@ -409,6 +411,11 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "its context."
         )),
         "continues": _prop("string", "Transfer an inactive source card's workspace and origin host; source workspace path is cleared."),
+        "workspace_of": _prop("string", (
+                "Task id whose directory this card works IN: copies its workspace kind and "
+                "path, runs on the host it ran on, and keeps its workspace until this card "
+                "is done. Refused if that task has no workspace path yet or the workspace "
+                "fields conflict.")),
         "parents": {
             "type": "array",
             "items": {"type": "string"},

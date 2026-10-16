@@ -145,6 +145,13 @@ def local_workspace_has_content(path: Optional[str]) -> bool:
     if not path:
         return False
     try:
+        # The canonical key (spec §2.4.1): a stored ``~/x`` scans the expanded
+        # directory, not a literal ``~`` that never exists.
+        from hermes_cli.kanban_db_workspace import canon
+        path = canon(path)
+    except (OSError, RuntimeError, ValueError):
+        return True
+    try:
         with os.scandir(path) as it:
             return any(True for _ in it)
     except (FileNotFoundError, NotADirectoryError):

@@ -8,12 +8,28 @@ spec (t_1cca39e1 / t_7133e03d) adds values here and deletes ``LINKED``.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+import logging
+import time
+from typing import Any, Dict, Mapping
+
+_log = logging.getLogger(__name__)
 
 NOT_PORTABLE = "not_portable"
 
 # portable() rules (hard_ok failures), in the order portable() checks them.
 WORKSPACE_KIND = "workspace_kind"
+# Phase 2b-i (t_6d5bc652): the workspace binds that replace the link input.
+# ``workspace_of:<id>`` = the card works IN <id>'s directory (explicit field);
+# ``workspace_shared:<id>`` = another live card has the same canonical path,
+# or a task-owned scratch/worktree path this card's path is nested under.
+WORKSPACE_OF = "workspace_of"
+WORKSPACE_SHARED = "workspace_shared"
+# ``placement.rule`` of a row a bind pinned to the bound card's pool host.
+BIND_HOST = "bind_host"
+# Event on a card whose workspace_of target is terminal with no local path.
+PLACEMENT_BIND_DROPPED_EVENT = "placement_bind_dropped"
+# Kill-switch rule only (``lineage_pins: legacy | kinds``): a link holds the
+# card local. Never produced under ``none``.
 LINKED = "linked"
 LOCAL_FILES = "local_files"
 PROFILE = "profile"
@@ -73,10 +89,21 @@ PLACEMENT_WAIT_EPISODE_END_KINDS = frozenset({
 
 # kanban.placement.lineage_pins (read per tick). ``kinds`` (default): only a
 # link kind that can share a workspace holds a card local; ``legacy``: any
-# link does, with the bare ``linked`` reason (the pre-t_ae87edff behaviour).
+# link does, with the bare ``linked`` reason (the pre-t_ae87edff behaviour);
+# ``none``: links never hold a card (spec Phase 2b-i), only the workspace
+# binds do. An UNKNOWN value reads as ``legacy`` (the safe side of a kill
+# switch: pin local), with one WARN per value per 5 min. Placement only:
+# retention has its own switch (kanban.workspace.retention_key).
 LINEAGE_PINS_KINDS = "kinds"
 LINEAGE_PINS_LEGACY = "legacy"
+LINEAGE_PINS_NONE = "none"
+LINEAGE_PINS_MODES = (LINEAGE_PINS_KINDS, LINEAGE_PINS_LEGACY, LINEAGE_PINS_NONE)
+# ``none`` becomes the default only after P0-7 (spec §7 Phase 0) posts a
+# pool-profile blocks rate at or under 1%.
 LINEAGE_PINS_DEFAULT = LINEAGE_PINS_KINDS
+LINEAGE_PINS_UNKNOWN = LINEAGE_PINS_LEGACY
+UNKNOWN_SWITCH_WARN_SECONDS = 300
+_unknown_switch_warned: Dict[tuple, float] = {}
 
 # Link kinds that never imply a shared workspace. ``derived-from`` is
 # provenance only (kanban_db.LINK_KIND_DERIVED_FROM): it never gates, so the
@@ -202,10 +229,31 @@ def linked(kind: str, other_id: str) -> str:
     return f"{LINKED}({kind}->{other_id})"
 
 
+def workspace_bind_rule(rule: str, other_id: str) -> str:
+    """``workspace_of:<id>`` / ``workspace_shared:<id>``."""
+    return f"{rule}:{other_id}"
+
+
+def note_unknown_switch(key: str, value: str, fallback: str) -> None:
+    """One WARN per (switch, value) per 5 minutes: the switches are read per
+    board per tick (and per GC decision), so an unthrottled WARN floods."""
+    now = time.monotonic()
+    last = _unknown_switch_warned.get((key, value))
+    if last is None or now - last >= UNKNOWN_SWITCH_WARN_SECONDS:
+        _unknown_switch_warned[(key, value)] = now
+        _log.warning("kanban: %s: unknown value %r, reading it as %r", key, value, fallback)
+
+
 def lineage_pins(kanban_cfg: Any) -> str:
-    """``kanban.placement.lineage_pins``; anything unrecognised reads as the
-    default, so a typo never silently re-pins every linked card."""
+    """``kanban.placement.lineage_pins``. Unset reads as the default; an
+    unrecognised value reads as ``legacy`` (spec §6 parse correction: a typo
+    on a kill switch lands on the safe side, every linked card local)."""
     pl = kanban_cfg.get("placement") if isinstance(kanban_cfg, Mapping) else None
-    mode = pl.get("lineage_pins") if isinstance(pl, Mapping) else None
-    mode = str(mode).strip().lower() if mode is not None else ""
-    return mode if mode in (LINEAGE_PINS_KINDS, LINEAGE_PINS_LEGACY) else LINEAGE_PINS_DEFAULT
+    raw = pl.get("lineage_pins") if isinstance(pl, Mapping) else None
+    if raw is None:
+        return LINEAGE_PINS_DEFAULT
+    mode = str(raw).strip().lower()
+    if mode in LINEAGE_PINS_MODES:
+        return mode
+    note_unknown_switch("kanban.placement.lineage_pins", mode, LINEAGE_PINS_UNKNOWN)
+    return LINEAGE_PINS_UNKNOWN

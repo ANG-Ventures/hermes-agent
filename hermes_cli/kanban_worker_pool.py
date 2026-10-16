@@ -992,15 +992,27 @@ def known_host_ids(fleet_dir: Path) -> Tuple[str, ...]:
     return tuple(dict.fromkeys(out))
 
 
-def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_content: bool,
+def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
              assignee: Optional[str], body: Optional[str], skills: Iterable[str] = (),
-             pool, native_command: bool = False,
+             pool, has_links: bool = False,
+             workspace_bind: Optional[Tuple[str, str, Optional[str]]] = None,
+             native_command: bool = False,
              manifest: Optional[Mapping[str, str]] = None,
              targets: Optional[Mapping[str, str]] = None,
              requires: Optional[Tuple[Optional[str], Optional[str]]] = None,
              body_signals: bool = True) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
+
+    New cards are portable unless a constraint says otherwise; a parent link
+    is not a constraint. ``workspace_bind`` is ``(rule, other_id, host)``
+    (spec §2.4, t_6d5bc652): the card shares ``other_id``'s directory
+    (``workspace_of:<id>`` or ``workspace_shared:<id>``) and runs where that
+    card ran: ``host`` None = local (the bind rule is the reason), else a
+    remote pin to ``host`` (route class ``pin``; a ``host:`` line naming a
+    different host contradicts the bind and holds the card). ``has_links``
+    is only the ``lineage_pins: legacy | kinds`` kill switch; under ``none``
+    the dispatcher passes False.
 
     ``requires`` is ``(hard_rule, soft_rule)`` from
     :mod:`kanban_host_capabilities` (t_8c474c2e): the ``requires:<cap>``
@@ -1022,9 +1034,17 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     """
     if (workspace_kind or "scratch") != "scratch":
         return False, _reasons.WORKSPACE_KIND, None
-    if has_links:
+    bind_rule, _bind_other, bind_host = workspace_bind or (None, None, None)
+    if bind_rule and bind_host is None:
+        return False, bind_rule, None
+    # A remote bind (Apollo r1 on #2032, Prism f399797453ae): the directory is
+    # on ``bind_host``, so the Studio-local facts (a lineage link, content at
+    # the same path on the Studio) say nothing about it. The rules that ask
+    # whether ANY pool host may run the card still apply; a refusal there is
+    # a wait at the dispatcher, never a local run against an empty path.
+    if has_links and not bind_rule:
         return False, _reasons.LINKED, None
-    if workspace_has_content:
+    if workspace_has_content and not bind_rule:
         return False, _reasons.LOCAL_FILES, None
     if not assignee or assignee not in tuple(pool.profiles or ()):
         return False, _reasons.PROFILE, None
@@ -1043,6 +1063,11 @@ def portable(*, workspace_kind: Optional[str], has_links: bool, workspace_has_co
     if access is not None:
         return False, _reasons.access_bound(access), None
     pin, ignored = resolve_pin(body, pool.hosts or (), getattr(pool, "pin_aliases", None))
+    if bind_rule:
+        # The bind is the pin; a body pin may only agree with it (spec §5).
+        if pin not in (None, PIN_ANY, bind_host.lower()):
+            return False, bind_rule, None
+        pin, ignored = bind_host.lower(), None
     if pin == PIN_STUDIO:
         return False, _reasons.HOST_STUDIO, None
     if pin is None and ignored is not None:

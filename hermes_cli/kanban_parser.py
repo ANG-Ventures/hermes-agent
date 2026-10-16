@@ -278,10 +278,16 @@ _SPECS = [
         _arg("--assignee", help="Profile name to assign"),
         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
         _arg("--continues", help="Transfer an inactive card's workspace and origin host"),
+        _arg("--workspace-of", dest="workspace_of", metavar="TASK",
+             help="Work IN TASK's directory: copies its workspace kind + path, runs where "
+                  "TASK ran, and keeps TASK's workspace until this card is done. New cards "
+                  "are portable unless a constraint says otherwise; a parent link is not a "
+                  "constraint."),
         _arg("--parent-kind", default=kb.DEFAULT_LINK_KIND, choices=sorted(kb.VALID_LINK_KINDS),
              help="Semantics for every --parent edge. 'blocks' (default) holds this "
                   "task until the parents are done; 'derived-from' records that a "
-                  "parent discovered/spawned this work without gating it."),
+                  "parent discovered/spawned this work without gating it. Neither "
+                  "affects where the task runs (use --workspace-of for that)."),
         _arg("--workspace",
              help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
                   "an explicit 'scratch' also opts out of a project-scoped board's project)"),
