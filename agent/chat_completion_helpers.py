@@ -2181,8 +2181,14 @@ def _consume_ephemeral_max_output(agent):
 
 
 def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides):
+    from agent.preserved_thinking import preserve_thinking_enabled, preserve_thinking_window
     ctx_len = getattr(agent, "context_compressor", None)
     ephemeral_out = _consume_ephemeral_max_output(agent)
+    # ``providers.<name>.preserve_thinking``: resolved here, where the provider name is known, and
+    # threaded down as booleans so the converter stays provider-agnostic.
+    route = (getattr(agent, "provider", None), getattr(agent, "requested_provider", None),
+             getattr(agent, "_anthropic_base_url", None) or getattr(agent, "base_url", None))
+    preserve_thinking = preserve_thinking_enabled(*route)
     anthropic_kwargs = agent._get_transport().build_kwargs(model=agent.model,
         messages=agent._prepare_anthropic_messages_for_api(api_messages), tools=tools_for_api,
         max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
@@ -2191,7 +2197,9 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
         context_length=ctx_len.context_length if ctx_len else None,
         base_url=getattr(agent, "_anthropic_base_url", None),
         fast_mode=request_overrides.get("speed") == "fast",
-        drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)))
+        drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
+        preserve_thinking=preserve_thinking,
+        thinking_window=preserve_thinking_window(*route) if preserve_thinking else "latest")
     # Stamp the pool affinity header (per-request, pool-scoped) so the relay's
     # reset-weighted router can pin this conversation to one sub for the prompt
     # cache. Merges into any existing extra_headers (e.g. anthropic-beta).
@@ -5618,6 +5626,9 @@ class _StreamingCall(StreamingWaitMonitor):
         if self.agent._interrupt_requested:
             return None
         if base_final_message is not None:
+            # Preserved thinking: what the API dropped from the replayed blocks, per turn.
+            from agent.preserved_thinking import log_input_transformations
+            log_input_transformations(base_final_message, self.api_kwargs, log_prefix=getattr(self.agent, "log_prefix", ""))
             self._check_anthropic_message(base_final_message, tool_drop=False)
             if not stream.output_modified:
                 return self._finish_anthropic_message(self._check_anthropic_message(base_final_message))
