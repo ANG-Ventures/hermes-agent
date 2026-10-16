@@ -915,5 +915,29 @@
       "gateway"
     ],
     "proposed_canary": "tests/fork_canaries/test_fork_canary_kanban_wake_contract.py (RED-proven 2026-10-15 t_0ea2883c: #2019 reverted -> W5; #2021 reverted -> W2 (2 turns); is_redundant forced False -> W4 W5 W8; NEVER_SUPPRESS_TRIGGERS emptied -> W8)"
+  },
+  {
+    "feature": "HTTP-200 refusal floor: banner + route-changes log name the seat, route, and Anthropic stop_details category/explanation (t_5d79bfea, t_a123064d)",
+    "tests": [
+      "tests/agent/test_fallback_bridge_codes.py::test_live_215226_refusal_line_through_the_real_handler",
+      "tests/agent/test_fallback_bridge_codes.py::test_live_0339_stream_keeps_stop_details_without_relay_management",
+      "tests/agent/test_fallback_bridge_codes.py::test_live_0339_refusal_banner_and_census_name_the_category",
+      "tests/agent/test_content_policy_refusal_stop_details.py"
+    ],
+    "paths": [
+      "agent/fallback_events.py",
+      "agent/fallback_policy.py",
+      "agent/turn_truncation.py",
+      "agent/chat_completion_helpers.py"
+    ],
+    "why": "A relay-200 refusal read 'content policy refusal (hop unknown, sub unknown)' (t_5d79bfea), then 'category=-' on every row (10-11, 10-13, 10-16 03:39 sub-vps-20) although the wire's message_delta carried stop_details {category: cyber, explanation}. The SDK's Delta model does not declare stop_details, so get_final_message() drops it; AnthropicStreamAccumulator only sees chunks on a Relay-MANAGED stream and the live stream ran unmanaged (no Relay consumer), so _call_anthropic also keeps stop_details from the message_delta it iterates (t_a123064d).",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ]
   }
 ]
