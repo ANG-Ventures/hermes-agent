@@ -1398,12 +1398,14 @@ def _handle_create(args: dict, **kw) -> str:
                       or _persisted_session_id(_current_origin_session_id())
                       or _persisted_session_id(_current_session_id())
                       or _persisted_session_id(get_session_env("HERMES_SESSION_ID", "")))
-        if project_id is None and workspace_kind is None and workspace_path is None:
+        if (project_id is None and workspace_kind is None and workspace_path is None
+                and not args.get("workspace_of")):
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
         new_tid = kb.create_task(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), parents_kind=parents_kind, continues=args.get("continues"),
+            workspace_of=args.get("workspace_of") or None,
             tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,

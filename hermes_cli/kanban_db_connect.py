@@ -1153,9 +1153,52 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             from hermes_cli import kanban_continuation as _kcont
             _kcont.backfill_origin_hosts(conn)
 
+    if "workspace_of" not in cols:
+        # After origin_host (fresh column order). Phase 2b-i, t_6d5bc652.
+        if _add_column_if_missing(conn, "tasks", "workspace_of", "workspace_of TEXT"):
+            _kb._log.info("kanban migration: workspace_of backfill set %d decompose child(ren)",
+                          backfill_workspace_of(conn))
+    # Retention reads ``workspace_of = ?`` per GC decision (Momus pass 3 answer 4).
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_workspace_of ON tasks(workspace_of) "
+                 "WHERE workspace_of IS NOT NULL")
+
     _rebuild_drifted_tables(conn)
     # After the rebuild: a rebuilt kanban_notify_subs drops extra indexes.
     _kb._ensure_single_waker_index(conn)
+
+
+def backfill_workspace_of(conn: sqlite3.Connection) -> int:
+    """Spec §6 / Q4: ``workspace_of = R`` on every NON-terminal decompose
+    child (``created`` event ``from_decompose_of = R``) whose canonical
+    ``workspace_path`` equals R's. Never touches a terminal row or a row that
+    already has the field; idempotent (a second run sets 0). Returns the count."""
+    import json
+    from hermes_cli.kanban_db_workspace import canon
+    n = 0
+    for ev in conn.execute(
+        "SELECT e.task_id, e.payload FROM task_events e JOIN tasks c ON c.id = e.task_id "
+        "WHERE e.kind = 'created' AND e.payload LIKE '%from_decompose_of%' "
+        "AND c.workspace_of IS NULL AND c.workspace_path IS NOT NULL AND c.workspace_path != '' "
+        "AND c.status NOT IN ('done', 'archived', 'failed', 'cancelled')"
+    ).fetchall():
+        try:
+            root = json.loads(ev[1] or "{}").get("from_decompose_of")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not isinstance(root, str) or not root or root == ev[0]:
+            continue
+        paths = {r[0]: r[1] for r in conn.execute(
+            "SELECT id, workspace_path FROM tasks WHERE id IN (?, ?)", (ev[0], root))}
+        try:
+            same = bool(paths.get(root)) and canon(paths[root]) == canon(paths[ev[0]])
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if same:
+            n += conn.execute(
+                "UPDATE tasks SET workspace_of = ? WHERE id = ? AND workspace_of IS NULL",
+                (root, ev[0]),
+            ).rowcount
+    return n
 
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:

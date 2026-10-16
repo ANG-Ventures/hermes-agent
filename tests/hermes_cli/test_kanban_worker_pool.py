@@ -577,7 +577,10 @@ def test_lineage_pins_legacy_is_todays_routing(kanban_home, monkeypatch):
 
 
 def test_lineage_pins_default_is_kinds(kanban_home, monkeypatch):
-    _lineage(monkeypatch, "typo")  # unrecognised -> default, never re-pins everything
+    # Unset -> the default. (An unrecognised value now reads as ``legacy``,
+    # spec v1.2 §6 parse correction, t_6d5bc652: AC-21 owns that case.)
+    from hermes_cli import config as _config
+    monkeypatch.setattr(_config, "load_config_readonly", lambda: {"kanban": {}})
     with kb.connect_closing() as conn:
         _parent, child = _derived(conn, child_body="host: any")
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (child,)).fetchone()

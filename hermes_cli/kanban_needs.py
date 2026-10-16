@@ -141,7 +141,12 @@ def load_registry(fleet_dir: Path) -> LaneRegistry:
     call (never cached: a flip takes effect on the next tick). The lists live under ``browsers``
     (the schema browserd reads); a top-level copy is read as a fallback. Absent file or keys =
     empty registry, mode off (nothing migrated); an existing unreadable/malformed file RAISES."""
-    path = Path(fleet_dir) / REGISTRY_FILE
+    return load_registry_file(Path(fleet_dir) / REGISTRY_FILE)
+
+
+def load_registry_file(path: Path) -> LaneRegistry:
+    """:func:`load_registry` for an explicit file (the host-local copy browserd reads, t_458bbb42)."""
+    path = Path(path)
     if not path.exists():
         return LaneRegistry()
     # An EXISTING file that cannot be read or parsed raises (Prism da4f556e96bb): the dispatcher's browser gate

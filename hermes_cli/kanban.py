@@ -964,6 +964,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 parents=tuple(args.parent or ()),
                 parents_kind=getattr(args, "parent_kind", None),
                 continues=getattr(args, "continues", None),
+                workspace_of=getattr(args, "workspace_of", None),
                 triage=bool(getattr(args, "triage", False)),
                 idempotency_key=getattr(args, "idempotency_key", None),
                 max_runtime_seconds=max_runtime,
