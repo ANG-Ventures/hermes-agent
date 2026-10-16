@@ -670,6 +670,8 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
             # on replay (class B, t_91b6a4c4).
             if isinstance(prev_wire, str) and prev_wire and isinstance(new_wire, str) and new_wire:
                 prev["api_content"] = prev_wire + "\n\n" + new_wire
+                # Mark the merge even for an empty prefix (resume row, content=''): replay keys on presence.
+                prev.setdefault(MERGED_TURN_PREFIX, prev_content)
             # A display-marker row (e.g. a model-switch marker persisted as role=user on
             # purpose, #48338) merging with a plain user row must not bury the plain row's
             # addressable identity: keeping the marker's display_kind hides the merged pair

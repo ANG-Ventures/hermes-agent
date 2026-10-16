@@ -85,3 +85,23 @@ def test_absorbed_user_turn_keeps_its_timestamp_prefix_stable(tmp_path):
     ]
     assert violations == []
     assert append_only_breaks(sent_n[-1], sent_n1[0]) == []
+
+
+def test_empty_resume_row_absorbing_a_turn_keeps_the_recovery_note(tmp_path):
+    """An empty-content resume row merges with prefix '': replay must key on the merge marker's
+    presence, not its truthiness, or the joined sidecar (and the recovery note) is dropped."""
+    db_path = tmp_path / "state.db"
+    session_id = "absorbed-resume-row"
+    db = SessionDB(db_path=db_path)
+    now = time.time()
+    db.create_session(session_id, source="test")
+    db.append_message(session_id, "user", "hello", timestamp=now - 300)
+    db.append_message(session_id, "assistant", "hi", timestamp=now - 290)
+    db.append_message(session_id, "user", "", timestamp=now - 10, api_content="recovery note")
+    api_text, persist_text, persist_ts = gateway_run._compose_inbound_user_turn("next", now)
+    db.append_message(session_id, "user", persist_text, timestamp=persist_ts, api_content=api_text)
+    db.close()
+
+    last = _reload_replay(db_path, session_id)[-1]
+    assert last["role"] == "user"
+    assert last.get("api_content") == "recovery note\n\n" + api_text

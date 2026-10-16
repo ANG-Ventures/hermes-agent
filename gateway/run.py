@@ -1392,7 +1392,8 @@ def _build_gateway_agent_history(
                 sidecar = entry.get("api_content")
                 # A row the alternation repair merged carries its parts' sent bytes joined
                 # (_merge_consecutive_users): one stamp over the joined text never matches them.
-                if rendered != content and sidecar and not msg.get(MERGED_TURN_PREFIX) and not (
+                # Presence, not truthiness: an empty resume row merges with prefix ''.
+                if rendered != content and sidecar and MERGED_TURN_PREFIX not in msg and not (
                     _sidecar_carries_rendered_turn(sidecar, rendered, content)
                 ):
                     entry.pop("api_content", None)
