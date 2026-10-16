@@ -770,6 +770,40 @@ def _live_pid_names_task(pid: int, task_id: str) -> bool:
     return re.search(rf"\bwork kanban task {re.escape(task_id)}(?![0-9A-Za-z_])", cmdline) is not None
 
 
+def _liveness_evidence(
+    conn: sqlite3.Connection, row, pid: int, kind: str, code: Optional[int], names_task: bool,
+) -> dict[str, Any]:
+    """The readings the crash sweep acted on, stamped on ``crashed``/``gave_up`` (t_fdfa6613).
+
+    A false crash (10-12: a 1.000 s fingerprint skew) used to be diagnosable only by reading
+    this module. ``decision`` is why the pid was judged gone: ``recycled`` (the pid is running
+    but failed the identity checks), ``signaled``, ``nonzero`` (exited with a nonzero code),
+    else ``not-alive``.
+    """
+    pid_exists = bool(_kb._pid_alive(pid))
+    recorded = conn.execute(
+        "SELECT worker_started_at FROM tasks WHERE id = ?", (row["id"],),
+    ).fetchone()
+    token_recorded = _kb._worker_owner_window(conn, row["id"], pid, row["current_run_id"])[2]
+    if pid_exists:
+        decision = "recycled"
+    elif kind == "signaled":
+        decision = "signaled"
+    elif code not in (None, 0):
+        decision = "nonzero"
+    else:
+        decision = "not-alive"
+    return {
+        "pid_exists": pid_exists,
+        "fingerprint_recorded": recorded[0] if recorded is not None else None,
+        "fingerprint_live": _process_fingerprint(pid) if pid_exists else None,
+        "start_token_recorded": token_recorded,
+        "start_token_live": _kb._pid_start_token(pid) if pid_exists else None,
+        "argv_names_task": names_task,
+        "decision": decision,
+    }
+
+
 def _process_group_evidence(pid: int) -> dict[str, Any]:
     """``{ppid, pgid, sid}`` of a live ``pid``, read without forking.
 
@@ -2035,6 +2069,8 @@ def detect_crashed_workers(
     # Cohort members whose pid was still in the process table: a misjudged
     # liveness check, not a kill (t_5c37ab9d). Named in the page.
     cohort_alive: list[str] = []
+    # task id -> ``_liveness_evidence``, stamped on its ``crashed`` / ``gave_up`` payloads.
+    liveness: dict[str, dict] = {}
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
@@ -2067,7 +2103,8 @@ def detect_crashed_workers(
                 continue
 
             pid = int(row["worker_pid"])
-            if _live_pid_names_task(pid, row["id"]):
+            names_task = _live_pid_names_task(pid, row["id"])
+            if names_task:
                 # The fingerprint disagrees, but the pid is running ``work kanban task <id>``:
                 # that is this card's worker. Booking it crashed spawns a duplicate beside it.
                 _kb._log.warning(
@@ -2087,6 +2124,8 @@ def detect_crashed_workers(
                 if logged is not None:
                     kind, code = _exit_code_kind(logged)
             dead.append((row, pid, kind, code))
+            # Read now: the reclaim UPDATE below clears ``worker_started_at``.
+            liveness[row["id"]] = _liveness_evidence(conn, row, pid, kind, code, names_task=names_task)
             if not _kb._pid_alive(pid):
                 # The worker died on its own; whatever it left in other
                 # process groups of its session would outlive it (a live pid
@@ -2156,6 +2195,7 @@ def detect_crashed_workers(
                     "exit_code": code,
                     "cohort_size": len(cohort_ids),
                     "cohort": sorted(cohort_ids)[:50],
+                    "liveness": liveness[row["id"]],
                 }
                 event_payload.update(_cohort_member_evidence(
                     pid, _spawn_group(conn, row["id"], row["current_run_id"], pid),
@@ -2321,6 +2361,7 @@ def detect_crashed_workers(
                 event_payload = {
                     "pid": pid, "claimer": row["claim_lock"], "exit_kind": kind,
                     "exit_code": code, "terminal_provider": True,
+                    "liveness": liveness[row["id"]],
                 }
             else:
                 protocol_violation = False
@@ -2331,7 +2372,7 @@ def detect_crashed_workers(
                 else:
                     error_text = f"pid {pid} not alive"
                 event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
+                event_payload = {"pid": pid, "claimer": row["claim_lock"], "liveness": liveness[row["id"]]}
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
@@ -2500,6 +2541,7 @@ def detect_crashed_workers(
                 violation_extra = {
                     "pid": pid,
                     "claimer": claimer,
+                    "liveness": liveness.get(tid),
                     "protocol_violations": streak,
                     "protocol_violation_limit": violation_limit,
                 }
@@ -2550,7 +2592,8 @@ def detect_crashed_workers(
                     release_claim=False,
                     end_run=False,
                     event_payload_extra={"pid": pid, "claimer": claimer, "provider_rejected": True,
-                                         "provider_rejected_streak": _rej_streak},
+                                         "provider_rejected_streak": _rej_streak,
+                                         "liveness": liveness.get(tid)},
                     block_kind="capability" if _rej_streak >= _PROVIDER_REJECTED_FAILURE_LIMIT else None,
                 )
                 if tripped:
@@ -2564,14 +2607,15 @@ def detect_crashed_workers(
                     force_trip=True,
                     release_claim=False,
                     end_run=False,
-                    event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
+                    event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True,
+                                         "liveness": liveness.get(tid)},
                 )
                 if tripped:
                     auto_blocked.append(tid)
                 continue
             fp = _error_fingerprint(error_text)
             is_systemic = _fp_counts.get(fp, 0) >= 3
-            failure_payload = {"pid": pid, "claimer": claimer}
+            failure_payload = {"pid": pid, "claimer": claimer, "liveness": liveness.get(tid)}
             if is_systemic:
                 # A same-error wave is a policy trip independent of the counter:
                 # ``_has_sticky_block`` holds it for an operator (84c6e50339).
