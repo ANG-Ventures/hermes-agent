@@ -55,6 +55,20 @@ class TestSkillManageBatch(unittest.TestCase):
         for rel in ("SKILL.md", "references/a.md", "scripts/r.py"):
             self.assertTrue(os.path.exists(os.path.join(base, rel)), rel)
 
+    def test_local_create_without_category_on_shared_host(self):
+        # t_613d6e5b: with a skills-shared/ tree present, the batch precompute ignored `local`
+        # and raised an uncaught SkillCreateError ("A shared group is required") before any op ran.
+        os.makedirs(os.path.join(self.home, "skills-shared", "general"), exist_ok=True)
+        with patch.object(self.smt, "_shared_authoring_enabled", return_value=True):
+            r = self._call("loc", [{"action": "create", "content": SK.format(n="loc"), "local": True}])
+            self.assertTrue(r["success"], r)
+            self.assertTrue(os.path.exists(os.path.join(self.home, "skills", "loc", "SKILL.md")))
+            self.assertFalse(os.path.exists(os.path.join(self.home, "skills-shared", "general", "loc")))
+            # A shared create with no group is a tool_error, never an uncaught raise.
+            r = self._call("shr", [{"action": "create", "content": SK.format(n="shr")}])
+            self.assertFalse(r["success"], r)
+            self.assertIn("shared group", r["error"])
+
     def test_advisory_findings_ride_on_the_op_result(self):
         # operations[] is the only call shape, so a finding the per-op handler attaches must
         # survive into the batch row or the linter is silent for every model call.
