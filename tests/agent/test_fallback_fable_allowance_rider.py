@@ -68,7 +68,8 @@ def test_non_fable_rate_limit_tail_unchanged():
     del base["fable_allowance"]
     before = fp.format_cause_rider(base, tz=UTC)
     assert "Fable weekly allowance" not in before
-    assert before.endswith("· pool had no other seat, 18:40:00"), before
+    # t_d6227140: "all subs" already says it; no " · pool had no other seat".
+    assert before == "model budget capped at the relay on all subs, 18:40:00", before
     # zero exhausted: not a Fable allowance event, the old tail stays
     zero = _row(fable_allowance={"exhausted": 0, "of": 25, "earliest_reset": None})
     assert fp.format_cause_rider(zero, tz=UTC) == before
