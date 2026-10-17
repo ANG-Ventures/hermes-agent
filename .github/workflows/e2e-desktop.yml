@@ -123,7 +123,8 @@ jobs:
         with:
           name: playwright-report-${{ github.sha }}
           path: apps/desktop/playwright-report
-          retention-days: 14
+          retention-days: 3  # was 14 (t_82cb42f5: org artifact-storage quota hit 2026-10-17); nothing reads these past the run
+
           overwrite: true
 
       # ── Upload test results (screenshots, traces, diffs) ───────────────
@@ -134,7 +135,8 @@ jobs:
         with:
           name: playwright-test-results-${{ github.sha }}
           path: apps/desktop/test-results
-          retention-days: 14
+          retention-days: 3  # was 14 (t_82cb42f5: org artifact-storage quota hit 2026-10-17); nothing reads these past the run
+
           overwrite: true
 
       # ── Upload just the visual diffs (small, fast to review) ──────────
@@ -148,7 +150,8 @@ jobs:
             apps/desktop/test-results/**/*-diff.png
             apps/desktop/test-results/**/*-actual.png
             apps/desktop/test-results/**/*-expected.png
-          retention-days: 14
+          retention-days: 3  # was 14 (t_82cb42f5: org artifact-storage quota hit 2026-10-17); nothing reads these past the run
+
           overwrite: true
           if-no-files-found: ignore
 

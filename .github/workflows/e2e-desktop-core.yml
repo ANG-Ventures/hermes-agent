@@ -90,6 +90,7 @@ jobs:
           path: |
             apps/desktop/test-results/core
             apps/desktop/playwright-report/core
-          retention-days: 14
+          retention-days: 3  # was 14 (t_82cb42f5: org artifact-storage quota hit 2026-10-17); nothing reads these past the run
+
           overwrite: true
           if-no-files-found: ignore
