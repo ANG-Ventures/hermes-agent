@@ -1,0 +1,4 @@
+{
+  "_doc": "review_coverage `by` values whose APPROVE at the exact head satisfies a required-closed PR or an edit of the gate lists (pipeline v2 SPEC D3 / pass-2 RC2, card t_489e8020). Read from the PR's BASE sha by scripts/lib/merge_policy.py. On the always-review list: editing this file needs an operator APPROVE at head (rc 43).",
+  "approvers": ["apollo", "apollo/operator", "apollo/media-library"]
+}

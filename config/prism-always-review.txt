@@ -1,0 +1,8 @@
+# Pipeline v2 D3: paths that always merit Prism review on ANG-Ventures/hermes-agent (fork).
+# Read at the PR's base sha by hermes-home scripts/lib/merge_policy.py; removing an entry is refused at merge (rc 32).
+# Seeded 2026-10-16 by Apollo (merge-gate hole 7, t_7dbacbbc). The fork's gates and landers:
+.github/**
+hermes_cli/kanban_pr_freshness.py
+hermes_cli/kanban_*.py
+tools/skill_manager_tool.py
+tools/terminal_tool.py
