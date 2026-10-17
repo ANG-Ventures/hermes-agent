@@ -42,6 +42,7 @@ from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: h
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError, RoutedPrOpenError
+from hermes_cli.kanban_supersede_content import SupersededContentError
 from hermes_cli.kanban_receipt import EXIT_NO_RECEIPT, ReceiptRequiredError
 from hermes_cli.kanban_handback_head import StaleHandbackHeadError
 from hermes_cli.kanban_identity import safe_comment_provenance
@@ -3271,7 +3272,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
             except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, RoutedPrOpenError,
-                    StaleHandbackHeadError) as draft_err:
+                    StaleHandbackHeadError, SupersededContentError) as draft_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue

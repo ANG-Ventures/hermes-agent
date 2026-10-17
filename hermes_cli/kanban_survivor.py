@@ -2748,8 +2748,13 @@ def _hold(conn, task_id, reason):
 
 def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
              survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=(),
-             survivor_none=False, survivor_reason=None):
-    """Return a verified survivor or None for non-code work; fail closed on doubt."""
+             survivor_none=False, survivor_reason=None, content_survivor=None):
+    """Return a verified survivor or None for non-code work; fail closed on doubt.
+
+    ``content_survivor`` is a ref :func:`kanban_supersede_content.verify` already
+    proved: the card's own PR content is on the default branch (t_8035c8af). It
+    stands in for an operator ``--survivor-ref`` when none is given.
+    """
     try:
         bases, held, previous = _state(conn, task_id)
         if not isinstance(bases, dict) or not (previous is None or isinstance(previous, dict)):
@@ -2791,6 +2796,8 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         stage = "remote survivor verification"
         explicit = _verified_explicit(task_id, survivor_ref, survivor_pr,
                                       unbound=survivor_unbound)
+        if not explicit and content_survivor and not cleanup:
+            explicit = {None: dict(content_survivor)}
         if explicit and task.workspace_kind == "dir" and not cleanup:
             # A shared directory is NEVER removed at completion. Its other
             # repositories (including ignored review worktrees) belong to

@@ -10373,6 +10373,36 @@ def _enforce_routed_pr_survivor(
     raise _open_pr.RoutedPrOpenError(task_id, opened, unverified, blank_reason=blank)
 
 
+def _enforce_superseded_content(
+    conn: sqlite3.Connection, task_id: str, superseded_by: Optional[str], *,
+    metadata: Optional[dict], survivor_pr,
+) -> list:
+    """``--superseded-by <sha>`` must carry the card's own PR content (t_8035c8af).
+
+    Ancestry alone let a commit that was merely ON main stand in for a PR whose
+    content was not (hermes-home#4729 09:47). For each of the card's own fleet
+    PRs, the PR's added lines must be present at the sha or on the default
+    branch, else :class:`kanban_supersede_content.SupersededContentError` names
+    the files that differ (audited, no mutation). The returned refs are the
+    survivor evidence :func:`kanban_survivor.preserve` records in place of a
+    separately bound ``--survivor-ref``.
+    """
+    from hermes_cli import kanban_open_pr as _open_pr
+    from hermes_cli import kanban_supersede_content as _content
+    shas = _content.supersede_shas(superseded_by)
+    if not shas:
+        return []
+    prs = _open_pr.split_fleet(_open_pr.extract_pr_refs(
+        *_card_recorded_pr_refs(conn, task_id), metadata=metadata, survivor_pr=survivor_pr))[0]
+    try:
+        return _content.verify(task_id, prs, shas)
+    except _content.SupersededContentError as err:
+        with write_txn(conn):
+            _append_event(conn, task_id, "completion_blocked_superseded_content",
+                          {"differs": err.differs, "unverified": err.unverified, "shas": shas})
+        raise
+
+
 @_home_session_guarded("complete")
 def complete_task(
     conn: sqlite3.Connection,
@@ -10801,6 +10831,10 @@ def complete_task(
     # SUPERSEDED-BY / RE-CARRIED-AS token naming merged work for that PR; an
     # unreadable lookup refuses too. Every completion is gated, including a
     # reviewer approving a card parked in review. Raises before any mutation.
+    content_survivors = _enforce_superseded_content(
+        conn, task_id, superseded_by, metadata=metadata, survivor_pr=survivor_pr)
+    if content_survivors:
+        metadata = dict(metadata or {}, superseded_content=content_survivors)
     try:
         _open_pr.enforce_not_closed_unmerged(
             task_id, result, summary, metadata=metadata,
@@ -10826,6 +10860,7 @@ def complete_task(
         survivor_unbound=survivor_unbound,
         survivor_none=survivor_none, survivor_reason=survivor_reason,
         evidence=[t for t in (summary, result) if t],
+        content_survivor=content_survivors[0] if content_survivors else None,
     )
     if survivor:
         metadata = dict(metadata or {}, survivor=survivor)
