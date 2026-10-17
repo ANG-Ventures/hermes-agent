@@ -4545,7 +4545,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                caps=None, caps_out: Optional[dict] = None,
                rules_out: Optional[dict] = None,
                access_out: Optional[dict] = None,
-               binds: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+               binds: Optional[dict] = None,
+               held: Optional[dict] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
     ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
@@ -4561,9 +4562,15 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     pinned by an enforced capability lands in ``affinity_out``; a warn-mode
     observation, a remote pin that lacks a hard requirement (F3) and an
     unknown ``requires:`` word land in ``caps_out``.
+
+    ``held`` is this tick's fleet pause pre-route set (``kanban_pause_hold.held_routes``): a held row returns its
+    wait BEFORE ``origin_route``, which can persist ``origin_host=NULL`` (Prism 76b7233abe29). Every ready row is
+    still presented here each tick (Router Core §4.2, lint-queue-loops D1).
     """
     from hermes_cli import kanban_worker_pool as _kwp
     from hermes_cli import kanban_continuation as _kcont
+    if held and row["id"] in held:
+        return held[row["id"]]
     _origin = _kcont.origin_route(
         conn, row, plan.config, config=_root_kanban_cfg(),
         states=getattr(plan, "continuation_states", {}), caps=caps,
@@ -5792,14 +5799,13 @@ def _dispatch_once_locked(
         _binds = _workspace_binds(conn, ready_rows, dry_run=dry_run)  # spec §2.4, per tick
         _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
         spillover.continuation_dry_run = dry_run
-        row_route = {r["id"]: _pause_held[r["id"]] if r["id"] in _pause_held else
-                     _route_row(conn, r, spillover, _eff_default, _native, _linked,
-                                _lineage, result.placement_affinity,
-                                unknown_out=result.unknown_pins,
-                                caps=_caps, caps_out=_caps_out,
-                                rules_out=row_rules,
-                                access_out=result.access_contradictions,
-                                binds=_binds)
+        row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
+                                         _lineage, result.placement_affinity,
+                                         unknown_out=result.unknown_pins,
+                                         caps=_caps, caps_out=_caps_out,
+                                         rules_out=row_rules,
+                                         access_out=result.access_contradictions,
+                                         binds=_binds, held=_pause_held)
                      for r in ready_rows}
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
@@ -5869,7 +5875,8 @@ def _dispatch_once_locked(
     # catches a row whose manifest appeared mid-tick.
     row_route.update(_pause_held)
     _kph.gate_rows(conn, ready_rows, result, row_route, dry_run, _pause_cache, lane="ready",
-                   planned=spillover is not None, entry=entry)
+                   planned=spillover is not None, entry=entry,
+                   pool=spillover.config if spillover is not None else None, caps=_caps)
     # Browser Sandboxes resolution gate (t_42728faf): after every route is known, before any spawn.
     _browser_gate(conn, ready_rows, result, row_route, dry_run, default_assignee)
     # Review rows are enumerated up front (not after the ready loop) so the
@@ -5889,7 +5896,8 @@ def _dispatch_once_locked(
         review_rows = _browser_hold_review_rows(conn, review_rows, result, dry_run)
         review_rows = _kph.gate_rows(conn, review_rows, result, row_route, dry_run, _pause_cache,
                                      lane="review", planned=spillover is not None, entry=entry,
-                                     pins_out=_review_pause_pins)
+                                     pins_out=_review_pause_pins,
+                                     pool=spillover.config if spillover is not None else None, caps=_caps)
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work

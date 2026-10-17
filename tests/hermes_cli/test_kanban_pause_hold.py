@@ -482,3 +482,63 @@ def test_resumed_review_card_never_spawns_locally(home, mkplan, monkeypatch):
             assert res.placement_waits[ids["E"]] == "pool_unavailable"
         else:
             assert (ids["E"], "ci-box") in spawned
+
+
+# -- Prism c3421355edd2: a resume pin never yields to a route to ANOTHER host ---
+
+@pytest.mark.parametrize("route", [("pin", "ace-ai"), ("origin", "ace-ai")])
+def test_resume_pin_waits_when_routing_chose_another_host(home, route):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="r", assignee="alpha", body="x")
+        _set(conn, tid, status="ready", origin_host="ci-box")
+        _manifest(home, "resumed", [{"lane": "kanban", "id": tid, "resume": {"new_run_id": None}}])
+        row = conn.execute("SELECT id, body, origin_host FROM tasks WHERE id=?", (tid,)).fetchone()
+        rr = {tid: route}
+        kph.gate_rows(conn, [row], None, rr, True, {}, lane="ready")
+        assert rr[tid][0] == "wait" and "resume_pin_conflict:routed_to:ace-ai" in rr[tid][1]
+
+
+def test_resume_pin_keeps_a_route_to_the_same_host(home):
+    """Control: a pin/origin route that already targets the origin stays as routed."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="r", assignee="alpha", body="x")
+        _set(conn, tid, status="ready", origin_host="ci-box")
+        _manifest(home, "resumed", [{"lane": "kanban", "id": tid, "resume": {"new_run_id": None}}])
+        row = conn.execute("SELECT id, body, origin_host FROM tasks WHERE id=?", (tid,)).fetchone()
+        rr = {tid: ("origin", "ci-box")}
+        kph.gate_rows(conn, [row], None, rr, True, {}, lane="ready")
+        assert rr[tid] == ("origin", "ci-box")
+
+
+# -- Prism 904f143f5a38: a resumed review keeps the origin's hard checks --------
+
+def test_resumed_review_requiring_studio_only_access_never_runs_on_origin(home, monkeypatch):
+    cfg = {"placement": {"continuation": "enforce"}}
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: cfg)
+    monkeypatch.setattr(kb, "_board_home_kanban_cfg", lambda: cfg)
+    monkeypatch.setattr(kb._kwh, "prepare_remote_workspace", lambda host, ws, **k: None)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="rv", assignee="alpha", body="requires: control-plane-read")
+        _set(conn, tid, status="review", origin_host="ci-box")
+        _manifest(home, "resumed", [{"lane": "kanban", "id": tid, "resume": {"new_run_id": None}}])
+        res, spawned = _tick(conn, _plan())
+        assert (tid, "ci-box") not in spawned
+        assert "origin_refused" in res.placement_waits[tid]
+        assert conn.execute("SELECT origin_host FROM tasks WHERE id=?", (tid,)).fetchone()["origin_host"] == "ci-box"
+
+
+@pytest.mark.parametrize("current, waits", [(("local", "studio_affinity:vault"), True), (("local", None), False),
+                                            (("portable", None), False)])
+def test_resume_pin_versus_a_local_route(home, current, waits):
+    """536374336fb5 in isolation: only a local route that carries a rule blocks the resume pin."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="r", assignee="alpha", body="x")
+        _set(conn, tid, status="ready", origin_host="ci-box")
+        _manifest(home, "resumed", [{"lane": "kanban", "id": tid, "resume": {"new_run_id": None}}])
+        row = conn.execute("SELECT id, body, origin_host FROM tasks WHERE id=?", (tid,)).fetchone()
+        rr = {tid: current}
+        kph.gate_rows(conn, [row], None, rr, True, {}, lane="ready")
+        if waits:
+            assert rr[tid][0] == "wait" and "resume_pin_conflict:studio_affinity:vault" in rr[tid][1]
+        else:
+            assert rr[tid] == ("pin", "ci-box")

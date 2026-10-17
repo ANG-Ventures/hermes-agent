@@ -87,41 +87,16 @@ def clear_lost_state(conn, task_id: str, host: str) -> bool:
     return True
 
 
-def origin_route(conn, row, pool, *, config: dict, states: dict, caps=None,
-                 dry_run: bool = False, now: Optional[int] = None):
-    """Return origin/wait/refused or None for the ordinary spill ladder.
-
-    states maps (host, workspace) to nonempty/empty/unknown/host_key_mismatch.
-    Unknown is sticky. All state-sharing edges are checked, not just the
-    first edge portable() reports. Provenance edges never bind placement.
-    """
+def origin_hard_refusal(conn, row, pool, host: str, caps=None) -> Optional[str]:
+    """Why the card's state on ``host`` cannot run there, or None: registry, assignee, hard capabilities,
+    Studio-only access, split brain. Pure over the probe: shared by :func:`origin_route` and the fleet pause
+    resume pin (Prism 904f143f5a38), which must keep these checks without letting an empty probe clear the origin."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_worker_hosts as kwh
-    selected = mode(config)
-    if selected == "off":
-        return None
-    host = kb._row_get(row, "origin_host")
-    if not host:
-        return None
     tid = row["id"]
-    state = states.get((host, row["workspace_path"]), "unknown")
-    if selected == "warn":
-        if not dry_run:
-            # One diagnostic per origin/state, not an append every tick.
-            last = kb._latest_event(conn, tid, "continuation_observed")
-            payload = {"host": host, "state": state}
-            if last is None or kb._json_or(last["payload"]) != payload:
-                kb._append_event(conn, tid, "continuation_observed", payload)
-        return None
-    if state == "empty":
-        if not dry_run:
-            clear_lost_state(conn, tid, host)
-        return None
     reason = None
     target = next((h for h in pool.pool_hosts if h.name.lower() == host.lower()), None)
-    if state == "host_key_mismatch":
-        reason = "origin host re-imaged? host-key mismatch"
-    elif target is None:
+    if target is None:
         reason = f"origin {host} is not in the worker registry"
     elif row["assignee"] not in target.profiles:
         reason = f"origin {host} does not serve assignee {row['assignee']}"
@@ -163,6 +138,41 @@ def origin_route(conn, row, pool, *, config: dict, states: dict, caps=None,
             if not other_host and kwh.local_workspace_has_content(other["workspace_path"]):
                 reason = f"split brain: {tid} state on {host}, {other['id']} state on studio"
                 break
+    return reason
+
+
+def origin_route(conn, row, pool, *, config: dict, states: dict, caps=None,
+                 dry_run: bool = False, now: Optional[int] = None):
+    """Return origin/wait/refused or None for the ordinary spill ladder.
+
+    states maps (host, workspace) to nonempty/empty/unknown/host_key_mismatch.
+    Unknown is sticky. All state-sharing edges are checked, not just the
+    first edge portable() reports. Provenance edges never bind placement.
+    """
+    from hermes_cli import kanban_db as kb
+    selected = mode(config)
+    if selected == "off":
+        return None
+    host = kb._row_get(row, "origin_host")
+    if not host:
+        return None
+    tid = row["id"]
+    state = states.get((host, row["workspace_path"]), "unknown")
+    if selected == "warn":
+        if not dry_run:
+            # One diagnostic per origin/state, not an append every tick.
+            last = kb._latest_event(conn, tid, "continuation_observed")
+            payload = {"host": host, "state": state}
+            if last is None or kb._json_or(last["payload"]) != payload:
+                kb._append_event(conn, tid, "continuation_observed", payload)
+        return None
+    if state == "empty":
+        if not dry_run:
+            clear_lost_state(conn, tid, host)
+        return None
+    target = next((h for h in pool.pool_hosts if h.name.lower() == host.lower()), None)
+    reason = "origin host re-imaged? host-key mismatch" if state == "host_key_mismatch" else \
+        origin_hard_refusal(conn, row, pool, host, caps)
     now = int(time.time()) if now is None else now
     if reason is None and state == "unknown":
         last = conn.execute(

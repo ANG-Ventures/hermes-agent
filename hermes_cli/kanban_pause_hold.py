@@ -161,10 +161,15 @@ def held_routes(rows, cache: dict) -> dict:
     return out
 
 
-def _pin_conflict(r, current) -> Optional[str]:
-    """A hard local restriction a resume pin must not override (Prism 536374336fb5): an explicit
-    ``host: studio`` pin, or a ``local`` route that carries a rule (access-bound, studio affinity, unknown
-    pin, not_portable). ``("local", None)`` and ``portable`` are ordinary and may be pinned to the origin."""
+def _pin_conflict(r, current, host: str, conn=None, pool=None, caps=None) -> Optional[str]:
+    """Why a resume pin to ``host`` must WAIT instead of being applied, or None:
+
+    * an explicit ``host: studio`` pin, or a ``local`` route carrying a rule (access-bound, studio affinity,
+      unknown pin, not_portable) (Prism 536374336fb5); ``("local", None)`` and ``portable`` may be pinned;
+    * a ``pin``/``origin`` route to ANOTHER host (Prism c3421355edd2): the resume fence never runs elsewhere;
+    * the origin's hard checks (registry, assignee, hard capabilities, Studio-only access, split brain), the
+      same ones ``origin_route`` applies, but without its probe arm, so an empty probe never clears the origin
+      of a held/resuming card (Prism 904f143f5a38). Needs a pool plan; the caller waits planless anyway."""
     from hermes_cli import kanban_worker_pool as _kwp
     body = _row(r, "body")
     if body:
@@ -173,6 +178,13 @@ def _pin_conflict(r, current) -> Optional[str]:
             return "host_studio"
     if current and current[0] == "local" and current[1]:
         return str(current[1])
+    if current and current[0] in ("pin", "origin") and current[1] and str(current[1]).lower() != host.lower():
+        return f"routed_to:{current[1]}"
+    if conn is not None and pool is not None:
+        from hermes_cli import kanban_continuation as _kcont
+        why = _kcont.origin_hard_refusal(conn, r, pool, host, caps)
+        if why:
+            return f"origin_refused:{why}"
     return None
 
 
@@ -194,7 +206,8 @@ def _write_status(mode: str, now: float) -> None:
 
 
 def gate_rows(conn, rows, result, row_route: dict, dry_run: bool, cache: dict, *, lane: str,
-              planned: bool = True, entry: str = "gateway", pins_out: Optional[dict] = None):
+              planned: bool = True, entry: str = "gateway", pins_out: Optional[dict] = None,
+              pool=None, caps=None):
     """Layer 1. Ready lane: writes ``row_route`` and returns ``rows``. Review lane: records the wait in
     ``result.placement_waits``, writes a resume pin into ``pins_out`` (Prism 01f1e61334ff) and returns the rows
     that may proceed.
@@ -221,7 +234,7 @@ def gate_rows(conn, rows, result, row_route: dict, dry_run: bool, cache: dict, *
             kept.append(r)
             continue
         current = row_route.get(r["id"]) if lane == "ready" else None
-        conflict = _pin_conflict(r, current)
+        conflict = _pin_conflict(r, current, verdict[1], conn, pool, caps)
         if conflict is not None:
             why = f"{CODE} ({verdict[1]}:resume_pin_conflict:{conflict})"
             if lane == "review":
@@ -240,7 +253,7 @@ def gate_rows(conn, rows, result, row_route: dict, dry_run: bool, cache: dict, *
             continue
         kept.append(r)
         if current and current[0] in ("pin", "origin", "wait"):
-            continue  # never widen an existing pin, never touch another gate's wait
+            continue  # same destination (a conflict waited above), or another gate's wait: leave it
         # RC-P3-1: with no pool plan a pin route reaches spillover.take(None); wait like a body pin does (I-11).
         row_route[r["id"]] = verdict if planned else ("wait", "pool_unavailable")
     return kept if lane == "review" else rows

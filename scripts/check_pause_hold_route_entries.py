@@ -13,8 +13,12 @@ ROUTE ENTRIES: ``_route_row``, ``origin_route``, ``clear_lost_state``. Every cal
 one guard per call in source order (a second call in the same function needs its own entry).
 
   * a guard is a NAME that must appear in a test (``if`` / ``elif`` / conditional expression /
-    comprehension ``if``) of an ancestor of the call inside the same function: the call is reached only
-    after that held-set or pin-set was consulted. ``_pause_held`` is the ready lane's pre-route held set
+    comprehension ``if``) of an ancestor of the call inside the same function, OR in the test of an earlier
+    top-level ``if <guard ...>: return ...`` of that function (an early exit for held rows): the call is reached
+    only after that held-set or pin-set was consulted.
+  * a guard written ``kw=NAME`` instead means the call itself must pass ``kw=NAME`` (the callee decides first:
+    ``_route_row(..., held=_pause_held)`` returns the hold before its own ``origin_route``). The ready-lane
+    comprehension stays unconditional, as Router Core §4.2 / lint-queue-loops D1 require. ``_pause_held`` is the ready lane's pre-route held set
     (``kanban_pause_hold.held_routes``); ``_review_pause_pins`` proves the review loop is the one fed by
     ``gate_rows`` (which already dropped held review rows).
   * ``guard`` None means the call is internal to another route entry that is itself guarded at its callers
@@ -42,11 +46,11 @@ SCAN = "hermes_cli"
 
 Key = Tuple[str, str, str]  # (repo-relative file, enclosing function, callee)
 SITES: Dict[Key, Tuple[Optional[str], ...]] = {
-    ("hermes_cli/kanban_db_dispatch.py", "_dispatch_once_locked", "_route_row"): ("_pause_held",),
+    ("hermes_cli/kanban_db_dispatch.py", "_dispatch_once_locked", "_route_row"): ("held=_pause_held",),
     # ready-lane no-plan continuation branch, then the review loop
     ("hermes_cli/kanban_db_dispatch.py", "_dispatch_once_locked", "origin_route"): ("_pause_held",
                                                                                      "_review_pause_pins"),
-    ("hermes_cli/kanban_db_dispatch.py", "_route_row", "origin_route"): (None,),
+    ("hermes_cli/kanban_db_dispatch.py", "_route_row", "origin_route"): ("held",),
     ("hermes_cli/kanban_continuation.py", "origin_route", "clear_lost_state"): (None,),
 }
 
@@ -76,11 +80,11 @@ def _tests_of(ancestor: ast.AST, child: ast.AST) -> List[ast.AST]:
 
 
 def _sites(tree: ast.AST) -> Iterator[Tuple[str, ast.Call, List[ast.AST]]]:
-    """(enclosing function, call, ancestor chain inside that function) for every route-entry call."""
+    """(enclosing function node, call, ancestor chain inside that function) for every route-entry call."""
     def walk(node, func, chain):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                yield from walk(child, child.name, [])
+                yield from walk(child, child, [])
                 continue
             if isinstance(child, ast.Call) and _callee(child) in ENTRIES and func is not None:
                 yield func, child, chain + [node]
@@ -88,7 +92,26 @@ def _sites(tree: ast.AST) -> Iterator[Tuple[str, ast.Call, List[ast.AST]]]:
     yield from walk(tree, None, [])
 
 
-def _guarded(call: ast.Call, chain: List[ast.AST], guard: str) -> bool:
+def _passes_kw(call: ast.Call, guard: str) -> bool:
+    kw, _, name = guard.partition("=")
+    return any(k.arg == kw and isinstance(k.value, ast.Name) and k.value.id == name for k in call.keywords)
+
+
+def _early_exit_before(func: ast.AST, call: ast.Call, guard: str) -> bool:
+    """A top-level ``if <test naming guard>: ... return`` in ``func`` that precedes the call's statement."""
+    for st in getattr(func, "body", []):
+        if any(n is call for n in ast.walk(st)):
+            return False
+        if isinstance(st, ast.If) and guard in _names(st.test) and st.body and isinstance(st.body[-1], ast.Return):
+            return True
+    return False
+
+
+def _guarded(call: ast.Call, chain: List[ast.AST], guard: str, func: ast.AST = None) -> bool:
+    if "=" in guard:
+        return _passes_kw(call, guard)
+    if func is not None and _early_exit_before(func, call, guard):
+        return True
     nodes = chain + [call]
     for i, anc in enumerate(chain):
         nxt = nodes[i + 1]
@@ -114,7 +137,8 @@ def check(root: Path) -> List[str]:
             findings.append(f"{rel}: unparseable ({exc})")
             continue
         calls = sorted(_sites(tree), key=lambda t: (t[1].lineno, t[1].col_offset))
-        for func, call, chain in calls:
+        for fnode, call, chain in calls:
+            func = fnode.name
             name = _callee(call)
             key = (rel, func, name)
             n = seen.get(key, 0)
@@ -125,9 +149,9 @@ def check(root: Path) -> List[str]:
                                 f"fleet pause hold before it (kanban_pause_hold.held_routes/decide), then add it")
                 continue
             guard = guards[n]
-            if guard is not None and not _guarded(call, chain, guard):
+            if guard is not None and not _guarded(call, chain, guard, fnode):
                 findings.append(f"{rel}:{call.lineno}: route entry {name}() in {func}() is reached without "
-                                f"`{guard}` in a guarding condition: the pause hold must decide before it")
+                                f"`{guard}` guarding it: the pause hold must decide before it")
     for key, guards in SITES.items():
         if not (root / key[0]).exists():
             findings.append(f"{key[0]}: SITES row names a missing file")
@@ -140,8 +164,7 @@ def check(root: Path) -> List[str]:
 _FIX_OK = '''
 def _dispatch_once_locked(conn, rows, plan):
     _pause_held = held_routes(rows, {})
-    row_route = {r["id"]: _pause_held[r["id"]] if r["id"] in _pause_held else _route_row(conn, r, plan)
-                 for r in rows}
+    row_route = {r["id"]: _route_row(conn, r, plan, held=_pause_held) for r in rows}
     for r in rows:
         if r["origin_host"] and r["id"] not in _pause_held:
             origin_route(conn, r)
@@ -151,7 +174,9 @@ def _dispatch_once_locked(conn, rows, plan):
         elif row["origin_host"]:
             origin_route(conn, row)
 
-def _route_row(conn, row, plan):
+def _route_row(conn, row, plan, held=None):
+    if held and row["id"] in held:
+        return held[row["id"]]
     return origin_route(conn, row)
 '''
 _FIX_CONT = '''
@@ -174,13 +199,17 @@ def _selftest() -> int:
     cases = {
         "green": (_FIX_OK, 0),
         # the 294e6432 shape: _route_row over every row, the hold only after routing
-        "unguarded comprehension": (_FIX_OK.replace(
-            '_pause_held[r["id"]] if r["id"] in _pause_held else _route_row(conn, r, plan)',
-            "_route_row(conn, r, plan)"), 1),
+        "route_row without held=": (_FIX_OK.replace("_route_row(conn, r, plan, held=_pause_held)",
+                                                     "_route_row(conn, r, plan)"), 1),
+        "route_row early exit removed": (_FIX_OK.replace(
+            '    if held and row["id"] in held:\n        return held[row["id"]]\n', ""), 1),
+        "early exit AFTER the call": (_FIX_OK.replace(
+            '    if held and row["id"] in held:\n        return held[row["id"]]\n    return origin_route(conn, row)',
+            '    x = origin_route(conn, row)\n    if held and row["id"] in held:\n        return held[row["id"]]\n'
+            '    return x'), 1),
         "unguarded no-plan loop": (_FIX_OK.replace(' and r["id"] not in _pause_held', ""), 1),
         "new route entry": (_FIX_OK + "\ndef other(conn, r):\n    origin_route(conn, r)\n", 1),
-        "stale row": (_FIX_OK.replace("def _route_row(conn, row, plan):\n    return origin_route(conn, row)",
-                                      "def _route_row(conn, row, plan):\n    return None"), 1),
+        "stale row": (_FIX_OK.replace("    return origin_route(conn, row)\n", "    return None\n"), 1),
     }
     bad = 0
     for name, (src, want) in cases.items():
