@@ -349,22 +349,11 @@ jobs:
           )) {
             if (Test-Path $pair.src) { Copy-Item $pair.src (Join-Path $out $pair.dst) -Recurse -Force }
           }
-          # proof/<phase>/desktop-frames is a PNG every 3 s (~45 MB/leg); the screen recording covers the same span.
-          # Keep the frames unless the remuxed mp4 is a playable recording (ffprobe reads a positive
-          # duration); an empty/unreadable recording from a failed recorder must not cost the frames.
+          # Evidence policy (Ace 2026-10-16, t_fccbe101): a FAILED (or known-failure) leg keeps EVERYTHING the
+          # recorder and the frame capture produced -- a recording that stopped early must never cost the frames
+          # taken after it (Prism 81c86c40a1ac). A green leg keeps no video and no frames: its proof is the
+          # passing assertions, and the 45 MB of frames + 30-60 MB of video per green leg is what hit the org quota.
           $mp4 = Join-Path $out "recording.mp4"
-          $playable = $false
-          if ((Test-Path -LiteralPath $mp4) -and (Get-Item -LiteralPath $mp4).Length -gt 0 -and (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
-            $dur = & ffprobe -v error -show_entries format=duration -of csv=p=0 $mp4 2>$null
-            $sec = 0.0
-            $playable = ($LASTEXITCODE -eq 0) -and [double]::TryParse(("$dur").Trim(), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$sec) -and ($sec -gt 0)
-          }
-          if ($playable) {
-            Get-ChildItem -LiteralPath $out -Directory -Recurse -Filter "desktop-frames" -ErrorAction SilentlyContinue |
-              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-          }
-          # Evidence policy (Ace 2026-10-16, t_fccbe101): a green leg keeps NO video and no frames; its proof
-          # is the passing assertions. Failed and known-failure legs keep the recording for the leg player.
           if ("${{ job.status }}" -eq "success" -and "${{ steps.update.outputs.known_failure }}" -eq "") {
             Remove-Item -LiteralPath $mp4 -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath (Join-Path $out "recording.mkv") -Force -ErrorAction SilentlyContinue
