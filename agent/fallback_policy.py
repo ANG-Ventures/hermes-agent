@@ -1395,8 +1395,15 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
 
 def _seat_token(row: Mapping[str, Any], seat_names: bool) -> str:
     seat = row.get("seat")
-    if (row.get("trigger_class") == "quota_model" and not is_direct_pin(row.get("from_provider"))
+    cls = row.get("trigger_class")
+    if (cls == "quota_model" and not is_direct_pin(row.get("from_provider"))
             and (not seat or row.get("pool_wide"))):
+        return "all subs"
+    # A seatless relay quota_seat with zero eligible seats is pool-wide too:
+    # the relay classes it quota_seat only because a seat recovers at a known
+    # time (t_d6227140). "sub unknown" is for genuinely missing evidence.
+    if (cls == "quota_seat" and not is_direct_pin(row.get("from_provider"))
+            and ((not seat and row.get("pool_eligible") == 0) or row.get("pool_wide"))):
         return "all subs"
     if not seat or seat == "unknown":
         return SUB_UNKNOWN
@@ -1548,7 +1555,9 @@ def _cause_body(row: Mapping[str, Any], seat_names: bool,
     seg = _hop_segment(hop, seat, row.get("http_status"))
     floors = tuple(f for f, hit in ((FLOOR_CAUSE, cause == UNCLASSIFIED_CAUSE),
                                     (FLOOR_HOP_SUB, seg == _HOP_SUB_UNKNOWN_SEG)) if hit)
-    return f"{prefix}{cause} {seg}{_pool_context(row)}, {window}", floors
+    # "all subs" already says the pool had no other seat (t_d6227140).
+    pool = "" if seat == "all subs" else _pool_context(row)
+    return f"{prefix}{cause} {seg}{pool}, {window}", floors
 
 
 # ── same-error re-failover backoff (t_7f2ced0d) ───────────────────────────
@@ -1769,7 +1778,24 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
         return "session demoted"
     if not relay_sourced:
         return None
+    if cls in ("quota_model", "quota_seat"):
+        # A relay quota refusal is a spent allowance, not request-rate
+        # limiting: never "rate limit" (t_d6227140).
+        return _relay_quota_head(row)
     return {"conn": "connection issue", "pool_pressure": "relay busy"}.get(cls)
+
+
+def _relay_quota_head(row: Mapping[str, Any]) -> str:
+    """``Fable weekly limit`` when the relay stated a Fable allowance with an
+    exhausted seat, or the model is Fable and the text names a weekly window;
+    else ``model quota`` / ``seat quota``."""
+    fa = row.get("fable_allowance")
+    if isinstance(fa, Mapping) and isinstance(fa.get("exhausted"), int) and fa["exhausted"] > 0:
+        return "Fable weekly limit"
+    if ("fable" in str(row.get("from_model") or "").lower()
+            and quota_window_from_text(row.get("err_head")) == "7d"):
+        return "Fable weekly limit"
+    return "model quota" if row.get("trigger_class") == "quota_model" else "seat quota"
 
 
 def _model_short(model: Optional[str]) -> str:
