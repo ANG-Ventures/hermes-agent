@@ -148,17 +148,45 @@ def test_s8_remove_file_shared_script_refused(tmp_path):
         assert (d / "scripts/x.py").is_file()
 
 
-def test_s9_tier_module_absent_fails_open_with_one_warning(tmp_path, caplog):
+def test_s9_tier_reader_absent_with_shared_tree_refuses(tmp_path, caplog):
+    # Prism P1 1c24bb177f50: with a skills-shared/ tree the reader is always deployed, so its
+    # absence is a broken deploy and must not wave a write through.
     with _root(tmp_path, with_tier=False) as (root, _, shared):
         d = _shared_skill(shared)
         with caplog.at_level(logging.WARNING, logger="tools.skill_manager_tool"):
-            res = _ops([{"action": "write_file", "name": "probe", "file_path": "scripts/x.py",
+            res = _ops([{"action": "write_file", "name": "probe", "file_path": "references/x.md",
+                         "file_content": "notes\n"}])
+        assert res["success"] is False, res
+        assert "tier reader missing" in res["error"] and "worktree + PR" in res["error"], res["error"]
+        assert str(root / "scripts" / "lib" / "autocommit_tier.py") in res["error"]
+        assert not (d / "references").exists()
+        assert any("tier reader missing" in r.getMessage() for r in caplog.records)
+
+
+def test_s9b_tier_reader_absent_without_shared_tree_allows(tmp_path):
+    # True vanilla install: no skills-shared/ and no tier table -> legacy local writes still work.
+    with _root(tmp_path, with_tier=False) as (_, local, shared):
+        shared.rename(shared.with_name("gone"))
+        d = local / "general" / "van"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(SK.format(n="van"))
+        with patch("agent.skill_utils.get_all_skills_dirs", return_value=[local]):
+            res = _ops([{"action": "write_file", "name": "van", "file_path": "scripts/x.py",
                          "file_content": "print(1)\n"}])
         assert res["success"] is True, res
-        assert (d / "scripts/x.py").is_file()
-        hits = [r for r in caplog.records if "fail-open" in r.getMessage()]
-        assert len(hits) == 1, [r.getMessage() for r in caplog.records]
-        assert str(root / "scripts" / "lib" / "autocommit_tier.py") in hits[0].getMessage()
+        assert (d / "scripts" / "x.py").is_file()
+        assert smt._exec_tier_refusal(d, d / "scripts" / "x.py", "write_file") is None
+
+
+def test_s9c_tier_reader_broken_refuses(tmp_path):
+    with _root(tmp_path) as (root, _, shared):
+        (root / "scripts" / "lib" / "autocommit_tier.py").write_text("raise RuntimeError('boom')\n")
+        d = _shared_skill(shared)
+        res = _ops([{"action": "write_file", "name": "probe", "file_path": "references/x.md",
+                     "file_content": "notes\n"}])
+        assert res["success"] is False, res
+        assert "unreadable" in res["error"] and "RuntimeError" in res["error"], res["error"]
+        assert not (d / "references").exists()
 
 
 def test_s10_exec_named_symlink_to_prose_still_refused(tmp_path):
@@ -173,3 +201,47 @@ def test_s10_exec_named_symlink_to_prose_still_refused(tmp_path):
         _refused(_ops([{"action": "write_file", "name": "probe", "file_path": "scripts/x.sh",
                         "file_content": "echo hi\n"}]))
         assert (d / "references" / "x.md").read_text() == "notes\n"
+
+
+def test_s11_prose_symlink_to_prose_inside_skill_allowed(tmp_path):
+    with _root(tmp_path) as (_, _, shared):
+        d = _shared_skill(shared)
+        (d / "references").mkdir()
+        (d / "references" / "real.md").write_text("notes\n")
+        (d / "references" / "alias.md").symlink_to("real.md")
+        assert smt._exec_tier_refusal(d, d / "references" / "alias.md", "write_file") is None
+        res = _ops([{"action": "write_file", "name": "probe", "file_path": "references/alias.md",
+                     "file_content": "more\n"}])
+        assert res["success"] is True, res
+        assert (d / "references" / "real.md").read_text() == "more\n"
+
+
+def test_s12_symlink_escaping_skills_shared_refused(tmp_path):
+    # Prism P1 7f9b52bf26bc: a link whose target leaves skills-shared/ is refused whatever its tier.
+    with _root(tmp_path) as (_, _, shared):
+        d = _shared_skill(shared)
+        outside = tmp_path / "elsewhere" / "notes.md"
+        outside.parent.mkdir()
+        outside.write_text("orig\n")
+        (d / "references").mkdir()
+        (d / "references" / "x.md").symlink_to(outside)
+        res = _ops([{"action": "write_file", "name": "probe", "file_path": "references/x.md",
+                     "file_content": "pwned\n"}])
+        assert res["success"] is False, res
+        assert "symlink escapes the skills tree" in res["error"], res["error"]
+        assert outside.read_text() == "orig\n"
+
+
+def test_s13_symlink_to_root_scripts_lib_refused(tmp_path):
+    with _root(tmp_path) as (root, _, shared):
+        d = _shared_skill(shared)
+        real = root / "scripts" / "lib" / "real.py"
+        real.write_text("print('live')\n")
+        (d / "references").mkdir()
+        (d / "references" / "x.md").symlink_to(real)
+        assert smt._exec_tier_refusal(d, d / "references" / "x.md", "write_file") is not None
+        res = _ops([{"action": "patch", "name": "probe", "file_path": "references/x.md",
+                     "old_string": "print('live')", "new_string": "print('pwned')"}])
+        assert res["success"] is False, res
+        assert "symlink escapes the skills tree" in res["error"], res["error"]
+        assert real.read_text() == "print('live')\n"
