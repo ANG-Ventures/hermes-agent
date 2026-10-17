@@ -42,7 +42,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
     # The find step is capped at 7 min so a slow API fails the STEP and the outage page below (3 calls
     # bounded at 30 s each + retries) still runs inside the job (Prism P1 81de6de0f429 / cdf7a8199dc5).
-    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
+    timeout-minutes: 12  # hard-cap-ok: pager, must fail fast (Prism P1 57ede82c53aa, t_48fd37d3)
     outputs:
       runs: ${{ steps.find.outputs.runs }}
       backlog: ${{ steps.find.outputs.backlog }}
@@ -248,7 +248,7 @@ jobs:
     if: ${{ needs.sweep.outputs.backlog != '' && needs.sweep.outputs.backlog != '0' }}
     name: backlog
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
+    timeout-minutes: 2  # hard-cap-ok: pager, must fail fast (Prism P1 57ede82c53aa, t_48fd37d3)
     steps:
       - run: |
           echo "::error::${{ needs.sweep.outputs.backlog }} red run(s) wait for the next sweep; this run is not a checkpoint"
@@ -271,7 +271,7 @@ jobs:
       matrix:
         run: ${{ fromJSON(needs.sweep.outputs.runs) }}
     # 2x measured p90 (4 s over 30 runs), floored at 10.
-    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
+    timeout-minutes: 10  # hard-cap-ok: pager, must fail fast (Prism P1 57ede82c53aa, t_48fd37d3)
     steps:
       # PAGE GATE (t_957f5398). #alerts is for reds a human acts on:
       #   - head_branch == default branch (push, workflow_dispatch on main, ...)
