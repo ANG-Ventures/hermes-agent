@@ -8741,7 +8741,10 @@ def _claim_and_open_run(
     *, event_extra: Optional[dict] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
+    when the CAS lost. Caller holds the txn. Raises ``PauseHeld`` (no write) for
+    a card whose origin host is paused (fleet pause layer 2, t_133d6efd)."""
+    from hermes_cli.kanban_pause_hold import refuse_if_held
+    refuse_if_held(conn, task_id)
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -9288,8 +9291,11 @@ def _open_review_run(
     Shared by :func:`claim_review_task` (dispatched reviewer) and the
     reviewer send-back in :func:`request_changes`, so both leave the same
     ``claimed(source_status=review)`` audit shape. Returns the new run id,
-    or None when the card is no longer an unclaimed ``review`` card.
+    or None when the card is no longer an unclaimed ``review`` card. Raises
+    ``PauseHeld`` (no write) for a paused host's card (t_133d6efd).
     """
+    from hermes_cli.kanban_pause_hold import refuse_if_held
+    refuse_if_held(conn, task_id)
     cur = conn.execute(
         """
         UPDATE tasks
@@ -13915,6 +13921,9 @@ def _operator_send_back_refusal(task_id: str, reason: str) -> Optional[str]:
     return None
 
 
+from hermes_cli.kanban_pause_hold import PauseHeld  # noqa: E402  (fleet pause layer 2, t_133d6efd)
+
+
 class _SendBackRefused(Exception):
     """Roll back a send-back's own review claim when the handoff is refused."""
 
@@ -14154,6 +14163,11 @@ def request_changes(
                 raise _SendBackRefused(detail)
     except _SendBackRefused as exc:
         return False, exc.detail
+    except PauseHeld as exc:
+        # Fleet pause layer 2 (t_133d6efd): the review card stays ``review``, held.
+        from hermes_cli.kanban_pause_hold import record_refusal
+        record_refusal(conn, exc, stage="request_changes")
+        return False, f"{exc}: resume or abandon the pause first"
     # Journal the committed coverage comment (add_comment's content hook),
     # only after commit so a rolled-back send-back journals nothing.
     for comment_id, comment_run_id, created_at in posted:
