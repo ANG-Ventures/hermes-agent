@@ -5757,6 +5757,12 @@ def _dispatch_once_locked(
     ).fetchall()
     # Operator-only cards are never spawnable, whatever their assignee.
     ready_rows = _kb._drop_no_worker_rows(conn, ready_rows, result, dry_run=dry_run)
+    # Fleet pause hold, PRE-ROUTE (t_133d6efd, Prism 76b7233abe29): a held card is never handed to a routing
+    # step, because origin_route can persist origin_host=NULL (continuation=enforce, empty probe) and the next
+    # tick would then see no origin. Every route entry below skips the ids in ``_pause_held``.
+    from hermes_cli import kanban_pause_hold as _kph
+    _pause_cache: dict = {}
+    _pause_held = _kph.held_routes(ready_rows, _pause_cache)
     # One route per row (KWLB D-11): with a pool plan, ONE stable sort puts
     # remote pins first, then non-portable cards (first claim on the local
     # budget), then portable ones; the ORDER BY holds inside each class.
@@ -5786,13 +5792,14 @@ def _dispatch_once_locked(
         _binds = _workspace_binds(conn, ready_rows, dry_run=dry_run)  # spec §2.4, per tick
         _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
         spillover.continuation_dry_run = dry_run
-        row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
-                                         _lineage, result.placement_affinity,
-                                         unknown_out=result.unknown_pins,
-                                         caps=_caps, caps_out=_caps_out,
-                                         rules_out=row_rules,
-                                         access_out=result.access_contradictions,
-                                         binds=_binds)
+        row_route = {r["id"]: _pause_held[r["id"]] if r["id"] in _pause_held else
+                     _route_row(conn, r, spillover, _eff_default, _native, _linked,
+                                _lineage, result.placement_affinity,
+                                unknown_out=result.unknown_pins,
+                                caps=_caps, caps_out=_caps_out,
+                                rules_out=row_rules,
+                                access_out=result.access_contradictions,
+                                binds=_binds)
                      for r in ready_rows}
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
@@ -5851,15 +5858,16 @@ def _dispatch_once_locked(
         from hermes_cli import kanban_worker_pool as _kwp_origin
         _unplanned_pool = _kwp_origin.read_pool(_kb.kanban_home() / 'fleet', kanban_cfg=_root_kanban_cfg())
         for r in ready_rows:
-            if r["origin_host"]:
+            if r["origin_host"] and r["id"] not in _pause_held:
                 _origin_route = _kcont_unplanned.origin_route(
                     conn, r, _unplanned_pool, config=_root_kanban_cfg(), states={}, dry_run=dry_run,
                     caps=_capability_tick(_unplanned_pool),
                 )
                 row_route[r["id"]] = _origin_route or ('local', None)
-    # Fleet pause hold, layer 1 (t_133d6efd, spec §5.8): after BOTH routing branches, before any spawn.
-    from hermes_cli import kanban_pause_hold as _kph
-    _pause_cache: dict = {}
+    # Fleet pause hold, layer 1 (t_133d6efd, spec §5.8): after BOTH routing branches, before any spawn. The
+    # pre-route holds win over anything a no-plan branch wrote; the post-route pass applies resume pins and
+    # catches a row whose manifest appeared mid-tick.
+    row_route.update(_pause_held)
     _kph.gate_rows(conn, ready_rows, result, row_route, dry_run, _pause_cache, lane="ready",
                    planned=spillover is not None, entry=entry)
     # Browser Sandboxes resolution gate (t_42728faf): after every route is known, before any spawn.
@@ -5868,6 +5876,7 @@ def _dispatch_once_locked(
     # budget split below can see whether review work exists at all. The
     # review lane is never offered to the pool: its rows are always local.
     review_rows = []
+    _review_pause_pins: dict = {}  # review id -> resume-origin host (Prism 01f1e61334ff)
     if review_dispatch_enabled():
         review_rows = conn.execute(
             "SELECT id, assignee, no_worker, body, skills, workspace_path, workspace_kind, origin_host FROM tasks "
@@ -5879,7 +5888,8 @@ def _dispatch_once_locked(
         )
         review_rows = _browser_hold_review_rows(conn, review_rows, result, dry_run)
         review_rows = _kph.gate_rows(conn, review_rows, result, row_route, dry_run, _pause_cache,
-                                     lane="review", entry=entry)
+                                     lane="review", planned=spillover is not None, entry=entry,
+                                     pins_out=_review_pause_pins)
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work
@@ -7043,7 +7053,15 @@ def _dispatch_once_locked(
         if spawn_budget is not None and spawned >= spawn_budget:
             break
         _review_origin_host = None
-        if row['origin_host'] and _kcont_lost.mode(_root_kanban_cfg()) == 'enforce':
+        if row['id'] in _review_pause_pins:
+            # A resumed paused card's first review run goes back to its origin (fleet pause resume fence).
+            _pin_host = _review_pause_pins[row['id']]
+            _review_origin_host = next((h for h in spillover.config.pool_hosts if h.name == _pin_host), None)
+            _refusal = spillover.pin_host_refusal(_pin_host)
+            if _review_origin_host is None or _refusal:
+                result.placement_waits[row['id']] = _refusal or 'origin_host_absent'
+                continue
+        elif row['origin_host'] and _kcont_lost.mode(_root_kanban_cfg()) == 'enforce':
             if spillover is None:
                 result.placement_waits[row['id']] = 'origin_host_absent'
                 continue

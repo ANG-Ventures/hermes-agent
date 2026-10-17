@@ -64,6 +64,24 @@ def enabled() -> bool:
     return value is not False and str(value).strip().lower() not in ("off", "false", "0", "no")
 
 
+def _valid(doc) -> bool:
+    """Every field :func:`decide` dereferences has the shape it expects (Prism aceb690c4071)."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("phase"), str) or not doc.get("host"):
+        return False
+    units = doc.get("units")
+    if units is None:
+        return True
+    if not isinstance(units, list):
+        return False
+    for unit in units:
+        if not isinstance(unit, dict):
+            return False
+        resume = unit.get("resume")
+        if resume is not None and not isinstance(resume, dict):
+            return False
+    return True
+
+
 def _load(host: str, cache: dict):
     if host in cache:
         return cache[host]
@@ -73,14 +91,15 @@ def _load(host: str, cache: dict):
     except FileNotFoundError:
         cache[host] = None
         return None
-    except OSError:
+    except (OSError, ValueError):   # ValueError: UnicodeDecodeError on non-UTF-8 bytes
+        _log.warning("kanban pause_hold: %s unreadable; every %s card is HELD", path, host)
         cache[host] = _UNREADABLE
         return _UNREADABLE
     try:
         doc = json.loads(raw)
-        if not isinstance(doc, dict) or not isinstance(doc.get("phase"), str) or not doc.get("host"):
-            raise ValueError("manifest lacks host/phase")
-    except ValueError:
+        if not _valid(doc):
+            raise ValueError("manifest shape")
+    except (ValueError, RecursionError):
         _log.warning("kanban pause_hold: %s unreadable; every %s card is HELD", path, host)
         doc = _UNREADABLE
     cache[host] = doc
@@ -88,7 +107,20 @@ def _load(host: str, cache: dict):
 
 
 def decide(origin_host: Optional[str], task_id: str, cache: dict):
-    """None | ("wait", "pause_hold (<host>:<id>)") | ("pin", host). Pure over the manifest contents."""
+    """None | ("wait", "pause_hold (<host>:<id>)") | ("pin", host). Pure over the manifest contents.
+
+    Never raises: any unexpected failure holds the host's card (fail closed), so neither layer can take a
+    dispatch tick or a claim down with something other than :class:`PauseHeld`."""
+    try:
+        return _decide(origin_host, task_id, cache)
+    except Exception:
+        _log.warning("kanban pause_hold: decide(%s) failed; card %s HELD", origin_host, task_id, exc_info=True)
+        if origin_host:
+            cache[str(origin_host)] = _UNREADABLE
+        return ("wait", f"{CODE} ({origin_host}:{UNREADABLE})")
+
+
+def _decide(origin_host, task_id, cache):
     if not origin_host:
         return None
     doc = _load(str(origin_host), cache)
@@ -101,10 +133,46 @@ def decide(origin_host: Optional[str], task_id: str, cache: dict):
         return ("wait", f"{CODE} ({origin_host}:{doc.get('id') or '?'})")
     if phase in PIN_PHASES:
         for unit in doc.get("units") or ():
-            if isinstance(unit, dict) and unit.get("lane") == "kanban" and unit.get("id") == task_id:
-                if ((unit.get("resume") or {}).get("new_run_id")) is None:
+            if unit.get("lane") == "kanban" and unit.get("id") == task_id:
+                if (unit.get("resume") or {}).get("new_run_id") is None:
                     return ("pin", str(origin_host))
                 return None
+    return None
+
+
+def _row(r, key):
+    try:
+        return r[key]
+    except (IndexError, KeyError):
+        return None
+
+
+def held_routes(rows, cache: dict) -> dict:
+    """Ready-lane PRE-ROUTE pass (Prism 76b7233abe29): ``{task_id: ("wait", reason)}`` for every row the hold
+    keeps. The dispatcher routes only the rows NOT in this dict, so ``origin_route`` (which can persist
+    ``origin_host=NULL`` under continuation=enforce) never sees a held card. Empty when the switch is off."""
+    if not rows or not enabled():
+        return {}
+    out = {}
+    for r in rows:
+        verdict = decide(_row(r, "origin_host"), r["id"], cache)
+        if verdict is not None and verdict[0] == "wait":
+            out[r["id"]] = verdict
+    return out
+
+
+def _pin_conflict(r, current) -> Optional[str]:
+    """A hard local restriction a resume pin must not override (Prism 536374336fb5): an explicit
+    ``host: studio`` pin, or a ``local`` route that carries a rule (access-bound, studio affinity, unknown
+    pin, not_portable). ``("local", None)`` and ``portable`` are ordinary and may be pinned to the origin."""
+    from hermes_cli import kanban_worker_pool as _kwp
+    body = _row(r, "body")
+    if body:
+        pin, _ignored = _kwp.resolve_pin(body, ())
+        if pin == _kwp.PIN_STUDIO:
+            return "host_studio"
+    if current and current[0] == "local" and current[1]:
+        return str(current[1])
     return None
 
 
@@ -126,9 +194,10 @@ def _write_status(mode: str, now: float) -> None:
 
 
 def gate_rows(conn, rows, result, row_route: dict, dry_run: bool, cache: dict, *, lane: str,
-              planned: bool = True, entry: str = "gateway"):
+              planned: bool = True, entry: str = "gateway", pins_out: Optional[dict] = None):
     """Layer 1. Ready lane: writes ``row_route`` and returns ``rows``. Review lane: records the wait in
-    ``result.placement_waits`` and returns the rows that may proceed.
+    ``result.placement_waits``, writes a resume pin into ``pins_out`` (Prism 01f1e61334ff) and returns the rows
+    that may proceed.
 
     ``hold-status.json`` is published on the ready lane only by a live GATEWAY tick (RC-P3-2: a one-shot
     ``hermes kanban dispatch`` runs the same code from disk before the gateway restarts and must not vouch for it).
@@ -140,11 +209,7 @@ def gate_rows(conn, rows, result, row_route: dict, dry_run: bool, cache: dict, *
         return rows
     kept = []
     for r in rows:
-        try:
-            origin = r["origin_host"]
-        except (IndexError, KeyError):
-            origin = None
-        verdict = decide(origin, r["id"], cache)
+        verdict = decide(_row(r, "origin_host"), r["id"], cache)
         if verdict is None:
             kept.append(r)
             continue
@@ -155,10 +220,25 @@ def gate_rows(conn, rows, result, row_route: dict, dry_run: bool, cache: dict, *
             row_route[r["id"]] = verdict
             kept.append(r)
             continue
-        kept.append(r)
-        if lane != "ready":
+        current = row_route.get(r["id"]) if lane == "ready" else None
+        conflict = _pin_conflict(r, current)
+        if conflict is not None:
+            why = f"{CODE} ({verdict[1]}:resume_pin_conflict:{conflict})"
+            if lane == "review":
+                result.placement_waits[r["id"]] = why
+                continue
+            row_route[r["id"]] = ("wait", why)
+            kept.append(r)
             continue
-        current = row_route.get(r["id"])
+        if lane == "review":
+            if not planned:
+                result.placement_waits[r["id"]] = "pool_unavailable"
+                continue
+            if pins_out is not None:
+                pins_out[r["id"]] = verdict[1]
+            kept.append(r)
+            continue
+        kept.append(r)
         if current and current[0] in ("pin", "origin", "wait"):
             continue  # never widen an existing pin, never touch another gate's wait
         # RC-P3-1: with no pool plan a pin route reaches spillover.take(None); wait like a body pin does (I-11).

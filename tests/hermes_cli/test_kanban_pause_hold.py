@@ -37,6 +37,8 @@ def home(tmp_path, monkeypatch):
     prof.mkdir(parents=True)
     # a PROFILE-scoped HERMES_HOME: the manifest must still be read under kanban_home() (= the root)
     monkeypatch.setenv("HERMES_HOME", str(prof))
+    # an inherited override must never steer init_db at a real board (Prism 131f3bd26253)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(h))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
@@ -282,7 +284,8 @@ def test_cli_claim_refuses_with_rc2(home, capsys):
 
 
 def _matrix_tick(home, monkeypatch, *, l1, l2, plan):
-    if not l1:
+    if not l1:   # layer 1 = the pre-route pass AND the post-route pass
+        monkeypatch.setattr(kph, "held_routes", lambda rows, cache: {})
         monkeypatch.setattr(kph, "gate_rows",
                             lambda conn, rows, *a, lane, **k: rows)
     if not l2:
@@ -331,3 +334,151 @@ def test_matrix_both_off_control_spawns(home, monkeypatch, mkplan):
     ids, res, got, events = _matrix_tick(home, monkeypatch, l1=False, l2=False, plan=mkplan())
     assert {ids[k] for k in "ABDEF"} <= got
 
+
+
+# -- Prism aceb690c4071: a corrupt manifest holds its host and never raises ----
+
+CORRUPT = [
+    pytest.param(b"\xff\xfe{}", id="non-utf8"),
+    pytest.param(None, id="resume-not-dict"),
+    pytest.param(json.dumps({"schema": 2, "id": MID, "host": "ci-box", "phase": "resumed", "units": 5}).encode(),
+                 id="units-not-list"),
+    pytest.param(("[" * 100000 + "]" * 100000).encode(), id="deep-nesting"),
+]
+
+
+def _corrupt(home, raw, task_id):
+    if raw is None:   # a PIN_PHASES manifest whose unit carries a truthy non-dict resume
+        raw = json.dumps({"schema": 2, "id": MID, "host": "ci-box", "phase": "resumed",
+                          "units": [{"lane": "kanban", "id": task_id, "resume": "x"}]}).encode()
+    d = home / "state" / "fleet-pause" / "ci-box"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "manifest.json").write_bytes(raw)
+
+
+@pytest.mark.parametrize("raw", CORRUPT)
+@pytest.mark.parametrize("mkplan", PLANS)
+def test_corrupt_manifest_holds_its_host_and_the_tick_survives(home, mkplan, raw):
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        _corrupt(home, raw, ids["A"])
+        res, spawned = _tick(conn, mkplan())
+        got = {t for t, _ in spawned}
+        for key in "ADF":
+            r = _routes(res)[ids[key]]
+            assert r["outcome"] == "held" and r["code"] == "pause_hold" and "unreadable" in r["detail"], (key, r)
+            assert ids[key] not in got and _runs(conn, ids[key]) == 0
+        assert res.placement_waits[ids["E"]] == "pause_hold (ci-box:unreadable)"
+        assert ids["C"] in got                          # another host's card still dispatches this tick
+
+
+@pytest.mark.parametrize("raw", CORRUPT)
+def test_corrupt_manifest_layer2_raises_pause_held_only(home, raw):
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        _corrupt(home, raw, ids["A"])
+        for claim, key in ((kb.claim_task, "A"), (kb.claim_review_task, "E")):
+            with pytest.raises(kph.PauseHeld) as ei:
+                claim(conn, ids[key])
+            assert ei.value.manifest_id == kph.UNREADABLE
+
+
+@pytest.mark.parametrize("raw", CORRUPT)
+def test_load_itself_classifies_every_corrupt_shape_unreadable(home, raw):
+    """The validation layer on its own (decide()'s catch-all would otherwise mask a missing check)."""
+    _corrupt(home, raw, "t_x")
+    assert kph._load("ci-box", {}) is kph._UNREADABLE
+
+
+def test_decide_never_raises_on_an_unexpected_error(home, monkeypatch):
+    def boom(host, cache):
+        raise RuntimeError("unexpected")
+    monkeypatch.setattr(kph, "_load", boom)
+    assert kph.decide("ci-box", "t_x", {}) == ("wait", f"pause_hold (ci-box:{kph.UNREADABLE})")
+
+
+# -- Prism 76b7233abe29: the hold runs before any routing that mutates the row --
+
+def _continuation_card(conn, home):
+    tid = kb.create_task(conn, title="cont", assignee="alpha", body="do the thing")
+    _set(conn, tid, status="ready", origin_host="ci-box", workspace_path="/tmp/ws")
+    _manifest(home)
+    return tid
+
+
+@pytest.mark.parametrize("mkplan", PLANS)
+def test_continuation_enforce_empty_probe_never_clears_a_held_origin(home, monkeypatch, mkplan):
+    cfg = {"placement": {"continuation": "enforce"}}
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: cfg)
+    monkeypatch.setattr(kb, "_board_home_kanban_cfg", lambda: cfg)
+    with kb.connect_closing() as conn:
+        tid = _continuation_card(conn, home)
+        for _ in range(2):
+            plan = mkplan()
+            if plan is not None:
+                plan.continuation_states = {("ci-box", "/tmp/ws"): "empty"}
+                plan.continuation_probed = True
+            res, spawned = _tick(conn, plan)
+            assert tid not in {t for t, _ in spawned}
+            row = conn.execute("SELECT origin_host FROM tasks WHERE id=?", (tid,)).fetchone()
+            assert row["origin_host"] == "ci-box"
+            assert _routes(res)[tid]["code"] == "pause_hold"
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='origin_state_lost'",
+                            (tid,)).fetchone()[0] == 0
+
+
+def test_continuation_enforce_empty_probe_control_clears_without_a_pause(home, monkeypatch):
+    """Control: the same fixture with NO manifest does clear the origin, so the held arm is not vacuous."""
+    cfg = {"placement": {"continuation": "enforce"}}
+    monkeypatch.setattr(kbd, "_root_kanban_cfg", lambda: cfg)
+    monkeypatch.setattr(kb, "_board_home_kanban_cfg", lambda: cfg)
+    with kb.connect_closing() as conn:
+        tid = _continuation_card(conn, home)
+        (home / "state" / "fleet-pause" / "ci-box" / "manifest.json").unlink()
+        plan = _plan()
+        plan.continuation_states = {("ci-box", "/tmp/ws"): "empty"}
+        plan.continuation_probed = True
+        _tick(conn, plan)
+        assert conn.execute("SELECT origin_host FROM tasks WHERE id=?", (tid,)).fetchone()["origin_host"] is None
+
+
+# -- Prism 536374336fb5: a resume pin never overrides a hard local restriction --
+
+def test_resume_pin_never_overrides_a_hard_local_route(home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="studio", assignee="alpha",
+                             body="host: studio\nrequires: control-plane-read\nRead the board.")
+        _set(conn, tid, status="ready", origin_host="ci-box")
+        _manifest(home, "resumed", [{"lane": "kanban", "id": tid, "resume": {"new_run_id": None}}])
+        res, spawned = _tick(conn, _plan())
+        assert (tid, "ci-box") not in spawned
+        r = _routes(res)[tid]
+        assert r["outcome"] == "held" and r["code"] == "pause_hold", r
+        assert "resume_pin_conflict" in r["detail"]
+
+
+def test_resume_pin_still_widens_an_ordinary_local_route(home):
+    """Control for 536374336fb5: an unrestricted card (local with no hard rule) still pins to its origin."""
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        _manifest(home, "resumed", [{"lane": "kanban", "id": ids["A"], "resume": {"new_run_id": None}}])
+        res, spawned = _tick(conn, _plan())
+        assert (ids["A"], "ci-box") in spawned
+
+
+# -- Prism 01f1e61334ff: the resume fence holds for review cards ---------------
+
+@pytest.mark.parametrize("mkplan", PLANS)
+def test_resumed_review_card_never_spawns_locally(home, mkplan, monkeypatch):
+    # the review lane prepares the remote workspace inline (ssh): record it instead
+    monkeypatch.setattr(kb._kwh, "prepare_remote_workspace", lambda host, ws, **k: None)
+    with kb.connect_closing() as conn:
+        ids = _cards(conn)
+        _manifest(home, "resumed", [{"lane": "kanban", "id": ids["E"], "resume": {"new_run_id": None}}])
+        res, spawned = _tick(conn, mkplan())
+        assert (ids["E"], "studio") not in spawned
+        if mkplan() is None:
+            assert ids["E"] not in {t for t, _ in spawned}
+            assert res.placement_waits[ids["E"]] == "pool_unavailable"
+        else:
+            assert (ids["E"], "ci-box") in spawned
