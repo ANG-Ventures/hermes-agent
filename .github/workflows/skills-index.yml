@@ -25,7 +25,7 @@ jobs:
     # scheduled run for two months and left the live index frozen; on Sep 17 ClawHub
     # page latency went from ~2.5 s to ~10 s, so the ~400-page walk alone runs 60-70 min
     # and 50 min cancelled it again (#114525). The cron is 12-hourly; 120 min leaves headroom.
-    timeout-minutes: 120
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     environment: trusted-automation
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -86,7 +86,7 @@ jobs:
     needs: build-index
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    timeout-minutes: 15
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     environment: trusted-automation
     steps:
       # Required: `Get GitHub App token` is a LOCAL composite action

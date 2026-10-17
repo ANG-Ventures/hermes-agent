@@ -28,7 +28,7 @@ jobs:
     name: Desktop core E2E (Linux)
     # Fork: no ubuntu-latest-32-core pool in this org; route like every other fork job.
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    timeout-minutes: 30
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
 

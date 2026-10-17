@@ -279,7 +279,7 @@ jobs:
     # whole matrix cannot spill, and GitHub will not overflow a full
     # self-hosted pool onto hosted runners by itself.
     runs-on: ${{ fromJSON(matrix.slice.runs_on) }}
-    timeout-minutes: 30
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     strategy:
       fail-fast: false
       # Static routing remains the default for every event, including
@@ -540,7 +540,7 @@ jobs:
     # writer processes per test; HERMES_TEST_WORKERS below bounds the trees.
     runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true' && needs.placement.result == 'success' && needs.placement.outputs.plan_valid == 'true' && needs.placement.outputs.plan_attempt == format('{0}', github.run_attempt) && needs.placement.outputs.e2e_runs_on || vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","ace-e2e-vm"]' || (contains(fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]'), 'self-hosted') && format('["{0}","X64"]', join(fromJSON(vars.CI_RUNNER_LABELS), '","')) || '["ubuntu-latest"]')) }}
     # 45, not 30: e2e measured 26 min on GitHub-hosted (#1624 rounds 4-7).
-    timeout-minutes: 45
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -686,7 +686,7 @@ jobs:
     # one-slot runners serialised them, 180 min wall vs 16 hosted (run 37197359967). The
     # Studio gate opens the route only while idle slots >= 1 + len(CI_E2E_VM_SHARDS).
     runs-on: ${{ vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && contains(format(',{0},', vars.CI_E2E_VM_SHARDS), format(',{0},', matrix.shard)) && matrix.shard != 'hosts/test_libc_musl' && matrix.shard != 'core/test_fresh_process_entrypoints' && fromJSON('["self-hosted","Linux","X64","ace-e2e-vm"]') || vars.CI_E2E_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 60
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     strategy:
       fail-fast: false
       matrix:

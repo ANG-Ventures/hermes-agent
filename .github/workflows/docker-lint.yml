@@ -53,7 +53,7 @@ jobs:
   shellcheck:
     name: Lint docker/ shell scripts (shellcheck)
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    timeout-minutes: 5
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
