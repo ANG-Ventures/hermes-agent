@@ -2181,14 +2181,14 @@ def _consume_ephemeral_max_output(agent):
 
 
 def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides):
-    from agent.preserved_thinking import preserve_thinking_enabled, preserve_thinking_window
+    from agent.preserved_thinking import resolve_preserve_thinking
     ctx_len = getattr(agent, "context_compressor", None)
     ephemeral_out = _consume_ephemeral_max_output(agent)
-    # ``providers.<name>.preserve_thinking``: resolved here, where the provider name is known, and
-    # threaded down as booleans so the converter stays provider-agnostic.
+    # preserve_thinking (config key, else the lane's registered profile): resolved here, where the
+    # provider name is known, and threaded down as booleans so the converter stays provider-agnostic.
     route = (getattr(agent, "provider", None), getattr(agent, "requested_provider", None),
              getattr(agent, "_anthropic_base_url", None) or getattr(agent, "base_url", None))
-    preserve_thinking = preserve_thinking_enabled(*route)
+    preserve_thinking, thinking_window, _ = resolve_preserve_thinking(*route)
     anthropic_kwargs = agent._get_transport().build_kwargs(model=agent.model,
         messages=agent._prepare_anthropic_messages_for_api(api_messages), tools=tools_for_api,
         max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
@@ -2199,7 +2199,7 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
         fast_mode=request_overrides.get("speed") == "fast",
         drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
         preserve_thinking=preserve_thinking,
-        thinking_window=preserve_thinking_window(*route) if preserve_thinking else "latest")
+        thinking_window=thinking_window)
     # Stamp the pool affinity header (per-request, pool-scoped) so the relay's
     # reset-weighted router can pin this conversation to one sub for the prompt
     # cache. Merges into any existing extra_headers (e.g. anthropic-beta).
