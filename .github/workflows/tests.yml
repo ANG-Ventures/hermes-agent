@@ -382,7 +382,10 @@ jobs:
           name: ci-slice-result-${{ matrix.slice.index }}-a${{ github.run_attempt }}
           path: ci-junit/
           if-no-files-found: warn
-          retention-days: 3  # was 14 (t_82cb42f5: org artifact-storage quota hit 2026-10-17); nothing reads these past the run
+          # 14 days on evidence events: flake_quarantine.py / flake_ledger.py read these
+          # junits back EVIDENCE_WINDOW_DAYS=14 for push/merge_group/schedule runs only.
+          # PR runs are never evidence, so they keep the t_82cb42f5 3-day cut.
+          retention-days: ${{ contains(fromJSON('["push", "merge_group", "schedule"]'), github.event_name) && 14 || 3 }}
 
       - name: Slice verdict (flake quarantine, base-ref list)
         # Green iff the suite passed, or every failure is a test that is
