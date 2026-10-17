@@ -1166,6 +1166,23 @@ def _validate_fallback_model(fb: Any, issues: List[ConfigIssue]) -> None:
                         suffix=" — fallback will be disabled")
 
 
+def _validate_delegation_fallback(config: Dict[str, Any], issues: List[ConfigIssue]) -> None:
+    """delegation.fallback_providers: null, a list of rungs, or the scalar ``auto``.
+
+    Any other scalar reaches the runtime as "no usable routes" and is silently ignored."""
+    deleg = config.get("delegation")
+    fb = deleg.get("fallback_providers") if isinstance(deleg, dict) else None
+    if fb is None or isinstance(fb, list):
+        return
+    from hermes_cli.fallback_config import is_auto_chain
+    if not is_auto_chain(fb):
+        _issue(issues, "error",
+               # Type only: the value can carry credentials and this message reaches chats.
+               f"delegation.fallback_providers must be a list, [] or 'auto', got a {type(fb).__name__}",
+               "Use 'auto' to reuse the parent's fallback lanes with the subagent's model, a list of "
+               "{provider, model} rungs for an explicit chain, or [] to disable subagent fallback")
+
+
 def _validate_web_backends(config: Dict[str, Any], issues: List[ConfigIssue]) -> None:
     """A stale web backend selection otherwise fails only at the first web_search/web_extract
     call with a generic "no registered provider" error; warn at startup instead."""
@@ -1271,6 +1288,7 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                    f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                    f"Move '{key}' under the appropriate section")
 
+    _validate_delegation_fallback(config, issues)
     _validate_web_backends(config, issues)
     _validate_quoted_containers(config, issues)
     return issues
