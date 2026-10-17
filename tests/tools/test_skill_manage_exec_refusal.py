@@ -159,3 +159,17 @@ def test_s9_tier_module_absent_fails_open_with_one_warning(tmp_path, caplog):
         hits = [r for r in caplog.records if "fail-open" in r.getMessage()]
         assert len(hits) == 1, [r.getMessage() for r in caplog.records]
         assert str(root / "scripts" / "lib" / "autocommit_tier.py") in hits[0].getMessage()
+
+
+def test_s10_exec_named_symlink_to_prose_still_refused(tmp_path):
+    # Prism r1 P1: the REQUESTED path is classified, not only the symlink's resolved destination.
+    with _root(tmp_path) as (_, _, shared):
+        d = _shared_skill(shared)
+        (d / "references").mkdir()
+        (d / "references" / "x.md").write_text("notes\n")
+        (d / "scripts").mkdir()
+        (d / "scripts" / "x.sh").symlink_to("../references/x.md")
+        assert smt._exec_tier_refusal(d, d / "scripts" / "x.sh", "write_file") is not None
+        _refused(_ops([{"action": "write_file", "name": "probe", "file_path": "scripts/x.sh",
+                        "file_content": "echo hi\n"}]))
+        assert (d / "references" / "x.md").read_text() == "notes\n"

@@ -542,7 +542,10 @@ def _exec_tier_refusal(skill_dir: Path, target: Path, action: str) -> Optional[D
         shared_r, target_r = shared.resolve(), target.resolve()
     except OSError:
         shared_r, target_r = shared, target
-    if not _is_within(target_r, shared_r):
+    # Both the REQUESTED path and its resolved destination are classified: a contained symlink
+    # (scripts/x.sh -> ../references/x.md) must not launder an exec-named path into prose.
+    pairs = [(t, s) for t, s in ((target, shared), (target_r, shared_r)) if _is_within(t, s)]
+    if not pairs:
         return None
     root = shared.parent  # unresolved: a symlinked skills-shared/ still reads the root's table
     try:
@@ -550,10 +553,12 @@ def _exec_tier_refusal(skill_dir: Path, target: Path, action: str) -> Optional[D
         if tier is None:
             return None
         rules = tier.load()
-        rel_root = f"{shared.name}/{target_r.relative_to(shared_r).as_posix()}"
-        skill_r = skill_dir.resolve()
-        rel_skill = target_r.relative_to(skill_r).as_posix() if _is_within(target_r, skill_r) else None
-        is_exec = any(tier.tier(p, rules) == "exec" for p in (rel_root, rel_skill) if p)
+        rel_root = f"{shared.name}/{pairs[0][0].relative_to(pairs[0][1]).as_posix()}"
+        cands = {f"{shared.name}/{t.relative_to(s).as_posix()}" for t, s in pairs}
+        for t, sd in ((target, skill_dir), (target_r, skill_dir.resolve())):
+            if _is_within(t, sd):
+                cands.add(t.relative_to(sd).as_posix())
+        is_exec = any(tier.tier(p, rules) == "exec" for p in cands)
     except Exception as e:  # a broken tier table never waves code through (the reader's own rule)
         return _err(f"skill_manage refuses {action} on {target}: the exec-tier table under {root} is "
                     f"unreadable ({type(e).__name__}: {e}); fix the table, or make the change in a "
