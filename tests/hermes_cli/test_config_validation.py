@@ -238,3 +238,8 @@ class TestDelegationFallbackProvidersValidation:
         issues = validate_config_structure({"delegation": {"fallback_providers": value}})
         errors = [i for i in issues if i.severity == "error" and "delegation.fallback_providers" in i.message]
         assert len(errors) == 1 and "'auto'" in errors[0].message
+
+    def test_error_never_echoes_the_value(self):
+        value = {"provider": "custom", "model": "m", "api_key": "sk-secret-value"}
+        issues = validate_config_structure({"delegation": {"fallback_providers": value}})
+        assert issues and not [i for i in issues if "sk-secret-value" in i.message + i.hint]

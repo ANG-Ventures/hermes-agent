@@ -245,14 +245,17 @@ def is_auto_chain(declared: Any) -> bool:
 
 def remodel_chain_for_child(
     inherited: list[dict[str, Any]] | None, *, child_provider: Any, child_model: Any, owner: str,
+    child_base_url: Any = None,
 ) -> list[dict[str, Any]] | None:
     """The parent's chain re-aimed at the child's model (``fallback_providers: auto``).
 
     Each rung keeps its lane (provider, endpoint, credentials) and takes the child's model, when
     the rung's model is from the child's model vendor. A rung from another vendor (a cross-vendor
     terminal rung such as ``cpa/gpt-6.1-sol``) is kept as-is, so the chain can still leave the
-    vendor; so is any rung whose vendor or the child's vendor is unknown. Rungs that would retry
-    the child's own primary route are dropped; order is kept and routes are de-duplicated.
+    vendor; so is any rung whose vendor or the child's vendor is unknown. A rung whose full route
+    (provider, model, endpoint) is the child's own primary is dropped; ``child_base_url`` is the
+    child's explicit endpoint (None = provider default, matching a rung with no ``base_url``), so a
+    same-provider rung on a backup endpoint survives. Order is kept and routes are de-duplicated.
     """
     from hermes_cli.model_normalize import detect_vendor
 
@@ -263,14 +266,14 @@ def remodel_chain_for_child(
         return None
     model = str(child_model or "").strip()
     child_vendor = detect_vendor(model) if model else None
-    primary = (str(child_provider or "").strip().lower(), model.lower())
+    primary = _entry_identity({"provider": child_provider, "model": model, "base_url": child_base_url})
     chain: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for rung in rungs:
         if child_vendor and detect_vendor(rung["model"]) == child_vendor:
             rung = {**rung, "model": model}
         identity = _entry_identity(rung)
-        if identity[:2] == primary or identity in seen:
+        if identity == primary or identity in seen:
             continue
         seen.add(identity)
         chain.append(rung)

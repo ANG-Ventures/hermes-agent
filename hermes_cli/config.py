@@ -1177,7 +1177,8 @@ def _validate_delegation_fallback(config: Dict[str, Any], issues: List[ConfigIss
     from hermes_cli.fallback_config import is_auto_chain
     if not is_auto_chain(fb):
         _issue(issues, "error",
-               f"delegation.fallback_providers must be a list, [] or 'auto', got {fb!r}",
+               # Type only: the value can carry credentials and this message reaches chats.
+               f"delegation.fallback_providers must be a list, [] or 'auto', got a {type(fb).__name__}",
                "Use 'auto' to reuse the parent's fallback lanes with the subagent's model, a list of "
                "{provider, model} rungs for an explicit chain, or [] to disable subagent fallback")
 

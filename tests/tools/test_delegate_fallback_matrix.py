@@ -292,6 +292,13 @@ def test_auto_cross_vendor_child_does_not_rewrite_other_vendor_rungs():
     ]
 
 
+
+def test_auto_keeps_a_same_provider_rung_on_a_different_endpoint():
+    chain = [{"provider": "openai", "model": "gpt-6.1", "base_url": "https://backup.example/v1"},
+             {"provider": "openai", "model": "gpt-6.1"}]
+    assert _auto(chain, provider="openai", model="gpt-6.2") == [
+        {"provider": "openai", "model": "gpt-6.2", "base_url": "https://backup.example/v1"}]
+
 @pytest.mark.parametrize("pinned", [True, False])
 def test_auto_with_no_parent_chain_is_none_with_one_warning(pinned, caplog):
     with caplog.at_level("WARNING"):

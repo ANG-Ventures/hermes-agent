@@ -519,6 +519,7 @@ _NOUS_PROVIDERS = frozenset({"nous", "nous-portal", "nousresearch"})
 
 def _resolve_child_fallback_chain(
     parent_agent, routing_cfg: Any, pinned: bool, *, child_provider: Any = None, child_model: Any = None,
+    child_base_url: Any = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """Fallback chain for a child, owned by the same config block as its route.
 
@@ -537,7 +538,8 @@ def _resolve_child_fallback_chain(
         if not pinned and inherited:
             return inherited
         return remodel_chain_for_child(
-            inherited, child_provider=child_provider, child_model=child_model, owner="delegation")
+            inherited, child_provider=child_provider, child_model=child_model,
+            child_base_url=child_base_url, owner="delegation")
     return scoped_fallback_chain(inherited, declared, pinned=pinned, owner="delegation")
 
 
@@ -647,7 +649,8 @@ def _resolve_child_runtime(
         "fallback_model": _resolve_child_fallback_chain(
             parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
             pinned=bool(override_provider or override_base_url or model),
-            child_provider=effective_requested_provider, child_model=effective_model),
+            child_provider=effective_requested_provider, child_model=effective_model,
+            child_base_url=override_base_url),
         "openrouter_min_coding_score": getattr(parent_agent, "openrouter_min_coding_score", None),
         # Routing filters reset to their defaults under a pinned provider (see _ROUTING_FILTER_DEFAULTS).
         **{a: d if override_provider else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},
