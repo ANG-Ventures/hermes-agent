@@ -310,7 +310,7 @@ jobs:
             /tmp/image-artifacts/image-${{ matrix.arch }}.tar.sha256
             /tmp/image-artifacts/identity.json
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 2  # image tars are test inputs for this run only (t_82cb42f5: 4 tars/run x 3.7k runs held 44 GB)
           compression-level: 0
 
   # ---------------------------------------------------------------------------
@@ -605,7 +605,7 @@ jobs:
           name: docker-publish-digest-${{ matrix.variant }}-${{ matrix.arch }}-${{ inputs.tag }}
           path: /tmp/digests/${{ matrix.arch }}.digest
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 2  # image tars are test inputs for this run only (t_82cb42f5: 4 tars/run x 3.7k runs held 44 GB)
 
   # Assemble the immutable versioned multi-arch manifest and expose its digest
   # to the parent release receipt. Registry-side only; nothing is rebuilt.
@@ -735,7 +735,7 @@ jobs:
           name: docker-publish-manifest-${{ inputs.tag }}
           path: /tmp/manifest/manifest.json
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 2  # image tars are test inputs for this run only (t_82cb42f5: 4 tars/run x 3.7k runs held 44 GB)
 
   # Strict phase gate: in every release phase, the jobs that phase requires
   # must actually have run and succeeded. `if: always()` keeps this job in
