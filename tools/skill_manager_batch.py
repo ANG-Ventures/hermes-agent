@@ -254,9 +254,13 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
     # skill_manage() calls re-enter them. Without the outer fence a concurrent writer landing
     # between the snapshot and a rollback would be silently reverted.
     with _smt._skill_mutation_locks(names):
+        try:
+            create_targets = {names[i]: _smt._resolve_skill_dir(names[i], op.get("category"),
+                                                                local=bool(op.get("local")))
+                              for i, op in enumerate(operations) if op.get("action") == "create"}
+        except _smt.SkillCreateError as e:
+            return tool_error(str(e), success=False)
         snap_root = Path(tempfile.mkdtemp(prefix="skill_batch_"))
-        create_targets = {names[i]: _smt._resolve_skill_dir(names[i], op.get("category"))
-                          for i, op in enumerate(operations) if op.get("action") == "create"}
         snapshots, snap_err = _snapshot_skills(names, snap_root, _smt._find_skill, create_targets)
         if snap_err is not None:
             shutil.rmtree(snap_root, ignore_errors=True)
