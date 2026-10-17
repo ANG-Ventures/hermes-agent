@@ -6,8 +6,9 @@ frontmatter KEY the PR touched existed on main, while the PR's new VALUE did not
 was on main and carried none of the PR's content. Ancestry cannot tell those apart.
 
 :func:`pr_content_check` reads the PR's file list and, for every file, asks whether the PR's added
-lines are all present in that file at ``sha`` or at the default-branch tip (a later, newer edit on
-main is a superset and passes). A removed file must be absent; a file GitHub gives no patch for
+lines are all present in that file (a later, newer edit on main is a superset and passes). The
+check runs against two candidates, ``sha`` and the default-branch tip; one of them must carry EVERY
+file, and that commit (not merely the requested one) is the survivor evidence. A removed file must be absent; a file GitHub gives no patch for
 (binary, oversized) must match the PR head's blob exactly. A file whose change only deletes lines
 has no added line to look for and passes. Every lookup that fails makes the answer unknown (None):
 the caller fails closed on it.
@@ -157,44 +158,64 @@ def file_carries(entry: dict, data: Optional[bytes]) -> bool:
     return added_lines(patch) <= set(_lines(data))
 
 
-def pr_content_check(repo: str, number: int, sha: str) -> Optional[dict]:
-    """``{"sha": <full sha>, "default": <branch>, "differs": [paths]}``, or ``None`` when unknown.
+def _carries(entry: dict, data: Optional[bytes], fetch_sides: Callable[[], tuple]) -> bool:
+    """Line-level check, then the key-level frontmatter fallback (base/head fetched on demand)."""
+    if file_carries(entry, data):
+        return True
+    if entry.get("status") == "removed" or not isinstance(entry.get("patch"), str):
+        return False
+    if not split_frontmatter(data):
+        return False
+    base, head = fetch_sides()
+    return frontmatter_carries(entry, data, base, head)
 
-    ``differs`` lists every file of ``repo#number`` whose change is carried neither at ``sha`` nor at
-    the default-branch tip; empty means the PR's content is on main.
+
+def pr_content_check(repo: str, number: int, sha: str) -> Optional[dict]:
+    """``{"sha": <carrier>, "requested": <full sha>, "default": <branch>, "differs": [paths]}``.
+
+    ``None`` when unknown. Candidates are the requested ``sha`` and the default-branch tip, pinned
+    to its commit sha. ``sha`` in the answer is the ONE candidate commit that carries the most PR
+    files (the requested commit wins a tie), and ``differs`` lists every file that commit does not
+    carry. Empty ``differs`` therefore means that commit alone carries all of the PR's content, so
+    it is safe to record as survivor evidence. It is never a commit that only passed because a
+    different ref held the content (Prism 6265717768a4).
     """
     try:
         full = str(_json([f"repos/{repo}/commits/{quote(sha)}"]).get("sha") or "")
         default = str(_json([f"repos/{repo}"]).get("default_branch") or "")
+        tip = str(_json([f"repos/{repo}/commits/{quote(default)}"]).get("sha") or "") if default else ""
         pr = _json([f"repos/{repo}/pulls/{int(number)}"])
         base_sha = str((pr.get("base") or {}).get("sha") or "")
         head_sha = str((pr.get("head") or {}).get("sha") or "")
         out = _gh(["--paginate", f"repos/{repo}/pulls/{int(number)}/files?per_page=100",
                    "--jq", ".[] | @json"])
-        if not full or not default or not base_sha or not head_sha or out is None:
+        if not full or not default or not tip or not base_sha or not head_sha or out is None:
             return None
         files = [json.loads(line) for line in out.splitlines() if line.strip()]
         if not files or len(files) > MAX_FILES:
             return None
-        differs = []
+        candidates = list(dict.fromkeys((full, tip)))
+        missing = {ref: [] for ref in candidates}
         for entry in files:
             path = str(entry.get("filename") or "")
             if not path:
                 return None
-            copies = [_file_bytes(repo, path, ref) for ref in (full, default)]
-            if any(file_carries(entry, data) for data in copies):
-                continue
-            if entry.get("status") != "removed" and isinstance(entry.get("patch"), str) and any(
-                    split_frontmatter(data) for data in copies):
-                old_path = str(entry.get("previous_filename") or path)
-                base = None if entry.get("status") == "added" else _file_bytes(repo, old_path, base_sha)
-                head = _file_bytes(repo, path, head_sha)
-                if any(frontmatter_carries(entry, data, base, head) for data in copies):
-                    continue
-            differs.append(path)
+            sides: list = []
+
+            def fetch_sides(entry=entry, path=path, sides=sides):
+                if not sides:
+                    old_path = str(entry.get("previous_filename") or path)
+                    base = None if entry.get("status") == "added" else _file_bytes(repo, old_path, base_sha)
+                    sides.append((base, _file_bytes(repo, path, head_sha)))
+                return sides[0]
+
+            for ref in candidates:
+                if not _carries(entry, _file_bytes(repo, path, ref), fetch_sides):
+                    missing[ref].append(path)
+        chosen = min(candidates, key=lambda ref: len(missing[ref]))
     except (_Unreadable, ValueError, TypeError, AttributeError):
         return None
-    return {"sha": full, "default": default, "differs": differs}
+    return {"sha": chosen, "requested": full, "default": default, "differs": missing[chosen]}
 
 
 def default_content_check() -> Optional[ContentCheckFn]:
@@ -213,8 +234,8 @@ class SupersededContentError(ValueError):
         self.unverified = list(unverified)
         parts = ["done refused: --superseded-by names a commit that does not carry this card's PR content."]
         for pr, paths in self.differs.items():
-            parts.append(f"{pr}: the PR's added lines are neither at that sha nor on the default branch in "
-                         f"{', '.join(paths)}.")
+            parts.append(f"{pr}: no single commit (that sha, or the default-branch tip) carries the "
+                         f"PR's added lines in {', '.join(paths)}.")
         if self.unverified:
             parts.append(f"GitHub could not be read to compare {', '.join(self.unverified)}; retry when "
                          f"`gh api repos/<owner>/<repo>/pulls/<n>/files` works.")

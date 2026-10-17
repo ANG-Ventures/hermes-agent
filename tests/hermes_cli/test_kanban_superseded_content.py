@@ -133,6 +133,62 @@ def test_shas_are_parsed_from_the_pointer_not_card_ids_or_pr_numbers():
     assert sc.supersede_shas("t_0c5ac29a -> #889") == []
 
 
+# --- pr_content_check(): the sha it returns must itself carry every file (Prism 6265717768a4) ---
+
+OLD, TIP, BASE_SHA, HEAD_SHA = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+ADDED = {"filename": "new.py", "status": "added", "patch": "@@ -0,0 +1,1 @@\n+print('landed')\n"}
+OTHER = {"filename": "other.py", "status": "added", "patch": "@@ -0,0 +1,1 @@\n+print('other')\n"}
+
+
+def _fake_github(monkeypatch, files, tree):
+    """``tree[ref][path]`` = bytes at that ref; ``main`` resolves to TIP."""
+    import json as _json_mod
+    shas = {OLD: OLD, TIP: TIP, "main": TIP}
+
+    def fake_json(args):
+        path = args[0]
+        if path.startswith(f"repos/{REPO}/commits/"):
+            return {"sha": shas[path.rsplit("/", 1)[1]]}
+        if path == f"repos/{REPO}":
+            return {"default_branch": "main"}
+        if path.startswith(f"repos/{REPO}/pulls/"):
+            return {"base": {"sha": BASE_SHA}, "head": {"sha": HEAD_SHA}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(sc, "_json", fake_json)
+    monkeypatch.setattr(sc, "_gh", lambda args, raw=False: "\n".join(_json_mod.dumps(f) for f in files))
+    monkeypatch.setattr(sc, "_file_bytes", lambda repo, path, ref: tree.get(shas.get(ref, ref), {}).get(path))
+
+
+def test_content_only_on_tip_records_the_tip_not_the_requested_sha(monkeypatch):
+    """Repro: main is at TIP with the PR's file; the pointer names an older OLD without it."""
+    _fake_github(monkeypatch, [ADDED], {OLD: {}, TIP: {"new.py": b"print('landed')\n"}})
+    out = sc.pr_content_check(REPO, 7, OLD)
+    assert out["differs"] == []
+    assert out["sha"] == TIP, "the survivor must be the commit that carries the content"
+    assert out["requested"] == OLD
+    survivors = sc.verify("t_x", op.extract_pr_refs(f"https://github.com/{REPO}/pull/7"), [OLD],
+                          check=sc.pr_content_check)
+    assert survivors[0]["sha"] == TIP
+
+
+def test_requested_sha_wins_when_it_carries_everything(monkeypatch):
+    _fake_github(monkeypatch, [ADDED], {OLD: {"new.py": b"print('landed')\n"},
+                                        TIP: {"new.py": b"print('landed')\n"}})
+    assert sc.pr_content_check(REPO, 7, OLD)["sha"] == OLD
+
+
+def test_files_split_across_two_commits_is_not_carried(monkeypatch):
+    """No single commit holds both files: nothing may be promoted to survivor evidence."""
+    _fake_github(monkeypatch, [ADDED, OTHER], {OLD: {"new.py": b"print('landed')\n"},
+                                               TIP: {"other.py": b"print('other')\n"}})
+    out = sc.pr_content_check(REPO, 7, OLD)
+    assert out["differs"] in (["new.py"], ["other.py"])
+    with pytest.raises(sc.SupersededContentError):
+        sc.verify("t_x", op.extract_pr_refs(f"https://github.com/{REPO}/pull/7"), [OLD],
+                  check=sc.pr_content_check)
+
+
 # --- E2E through complete_task on a temp board ---------------------------
 
 
