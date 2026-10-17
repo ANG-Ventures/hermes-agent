@@ -7064,8 +7064,10 @@ def _dispatch_once_locked(
         if row['id'] in _review_pause_pins:
             # A resumed paused card's first review run goes back to its origin (fleet pause resume fence).
             _pin_host = _review_pause_pins[row['id']]
-            _review_origin_host = next((h for h in spillover.config.pool_hosts if h.name == _pin_host), None)
-            _refusal = spillover.pin_host_refusal(_pin_host)
+            # case-insensitive, the same match origin_hard_refusal admitted the pin with (Prism f4198478cbb2)
+            _review_origin_host = next((h for h in spillover.config.pool_hosts
+                                        if h.name.lower() == _pin_host.lower()), None)
+            _refusal = spillover.pin_host_refusal(_review_origin_host.name if _review_origin_host else _pin_host)
             if _review_origin_host is None or _refusal:
                 result.placement_waits[row['id']] = _refusal or 'origin_host_absent'
                 continue

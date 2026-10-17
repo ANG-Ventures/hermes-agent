@@ -542,3 +542,18 @@ def test_resume_pin_versus_a_local_route(home, current, waits):
             assert rr[tid][0] == "wait" and "resume_pin_conflict:studio_affinity:vault" in rr[tid][1]
         else:
             assert rr[tid] == ("pin", "ci-box")
+
+
+def test_resumed_review_pin_matches_the_registry_case_insensitively(home, monkeypatch):
+    """Prism f4198478cbb2: origin `CI-Box` resumes on registered host `ci-box`, not origin_host_absent forever."""
+    monkeypatch.setattr(kb._kwh, "prepare_remote_workspace", lambda host, ws, **k: None)
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="rv", assignee="alpha", body="x")
+        _set(conn, tid, status="review", origin_host="CI-Box")
+        d = home / "state" / "fleet-pause" / "CI-Box"
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text(json.dumps({"schema": 2, "id": MID, "host": "CI-Box", "phase": "resumed",
+                                                     "units": [{"lane": "kanban", "id": tid,
+                                                                "resume": {"new_run_id": None}}]}))
+        res, spawned = _tick(conn, _plan())
+        assert (tid, "ci-box") in spawned, res.placement_waits.get(tid)
