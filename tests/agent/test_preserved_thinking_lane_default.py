@@ -91,6 +91,13 @@ def test_dedicated_custom_registration_is_honoured(lane):
     assert pt.resolve_preserve_thinking("custom:relay") == (True, "latest", "lane")
 
 
+def test_bare_custom_route_finds_the_lane_through_its_base_url(lane):
+    lane["providers"]["claude-alr"] = {"base_url": "http://127.0.0.1:18810/anthropic"}
+    lane["registry"]["claude-alr"] = _profile(preserve_thinking=True)
+    assert pt.resolve_preserve_thinking("custom", base_url="http://127.0.0.1:18810/anthropic") == (True, "latest", "lane")
+    assert pt.resolve_preserve_thinking("custom", base_url="http://elsewhere:1/x")[0] is False
+
+
 def test_source_logged_once_per_route_at_info(lane, caplog):
     lane["registry"]["claude-alr"] = _profile(preserve_thinking=True)
     with caplog.at_level(logging.INFO, logger=pt.logger.name):

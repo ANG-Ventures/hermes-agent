@@ -75,14 +75,33 @@ def _match_identity(identity: str, providers: Dict[str, Any]) -> Optional[Dict[s
     return None
 
 
-def _match_base_url(base_url: str, providers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """The ONE ``providers:`` entry serving ``base_url``; two entries on one endpoint is ambiguous, so off."""
+def _base_url_hit(base_url: str, providers: Dict[str, Any]) -> Optional[tuple]:
+    """``(key, entry)`` of the ONE ``providers:`` entry serving ``base_url``; two on one endpoint is ambiguous."""
     target = str(base_url or "").strip().rstrip("/").lower()
     if not target:
         return None
-    hits = [e for e in providers.values() if isinstance(e, dict)
+    hits = [(k, e) for k, e in providers.items() if isinstance(e, dict)
             and str(e.get("base_url") or e.get("url") or e.get("api") or "").strip().rstrip("/").lower() == target]
     return hits[0] if len(hits) == 1 else None
+
+
+def _match_base_url(base_url: str, providers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ONE ``providers:`` entry serving ``base_url``; two entries on one endpoint is ambiguous, so off."""
+    hit = _base_url_hit(base_url, providers)
+    return hit[1] if hit else None
+
+
+def _base_url_identity(provider: Optional[str], requested_provider: Optional[str],
+                       base_url: Optional[str]) -> Optional[str]:
+    """The ``providers:`` key a bare ``custom`` route matched by ``base_url`` (Prism 23aed6f7f612)."""
+    ids = _route_identities(provider, requested_provider)
+    if not base_url or not any(i.lower() == "custom" for i in ids):
+        return None
+    try:
+        hit = _base_url_hit(base_url, _load_providers_config())
+    except Exception:  # noqa: BLE001
+        return None
+    return str(hit[0]) if hit else None
 
 
 def _provider_entry(provider: Optional[str], requested_provider: Optional[str] = None,
@@ -172,7 +191,8 @@ def resolve_preserve_thinking(provider: Optional[str], requested_provider: Optio
         window = _window(entry.get("preserve_thinking_window")) if enabled else WINDOW_LATEST
         source = "config"
     else:
-        profile = _lane_profile(identities)
+        url_key = _base_url_identity(provider, requested_provider, base_url)
+        profile = _lane_profile(identities + ([url_key] if url_key else []))
         enabled = (profile is not None and getattr(profile, "preserve_thinking", None) is True
                    and getattr(profile, "api_mode", None) == "anthropic_messages")
         if enabled:
