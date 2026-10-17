@@ -6272,6 +6272,8 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+    from hermes_cli.kanban_db_workspace import refuse_runtime_tree_workspace
+    refuse_runtime_tree_workspace(workspace_kind, workspace_path)
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):

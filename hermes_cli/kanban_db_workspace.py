@@ -33,6 +33,29 @@ def _path_key(path: Path | str | None) -> str:
     """
     return unicodedata.normalize("NFC", str(path)) if path is not None else ""
 
+RUNTIME_TREE_WORKSPACE_ERROR = (
+    "workspace under the live runtime tree; use ~/.hermes/hermes-agent (fork/main)"
+)
+
+
+def refuse_runtime_tree_workspace(kind: Optional[str], path: Path | str | None) -> None:
+    """Refuse a ``dir``/``worktree`` workspace at or under the live runtime tree.
+
+    ``<hermes-root>/runtime/hermes-agent`` is the import path of every running
+    gateway; a worktree anchored there shares its refs and index dir, and a
+    worker cwd inside it is one mistake from a write into live code (10-16,
+    t_3b6e4e6b / t_91b6a4c4). Realpaths on both sides so a symlink cannot alias in.
+    """
+    if kind not in ("dir", "worktree") or not path:
+        return
+    from hermes_constants import get_default_hermes_root
+
+    runtime = (get_default_hermes_root() / "runtime" / "hermes-agent").resolve(strict=False)
+    target = Path(path).expanduser().resolve(strict=False)
+    if target == runtime or runtime in target.parents:
+        raise ValueError(RUNTIME_TREE_WORKSPACE_ERROR)
+
+
 def canon(path: Path | str) -> str:
     """THE canonical key of a workspace path (spec §2.4.1): ``~`` expanded,
     resolved without requiring existence, NFC. ``~/x`` on an unspawned card
@@ -928,6 +951,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 "--workspace worktree:<absolute-repo-path>."
             )
         anchor = Path(board_default).expanduser()
+        refuse_runtime_tree_workspace("worktree", anchor)
         if not anchor.is_absolute():
             raise ValueError(
                 f"board {board_slug!r} default_workdir {board_default!r} is not "
@@ -942,6 +966,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         return _anchored_worktree(repo_root, task.id, branch_name)
 
     requested = Path(task.workspace_path).expanduser()
+    refuse_runtime_tree_workspace("worktree", requested)
     if not requested.is_absolute():
         raise ValueError(
             f"task {task.id} has non-absolute worktree path "
@@ -1035,6 +1060,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         if not task.workspace_path:
             raise ValueError(f"task {task.id} has workspace_kind=dir but no workspace_path")
         p = Path(task.workspace_path).expanduser()
+        refuse_runtime_tree_workspace("dir", p)
         if not p.is_absolute():
             raise ValueError(
                 f"task {task.id} has non-absolute workspace_path "
