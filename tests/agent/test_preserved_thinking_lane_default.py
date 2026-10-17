@@ -86,6 +86,11 @@ def test_custom_slug_resolves_the_lane(lane):
     assert pt.preserve_thinking_enabled("custom") is False
 
 
+def test_dedicated_custom_registration_is_honoured(lane):
+    lane["registry"]["custom:relay"] = _profile(preserve_thinking=True)
+    assert pt.resolve_preserve_thinking("custom:relay") == (True, "latest", "lane")
+
+
 def test_source_logged_once_per_route_at_info(lane, caplog):
     lane["registry"]["claude-alr"] = _profile(preserve_thinking=True)
     with caplog.at_level(logging.INFO, logger=pt.logger.name):

@@ -129,8 +129,13 @@ def _lane_profile(identities: list) -> Any:
         from providers import get_provider_profile
     except Exception:  # noqa: BLE001 — no registry is no lane, never a dead turn
         return None
+    # A dedicated ``custom:<name>`` registration wins; the bare name is the fallback (Prism 90807bf79dbc).
+    names = []
     for ident in identities:
-        name = ident[len("custom:"):] if ident.lower().startswith("custom:") else ident
+        names.append(ident)
+        if ident.lower().startswith("custom:"):
+            names.append(ident[len("custom:"):])
+    for name in names:
         if not name or name.lower() == "custom":
             continue
         try:
