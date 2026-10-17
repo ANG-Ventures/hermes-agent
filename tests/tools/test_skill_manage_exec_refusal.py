@@ -225,10 +225,11 @@ def test_s12_symlink_escaping_skills_shared_refused(tmp_path):
         outside.write_text("orig\n")
         (d / "references").mkdir()
         (d / "references" / "x.md").symlink_to(outside)
+        g = smt._exec_tier_refusal(d, d / "references" / "x.md", "write_file")
+        assert g is not None and "symlink escapes the skills tree" in g["error"], g
         res = _ops([{"action": "write_file", "name": "probe", "file_path": "references/x.md",
                      "file_content": "pwned\n"}])
         assert res["success"] is False, res
-        assert "symlink escapes the skills tree" in res["error"], res["error"]
         assert outside.read_text() == "orig\n"
 
 
@@ -239,9 +240,9 @@ def test_s13_symlink_to_root_scripts_lib_refused(tmp_path):
         real.write_text("print('live')\n")
         (d / "references").mkdir()
         (d / "references" / "x.md").symlink_to(real)
-        assert smt._exec_tier_refusal(d, d / "references" / "x.md", "write_file") is not None
+        g = smt._exec_tier_refusal(d, d / "references" / "x.md", "write_file")
+        assert g is not None and "symlink escapes the skills tree" in g["error"], g
         res = _ops([{"action": "patch", "name": "probe", "file_path": "references/x.md",
                      "old_string": "print('live')", "new_string": "print('pwned')"}])
         assert res["success"] is False, res
-        assert "symlink escapes the skills tree" in res["error"], res["error"]
         assert real.read_text() == "print('live')\n"
