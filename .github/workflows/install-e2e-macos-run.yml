@@ -191,9 +191,24 @@ jobs:
           if [ -f "${{ runner.temp }}/e2e-logs/recording.mkv" ]; then
             ffmpeg -y -hide_banner -loglevel error -i "${{ runner.temp }}/e2e-logs/recording.mkv" \
               -c copy "${{ runner.temp }}/e2e-logs/recording.mp4"
+            # Same stream; playback.html prefers the mp4. set -e keeps the mkv when the remux fails.
+            rm -f "${{ runner.temp }}/e2e-logs/recording.mkv"
           fi
 
       # Artifact names cannot contain '/'; install-ref may be a full ref.
+      # Evidence policy (Ace 2026-10-16, t_fccbe101): the recording is kept ONLY when the leg failed.
+      # A green leg's proof is the passing assertions; its 30-60 MB video was 95% of the artifact bytes
+      # that hit the org quota. Text logs are always kept (7 d). job.status is the leg's own outcome.
+      - name: Trim evidence on success (keep the recording only for a failed leg)
+        if: ${{ always() && job.status == 'success' }}
+        run: |
+          set -euo pipefail
+          d="${{ runner.temp }}/e2e-logs"
+          if [ -d "$d" ]; then
+            find "$d" -type f \( -name 'recording.mp4' -o -name 'recording.mkv' -o -name '*.png' \) -print -delete | sed 's/^/trimmed: /'
+            echo "leg passed: recording dropped; text logs kept" > "$d/evidence-policy.txt"
+          fi
+
       - name: Build artifact name
         id: artifact
         if: always()
@@ -202,11 +217,13 @@ jobs:
 
       - name: Upload logs
         if: always()
+        # Evidence, not a deliverable: an artifact-quota hit must not red a leg that passed.
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ${{ runner.temp }}/e2e-logs
-          retention-days: 14
+          retention-days: 7
           if-no-files-found: ignore
 
   # ---- arm 3: the real signed bundle pair, in-app update ------------------
@@ -280,6 +297,21 @@ jobs:
           if [ -f "${{ runner.temp }}/e2e-logs/recording.mkv" ]; then
             ffmpeg -y -hide_banner -loglevel error -i "${{ runner.temp }}/e2e-logs/recording.mkv" \
               -c copy "${{ runner.temp }}/e2e-logs/recording.mp4"
+            # Same stream; playback.html prefers the mp4. set -e keeps the mkv when the remux fails.
+            rm -f "${{ runner.temp }}/e2e-logs/recording.mkv"
+          fi
+
+      # Evidence policy (Ace 2026-10-16, t_fccbe101): the recording is kept ONLY when the leg failed.
+      # A green leg's proof is the passing assertions; its 30-60 MB video was 95% of the artifact bytes
+      # that hit the org quota. Text logs are always kept (7 d). job.status is the leg's own outcome.
+      - name: Trim evidence on success (keep the recording only for a failed leg)
+        if: ${{ always() && job.status == 'success' }}
+        run: |
+          set -euo pipefail
+          d="${{ runner.temp }}/e2e-logs"
+          if [ -d "$d" ]; then
+            find "$d" -type f \( -name 'recording.mp4' -o -name 'recording.mkv' -o -name '*.png' \) -print -delete | sed 's/^/trimmed: /'
+            echo "leg passed: recording dropped; text logs kept" > "$d/evidence-policy.txt"
           fi
 
       - name: Build artifact name
@@ -290,9 +322,11 @@ jobs:
 
       - name: Upload logs
         if: always()
+        # Evidence, not a deliverable: an artifact-quota hit must not red a leg that passed.
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: ${{ runner.temp }}/e2e-logs
-          retention-days: 14
+          retention-days: 7
           if-no-files-found: ignore

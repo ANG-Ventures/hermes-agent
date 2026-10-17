@@ -272,3 +272,25 @@ re-syncs it), but it may not delete or modify the user's own durable state —
 ## Artifacts
 
 Each leg uploads its logs as an artifact. Every leg also records the screen for its whole run: the composite action `.github/actions/e2e-screen-record` records with the OS's capture backend (x11grab on linux, gdigrab on windows, avfoundation on macos), and fails the leg if the recording is missing or has zero frames. ffmpeg itself comes from the PM toolchain — jobs pass `packages: ffmpeg` to `actions/setup-pm`, which installs the locked, sha256-pinned build (native per-OS, including win32-arm64) and puts it on `PATH`; the action only verifies it is there. Linux runners have no display, so the action starts `Xvfb :99` first and exports `DISPLAY` for every later step — the app under test and the recorder share that display. The windows GUI leg also uploads screenshots and the update result file. Get them with `gh run download <run-id>`.
+
+### Evidence retention policy (2026-10-16)
+
+What a leg uploads depends on how it ended. The rule, decided after the org hit GitHub's artifact-storage quota
+(every PR in the org went red on `upload-artifact` after its tests had passed; install-e2e bundles were ~15 GB at
+14-day retention, 95% of it video and per-3-s PNG frames of *passing* installs):
+
+| leg outcome | kept in the artifact | retention |
+|---|---|---|
+| **passed** | text logs, transcripts, `shas.json`, update-result JSON, `evidence-policy.txt` ("recording dropped") | 7 d |
+| **failed / known-failure** | all of the above **plus** `recording.mp4` (or `.mkv` if the remux failed) and any frames the recorder left | 7 d |
+
+Rationale: a green leg's proof is the passing assertions; its 30–60 MB video is dead weight and, kept for everyone,
+makes "a recording exists" noise instead of signal. The trim step runs `if: always() && job.status == 'success'`
+(and, on the windows GUI leg, only when `known_failure` is empty), so a failing leg is never trimmed. Every upload
+step is `continue-on-error: true` — evidence, not a deliverable — so an upload failure (quota, outage) can never red
+a leg that passed; the leg player (`playback.html`) therefore only applies to failed legs, which is where it is used.
+Per-run report inputs (`install-e2e-player`, `install-e2e-known-*`) stay at 2 d: the report job reads them minutes later.
+
+Org-wide storage is watched weekly (`hermes-home scripts/gh-billing-readout.py`, sku "Actions storage": top repos
+by GB-day, page at > 20 GB-day per repo or > 40 org-wide). If you add an upload, default to `retention-days: 2`,
+`continue-on-error: true`, and no binaries in a bundle named "logs".
