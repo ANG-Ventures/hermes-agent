@@ -148,6 +148,7 @@ jobs:
           name: Hermes-Setup-windows-x64
           path: ${{ runner.temp }}/out/Hermes-Setup.exe
           if-no-files-found: error
+          retention-days: 7   # hand-dispatched signed builds, no other copy (t_82cb42f5); the 90-day default held ~GBs
 
   macos-arm64:
     name: Hermes-Setup.dmg (macos arm64, signed + notarized)
@@ -255,3 +256,4 @@ jobs:
           name: Hermes-Setup-macos-arm64
           path: ${{ runner.temp }}/out/Hermes-Setup.dmg
           if-no-files-found: error
+          retention-days: 7   # hand-dispatched signed builds, no other copy (t_82cb42f5); the 90-day default held ~GBs

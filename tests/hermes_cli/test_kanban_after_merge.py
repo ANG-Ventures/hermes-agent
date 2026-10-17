@@ -213,3 +213,65 @@ def test_cli_link_prints_gate(kanban_home):
     assert f"Gate: {child} will not start until {parent} is DONE" in out
     out = kanban.run_slash(f"link {parent} {other} --kind after-merge")
     assert f"Gate: {other} will not start until {parent}'s PR is MERGED" in out
+
+
+# Prism 50dc72190d84: a MERGED cached from one oracle is invisible to a different oracle.
+def test_sandbox_merged_does_not_leak_to_live_oracle():
+    if True:
+        import hermes_cli.kanban_after_merge as am
+        am._CACHE.clear()
+        ref = type("R", (), {"repo": "ANG-Ventures/x", "number": 7})()
+        sandbox = lambda repo, n: {"state": "MERGED"}
+        live_calls = []
+
+        def live(repo, n):
+            live_calls.append((repo, n))
+            return {"state": "OPEN"}
+
+        assert am._state(ref, sandbox, 1000.0, [10]) == "MERGED"
+        # the live oracle must be consulted, and must see OPEN, not the sandbox's MERGED
+        assert am._state(ref, live, 1000.0, [10]) == "OPEN"
+        assert live_calls == [("ANG-Ventures/x", 7)]
+
+def test_same_oracle_still_caches_merged_for_good():
+    if True:
+        import hermes_cli.kanban_after_merge as am
+        am._CACHE.clear()
+        ref = type("R", (), {"repo": "ANG-Ventures/x", "number": 8})()
+        calls = []
+
+        def live(repo, n):
+            calls.append(1)
+            return {"state": "MERGED"}
+
+        assert am._state(ref, live, 1000.0, [10]) == "MERGED"
+        assert am._state(ref, live, 99999.0, [10]) == "MERGED"
+        assert len(calls) == 1
+
+
+# Prism 7aaa3acdd804: id() of a freed oracle is recycled. A sandbox oracle's MERGED, cached and then the oracle
+# dropped, must not be inherited by a new live oracle that lands on the same id.
+def test_freed_sandbox_oracle_id_reuse_does_not_leak_merged():
+    import gc
+
+    am._CACHE.clear()
+    ref = type("R", (), {"repo": "ANG-Ventures/x", "number": 7})()
+
+    def make(state, calls):
+        def q(repo, n):
+            calls.append((repo, n))
+            return {"state": state}
+        return q
+
+    sandbox = make("MERGED", [])
+    assert am._state(ref, sandbox, 1000.0, [10]) == "MERGED"
+    del sandbox
+    gc.collect()
+    # CPython hands the freed slot to the next same-sized object, so some of these reuse the sandbox's id.
+    for _ in range(50):
+        calls: list = []
+        live = make("OPEN", calls)
+        assert am._state(ref, live, 1001.0, [10]) == "OPEN"
+        assert calls == [("ANG-Ventures/x", 7)]
+        del live
+        gc.collect()

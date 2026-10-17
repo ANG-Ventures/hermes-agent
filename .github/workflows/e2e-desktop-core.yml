@@ -28,7 +28,7 @@ jobs:
     name: Desktop core E2E (Linux)
     # Fork: no ubuntu-latest-32-core pool in this org; route like every other fork job.
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    timeout-minutes: 30
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
 
@@ -90,6 +90,7 @@ jobs:
           path: |
             apps/desktop/test-results/core
             apps/desktop/playwright-report/core
-          retention-days: 14
+          retention-days: 3  # was 14 (t_82cb42f5: org artifact-storage quota hit 2026-10-17); nothing reads these past the run
+
           overwrite: true
           if-no-files-found: ignore

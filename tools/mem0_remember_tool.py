@@ -119,7 +119,11 @@ def mem0_remember_tool(fact: str, supersedes: str = "") -> str:
 
 registry.register(
     name="mem0_remember",
-    toolset="memory_write",
+    # "memory", not a toolset of its own: a saved platform_toolsets list (every gateway platform)
+    # resolves to toolset KEYS, and no list ever carried "memory_write", so the tool was never in
+    # tools[] outside the hermes-cli composite. Riding "memory" also keeps disabling memory the
+    # one switch that turns this off.
+    toolset="memory",
     schema=REMEMBER_SCHEMA,
     handler=lambda args, **kw: mem0_remember_tool(args.get("fact", ""), args.get("supersedes", "")),
     check_fn=check_mem0_remember_requirements,

@@ -62,7 +62,7 @@ jobs:
   generate-patch:
     name: Generate eslint --fix patch
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    timeout-minutes: 5
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     outputs:
       has-fixes: ${{ steps.produce-patch.outputs.has-fixes }}
     # No permissions override → inherits workflow-level contents: read.
@@ -139,7 +139,7 @@ jobs:
     # avoids a redundant checkout/download, and keeps the job graph honest.
     if: needs.generate-patch.outputs.has-fixes == 'true'
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    timeout-minutes: 15
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     environment: trusted-automation
     permissions:
       contents: write # needed to push to bot/js-autofix

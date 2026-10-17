@@ -143,6 +143,28 @@ def test_knob_on_tool_is_resident_in_fork_tools_whitelisted_and_writes(mem0_home
     assert fake.rows[0]["metadata"]["write_origin"] == "background_review"
 
 
+def test_knob_on_tool_resident_under_an_explicit_platform_toolsets_list(mem0_home, tmp_path):
+    """A gateway resolves a SAVED ``platform_toolsets`` list (``memory``, ``skills``, ...) to
+    toolset keys, not the ``hermes-<platform>`` composite. mem0_remember must ride one of those
+    keys, or the parent's tools[] never holds it and the review fork cannot see it (the
+    2026-10-05..10-15 dark period: 2 ledger rows ever)."""
+    mem0_home(knob=True)
+    with (tmp_path / "config.yaml").open("a") as fh:
+        fh.write("platform_toolsets:\n  discord:\n    - memory\n    - skills\n    - terminal\n")
+    from hermes_cli.config import load_config
+    from hermes_cli.tools_config import _get_platform_tools
+    from model_tools import get_tool_definitions
+
+    enabled = sorted(_get_platform_tools(load_config(), "discord"))
+    parent_tools = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
+    assert "mem0_remember" in _names(parent_tools)
+
+    fork = _fork_from(parent_tools)
+    from agent.background_review import _review_tool_whitelist
+    whitelist, _ = _review_tool_whitelist(fork, None, review_memory=True)
+    assert "mem0_remember" in whitelist
+
+
 def test_knob_off_tool_absent_everywhere(mem0_home):
     mem0_home(knob=False)
     parent_tools = _parent_tools()

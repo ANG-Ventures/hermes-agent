@@ -147,17 +147,28 @@ jobs:
         with:
           mode: stop
           output: ${{ runner.temp }}/hermes-bundled-update-recording.mkv
+      # Evidence policy (Ace 2026-10-16, t_fccbe101): recording kept ONLY for a failed leg; logs always, 7 d.
+      - name: Trim evidence on success (keep the recording only for a failed leg)
+        if: ${{ always() && job.status == 'success' }}
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath "${{ runner.temp }}/hermes-bundled-update-recording.mkv" -Force -ErrorAction SilentlyContinue
+          Get-ChildItem -LiteralPath "${{ runner.temp }}/hermes-bundled-update/proof" -Recurse -Include *.png -ErrorAction SilentlyContinue | Remove-Item -Force
+          "leg passed: recording dropped; text logs kept" | Set-Content "${{ runner.temp }}/hermes-bundled-update/evidence-policy.txt"
       - name: Upload native acceptance evidence
         if: always()
+        # Evidence, not a deliverable: an artifact-quota hit must not red a leg that passed.
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: install-e2e-logs-${{ inputs.leg-id }}-bundle-${{ inputs.bundle-arch }}
           path: |
             ${{ runner.temp }}/hermes-bundled-update/proof/
             ${{ runner.temp }}/hermes-bundled-update/home/logs/
+            ${{ runner.temp }}/hermes-bundled-update/evidence-policy.txt
             ${{ runner.temp }}/hermes-bundled-update-recording.mkv
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
   e2e:
     # Short static name on purpose: name expressions render UNEXPANDED on
     # skipped jobs.
@@ -298,7 +309,8 @@ jobs:
           name: install-e2e-known-${{ steps.update.outputs.known_failure }}--${{ inputs.leg-id }}
           path: gui-e2e-proof/known-failure.json
           if-no-files-found: error
-          retention-days: 14
+          # Read by this run's report job only (generate-e2e-matrix.mjs).
+          retention-days: 2
 
       - name: Stop screen recording
         if: always()
@@ -314,6 +326,10 @@ jobs:
           $mkv = "$env:GITHUB_WORKSPACE\gui-e2e-proof\recording.mkv"
           if (Test-Path -LiteralPath $mkv) {
             & ffmpeg -y -hide_banner -loglevel error -i $mkv -c copy "$env:GITHUB_WORKSPACE\gui-e2e-proof\recording.mp4"
+            # The mp4 is the same stream (playback.html prefers it); keep the mkv only if the remux failed.
+            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath "$env:GITHUB_WORKSPACE\gui-e2e-proof\recording.mp4")) {
+              Remove-Item -LiteralPath $mkv -Force
+            }
           }
 
       - name: Collect proof + logs
@@ -333,12 +349,26 @@ jobs:
           )) {
             if (Test-Path $pair.src) { Copy-Item $pair.src (Join-Path $out $pair.dst) -Recurse -Force }
           }
+          # Evidence policy (Ace 2026-10-16, t_fccbe101): a FAILED (or known-failure) leg keeps EVERYTHING the
+          # recorder and the frame capture produced -- a recording that stopped early must never cost the frames
+          # taken after it (Prism 81c86c40a1ac). A green leg keeps no video and no frames: its proof is the
+          # passing assertions, and the 45 MB of frames + 30-60 MB of video per green leg is what hit the org quota.
+          $mp4 = Join-Path $out "recording.mp4"
+          if ("${{ job.status }}" -eq "success" -and "${{ steps.update.outputs.known_failure }}" -eq "") {
+            Remove-Item -LiteralPath $mp4 -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath (Join-Path $out "recording.mkv") -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -LiteralPath $out -Directory -Recurse -Filter "desktop-frames" -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            "leg passed: recording dropped; text logs kept" | Set-Content (Join-Path $out "evidence-policy.txt")
+          }
 
       - name: Upload proof + logs
         if: always()
+        # Evidence, not a deliverable: an artifact-quota hit must not red a leg that passed.
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: install-e2e-logs-${{ inputs.leg-id }}
           path: gui-e2e-proof
-          retention-days: 14
+          retention-days: 7
           if-no-files-found: ignore

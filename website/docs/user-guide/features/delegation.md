@@ -274,6 +274,8 @@ delegation:
 
 If omitted, subagents use the same model as the parent.
 
+**`fallback_providers: auto`:** set `delegation.fallback_providers: auto` to give subagents the parent's fallback lanes without hand-writing a chain. At spawn time Hermes takes the parent's effective chain, keeps each rung's provider, endpoint and credentials, and swaps in the subagent's own model (`delegation.model`, else the parent model) on every rung from the same model vendor. A rung from another vendor (for example a `gpt-*` terminal rung behind `claude-*` rungs) keeps its model, so the chain can still leave the vendor. A rung that would retry the subagent's own primary route is dropped, and duplicate routes are collapsed. An unpinned subagent gets the parent chain unchanged. If the parent has no chain, the subagent runs without fallback and one warning is logged. `auto` is resolved per spawn and is never written back to config. It is not the same as `{provider: auto}` in `auxiliary.<task>.fallback_chain`: that entry swaps in the session's main model, while this one keeps the parent's lanes and puts the subagent's model on them.
+
 ### Cost strategy: frontier planner, inexpensive workers
 
 Decomposing a problem into well-specified subtasks takes frontier-level judgment; executing a subtask that already comes with a clear goal, full context, and an output contract usually doesn't. Meanwhile the children are where the tokens go — a parallel batch of subagents typically burns the large majority of a run's total tokens, so the worker model is where the cost actually lives. Pinning `delegation.model` to an inexpensive model while your main session stays on a frontier model keeps the planning quality where it matters and cuts spend where the volume is:

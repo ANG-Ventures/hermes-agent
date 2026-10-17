@@ -328,6 +328,22 @@ model:
 #     models:
 #       gpt-5.4:
 #         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
+#
+# ``preserve_thinking`` (default false): keep Anthropic's signed thinking blocks
+# on replay through a relay that sits IN FRONT of api.anthropic.com (a pool /
+# proxy that validates the same signatures). Non-anthropic.com endpoints strip
+# every thinking block by default; this flag treats the provider as first-party
+# for that one decision and sends the ``thinking-binding-controls-2026-08-01``
+# beta with ``thinking.block_binding.prefix_mismatch_behavior: drop_block``, so a
+# history edit drops one block (logged as ``input_transformations``) instead of
+# 400ing the turn. Only set it on a provider you KNOW forwards to Anthropic
+# unchanged; a compatible endpoint that is not Anthropic will reject the blocks.
+# ``preserve_thinking_window`` (``latest`` default | ``contiguous``) widens the
+# replay from the latest assistant turn to every assistant turn.
+#
+#   my-anthropic-relay:
+#     preserve_thinking: true
+#     preserve_thinking_window: latest
 
 # =============================================================================
 # Unified Timeouts (operation deadlines)

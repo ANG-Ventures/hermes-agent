@@ -37,7 +37,7 @@ jobs:
   diff:
     name: package-lock.json semantic diff
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    timeout-minutes: 5
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     outputs:
       changed: ${{ steps.diff.outputs.changed }}
       review_status: ${{ steps.emit-status.outputs.review_status }}

@@ -233,6 +233,7 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
             ('+', 'last_turn_cache_write_tokens_unknown', 'last_turn_cache_read_tokens_unknown'),
             ('+', 'last_turn_usage_unknown', 'last_turn_cache_write_tokens_unknown'),
         )),
+        ('36 2026-10-16T08:30Z t_91b6a4c4', (('+', 'system_prompt_static_len', 'tool_names'),)),
         ),
     ),
     "messages": _TableHistory(
