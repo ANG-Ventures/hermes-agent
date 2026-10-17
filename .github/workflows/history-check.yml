@@ -26,7 +26,7 @@ permissions:
 jobs:
   check-common-ancestor:
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    timeout-minutes: 10
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     outputs:
       review_status: ${{ steps.merge-base-check.outputs.review_status }}
     steps:

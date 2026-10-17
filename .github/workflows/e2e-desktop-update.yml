@@ -30,7 +30,7 @@ jobs:
     name: Desktop install/update E2E (Linux, ${{ matrix.cell }})
     # Fork: no ubuntu-latest-32-core pool in this org; route like every other fork job.
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    timeout-minutes: 30
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     # Advisory until stable on CI (see ci.yaml): a red shard does not fail the caller.
     continue-on-error: true
     strategy:
