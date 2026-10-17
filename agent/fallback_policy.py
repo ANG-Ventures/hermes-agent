@@ -1478,9 +1478,34 @@ def cause_rider_with_floors(row: Mapping[str, Any], *, seat_names: bool = True,
     return text, tuple(hit)
 
 
+def _fable_allowance_tail(row: Mapping[str, Any],
+                          tz: Optional[_dt.tzinfo]) -> Optional[str]:
+    """``Fable weekly allowance (7d_oi) exhausted on N/M seats; earliest reset
+    <local Day HH:MM>`` when the relay stated the shared-snapshot allowance
+    (``x-pool-fable-allowance``) on a model-quota failure and at least one
+    seat is exhausted. Nothing about lanes or seats: the header already names
+    the destination (Ace 2026-10-17 11:58, claude-pool t_c61937cd)."""
+    fa = row.get("fable_allowance")
+    if (row.get("trigger_class") not in ("quota_model", "quota_seat")
+            or not isinstance(fa, Mapping)):
+        return None
+    n, m = fa.get("exhausted"), fa.get("of")
+    if not isinstance(n, int) or not isinstance(m, int) or n <= 0 or m <= 0:
+        return None
+    text = f"Fable weekly allowance (7d_oi) exhausted on {n}/{m} seats"
+    reset = fa.get("earliest_reset")
+    if isinstance(reset, (int, float)) and not isinstance(reset, bool):
+        at = _hms(reset, tz)
+        text += f"; earliest reset {at.strftime('%a %H:%M')}"
+    return text
+
+
 def _cause_body(row: Mapping[str, Any], seat_names: bool,
                 tz: Optional[_dt.tzinfo]) -> Tuple[str, Tuple[str, ...]]:
     prefix, window = _count_window(row, tz)
+    fable_tail = _fable_allowance_tail(row, tz)
+    if fable_tail is not None:
+        return f"{prefix}{fable_tail}, {window}", ()
     if row.get("trigger_class") == NO_FIRST_BYTE_BUDGET_CLASS:
         return f"{prefix}{_budget_cut_body(row, seat_names)}, {window}", ()
     _fl = row.get("floor") if isinstance(row.get("floor"), Mapping) else {}

@@ -1057,6 +1057,7 @@ def stash_api_error(agent: Any, api_error: BaseException,
                                  "x-pool-unreachable",
                                  "x-pool-route-id", "retry-after",
                                  "x-relay-eligible", "x-pool-other-eligible",
+                                 "x-pool-fable-allowance",
                                  "x-ratelimit-limit", "x-ratelimit-remaining",
                                  "x-ratelimit-reset")},
             "body": body if isinstance(body, dict) else None,
@@ -1182,6 +1183,27 @@ def relay_hop_seat(headers: Any, body: Any) -> Tuple[Optional[str], Optional[str
     except Exception:  # noqa: BLE001
         return None, None
     return hop, seat
+
+
+def fable_allowance(headers: Any) -> Optional[dict]:
+    """The relay's shared-snapshot Fable allowance (``x-pool-fable-allowance:
+    <exhausted>/<of>; earliest_reset=<iso|none>``, claude-pool t_c61937cd) as
+    ``{exhausted, of, earliest_reset}`` (epoch or None), else None. Junk ->
+    None. Never raises."""
+    try:
+        v = (_lower_headers(headers).get("x-pool-fable-allowance") or "").strip()
+        counts, _, rest = v.partition(";")
+        n, _, m = counts.strip().partition("/")
+        if not (n.isdigit() and m.isdigit()) or int(m) <= 0:
+            return None
+        reset = None
+        key, _, val = rest.strip().partition("=")
+        if key == "earliest_reset" and val and val != "none":
+            import datetime as _d
+            reset = _d.datetime.fromisoformat(val.replace("Z", "+00:00")).timestamp()
+        return {"exhausted": int(n), "of": int(m), "earliest_reset": reset}
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def pool_eligible(headers: Any) -> Optional[int]:
@@ -1401,6 +1423,9 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
         elig = pool_eligible(headers)
         if elig is not None and "pool_eligible" not in row:
             row["pool_eligible"] = elig
+        fa = fable_allowance(headers)
+        if fa is not None and "fable_allowance" not in row:
+            row["fable_allowance"] = fa   # notice only, not a ledger column
         if pending and pending.get("elapsed_s") is not None:
             row.setdefault("elapsed_s", pending.get("elapsed_s"))
         if not r_seat:
