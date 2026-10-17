@@ -2776,6 +2776,18 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_pause_hold as kph
+    try:
+        return _cmd_claim_unheld(args)
+    except kph.PauseHeld as exc:
+        # Fleet pause layer 2 (t_133d6efd): the opener refused before the CAS; nothing was written.
+        with kb.connect_closing() as conn:
+            kph.record_refusal(conn, exc)
+        return _err(f"cannot claim {args.task_id}: held by fleet-pause {exc.manifest_id} (host {exc.host}): "
+                    "resume or abandon first", rc=2)
+
+
+def _cmd_claim_unheld(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if args.review:
             session_ref = _operator_review_session_ref()

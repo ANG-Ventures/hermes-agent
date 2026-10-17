@@ -3910,6 +3910,17 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _pause_held_at_claim(conn, result, exc) -> None:
+    """A run opener refused a paused host's card (fleet pause layer 2, t_133d6efd). In a correct build layer 1 held
+    it first, so reaching this means a route entry bypassed ``gate_rows``: record the wait with ``stage=claim``, the
+    refusal event in its own txn (the opener's rolled back), and say so loudly."""
+    from hermes_cli import kanban_pause_hold as _kph
+    _kb._log.warning("kanban dispatch: pause_hold reached the claim for %s: a route entry bypassed gate_rows",
+                     exc.task_id)
+    result.placement_waits[exc.task_id] = exc.reason
+    _kph.record_refusal(conn, exc)
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -3984,7 +3995,12 @@ def _dispatch_lane_task(
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    from hermes_cli import kanban_pause_hold as _kph
+    try:
+        claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    except _kph.PauseHeld as exc:
+        _pause_held_at_claim(conn, result, exc)
+        return False
     if claimed is None:
         return False
     try:
@@ -5841,6 +5857,11 @@ def _dispatch_once_locked(
                     caps=_capability_tick(_unplanned_pool),
                 )
                 row_route[r["id"]] = _origin_route or ('local', None)
+    # Fleet pause hold, layer 1 (t_133d6efd, spec §5.8): after BOTH routing branches, before any spawn.
+    from hermes_cli import kanban_pause_hold as _kph
+    _pause_cache: dict = {}
+    _kph.gate_rows(conn, ready_rows, result, row_route, dry_run, _pause_cache, lane="ready",
+                   planned=spillover is not None, entry=entry)
     # Browser Sandboxes resolution gate (t_42728faf): after every route is known, before any spawn.
     _browser_gate(conn, ready_rows, result, row_route, dry_run, default_assignee)
     # Review rows are enumerated up front (not after the ready loop) so the
@@ -5857,6 +5878,8 @@ def _dispatch_once_locked(
             conn, review_rows, result, dry_run=dry_run,
         )
         review_rows = _browser_hold_review_rows(conn, review_rows, result, dry_run)
+        review_rows = _kph.gate_rows(conn, review_rows, result, row_route, dry_run, _pause_cache,
+                                     lane="review", entry=entry)
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work
@@ -6714,7 +6737,11 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = _kb.claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        try:
+            claimed = _kb.claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        except _kph.PauseHeld as exc:
+            _pause_held_at_claim(conn, result, exc)
+            claimed = None
         if claimed is None:
             if placed_host is not None:
                 spillover.release(placed_host, _rid)
@@ -7090,7 +7117,13 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = _kb.claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        try:
+            claimed = _kb.claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        except _kph.PauseHeld as exc:
+            _pause_held_at_claim(conn, result, exc)
+            if _review_origin_host is not None:
+                spillover.release(_review_origin_host, getattr(spillover, "last_reservation", None))
+            continue
         if claimed is None:
             continue
         # Review spawns are workers too: a capacity window that re-routes the
