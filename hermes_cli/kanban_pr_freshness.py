@@ -19,6 +19,10 @@ BEFORE the card leaves the worker. Card t_14b81673 (2026-09-25):
     non-milestone card is handed to ``scripts/fleet-merge.sh`` (the only
     sanctioned merge lane; it applies the FleetReview gate, attribution and
     SHA-bound arm itself). Spawned detached: the handoff never waits on it.
+    Pipeline v2 (t_7dbacbbc): when ``config/merge-gate-profile.json`` reads v2
+    for the repo (:func:`merge_gate_profile`), a red/pending/no-CI head is armed
+    too, its CI state REPORTED in the fleet-merge ``--reason`` (CI gates deploy,
+    not merge). Absent/unreadable/unknown profile = v1 = green only.
 
 Fail-OPEN everywhere except (a): a GitHub lookup error, an update-branch
 failure or a missing fleet-merge.sh is recorded and the handoff proceeds —
@@ -104,24 +108,67 @@ def _default_gh() -> Optional[GhFn]:
     return gh_api
 
 
-def _ci_green(gh: GhFn, repo: str, sha: str) -> bool:
+def _ci_report(gh: GhFn, repo: str, sha: str) -> str:
+    """'' when the head is CI-green, else a one-line description of why not (red/pending/none/unreadable)."""
     runs = gh(f"repos/{repo}/commits/{sha}/check-runs?per_page=100")
     items = (runs or {}).get("check_runs")
-    if not isinstance(items, list) or not items:
-        return False
+    if not isinstance(items, list):
+        return "check-runs unreadable"
+    if not items:
+        return "no check runs"
+    red, pending = [], []
     for run in items:
         if not isinstance(run, dict):
-            return False
-        if run.get("status") != "completed" or str(run.get("conclusion") or "") not in _GREEN:
-            return False
+            return "check-runs unreadable"
+        name = str(run.get("name") or "?")
+        if run.get("status") != "completed":
+            pending.append(name)
+        elif str(run.get("conclusion") or "") not in _GREEN:
+            red.append(name)
+    parts = []
+    if red:
+        parts.append("red: " + ", ".join(sorted(set(red))[:5]))
+    if pending:
+        parts.append("pending: " + ", ".join(sorted(set(pending))[:5]))
     status = gh(f"repos/{repo}/commits/{sha}/status")
     state = str((status or {}).get("state") or "")
     # "pending" with zero statuses is GitHub's shape for "no legacy statuses".
-    if state == "failure" or state == "error":
-        return False
-    if state == "pending" and (status or {}).get("total_count"):
-        return False
-    return True
+    if state in ("failure", "error") or (state == "pending" and (status or {}).get("total_count")):
+        parts.append(f"commit status {state}")
+    return "; ".join(parts)
+
+
+def _ci_green(gh: GhFn, repo: str, sha: str) -> bool:
+    return _ci_report(gh, repo, sha) == ""
+
+
+def merge_gate_profile(repo: str, path: Optional[str] = None) -> str:
+    """Pipeline v2 merge-gate profile for ``repo`` (t_7dbacbbc): ``"v2"`` or ``"v1"``.
+
+    Same semantics as hermes-home ``scripts/lib/merge_gate_profile.py`` (this package cannot import it): reads
+    ``<hermes root>/config/merge-gate-profile.json`` (``{"profile": "v1"|"v2", "repos": [...]}``). Absent,
+    unreadable or unknown -> v1; v2 only when the profile is v2 AND ``repo`` is listed (case-insensitive).
+    ``KANBAN_MERGE_GATE_PROFILE`` overrides the path (tests).
+    """
+    if path is None:
+        path = os.environ.get("KANBAN_MERGE_GATE_PROFILE") or ""
+        if not path:
+            try:
+                from hermes_constants import get_default_hermes_root
+                path = str(get_default_hermes_root() / "config" / "merge-gate-profile.json")
+            except Exception:  # noqa: BLE001 -- fail-safe: v1
+                return "v1"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return "v1"
+    if not isinstance(d, dict) or d.get("profile") not in ("v1", "v2"):
+        return "v1"
+    repos = d.get("repos", ["ANG-Ventures/hermes-home"])
+    if not isinstance(repos, list) or not all(isinstance(r, str) for r in repos):
+        return "v1"
+    return "v2" if d["profile"] == "v2" and repo.casefold() in {r.casefold() for r in repos} else "v1"
 
 
 def _fleet_merge_path() -> Optional[Path]:
@@ -134,18 +181,23 @@ def _fleet_merge_path() -> Optional[Path]:
     return p if p.is_file() else None
 
 
-def spawn_arm(repo: str, number: int, sha: str, task_id: str) -> Optional[str]:
-    """Hand the PR to fleet-merge.sh, detached. Returns the log path or None."""
+def spawn_arm(repo: str, number: int, sha: str, task_id: str, ci_report: str = "") -> Optional[str]:
+    """Hand the PR to fleet-merge.sh, detached. Returns the log path or None.
+
+    ``ci_report`` (t_7dbacbbc, profile v2 only): the non-green CI state, carried into ``--reason``."""
     script = _fleet_merge_path()
     if script is None:
         return None
     from hermes_constants import get_default_hermes_root
     log_dir = get_default_hermes_root() / "logs" / "handoff-automerge"
     log_path = log_dir / f"{task_id}-{repo.replace('/', '_')}-{number}.log"
+    reason = (f"handoff freshness gate: CI reported not green on head {sha[:12]} ({ci_report}; "
+              f"v2: CI gates deploy), card {task_id}") if ci_report else \
+        f"handoff freshness gate: CI green on head {sha[:12]}, card {task_id}"
     argv = [
         "bash", str(script), repo, str(number),
         "--by", "kanban-handoff/freshness-gate",
-        "--reason", f"handoff freshness gate: CI green on head {sha[:12]}, card {task_id}",
+        "--reason", reason,
         "--sha", sha, "--card", task_id,
     ]
     try:
@@ -159,7 +211,7 @@ def spawn_arm(repo: str, number: int, sha: str, task_id: str) -> Optional[str]:
     return str(log_path)
 
 
-ArmFn = Callable[[str, int, str, str], Optional[str]]
+ArmFn = Callable[..., Optional[str]]   # (repo, number, sha, task_id[, ci_report]) -> log path
 
 
 def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
@@ -243,9 +295,18 @@ def check(refs, *, task_id: str, allow_arm: bool, gh: Optional[GhFn] = None,
             continue
         if allow_arm and armable_keys is not None and key.lower() not in armable_keys:
             entry["automerge"] = "not armed: PR only mentioned, not this card's handoff PR"
-        elif allow_arm and automerge_enabled() and _ci_green(gh, ref.repo, head):
-            log = arm(ref.repo, ref.number, head, task_id)
-            entry["automerge"] = f"fleet-merge spawned ({log})" if log else "not spawned"
         elif allow_arm and automerge_enabled():
-            entry["automerge"] = "ci not green; not armed"
+            ci = _ci_report(gh, ref.repo, head)
+            if not ci:
+                log = arm(ref.repo, ref.number, head, task_id)
+                entry["automerge"] = f"fleet-merge spawned ({log})" if log else "not spawned"
+            elif ci != "check-runs unreadable" and merge_gate_profile(ref.repo) == "v2":
+                # t_7dbacbbc (pipeline v2 D1): CI gates deploy, not merge. Not green is REPORTED into the
+                # fleet-merge --reason, never a reason to skip the arm. v1: unchanged ("ci not green").
+                entry["ci_reported"] = ci
+                log = arm(ref.repo, ref.number, head, task_id, ci)
+                entry["automerge"] = (f"fleet-merge spawned, CI reported not green ({log})" if log
+                                      else "not spawned")
+            else:
+                entry["automerge"] = "ci not green; not armed"
     return report
