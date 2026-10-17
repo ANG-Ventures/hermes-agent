@@ -138,11 +138,11 @@ def test_d8_validator_accepts_null_list_empty_and_auto(value):
 
 @pytest.mark.parametrize("value", [
     "inherit", "parent", 1, True,
-    {"provider": "custom", "model": "m", "api_key": "sk-canary-SECRET-7731"},
+    {"provider": "custom", "model": "m", "api_key": "CANARY_SECRET_MUST_NOT_ECHO"},
 ])
 def test_d8_validator_refuses_other_shapes_without_echoing_them(value):
     issues = _fallback_issues(value)
     assert len(issues) == 1 and issues[0].severity == "error"
     assert "'auto'" in issues[0].message
     text = issues[0].message + issues[0].hint
-    assert "sk-canary-SECRET-7731" not in text and repr(value) not in text
+    assert "CANARY_SECRET_MUST_NOT_ECHO" not in text and repr(value) not in text
