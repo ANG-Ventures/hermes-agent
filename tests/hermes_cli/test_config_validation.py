@@ -223,3 +223,18 @@ class TestQuotedContainerValues:
             "plugins": {"enabled": ["a"]},
         })
         assert not [i for i in issues if "quoted string" in i.message]
+
+
+class TestDelegationFallbackProvidersValidation:
+    """delegation.fallback_providers accepts null, a list, [] or the scalar 'auto'."""
+
+    @pytest.mark.parametrize("value", [None, [], [{"provider": "p", "model": "m"}], "auto", " AUTO "])
+    def test_accepted_shapes_raise_nothing(self, value):
+        issues = validate_config_structure({"delegation": {"fallback_providers": value}})
+        assert not [i for i in issues if "delegation.fallback_providers" in i.message]
+
+    @pytest.mark.parametrize("value", ["inherit", "parent", 1, True])
+    def test_other_scalars_are_an_error(self, value):
+        issues = validate_config_structure({"delegation": {"fallback_providers": value}})
+        errors = [i for i in issues if i.severity == "error" and "delegation.fallback_providers" in i.message]
+        assert len(errors) == 1 and "'auto'" in errors[0].message

@@ -235,6 +235,48 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     return chain
 
 
+#: ``delegation.fallback_providers: auto`` — reuse the parent's fallback lanes with the child's model.
+AUTO_CHAIN = "auto"
+
+
+def is_auto_chain(declared: Any) -> bool:
+    return isinstance(declared, str) and declared.strip().lower() == AUTO_CHAIN
+
+
+def remodel_chain_for_child(
+    inherited: list[dict[str, Any]] | None, *, child_provider: Any, child_model: Any, owner: str,
+) -> list[dict[str, Any]] | None:
+    """The parent's chain re-aimed at the child's model (``fallback_providers: auto``).
+
+    Each rung keeps its lane (provider, endpoint, credentials) and takes the child's model, when
+    the rung's model is from the child's model vendor. A rung from another vendor (a cross-vendor
+    terminal rung such as ``cpa/gpt-6.1-sol``) is kept as-is, so the chain can still leave the
+    vendor; so is any rung whose vendor or the child's vendor is unknown. Rungs that would retry
+    the child's own primary route are dropped; order is kept and routes are de-duplicated.
+    """
+    from hermes_cli.model_normalize import detect_vendor
+
+    rungs = _iter_fallback_entries(list(inherited or []))
+    if not rungs:
+        logger.warning("%s fallback_providers is 'auto' but the parent has no fallback chain; "
+                       "the child runs without fallback", owner)
+        return None
+    model = str(child_model or "").strip()
+    child_vendor = detect_vendor(model) if model else None
+    primary = (str(child_provider or "").strip().lower(), model.lower())
+    chain: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for rung in rungs:
+        if child_vendor and detect_vendor(rung["model"]) == child_vendor:
+            rung = {**rung, "model": model}
+        identity = _entry_identity(rung)
+        if identity[:2] == primary or identity in seen:
+            continue
+        seen.add(identity)
+        chain.append(rung)
+    return chain or None
+
+
 def scoped_fallback_chain(
     inherited: list[dict[str, Any]] | None, declared: Any, *, pinned: bool, owner: str,
 ) -> list[dict[str, Any]] | None:

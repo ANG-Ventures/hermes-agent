@@ -240,5 +240,76 @@ def test_declared_child_chain_activates_on_primary_failure():
     assert child.provider == "deepseek"
 
 
+
+# ``fallback_providers: auto`` — the parent's lanes, re-aimed at the child's model.
+LANE_CHAIN = [
+    {"provider": "claude-dtlr", "model": "claude-fable-5-1"},
+    {"provider": "claude-btpr", "model": "claude-fable-5-1", "base_url": "http://btpr.example/v1", "key_env": "BTPR_KEY"},
+    {"provider": "claude-bpr", "model": "claude-fable-5-1"},
+    {"provider": "cpa", "model": "gpt-6.1-sol"},
+]
+
+
+def _auto(chain, *, pinned=True, provider="claude-alr", model="claude-opus-5-5"):
+    return _resolve_child_fallback_chain(
+        _parent(chain), {"fallback_providers": "auto"}, pinned=pinned,
+        child_provider=provider, child_model=model)
+
+
+def test_auto_pinned_child_keeps_parent_lanes_with_its_own_model():
+    assert _auto(list(LANE_CHAIN)) == [
+        {"provider": "claude-dtlr", "model": "claude-opus-5-5"},
+        {"provider": "claude-btpr", "model": "claude-opus-5-5", "base_url": "http://btpr.example/v1", "key_env": "BTPR_KEY"},
+        {"provider": "claude-bpr", "model": "claude-opus-5-5"},
+        {"provider": "cpa", "model": "gpt-6.1-sol"},  # cross-vendor terminal rung leaves the vendor untouched
+    ]
+
+
+def test_auto_unpinned_child_inherits_parent_chain_verbatim():
+    assert _auto(list(LANE_CHAIN), pinned=False, model="claude-fable-5-1") == LANE_CHAIN
+
+
+def test_auto_drops_the_rung_that_is_the_childs_own_primary():
+    chain = [{"provider": "claude-alr", "model": "claude-fable-5-1"}, *LANE_CHAIN]
+    assert [(r["provider"], r["model"]) for r in _auto(chain)] == [
+        ("claude-dtlr", "claude-opus-5-5"), ("claude-btpr", "claude-opus-5-5"),
+        ("claude-bpr", "claude-opus-5-5"), ("cpa", "gpt-6.1-sol")]
+
+
+def test_auto_dedupes_rungs_that_collapse_onto_one_route():
+    chain = [{"provider": "claude-bpr", "model": "claude-fable-5-1"},
+             {"provider": "claude-bpr", "model": "claude-sonnet-5-5"}]
+    assert _auto(chain) == [{"provider": "claude-bpr", "model": "claude-opus-5-5"}]
+
+
+def test_auto_cross_vendor_child_does_not_rewrite_other_vendor_rungs():
+    # A gpt child on a claude-lane parent: claude rungs keep their model, the gpt rung takes the child's.
+    assert _auto(list(LANE_CHAIN), provider="openai-codex", model="gpt-6.2") == [
+        {"provider": "claude-dtlr", "model": "claude-fable-5-1"},
+        {"provider": "claude-btpr", "model": "claude-fable-5-1", "base_url": "http://btpr.example/v1", "key_env": "BTPR_KEY"},
+        {"provider": "claude-bpr", "model": "claude-fable-5-1"},
+        {"provider": "cpa", "model": "gpt-6.2"},
+    ]
+
+
+@pytest.mark.parametrize("pinned", [True, False])
+def test_auto_with_no_parent_chain_is_none_with_one_warning(pinned, caplog):
+    with caplog.at_level("WARNING"):
+        assert _auto([], pinned=pinned) is None
+    assert [r for r in caplog.records if "'auto'" in r.getMessage()].__len__() == 1
+
+
+def test_auto_reaches_the_child_constructor_with_the_child_model():
+    parent = _parent(list(LANE_CHAIN))
+    parent.provider, parent.model = "claude-alr", "claude-fable-5-1"
+    parent.requested_provider = "claude-alr"
+    kwargs = _spawn_kwargs(parent, {"fallback_providers": "auto"}, model="claude-opus-5-5")
+    assert kwargs["model"] == "claude-opus-5-5"
+    assert [(r["provider"], r["model"]) for r in kwargs["fallback_model"]] == [
+        ("claude-dtlr", "claude-opus-5-5"), ("claude-btpr", "claude-opus-5-5"),
+        ("claude-bpr", "claude-opus-5-5"), ("cpa", "gpt-6.1-sol")]
+    assert parent._fallback_chain == LANE_CHAIN  # resolved per spawn, parent state untouched
+
+
 if __name__ == "__main__":
     unittest.main()

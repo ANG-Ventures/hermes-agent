@@ -1566,7 +1566,7 @@ DEFAULT_CONFIG = {
         # Fallback chain for delegated children (same entry format as the top-level list).
         # For an unpinned child, null = inherit the parent chain; [] = disable fallback.
         # A child pinned by provider, endpoint, or model gets no fallback unless this
-        # setting declares one explicitly.
+        # setting declares one explicitly. "auto" = the parent's lanes with the child's model.
         "fallback_providers": None,
         "base_url": "",  # direct OpenAI-compatible endpoint for subagents
         "api_key": "",  # key for delegation.base_url (falls back to OPENAI_API_KEY)
