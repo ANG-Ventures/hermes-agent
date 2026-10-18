@@ -57,3 +57,13 @@ def test_never_joinable_studio_local_or_identity_or_plan_for_another_host(tmp_pa
     # a plan cut for ace-ai never joins for a worker that moved to ace-media
     assert not kbd._relay_joinable([kbg.Plan(kn.EPHEMERAL, LANE, "act", host="ace-ai")], "ace-media",
                                    reg.local_ephemeral)
+
+
+def test_ci_box_worker_joins_its_own_ci_box_ephemeral(tmp_path):
+    """t_36b46ab2: a card PLACED on ci-box plans its ephemeral on ci-box (a browserd host) and the s7 join relays
+    to it (dispatch_relay.py --host ci-box --source-host ci-box); it used to wait browser_join_off forever."""
+    for local in ([], ["ace-ai"]):
+        reg = _reg(tmp_path, local)
+        p = _plan(reg, "ci-box")
+        assert p.host == "ci-box"
+        assert kbd._relay_joinable([p], "ci-box", reg.local_ephemeral)
