@@ -481,7 +481,7 @@ def _task_scope(task_id: str) -> tuple[list[str], Optional[float]]:
         return [], None
     if task is None:
         return [], None
-    return sorted(kb._extract_explicit_dispatch_file_paths(task.body)), task.created_at
+    return kb.card_declared_scope(task.body)[0], task.created_at
 
 
 def run(args: argparse.Namespace) -> int:

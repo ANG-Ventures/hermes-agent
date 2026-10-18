@@ -1045,6 +1045,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 f"{d['id']} ({d['score']:.2f})" for d in dup_warning.get("duplicates", [])
             )
             print(f"\n⚠  similar card(s) created in the last 24h: {similar}", file=sys.stderr)
+        scope_warning = kb.inferred_scope_warning(task.body)
+        if scope_warning:
+            print(f"\n⚠  {task_id}: {scope_warning}", file=sys.stderr)
 
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle
         # by design, unassigned can't dispatch); skipped under --json so stdout stays parseable.

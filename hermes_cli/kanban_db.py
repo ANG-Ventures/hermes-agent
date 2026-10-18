@@ -10327,7 +10327,7 @@ def _enforce_branch_base(
             task.id,
             workspace_path=task.workspace_path,
             workspace_kind=task.workspace_kind,
-            scope=sorted(_extract_explicit_dispatch_file_paths(task.body)),
+            scope=card_declared_scope(task.body)[0],
             created_at=task.created_at,
             metadata=metadata,
         )
@@ -18926,6 +18926,52 @@ def _extract_explicit_dispatch_file_paths(body: Optional[str]) -> set[str]:
         for candidate in candidates
         if (normalized := _normalize_dispatch_file_path(candidate)) is not None
     }
+
+
+_SCOPE_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*declared\s+file\s+scope\s*#*\s*$", re.I)
+_ANY_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
+_SCOPE_ANY_RE = re.compile(r"^\s*scope\s*:\s*any\s*$", re.I | re.M)
+
+
+def card_declared_scope(body: Optional[str]) -> tuple[list[str], str]:
+    """The card's handback file scope and where it came from (t_21755425).
+
+    ``source`` is ``any`` (a ``scope: any`` line, or the heading with ``any``:
+    unrestricted), ``heading`` (ONLY the entries under ``## Declared file
+    scope``; prose mentions elsewhere no longer narrow it), or ``inferred``
+    (no declaration: every explicit path token in the body, the historic
+    behaviour). An empty list means unrestricted.
+    """
+    text = body or ""
+    if _SCOPE_ANY_RE.search(text):
+        return [], "any"
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines) if _SCOPE_HEADING_RE.match(ln)), None)
+    if start is None:
+        return sorted(_extract_explicit_dispatch_file_paths(text)), "inferred"
+    entries: list[str] = []
+    for ln in lines[start + 1:]:
+        if _ANY_HEADING_RE.match(ln):
+            break
+        item = ln.strip().lstrip("-*+").strip().strip("`")
+        if not item or item.endswith(":"):  # blank, or a repo label like ``owner/repo:``
+            continue
+        token = item.split()[0].strip("`")
+        if token.lower() == "any":
+            return [], "any"
+        entries.append(token)
+    return sorted(set(entries)), "heading"
+
+
+def inferred_scope_warning(body: Optional[str]) -> Optional[str]:
+    """Create-time warning when prose paths silently became the handback scope."""
+    scope, source = card_declared_scope(body)
+    if source != "inferred" or not scope:
+        return None
+    return (
+        "this card's handback will be limited to: " + ", ".join(scope)
+        + "; add a `## Declared file scope` block or `scope: any`"
+    )
 
 
 def _changed_files_from_value(value: Any) -> set[str]:
