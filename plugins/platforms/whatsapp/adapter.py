@@ -1071,12 +1071,17 @@ def _is_connected(config) -> bool:
     YAML ``enabled: true``) is connected, so ``get_connected_platforms()`` keeps it (Prism b7cecd77117e).
     A paired creds.json is NOT an opt-in: removing / falsing WHATSAPP_ENABLED is the documented disable.
     """
-    from gateway.config_env import in_enablement_probe
-    if config is not None and getattr(config, "enabled", False) and not in_enablement_probe():
-        return True
     # Via hermes_cli.gateway.get_env_value (not os.getenv) so setup-status callers that patch it observe the same value.
     import hermes_cli.gateway as gateway_mod
-    return (gateway_mod.get_env_value("WHATSAPP_ENABLED") or "").strip().lower() in {"true", "1", "yes"}
+    from gateway.config_env import in_enablement_probe
+    from utils import is_truthy_value
+    # A SET WHATSAPP_ENABLED is authoritative either way, so any false-ish value (`off`, ` false `) is an opt-out
+    # even over a YAML enable (Prism 8ab4519d8689). Only when it is unset does an enabled config count, and
+    # never the enablement probe's synthetic one.
+    raw = (gateway_mod.get_env_value("WHATSAPP_ENABLED") or "").strip()
+    if raw:
+        return is_truthy_value(raw)
+    return bool(config is not None and getattr(config, "enabled", False) and not in_enablement_probe())
 
 
 def register(ctx) -> None:
