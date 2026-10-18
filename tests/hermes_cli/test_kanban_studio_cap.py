@@ -164,6 +164,13 @@ def test_one_unreadable_board_fails_the_cap_closed(kanban_home, monkeypatch):
                         lambda include_archived=False: [{"slug": "default"}, {"slug": "other"}])
     monkeypatch.setattr(kb, "connect", connect)
     assert kbd._local_running_now() is None
+
+    def no_boards(include_archived=False):
+        raise OSError("board registry unreadable")      # Prism 07a21b82824b
+
+    with monkeypatch.context() as m:
+        m.setattr(kb, "list_boards", no_boards)
+        assert kbd._local_running_now() is None
     with kb.connect_closing() as conn:
         ids = _make(conn, 3, assignee="beta")
         res, spawned = _tick(conn, spillover=None)

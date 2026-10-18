@@ -5225,7 +5225,7 @@ def _local_running_now() -> Optional[int]:
     try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
-        boards = [{"slug": _kb.DEFAULT_BOARD}]
+        return None  # unknown board set: fail closed (Prism 07a21b82824b)
     for meta in _kb.enumerating_each(boards):
         slug = (meta.get("slug") if isinstance(meta, dict) else None) or _kb.DEFAULT_BOARD
         conn = None
