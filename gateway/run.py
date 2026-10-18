@@ -1160,6 +1160,12 @@ def _build_replay_entry(
             entry[_rkey] = _rval
     if preserve_timestamp and msg.get("timestamp"):
         entry["timestamp"] = msg["timestamp"]
+    # The steer kind is what keeps a bare-sent /steer row unstamped on replay. Entries are fed back
+    # through this builder (in-band queued follow-up: history=result["messages"]) and persisted by
+    # compaction; dropping the kind stamped the row next time, +/-30 B mid-history (t_fd02a3a1).
+    from agent.prompt_builder import STEER_DISPLAY_KIND
+    if role == "user" and msg.get("display_kind") == STEER_DISPLAY_KIND:
+        entry["display_kind"] = STEER_DISPLAY_KIND
     # Replay rebuilds the SAME conversation for its next turn: every role keeps its uid and merge witness, so a
     # context engine sees the uids the store holds. Tool-call uid maps stay with the rows that still carry
     # their calls (those pass through whole); on a plain row a leftover map would name calls it no longer has.
