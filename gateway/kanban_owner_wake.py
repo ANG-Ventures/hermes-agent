@@ -677,6 +677,29 @@ def actionable_red_items(card: dict, items: list[dict], status: Optional[str],
     return keep
 
 
+def terminal_pending_items(kb: Any, card: dict, items: list[dict], status: Optional[str]) -> list[dict]:
+    """t_26ebe71a: ``stuck`` items (gave_up / reclaimed / ...) of a review card approved at its PR head with a land
+    in flight there are withheld with a ``terminal-pending`` receipt; the lander owns the card, not the owner.
+    Blocking; worker thread."""
+    from hermes_cli import kanban_terminal_pending as _tp
+
+    stuck = [i for i in items if i.get("trigger") == TRIGGER_STUCK]
+    if not stuck or status not in ("review", "running"):
+        return items
+    try:
+        conn = kb.connect_readonly(board=card["board"])
+    except Exception:
+        return items
+    try:
+        pending = _tp.terminal_pending(conn, card["task_id"])
+    finally:
+        conn.close()
+    if pending is None:
+        return items
+    unrecorded = _record_noise(card, stuck, _tp.REASON)
+    return [i for i in items if i.get("trigger") != TRIGGER_STUCK] + unrecorded
+
+
 def resolve_settings() -> tuple[bool, tuple[str, ...]]:
     """(``kanban.wake_owner_session``, ``kanban.wake_owner_profiles``). Errors -> defaults."""
     try:
@@ -1180,6 +1203,8 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             if suppress_cfgs[owner_profile].actionable_only:
                 items = await asyncio.to_thread(
                     actionable_red_items, card, items, current.get("status"), state.red_seen)
+        if items and any(i.get("trigger") == TRIGGER_STUCK for i in items):
+            items = await asyncio.to_thread(terminal_pending_items, kb, card, items, current.get("status"))
         if not items:
             state.pending.pop(key, None)
             continue

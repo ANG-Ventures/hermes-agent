@@ -9711,6 +9711,15 @@ def release_stale_claims(
                 and not heartbeat_stale):
             _extend_live_stale_claim(conn, row, now)
             continue
+        # t_26ebe71a: a review claim on a card approved at its PR head with a
+        # land in flight there is waiting for the lander, not for a reviewer.
+        # Nothing outside the claiming session can extend it, so the sweep does.
+        review_claim = _retry_status_for_run(conn, row["id"], row["current_run_id"]) == "review"
+        if review_claim and not row["worker_pid"]:
+            from hermes_cli import kanban_terminal_pending as _tp
+            pending = _tp.terminal_pending(conn, row["id"])
+            if pending is not None and _tp.extend_claim(conn, row, now, pending):
+                continue
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
@@ -9761,12 +9770,16 @@ def release_stale_claims(
         # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
         # the run ended without a verdict, so it counts toward the breaker and a
         # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
-        _record_task_failure(
-            conn, row["id"], f"stale_lock={row['claim_lock']}",
-            outcome="reclaimed", failure_limit=failure_limit,
-            release_claim=False, end_run=False,
-            event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
-        )
+        # A REVIEW claim's lapse is not an implementation failure (t_26ebe71a:
+        # 10-13 07:11 t_75fdedd4 gave_up on two review-lease expiries while the
+        # reviewer waited on CI); the card goes back to ``review`` uncounted.
+        if retry_status != "review":
+            _record_task_failure(
+                conn, row["id"], f"stale_lock={row['claim_lock']}",
+                outcome="reclaimed", failure_limit=failure_limit,
+                release_claim=False, end_run=False,
+                event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
+            )
         # Post-commit observer; every non-reclaim branch ``continue``d above.
         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
             _fire_kanban_lifecycle_hook(
