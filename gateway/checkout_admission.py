@@ -179,6 +179,29 @@ def _pid_alive(pid: int) -> bool:
     return bool(psutil.pid_exists(pid))
 
 
+def _same_live_process(pid: Any, boot_ts: Any) -> bool:
+    """True when ``pid`` is alive AND is the process that started at ``boot_ts``.
+
+    A pid from a record written before the current host boot, or one that an
+    unrelated process reused (created after the recorded start), is not the
+    publisher. Without a usable ``boot_ts`` this degrades to pid liveness.
+    """
+    if not _pid_alive(pid):
+        return False
+    if not isinstance(boot_ts, (int, float)) or isinstance(boot_ts, bool):
+        return True
+    import psutil
+
+    try:
+        if boot_ts < psutil.boot_time():
+            return False
+        return psutil.Process(pid).create_time() <= boot_ts + 1
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.Error:
+        return True  # cannot tell: fail closed (treat as the live publisher)
+
+
 @dataclass(frozen=True)
 class HoldState:
     epoch: str
@@ -481,9 +504,11 @@ class AdmissionGate:
 
         Two processes configured with the same name overwrite one record, so
         an idle snapshot could hide the other's work. Once a foreign live
-        instance is seen the flag stays set while its pid lives (sticky, so
-        our own back-to-back writes cannot clear it) and ``evaluate`` reads
-        the record as UNKNOWN.
+        instance is seen the flag stays set while that same process lives
+        (sticky, so our own back-to-back writes cannot clear it) and
+        ``evaluate`` reads the record as UNKNOWN. "Same process" is checked
+        on every publish against the record's ``boot_ts``, so a pid an
+        unrelated process reused after a reboot never pins the flag.
         """
         try:
             prev = self.store.read_consumer(self.consumer)
@@ -491,9 +516,11 @@ class AdmissionGate:
             prev = None
         if (isinstance(prev, dict) and prev.get("instance") not in (None, self.instance)
                 and prev.get("host") == self.host and prev.get("pid") != self.pid):
-            self._foreign = (prev.get("pid"), prev.get("instance"))
+            self._foreign = (prev.get("pid"), prev.get("instance"), prev.get("boot_ts"))
         foreign = self._foreign
-        if foreign is not None and _pid_alive(foreign[0]):
+        if foreign is not None and not _same_live_process(foreign[0], foreign[2]):
+            self._foreign = foreign = None
+        if foreign is not None:
             record["shared_with"] = {"pid": foreign[0], "instance": foreign[1]}
         return record
 

@@ -800,6 +800,57 @@ def test_consumer_name_shared_by_two_live_processes_is_unknown(store):
     assert "shared" in rep["consumers"][0]["why"]
 
 
+def _foreign_record(store, name, *, boot_ts):
+    """Publish under ``name`` as a different instance whose pid (our parent)
+    is alive on this host, stamped with ``boot_ts``."""
+    other = _gate(store, name)
+    other.pid = os.getppid()
+    other.instance = "previous-boot"
+    other.boot_ts = boot_ts
+    other.publish()
+
+
+def test_reused_pid_started_after_record_is_not_shared(store, monkeypatch):
+    """t_2882f0c1: a live pid whose process started AFTER the record's boot_ts
+    is a reuse (wireplumber after reboot), not a second live publisher."""
+    import psutil
+
+    monkeypatch.setattr(psutil, "boot_time", lambda: 0.0)
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE,
+                    boot_ts=psutil.Process(os.getppid()).create_time() - 60)
+    me = _gate(store, SERVE)
+    assert "shared_with" not in me.publish()
+    assert "shared_with" not in me.publish()
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
+def test_record_from_before_host_boot_is_not_shared(store):
+    """t_2882f0c1: a record written before the current host boot is never a
+    live foreign publisher, whatever now holds its pid."""
+    import psutil
+
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE, boot_ts=psutil.boot_time() - 60)
+    me = _gate(store, SERVE)
+    assert "shared_with" not in me.publish()
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
+def test_sticky_shared_flag_clears_when_foreign_pid_is_reused(store):
+    """t_2882f0c1: the sticky flag is re-checked every publish, so once the
+    recorded process is gone and its pid reused the flag drops."""
+    import psutil
+
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE, boot_ts=time.time())
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")  # genuine: flagged
+    pid, inst, _ = me._foreign
+    me._foreign = (pid, inst, psutil.boot_time() - 60)  # same pid, older process
+    assert "shared_with" not in me.publish()
+
+
 def test_unreadable_unexpected_consumer_record_is_unknown(store):
     """#1035 checkout_admission.py:601: a corrupt record for a consumer the
     operator did not list may belong to a live consumer -> UNKNOWN, not skipped."""
