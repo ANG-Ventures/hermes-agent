@@ -410,6 +410,8 @@ HEAD_TP = "3806e0d8a3f043f550f0d5858e89926f5cd5129b"
 
 def _approved_and_landing(env, tid, *, land=True):
     """An operator APPROVE at HEAD_TP on the card and (``land``) an open land request for it at that head."""
+    for pr in (2115, 2116, 2117):   # green: the handback itself is not what these rows count
+        env["health"][(REPO, pr)] = {"state": "open", "mergeable_state": "clean", "failing": [], "head": HEAD_TP}
     rec = {"verdict": "APPROVE", "head_sha": HEAD_TP, "reviewer": "human:apollo", "findings": 0, "items": []}
     with kb.connect_closing() as conn:
         kb.add_comment(conn, tid, "default", "review_coverage: " + json.dumps(rec))
@@ -441,8 +443,8 @@ def test_w15_gave_up_on_approved_landing_card_with_wake_sub_is_zero_turns_and_a_
     env = tp_env
     tid = _card(env)
     _sub(tid)
-    _handback(tid, 2115)
     _approved_and_landing(env, tid)
+    _handback(tid, 2115)
     _tick(env)
     before = len(env["adapter"].handled)
     _gave_up(tid)
@@ -455,8 +457,8 @@ def test_w16_gave_up_on_approved_landing_card_without_sub_is_zero_owner_wakes(tp
     """RED-PROVABLE: drop terminal_pending_items from the owner-wake tick -> one owner-wake stuck turn."""
     env = tp_env
     tid = _card(env)
-    _handback(tid, 2116)
     _approved_and_landing(env, tid)
+    _handback(tid, 2116)
     _gave_up(tid)
     turns = _tick(env)
     assert turns == [], _msg("W16", "owner-wake fired stuck on an approved+landing card", turns)
@@ -467,8 +469,8 @@ def test_w17_gave_up_on_approved_card_with_no_land_still_wakes(tp_env):
     """Guard for W15/W16: an APPROVE alone, no land in flight, is a card nobody is landing; the owner hears it."""
     env = tp_env
     tid = _card(env)
-    _handback(tid, 2117)
     _approved_and_landing(env, tid, land=False)
+    _handback(tid, 2117)
     _gave_up(tid)
     turns = _tick(env)
     assert _paths(turns) == ["owner-wake"], _msg("W17", "a gave_up with no land in flight must wake once", turns)

@@ -61,10 +61,11 @@ def approve_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     The NEWEST record decides: an APPROVE followed by a send-back is not an approval any more."""
     from hermes_cli import kanban_db as kb
 
-    rows = conn.execute(
+    # Plain tuples -> dicts: a read-only board connection carries no row factory.
+    rows = [{"body": r[0] or ""} for r in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND body LIKE '%review_coverage:%' "
         "ORDER BY id DESC LIMIT 20", (task_id,),
-    ).fetchall()
+    ).fetchall()]
     record, _err = kb._latest_review_coverage(rows)  # noqa: SLF001 -- the one review_coverage parser
     if not isinstance(record, dict) or str(record.get("verdict") or "").upper() != "APPROVE":
         return None
