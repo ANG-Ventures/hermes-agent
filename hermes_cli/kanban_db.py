@@ -18943,23 +18943,31 @@ def card_declared_scope(body: Optional[str]) -> tuple[list[str], str]:
     behaviour). An empty list means unrestricted.
     """
     text = body or ""
-    if _SCOPE_ANY_RE.search(text):
+    # Fenced code blocks are examples, never the card's own declaration.
+    lines, fenced = [], False
+    for ln in text.splitlines():
+        if ln.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced:
+            lines.append(ln)
+    if any(_SCOPE_ANY_RE.match(ln) for ln in lines):
         return [], "any"
-    lines = text.splitlines()
     start = next((i for i, ln in enumerate(lines) if _SCOPE_HEADING_RE.match(ln)), None)
     if start is None:
         return sorted(_extract_explicit_dispatch_file_paths(text)), "inferred"
+    level = len(lines[start].strip()) - len(lines[start].strip().lstrip("#"))
     entries: list[str] = []
     for ln in lines[start + 1:]:
         if _ANY_HEADING_RE.match(ln):
-            break
-        item = ln.strip().lstrip("-*+").strip().strip("`")
-        if not item or item.endswith(":"):  # blank, or a repo label like ``owner/repo:``
+            if len(ln.strip()) - len(ln.strip().lstrip("#")) <= level:
+                break
+            continue  # a nested sub-heading (``### repo``) stays inside the section
+        tokens = ln.strip().lstrip("-*+").strip().replace("`", " ").split()
+        if not tokens or tokens[0].endswith(":"):  # blank, or a repo label ``owner/repo:``
             continue
-        token = item.split()[0].strip("`")
-        if token.lower() == "any":
+        if tokens[0].lower() == "any":
             return [], "any"
-        entries.append(token)
+        entries.append(tokens[0])
     return sorted(set(entries)), "heading"
 
 

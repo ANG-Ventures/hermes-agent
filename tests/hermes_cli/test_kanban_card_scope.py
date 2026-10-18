@@ -20,6 +20,7 @@ import pytest
 
 from hermes_cli import kanban_branch_base as bb
 from hermes_cli import kanban_db as kb
+from tools import kanban_tools as kt
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -66,6 +67,26 @@ def test_heading_scope_is_only_its_entries():
 def test_scope_any_is_unrestricted(body):
     assert kb.card_declared_scope(body) == ([], "any")
     assert kb.inferred_scope_warning(body) is None
+
+
+def test_nested_headings_stay_inside_the_section():
+    body = ("## Declared file scope\n### ANG-Ventures/hermes-agent\n- hermes_cli/a.py\n"
+            "### ANG-Ventures/hermes-home\n- scripts/b.py\n## Acceptance\n- gateway/run.py\n")
+    assert kb.card_declared_scope(body) == (["scripts/b.py", "hermes_cli/a.py"], "heading")
+
+
+def test_fenced_examples_do_not_declare_scope():
+    body = ("Example for authors:\n```\n## Declared file scope\n- docs/x.md\nscope: any\n```\n\n"
+            "## Declared file scope\n- hermes_cli/kanban_db.py\n")
+    assert kb.card_declared_scope(body) == (["hermes_cli/kanban_db.py"], "heading")
+    only_fenced = "edit hermes_cli/a.py\n```\nscope: any\n```\n"
+    assert kb.card_declared_scope(only_fenced)[1] == "inferred"
+
+
+@pytest.mark.parametrize("junk", ["- ` `", "- `", "-", "* ``", "  "])
+def test_degenerate_heading_lines_do_not_crash(junk):
+    body = f"## Declared file scope\n{junk}\n- hermes_cli/a.py\n"
+    assert kb.card_declared_scope(body) == (["hermes_cli/a.py"], "heading")
 
 
 def test_no_paths_no_warning_and_explicit_path_cards_unchanged():
@@ -174,9 +195,9 @@ def test_cli_create_prints_scope_warning(tmp_path):
 
 
 def test_tool_create_returns_scope_warning(board, monkeypatch):
-    from tools import kanban_tools as kt
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    for k in list(os.environ):
+        if k.startswith(("HERMES_KANBAN", "HERMES_SESSION_", "HERMES_DELEGATED")):
+            monkeypatch.delenv(k, raising=False)
     d = json.loads(kt._handle_create({"title": "prose card", "assignee": "peer",
                                       "body": PROSE_BODY, "unhomed": True}))
     assert d["ok"] is True, d
