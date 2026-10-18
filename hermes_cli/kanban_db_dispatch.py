@@ -4867,13 +4867,17 @@ def _browser_join_on() -> bool:
     return _root_kanban_cfg().get("browser_join") is True
 
 
-def _relay_joinable(plans, worker_host: str) -> bool:
-    """The s7 join this build takes: every plan is a ``browser:ephemeral`` on a browserd host that is NOT
-    the worker's own (ci-box for an ace-ai worker). Identity leases and same-host ephemerals stay held."""
+def _relay_joinable(plans, worker_host: str, local_ephemeral=()) -> bool:
+    """The s7 join this build takes: every plan is a ``browser:ephemeral`` on a Linux browserd the dispatcher
+    relays to over ssh: ci-box for a worker on another host, or the worker's own host when it is in
+    ``browsers.local_ephemeral_hosts`` (t_2dca69d0). Identity leases and Studio-local ephemerals stay held."""
     from hermes_cli import kanban_browser_gate as _kbg
     from hermes_cli import kanban_needs as _kn
-    return bool(plans) and all(p.need == _kn.EPHEMERAL and p.identity is None and p.host == _kbg.EPHEMERAL_HOST
-                               and p.host != worker_host for p in plans)
+    return bool(plans) and all(
+        p.need == _kn.EPHEMERAL and p.identity is None
+        and ((p.host == _kbg.EPHEMERAL_HOST and p.host != worker_host)
+             or (p.host == worker_host and p.host in local_ephemeral and p.host not in _kbg.BROWSERD_HOSTS))
+        for p in plans)
 
 
 def _browser_relay_create(host: str, card: str, run: str, source_host: str) -> dict:
@@ -5007,7 +5011,7 @@ def _browser_gate(conn, ready_rows, result, row_route: dict, dry_run: bool,
         elif v.plans:
             caps["browser_lease_plan"] = [p.as_dict() for p in v.plans]
             wh = _pin_host(row_route.get(tid))
-            if join and join_on and _relay_joinable(v.plans, wh):
+            if join and join_on and _relay_joinable(v.plans, wh, reg.local_ephemeral):
                 result.browser_joins[tid] = {"plans": [p.as_dict() for p in v.plans], "source_host": wh}
                 caps["browser_join"] = dict(result.browser_joins[tid])
             else:
