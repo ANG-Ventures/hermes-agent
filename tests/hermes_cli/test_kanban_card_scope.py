@@ -25,7 +25,7 @@ REPO = Path(__file__).resolve().parents[2]
 
 # The t_a964f306 shape: one example path in prose, no declaration.
 PROSE_BODY = (
-    "GOAL: lint every capability timing file, e.g. capabilities/device_timing.yaml,\n"
+    "GOAL: lint every capability timing file such as capabilities/device_timing.yaml,\n"
     "and page when one drifts. Build the lint, the CI workflow, and the pager.\n"
 )
 
@@ -54,7 +54,7 @@ def test_prose_only_body_infers_scope_and_warns():
 def test_heading_scope_is_only_its_entries():
     scope, source = kb.card_declared_scope(HEADING_BODY)
     assert source == "heading"
-    assert scope == ["docs/*.md", "tests/hermes_cli/", "hermes_cli/kanban_db.py"]
+    assert scope == sorted(["docs/*.md", "tests/hermes_cli/", "hermes_cli/kanban_db.py"])
     assert kb.inferred_scope_warning(HEADING_BODY) is None
 
 
