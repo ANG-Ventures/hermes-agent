@@ -131,3 +131,94 @@ def test_interrupt_turn_only_while_active():
     assert calls == ["lost"] and lease.interrupt_message == "lost"
     lease.deactivate_after_liveness_abort()
     assert lease.stop.is_set() and lease.is_turn_active() is False
+
+
+_REFRESH_FAILED_MSG = "Session turn lease could not be refreshed; stopping to protect the transcript."
+
+
+def _refresh_lease(monkeypatch, outcomes):
+    """A live lease whose refreshes follow ``outcomes`` (True/False or an exception to raise) on
+    a fake clock; backoff waits advance the clock instead of sleeping."""
+    import sqlite3
+
+    from agent import turn_facade_lease as mod
+
+    clock = [1000.0]
+    monkeypatch.setattr(mod, "_now", lambda: clock[0])
+    db = _Db()
+    calls = []
+
+    def refresh(session_id, holder, **kwargs):
+        calls.append(clock[0])
+        outcome = outcomes.pop(0) if outcomes else sqlite3.OperationalError("database is locked")
+        if isinstance(outcome, BaseException):
+            clock[0] += 20.0  # the busy timeout spent before sqlite gives up
+            raise outcome
+        return outcome
+
+    db.refresh_session_turn_lease = refresh
+    agent = _agent(db)
+    interrupts = []
+    agent.interrupt = lambda msg, **kw: interrupts.append(msg)
+    lease = DurableTurnLease(agent, db, "s1", "h")
+    lease.turn_active = True
+    waits = []
+
+    def fake_wait(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+        return lease.stop.is_set()
+
+    lease._backoff_wait = fake_wait
+    clock[0] += 60.0  # first scheduled tick: one refresh interval after admission
+    return lease, clock, calls, interrupts, waits
+
+
+def test_refresh_locked_once_then_ok_does_not_interrupt(monkeypatch):
+    import sqlite3
+
+    lease, clock, calls, interrupts, waits = _refresh_lease(
+        monkeypatch, [sqlite3.OperationalError("database is locked"), True]
+    )
+    assert lease.refresh_tick() is None  # timer keeps running
+    assert interrupts == [] and lease.interrupt_message is None
+    assert len(calls) == 2 and waits == [5.0]
+    assert lease.last_refresh_ok == calls[1]
+
+
+def test_refresh_locked_until_ttl_margin_interrupts_once(monkeypatch):
+    from agent import turn_facade_lease as mod
+
+    lease, clock, calls, interrupts, waits = _refresh_lease(monkeypatch, [])
+    acquired_at = clock[0] - 60.0
+    assert lease.refresh_tick() is False
+    assert interrupts == [_REFRESH_FAILED_MSG]
+    # Gave up only once the lease could actually lapse, never with real validity left.
+    assert clock[0] - acquired_at >= LEASE_TTL_SECONDS - mod.LEASE_REFRESH_SAFETY_MARGIN_SECONDS
+    assert clock[0] - acquired_at < LEASE_TTL_SECONDS
+    assert len(calls) > 2
+    # Each failed attempt logged a WARNING; one ERROR when it finally interrupted.
+    assert len(waits) == len(calls) - 1
+
+
+def test_refresh_returning_false_interrupts_immediately(monkeypatch):
+    lease, clock, calls, interrupts, waits = _refresh_lease(monkeypatch, [False])
+    assert lease.refresh_tick() is False
+    assert interrupts == ["Session turn lease lost; stopping to protect the transcript."]
+    assert len(calls) == 1 and waits == []
+
+
+def test_refresh_retry_stops_quietly_when_turn_ends(monkeypatch):
+    import sqlite3
+
+    lease, clock, calls, interrupts, waits = _refresh_lease(
+        monkeypatch, [sqlite3.OperationalError("database is locked")]
+    )
+
+    def wait_then_stop(seconds):
+        lease.stop_refresher()
+        return True
+
+    lease._backoff_wait = wait_then_stop
+    assert lease.refresh_tick() is False
+    assert interrupts == [] and len(calls) == 1
