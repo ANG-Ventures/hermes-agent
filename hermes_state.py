@@ -526,9 +526,12 @@ _WRITE_PLUMBING_FRAMES = frozenset({
 
 
 def _write_caller_name() -> str:
-    """Name of the SessionDB method that opened this write transaction (for the lock-holder ledger)."""
-    frame = sys._getframe(2)
+    """Name of the SessionDB method that opened this write transaction (for the lock-holder ledger).
+    Diagnostic only: an audit hook that denies frame access (test_handle_diagnostics_unavailable_does_not_block_database)
+    must never block the write, so any failure here is "write"."""
+    frame = None
     try:
+        frame = sys._getframe(2)
         for _ in range(6):
             if frame is None:
                 break
@@ -536,6 +539,8 @@ def _write_caller_name() -> str:
                 return frame.f_code.co_name
             frame = frame.f_back
         return "write"
+    except Exception:
+        return "write"  # ledger attribution must not prevent the write
     finally:
         del frame
 
