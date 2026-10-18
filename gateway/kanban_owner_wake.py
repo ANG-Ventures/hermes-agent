@@ -678,12 +678,14 @@ def actionable_red_items(card: dict, items: list[dict], status: Optional[str],
 
 
 def is_review_lease_lapse(item: dict) -> bool:
-    """A ``reclaimed`` of a REVIEW claim that had no worker pid: an operator ``claim --review`` lease ran out.
+    """A ``reclaimed`` of an operator ``claim --review`` lease that ran out (no worker pid, and the reclaimer's
+    ``dead_claimer_release_basis`` is ``operator_claim_no_worker``; a NULL pid alone can be a failed reviewer launch).
     No worker existed, so nothing is stuck; its ``heartbeat_stale`` is the implementer run's old heartbeat
     (2026-10-13: every one of the 8 ``stuck (reclaimed)`` wakes 07:00-08:30 was this shape)."""
     p = item.get("payload") or {}
     return (item.get("kind") == "reclaimed" and p.get("retry_status") == "review"
-            and "worker_pid" in p and p.get("worker_pid") is None)
+            and "worker_pid" in p and p.get("worker_pid") is None
+            and p.get("dead_claimer_release_basis") == "operator_claim_no_worker")
 
 
 def terminal_pending_items(kb: Any, card: dict, items: list[dict], status: Optional[str]) -> list[dict]:
@@ -1217,7 +1219,12 @@ async def tick(runner: Any, *, now: Optional[float] = None,
                 items = await asyncio.to_thread(
                     actionable_red_items, card, items, current.get("status"), state.red_seen)
         if items and any(i.get("trigger") == TRIGGER_STUCK for i in items):
-            items = await asyncio.to_thread(terminal_pending_items, kb, card, items, current.get("status"))
+            if owner_profile not in suppress_cfgs:
+                suppress_cfgs[owner_profile] = await asyncio.to_thread(
+                    _ns.resolve_config, _owner_home(runner, entry, owner_profile))
+            # Same kill switch as the notifier's terminal-pending branch (``_s5``).
+            if suppress_cfgs[owner_profile].enabled and suppress_cfgs[owner_profile].actionable_only:
+                items = await asyncio.to_thread(terminal_pending_items, kb, card, items, current.get("status"))
         if not items:
             state.pending.pop(key, None)
             continue

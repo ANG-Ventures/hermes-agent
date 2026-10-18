@@ -127,7 +127,8 @@ def test_every_open_land_intent_counts(home, intent):
             d = home / "state" / "apollo-land-queue"
             d.mkdir(parents=True)
             (d / "1-x-4049.json").write_text(json.dumps({"id": "1-x-4049", "card": tid, "repo": "o/r", "pr": 4049,
-                                                         "status": "pending"}))
+                                                         "status": "pending", "merging_sha": HEAD,
+                                                         "enqueued_at": time.time()}))
         try:
             assert tp.terminal_pending(conn, tid) is not None
             assert kb.release_stale_claims(conn) == 0
@@ -164,6 +165,67 @@ def test_not_terminal_pending_is_reclaimed_as_before(home, shape):
         assert "reclaimed" in _kinds(conn, tid)
 
 
+@pytest.mark.parametrize("shape", ["request-json", "request-inflight", "request-parked-mtime", "queue-row"])
+def test_stale_open_land_intent_ages_out(home, shape):
+    """Prism 798c56e8cf8c: a lander / queue process that died and left its file behind must not extend the claim
+    forever. Every open intent is bounded by ARMED_HORIZON_S (row timestamp, else file mtime)."""
+    old = time.time() - tp.ARMED_HORIZON_S - 60
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        _approve(conn, tid)
+        if shape == "queue-row":
+            d = home / "state" / "apollo-land-queue"
+            d.mkdir(parents=True)
+            (d / "q.json").write_text(json.dumps({"id": "q", "card": tid, "status": "pending",
+                                                  "merging_sha": HEAD, "enqueued_at": old}))
+        else:
+            suffix = {"request-json": ".json", "request-inflight": ".inflight",
+                      "request-parked-mtime": ".parked.json"}[shape]
+            d = _land_request(home, tid, suffix=suffix)
+            path = d / f"01TESTLANDREQ{suffix}"
+            if shape == "request-parked-mtime":   # no created_at: the file's mtime decides
+                req = json.loads(path.read_text())
+                req.pop("created_at")
+                path.write_text(json.dumps(req))
+                os.utime(path, (old, old))
+            else:
+                req = json.loads(path.read_text())
+                req["created_at"] = old
+                path.write_text(json.dumps(req))
+        assert tp.terminal_pending(conn, tid) is None
+        assert kb.release_stale_claims(conn) == 1
+        assert kb.get_task(conn, tid).status == "review"
+
+
+@pytest.mark.parametrize("row", [
+    {"status": "pending"},                                    # no verified head yet
+    {"status": None, "rc_posted_sha": OTHER},                 # verified, but a different (unapproved) head
+])
+def test_queue_row_needs_the_verified_approved_head(home, row):
+    """Prism 7c8e2b974c90: a queue row waits on whatever head the PR carries; without a verified sha equal to the
+    APPROVE's head it is not a land of the approved head."""
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        _approve(conn, tid)
+        d = home / "state" / "apollo-land-queue"
+        d.mkdir(parents=True)
+        (d / "q.json").write_text(json.dumps(dict(row, id="q", card=tid, enqueued_at=time.time())))
+        assert tp.terminal_pending(conn, tid) is None
+
+
+def test_module_imports_and_fails_open_without_fcntl(home, monkeypatch):
+    """Prism 9686b2f83fad: native Windows has no fcntl. The module must import and treat a pin as not live."""
+    code = ("import sys; sys.modules['fcntl'] = None\n"
+            "from hermes_cli import kanban_terminal_pending as tp\n"
+            "import pathlib, tempfile\n"
+            "p = pathlib.Path(tempfile.mkdtemp()) / 'x.lock'; p.write_text('')\n"
+            "assert tp.fcntl is None and tp._lock_held(p) is False\n"
+            "print('ok')")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         cwd=str(Path(__file__).resolve().parents[2]))
+    assert out.returncode == 0 and out.stdout.strip() == "ok", out.stderr
+
+
 # --- (b) a review-claim reclaim never counts toward the implementation retry budget -------------------------
 
 
@@ -180,6 +242,32 @@ def test_review_claim_lapse_does_not_count_or_give_up(home):
             with kb.write_txn(conn):
                 conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 5, tid))
         assert "gave_up" not in _kinds(conn, tid)
+
+
+def test_dispatcher_reviewer_run_lapse_still_counts(home, monkeypatch):
+    """Prism c54bb0d8dbb3 / 035dc68f1c41: a dispatcher-claimed reviewer run (no ``operator_claim``) whose spawn never
+    stamped a pid is a launch failure. Its reclaim counts toward the breaker, is never extended, and its owner
+    wake is not withheld as a lease lapse."""
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", "1")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="reviewer launch failed", assignee="builder")
+        impl = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="ready", reviewer="human", expected_run_id=impl.current_run_id)
+        _approve(conn, tid)
+        _land_request(home, tid)          # approved + land open: still not an operator lease, so no extension
+        host = kb._claimer_id().rpartition(":")[0]
+        assert kb.claim_review_task(conn, tid, claimer=f"{host}:{_dead_pid()}")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 5, tid))
+            conn.execute("UPDATE task_runs SET started_at = started_at - 100 WHERE task_id = ? AND id = "
+                         "(SELECT current_run_id FROM tasks WHERE id = ?)", (tid, tid))
+        assert kb.release_stale_claims(conn, failure_limit=1) == 1
+        kinds = _kinds(conn, tid)
+        assert "claim_extended" not in kinds
+        assert "gave_up" in kinds
+        rec = [e for e in kb.list_events(conn, task_id=tid) if e.kind == "reclaimed"][-1]
+        assert rec.payload.get("dead_claimer_release_basis") != "operator_claim_no_worker"
+        assert not ow.is_review_lease_lapse({"kind": "reclaimed", "payload": rec.payload})
 
 
 def test_implementation_claim_lapse_still_counts(home, monkeypatch):
@@ -242,13 +330,20 @@ def test_owner_wake_withholds_pidless_review_lease_lapse(home):
         assert [(r["kind"], r["reason"]) for r in receipts] == [("reclaimed", tp.REASON_LEASE_LAPSE)]
 
 
+_OP = {"dead_claimer_release_basis": "operator_claim_no_worker"}
+
+
 @pytest.mark.parametrize("payload", [
-    {"retry_status": "review", "worker_pid": 4242},          # a spawned reviewer worker died: stuck is real
-    {"retry_status": "ready", "worker_pid": None},           # an implementation claim
-    {"retry_status": "review"},                              # no worker_pid field: unknown, fail open
+    dict(_OP, retry_status="review", worker_pid=4242),       # a spawned reviewer worker died: stuck is real
+    dict(_OP, retry_status="ready", worker_pid=None),        # an implementation claim
+    dict(_OP, retry_status="review"),                        # no worker_pid field: unknown, fail open
+    {"retry_status": "review", "worker_pid": None},          # NULL pid, no operator provenance: a failed launch
+    {"retry_status": "review", "worker_pid": None, "dead_claimer_release_basis": "launch_bound"},
 ])
-def test_lease_lapse_is_only_the_pidless_review_claim(payload):
+def test_lease_lapse_is_only_the_operator_review_claim(payload):
     assert not ow.is_review_lease_lapse({"kind": "reclaimed", "payload": dict(payload, heartbeat_stale=True)})
+    assert ow.is_review_lease_lapse({"kind": "reclaimed", "payload": dict(_OP, retry_status="review",
+                                                                            worker_pid=None)})
     assert not ow.is_review_lease_lapse({"kind": "crashed", "payload": {"retry_status": "review", "worker_pid": None}})
 
 

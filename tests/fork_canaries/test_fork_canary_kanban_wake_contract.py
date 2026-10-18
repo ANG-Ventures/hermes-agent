@@ -465,6 +465,21 @@ def test_w16_gave_up_on_approved_landing_card_without_sub_is_zero_owner_wakes(tp
     assert ("terminal-pending", "owner-wake") in _reasons(tid), _reasons(tid)
 
 
+def test_w16b_owner_wake_terminal_pending_honours_the_kill_switch(tp_env):
+    """Prism 93c774f94d98: ``notify_suppress.enabled: false`` (or ``actionable_only: false``) restores the stuck
+    wake on the owner-wake path too, as it does on the notifier's. RED-PROVABLE: drop the cfg gate -> 0 turns."""
+    env = tp_env
+    from hermes_constants import get_hermes_home
+    (get_hermes_home() / "config.yaml").write_text("kanban:\n  notify_suppress:\n    enabled: false\n")
+    tid = _card(env)
+    _approved_and_landing(env, tid)
+    _handback(tid, 2116)
+    _gave_up(tid)
+    turns = _tick(env)
+    assert _paths(turns) == ["owner-wake"], _msg("W16b", "kill switch off must restore the owner wake", turns)
+    assert ("terminal-pending", "owner-wake") not in _reasons(tid), _reasons(tid)
+
+
 def test_w17_gave_up_on_approved_card_with_no_land_still_wakes(tp_env):
     """Guard for W15/W16: an APPROVE alone, no land in flight, is a card nobody is landing; the owner hears it."""
     env = tp_env

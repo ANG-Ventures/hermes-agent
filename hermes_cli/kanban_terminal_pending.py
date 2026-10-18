@@ -27,7 +27,6 @@ pending: the predicate fails open to today's behaviour, never to a claim that ca
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
@@ -36,11 +35,17 @@ import time
 from pathlib import Path
 from typing import Optional
 
+try:
+    import fcntl
+except ImportError:  # native Windows: no land-watch flock to probe, so a pin is never a live watch
+    fcntl = None  # type: ignore[assignment]
+
 REASON = "terminal-pending"
 # The owner wake's receipt for a pid-less review claim whose lease ran out (no worker existed to be stuck).
 REASON_LEASE_LAPSE = "review-lease-lapse"
-# A lander result that left the PR armed on GitHub (auto-merge / merge queue) stays a land in flight for this long;
-# land_request.py's own PARK_MAX_SECONDS bound for a parked request.
+# Every land intent ages out after this long (land_request.py's own PARK_MAX_SECONDS bound for a parked request):
+# an ARMED/QUEUED result, an open request file and a pending queue row alike. A lander or queue process that died
+# and left its file behind must not keep a review claim alive forever.
 ARMED_HORIZON_S = 6 * 3600
 ARMED_STATUSES = frozenset({"ARMED", "QUEUED"})
 _OPEN_SUFFIXES = (".parked.json", ".inflight", ".json")
@@ -82,6 +87,15 @@ def _read(path: Path) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
+def _fresh(path: Path, at: object, now: float) -> bool:
+    """Inside :data:`ARMED_HORIZON_S`, by the row's own timestamp, else the file's mtime. Unknown age = stale."""
+    try:
+        ts = float(at) if at else path.stat().st_mtime
+    except (OSError, TypeError, ValueError):
+        return False
+    return now - ts <= ARMED_HORIZON_S
+
+
 def _land_requests(root: Path, task_id: str, head: str, now: float) -> Optional[dict]:
     d = root / "var" / "land-requests"
     try:
@@ -96,7 +110,8 @@ def _land_requests(root: Path, task_id: str, head: str, now: float) -> Optional[
         if uid.startswith(".") or f"{uid}.done.json" in present or f"{uid}.cancel.json" in present:
             continue
         req = _read(d / name)
-        if req and req.get("card") == task_id and _same_head(req.get("review_head_sha"), head):
+        if (req and req.get("card") == task_id and _same_head(req.get("review_head_sha"), head)
+                and _fresh(d / name, req.get("created_at"), now)):
             return {"source": "land-request", "id": uid, "repo": req.get("repo"), "pr": req.get("pr"),
                     "head": req.get("review_head_sha"), "state": "parked" if name.endswith(".parked.json")
                     else "inflight" if name.endswith(".inflight") else "pending"}
@@ -130,6 +145,8 @@ def _land_requests(root: Path, task_id: str, head: str, now: float) -> Optional[
 
 def _lock_held(path: Path) -> bool:
     """A live land-watch holds an exclusive flock on its lock file for its whole life."""
+    if fcntl is None:
+        return False
     try:
         fh = open(path, "rb")
     except OSError:
@@ -162,9 +179,11 @@ def _land_watch(root: Path, task_id: str, head: str) -> Optional[dict]:
     return None
 
 
-def _land_queue(root: Path, task_id: str, head: str) -> Optional[dict]:
-    """A pending ``state/apollo-land-queue/<id>.json`` row for the card (``scripts/apollo_land_queue.py``). The
-    row waits on CI for whatever head the PR has; one that already names a sha must name the APPROVE's head."""
+def _land_queue(root: Path, task_id: str, head: str, now: float) -> Optional[dict]:
+    """A pending ``state/apollo-land-queue/<id>.json`` row for the card (``scripts/apollo_land_queue.py``),
+    enqueued inside :data:`ARMED_HORIZON_S`, whose verified head (``merging_sha`` / ``rc_posted_sha``) is the
+    APPROVE's head. A row that has not verified a head yet waits on whatever the PR carries, which may be an
+    unapproved push: it is not a land of the approved head."""
     d = root / "state" / "apollo-land-queue"
     try:
         names = os.listdir(d)
@@ -177,10 +196,10 @@ def _land_queue(root: Path, task_id: str, head: str) -> Optional[dict]:
         if not row or row.get("card") != task_id or row.get("status") not in (None, "pending"):
             continue
         sha = row.get("merging_sha") or row.get("rc_posted_sha")
-        if sha and not _same_head(sha, head):
+        if not _same_head(sha, head) or not _fresh(d / name, row.get("enqueued_at"), now):
             continue
         return {"source": "apollo-land-queue", "id": row.get("id"), "repo": row.get("repo"), "pr": row.get("pr"),
-                "head": sha or None, "state": "queued"}
+                "head": sha, "state": "queued"}
     return None
 
 
@@ -194,7 +213,7 @@ def land_intent(task_id: str, head: str, *, root: Optional[Path] = None,
     root = Path(root)
     now = time.time() if now is None else now
     return (_land_requests(root, task_id, head, now) or _land_watch(root, task_id, head)
-            or _land_queue(root, task_id, head))
+            or _land_queue(root, task_id, head, now))
 
 
 def terminal_pending(conn: sqlite3.Connection, task_id: str, *, root: Optional[Path] = None,
