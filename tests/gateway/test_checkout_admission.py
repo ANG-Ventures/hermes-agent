@@ -809,7 +809,8 @@ def _foreign_record(store, name, **fields):
     other.pid = os.getppid()
     other.instance = "other-instance"
     other.start_offset = ca._start_offset(other.pid)  # genuine by default
-    other.create_time = None if other.start_offset is not None else ca._create_time(other.pid)
+    other.time_ns = ca._time_ns_id() if other.start_offset is not None else None
+    other.create_time = ca._create_time(other.pid)
     rec = other.snapshot()
     rec.update(fields)
     rec = {k: v for k, v in rec.items() if v is not ...}
@@ -926,6 +927,34 @@ def test_fallback_offset_never_mixes_boot_time(monkeypatch):
     monkeypatch.setattr(ca, "_start_offset", lambda pid: None)
     monkeypatch.setattr(psutil, "boot_time", lambda: (_ for _ in ()).throw(AssertionError("boot_time read")))
     assert ca._finite(ca._create_time(os.getpid()))
+
+
+def test_empty_recorded_boot_id_is_missing_evidence_not_another_boot(store, monkeypatch):
+    """Prism f-6a6148c60a0851c2: boot_id "" on a live, busy foreign record must not clear the flag."""
+    monkeypatch.setattr(ca, "_host_boot_id", lambda: "current-boot")
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE, boot_id="")
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
+
+
+def test_offset_from_another_time_namespace_is_inconclusive(store, monkeypatch):
+    """Prism f-4c7533074d58f2a7: a recorded start_offset taken in a different time namespace is not
+    comparable; the absolute create_time decides, and a genuine publisher stays flagged even when the
+    offsets disagree by an hour."""
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    rec = store.read_consumer(SERVE)
+    if rec.get("start_offset") is None:
+        pytest.skip("no procfs offset on this host")
+    _foreign_record(store, SERVE, start_offset=rec["start_offset"] + 3600, time_ns="time:[1]")  # other namespace
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")  # genuine: create_time matches
+    # and a reused pid in that situation still clears (create_time off by an hour)
+    _foreign_record(store, SERVE, start_offset=rec["start_offset"] + 3600, time_ns="time:[1]",
+                    create_time=rec["create_time"] - 3600)
+    me = _gate(store, SERVE)
+    assert "shared_with" not in me.publish()
 
 
 def test_sticky_shared_flag_clears_when_foreign_pid_is_reused(store):

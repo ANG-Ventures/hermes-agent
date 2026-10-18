@@ -192,6 +192,16 @@ def _host_boot_id() -> Optional[str]:
         return None
 
 
+def _time_ns_id() -> Optional[str]:
+    """Identity of this process's time namespace (Linux ``/proc/self/ns/time``, e.g. ``time:[4026531834]``).
+    ``/proc/<pid>/stat`` start times are relative to the READER's time namespace, so a boot-relative offset
+    only compares across publishers in the same one (Prism f-4c7533074d58f2a7). None where unsupported."""
+    try:
+        return os.readlink("/proc/self/ns/time") or None
+    except OSError:
+        return None
+
+
 def _start_offset(pid: int) -> Optional[float]:
     """Seconds from host boot to ``pid``'s start, on a basis a wall-clock step
     cannot move: the kernel's own boot-relative ``starttime`` (field 22 of
@@ -241,12 +251,22 @@ def _same_live_process(pid: Any, rec: Mapping[str, Any]) -> bool:
     try:
         boot_id, off, ct = rec.get("boot_id"), rec.get("start_offset"), rec.get("create_time")
         cur_boot = _host_boot_id()
-        if isinstance(boot_id, str) and cur_boot and boot_id != cur_boot:
+        # An EMPTY recorded boot_id is missing evidence, not another boot (Prism f-6a6148c60a0851c2).
+        if isinstance(boot_id, str) and boot_id and cur_boot and boot_id != cur_boot:
             return False
         if _finite(off):
-            cur = _start_offset(pid)
-            if cur is not None and abs(cur - off) > 1:
-                return False
+            # The offset is only comparable inside one time namespace (Prism f-4c7533074d58f2a7): a recorded
+            # namespace that differs from ours, or is missing on either side, makes the offset inconclusive
+            # (keep the record live); then only a recorded absolute create_time may clear it.
+            tns, cur_tns = rec.get("time_ns"), _time_ns_id()
+            if tns and cur_tns and tns == cur_tns:
+                cur = _start_offset(pid)
+                if cur is not None and abs(cur - off) > 1:
+                    return False
+            elif _finite(ct):
+                cur = _create_time(pid)
+                if cur is not None and abs(cur - ct) > 1:
+                    return False
         elif _finite(ct):
             cur = _create_time(pid)
             if cur is not None and abs(cur - ct) > 1:
@@ -448,7 +468,10 @@ class AdmissionGate:
             self.start_offset: Optional[float] = _start_offset(self.pid)
         except Exception:
             self.start_offset = None
-        self.create_time: Optional[float] = None if self.start_offset is not None else _create_time(self.pid)
+        self.time_ns = _time_ns_id() if self.start_offset is not None else None
+        # create_time is ALWAYS recorded (Prism f-4c7533074d58f2a7): the absolute timestamp is the fallback
+        # identity when a reader cannot compare the boot-relative offset (other time namespace, no procfs).
+        self.create_time: Optional[float] = _create_time(self.pid)
         self._clock = clock
         self._active_work = active_work
         self._serving = serving
@@ -557,7 +580,7 @@ class AdmissionGate:
             return {
                 "schema": SCHEMA, "consumer": self.consumer, "pid": self.pid,
                 "host": self.host, "instance": self.instance, "boot_ts": self.boot_ts,
-                "boot_id": self.boot_id, "start_offset": self.start_offset, "create_time": self.create_time,
+                "boot_id": self.boot_id, "start_offset": self.start_offset, "create_time": self.create_time, "time_ns": self.time_ns,
                 "published_at": self._clock(), "hold_epoch": hold_epoch,
                 "hold_error": hold_error, "tickets": tickets,
                 "active_work": work_total, "active_work_detail": work_detail,
@@ -582,7 +605,7 @@ class AdmissionGate:
         if (isinstance(prev, dict) and prev.get("instance") not in (None, self.instance)
                 and prev.get("host") == self.host and prev.get("pid") != self.pid):
             self._foreign = (prev.get("pid"), prev.get("instance"),
-                             {k: prev[k] for k in ("boot_id", "start_offset", "create_time") if k in prev})
+                             {k: prev[k] for k in ("boot_id", "start_offset", "create_time", "time_ns") if k in prev})
         foreign = self._foreign
         if foreign is not None and not _same_live_process(foreign[0], foreign[2]):
             self._foreign = foreign = None
