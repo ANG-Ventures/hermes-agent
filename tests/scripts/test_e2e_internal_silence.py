@@ -27,6 +27,17 @@ def test_quiet_arms_fail_on_any_post_after_the_completion():
         assert e2e.arm_verdict(arm, "x", [P("9", 1.0, "Already handled.\nNO_REPLY")]) == ("9", True, False)
 
 
+def test_turn_end_wait_reports_timeout_instead_of_passing(monkeypatch):
+    """Prism 7f089cac187d: a stalled completion turn must not read as successful silence."""
+    clock = iter(range(0, 10_000, 100))
+    monkeypatch.setattr(e2e.time, "time", lambda: next(clock))
+    monkeypatch.setattr(e2e.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(e2e, "_db_rows", lambda *_a: [(0,)])
+    assert e2e._wait_turn_end("home", 0.0) is False
+    monkeypatch.setattr(e2e, "_db_rows", lambda *_a: [(1,)])
+    assert e2e._wait_turn_end("home", 0.0) is True
+
+
 def test_prompts_name_the_arm_shape():
     assert "E2E-LONG-ab12" in e2e.prompt_for("long", "ab12")
     assert "Already handled." in e2e.prompt_for("short", "ab12")

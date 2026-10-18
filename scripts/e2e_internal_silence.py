@@ -89,26 +89,34 @@ def _db_rows(home: str, sql: str, args: tuple) -> list[tuple]:
         con.close()
 
 
-def _wait_completion(home: str, since: float) -> float | None:
-    """Timestamp of the internal (completion) user row persisted after ``since``."""
+def _wait_completion(home: str, since: float) -> tuple[float | None, str]:
+    """``(ts, "")`` of the internal (completion) user row persisted after ``since``, or
+    ``(None, reason)``: a failed launching turn (provider down, model capped) ends the wait at once."""
     deadline = time.time() + COMPLETION_WAIT_S
     while time.time() < deadline:
         rows = _db_rows(home, "select min(timestamp) from messages where role='user' "
                               "and display_kind='internal_notification' and timestamp > ?", (since,))
         if rows and rows[0][0]:
-            return float(rows[0][0])
+            return float(rows[0][0]), ""
+        failed = _db_rows(home, "select count(*) from messages where role='assistant' "
+                                "and display_kind='failed_turn' and timestamp > ?", (since,))
+        if failed and failed[0][0]:
+            return None, "launch_turn_failed(see scratch errors.log: provider/model)"
         time.sleep(3)
-    return None
+    return None, f"no_completion_turn_in_{COMPLETION_WAIT_S:.0f}s"
 
 
-def _wait_turn_end(home: str, since: float) -> None:
+def _wait_turn_end(home: str, since: float) -> bool:
+    """True once the completion turn finished (a ``stop`` assistant row after ``since``); False on
+    timeout, so a stalled or crashed turn is never read as successful silence (Prism 7f089cac187d)."""
     deadline = time.time() + COMPLETION_WAIT_S
     while time.time() < deadline:
         rows = _db_rows(home, "select count(*) from messages where role='assistant' "
                               "and finish_reason='stop' and timestamp > ?", (since,))
         if rows and rows[0][0]:
-            return
+            return True
         time.sleep(3)
+    return False
 
 
 def _bot_messages(dc, channel: str, target_id: str, after_id: str, since_ts: float) -> list[Posted]:
@@ -120,7 +128,7 @@ def _bot_messages(dc, channel: str, target_id: str, after_id: str, since_ts: flo
 
 def _log_has(home: str, needle: str) -> bool:
     try:
-        with open(os.path.join(home, "logs", "gateway.log"), errors="replace") as fh:
+        with open(os.path.join(home, "logs", "gateway.log"), encoding="utf-8", errors="replace") as fh:
             return any(needle in line for line in fh)
     except FileNotFoundError:
         return False
@@ -132,14 +140,14 @@ def run_arm(arm: str, env: dict, puppet, dc, target_id: str) -> bool:
     thread = dc.req("POST", f"/channels/{env['PUPPET_CH']}/threads",
                     {"name": f"t_bb4059d2 e2e {arm} {nonce}", "auto_archive_duration": 60, "type": 11})
     tid = thread["id"]
-    with open(env["PUPPET_THREADS"], "a") as fh:
+    with open(env["PUPPET_THREADS"], "a", encoding="utf-8") as fh:
         fh.write(f"{tid}\n")
     t_send = time.time()
     sent = dc.req("POST", f"/channels/{tid}/messages", {"content": f"<@{target_id}> {prompt_for(arm, nonce)}"})
-    done_ts = _wait_completion(home, t_send)
+    done_ts, why = _wait_completion(home, t_send)
     if done_ts is None:
         print(f"arm={arm} head={head} posted=none marker_leaked=n verdict=FAIL "
-              f"thread={tid} sent={sent['id']} reason=no_completion_turn_in_{COMPLETION_WAIT_S:.0f}s")
+              f"thread={tid} sent={sent['id']} reason={why}", flush=True)
         return False
     if arm == "long":
         deadline = done_ts + LONG_WAIT_S
@@ -150,7 +158,11 @@ def run_arm(arm: str, env: dict, puppet, dc, target_id: str) -> bool:
                 break
             time.sleep(4)
     else:
-        _wait_turn_end(home, done_ts)
+        if not _wait_turn_end(home, done_ts):
+            print(f"arm={arm} head={head} posted=none marker_leaked=n verdict=FAIL thread={tid} "
+                  f"sent={sent['id']} nonce={nonce} reason=completion_turn_not_finished_in_{COMPLETION_WAIT_S:.0f}s",
+                  flush=True)
+            return False
         time.sleep(QUIET_WINDOW_S)
         after = _bot_messages(dc, tid, target_id, sent["id"], done_ts)
     posted, leaked, ok = arm_verdict(arm, nonce, after)
@@ -167,7 +179,7 @@ def run_arm(arm: str, env: dict, puppet, dc, target_id: str) -> bool:
 def enable_agent_notify(home: str) -> None:
     """Scratch-only: production keeps it off; the E2E needs bg completions to wake the agent.
     Read at spawn time (tools/process_registry.py::resolve_agent_notify_mode), so no restart."""
-    with open(os.path.join(home, "config.yaml"), "a") as fh:
+    with open(os.path.join(home, "config.yaml"), "a", encoding="utf-8") as fh:
         fh.write("display:\n  background_process_agent_notify: 'on'\n")
 
 
