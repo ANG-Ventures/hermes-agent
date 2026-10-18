@@ -172,7 +172,7 @@ def test_no_synthetic_is_connected_caller_bypasses_the_probe():
     assert hits == ["gateway/config_env.py"], hits
 
 
-@pytest.mark.parametrize("value", ["false", " false ", "off", "OFF", "0", "no", "disabled"])
+@pytest.mark.parametrize("value", ["false", " false ", "off", "OFF", "0", "no", "disabled", "", " "])
 def test_set_false_env_beats_yaml_enable(home, monkeypatch, value):
     # Prism 8ab4519d8689: a SET non-truthy WHATSAPP_ENABLED is an opt-out even over a YAML enable.
     monkeypatch.setenv("WHATSAPP_ENABLED", value)
@@ -185,4 +185,10 @@ def test_set_false_env_beats_yaml_enable(home, monkeypatch, value):
 def test_set_truthy_env_enables(home, monkeypatch, value):
     monkeypatch.setenv("WHATSAPP_ENABLED", value)
     cfg = _load(home, "")
+    assert Platform.WHATSAPP in cfg.get_connected_platforms()
+
+
+def test_unset_env_lets_yaml_enable_through(home):
+    # the other half of 81ee3ffaa7bc: UNSET (not empty) keeps the YAML enable
+    cfg = _load(home, "platforms:\n  whatsapp:\n    enabled: true\n")
     assert Platform.WHATSAPP in cfg.get_connected_platforms()

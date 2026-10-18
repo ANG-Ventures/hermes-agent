@@ -1075,11 +1075,11 @@ def _is_connected(config) -> bool:
     import hermes_cli.gateway as gateway_mod
     from gateway.config_env import in_enablement_probe
     from utils import is_truthy_value
-    # A SET WHATSAPP_ENABLED is authoritative either way, so any false-ish value (`off`, ` false `) is an opt-out
+    # A SET WHATSAPP_ENABLED is authoritative either way, so any non-truthy value (`off`, ` false `, empty) is an opt-out
     # even over a YAML enable (Prism 8ab4519d8689). Only when it is unset does an enabled config count, and
     # never the enablement probe's synthetic one.
-    raw = (gateway_mod.get_env_value("WHATSAPP_ENABLED") or "").strip()
-    if raw:
+    raw = gateway_mod.get_env_value("WHATSAPP_ENABLED")
+    if raw is not None:   # SET, even empty or whitespace (Prism 81ee3ffaa7bc): only a truthy value enables
         return is_truthy_value(raw)
     return bool(config is not None and getattr(config, "enabled", False) and not in_enablement_probe())
 

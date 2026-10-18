@@ -270,11 +270,13 @@ def _whatsapp(config: GatewayConfig) -> None:
     WHATSAPP_ENABLED=true follows the credential contract — it never beats an explicit YAML disable
     (the dashboard's disable action writes only ``platforms.whatsapp.enabled: false`` and leaves the
     env flag on disk, #73289)."""
-    raw = (getenv("WHATSAPP_ENABLED") or "").strip()
+    from gateway.config import _getenv
+    raw_set = _getenv("WHATSAPP_ENABLED", None)   # None = unset; "" / " " = SET (Prism 81ee3ffaa7bc)
+    raw = raw_set or ""
     wa_cfg = config.platforms.get(Platform.WHATSAPP)
-    # Any SET non-truthy value is the opt-out (`off`, ` false `, ...), the same rule the plugin's
+    # Any SET non-truthy value is the opt-out (`off`, ` false `, empty, ...), the same rule the plugin's
     # is_connected applies (Prism 8ab4519d8689); previously only the exact strings false/0/no disabled.
-    if wa_cfg is not None and raw and not is_truthy_value(raw):
+    if wa_cfg is not None and raw_set is not None and not is_truthy_value(raw_set):
         wa_cfg.enabled = False
     elif is_truthy_value(raw):
         _enable_from_env(config, Platform.WHATSAPP)
