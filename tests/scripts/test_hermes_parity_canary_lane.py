@@ -310,3 +310,68 @@ def test_only_fork_side_repair_commits_count(tmp_path):
     _git(repo, "merge", "-q", "--no-ff", "-m", "parity: upstream sync 2", "upstream")
     _commit(repo, "chore: resolve conflict notes", {"notes.md": "n\n"})
     assert _check(repo) == []
+
+
+def test_empty_exempt_trailer_does_not_borrow_the_next_line_as_its_reason(tmp_path):
+    # Prism f59b188cd0eb: `\s*` after the colon crossed the newline into `Signed-off-by: ...`
+    repo = _sync_repo(tmp_path)
+    _commit(repo, "fix: restore x regressed by parity merge\n\nCanary-Exempt:\nSigned-off-by: Some One <s@example.com>",
+            {"src.py": "x = 2\n"})
+    errors, exempt = parity_pr_check.check(repo, base="main", head="HEAD", upstream="upstream")
+    assert exempt == []
+    assert len(errors) == 1 and "restore without a canary" in errors[0]
+
+
+def test_new_test_in_a_file_registered_only_by_another_nodeid_is_refused(tmp_path):
+    # Prism bcadb1cf511b: the registry names file::test_old, the repair adds test_new in the same file;
+    # the lane never runs test_new, so the repair is not guarded
+    repo = _sync_repo(tmp_path)
+    _git(repo, "checkout", "-q", "main")
+    _commit(repo, "register old", {"tests/test_z.py": "def test_old():\n    assert 1\n",
+                                   "docs/sync/fork-features.json": json.dumps([
+        {"feature": "z", "tests": ["tests/test_z.py::test_old"], "paths": ["src.py"], "why": "", "lifecycle": "fork-permanent"}])})
+    _git(repo, "checkout", "-q", "sync/upstream-2026-10-18")
+    _git(repo, "merge", "-q", "--no-edit", "main")
+    base = _git(repo, "rev-parse", "main")
+    _commit(repo, "fix: restore z regressed by the merge",
+            {"src.py": "x = 4\n", "tests/test_z.py": "def test_old():\n    assert 1\n\n\ndef test_new():\n    assert 2\n"})
+    errors, _ = parity_pr_check.check(repo, base=base, head="HEAD", upstream="upstream")
+    assert len(errors) == 1 and "canary not registered" in errors[0]
+    # changing the registered nodeid itself (or registering the new one) guards the repair
+    _commit(repo, "fix: restore z harder", {"src.py": "x = 5\n", "tests/test_z.py":
+            "def test_old():\n    assert 3\n\n\ndef test_new():\n    assert 2\n"})
+    errors, _ = parity_pr_check.check(repo, base=base, head="HEAD", upstream="upstream")
+    assert len(errors) == 1 and "restore z regressed" in errors[0]
+    _commit(repo, "fork-features: register z new", {"docs/sync/fork-features.json": json.dumps([
+        {"feature": "z", "tests": ["tests/test_z.py::test_old", "tests/test_z.py::test_new"], "paths": ["src.py"],
+         "why": "", "lifecycle": "fork-permanent"}])})
+    assert parity_pr_check.check(repo, base=base, head="HEAD", upstream="upstream")[0] == []
+
+
+def test_class_and_parametrized_registrations_cover_their_changed_members(tmp_path):
+    repo = _sync_repo(tmp_path)
+    _commit(repo, "fix: restore c regressed by parity merge", {"src.py": "x = 2\n", "tests/test_c.py":
+            "import pytest\n\nclass TestC:\n    def test_m(self):\n        assert 1\n\n\n"
+            "@pytest.mark.parametrize('n', [1])\ndef test_p(n):\n    assert n\n"})
+    _commit(repo, "fork-features: register c", {"docs/sync/fork-features.json": json.dumps([
+        {"feature": "c", "tests": ["tests/test_c.py::TestC"], "paths": ["src.py"], "why": "", "lifecycle": "fork-permanent"}])})
+    assert _check(repo) == []
+    _commit(repo, "fix: restore p regressed by parity merge", {"src.py": "x = 3\n", "tests/test_c.py":
+            "import pytest\n\nclass TestC:\n    def test_m(self):\n        assert 1\n\n\n"
+            "@pytest.mark.parametrize('n', [1, 2])\ndef test_p(n):\n    assert n\n"})
+    assert len(_check(repo)) == 1
+    _commit(repo, "fork-features: register p", {"docs/sync/fork-features.json": json.dumps([
+        {"feature": "c", "tests": ["tests/test_c.py::TestC", "tests/test_c.py::test_p[1]"], "paths": ["src.py"],
+         "why": "", "lifecycle": "fork-permanent"}])})
+    assert _check(repo) == []
+
+
+def test_repair_test_with_a_non_ascii_path_is_seen(tmp_path):
+    # Prism b83db54ce8eb: core.quotePath quoted the path, so _is_test_file never matched it
+    repo = _sync_repo(tmp_path)
+    _git(repo, "config", "core.quotePath", "true")
+    _commit(repo, "fix: restore e regressed by parity merge", {"src.py": "x = 2\n", "tests/test_café.py": "def test_e(): pass\n"})
+    _commit(repo, "fork-features: register e", {"docs/sync/fork-features.json": json.dumps([
+        {"feature": "e", "tests": ["tests/test_café.py"], "paths": ["src.py"], "why": "", "lifecycle": "fork-permanent"}])})
+    assert _check(repo) == []
+    assert "tests/test_café.py" in parity_pr_check.touched_files(repo, _git(repo, "rev-parse", "HEAD~1"))

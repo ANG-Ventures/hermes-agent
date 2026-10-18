@@ -14,6 +14,7 @@ Failure shapes:
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -24,7 +25,8 @@ REPAIR_SUBJECT = re.compile(r"^(?:fix|restore|revert)\b|\b(?:restore[sd]?|regres
 MANIFEST = str(forkdelta.DEFAULT_MANIFEST)
 
 
-EXEMPT_TRAILER = re.compile(r"^Canary-Exempt:\s*(\S.{9,})$", re.MULTILINE | re.IGNORECASE)
+# `[ \t]*`, not `\s*`: an empty trailer must not borrow the next line (a Signed-off-by) as its reason
+EXEMPT_TRAILER = re.compile(r"^Canary-Exempt:[ \t]*(\S.{9,})$", re.MULTILINE | re.IGNORECASE)
 
 
 def fork_commits(repo: Path, base: str, head: str, upstream: str) -> list[tuple[str, str, str]]:
@@ -40,8 +42,9 @@ def fork_commits(repo: Path, base: str, head: str, upstream: str) -> list[tuple[
 
 
 def touched_files(repo: Path, sha: str) -> list[str]:
-    out = gitops.run_git(repo, ["show", "--no-renames", "--name-only", "--format=", sha]).stdout
-    return [p for p in out.splitlines() if p]
+    # -z: core.quotePath would otherwise quote non-ASCII paths and _is_test_file would never match them
+    out = gitops.run_git(repo, ["show", "--no-renames", "--name-only", "-z", "--format=", sha]).stdout
+    return [p.strip("\n") for p in out.split("\0") if p.strip("\n")]
 
 
 def _entries(repo: Path, rev: str) -> dict[str, dict]:
@@ -55,13 +58,69 @@ def _is_test_file(p: str) -> bool:
     return p.startswith("tests/") and p.endswith(".py") and "/test_" in "/" + p
 
 
+def _def_sources(src: str) -> dict[str, str] | None:
+    """Source of every top-level def/class (``name``) and class method (``Cls::meth``); None if unparsable."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    lines = src.splitlines()
+
+    def seg(node: ast.AST) -> str:  # decorators included: a changed parametrize/mark is a changed test
+        start = min([node.lineno] + [d.lineno for d in node.decorator_list])
+        return "\n".join(lines[start - 1:node.end_lineno])
+
+    out: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out[node.name] = seg(node)
+            if isinstance(node, ast.ClassDef):
+                for sub in node.body:
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        out[f"{node.name}::{sub.name}"] = seg(sub)
+    return out
+
+
+def _node_key(nodeid: str) -> str:
+    """``f.py::Cls::test_m[1]`` -> ``Cls::test_m``; ``f.py::test_p[2]`` -> ``test_p``."""
+    return "::".join(part.split("[", 1)[0] for part in nodeid.split("::")[1:3])
+
+
+def _changed_defs(repo: Path, sha: str, path: str) -> set[str] | None:
+    """Keys of the defs ``sha`` added or changed in ``path``; None when either side cannot be parsed."""
+    def at(rev: str) -> str:
+        res = gitops.run_git(repo, ["show", f"{rev}:{path}"], check=False)
+        return res.stdout if res.returncode == 0 else ""
+    new, old = _def_sources(at(sha)), _def_sources(at(f"{sha}^"))
+    if new is None or old is None:
+        return None
+    return {k for k, v in new.items() if old.get(k) != v}
+
+
+def _guarded(repo: Path, sha: str, path: str, nodeids: dict[str, list[str]]) -> bool:
+    """A repair's test file guards it when the registry names the file WHOLE, or names a nodeid whose def the
+    commit added or changed. A nodeid elsewhere in the same file guards nothing: the lane never runs the rest."""
+    named = nodeids.get(path) or []
+    if any("::" not in n for n in named):
+        return True
+    keys = {_node_key(n) for n in named}
+    if not keys:
+        return False
+    changed = _changed_defs(repo, sha, path)
+    return bool(changed and keys & changed)
+
+
 def check(repo: Path, *, base: str, head: str, upstream: str) -> tuple[list[str], list[str]]:
     """-> (errors, exemptions). A repair commit counts when it changes code outside tests/ (a test-only fix is
     test hygiene: fork-feature-canary-lane "Deliberate non-goals"). It passes when a test file it adds or
-    modifies is named by a registry entry at the head (already guarded, or a new/updated row), or when its
+    modifies is named WHOLE by a registry entry at the head, or one of its registered nodeids is a def the commit
+    added or changed (already guarded, or a new/updated row), or when its
     body carries ``Canary-Exempt: <reason>`` (>= 10 chars; listed in the output, so never silent)."""
     after = _entries(repo, head)
-    registered = {n.split("::", 1)[0] for e in after.values() for n in e.get("tests") or []}
+    nodeids: dict[str, list[str]] = {}
+    for e in after.values():
+        for n in e.get("tests") or []:
+            nodeids.setdefault(n.split("::", 1)[0], []).append(n)
     errors, exempt = [], []
     for sha, subject, body in fork_commits(repo, base, head, upstream):
         if not REPAIR_SUBJECT.search(subject):
@@ -80,7 +139,7 @@ def check(repo: Path, *, base: str, head: str, upstream: str) -> tuple[list[str]
             errors.append(f"{sha[:10]} {subject!r}: repair commit changes code but no test (restore without a canary; "
                           "add a RED-proven canary, fork-feature-canary-lane Phase 3-5, or a 'Canary-Exempt: <why>' "
                           "trailer when the repair restores no fork behavior)")
-        elif not tests & registered:
+        elif not any(_guarded(repo, sha, p, nodeids) for p in tests):
             errors.append(f"{sha[:10]} {subject!r}: none of {sorted(tests)} is named by a {MANIFEST} entry at the "
                           "head (canary not registered: add or update the feature's row)")
     return errors, exempt
