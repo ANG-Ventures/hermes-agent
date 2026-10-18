@@ -7,8 +7,16 @@ entries, so a platform this boot never runs kept its last state forever.
 
 import json
 import os
+import subprocess
+import sys
 
 from gateway import status
+
+
+def _dead_pid():
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
 
 
 def _seed(home, platforms):
@@ -19,7 +27,7 @@ def test_startup_drops_entries_from_a_previous_boot(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _seed(tmp_path, {
         "whatsapp": {"state": "fatal", "error_code": "whatsapp_not_paired",
-                     "writer_pid": 58324, "writer_start_time": 12345},
+                     "writer_pid": _dead_pid(), "writer_start_time": 12345},
         "legacy": {"state": "fatal"},  # pre-stamp record: no writer identity at all
     })
 
@@ -53,9 +61,26 @@ def test_same_pid_different_start_time_is_stale(tmp_path, monkeypatch):
     assert status.read_runtime_status()["platforms"] == {}
 
 
+def test_live_foreign_writer_entries_are_kept(tmp_path, monkeypatch):
+    # Another still-running writer (e.g. a multiplexed peer, a draining predecessor) keeps its entries.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    peer = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        start = status._get_process_start_time(peer.pid)
+        _seed(tmp_path, {"reviewer:discord": {"state": "connected", "writer_pid": peer.pid, "writer_start_time": start},
+                         "slack": {"state": "connected", "writer_pid": peer.pid, "writer_start_time": start}})
+
+        status.write_runtime_status(drop_stale_platforms=True, reload_existing=True)
+
+        assert set(status.read_runtime_status()["platforms"]) == {"reviewer:discord", "slack"}
+    finally:
+        peer.kill()
+        peer.wait()
+
+
 def test_without_the_flag_entries_are_untouched(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _seed(tmp_path, {"whatsapp": {"state": "fatal", "writer_pid": 58324, "writer_start_time": 1}})
+    _seed(tmp_path, {"whatsapp": {"state": "fatal", "writer_pid": _dead_pid(), "writer_start_time": 1}})
 
     status.write_runtime_status(clear_profile_platforms=True, reload_existing=True)
 

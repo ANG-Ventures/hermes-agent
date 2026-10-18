@@ -84,13 +84,18 @@ def test_explicit_disable_wins(home, monkeypatch):
     assert wa is None or not wa.enabled
 
 
-def test_paired_creds_on_disk_enable(home):
+@pytest.mark.parametrize("env", [None, "false"])
+def test_paired_creds_are_not_an_opt_in(home, monkeypatch, env):
+    # Removing / falsing WHATSAPP_ENABLED is the documented disable; a leftover paired session must not undo it.
+    if env is not None:
+        monkeypatch.setenv("WHATSAPP_ENABLED", env)
     session = home / "wa-session"
     session.mkdir()
     (session / "creds.json").write_text("{}", encoding="utf-8")
     cfg = _load(home, f"whatsapp:\n  session_path: {session}\n")
-    assert _wa(cfg) is not None and _wa(cfg).enabled
-    assert Platform.WHATSAPP in cfg.get_connected_platforms()
+    wa = _wa(cfg)
+    assert wa is None or not wa.enabled
+    assert Platform.WHATSAPP not in cfg.get_connected_platforms()
 
 
 def test_is_connected_unit(home):
@@ -102,14 +107,10 @@ def test_is_connected_unit(home):
     assert not _is_connected(None)
 
 
-def test_is_connected_env_and_creds_unit(home, monkeypatch):
+def test_is_connected_env_unit(home, monkeypatch):
     from plugins.platforms.whatsapp.adapter import _is_connected
 
     monkeypatch.setenv("WHATSAPP_ENABLED", "yes")
     assert _is_connected(PlatformConfig(enabled=True))
     monkeypatch.setenv("WHATSAPP_ENABLED", "false")
-    assert not _is_connected(PlatformConfig(enabled=True))
-    session = home / "s"
-    session.mkdir()
-    (session / "creds.json").write_text("{}", encoding="utf-8")
-    assert _is_connected(PlatformConfig(enabled=True, extra={"session_path": str(session)}))
+    assert not _is_connected(PlatformConfig(enabled=True, extra={"gateway_restart_notification": False}))
