@@ -208,6 +208,56 @@ def test_refresh_returning_false_interrupts_immediately(monkeypatch):
     assert len(calls) == 1 and waits == []
 
 
+def test_real_state_db_write_lock_past_busy_timeout_kills_no_turn(tmp_path, monkeypatch):
+    """2026-10-18 04:18: a VACUUM held the state.db writer past the write patience and every live
+    turn's refresh raised "database is locked". Against a REAL SessionDB, a foreign writer holding
+    the lock for several write-patience windows must kill zero turns, and the row is renewed once
+    the lock clears. Time is scaled down (patience 0.2 s, TTL 8 s, lock 3 s > the writer's
+    1 s busy timeout); the shape is the incident's."""
+    import sqlite3
+    import time
+
+    from agent import turn_facade_lease as mod
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.2)
+    monkeypatch.setattr(mod, "LEASE_TTL_SECONDS", 8.0)
+    monkeypatch.setattr(mod, "LEASE_REFRESH_SAFETY_MARGIN_SECONDS", 2.0)
+    monkeypatch.setattr(mod, "_REFRESH_RETRY_BACKOFF_SECONDS", (0.1, 0.2))
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.create_session("s1", source="test")
+    holder = "pid=0:turn=live"
+    assert db.try_acquire_session_turn_lease("s1", holder, ttl_seconds=8.0)
+    agent = _agent(db)
+    interrupts = []
+    agent.interrupt = lambda msg, **kw: interrupts.append(msg)
+    lease = DurableTurnLease(agent, db, "s1", holder)
+    lease.turn_active = True
+
+    def expires_at():
+        with sqlite3.connect(path) as c:
+            return c.execute("SELECT expires_at FROM session_turn_leases").fetchone()[0]
+
+    before = expires_at()
+    blocker = sqlite3.connect(path, timeout=0, isolation_level=None, check_same_thread=False)
+    blocker.execute("BEGIN IMMEDIATE")  # the foreign writer (VACUUM stand-in)
+    threading.Timer(3.0, lambda: blocker.execute("COMMIT")).start()
+    started = time.monotonic()
+    try:
+        assert lease.refresh_tick() is None
+    finally:
+        try:
+            blocker.execute("COMMIT")
+        except sqlite3.Error:
+            pass
+        blocker.close()
+    assert time.monotonic() - started >= 3.0  # it really waited out the lock
+    assert interrupts == [] and lease.interrupt_message is None
+    assert expires_at() > before
+    db.release_session_turn_lease("s1", holder)
+
+
 def test_refresh_retry_stops_quietly_when_turn_ends(monkeypatch):
     import sqlite3
 
