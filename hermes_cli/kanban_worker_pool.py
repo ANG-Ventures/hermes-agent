@@ -436,10 +436,20 @@ def read_caps(fleet_dir: Path, *, now: Optional[float] = None,
     return out
 
 
+def declares_requirements(body: Optional[str]) -> bool:
+    """True when the body carries a line-anchored ``requires:`` line."""
+    from hermes_cli import kanban_host_capabilities as _khc
+    return bool(_khc.declared_words(body))
+
+
 def needs_allowed_hosts(body: Optional[str], pool) -> Optional[Tuple[str, ...]]:
     """None when the body names no Studio-only resource; else the enabled
     pool hosts whose fresh reach-matrix ``caps`` cover every need (``()`` =
-    none: the card runs on the Studio or waits, never spills)."""
+    none: the card runs on the Studio or waits, never spills). A body with
+    an explicit ``requires:`` line is judged by that line, not by prose
+    (None, t_6d9e7d90)."""
+    if declares_requirements(body):
+        return None
     needs = card_needs(body)
     if not needs:
         return None
@@ -1000,7 +1010,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
              manifest: Optional[Mapping[str, str]] = None,
              targets: Optional[Mapping[str, str]] = None,
              requires: Optional[Tuple[Optional[str], Optional[str]]] = None,
-             body_signals: bool = True) -> Tuple[bool, Optional[str], Optional[str]]:
+             body_signals: bool = True,
+             worktree_hosts: Optional[Tuple[str, ...]] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
 
@@ -1031,8 +1042,14 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     portable; ``manifest`` carries the skill-manifest half of that check.
     ``targets`` (``{skill: host}``, manifest ``host_affinity: <host>``) makes
     the card host-bound to those hosts (:func:`reach_allowed_hosts`).
+
+    ``worktree_hosts`` (t_6d9e7d90, :mod:`kanban_worktree_port`): the pool
+    hosts holding a git mirror of a ``worktree`` card's repo. Non-empty, the
+    card is judged like a scratch card (the dispatcher clones it on the
+    chosen host); a pin to a host outside that set keeps it local.
     """
-    if (workspace_kind or "scratch") != "scratch":
+    kind = workspace_kind or "scratch"
+    if kind != "scratch" and not (kind == "worktree" and worktree_hosts):
         return False, _reasons.WORKSPACE_KIND, None
     bind_rule, _bind_other, bind_host = workspace_bind or (None, None, None)
     if bind_rule and bind_host is None:
@@ -1070,6 +1087,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
         pin, ignored = bind_host.lower(), None
     if pin == PIN_STUDIO:
         return False, _reasons.HOST_STUDIO, None
+    if kind == "worktree" and pin not in (None, PIN_ANY) and pin not in worktree_hosts:
+        return False, _reasons.WORKSPACE_KIND, None  # no mirror on the pinned host
     if pin is None and ignored is not None:
         # A host: line that names no host (typo, unregistered name): never
         # portable, a typo must not widen the blast radius (t_cb2b888d).
@@ -1163,6 +1182,11 @@ def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
         why = (manifest or {}).get(s)
         if why:
             return "studio_manifest", f"skill:{s} ({why})"
+    if declares_requirements(body):
+        # An explicit ``requires:`` line (``none`` included) is the author's
+        # statement of what the card needs; prose words never outrank it
+        # (t_6d9e7d90: "SSH keys", "docker compose", "vault" in a docs card).
+        return None
     m = STUDIO_BODY_RE.search(body or "") if body_signals else None
     if m:
         return "studio_body", f"body:{m.group(0)}"

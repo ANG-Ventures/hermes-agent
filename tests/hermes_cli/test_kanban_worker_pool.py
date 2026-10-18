@@ -440,6 +440,80 @@ def test_blocks_child_is_not_portable_and_names_the_link(kanban_home):
             "local", f"not_portable:linked(blocks->{parent})")
 
 
+@pytest.mark.parametrize("terminal", ["done", "archived"])
+def test_blocks_link_to_a_terminal_parent_pins_nothing(kanban_home, terminal):
+    """t_6d9e7d90 (Ace/Apollo 14:3x): a link whose far end is terminal holds
+    nothing. 12 browser-cron cards stayed Studio-local behind
+    blocks->t_18554f6e, which closed 10-15."""
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1, assignee="beta")
+        (child,) = _make(conn, 1)
+        kb.link_tasks(conn, parent, child, kind="blocks")
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (terminal, parent))
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+        assert child not in kbd._linked_ids(conn, [child])
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (child,)).fetchone()
+        assert kbd._route_row(conn, row, _plan(free=2)) == ("portable", None)
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+    assert (child, "ace-ai") in spawned and child not in res.placement_waits
+
+
+def test_terminal_child_does_not_pin_its_live_parent(kanban_home):
+    """The other direction: a done CHILD no longer holds its ready parent."""
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1)
+        (child,) = _make(conn, 1, assignee="beta")
+        kb.link_tasks(conn, parent, child, kind="blocks")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (child,))
+        conn.commit()
+        assert parent not in kbd._linked_ids(conn, [parent])
+
+
+def test_live_far_end_still_pins_beside_a_terminal_one(kanban_home):
+    """A terminal edge is skipped, never the card: a second, live blocks edge
+    still holds it and is the one named."""
+    with kb.connect_closing() as conn:
+        done_p, live_p = _make(conn, 2, assignee="beta")
+        (child,) = _make(conn, 1)
+        kb.link_tasks(conn, done_p, child, kind="blocks")
+        kb.link_tasks(conn, live_p, child, kind="blocks")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (done_p,))
+        conn.commit()
+        assert kbd._linked_ids(conn, [child])[child] == ("blocks", live_p)
+
+
+def test_legacy_lineage_mode_still_pins_a_terminal_parent(kanban_home):
+    """Kill switch: ``lineage_pins: legacy`` keeps every link pinning."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    with kb.connect_closing() as conn:
+        (parent,) = _make(conn, 1, assignee="beta")
+        (child,) = _make(conn, 1)
+        kb.link_tasks(conn, parent, child, kind="blocks")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        conn.commit()
+        assert kbd._linked_ids(conn, [child], _pr.LINEAGE_PINS_LEGACY)[child] == ("blocks", parent)
+
+
+def test_human_review_lane_rows_are_dropped_before_routing(kanban_home, monkeypatch):
+    """t_6d9e7d90: a ``human:apollo`` handback sitting in ready is skipped
+    nonspawnable BEFORE the classifier, so it never shows as a placement
+    hold; a worker card beside it still places."""
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists",
+                        lambda name: not str(name).startswith("human"), raising=False)
+    with kb.connect_closing() as conn:
+        (review,) = _make(conn, 1, assignee="human:apollo")
+        (work,) = _make(conn, 1)
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        kinds = [r[0] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (review,))]
+    assert review in res.skipped_nonspawnable
+    assert review not in res.placement_waits
+    assert all(e["task_id"] != review for e in res.routes)
+    assert kinds.count("skipped_nonspawnable") == 1
+    assert (work, "ace-ai") in spawned
+
+
 def test_legacy_null_kind_link_still_holds_local(kanban_home):
     """A NULL kind reads as ``blocks`` (normalize_link_kind), never un-holds."""
     with kb.connect_closing() as conn:

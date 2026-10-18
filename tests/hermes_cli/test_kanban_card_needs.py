@@ -119,6 +119,22 @@ def test_portable_binds_studio_needs_and_a_pin_still_wins():
     assert kwp.studio_affinity(DEC6D40F, (), pool) == ("studio_needs", "needs:skills_tree,vault")
 
 
+def test_explicit_requires_line_outranks_sniffed_prose_needs():
+    """t_6d9e7d90 (Apollo 14:5x): a ``requires:`` line is the author's
+    statement of need; prose (vault, skills-shared) no longer binds the card
+    to the Studio. ``requires: none`` and a real capability word both count."""
+    pool = kwp.PoolConfig(hosts=("ci-box",), profiles=("alpha",), pool_hosts=(_host("ci-box"),))
+
+    def port(body):
+        return kwp.portable(workspace_kind="scratch", has_links=False, workspace_has_content=False,
+                            assignee="alpha", body=body, pool=pool)
+    for decl in ("requires: none\n", "requires: fleet-ssh\n"):
+        assert port(decl + DEC6D40F) == (True, None, "policy"), decl
+        assert kwp.needs_allowed_hosts(decl + DEC6D40F, pool) is None
+    # prose that only MENTIONS the word keeps binding (not line-anchored)
+    assert port("note: requires: none is not set here\n" + DEC6D40F)[1] == "studio_needs"
+
+
 # -- dispatcher: ci-box free, Studio full ------------------------------------
 
 @pytest.fixture(autouse=True)

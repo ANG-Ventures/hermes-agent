@@ -4152,8 +4152,14 @@ def _linked_ids(conn, ids, mode: Optional[str] = None) -> dict:
     ``mode`` is ``kanban.placement.lineage_pins`` (None = read it): ``kinds``
     skips provenance-only kinds (``derived-from``); ``legacy`` counts every
     link, as before t_ae87edff. NULL reads as ``blocks``; an unknown kind
-    holds the card (fail closed)."""
+    holds the card (fail closed).
+
+    An edge whose FAR end is terminal (done/archived/failed/cancelled) pins
+    nothing (t_6d9e7d90): there is no live run to co-locate with, and a shared
+    directory is the workspace binds' job (spec §2.4), not the link's.
+    ``legacy`` keeps the old behaviour (the kill switch)."""
     from hermes_cli import kanban_placement_reasons as _pr
+    from hermes_cli.kanban_db_workspace import _TERMINAL_STATUSES
     if mode is None:
         mode = _lineage_pins_mode()
     if mode == _pr.LINEAGE_PINS_NONE:
@@ -4167,9 +4173,10 @@ def _linked_ids(conn, ids, mode: Optional[str] = None) -> dict:
         chunk = ids[i:i + _LINK_CHUNK]
         marks = ",".join("?" * len(chunk))
         for r in conn.execute(
-            f"SELECT parent_id, child_id, kind FROM task_links "
-            f"WHERE parent_id IN ({marks}) OR child_id IN ({marks}) "
-            f"ORDER BY parent_id, child_id", chunk + chunk,
+            f"SELECT l.parent_id, l.child_id, l.kind, p.status, c.status FROM task_links l "
+            f"LEFT JOIN tasks p ON p.id = l.parent_id LEFT JOIN tasks c ON c.id = l.child_id "
+            f"WHERE l.parent_id IN ({marks}) OR l.child_id IN ({marks}) "
+            f"ORDER BY l.parent_id, l.child_id", chunk + chunk,
         ):
             try:
                 kind = _kb.normalize_link_kind(r[2])
@@ -4182,7 +4189,9 @@ def _linked_ids(conn, ids, mode: Optional[str] = None) -> dict:
             # a reason that flips with it resets placement_wait ``since``
             # (Prism 9457394f1922).
             edge = (r[0], r[1])
-            for me, other in ((r[0], r[1]), (r[1], r[0])):
+            for me, other, other_status in ((r[0], r[1], r[4]), (r[1], r[0], r[3])):
+                if mode != _pr.LINEAGE_PINS_LEGACY and other_status in _TERMINAL_STATUSES:
+                    continue  # a terminal far end pins nothing (t_6d9e7d90)
                 if me not in best or edge < best[me]:
                     best[me] = edge
                     out[me] = (kind, other)
@@ -4546,7 +4555,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
                rules_out: Optional[dict] = None,
                access_out: Optional[dict] = None,
                binds: Optional[dict] = None,
-               held: Optional[dict] = None) -> "tuple[str, Optional[str]]":
+               held: Optional[dict] = None,
+               worktree_out: Optional[dict] = None,
+               board: Optional[str] = None) -> "tuple[str, Optional[str]]":
     """One route per ready row (KWLB PRD 5.2.6/5.3): ``("pin", host)``,
     ``("portable", None)``, ``("local", rule)`` or ``("wait", reason)``.
     ``rules_out[id]`` gets the ``portable()`` rule (``pin``/``policy`` when
@@ -4609,6 +4620,17 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     targets = _manifest_targets(skills, assignee) if allowlisted and skills else {}
     pin, ignored = _kwp.resolve_pin(row["body"], plan.config.hosts or (),
                                     getattr(plan.config, "pin_aliases", None))
+    # A worktree card whose repo has a mirror on pool hosts (t_6d9e7d90): the
+    # spawn clones it there. ``worktree_out[id]`` = (repo, mirror, hosts).
+    wt_hosts = None
+    if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and not linked and bind is None:
+        from hermes_cli import kanban_worktree_port as _kwt
+        port = _kwt.port_for(row["id"], row["workspace_path"],
+                             _kwt.board_default_workdir(board), _kb.kanban_home() / "fleet")
+        if port is not None:
+            wt_hosts = port[2]
+            if worktree_out is not None:
+                worktree_out[row["id"]] = port
     verdict = None
     if caps is not None:
         from hermes_cli import kanban_host_capabilities as _khc
@@ -4625,6 +4647,7 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
         native_command=native, manifest=manifest, targets=targets,
         requires=verdict.for_portable() if verdict is not None else None,
         body_signals=caps is None or caps.legacy_body,
+        worktree_hosts=wt_hosts,
     )
     if ignored is not None:
         _kwp.note_ignored_pin(row["id"], ignored)
@@ -5769,6 +5792,9 @@ def _dispatch_once_locked(
     ).fetchall()
     # Operator-only cards are never spawnable, whatever their assignee.
     ready_rows = _kb._drop_no_worker_rows(conn, ready_rows, result, dry_run=dry_run)
+    # Human review lanes are never a spawn: drop them BEFORE routing so a
+    # handback is not counted as a placement hold (t_6d9e7d90).
+    ready_rows = _drop_human_lane_rows(conn, ready_rows, result, dry_run=dry_run)
     # Fleet pause hold, PRE-ROUTE (t_133d6efd, Prism 76b7233abe29): a held card is never handed to a routing
     # step, because origin_route can persist origin_host=NULL (continuation=enforce, empty probe) and the next
     # tick would then see no origin. Every route entry below skips the ids in ``_pause_held``.
@@ -5781,6 +5807,7 @@ def _dispatch_once_locked(
     # Without a plan every row is local and the order is unchanged.
     row_route: dict = {}
     row_rules: dict = {}  # task id -> portable() rule, for the placement record
+    _worktree_ports: dict = {}  # worktree card -> (repo, mirror, hosts) (t_6d9e7d90)
     # Ready cards whose Studio binding was evaluated this tick (a pool plan
     # ran the classifier on every one of them) and, of those, the ones the
     # spawn loop reached: the affinity event log reconciles against both.
@@ -5810,7 +5837,8 @@ def _dispatch_once_locked(
                                          caps=_caps, caps_out=_caps_out,
                                          rules_out=row_rules,
                                          access_out=result.access_contradictions,
-                                         binds=_binds, held=_pause_held)
+                                         binds=_binds, held=_pause_held,
+                                         worktree_out=_worktree_ports, board=board)
                      for r in ready_rows}
         _caps_into_result(result, _caps, _caps_out)
         _affinity_evaluated = [r["id"] for r in ready_rows]
@@ -6711,6 +6739,11 @@ def _dispatch_once_locked(
                     # intersected with the reach proof when both apply.
                     _only = tuple(_cap_only) if _only is None else \
                         tuple(h for h in _only if h in _cap_only)
+                _wt_port = _worktree_ports.get(row["id"])
+                if _wt_port is not None:
+                    # A worktree card lands only where its repo's mirror is.
+                    _only = _wt_port[2] if _only is None else tuple(
+                        h for h in _only if h.lower() in _wt_port[2])
             _board_slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
             # Scorer-backed takes (pins included) book a reservation for this card.
             _take_kw = {} if getattr(getattr(spillover, "signal", None), "placement_table", None) is None \
@@ -6797,7 +6830,22 @@ def _dispatch_once_locked(
                 claimed, board=board, conn=conn,
             )
             resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
+            _wt_port = _worktree_ports.get(claimed.id) if placed_host is not None else None
+            if claimed.workspace_kind == "worktree" and _wt_port is not None:
+                # Ported worktree (t_6d9e7d90): clone on the pool host from
+                # origin + its mirror, then the card is scratch at that path.
+                # The scratch path resolves exactly as a scratch card's would
+                # (same root, same local placeholder dir), so the admission
+                # checks below apply unchanged.
+                from hermes_cli import kanban_worktree_port as _kwt
+                resolved_branch_name = (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
+                claimed.workspace_kind, claimed.workspace_path = "scratch", None
+                workspace = _kbw.resolve_workspace(claimed, board=board)
+                _kwt.clone_on_host(placed_host, str(workspace), _wt_port[0], _wt_port[1],
+                                   resolved_branch_name)
+                _kwt.convert(conn, claimed, str(workspace), resolved_branch_name,
+                             host=placed_host.name, slug=_wt_port[0], mirror=_wt_port[1])
+            elif claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = _kbw.resolve_workspace(claimed, board=board)
@@ -7307,6 +7355,27 @@ def _dispatch_once_locked(
         except Exception as exc:  # never break a dispatcher tick
             _kb._log.warning("kanban priority-starvation check failed: %s", exc)
     return result
+
+
+def _drop_human_lane_rows(conn: sqlite3.Connection, rows: list, result, *, dry_run: bool) -> list:
+    """Drop ready rows assigned to a human review lane (``human`` /
+    ``human:<who>``) that is not a spawnable profile here. They land in
+    ``skipped_nonspawnable`` exactly as the spawn loop would put them, minus
+    the routing pass: on 2026-10-18 68 of 98 ready rows were such handbacks,
+    each classified ``profile`` and reported as a held placement
+    (t_6d9e7d90). Unimportable profiles module: rows kept (old behaviour)."""
+    exists = _profile_exists_fn()
+    if exists is None:
+        return rows
+    kept = []
+    for row in rows:
+        a = (row["assignee"] or "").strip().lower()
+        if (a == "human" or a.startswith("human:")) and not exists(row["assignee"]):
+            _note_skipped_nonspawnable(conn, row["id"], row["assignee"], dry_run=dry_run)
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        kept.append(row)
+    return kept
 
 
 def _note_skipped_nonspawnable(
