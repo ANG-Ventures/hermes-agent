@@ -140,3 +140,33 @@ def test_is_connected_env_unit(home, monkeypatch):
     assert _is_connected(PlatformConfig(enabled=True))
     monkeypatch.setenv("WHATSAPP_ENABLED", "false")
     assert not _in_probe(_is_connected, PlatformConfig(enabled=True, extra={"gateway_restart_notification": False}))
+
+
+def test_setup_wizard_status_is_not_fooled_by_its_own_probe(home):
+    # Prism 8ab4519d8689: the wizard's _platform_status built PlatformConfig(enabled=True) outside the probe
+    # flag, so a fresh home read WhatsApp as "configured" and the any-configured check entered service install.
+    from gateway.platform_registry import platform_registry
+    from hermes_cli.gateway_setup_wizard import _platform_status
+
+    assert _platform_status({"_registry_entry": platform_registry.get("whatsapp")}) == "not configured"
+
+
+def test_setup_wizard_status_honors_env_opt_in(home, monkeypatch):
+    from gateway.platform_registry import platform_registry
+    from hermes_cli.gateway_setup_wizard import _platform_status
+
+    monkeypatch.setenv("WHATSAPP_ENABLED", "true")
+    assert _platform_status({"_registry_entry": platform_registry.get("whatsapp")}) == "configured"
+
+
+def test_no_synthetic_is_connected_caller_bypasses_the_probe():
+    # Every non-test caller that builds a synthetic enabled=True view for is_connected goes through
+    # probe_is_connected (one owner). A new caller that hand-rolls it fails here.
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    pat = re.compile(r"is_connected\(\s*PlatformConfig\(\s*enabled=True")
+    hits = [str(p.relative_to(root)) for d in ("gateway", "hermes_cli", "plugins", "agent")
+            for p in (root / d).rglob("*.py") if pat.search(p.read_text(encoding="utf-8", errors="ignore"))]
+    assert hits == ["gateway/config_env.py"], hits

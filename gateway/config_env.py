@@ -382,8 +382,20 @@ _ENABLEMENT_PROBE: "contextvars.ContextVar[bool]" = contextvars.ContextVar("plug
 
 
 def in_enablement_probe() -> bool:
-    """Whether the current ``is_connected`` call is the env pass's synthetic enablement probe."""
+    """Whether the current ``is_connected`` call is a synthetic enablement probe."""
     return _ENABLEMENT_PROBE.get()
+
+
+def probe_is_connected(entry, extra: Optional[dict] = None) -> bool:
+    """THE way to ask a plugin "has the user configured you?" without a real config: calls
+    ``entry.is_connected`` on a synthetic ``enabled=True`` view INSIDE the enablement-probe flag, so a
+    checker never mistakes the probe's own ``enabled`` for an opt-in. Used by the env pass and the setup
+    wizard (Prism 8ab4519d8689: the wizard built its own synthetic view outside the flag)."""
+    token = _ENABLEMENT_PROBE.set(True)
+    try:
+        return bool(entry.is_connected(PlatformConfig(enabled=True, extra=extra if extra is not None else {})))
+    finally:
+        _ENABLEMENT_PROBE.reset(token)
 
 
 def _plugin_is_configured(entry, existing_extra: dict, seed: Optional[dict]) -> bool:
@@ -392,11 +404,7 @@ def _plugin_is_configured(entry, existing_extra: dict, seed: Optional[dict]) -> 
         for k, v in (seed or {}).items():
             if k != "home_channel":
                 existing_extra.setdefault(k, v)
-        token = _ENABLEMENT_PROBE.set(True)
-        try:
-            configured = bool(entry.is_connected(PlatformConfig(enabled=True, extra=existing_extra)))
-        finally:
-            _ENABLEMENT_PROBE.reset(token)
+        configured = probe_is_connected(entry, existing_extra)
     except Exception as exc:
         logger.debug("is_connected for %s raised: %s — skipping enablement", entry.name, exc)
         return False
