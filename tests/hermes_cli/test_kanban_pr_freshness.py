@@ -72,6 +72,9 @@ def test_draft_is_refused_before_any_mutation():
         fr.check(_refs(), task_id="t_x", allow_arm=True, gh=gh, arm=lambda *a: armed.append(a))
     assert exc.value.prs == ["o/r#5"]
     assert gh.updates() == [] and armed == []
+    msg = str(exc.value)
+    assert "ace_gate.py ready <owner/repo> <n>" in msg and "gh pr ready" not in msg
+    assert "rc=21" in msg and "reviewer hold" in msg
 
 
 def test_stale_head_is_updated_bound_to_measured_sha_and_not_armed():
