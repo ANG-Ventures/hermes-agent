@@ -192,6 +192,16 @@ def _host_boot_id() -> Optional[str]:
         return None
 
 
+def _pid_ns_id() -> Optional[str]:
+    """Identity of this process's PID namespace (Linux ``/proc/self/ns/pid``). A recorded pid only names a process
+    we can inspect when it was recorded in OUR pid namespace (Prism f-0d05a4e1ac34ca32: containers can share
+    hostname, store, boot id and time namespace but not pids). None where unsupported."""
+    try:
+        return os.readlink("/proc/self/ns/pid") or None
+    except OSError:
+        return None
+
+
 def _time_ns_id() -> Optional[str]:
     """Identity of this process's time namespace (Linux ``/proc/self/ns/time``, e.g. ``time:[4026531834]``).
     ``/proc/<pid>/stat`` start times are relative to the READER's time namespace, so a boot-relative offset
@@ -252,6 +262,13 @@ def _same_live_process(pid: Any, rec: Mapping[str, Any]) -> bool:
     record live: a false "shared" defers a deploy, a false "gone" lets it
     mutate under a busy consumer.
     """
+    # The pid names a process we can inspect ONLY inside our own PID namespace (Prism f-0d05a4e1ac34ca32: containers
+    # share hostname, store, boot id and time namespace, not pids). A recorded namespace that differs from ours, or is
+    # absent while the kernel exposes one, means every local read of that pid (liveness, start time) is about an
+    # unrelated process: inconclusive, the record stays live.
+    cur_pns = _pid_ns_id()
+    if cur_pns and rec.get("pid_ns") != cur_pns:
+        return True
     if not _pid_alive(pid):
         return False
     import psutil
@@ -479,6 +496,7 @@ class AdmissionGate:
         except Exception:
             self.start_offset = None
         self.time_ns = _time_ns_id() if self.start_offset is not None else None
+        self.pid_ns = _pid_ns_id()
         # create_time is ALWAYS recorded (Prism f-4c7533074d58f2a7): the absolute timestamp is the fallback
         # identity when a reader cannot compare the boot-relative offset (other time namespace, no procfs).
         self.create_time: Optional[float] = _create_time(self.pid)
@@ -590,7 +608,7 @@ class AdmissionGate:
             return {
                 "schema": SCHEMA, "consumer": self.consumer, "pid": self.pid,
                 "host": self.host, "instance": self.instance, "boot_ts": self.boot_ts,
-                "boot_id": self.boot_id, "start_offset": self.start_offset, "create_time": self.create_time, "time_ns": self.time_ns,
+                "boot_id": self.boot_id, "start_offset": self.start_offset, "create_time": self.create_time, "time_ns": self.time_ns, "pid_ns": self.pid_ns,
                 "published_at": self._clock(), "hold_epoch": hold_epoch,
                 "hold_error": hold_error, "tickets": tickets,
                 "active_work": work_total, "active_work_detail": work_detail,
@@ -615,7 +633,7 @@ class AdmissionGate:
         if (isinstance(prev, dict) and prev.get("instance") not in (None, self.instance)
                 and prev.get("host") == self.host and prev.get("pid") != self.pid):
             self._foreign = (prev.get("pid"), prev.get("instance"),
-                             {k: prev[k] for k in ("boot_id", "start_offset", "create_time", "time_ns") if k in prev})
+                             {k: prev[k] for k in ("boot_id", "start_offset", "create_time", "time_ns", "pid_ns") if k in prev})
         foreign = self._foreign
         if foreign is not None and not _same_live_process(foreign[0], foreign[2]):
             self._foreign = foreign = None

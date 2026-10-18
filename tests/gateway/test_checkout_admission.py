@@ -981,6 +981,28 @@ def test_linux_incomparable_offset_never_clears_on_create_time(store, monkeypatc
     assert me.publish().get("shared_with")
 
 
+def test_record_from_another_pid_namespace_is_never_cleared(store, monkeypatch):
+    """Prism f-0d05a4e1ac34ca32: a record written in another PID namespace names a pid we cannot inspect; a
+    local process at that number with a different start offset is unrelated, so the record stays live."""
+    if ca._pid_ns_id() is None:
+        pytest.skip("no /proc/self/ns/pid on this host")
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    rec = store.read_consumer(SERVE)
+    # same pid, same boot, same time namespace, offset off by an hour: in OUR namespace that is a reused pid...
+    _foreign_record(store, SERVE, start_offset=(rec.get("start_offset") or 0) + 3600,
+                    create_time=rec["create_time"] - 3600)
+    assert "shared_with" not in _gate(store, SERVE).publish()
+    # ...but recorded in ANOTHER pid namespace it is inconclusive and the busy publisher stays flagged
+    _foreign_record(store, SERVE, start_offset=(rec.get("start_offset") or 0) + 3600,
+                    create_time=rec["create_time"] - 3600, pid_ns="pid:[1]")
+    assert _gate(store, SERVE).publish().get("shared_with")
+    # a legacy record with no pid_ns at all, on a kernel that exposes one, is inconclusive too
+    _foreign_record(store, SERVE, start_offset=(rec.get("start_offset") or 0) + 3600,
+                    create_time=rec["create_time"] - 3600, pid_ns=...)
+    assert _gate(store, SERVE).publish().get("shared_with")
+
+
 def test_sticky_shared_flag_clears_when_foreign_pid_is_reused(store):
     """t_2882f0c1: the sticky flag is re-checked every publish, so once the
     recorded process is gone and its pid reused the flag drops."""
