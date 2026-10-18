@@ -467,6 +467,7 @@ def query_pr_health(repo: str, number: int) -> Optional[dict]:
            "mergeable_state": str(pr.get("mergeable_state") or ""), "failing": [],
            "labels": [str((x or {}).get("name") or "") for x in pr.get("labels") or [] if isinstance(x, dict)]}
     sha = (pr.get("head") or {}).get("sha")
+    out["head"] = str(sha or "")
     if out["state"] == "open" and sha:
         runs = _gh_pages(f"repos/{repo}/commits/{sha}/check-runs", "check_runs")
         if runs is None:
@@ -502,11 +503,23 @@ def default_pr_health() -> Optional[PrHealthFn]:
     return query_pr_health
 
 
-def handback_pr_state(kb: Any, conn: Any, task: dict, payload: Optional[dict],
-                      run_id: Optional[int], pr_health: Optional[PrHealthFn],
-                      memo: dict) -> Optional[str]:
+def red_key(task_id: str, ref: str, health: dict) -> str:
+    """S5 dedupe key of one bad PR on a handback: (card, PR, head, red-set, dirty).
+    The same key twice is the same news twice (t_1ac4c83b: four turns, one red)."""
+    names = [] if label_pending(health) else sorted(str(n) for n in health.get("failing") or [] if n)
+    dirty = "dirty" if str(health.get("mergeable_state") or "").lower() == "dirty" else ""
+    return f"{task_id}|{ref}@{health.get('head') or ''}|{','.join(names)}|{dirty}"
+
+
+def handback_pr_verdict(kb: Any, conn: Any, task: dict, payload: Optional[dict],
+                        run_id: Optional[int], pr_health: Optional[PrHealthFn],
+                        memo: dict) -> dict:
+    """``{"state": str|None, "keys": [red_key...], "inherited_only": bool}`` for a review handback.
+    ``inherited_only``: every bad PR is red ONLY on checks main fails at the same head (no own red,
+    not dirty), so the owner has nothing to do on the PR (S5). Raises :class:`PrHealthUnknown`."""
+    out = {"state": None, "keys": [], "inherited_only": False}
     if pr_health is None:
-        return None
+        return out
     from hermes_cli import kanban_open_pr as _op
 
     meta = None
@@ -518,7 +531,7 @@ def handback_pr_state(kb: Any, conn: Any, task: dict, payload: Optional[dict],
             meta = None
     refs = _op.extract_pr_refs((payload or {}).get("summary"), task.get("result"),
                                metadata=meta if isinstance(meta, dict) else None)
-    states = []
+    states, inherited = [], []
     for ref in refs:
         if not _op.is_fleet_ref(ref):
             continue
@@ -530,10 +543,23 @@ def handback_pr_state(kb: Any, conn: Any, task: dict, payload: Optional[dict],
                 memo[key] = None
         if memo[key] is None:
             raise PrHealthUnknown(f"{ref.repo}#{ref.number}")
-        bad = pr_is_red_or_dirty(memo[key])
+        health = memo[key]
+        bad = pr_is_red_or_dirty(health)
         if bad:
-            states.append(f"{ref.repo}#{ref.number} {bad}")
-    return "; ".join(states) or None
+            label = f"{ref.repo}#{ref.number}"
+            states.append(f"{label} {bad}")
+            out["keys"].append(red_key(str(task.get("id") or ""), label, health))
+            inherited.append(bool(health.get("inherited_from_main"))
+                             and str(health.get("mergeable_state") or "").lower() != "dirty")
+    out["state"] = "; ".join(states) or None
+    out["inherited_only"] = bool(inherited) and all(inherited)
+    return out
+
+
+def handback_pr_state(kb: Any, conn: Any, task: dict, payload: Optional[dict],
+                      run_id: Optional[int], pr_health: Optional[PrHealthFn],
+                      memo: dict) -> Optional[str]:
+    return handback_pr_verdict(kb, conn, task, payload, run_id, pr_health, memo)["state"]
 
 
 def gated_ready_children(kb: Any, conn: Any, task_id: str) -> list[dict]:
@@ -563,6 +589,7 @@ class WakeState:
         self.pending: dict[str, dict] = {}   # "board|task" -> card dict
         self.last_wake: dict[str, float] = {}
         self.row_failures: dict[str, int] = {}  # "board|event" -> failed classifications
+        self.red_seen: dict[str, float] = {}  # S5: red_key -> when it last woke an owner
         self._load()
 
     def _load(self) -> None:
@@ -574,11 +601,14 @@ class WakeState:
             self.cursors = {str(k): int(v) for k, v in (raw.get("cursors") or {}).items()}
             self.pending = dict(raw.get("pending") or {})
             self.last_wake = {str(k): float(v) for k, v in (raw.get("last_wake") or {}).items()}
+            self.red_seen = {str(k): float(v) for k, v in (raw.get("red_seen") or {}).items()}
 
     def write_owner_wake_state(self, now: float) -> None:
         """Blocking (fsync + rename): call via ``asyncio.to_thread`` only."""
         self.last_wake = {k: v for k, v in self.last_wake.items() if now - v < COALESCE_SECONDS * 6}
-        data = {"cursors": self.cursors, "pending": self.pending, "last_wake": self.last_wake}
+        _ns.note_red_seen(self.red_seen, (), now)
+        data = {"cursors": self.cursors, "pending": self.pending, "last_wake": self.last_wake,
+                "red_seen": self.red_seen}
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=".owner-wake-", dir=str(self.path.parent))
@@ -600,6 +630,51 @@ def state_path() -> Path:
     from hermes_constants import get_hermes_home
 
     return get_hermes_home() / "gateway" / STATE_FILENAME
+
+
+def runner_state(runner: Any) -> WakeState:
+    """The gateway's one :class:`WakeState`; the notifier reads its ``red_seen`` too (S5),
+    so a red the notifier's wake carried does not wake the owner again from here."""
+    state = getattr(runner, "_kanban_owner_wake_state", None)
+    if state is None:
+        state = WakeState(state_path())
+        runner._kanban_owner_wake_state = state
+    return state
+
+
+def _record_noise(card: dict, items: list[dict], why: str) -> list[dict]:
+    """Receipt each withheld item (``notify_suppressed``, path owner-wake); return the items that
+    could NOT be receipted (a locked board keeps them deliverable). Blocking; worker thread."""
+    class _Ev:
+        def __init__(self, i: dict) -> None:
+            self.id = i["event_id"]
+            self.kind = i.get("kind")
+            self.payload = i.get("payload")
+            self.actor_session_id = i.get("actor_sid") or None
+            self.actor_profile = i.get("actor_profile") or None
+
+    return [i for i in items
+            if not _ns.record_suppressed(card.get("board"), card["task_id"], _Ev(i), why, "owner-wake")]
+
+
+def actionable_red_items(card: dict, items: list[dict], status: Optional[str],
+                         seen: dict) -> list[dict]:
+    """S5: red handbacks minus the non-actionable ones (inherited-only red, a (card, PR, head,
+    red-set) that already woke, a card no longer in review). Withheld ones get a receipt.
+    Blocking; worker thread."""
+    keep, noise = [], {}
+    for i in items:
+        why = None
+        if i.get("trigger") == TRIGGER_RED_HANDBACK:
+            why = _ns.red_handback_noise(i.get("red_keys") or (), bool(i.get("inherited_only")),
+                                         seen, status)
+        if why:
+            noise.setdefault(why, []).append(i)
+        else:
+            keep.append(i)
+    for why, group in noise.items():
+        keep.extend(_record_noise(card, group, why))
+    return keep
 
 
 def resolve_settings() -> tuple[bool, tuple[str, ...]]:
@@ -750,11 +825,12 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
             return None   # a plain ready card on a human assignee, not a scheduled wake
         item.update(trigger=TRIGGER_WOKE_NONSPAWNABLE, assignee=str((payload or {}).get("assignee") or ""))
     elif kind == "review_requested":
-        bad = handback_pr_state(kb, conn, {"result": r["result"]}, payload, r["run_id"],
-                                pr_health, memo)
-        if not bad:
+        verdict = handback_pr_verdict(kb, conn, {"id": r["task_id"], "result": r["result"]}, payload,
+                                      r["run_id"], pr_health, memo)
+        if not verdict["state"]:
             return None
-        item.update(trigger=TRIGGER_RED_HANDBACK, pr_state=bad)
+        item.update(trigger=TRIGGER_RED_HANDBACK, pr_state=verdict["state"],
+                    red_keys=verdict["keys"], inherited_only=verdict["inherited_only"])
     else:
         return None
     return item
@@ -1013,10 +1089,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         return 0
     now = time.time() if now is None else now
     if state is None:
-        state = getattr(runner, "_kanban_owner_wake_state", None)
-        if state is None:
-            state = WakeState(state_path())
-            runner._kanban_owner_wake_state = state
+        state = runner_state(runner)
     if pr_health is None and use_default_pr_health:
         pr_health = default_pr_health()
     await asyncio.to_thread(scan, state, now, pr_health)
@@ -1099,6 +1172,14 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         if items and await asyncio.to_thread(has_wake_sub, kb, card["board"], card["task_id"],
                                              entry.origin, owner_profile):
             items = [i for i in items if i["kind"] not in SUB_WAKE_KINDS]
+        # S5 (t_4f6afb67): a red handback the owner cannot act on is a ledger row.
+        if items and any(i.get("trigger") == TRIGGER_RED_HANDBACK for i in items):
+            if owner_profile not in suppress_cfgs:
+                suppress_cfgs[owner_profile] = await asyncio.to_thread(
+                    _ns.resolve_config, _owner_home(runner, entry, owner_profile))
+            if suppress_cfgs[owner_profile].actionable_only:
+                items = await asyncio.to_thread(
+                    actionable_red_items, card, items, current.get("status"), state.red_seen)
         if not items:
             state.pending.pop(key, None)
             continue
@@ -1118,6 +1199,8 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         for key, card in cards:
             state.pending.pop(key, None)
             state.last_wake[key] = now
+            for i in card.get("items") or []:
+                _ns.note_red_seen(state.red_seen, i.get("red_keys") or (), now)
         logger.info(
             "kanban owner-wake: woke %s for %s",
             session_key,

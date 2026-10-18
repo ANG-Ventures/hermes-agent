@@ -2498,6 +2498,13 @@ DEFAULT_CONFIG = {
             "self_window_min": 30,
             "closers": ["review-card closer", "land-autopilot", "merge-pass",
                         "review-merge-pass", "kanban-review-merge-pass"],
+            # t_4f6afb67 (S5): withhold the WAKE (the line still posts) for a
+            # red handback whose every red is inherited from main, a red already
+            # woken at the same (card, PR, head, red-set), a handback whose card
+            # left review, the home session's own send-back/handback/block echo,
+            # and a closer's stamped auto-route send-back. Receipts show in
+            # `kanban show` under "Withheld notifications".
+            "actionable_only": True,
         },
         # True: a completion whose handoff says it did not land ("NOT
         # DEPLOYED", "STOP finding", outcome=partial, ...) goes to review

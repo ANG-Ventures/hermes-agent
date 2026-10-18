@@ -303,3 +303,100 @@ def test_w9_wake_only_sub_is_never_suppressed(env):
     turns = _tick(env)
     assert _paths(turns) == ["notifier"], _msg("W9", "a delivery_mode='wake' sub must always wake once", turns)
     assert _receipts(tid) == []
+
+
+# --- W10-W14: S5 actionable-only wakes (t_4f6afb67) -----------------------------
+
+
+def _red(env, pr, checks, *, head="a" * 40, inherited=None, state="open"):
+    env["health"][(REPO, pr)] = {"state": state, "mergeable_state": "clean", "failing": list(checks),
+                                 "head": head, "inherited_from_main": inherited}
+
+
+def _rehandback(tid, pr: int):
+    """A second review_requested on a card already in review (a worker re-handing back)."""
+    with kb.connect_closing() as conn, kb.write_txn(conn), \
+            kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+        kb._append_event(conn, tid, "review_requested", {"summary": f"PR {REPO}#{pr} ready"})  # noqa: SLF001
+
+
+def _reasons(tid) -> list:
+    return [(r.payload["reason"], r.payload["path"]) for r in _receipts(tid)]
+
+
+def test_w10_inherited_only_red_handback_is_zero_turns_and_a_receipt(env):
+    """S5 (t_a716c180 05:05, 10-12): main's red inherited into the PR is not the owner's to fix.
+
+    RED-PROVABLE: drop the inherited-only rule from red_handback_noise -> 1 owner-wake turn."""
+    _red(env, 2110, ["lints-fast"], inherited="5cb9ca920abc")
+    tid = _card(env)
+    _handback(tid, 2110)
+    turns = _tick(env)
+    assert turns == [], _msg("W10", "an inherited-only red woke its owner", turns)
+    assert ("inherited-red", "owner-wake") in _reasons(tid), _reasons(tid)
+
+
+def test_w11_same_red_same_head_wakes_once(env):
+    """S5 (t_1ac4c83b 03:48/04:03/04:20, 10-12): one (card, PR, head, red-set) is one wake.
+
+    RED-PROVABLE: skip note_red_seen -> the second handback wakes again."""
+    _red(env, 2111, ["logs-noise-emitters"])
+    tid = _card(env)
+    _handback(tid, 2111)
+    first = list(_tick(env))
+    assert _paths(first) == ["owner-wake"], _msg("W11", "the first red must wake once", first)
+    env["runner"]._kanban_owner_wake_state.last_wake.clear()   # past the coalescing window
+    _rehandback(tid, 2111)
+    turns = _tick(env)[len(first):]
+    assert turns == [], _msg("W11", "the same red at the same head woke twice", turns)
+    assert ("duplicate-red", "owner-wake") in _reasons(tid), _reasons(tid)
+
+
+def test_w12_new_head_or_new_red_wakes_again(env):
+    """Guard for W11: a push (new head) with a red is new news."""
+    _red(env, 2112, ["lint"], head="a" * 40)
+    tid = _card(env)
+    _handback(tid, 2112)
+    first = list(_tick(env))
+    env["runner"]._kanban_owner_wake_state.last_wake.clear()
+    _red(env, 2112, ["lint"], head="b" * 40)
+    _rehandback(tid, 2112)
+    turns = _tick(env)[len(first):]
+    assert _paths(turns) == ["owner-wake"], _msg("W12", "a red at a NEW head must wake", turns)
+
+
+def test_w13_home_session_send_back_is_no_wake_but_the_line_posts(env):
+    """S5 (12 turns in the CI session, 10-12): the operator's own request-changes, echoed back.
+
+    RED-PROVABLE: drop is_own_echo -> one notifier turn."""
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, \
+            kb.mutation_actor(session_ids=[env["group"].session_id], profile="default", surface="gateway"):
+        kb.request_review(conn, tid, force=True, summary="handback")
+    with kb.connect_closing() as conn, kb.write_txn(conn), \
+            kb.mutation_actor(session_ids=[env["group"].session_id], profile="default", surface="gateway"):
+        kb._append_event(conn, tid, "changes_requested", {"reason": "P1 real"})  # noqa: SLF001
+    turns = _tick(env)
+    assert turns == [], _msg("W13", "the home session's own send-back woke it", turns)
+    assert ("own-session-echo", "notifier-wake") in _reasons(tid), _reasons(tid)
+
+
+def test_w14_worker_needs_input_block_still_wakes_and_kill_switch_restores(env):
+    """S5 keeps the actionable set: a worker's needs_input block wakes once; with
+    actionable_only off, W10's inherited red wakes again."""
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn), \
+            kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})  # noqa: SLF001
+    turns = list(_tick(env))
+    assert _paths(turns) == ["notifier"], _msg("W14", "a worker's needs_input block must wake once", turns)
+    from hermes_constants import get_hermes_home
+    (get_hermes_home() / "config.yaml").write_text(
+        "kanban:\n  notify_suppress:\n    actionable_only: false\n")
+    _red(env, 2114, ["lints-fast"], inherited="5cb9ca920abc")
+    t2 = _card(env)
+    _handback(t2, 2114)
+    more = _tick(env)[len(turns):]
+    assert _paths(more) == ["owner-wake"], _msg("W14", "actionable_only:false must restore the wake", more)

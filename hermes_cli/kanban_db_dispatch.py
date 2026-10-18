@@ -4869,13 +4869,14 @@ def _browser_join_on() -> bool:
 
 def _relay_joinable(plans, worker_host: str, local_ephemeral=()) -> bool:
     """The s7 join this build takes: every plan is a ``browser:ephemeral`` on a Linux browserd the dispatcher
-    relays to over ssh: ci-box for a worker on another host, or the worker's own host when it is in
-    ``browsers.local_ephemeral_hosts`` (t_2dca69d0). Identity leases and Studio-local ephemerals stay held."""
+    relays to over ssh: ci-box for a worker on any host (ci-box's own workers too, ``--source-host ci-box``,
+    t_36b46ab2), or the worker's own host when it is in ``browsers.local_ephemeral_hosts`` (t_2dca69d0).
+    Identity leases and Studio-local ephemerals stay held."""
     from hermes_cli import kanban_browser_gate as _kbg
     from hermes_cli import kanban_needs as _kn
     return bool(plans) and all(
         p.need == _kn.EPHEMERAL and p.identity is None
-        and ((p.host == _kbg.EPHEMERAL_HOST and p.host != worker_host)
+        and (p.host == _kbg.EPHEMERAL_HOST
              or (p.host == worker_host and p.host in local_ephemeral and p.host not in _kbg.BROWSERD_HOSTS))
         for p in plans)
 
