@@ -24,6 +24,8 @@ from dataclasses import dataclass
 SILENCE_TOKEN = "NO_REPLY"
 LONG_WAIT_S = 120.0
 QUIET_WINDOW_S = 60.0
+# The long reply is judged once its Discord content has not changed for this long.
+EDIT_SETTLE_S = 20.0
 COMPLETION_WAIT_S = 240.0
 # Long enough that the launching turn has finished before the completion lands, so the completion
 # is its own internal turn (not a queued follow-up of a still-running human turn).
@@ -119,6 +121,26 @@ def _wait_turn_end(home: str, since: float) -> bool:
     return False
 
 
+def settled_messages(fetch, settle_s: float = EDIT_SETTLE_S, limit_s: float = LONG_WAIT_S) -> list[Posted]:
+    """The bot's messages once no post or edit has changed them for ``settle_s``.
+
+    Called after the completion turn finished: a streamed reply can still gain its trailing
+    NO_REPLY in a later edit, so the verdict reads the FINAL content, never the first frame that
+    carries the nonce (Prism 7f089cac187d on #2060).  ``limit_s`` bounds a reply that keeps
+    changing; the last fetch is judged then."""
+    deadline = time.time() + limit_s
+    last = fetch()
+    stable_since = time.time()
+    while time.time() < deadline:
+        time.sleep(min(4.0, settle_s))
+        cur = fetch()
+        if cur != last:
+            last, stable_since = cur, time.time()
+        elif time.time() - stable_since >= settle_s:
+            break
+    return last
+
+
 def _bot_messages(dc, channel: str, target_id: str, after_id: str, since_ts: float) -> list[Posted]:
     msgs = dc.req("GET", f"/channels/{channel}/messages?after={after_id}&limit=50") or []
     out = [Posted(m["id"], _iso_ts(m["timestamp"]), m.get("content", ""))
@@ -149,22 +171,17 @@ def run_arm(arm: str, env: dict, puppet, dc, target_id: str) -> bool:
         print(f"arm={arm} head={head} posted=none marker_leaked=n verdict=FAIL "
               f"thread={tid} sent={sent['id']} reason={why}", flush=True)
         return False
+    if not _wait_turn_end(home, done_ts):
+        print(f"arm={arm} head={head} posted=none marker_leaked=n verdict=FAIL thread={tid} "
+              f"sent={sent['id']} nonce={nonce} reason=completion_turn_not_finished_in_{COMPLETION_WAIT_S:.0f}s",
+              flush=True)
+        return False
+    fetch = lambda: _bot_messages(dc, tid, target_id, sent["id"], done_ts)  # noqa: E731
     if arm == "long":
-        deadline = done_ts + LONG_WAIT_S
-        after: list[Posted] = []
-        while time.time() < deadline:
-            after = _bot_messages(dc, tid, target_id, sent["id"], done_ts)
-            if arm_verdict(arm, nonce, after)[0] != "none":
-                break
-            time.sleep(4)
+        after = settled_messages(fetch)
     else:
-        if not _wait_turn_end(home, done_ts):
-            print(f"arm={arm} head={head} posted=none marker_leaked=n verdict=FAIL thread={tid} "
-                  f"sent={sent['id']} nonce={nonce} reason=completion_turn_not_finished_in_{COMPLETION_WAIT_S:.0f}s",
-                  flush=True)
-            return False
         time.sleep(QUIET_WINDOW_S)
-        after = _bot_messages(dc, tid, target_id, sent["id"], done_ts)
+        after = fetch()
     posted, leaked, ok = arm_verdict(arm, nonce, after)
     extra = ""
     if arm == "short":
