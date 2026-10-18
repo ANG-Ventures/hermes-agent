@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-from . import __version__, bisect as bisect_mod, buckets, catchup, forkdelta, gates, gitops, lint_manifest, state
+from . import __version__, bisect as bisect_mod, buckets, canary_lane, catchup, forkdelta, gates, gitops, lint_manifest, parity_pr_check, state
 
 
 DEFAULT_WORKTREE_ROOT = Path.home() / ".hermes" / "worktrees"
@@ -478,6 +478,33 @@ def build_parser() -> argparse.ArgumentParser:
     lint.add_argument("--fork-ref", default="fork/main")
     lint.add_argument("--vacuous-ok", action="store_true")
     lint.set_defaults(func=cmd_lint_manifest)
+
+    lane = sub.add_parser("canary-lane", help="run every registered fork-feature nodeid; skipped/uncollected = RED")
+    lane.add_argument("--worktree", type=Path)
+    lane.add_argument("--python", help="interpreter for the main pass (default: this one)")
+    lane.add_argument("--ptb-python", help="interpreter with real python-telegram-bot for *_ptb.py nodeids")
+    lane.add_argument("--group", choices=("all", "plain", "ptb"), default="all",
+                      help="plain = every nodeid outside *_ptb.py; ptb = only *_ptb.py (run under a real-PTB env)")
+    lane.add_argument("--jobs", type=int, default=4, help="test files run in parallel, one pytest process each")
+    lane.add_argument("--timeout", type=int, default=600, help="per-file pytest timeout, seconds")
+    scope = lane.add_mutually_exclusive_group()
+    scope.add_argument("--changed-file-list", help="file of changed paths; no-op (rc 0) when none is a lane input")
+    scope.add_argument("--changed-from", help="base ref; changed = merge-base(base, HEAD)..HEAD")
+    lane.set_defaults(func=lambda a: canary_lane.main(a))
+
+    pcheck = sub.add_parser("parity-pr-check",
+                            help="a sync PR's own fix/restore commits must each add or update a registry entry")
+    pcheck.add_argument("--worktree", type=Path)
+    pcheck.add_argument("--base", required=True, help="the PR base (fork main) ref or sha")
+    pcheck.add_argument("--head", default="HEAD")
+    pcheck.add_argument("--upstream", default="origin/main", help="upstream ref the sync merges in")
+    pcheck.set_defaults(func=lambda a: parity_pr_check.main(a))
+
+    pclass = sub.add_parser("parity-classify", help="print yes|no: is this PR a parity/upstream sync")
+    pclass.add_argument("--title", default="")
+    pclass.add_argument("--head-ref", default="")
+    pclass.add_argument("--commits", type=int, default=0)
+    pclass.set_defaults(func=lambda a: parity_pr_check.classify_main(a))
 
     catch = sub.add_parser("catchup", help="fast catch-up merge with manifest and closure-selected tests")
     catch.add_argument("--max-commits", type=int, default=50)
