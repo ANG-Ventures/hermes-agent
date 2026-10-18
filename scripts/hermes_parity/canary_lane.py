@@ -76,7 +76,9 @@ def _run_file(python: str, repo: Path, nodeids: Sequence[str], timeout_s: int) -
     process over every registered file cross-contaminates module state and hung on ace-media)."""
     with tempfile.TemporaryDirectory(prefix="canary-lane-") as td:
         report = Path(td) / "report.json"
-        env = {k: v for k, v in os.environ.items() if k != "HERMES_HOME"}   # tests/conftest.py isolates the home
+        # HERMES_HOME: tests/conftest.py isolates the home. PYTEST_ADDOPTS: `-o addopts=` does not clear it, and an
+        # inherited `-k`/`-m` would deselect registered members before collection is recorded.
+        env = {k: v for k, v in os.environ.items() if k not in ("HERMES_HOME", "PYTEST_ADDOPTS")}
         cmd = [python, "-m", "pytest", "-q", "-rfEs", "-o", "addopts=", "-p", "no:cacheprovider",
                "-p", "no:randomly", "-p", "scripts.hermes_parity.canary_plugin",
                "--canary-report", str(report), *nodeids]
@@ -222,8 +224,9 @@ def changed_from(repo: Path, base: str) -> list[str]:
     # --no-renames: a rename lists only its NEW path by default, so moving a registered test or a covered
     # source to an unregistered name would read as "not affected"; both sides must be checked
     base_sha = gitops.merge_base(repo, base, "HEAD")
-    out = gitops.run_git(repo, ["diff", "--no-renames", "--name-only", f"{base_sha}..HEAD"]).stdout
-    return [line for line in out.splitlines() if line]
+    # -z: otherwise git C-quotes non-ASCII paths ("tests/test_caf\\303\\251.py") and no registry entry matches
+    out = gitops.run_git(repo, ["diff", "-z", "--no-renames", "--name-only", f"{base_sha}..HEAD"]).stdout
+    return [p for p in out.split("\0") if p]
 
 
 def main(args) -> int:

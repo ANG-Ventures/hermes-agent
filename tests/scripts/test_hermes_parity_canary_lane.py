@@ -166,6 +166,32 @@ def test_changed_from_sees_both_sides_of_a_rename(tmp_path):
     assert "tests/test_guarded.py" in canary_lane.changed_from(repo, "main")
 
 
+def test_inherited_pytest_addopts_cannot_deselect_registered_members(tmp_path, monkeypatch):
+    # Prism 7ca5450ad8e2
+    f = "tests/test_canary_x.py"
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-k test_holds")
+    result = _run(_lane_repo(tmp_path, [f]))
+    assert f"RED {f}::test_red: failed" in result.failures
+
+
+def test_changed_from_returns_non_ascii_paths_unquoted(tmp_path):
+    # Prism 5b1bbed43d18: default core.quotePath C-quotes non-ASCII names
+    repo = tmp_path / "q"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "T")
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "checkout", "-q", "-b", "pr")
+    (repo / "tests").mkdir()
+    (repo / "tests/test_café.py").write_text("def test_a(): pass\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "add")
+    assert canary_lane.changed_from(repo, "main") == ["tests/test_café.py"]
+
+
 def test_ptb_nodeids_without_a_ptb_interpreter_are_red_not_dropped(tmp_path):
     repo = _lane_repo(tmp_path, ["tests/test_thing_ptb.py::test_a"])
     result = _run(repo)
