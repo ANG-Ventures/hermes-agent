@@ -538,6 +538,9 @@ def test_run_conversation_interrupts_when_lease_refresh_lost(monkeypatch):
 
 
 def test_run_conversation_interrupts_when_lease_refresh_errors(monkeypatch):
+    # Refresh errors are retried until the lease could lapse; a margin of the whole TTL makes the
+    # first error final so this exercises the interrupt plumbing without waiting minutes.
+    monkeypatch.setattr("agent.turn_facade_lease.LEASE_REFRESH_SAFETY_MARGIN_SECONDS", 300.0)
     db = _DB()
     agent = _agent_with_db(db)
     agent._session_turn_lease_refresh_interval = 0.01
@@ -583,6 +586,7 @@ def test_run_conversation_interrupts_when_lease_refresh_errors(monkeypatch):
 
 
 def test_refresh_error_after_loop_completion_does_not_poison_next_turn(monkeypatch):
+    monkeypatch.setattr("agent.turn_facade_lease.LEASE_REFRESH_SAFETY_MARGIN_SECONDS", 300.0)
     db = _DB()
     agent = _agent_with_db(db)
     agent._session_turn_lease_refresh_interval = 0.01

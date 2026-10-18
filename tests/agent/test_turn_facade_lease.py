@@ -131,3 +131,144 @@ def test_interrupt_turn_only_while_active():
     assert calls == ["lost"] and lease.interrupt_message == "lost"
     lease.deactivate_after_liveness_abort()
     assert lease.stop.is_set() and lease.is_turn_active() is False
+
+
+_REFRESH_FAILED_MSG = "Session turn lease could not be refreshed; stopping to protect the transcript."
+
+
+def _refresh_lease(monkeypatch, outcomes):
+    """A live lease whose refreshes follow ``outcomes`` (True/False or an exception to raise) on
+    a fake clock; backoff waits advance the clock instead of sleeping."""
+    import sqlite3
+
+    from agent import turn_facade_lease as mod
+
+    clock = [1000.0]
+    monkeypatch.setattr(mod, "_now", lambda: clock[0])
+    db = _Db()
+    calls = []
+
+    def refresh(session_id, holder, **kwargs):
+        calls.append(clock[0])
+        outcome = outcomes.pop(0) if outcomes else sqlite3.OperationalError("database is locked")
+        if isinstance(outcome, BaseException):
+            clock[0] += 20.0  # the busy timeout spent before sqlite gives up
+            raise outcome
+        return outcome
+
+    db.refresh_session_turn_lease = refresh
+    agent = _agent(db)
+    interrupts = []
+    agent.interrupt = lambda msg, **kw: interrupts.append(msg)
+    lease = DurableTurnLease(agent, db, "s1", "h")
+    lease.turn_active = True
+    waits = []
+
+    def fake_wait(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+        return lease.stop.is_set()
+
+    lease._backoff_wait = fake_wait
+    clock[0] += 60.0  # first scheduled tick: one refresh interval after admission
+    return lease, clock, calls, interrupts, waits
+
+
+def test_refresh_locked_once_then_ok_does_not_interrupt(monkeypatch):
+    import sqlite3
+
+    lease, clock, calls, interrupts, waits = _refresh_lease(
+        monkeypatch, [sqlite3.OperationalError("database is locked"), True]
+    )
+    assert lease.refresh_tick() is None  # timer keeps running
+    assert interrupts == [] and lease.interrupt_message is None
+    assert len(calls) == 2 and waits == [5.0]
+    assert lease.last_refresh_ok == calls[1]
+
+
+def test_refresh_locked_until_ttl_margin_interrupts_once(monkeypatch):
+    from agent import turn_facade_lease as mod
+
+    lease, clock, calls, interrupts, waits = _refresh_lease(monkeypatch, [])
+    acquired_at = clock[0] - 60.0
+    assert lease.refresh_tick() is False
+    assert interrupts == [_REFRESH_FAILED_MSG]
+    # Gave up only once the lease could actually lapse, never with real validity left.
+    assert clock[0] - acquired_at >= LEASE_TTL_SECONDS - mod.LEASE_REFRESH_SAFETY_MARGIN_SECONDS
+    assert clock[0] - acquired_at < LEASE_TTL_SECONDS
+    assert len(calls) > 2
+    # Each failed attempt logged a WARNING; one ERROR when it finally interrupted.
+    assert len(waits) == len(calls) - 1
+
+
+def test_refresh_returning_false_interrupts_immediately(monkeypatch):
+    lease, clock, calls, interrupts, waits = _refresh_lease(monkeypatch, [False])
+    assert lease.refresh_tick() is False
+    assert interrupts == ["Session turn lease lost; stopping to protect the transcript."]
+    assert len(calls) == 1 and waits == []
+
+
+def test_real_state_db_write_lock_past_busy_timeout_kills_no_turn(tmp_path, monkeypatch):
+    """2026-10-18 04:18: a VACUUM held the state.db writer past the write patience and every live
+    turn's refresh raised "database is locked". Against a REAL SessionDB, a foreign writer holding
+    the lock for several write-patience windows must kill zero turns, and the row is renewed once
+    the lock clears. Time is scaled down (patience 0.2 s, TTL 8 s, lock 3 s > the writer's
+    1 s busy timeout); the shape is the incident's."""
+    import sqlite3
+    import time
+
+    from agent import turn_facade_lease as mod
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.2)
+    monkeypatch.setattr(mod, "LEASE_TTL_SECONDS", 8.0)
+    monkeypatch.setattr(mod, "LEASE_REFRESH_SAFETY_MARGIN_SECONDS", 2.0)
+    monkeypatch.setattr(mod, "_REFRESH_RETRY_BACKOFF_SECONDS", (0.1, 0.2))
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.create_session("s1", source="test")
+    holder = "pid=0:turn=live"
+    assert db.try_acquire_session_turn_lease("s1", holder, ttl_seconds=8.0)
+    agent = _agent(db)
+    interrupts = []
+    agent.interrupt = lambda msg, **kw: interrupts.append(msg)
+    lease = DurableTurnLease(agent, db, "s1", holder)
+    lease.turn_active = True
+
+    def expires_at():
+        with sqlite3.connect(path) as c:
+            return c.execute("SELECT expires_at FROM session_turn_leases").fetchone()[0]
+
+    before = expires_at()
+    blocker = sqlite3.connect(path, timeout=0, isolation_level=None, check_same_thread=False)
+    blocker.execute("BEGIN IMMEDIATE")  # the foreign writer (VACUUM stand-in)
+    threading.Timer(3.0, lambda: blocker.execute("COMMIT")).start()
+    started = time.monotonic()
+    try:
+        assert lease.refresh_tick() is None
+    finally:
+        try:
+            blocker.execute("COMMIT")
+        except sqlite3.Error:
+            pass
+        blocker.close()
+    assert time.monotonic() - started >= 3.0  # it really waited out the lock
+    assert interrupts == [] and lease.interrupt_message is None
+    assert expires_at() > before
+    db.release_session_turn_lease("s1", holder)
+
+
+def test_refresh_retry_stops_quietly_when_turn_ends(monkeypatch):
+    import sqlite3
+
+    lease, clock, calls, interrupts, waits = _refresh_lease(
+        monkeypatch, [sqlite3.OperationalError("database is locked")]
+    )
+
+    def wait_then_stop(seconds):
+        lease.stop_refresher()
+        return True
+
+    lease._backoff_wait = wait_then_stop
+    assert lease.refresh_tick() is False
+    assert interrupts == [] and len(calls) == 1
