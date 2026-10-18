@@ -140,6 +140,76 @@ def test_off_switch_allows(fleet):
     assert _tool(tid, ACK_1047).get("ok") is True
 
 
+@pytest.mark.parametrize("sep", ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\r"])
+def test_non_newline_separators_are_one_line_like_the_fleet_grammar(fleet, sep):
+    """Prism 38d008dd32f1: ``splitlines()`` split ``merged<sep>prose`` into a valid line + prose."""
+    home, tid = fleet
+    body = f"close-on: merged{sep}trailing prose"
+    lib = guard._load("close_on")
+    gate = lib.LINE_RE.search(body).group("gate")
+    assert lib.parse_release(gate) is None, "the fleet grammar reads this as ONE invalid gate"
+    with pytest.raises(guard.CloseOnLineRefused):
+        with kb.connect_closing() as conn:
+            kb.add_comment(conn, tid, "daedalus", body)
+    assert _comments(tid) == []
+
+
+def _triaged(tid):
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+
+
+def test_triage_resolve_reason_is_refused_before_any_write(fleet):
+    """Prism bfa6281ecbac: ``triage_resolve_task`` inserted its reason inline, past the guard."""
+    _, tid = fleet
+    _triaged(tid)
+    with kb.connect_closing() as conn:
+        events = len(kb.list_events(conn, tid))
+        ok, err = kb.triage_resolve_task(conn, tid, to="todo", actor="daedalus",
+                                         reason="Bare `close-on: merged` posted above")
+        assert not ok and guard.REFUSAL_HINT in err
+        assert kb.get_task(conn, tid).status == "triage"
+        assert len(kb.list_events(conn, tid)) == events
+    assert _comments(tid) == []
+    with kb.connect_closing() as conn:
+        assert kb.triage_resolve_task(conn, tid, to="todo", actor="daedalus", reason="human decided")[0]
+    assert _comments(tid) == ["TRIAGE-RESOLVE -> todo: human decided"]
+
+
+def test_request_changes_coverage_is_refused_before_any_write(fleet, monkeypatch):
+    """Prism bfa6281ecbac: the review_coverage comment was an inline INSERT, past the guard."""
+    from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as LENSES
+
+    _, tid = fleet
+    session = "20261017_200000_operator"
+    monkeypatch.setenv("HERMES_SESSION_ID", session)
+    with kb.connect_closing() as conn:
+        impl = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="ready", reviewer="human",
+                                 expected_run_id=impl.current_run_id)
+        before = (len(kb.list_events(conn, tid)), len(kb.list_runs(conn, tid)))
+    coverage = json.dumps({
+        "verdict": "CHANGES_REQUESTED", "head_sha": "1ee13c3d39", "lenses": {k: "done" for k in LENSES},
+        "findings": 1, "items": ["Bare `close-on: merged` posted above"], "review_minutes": 4, "batch_id": "b1",
+    })
+    with kb.connect_closing() as conn:
+        ok, err = kb.request_changes(conn, tid, reason="fix it", claimer="apollo", coverage=coverage,
+                                     session_ref=kb.derive_session_ref(session))
+        assert not ok and guard.REFUSAL_HINT in err, err
+        assert (len(kb.list_events(conn, tid)), len(kb.list_runs(conn, tid))) == before
+        assert kb.get_task(conn, tid).status == "review"
+    assert _comments(tid) == []
+
+
+def test_insert_comment_helper_is_guarded(fleet):
+    """The shared inline helper (``_insert_comment``) carries the same check."""
+    _, tid = fleet
+    with pytest.raises(guard.CloseOnLineRefused):
+        with kb.connect_closing() as conn, kb.write_txn(conn):
+            kb._insert_comment(conn, tid, "daedalus", "Bare `close-on: merged` above", 1)
+    assert _comments(tid) == []
+
+
 def test_block_reason_is_refused_before_the_transition(fleet, capsys):
     _, tid = fleet
     top = argparse.ArgumentParser(prog="hermes")

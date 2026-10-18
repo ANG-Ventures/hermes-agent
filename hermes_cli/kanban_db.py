@@ -8217,6 +8217,11 @@ def _insert_comment(
     opens its own txn and emits ``commented``). Still attributable: provenance
     resolves best-effort via :func:`_inline_comment_provenance` (NULL/NULL
     renders as ``provenance unknown``, never a guess)."""
+    # Same release-line guard as add_comment (t_80c7e5b9). Today's callers post fixed
+    # templates; a raise here aborts the caller's txn rather than storing a bad gate.
+    from hermes_cli.kanban_close_on_guard import check_comment
+
+    check_comment(author, body)
     run_id, session_ref = _inline_comment_provenance(task_id)
     conn.execute(
         "INSERT INTO task_comments (task_id, author, body, run_id, session_ref, created_at) "
@@ -14017,6 +14022,13 @@ def request_changes(
             return False, coverage_error
     coverage_body = f"review_coverage: {coverage_text}" if coverage_text else None
     comment_author = str(claimer or "reviewer").strip() or "reviewer"
+    if coverage_body is not None:
+        # Inline INSERT below bypasses add_comment's release-line guard: check before any write (t_80c7e5b9).
+        from hermes_cli.kanban_close_on_guard import refusal as _close_on_refusal
+
+        close_on_error = _close_on_refusal(comment_author, coverage_body)
+        if close_on_error:
+            return False, close_on_error
 
     opened: list[int] = []
     posted: list[tuple[int, int, int]] = []  # (comment_id, run_id, created_at)
@@ -14866,6 +14878,13 @@ def triage_resolve_task(
     reason = (reason or "").strip()
     if not reason:
         return False, "a reason is required (this is a human-in-the-loop decision)"
+    if actor and actor.strip():
+        # The TRIAGE-RESOLVE comment is an inline INSERT (no add_comment guard): check before any write (t_80c7e5b9).
+        from hermes_cli.kanban_close_on_guard import refusal as _close_on_refusal
+
+        close_on_error = _close_on_refusal(actor.strip(), f"TRIAGE-RESOLVE -> {to}: {reason}")
+        if close_on_error:
+            return False, close_on_error
 
     now = int(time.time())
     with write_txn(conn):

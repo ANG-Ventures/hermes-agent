@@ -84,7 +84,10 @@ def _load(name: str) -> Optional[ModuleType]:
 def violations(body: str, lib: ModuleType) -> list[tuple[str, str]]:
     """``[(line, why)]`` for every token-carrying line that is not a valid release line."""
     out = []
-    for line in str(body or "").splitlines():
+    # ``\n`` only, the fleet grammar's one line boundary (``LINE_RE`` is ``re.M`` with a
+    # ``[^\n]*`` gate). ``splitlines()`` also splits on \v, \f, \x1c-\x1e, \x85, U+2028/9,
+    # which would pass ``close-on: merged\vprose`` as a valid line plus prose.
+    for line in str(body or "").split("\n"):
         if not TOKEN_RE.search(line):
             continue
         m = lib.LINE_RE.match(line)
@@ -119,3 +122,12 @@ def check_comment(author: str, body: str) -> None:
             f"{REFUSAL_HINT}. Valid: `close-on: merged`, `close-on: <cron-id> <text>`, "
             "`close-on: <ISO-8601 with offset> <text>`, or a close-on predicate / `manual:` gate."
         )
+
+
+def refusal(author: str, body: str) -> Optional[str]:
+    """:func:`check_comment` for writers that return ``(ok, reason)``: the message, or None."""
+    try:
+        check_comment(author, body)
+    except CloseOnLineRefused as exc:
+        return str(exc)
+    return None
