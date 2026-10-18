@@ -677,12 +677,25 @@ def actionable_red_items(card: dict, items: list[dict], status: Optional[str],
     return keep
 
 
+def is_review_lease_lapse(item: dict) -> bool:
+    """A ``reclaimed`` of a REVIEW claim that had no worker pid: an operator ``claim --review`` lease ran out.
+    No worker existed, so nothing is stuck; its ``heartbeat_stale`` is the implementer run's old heartbeat
+    (2026-10-13: every one of the 8 ``stuck (reclaimed)`` wakes 07:00-08:30 was this shape)."""
+    p = item.get("payload") or {}
+    return (item.get("kind") == "reclaimed" and p.get("retry_status") == "review"
+            and "worker_pid" in p and p.get("worker_pid") is None)
+
+
 def terminal_pending_items(kb: Any, card: dict, items: list[dict], status: Optional[str]) -> list[dict]:
     """t_26ebe71a: ``stuck`` items (gave_up / reclaimed / ...) of a review card approved at its PR head with a land
     in flight there are withheld with a ``terminal-pending`` receipt; the lander owns the card, not the owner.
-    Blocking; worker thread."""
+    A pid-less review-claim lapse is withheld with a ``review-lease-lapse`` receipt. Blocking; worker thread."""
     from hermes_cli import kanban_terminal_pending as _tp
 
+    lapses = [i for i in items if i.get("trigger") == TRIGGER_STUCK and is_review_lease_lapse(i)]
+    if lapses:
+        unrecorded = _record_noise(card, lapses, _tp.REASON_LEASE_LAPSE)
+        items = [i for i in items if not any(i is x for x in lapses)] + unrecorded
     stuck = [i for i in items if i.get("trigger") == TRIGGER_STUCK]
     if not stuck or status not in ("review", "running"):
         return items

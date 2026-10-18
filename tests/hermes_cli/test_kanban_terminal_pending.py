@@ -1,0 +1,266 @@
+"""A review card approved at its PR head with a land in flight is TERMINAL-PENDING (t_26ebe71a).
+
+2026-10-13 07:00-08:30: seven review cards with an APPROVE at the current head and a land queued had their
+15-min operator review claim expire while the reviewer waited on CI. The TTL sweep reclaimed each one, scored
+it as a worker failure (``gave_up``: failures 2-3 vs effective_limit 2, ``retry_status=review``) and the owner
+got ``stuck`` / ``gave_up`` wakes for finished cards. One fixture per rule:
+
+(a) the sweep EXTENDS a terminal-pending review claim instead of reclaiming it;
+(b) a review claim that does lapse goes back to ``review`` without touching the retry counter;
+(c) the owner wake withholds ``stuck`` on a terminal-pending card with a ``terminal-pending`` receipt.
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from gateway import kanban_owner_wake as ow
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_terminal_pending as tp
+from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES
+
+HEAD = "3806e0d8a3f043f550f0d5858e89926f5cd5129b"
+OTHER = "fad526c44b7ef3a83fc6586f73b3bc1305634196"
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    root.mkdir()
+    for key in list(os.environ):
+        if key.startswith("HERMES_KANBAN"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    return root
+
+
+def _dead_pid() -> int:
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def _approve(conn, task_id, head=HEAD, verdict="APPROVE"):
+    rec = {"verdict": verdict, "head_sha": head, "reviewer": "human:apollo",
+           "lenses": {name: "done" for name in REQUIRED_REVIEW_LENSES}, "findings": 0, "items": [],
+           "review_minutes": 5, "batch_id": "n/a: test"}
+    kb.add_comment(conn, task_id, "default", "review_coverage: " + json.dumps(rec))
+
+
+def _operator_review_claim(conn, title="approved, landing"):
+    """The 10-13 shape: ``claim --review`` from a CLI pid that has exited, no worker pid, claim expired."""
+    tid = kb.create_task(conn, title=title, assignee="builder")
+    impl = kb.claim_task(conn, tid)
+    assert impl
+    assert kb.request_review(conn, tid, summary="ready", reviewer="human", expected_run_id=impl.current_run_id)
+    host = kb._claimer_id().rpartition(":")[0]
+    assert kb.claim_review_task(conn, tid, claimer=f"{host}:{_dead_pid()}", operator_claim=True)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 5, tid))
+    return tid
+
+
+def _land_request(root: Path, card: str, head=HEAD, suffix=".json", done=False, ulid="01TESTLANDREQ"):
+    d = root / "var" / "land-requests"
+    d.mkdir(parents=True, exist_ok=True)
+    req = {"ulid": ulid, "repo": "ANG-Ventures/hermes-home", "pr": 4049, "review_head_sha": head,
+           "card": card, "created_at": time.time()}
+    (d / f"{ulid}{suffix}").write_text(json.dumps(req))
+    if done:
+        (d / f"{ulid}.done.json").write_text(json.dumps(req))
+        (d / f"{ulid}.result.json").write_text(json.dumps({"ulid": ulid, "status": "FAILED", "rc": 9,
+                                                           "finished_at": time.time()}))
+    return d
+
+
+def _kinds(conn, tid):
+    return [e.kind for e in kb.list_events(conn, task_id=tid)]
+
+
+# --- (a) the TTL sweep extends a terminal-pending review claim ---------------------------------------------
+
+
+def test_sweep_extends_approved_review_claim_with_open_land_request(home):
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        _approve(conn, tid)
+        _land_request(home, tid)
+        assert kb.release_stale_claims(conn, failure_limit=1) == 0
+        task = kb.get_task(conn, tid)
+        assert task.status == "running" and task.claim_expires > time.time()
+        ext = [e for e in kb.list_events(conn, task_id=tid) if e.kind == "claim_extended"][-1]
+        assert ext.payload["reason"] == "terminal_pending"
+        assert ext.payload["land"]["source"] == "land-request"
+        assert "reclaimed" not in _kinds(conn, tid) and "gave_up" not in _kinds(conn, tid)
+
+
+@pytest.mark.parametrize("intent", ["inflight", "parked", "armed", "land-watch", "land-queue"])
+def test_every_open_land_intent_counts(home, intent):
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        _approve(conn, tid)
+        held = None
+        if intent == "inflight":
+            _land_request(home, tid, suffix=".inflight")
+        elif intent == "parked":
+            _land_request(home, tid, suffix=".parked.json")
+        elif intent == "armed":
+            d = _land_request(home, tid, suffix=".done.json")
+            (d / "01TESTLANDREQ.result.json").write_text(json.dumps(
+                {"ulid": "01TESTLANDREQ", "status": "ARMED", "rc": 0, "finished_at": time.time()}))
+        elif intent == "land-watch":
+            d = home / "var" / "land-watch"
+            d.mkdir(parents=True)
+            (d / "ANG-Ventures_hermes-home-4049.pin.json").write_text(json.dumps({"card": tid, "head": HEAD}))
+            held = open(d / "ANG-Ventures_hermes-home-4049.lock", "w")
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            d = home / "state" / "apollo-land-queue"
+            d.mkdir(parents=True)
+            (d / "1-x-4049.json").write_text(json.dumps({"id": "1-x-4049", "card": tid, "repo": "o/r", "pr": 4049,
+                                                         "status": "pending"}))
+        try:
+            assert tp.terminal_pending(conn, tid) is not None
+            assert kb.release_stale_claims(conn) == 0
+        finally:
+            if held:
+                held.close()
+
+
+@pytest.mark.parametrize("shape", ["no-land", "land-finished", "land-other-head", "approve-other-head",
+                                   "newest-is-sendback", "land-watch-dead", "land-cancelled"])
+def test_not_terminal_pending_is_reclaimed_as_before(home, shape):
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        _approve(conn, tid, head=OTHER if shape == "approve-other-head" else HEAD)
+        if shape == "newest-is-sendback":
+            _approve(conn, tid, verdict="CHANGES_REQUESTED")
+        if shape in ("land-finished",):
+            _land_request(home, tid, suffix=".done.json", done=True)
+        elif shape == "land-other-head":
+            _land_request(home, tid, head=OTHER)
+        elif shape == "land-cancelled":
+            d = _land_request(home, tid)
+            (d / "01TESTLANDREQ.cancel.json").write_text("{}")
+        elif shape in ("approve-other-head", "newest-is-sendback"):
+            _land_request(home, tid)
+        elif shape == "land-watch-dead":
+            d = home / "var" / "land-watch"
+            d.mkdir(parents=True)
+            (d / "o_r-1.pin.json").write_text(json.dumps({"card": tid, "head": HEAD}))
+            (d / "o_r-1.lock").write_text("pid=1")
+        assert tp.terminal_pending(conn, tid) is None
+        assert kb.release_stale_claims(conn) == 1
+        assert kb.get_task(conn, tid).status == "review"
+        assert "reclaimed" in _kinds(conn, tid)
+
+
+# --- (b) a review-claim reclaim never counts toward the implementation retry budget -------------------------
+
+
+def test_review_claim_lapse_does_not_count_or_give_up(home):
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn, "no land yet")
+        for _ in range(3):   # 10-13: three lapses tripped gave_up at failures 2-3 vs limit 2
+            assert kb.release_stale_claims(conn, failure_limit=1) == 1
+            task = kb.get_task(conn, tid)
+            assert task.status == "review"
+            assert task.consecutive_failures == 0
+            host = kb._claimer_id().rpartition(":")[0]
+            assert kb.claim_review_task(conn, tid, claimer=f"{host}:{_dead_pid()}", operator_claim=True)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 5, tid))
+        assert "gave_up" not in _kinds(conn, tid)
+
+
+def test_implementation_claim_lapse_still_counts(home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="impl", assignee="builder")
+        assert kb.claim_task(conn, tid)
+        from hermes_cli import kanban_db_dispatch as kbd
+        kbd._set_worker_pid(conn, tid, 999_998)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 5, tid))
+        assert kb.release_stale_claims(conn, failure_limit=1) == 1
+        assert "gave_up" in _kinds(conn, tid)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+# --- (c) stuck / gave_up owner wakes on a terminal-pending card become a receipt ----------------------------
+
+
+def _items(conn, tid):
+    return [{"event_id": e.id, "kind": e.kind, "trigger": ow.TRIGGER_STUCK, "payload": e.payload,
+             "actor_sid": "", "actor_profile": "", "event_ts": e.created_at}
+            for e in kb.list_events(conn, task_id=tid) if e.kind in ("gave_up", "reclaimed")]
+
+
+def _gave_up_card(conn):
+    tid = _operator_review_claim(conn)
+    with kb.write_txn(conn):
+        kb._append_event(conn, tid, "gave_up", {"failures": 2, "effective_limit": 2, "retry_status": "review"})
+    return tid
+
+
+def test_owner_wake_withholds_stuck_on_terminal_pending_with_receipt(home):
+    with kb.connect() as conn:
+        tid = _gave_up_card(conn)
+        _approve(conn, tid)
+        _land_request(home, tid)
+        items = _items(conn, tid)
+        other = {"event_id": 1, "kind": "completed", "trigger": ow.TRIGGER_LAST_BLOCKER}
+        card = {"board": kb.DEFAULT_BOARD, "task_id": tid}
+        kept = ow.terminal_pending_items(kb, card, items + [other], "review")
+        assert kept == [other], "only the stuck items are withheld"
+        receipts = [e.payload for e in kb.list_events(conn, task_id=tid) if e.kind == "notify_suppressed"]
+        assert [(r["kind"], r["reason"], r["path"]) for r in receipts] == [("gave_up", tp.REASON, "owner-wake")]
+        from hermes_cli import kanban_show_suppressed as kss
+        rows = kss.suppressed_rows(kb.list_events(conn, task_id=tid))
+        assert rows and rows[0]["reason"] == "terminal-pending"
+
+
+def test_owner_wake_withholds_pidless_review_lease_lapse(home):
+    """The real 10-13 07:11 payload: a reclaim of an operator review claim, heartbeat_stale from the old run."""
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        assert kb.release_stale_claims(conn) == 1
+        items = _items(conn, tid)
+        assert items and items[0]["payload"]["retry_status"] == "review"
+        assert items[0]["payload"]["worker_pid"] is None
+        assert ow.terminal_pending_items(kb, {"board": kb.DEFAULT_BOARD, "task_id": tid}, items, "review") == []
+        receipts = [e.payload for e in kb.list_events(conn, task_id=tid) if e.kind == "notify_suppressed"]
+        assert [(r["kind"], r["reason"]) for r in receipts] == [("reclaimed", tp.REASON_LEASE_LAPSE)]
+
+
+@pytest.mark.parametrize("payload", [
+    {"retry_status": "review", "worker_pid": 4242},          # a spawned reviewer worker died: stuck is real
+    {"retry_status": "ready", "worker_pid": None},           # an implementation claim
+    {"retry_status": "review"},                              # no worker_pid field: unknown, fail open
+])
+def test_lease_lapse_is_only_the_pidless_review_claim(payload):
+    assert not ow.is_review_lease_lapse({"kind": "reclaimed", "payload": dict(payload, heartbeat_stale=True)})
+    assert not ow.is_review_lease_lapse({"kind": "crashed", "payload": {"retry_status": "review", "worker_pid": None}})
+
+
+@pytest.mark.parametrize("shape", ["no-land", "not-approved", "card-blocked"])
+def test_owner_wake_keeps_stuck_when_not_terminal_pending(home, shape):
+    with kb.connect() as conn:
+        tid = _gave_up_card(conn)
+        if shape != "not-approved":
+            _approve(conn, tid)
+        if shape != "no-land":
+            _land_request(home, tid)
+        items = _items(conn, tid)
+        status = "blocked" if shape == "card-blocked" else "review"
+        assert ow.terminal_pending_items(kb, {"board": kb.DEFAULT_BOARD, "task_id": tid}, items, status) == items
+        assert "notify_suppressed" not in _kinds(conn, tid)

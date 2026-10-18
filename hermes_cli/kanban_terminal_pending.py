@@ -37,6 +37,8 @@ from pathlib import Path
 from typing import Optional
 
 REASON = "terminal-pending"
+# The owner wake's receipt for a pid-less review claim whose lease ran out (no worker existed to be stuck).
+REASON_LEASE_LAPSE = "review-lease-lapse"
 # A lander result that left the PR armed on GitHub (auto-merge / merge queue) stays a land in flight for this long;
 # land_request.py's own PARK_MAX_SECONDS bound for a parked request.
 ARMED_HORIZON_S = 6 * 3600
