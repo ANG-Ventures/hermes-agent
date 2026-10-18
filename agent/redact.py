@@ -1364,7 +1364,7 @@ def redact_for_egress(text: str) -> str:
 
 _TRACKER_FIELD_HINT_RE = re.compile(r"passkey|torrent_pass|cookie|mam_?id|cf_clearance|\"pass\"", re.IGNORECASE)
 _TRACKER_FIELD_RE = re.compile(
-    r'("(?:passkey|torrent_pass|cookies?|mam_?id|cf_clearance|pass)")(\s*:\s*)"([^"\n]+)"', re.IGNORECASE)
+    r'("(?:passkey|torrent_pass|cookies?|mam_?id|cf_clearance|pass)")(\s*:\s*)"((?:\\.|[^"\\\n])+)"', re.IGNORECASE)
 
 
 def _tracker_field_sub(m: re.Match) -> str:

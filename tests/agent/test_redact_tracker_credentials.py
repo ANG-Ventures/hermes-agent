@@ -75,6 +75,14 @@ def test_terminal_boundary_sqlite_dump_masked():
     assert '"uid": "1234567"' in out
 
 
+def test_terminal_boundary_escaped_quote_in_value():
+    # Prism round 2: an escaped quote inside the JSON string must not end the match early.
+    text = json.dumps({"cookie": 'session="' + _IPT_PASS + '"'})
+    out = redact_terminal_output(text, "sqlite3 -readonly prowlarr.db 'select * from IndexerStatus'", force=True)
+    _assert_no_secret(out)
+    assert json.loads(out) == {"cookie": "***"}
+
+
 def test_terminal_boundary_keeps_source_literals():
     src = 'cfg = {"pass": "yes", "cookie": "none"}\n'
     assert redact_terminal_output(src, "cat app.py", force=True) == src
