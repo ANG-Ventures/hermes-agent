@@ -141,6 +141,23 @@ def test_nonzero_pytest_exit_with_passing_items_is_red(tmp_path):
     assert len(result.failures) == 1 and result.failures[0].startswith(f"PYTEST EXIT {f}: rc 1")
 
 
+def test_member_whose_body_never_ran_is_red_not_a_skipped_member(tmp_path):
+    # Prism 6c8f20320fee (Apollo-proven on 0ab6cf0e): setup passed, no call report (pytest.exit before the
+    # call, a session hook that ends the run), sibling passed -> the old classifier filed it as a skipped
+    # member (WARN) and the lane read GREEN while the guard never executed.
+    f = "tests/test_canary_x.py"
+    data = {"collected": [f + "::test_a", f + "::test_b"], "errors": [], "rc": 0, "reports": [
+        {"nodeid": f + "::test_a", "when": w, "outcome": "passed", "xfail": False, "reason": ""}
+        for w in ("setup", "call", "teardown")] + [
+        {"nodeid": f + "::test_b", "when": w, "outcome": "passed", "xfail": False, "reason": ""}
+        for w in ("setup", "teardown")]}
+    result = canary_lane.LaneResult()
+    canary_lane._classify_checked(f, [f], data, result)
+    assert not result.ok
+    assert result.failures == [f"NO CALL {f}::test_b: setup passed but the test body never ran (session ended "
+                               "before the call; not coverage)"]
+
+
 def test_interrupt_in_fixture_teardown_is_red(tmp_path):
     repo = _lane_repo(tmp_path, ["tests/test_td.py::test_a"])
     (repo / "tests/test_td.py").write_text(

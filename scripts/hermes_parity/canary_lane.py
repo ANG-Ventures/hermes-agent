@@ -175,9 +175,16 @@ def classify(nodeids: Sequence[str], data: dict, result: LaneResult) -> None:
             # a file/class registration is a container: one member skipping (a platforms("windows") test on
             # linux) is that member's OS lane's job, but a container where NOTHING runs guards nothing
             member = item.startswith(nodeid + "::")
-            if state in ("passed", "xfailed") and item not in called:
-                # xfail(run=False) reports from setup; pytest.exit() leaves a passing setup and no call
+            if state == "xfailed" and item not in called:
+                # xfail(run=False) reports from setup as skipped+wasxfail: the body never ran -> a skip, not coverage
                 state, reason = "skipped", reason or "the test body never ran (no call phase)"
+            elif state == "passed" and item not in called:
+                # Prism 6c8f20320fee: setup PASSED and no call report (pytest.exit() before the call, a session
+                # hook ending the run). Not a skip (a real skip reports `skipped` from setup): the guard simply
+                # never executed, so it is RED even inside a file/class registration whose siblings ran.
+                result.failures.append(f"NO CALL {item}: setup passed but the test body never ran (session "
+                                       "ended before the call; not coverage)")
+                continue
             if state in ("passed", "xfailed"):
                 result.executed[item] = state
                 ran += 1
