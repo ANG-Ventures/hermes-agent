@@ -26,11 +26,13 @@ def _entry(patch, status="modified", filename="skills/x/SKILL.md"):
 
 
 # --- line-level file check -------------------------------------------------
+# file_carries(entry, candidate, merge_base, head): every side is the file's bytes, None = absent.
 
 
 def test_pr_content_on_main_is_carried():
     patch = "@@ -1,3 +1,3 @@\n keep\n-old line\n+new line\n tail\n"
-    assert sc.file_carries(_entry(patch), b"keep\nnew line\ntail\n")
+    mb, head = b"keep\nold line\ntail\n", b"keep\nnew line\ntail\n"
+    assert sc.file_carries(_entry(patch), b"keep\nnew line\ntail\n", mb, head)
 
 
 def test_key_present_but_value_absent_is_not_carried():
@@ -38,28 +40,49 @@ def test_key_present_but_value_absent_is_not_carried():
     patch = ("@@ -1,3 +1,3 @@\n ---\n"
              "-metadata: {hermes: {portability: cli, requires: [uv]}}\n"
              "+metadata: {hermes: {portability: cli, requires: [], requires_bins: [uv]}}\n ---\n")
-    main = b"---\nmetadata: {hermes: {portability: cli, requires: [uv]}}\n---\n"
-    assert not sc.file_carries(_entry(patch), main)
+    mb = b"---\nmetadata: {hermes: {portability: cli, requires: [uv]}}\n---\n"
+    head = b"---\nmetadata: {hermes: {portability: cli, requires: [], requires_bins: [uv]}}\n---\n"
+    assert not sc.file_carries(_entry(patch), mb, mb, head)
 
 
 def test_later_edit_on_main_superset_is_carried():
     patch = "@@ -1,2 +1,3 @@\n a\n+added by the PR\n b\n"
-    assert sc.file_carries(_entry(patch), b"a\nadded by the PR\nnewer line from another PR\nb\n")
+    mb, head = b"a\nb\n", b"a\nadded by the PR\nb\n"
+    assert sc.file_carries(_entry(patch), b"a\nadded by the PR\nnewer line from another PR\nb\n", mb, head)
 
 
 def test_removed_file_must_be_absent():
-    assert sc.file_carries(_entry("", status="removed"), None)
-    assert not sc.file_carries(_entry("", status="removed"), b"still here\n")
+    assert sc.file_carries(_entry("", status="removed"), None, b"x\n", None)
+    assert not sc.file_carries(_entry("", status="removed"), b"still here\n", b"still here\n", None)
 
 
 def test_patchless_file_needs_the_exact_blob():
     data = b"\x00\x01binary"
     entry = {"filename": "a.bin", "status": "modified", "sha": sc._blob_sha(data)}
-    assert sc.file_carries(entry, data)
-    assert not sc.file_carries(entry, data + b"!")
+    assert sc.file_carries(entry, data, b"old", data)
+    assert not sc.file_carries(entry, data + b"!", b"old", data)
 
 
-# --- key-level frontmatter fallback (the drain re-serializes headers) ------
+def test_added_line_counted_as_a_multiset():
+    """Prism 683cd59569ec: a line the PR adds twice must appear twice more than at merge-base."""
+    patch = "@@ -1,2 +1,4 @@\n a\n+dup\n b\n+dup\n"
+    mb, head = b"a\nb\n", b"a\ndup\nb\ndup\n"
+    assert not sc.file_carries(_entry(patch), b"a\ndup\nb\n", mb, head)
+    assert sc.file_carries(_entry(patch), b"a\ndup\nb\ndup\n", mb, head)
+    # a line already at merge-base once, added once more by the PR: once on the candidate is not enough
+    mb2, head2 = b"dup\na\n", b"dup\na\ndup\n"
+    assert not sc.file_carries(_entry("@@ -1,2 +1,3 @@\n dup\n a\n+dup\n"), b"dup\na\n", mb2, head2)
+
+
+def test_removed_lines_must_be_gone():
+    """Prism 320e231efa19: a deletion-only PR is not vacuously carried while main keeps the lines."""
+    patch = "@@ -1,3 +1,2 @@\n a\n-secret: leak\n b\n"
+    mb, head = b"a\nsecret: leak\nb\n", b"a\nb\n"
+    assert not sc.file_carries(_entry(patch), mb, mb, head)
+    assert sc.file_carries(_entry(patch), b"a\nb\nnewer\n", mb, head)
+
+
+# --- frontmatter: parsed key paths vs merge-base (the drain re-serializes headers) ---
 
 BASE = b'---\nname: s\nmetadata: {hermes: {tags: [a], portability: portable, requires: [uv]}}\n---\n\n# s\n'
 HEAD = b'---\nname: s\nmetadata: {hermes: {tags: [a], portability: cli, requires: [uv]}}\n---\n\n# s\n'
@@ -71,21 +94,30 @@ RETAG = ("@@ -1,3 +1,3 @@\n ---\n name: s\n"
 def test_reserialized_frontmatter_with_the_pr_value_is_carried():
     main = (b"---\nname: s\nmetadata:\n  hermes:\n    tags: [a, b]\n    portability: cli\n"
             b"    requires: []\n---\n\n# s\n")  # tags/requires: newer edits the PR did not touch
-    assert not sc.file_carries(_entry(RETAG), main)
-    assert sc.frontmatter_carries(_entry(RETAG), main, BASE, HEAD)
+    assert sc.file_carries(_entry(RETAG), main, BASE, HEAD)
 
 
 def test_reserialized_frontmatter_without_the_pr_value_is_not_carried():
     main = b"---\nname: s\nmetadata:\n  hermes:\n    tags: [a]\n    portability: portable\n---\n\n# s\n"
-    assert not sc.frontmatter_carries(_entry(RETAG), main, BASE, HEAD)
+    assert not sc.file_carries(_entry(RETAG), main, BASE, HEAD)
 
 
-def test_frontmatter_fallback_still_checks_body_lines():
+def test_frontmatter_body_lines_still_checked():
+    """Prism 4e78214bba60: the body after the header goes through the line check."""
     patch = RETAG + "@@ -6,1 +6,2 @@\n # s\n+body line from the PR\n"
     main = b"---\nname: s\nmetadata:\n  hermes:\n    tags: [a]\n    portability: cli\n---\n\n# s\n"
-    assert not sc.frontmatter_carries(_entry(patch), main, BASE, HEAD + b"body line from the PR\n")
-    assert sc.frontmatter_carries(_entry(patch), main + b"body line from the PR\n", BASE,
-                                  HEAD + b"body line from the PR\n")
+    head = HEAD + b"body line from the PR\n"
+    assert not sc.file_carries(_entry(patch), main, BASE, head)
+    assert sc.file_carries(_entry(patch), main + b"body line from the PR\n", BASE, head)
+
+
+def test_frontmatter_body_line_equal_to_a_header_line_still_checked():
+    """Prism 4e78214bba60: a body line that also appears in the header is not exempted."""
+    patch = "@@ -3,1 +3,2 @@\n ---\n+name: s\n"
+    mb = b"---\nname: s\n---\n"
+    head = b"---\nname: s\n---\nname: s\n"
+    assert not sc.file_carries(_entry(patch), b"---\nname: s\n---\n", mb, head)
+    assert sc.file_carries(_entry(patch), b"---\nname: s\n---\nname: s\n", mb, head)
 
 
 def test_frontmatter_key_the_pr_removed_must_be_gone():
@@ -95,8 +127,56 @@ def test_frontmatter_key_the_pr_removed_must_be_gone():
              "+metadata: {hermes: {tags: [a], portability: portable}}\n ---\n")
     kept = b"---\nname: s\nmetadata:\n  hermes:\n    tags: [a]\n    portability: portable\n    requires: [uv]\n---\n"
     gone = b"---\nname: s\nmetadata:\n  hermes:\n    tags: [a]\n    portability: portable\n---\n"
-    assert not sc.frontmatter_carries(_entry(patch), kept, BASE, head)
-    assert sc.frontmatter_carries(_entry(patch), gone, BASE, head)
+    assert not sc.file_carries(_entry(patch), kept, BASE, head)
+    assert sc.file_carries(_entry(patch), gone, BASE, head)
+
+
+def test_frontmatter_baseline_is_the_merge_base_not_base_sha():
+    """Prism 04e61c328b13: the PR's change is measured from the merge-base. Here main (base.sha)
+    already moved portability to `cli` after the PR branched; the PR set it to `cli` too, and the
+    candidate has `portable`. Measured from base.sha the PR changed nothing and passes vacuously."""
+    mb = b"---\nname: s\nportability: portable\n---\n"
+    head = b"---\nname: s\nportability: cli\n---\n"
+    patch = "@@ -1,4 +1,4 @@\n ---\n name: s\n-portability: portable\n+portability: cli\n ---\n"
+    assert not sc.file_carries(_entry(patch), mb, mb, head)
+
+
+def test_frontmatter_empty_mapping_is_a_value():
+    """Prism d20063658cfe: `requires: {}` replacing a populated mapping must be carried as `{}`."""
+    mb = b"---\nname: s\nrequires: {bins: [uv]}\n---\n"
+    head = b"---\nname: s\nrequires: {}\n---\n"
+    patch = "@@ -1,4 +1,4 @@\n ---\n name: s\n-requires: {bins: [uv]}\n+requires: {}\n ---\n"
+    assert not sc.file_carries(_entry(patch), b"---\nname: s\n---\n", mb, head)
+    assert not sc.file_carries(_entry(patch), b"---\nname: s\nrequires: {env: [X]}\n---\n", mb, head)
+    assert sc.file_carries(_entry(patch), b"---\nname: s\nrequires:\n  {}\n---\n", mb, head)
+    # an empty list is likewise a value, not a missing key
+    mb2, head2 = b"---\nreq: [uv]\n---\n", b"---\nreq: []\n---\n"
+    assert not sc.file_carries(_entry("@@ -1 +1 @@\n-req: [uv]\n+req: []\n"), b"---\n---\n", mb2, head2)
+
+
+def test_frontmatter_value_must_be_deep_equal():
+    """Prism f1da33336140 / 397de598ef77: the PR's value is compared parsed and whole, so a candidate
+    that merely contains the key (or a list that only overlaps) is refused."""
+    mb = b"---\nrequires_bins: [git]\n---\n"
+    head = b"---\nrequires_bins: [git, uv]\n---\n"
+    patch = "@@ -1,3 +1,3 @@\n ---\n-requires_bins: [git]\n+requires_bins: [git, uv]\n ---\n"
+    assert not sc.file_carries(_entry(patch), b"---\nrequires_bins: [git]\n---\n", mb, head)
+    assert not sc.file_carries(_entry(patch), b"---\nrequires_bins: [uv]\n---\n", mb, head)
+    assert not sc.file_carries(_entry(patch), b"---\nrequires_bins: 'git, uv'\n---\n", mb, head)
+    assert sc.file_carries(_entry(patch), b"---\nrequires_bins:\n  - git\n  - uv\n---\n", mb, head)
+
+
+def test_frontmatter_unparseable_on_any_side_refuses():
+    head = b"---\nname: s\nportability: cli\n---\n"
+    mb = b"---\nname: s\nportability: portable\n---\n"
+    patch = "@@ -1,4 +1,4 @@\n ---\n name: s\n-portability: portable\n+portability: cli\n ---\n"
+    broken = b"---\nname: s\nportability: cli\n  bad: [\n---\n"
+    unclosed = b"---\nname: s\nportability: cli\n"
+    assert sc.file_carries(_entry(patch), head, mb, head)
+    assert not sc.file_carries(_entry(patch), broken, mb, head)
+    assert not sc.file_carries(_entry(patch), head, broken, head)
+    assert not sc.file_carries(_entry(patch), head, mb, broken + b"x\n")
+    assert not sc.file_carries(_entry(patch), unclosed, mb, head)
 
 
 # --- verify(): the gate's verdict --------------------------------------------
@@ -135,18 +215,22 @@ def test_shas_are_parsed_from_the_pointer_not_card_ids_or_pr_numbers():
 
 # --- pr_content_check(): the sha it returns must itself carry every file (Prism 6265717768a4) ---
 
-OLD, TIP, BASE_SHA, HEAD_SHA = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+OLD, TIP, BASE_SHA, HEAD_SHA, MB_SHA, OFF = "a" * 40, "b" * 40, "c" * 40, "d" * 40, "e" * 40, "f" * 40
 ADDED = {"filename": "new.py", "status": "added", "patch": "@@ -0,0 +1,1 @@\n+print('landed')\n"}
 OTHER = {"filename": "other.py", "status": "added", "patch": "@@ -0,0 +1,1 @@\n+print('other')\n"}
 
 
-def _fake_github(monkeypatch, files, tree):
-    """``tree[ref][path]`` = bytes at that ref; ``main`` resolves to TIP."""
+def _fake_github(monkeypatch, files, tree, on_default=(OLD, TIP)):
+    """``tree[ref][path]`` = bytes at that ref; ``main`` resolves to TIP; MB is the merge-base."""
     import json as _json_mod
-    shas = {OLD: OLD, TIP: TIP, "main": TIP}
+    shas = {OLD: OLD, TIP: TIP, "main": TIP, OFF: OFF}
 
     def fake_json(args):
         path = args[0]
+        if path == f"repos/{REPO}/compare/{BASE_SHA}...{HEAD_SHA}":
+            return {"merge_base_commit": {"sha": MB_SHA}}
+        if path.startswith(f"repos/{REPO}/compare/{TIP}..."):
+            return {"status": "behind" if path.rsplit("...", 1)[1] in on_default else "diverged"}
         if path.startswith(f"repos/{REPO}/commits/"):
             return {"sha": shas[path.rsplit("/", 1)[1]]}
         if path == f"repos/{REPO}":
@@ -160,9 +244,12 @@ def _fake_github(monkeypatch, files, tree):
     monkeypatch.setattr(sc, "_file_bytes", lambda repo, path, ref: tree.get(shas.get(ref, ref), {}).get(path))
 
 
+HEAD_TREE = {"new.py": b"print('landed')\n", "other.py": b"print('other')\n"}
+
+
 def test_content_only_on_tip_records_the_tip_not_the_requested_sha(monkeypatch):
     """Repro: main is at TIP with the PR's file; the pointer names an older OLD without it."""
-    _fake_github(monkeypatch, [ADDED], {OLD: {}, TIP: {"new.py": b"print('landed')\n"}})
+    _fake_github(monkeypatch, [ADDED], {OLD: {}, TIP: {"new.py": b"print('landed')\n"}, HEAD_SHA: HEAD_TREE})
     out = sc.pr_content_check(REPO, 7, OLD)
     assert out["differs"] == []
     assert out["sha"] == TIP, "the survivor must be the commit that carries the content"
@@ -174,19 +261,46 @@ def test_content_only_on_tip_records_the_tip_not_the_requested_sha(monkeypatch):
 
 def test_requested_sha_wins_when_it_carries_everything(monkeypatch):
     _fake_github(monkeypatch, [ADDED], {OLD: {"new.py": b"print('landed')\n"},
-                                        TIP: {"new.py": b"print('landed')\n"}})
+                                        TIP: {"new.py": b"print('landed')\n"}, HEAD_SHA: HEAD_TREE})
     assert sc.pr_content_check(REPO, 7, OLD)["sha"] == OLD
 
 
 def test_files_split_across_two_commits_is_not_carried(monkeypatch):
     """No single commit holds both files: nothing may be promoted to survivor evidence."""
     _fake_github(monkeypatch, [ADDED, OTHER], {OLD: {"new.py": b"print('landed')\n"},
-                                               TIP: {"other.py": b"print('other')\n"}})
+                                               TIP: {"other.py": b"print('other')\n"}, HEAD_SHA: HEAD_TREE})
     out = sc.pr_content_check(REPO, 7, OLD)
     assert out["differs"] in (["new.py"], ["other.py"])
     with pytest.raises(sc.SupersededContentError):
         sc.verify("t_x", op.extract_pr_refs(f"https://github.com/{REPO}/pull/7"), [OLD],
                   check=sc.pr_content_check)
+
+
+def test_sha_off_the_default_branch_is_refused_before_content(monkeypatch):
+    """Prism 4aa42857aa36: a branch-only commit carrying the content is not a superseder, and is
+    never recorded as on-default survivor evidence, even though the tip carries the content too."""
+    tree = {OFF: {"new.py": b"print('landed')\n"}, TIP: {"new.py": b"print('landed')\n"}, HEAD_SHA: HEAD_TREE}
+    _fake_github(monkeypatch, [ADDED], tree)
+    out = sc.pr_content_check(REPO, 7, OFF)
+    assert out["off_default"] is True and not out["sha"]
+    with pytest.raises(sc.SupersededContentError) as err:
+        sc.verify("t_x", op.extract_pr_refs(f"https://github.com/{REPO}/pull/7"), [OFF],
+                  check=sc.pr_content_check)
+    assert err.value.off_default == [OFF]
+    assert "not on the default branch" in str(err.value)
+
+
+def test_merge_base_not_base_sha_is_read(monkeypatch):
+    """Prism 04e61c328b13 at the fetch layer: the PR-side baseline bytes come from the merge-base."""
+    seen = []
+    _fake_github(monkeypatch, [{"filename": "x.md", "status": "modified",
+                                "patch": "@@ -1 +1 @@\n-old\n+new\n"}],
+                 {MB_SHA: {"x.md": b"old\n"}, HEAD_SHA: {"x.md": b"new\n"}, TIP: {"x.md": b"new\n"},
+                  OLD: {"x.md": b"new\n"}, BASE_SHA: {"x.md": b"new\n"}})
+    real = sc._file_bytes
+    monkeypatch.setattr(sc, "_file_bytes", lambda repo, path, ref: (seen.append(ref), real(repo, path, ref))[1])
+    assert sc.pr_content_check(REPO, 7, OLD)["differs"] == []
+    assert MB_SHA in seen and BASE_SHA not in seen
 
 
 # --- E2E through complete_task on a temp board ---------------------------

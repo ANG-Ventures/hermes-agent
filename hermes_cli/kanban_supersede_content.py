@@ -5,13 +5,16 @@ A SHA superseder used to be checked for ancestry only: "is <sha> on the default 
 frontmatter KEY the PR touched existed on main, while the PR's new VALUE did not: the named commit
 was on main and carried none of the PR's content. Ancestry cannot tell those apart.
 
-:func:`pr_content_check` reads the PR's file list and, for every file, asks whether the PR's added
-lines are all present in that file (a later, newer edit on main is a superset and passes). The
-check runs against two candidates, ``sha`` and the default-branch tip; one of them must carry EVERY
-file, and that commit (not merely the requested one) is the survivor evidence. A removed file must be absent; a file GitHub gives no patch for
-(binary, oversized) must match the PR head's blob exactly. A file whose change only deletes lines
-has no added line to look for and passes. Every lookup that fails makes the answer unknown (None):
-the caller fails closed on it.
+:func:`pr_content_check` first refuses a ``sha`` that is not reachable from the default branch.
+It then reads the PR's file list and, for every file, compares the merge-base, the PR head and a
+candidate commit as line MULTISETS: each line the PR added must be on the candidate at least as
+often as on the head, each line it removed no more often (a later, newer edit on main that touches
+neither passes). A YAML frontmatter header is compared by parsed key path instead (the drain
+re-serializes headers), and an unparseable header on any side refuses. Candidates are ``sha`` and
+the default-branch tip; one of them must carry EVERY file, and that commit is the survivor
+evidence. A removed file must be absent; a file GitHub gives no patch for (binary, oversized) must
+match the PR head's blob exactly. Every lookup that fails makes the answer unknown (None): the
+caller fails closed on it.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import hashlib
 import json
 import os
 import subprocess
+from collections import Counter
 from typing import Callable, Optional
 from urllib.parse import quote
 
@@ -69,23 +73,25 @@ def _blob_sha(data: bytes) -> str:
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
-def added_lines(patch: str) -> set:
-    """Non-blank lines a unified-diff hunk body adds (GitHub's ``files[].patch`` has no ``+++`` header)."""
-    out = set()
-    for line in patch.splitlines():
-        if line.startswith("+") and not line.startswith("+++ "):
-            body = line[1:].rstrip("\r")
-            if body.strip():
-                out.add(body)
-    return out
-
-
 def _lines(data: bytes) -> list:
     return [line.rstrip("\r") for line in data.decode("utf-8", "replace").splitlines()]
 
 
+def _counts(lines) -> Counter:
+    """Multiset of non-blank lines: a line present twice counts twice (Prism 683cd59569ec)."""
+    return Counter(line for line in lines if line.strip())
+
+
+class _Unparseable(Exception):
+    """A ``---`` fenced header that is not a YAML mapping (unclosed, invalid, or a scalar/list)."""
+
+
 def split_frontmatter(data: Optional[bytes]):
-    """``(mapping, frontmatter_lines, body_lines)`` for a ``---``-fenced YAML header, else ``None``."""
+    """``(mapping, body_lines)`` for a ``---``-fenced YAML header, ``None`` when there is no header.
+
+    Raises :class:`_Unparseable` when the file opens with ``---`` but the header does not load as a
+    mapping: an unreadable header is never "no header", it is a refusal.
+    """
     if data is None:
         return None
     lines = _lines(data)
@@ -93,103 +99,127 @@ def split_frontmatter(data: Optional[bytes]):
         return None
     try:
         end = lines.index("---", 1)
-    except ValueError:
-        return None
+    except ValueError as exc:
+        raise _Unparseable("unclosed frontmatter") from exc
     from ruamel.yaml import YAML
     try:
         mapping = YAML(typ="safe", pure=True).load("\n".join(lines[1:end]))
-    except Exception:  # noqa: BLE001 - any parse failure means "not comparable", never a pass
-        return None
+    except Exception as exc:  # noqa: BLE001 - any parse failure is a refusal, never a pass
+        raise _Unparseable(str(exc)[:120]) from exc
+    if mapping is None:
+        mapping = {}
     if not isinstance(mapping, dict):
-        return None
-    return mapping, lines[:end + 1], lines[end + 1:]
-
-
-def _leaves(node, prefix=()) -> dict:
-    """``{key path: value}``; a non-mapping value (scalar or list) is one leaf."""
-    if isinstance(node, dict):
-        out = {}
-        for key, value in node.items():
-            out.update(_leaves(value, prefix + (str(key),)))
-        return out
-    return {prefix: node}
-
-
-def frontmatter_carries(entry: dict, data: Optional[bytes], base: Optional[bytes],
-                        head: Optional[bytes]) -> bool:
-    """Key-level check for a YAML-frontmatter file whose header a later writer re-serialized.
-
-    The home-autocommit drain applies frontmatter retags KEY-level and re-emits the header in block
-    style, so the PR's flow-style line never appears verbatim on main. Every leaf the PR changed
-    (base -> head) must hold the head value at the target and every leaf it removed must be gone;
-    the PR's added BODY lines must be present line by line. Leaves the PR did not touch may differ
-    (another PR's newer edit). Unparseable on any side -> False.
-    """
-    target, mine = split_frontmatter(data), split_frontmatter(head)
-    if target is None or mine is None:
-        return False
-    before = split_frontmatter(base) if base is not None else ({}, [], [])
-    if before is None:
-        return False
-    old, new, have = _leaves(before[0]), _leaves(mine[0]), _leaves(target[0])
-    for path, value in new.items():
-        if old.get(path, _MISSING) != value and have.get(path, _MISSING) != value:
-            return False
-    if any(path in have for path in old if path not in new):
-        return False
-    header = set(mine[1])
-    body_added = {line for line in added_lines(entry.get("patch") or "") if line not in header}
-    return body_added <= set(target[2])
+        raise _Unparseable("frontmatter is not a mapping")
+    return mapping, lines[end + 1:]
 
 
 _MISSING = object()
 
 
-def file_carries(entry: dict, data: Optional[bytes]) -> bool:
-    """Does one ref's copy of the file (``None`` = absent) carry this PR file entry's change?"""
+def _keys(node, prefix=()) -> dict:
+    """``{key path: value}``. A non-mapping value and an EMPTY mapping are each one value (an empty
+    mapping is a value, not "no keys": Prism d20063658cfe)."""
+    if isinstance(node, dict) and node:
+        out = {}
+        for key, value in node.items():
+            out.update(_keys(value, prefix + (str(key),)))
+        return out
+    return {prefix: node}
+
+
+def frontmatter_carries(mb: dict, head: dict, cand: dict) -> bool:
+    """Every key path whose value differs between merge-base and PR head holds the head value on the
+    candidate (deep equality; a key the PR removed must be absent). Paths the PR did not change may
+    differ: that is another writer's newer edit, or the drain's block-style re-serialization."""
+    old, new, have = _keys(mb), _keys(head), _keys(cand)
+    for path in set(old) | set(new):
+        want = new.get(path, _MISSING)
+        if old.get(path, _MISSING) == want:
+            continue
+        got = have.get(path, _MISSING)
+        if want is _MISSING:
+            if got is not _MISSING:  # a key path the PR removed must be absent on the candidate
+                return False
+        elif got is _MISSING or got != want or type(got) is not type(want):
+            return False
+    return True
+
+
+def lines_carry(mb_lines, head_lines, cand_lines) -> bool:
+    """Line multiset check: a line the PR added N times appears at least as often on the candidate as
+    on the PR head; a line the PR removed appears no more often than on the PR head (Prism
+    320e231efa19). A later newer edit on main that touches neither is fine."""
+    mb, head, cand = _counts(mb_lines), _counts(head_lines), _counts(cand_lines)
+    for line in set(mb) | set(head):
+        if head[line] > mb[line] and cand[line] < head[line]:
+            return False
+        if head[line] < mb[line] and cand[line] > head[line]:
+            return False
+    return True
+
+
+def file_carries(entry: dict, cand: Optional[bytes], mb: Optional[bytes], head: Optional[bytes]) -> bool:
+    """Does the candidate's copy of the file (``None`` = absent) carry this PR file entry's change?
+
+    ``mb``/``head`` are the file at the PR's merge-base and head (``None`` = absent there). A file whose
+    head opens with YAML frontmatter is compared key by key on the header and line by line on the
+    body after it; an unparseable header on any side refuses (Prism f1da33336140, 397de598ef77,
+    04e61c328b13, 4e78214bba60).
+    """
     if entry.get("status") == "removed":
-        return data is None
-    if data is None:
+        return cand is None
+    if cand is None or head is None:
         return False
-    patch = entry.get("patch")
-    if not isinstance(patch, str):
+    if not isinstance(entry.get("patch"), str):
         # No patch (binary or too large to diff): only the exact blob proves it.
-        return _blob_sha(data) == entry.get("sha")
-    return added_lines(patch) <= set(_lines(data))
-
-
-def _carries(entry: dict, data: Optional[bytes], fetch_sides: Callable[[], tuple]) -> bool:
-    """Line-level check, then the key-level frontmatter fallback (base/head fetched on demand)."""
-    if file_carries(entry, data):
-        return True
-    if entry.get("status") == "removed" or not isinstance(entry.get("patch"), str):
+        return _blob_sha(cand) == entry.get("sha")
+    try:
+        mine = split_frontmatter(head)
+        if mine is None:
+            return lines_carry(_lines(mb) if mb is not None else [], _lines(head), _lines(cand))
+        target = split_frontmatter(cand)
+        before = split_frontmatter(mb) if mb is not None else ({}, [])
+    except _Unparseable:
         return False
-    if not split_frontmatter(data):
+    if target is None:
         return False
-    base, head = fetch_sides()
-    return frontmatter_carries(entry, data, base, head)
+    if before is None:  # merge-base had no header: all of it was body
+        before = ({}, _lines(mb or b""))
+    return frontmatter_carries(before[0], mine[0], target[0]) and lines_carry(before[1], mine[1], target[1])
 
 
 def pr_content_check(repo: str, number: int, sha: str) -> Optional[dict]:
     """``{"sha": <carrier>, "requested": <full sha>, "default": <branch>, "differs": [paths]}``.
 
-    ``None`` when unknown. Candidates are the requested ``sha`` and the default-branch tip, pinned
-    to its commit sha. ``sha`` in the answer is the ONE candidate commit that carries the most PR
-    files (the requested commit wins a tie), and ``differs`` lists every file that commit does not
-    carry. Empty ``differs`` therefore means that commit alone carries all of the PR's content, so
-    it is safe to record as survivor evidence. It is never a commit that only passed because a
-    different ref held the content (Prism 6265717768a4).
+    ``None`` when unknown. The requested ``sha`` must be reachable from the default branch (compare
+    status identical/behind) before any content is read; otherwise the answer carries
+    ``"off_default": True`` and no carrier (Prism 4aa42857aa36). Candidates are the requested ``sha``
+    and the default-branch tip, pinned to its commit sha. ``sha`` in the answer is the ONE candidate
+    commit that carries the most PR files (the requested commit wins a tie), and ``differs`` lists
+    every file that commit does not carry. Empty ``differs`` therefore means that commit alone carries
+    all of the PR's content, so it is safe to record as survivor evidence (Prism 6265717768a4). The
+    PR side is measured from the merge-base of base and head, never ``base.sha`` (a later main).
     """
     try:
         full = str(_json([f"repos/{repo}/commits/{quote(sha)}"]).get("sha") or "")
         default = str(_json([f"repos/{repo}"]).get("default_branch") or "")
         tip = str(_json([f"repos/{repo}/commits/{quote(default)}"]).get("sha") or "") if default else ""
+        if not full or not default or not tip:
+            return None
+        reach = str(_json([f"repos/{repo}/compare/{tip}...{full}"]).get("status") or "")
+        if reach not in ("identical", "behind"):
+            return {"sha": None, "requested": full, "default": default, "differs": [],
+                    "off_default": True}
         pr = _json([f"repos/{repo}/pulls/{int(number)}"])
         base_sha = str((pr.get("base") or {}).get("sha") or "")
         head_sha = str((pr.get("head") or {}).get("sha") or "")
+        if not base_sha or not head_sha:
+            return None
+        mb_sha = str((_json([f"repos/{repo}/compare/{base_sha}...{head_sha}"])
+                      .get("merge_base_commit") or {}).get("sha") or "")
         out = _gh(["--paginate", f"repos/{repo}/pulls/{int(number)}/files?per_page=100",
                    "--jq", ".[] | @json"])
-        if not full or not default or not tip or not base_sha or not head_sha or out is None:
+        if not mb_sha or out is None:
             return None
         files = [json.loads(line) for line in out.splitlines() if line.strip()]
         if not files or len(files) > MAX_FILES:
@@ -200,17 +230,12 @@ def pr_content_check(repo: str, number: int, sha: str) -> Optional[dict]:
             path = str(entry.get("filename") or "")
             if not path:
                 return None
-            sides: list = []
-
-            def fetch_sides(entry=entry, path=path, sides=sides):
-                if not sides:
-                    old_path = str(entry.get("previous_filename") or path)
-                    base = None if entry.get("status") == "added" else _file_bytes(repo, old_path, base_sha)
-                    sides.append((base, _file_bytes(repo, path, head_sha)))
-                return sides[0]
-
+            status = entry.get("status")
+            old_path = str(entry.get("previous_filename") or path)
+            mb = None if status == "added" else _file_bytes(repo, old_path, mb_sha)
+            head = None if status == "removed" else _file_bytes(repo, path, head_sha)
             for ref in candidates:
-                if not _carries(entry, _file_bytes(repo, path, ref), fetch_sides):
+                if not file_carries(entry, _file_bytes(repo, path, ref), mb, head):
                     missing[ref].append(path)
         chosen = min(candidates, key=lambda ref: len(missing[ref]))
     except (_Unreadable, ValueError, TypeError, AttributeError):
@@ -228,11 +253,15 @@ def default_content_check() -> Optional[ContentCheckFn]:
 class SupersededContentError(ValueError):
     """``--superseded-by <sha>`` names a commit that does not carry the card's PR content."""
 
-    def __init__(self, task_id: str, differs: dict, unverified: list):
+    def __init__(self, task_id: str, differs: dict, unverified: list, off_default=()):
         self.task_id = task_id
         self.differs = {pr: list(paths) for pr, paths in differs.items()}
         self.unverified = list(unverified)
+        self.off_default = list(off_default)
         parts = ["done refused: --superseded-by names a commit that does not carry this card's PR content."]
+        if self.off_default:
+            parts.append(f"{', '.join(self.off_default)} is not on the default branch; a superseder "
+                         f"must be a landed commit.")
         for pr, paths in self.differs.items():
             parts.append(f"{pr}: no single commit (that sha, or the default-branch tip) carries the "
                          f"PR's added lines in {', '.join(paths)}.")
@@ -263,11 +292,15 @@ def verify(task_id: str, prs, shas, *, check: Optional[ContentCheckFn] = None) -
         check = default_content_check()
     if check is None or not shas or not prs:
         return []
-    differs, unverified, survivors = {}, [], []
+    differs, unverified, off_default, survivors = {}, [], [], []
     for ref in prs:
         key = f"{ref.repo}#{ref.number}"
         results = [check(ref.repo, ref.number, sha) for sha in shas]
-        ok = next((r for r in results if r is not None and not r.get("differs")), None)
+        off = [r for r in results if r is not None and r.get("off_default")]
+        if off:
+            off_default.extend(r["requested"] for r in off if r["requested"] not in off_default)
+            continue
+        ok = next((r for r in results if r is not None and not r.get("differs") and r.get("sha")), None)
         if ok is not None:
             survivors.append({"remote": f"https://github.com/{ref.repo}", "branch": ok["default"],
                               "sha": ok["sha"], "pr": key, "external": True,
@@ -278,6 +311,6 @@ def verify(task_id: str, prs, shas, *, check: Optional[ContentCheckFn] = None) -
             unverified.append(key)
         else:
             differs[key] = seen["differs"]
-    if differs or unverified:
-        raise SupersededContentError(task_id, differs, unverified)
+    if differs or unverified or off_default:
+        raise SupersededContentError(task_id, differs, unverified, off_default)
     return survivors
