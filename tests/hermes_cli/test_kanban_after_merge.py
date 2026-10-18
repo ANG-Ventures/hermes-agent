@@ -163,6 +163,76 @@ def test_after_merge_without_recorded_pr_waits_for_parent_done(kanban_home):
         assert kb.get_task(conn, child).status == "ready"
 
 
+def _mark_done(conn, task_id: str, status: str = "done") -> None:
+    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    conn.commit()
+
+
+# t_ab2499c5 (2026-10-18 02:02): A8 t_ccdca9ef was completed while its PR hermes-home#4662 was a
+# reviewer-held open DRAFT; the old "or the parent is done" arm released both after-merge children.
+def test_done_parent_with_open_draft_pr_keeps_child_gated(kanban_home, monkeypatch):
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kb.connect() as conn:
+        parent = _parent_with_pr(conn)
+        child = kb.create_task(conn, title="integration cutover", assignee="daedalus")
+        kb.link_tasks(conn, parent, child, kind="after-merge")
+        _mark_done(conn, parent)
+        q = _oracle("OPEN")  # a draft PR reads OPEN
+        assert am.release_merged_edges(conn, query_fn=q) == []
+        assert q.calls == [("ANG-Ventures/hermes-agent", 4242)]
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb._parents_satisfied(conn, child) is False
+        # A child some other writer set ready is still demoted at claim time.
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child,))
+        conn.commit()
+        assert kb.claim_task(conn, child) is None
+        assert kb.get_task(conn, child).status == "todo"
+        # The real tick, too.
+        am._CACHE.clear()
+        monkeypatch.setattr(am, "_default_query", lambda: _oracle("OPEN"))
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.parent_links(conn, child) == [(parent, kb.LINK_KIND_AFTER_MERGE)]
+
+
+def test_done_parent_with_merged_pr_releases(kanban_home):
+    with kb.connect() as conn:
+        parent = _parent_with_pr(conn)
+        child = kb.create_task(conn, title="integration cutover", assignee="daedalus")
+        kb.link_tasks(conn, parent, child, kind="after-merge")
+        _mark_done(conn, parent)
+        assert am.release_merged_edges(conn, query_fn=_oracle("MERGED")) == [(parent, child)]
+        assert kb.parent_links(conn, child) == [(parent, kb.LINK_KIND_DERIVED_FROM)]
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.claim_task(conn, child) is not None
+
+
+def test_done_parent_without_pr_releases_edge_on_close(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="no pr", assignee="daedalus")
+        child = kb.create_task(conn, title="drill", assignee="daedalus")
+        kb.link_tasks(conn, parent, child, kind="after-merge")
+        _mark_done(conn, parent)
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.parent_links(conn, child) == [(parent, kb.LINK_KIND_DERIVED_FROM)]
+
+
+def test_create_behind_done_parent_with_open_pr_starts_todo(kanban_home):
+    with kb.connect() as conn:
+        parent = _parent_with_pr(conn)
+        _mark_done(conn, parent)
+        child = kb.create_task(conn, title="cutover", assignee="daedalus",
+                               parents=[parent], parents_kind="after-merge")
+        assert kb.get_task(conn, child).status == "todo"
+        assert am.release_merged_edges(conn, query_fn=_oracle("OPEN")) == []
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+
+
 def test_dispatch_tick_releases_and_promotes_in_one_tick(kanban_home, monkeypatch):
     """The real tick: release before the lock, recompute_ready promotes."""
     from hermes_cli import kanban_db_dispatch as kbd
