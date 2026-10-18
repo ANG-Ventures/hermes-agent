@@ -1167,9 +1167,12 @@ class TurnRunner:
                         on_missing_cursor="fallback" if want_interim_messages else "raise",
                     )
                     # Internal-event turns (bg-process completions) resolve silence with the
-                    # autonomous rule; hold their preview until the final text is known so a
+                    # internal rule; hold their preview until the final text is known so a
                     # "note + NO_REPLY" never flashes on screen.
                     consumer_cfg.internal_event = ctx.persist_user_display_kind == "internal_notification"
+                    if consumer_cfg.internal_event:
+                        from gateway.response_filters import internal_short_note_words
+                        consumer_cfg.internal_short_note_words = internal_short_note_words(ctx.user_config)
                     stream_consumer = GatewayStreamConsumer(
                         adapter=adapter, chat_id=ctx.source.chat_id, config=consumer_cfg,
                         adapter_resolver=lambda: self._runner._delivery_adapter_for(ctx.source),
