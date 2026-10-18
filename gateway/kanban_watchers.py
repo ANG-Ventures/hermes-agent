@@ -2168,7 +2168,10 @@ class GatewayKanbanWatchersMixin:
                                     wake_noise: dict = {}
                                     red_keys: dict = {}
                                     _wake_mode = (sub.get("delivery_mode") or "notify") in ("notify+wake", "wake")
-                                    _s5 = (_wake_mode and platform != "api_server"
+                                    # notify+wake only: the line still posts, so the owner is
+                                    # told; a wake-only sub's wake IS the delivery (d9c37a52d911).
+                                    _s5 = ((sub.get("delivery_mode") or "notify") == "notify+wake"
+                                           and platform != "api_server"
                                            and _suppress_cfg.enabled and _suppress_cfg.actionable_only)
                                     _s5_home = _s5 and _hr.same_chat(
                                         getattr(home_res, "target", None), platform,
