@@ -516,12 +516,11 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
 
 
 def _load_tier_module(root: Path):
-    """The Hermes root's tier reader (``<root>/scripts/lib/autocommit_tier.py``), or None when absent.
-    A vanilla install has no tier table, so absence fails OPEN; a present-but-broken module raises."""
+    """The Hermes root's tier reader (``<root>/scripts/lib/autocommit_tier.py``), or None when absent
+    (the caller decides what absence means); a present-but-broken module raises."""
     import importlib.util
     path = root / "scripts" / "lib" / "autocommit_tier.py"
     if not path.is_file():
-        logger.warning("skill_manage exec-tier check skipped: %s not found (fail-open)", path)
         return None
     spec = importlib.util.spec_from_file_location("_hermes_autocommit_tier", path)
     if spec is None or spec.loader is None:
@@ -548,13 +547,28 @@ def _exec_tier_refusal(skill_dir: Path, target: Path, action: str) -> Optional[D
     if not pairs:
         return None
     root = shared.parent  # unresolved: a symlinked skills-shared/ still reads the root's table
+    rel_root = f"{shared.name}/{pairs[0][0].relative_to(pairs[0][1]).as_posix()}"
+    if _is_within(target, shared) and not _is_within(target_r, shared_r):
+        # A write through it lands on whatever the link points at (a live exec file outside the tree).
+        logger.warning("LIVE-EDIT refused skill_manage %s %s: symlink escapes to %s", action, rel_root,
+                       target_r)
+        return _err(f"skill_manage refuses {action} on '{rel_root}': the symlink escapes the skills tree "
+                    f"(resolves to {target_r}). Edit the real file in a worktree of its repo and open a PR.")
     try:
         tier = _load_tier_module(root)
         if tier is None:
-            return None
+            if not shared.is_dir():  # true vanilla install: no shared tree, no tier table
+                return None
+            logger.warning("LIVE-EDIT refused skill_manage %s %s: tier reader missing under %s",
+                           action, rel_root, root)
+            return _err(f"skill_manage refuses {action} on '{rel_root}': tier reader missing "
+                        f"({root / 'scripts' / 'lib' / 'autocommit_tier.py'}); fix the deploy or use a "
+                        "worktree + PR.")
         rules = tier.load()
-        rel_root = f"{shared.name}/{pairs[0][0].relative_to(pairs[0][1]).as_posix()}"
         cands = {f"{shared.name}/{t.relative_to(s).as_posix()}" for t, s in pairs}
+        root_r = root.resolve()
+        if _is_within(target_r, root_r):  # the resolved path, as the ROOT's table names it
+            cands.add(target_r.relative_to(root_r).as_posix())
         for t, sd in ((target, skill_dir), (target_r, skill_dir.resolve())):
             if _is_within(t, sd):
                 cands.add(t.relative_to(sd).as_posix())
