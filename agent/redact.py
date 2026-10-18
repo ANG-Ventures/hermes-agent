@@ -534,7 +534,11 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
 
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
+# Tracker session fields (t_95b396e6): an arr ``IndexerStatus.Cookies`` / indexer ``Settings`` row
+# carries ``{"uid", "pass"}`` (IPTorrents), ``mam_id``/``mamId`` (MyAnonamouse), ``passkey`` and
+# ``cf_clearance``; ``cookie(s)`` holds a whole ``uid=..; pass=..`` header. ``pass`` is already a
+# strong key in _STRONG_KEY_KEYWORD_RE, so it masks whole like ``password``.
+_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material|passkey|torrent_pass|cookies?|mam_?id|cf_clearance|pass)"
 _JSON_FIELD_RE = re.compile(rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"', re.IGNORECASE)
 
 # Python ``repr`` uses single-quoted mapping fields, so opaque credentials in
@@ -562,6 +566,14 @@ _PYTHON_REPR_SECRET_KEYS = frozenset({
     "raw_secret",
     "secret_input",
     "key_material",
+    # Tracker session credentials (t_95b396e6). Exact names only: ``cookie_count`` stays readable.
+    "passkey",
+    "torrent_pass",
+    "cookie",
+    "cookies",
+    "mam_id",
+    "mamid",
+    "cf_clearance",
 })
 _PYTHON_REPR_ENV_SUFFIXES = (
     "_API_KEY",
