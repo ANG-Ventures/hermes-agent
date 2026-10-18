@@ -195,6 +195,7 @@ class HostSpec:
     clock_mhz: float = 0.0           # max single-core clock (core_class "fast")
     default_preference: str = "normal"   # "low" = the headroom layer takes it only when no normal host has headroom
     unmeasurable_axes: tuple = ()        # axes this host's OS cannot report (darwin: no PSI, no %system); never required
+    cpu_saturable: bool = False          # negative cpu headroom is a score penalty here, not a refusal (t_bfb88c23)
 
     def slots_for(self, consumer: str) -> Optional[int]:
         s = self.slots.get(consumer)
@@ -322,6 +323,11 @@ def validate(doc) -> List[str]:
             errs.append(f"hosts.{hid}.unmeasurable_axes may list only psi_cpu_some10, psi_mem_some10, system_pct")
         if isinstance(h, dict) and h.get("default_preference", "normal") not in ("normal", "low"):
             errs.append(f"hosts.{hid}.default_preference must be normal|low (never an ordinal)")
+        if isinstance(h, dict) and "cpu_saturable" in h:
+            if not isinstance(h["cpu_saturable"], bool):
+                errs.append(f"hosts.{hid}.cpu_saturable must be true|false")
+            elif h["cpu_saturable"] and _num(h.get("cores_reserve")) and h["cores_reserve"] > 0:
+                errs.append(f"hosts.{hid}: cpu_saturable with cores_reserve {h['cores_reserve']} > 0 (a saturable cpu axis keeps no cores back)")
     cw = doc.get("closed_when", {})
     if not isinstance(cw, dict) or any(not _num(v) or v < 0 for k, v in cw.items() if not k.startswith("_")):
         errs.append("closed_when must map axis -> number >= 0")
@@ -352,7 +358,8 @@ def load_hosts(path=None) -> HostTable:
             slots={c: int(v["slots"]) for c, v in h["consumers"].items()},
             aliases=tuple(h.get("aliases", [])), clock_mhz=float(h.get("clock_mhz", 0.0)),
             default_preference=str(h.get("default_preference", "normal")),
-            unmeasurable_axes=tuple(h.get("unmeasurable_axes", [])))
+            unmeasurable_axes=tuple(h.get("unmeasurable_axes", [])),
+            cpu_saturable=h.get("cpu_saturable") is True)
     fps = {c: Footprint.of(fp) for c, fp in doc["footprints"].items() if not c.startswith("_")}
     pfps = {c: {pn: Footprint.of(pf) for pn, pf in fp["profiles"].items() if not pn.startswith("_")}
             for c, fp in doc["footprints"].items() if not c.startswith("_") and isinstance(fp.get("profiles"), dict)}
@@ -525,6 +532,8 @@ def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consume
              reserved: Optional[Footprint] = None, require_axes: Iterable[str] = REQUIRED_AXES,
              slots_used: float = 0.0, now: Optional[float] = None, stale_after_s: Optional[float] = None) -> Headroom:
     """``reserved`` = the sum of LIVE reservations on this host (promised, not yet in the sample).
+    A ``cpu_saturable`` host is never refused on negative cpu headroom: the cpu fraction stays negative as a score
+    PENALTY (it ranks below every host with cpu room), binding ``cpu-saturated``; memory and scratch still refuse.
     ``slots_used`` = live reservations of THIS consumer on this host; a positive ``consumers.<c>.slots`` caps it.
     ``require_axes``: every named Sample field must be a finite number, else the host is closed (unmeasured).
     ``stale_after_s`` (with ``now``): re-check the sample's age at decision time; a sample marked fresh when it
@@ -585,10 +594,14 @@ def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consume
     mem_frac = h.mem_gb / spec.mem_total_gb
     cpu_frac = h.cores / spec.cores
     h.score, h.binding = (mem_frac, "mem") if mem_frac <= cpu_frac else (cpu_frac, "cpu")
+    if h.binding == "cpu" and h.cores < 0 and spec.cpu_saturable:
+        # clamped at -1 (a full box of oversubscription): the penalty orders it below every host with room, and a
+        # load spike cannot push it below a host that is merely thinner on memory
+        h.score, h.binding = max(-1.0, cpu_frac), "cpu-saturated"
     if h.mem_gb < 0:
         h.reason = f"no_headroom:mem {h.mem_gb:.1f} GB"
         return h
-    if h.cores < 0:
+    if h.cores < 0 and not spec.cpu_saturable:
         h.reason = f"no_headroom:cpu {h.cores:.1f} cores"
         return h
     if h.scratch_gb is not None and h.scratch_gb < 0:
