@@ -800,54 +800,100 @@ def test_consumer_name_shared_by_two_live_processes_is_unknown(store):
     assert "shared" in rep["consumers"][0]["why"]
 
 
-def _foreign_record(store, name, *, boot_ts):
-    """Publish under ``name`` as a different instance whose pid (our parent)
-    is alive on this host, stamped with ``boot_ts``."""
+def _foreign_record(store, name, **fields):
+    """Publish under ``name`` as another instance whose pid (our parent) is
+    alive on this host; ``fields`` override the start-identity fields. A
+    field set to ``...`` is dropped (legacy record shape)."""
     other = _gate(store, name)
     other.pid = os.getppid()
-    other.instance = "previous-boot"
-    other.boot_ts = boot_ts
-    other.publish()
+    other.instance = "other-instance"
+    other.start_offset = ca._start_offset(other.pid)  # genuine by default
+    rec = other.snapshot()
+    rec.update(fields)
+    rec = {k: v for k, v in rec.items() if v is not ...}
+    store.write_consumer(name, rec)
 
 
-def test_reused_pid_started_after_record_is_not_shared(store, monkeypatch):
-    """t_2882f0c1: a live pid whose process started AFTER the record's boot_ts
-    is a reuse (wireplumber after reboot), not a second live publisher."""
+def _parent_create_time():
     import psutil
 
-    monkeypatch.setattr(psutil, "boot_time", lambda: 0.0)
+    return psutil.Process(os.getppid()).create_time()
+
+
+@pytest.mark.parametrize("fields", [
+    pytest.param({}, id="genuine"),
+    pytest.param({"start_offset": float("nan"), "boot_ts": float("nan")}, id="nan-fails-closed"),
+    pytest.param({"boot_id": ..., "start_offset": ..., "boot_ts": float("inf")}, id="legacy-nonfinite"),
+])
+def test_genuine_or_inconclusive_foreign_record_is_shared(store, fields):
     store.hold("op", [SERVE], mode="freeze")
-    _foreign_record(store, SERVE,
-                    boot_ts=psutil.Process(os.getppid()).create_time() - 60)
+    _foreign_record(store, SERVE, **fields)
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
+    assert ca.evaluate(store)["verdict"] == UNKNOWN
+
+
+@pytest.mark.parametrize("fields", [
+    pytest.param("offset", id="start-offset-mismatch"),
+    pytest.param("legacy", id="legacy-create-time-after-boot-ts"),
+])
+def test_reused_pid_started_after_record_is_not_shared(store, fields):
+    """t_2882f0c1: a live pid that is a different process than the record's
+    publisher (wireplumber reusing serve-clanker's pid) is not shared."""
+    if fields == "offset":
+        kw = {"start_offset": ca._start_offset(os.getppid()) - 60}
+    else:
+        kw = {"boot_id": ..., "start_offset": ..., "boot_ts": _parent_create_time() - 60}
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE, **kw)
     me = _gate(store, SERVE)
     assert "shared_with" not in me.publish()
     assert "shared_with" not in me.publish()
     assert ca.evaluate(store)["verdict"] == QUIESCENT
 
 
-def test_record_from_before_host_boot_is_not_shared(store):
-    """t_2882f0c1: a record written before the current host boot is never a
-    live foreign publisher, whatever now holds its pid."""
+@pytest.mark.parametrize("fields", ["boot_id", "legacy"])
+def test_record_from_before_host_boot_is_not_shared(store, monkeypatch, fields):
+    """t_2882f0c1: a record written in a previous host boot is never a live
+    foreign publisher, whatever now holds its pid."""
     import psutil
 
+    if fields == "boot_id":
+        monkeypatch.setattr(ca, "_host_boot_id", lambda: "current-boot")
+        kw = {"boot_id": "previous-boot"}
+    else:
+        kw = {"boot_id": ..., "start_offset": ..., "boot_ts": psutil.boot_time() - 60}
     store.hold("op", [SERVE], mode="freeze")
-    _foreign_record(store, SERVE, boot_ts=psutil.boot_time() - 60)
+    _foreign_record(store, SERVE, **kw)
     me = _gate(store, SERVE)
     assert "shared_with" not in me.publish()
     assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
+def test_wall_clock_step_keeps_genuine_foreign_publisher_shared(store, monkeypatch):
+    """A forward clock step moves psutil's boot_time and create_time together
+    (Linux derives both from btime); the boot-relative start offset must
+    still identify the genuine foreign publisher."""
+    import psutil
+
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    real_boot, real_ct = psutil.boot_time, psutil.Process.create_time
+    monkeypatch.setattr(psutil, "boot_time", lambda: real_boot() + 3600)
+    monkeypatch.setattr(psutil.Process, "create_time", lambda self: real_ct(self) + 3600)
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
 
 
 def test_sticky_shared_flag_clears_when_foreign_pid_is_reused(store):
     """t_2882f0c1: the sticky flag is re-checked every publish, so once the
     recorded process is gone and its pid reused the flag drops."""
-    import psutil
-
     store.hold("op", [SERVE], mode="freeze")
-    _foreign_record(store, SERVE, boot_ts=time.time())
+    _foreign_record(store, SERVE)
     me = _gate(store, SERVE)
     assert me.publish().get("shared_with")  # genuine: flagged
-    pid, inst, _ = me._foreign
-    me._foreign = (pid, inst, psutil.boot_time() - 60)  # same pid, older process
+    pid, inst, evidence = me._foreign
+    me._foreign = (pid, inst, dict(evidence, start_offset=evidence["start_offset"] - 60))
     assert "shared_with" not in me.publish()
 
 

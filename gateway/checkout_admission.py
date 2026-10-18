@@ -49,6 +49,7 @@ import argparse
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -179,27 +180,59 @@ def _pid_alive(pid: int) -> bool:
     return bool(psutil.pid_exists(pid))
 
 
-def _same_live_process(pid: Any, boot_ts: Any) -> bool:
-    """True when ``pid`` is alive AND is the process that started at ``boot_ts``.
+def _finite(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
-    A pid from a record written before the current host boot, or one that an
-    unrelated process reused (created after the recorded start), is not the
-    publisher. Without a usable ``boot_ts`` this degrades to pid liveness.
+
+def _host_boot_id() -> Optional[str]:
+    """Kernel boot UUID (Linux): unlike any timestamp, immune to clock steps."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip() or None
+    except OSError:
+        return None
+
+
+def _start_offset(pid: int) -> float:
+    """Seconds from host boot to ``pid``'s start. On Linux psutil derives both
+    terms from the same btime, so a wall-clock step cancels out."""
+    import psutil
+
+    return psutil.Process(pid).create_time() - psutil.boot_time()
+
+
+def _same_live_process(pid: Any, rec: Mapping[str, Any]) -> bool:
+    """True unless there is positive evidence that ``pid`` is no longer the
+    process that wrote ``rec`` (dead, other host boot, or a reused pid).
+
+    Inconclusive evidence (missing/non-finite fields, psutil errors) keeps the
+    record live: a false "shared" defers a deploy, a false "gone" lets it
+    mutate under a busy consumer.
     """
     if not _pid_alive(pid):
         return False
-    if not isinstance(boot_ts, (int, float)) or isinstance(boot_ts, bool):
-        return True
     import psutil
 
     try:
+        if "boot_id" in rec or "start_offset" in rec:
+            boot_id, off = rec.get("boot_id"), rec.get("start_offset")
+            cur_boot = _host_boot_id()
+            if isinstance(boot_id, str) and cur_boot and boot_id != cur_boot:
+                return False
+            if _finite(off) and abs(_start_offset(pid) - off) > 1:
+                return False
+            return True
+        # Record from a publisher that predates boot_id/start_offset: only
+        # wall-clock evidence exists.
+        boot_ts = rec.get("boot_ts")
+        if not _finite(boot_ts):
+            return True
         if boot_ts < psutil.boot_time():
             return False
         return psutil.Process(pid).create_time() <= boot_ts + 1
     except psutil.NoSuchProcess:
         return False
     except psutil.Error:
-        return True  # cannot tell: fail closed (treat as the live publisher)
+        return True
 
 
 @dataclass(frozen=True)
@@ -385,6 +418,11 @@ class AdmissionGate:
         self.pid = os.getpid()
         self.host = socket.gethostname()
         self.boot_ts = clock()
+        self.boot_id = _host_boot_id()
+        try:
+            self.start_offset: Optional[float] = _start_offset(self.pid)
+        except Exception:
+            self.start_offset = None
         self._clock = clock
         self._active_work = active_work
         self._serving = serving
@@ -493,6 +531,7 @@ class AdmissionGate:
             return {
                 "schema": SCHEMA, "consumer": self.consumer, "pid": self.pid,
                 "host": self.host, "instance": self.instance, "boot_ts": self.boot_ts,
+                "boot_id": self.boot_id, "start_offset": self.start_offset,
                 "published_at": self._clock(), "hold_epoch": hold_epoch,
                 "hold_error": hold_error, "tickets": tickets,
                 "active_work": work_total, "active_work_detail": work_detail,
@@ -506,9 +545,9 @@ class AdmissionGate:
         an idle snapshot could hide the other's work. Once a foreign live
         instance is seen the flag stays set while that same process lives
         (sticky, so our own back-to-back writes cannot clear it) and
-        ``evaluate`` reads the record as UNKNOWN. "Same process" is checked
-        on every publish against the record's ``boot_ts``, so a pid an
-        unrelated process reused after a reboot never pins the flag.
+        ``evaluate`` reads the record as UNKNOWN. "Same process" is re-checked
+        on every publish (``_same_live_process``), so a pid an unrelated
+        process reused after a reboot never pins the flag.
         """
         try:
             prev = self.store.read_consumer(self.consumer)
@@ -516,7 +555,8 @@ class AdmissionGate:
             prev = None
         if (isinstance(prev, dict) and prev.get("instance") not in (None, self.instance)
                 and prev.get("host") == self.host and prev.get("pid") != self.pid):
-            self._foreign = (prev.get("pid"), prev.get("instance"), prev.get("boot_ts"))
+            self._foreign = (prev.get("pid"), prev.get("instance"),
+                             {k: prev[k] for k in ("boot_ts", "boot_id", "start_offset") if k in prev})
         foreign = self._foreign
         if foreign is not None and not _same_live_process(foreign[0], foreign[2]):
             self._foreign = foreign = None
