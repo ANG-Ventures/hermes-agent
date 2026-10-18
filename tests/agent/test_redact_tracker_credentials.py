@@ -11,7 +11,8 @@ import json
 
 import pytest
 
-from agent.redact import is_secret_field_name, redact_sensitive_json, redact_sensitive_text
+from agent.redact import (
+    is_secret_field_name, redact_sensitive_json, redact_sensitive_text, redact_terminal_output)
 
 # Synthetic shapes matching the real values (lengths/alphabets), never real credentials. Built at
 # import time so no credential-shaped literal sits in the tree for secret scanners to flag.
@@ -64,8 +65,23 @@ def test_sqlite_indexerstatus_row_shape_masked():
     assert "2026-11-17 19:08:20Z" in out  # non-secret columns untouched
 
 
+def test_terminal_boundary_sqlite_dump_masked():
+    # The production path: terminal output for a sqlite3 command runs source-preserving
+    # (code_file=True), which skips the JSON assignment pass (Prism P1 on #2085).
+    row = ('1|3|{\n  "uid": "1234567",\n  "pass": "%s"\n}|x\n5|5|{\n  "mam_id": "%s"\n}|y\n'
+           '{"cf_clearance": "%s", "cookie": "uid=1234567; pass=%s"}' % (_IPT_PASS, _MAM_ID, _CF, _IPT_PASS))
+    out = redact_terminal_output(row, 'sqlite3 -readonly prowlarr.db "select * from IndexerStatus"', force=True)
+    _assert_no_secret(out)
+    assert '"uid": "1234567"' in out
+
+
+def test_terminal_boundary_keeps_source_literals():
+    src = 'cfg = {"pass": "yes", "cookie": "none"}\n'
+    assert redact_terminal_output(src, "cat app.py", force=True) == src
+
+
 def test_python_repr_fields_masked():
-    text = repr({"cookie": f"uid=1; pass={_IPT_PASS}", "mamId": _MAM_ID, "passkey": _PASSKEY,
+    text = repr({"cookie": f"uid=1; pass={_IPT_PASS}", "mamId": _MAM_ID, "passkey": _PASSKEY, "pass": _IPT_PASS,
                  "baseUrl": "http://prowlarr:9696/3/"})
     out = redact_sensitive_text(text, force=True)
     _assert_no_secret(out)
@@ -79,7 +95,7 @@ def test_structured_leaf_masked():
     assert out["name"] == "IPTorrents"
 
 
-@pytest.mark.parametrize("key", ["passkey", "cookie", "mam_id", "mamId", "cf_clearance"])
+@pytest.mark.parametrize("key", ["passkey", "cookie", "mam_id", "mamId", "cf_clearance", "pass"])
 def test_field_name_policy(key):
     assert is_secret_field_name(key)
 

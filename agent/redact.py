@@ -571,6 +571,7 @@ _PYTHON_REPR_SECRET_KEYS = frozenset({
     "torrent_pass",
     "cookie",
     "cookies",
+    "pass",
     "mam_id",
     "mamid",
     "cf_clearance",
@@ -1361,6 +1362,18 @@ def redact_for_egress(text: str) -> str:
     return text
 
 
+_TRACKER_FIELD_HINT_RE = re.compile(r"passkey|torrent_pass|cookie|mam_?id|cf_clearance|\"pass\"", re.IGNORECASE)
+_TRACKER_FIELD_RE = re.compile(
+    r'("(?:passkey|torrent_pass|cookies?|mam_?id|cf_clearance|pass)")(\s*:\s*)"([^"\n]+)"', re.IGNORECASE)
+
+
+def _tracker_field_sub(m: re.Match) -> str:
+    value = m.group(3)
+    if not _looks_like_opaque_credential(value) or value == "***" or value.startswith("«redacted"):
+        return m.group(0)
+    return f'{m.group(1)}{m.group(2)}"***"'
+
+
 def redact_terminal_output(output: str, command: str | None = None, *, force: bool = False) -> str:
     """Single redaction policy for ALL terminal-output surfaces: the ENV/YAML-assignment
     pass runs only when ``command`` is an env dump or reads a secret-bearing file (``.env``,
@@ -1370,6 +1383,11 @@ def redact_terminal_output(output: str, command: str | None = None, *, force: bo
         return output
     code_file = not (is_env_dump_command(command) or _command_reads_secret_file(command))
     redacted = redact_sensitive_text(output, force=force, code_file=code_file)
+    # Source-preserving output skips the JSON assignment pass, but a DB/API dump (``sqlite3 ...
+    # select * from IndexerStatus``) prints tracker session JSON verbatim (t_95b396e6). Mask those
+    # few field names here, opaque values only, so a source file's ``"pass": "yes"`` survives.
+    if code_file and (force or _redact_enabled()) and '"' in redacted and _TRACKER_FIELD_HINT_RE.search(redacted):
+        redacted = _TRACKER_FIELD_RE.sub(_tracker_field_sub, redacted)
     # Source-preserving output still gets the Python-repr pass on high-confidence
     # diagnostic lines (pytest ``E   `` introspection, final exception lines): that is
     # where {'BRAVE_API_KEY': '…'} leaks, not in source dumps.
