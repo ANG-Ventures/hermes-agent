@@ -98,6 +98,10 @@ ADMISSIONS_REL = Path("var") / "placement" / "admissions.jsonl"
 RANK_KEYS = frozenset({"prio", "ladder", "order", "rank", "last", "last_pick", "preference", "preferred"})
 DEFAULT_SATURATE_TO = 1.0   # the default-first host is "comfortable" while load <= saturate_to x physical cores
 DEFAULT_STALE_AFTER_S = 60.0
+# A reservation older than this is a RUNNING process, already inside the host's load1 (the 1-minute load average):
+# its threads are not subtracted again on the cpu axis (t_bfb88c23: ace-ai 16 - 4 reserve - 7.7 load - 5 reserved
+# thr - 1 = -1.7 on a box with 8 idle cores). Memory keeps the full promise (MemAvailable lags allocation).
+LOAD1_WINDOW_S = 60.0
 DEFAULT_MARGIN = 0.10
 DEFERRED_REEMIT_S = 900.0    # a job still deferred for the same reason is re-logged at most this often
 FOOTPRINT_KEYS = ("ram_gb", "threads", "scratch_gb", "gpu_mb")
@@ -532,6 +536,8 @@ def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consume
              reserved: Optional[Footprint] = None, require_axes: Iterable[str] = REQUIRED_AXES,
              slots_used: float = 0.0, now: Optional[float] = None, stale_after_s: Optional[float] = None) -> Headroom:
     """``reserved`` = the sum of LIVE reservations on this host (promised, not yet in the sample).
+    Its memory is subtracted in full; its threads should be only the reservations younger than LOAD1_WINDOW_S
+    (``live_reservations(..., cpu_seen_after_s=LOAD1_WINDOW_S)``), because an older one is in load1 already.
     A ``cpu_saturable`` host is never refused on negative cpu headroom: the cpu fraction stays negative as a score
     PENALTY (it ranks below every host with cpu room), binding ``cpu-saturated``; memory and scratch still refuse.
     ``slots_used`` = live reservations of THIS consumer on this host; a positive ``consumers.<c>.slots`` caps it.
@@ -1037,17 +1043,24 @@ def _prune(rows: List[dict], now: float) -> tuple:
     return live, gone
 
 
-def live_reservations(path=None, *, now: Optional[float] = None, table: Optional[HostTable] = None) -> Dict[str, Footprint]:
+def live_reservations(path=None, *, now: Optional[float] = None, table: Optional[HostTable] = None,
+                      cpu_seen_after_s: Optional[float] = None) -> Dict[str, Footprint]:
     """{host: summed Footprint} of every reservation whose TTL has not expired and that was not released.
-    With ``table`` the keys are canonical host ids (aliases summed). Raises LedgerError on a corrupt ledger."""
+    With ``table`` the keys are canonical host ids (aliases summed). Raises LedgerError on a corrupt ledger.
+    ``cpu_seen_after_s`` (the scorer passes LOAD1_WINDOW_S): a row booked at least that long ago contributes
+    0 threads, because its process is in the sampled load1 already (t_bfb88c23); a row with no ``at`` keeps
+    its threads. Memory, scratch and gpu are never aged. None = every live row in full (the promise)."""
     now = _now(now)
     doc = _read_ledger(reservations_path(path))
     out: Dict[str, Footprint] = {}
     for row in doc["rows"]:          # every row validated by _read_ledger
         if _row_live(row, now):
             key = (table.resolve(row["host"]) or row["host"]) if table else row["host"]
+            fp = _row_footprint(row)
+            if cpu_seen_after_s is not None and _num(row.get("at")) and now - float(row["at"]) >= cpu_seen_after_s:
+                fp = dataclasses.replace(fp, threads=0.0)
             prev = out.get(key)
-            out[key] = prev.plus(_row_footprint(row)) if prev else _row_footprint(row)
+            out[key] = prev.plus(fp) if prev else fp
     return out
 
 
@@ -1153,7 +1166,7 @@ def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample
             for row in _read_ledger(p)["rows"]:
                 if _row_live(row, now) and row["consumer"] == consumer and row.get("job_id") == job_id:
                     return Decision(row["host"], "", [], consumer, _row_footprint(row), rule="reuse"), row["id"]
-        resv = live_reservations(p, now=now, table=table)
+        resv = live_reservations(p, now=now, table=table, cpu_seen_after_s=LOAD1_WINDOW_S)
         for k, v in extra_reserved.items():
             hid = table.resolve(k) or k
             resv[hid] = resv[hid].plus(v) if hid in resv else v

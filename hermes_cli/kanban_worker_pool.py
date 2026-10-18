@@ -1585,8 +1585,10 @@ class SpilloverPlan:
             return sig.placement_live
         from hermes_cli import placement as _placement
         # A corrupt ledger raises LedgerError: take() refuses (never reads it as empty).
+        # threads aged past the load1 window, the same view placement.admit() scores (t_bfb88c23)
         return _placement.live_reservations(sig.placement_reservations, now=sig.clock(),
-                                            table=sig.placement_table)
+                                            table=sig.placement_table,
+                                            cpu_seen_after_s=_placement.LOAD1_WINDOW_S)
 
     def probe(self, name: str) -> Optional[dict]:
         d = self.detail.get(name) or {}

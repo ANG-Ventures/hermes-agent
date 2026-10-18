@@ -145,7 +145,8 @@ def pick_rung(pool: kwp.PoolConfig, block: Mapping, tick_hosts: Mapping, *, poli
         live = None
         if table is not None:
             try:
-                live = placement.live_reservations(rpath, now=now, table=table)
+                live = placement.live_reservations(rpath, now=now, table=table,
+                                                   cpu_seen_after_s=placement.LOAD1_WINDOW_S)
             except placement.PlacementError:
                 live = None  # take() re-reads, refuses and names the error
         signal = kwp.TargetSignal(policy=policy, state_path=root / "var" / kwp.TARGET_STATE_FILE,
