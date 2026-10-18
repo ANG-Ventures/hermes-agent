@@ -172,7 +172,26 @@ _EXCLUDED_ROOT_PATH_GLOBS = (
     # files that are gone by the time the zip reaches them. Both are rebuilt from durable state:
     ("var", "subs-portal", "site", "shards"),  # subs.ace bake output (rebuilt from ledger.db)
     ("var", "pin-surfaces"),        # pin-factory witness captures (rewritten every gateway boot)
+    # 2026-10-18 (t_5bea54fb): the Sunday full listed 6,973,690 files and was killed 8 h 49 m in. A names-only
+    # census through this walker: var/scratch 3.79 M (offbox-ci's per-PR `git archive` exports orphaned by early
+    # exits), var/gh-app per-call state 1.14 M (30 s TTL, never pruned). Each row below is regenerable:
+    ("var", "scratch"),                     # per-run scratch (offbox-ci tree exports, removed after each run)
+    ("var", "gh-app", "readcache"),         # gh-shim 30 s read floor, one file per (lane, cwd, argv)
+    ("var", "gh-app", "callers"),           # gh-shim per-caller request history, 1 h window
+    ("var", "gh-app", "raw"),               # gh-shim read-after-write marks, 330 s window
+    ("var", "lines-portal", "repos"),       # lines.ace's repo clones (its scripts + certs stay in)
+    ("var", "graphify"),                    # code-graph builds (rebuilt from the repos)
+    ("mirrors",),                           # bare git mirrors of GitHub repos (`kanban clone` objects)
+    ("runtime", "hermes-agent"),           # deploy checkout of the fork, advanced by fleet/deploy.sh
+    ("kanban", "workspaces-aside"),         # parked kanban scratch workspaces (same class as workspaces/)
+    ("state", "test-gate", "cache"),        # test-gate PASS cache, keyed by tree hash
 )
+
+# Root-level rollback copies of a DB (`kanban.db.bak-notify-sweep-<ts>`, `state.db.bak-<tag>`, ...). Pre-change
+# rollback points written by sweeps and repair recipes, not state: the DB itself is in the archive (sqlite backup)
+# and kanban.db has its own hourly tier. 2026-10-18: 68 of them at the root, 4.7 GB. Root-only, so a profile's own
+# files are untouched; fnmatch on the basename.
+_EXCLUDED_ROOT_FILE_GLOBS = ("*.db.bak*", "*.db.*.bak", "*.sqlite.bak*")
 
 # Root-anchored ``cache/`` rules. ``$HERMES_HOME/cache/`` is the fleet's REGENERABLE
 # scratch root (tool caches, telemetry cuts, per-incident capture dirs) — not agent
@@ -521,6 +540,8 @@ def _should_exclude(rel_path: Path) -> bool:
     if _matches_path_glob(parts) or _is_excluded_cache_path(parts):
         return True
     name = rel_path.name
+    if len(parts) == 1 and any(fnmatch.fnmatchcase(name, g) for g in _EXCLUDED_ROOT_FILE_GLOBS):
+        return True
     return name in _EXCLUDED_NAMES or name.startswith(_EXCLUDED_PREFIXES) or name.endswith(_EXCLUDED_SUFFIXES)
 
 
