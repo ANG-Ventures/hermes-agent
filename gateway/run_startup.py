@@ -1283,6 +1283,7 @@ class GatewayStartupMixin:
                 gateway_state="starting",
                 exit_reason=None,
                 clear_profile_platforms=True,
+                drop_stale_platforms=True,
                 reload_existing=True,
                 wait_timeout=2.0,
             )
