@@ -232,6 +232,8 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
     target_error = _memory_target_error(store, target)
     if target_error is not None:
         return "rejected", json.dumps(target_error)
+    if (rendered := store.rendered_file_error(target)) is not None:
+        return "rejected", json.dumps(rendered, ensure_ascii=False)
     if operations:
         if not isinstance(operations, list):
             return "rejected", tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
