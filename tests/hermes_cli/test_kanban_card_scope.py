@@ -72,7 +72,7 @@ def test_scope_any_is_unrestricted(body):
 def test_nested_headings_stay_inside_the_section():
     body = ("## Declared file scope\n### ANG-Ventures/hermes-agent\n- hermes_cli/a.py\n"
             "### ANG-Ventures/hermes-home\n- scripts/b.py\n## Acceptance\n- gateway/run.py\n")
-    assert kb.card_declared_scope(body) == (["scripts/b.py", "hermes_cli/a.py"], "heading")
+    assert kb.card_declared_scope(body) == (sorted(["scripts/b.py", "hermes_cli/a.py"]), "heading")
 
 
 def test_fenced_examples_do_not_declare_scope():
@@ -81,6 +81,40 @@ def test_fenced_examples_do_not_declare_scope():
     assert kb.card_declared_scope(body) == (["hermes_cli/kanban_db.py"], "heading")
     only_fenced = "edit hermes_cli/a.py\n```\nscope: any\n```\n"
     assert kb.card_declared_scope(only_fenced)[1] == "inferred"
+
+
+@pytest.mark.parametrize("example", [
+    # Prism cc6692a839eb: ``` inside a ~~~ example closed the fence early
+    "~~~markdown\n```\nscope: any\n~~~\n",
+    # a longer opener is not closed by a shorter run
+    "````\n```\nscope: any\n````\n",
+    # a fence line with an info string never closes
+    "```\n```python\nscope: any\n```\n",
+])
+def test_fence_closes_only_on_matching_delimiter(example):
+    body = f"## Declared file scope\n- hermes_cli/a.py\n## Examples\n{example}"
+    assert kb.card_declared_scope(body) == (["hermes_cli/a.py"], "heading")
+
+
+@pytest.mark.parametrize("line", [
+    "ANG-Ventures/hermes-agent: hermes_cli/a.py",
+    "Files: hermes_cli/a.py",
+    "- Files: `hermes_cli/a.py`",
+])
+def test_inline_label_keeps_paths(line):
+    """Prism 994ce9334b80: ``label: path`` lines were skipped whole -> empty scope."""
+    body = f"## Declared file scope\n{line}\n## Acceptance\nalso scripts/b.py\n"
+    assert kb.card_declared_scope(body) == (["hermes_cli/a.py"], "heading")
+
+
+def test_empty_declaration_is_not_unrestricted():
+    """Prism 994ce9334b80: a heading with only labels returned ([], heading),
+    which check_checkout() reads as unrestricted; fall back to inference."""
+    body = ("edit hermes_cli/a.py\n## Declared file scope\n### ANG-Ventures/hermes-agent\n"
+            "ANG-Ventures/hermes-home:\n## Acceptance\nDone\n")
+    scope, source = kb.card_declared_scope(body)
+    assert (scope, source) == (["hermes_cli/a.py"], "inferred")
+    assert kb.inferred_scope_warning(body) is not None
 
 
 @pytest.mark.parametrize("junk", ["- ` `", "- `", "-", "* ``", "  "])
@@ -154,7 +188,10 @@ def _create_and_complete(body: str, ws: Path) -> str:
         conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (int(time.time()) - 60, tid))
         kb.claim_task(conn, tid)
         run = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
-        kb.complete_task(conn, tid, summary="done", expected_run_id=run)
+        # structured metadata is a receipt, so the default-on receipt gate
+        # does not refuse before the scope guard is reached
+        kb.complete_task(conn, tid, summary="done", expected_run_id=run,
+                         metadata={"changed_files": ["scripts/lint_timing.py"]})
         return conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0]
 
 
@@ -174,6 +211,16 @@ def test_e2e_heading_covers_files_prose_example_does_not(board, tmp_path):
     ws = _fresh_broad_workspace(tmp_path)
     body = PROSE_BODY + "\n## Declared file scope\n- scripts/\n- .github/workflows/*.yml\n"
     assert _create_and_complete(body, ws) == "done"
+
+
+def test_e2e_inline_label_scope_refuses_unrelated_file(board, tmp_path):
+    """Prism 994ce9334b80 repro: ``repo: path`` parsed to an empty scope and a
+    fresh branch touching unrelated files passed the guard."""
+    ws = _fresh_broad_workspace(tmp_path)
+    body = "## Declared file scope\nANG-Ventures/hermes-agent: hermes_cli/a.py\n"
+    with pytest.raises(bb.StaleBaseError) as ei:
+        _create_and_complete(body, ws)
+    assert "outside the card's declared scope" in str(ei.value)
 
 
 # --- surfaces: CLI stderr + tool return ------------------------------------

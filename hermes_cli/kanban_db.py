@@ -18930,6 +18930,7 @@ def _extract_explicit_dispatch_file_paths(body: Optional[str]) -> set[str]:
 
 _SCOPE_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*declared\s+file\s+scope\s*#*\s*$", re.I)
 _ANY_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
+_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _SCOPE_ANY_RE = re.compile(r"^\s*scope\s*:\s*any\s*$", re.I | re.M)
 
 
@@ -18943,13 +18944,22 @@ def card_declared_scope(body: Optional[str]) -> tuple[list[str], str]:
     behaviour). An empty list means unrestricted.
     """
     text = body or ""
-    # Fenced code blocks are examples, never the card's own declaration.
-    lines, fenced = [], False
+    # Fenced code blocks are examples, never the card's own declaration. A
+    # fence closes only on the SAME marker char, at least as long, with no
+    # info string (CommonMark); toggling on any fence-looking line let a
+    # ``` inside a ~~~ example expose its ``scope: any`` (Prism cc6692a839eb).
+    lines: list[str] = []
+    fence: Optional[str] = None
     for ln in text.splitlines():
-        if ln.lstrip().startswith(("```", "~~~")):
-            fenced = not fenced
-        elif not fenced:
-            lines.append(ln)
+        m = _FENCE_RE.match(ln)
+        if fence is None:
+            if m:
+                fence = m.group(1)
+            else:
+                lines.append(ln)
+        elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
+                and not ln.strip()[len(m.group(1)):].strip():
+            fence = None
     if any(_SCOPE_ANY_RE.match(ln) for ln in lines):
         return [], "any"
     start = next((i for i, ln in enumerate(lines) if _SCOPE_HEADING_RE.match(ln)), None)
@@ -18962,12 +18972,23 @@ def card_declared_scope(body: Optional[str]) -> tuple[list[str], str]:
             if len(ln.strip()) - len(ln.strip().lstrip("#")) <= level:
                 break
             continue  # a nested sub-heading (``### repo``) stays inside the section
-        tokens = ln.strip().lstrip("-*+").strip().replace("`", " ").split()
-        if not tokens or tokens[0].endswith(":"):  # blank, or a repo label ``owner/repo:``
+        tokens = ln.strip().lstrip("-*+").strip().replace("`", " ").replace(",", " ").split()
+        if not tokens:
+            continue
+        if tokens[0].endswith(":"):
+            # A label (``owner/repo:`` / ``Files:``). Paths on the same line
+            # are still entries; dropping them emptied the scope, and an empty
+            # scope is unrestricted (Prism 994ce9334b80).
+            entries.extend(t for t in tokens[1:] if _normalize_dispatch_file_path(t))
             continue
         if tokens[0].lower() == "any":
             return [], "any"
         entries.append(tokens[0])
+    if not entries:
+        # A declaration that names nothing must not widen the scope to
+        # unrestricted: fall back to the explicit-path inference it replaced
+        # (Prism 994ce9334b80). ``scope: any`` is the way to say unrestricted.
+        return sorted(_extract_explicit_dispatch_file_paths(text)), "inferred"
     return sorted(set(entries)), "heading"
 
 
