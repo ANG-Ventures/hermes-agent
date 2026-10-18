@@ -1384,6 +1384,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             pr_card_map = {}
 
     held = held_repo([c.body for c in comments]) if task.status in ("review", "blocked", "ready") else None
+    from hermes_cli import kanban_show_suppressed as kss
+
     if want_json:
         _print_json({
             "task": _task_to_dict(task),
@@ -1405,6 +1407,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 for c in comments
             ],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
+            "withheld_notifications": kss.suppressed_rows(events),
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
             "placement": placement,
         })
@@ -1491,6 +1494,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
             f"{kb.format_comment_author(c.author, run_id=c.run_id, session_ref=c.session_ref)}: {c.body}"
             for c in comments))
     if events:
+        withheld = kss.suppressed_rows(events)
+        if withheld:
+            _print_section(f"Withheld notifications ({len(withheld)}):", kss.format_rows(withheld, _fmt_ts))
         _print_section(f"Events ({len(events)}):", (
             f"  [{_fmt_ts(e.created_at)}]{f' [run {e.run_id}]' if e.run_id else ''} {e.kind}"
             f"{f' {e.payload}' if e.payload else ''}" for e in events[-20:]))
