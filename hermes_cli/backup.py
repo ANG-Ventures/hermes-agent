@@ -704,11 +704,25 @@ def _discard_failed_zip_members(zf: zipfile.ZipFile, filelist_len: int) -> None:
     zf.NameToInfo.update((info.filename, info) for info in zf.filelist)
 
 
+# Already-compressed payloads gain ~nothing from deflate and cost its full CPU pass: STORE them (t_5bea54fb,
+# the Sunday full ran single-threaded deflate-6 over every byte). Suffix match, lower-cased.
+_STORED_SUFFIXES = frozenset({
+    ".gz", ".tgz", ".zst", ".br", ".xz", ".bz2", ".lz4", ".zip", ".gpg", ".age", ".7z", ".whl", ".jar",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".avif",
+    ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".mp4", ".m4v", ".mov", ".mkv", ".webm",
+    ".pdf", ".epub", ".pack",
+})
+
+
 def _write_zip_file(zf: zipfile.ZipFile, path: Path, arcname: str) -> None:
     """Write one member while keeping a failed partial write out of the central directory."""
     filelist_len = len(zf.filelist)
+    stored = Path(arcname).suffix.lower() in _STORED_SUFFIXES
     try:
-        zf.write(path, arcname=arcname)
+        if stored:
+            zf.write(path, arcname=arcname, compress_type=zipfile.ZIP_STORED)
+        else:
+            zf.write(path, arcname=arcname)
     except Exception:
         _discard_failed_zip_members(zf, filelist_len)
         raise
