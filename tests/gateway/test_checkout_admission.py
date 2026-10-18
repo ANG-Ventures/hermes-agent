@@ -905,6 +905,7 @@ def test_no_procfs_fallback_identity_is_clock_step_safe(store, monkeypatch):
     import psutil
 
     monkeypatch.setattr(ca, "_start_offset", lambda pid: None)  # no procfs
+    monkeypatch.setattr(ca, "_create_time_is_stable", lambda: True)  # the no-procfs hosts (macOS/Windows) store it
     store.hold("op", [SERVE], mode="freeze")
     _foreign_record(store, SERVE)
     real_boot = psutil.boot_time
@@ -942,6 +943,7 @@ def test_offset_from_another_time_namespace_is_inconclusive(store, monkeypatch):
     """Prism f-4c7533074d58f2a7: a recorded start_offset taken in a different time namespace is not
     comparable; the absolute create_time decides, and a genuine publisher stays flagged even when the
     offsets disagree by an hour."""
+    monkeypatch.setattr(ca, "_create_time_is_stable", lambda: True)   # macOS/Windows rule: create_time is kernel-stored
     store.hold("op", [SERVE], mode="freeze")
     _foreign_record(store, SERVE)
     rec = store.read_consumer(SERVE)
@@ -955,6 +957,28 @@ def test_offset_from_another_time_namespace_is_inconclusive(store, monkeypatch):
                     create_time=rec["create_time"] - 3600)
     me = _gate(store, SERVE)
     assert "shared_with" not in me.publish()
+
+
+def test_linux_incomparable_offset_never_clears_on_create_time(store, monkeypatch):
+    """Prism f-0d05a4e1ac34ca32 / f-78f5d20661de8262: on Linux create_time is btime + starttime/CLK_TCK
+    (clock-step sensitive), so with no comparable offset (other / missing time namespace) a create_time
+    mismatch of an hour must NOT read as a reused pid; the live foreign publisher stays flagged."""
+    monkeypatch.setattr(ca.sys, "platform", "linux")   # the Linux rule, exercised through the real predicate on every host
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    rec = store.read_consumer(SERVE)
+    if rec.get("start_offset") is None:
+        pytest.skip("no procfs offset on this host")
+    _foreign_record(store, SERVE, start_offset=rec["start_offset"] + 3600, time_ns="time:[1]",
+                    create_time=rec["create_time"] - 3600)
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
+    # and with NO time namespace on either side (pre-5.6 kernel) the same holds
+    _foreign_record(store, SERVE, start_offset=rec["start_offset"] + 3600, time_ns=None,
+                    create_time=rec["create_time"] - 3600)
+    monkeypatch.setattr(ca, "_time_ns_id", lambda: None)
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
 
 
 def test_sticky_shared_flag_clears_when_foreign_pid_is_reused(store):

@@ -221,6 +221,14 @@ def _start_offset(pid: int) -> Optional[float]:
         return None
 
 
+def _create_time_is_stable() -> bool:
+    """Whether psutil's create_time() is a kernel-stored timestamp (macOS, Windows, BSD: yes) rather than
+    ``btime + starttime/CLK_TCK`` recomputed from the CURRENT wall clock (Linux: no, so a clock step between
+    the publisher's sample and ours shifts it; Prism f-0d05a4e1ac34ca32). Only a stable create_time may
+    clear the collision flag."""
+    return not sys.platform.startswith("linux")
+
+
 def _create_time(pid: int) -> Optional[float]:
     """Fallback identity without procfs (macOS, Windows): psutil's absolute
     process creation timestamp. The kernel stores it once at process start and
@@ -263,11 +271,13 @@ def _same_live_process(pid: Any, rec: Mapping[str, Any]) -> bool:
                 cur = _start_offset(pid)
                 if cur is not None and abs(cur - off) > 1:
                     return False
-            elif _finite(ct):
+            elif _finite(ct) and _create_time_is_stable():
                 cur = _create_time(pid)
                 if cur is not None and abs(cur - ct) > 1:
                     return False
-        elif _finite(ct):
+            # Linux with an incomparable offset: NOTHING clock-step-safe is left to compare, so the record
+            # stays live (Prism f-0d05a4e1ac34ca32 / f-78f5d20661de8262). A stale record ages out via boot_id.
+        elif _finite(ct) and _create_time_is_stable():
             cur = _create_time(pid)
             if cur is not None and abs(cur - ct) > 1:
                 return False
