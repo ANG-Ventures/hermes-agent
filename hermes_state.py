@@ -1274,9 +1274,12 @@ class SessionDB(
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
+                    hold = None
                     self._conn.execute("BEGIN IMMEDIATE")
-                    hold = hold_started(self.db_path, _write_caller_name())  # holder-side lock ledger
                     try:
+                        # Inside the rollback try: nothing between BEGIN and fn may leave the
+                        # transaction open (hold_started never raises; this is the backstop).
+                        hold = hold_started(self.db_path, _write_caller_name())  # holder-side lock ledger
                         fn_started = True
                         result = fn(self._conn)
                         self._conn.commit()

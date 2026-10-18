@@ -327,9 +327,12 @@ class TurnExplainersMixin:
             if persistence_cause == "locked":
                 # Name who held the write lock (t_c54736c9): the raw diagnostic, like a Details: line.
                 from agent.redact import redact_sensitive_text
+                from hermes_state import _default_db_path
                 from hermes_state_lockowners import last_timeout_holder
 
-                holder = last_timeout_holder()
+                # Scoped to the failing store: a multiplexed process serves several profiles, and
+                # another store's holder must not reach this chat (Prism eb32d69446e1).
+                holder = last_timeout_holder(db_path or _default_db_path())
                 if holder:  # argv reaches chat here, not only the log: redact it
                     body = f"{body} [state.db write-lock holder: {redact_sensitive_text(holder)}]"
         else:

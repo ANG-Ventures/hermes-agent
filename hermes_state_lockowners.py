@@ -132,11 +132,31 @@ _TIMEOUT_MEMORY_S = 600.0
 _WATCHDOG_TICK_S = 0.5
 
 _holds_lock = threading.Lock()
+# Serializes ledger publication with hold completion: a watchdog "holding" write that lost the race
+# to hold_ended() must not overwrite the "released" record (Prism 147f02dd5e23).
+_publish_lock = threading.Lock()
 _active_holds: Dict[int, dict] = {}
 _hold_seq = 0
 _watchdog_running = False
 _watchdog_pid = 0
 _last_timeout: Dict[str, Tuple[float, str]] = {}
+# Bound at import: the watchdog is internal plumbing. Tests (and libraries) that replace
+# ``threading.Thread`` with an inline starter would otherwise run the watchdog loop inside
+# hold_started() while it holds _holds_lock, deadlocking the writer (the 4 tui_gateway reds on #2072).
+_Thread = threading.Thread
+
+
+def _reset_after_fork() -> None:
+    """A fork child inherits the locks in whatever state another parent thread left them, and no
+    watchdog thread: start from scratch (Prism c0c7a990a4d6)."""
+    global _holds_lock, _publish_lock, _active_holds, _watchdog_running, _watchdog_pid
+    _holds_lock, _publish_lock = threading.Lock(), threading.Lock()
+    _active_holds = {}
+    _watchdog_running, _watchdog_pid = False, 0
+
+
+if hasattr(os, "register_at_fork"):  # POSIX only
+    os.register_at_fork(after_in_child=_reset_after_fork)
 
 
 def _ledger_dir(db_path) -> str:
@@ -171,56 +191,80 @@ def _write_record(hold: dict, **fields) -> None:
         logger.debug("state.db lock-holder ledger write failed", exc_info=True)
 
 
-def _watchdog_loop() -> None:
+def _select_due_holds() -> Optional[List[dict]]:
+    """Mark and return holds open >= _HOLD_RECORD_MIN_S; None when no hold is active (watchdog exits)."""
     global _watchdog_running
-    while True:
-        time.sleep(_WATCHDOG_TICK_S)
-        now = time.monotonic()
-        with _holds_lock:
-            if not _active_holds:
-                _watchdog_running = False  # under the lock: hold_started() restarts it
-                return
-            due = [h for h in _active_holds.values()
-                   if not h["marked"] and now - h["t0"] >= _HOLD_RECORD_MIN_S]
-            for hold in due:
-                hold["marked"] = True
+    now = time.monotonic()
+    with _holds_lock:
+        if not _active_holds:
+            _watchdog_running = False  # under the lock: hold_started() restarts it
+            return None
+        due = [h for h in _active_holds.values() if not h["marked"] and now - h["t0"] >= _HOLD_RECORD_MIN_S]
         for hold in due:
+            hold["marked"] = True
+    return due
+
+
+def _publish_holding(hold: dict) -> None:
+    with _publish_lock:
+        if not hold["ended"]:  # hold_ended() already published "released": never resurrect it
             _write_record(hold, state="holding")
 
 
-def hold_started(db_path, op: str) -> int:
-    """Register a write-lock hold that just began (BEGIN IMMEDIATE succeeded); returns its token."""
+def _watchdog_loop() -> None:
+    while True:
+        time.sleep(_WATCHDOG_TICK_S)
+        due = _select_due_holds()
+        if due is None:
+            return
+        for hold in due:
+            _publish_holding(hold)
+
+
+def hold_started(db_path, op: str) -> Optional[int]:
+    """Register a write-lock hold that just began (BEGIN IMMEDIATE succeeded); returns its token.
+    Never raises: a failure here (thread exhaustion at load 160) must not break the write."""
     global _hold_seq, _watchdog_running, _watchdog_pid
-    with _holds_lock:
-        _hold_seq += 1
-        token = _hold_seq
-        _active_holds[token] = {"db_path": db_path, "op": op, "t0": time.monotonic(), "since": time.time(),
-                                "marked": False, "pid": os.getpid(), "who": None, "ledger": None}
-        if not _watchdog_running or _watchdog_pid != os.getpid():  # a fork child has no watchdog thread
-            _watchdog_running, _watchdog_pid = True, os.getpid()
-            threading.Thread(target=_watchdog_loop, name="state-db-lock-ledger", daemon=True).start()
-    return token
+    try:
+        with _holds_lock:
+            _hold_seq += 1
+            token = _hold_seq
+            _active_holds[token] = {"db_path": db_path, "op": op, "t0": time.monotonic(), "since": time.time(),
+                                    "marked": False, "ended": False, "pid": os.getpid(), "who": None,
+                                    "ledger": None}
+            if not _watchdog_running or _watchdog_pid != os.getpid():
+                try:
+                    _Thread(target=_watchdog_loop, name="state-db-lock-ledger", daemon=True).start()
+                    _watchdog_running, _watchdog_pid = True, os.getpid()
+                except Exception:  # RuntimeError("can't start new thread"): no "holding" marks this time
+                    logger.debug("state.db lock-holder watchdog did not start", exc_info=True)
+        return token
+    except Exception:
+        logger.debug("state.db lock-holder ledger registration failed", exc_info=True)
+        return None
 
 
-def hold_ended(token: int) -> None:
+def hold_ended(token: Optional[int]) -> None:
     """Close a hold; one of >= _HOLD_RECORD_MIN_S is written to the ledger with its duration."""
+    if token is None:
+        return
     with _holds_lock:
         hold = _active_holds.pop(token, None)
+        if hold is not None:
+            hold["ended"] = True
     if hold is None:
         return
     held = time.monotonic() - hold["t0"]
-    if held >= _HOLD_RECORD_MIN_S:
-        _write_record(hold, state="released", held_s=round(held, 1), released_at=time.time())
+    if held >= _HOLD_RECORD_MIN_S or hold["marked"]:
+        with _publish_lock:
+            _write_record(hold, state="released", held_s=round(held, 1), released_at=time.time())
 
 
 def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True
-    return True
+    # Never os.kill(pid, 0): on Windows signal 0 is CTRL_C_EVENT (Prism 765905ac86f6).
+    from hermes_cli._subprocess_compat import pid_exists_stdlib
+
+    return pid_exists_stdlib(pid)
 
 
 def recent_ledger_holders(db_path, window_s: float, *, exclude_pid: Optional[int] = None) -> List[str]:
@@ -236,7 +280,7 @@ def recent_ledger_holders(db_path, window_s: float, *, exclude_pid: Optional[int
         if not name.endswith(".json"):
             continue
         try:
-            with open(os.path.join(ledger, name), encoding="utf-8") as handle:
+            with open(os.path.join(ledger, name), encoding="utf-8-sig") as handle:
                 rec = json.load(handle)
             pid = int(rec["pid"])
         except (OSError, ValueError, KeyError, TypeError):
@@ -256,13 +300,11 @@ def recent_ledger_holders(db_path, window_s: float, *, exclude_pid: Optional[int
     return [line for _, line in sorted(found, reverse=True)]
 
 
-def last_timeout_holder(db_path=None) -> Optional[str]:
-    """Holder named by this process's most recent write-lock deadline (last 10 min): on *db_path*, or
-    on any state.db when None (the cron explainer renders without a path and must match the turn's)."""
-    if db_path is not None:
-        entry = _last_timeout.get(os.path.realpath(os.fspath(db_path)))
-    else:
-        entry = max(_last_timeout.values(), default=None)
+def last_timeout_holder(db_path) -> Optional[str]:
+    """Holder named by this process's most recent write-lock deadline (last 10 min) on *db_path* only:
+    a multiplexed process serves several profiles' stores, and another store's holder must never
+    reach this one's chat (Prism eb32d69446e1)."""
+    entry = _last_timeout.get(os.path.realpath(os.fspath(db_path)))
     if entry is None or time.time() - entry[0] > _TIMEOUT_MEMORY_S:
         return None
     return entry[1]

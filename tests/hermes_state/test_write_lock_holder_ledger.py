@@ -60,7 +60,7 @@ def _hold_in_child(db_path, hold_s, op="fixture_hold"):
         db.close()
         print("released", flush=True)
     """)
-    return subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True,
+    return subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True, encoding="utf-8",
                             env={**os.environ, "HERMES_HOME": str(Path(db_path).parent)})
 
 
@@ -89,7 +89,7 @@ def test_holder_that_released_before_the_deadline_is_named(db, monkeypatch, capl
     finally:
         child.kill()
         child.wait()
-    rec = json.loads((_ledger(db.db_path) / f"{child.pid}.json").read_text())
+    rec = json.loads((_ledger(db.db_path) / f"{child.pid}.json").read_text(encoding="utf-8-sig"))
     assert rec["state"] == "released" and rec["op"] == "fixture_hold" and rec["held_s"] >= 2.0, rec
     assert f"PID {child.pid} " in detail and "fixture_hold" in detail and "released" in detail, detail
     assert "held the write lock for 3s" in detail or "held the write lock for 2s" in detail, detail
@@ -98,10 +98,10 @@ def test_holder_that_released_before_the_deadline_is_named(db, monkeypatch, capl
 
 def test_live_long_hold_is_marked_holding_while_it_is_open(db, monkeypatch):
     monkeypatch.setattr(lockowners, "state_db_write_lock_holders", lambda _p: [])
-    child = _hold_in_child(db.db_path, 4.0)
+    child = _hold_in_child(db.db_path, 30.0)  # far past the poll: the SIGKILL below always lands mid-hold
     try:
         assert child.stdout.readline().strip() == "held"
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 15.0
         lines = []
         while time.monotonic() < deadline:
             lines = lockowners.recent_ledger_holders(db.db_path, 60.0)
@@ -120,7 +120,7 @@ def test_vacuum_is_recorded_as_a_vacuum_hold(db, monkeypatch):
     monkeypatch.setattr(lockowners, "_HOLD_RECORD_MIN_S", 0.0)
     db.create_session("s1", "cli")
     db.vacuum()
-    rec = json.loads((_ledger(db.db_path) / f"{os.getpid()}.json").read_text())
+    rec = json.loads((_ledger(db.db_path) / f"{os.getpid()}.json").read_text(encoding="utf-8-sig"))
     assert rec["op"] == "vacuum" and rec["state"] == "released", rec
 
 
@@ -128,7 +128,7 @@ def test_ledger_names_the_public_method_that_held_the_lock(db, monkeypatch):
     monkeypatch.setattr(lockowners, "_HOLD_RECORD_MIN_S", 0.0)
     db.create_session("s1", "cli")
     db.prune_sessions(older_than_days=90)
-    rec = json.loads((_ledger(db.db_path) / f"{os.getpid()}.json").read_text())
+    rec = json.loads((_ledger(db.db_path) / f"{os.getpid()}.json").read_text(encoding="utf-8-sig"))
     assert rec["op"] == "prune_sessions", rec
 
 
@@ -176,5 +176,121 @@ def test_locked_stop_message_names_the_holder(db, monkeypatch):
     monkeypatch.setattr(lockowners, "state_db_write_lock_holders",
                         lambda _p: ["PID 4242 (hermes gateway run) holds WAL write lock on state.db-shm"])
     lockowners.log_write_lock_holders(db.db_path, 180.0)
-    out = AIAgent._format_turn_completion_explanation("session_persistence_failed", "locked")
+    out = AIAgent._format_turn_completion_explanation("session_persistence_failed", "locked", db_path=db.db_path)
     assert "busy" in out.lower() and "PID 4242 (hermes gateway run)" in out, out
+
+
+def test_stop_message_names_only_the_failing_stores_holder(tmp_path, monkeypatch):
+    """Two profiles' stores in one process: B's later timeout must not reach A's chat."""
+    from run_agent import AIAgent
+
+    a, b = tmp_path / "a" / "state.db", tmp_path / "b" / "state.db"
+    monkeypatch.setattr(lockowners, "state_db_write_lock_holders", lambda _p: ["PID 1111 (holder-of-A)"])
+    lockowners.log_write_lock_holders(a, 180.0)
+    monkeypatch.setattr(lockowners, "state_db_write_lock_holders", lambda _p: ["PID 2222 (holder-of-B)"])
+    lockowners.log_write_lock_holders(b, 180.0)
+    out_a = AIAgent._format_turn_completion_explanation("session_persistence_failed", "locked", db_path=a)
+    assert "holder-of-A" in out_a and "holder-of-B" not in out_a, out_a
+    out_c = AIAgent._format_turn_completion_explanation(
+        "session_persistence_failed", "locked", db_path=tmp_path / "c" / "state.db")
+    assert "holder-of" not in out_c, out_c
+
+
+class _InlineThread:
+    """The tui_gateway test shape: ``threading.Thread`` patched to run its target inside start()."""
+
+    def __init__(self, *, target, **_kwargs):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+def test_writes_survive_an_inline_thread_patch(tmp_path, monkeypatch):
+    """#2072 off-box reds: 4 tui_gateway tests patch threading.Thread; the watchdog then ran inside
+    hold_started() under _holds_lock and deadlocked the first write."""
+    import threading as _threading
+
+    db = SessionDB(db_path=tmp_path / "state.db")  # not the fixture: a deadlocked db cannot close()
+    monkeypatch.setattr(_threading, "Thread", _InlineThread)
+    monkeypatch.setattr(lockowners, "_watchdog_running", False)
+    done = []
+    runner = lockowners._Thread(target=lambda: (db.create_session("s1", "cli"), done.append(1)), daemon=True)
+    runner.start()
+    runner.join(10.0)
+    if done != [1]:
+        # Unwedge the stuck writer so teardown/atexit can close the db: empty the registry, then
+        # release the lock hold_started() is sitting on so the inline watchdog sees no holds and returns.
+        lockowners._active_holds.clear()
+        try:
+            lockowners._holds_lock.release()
+        except RuntimeError:
+            pass
+        runner.join(10.0)
+        pytest.fail("write deadlocked under an inline threading.Thread patch")
+    db.close()
+
+
+def test_released_record_is_never_republished_as_holding(db, monkeypatch):
+    """Prism 147f02dd5e23 barrier: the watchdog selects a due hold, the hold completes and publishes
+    "released", then the watchdog resumes publication. The record must stay "released"."""
+    monkeypatch.setattr(lockowners, "_HOLD_RECORD_MIN_S", 0.0)
+    monkeypatch.setattr(lockowners, "_watchdog_running", True)  # no real watchdog: we play it by hand
+    monkeypatch.setattr(lockowners, "_watchdog_pid", os.getpid())
+    token = lockowners.hold_started(db.db_path, "raced_op")
+    due = lockowners._select_due_holds()  # watchdog: selected, about to publish
+    assert [h["op"] for h in due] == ["raced_op"]
+    lockowners.hold_ended(token)  # completion wins the race
+    for hold in due:
+        lockowners._publish_holding(hold)  # watchdog resumes
+    rec = json.loads((_ledger(db.db_path) / f"{os.getpid()}.json").read_text(encoding="utf-8-sig"))
+    assert rec["state"] == "released" and rec["op"] == "raced_op", rec
+
+
+def test_ledger_failure_never_blocks_the_write(db, monkeypatch):
+    """Prism 840e2f7857ad: thread exhaustion at load must not leave BEGIN IMMEDIATE open."""
+    def _no_threads(*_a, **_k):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(lockowners, "_Thread", _no_threads)
+    monkeypatch.setattr(lockowners, "_watchdog_running", False)
+    db.create_session("s1", "cli")
+    db.append_message(session_id="s1", role="user", content="still written")
+    assert not db._conn.in_transaction
+    assert [m["content"] for m in db.get_messages("s1")] == ["still written"]
+
+
+def test_pid_probe_never_signals_on_windows(monkeypatch):
+    """Prism 765905ac86f6: os.kill(pid, 0) is CTRL_C_EVENT on Windows; the probe must not signal."""
+    import hermes_cli._subprocess_compat as compat
+
+    def _no_signal(*_a):
+        raise AssertionError("os.kill called")
+
+    monkeypatch.setattr(compat, "IS_WINDOWS", True)
+    monkeypatch.setattr(compat, "win32_pid_exists", lambda pid: pid == 4242)
+    monkeypatch.setattr(os, "kill", _no_signal)
+    assert lockowners._pid_alive(4242) is True
+    assert lockowners._pid_alive(4243) is False
+
+
+@pytest.mark.platforms("posix")
+def test_fork_child_does_not_inherit_a_held_registry_lock(tmp_path):
+    """Prism c0c7a990a4d6: fork while another thread holds _holds_lock; the child's write must not hang."""
+    db_path = tmp_path / "state.db"
+    SessionDB(db_path=db_path).close()
+    with lockowners._holds_lock:  # the parent's watchdog, mid-tick
+        pid = os.fork()  # windows-footgun: ok — platforms("posix") test
+        if pid == 0:  # child
+            import signal
+
+            signal.alarm(20)
+            try:
+                child = SessionDB(db_path=db_path)
+                child.create_session("forked", "cli")
+                child.close()
+                os._exit(0)
+            except BaseException:
+                os._exit(3)
+    _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
