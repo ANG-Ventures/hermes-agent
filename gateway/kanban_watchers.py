@@ -2161,13 +2161,33 @@ class GatewayKanbanWatchersMixin:
                                     # rides THIS wake, so the owner-wake does not send
                                     # a second turn for the same event.
                                     red_state: dict = {}
-                                    if (sub.get("delivery_mode") or "notify") in ("notify+wake", "wake"):
+                                    # S5 (t_4f6afb67): events whose WAKE carries no decision
+                                    # for the owner (ev.id -> reason). The line still posts;
+                                    # the wake is withheld and a notify_suppressed receipt
+                                    # lands on the card (kanban show lists it).
+                                    wake_noise: dict = {}
+                                    red_keys: dict = {}
+                                    _wake_mode = (sub.get("delivery_mode") or "notify") in ("notify+wake", "wake")
+                                    _s5 = (_wake_mode and platform != "api_server"
+                                           and _suppress_cfg.enabled and _suppress_cfg.actionable_only)
+                                    _s5_home = _s5 and _hr.same_chat(
+                                        getattr(home_res, "target", None), platform,
+                                        sub.get("chat_id"), sub.get("thread_id"),
+                                    )
+                                    _red_seen = _ow.runner_state(self).red_seen if _s5 else {}
+                                    if _wake_mode:
                                         for _ev in events:
+                                            if _s5_home and _ns.is_own_echo(_ev, _home_sid, True):
+                                                wake_noise[_ev.id] = _ns.REASON_OWN_ECHO
+                                                continue
+                                            if _s5 and _ns.is_auto_route(_ev, _suppress_cfg):
+                                                wake_noise[_ev.id] = _ns.REASON_AUTO_ROUTE
+                                                continue
                                             if _ev.kind != "review_requested":
                                                 continue
                                             try:
-                                                _bad = _ow.handback_pr_state(
-                                                    _kb, conn, {"result": getattr(task, "result", None)},
+                                                _verdict = _ow.handback_pr_verdict(
+                                                    _kb, conn, {"id": sub["task_id"], "result": getattr(task, "result", None)},
                                                     _ev.payload, _ev.run_id, _red_health, _red_memo,
                                                 )
                                             except Exception as _rs_exc:
@@ -2175,9 +2195,16 @@ class GatewayKanbanWatchersMixin:
                                                 # which retries until GitHub answers.
                                                 logger.debug("kanban notifier: PR state for %s unread: %s",
                                                              sub["task_id"], _rs_exc)
-                                                _bad = None
-                                            if _bad:
-                                                red_state[_ev.id] = _bad
+                                                continue
+                                            if not _verdict["state"]:
+                                                continue
+                                            red_state[_ev.id] = _verdict["state"]
+                                            red_keys[_ev.id] = _verdict["keys"]
+                                            _why_red = _ns.red_handback_noise(
+                                                _verdict["keys"], _verdict["inherited_only"], _red_seen,
+                                            ) if _s5 else None
+                                            if _why_red:
+                                                wake_noise[_ev.id] = _why_red
                                     # t_f3323c8a W8c: the children a completed close
                                     # unblocked ride THIS wake too (owner-wake's
                                     # last_blocker_done), one turn not two.
@@ -2209,6 +2236,8 @@ class GatewayKanbanWatchersMixin:
                                         "home_res": home_res,
                                         "close_gates": close_gates,
                                         "red_state": red_state,
+                                        "red_keys": red_keys,
+                                        "wake_noise": wake_noise,
                                         "ready_state": ready_state,
                                         "self_event_ids": _self_ids,
                                         "suppressed": suppressed,
@@ -2886,11 +2915,22 @@ class GatewayKanbanWatchersMixin:
                         _self_ids = set(d.get("self_event_ids") or ()) & _sent_event_ids
                         # t_4c7da648: a suppressed event never wakes, sent or not.
                         _suppressed_ids = set(d.get("suppressed") or ())
+                        # S5 (t_4f6afb67): an event whose wake is no decision for the
+                        # owner never wakes either. Withheld only once its receipt is
+                        # persisted; a failed write (locked board) wakes as before.
+                        _noise = dict(d.get("wake_noise") or {})
+                        if _noise and (wake_agent or _defer_pending):
+                            for ev in d["events"]:
+                                if ev.id in _noise and ev.kind in _WAKE_KINDS and ev.id not in _self_ids \
+                                        and not await _to_thread_process_service(
+                                            _ns.record_suppressed, board_slug, sub["task_id"], ev,
+                                            _noise[ev.id], "notifier-wake"):
+                                    _noise.pop(ev.id, None)
                         _wake_kinds = (
                             {
                                 ev.kind for ev in d["events"]
                                 if ev.kind in _WAKE_KINDS and ev.id not in _self_ids
-                                and ev.id not in _suppressed_ids
+                                and ev.id not in _suppressed_ids and ev.id not in _noise
                             }
                             # t_b7b31563: a deferred wake builds its text here
                             # too; it is parked (not delivered) further down.
@@ -2940,6 +2980,10 @@ class GatewayKanbanWatchersMixin:
                                     who=(sub.get("user_id"), sub.get("user_id_alt")),
                                     profile=sub.get("notifier_profile"),
                                 )
+                                # S5: this (card, PR, head, red-set) has now woken its owner.
+                                _seen = _owner_wake_mod.runner_state(self).red_seen
+                                for _rid in _red_ids:
+                                    _ns.note_red_seen(_seen, (d.get("red_keys") or {}).get(_rid) or (), time.time())
                         if _wake_kinds:
                             if _is_push_adapter:
                                 _session_key = getattr(task, "session_id", None) or ""
