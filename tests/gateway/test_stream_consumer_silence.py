@@ -385,6 +385,29 @@ class TestInternalEventLongReplyDelivered:
         assert consumer.delivered_final_matches(self.LONG) is True
 
     @pytest.mark.asyncio
+    async def test_native_stream_marker_first_long_reply_drops_marker(self):
+        """Prism 52ccd9c3b209 on #2060: a native-stream adapter opens the stream with an empty
+        seed frame before any text, so the leading strip must key on visible text pushed, not on
+        the stream being open."""
+        from tests.gateway.test_stream_consumer_wecom_native import (
+            _make_native_streaming_adapter,
+        )
+        adapter = _make_native_streaming_adapter()
+        raw = "NO_REPLY\n\n" + self.LONG
+        chunks = [raw[i:i + 40] for i in range(0, len(raw), 40)]
+        consumer = await self._stream(adapter, self._cfg(), chunks, raw)
+
+        frames = [f["text"] for f in adapter.frames]
+        assert frames and frames[0] == ""  # the seed opened the stream first
+        visible = [t for t in frames if t] + _sent_and_edited(adapter)
+        assert visible, "long reply was not delivered"
+        for text in visible:
+            assert "NO_REPLY" not in text, f"marker leaked: {text!r}"
+        assert visible[-1].strip() == self.LONG
+        assert consumer.final_content_delivered is True
+        assert consumer.delivered_final_matches(self.LONG) is True
+
+    @pytest.mark.asyncio
     async def test_short_note_is_held_and_never_shown(self):
         adapter = _make_adapter()
         raw = "Already reported.\nNO_REPLY"
