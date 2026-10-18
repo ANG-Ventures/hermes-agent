@@ -50,12 +50,12 @@ def clean_home(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("name", sorted(_plugin_entries()))
 def test_behaviour_keys_never_read_as_configured(name, clean_home):
+    # Drive the REAL probe seam (_plugin_is_configured sets the enablement-probe flag around is_connected),
+    # so a checker that trusts the probe's synthetic enabled=True is caught here.
+    from gateway.config_env import _plugin_is_configured
     entry = _plugin_entries()[name]
     for extra in BEHAVIOUR_EXTRAS:
-        try:
-            hit = entry.is_connected(PlatformConfig(enabled=True, extra=dict(extra)))
-        except Exception:
-            hit = False  # a raising probe is treated as not-configured by _plugin_is_configured
+        hit = _plugin_is_configured(entry, dict(extra), None)
         assert not hit, f"{name}.is_connected reads {extra} as configured: the enablement probe defeats itself"
 
 
@@ -87,5 +87,7 @@ def test_whatsapp_env_opt_in_enables(wa_home, monkeypatch):
 
 
 def test_whatsapp_explicit_yaml_enable_enables(wa_home):
-    _, wa = _load(wa_home, "whatsapp:\n  enabled: true\n")
+    cfg, wa = _load(wa_home, "whatsapp:\n  enabled: true\n")
     assert wa is not None and wa.enabled
+    # .enabled alone is not enough: the gateway starts adapters from get_connected_platforms() (Prism b7cecd77117e).
+    assert Platform.WHATSAPP in cfg.get_connected_platforms()

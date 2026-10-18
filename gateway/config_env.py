@@ -6,6 +6,7 @@ copy the values into ``extra``" — declared as ``_Cred`` rows in ``_ENV_STEPS``
 order = application order). Platforms with unique gating are small functions in the same table.
 """
 
+import contextvars
 import contextlib
 import json
 import logging
@@ -374,13 +375,28 @@ def _plugin_probe_seed(entry) -> Optional[dict]:
     return seed if isinstance(seed, dict) and seed else None
 
 
+# True only while ``_plugin_is_configured`` calls a plugin's ``is_connected`` on its SYNTHETIC
+# ``enabled=True`` view. A checker that trusts ``config.enabled`` must not trust it then: the flag is the
+# probe's own, not the user's (t_83ff59d4: a display-only ``whatsapp:`` block auto-enabled an unpaired adapter).
+_ENABLEMENT_PROBE: "contextvars.ContextVar[bool]" = contextvars.ContextVar("plugin_enablement_probe", default=False)
+
+
+def in_enablement_probe() -> bool:
+    """Whether the current ``is_connected`` call is the env pass's synthetic enablement probe."""
+    return _ENABLEMENT_PROBE.get()
+
+
 def _plugin_is_configured(entry, existing_extra: dict, seed: Optional[dict]) -> bool:
     """``entry.is_connected`` on a transient ``enabled=True`` view seeded with env extras (never the real config)."""
     try:
         for k, v in (seed or {}).items():
             if k != "home_channel":
                 existing_extra.setdefault(k, v)
-        configured = bool(entry.is_connected(PlatformConfig(enabled=True, extra=existing_extra)))
+        token = _ENABLEMENT_PROBE.set(True)
+        try:
+            configured = bool(entry.is_connected(PlatformConfig(enabled=True, extra=existing_extra)))
+        finally:
+            _ENABLEMENT_PROBE.reset(token)
     except Exception as exc:
         logger.debug("is_connected for %s raised: %s — skipping enablement", entry.name, exc)
         return False

@@ -72,9 +72,26 @@ def test_env_opt_in_still_enables(home, monkeypatch):
     "platforms:\n  whatsapp:\n    enabled: true\n",
 ])
 def test_explicit_yaml_enable_still_enables(home, yaml_text):
-    # enabled => the adapter starts (and reports not-paired itself); "connected" additionally needs pairing.
+    # An explicit YAML enable must reach get_connected_platforms() (the set the gateway starts adapters
+    # for), not just set .enabled: asserting only .enabled let Prism b7cecd77117e through.
     cfg = _load(home, yaml_text)
     assert _wa(cfg) is not None and _wa(cfg).enabled
+    assert Platform.WHATSAPP in cfg.get_connected_platforms()
+
+
+def test_probe_view_is_not_an_opt_in(home):
+    # The env pass's synthetic enabled=True view must not read as configured; a real enabled config must.
+    from gateway.config_env import _ENABLEMENT_PROBE
+    from gateway.platform_registry import platform_registry
+
+    check = platform_registry.get("whatsapp").is_connected
+    view = PlatformConfig(enabled=True, extra={"gateway_restart_notification": False})
+    token = _ENABLEMENT_PROBE.set(True)
+    try:
+        assert not check(view)
+    finally:
+        _ENABLEMENT_PROBE.reset(token)
+    assert check(view)
 
 
 def test_explicit_disable_wins(home, monkeypatch):
@@ -98,12 +115,21 @@ def test_paired_creds_are_not_an_opt_in(home, monkeypatch, env):
     assert Platform.WHATSAPP not in cfg.get_connected_platforms()
 
 
+def _in_probe(fn, *a):
+    from gateway.config_env import _ENABLEMENT_PROBE
+    token = _ENABLEMENT_PROBE.set(True)
+    try:
+        return fn(*a)
+    finally:
+        _ENABLEMENT_PROBE.reset(token)
+
+
 def test_is_connected_unit(home):
     from plugins.platforms.whatsapp.adapter import _is_connected
 
-    # the exact transient view _plugin_is_configured builds
-    assert not _is_connected(PlatformConfig(enabled=True, extra={"gateway_restart_notification": False}))
-    assert not _is_connected(PlatformConfig(enabled=True, extra={"require_mention": True, "dm_policy": "open"}))
+    # the exact transient view _plugin_is_configured builds, inside the probe it builds it in
+    assert not _in_probe(_is_connected, PlatformConfig(enabled=True, extra={"gateway_restart_notification": False}))
+    assert not _in_probe(_is_connected, PlatformConfig(enabled=True, extra={"require_mention": True, "dm_policy": "open"}))
     assert not _is_connected(None)
 
 
@@ -113,4 +139,4 @@ def test_is_connected_env_unit(home, monkeypatch):
     monkeypatch.setenv("WHATSAPP_ENABLED", "yes")
     assert _is_connected(PlatformConfig(enabled=True))
     monkeypatch.setenv("WHATSAPP_ENABLED", "false")
-    assert not _is_connected(PlatformConfig(enabled=True, extra={"gateway_restart_notification": False}))
+    assert not _in_probe(_is_connected, PlatformConfig(enabled=True, extra={"gateway_restart_notification": False}))

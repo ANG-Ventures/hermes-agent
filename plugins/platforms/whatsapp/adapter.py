@@ -1062,18 +1062,21 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
 
 
 def _is_connected(config) -> bool:
-    """Connected == the user opted in with WHATSAPP_ENABLED; auth lives in the bridge.
+    """Connected == the user opted in: WHATSAPP_ENABLED, or a real config that is enabled; auth lives in the bridge.
 
-    Never "enabled and any extra key": the env pass probes this with a transient ``enabled=True`` view, so
-    a display/behaviour key alone (``whatsapp: {gateway_restart_notification: false}``) auto-enabled an
-    unpaired adapter that booted DEGRADED with ``whatsapp_not_paired`` (fork t_83ff59d4). An explicit YAML
-    ``enabled: true`` needs no probe: the env pass skips ``is_connected`` for already-enabled platforms.
+    Inside the env pass's enablement probe (``gateway.config_env.in_enablement_probe()``) the ``enabled=True``
+    is synthetic, so only WHATSAPP_ENABLED counts there: a display/behaviour key alone
+    (``whatsapp: {gateway_restart_notification: false}``) used to auto-enable an unpaired adapter that booted
+    DEGRADED with ``whatsapp_not_paired`` (fork t_83ff59d4). Outside the probe, an enabled config (an explicit
+    YAML ``enabled: true``) is connected, so ``get_connected_platforms()`` keeps it (Prism b7cecd77117e).
     A paired creds.json is NOT an opt-in: removing / falsing WHATSAPP_ENABLED is the documented disable.
     """
+    from gateway.config_env import in_enablement_probe
+    if config is not None and getattr(config, "enabled", False) and not in_enablement_probe():
+        return True
     # Via hermes_cli.gateway.get_env_value (not os.getenv) so setup-status callers that patch it observe the same value.
     import hermes_cli.gateway as gateway_mod
     return (gateway_mod.get_env_value("WHATSAPP_ENABLED") or "").strip().lower() in {"true", "1", "yes"}
-
 
 
 def register(ctx) -> None:

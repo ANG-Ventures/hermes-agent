@@ -78,13 +78,44 @@ def test_live_foreign_writer_entries_are_kept(tmp_path, monkeypatch):
         peer.wait()
 
 
-def test_without_the_flag_entries_are_untouched(tmp_path, monkeypatch):
+def test_any_write_drops_a_dead_stamped_writer(tmp_path, monkeypatch):
+    # Not only the startup write: an ordinary status write also drops a dead writer's stamped entry.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _seed(tmp_path, {"whatsapp": {"state": "fatal", "writer_pid": _dead_pid(), "writer_start_time": 1}})
 
     status.write_runtime_status(clear_profile_platforms=True, reload_existing=True)
 
-    assert set(status.read_runtime_status()["platforms"]) == {"whatsapp"}
+    assert status.read_runtime_status()["platforms"] == {}
+
+
+def test_ordinary_write_keeps_unstamped_entries(tmp_path, monkeypatch):
+    # Unstamped entries are only judged at startup (drop_stale_platforms), when no live writer can own them.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _seed(tmp_path, {"slack": {"state": "connected"}})
+
+    status.write_runtime_status(reload_existing=True)
+
+    assert set(status.read_runtime_status()["platforms"]) == {"slack"}
+
+
+def test_draining_predecessor_entry_goes_after_it_exits(tmp_path, monkeypatch):
+    # Prism 2129945e0725: the predecessor is still draining (alive) at the successor's startup write, so its
+    # entry survives that write; it must be gone on the first ordinary write after the predecessor exits.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    old = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        _seed(tmp_path, {"whatsapp": {"state": "fatal", "writer_pid": old.pid,
+                                      "writer_start_time": status._get_process_start_time(old.pid)}})
+        status.write_runtime_status(gateway_state="starting", clear_profile_platforms=True,
+                                    drop_stale_platforms=True, reload_existing=True)
+        assert set(status.read_runtime_status()["platforms"]) == {"whatsapp"}
+    finally:
+        old.kill()
+        old.wait()
+
+    status.write_runtime_status(gateway_state="running", reload_existing=True)
+
+    assert status.read_runtime_status()["platforms"] == {}
 
 
 def test_gateway_startup_write_passes_the_flag():
