@@ -960,5 +960,33 @@
       "gateway",
       "cron"
     ]
+  },
+  {
+    "feature": "internal-turn silence: a long reply beside a NO_REPLY line is delivered, not swallowed",
+    "tests": [
+      "tests/gateway/test_response_filters.py::test_long_summary_with_marker_is_delivered_without_the_marker",
+      "tests/gateway/test_response_filters.py::test_short_note_must_be_one_line_and_at_most_the_word_cap",
+      "tests/gateway/test_response_filters.py::test_cron_keeps_the_loose_rule_for_a_long_report",
+      "tests/gateway/test_gateway_silence_tokens.py::test_internal_event_long_reply_with_marker_is_delivered_without_it",
+      "tests/gateway/test_gateway_silence_tokens.py::test_internal_event_short_note_plus_marker_is_suppressed",
+      "tests/gateway/test_stream_consumer_silence.py::TestInternalEventLongReplyDelivered::test_native_stream_marker_first_long_reply_drops_marker"
+    ],
+    "paths": [
+      "gateway/response_filters.py",
+      "gateway/run_turn.py",
+      "gateway/run_turn_runner.py",
+      "gateway/stream_consumer.py",
+      "tools/process_registry_notifications.py",
+      "hermes_cli/config_defaults.py"
+    ],
+    "why": "Measured 2026-10-17: on internal turns (kanban wakes, background completions, deadman pages) the gateway's loose rule dropped any reply with NO_REPLY on its own first/last line: 555 replies / ~24k words in 7 days, nothing logged. #2060 (t_bb4059d2) delivers prose beside the marker unless it is a one-line note of <= display.internal_silence_short_note_words (12) words, strips the marker lines, and logs every verdict ('silence marker on a long internal reply: delivering N words' / 'suppressed an N-word note'); #2066 covers native-stream transports. Live E2E on the puppet lane: main swallowed the long arm, the PR delivered it. A parity merge that takes upstream's is_autonomous_silence_response for internal turns brings the swallow back silently.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ]
   }
 ]
