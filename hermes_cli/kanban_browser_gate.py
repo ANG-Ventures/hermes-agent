@@ -116,8 +116,10 @@ def _policy(row: Mapping) -> dict:
     return p if isinstance(p, dict) else {}
 
 
-def ephemeral_host(worker_host: Optional[str]) -> str:
-    return worker_host if worker_host in BROWSERD_HOSTS else EPHEMERAL_HOST
+def ephemeral_host(worker_host: Optional[str], local: Iterable[str] = ()) -> str:
+    """The browserd host for a worker's ``browser:ephemeral``: its own when it runs one (the Studio, ci-box, or a
+    host in ``browsers.local_ephemeral_hosts``, t_2dca69d0), else ci-box."""
+    return worker_host if worker_host in BROWSERD_HOSTS or (worker_host and worker_host in local) else EPHEMERAL_HOST
 
 
 def decide(need: str, *, lane: str, registry: kn.LaneRegistry, assignee: Optional[str], body: Optional[str],
@@ -129,7 +131,7 @@ def decide(need: str, *, lane: str, registry: kn.LaneRegistry, assignee: Optiona
     if lane == kn.LANE_NONE or lane not in registry.migrated:
         return {"need": need, "lane": lane, "reason": "lane_not_migrated"}
     if need == kn.EPHEMERAL:
-        return Plan(need, lane, "act", host=ephemeral_host(worker_host))
+        return Plan(need, lane, "act", host=ephemeral_host(worker_host, registry.local_ephemeral))
     name = identity_name(need)
     try:
         row = lookup(name)
