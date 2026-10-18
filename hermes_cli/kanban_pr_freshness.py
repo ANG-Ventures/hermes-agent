@@ -6,7 +6,7 @@ BEFORE the card leaves the worker. Card t_14b81673 (2026-09-25):
 
 (a) DRAFT -> refuse. A draft PR is not a handoff (hermes-agent#821 sat as a
     draft in the review lane). :class:`DraftPrError` is raised; the card stays
-    in-flight so the worker can ``gh pr ready`` and retry.
+    in-flight so the worker can ``ace_gate.py ready`` and retry.
 (b) STALE -> update. A head more than :data:`STALE_BEHIND_MAX` (20, the same
     number as fleet-merge.sh ``FLEET_MERGE_STALE_BASE_MAX``) commits behind its
     base AND reported ``mergeable_state=behind`` (a strict up-to-date rule blocks
@@ -66,8 +66,10 @@ class DraftPrError(ValueError):
             f"handoff refused: {', '.join(self.prs)} "
             f"{'is a DRAFT PR' if len(self.prs) == 1 else 'are DRAFT PRs'}. "
             f"A draft is not landable and must not enter the review lane. "
-            f"Run `gh pr ready <n> -R <repo>` (or name the right PR), then retry; "
-            f"if the draft is INTENTIONALLY left open, complete with "
+            f"Run `~/.hermes/scripts/ace_gate.py ready <owner/repo> <n>` (or name "
+            f"the right PR), then retry; rc=21 = a reviewer review-hold: leave it "
+            f"draft and complete with --draft-ok 'reviewer hold: <who>'. "
+            f"If the draft is otherwise INTENTIONALLY left open, complete with "
             f"--draft-ok/draft_ok \"<reason>\" (audited). "
             f"{task_id} is still in-flight (no state change)."
         )
