@@ -1127,7 +1127,7 @@ class GatewayStartupMixin:
         from gateway.response_filters import (
             is_intentional_silence_response, is_machinery_display_kind, silence_allowed,
         )
-        from gateway.run import _sanitize_gateway_final_response
+        from gateway.run import _is_interrupt_close_tail, _sanitize_gateway_final_response
         from gateway.run_turn import _unexpected_silence_reply
         from gateway.warning_notifications import diagnostic_turn_muted
         from hermes_cli.timefmt import coerce_epoch
@@ -1135,6 +1135,13 @@ class GatewayStartupMixin:
         last = visible[-1] if visible else {}
         if (last.get("role") != "assistant" or last.get("tool_calls") or not isinstance(last.get("content"), str)
                 or (coerce_epoch(last.get("timestamp")) or 0) < started):
+            return None
+        # The interrupt-close row ("Operation interrupted.", or the partial text the kill caught) is
+        # the placeholder the shutdown wrote to keep the transcript valid, not a reply the turn
+        # produced: the live path discards it as noise (run_turn: "Operation interrupted." is noise).
+        # Ledgering it would mail the placeholder as a recovered reply AND settle the marker, so the
+        # interrupted turn never resumes.
+        if _is_interrupt_close_tail(visible):
             return None
         prompt = next((m for m in reversed(visible) if m.get("role") == "user"), {})
         if is_machinery_display_kind(prompt.get("display_kind")):

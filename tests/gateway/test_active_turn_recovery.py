@@ -542,6 +542,29 @@ async def test_unclean_restart_delivers_a_persisted_unledgered_reply_instead_of_
     _close_store_db(store)
 
 
+@pytest.mark.asyncio
+async def test_unclean_restart_resumes_a_turn_whose_tail_is_only_the_interrupt_close(tmp_path):
+    """A turn cut mid-flight by a restart is closed with the interrupt-close placeholder
+    ("Operation interrupted.", stamped ``finish_reason="interrupt_close"`` on the persisted row; the
+    live path discards it as noise). That placeholder is not a reply the dead process owed: ledgering
+    it mailed "Recovered reply - Operation interrupted." to the chat AND cleared the marker, so the
+    interrupted sibling never got its resume (2026-10-18)."""
+    from gateway.delivery_ledger import sweep_recoverable
+
+    runner, store = _db_runner(tmp_path)
+    source = _turn(store, "cut-mid-turn", marked=True, reply=None)
+    entry = _entry_for(store, source)
+    store._db.append_message(session_id=entry.session_id, role="assistant", content="Operation interrupted.",
+                             finish_reason="interrupt_close")
+
+    assert await runner._recover_unclean_sessions() == (1, 0)
+
+    entry = _entry_for(store, source)
+    assert (entry.resume_pending, entry.resume_reason) == (True, "restart_interrupted")
+    assert sweep_recoverable(deliverable_platforms={"discord"}) == []
+    _close_store_db(store)
+
+
 _WAKE = {"display_kind": "internal_notification"}
 
 
