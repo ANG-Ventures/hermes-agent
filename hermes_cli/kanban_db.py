@@ -15020,6 +15020,9 @@ def _archive_closed_pr_gate(conn: sqlite3.Connection, task_id: str, query_fn=Non
         return
     texts: list = [task.result] + [run.summary for run in runs]
     comments = [c.body for c in list_comments(conn, task_id)]
+    # Prism a3069816b211: archive accepted a SHA superseder on ancestry alone. The same content gate as
+    # complete_task runs over every SHA token the closed-unmerged gate below would accept.
+    _enforce_superseded_content(conn, task_id, None, metadata=None, survivor_pr=None, texts=texts)
     try:
         _open_pr.enforce_not_closed_unmerged(
             task_id, *texts, recorded=urls,

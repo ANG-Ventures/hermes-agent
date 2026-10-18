@@ -474,3 +474,26 @@ def test_order_check_tolerates_later_edits_around_the_block():
     cand = b"top newer\na\nb\nNEW1\ninserted later\nNEW2\nc\nd changed later\nd\n"
     assert sc.file_carries(_entry(patch), cand, mb, head)
     assert not sc.file_carries(_entry(patch), b"a\nb\nNEW2\nNEW1\nc\nd\n", mb, head)
+
+
+def test_archive_runs_the_content_gate_on_a_sha_superseder(board, monkeypatch):
+    """Prism a3069816b211: an earlier run summary `SUPERSEDED-BY <sha>` whose sha is on main but lacks
+    the PR's content must not let archive_task hide the card (complete_task already refuses it)."""
+    _gate_stubs(monkeypatch, _check(
+        **{SHA: {"sha": SHA, "default": "main", "differs": ["skills-shared/smart-home/cad-part/SKILL.md"]}}))
+    with kb.connect() as conn:
+        tid, run = _drain_card(conn)
+        conn.execute("UPDATE task_runs SET summary=? WHERE id=?", (f"carve landed SUPERSEDED-BY {SHA}", run))
+        conn.commit()
+        with pytest.raises(sc.SupersededContentError, match="cad-part/SKILL.md"):
+            kb.archive_task(conn, tid)
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] != "archived"
+
+
+def test_archive_with_a_content_carrying_sha_still_archives(board, monkeypatch):
+    _gate_stubs(monkeypatch, _check(**{SHA: {"sha": SHA, "default": "main", "differs": []}}))
+    with kb.connect() as conn:
+        tid, run = _drain_card(conn)
+        conn.execute("UPDATE task_runs SET summary=? WHERE id=?", (f"SUPERSEDED-BY {SHA}", run))
+        conn.commit()
+        assert kb.archive_task(conn, tid) is True
