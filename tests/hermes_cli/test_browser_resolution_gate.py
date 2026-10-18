@@ -84,14 +84,14 @@ def write_hosts(h: Path, *, mode="on", migrated=PHASE1, legacy=LEGACY):
         {"browsers": {"mode": mode, "migrated_lanes": list(migrated), "legacy_allowlist": list(legacy)}}))
 
 
-def _pool():
+def _pool(name="ace-ai"):
     """The live pool's shape: a pool plan with the Studio-bound browser skills (t_8c474c2e)."""
-    host = kwp.PoolHost(name="ace-ai", ssh_host="ace-ai", ssh_user=kwp.SSH_USER, slots=4, capacity_pct=0.8,
+    host = kwp.PoolHost(name=name, ssh_host=name, ssh_user=kwp.SSH_USER, slots=4, capacity_pct=0.8,
                         absence="required", profiles=(OTHER, SOAK_PROFILE), state="active", enabled=True,
                         priority=0)
     p = kwp.plan([host], {}, probe=lambda h: (1.0, 32))
     p.band, p.spill_reason = "paused", "load"
-    p.config = kwp.PoolConfig(hosts=("ace-ai",), profiles=(OTHER, SOAK_PROFILE), pool_hosts=(host,),
+    p.config = kwp.PoolConfig(hosts=(name,), profiles=(OTHER, SOAK_PROFILE), pool_hosts=(host,),
                               studio_bound_skills=("amazon-cart-ops-local", "amazon-login", "browser-access",
                                                    "ebay-seller-ops", "ebay-login"))
     return p
@@ -469,6 +469,21 @@ def test_join_spawns_the_ace_ai_ephemeral_with_the_lease_env_only(home, ledger, 
         assert "L" * 64 not in dump
         (ev,) = _events(conn, tid, "browser_lease_joined")
         assert ev["host"] == "ci-box" and ev["source_host"] == "ace-ai" and ev["name"] == "eph-ci-box-x"
+
+
+def test_join_spawns_a_ci_box_placed_ephemeral_on_ci_box(home, ledger, join):
+    """t_36b46ab2: a card placed ON ci-box joins its own ci-box ephemeral (source_host ci-box), never browser_join_off."""
+    calls, _ = join
+    with kb.connect_closing() as conn:
+        tid = _card(conn, body=EPH_BODY.replace("host: ace-ai", "host: ci-box"))
+        res, got = _live_env(conn, _pool("ci-box"))
+        assert res.placement_waits.get(tid) != kbg.WAIT_JOIN_OFF
+        assert got[tid]["placement"] == "ci-box"
+        run = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        assert calls == [{"host": "ci-box", "card": tid, "run": str(run), "source_host": "ci-box"}]
+        assert got[tid]["env"]["BROWSER_LEASE_URL"] == LEASE["lease_url"]
+        (ev,) = _events(conn, tid, "browser_lease_joined")
+        assert ev["host"] == "ci-box" and ev["source_host"] == "ci-box"
 
 
 def test_join_off_holds_the_same_card(home, ledger, join):
