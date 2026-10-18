@@ -532,7 +532,8 @@ _SPECS = [
                   "'derived-from' records provenance only — the parent discovered/spawned the "
                   "child, which stays independently dispatchable. A DEPLOY must never be gated "
                   "on a DISCOVERY. 'after-merge' holds the child until the parent's recorded PR is "
-                  "MERGED (or the parent is done): use it for a child that is part of the "
+                  "MERGED, even past a done parent (a parent done with no PR releases it on close): "
+                  "use it for a child that is part of the "
                   "parent's close condition, where 'blocks' deadlocks."),
     ], help="Add a parent->child dependency"),
     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
@@ -578,7 +579,9 @@ _SPECS = [
              help="Evidence pointer for a card whose premise was already satisfied elsewhere. "
                   "Closes it done with outcome 'superseded'; no --result/--summary required, "
                   "but the pointer must be non-empty (an unnamed supersede is a silent delete "
-                  "of the work)."),
+                  "of the work). A SHA is verified against the card's own PR: every file's "
+                  "added lines must be at that SHA or on the default branch, and a pass is "
+                  "the survivor evidence (no --survivor-ref needed)."),
         _arg("--external", metavar="URL",
              help="Terminal close for a card whose remaining step is an outside party's (an "
                   "upstream maintainer merge): closes it done with outcome 'external', no "

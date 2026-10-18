@@ -73,12 +73,74 @@ def _comment_as(monkeypatch, profile, tid, author, token=None):
     return row["author"], json.loads(ev["payload"])
 
 
+def _comment_rows(tid):
+    with kb.connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id=?", (tid,)
+        ).fetchone()[0], conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='commented'", (tid,)
+        ).fetchone()[0]
+
+
+def _refused_as(monkeypatch, capsys, profile, tid, author, token=None):
+    """``--author <operator label>`` without a valid token: rc != 0, nothing
+    written, one stderr line naming the fix (t_6572add1)."""
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    if token is None:
+        monkeypatch.delenv(kb.OPERATOR_TOKEN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, token)
+    before = _comment_rows(tid)
+    capsys.readouterr()
+    top = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(top.add_subparsers(dest="command"))
+    args = top.parse_args(["kanban", "comment", tid, "--author", author, "forged ruling"])
+    assert kc.kanban_command(args) != 0
+    assert _comment_rows(tid) == before
+    out = capsys.readouterr()
+    assert "Comment added" not in out.out
+    assert out.err.strip() == (
+        f"--author {author} needs {kb.OPERATOR_TOKEN_ENV}="
+        "$(cat ~/.hermes/kanban/operator-token); not posted"
+    )
+
+
 @pytest.mark.parametrize("token", [None, "wrong-token"])
 def test_worker_cannot_forge_operator_author(board, monkeypatch, capsys, token):
-    author, payload = _comment_as(monkeypatch, "daedalus", board, "human:apollo", token)
-    assert author == "daedalus"
-    assert payload.get("claimed_author") == "human:apollo"
-    assert "claimed_author" in capsys.readouterr().err
+    _refused_as(monkeypatch, capsys, "daedalus", board, "human:apollo", token)
+
+
+# ── t_6572add1: --author <operator> without the token was a SILENT downgrade
+# (rc 0, "Comment added", stored as unverified:default / default) that every
+# operator-trust reader ignored: 182 rows in 24 h, a deadman FAILSAFE page on a
+# card Apollo had answered. It now refuses and writes nothing.
+
+
+@pytest.mark.parametrize("token", [None, "wrong-token"])
+def test_author_apollo_without_token_is_refused(board, monkeypatch, capsys, token):
+    _refused_as(monkeypatch, capsys, "default", board, "apollo", token)
+
+
+def test_author_apollo_refused_even_from_the_operator_gateway_tree(
+        board, monkeypatch, capsys, operator_gateway):
+    """The 156 measured rows came from a proven ``default`` caller asking for
+    ``apollo``: that downgrade (to ``default``) is refused as well."""
+    _refused_as(monkeypatch, capsys, "default", board, "apollo")
+
+
+def test_author_apollo_with_token_is_apollo_and_no_run(board, monkeypatch):
+    author, payload = _comment_as(monkeypatch, "default", board, "apollo", TOKEN)
+    assert author == "apollo"
+    assert "claimed_author" not in payload
+    with kb.connect() as conn:
+        row = conn.execute(
+            "SELECT run_id FROM task_comments WHERE task_id=? ORDER BY id DESC LIMIT 1", (board,)
+        ).fetchone()
+    assert row["run_id"] is None
+
+
+def test_no_author_keeps_the_unverified_path(board, monkeypatch):
+    assert _bare_comment(monkeypatch, "default", board) == "unverified:default"
 
 
 def test_operator_token_honours_author(board, monkeypatch):
@@ -121,10 +183,7 @@ def test_worker_selecting_default_profile_cannot_forge_author(board, monkeypatch
     import os
 
     _seed_worker_run(board, os.getpid())
-    author, payload = _comment_as(monkeypatch, "default", board, "human:apollo")
-    assert author == "daedalus"
-    assert payload.get("claimed_author") == "human:apollo"
-    assert "claimed_author" in capsys.readouterr().err
+    _refused_as(monkeypatch, capsys, "default", board, "human:apollo")
 
 
 def test_worker_selecting_default_profile_writes_as_itself_without_author(board, monkeypatch):
@@ -218,18 +277,16 @@ def test_triage_sweep_author_is_gated(board, monkeypatch):
 # ── Prism round 1 on #1791 ──────────────────────────────────────────────────
 
 
-def test_operator_label_needs_token_without_proven_worker(board, monkeypatch):
+def test_operator_label_needs_token_without_proven_worker(board, monkeypatch, capsys):
     """d11c14fcd7fe: missing worker ancestry (a reparented helper) is never
     proof of operator status, so an operator LABEL needs the token from any
     caller other than the label itself."""
-    author, payload = _comment_as(monkeypatch, "default", board, "human:apollo")
-    assert author == "unverified:default"
-    assert payload.get("claimed_author") == "human:apollo"
+    _refused_as(monkeypatch, capsys, "default", board, "human:apollo")
     author, payload = _comment_as(monkeypatch, "default", board, "human:apollo", TOKEN)
     assert author == "human:apollo"
 
 
-def test_worker_whose_profile_is_default_loses_the_exemption(board, monkeypatch):
+def test_worker_whose_profile_is_default_loses_the_exemption(board, monkeypatch, capsys):
     """26d8f8ddc376: a dispatched run recorded as ``default`` is still a worker;
     the service-label exemption is keyed on worker status, not on its label."""
     import os
@@ -238,9 +295,7 @@ def test_worker_whose_profile_is_default_loses_the_exemption(board, monkeypatch)
     author, payload = _comment_as(monkeypatch, "default", board, "land-autopilot")
     assert author == "default"
     assert payload.get("claimed_author") == "land-autopilot"
-    author, payload = _comment_as(monkeypatch, "default", board, "human:apollo")
-    assert author == "default"
-    assert payload.get("claimed_author") == "human:apollo"
+    _refused_as(monkeypatch, capsys, "default", board, "human:apollo")
 
 
 @pytest.mark.usefixtures("kanban_pins")  # pins a kanban path on purpose (t_65791cd2)
@@ -282,7 +337,7 @@ def _bare_comment(monkeypatch, profile, tid, token=None, body="APOLLO RULED: go"
 
 
 @pytest.mark.parametrize("profile", ["apollo", "default", "aegis"])
-def test_own_operator_name_without_proof_is_not_an_operator_label(board, monkeypatch, profile):
+def test_own_operator_name_without_proof_is_not_an_operator_label(board, monkeypatch, capsys, profile):
     """The card's verify: no worker ancestry, HERMES_PROFILE=<operator>, no
     token, ``comment`` -> the stored author is not an operator label."""
     from hermes_cli.kanban_identity import is_operator_label
@@ -290,10 +345,8 @@ def test_own_operator_name_without_proof_is_not_an_operator_label(board, monkeyp
     author = _bare_comment(monkeypatch, profile, board)
     assert author == f"unverified:{profile}"
     assert not is_operator_label(author)
-    # ...and --author <own name> takes the same road (no own-name fast path).
-    author, payload = _comment_as(monkeypatch, profile, board, profile)
-    assert not is_operator_label(author)
-    assert payload.get("claimed_author") == profile
+    # ...and --author <own name> gets no own-name fast path: refused.
+    _refused_as(monkeypatch, capsys, profile, board, profile)
 
 
 def test_token_carrying_operator_script_still_writes_apollo(board, monkeypatch):

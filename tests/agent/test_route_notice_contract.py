@@ -154,8 +154,11 @@ def test_head_label_override_only_for_relay_sourced_transients():
     assert fp.head_label_override({"trigger_class": "pool_pressure",
                                    "relay_synthetic": 1}) == "relay busy"
     assert fp.head_label_override({"trigger_class": "conn", "class_source": "text"}) is None
+    # t_d6227140: a relay quota refusal is labelled by the quota, never "rate limit".
     assert fp.head_label_override({"trigger_class": "quota_seat",
-                                   "class_source": "relay_header"}) is None
+                                   "class_source": "relay_header"}) == "seat quota"
+    assert fp.head_label_override({"trigger_class": "quota_seat",
+                                   "class_source": "text"}) is None
 
 
 @pytest.mark.parametrize("branch", ["warm_seat", "fallback_cold", "compaction", "fallback_failed"])

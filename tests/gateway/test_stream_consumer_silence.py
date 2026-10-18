@@ -342,6 +342,90 @@ class TestHumanTurnTrailingMarkerStrip:
         assert consumer.final_content_delivered is False
 
 
+class TestInternalEventLongReplyDelivered:
+    """t_bb4059d2: on an internal turn the stream consumer uses the same predicate as the final
+    send.  A long reply beside a marker streams (marker stripped) and is never retracted; a short
+    note is held and never shown."""
+
+    LONG = ("PR 4791 merged and the dispatcher picked up the new placement rule on the next tick. "
+            "Two cards that were parked on local_full respawned on ci-box and both finished green "
+            "within ten minutes.")
+
+    @staticmethod
+    def _cfg(words=12):
+        return StreamConsumerConfig(
+            edit_interval=0.0, buffer_threshold=1, internal_event=True,
+            strip_trailing_silence_marker=True, internal_short_note_words=words,
+        )
+
+    async def _stream(self, adapter, cfg, chunks, final):
+        consumer = GatewayStreamConsumer(adapter, "chat_1", cfg)
+        task = asyncio.create_task(consumer.run())
+        for chunk in chunks:
+            consumer.on_delta(chunk)
+            await asyncio.sleep(0.05)
+        consumer.finish(final)
+        await asyncio.wait_for(task, timeout=5)
+        return consumer
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("marker_first", [False, True], ids=["marker-last", "marker-first"])
+    async def test_long_reply_streams_without_marker_and_is_not_retracted(self, marker_first):
+        adapter = _make_adapter()
+        raw = ("NO_REPLY\n\n" + self.LONG) if marker_first else (self.LONG + "\n\nNO_REPLY")
+        chunks = [raw[i:i + 40] for i in range(0, len(raw), 40)]
+        consumer = await self._stream(adapter, self._cfg(), chunks, raw)
+
+        texts = _sent_and_edited(adapter)
+        assert texts and texts[-1].strip() == self.LONG
+        for text in texts:
+            assert "NO_REPLY" not in text, f"marker leaked: {text!r}"
+        adapter.delete_message.assert_not_called()
+        assert consumer.final_content_delivered is True
+        assert consumer.delivered_final_matches(self.LONG) is True
+
+    @pytest.mark.asyncio
+    async def test_native_stream_marker_first_long_reply_drops_marker(self):
+        """Prism 52ccd9c3b209 on #2060: a native-stream adapter opens the stream with an empty
+        seed frame before any text, so the leading strip must key on visible text pushed, not on
+        the stream being open."""
+        from tests.gateway.test_stream_consumer_wecom_native import (
+            _make_native_streaming_adapter,
+        )
+        adapter = _make_native_streaming_adapter()
+        raw = "NO_REPLY\n\n" + self.LONG
+        chunks = [raw[i:i + 40] for i in range(0, len(raw), 40)]
+        consumer = await self._stream(adapter, self._cfg(), chunks, raw)
+
+        frames = [f["text"] for f in adapter.frames]
+        assert frames and frames[0] == ""  # the seed opened the stream first
+        visible = [t for t in frames if t] + _sent_and_edited(adapter)
+        assert visible, "long reply was not delivered"
+        for text in visible:
+            assert "NO_REPLY" not in text, f"marker leaked: {text!r}"
+        assert visible[-1].strip() == self.LONG
+        assert consumer.final_content_delivered is True
+        assert consumer.delivered_final_matches(self.LONG) is True
+
+    @pytest.mark.asyncio
+    async def test_short_note_is_held_and_never_shown(self):
+        adapter = _make_adapter()
+        raw = "Already reported.\nNO_REPLY"
+        consumer = await self._stream(adapter, self._cfg(), ["Already reported.", "\nNO_REPLY"], raw)
+
+        assert _sent_and_edited(adapter) == []
+        assert consumer.final_content_delivered is False
+
+    @pytest.mark.asyncio
+    async def test_zero_words_keeps_the_loose_rule(self):
+        adapter = _make_adapter()
+        raw = self.LONG + "\n\nNO_REPLY"
+        consumer = await self._stream(adapter, self._cfg(0), [raw], raw)
+
+        assert _sent_and_edited(adapter) == []
+        assert consumer.final_content_delivered is False
+
+
 def _strip_cfg(**kw):
     return StreamConsumerConfig(
         edit_interval=0.01, buffer_threshold=1,

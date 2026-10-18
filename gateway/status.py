@@ -1337,6 +1337,29 @@ def _coerce_session_store(session_store: Any) -> dict[str, str]:
     return {"status": state if state in {"ok", "unavailable", "retrying"} else "unknown"}
 
 
+def _platform_entry_writer_alive(entry: Any) -> bool:
+    """True when the process stamped on a ``platforms`` entry (writer_pid + writer_start_time) is still
+    running as that same incarnation. Unstamped entries and dead / recycled pids are stale."""
+    if not isinstance(entry, dict):
+        return False
+    pid, recorded = entry.get("writer_pid"), entry.get("writer_start_time")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    current = _get_process_start_time(pid)
+    if recorded is None or current is None:
+        # No fingerprint on one side: only this process can vouch for itself.
+        return pid == os.getpid() and recorded == current
+    try:
+        return start_time_fingerprints_match(recorded, current)
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_stamped(entry: Any) -> bool:
+    return isinstance(entry, dict) and isinstance(entry.get("writer_pid"), int) and not isinstance(
+        entry.get("writer_pid"), bool)
+
+
 def _prepare_runtime_status_update(
     *, gateway_state: Any = _UNSET, exit_reason: Any = _UNSET, restart_requested: Any = _UNSET,
     active_agents: Any = _UNSET, active_agent_keys: Any = _UNSET, active_work: Any = _UNSET, platform: Any = _UNSET, platform_state: Any = _UNSET,
@@ -1345,7 +1368,7 @@ def _prepare_runtime_status_update(
     multiplex_standalone_reason: Any = _UNSET,
     platform_metrics: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
-    drop_profile_platforms: Optional[str] = None,
+    drop_profile_platforms: Optional[str] = None, drop_stale_platforms: bool = False,
     load_existing: bool = True, reload_existing: bool = False,
 ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     """Merge one update into the process-wide canonical status snapshot."""
@@ -1371,6 +1394,18 @@ def _prepare_runtime_status_update(
                 if not isinstance(k, str) or ":" not in k
                 or (drop_prefix is not None and not k.startswith(drop_prefix))
             }
+        # An entry whose writer process is gone (dead or recycled pid) is stale: a platform this boot does not
+        # run would otherwise keep reading e.g. ``whatsapp: fatal`` forever (t_83ff59d4). This runs on EVERY
+        # write, not only at startup: during an overlapping restart the draining predecessor is still alive at
+        # the successor's startup write, and its entries must go on the first write after it exits (Prism
+        # 2129945e0725). Own entries are never probed (cheap path); a foreign entry costs one start-time read.
+        # Unstamped entries are dropped only at startup (``drop_stale_platforms``), when no live writer can
+        # own them.
+        own = (current_record["pid"], current_record["start_time"])
+        payload["platforms"] = {
+            k: v for k, v in payload["platforms"].items()
+            if (isinstance(v, dict) and (v.get("writer_pid"), v.get("writer_start_time")) == own)
+            or (_platform_entry_writer_alive(v) if (drop_stale_platforms or _is_stamped(v)) else True)}
         payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
         # boot_id MUST be refreshed on every write, not seeded once: gateway_state.json
         # survives across reboots (never unlinked at startup), so without this the

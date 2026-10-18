@@ -41,6 +41,16 @@ Step 1: do the thing.
 """
 
 
+# A fleet-shaped root always deploys the exec-tier reader; a skills-shared/ tree without it is a broken
+# deploy that skill_manage refuses (t_e5af9a95). This stub classifies everything as prose.
+_TIER_STUB = "def load():\n    return []\ndef tier(path, rules):\n    return 'prose'\n"
+
+
+def _plant_tier_reader(root):
+    (root / "scripts" / "lib").mkdir(parents=True, exist_ok=True)
+    (root / "scripts" / "lib" / "autocommit_tier.py").write_text(_TIER_STUB)
+
+
 @contextmanager
 def _fleet_home(tmp_path, groups=("devops", "general", "research")):
     """A fleet-shaped HERMES_HOME: a skills-shared/ tree with the given groups
@@ -52,6 +62,7 @@ def _fleet_home(tmp_path, groups=("devops", "general", "research")):
     local.mkdir(parents=True, exist_ok=True)
     for g in groups:
         (shared / g).mkdir(parents=True, exist_ok=True)
+    _plant_tier_reader(home)
     with patch.object(smt, "HERMES_HOME", home), \
          patch.object(smt, "SKILLS_DIR", local), \
          patch("agent.skill_utils.get_all_skills_dirs",
@@ -87,6 +98,7 @@ def _profile_home(tmp_path, profile="athena", root_name="root",
     local.mkdir(parents=True, exist_ok=True)
     for g in groups:
         (shared / g).mkdir(parents=True, exist_ok=True)
+    _plant_tier_reader(root)
     with patch.object(smt, "HERMES_HOME", home), \
          patch.object(smt, "SKILLS_DIR", local), \
          patch("agent.skill_utils.get_all_skills_dirs",

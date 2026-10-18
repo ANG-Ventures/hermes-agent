@@ -960,5 +960,54 @@
       "gateway",
       "cron"
     ]
+  },
+  {
+    "feature": "internal-turn silence: a long reply beside a NO_REPLY line is delivered, not swallowed",
+    "tests": [
+      "tests/gateway/test_response_filters.py::test_long_summary_with_marker_is_delivered_without_the_marker",
+      "tests/gateway/test_response_filters.py::test_short_note_must_be_one_line_and_at_most_the_word_cap",
+      "tests/gateway/test_response_filters.py::test_cron_keeps_the_loose_rule_for_a_long_report",
+      "tests/gateway/test_gateway_silence_tokens.py::test_internal_event_long_reply_with_marker_is_delivered_without_it",
+      "tests/gateway/test_gateway_silence_tokens.py::test_internal_event_short_note_plus_marker_is_suppressed",
+      "tests/gateway/test_stream_consumer_silence.py::TestInternalEventLongReplyDelivered::test_native_stream_marker_first_long_reply_drops_marker"
+    ],
+    "paths": [
+      "gateway/response_filters.py",
+      "gateway/run_turn.py",
+      "gateway/run_turn_runner.py",
+      "gateway/stream_consumer.py",
+      "tools/process_registry_notifications.py",
+      "hermes_cli/config_defaults.py"
+    ],
+    "why": "Measured 2026-10-17: on internal turns (kanban wakes, background completions, deadman pages) the gateway's loose rule dropped any reply with NO_REPLY on its own first/last line: 555 replies / ~24k words in 7 days, nothing logged. #2060 (t_bb4059d2) delivers prose beside the marker unless it is a one-line note of <= display.internal_silence_short_note_words (12) words, strips the marker lines, and logs every verdict ('silence marker on a long internal reply: delivering N words' / 'suppressed an N-word note'); #2066 covers native-stream transports. Live E2E on the puppet lane: main swallowed the long arm, the PR delivered it. A parity merge that takes upstream's is_autonomous_silence_response for internal turns brings the swallow back silently.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ]
+  },
+  {
+    "feature": "whatsapp opt-in gate: a display/behaviour key in whatsapp: never auto-enables the adapter; a dead writer's platforms entries are dropped on every status write (t_83ff59d4)",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_plugin_platform_optin.py",
+      "tests/fork_canaries/test_fork_canary_gateway_state_stale_platforms.py",
+      "tests/gateway/test_whatsapp_optin_gate.py"
+    ],
+    "paths": [
+      "plugins/platforms/whatsapp/adapter.py",
+      "gateway/status.py",
+      "gateway/run_startup.py"
+    ],
+    "why": "Measured 2026-10-18: 7 gateways (aegis, argus, athena, cadmus, daedalus, daedalus-opus, momus) booted DEGRADED with whatsapp: fatal whatsapp_not_paired since >=2026-09-26 although none ever had WhatsApp. Their config carried only whatsapp: {gateway_restart_notification: false}. config_env._plugin_is_configured probes is_connected with a transient enabled=True, and whatsapp's _is_connected returned True for 'enabled and any extra', so the probe defeated the #31116 gate. _is_connected now means opt-in: WHATSAPP_ENABLED truthy; an explicit YAML enabled: true is already enabled and never probed; a leftover paired creds.json is not an opt-in (removing WHATSAPP_ENABLED is the documented disable, Prism #2069 r1). Swept every registered plugin's is_connected with the same transient view + behaviour keys: only whatsapp hit. Second half: the startup status write reloaded gateway_state.json and kept bare-key platform entries from the previous pid, so whatsapp: fatal outlived the disable; write_runtime_status(drop_stale_platforms=True) at startup drops entries whose writer (writer_pid + writer_start_time) is no longer running; a live writer keeps its entries (Prism #2069 r1). Parity-merge risk: upstream's whatsapp _is_connected carries the same 'enabled and extra' shape; a merge taking it brings the DEGRADED boot back with every upstream test green.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_plugin_platform_optin.py (every registered plugin is_connected vs behaviour-only extras; whatsapp end to end + positive controls) and tests/fork_canaries/test_fork_canary_gateway_state_stale_platforms.py (RED-proven 2026-10-18 t_83ff59d4: _is_connected reverted to enabled-and-extra -> whatsapp param + display-key test; drop_stale_platforms removed -> 5 of 6; on fork/main sources 15 failed, 30 passed)"
   }
 ]

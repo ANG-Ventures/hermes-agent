@@ -413,7 +413,7 @@ def _completion_status(evt: dict) -> str:
 # answer their own completions with "already handled" posts (Ace, 2026-09-27).
 COMPLETION_SILENCE_HINT = (
     "If this result is already reported or changes nothing for the user, "
-    "end your reply with NO_REPLY on its own line — nothing will be posted."
+    "reply with only NO_REPLY (nothing else) and nothing will be posted."
 )
 
 

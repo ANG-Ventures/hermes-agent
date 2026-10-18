@@ -22,6 +22,14 @@ MEMORY_BLOCK_HEADERS = {
 
 ENTRY_DELIMITER = "\n§\n"
 
+# A memory file whose first entry starts with this is RENDERED by its owner from templates
+# (fleet: scripts/memory-md-render.py, lint memory_md_role_consistent / user_md_fleet_identical).
+# An in-place write would drift it from its render, so every write path refuses it.
+POINTER_FILE_PREFIX = "POINTER FILE"
+_RENDERED_SOURCES = {
+    "memory": "fleet/memory-templates/common.md (every role) or fleet/memory-templates/role-<role>.md",
+    "user": "fleet/memory-templates/USER.md"}
+
 
 def _scan_memory_content(content: str) -> Optional[str]:
     """Error string if *content* matches injection/exfil patterns. Strict scope:
@@ -53,6 +61,21 @@ def _read_failed_error(path: Path) -> Dict[str, Any]:
         f"(temporarily locked by another program, a permission change, invalid/corrupt text encoding, "
         f"or a filesystem error). Treating an unreadable file as empty and saving would wipe existing "
         f"memory, so the write is refused. Nothing was changed — retry in a moment.")
+
+
+def _is_rendered(raw: str) -> bool:
+    return raw.lstrip().startswith(POINTER_FILE_PREFIX)
+
+
+def _rendered_file_error(path: Path, target: str) -> Dict[str, Any]:
+    """Terminal refusal for a rendered pointer file: nothing was written."""
+    return {"success": False, "done": True, "error": (
+        f"Refusing to write {path.name}: it is a RENDERED pointer file (first line 'POINTER FILE'), "
+        f"rebuilt from {_RENDERED_SOURCES['user' if target == 'user' else 'memory']} by "
+        f"scripts/memory-md-render.py. An in-place edit drifts it from its render. Nothing was changed. "
+        f"Save a durable fact with mem0_conclude instead; a pointer line belongs in the template, "
+        f"then re-render with `scripts/memory-md-render.py --all --apply`"
+        f"{' --user' if target == 'user' else ''}.")}
 
 
 def _find_unique_match(entries: List[str], old_text: str) -> Tuple[Optional[int], bool]:
@@ -109,6 +132,13 @@ class MemoryStore:
     # reset_consolidation_failures() (#42405).
     def target_enabled(self, target: str) -> bool:
         return self.user_profile_enabled if target == "user" else self.memory_enabled
+
+    def rendered_file_error(self, target: str) -> Optional[Dict[str, Any]]:
+        """The refusal ``_mutate`` would return for a rendered pointer file, checked up front so
+        a write is not staged for approval only to be refused at replay."""
+        path = self._path_for(target)
+        raw, read_ok = self._read_raw_checked(path)
+        return _rendered_file_error(path, target) if read_ok and _is_rendered(raw) else None
 
     def reset_consolidation_failures(self) -> None:
         """Call at turn start."""
@@ -258,6 +288,8 @@ class MemoryStore:
             raw, read_ok = self._read_raw_checked(path)
             if not read_ok:
                 return _read_failed_error(path)
+            if _is_rendered(raw):
+                return _rendered_file_error(path, target)
             bak = None if skip_drift else self._detect_external_drift(target, raw)
             self._set_entries(target, list(dict.fromkeys(self._parse_entries(raw))))
             if bak:

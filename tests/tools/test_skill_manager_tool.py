@@ -1270,6 +1270,16 @@ class TestCuratorConsolidationDeleteGuard:
         _reset_background_review_read_marks()
 
 
+# A fleet-shaped root always deploys the exec-tier reader; a skills-shared/ tree without it is a broken
+# deploy that skill_manage refuses (t_e5af9a95). This stub classifies everything as prose.
+_TIER_STUB = "def load():\n    return []\ndef tier(path, rules):\n    return 'prose'\n"
+
+
+def _plant_tier_reader(root):
+    (root / "scripts" / "lib").mkdir(parents=True, exist_ok=True)
+    (root / "scripts" / "lib" / "autocommit_tier.py").write_text(_TIER_STUB)
+
+
 class TestCreateSeesUnsubscribedSharedGroups:
     """A create must collide with a skill in ANY shared group, subscribed or not.
 
@@ -1289,6 +1299,7 @@ class TestCreateSeesUnsubscribedSharedGroups:
         shared = hermes_home / "skills-shared"
         for g in ("general", "finance"):
             (shared / g).mkdir(parents=True, exist_ok=True)
+        _plant_tier_reader(hermes_home)
         with patch("tools.skill_manager_tool.SKILLS_DIR", skills_root), \
              patch("tools.skill_manager_tool.HERMES_HOME", hermes_home), \
              patch("agent.skill_utils.get_all_skills_dirs",

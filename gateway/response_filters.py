@@ -78,6 +78,43 @@ def is_intentional_silence_response(response: Any) -> bool:
     return any(c in LIVE_GATEWAY_SILENT_MARKERS for c in _canonical_silence_candidates(response))
 
 
+def _strip_code_wrap(s: str) -> str:
+    """Peel a whole-value markdown code fence, then any inline backtick span.
+
+    An agent cron (whose reply IS its final message) routinely formats the literal sentinel,
+    which would otherwise leak to the channel as noise.  Only *symmetric* wrapping is stripped,
+    so real prose is untouched.
+    """
+    t = s.strip()
+    if t.startswith("```") and t.endswith("```") and len(t) >= 6:
+        inner = t[3:-3]
+        # Drop the whole opening-fence info-string line (```, ```text, ...)
+        # — anything up to the first newline is the fence header.
+        if "\n" in inner:
+            inner = inner.split("\n", 1)[1]
+        t = inner.strip()
+    while len(t) >= 2 and t[0] == "`" and t[-1] == "`":
+        t = t.strip("`").strip()
+    return t
+
+
+def _is_marker_line(line: str) -> bool:
+    """A line (or whole value) that is a silence token: bare, code-spanned, or fenced."""
+    return is_intentional_silence_response(line) or is_intentional_silence_response(_strip_code_wrap(line))
+
+
+def _opens_with_bracketed_marker(stripped: str) -> bool:
+    # Peel a leading inline code-span (any backtick-run length) first so
+    # "`[SILENT]` note" / "``[SILENT]`` note" also count (same reflex).
+    head = stripped
+    if head.startswith("`"):
+        run = len(head) - len(head.lstrip("`"))
+        close = head.find("`" * run, run)
+        if close != -1:
+            head = head[run:close].strip()
+    return head.upper().startswith(_BRACKETED_SILENCE_MARKERS)
+
+
 def is_autonomous_silence_response(response: Any) -> bool:
     """Loose silence matcher for autonomous lanes (cron, webhook).
 
@@ -91,46 +128,116 @@ def is_autonomous_silence_response(response: Any) -> bool:
     if not stripped:
         return False
 
-    def _strip_code_wrap(s: str) -> str:
-        # Peel a whole-value markdown code fence, then any inline backtick span.
-        # An agent cron (whose reply IS its final message) routinely formats the
-        # literal sentinel, which would otherwise leak to the channel as noise.
-        # Only *symmetric* wrapping is stripped, so real prose is untouched.
-        t = s.strip()
-        if t.startswith("```") and t.endswith("```") and len(t) >= 6:
-            inner = t[3:-3]
-            # Drop the whole opening-fence info-string line (```, ```text, ...)
-            # — anything up to the first newline is the fence header.
-            if "\n" in inner:
-                inner = inner.split("\n", 1)[1]
-            t = inner.strip()
-        while len(t) >= 2 and t[0] == "`" and t[-1] == "`":
-            t = t.strip("`").strip()
-        return t
-
     lines = [ln for ln in stripped.splitlines() if ln.strip()]
     # Bracketed form only for the prefix rule, so a bare "Silent retry succeeded" is NOT swallowed.
     # Same de-punctuating forms as the interactive rule, so ``【静默】`` / ``静默。`` cannot
     # be suppressed in chat yet delivered by cron.
-    # Peel a leading inline code-span (any backtick-run length) first so
-    # "`[SILENT]` note" / "``[SILENT]`` note" also count (same reflex).
-    head = stripped
-    if head.startswith("`"):
-        run = len(head) - len(head.lstrip("`"))
-        close = head.find("`" * run, run)
-        if close != -1:
-            head = head[run:close].strip()
-    if head.upper().startswith(_BRACKETED_SILENCE_MARKERS):
+    if _opens_with_bracketed_marker(stripped):
         return True
     # Whole response, or its own first/last line, is a token (bare, code-spanned, or fenced).
-    return any(
-        is_intentional_silence_response(c) or is_intentional_silence_response(_strip_code_wrap(c))
-        for c in (stripped, lines[0], lines[-1])
-    )
+    return any(_is_marker_line(c) for c in (stripped, lines[0], lines[-1]))
+
+
+# Internal turns: a marker on its own first/last line silences the reply only when what is left
+# is a short note ("Already reported.") — at most this many words on one line.  Agents write
+# "<summary>\n\nNO_REPLY" meaning "post this, no answer needed"; under the loose rule the summary
+# vanished (555 replies / 24k words in 7 days, t_bb4059d2).  0 restores the loose rule.
+SHORT_NOTE_WORDS = 12
+SHORT_NOTE_WORDS_CONFIG_KEY = "internal_silence_short_note_words"  # under ``display:``
+
+
+def internal_short_note_words(user_config: Any) -> int:
+    """``display.internal_silence_short_note_words`` from a raw user config; default when unset/invalid."""
+    display = user_config.get("display") if isinstance(user_config, dict) else None
+    raw = display.get(SHORT_NOTE_WORDS_CONFIG_KEY) if isinstance(display, dict) else None
+    if raw is None or isinstance(raw, bool):
+        return SHORT_NOTE_WORDS
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return SHORT_NOTE_WORDS
+
+
+def _configured_short_note_words() -> int:
+    from gateway.run import _load_gateway_config  # profile-aware gateway home
+    return internal_short_note_words(_load_gateway_config())
+
+
+def _drop_edge_marker_lines(lines: list[str]) -> list[str]:
+    """``lines`` without the blank/marker lines at either end."""
+    start, end = 0, len(lines)
+    while start < end and (not lines[start].strip() or _is_marker_line(lines[start])):
+        start += 1
+    while end > start and (not lines[end - 1].strip() or _is_marker_line(lines[end - 1])):
+        end -= 1
+    return lines[start:end]
+
+
+def classify_internal_silence(
+    response: Any, short_note_words: Optional[int] = None,
+) -> tuple[bool, Optional[int]]:
+    """``(silent, note_words)`` for an internal-turn reply.
+
+    ``note_words`` is the word count of the prose beside an own-line marker, ``None`` when the
+    reply is not that case (no marker, a bare marker, or the ``[SILENT] ...`` prefix form, which
+    all keep the autonomous rule).  ``short_note_words`` ``None`` reads the gateway config.
+    """
+    if not is_autonomous_silence_response(response):
+        return False, None
+    stripped = response.strip()
+    if _is_marker_line(stripped):
+        return True, None
+    lines = stripped.splitlines()
+    nonblank = [ln for ln in lines if ln.strip()]
+    if _opens_with_bracketed_marker(stripped) and not _is_marker_line(nonblank[0]):
+        return True, None
+    if short_note_words is None:
+        short_note_words = _configured_short_note_words()
+    if short_note_words <= 0:
+        return True, None
+    rest = [ln for ln in _drop_edge_marker_lines(lines) if ln.strip()]
+    words = sum(_note_word_count(w) for ln in rest for w in ln.split())
+    return words <= short_note_words and len(rest) <= 1, words
+
+
+def _is_wide_letter(ch: str) -> bool:
+    # CJK ideographs / kana / hangul: written without spaces, so each counts as a word.
+    return ch.isalnum() and unicodedata.east_asian_width(ch) in ("W", "F")
+
+
+def _note_word_count(token: str) -> int:
+    """Words in one whitespace-split token.  A word carries a letter or digit (a bare "—" or "-"
+    bullet is not one); each wide CJK letter is its own word, the rest of the token counts once."""
+    wide = sum(1 for ch in token if _is_wide_letter(ch))
+    narrow = any(ch.isalnum() and not _is_wide_letter(ch) for ch in token)
+    return wide + (1 if narrow else 0)
+
+
+def is_internal_silence_response(response: Any, short_note_words: Optional[int] = None) -> bool:
+    """Silence rule for internal-event turns: :func:`is_autonomous_silence_response`, except that
+    an own-line marker beside more than a short one-line note is delivered (marker stripped)."""
+    return classify_internal_silence(response, short_note_words)[0]
+
+
+def strip_internal_silence_marker_lines(response: Any) -> Any:
+    """Drop the marker lines at either end of an internal reply that is being DELIVERED.
+
+    On an internal turn those lines were control tokens for the gateway (any form the loose rule
+    reads: ``NO_REPLY``, ``no reply``, `` `[SILENT]` ``), never content.  A reply that would be
+    empty without them is returned unchanged for the silence rules to judge.
+    """
+    if not isinstance(response, str):
+        return response
+    lines = response.strip().split("\n")
+    kept = _drop_edge_marker_lines(lines)
+    if len(kept) == len(lines) or not kept:
+        return response
+    return "\n".join(kept).strip()
 
 
 def is_intentional_silence_agent_result(
     agent_result: dict | None, response: Any, *, internal: bool = False,
+    short_note_words: Optional[int] = None,
 ) -> bool:
     """Silence markers suppress delivery only for successful agent turns.
 
@@ -143,7 +250,7 @@ def is_intentional_silence_agent_result(
     if not isinstance(agent_result, dict) or agent_result.get("failed"):
         return False
     if internal:
-        return is_autonomous_silence_response(response)
+        return is_internal_silence_response(response, short_note_words)
     return is_intentional_silence_response(response)
 
 
