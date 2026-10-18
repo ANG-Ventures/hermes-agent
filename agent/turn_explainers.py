@@ -324,6 +324,14 @@ class TurnExplainersMixin:
                 body = _persistence_evidence_explanation(agent)
             else:
                 body = t(_persistence_explanation_key(persistence_cause), **fill)
+            if persistence_cause == "locked":
+                # Name who held the write lock (t_c54736c9): the raw diagnostic, like a Details: line.
+                from agent.redact import redact_sensitive_text
+                from hermes_state_lockowners import last_timeout_holder
+
+                holder = last_timeout_holder()
+                if holder:  # argv reaches chat here, not only the log: redact it
+                    body = f"{body} [state.db write-lock holder: {redact_sensitive_text(holder)}]"
         else:
             body = None
         return t("explainer.no_reply_prefix") + body if body else ""
