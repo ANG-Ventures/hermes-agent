@@ -1062,23 +1062,17 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
 
 
 def _is_connected(config) -> bool:
-    """Connected == the user opted in: WHATSAPP_ENABLED truthy, or a paired session (creds.json) on disk.
+    """Connected == the user opted in with WHATSAPP_ENABLED; auth lives in the bridge.
 
     Never "enabled and any extra key": the env pass probes this with a transient ``enabled=True`` view, so
     a display/behaviour key alone (``whatsapp: {gateway_restart_notification: false}``) auto-enabled an
     unpaired adapter that booted DEGRADED with ``whatsapp_not_paired`` (fork t_83ff59d4). An explicit YAML
     ``enabled: true`` needs no probe: the env pass skips ``is_connected`` for already-enabled platforms.
+    A paired creds.json is NOT an opt-in: removing / falsing WHATSAPP_ENABLED is the documented disable.
     """
     # Via hermes_cli.gateway.get_env_value (not os.getenv) so setup-status callers that patch it observe the same value.
     import hermes_cli.gateway as gateway_mod
-    if (gateway_mod.get_env_value("WHATSAPP_ENABLED") or "").strip().lower() in {"true", "1", "yes"}:
-        return True
-    extra = (getattr(config, "extra", None) or {}) if config is not None else {}
-    try:
-        session = Path(extra.get("session_path") or get_hermes_dir("platforms/whatsapp/session", "whatsapp/session"))
-        return (session / "creds.json").is_file()
-    except (OSError, TypeError, ValueError):
-        return False
+    return (gateway_mod.get_env_value("WHATSAPP_ENABLED") or "").strip().lower() in {"true", "1", "yes"}
 
 
 

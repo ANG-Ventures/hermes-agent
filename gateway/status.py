@@ -1337,13 +1337,18 @@ def _coerce_session_store(session_store: Any) -> dict[str, str]:
     return {"status": state if state in {"ok", "unavailable", "retrying"} else "unknown"}
 
 
-def _platform_entry_written_by(entry: Any, record: dict[str, Any]) -> bool:
-    """True when a ``platforms`` entry was written by the process in ``record`` (same pid + start time)."""
-    if not isinstance(entry, dict) or entry.get("writer_pid") != record.get("pid"):
+def _platform_entry_writer_alive(entry: Any) -> bool:
+    """True when the process stamped on a ``platforms`` entry (writer_pid + writer_start_time) is still
+    running as that same incarnation. Unstamped entries and dead / recycled pids are stale."""
+    if not isinstance(entry, dict):
         return False
-    recorded, current = entry.get("writer_start_time"), record.get("start_time")
+    pid, recorded = entry.get("writer_pid"), entry.get("writer_start_time")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    current = _get_process_start_time(pid)
     if recorded is None or current is None:
-        return recorded == current
+        # No fingerprint on one side: only this process can vouch for itself.
+        return pid == os.getpid() and recorded == current
     try:
         return start_time_fingerprints_match(recorded, current)
     except (TypeError, ValueError):
@@ -1385,10 +1390,11 @@ def _prepare_runtime_status_update(
                 or (drop_prefix is not None and not k.startswith(drop_prefix))
             }
         if drop_stale_platforms:
-            # A previous boot's entry (writer_pid/writer_start_time not this process) is stale: a platform
+            # An entry whose writer process is gone (dead pid, recycled pid, or unstamped) is stale: a platform
             # this boot does not run would otherwise keep reading e.g. ``whatsapp: fatal`` forever (t_83ff59d4).
+            # Entries of a writer that is still running are kept.
             payload["platforms"] = {
-                k: v for k, v in payload["platforms"].items() if _platform_entry_written_by(v, current_record)}
+                k: v for k, v in payload["platforms"].items() if _platform_entry_writer_alive(v)}
         payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
         # boot_id MUST be refreshed on every write, not seeded once: gateway_state.json
         # survives across reboots (never unlinked at startup), so without this the
