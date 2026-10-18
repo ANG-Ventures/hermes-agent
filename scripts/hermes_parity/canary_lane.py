@@ -111,12 +111,22 @@ def _run_pass(python: str, repo: Path, nodeids: Sequence[str], result: LaneResul
                 if "crash" in one:
                     result.failures.append(f"NO REPORT {n} (rc {one['rc']}): {one['crash'][-400:].strip()}")
                 else:
-                    classify([n], one, result)
+                    _classify_checked(n, [n], one, result)
             continue
         if "crash" in data:
             result.failures.append(f"NO REPORT {f} (rc {data['rc']}): {data['crash'][-400:].strip()}")
             continue
-        classify(by_file[f], data, result)
+        _classify_checked(f, nodes, data, result)
+
+
+def _classify_checked(label: str, nodes: Sequence[str], data: dict, result: LaneResult) -> None:
+    """classify, then hold the process to its exit status: a nonzero pytest exit that no item failure explains
+    (interrupted teardown, a session hook setting exitstatus, pytest.exit()) is RED, never coverage."""
+    before = len(result.failures)
+    classify(nodes, data, result)
+    if data.get("rc", 0) != 0 and len(result.failures) == before:
+        result.failures.append(f"PYTEST EXIT {label}: rc {data['rc']} with no failing item (session failed or was "
+                               "interrupted; its item outcomes are not trusted)")
 
 
 def _expand(nodeid: str, collected: Sequence[str]) -> list[str]:
@@ -134,8 +144,11 @@ _RANK = {"passed": 0, "xfailed": 1, "skipped": 2}   # anything else (failed / er
 def classify(nodeids: Sequence[str], data: dict, result: LaneResult) -> None:
     collected = data.get("collected") or []
     outcome: dict[str, tuple[str, str]] = {}
+    called: set[str] = set()   # items whose test body actually ran (a call-phase report exists)
     for r in data.get("reports") or []:
         node, when, oc = r["nodeid"], r["when"], r["outcome"]
+        if when == "call":
+            called.add(node)
         prev = outcome.get(node)
         if oc == "skipped":
             state = "xfailed" if r.get("xfail") else "skipped"
@@ -160,6 +173,9 @@ def classify(nodeids: Sequence[str], data: dict, result: LaneResult) -> None:
             # a file/class registration is a container: one member skipping (a platforms("windows") test on
             # linux) is that member's OS lane's job, but a container where NOTHING runs guards nothing
             member = item.startswith(nodeid + "::")
+            if state in ("passed", "xfailed") and item not in called:
+                # xfail(run=False) reports from setup; pytest.exit() leaves a passing setup and no call
+                state, reason = "skipped", reason or "the test body never ran (no call phase)"
             if state in ("passed", "xfailed"):
                 result.executed[item] = state
                 ran += 1
@@ -203,7 +219,11 @@ def run_lane(repo: Path, *, python: str, ptb_python: str | None, manifest: Path 
 
 
 def changed_from(repo: Path, base: str) -> list[str]:
-    return gitops.changed_files(repo, gitops.merge_base(repo, base, "HEAD"), "HEAD")
+    # --no-renames: a rename lists only its NEW path by default, so moving a registered test or a covered
+    # source to an unregistered name would read as "not affected"; both sides must be checked
+    base_sha = gitops.merge_base(repo, base, "HEAD")
+    out = gitops.run_git(repo, ["diff", "--no-renames", "--name-only", f"{base_sha}..HEAD"]).stdout
+    return [line for line in out.splitlines() if line]
 
 
 def main(args) -> int:

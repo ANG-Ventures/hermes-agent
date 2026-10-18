@@ -10,6 +10,9 @@ name: fork-canary-lane
 # (`canary-lane --changed-file-list`, rc 0 "not affected"), never a static paths: filter.
 on:
   pull_request:
+    # edited: a retitle can turn a PR into a parity PR (title-classified), which must re-run the full lane
+    # and parity-pr-check without a new push
+    types: [opened, synchronize, reopened, edited]
   merge_group:
   workflow_dispatch:
 

@@ -120,6 +120,52 @@ def test_red_canary_is_red(tmp_path):
     assert result.failures == [f"RED {f}::test_red: failed"]
 
 
+def test_xfail_run_false_never_executes_so_it_is_not_coverage(tmp_path):
+    # Prism c001f9d1a1f7: xfail(run=False) reports from setup; the body never runs
+    repo = _lane_repo(tmp_path, ["tests/test_guard.py::test_guard"])
+    (repo / "tests/test_guard.py").write_text(
+        "import pytest\n\n@pytest.mark.xfail(run=False, strict=True, reason='x')\ndef test_guard():\n    assert False\n",
+        encoding="utf-8")
+    result = _run(repo)
+    assert not result.ok and result.failures[0].startswith("SKIPPED tests/test_guard.py::test_guard")
+    assert not result.executed
+
+
+def test_nonzero_pytest_exit_with_passing_items_is_red(tmp_path):
+    # Prism 808f1e4f5851 / 38481748ef84: a session hook (or interrupted teardown) fails the run after passing items
+    f = "tests/test_canary_x.py"
+    repo = _lane_repo(tmp_path, [f"{f}::test_holds"])
+    (repo / "tests/conftest.py").write_text("def pytest_sessionfinish(session):\n    session.exitstatus = 1\n",
+                                            encoding="utf-8")
+    result = _run(repo)
+    assert len(result.failures) == 1 and result.failures[0].startswith(f"PYTEST EXIT {f}: rc 1")
+
+
+def test_interrupt_in_fixture_teardown_is_red(tmp_path):
+    repo = _lane_repo(tmp_path, ["tests/test_td.py::test_a"])
+    (repo / "tests/test_td.py").write_text(
+        "import pytest\n\n@pytest.fixture\ndef fx():\n    yield\n    raise KeyboardInterrupt\n\n"
+        "def test_a(fx):\n    assert True\n", encoding="utf-8")
+    assert not _run(repo).ok
+
+
+def test_changed_from_sees_both_sides_of_a_rename(tmp_path):
+    # Prism e85a3140eaba: git diff --name-only lists only the new path of a rename by default
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "T")
+    (repo / "tests").mkdir()
+    (repo / "tests/test_guarded.py").write_text("def test_a():\n    assert 1 + 1 == 2\n" * 5, encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "checkout", "-q", "-b", "pr")
+    _git(repo, "mv", "tests/test_guarded.py", "tests/test_unregistered_name.py")
+    _git(repo, "commit", "-q", "-m", "rename")
+    assert "tests/test_guarded.py" in canary_lane.changed_from(repo, "main")
+
+
 def test_ptb_nodeids_without_a_ptb_interpreter_are_red_not_dropped(tmp_path):
     repo = _lane_repo(tmp_path, ["tests/test_thing_ptb.py::test_a"])
     result = _run(repo)
