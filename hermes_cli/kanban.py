@@ -38,6 +38,7 @@ from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
 from hermes_cli import kanban_verb_input as kvi
+from hermes_cli.kanban_close_on_guard import check_comment as check_close_on_comment
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
@@ -3480,6 +3481,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
         except ValueError:
             return _err(f"invalid --until {args.until!r} (+<N>[smhd], epoch seconds or ISO-8601)")
     author = _profile_author()
+    if reason:
+        # Before the transition: the BLOCKED comment is written after it lands (t_ebc8eb87).
+        check_close_on_comment(author, f"BLOCKED: {reason}")
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
     failed: list[str] = []
@@ -3544,6 +3548,9 @@ def _parse_wake_at(value: str) -> int:
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     author = _profile_author()
+    if reason:
+        # Before the transition: the SCHEDULED comment is written after it lands (t_ebc8eb87).
+        check_close_on_comment(author, f"SCHEDULED: {reason}")
     ids = _bulk_ids(args)
     wake_at: Optional[int] = None
     if getattr(args, "now", False):
@@ -3808,6 +3815,13 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
         # The caller must hold the review run: as its dispatcher-owned worker,
         # or as the operator session that made ``claim --review`` (human lane).
         worker_run = _worker_run_id_for(tid)
+        sendback_body = (
+            f"changes requested (operator send-back, {operator}): "
+            if operator else "changes requested (human review lane): "
+        ) + str(kb.redact_review_value(reason))
+        if worker_run is None:
+            # Before any write: the human-lane mirror comment lands after the transition (t_ebc8eb87).
+            check_close_on_comment(_profile_author(), sendback_body)
         if operator is not None and worker_run is not None:
             # A dispatched reviewer run always carries full coverage.
             print(
@@ -3890,12 +3904,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             # carries it too).
             _unused_run, session_ref = safe_comment_provenance(tid)
             kb.add_comment(
-                conn, tid, _profile_author(),
-                (
-                    f"changes requested (operator send-back, {operator}): "
-                    if operator else "changes requested (human review lane): "
-                )
-                + str(kb.redact_review_value(reason)),
+                conn, tid, _profile_author(), sendback_body,
                 run_id=(
                     held_run if held_run is not None
                     else getattr(kb.latest_run(conn, tid), "id", None)

@@ -7916,6 +7916,10 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    # The one place every comment writer shares, so the body is exact (t_ebc8eb87).
+    from hermes_cli.kanban_close_on_guard import check_comment
+
+    check_comment(author, body)
     if claimed_author is not None:
         if not isinstance(claimed_author, str) or not claimed_author.strip():
             raise ValueError("claimed_author must be a non-empty string")

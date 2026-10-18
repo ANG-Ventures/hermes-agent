@@ -1,0 +1,151 @@
+"""The kanban comment write path refuses a malformed ``close-on`` line (t_ebc8eb87).
+
+Regression for t_d712b9ff (2026-10-17 10:47): an ACK comment quoting "Bare `close-on: merged`"
+in prose was read by the review-merge-pass as a new, unprovable gate. The check lives in
+``kanban_db.add_comment`` so the CLI verb and the ``kanban_comment`` tool are refused by the
+same function. The fleet grammar is loaded from ``<fleet root>/scripts/lib``; the fixture below
+installs a stand-in with the real ``LINE_RE`` and the release shapes of ``parse_release``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import textwrap
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban as kc
+from hermes_cli import kanban_close_on_guard as guard
+from hermes_cli import kanban_db as kb
+
+ACK_1047 = ("DEADMAN ACK (Apollo 11:25 PT): #4737 MERGED a9fd8b9fc7. The closer held on my earlier "
+            "close-on line (trailing prose after `merged` is malformed per close_on.py). Bare "
+            "`close-on: merged` posted above; the next review-merge-pass tick completes this card.")
+
+CLOSE_ON_LIB = textwrap.dedent(r'''
+    import re
+    LINE_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?[*_`]*close-on[*_`]*[ \t]*:[*_`]*[ \t]*(?P<gate>[^\n]*)$", re.I | re.M)
+
+    def parse_release(gate):
+        raw = " ".join(str(gate or "").split()).strip(" *_`")
+        if re.fullmatch(r"merged\.?", raw, re.I):
+            return {"kind": "merged"}
+        if re.match(r"manual\s*:\s*\S", raw, re.I):
+            return {"kind": "gate"}
+        head, _, text = raw.partition(" ")
+        if re.fullmatch(r"[0-9a-f]{12}", head) and text.strip():
+            return {"kind": "cron"}
+        return None
+''')
+
+OUR_AUTHORS_LIB = textwrap.dedent('''
+    def is_machine(body):
+        return isinstance(body, str) and body.lstrip().startswith("[review-merge-pass]")
+''')
+
+
+@pytest.fixture
+def fleet(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    (home / "scripts" / "lib").mkdir(parents=True)
+    (home / "scripts" / "lib" / "close_on.py").write_text(CLOSE_ON_LIB, encoding="utf-8")
+    (home / "scripts" / "lib" / "our_authors.py").write_text(OUR_AUTHORS_LIB, encoding="utf-8")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    for var in [k for k in os.environ if k.startswith("HERMES_KANBAN") and k != "HERMES_KANBAN_HOME"]:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "daedalus")
+    guard._LIB_CACHE.clear()
+    kb._INITIALIZED_PATHS.clear()
+    assert str(kb.kanban_db_path()).startswith(str(tmp_path))
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="t", assignee="daedalus")
+    return home, tid
+
+
+def _comments(tid):
+    with kb.connect_closing() as conn:
+        return [c.body for c in kb.list_comments(conn, tid)]
+
+
+def _tool(tid, body):
+    from tools import kanban_tools as kt
+
+    return json.loads(kt._handle_comment({"task_id": tid, "body": body}))
+
+
+def _cli(tid, body, capsys):
+    top = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(top.add_subparsers(dest="command"))
+    rc = kc.kanban_command(top.parse_args(["kanban", "comment", tid, "--body", body]))
+    return rc, capsys.readouterr().err
+
+
+@pytest.mark.parametrize("body", [
+    "close-on: merged",
+    "context first\n\nclose-on: merged\n",
+    "close-on: manual: Ace reads the dashboard",
+    "release line posted; the card closes on merge",
+])
+def test_valid_lines_and_plain_prose_are_allowed(fleet, body):
+    _, tid = fleet
+    assert _tool(tid, body).get("ok") is True
+    assert _comments(tid) == [body.strip()]
+
+
+@pytest.mark.parametrize("body", [ACK_1047, "close-on: merged — ANG-Ventures/x#1 MERGED via fleet-merge"])
+def test_tool_and_cli_refuse_through_add_comment(fleet, capsys, body):
+    _, tid = fleet
+    out = _tool(tid, body)
+    assert "ok" not in out and guard.REFUSAL_HINT in json.dumps(out)
+    rc, err = _cli(tid, body, capsys)
+    assert rc != 0 and guard.REFUSAL_HINT in err
+    assert _comments(tid) == []
+
+
+def test_both_entry_points_route_through_the_one_function(fleet, capsys, monkeypatch):
+    """With check_comment disabled, both surfaces write the body: no second check exists."""
+    _, tid = fleet
+    monkeypatch.setattr(guard, "check_comment", lambda author, body: None)
+    assert _tool(tid, ACK_1047).get("ok") is True
+    assert _cli(tid, ACK_1047, capsys)[0] == 0
+    assert _comments(tid) == [ACK_1047, ACK_1047]
+
+
+def test_machine_authors_and_marked_bodies_are_exempt(fleet):
+    _, tid = fleet
+    marked = "[review-merge-pass] LANDED o/r#1 @ abc: held, close-on line has trailing prose"
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "kanban-dispatcher", ACK_1047)
+        kb.add_comment(conn, tid, "default", marked)
+    assert _comments(tid) == [ACK_1047, marked]
+
+
+def test_unreadable_library_allows(fleet):
+    home, tid = fleet
+    (home / "scripts" / "lib" / "close_on.py").unlink()
+    guard._LIB_CACHE.clear()
+    assert _tool(tid, ACK_1047).get("ok") is True
+
+
+def test_off_switch_allows(fleet):
+    home, tid = fleet
+    (home / "state").mkdir(exist_ok=True)
+    (home / "state" / "close-on-comment-policy-off").write_text("", encoding="utf-8")
+    assert _tool(tid, ACK_1047).get("ok") is True
+
+
+def test_block_reason_is_refused_before_the_transition(fleet, capsys):
+    _, tid = fleet
+    top = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(top.add_subparsers(dest="command"))
+    rc = kc.kanban_command(top.parse_args(["kanban", "block", tid, "--body", ACK_1047]))
+    assert rc != 0 and guard.REFUSAL_HINT in capsys.readouterr().err
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "blocked"
+    assert _comments(tid) == []
