@@ -115,3 +115,12 @@ def test_internal_rule_reads_gateway_config_when_unset(monkeypatch):
 def test_cron_keeps_the_loose_rule_for_a_long_report():
     from cron.scheduler import _is_cron_silence_response
     assert _is_cron_silence_response(LONG_SUMMARY + "\n\nNO_REPLY")
+
+
+def test_cjk_reply_beside_a_marker_counts_each_ideograph_as_a_word():
+    """CJK prose has no spaces: a 50-character summary was one "word" and stayed silent."""
+    long_zh = "这是一个很长的总结，说明部署已经完成，网关已经重启，漂移告警现在报告的是正确的状态。"
+    assert not is_internal_silence_response(long_zh + "\nNO_REPLY", 12)
+    assert strip_internal_silence_marker_lines(long_zh + "\nNO_REPLY") == long_zh
+    assert is_internal_silence_response("已经报告了。\nNO_REPLY", 12)
+    assert is_internal_silence_response("PR 12 已合并。\nNO_REPLY", 12)

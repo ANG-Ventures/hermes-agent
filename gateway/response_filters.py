@@ -196,9 +196,21 @@ def classify_internal_silence(
     if short_note_words <= 0:
         return True, None
     rest = [ln for ln in _drop_edge_marker_lines(lines) if ln.strip()]
-    # A word carries a letter or digit; a bare "—" or "-" bullet is not one.
-    words = sum(1 for ln in rest for w in ln.split() if any(ch.isalnum() for ch in w))
+    words = sum(_note_word_count(w) for ln in rest for w in ln.split())
     return words <= short_note_words and len(rest) <= 1, words
+
+
+def _is_wide_letter(ch: str) -> bool:
+    # CJK ideographs / kana / hangul: written without spaces, so each counts as a word.
+    return ch.isalnum() and unicodedata.east_asian_width(ch) in ("W", "F")
+
+
+def _note_word_count(token: str) -> int:
+    """Words in one whitespace-split token.  A word carries a letter or digit (a bare "—" or "-"
+    bullet is not one); each wide CJK letter is its own word, the rest of the token counts once."""
+    wide = sum(1 for ch in token if _is_wide_letter(ch))
+    narrow = any(ch.isalnum() and not _is_wide_letter(ch) for ch in token)
+    return wide + (1 if narrow else 0)
 
 
 def is_internal_silence_response(response: Any, short_note_words: Optional[int] = None) -> bool:
