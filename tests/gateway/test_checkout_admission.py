@@ -809,6 +809,7 @@ def _foreign_record(store, name, **fields):
     other.pid = os.getppid()
     other.instance = "other-instance"
     other.start_offset = ca._start_offset(other.pid)  # genuine by default
+    other.create_time = None if other.start_offset is not None else ca._create_time(other.pid)
     rec = other.snapshot()
     rec.update(fields)
     rec = {k: v for k, v in rec.items() if v is not ...}
@@ -893,6 +894,38 @@ def test_start_offset_reads_the_kernel_boot_relative_starttime(tmp_path, monkeyp
     assert off > 0
     import psutil
     assert abs(off - (psutil.Process(pid).create_time() - psutil.boot_time())) < 1
+
+
+def test_no_procfs_fallback_identity_is_clock_step_safe(store, monkeypatch):
+    """Prism (round 3 on #2075): without procfs the identity is psutil's stored
+    absolute create_time, compared against itself; boot_time() never enters.
+    Step boot_time by an hour with procfs hidden: the genuine foreign publisher
+    stays flagged, and a reused pid (create_time off by an hour) still clears."""
+    import psutil
+
+    monkeypatch.setattr(ca, "_start_offset", lambda pid: None)  # no procfs
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    real_boot = psutil.boot_time
+    monkeypatch.setattr(psutil, "boot_time", lambda: real_boot() + 3600)
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")  # genuine, flagged
+    # the recorded process was replaced by one born an hour later: not the same
+    rec = store.read_consumer(SERVE)
+    assert rec.get("start_offset") is None and ca._finite(rec.get("create_time"))
+    _foreign_record(store, SERVE, create_time=rec["create_time"] - 3600)
+    me = _gate(store, SERVE)
+    assert "shared_with" not in me.publish()
+
+
+def test_fallback_offset_never_mixes_boot_time(monkeypatch):
+    """The no-procfs path must not compute create_time - boot_time: with
+    boot_time patched to raise, the identity still resolves."""
+    import psutil
+
+    monkeypatch.setattr(ca, "_start_offset", lambda pid: None)
+    monkeypatch.setattr(psutil, "boot_time", lambda: (_ for _ in ()).throw(AssertionError("boot_time read")))
+    assert ca._finite(ca._create_time(os.getpid()))
 
 
 def test_sticky_shared_flag_clears_when_foreign_pid_is_reused(store):

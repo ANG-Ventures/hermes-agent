@@ -192,14 +192,14 @@ def _host_boot_id() -> Optional[str]:
         return None
 
 
-def _start_offset(pid: int) -> float:
+def _start_offset(pid: int) -> Optional[float]:
     """Seconds from host boot to ``pid``'s start, on a basis a wall-clock step
-    cannot move. Linux: the kernel's own boot-relative ``starttime`` (field 22
-    of ``/proc/<pid>/stat``, clock ticks since boot) read directly, so no boot
+    cannot move: the kernel's own boot-relative ``starttime`` (field 22 of
+    ``/proc/<pid>/stat``, clock ticks since boot) read directly, so no boot
     timestamp enters the arithmetic at all (Prism bc03ae51308a: psutil < 6
     computed ``create_time`` from a CACHED btime while ``boot_time()`` read a
-    fresh one, so the two terms could straddle a clock step). Elsewhere, psutil's
-    two terms taken in one call (same basis within microseconds)."""
+    fresh one, so the two terms could straddle a clock step). None where there
+    is no procfs: the identity there is ``_create_time``."""
     try:
         with open(f"/proc/{pid}/stat", "rb") as fh:
             data = fh.read()
@@ -208,9 +208,22 @@ def _start_offset(pid: int) -> float:
         fields = data[data.rfind(b")") + 2:].split()
         return int(fields[19]) / os.sysconf("SC_CLK_TCK")
     except (OSError, IndexError, ValueError, AttributeError):
-        import psutil
+        return None
 
-        return psutil.Process(pid).create_time() - psutil.boot_time()
+
+def _create_time(pid: int) -> Optional[float]:
+    """Fallback identity without procfs (macOS, Windows): psutil's absolute
+    process creation timestamp. The kernel stores it once at process start and
+    a later clock step does not rewrite it, so both sides of the comparison read
+    the same stored value; ``boot_time()`` never enters (Prism: a
+    ``create_time - boot_time`` difference moved with the clock on these hosts
+    and rejected a genuine live publisher)."""
+    import psutil
+
+    try:
+        return float(psutil.Process(pid).create_time())
+    except psutil.Error:
+        return None
 
 
 def _same_live_process(pid: Any, rec: Mapping[str, Any]) -> bool:
@@ -226,12 +239,18 @@ def _same_live_process(pid: Any, rec: Mapping[str, Any]) -> bool:
     import psutil
 
     try:
-        boot_id, off = rec.get("boot_id"), rec.get("start_offset")
+        boot_id, off, ct = rec.get("boot_id"), rec.get("start_offset"), rec.get("create_time")
         cur_boot = _host_boot_id()
         if isinstance(boot_id, str) and cur_boot and boot_id != cur_boot:
             return False
-        if _finite(off) and abs(_start_offset(pid) - off) > 1:
-            return False
+        if _finite(off):
+            cur = _start_offset(pid)
+            if cur is not None and abs(cur - off) > 1:
+                return False
+        elif _finite(ct):
+            cur = _create_time(pid)
+            if cur is not None and abs(cur - ct) > 1:
+                return False
         # A record from a pre-boot_id publisher carries only wall-clock
         # boot_ts, which a clock step can make look stale: keep it live.
         return True
@@ -429,6 +448,7 @@ class AdmissionGate:
             self.start_offset: Optional[float] = _start_offset(self.pid)
         except Exception:
             self.start_offset = None
+        self.create_time: Optional[float] = None if self.start_offset is not None else _create_time(self.pid)
         self._clock = clock
         self._active_work = active_work
         self._serving = serving
@@ -537,7 +557,7 @@ class AdmissionGate:
             return {
                 "schema": SCHEMA, "consumer": self.consumer, "pid": self.pid,
                 "host": self.host, "instance": self.instance, "boot_ts": self.boot_ts,
-                "boot_id": self.boot_id, "start_offset": self.start_offset,
+                "boot_id": self.boot_id, "start_offset": self.start_offset, "create_time": self.create_time,
                 "published_at": self._clock(), "hold_epoch": hold_epoch,
                 "hold_error": hold_error, "tickets": tickets,
                 "active_work": work_total, "active_work_detail": work_detail,
@@ -562,7 +582,7 @@ class AdmissionGate:
         if (isinstance(prev, dict) and prev.get("instance") not in (None, self.instance)
                 and prev.get("host") == self.host and prev.get("pid") != self.pid):
             self._foreign = (prev.get("pid"), prev.get("instance"),
-                             {k: prev[k] for k in ("boot_id", "start_offset") if k in prev})
+                             {k: prev[k] for k in ("boot_id", "start_offset", "create_time") if k in prev})
         foreign = self._foreign
         if foreign is not None and not _same_live_process(foreign[0], foreign[2]):
             self._foreign = foreign = None
