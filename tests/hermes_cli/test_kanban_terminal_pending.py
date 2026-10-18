@@ -359,3 +359,100 @@ def test_owner_wake_keeps_stuck_when_not_terminal_pending(home, shape):
         status = "blocked" if shape == "card-blocked" else "review"
         assert ow.terminal_pending_items(kb, {"board": kb.DEFAULT_BOARD, "task_id": tid}, items, status) == items
         assert "notify_suppressed" not in _kinds(conn, tid)
+
+
+# --- Prism round 3 ------------------------------------------------------------------------------------------
+
+
+def test_extended_workerless_lease_holds_no_worker_slot(home, monkeypatch, all_assignees_spawnable):
+    """Prism 5207920d8aa5: an extended terminal-pending lease stays ``running`` (review ownership kept) but the
+    board, host and per-profile worker counters do not charge it; a real running worker still counts."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        _approve(conn, tid)
+        _land_request(home, tid)
+        assert kb.release_stale_claims(conn) == 0
+        assert kb.get_task(conn, tid).status == "running"
+        assert kbd.count_running_tasks(conn) == 0
+        assert kb._count_running_strict(conn) == 0
+        assert kb.count_running_tasks_host() == 0
+        # Per-profile cap 1 for the lease's assignee: the ready card of that profile still spawns.
+        ready = kb.create_task(conn, title="next", assignee=kb.get_task(conn, tid).assignee)
+        spawns: list = []
+        res = kbd.dispatch_once(conn, spawn_fn=lambda task, ws, board=None: spawns.append(task.id) or 42,
+                                max_in_progress=1, max_in_progress_per_profile=1)
+        assert [t for t, *_ in res.spawned] == [ready]
+        assert kb.get_task(conn, tid).status == "running", "the lease keeps the card"
+        assert kbd.count_running_tasks(conn) == 1, "a real worker still counts"
+
+
+def test_unextended_pidless_review_claim_still_counts(home):
+    """Only a lease this module positively extended is excluded; an unexpired operator review claim counts."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) + 600, tid))
+        assert kbd.count_running_tasks(conn) == 1
+
+
+@pytest.mark.parametrize("kind", ["human", "machine", "default-human"])
+def test_operator_sendback_withdraws_the_earlier_approve(home, kind):
+    """Prism 43b2117caf62: an operator send-back writes no coverage record. A human one withdraws the APPROVE until
+    a newer APPROVE supersedes it; a machine send-back never holds a landing, so it does not."""
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        _approve(conn, tid)
+        _land_request(home, tid)
+        assert tp.approve_head(conn, tid) == HEAD
+        payload = {"reason": "wrong repo", "operator": "apollo: wrong repo"}
+        if kind != "default-human":
+            payload["operator_kind"] = kind
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "changes_requested", payload)
+        if kind == "machine":
+            assert tp.approve_head(conn, tid) == HEAD
+            return
+        assert tp.approve_head(conn, tid) is None
+        assert tp.terminal_pending(conn, tid) is None
+        assert kb.release_stale_claims(conn) == 1          # not extended
+        time.sleep(1.05)                                   # created_at is whole seconds; a newer APPROVE wins
+        _approve(conn, tid)
+        assert tp.approve_head(conn, tid) == HEAD
+
+
+def test_real_request_changes_operator_sendback_withdraws(home, monkeypatch):
+    """The same through the real ``request_changes(operator=...)`` path on a card parked in review."""
+    from hermes_cli import kanban_identity as _ki
+
+    monkeypatch.setenv("HERMES_PROFILE", "apollo")
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    monkeypatch.setattr(_ki, "_runs_under_operator_gateway", lambda name: True)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="approved then bounced", assignee="builder")
+        impl = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="ready", reviewer="human", expected_run_id=impl.current_run_id)
+        _approve(conn, tid)
+        _land_request(home, tid)
+        assert tp.approve_head(conn, tid) == HEAD
+        ok, why = kb.request_changes(conn, tid, reason="rebase first", claimer="apollo",
+                                     operator="Ace via Apollo: rebase first")
+        assert ok, why
+        assert tp.approve_head(conn, tid) is None
+
+
+def test_one_malformed_result_file_does_not_disable_the_lookup(home):
+    """Prism d6f16f45db8f: a non-numeric ``finished_at`` in one result is skipped; another ARMED land still counts."""
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        _approve(conn, tid)
+        d = _land_request(home, tid, suffix=".done.json", ulid="01ARMED")
+        (d / "01ARMED.result.json").write_text(json.dumps(
+            {"ulid": "01ARMED", "status": "ARMED", "rc": 0, "finished_at": time.time()}))
+        bad = dict(json.loads((d / "01ARMED.done.json").read_text()), ulid="01BAD", pr=9999)
+        (d / "01BAD.done.json").write_text(json.dumps(bad))
+        (d / "01BAD.result.json").write_text(json.dumps({"ulid": "01BAD", "status": "ARMED", "finished_at": "soon"}))
+        assert tp.terminal_pending(conn, tid) is not None

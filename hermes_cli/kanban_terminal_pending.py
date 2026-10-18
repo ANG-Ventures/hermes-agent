@@ -51,6 +51,15 @@ ARMED_STATUSES = frozenset({"ARMED", "QUEUED"})
 _OPEN_SUFFIXES = (".parked.json", ".inflight", ".json")
 _CLOSED_SUFFIXES = (".done.json", ".result.json", ".unparked.json", ".cancel.json", ".superseded.json")
 _HEX_RE = re.compile(r"^[0-9a-f]{7,40}$")
+# A ``running`` row that is an operator review lease this module EXTENDED for the lander: no worker process, the
+# current run carries a ``claim_extended`` with reason ``terminal_pending``. Board, host and per-profile worker
+# budgets AND this onto ``status = 'running'``, so the lease keeps review ownership but no worker slot
+# (Prism 5207920d8aa5). CASE: json_extract only on valid JSON, so a legacy malformed payload cannot raise.
+NOT_EXTENDED_LEASE_SQL = (
+    "NOT (tasks.worker_pid IS NULL AND EXISTS (SELECT 1 FROM task_events e WHERE e.run_id = tasks.current_run_id "
+    "AND e.task_id = tasks.id AND e.kind = 'claim_extended' AND CASE WHEN json_valid(e.payload) "
+    "THEN json_extract(e.payload, '$.reason') END = 'terminal_pending'))"
+)
 
 
 def _same_head(a: object, b: object) -> bool:
@@ -63,19 +72,33 @@ def _same_head(a: object, b: object) -> bool:
 def approve_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """The PR head of the card's newest ``review_coverage`` record when that record is an APPROVE, else None.
 
-    The NEWEST record decides: an APPROVE followed by a send-back is not an approval any more."""
+    The NEWEST record decides: an APPROVE followed by a send-back is not an approval any more. An operator
+    send-back (``request_changes(operator=...)``) writes no coverage record, only a ``changes_requested`` event,
+    so any non-machine ``changes_requested`` at or after the APPROVE withdraws it too (Prism 43b2117caf62) until
+    a newer APPROVE supersedes it. A machine send-back never holds a landing (t_86ca5b3d), so it does not."""
     from hermes_cli import kanban_db as kb
 
-    # Plain tuples -> dicts: a read-only board connection carries no row factory.
-    rows = [{"body": r[0] or ""} for r in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND body LIKE '%review_coverage:%' "
+    record, approved_at = None, None
+    for body, created_at in conn.execute(
+        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND body LIKE '%review_coverage:%' "
         "ORDER BY id DESC LIMIT 20", (task_id,),
-    ).fetchall()]
-    record, _err = kb._latest_review_coverage(rows)  # noqa: SLF001 -- the one review_coverage parser
+    ).fetchall():
+        # Plain tuples -> dicts: a read-only board connection carries no row factory.
+        record, _err = kb._latest_review_coverage([{"body": body or ""}])  # noqa: SLF001 -- the one parser
+        if isinstance(record, dict):
+            approved_at = created_at
+            break
     if not isinstance(record, dict) or str(record.get("verdict") or "").upper() != "APPROVE":
         return None
     head = str(record.get("head_sha") or "").strip().lower()
-    return head if _HEX_RE.match(head) else None
+    if not _HEX_RE.match(head):
+        return None
+    withdrawn = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested' AND created_at >= ? "
+        "AND COALESCE(CASE WHEN json_valid(payload) THEN json_extract(payload, '$.operator_kind') END, '') "
+        "!= 'machine' LIMIT 1", (task_id, int(approved_at or 0)),
+    ).fetchone()
+    return None if withdrawn else head
 
 
 def _read(path: Path) -> Optional[dict]:
@@ -130,8 +153,11 @@ def _land_requests(root: Path, task_id: str, head: str, now: float) -> Optional[
         req = _read(d / name.replace(".result.json", ".done.json"))
         if not res or not req:
             continue
+        try:  # one malformed result skips that entry, never the whole lookup (Prism d6f16f45db8f)
+            at = float(res.get("finished_at") or 0)
+        except (TypeError, ValueError):
+            continue
         key = (str(req.get("repo") or "").lower(), str(req.get("pr")))
-        at = float(res.get("finished_at") or 0)
         if key not in newest or at > newest[key][0]:
             newest[key] = (at, res, req)
     for at, res, req in newest.values():

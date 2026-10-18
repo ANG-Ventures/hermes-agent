@@ -19427,8 +19427,12 @@ def count_running_tasks_host() -> Optional[int]:
 
 def _count_running_strict(conn: sqlite3.Connection) -> int:
     """``count_running_tasks`` that RAISES on a broken board (no fail-open)."""
+    from hermes_cli.kanban_terminal_pending import NOT_EXTENDED_LEASE_SQL
+
     return int(
-        conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
+        conn.execute(
+            f"SELECT COUNT(*) FROM tasks WHERE status = 'running' AND {NOT_EXTENDED_LEASE_SQL}"
+        ).fetchone()[0]
     )
 
 
