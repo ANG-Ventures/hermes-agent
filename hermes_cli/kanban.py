@@ -2866,6 +2866,15 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author, claimed = _comment_author(args.author)
+    from hermes_cli.kanban_identity import is_operator_label
+
+    if claimed is not None and is_operator_label(claimed):
+        # A silent downgrade exited 0 while every operator-trust reader
+        # ignored the row (182 in 24 h, t_6572add1): refuse, write nothing.
+        token_file = str(kb.operator_token_path()).replace(str(Path.home()), "~", 1)
+        return _err(
+            f"--author {claimed} needs {kb.OPERATOR_TOKEN_ENV}=$(cat {token_file}); not posted"
+        )
     if claimed is not None:
         print(
             f"kanban: --author {claimed!r} needs the operator token "
