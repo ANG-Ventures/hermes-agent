@@ -145,6 +145,11 @@ TOTAL_MAX_IN_PROGRESS = "max_in_progress"
 TOTAL_MEMORY_CRITICAL = "memory_critical"
 TOTAL_MAX_NEW = "max_new"
 TOTAL_READY_BUDGET = "ready_budget"
+# The Studio's own kanban-worker cap (t_b0a8a427): a LOCAL-route row waits
+# ``total:studio_cap (<running>/<slots> running)`` or ``total:studio_load
+# (load1 X >= bar Y)``; portable rows go to the pool instead.
+TOTAL_STUDIO_CAP = "studio_cap"
+TOTAL_STUDIO_LOAD = "studio_load"
 
 # The record of every spawn, both routes (spec §4.1); its ``route`` values
 # live in kanban_db_dispatch (``_ROUTE_*``): routes are not hold reasons.

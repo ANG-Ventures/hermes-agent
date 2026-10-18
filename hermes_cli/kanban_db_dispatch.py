@@ -337,6 +337,9 @@ class DispatchResult:
     the gateway's load gate (``kanban.dispatch_load_gate``) held the host was
     over its run-queue bar. The string is the human reason (load1/ncpu). NOT
     an operator-actionable failure; spawning resumes when the host cools."""
+    studio_cap_hold: Optional[str] = None
+    """``total:studio_cap (...)`` / ``total:studio_load (...)`` when the
+    Studio's own kanban-worker cap (t_b0a8a427) bound the local budget."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -5211,6 +5214,78 @@ def _manifest_targets(skills, assignee) -> dict:
     return manifest_targets_safe(skills, assignee)
 
 
+def _local_running_now() -> Optional[int]:
+    """Kanban workers running ON THIS HOST, every board: running minus the
+    runs whose current run carries a ``worker_placed`` event (a pool host).
+    None when no board could be read (the cap then fails closed)."""
+    from hermes_cli import kanban_worker_pool as _kwp_lr
+    total, remote, read = 0, 0, 0
+    seen: set = set()
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        boards = [{"slug": _kb.DEFAULT_BOARD}]
+    for meta in _kb.enumerating_each(boards):
+        slug = (meta.get("slug") if isinstance(meta, dict) else None) or _kb.DEFAULT_BOARD
+        conn = None
+        try:
+            with _kb.enumerating_boards():
+                path = str(_kb.kanban_db_path(slug).expanduser().resolve())
+                if path in seen:
+                    continue
+                conn = _kb.connect(board=slug)
+            seen.add(path)
+            total += count_running_tasks(conn)
+            remote += sum(_kwp_lr.running_by_host(conn).values())
+            read += 1
+        except Exception:
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return max(0, total - remote) if read else None
+
+
+def _studio_cap_room() -> "tuple[Optional[int], Optional[str]]":
+    """``(room, reason)`` under the Studio's own kanban-worker cap (t_b0a8a427).
+
+    ``(None, None)`` = no ``studio`` kanban-worker row in fleet-roles.json:
+    uncapped. Otherwise ``room`` = slots - local running (0 when the load1
+    bar ``studio.capacity_pct x ncpu`` is reached), and ``reason`` the
+    ``total:studio_cap|studio_load (...)`` hold a local-bound row waits on.
+    An unknown running count holds everything (fail closed)."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    from hermes_cli import kanban_worker_pool as _kwp_cap
+    try:
+        cap, warning = _kwp_cap.read_local_cap(_kb.kanban_home() / "fleet")
+    except Exception as exc:
+        _kb._log.warning("kanban dispatch: studio cap unreadable (%s); uncapped", exc)
+        return None, None
+    if warning:
+        _kb._log.warning("%s", warning)
+    if cap is None:
+        return None, None
+    running = _local_running_now()
+    if running is None:
+        return 0, f"{_pr.total(_pr.TOTAL_STUDIO_CAP)} (running count unreadable)"
+    if cap.capacity_pct is not None:
+        try:
+            load1 = os.getloadavg()[0]
+        except (OSError, AttributeError):
+            load1 = None
+        ncpu = os.cpu_count() or 1
+        bar = _kwp_cap.host_threshold(ncpu, cap.capacity_pct)
+        if load1 is not None and load1 >= bar:
+            return 0, (f"{_pr.total(_pr.TOTAL_STUDIO_LOAD)} "
+                       f"(load1 {load1:.1f} >= {bar:.1f} = {cap.capacity_pct:g} x {ncpu})")
+    room = max(0, cap.slots - running)
+    state = "" if cap.state == "active" else f", {cap.state}"
+    return room, f"{_pr.total(_pr.TOTAL_STUDIO_CAP)} ({running}/{cap.slots} running{state})"
+
+
 def _route_wait(route: str, arg: Optional[str], local_free: bool, plan) -> Optional[str]:
     """Why this row cannot spawn anywhere this tick, or None to proceed.
 
@@ -5662,6 +5737,18 @@ def _dispatch_once_locked(
         local_budget = 0
         if (spillover is None or spillover.budget <= 0) and not route_first:
             return result
+    # The Studio's HARD kanban-worker cap (t_b0a8a427): slots from
+    # fleet-roles.json ``studio`` + a load1/ncpu bar, counted like a remote
+    # host. It clamps the LOCAL budget only: portable rows go to the pool, and
+    # local-bound rows wait ``total:studio_cap|studio_load`` (never a fallback).
+    local_hold: Optional[str] = None
+    _cap_room, _cap_reason = _studio_cap_room()
+    if _cap_room is not None and (local_budget is None or local_budget >= _cap_room):
+        # The cap is the binding local limit this tick: a local-bound row that
+        # finds no local slot waits on the cap, by name.
+        local_budget = _cap_room
+        local_hold = _cap_reason
+        result.studio_cap_hold = _cap_reason
 
     running_count = 0
     spawn_budget: Optional[int] = None
@@ -5710,6 +5797,7 @@ def _dispatch_once_locked(
     # ``local_budget`` only, never the total (a paused tick may still place).
     if local_budget == 0 and not spawn_paused:
         result.spawn_capped = (
+            f"studio cap: {local_hold}" if local_hold is not None else
             "load gate: this tick's spawn allowance for this board is 0"
         )
 
@@ -6469,6 +6557,7 @@ def _dispatch_once_locked(
         if record_only is not None:
             result.placement_waits[row["id"]] = (
                 record_only if record_only != "wall"
+                else local_hold if (local_hold is not None and route == "local")
                 else _wall_reason(route, route_arg, spillover))
             continue
         if ready_budget is not None and spawned >= ready_budget:
@@ -6479,6 +6568,10 @@ def _dispatch_once_locked(
                 continue
             break
         local_free = ready_local is None or local_spawned < ready_local
+        if not local_free and local_hold is not None and route == "local":
+            # The Studio cap holds a local-bound row by name (t_b0a8a427).
+            result.placement_waits[row["id"]] = local_hold
+            continue
         if route == "portable" and local_free and not _caps_out.get("only", {}).get(row["id"]):
             _portable_room.add(row["id"])
         pool_free = spillover is not None and spillover.budget > 0

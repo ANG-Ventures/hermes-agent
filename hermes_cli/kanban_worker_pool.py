@@ -76,7 +76,12 @@ _ROLES_ROW = frozenset({"roles", "state"})
 # change); validated by the router's registry, never read for placement here.
 _ROLES_ROW_OPTIONAL = frozenset({"last_change"})
 _SIDECAR_TOP = frozenset({"_doc", "schema", "ssh_user", "capacity_pct", "priority",
-                          "profiles", "studio_only", "studio_bound_skills", "hosts"})
+                          "profiles", "studio_only", "studio_bound_skills", "hosts", "studio"})
+# The dispatcher's OWN host (t_b0a8a427). Its ``fleet-roles.json`` row (id
+# ``studio``, the router host-table id) caps LOCAL kanban workers; it is never a
+# pool member. ``kanban-pool.json`` ``studio.capacity_pct`` is its load1/ncpu bar.
+LOCAL_ROLE_ROW = "studio"
+_SIDECAR_STUDIO = frozenset({"capacity_pct"})
 _SIDECAR_ROW = frozenset({"enabled", "absence", "capacity_pct", "profiles"})
 _ABSENCE = ("required", "optional")
 _STATES = ("active", "draining")
@@ -261,6 +266,14 @@ def validate_sidecar(doc) -> List[str]:
     for key in ("profiles", "studio_only", "studio_bound_skills"):
         if key in doc and not _str_list(doc[key]):
             errs.append(f"{key} must be a list of non-empty strings")
+    if "studio" in doc:
+        st = doc["studio"]
+        if not isinstance(st, dict) or set(st) - _SIDECAR_STUDIO:
+            errs.append(f"studio must be an object with only {sorted(_SIDECAR_STUDIO)}")
+        elif "capacity_pct" in st and not _pct(st["capacity_pct"]):
+            errs.append(f"studio.capacity_pct must be in (0, 1], not {st['capacity_pct']!r}")
+    if isinstance(doc.get("hosts"), dict) and LOCAL_ROLE_ROW in doc["hosts"]:
+        errs.append(f"hosts.{LOCAL_ROLE_ROW}: the dispatcher host is never a pool host (use the top-level studio key)")
     prio = doc.get("priority")
     if not isinstance(prio, list) or not all(isinstance(h, str) and _PLAIN_RE.fullmatch(h) for h in prio):
         errs.append("priority must be a list of plain host ids")
@@ -321,7 +334,7 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         roles = parse_roles(roles_doc) if roles_doc is not None else {}
     except PoolError as exc:
         return PoolConfig(warnings=(f"kanban pool: roles refused: {exc}",), refused="roles")
-    with_role = {h for h, (r, _s) in roles.items() if ROLE in r}
+    with_role = {h for h, (r, _s) in roles.items() if ROLE in r and h != LOCAL_ROLE_ROW}
     legacy = (kanban_cfg or {}).get("worker_hosts") if isinstance(kanban_cfg, Mapping) else None
     if legacy not in (None, [], {}, ""):
         if with_role:
@@ -405,6 +418,49 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
         pin_aliases=pin_aliases(fleet_dir),
         caps=read_caps(fleet_dir),
     )
+
+
+@dataclass(frozen=True)
+class LocalCap:
+    """The dispatcher host's own kanban-worker cap (t_b0a8a427).
+
+    ``slots`` = ``fleet-roles.json`` ``hosts.studio.roles.kanban-worker.slots``
+    (0 when the row is ``draining``); ``capacity_pct`` = ``kanban-pool.json``
+    ``studio.capacity_pct`` (the load1/ncpu bar), None = no load bar.
+    """
+
+    slots: int
+    capacity_pct: Optional[float]
+    state: str
+
+
+def read_local_cap(fleet_dir: Path) -> Tuple[Optional[LocalCap], Optional[str]]:
+    """``(cap, warning)``. No ``studio`` kanban-worker row = ``(None, None)``
+    (uncapped, the pre-t_b0a8a427 behaviour). A roles file that does not parse
+    is ``(None, warning)``: the router and every pool reader refuse it too.
+    A sidecar that does not parse keeps the slot cap and drops the load bar."""
+    fleet_dir = Path(fleet_dir)
+    try:
+        roles = parse_roles(_read_json(fleet_dir / ROLES_FILE) or {"schema": 1, "hosts": {}})
+    except (OSError, ValueError) as exc:
+        return None, f"kanban local cap: fleet-roles.json unreadable, Studio uncapped: {exc}"
+    row = roles.get(LOCAL_ROLE_ROW)
+    if row is None or ROLE not in row[0]:
+        return None, None
+    slots = 0 if row[1] == "draining" else int(row[0][ROLE])
+    pct: Optional[float] = None
+    warning = None
+    try:
+        side = _read_json(fleet_dir / SIDECAR_FILE)
+        st = side.get("studio") if isinstance(side, dict) else None
+        if isinstance(st, dict) and "capacity_pct" in st:
+            if _pct(st["capacity_pct"]):
+                pct = float(st["capacity_pct"])
+            else:
+                warning = f"kanban local cap: studio.capacity_pct {st['capacity_pct']!r} refused (no load bar)"
+    except (OSError, ValueError) as exc:
+        warning = f"kanban local cap: {SIDECAR_FILE} unreadable (slot cap only): {exc}"
+    return LocalCap(slots=slots, capacity_pct=pct, state=row[1]), warning
 
 
 def card_needs(body: Optional[str]) -> frozenset:
@@ -982,7 +1038,7 @@ def known_host_ids(fleet_dir: Path) -> Tuple[str, ...]:
     if isinstance(roles, dict) and isinstance(roles.get("hosts"), dict):
         for hid, row in roles["hosts"].items():
             r = row.get("roles") if isinstance(row, dict) else None
-            if isinstance(hid, str) and isinstance(r, dict) and ROLE in r:
+            if isinstance(hid, str) and isinstance(r, dict) and ROLE in r and hid != LOCAL_ROLE_ROW:
                 out.append(hid.lower())
     if isinstance(side, dict):
         hosts = side.get("hosts")
