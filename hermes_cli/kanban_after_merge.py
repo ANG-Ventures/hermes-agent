@@ -11,8 +11,11 @@ An ``after-merge`` edge gates like ``blocks`` (every gating query reads
 :data:`kanban_db.GATING_LINK_KINDS`) until :func:`release_merged_edges`
 sees every fleet PR the parent's runs recorded read MERGED. It then rewrites
 the edge to ``derived-from`` (the lineage stays, the gate goes) and the same
-dispatcher tick promotes the child. A parent that reaches ``done`` first
-releases the child the ordinary way.
+dispatcher tick promotes the child. The parent's status does not release it:
+a parent marked ``done`` while its PR is still open (t_ccdca9ef, completed at
+2026-10-18 02:02 with hermes-home#4662 a reviewer-held draft) keeps the gate
+until that PR merges (t_ab2499c5). Only a parent that closes with NO recorded
+fleet PR releases the edge on close (:func:`release_prless_closed_parents`).
 
 :func:`refuse_close_condition_deadlock` is the link-time lint: a ``blocks``
 edge whose child id appears in the parent's body is refused, naming this kind.
@@ -49,7 +52,7 @@ def describe_gate(parent_id: str, child_id: str, kind: str) -> str:
 
     if kind == kb.LINK_KIND_AFTER_MERGE:
         return (f"{child_id} will not start until {parent_id}'s PR is MERGED "
-                f"(or {parent_id} is DONE)")
+                f"(or {parent_id} is DONE with no PR recorded)")
     if kind == kb.LINK_KIND_DERIVED_FROM:
         return f"{child_id} is not gated on {parent_id} (provenance only)"
     return f"{child_id} will not start until {parent_id} is DONE"
@@ -118,15 +121,17 @@ def release_merged_edges(
 ) -> list[tuple[str, str]]:
     """Rewrite every ``after-merge`` edge whose parent's recorded fleet PRs all
     read MERGED to ``derived-from``; return the released ``(parent, child)``
-    pairs. A parent with no recorded PR, an OPEN/CLOSED PR or an unreadable one
-    keeps the gate. Lookups happen before the short write txn, which re-reads
-    the parent's PR set and skips any parent whose set changed meanwhile."""
+    pairs. An OPEN (draft or not), CLOSED or unreadable PR keeps the gate, open
+    parent or done one alike. A parent with no recorded PR is left to
+    :func:`release_prless_closed_parents`. Lookups happen before the short
+    write txn, which re-reads the parent's PR set and skips any parent whose
+    set changed meanwhile."""
     from hermes_cli import kanban_db as kb
 
     edges = conn.execute(
         "SELECT l.parent_id, l.child_id FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id JOIN tasks c ON c.id = l.child_id "
-        "WHERE l.kind = ? AND p.status NOT IN ('done', 'archived') "
+        "JOIN tasks c ON c.id = l.child_id "
+        "WHERE l.kind = ? "
         "AND c.status NOT IN ('done', 'archived') ORDER BY l.parent_id, l.child_id",
         (kb.LINK_KIND_AFTER_MERGE,),
     ).fetchall()
@@ -177,5 +182,46 @@ def release_merged_edges(
             if cur.rowcount == 1:
                 kb._append_event(conn, child_id, "after_merge_released",
                                  {"parent": parent_id, "prs": merged_prs[parent_id]})
+                released.append((parent_id, child_id))
+    return released
+
+
+def release_prless_closed_parents(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """Rewrite to ``derived-from`` every ``after-merge`` edge whose parent is
+    ``done``/``archived`` and recorded NO fleet PR: there is nothing to merge,
+    so the close is the release (the pre-t_ab2499c5 behaviour for that case).
+    A closed parent WITH a recorded PR is left to :func:`release_merged_edges`.
+    No GitHub I/O; opens its own write txn only when something is released."""
+    from hermes_cli import kanban_db as kb
+
+    edges = conn.execute(
+        "SELECT l.parent_id, l.child_id FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id JOIN tasks c ON c.id = l.child_id "
+        "WHERE l.kind = ? AND p.status IN ('done', 'archived') "
+        "AND c.status NOT IN ('done', 'archived') ORDER BY l.parent_id, l.child_id",
+        (kb.LINK_KIND_AFTER_MERGE,),
+    ).fetchall()
+    prless = {pid for pid in dict.fromkeys(e["parent_id"] for e in edges) if not _fleet_refs(conn, pid)}
+    released: list[tuple[str, str]] = []
+    if not prless:
+        return released
+    with kb.write_txn(conn):
+        for edge in edges:
+            parent_id, child_id = edge["parent_id"], edge["child_id"]
+            if parent_id not in prless:
+                continue
+            # The PR-less read ran outside the txn: a parent that recorded a PR
+            # meanwhile waits for that PR to merge, never released on the stale read.
+            if _fleet_refs(conn, parent_id):
+                continue
+            cur = conn.execute(
+                "UPDATE task_links SET kind = ? WHERE parent_id = ? AND child_id = ? AND kind = ? "
+                "AND EXISTS (SELECT 1 FROM tasks p WHERE p.id = ? "
+                "            AND p.status IN ('done', 'archived'))",
+                (kb.LINK_KIND_DERIVED_FROM, parent_id, child_id, kb.LINK_KIND_AFTER_MERGE, parent_id),
+            )
+            if cur.rowcount == 1:
+                kb._append_event(conn, child_id, "after_merge_released",
+                                 {"parent": parent_id, "prs": [], "reason": "parent_closed_without_pr"})
                 released.append((parent_id, child_id))
     return released

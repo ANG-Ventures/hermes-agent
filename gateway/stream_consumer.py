@@ -1103,9 +1103,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if not self.cfg.strip_trailing_silence_marker:
             return
         if (self.cfg.internal_event and not self._turn_split_delivery
-                and self._message_id is None and not self._native_stream_opened):
+                and self._message_id is None and self._native_last_pushed_len == 0
+                and not self._already_sent):
             # Internal turns hold every preview, so nothing is on screen yet and the whole turn is
-            # still the live tail: drop a leading marker line too.
+            # still the live tail: drop a leading marker line too.  A native stream opened by its
+            # empty seed frame has shown nothing, so it counts as nothing on screen (Prism
+            # 52ccd9c3b209).
             kept = _strip_internal_silence_marker_lines(self._accumulated)
             if kept != self._accumulated:
                 self._accumulated = kept

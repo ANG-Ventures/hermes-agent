@@ -234,9 +234,12 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 #                        dispatchable the moment it is defined and is NEVER
 #                        gated on the parent.
 #   * ``after-merge``  — the child waits for the parent's PR, not its close.
-#                        It gates like ``blocks`` until every PR the parent
-#                        recorded reads MERGED (or the parent is done); the
-#                        dispatcher then rewrites the edge to ``derived-from``
+#                        It gates until every PR the parent recorded reads
+#                        MERGED, whatever the parent's status: a DONE parent
+#                        whose PR is still open (a reviewer-held draft) keeps
+#                        the gate (t_ab2499c5). Only a parent that closes with
+#                        NO recorded PR releases it on close. The release
+#                        rewrites the edge to ``derived-from``
 #                        (kanban_after_merge.py). Use it for a child that is
 #                        itself part of the parent's close condition (Prism
 #                        residue, an acceptance drill after merge), where a
@@ -255,6 +258,10 @@ DEFAULT_LINK_KIND = LINK_KIND_BLOCKS
 # Kinds that hold the child while the parent is open. An ``after-merge`` edge
 # stops gating when the dispatcher releases it, so every gate reads one list.
 GATING_LINK_KINDS = (LINK_KIND_BLOCKS, LINK_KIND_AFTER_MERGE)
+# A gating edge is OPEN while its parent is not terminal, and an ``after-merge``
+# edge stays open until the release rewrites it, even past a done parent
+# (t_ab2499c5). Every "are the parents satisfied" read uses this, aliased l/p.
+_EDGE_OPEN_SQL = f"(p.status NOT IN ('done', 'archived') OR l.kind = '{LINK_KIND_AFTER_MERGE}')"
 
 
 def normalize_link_kind(kind: Optional[str]) -> str:
@@ -6353,7 +6360,10 @@ def create_task(
                                 "(" + ",".join("?" * len(parents)) + ")",
                                 parents,
                             ).fetchall()
-                            if any(r["status"] != "done" for r in rows):
+                            # An after-merge edge waits for the release even
+                            # behind a done parent (t_ab2499c5).
+                            if parents_kind == LINK_KIND_AFTER_MERGE or any(
+                                    r["status"] != "done" for r in rows):
                                 task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
@@ -8494,6 +8504,15 @@ def _latest_block_source(conn: sqlite3.Connection, task_id: str) -> Optional[str
     return "explicit"
 
 
+def _had_after_merge_release(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when an ``after-merge`` edge into ``task_id`` was released (and so
+    rewritten to ``derived-from``): the dependency was real and is satisfied."""
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'after_merge_released' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """True when ``task_id`` has an active block event, or the newest
     ``gave_up`` says the block must wait for an operator.
@@ -8546,7 +8565,7 @@ def find_parent_satisfied_sticky_blocks(conn: sqlite3.Connection) -> list[str]:
         "AND NOT EXISTS ("
         "  SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
         "  WHERE l.child_id = t.id AND COALESCE(l.kind, ?) IN (?, ?) "
-        "  AND p.status NOT IN ('done', 'archived')"
+        f"  AND {_EDGE_OPEN_SQL}"
         ") ORDER BY t.id",
         (DEFAULT_LINK_KIND, *GATING_LINK_KINDS, DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
     ).fetchall()
@@ -8659,6 +8678,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    from hermes_cli import kanban_after_merge as _am
+    _am.release_prless_closed_parents(conn)
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
@@ -8669,20 +8690,26 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             task_id = row["id"]
             cur_status = row["status"]
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status, l.kind FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ? AND COALESCE(l.kind, ?) IN (?, ?)",
                 (task_id, DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
             ).fetchall()
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 block_source = _latest_block_source(conn, task_id)
-                if block_source != "initial_status" or not parents:
+                # A released after-merge edge (now derived-from) was a real
+                # dependency: its creation hold releases like a closed
+                # ``blocks`` parent's would (t_ab2499c5).
+                if block_source != "initial_status" or not (
+                        parents or _had_after_merge_release(conn, task_id)):
                     # Explicit worker/operator blocks always require an unblock.
                     # Parentless creation holds are the human-ops/R3 gate and
                     # remain sticky too. Only a creation hold backed by at
                     # least one real dependency edge may auto-release.
                     continue
-            if all(p["status"] in ("done", "archived") for p in parents):
+            # A still-present after-merge edge is open even past a done parent.
+            if all(p["status"] in ("done", "archived") and p["kind"] != LINK_KIND_AFTER_MERGE
+                   for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
@@ -8726,7 +8753,7 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
         "WHERE l.child_id = ? AND COALESCE(l.kind, ?) IN (?, ?) "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        f"AND {_EDGE_OPEN_SQL} LIMIT 1",
         (task_id, DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
     ).fetchone() is None
 
@@ -8739,7 +8766,7 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
     rows = conn.execute(
         "SELECT p.id, p.status FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') "
+        f"WHERE l.child_id = ? AND {_EDGE_OPEN_SQL} "
         "ORDER BY p.id", (task_id,),
     ).fetchall()
     return [(row["id"], row["status"]) for row in rows]
@@ -14456,12 +14483,13 @@ def promote_task(
     # writer set 'ready', so a forced promotion would only report a success the
     # first claim silently reverts (#106195). The dependency itself is the knob.
     parents = conn.execute(
-        "SELECT t.id, t.status FROM tasks t "
+        "SELECT t.id, t.status, l.kind FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
         "WHERE l.child_id = ? AND COALESCE(l.kind, ?) IN (?, ?)",
         (task_id, DEFAULT_LINK_KIND, *GATING_LINK_KINDS),
     ).fetchall()
-    unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
+    unsatisfied = [p["id"] for p in parents
+                   if p["status"] not in ("done", "archived") or p["kind"] == LINK_KIND_AFTER_MERGE]
     if unsatisfied:
         return False, (
             f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
