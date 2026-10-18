@@ -1223,17 +1223,24 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
 
 
 def _is_connected(config) -> bool:
-    """Connected == the user opted in with WHATSAPP_ENABLED; auth lives in the bridge.
+    """Connected == the user opted in: WHATSAPP_ENABLED, or a real enabled config; auth lives in the bridge.
 
-    Never "enabled and any extra key": the env pass probes this with a transient ``enabled=True`` view, so
-    a display/behaviour key alone (``whatsapp: {gateway_restart_notification: false}``) auto-enabled an
-    unpaired adapter that booted DEGRADED with ``whatsapp_not_paired``.  An explicit YAML
-    ``enabled: true`` needs no probe: the env pass skips ``is_connected`` for already-enabled platforms.
-    A paired creds.json is NOT an opt-in: removing / falsing WHATSAPP_ENABLED is the documented disable.
+    A SET WHATSAPP_ENABLED decides either way (any non-truthy value, empty included, is an opt-out, even over
+    a YAML enable). Unset, a real enabled config counts, so an explicit YAML ``enabled: true`` reaches
+    ``get_connected_platforms()``. The env pass's enablement probe never counts: its ``enabled=True`` is
+    synthetic, and "enabled and any extra key" let a display/behaviour key alone
+    (``whatsapp: {gateway_restart_notification: false}``) auto-enable an unpaired adapter that booted
+    DEGRADED with ``whatsapp_not_paired``. A paired creds.json is NOT an opt-in.
     """
     # Via hermes_cli.gateway.get_env_value (not os.getenv) so setup-status callers that patch it observe the same value.
     import hermes_cli.gateway as gateway_mod
-    return (gateway_mod.get_env_value("WHATSAPP_ENABLED") or "").strip().lower() in {"true", "1", "yes"}
+    from gateway.config_env import in_enablement_probe
+    from utils import is_truthy_value
+
+    raw = gateway_mod.get_env_value("WHATSAPP_ENABLED")
+    if raw is not None:
+        return is_truthy_value(raw)
+    return bool(config is not None and getattr(config, "enabled", False) and not in_enablement_probe())
 
 
 # System-prompt platform hint (PlatformEntry.platform_hint); cached-prompt bytes, keep stable.

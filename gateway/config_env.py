@@ -7,6 +7,7 @@ copy the values into ``extra``" — declared by each platform plugin as ``Platfo
 msgraph_webhook, relay) keep their small functions here.
 """
 
+import contextvars
 import logging
 import os
 from typing import Optional
@@ -161,13 +162,34 @@ def _plugin_probe_seed(entry) -> Optional[dict]:
     return seed if isinstance(seed, dict) and seed else None
 
 
+# True only while ``probe_is_connected`` calls a plugin's ``is_connected`` on its SYNTHETIC ``enabled=True``
+# view. A checker that trusts ``config.enabled`` must not trust it then: the flag is the probe's, not the user's.
+_ENABLEMENT_PROBE: "contextvars.ContextVar[bool]" = contextvars.ContextVar("plugin_enablement_probe", default=False)
+
+
+def in_enablement_probe() -> bool:
+    """Whether the current ``is_connected`` call is a synthetic enablement probe."""
+    return _ENABLEMENT_PROBE.get()
+
+
+def probe_is_connected(entry, extra: Optional[dict] = None) -> bool:
+    """Ask a plugin "has the user configured you?" without a real config: ``entry.is_connected`` on a
+    synthetic ``enabled=True`` view, inside the enablement-probe flag. The one owner of that view (the env
+    pass and the setup wizard both use it), so no caller can forget the flag."""
+    token = _ENABLEMENT_PROBE.set(True)
+    try:
+        return bool(entry.is_connected(PlatformConfig(enabled=True, extra=extra if extra is not None else {})))
+    finally:
+        _ENABLEMENT_PROBE.reset(token)
+
+
 def _plugin_is_configured(entry, existing_extra: dict, seed: Optional[dict]) -> bool:
     """``entry.is_connected`` on a transient ``enabled=True`` view seeded with env extras (never the real config)."""
     try:
         for k, v in (seed or {}).items():
             if k != "home_channel":
                 existing_extra.setdefault(k, v)
-        configured = bool(entry.is_connected(PlatformConfig(enabled=True, extra=existing_extra)))
+        configured = probe_is_connected(entry, existing_extra)
     except Exception as exc:
         logger.debug("is_connected for %s raised: %s — skipping enablement", entry.name, exc)
         return False

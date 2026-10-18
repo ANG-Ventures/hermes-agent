@@ -72,9 +72,11 @@ def test_env_opt_in_still_enables(home, monkeypatch):
     "platforms:\n  whatsapp:\n    enabled: true\n",
 ])
 def test_explicit_yaml_enable_still_enables(home, yaml_text):
-    # enabled => the adapter starts (and reports not-paired itself); "connected" additionally needs pairing.
+    # The gateway starts adapters for get_connected_platforms(), so .enabled alone is not enough: the
+    # plugin's is_connected must also accept a real enabled config (it only rejects the probe's synthetic one).
     cfg = _load(home, yaml_text)
     assert _wa(cfg) is not None and _wa(cfg).enabled
+    assert Platform.WHATSAPP in cfg.get_connected_platforms()
 
 
 def test_explicit_disable_wins(home, monkeypatch):
@@ -98,13 +100,33 @@ def test_paired_creds_are_not_an_opt_in(home, monkeypatch, env):
     assert Platform.WHATSAPP not in cfg.get_connected_platforms()
 
 
+def _probe(fn, view):
+    """Call *fn* the way the env pass does: inside the enablement probe."""
+    from gateway.config_env import _ENABLEMENT_PROBE
+
+    token = _ENABLEMENT_PROBE.set(True)
+    try:
+        return fn(view)
+    finally:
+        _ENABLEMENT_PROBE.reset(token)
+
+
 def test_is_connected_unit(home):
     from plugins.platforms.whatsapp.adapter import _is_connected
 
-    # the exact transient view _plugin_is_configured builds
-    assert not _is_connected(PlatformConfig(enabled=True, extra={"gateway_restart_notification": False}))
-    assert not _is_connected(PlatformConfig(enabled=True, extra={"require_mention": True, "dm_policy": "open"}))
+    # the exact transient view _plugin_is_configured builds, inside the probe it builds it in
+    assert not _probe(_is_connected, PlatformConfig(enabled=True, extra={"gateway_restart_notification": False}))
+    assert not _probe(_is_connected, PlatformConfig(enabled=True, extra={"require_mention": True, "dm_policy": "open"}))
     assert not _is_connected(None)
+
+
+def test_probe_view_is_not_an_opt_in_but_a_real_enabled_config_is(home):
+    from plugins.platforms.whatsapp.adapter import _is_connected
+
+    view = PlatformConfig(enabled=True, extra={"gateway_restart_notification": False})
+    assert not _probe(_is_connected, view)
+    assert _is_connected(view)
+    assert not _is_connected(PlatformConfig(enabled=False))
 
 
 def test_is_connected_env_unit(home, monkeypatch):
@@ -113,4 +135,56 @@ def test_is_connected_env_unit(home, monkeypatch):
     monkeypatch.setenv("WHATSAPP_ENABLED", "yes")
     assert _is_connected(PlatformConfig(enabled=True))
     monkeypatch.setenv("WHATSAPP_ENABLED", "false")
-    assert not _is_connected(PlatformConfig(enabled=True, extra={"gateway_restart_notification": False}))
+    assert not _probe(_is_connected, PlatformConfig(enabled=True, extra={"gateway_restart_notification": False}))
+
+
+def test_setup_wizard_status_is_not_fooled_by_its_own_probe(home):
+    # The setup wizard's status line used to build its own PlatformConfig(enabled=True) outside the probe,
+    # so a fresh home read WhatsApp as "configured".
+    from gateway.platform_registry import platform_registry
+    from hermes_cli.gateway_setup_wizard import _platform_status
+
+    assert _platform_status({"_registry_entry": platform_registry.get("whatsapp")}) == "not configured"
+
+
+def test_setup_wizard_status_honors_env_opt_in(home, monkeypatch):
+    from gateway.platform_registry import platform_registry
+    from hermes_cli.gateway_setup_wizard import _platform_status
+
+    monkeypatch.setenv("WHATSAPP_ENABLED", "true")
+    assert _platform_status({"_registry_entry": platform_registry.get("whatsapp")}) == "configured"
+
+
+def test_synthetic_is_connected_view_has_one_owner():
+    # Every non-test caller that builds a synthetic enabled=True view for is_connected goes through
+    # gateway.config_env.probe_is_connected, so no caller can forget the probe flag.
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    pat = re.compile(r"is_connected\(\s*PlatformConfig\(\s*enabled=True")
+    hits = sorted(str(f.relative_to(root)) for d in ("gateway", "hermes_cli", "plugins", "agent")
+                  for f in (root / d).rglob("*.py") if pat.search(f.read_text(encoding="utf-8", errors="ignore")))
+    assert hits == ["gateway/config_env.py"], hits
+
+
+@pytest.mark.parametrize("value", ["false", " false ", "off", "OFF", "0", "no", "disabled", "", " "])
+def test_set_non_truthy_env_beats_yaml_enable(home, monkeypatch, value):
+    # A SET WHATSAPP_ENABLED is authoritative: any non-truthy value, empty included, is an opt-out.
+    monkeypatch.setenv("WHATSAPP_ENABLED", value)
+    cfg = _load(home, "platforms:\n  whatsapp:\n    enabled: true\n")
+    assert Platform.WHATSAPP not in cfg.get_connected_platforms()
+    assert _wa(cfg) is None or not _wa(cfg).enabled
+
+
+@pytest.mark.parametrize("value", ["true", " TRUE ", "1", "yes"])
+def test_set_truthy_env_enables(home, monkeypatch, value):
+    monkeypatch.setenv("WHATSAPP_ENABLED", value)
+    cfg = _load(home, "")
+    assert Platform.WHATSAPP in cfg.get_connected_platforms()
+
+
+def test_unset_env_lets_yaml_enable_through(home):
+    # Only UNSET (not empty) leaves the decision to config.yaml.
+    cfg = _load(home, "platforms:\n  whatsapp:\n    enabled: true\n")
+    assert Platform.WHATSAPP in cfg.get_connected_platforms()

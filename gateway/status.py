@@ -1104,6 +1104,11 @@ def _platform_entry_writer_alive(entry: Any) -> bool:
         return False
 
 
+def _is_stamped(entry: Any) -> bool:
+    pid = entry.get("writer_pid") if isinstance(entry, dict) else None
+    return isinstance(pid, int) and not isinstance(pid, bool)
+
+
 def _prepare_runtime_status_update(
     *, gateway_state: Any = _UNSET, exit_reason: Any = _UNSET, restart_requested: Any = _UNSET,
     active_agents: Any = _UNSET, active_work: Any = _UNSET, platform: Any = _UNSET, platform_state: Any = _UNSET,
@@ -1138,12 +1143,17 @@ def _prepare_runtime_status_update(
                 if not isinstance(k, str) or ":" not in k
                 or (drop_prefix is not None and not k.startswith(drop_prefix))
             }
-        if drop_stale_platforms:
-            # An entry whose writer process is gone (dead pid, recycled pid, or unstamped) is stale: a platform
-            # this boot does not run would otherwise keep reading e.g. ``whatsapp: fatal`` forever.
-            # Entries of a writer that is still running are kept.
-            payload["platforms"] = {
-                k: v for k, v in payload["platforms"].items() if _platform_entry_writer_alive(v)}
+        # An entry whose writer process is gone (dead or recycled pid) is stale: a platform this boot does not
+        # run would otherwise keep reading e.g. ``whatsapp: fatal`` forever. This runs on EVERY write: during an
+        # overlapping restart the draining predecessor is still alive at the successor's startup write, and its
+        # entries must go on the first write after it exits. Own entries are never probed; a foreign stamped
+        # entry costs one start-time read. Unstamped entries are judged only at startup
+        # (``drop_stale_platforms``), when no live writer can own them.
+        own = (current_record["pid"], current_record["start_time"])
+        payload["platforms"] = {
+            k: v for k, v in payload["platforms"].items()
+            if (isinstance(v, dict) and (v.get("writer_pid"), v.get("writer_start_time")) == own)
+            or (_platform_entry_writer_alive(v) if (drop_stale_platforms or _is_stamped(v)) else True)}
         payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
         payload["updated_at"] = _utc_now_iso()
         payload.update(_get_code_identity_fields())
