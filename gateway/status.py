@@ -1086,6 +1086,19 @@ def _coerce_session_store(session_store: Any) -> dict[str, str]:
     return {"status": state if state in {"ok", "unavailable", "retrying"} else "unknown"}
 
 
+def _platform_entry_written_by(entry: Any, record: dict[str, Any]) -> bool:
+    """True when a ``platforms`` entry was written by the process in ``record`` (same pid + start time)."""
+    if not isinstance(entry, dict) or entry.get("writer_pid") != record.get("pid"):
+        return False
+    recorded, current = entry.get("writer_start_time"), record.get("start_time")
+    if recorded is None or current is None:
+        return recorded == current
+    try:
+        return start_time_fingerprints_match(recorded, current)
+    except (TypeError, ValueError):
+        return False
+
+
 def _prepare_runtime_status_update(
     *, gateway_state: Any = _UNSET, exit_reason: Any = _UNSET, restart_requested: Any = _UNSET,
     active_agents: Any = _UNSET, active_work: Any = _UNSET, platform: Any = _UNSET, platform_state: Any = _UNSET,
@@ -1094,7 +1107,7 @@ def _prepare_runtime_status_update(
     parked_profiles: Any = _UNSET, multiplex_standalone_reason: Any = _UNSET,
     platform_metrics: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
-    drop_profile_platforms: Optional[str] = None,
+    drop_profile_platforms: Optional[str] = None, drop_stale_platforms: bool = False,
     load_existing: bool = True, reload_existing: bool = False,
 ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     """Merge one update into the process-wide canonical status snapshot."""
@@ -1120,6 +1133,11 @@ def _prepare_runtime_status_update(
                 if not isinstance(k, str) or ":" not in k
                 or (drop_prefix is not None and not k.startswith(drop_prefix))
             }
+        if drop_stale_platforms:
+            # A previous boot's entry (writer_pid/writer_start_time not this process) is stale: a platform
+            # this boot does not run would otherwise keep reading e.g. ``whatsapp: fatal`` forever.
+            payload["platforms"] = {
+                k: v for k, v in payload["platforms"].items() if _platform_entry_written_by(v, current_record)}
         payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
         payload["updated_at"] = _utc_now_iso()
         payload.update(_get_code_identity_fields())
