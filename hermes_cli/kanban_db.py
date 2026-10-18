@@ -8504,6 +8504,15 @@ def _latest_block_source(conn: sqlite3.Connection, task_id: str) -> Optional[str
     return "explicit"
 
 
+def _had_after_merge_release(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when an ``after-merge`` edge into ``task_id`` was released (and so
+    rewritten to ``derived-from``): the dependency was real and is satisfied."""
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'after_merge_released' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """True when ``task_id`` has an active block event, or the newest
     ``gave_up`` says the block must wait for an operator.
@@ -8688,7 +8697,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
             ).fetchall()
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 block_source = _latest_block_source(conn, task_id)
-                if block_source != "initial_status" or not parents:
+                # A released after-merge edge (now derived-from) was a real
+                # dependency: its creation hold releases like a closed
+                # ``blocks`` parent's would (t_ab2499c5).
+                if block_source != "initial_status" or not (
+                        parents or _had_after_merge_release(conn, task_id)):
                     # Explicit worker/operator blocks always require an unblock.
                     # Parentless creation holds are the human-ops/R3 gate and
                     # remain sticky too. Only a creation hold backed by at

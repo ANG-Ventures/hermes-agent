@@ -210,6 +210,10 @@ def release_prless_closed_parents(conn: sqlite3.Connection) -> list[tuple[str, s
             parent_id, child_id = edge["parent_id"], edge["child_id"]
             if parent_id not in prless:
                 continue
+            # The PR-less read ran outside the txn: a parent that recorded a PR
+            # meanwhile waits for that PR to merge, never released on the stale read.
+            if _fleet_refs(conn, parent_id):
+                continue
             cur = conn.execute(
                 "UPDATE task_links SET kind = ? WHERE parent_id = ? AND child_id = ? AND kind = ? "
                 "AND EXISTS (SELECT 1 FROM tasks p WHERE p.id = ? "

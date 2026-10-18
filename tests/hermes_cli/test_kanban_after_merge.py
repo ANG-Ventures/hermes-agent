@@ -221,6 +221,64 @@ def test_done_parent_without_pr_releases_edge_on_close(kanban_home):
         assert kb.parent_links(conn, child) == [(parent, kb.LINK_KIND_DERIVED_FROM)]
 
 
+def test_prless_release_rereads_recorded_prs_inside_the_write_txn(kanban_home, monkeypatch):
+    """A PR recorded on the parent between the PR-less read and the write txn keeps the gate."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="no pr yet", assignee="daedalus")
+        child = kb.create_task(conn, title="drill", assignee="daedalus")
+        kb.link_tasks(conn, parent, child, kind="after-merge")
+        _mark_done(conn, parent)
+        real_txn = kb.write_txn
+
+        def txn_after_pr_recorded(c):
+            # The parent's run records its PR after the outside read, before the txn.
+            c.execute("INSERT INTO task_runs (task_id, profile, status, started_at, metadata) "
+                      "VALUES (?, 'daedalus', 'done', 0, ?)", (parent, f'{{"pr_url": "{PR}"}}'))
+            c.commit()
+            return real_txn(c)
+
+        monkeypatch.setattr(kb, "write_txn", txn_after_pr_recorded)
+        assert am._fleet_refs(conn, parent) == []
+        assert am.release_prless_closed_parents(conn) == []
+        monkeypatch.setattr(kb, "write_txn", real_txn)
+        assert am._fleet_refs(conn, parent) != []
+        assert kb.parent_links(conn, child) == [(parent, kb.LINK_KIND_AFTER_MERGE)]
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_creation_held_child_behind_prless_done_parent_promotes(kanban_home):
+    """Prism 24333b300d1f: the PR-less release must not strand an initial_status=blocked child."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="no pr", assignee="daedalus")
+        child = kb.create_task(conn, title="held drill", assignee="daedalus", parents=[parent],
+                               parents_kind="after-merge", initial_status="blocked")
+        assert kb.get_task(conn, child).status == "blocked"
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "blocked"  # parent open: still held
+        _mark_done(conn, parent)
+        for _ in range(2):
+            kb.recompute_ready(conn)
+        assert kb.parent_links(conn, child) == [(parent, kb.LINK_KIND_DERIVED_FROM)]
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_operator_blocked_child_behind_prless_done_parent_stays_blocked(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="no pr", assignee="daedalus")
+        child = kb.create_task(conn, title="drill", assignee="daedalus")
+        kb.link_tasks(conn, parent, child, kind="after-merge")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child,))
+        conn.commit()
+        assert kb.block_task(conn, child, reason="operator hold", kind="needs_input")
+        assert kb.get_task(conn, child).status == "blocked"
+        _mark_done(conn, parent)
+        for _ in range(2):
+            kb.recompute_ready(conn)
+        assert kb.parent_links(conn, child) == [(parent, kb.LINK_KIND_DERIVED_FROM)]
+        assert kb.get_task(conn, child).status == "blocked"
+
+
 def test_create_behind_done_parent_with_open_pr_starts_todo(kanban_home):
     with kb.connect() as conn:
         parent = _parent_with_pr(conn)
