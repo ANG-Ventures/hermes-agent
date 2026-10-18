@@ -78,6 +78,19 @@ allowance is ``min(load allowance against spill_above, CPU allowance against
 cpu_pause)`` (option D). ``cpu >= cpu_pause`` is the CPU twin of the hard
 pause. ``cpu_headroom`` keeps its own allowance and is a ``spilling`` row.
 
+2026-10-18 (t_a7978f86): load1 325 with the CPU 54% idle, P-cores 33% busy
+and the 8 E-cores 100% busy. The ``cpu_headroom`` row read the mean over
+all 32 cores (0.41-0.50 < ``cpu_busy_pause``) and kept admitting 17-26 local
+spawns an hour, while the background QoS band (the E-cores on Apple
+silicon: test-gate's nice-19 runs, launchd Background agents, dpx units)
+got no slice and dpx ``/health`` took 8 s. ``ecore_gate`` (``off`` |
+``report`` | ``on``) reads E-core busy from per-cpu ``psutil.cpu_times``
+deltas; at ``ecore_busy_pause`` (default 0.95) or above, a CPU-headroom
+allowance is NO headroom for local spawns. ``report`` (the default until
+the D1 ruling) changes nothing and logs ``kanban load gate (dry): ...
+would-refuse N``; ``on`` refuses. Hosts without a perflevel split (Linux,
+Intel) have no E-core sample and the knob is inert there.
+
 ``kanban.max_spawn`` stays the hard concurrency ceiling; this gate is the
 governor that decides how fast the host is allowed to approach it.
 
@@ -104,6 +117,9 @@ DEFAULT_WORKER_LOAD_COST_MAX = 4.0
 DEFAULT_RAMP_SECONDS = 600.0
 DEFAULT_SLOPE_WINDOW_SECONDS = 600.0
 DEFAULT_CPU_BUSY_PAUSE = 0.70
+DEFAULT_ECORE_BUSY_PAUSE = 0.95
+ECORE_GATE_MODES = ("off", "report", "on")
+DEFAULT_ECORE_GATE = "report"
 DEFAULT_WORKER_CPU_COST = 1.0
 SLOPE_MIN_SAMPLES = 5
 SLOPE_MIN_X_STDEV = 1.0
@@ -224,6 +240,15 @@ class LoadGate:
         self.worker_cpu_cost = _num(
             cfg.get("worker_cpu_cost"), DEFAULT_WORKER_CPU_COST
         )
+        mode = str(cfg.get("ecore_gate", DEFAULT_ECORE_GATE)).strip().lower()
+        self.ecore_gate = mode if mode in ECORE_GATE_MODES else DEFAULT_ECORE_GATE
+        eb = _num(cfg.get("ecore_busy_pause"), DEFAULT_ECORE_BUSY_PAUSE)
+        self.ecore_busy_pause = eb if 0.0 < eb <= 1.0 else DEFAULT_ECORE_BUSY_PAUSE
+        self.ecore_busy: Optional[float] = None
+        self.ecore_would_refuse = 0     # local spawns the E-core leg refused / would refuse this tick
+        self._ecore_prev = None
+        self._ecore_cpus: "Optional[tuple[int, ...]]" = None
+        self._ecore_reported_at: Optional[float] = None
         pf = _num(cfg.get("proc_pause_fraction"), DEFAULT_PROC_PAUSE_FRACTION)
         self.proc_pause_fraction = pf if pf < 1.0 else DEFAULT_PROC_PAUSE_FRACTION
         rf = _num(cfg.get("proc_resume_fraction"), DEFAULT_PROC_RESUME_FRACTION)
@@ -443,6 +468,7 @@ class LoadGate:
         cpu_busy: Optional[float] = None,
         procs: Optional[int] = None,
         proc_limit: Optional[int] = None,
+        ecore_busy: Optional[float] = None,
     ) -> "tuple[Optional[int], Optional[str]]":
         """Return ``(allowance, reason)`` for this tick.
 
@@ -453,6 +479,7 @@ class LoadGate:
         (0..1 of all cores) corroborates a load1 pause. Both are optional.
         ``procs`` / ``proc_limit`` (this uid's process count and its limit)
         drive the process-slot pause; either missing = no process gate.
+        ``ecore_busy`` (0..1 of the E-cores) is the ``ecore_gate`` leg.
         """
         self.pool = {"planned": False, "reason": "not_needed"}
         if not self.enabled:
@@ -477,6 +504,13 @@ class LoadGate:
             )
         except (TypeError, ValueError):
             self.cpu_busy = None
+        try:
+            self.ecore_busy = (
+                min(1.0, max(0.0, float(ecore_busy))) if ecore_busy is not None else None
+            )
+        except (TypeError, ValueError):
+            self.ecore_busy = None
+        self.ecore_would_refuse = 0
         self.running = None
         self.observe(load1, running, now)
         measured = self.measured_cost(now)
@@ -512,7 +546,8 @@ class LoadGate:
                 if allowance == 0:
                     self.last_reason = (
                         f"{hard}; cpu_busy={self.cpu_busy:.2f} < {self.cpu_busy_pause:.2f} "
-                        f"but pending cpu={pending_cpu:.1f} cores fills the headroom"
+                        + (self._ecore_reason() if self._ecore_blocks() else
+                           f"but pending cpu={pending_cpu:.1f} cores fills the headroom")
                     )
                     return 0, self.last_reason
                 self.last_reason = None
@@ -627,6 +662,7 @@ class LoadGate:
                 f"spilling ({self.spill_reason}): projected load1={projected:.1f} vs "
                 f"spill_above={self.spill_above:.1f}, cpu_busy={cpu} vs "
                 f"cpu_pause={self.cpu_pause:.2f} leave no local worker"
+                + (f"; {self._ecore_reason()}" if self._ecore_blocks() else "")
             )
             return 0, self.last_reason
         self.state, self.last_reason = "admitting", None
@@ -668,7 +704,29 @@ class LoadGate:
         if headroom > 0:
             allowance = int(math.floor(headroom / self.worker_cpu_cost))
             allowance = max(allowance, self._empty_host_floor(now))
-        return max(0, min(allowance, self.max_spawn_per_tick)), pending_cpu
+        allowance = max(0, min(allowance, self.max_spawn_per_tick))
+        if allowance and self._ecore_saturated():
+            # t_a7978f86: the mean hides a saturated E-core band. report: count only; on: no headroom.
+            self.ecore_would_refuse = max(self.ecore_would_refuse, allowance)
+            if self.ecore_gate == "on":
+                allowance = 0
+        return allowance, pending_cpu
+
+    def _ecore_saturated(self) -> bool:
+        return (
+            self.ecore_gate != "off"
+            and self.ecore_busy is not None
+            and self.ecore_busy >= self.ecore_busy_pause
+        )
+
+    def _ecore_blocks(self) -> bool:
+        return self.ecore_gate == "on" and self.ecore_would_refuse > 0
+
+    def _ecore_reason(self) -> str:
+        return (
+            f"but ecore_busy={self.ecore_busy:.2f} >= ecore_busy_pause="
+            f"{self.ecore_busy_pause:.2f} (E-core band saturated; no local headroom)"
+        )
 
     def record_spawns(self, n: int, now: Optional[float] = None) -> None:
         """Book ``n`` workers actually spawned this tick into the ramp window."""
@@ -700,9 +758,15 @@ class LoadGate:
             return None, None
         busy, self._cpu_prev = sample_cpu_busy(self._cpu_prev, block=cpu_block)
         procs, proc_limit = sample_user_procs() if self.enabled else (None, None)
+        ecore = None
+        if self.enabled and self.ecore_gate != "off":
+            if self._ecore_cpus is None:
+                self._ecore_cpus = ecore_cpu_indices()
+            ecore, self._ecore_prev = sample_ecore_busy(
+                self._ecore_cpus, self._ecore_prev, block=cpu_block)
         return self.admit(
             load1, load5=load5, running=running, cpu_busy=busy,
-            procs=procs, proc_limit=proc_limit,
+            procs=procs, proc_limit=proc_limit, ecore_busy=ecore,
         )
 
     def finish_tick(self, spawned: int, logger=None, path=None) -> None:
@@ -749,6 +813,10 @@ class LoadGate:
             "running": self.running,
             "cpu_busy": None if self.cpu_busy is None else round(self.cpu_busy, 3),
             "cpu_busy_pause": self.cpu_busy_pause,
+            "ecore_gate": self.ecore_gate,
+            "ecore_busy": None if self.ecore_busy is None else round(self.ecore_busy, 3),
+            "ecore_busy_pause": self.ecore_busy_pause,
+            "ecore_would_refuse": self.ecore_would_refuse,
             "procs": self.procs,
             "proc_limit": self.proc_limit,
             "proc_pause_fraction": self.proc_pause_fraction,
@@ -798,6 +866,19 @@ class LoadGate:
                 self.spill_keys_error,
             )
             self._spill_warned_at = now
+        if self.ecore_would_refuse and (
+            self._ecore_reported_at is None
+            or now - self._ecore_reported_at >= SUMMARY_INTERVAL_SECONDS
+        ):
+            logger.warning(
+                "kanban load gate%s: ecore_busy=%.2f >= %.2f with cpu_busy=%s: %s %d local (%s)",
+                "" if self.ecore_gate == "on" else " (dry)", self.ecore_busy,
+                self.ecore_busy_pause,
+                "?" if self.cpu_busy is None else f"{self.cpu_busy:.2f}",
+                "refused" if self.ecore_gate == "on" else "would-refuse",
+                self.ecore_would_refuse, self._line(),
+            )
+            self._ecore_reported_at = now
         if self.state != self._last_logged_state:
             level = logger.warning if self.state == "paused" else logger.info
             if self.state == "proc_paused":
@@ -941,6 +1022,69 @@ def sample_cpu_busy(prev=None, block: float = 0.0):
         return None, cur
     total = sum(cur) - sum(prev)
     idle = cur.idle - prev.idle
+    if total <= 0:
+        return None, cur
+    return min(1.0, max(0.0, 1.0 - idle / total)), cur
+
+
+def ecore_cpu_indices(sysctl=None, ncpu: Optional[int] = None) -> "tuple[int, ...]":
+    """Logical cpu indices of the efficiency cores, or () when the host has none.
+
+    Apple silicon lists each die's E-cores first (M3 Ultra, 2 dies x 16: 0-3
+    and 16-19; ``hw.packages`` still says 1). Verified live on the Studio
+    2026-10-18: cpus 0-3 and 16-19 at 100% while the P-cores sat at 9-76%.
+    """
+    import sys
+
+    if sysctl is None:
+        if sys.platform != "darwin":
+            return ()
+
+        def sysctl(name):
+            import subprocess
+
+            out = subprocess.run(["sysctl", "-n", name], capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+            return int(out or 0)
+    try:
+        e_n = int(sysctl("hw.perflevel1.logicalcpu") or 0)
+        dies = max(1, int(sysctl("hw.packages") or 1))
+    except Exception:
+        return ()
+    n = int(ncpu or os.cpu_count() or 0)
+    if not e_n or e_n >= n:
+        return ()
+    if dies == 1 and n >= 32 and e_n % 2 == 0 and n % 2 == 0:
+        dies = 2  # Ultra: two dies behind one package
+    if n % dies or e_n % dies:
+        dies = 1
+    per, e_per = n // dies, e_n // dies
+    return tuple(d * per + i for d in range(dies) for i in range(e_per))
+
+
+def sample_ecore_busy(cpus, prev=None, block: float = 0.0):
+    """``(busy_fraction | None, snapshot)``: mean busy of ``cpus`` from per-cpu
+    ``psutil.cpu_times`` deltas. None with no E-cores, no psutil or no delta."""
+    if not cpus:
+        return None, None
+    try:
+        import psutil
+    except Exception:
+        return None, None
+    try:
+        cur = psutil.cpu_times(percpu=True)
+        if prev is None and block > 0:
+            prev = cur
+            time.sleep(block)
+            cur = psutil.cpu_times(percpu=True)
+    except Exception:
+        return None, prev
+    if prev is None or len(prev) != len(cur) or max(cpus) >= len(cur):
+        return None, cur
+    total = idle = 0.0
+    for i in cpus:
+        total += sum(cur[i]) - sum(prev[i])
+        idle += cur[i].idle - prev[i].idle
     if total <= 0:
         return None, cur
     return min(1.0, max(0.0, 1.0 - idle / total)), cur
