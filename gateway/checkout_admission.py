@@ -213,22 +213,15 @@ def _same_live_process(pid: Any, rec: Mapping[str, Any]) -> bool:
     import psutil
 
     try:
-        if "boot_id" in rec or "start_offset" in rec:
-            boot_id, off = rec.get("boot_id"), rec.get("start_offset")
-            cur_boot = _host_boot_id()
-            if isinstance(boot_id, str) and cur_boot and boot_id != cur_boot:
-                return False
-            if _finite(off) and abs(_start_offset(pid) - off) > 1:
-                return False
-            return True
-        # Record from a publisher that predates boot_id/start_offset: only
-        # wall-clock evidence exists.
-        boot_ts = rec.get("boot_ts")
-        if not _finite(boot_ts):
-            return True
-        if boot_ts < psutil.boot_time():
+        boot_id, off = rec.get("boot_id"), rec.get("start_offset")
+        cur_boot = _host_boot_id()
+        if isinstance(boot_id, str) and cur_boot and boot_id != cur_boot:
             return False
-        return psutil.Process(pid).create_time() <= boot_ts + 1
+        if _finite(off) and abs(_start_offset(pid) - off) > 1:
+            return False
+        # A record from a pre-boot_id publisher carries only wall-clock
+        # boot_ts, which a clock step can make look stale: keep it live.
+        return True
     except psutil.NoSuchProcess:
         return False
     except psutil.Error:
@@ -556,7 +549,7 @@ class AdmissionGate:
         if (isinstance(prev, dict) and prev.get("instance") not in (None, self.instance)
                 and prev.get("host") == self.host and prev.get("pid") != self.pid):
             self._foreign = (prev.get("pid"), prev.get("instance"),
-                             {k: prev[k] for k in ("boot_ts", "boot_id", "start_offset") if k in prev})
+                             {k: prev[k] for k in ("boot_id", "start_offset") if k in prev})
         foreign = self._foreign
         if foreign is not None and not _same_live_process(foreign[0], foreign[2]):
             self._foreign = foreign = None

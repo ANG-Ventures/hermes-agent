@@ -814,16 +814,10 @@ def _foreign_record(store, name, **fields):
     store.write_consumer(name, rec)
 
 
-def _parent_create_time():
-    import psutil
-
-    return psutil.Process(os.getppid()).create_time()
-
-
 @pytest.mark.parametrize("fields", [
     pytest.param({}, id="genuine"),
     pytest.param({"start_offset": float("nan"), "boot_ts": float("nan")}, id="nan-fails-closed"),
-    pytest.param({"boot_id": ..., "start_offset": ..., "boot_ts": float("inf")}, id="legacy-nonfinite"),
+    pytest.param({"boot_id": ..., "start_offset": ...}, id="legacy-record-stays-live"),
 ])
 def test_genuine_or_inconclusive_foreign_record_is_shared(store, fields):
     store.hold("op", [SERVE], mode="freeze")
@@ -833,17 +827,10 @@ def test_genuine_or_inconclusive_foreign_record_is_shared(store, fields):
     assert ca.evaluate(store)["verdict"] == UNKNOWN
 
 
-@pytest.mark.parametrize("fields", [
-    pytest.param("offset", id="start-offset-mismatch"),
-    pytest.param("legacy", id="legacy-create-time-after-boot-ts"),
-])
-def test_reused_pid_started_after_record_is_not_shared(store, fields):
+def test_reused_pid_started_after_record_is_not_shared(store):
     """t_2882f0c1: a live pid that is a different process than the record's
     publisher (wireplumber reusing serve-clanker's pid) is not shared."""
-    if fields == "offset":
-        kw = {"start_offset": ca._start_offset(os.getppid()) - 60}
-    else:
-        kw = {"boot_id": ..., "start_offset": ..., "boot_ts": _parent_create_time() - 60}
+    kw = {"start_offset": ca._start_offset(os.getppid()) - 60}
     store.hold("op", [SERVE], mode="freeze")
     _foreign_record(store, SERVE, **kw)
     me = _gate(store, SERVE)
@@ -852,17 +839,11 @@ def test_reused_pid_started_after_record_is_not_shared(store, fields):
     assert ca.evaluate(store)["verdict"] == QUIESCENT
 
 
-@pytest.mark.parametrize("fields", ["boot_id", "legacy"])
-def test_record_from_before_host_boot_is_not_shared(store, monkeypatch, fields):
+def test_record_from_before_host_boot_is_not_shared(store, monkeypatch):
     """t_2882f0c1: a record written in a previous host boot is never a live
     foreign publisher, whatever now holds its pid."""
-    import psutil
-
-    if fields == "boot_id":
-        monkeypatch.setattr(ca, "_host_boot_id", lambda: "current-boot")
-        kw = {"boot_id": "previous-boot"}
-    else:
-        kw = {"boot_id": ..., "start_offset": ..., "boot_ts": psutil.boot_time() - 60}
+    monkeypatch.setattr(ca, "_host_boot_id", lambda: "current-boot")
+    kw = {"boot_id": "previous-boot"}
     store.hold("op", [SERVE], mode="freeze")
     _foreign_record(store, SERVE, **kw)
     me = _gate(store, SERVE)
