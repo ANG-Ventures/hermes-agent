@@ -89,8 +89,8 @@ def _platform_status(platform: dict) -> str:
         # to check_fn when is_connected returned False, or "SDK installed" would override "no token".
         try:
             if entry.is_connected is not None:
-                from gateway.config import PlatformConfig
-                configured = bool(entry.is_connected(PlatformConfig(enabled=True)))
+                from gateway.config_env import probe_is_connected
+                configured = probe_is_connected(entry)
             else:
                 configured = bool(entry.check_fn())
         except Exception:
