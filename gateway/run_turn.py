@@ -165,6 +165,27 @@ def hygiene_no_commit_reason(agent) -> str:
     return "in-place commit did not complete"
 
 
+
+def _log_internal_silence_verdict(response, silent: bool, platform_name, source) -> None:
+    """INFO line for an internal reply whose own-line marker sat beside prose, so a swallowed or
+    delivered note is never invisible (t_bb4059d2)."""
+    from gateway.response_filters import classify_internal_silence
+    try:
+        _, words = classify_internal_silence(response)
+    except Exception:
+        logger.debug("internal silence classification failed", exc_info=True)
+        return
+    if words is None:
+        return
+    chat = getattr(source, "chat_id", None) or "unknown"
+    if silent:
+        logger.info("silence marker suppressed an %d-word note: platform=%s chat=%s",
+                    words, platform_name, chat)
+    else:
+        logger.info("silence marker on a long internal reply: delivering %d words: platform=%s chat=%s",
+                    words, platform_name, chat)
+
+
 class GatewayTurnMixin:
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
@@ -445,8 +466,8 @@ class GatewayTurnMixin:
     @staticmethod
     def _is_intentional_silence(agent_result, response, *, internal: bool = False) -> bool:
         """``internal``: a system-generated event (bg-process completion, restore replay) has no
-        human waiting, so a short note + NO_REPLY on its own line is suppressed (autonomous
-        rule); human turns keep the exact-marker rule."""
+        human waiting, so a short one-line note + NO_REPLY on its own line is suppressed (a longer
+        reply is delivered without the marker); human turns keep the exact-marker rule."""
         try:
             from gateway.response_filters import is_intentional_silence_agent_result
             return is_intentional_silence_agent_result(agent_result, response, internal=internal)
@@ -1668,9 +1689,12 @@ class GatewayTurnMixin:
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
+        _internal_turn = _silence_kind == "internal_notification"
         _intentional_silence = self._is_intentional_silence(
-            agent_result, response, internal=_silence_kind == "internal_notification",
+            agent_result, response, internal=_internal_turn,
         )
+        if _internal_turn:
+            _log_internal_silence_verdict(response, _intentional_silence, _platform_name, source)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
         if _intentional_silence and not silence_allowed(_silence_kind, _silence_reply_expected):
             logger.warning(
@@ -1723,7 +1747,12 @@ class GatewayTurnMixin:
             # transcript keeps the raw turn.
             from gateway.run import _gateway_surface_passes_raw_text
             if not _gateway_surface_passes_raw_text(source.platform):
-                from gateway.response_filters import strip_trailing_silence_marker
+                from gateway.response_filters import (
+                    strip_internal_silence_marker_lines, strip_trailing_silence_marker,
+                )
+                if _internal_turn:
+                    # A long internal reply delivered despite its marker: drop the marker lines.
+                    response = strip_internal_silence_marker_lines(response)
                 response = strip_trailing_silence_marker(response)
 
         # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
@@ -4230,6 +4259,11 @@ class GatewayTurnMixin:
                 )
                 first_response = _unexpected_silence_reply()
                 _already_streamed = False
+        elif first_response and turn_ctx.persist_user_display_kind == "internal_notification":
+            from gateway.run import _gateway_surface_passes_raw_text
+            if not _gateway_surface_passes_raw_text(turn_ctx.source.platform):
+                from gateway.response_filters import strip_internal_silence_marker_lines
+                first_response = strip_internal_silence_marker_lines(first_response)
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
         if first_response:

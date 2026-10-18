@@ -1698,10 +1698,14 @@ class GatewayKanbanWatchersMixin:
         }
         # Same contention gate as the kanban notifier (t_74bf5296): under
         # host load or a capped lane of the profile that would run the turn,
-        # the caller sends a notify.
+        # the caller sends a notify. ``human_owner`` (t_b0f092ba): the caller
+        # wakes a human:* owner's operator session (the review deadman), weighed
+        # like the notifier's human-owned wakes (t_b7b31563): host load1 alone
+        # never downgrades it, dispatcher proc_paused and the lane still do.
         downgrade = await _to_thread_process_service(
             _wake_downgrade_reason, self,
             self._wake_gate_profile(plat, sub, profile or None),
+            params.get("human_owner") is True,
         )
         if downgrade:
             logger.info(

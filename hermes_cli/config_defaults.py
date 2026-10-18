@@ -1087,6 +1087,10 @@ DEFAULT_CONFIG = {
         #   "on"            — inject every completion
         # Read by gateway/run.py::_load_background_agent_notify_mode.
         "background_process_agent_notify": "off",
+        # Internal turns (bg completions, kanban handoffs): a NO_REPLY line beside more than this
+        # many words (or more than one line) is delivered, marker stripped. 0 = the marker always
+        # silences. Read by gateway/response_filters.py::internal_short_note_words.
+        "internal_silence_short_note_words": 12,
         "streaming": False,
         "timestamps": False,      # message timestamps (CLI labels, TUI rows, desktop transcript)
         "timestamp_format": "%H:%M",  # strftime format, e.g. "%b-%d %H:%M"
@@ -1566,7 +1570,7 @@ DEFAULT_CONFIG = {
         # Fallback chain for delegated children (same entry format as the top-level list).
         # For an unpinned child, null = inherit the parent chain; [] = disable fallback.
         # A child pinned by provider, endpoint, or model gets no fallback unless this
-        # setting declares one explicitly.
+        # setting declares one explicitly. "auto" = the parent's lanes with the child's model.
         "fallback_providers": None,
         "base_url": "",  # direct OpenAI-compatible endpoint for subagents
         "api_key": "",  # key for delegation.base_url (falls back to OPENAI_API_KEY)
@@ -2463,12 +2467,13 @@ DEFAULT_CONFIG = {
         # Seconds to batch lifecycle_channel lines into one digest post
         # (0 = one post per line). The wake is never delayed.
         "lifecycle_digest_seconds": 0,
-        # With lifecycle_channel set: "home" (default, t_808bc8e6) posts each
-        # done / ready-for-review / blocked / changes-requested line in the
-        # card's HOME chat (its home session's origin); lifecycle_channel is
-        # the fallback, tagged [no-home] / [home-unreachable:<reason>].
-        # "channel" = every routed line to lifecycle_channel (pre-10-02).
-        "lifecycle_route": "home",
+        # With lifecycle_channel set: "channel" (default, t_eb8c6fd7, Ace
+        # 2026-10-17: receipts go to #logs) sends every done / ready-for-review
+        # / blocked line to lifecycle_channel. "home" (opt-in, t_808bc8e6)
+        # posts them, plus changes-requested, in the card's HOME chat (its
+        # home session's origin); lifecycle_channel is then the fallback,
+        # tagged [no-home] / [home-unreachable:<reason>].
+        "lifecycle_route": "channel",
         # Seconds to fold home-chat lines into one post per home chat (one
         # operator batch = one line). 0 = one post per line.
         "lifecycle_home_digest_seconds": 120,

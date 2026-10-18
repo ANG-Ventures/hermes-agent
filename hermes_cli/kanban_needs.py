@@ -130,6 +130,9 @@ class LaneRegistry:
     migrated: Tuple[str, ...] = ()
     legacy: Tuple[str, ...] = ()
     mode: str = "off"   # browsers.mode (AC-1.13 kill switch); absent = off
+    # browsers.local_ephemeral_hosts (t_2dca69d0): Linux hosts whose OWN browserd serves their workers'
+    # browser:ephemeral (ace-ai, ace-media). Absent/empty = every non-browserd worker host uses ci-box.
+    local_ephemeral: Tuple[str, ...] = ()
 
     @property
     def names(self) -> frozenset:
@@ -163,7 +166,8 @@ def load_registry_file(path: Path) -> LaneRegistry:
             if isinstance(v, list) else ()
     mode = sect.get("mode")
     return LaneRegistry(migrated=_list("migrated_lanes"), legacy=_list("legacy_allowlist"),
-                        mode=str(mode).strip().lower() if isinstance(mode, str) else "off")
+                        mode=str(mode).strip().lower() if isinstance(mode, str) else "off",
+                        local_ephemeral=_list("local_ephemeral_hosts"))
 
 
 _ORIGIN_RE = re.compile(r"^[ \t]*origin:[ \t]*([^\s·]+)", re.IGNORECASE | re.MULTILINE)

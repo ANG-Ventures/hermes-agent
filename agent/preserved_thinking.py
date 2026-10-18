@@ -20,6 +20,19 @@ resume notices) and ``agent/turn_recovery.py``'s thinking_signature 400 recovery
 replay from the latest assistant turn to every assistant turn; off by default, measured before it
 is widened.
 
+The flag is a LANE property (Ace 2026-10-17): a registered provider profile may carry
+``preserve_thinking = True`` (and ``preserve_thinking_window``); the fleet pin factory sets it on
+every a-family Anthropic-wire pin (alr/apr/apx-N). Resolution order, first decisive wins:
+
+1. ``config``: an explicit ``providers.<name>.preserve_thinking`` key, either direction. A
+   non-bool value is a decision too: off (fail closed), never a fall-through to the lane.
+2. ``lane``: the registered profile (``providers.get_provider_profile``) for a route identity has
+   ``preserve_thinking is True`` and ``api_mode == "anthropic_messages"``.
+3. ``off``.
+
+The first decision per route identity and source is logged once per process at INFO
+(``preserve_thinking: route=<id> source=<config|lane|off> ...``), so agent.log names the layer.
+
 The provider name is resolved where the agent knows it (``chat_completion_helpers``,
 ``ContextCompressor``) and threaded down as booleans, so the pure converter stays
 provider-agnostic and the config read happens once per request, not per message.
@@ -62,19 +75,38 @@ def _match_identity(identity: str, providers: Dict[str, Any]) -> Optional[Dict[s
     return None
 
 
-def _match_base_url(base_url: str, providers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """The ONE ``providers:`` entry serving ``base_url``; two entries on one endpoint is ambiguous, so off."""
+def _base_url_hit(base_url: str, providers: Dict[str, Any]) -> Optional[tuple]:
+    """``(key, entry)`` of the ONE ``providers:`` entry serving ``base_url``; two on one endpoint is ambiguous."""
     target = str(base_url or "").strip().rstrip("/").lower()
     if not target:
         return None
-    hits = [e for e in providers.values() if isinstance(e, dict)
+    hits = [(k, e) for k, e in providers.items() if isinstance(e, dict)
             and str(e.get("base_url") or e.get("url") or e.get("api") or "").strip().rstrip("/").lower() == target]
     return hits[0] if len(hits) == 1 else None
 
 
+def _match_base_url(base_url: str, providers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ONE ``providers:`` entry serving ``base_url``; two entries on one endpoint is ambiguous, so off."""
+    hit = _base_url_hit(base_url, providers)
+    return hit[1] if hit else None
+
+
+def _base_url_identity(provider: Optional[str], requested_provider: Optional[str],
+                       base_url: Optional[str]) -> Optional[str]:
+    """The ``providers:`` key a bare ``custom`` route matched by ``base_url`` (Prism 23aed6f7f612)."""
+    ids = _route_identities(provider, requested_provider)
+    if not base_url or not any(i.lower() == "custom" for i in ids):
+        return None
+    try:
+        hit = _base_url_hit(base_url, _load_providers_config())
+    except Exception:  # noqa: BLE001
+        return None
+    return str(hit[0]) if hit else None
+
+
 def _provider_entry(provider: Optional[str], requested_provider: Optional[str] = None,
-                    base_url: Optional[str] = None) -> Dict[str, Any]:
-    """Resolve the agent's route to its ``providers:`` block.
+                    base_url: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Resolve the agent's route to its ``providers:`` block (``{}`` = no block; None = unreadable).
 
     A named ``providers:`` relay does not keep its config key in ``agent.provider``: the runtime
     resolver returns ``provider="custom"`` with the key in ``requested_provider``, and other paths
@@ -98,24 +130,95 @@ def _provider_entry(provider: Optional[str], requested_provider: Optional[str] =
             entry = _match_base_url(base_url, providers)
     except Exception:  # noqa: BLE001 — an unreadable config is flag-off, never a dead turn
         logger.debug("preserve_thinking: providers config unreadable; treating as off", exc_info=True)
-        return {}
+        return None
     return entry if isinstance(entry, dict) else {}
+
+
+def _route_identities(provider: Optional[str], requested_provider: Optional[str]) -> list:
+    return [str(i).strip() for i in (requested_provider, provider) if i and str(i).strip()]
+
+
+def _lane_profile(identities: list) -> Any:
+    """The registered provider profile that declares ``preserve_thinking`` for this route, or None.
+
+    Only an Anthropic-wire profile counts: a chat_completions face (bpx/bpr) drives a genuine CLI
+    that holds its own history, so there is no signed block for the harness to strip or keep.
+    """
+    try:
+        from providers import get_provider_profile
+    except Exception:  # noqa: BLE001 — no registry is no lane, never a dead turn
+        return None
+    # A dedicated ``custom:<name>`` registration wins; the bare name is the fallback (Prism 90807bf79dbc).
+    names = []
+    for ident in identities:
+        names.append(ident)
+        if ident.lower().startswith("custom:"):
+            names.append(ident[len("custom:"):])
+    for name in names:
+        if not name or name.lower() == "custom":
+            continue
+        try:
+            profile = get_provider_profile(name)
+        except Exception:  # noqa: BLE001
+            logger.debug("preserve_thinking: provider lookup failed for %s", name, exc_info=True)
+            continue
+        if profile is None or getattr(profile, "preserve_thinking", None) is None:
+            continue
+        return profile
+    return None
+
+
+_logged_sources: set = set()
+
+
+def _log_source(route: str, source: str, enabled: bool, window: str) -> None:
+    key = (route, source)
+    if key in _logged_sources:
+        return
+    _logged_sources.add(key)
+    logger.info("preserve_thinking: route=%s source=%s enabled=%s window=%s", route, source, enabled, window)
+
+
+def resolve_preserve_thinking(provider: Optional[str], requested_provider: Optional[str] = None,
+                              base_url: Optional[str] = None) -> tuple:
+    """``(enabled, window, source)`` for a route; ``source`` is ``config`` | ``lane`` | ``off``."""
+    identities = _route_identities(provider, requested_provider)
+    entry = _provider_entry(provider, requested_provider, base_url)
+    if entry is None:  # unreadable config: fail closed, never fall through to the lane
+        enabled, window, source = False, WINDOW_LATEST, "off"
+    elif "preserve_thinking" in entry:
+        enabled = entry.get("preserve_thinking") is True
+        window = _window(entry.get("preserve_thinking_window")) if enabled else WINDOW_LATEST
+        source = "config"
+    else:
+        url_key = _base_url_identity(provider, requested_provider, base_url)
+        profile = _lane_profile(identities + ([url_key] if url_key else []))
+        enabled = (profile is not None and getattr(profile, "preserve_thinking", None) is True
+                   and getattr(profile, "api_mode", None) == "anthropic_messages")
+        if enabled:
+            window = _window(entry.get("preserve_thinking_window")
+                             or getattr(profile, "preserve_thinking_window", None))
+            source = "lane"
+        else:
+            window, source = WINDOW_LATEST, "off"
+    _log_source(identities[0] if identities else (base_url or "?"), source, enabled, window)
+    return enabled, window, source
+
+
+def _window(value: Any) -> str:
+    return value if isinstance(value, str) and value in _WINDOWS else WINDOW_LATEST
 
 
 def preserve_thinking_enabled(provider: Optional[str], requested_provider: Optional[str] = None,
                               base_url: Optional[str] = None) -> bool:
-    """``providers.<route>.preserve_thinking is True``; anything else (missing, truthy string) is off."""
-    return _provider_entry(provider, requested_provider, base_url).get("preserve_thinking") is True
+    """Config key if present (must be a real ``True``), else the lane default, else off."""
+    return resolve_preserve_thinking(provider, requested_provider, base_url)[0]
 
 
 def preserve_thinking_window(provider: Optional[str], requested_provider: Optional[str] = None,
                              base_url: Optional[str] = None) -> str:
-    """``latest`` unless the flag is on AND ``preserve_thinking_window`` is a known value."""
-    entry = _provider_entry(provider, requested_provider, base_url)
-    if entry.get("preserve_thinking") is not True:
-        return WINDOW_LATEST
-    window = entry.get("preserve_thinking_window")
-    return window if isinstance(window, str) and window in _WINDOWS else WINDOW_LATEST
+    """``latest`` unless the flag is on AND the config or lane window is a known value."""
+    return resolve_preserve_thinking(provider, requested_provider, base_url)[1]
 
 
 def strip_thinking_at_boundary(message: Dict[str, Any]) -> Dict[str, Any]:

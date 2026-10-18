@@ -108,7 +108,7 @@ def _card(conn, session=None, title="card", sub_chat=APOLLO, assignee="worker"):
     return tid
 
 
-def _run(tmp_path, monkeypatch, make, *, digest=0, home_digest=0, route=None,
+def _run(tmp_path, monkeypatch, make, *, digest=0, home_digest=0, route="home",
          discord=None, telegram=None, clock=None):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "hr.db"))
     kb.init_db()
@@ -517,3 +517,57 @@ def test_same_chat_treats_thread_equal_to_chat_as_no_thread():
     assert not hr.same_chat(home, "discord", "T2", "T2")
     assert not hr.same_chat(home, "slack", "T1", "T1")
     assert not hr.same_chat(None, "discord", "T1", "T1")
+
+
+# --- t_eb8c6fd7: the DEFAULT is `channel` (Ace 2026-10-17: receipts go to #logs) -----------------------
+
+
+def test_default_route_is_channel_and_home_is_opt_in():
+    assert hr.parse_route_mode(None) == hr.ROUTE_CHANNEL
+    assert hr.parse_route_mode("") == hr.ROUTE_CHANNEL
+    assert hr.parse_route_mode("bogus") == hr.ROUTE_CHANNEL
+    assert hr.parse_route_mode(" Home ") == hr.ROUTE_HOME
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    assert hr.parse_route_mode(DEFAULT_CONFIG["kanban"]["lifecycle_route"]) == hr.ROUTE_CHANNEL
+
+
+def test_unset_route_done_card_posts_nothing_home_one_line_to_logs(tmp_path, monkeypatch):
+    """Live config shape: lifecycle_channel set, lifecycle_route absent."""
+    def make(conn):
+        tid = _card(conn, S_APOLLO)
+        kb.complete_task(conn, tid, summary="shipped")
+        return tid
+
+    tid, ad, _ = _run(tmp_path, monkeypatch, make, route=None)
+    sent = ad[Platform.DISCORD].sent
+    assert [m["chat_id"] for m in sent] == [LOGS], "one receipt line in #logs"
+    assert not [m for m in sent if m["chat_id"] == APOLLO], "nothing in the home chat"
+    assert f"{tid} done" in sent[0]["text"] and "[no-home]" not in sent[0]["text"]
+
+
+def test_unset_route_changes_requested_still_reaches_the_human(tmp_path, monkeypatch):
+    """changes_requested is not a receipt kind: under the channel default it stays in the subscriber's chat."""
+    def make(conn):
+        tid = _card(conn, S_CC, sub_chat=APOLLO)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "changes_requested", {"reason": "fix the test", "reviewer": "apollo"})
+        return tid
+
+    _tid, ad, _ = _run(tmp_path, monkeypatch, make, route=None)
+    assert [m["chat_id"] for m in ad[Platform.DISCORD].sent if "requested" in m["text"]] == [APOLLO]
+
+
+@pytest.mark.parametrize("route", [None, "home"])
+def test_flipping_the_default_removes_no_wake(tmp_path, monkeypatch, route):
+    """A notify+wake sub is woken on a review hand-off under BOTH routes: the digest route never owns a wake."""
+    def make(conn):
+        tid = kb.create_task(conn, title="card", assignee="worker", session_id=S_APOLLO)
+        kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=APOLLO,
+                          chat_type="group", user_id="u1", delivery_mode="notify+wake")
+        kb.request_review(conn, tid, summary="PR ready", force=True)
+        return tid
+
+    tid, ad, _ = _run(tmp_path, monkeypatch, make, route=route)
+    woke = [e for e in ad[Platform.DISCORD].handled if e.source.chat_id == APOLLO]
+    assert len(woke) == 1, (route, ad[Platform.DISCORD].handled)
+    assert tid in woke[0].text

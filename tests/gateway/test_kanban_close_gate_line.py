@@ -186,7 +186,7 @@ def test_watcher_folds_an_operator_batch_into_one_home_line(tmp_path, monkeypatc
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "k.db"))
     kb.init_db()
     (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump({"kanban": {
-        "lifecycle_channel": "telegram:logs", "lifecycle_home_digest_seconds": 120}}))
+        "lifecycle_channel": "telegram:logs", "lifecycle_route": "home", "lifecycle_home_digest_seconds": 120}}))
     sid = "20260924_121319_4865b4f3"
     monkeypatch.setattr(hr, "read_session_row", lambda s: {
         "origin_json": json.dumps({"platform": "telegram", "chat_id": "home", "chat_type": "group"}),

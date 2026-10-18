@@ -28,9 +28,10 @@ from gateway.config import (
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR)
 from gateway.response_filters import (
-    is_autonomous_silence_response as _is_autonomous_silence_response,
     is_intentional_silence_response as _is_intentional_silence_response,
+    is_internal_silence_response as _is_internal_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker,
+    strip_internal_silence_marker_lines as _strip_internal_silence_marker_lines,
     strip_trailing_silence_marker as _strip_trailing_silence_marker)
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
@@ -78,9 +79,12 @@ class StreamConsumerConfig:
     chat_type: str = ""  # originating chat type; gates platform-specific drafts
     # True when the turn was triggered by an internal gateway event (background-process
     # completion, restore replay) rather than a human.  Such turns resolve silence with the
-    # autonomous rule (is_autonomous_silence_response) and hold mid-stream previews until the
+    # internal rule (is_internal_silence_response) and hold mid-stream previews until the
     # final text is known.  Human turns are unaffected.
     internal_event: bool = False
+    # display.internal_silence_short_note_words for the internal rule; None reads the gateway
+    # config.  The gateway passes the turn's value so the consumer and the final-send filter agree.
+    internal_short_note_words: Optional[int] = None
     # Drop a silence marker alone on the last line of the completed turn (``note\nNO_REPLY``
     # delivered under the exact-marker rule).  Set by the gateway for chat surfaces only; raw-text
     # surfaces (api_server, webhook, local) keep the token.  Applied to the whole turn, never per chunk.
@@ -615,10 +619,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     # A bare intentional-silence marker (NO_REPLY / [SILENT]): the
                     # gateway's whole-response filter runs too late for a streamed
                     # preview, so retract it here instead of finalizing.
-                    # Internal-event turns use the autonomous rule (marker on its own
-                    # first/last line), human turns the exact rule.
-                    _silence_fn = (_is_autonomous_silence_response if self.cfg.internal_event
-                                   else _is_intentional_silence_response)
+                    # Internal-event turns use the internal rule (marker on its own
+                    # first/last line beside at most a short note), human turns the exact rule.
+                    _silence_fn = self._silence_predicate()
                     if _silence_fn(self._clean_for_display(self._accumulated)):
                         self._internal_held = []
                         await self._suppress_silence_marker()
@@ -1072,9 +1075,18 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """
         return _BasePlatformAdapter.strip_media_directives_for_display(text)
 
+    def _silence_predicate(self):
+        if not self.cfg.internal_event:
+            return _is_intentional_silence_response
+        words = self.cfg.internal_short_note_words
+        return lambda text: _is_internal_silence_response(text, words)
+
     def _final_marker_strip(self, text: str) -> str:
-        """Apply the turn-final trailing-marker strip when this surface wants it."""
+        """Apply the turn-final marker strip when this surface wants it.  An internal turn that is
+        delivered drops its marker lines at either end (same strip as the gateway's final send)."""
         if self.cfg.strip_trailing_silence_marker:
+            if self.cfg.internal_event:
+                text = _strip_internal_silence_marker_lines(text)
             return _strip_trailing_silence_marker(text)
         return text
 
@@ -1090,6 +1102,15 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """
         if not self.cfg.strip_trailing_silence_marker:
             return
+        if (self.cfg.internal_event and not self._turn_split_delivery
+                and self._message_id is None and not self._native_stream_opened):
+            # Internal turns hold every preview, so nothing is on screen yet and the whole turn is
+            # still the live tail: drop a leading marker line too.
+            kept = _strip_internal_silence_marker_lines(self._accumulated)
+            if kept != self._accumulated:
+                self._accumulated = kept
+                if self._stream_ledger:
+                    self._stream_ledger = _strip_internal_silence_marker_lines(self._stream_ledger)
         full = (self._stream_ledger or self._accumulated).rstrip()
         stripped = _strip_trailing_silence_marker(full)
         if stripped == full:

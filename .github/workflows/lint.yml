@@ -252,6 +252,12 @@ jobs:
       - name: Forbid gateway service-definition writers that bypass the ownership chokepoint
         run: python scripts/check_service_definition_writers.py
 
+      # A kanban route entry (_route_row / origin_route / clear_lost_state) can spawn or MUTATE a card, so the
+      # fleet pause hold decides before every one of them; a new entry without the hold is red (t_133d6efd,
+      # Prism 76b7233abe29: origin_route cleared a paused card's origin before the post-route hold saw it).
+      - name: Forbid kanban route entries that bypass the fleet pause hold
+        run: python scripts/check_pause_hold_route_entries.py --selftest && python scripts/check_pause_hold_route_entries.py
+
       # The OS lanes import only files carrying the matching marker, so a test that fakes
       # macOS (is_macos -> True, sys.platform -> "darwin") without `platforms("macos")` is green on
       # Linux over a faked branch and never runs on macOS (#111866, AGENTS.md § Don't fake the host OS).

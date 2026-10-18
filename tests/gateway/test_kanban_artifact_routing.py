@@ -83,7 +83,7 @@ async def _tick(monkeypatch, runner):
     await runner._kanban_notifier_watcher(interval=1)
 
 
-def _run(tmp_path, monkeypatch, session, *, channel=True, home_digest=0, route=None,
+def _run(tmp_path, monkeypatch, session, *, channel=True, home_digest=0, route="home",
          adapter=None):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "art.db"))
     kb.init_db()

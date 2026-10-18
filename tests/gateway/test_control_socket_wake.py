@@ -458,6 +458,52 @@ def test_wake_downgraded_under_host_contention(store, tmp_path):
     assert adapter.handled == []
 
 
+def _host_loaded_gate(tmp_path, proc_paused=False):
+    from hermes_cli.kanban_wake_gate import WakeGate
+
+    gate = WakeGate(
+        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48}}},
+        ncpu=32, loadavg=lambda: (71.0, 70.0, 60.0), lane_probe=lambda p: None,
+        state_file=tmp_path / "wake_gate.json",
+    )
+    gate.dispatcher_proc_paused = lambda: "dispatcher proc_paused" if proc_paused else None
+    return gate
+
+
+def test_human_owner_wake_is_not_downgraded_by_host_load_alone(store, tmp_path):
+    """t_b0f092ba: the review deadman wakes a human:* owner's session. Like the
+    notifier's human-owned wakes (t_b7b31563), load1 alone does not downgrade
+    it; the turn runs."""
+    _human_turn(store)
+    adapter = RecordingAdapter()
+    runner = _runner(store, adapter)
+    runner._kanban_wake_gate = _host_loaded_gate(tmp_path)
+    result = asyncio.run(runner._deliver_control_wake(_params(human_owner=True)))
+    assert result["delivered"] is True, result
+    assert len(adapter.handled) == 1
+
+
+def test_human_owner_wake_still_downgraded_when_dispatcher_proc_paused(store, tmp_path):
+    _human_turn(store)
+    adapter = RecordingAdapter()
+    runner = _runner(store, adapter)
+    runner._kanban_wake_gate = _host_loaded_gate(tmp_path, proc_paused=True)
+    result = asyncio.run(runner._deliver_control_wake(_params(human_owner=True)))
+    assert result["downgraded"] == "dispatcher proc_paused", result
+    assert adapter.handled == []
+
+
+def test_human_owner_must_be_literal_true(store, tmp_path):
+    """A truthy non-bool (\"yes\") never relaxes the gate."""
+    _human_turn(store)
+    adapter = RecordingAdapter()
+    runner = _runner(store, adapter)
+    runner._kanban_wake_gate = _host_loaded_gate(tmp_path)
+    result = asyncio.run(runner._deliver_control_wake(_params(human_owner="yes")))
+    assert result["downgraded"] == "host load 71", result
+    assert adapter.handled == []
+
+
 def _lane_gate(tmp_path, capped_profile):
     from hermes_cli.kanban_wake_gate import WakeGate
 

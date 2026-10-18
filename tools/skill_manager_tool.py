@@ -515,10 +515,85 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
     return (None, guard) if guard else (skill_dir, None)
 
 
+def _load_tier_module(root: Path):
+    """The Hermes root's tier reader (``<root>/scripts/lib/autocommit_tier.py``), or None when absent
+    (the caller decides what absence means); a present-but-broken module raises."""
+    import importlib.util
+    path = root / "scripts" / "lib" / "autocommit_tier.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("_hermes_autocommit_tier", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _exec_tier_refusal(skill_dir: Path, target: Path, action: str) -> Optional[Dict[str, Any]]:
+    """Refuse a write/delete of an exec-tier file inside the live shared skills tree.
+
+    Exec tier = the root's ``scripts/lib/autocommit-tier.json`` globs (read through its one reader),
+    matched against the path relative to the Hermes root and relative to the skill (so a skill's own
+    ``scripts/**`` counts). No op argument escapes it: such a change goes through a worktree + PR."""
+    shared = _shared_skills_root()
+    try:
+        shared_r, target_r = shared.resolve(), target.resolve()
+    except OSError:
+        shared_r, target_r = shared, target
+    # Both the REQUESTED path and its resolved destination are classified: a contained symlink
+    # (scripts/x.sh -> ../references/x.md) must not launder an exec-named path into prose.
+    pairs = [(t, s) for t, s in ((target, shared), (target_r, shared_r)) if _is_within(t, s)]
+    if not pairs:
+        return None
+    root = shared.parent  # unresolved: a symlinked skills-shared/ still reads the root's table
+    rel_root = f"{shared.name}/{pairs[0][0].relative_to(pairs[0][1]).as_posix()}"
+    if _is_within(target, shared) and not _is_within(target_r, shared_r):
+        # A write through it lands on whatever the link points at (a live exec file outside the tree).
+        logger.warning("LIVE-EDIT refused skill_manage %s %s: symlink escapes to %s", action, rel_root,
+                       target_r)
+        return _err(f"skill_manage refuses {action} on '{rel_root}': the symlink escapes the skills tree "
+                    f"(resolves to {target_r}). Edit the real file in a worktree of its repo and open a PR.")
+    try:
+        tier = _load_tier_module(root)
+        if tier is None:
+            if not shared.is_dir():  # true vanilla install: no shared tree, no tier table
+                return None
+            logger.warning("LIVE-EDIT refused skill_manage %s %s: tier reader missing under %s",
+                           action, rel_root, root)
+            return _err(f"skill_manage refuses {action} on '{rel_root}': tier reader missing "
+                        f"({root / 'scripts' / 'lib' / 'autocommit_tier.py'}); fix the deploy or use a "
+                        "worktree + PR.")
+        rules = tier.load()
+        cands = {f"{shared.name}/{t.relative_to(s).as_posix()}" for t, s in pairs}
+        root_r = root.resolve()
+        if _is_within(target_r, root_r):  # the resolved path, as the ROOT's table names it
+            cands.add(target_r.relative_to(root_r).as_posix())
+        for t, sd in ((target, skill_dir), (target_r, skill_dir.resolve())):
+            if _is_within(t, sd):
+                cands.add(t.relative_to(sd).as_posix())
+        is_exec = any(tier.tier(p, rules) == "exec" for p in cands)
+    except Exception as e:  # a broken tier table never waves code through (the reader's own rule)
+        return _err(f"skill_manage refuses {action} on {target}: the exec-tier table under {root} is "
+                    f"unreadable ({type(e).__name__}: {e}); fix the table, or make the change in a "
+                    "worktree + PR.")
+    if not is_exec:
+        return None
+    logger.warning("LIVE-EDIT refused skill_manage %s %s", action, rel_root)
+    return _err(
+        f"skill_manage refuses {action} on '{rel_root}': it is an exec-tier (code) file inside the live "
+        "skills-shared/ tree, and code never reaches the live tree through a tool write. Exits: make the "
+        "change in a worktree of the repo and open a PR; for an edit already sitting on the live tree, "
+        f"run `autocommit-hermes-home.sh drain-pr --code {rel_root}`. No skill_manage argument "
+        "(local included) bypasses this.")
+
+
 def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label: str,
                    content: str) -> Optional[Dict[str, Any]]:
     """Read-before-write guard (existing targets only), atomic write, then the security scan;
     a blocked scan restores the original (or unlinks a new file). Error dict or None."""
+    if refusal := _exec_tier_refusal(skill_dir, target, action):
+        return refusal
     original = None
     if target.exists():
         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
@@ -789,6 +864,8 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     target, err = _resolve_supporting_file(skill_dir, file_path)
     if err:
         return err
+    if refusal := _exec_tier_refusal(skill_dir, target, "remove_file"):
+        return refusal
     if not target.exists():  # list what IS there so the model can pick the right path
         available = [str(f.relative_to(skill_dir)) for subdir in ALLOWED_SUBDIRS
                      if (skill_dir / subdir).exists() for f in (skill_dir / subdir).rglob("*") if f.is_file()]

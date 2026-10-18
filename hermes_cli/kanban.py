@@ -38,10 +38,12 @@ from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
 from hermes_cli import kanban_verb_input as kvi
+from hermes_cli.kanban_close_on_guard import check_comment as check_close_on_comment
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
 from hermes_cli.kanban_open_pr import ClosedUnmergedPrError, RoutedPrOpenError
+from hermes_cli.kanban_supersede_content import SupersededContentError
 from hermes_cli.kanban_receipt import EXIT_NO_RECEIPT, ReceiptRequiredError
 from hermes_cli.kanban_handback_head import StaleHandbackHeadError
 from hermes_cli.kanban_identity import safe_comment_provenance
@@ -2776,6 +2778,18 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_pause_hold as kph
+    try:
+        return _cmd_claim_unheld(args)
+    except kph.PauseHeld as exc:
+        # Fleet pause layer 2 (t_133d6efd): the opener refused before the CAS; nothing was written.
+        with kb.connect_closing() as conn:
+            kph.record_refusal(conn, exc)
+        return _err(f"cannot claim {args.task_id}: held by fleet-pause {exc.manifest_id} (host {exc.host}): "
+                    "resume or abandon first", rc=2)
+
+
+def _cmd_claim_unheld(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if args.review:
             session_ref = _operator_review_session_ref()
@@ -2852,6 +2866,15 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author, claimed = _comment_author(args.author)
+    from hermes_cli.kanban_identity import is_operator_label
+
+    if claimed is not None and is_operator_label(claimed):
+        # A silent downgrade exited 0 while every operator-trust reader
+        # ignored the row (182 in 24 h, t_6572add1): refuse, write nothing.
+        token_file = str(kb.operator_token_path()).replace(str(Path.home()), "~", 1)
+        return _err(
+            f"--author {claimed} needs {kb.OPERATOR_TOKEN_ENV}=$(cat {token_file}); not posted"
+        )
     if claimed is not None:
         print(
             f"kanban: --author {claimed!r} needs the operator token "
@@ -3259,7 +3282,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
             except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, RoutedPrOpenError,
-                    StaleHandbackHeadError) as draft_err:
+                    StaleHandbackHeadError, SupersededContentError) as draft_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
@@ -3468,6 +3491,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
         except ValueError:
             return _err(f"invalid --until {args.until!r} (+<N>[smhd], epoch seconds or ISO-8601)")
     author = _profile_author()
+    if reason:
+        # Before the transition: the BLOCKED comment is written after it lands (t_ebc8eb87).
+        check_close_on_comment(author, f"BLOCKED: {reason}")
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
     failed: list[str] = []
@@ -3532,6 +3558,9 @@ def _parse_wake_at(value: str) -> int:
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     author = _profile_author()
+    if reason:
+        # Before the transition: the SCHEDULED comment is written after it lands (t_ebc8eb87).
+        check_close_on_comment(author, f"SCHEDULED: {reason}")
     ids = _bulk_ids(args)
     wake_at: Optional[int] = None
     if getattr(args, "now", False):
@@ -3796,6 +3825,13 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
         # The caller must hold the review run: as its dispatcher-owned worker,
         # or as the operator session that made ``claim --review`` (human lane).
         worker_run = _worker_run_id_for(tid)
+        sendback_body = (
+            f"changes requested (operator send-back, {operator}): "
+            if operator else "changes requested (human review lane): "
+        ) + str(kb.redact_review_value(reason))
+        if worker_run is None:
+            # Before any write: the human-lane mirror comment lands after the transition (t_ebc8eb87).
+            check_close_on_comment(_profile_author(), sendback_body)
         if operator is not None and worker_run is not None:
             # A dispatched reviewer run always carries full coverage.
             print(
@@ -3878,12 +3914,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             # carries it too).
             _unused_run, session_ref = safe_comment_provenance(tid)
             kb.add_comment(
-                conn, tid, _profile_author(),
-                (
-                    f"changes requested (operator send-back, {operator}): "
-                    if operator else "changes requested (human review lane): "
-                )
-                + str(kb.redact_review_value(reason)),
+                conn, tid, _profile_author(), sendback_body,
                 run_id=(
                     held_run if held_run is not None
                     else getattr(kb.latest_run(conn, tid), "id", None)

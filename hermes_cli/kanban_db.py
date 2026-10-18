@@ -7916,6 +7916,10 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    # The one place every comment writer shares, so the body is exact (t_ebc8eb87).
+    from hermes_cli.kanban_close_on_guard import check_comment
+
+    check_comment(author, body)
     if claimed_author is not None:
         if not isinstance(claimed_author, str) or not claimed_author.strip():
             raise ValueError("claimed_author must be a non-empty string")
@@ -8213,6 +8217,11 @@ def _insert_comment(
     opens its own txn and emits ``commented``). Still attributable: provenance
     resolves best-effort via :func:`_inline_comment_provenance` (NULL/NULL
     renders as ``provenance unknown``, never a guess)."""
+    # Same release-line guard as add_comment (t_80c7e5b9). Today's callers post fixed
+    # templates; a raise here aborts the caller's txn rather than storing a bad gate.
+    from hermes_cli.kanban_close_on_guard import check_comment
+
+    check_comment(author, body)
     run_id, session_ref = _inline_comment_provenance(task_id)
     conn.execute(
         "INSERT INTO task_comments (task_id, author, body, run_id, session_ref, created_at) "
@@ -8741,7 +8750,10 @@ def _claim_and_open_run(
     *, event_extra: Optional[dict] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
+    when the CAS lost. Caller holds the txn. Raises ``PauseHeld`` (no write) for
+    a card whose origin host is paused (fleet pause layer 2, t_133d6efd)."""
+    from hermes_cli.kanban_pause_hold import refuse_if_held
+    refuse_if_held(conn, task_id)
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -9288,8 +9300,11 @@ def _open_review_run(
     Shared by :func:`claim_review_task` (dispatched reviewer) and the
     reviewer send-back in :func:`request_changes`, so both leave the same
     ``claimed(source_status=review)`` audit shape. Returns the new run id,
-    or None when the card is no longer an unclaimed ``review`` card.
+    or None when the card is no longer an unclaimed ``review`` card. Raises
+    ``PauseHeld`` (no write) for a paused host's card (t_133d6efd).
     """
+    from hermes_cli.kanban_pause_hold import refuse_if_held
+    refuse_if_held(conn, task_id)
     cur = conn.execute(
         """
         UPDATE tasks
@@ -10367,6 +10382,40 @@ def _enforce_routed_pr_survivor(
     raise _open_pr.RoutedPrOpenError(task_id, opened, unverified, blank_reason=blank)
 
 
+def _enforce_superseded_content(
+    conn: sqlite3.Connection, task_id: str, superseded_by: Optional[str], *,
+    metadata: Optional[dict], survivor_pr, texts=(),
+) -> list:
+    """A SHA superseder must carry the card's own PR content (t_8035c8af).
+
+    Ancestry alone let a commit that was merely ON main stand in for a PR whose
+    content was not (hermes-home#4729 09:47). Every SHA the closed-unmerged
+    gate would accept is checked here: ``--superseded-by`` and each
+    ``SUPERSEDED-BY <sha>`` / ``RE-CARRIED-AS <sha>`` token in ``texts``
+    (result + summary; Prism abd009e5ca09 / 37e57666a117). For each of the
+    card's own fleet PRs, the PR's added lines must be present at the sha or on
+    the default branch, else :class:`kanban_supersede_content.SupersededContentError`
+    names the files that differ (audited, no mutation). The returned refs are
+    the survivor evidence :func:`kanban_survivor.preserve` records in place of
+    a separately bound ``--survivor-ref``.
+    """
+    from hermes_cli import kanban_open_pr as _open_pr
+    from hermes_cli import kanban_supersede_content as _content
+    shas = list(dict.fromkeys(_content.supersede_shas(superseded_by)
+                              + _content.token_shas(*texts)))
+    if not shas:
+        return []
+    prs = _open_pr.split_fleet(_open_pr.extract_pr_refs(
+        *_card_recorded_pr_refs(conn, task_id), metadata=metadata, survivor_pr=survivor_pr))[0]
+    try:
+        return _content.verify(task_id, prs, shas)
+    except _content.SupersededContentError as err:
+        with write_txn(conn):
+            _append_event(conn, task_id, "completion_blocked_superseded_content",
+                          {"differs": err.differs, "unverified": err.unverified, "shas": shas})
+        raise
+
+
 @_home_session_guarded("complete")
 def complete_task(
     conn: sqlite3.Connection,
@@ -10795,6 +10844,11 @@ def complete_task(
     # SUPERSEDED-BY / RE-CARRIED-AS token naming merged work for that PR; an
     # unreadable lookup refuses too. Every completion is gated, including a
     # reviewer approving a card parked in review. Raises before any mutation.
+    content_survivors = _enforce_superseded_content(
+        conn, task_id, superseded_by, metadata=metadata, survivor_pr=survivor_pr,
+        texts=(result, summary))
+    if content_survivors:
+        metadata = dict(metadata or {}, superseded_content=content_survivors)
     try:
         _open_pr.enforce_not_closed_unmerged(
             task_id, result, summary, metadata=metadata,
@@ -10820,6 +10874,7 @@ def complete_task(
         survivor_unbound=survivor_unbound,
         survivor_none=survivor_none, survivor_reason=survivor_reason,
         evidence=[t for t in (summary, result) if t],
+        content_survivor=content_survivors[0] if content_survivors else None,
     )
     if survivor:
         metadata = dict(metadata or {}, survivor=survivor)
@@ -13915,6 +13970,9 @@ def _operator_send_back_refusal(task_id: str, reason: str) -> Optional[str]:
     return None
 
 
+from hermes_cli.kanban_pause_hold import PauseHeld  # noqa: E402  (fleet pause layer 2, t_133d6efd)
+
+
 class _SendBackRefused(Exception):
     """Roll back a send-back's own review claim when the handoff is refused."""
 
@@ -14004,6 +14062,13 @@ def request_changes(
             return False, coverage_error
     coverage_body = f"review_coverage: {coverage_text}" if coverage_text else None
     comment_author = str(claimer or "reviewer").strip() or "reviewer"
+    if coverage_body is not None:
+        # Inline INSERT below bypasses add_comment's release-line guard: check before any write (t_80c7e5b9).
+        from hermes_cli.kanban_close_on_guard import refusal as _close_on_refusal
+
+        close_on_error = _close_on_refusal(comment_author, coverage_body)
+        if close_on_error:
+            return False, close_on_error
 
     opened: list[int] = []
     posted: list[tuple[int, int, int]] = []  # (comment_id, run_id, created_at)
@@ -14154,6 +14219,11 @@ def request_changes(
                 raise _SendBackRefused(detail)
     except _SendBackRefused as exc:
         return False, exc.detail
+    except PauseHeld as exc:
+        # Fleet pause layer 2 (t_133d6efd): the review card stays ``review``, held.
+        from hermes_cli.kanban_pause_hold import record_refusal
+        record_refusal(conn, exc, stage="request_changes")
+        return False, f"{exc}: resume or abandon the pause first"
     # Journal the committed coverage comment (add_comment's content hook),
     # only after commit so a rolled-back send-back journals nothing.
     for comment_id, comment_run_id, created_at in posted:
@@ -14848,6 +14918,13 @@ def triage_resolve_task(
     reason = (reason or "").strip()
     if not reason:
         return False, "a reason is required (this is a human-in-the-loop decision)"
+    if actor and actor.strip():
+        # The TRIAGE-RESOLVE comment is an inline INSERT (no add_comment guard): check before any write (t_80c7e5b9).
+        from hermes_cli.kanban_close_on_guard import refusal as _close_on_refusal
+
+        close_on_error = _close_on_refusal(actor.strip(), f"TRIAGE-RESOLVE -> {to}: {reason}")
+        if close_on_error:
+            return False, close_on_error
 
     now = int(time.time())
     with write_txn(conn):
@@ -14966,6 +15043,9 @@ def _archive_closed_pr_gate(conn: sqlite3.Connection, task_id: str, query_fn=Non
         return
     texts: list = [task.result] + [run.summary for run in runs]
     comments = [c.body for c in list_comments(conn, task_id)]
+    # Prism a3069816b211: archive accepted a SHA superseder on ancestry alone. The same content gate as
+    # complete_task runs over every SHA token the closed-unmerged gate below would accept.
+    _enforce_superseded_content(conn, task_id, None, metadata=None, survivor_pr=None, texts=texts)
     try:
         _open_pr.enforce_not_closed_unmerged(
             task_id, *texts, recorded=urls,

@@ -939,5 +939,26 @@
       "gateway",
       "cron"
     ]
+  },
+  {
+    "feature": "delegation fallback_providers: auto / pinned-child chain contract",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_delegation_fallback_contract.py"
+    ],
+    "paths": [
+      "tools/delegate_tool_config.py",
+      "hermes_cli/fallback_config.py",
+      "hermes_cli/config.py",
+      "hermes_cli/config_defaults.py"
+    ],
+    "why": "Measured 2026-10-16: a subagent pinned by delegation.model got NO fallback chain (pinned children never borrow the parent's), so one lane outage failed every pinned child. #2043 (t_3b6cc34b) added delegation.fallback_providers: auto, resolved per spawn in _resolve_child_fallback_chain: unpinned child -> parent chain verbatim; pinned child -> parent lanes re-aimed at the child's model via fallback_config.remodel_chain_for_child (same-vendor rungs only, cross-vendor terminal rung kept, child's own route dropped, deduped); empty parent chain -> None + one WARNING; validate_config_structure refuses any other scalar without echoing it. Parity-merge risk: tools/delegate_tool_config.py is an upstream-refactored file (c47bf78d68 fallback refactor); a merge that takes upstream's resolver drops the is_auto_chain branch while every upstream test stays green, and 'auto' then silently reads as 'no usable routes'. The canary (D1-D8) drives _build_child_agent end to end and pins the absent/list/[]/auto table plus the validator; when upstream rewrites _resolve_child_fallback_chain, re-thread is_auto_chain/remodel_chain_for_child before taking the merge.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "cron"
+    ]
   }
 ]

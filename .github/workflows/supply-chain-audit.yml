@@ -181,7 +181,7 @@ jobs:
     name: Check PyPI dependency upper bounds
     if: inputs.deps
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    timeout-minutes: 15
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     outputs:
       review_status: ${{ steps.emit-status.outputs.review_status }}
     steps:
@@ -260,7 +260,7 @@ jobs:
     needs: [scan, dep-bounds]
     if: always()
     runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
-    timeout-minutes: 15
+    timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     outputs:
       review_status: ${{ steps.merge.outputs.review_status }}
       critical_findings: ${{ steps.merge.outputs.critical_findings }}

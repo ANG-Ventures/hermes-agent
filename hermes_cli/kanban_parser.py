@@ -578,7 +578,9 @@ _SPECS = [
              help="Evidence pointer for a card whose premise was already satisfied elsewhere. "
                   "Closes it done with outcome 'superseded'; no --result/--summary required, "
                   "but the pointer must be non-empty (an unnamed supersede is a silent delete "
-                  "of the work)."),
+                  "of the work). A SHA is verified against the card's own PR: every file's "
+                  "added lines must be at that SHA or on the default branch, and a pass is "
+                  "the survivor evidence (no --survivor-ref needed)."),
         _arg("--external", metavar="URL",
              help="Terminal close for a card whose remaining step is an outside party's (an "
                   "upstream maintainer merge): closes it done with outcome 'external', no "

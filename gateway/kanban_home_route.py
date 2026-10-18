@@ -1,18 +1,27 @@
-"""Route kanban lifecycle lines to the card's HOME channel (t_808bc8e6).
+"""Route kanban lifecycle lines: receipts to ``kanban.lifecycle_channel`` by default; HOME chat opt-in.
 
-Ace ruling 2026-10-02 17:30: a done / ready-for-review / blocked / changes-requested
-line about a card goes to the channel the card was born in (its home session's
-origin chat), not to ``kanban.lifecycle_channel`` (#logs). #logs is the fallback,
-used only when the card has no resolvable home, with a one-word tag naming why:
+DEFAULT ``channel`` (t_eb8c6fd7, Ace ruling 2026-10-17 00:12, superseding 2026-10-02):
+"I don't really want to hear about things that don't need me." A done /
+ready-for-review / blocked line is a receipt, so it goes to the lifecycle channel
+(#logs). What needs a human is not this module's job: a review_requested hand-off
+wakes the owner (gateway/kanban_owner_wake.py, the notifier's own wake), and a
+changes_requested line stays in the subscriber's chat (it is not a receipt kind).
+The routing rule: an instruction to Apollo WAKES Apollo; only asks of Ace and loud
+fails reach the chat; receipts go to #logs.
+
+OPT-IN ``kanban.lifecycle_route: home`` (t_808bc8e6, Ace ruling 2026-10-02 17:30):
+a done / ready-for-review / blocked / changes-requested line about a card goes to
+the channel the card was born in (its home session's origin chat), not to
+``kanban.lifecycle_channel`` (#logs). #logs is the fallback, used only when the
+card has no resolvable home, with a one-word tag naming why:
 
 * ``[no-home]``                     no session, an ``operator:`` pseudo-session, an
                                     unknown session, or a session with no chat
 * ``[home-unreachable:<reason>]``   the gateway has no adapter for the home's
                                     platform, or the send to the home failed
 
-``kanban.lifecycle_route: channel`` restores the old behaviour (every routed
-line to ``lifecycle_channel``). With ``lifecycle_channel`` unset nothing here
-runs: lines stay in the subscriber's chat, as before.
+With ``lifecycle_channel`` unset nothing here runs: lines stay in the
+subscriber's chat, as before.
 """
 from __future__ import annotations
 
@@ -213,8 +222,9 @@ def format_for_platform(platform: str, text: str) -> str:
 
 
 def parse_route_mode(value: Any) -> str:
+    """``home`` only when asked for; anything else (unset included) is ``channel`` (10-17 ruling)."""
     v = str(value or "").strip().lower()
-    return ROUTE_CHANNEL if v == ROUTE_CHANNEL else ROUTE_HOME
+    return ROUTE_HOME if v == ROUTE_HOME else ROUTE_CHANNEL
 
 
 def resolve_route_config() -> tuple[str, int]:
