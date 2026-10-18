@@ -42,12 +42,23 @@ def _mk_big_skill(root: Path, group: str, name: str, kb: int = 140) -> Path:
     return d
 
 
+# A fleet-shaped root always deploys the exec-tier reader; a skills-shared/ tree without it is a broken
+# deploy that skill_manage refuses (t_e5af9a95). This stub classifies everything as prose.
+_TIER_STUB = "def load():\n    return []\ndef tier(path, rules):\n    return 'prose'\n"
+
+
+def _plant_tier_reader(root):
+    (root / "scripts" / "lib").mkdir(parents=True, exist_ok=True)
+    (root / "scripts" / "lib" / "autocommit_tier.py").write_text(_TIER_STUB)
+
+
 @pytest.fixture
 def orch_env(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     (home / "skills").mkdir(parents=True)
     shared = home / "skills-shared"
     (shared / "smart-home").mkdir(parents=True)
+    _plant_tier_reader(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
