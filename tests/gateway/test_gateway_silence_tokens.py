@@ -333,13 +333,17 @@ async def test_prose_mentioning_silence_token_is_delivered(monkeypatch, tmp_path
 
 # --------------------------------------------------------------------------
 # Internal-event turns (bg-process completions, restore replays) resolve
-# silence with the autonomous rule; human turns stay exact-marker.
+# silence with the internal rule: a marker on its own line silences a short
+# one-line note; a longer reply is delivered without the marker (t_bb4059d2).
+# Human turns stay exact-marker.
 # --------------------------------------------------------------------------
 
 _NOTE_THEN_MARKER = (
     "That's the #176 CI watch confirming green — already merged on that "
     "result. No new information.\n\nNO_REPLY"
 )
+_NOTE_STRIPPED = _NOTE_THEN_MARKER.rsplit("\n\nNO_REPLY", 1)[0]
+_SHORT_NOTE_THEN_MARKER = "Already reported.\nNO_REPLY"
 
 
 def _internal_event():
@@ -365,19 +369,59 @@ def _agent_result(text, *, failed=False):
     }
 
 
-def test_internal_flag_selects_autonomous_rule_and_failure_still_wins():
+def test_internal_flag_selects_internal_rule_and_failure_still_wins():
     ok = {"failed": False}
-    assert is_intentional_silence_agent_result(ok, _NOTE_THEN_MARKER, internal=True)
-    assert not is_intentional_silence_agent_result(ok, _NOTE_THEN_MARKER)
+    assert is_intentional_silence_agent_result(ok, _SHORT_NOTE_THEN_MARKER, internal=True)
+    assert not is_intentional_silence_agent_result(ok, _SHORT_NOTE_THEN_MARKER)
     assert not is_intentional_silence_agent_result(
-        {"failed": True}, _NOTE_THEN_MARKER, internal=True,
+        {"failed": True}, _SHORT_NOTE_THEN_MARKER, internal=True,
     )
     # Exact markers are silence under both rules.
     assert is_intentional_silence_agent_result(ok, "NO_REPLY", internal=True)
 
 
 @pytest.mark.asyncio
-async def test_internal_event_note_plus_marker_is_suppressed(monkeypatch, tmp_path):
+async def test_internal_event_short_note_plus_marker_is_suppressed(monkeypatch, tmp_path, caplog):
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value=_agent_result(_SHORT_NOTE_THEN_MARKER))
+
+    with caplog.at_level("INFO"):
+        response = await runner._handle_message_with_agent(
+            _internal_event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+        )
+
+    assert response == ""
+    assert any("silence marker suppressed an 2-word note" in r.getMessage() for r in caplog.records)
+    # Transcript still records the assistant turn (delivery-only decision).
+    appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
+    assert appended[-1].get("content") == _SHORT_NOTE_THEN_MARKER
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker_first", [False, True], ids=["marker-last", "marker-first"])
+async def test_internal_event_long_reply_with_marker_is_delivered_without_it(
+        monkeypatch, tmp_path, caplog, marker_first):
+    """t_bb4059d2: "<summary>\\n\\nNO_REPLY" on a kanban/bg wake meant "post this"; the
+    loose rule swallowed it (555 replies in 7 days).  The summary goes out, the token does not."""
+    runner = _runner(monkeypatch, tmp_path)
+    raw = ("NO_REPLY\n\n" + _NOTE_STRIPPED) if marker_first else _NOTE_THEN_MARKER
+    runner._run_agent = AsyncMock(return_value=_agent_result(raw))
+
+    with caplog.at_level("INFO"):
+        response = await runner._handle_message_with_agent(
+            _internal_event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+        )
+
+    assert response == _NOTE_STRIPPED
+    assert any("silence marker on a long internal reply: delivering 15 words" in r.getMessage()
+               for r in caplog.records)
+    appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
+    assert appended[-1].get("content") == raw
+
+
+@pytest.mark.asyncio
+async def test_internal_short_note_words_zero_restores_the_loose_rule(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("display:\n  internal_silence_short_note_words: 0\n")
     runner = _runner(monkeypatch, tmp_path)
     runner._run_agent = AsyncMock(return_value=_agent_result(_NOTE_THEN_MARKER))
 
@@ -386,9 +430,6 @@ async def test_internal_event_note_plus_marker_is_suppressed(monkeypatch, tmp_pa
     )
 
     assert response == ""
-    # Transcript still records the assistant turn (delivery-only decision).
-    appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
-    assert appended[-1].get("content") == _NOTE_THEN_MARKER
 
 
 @pytest.mark.asyncio
@@ -574,8 +615,9 @@ def _kanban_digest_event(*, internal):
 
 
 @pytest.mark.asyncio
-async def test_internal_kanban_digest_note_plus_marker_is_suppressed(monkeypatch, tmp_path):
-    """The notifier's own wake (gateway/wake.py, internal=True): silence."""
+async def test_internal_kanban_digest_long_note_plus_marker_is_delivered(monkeypatch, tmp_path):
+    """The notifier's own wake (gateway/wake.py, internal=True): a 19-word note beside the
+    marker is a report, not an "already handled" line, so it is delivered without the token."""
     runner = _runner(monkeypatch, tmp_path)
     runner._run_agent = AsyncMock(return_value=_agent_result(_KANBAN_DIGEST_NOTE))
 
@@ -584,7 +626,7 @@ async def test_internal_kanban_digest_note_plus_marker_is_suppressed(monkeypatch
         "agent:main:telegram:group:-1001:12345", 1,
     )
 
-    assert response == ""
+    assert response == _KANBAN_DIGEST_NOTE_STRIPPED
 
 
 @pytest.mark.asyncio

@@ -2930,7 +2930,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
 # Appended to every agent-facing background-completion turn. These arrive as
 # internal events, whose replies the gateway drops when NO_REPLY
 # (gateway/response_filters.SILENT_REPLY_TOKEN) is the whole reply or sits on its
-# own first/last line (is_autonomous_silence_response), but the model only uses it
+# own first/last line beside a short note (is_internal_silence_response), but the model only uses it
 # if the injected turn says so — without this line agents answer their own
 # completions with "already handled" posts (Ace, 2026-09-27).
 AGENT_NOTIFY_MODES = ("off", "empty-success", "on")

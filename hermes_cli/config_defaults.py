@@ -1087,6 +1087,10 @@ DEFAULT_CONFIG = {
         #   "on"            — inject every completion
         # Read by gateway/run.py::_load_background_agent_notify_mode.
         "background_process_agent_notify": "off",
+        # Internal turns (bg completions, kanban handoffs): a NO_REPLY line beside more than this
+        # many words (or more than one line) is delivered, marker stripped. 0 = the marker always
+        # silences. Read by gateway/response_filters.py::internal_short_note_words.
+        "internal_silence_short_note_words": 12,
         "streaming": False,
         "timestamps": False,      # message timestamps (CLI labels, TUI rows, desktop transcript)
         "timestamp_format": "%H:%M",  # strftime format, e.g. "%b-%d %H:%M"
