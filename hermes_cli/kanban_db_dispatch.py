@@ -5217,7 +5217,8 @@ def _manifest_targets(skills, assignee) -> dict:
 def _local_running_now() -> Optional[int]:
     """Kanban workers running ON THIS HOST, every board: running minus the
     runs whose current run carries a ``worker_placed`` event (a pool host).
-    None when no board could be read (the cap then fails closed)."""
+    None when ANY board could not be read: a partial count would admit past
+    the hard cap (Prism 03b2950a655c), so the cap fails closed instead."""
     from hermes_cli import kanban_worker_pool as _kwp_lr
     total, remote, read = 0, 0, 0
     seen: set = set()
@@ -5239,7 +5240,7 @@ def _local_running_now() -> Optional[int]:
             remote += sum(_kwp_lr.running_by_host(conn).values())
             read += 1
         except Exception:
-            continue
+            return None
         finally:
             if conn is not None:
                 try:

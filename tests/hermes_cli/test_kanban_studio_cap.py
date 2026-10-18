@@ -149,6 +149,28 @@ def test_running_local_workers_count_against_the_cap(kanban_home):
     assert any(r.startswith("total:studio_cap (2/3 running)") for r in res.placement_waits.values())
 
 
+def test_one_unreadable_board_fails_the_cap_closed(kanban_home, monkeypatch):
+    """Prism 03b2950a655c: a board that cannot be read hides its running
+    workers; a partial count must not admit past the cap."""
+    _write_fleet(kanban_home, studio_slots=6)
+    real = kb.connect
+
+    def connect(*a, board=None, **kw):
+        if board == "other":
+            raise PermissionError("board other unreadable")
+        return real(*a, board=board, **kw)
+
+    monkeypatch.setattr(kb, "list_boards",
+                        lambda include_archived=False: [{"slug": "default"}, {"slug": "other"}])
+    monkeypatch.setattr(kb, "connect", connect)
+    assert kbd._local_running_now() is None
+    with kb.connect_closing() as conn:
+        ids = _make(conn, 3, assignee="beta")
+        res, spawned = _tick(conn, spillover=None)
+    assert spawned == []
+    assert all(res.placement_waits[t].startswith("total:studio_cap (running count unreadable)") for t in ids)
+
+
 def test_no_studio_row_keeps_todays_unbounded_local_route(kanban_home):
     _write_fleet(kanban_home)                             # mutation guard: no row = no cap
     with kb.connect_closing() as conn:
