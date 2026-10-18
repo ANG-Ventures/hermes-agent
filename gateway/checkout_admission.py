@@ -193,11 +193,24 @@ def _host_boot_id() -> Optional[str]:
 
 
 def _start_offset(pid: int) -> float:
-    """Seconds from host boot to ``pid``'s start. On Linux psutil derives both
-    terms from the same btime, so a wall-clock step cancels out."""
-    import psutil
+    """Seconds from host boot to ``pid``'s start, on a basis a wall-clock step
+    cannot move. Linux: the kernel's own boot-relative ``starttime`` (field 22
+    of ``/proc/<pid>/stat``, clock ticks since boot) read directly, so no boot
+    timestamp enters the arithmetic at all (Prism bc03ae51308a: psutil < 6
+    computed ``create_time`` from a CACHED btime while ``boot_time()`` read a
+    fresh one, so the two terms could straddle a clock step). Elsewhere, psutil's
+    two terms taken in one call (same basis within microseconds)."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+        # comm may contain spaces/parens: split after the LAST ')'. starttime is
+        # field 22 (1-based) = index 19 of the fields after state.
+        fields = data[data.rfind(b")") + 2:].split()
+        return int(fields[19]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, IndexError, ValueError, AttributeError):
+        import psutil
 
-    return psutil.Process(pid).create_time() - psutil.boot_time()
+        return psutil.Process(pid).create_time() - psutil.boot_time()
 
 
 def _same_live_process(pid: Any, rec: Mapping[str, Any]) -> bool:

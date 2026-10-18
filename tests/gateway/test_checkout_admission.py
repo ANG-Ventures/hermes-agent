@@ -7,6 +7,7 @@ directory; modality tests drive the real ingress seams (gateway messaging
 ``tui_gateway.ws.handle_ws``).
 """
 from __future__ import annotations
+from pathlib import Path
 
 import asyncio
 import json
@@ -864,6 +865,34 @@ def test_wall_clock_step_keeps_genuine_foreign_publisher_shared(store, monkeypat
     monkeypatch.setattr(psutil.Process, "create_time", lambda self: real_ct(self) + 3600)
     me = _gate(store, SERVE)
     assert me.publish().get("shared_with")
+
+
+def test_clock_step_between_psutil_terms_keeps_genuine_foreign_publisher_shared(store, monkeypatch):
+    """Prism bc03ae51308a: older psutil computed create_time from a CACHED btime
+    while boot_time() re-read a fresh one, so after a clock step the two terms
+    straddled it and the offset was off by the step. The offset must not depend
+    on psutil's wall-clock terms at all: step ONLY boot_time (the cache-miss
+    shape) and the genuine publisher must stay flagged."""
+    import psutil
+
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    real_boot = psutil.boot_time
+    monkeypatch.setattr(psutil, "boot_time", lambda: real_boot() + 3600)   # create_time NOT stepped
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
+
+
+def test_start_offset_reads_the_kernel_boot_relative_starttime(tmp_path, monkeypatch):
+    """On Linux the offset comes straight from /proc/<pid>/stat field 22 (ticks
+    since boot), with a comm that contains spaces and parens."""
+    if not Path("/proc").exists():
+        pytest.skip("no procfs")
+    pid = os.getpid()
+    off = ca._start_offset(pid)
+    assert off > 0
+    import psutil
+    assert abs(off - (psutil.Process(pid).create_time() - psutil.boot_time())) < 1
 
 
 def test_sticky_shared_flag_clears_when_foreign_pid_is_reused(store):
