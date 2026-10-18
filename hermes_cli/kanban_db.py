@@ -10375,21 +10375,25 @@ def _enforce_routed_pr_survivor(
 
 def _enforce_superseded_content(
     conn: sqlite3.Connection, task_id: str, superseded_by: Optional[str], *,
-    metadata: Optional[dict], survivor_pr,
+    metadata: Optional[dict], survivor_pr, texts=(),
 ) -> list:
-    """``--superseded-by <sha>`` must carry the card's own PR content (t_8035c8af).
+    """A SHA superseder must carry the card's own PR content (t_8035c8af).
 
     Ancestry alone let a commit that was merely ON main stand in for a PR whose
-    content was not (hermes-home#4729 09:47). For each of the card's own fleet
-    PRs, the PR's added lines must be present at the sha or on the default
-    branch, else :class:`kanban_supersede_content.SupersededContentError` names
-    the files that differ (audited, no mutation). The returned refs are the
-    survivor evidence :func:`kanban_survivor.preserve` records in place of a
-    separately bound ``--survivor-ref``.
+    content was not (hermes-home#4729 09:47). Every SHA the closed-unmerged
+    gate would accept is checked here: ``--superseded-by`` and each
+    ``SUPERSEDED-BY <sha>`` / ``RE-CARRIED-AS <sha>`` token in ``texts``
+    (result + summary; Prism abd009e5ca09 / 37e57666a117). For each of the
+    card's own fleet PRs, the PR's added lines must be present at the sha or on
+    the default branch, else :class:`kanban_supersede_content.SupersededContentError`
+    names the files that differ (audited, no mutation). The returned refs are
+    the survivor evidence :func:`kanban_survivor.preserve` records in place of
+    a separately bound ``--survivor-ref``.
     """
     from hermes_cli import kanban_open_pr as _open_pr
     from hermes_cli import kanban_supersede_content as _content
-    shas = _content.supersede_shas(superseded_by)
+    shas = list(dict.fromkeys(_content.supersede_shas(superseded_by)
+                              + _content.token_shas(*texts)))
     if not shas:
         return []
     prs = _open_pr.split_fleet(_open_pr.extract_pr_refs(
@@ -10832,7 +10836,8 @@ def complete_task(
     # unreadable lookup refuses too. Every completion is gated, including a
     # reviewer approving a card parked in review. Raises before any mutation.
     content_survivors = _enforce_superseded_content(
-        conn, task_id, superseded_by, metadata=metadata, survivor_pr=survivor_pr)
+        conn, task_id, superseded_by, metadata=metadata, survivor_pr=survivor_pr,
+        texts=(result, summary))
     if content_survivors:
         metadata = dict(metadata or {}, superseded_content=content_survivors)
     try:

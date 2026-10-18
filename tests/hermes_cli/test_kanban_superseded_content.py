@@ -371,3 +371,106 @@ def test_e2e_card_pointer_without_sha_is_not_content_checked(board, monkeypatch)
         tid = kb.create_task(conn, title="already fixed", assignee="worker")
         kb.claim_task(conn, tid)
         assert kb.complete_task(conn, tid, superseded_by="t_0c5ac29a -> #889") is True
+
+
+# --- round 3 (Apollo send-back @ 1ff9ac0a) ------------------------------------
+
+
+def test_summary_only_sha_token_is_content_checked(board, monkeypatch):
+    """Prism abd009e5ca09 / 37e57666a117: `SUPERSEDED-BY <sha>` in --summary (no --superseded-by flag)
+    is the path t_c889cc2d was closed on. It must go through the content gate too."""
+    _gate_stubs(monkeypatch, _check(
+        **{SHA: {"sha": SHA, "default": "main", "differs": ["skills-shared/smart-home/cad-part/SKILL.md"]}}))
+    with kb.connect() as conn:
+        tid, run = _drain_card(conn)
+        with pytest.raises(sc.SupersededContentError, match="cad-part/SKILL.md"):
+            kb.complete_task(conn, tid, expected_run_id=run, summary=f"carve landed SUPERSEDED-BY {SHA}",
+                             metadata={"pr_url": PR_URL})
+        with pytest.raises(sc.SupersededContentError):
+            kb.complete_task(conn, tid, expected_run_id=run, result=f"#4736 RE-CARRIED-AS {SHA[:12]}",
+                             metadata={"pr_url": PR_URL})
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "running"
+
+
+def test_summary_only_sha_token_carrying_the_content_closes(board, monkeypatch):
+    _gate_stubs(monkeypatch, _check(**{SHA: {"sha": SHA, "default": "main", "differs": []}}))
+    with kb.connect() as conn:
+        tid, run = _drain_card(conn)
+        assert kb.complete_task(conn, tid, expected_run_id=run, summary=f"SUPERSEDED-BY {SHA}",
+                                metadata={"pr_url": PR_URL}) is True
+        assert kb.list_runs(conn, tid)[-1].metadata["survivor"]["refs"][0]["sha"] == SHA
+
+
+def test_token_shas_skip_pr_targets():
+    assert sc.token_shas(f"x SUPERSEDED-BY {SHA[:11]}; y RE-CARRIED-AS #9", None,
+                         "SUPERSEDED-BY ANG-Ventures/hermes-home#4736") == [SHA[:11]]
+
+
+def test_rename_is_checked_at_the_new_path_and_old_path_gone(monkeypatch):
+    """Prism 1b9ec408800f: a rename is carried only when the new path holds the content AND the old
+    path is gone; a copy beside the original is not the PR's rename."""
+    entry = {"filename": "new/x.md", "previous_filename": "old/x.md", "status": "renamed",
+             "patch": "@@ -1 +1 @@\n-old body\n+new body\n"}
+    tree = {MB_SHA: {"old/x.md": b"old body\n"}, HEAD_SHA: {"new/x.md": b"new body\n"},
+            TIP: {"new/x.md": b"new body\n"},
+            OLD: {"new/x.md": b"new body\n", "old/x.md": b"old body\n"}}
+    _fake_github(monkeypatch, [entry], tree)
+    assert sc.pr_content_check(REPO, 7, OLD)["sha"] == TIP  # OLD still has the old path
+    tree[TIP]["old/x.md"] = b"old body\n"
+    assert sc.pr_content_check(REPO, 7, OLD)["differs"] == ["new/x.md"]
+
+
+def test_pure_rename_without_patch_still_needs_old_path_gone(monkeypatch):
+    entry = {"filename": "new/x.md", "previous_filename": "old/x.md", "status": "renamed",
+             "sha": sc._blob_sha(b"same\n")}
+    tree = {MB_SHA: {"old/x.md": b"same\n"}, HEAD_SHA: {"new/x.md": b"same\n"},
+            TIP: {"new/x.md": b"same\n", "old/x.md": b"same\n"}, OLD: {"new/x.md": b"same\n"}}
+    _fake_github(monkeypatch, [entry], tree)
+    out = sc.pr_content_check(REPO, 7, OLD)
+    assert out["sha"] == OLD and out["differs"] == []
+    tree[OLD]["old/x.md"] = b"same\n"
+    assert sc.pr_content_check(REPO, 7, OLD)["differs"] == ["new/x.md"]
+
+
+def test_frontmatter_equality_is_typed_at_every_depth():
+    """Prism 78093f0a74dc: `1` is not `true` and not `1.0`, also inside a list (Python's 1 == True)."""
+    mb = b"---\nflags: [0]\nn: 0\n---\n"
+    head = b"---\nflags: [1]\nn: 1\n---\n"
+    patch = "@@ -1,4 +1,4 @@\n ---\n-flags: [0]\n-n: 0\n+flags: [1]\n+n: 1\n ---\n"
+    assert sc.file_carries(_entry(patch), b"---\nflags:\n  - 1\nn: 1\n---\n", mb, head)
+    assert not sc.file_carries(_entry(patch), b"---\nflags: [true]\nn: 1\n---\n", mb, head)
+    assert not sc.file_carries(_entry(patch), b"---\nflags: [1]\nn: 1.0\n---\n", mb, head)
+    assert not sc.file_carries(_entry(patch), b"---\nflags: [1]\nn: '1'\n---\n", mb, head)
+
+
+def test_frontmatter_formatting_only_difference_is_carried():
+    """Quoting / flow vs block / comments are formatting, not content."""
+    mb = b"---\nname: s\nmeta: {a: x}\n---\n"
+    head = b"---\nname: s\nmeta: {a: 'y', b: [1, 2]}\n---\n"
+    patch = "@@ -1,4 +1,4 @@\n ---\n name: s\n-meta: {a: x}\n+meta: {a: 'y', b: [1, 2]}\n ---\n"
+    cand = b'---\nname: s\nmeta:\n  # reflowed by the drain\n  a: "y"\n  b:\n    - 1\n    - 2\n---\n'
+    assert sc.file_carries(_entry(patch), cand, mb, head)
+
+
+def test_reorder_is_not_carried_by_the_multiset():
+    """Prism b4f089dc2ff6: a PR whose whole point is reordering lines is not carried by the
+    merge-base order, though every line count matches."""
+    mb, head = b"a\nb\nc\n", b"c\na\nb\n"
+    patch = "@@ -1,3 +1,3 @@\n+c\n a\n b\n-c\n"
+    assert not sc.file_carries(_entry(patch), mb, mb, head)
+    assert sc.file_carries(_entry(patch), head, mb, head)
+    # a moved line inside a frontmatter body
+    fm_mb = b"---\nname: s\n---\nstep one\nstep two\nstep three\n"
+    fm_head = b"---\nname: s\n---\nstep two\nstep one\nstep three\n"
+    assert not sc.file_carries(_entry("@@ -4,2 +4,2 @@\n+step two\n step one\n-step two\n"),
+                               fm_mb, fm_mb, fm_head)
+
+
+def test_order_check_tolerates_later_edits_around_the_block():
+    """A newer edit on main that inserts lines between the PR's block and its neighbours, or edits
+    elsewhere in the file, is still a superset."""
+    mb, head = b"a\nb\nc\nd\n", b"a\nb\nNEW1\nNEW2\nc\nd\n"
+    patch = "@@ -2,2 +2,4 @@\n b\n+NEW1\n+NEW2\n c\n"
+    cand = b"top newer\na\nb\nNEW1\ninserted later\nNEW2\nc\nd changed later\nd\n"
+    assert sc.file_carries(_entry(patch), cand, mb, head)
+    assert not sc.file_carries(_entry(patch), b"a\nb\nNEW2\nNEW1\nc\nd\n", mb, head)

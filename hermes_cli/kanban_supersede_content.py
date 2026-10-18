@@ -9,8 +9,10 @@ was on main and carried none of the PR's content. Ancestry cannot tell those apa
 It then reads the PR's file list and, for every file, compares the merge-base, the PR head and a
 candidate commit as line MULTISETS: each line the PR added must be on the candidate at least as
 often as on the head, each line it removed no more often (a later, newer edit on main that touches
-neither passes). A YAML frontmatter header is compared by parsed key path instead (the drain
-re-serializes headers), and an unparseable header on any side refuses. Candidates are ``sha`` and
+neither passes), and each block the PR inserted must keep its order against its neighbours. A YAML
+frontmatter header is compared by parsed key path instead (the drain re-serializes headers), with
+typed deep equality, and an unparseable header on any side refuses. A renamed file is checked at its
+new path and its old path must be gone. Candidates are ``sha`` and
 the default-branch tip; one of them must carry EVERY file, and that commit is the survivor
 evidence. A removed file must be absent; a file GitHub gives no patch for (binary, oversized) must
 match the PR head's blob exactly. Every lookup that fails makes the answer unknown (None): the
@@ -116,15 +118,44 @@ def split_frontmatter(data: Optional[bytes]):
 _MISSING = object()
 
 
+def _plain(value):
+    """A loaded YAML value as a type-tagged plain tree, so equality is semantic and typed at every depth
+    (Prism 78093f0a74dc): ``1`` never equals ``true`` or ``1.0`` (Python's ``1 == True`` would, even
+    inside a list), and a ruamel ``CommentedMap``/``CommentedSeq``/``ScalarString`` compares like the
+    plain dict/list/str it wraps, so formatting alone never refuses."""
+    if value is None:
+        return ("null",)
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int):
+        return ("int", int(value))
+    if isinstance(value, float):
+        return ("float", float(value))
+    if isinstance(value, str):
+        return ("str", str(value))
+    if isinstance(value, dict):
+        return ("map", tuple(sorted((_plain(k), _plain(v)) for k, v in value.items())))
+    if isinstance(value, (list, tuple)):
+        return ("seq", tuple(_plain(v) for v in value))
+    if isinstance(value, (set, frozenset)):
+        return ("set", tuple(sorted(_plain(v) for v in value)))
+    if isinstance(value, (bytes, bytearray)):
+        return ("bytes", bytes(value))
+    if hasattr(value, "isoformat"):
+        return (type(value).__name__, value.isoformat())
+    return (type(value).__name__, repr(value))
+
+
 def _keys(node, prefix=()) -> dict:
-    """``{key path: value}``. A non-mapping value and an EMPTY mapping are each one value (an empty
-    mapping is a value, not "no keys": Prism d20063658cfe)."""
+    """``{key path: plain value}``. A non-mapping value and an EMPTY mapping are each one value (an
+    empty mapping is a value, not "no keys": Prism d20063658cfe). Path segments are typed too, so key
+    ``1`` and key ``"1"`` are different paths."""
     if isinstance(node, dict) and node:
         out = {}
         for key, value in node.items():
-            out.update(_keys(value, prefix + (str(key),)))
+            out.update(_keys(value, prefix + (_plain(key),)))
         return out
-    return {prefix: node}
+    return {prefix: _plain(node)}
 
 
 def frontmatter_carries(mb: dict, head: dict, cand: dict) -> bool:
@@ -140,7 +171,34 @@ def frontmatter_carries(mb: dict, head: dict, cand: dict) -> bool:
         if want is _MISSING:
             if got is not _MISSING:  # a key path the PR removed must be absent on the candidate
                 return False
-        elif got is _MISSING or got != want or type(got) is not type(want):
+        elif got is _MISSING or got != want:  # plain, type-tagged trees: typed deep equality
+            return False
+    return True
+
+
+def _is_subsequence(needle, haystack) -> bool:
+    it = iter(haystack)
+    return all(any(line == h for h in it) for line in needle)
+
+
+def _order_carried(mb_lines, head_lines, cand_lines) -> bool:
+    """Every block of lines the PR inserted sits in the same place relative to its neighbours on the
+    candidate (Prism b4f089dc2ff6: a multiset passes a PR whose whole point is a reorder or a move).
+
+    Blank lines are ignored. ``difflib`` marks the head lines the PR inserted or replaced; each maximal
+    run of them, with the nearest unchanged head line before and after it, must appear on the candidate
+    as a subsequence (in that order, with anything in between: a later newer edit on main is fine).
+    Each block is checked on its own, so unrelated later edits elsewhere never refuse."""
+    import difflib
+    mb = [line for line in mb_lines if line.strip()]
+    head = [line for line in head_lines if line.strip()]
+    cand = [line for line in cand_lines if line.strip()]
+    ops = difflib.SequenceMatcher(None, mb, head, autojunk=False).get_opcodes()
+    for tag, _i1, _i2, j1, j2 in ops:
+        if tag not in ("insert", "replace"):
+            continue
+        block = head[max(j1 - 1, 0):j2 + 1]
+        if not _is_subsequence(block, cand):
             return False
     return True
 
@@ -148,14 +206,15 @@ def frontmatter_carries(mb: dict, head: dict, cand: dict) -> bool:
 def lines_carry(mb_lines, head_lines, cand_lines) -> bool:
     """Line multiset check: a line the PR added N times appears at least as often on the candidate as
     on the PR head; a line the PR removed appears no more often than on the PR head (Prism
-    320e231efa19). A later newer edit on main that touches neither is fine."""
+    320e231efa19). Then the order check (:func:`_order_carried`). A later newer edit on main that
+    touches neither is fine."""
     mb, head, cand = _counts(mb_lines), _counts(head_lines), _counts(cand_lines)
     for line in set(mb) | set(head):
         if head[line] > mb[line] and cand[line] < head[line]:
             return False
         if head[line] < mb[line] and cand[line] > head[line]:
             return False
-    return True
+    return _order_carried(mb_lines, head_lines, cand_lines)
 
 
 def file_carries(entry: dict, cand: Optional[bytes], mb: Optional[bytes], head: Optional[bytes]) -> bool:
@@ -234,8 +293,12 @@ def pr_content_check(repo: str, number: int, sha: str) -> Optional[dict]:
             old_path = str(entry.get("previous_filename") or path)
             mb = None if status == "added" else _file_bytes(repo, old_path, mb_sha)
             head = None if status == "removed" else _file_bytes(repo, path, head_sha)
+            renamed_from = old_path if status == "renamed" and old_path != path else None
             for ref in candidates:
-                if not file_carries(entry, _file_bytes(repo, path, ref), mb, head):
+                # A rename is carried at its NEW path, and only once the old path is gone (Prism
+                # 1b9ec408800f): a copy beside the original is not the PR's rename.
+                if (not file_carries(entry, _file_bytes(repo, path, ref), mb, head)
+                        or (renamed_from and _file_bytes(repo, renamed_from, ref) is not None)):
                     missing[ref].append(path)
         chosen = min(candidates, key=lambda ref: len(missing[ref]))
     except (_Unreadable, ValueError, TypeError, AttributeError):
@@ -278,8 +341,24 @@ def supersede_shas(superseded_by: Optional[str]) -> list:
     from hermes_cli.kanban_open_pr import _TARGET_RE
     if not isinstance(superseded_by, str):
         return []
-    return list(dict.fromkeys(t for t in _TARGET_RE.findall(superseded_by)
-                              if all(c in "0123456789abcdef" for c in t) and any(c in "abcdef" for c in t)))
+    return list(dict.fromkeys(t for t in _TARGET_RE.findall(superseded_by) if _is_sha(t)))
+
+
+def token_shas(*texts: Optional[str]) -> list:
+    """Commit SHAs named by a ``SUPERSEDED-BY <sha>`` / ``RE-CARRIED-AS <sha>`` token in free text
+    (``--result`` / ``--summary``), parsed with the closed-unmerged gate's own regex so the content
+    gate sees every SHA that gate would accept (Prism abd009e5ca09 / 37e57666a117). PR-number targets
+    are left to that gate's merged-PR check."""
+    from hermes_cli.kanban_open_pr import _SUPERSEDE_RE
+    out: list = []
+    for text in texts:
+        if isinstance(text, str):
+            out += [t for t in _SUPERSEDE_RE.findall(text) if _is_sha(t)]
+    return list(dict.fromkeys(out))
+
+
+def _is_sha(token: str) -> bool:
+    return all(c in "0123456789abcdef" for c in token) and any(c in "abcdef" for c in token)
 
 
 def verify(task_id: str, prs, shas, *, check: Optional[ContentCheckFn] = None) -> list:
