@@ -532,7 +532,8 @@ _SPECS = [
                   "'derived-from' records provenance only — the parent discovered/spawned the "
                   "child, which stays independently dispatchable. A DEPLOY must never be gated "
                   "on a DISCOVERY. 'after-merge' holds the child until the parent's recorded PR is "
-                  "MERGED (or the parent is done): use it for a child that is part of the "
+                  "MERGED, even past a done parent (a parent done with no PR releases it on close): "
+                  "use it for a child that is part of the "
                   "parent's close condition, where 'blocks' deadlocks."),
     ], help="Add a parent->child dependency"),
     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
