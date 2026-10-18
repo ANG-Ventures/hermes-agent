@@ -2482,6 +2482,19 @@ class SessionStore(
             present = self._db.has_platform_message_id(
                 session_id, platform_message_id
             )
+            _steered = getattr(self._db, "has_steered_platform_message_id", None)
+            if not present and callable(_steered):
+                # A steer-delivered message has no platform_message_id on its row; its id
+                # lives in the steer origin header (see has_steered_platform_message_id).
+                # With privacy.redact_pii the header carries _hash_id(message_id) instead.
+                present = _steered(session_id, platform_message_id) or _steered(
+                    session_id, _hash_id(str(platform_message_id))
+                )
+                if present:
+                    logger.info(
+                        "Redelivery authority: message %s was delivered by /steer in "
+                        "session %s; treating it as present", platform_message_id, session_id,
+                    )
             return (True, bool(present))
         except Exception:
             logger.debug(

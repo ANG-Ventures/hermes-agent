@@ -76,6 +76,66 @@ class SuppressConfig:
     kinds: frozenset = frozenset(DEFAULT_KINDS)
     self_window_s: int = DEFAULT_SELF_WINDOW_MIN * 60
     closers: tuple = DEFAULT_CLOSERS
+    actionable_only: bool = True
+
+
+# --- S5: actionable-only wakes (t_4f6afb67) -----------------------------------
+#
+# 2026-10-12, two operator sessions: one red PR woke t_1ac4c83b four times (two
+# of them citing a run already handled), a red main had inherited into PRs woke
+# their owners to "fix" a PR with nothing wrong, and the operator's own
+# request-changes woke the operator. Each of these is a ledger row now (a
+# ``notify_suppressed`` receipt, shown by ``kanban show``), not a turn.
+# ``kanban.notify_suppress.actionable_only: false`` turns all four off.
+REASON_INHERITED_RED = "inherited-red"      # every red is main's; nothing to do on the PR
+REASON_DUPLICATE_RED = "duplicate-red"      # same (card, PR, head, red-set) already woke
+REASON_STALE_HANDBACK = "stale-handback"    # the card left review before the wake ran
+REASON_OWN_ECHO = "own-session-echo"        # the home session made this transition itself
+REASON_AUTO_ROUTE = "auto-route"            # a closer sent the card back to its implementer itself
+# Kinds the home session's own action produces; an echo of them is no news.
+OWN_ECHO_KINDS = frozenset({"changes_requested", "review_requested", "blocked", "archived"})
+RED_SEEN_TTL_S = 24 * 3600
+
+
+def red_handback_noise(keys: Iterable[str], inherited_only: bool, seen: Optional[dict],
+                       card_status: Optional[str] = None) -> Optional[str]:
+    """Why a red/dirty review handback is NOT actionable, or None (wake).
+    ``seen``: red keys already delivered (key -> epoch); ``card_status``: the card now."""
+    keys = [k for k in keys or () if k]
+    if card_status is not None and card_status != "review":
+        return REASON_STALE_HANDBACK
+    if inherited_only:
+        return REASON_INHERITED_RED
+    if keys and all(k in (seen or {}) for k in keys):
+        return REASON_DUPLICATE_RED
+    return None
+
+
+def note_red_seen(seen: dict, keys: Iterable[str], now: float) -> None:
+    """Record delivered red keys; prune entries past :data:`RED_SEEN_TTL_S`."""
+    for k in [k for k, ts in seen.items() if now - float(ts) > RED_SEEN_TTL_S]:
+        seen.pop(k, None)
+    for k in keys or ():
+        if k:
+            seen[k] = now
+
+
+def is_own_echo(event: Any, home_session_id: Optional[str], is_home: bool) -> bool:
+    """The home session's own changes_requested / review_requested / blocked / archived,
+    delivered back to the home chat. A foreign subscriber still gets it."""
+    actor = _s(getattr(event, "actor_session_id", None) if not isinstance(event, dict)
+               else event.get("actor_session_id"))
+    kind = _s(getattr(event, "kind", None) if not isinstance(event, dict) else event.get("kind"))
+    return bool(is_home and actor and actor == _s(home_session_id) and kind in OWN_ECHO_KINDS)
+
+
+def is_auto_route(event: Any, cfg: "SuppressConfig") -> bool:
+    """A ``changes_requested`` a configured closer STAMPED (``actor_profile`` exactly a closer,
+    never the prose guess): the merge pass already requeued the card to its implementer
+    (``HOLD-FR``, own-diff red), so the owner has nothing to decide."""
+    g = (lambda k: event.get(k)) if isinstance(event, dict) else (lambda k: getattr(event, k, None))
+    actor = _s(g("actor_profile")).lower()
+    return _s(g("kind")) == "changes_requested" and bool(actor) and actor in {_s(c).lower() for c in cfg.closers}
 
 
 def _truthy(v: Any, default: bool) -> bool:
@@ -108,6 +168,7 @@ def parse_config(kcfg: Optional[dict]) -> SuppressConfig:
         kinds=frozenset(_names(raw.get("kinds"), DEFAULT_KINDS)),
         self_window_s=max(0, window) * 60,
         closers=_names(raw.get("closers"), DEFAULT_CLOSERS),
+        actionable_only=_truthy(raw.get("actionable_only"), True),
     )
 
 
