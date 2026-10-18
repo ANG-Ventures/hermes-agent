@@ -15,7 +15,8 @@ def fleet(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     (home / "skills").mkdir(parents=True)
     shared = tmp_path / "skills-shared"
-    for group, name in (("general", "subscribed-skill"), ("gaming", "game-skill"), ("_lib", "lib-skill")):
+    for group, name in (("general", "subscribed-skill"), ("gaming", "game-skill"), ("_lib", "lib-skill"),
+                        ("foo-aux", "idle-skill")):
         d = shared / group / name
         d.mkdir(parents=True)
         (d / "SKILL.md").write_text("---\nname: %s\ndescription: %s test skill.\n---\n\n# %s\n" % (name, group, name))
@@ -68,3 +69,12 @@ def test_non_sibling_and_underscore_dirs_are_ignored(fleet):
         "%s\n%s\nrelative/path\n" % (fleet["outside"], fleet["shared"] / "_lib"))
     assert _view(fleet, "rogue-skill")["success"] is False
     assert _view(fleet, "lib-skill")["success"] is False
+
+
+def test_aux_sibling_group_resolves(fleet):
+    """`<group>-aux` (the idle-skill tier, Ace 2026-10-18) is a sibling of the configured dirs, so it loads."""
+    assert _view(fleet, "idle-skill")["success"] is False
+    (fleet["scratch"] / "skill-groups").write_text(str(fleet["shared"] / "foo-aux") + "\n")
+    r = _view(fleet, "idle-skill")
+    assert r["success"] is True, r
+    assert Path(r["skill_dir"]) == (fleet["shared"] / "foo-aux" / "idle-skill").resolve()
