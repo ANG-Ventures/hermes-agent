@@ -1,7 +1,7 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
 VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole for the utilization wiring, t_da6f84f7, from
-ANG-Ventures/hermes-home#5183 rebased on main; sha256 37d925ba747e49c582409509b2765bfb71a03a5131bce7df032313c8c2da33ac; first vendored @ 2fe117cbcb,
+ANG-Ventures/hermes-home#5183 rebased on main; sha256 43a67bfd1ed5fdc5d951066185bc437a0f707687d5b5e85bde0729a928789963; first vendored @ 2fe117cbcb,
 hermes-home#4462) for the kanban dispatcher (t_d6ce856e) and its alloc_client route (t_4187c8f1): the fork may not
 import hermes-home code. The ONLY local changes are ``fleet_root()`` plus ``encoding="utf-8"`` on two ``open()`` calls
 (the fork's PLW1514 lint); ``tests/hermes_cli/test_kanban_headroom_placement.py`` checks the rest against the canonical
@@ -979,8 +979,8 @@ def _headroom_utilization(h: Headroom, spec: HostSpec, sample: Sample, fp: Footp
     h.need, h.cpu_busy, h.binding = need, sample.cpu_busy, v.binding
     if "mem_gb" in v.free and "cpu" in v.free and _num(sample.ncpu):
         h.mem_gb, h.cores = v.free["mem_gb"], v.free["cpu"] * float(sample.ncpu)    # cores = CPUs of room left
-    h.reserved_gb = sum(le.need.ram_gb for le in leases if le.host == spec.name)
-    h.reserved_threads = sum(le.need.cpus for le in leases if le.host == spec.name)
+    held = admission.live_leases(leases, spec.name, row.get("at"))   # the leases admit() counted (Prism 8e3aa5ad12d5)
+    h.reserved_gb, h.reserved_threads = held.ram_gb, held.cpus
     if not v.ok:
         h.reason = (f"no_headroom:{v.binding} ({v.reason})" if v.reason.startswith("saturated")
                     else f"closed:{v.reason}")
@@ -1318,7 +1318,48 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
 
 # ── utilization admission: kill switch, classes, leases, measured usage (t_da6f84f7) ─────────────
 _MODE_CACHE: Dict[str, tuple] = {}
-_ADMISSION_LINE = re.compile(r"^  admission:[ \t]*['\"]?([A-Za-z_-]*)['\"]?[ \t]*(?:#.*)?$")
+_ADMISSION_LINE = re.compile(r"^([ \t]+)admission:[ \t]*['\"]?([A-Za-z_-]*)['\"]?[ \t]*(?:#.*)?$")
+_KEY_LINE = re.compile(r"^([ \t]+)[^ \t#]")
+_FLOW_KANBAN = re.compile(r"^kanban:[ \t]*\{(.*)\}[ \t]*(?:#.*)?$")
+_FLOW_ADMISSION = re.compile(r"(?:^|,)[ \t]*admission:[ \t]*['\"]?([A-Za-z_-]*)['\"]?[ \t]*(?:,|$)")
+
+
+def _parse_admission(text: str) -> str:
+    """``kanban.admission`` from config.yaml text. PyYAML when importable (the same parse the other config readers
+    do); else a stdlib reader of the top-level ``kanban:`` mapping's DIRECT child at whatever indent the mapping uses,
+    and of the flow form ``kanban: {admission: x}`` (Prism 7ca95688be5a / 39c7eb0a3015)."""
+    try:
+        import yaml  # noqa: PLC0415  (optional: launchd hooks run /usr/bin/python3 without it)
+    except ImportError:
+        yaml = None
+    if yaml is not None:
+        try:
+            doc = yaml.safe_load(text)
+        except yaml.YAMLError:
+            return "legacy"
+        kb = doc.get("kanban") if isinstance(doc, dict) else None
+        v = kb.get("admission") if isinstance(kb, dict) else None
+        return v if isinstance(v, str) and v in ADMISSION_MODES else "legacy"
+    inside, child = False, None
+    for ln in text.splitlines():
+        if ln and not ln[0].isspace() and not ln.startswith("#"):
+            fm = _FLOW_KANBAN.match(ln)
+            if fm:
+                am = _FLOW_ADMISSION.search(fm.group(1))
+                return am.group(1) if am and am.group(1) in ADMISSION_MODES else "legacy"
+            inside, child = ln.split("#", 1)[0].rstrip() == "kanban:", None
+            continue
+        if not inside:
+            continue
+        km = _KEY_LINE.match(ln)
+        if not km:
+            continue
+        if child is None:
+            child = km.group(1)           # the first key fixes the mapping's direct-child indent
+        m = _ADMISSION_LINE.match(ln)
+        if m and m.group(1) == child:
+            return m.group(2) if m.group(2) in ADMISSION_MODES else "legacy"
+    return "legacy"
 
 
 def admission_mode(path=None) -> str:
@@ -1333,19 +1374,10 @@ def admission_mode(path=None) -> str:
     hit = _MODE_CACHE.get(key)
     if hit and hit[0] == sig:
         return hit[1]
-    mode, inside = "legacy", False
     try:
-        lines = p.read_text(encoding="utf-8").splitlines()
+        mode = _parse_admission(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        lines = []
-    for ln in lines:                       # stdlib only: the top-level ``kanban:`` block's direct ``admission:`` key
-        if ln and not ln[0].isspace() and not ln.startswith("#"):
-            inside = ln.split("#", 1)[0].rstrip() == "kanban:"
-            continue
-        m = _ADMISSION_LINE.match(ln) if inside else None
-        if m:
-            mode = m.group(1) if m.group(1) in ADMISSION_MODES else "legacy"
-            break
+        mode = "legacy"
     _MODE_CACHE[key] = (sig, mode)
     return mode
 
@@ -1751,18 +1783,22 @@ def release(reservation_id: str, *, path=None, now: Optional[float] = None, admi
         doc = _read_ledger(p)
         _check_owner(doc["rows"], reservation_id, owner)
         live, lines = _prune(doc["rows"], now)
-        rows = []
+        rows, done = [], []
         for r in live:
             if r.get("id") == reservation_id:
                 lines.append(_ledger_line(at=now, host=r["host"], consumer=r["consumer"], job_id=r.get("job_id"),
                                           fp=_row_footprint(r), decision="released", reservation=r["id"],
                                           reason=f"held {now - float(r.get('at') or now):.0f}s"))
-                if actual:
-                    record_usage(r, actual, now=now, path=usage_path)
+                done.append(r)
                 continue
             rows.append(r)
         _write_ledger(p, {"schema": SCHEMA, "rows": rows})
         _append_admissions(admissions_path_for(p, admissions_path), lines)
+        # the measurement only after the release committed: a failed ledger write must not leave a usage row
+        # that a retried release() appends again (Prism ca81355a9fd0 / f5f4e1fe5c62)
+        for r in done:
+            if actual:
+                record_usage(r, actual, now=now, path=usage_path)
     return len(rows) < len(live)
 
 
@@ -1772,7 +1808,11 @@ def record_usage(row: Mapping, actual: Mapping, *, now: float, path=None) -> Opt
     try:
         est = admission.Estimate(cpus=float(row.get("threads") or 0), ram_gb=float(row.get("ram_gb") or 0),
                                  gpu_mib=float(row.get("gpu_mb") or 0), source="lease")
-        vals = {k: float(actual.get(k) or 0.0) for k in ("cpus", "ram_gb", "gpu_mib")}
+        missing = [k for k in ("cpus", "ram_gb") if actual.get(k) is None]
+        if missing:     # an unmeasured axis is never recorded as 0 (Prism dd0cbea04139); gpu_mib absent = no GPU
+            raise ValueError(f"actual is missing {','.join(missing)}: {dict(actual)!r}")
+        vals = {k: float(actual[k]) for k in ("cpus", "ram_gb")}
+        vals["gpu_mib"] = float(actual.get("gpu_mib") or 0.0)
         if not all(math.isfinite(v) and v >= 0 for v in vals.values()):
             raise ValueError(f"actual must be finite numbers >= 0, not {dict(actual)!r}")
         return admission.record_actual(class_usage_path(path), job_class=str(row.get("job_class") or row["consumer"]),

@@ -212,7 +212,6 @@ class GateTickBuilder:
             placement_table=kh.load_table(root),
             placement_reservations=root / placement.RESERVATIONS_REL,
             allocd=kh.allocd_mode(cfg),
-            admission=klg.admission_mode(cfg.get("admission") if isinstance(cfg, dict) else None),
         )
 
     def build(self, boards) -> GateTick:

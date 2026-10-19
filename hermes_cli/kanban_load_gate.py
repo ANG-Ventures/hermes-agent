@@ -620,7 +620,7 @@ class LoadGate:
         ctx = utilization_context()
         sample = {"host": ctx["host"], "os": _os_name(), "at": now, "ncpu": self.ncpu, "cpu_busy": self.cpu_busy,
                   "mem_available_gb": ctx["mem_available_gb"], "mem_total_gb": ctx["mem_total_gb"],
-                  "procs": self.procs, "maxproc": self.proc_limit}
+                  "procs": self.procs, "maxproc": self.proc_limit, **sample_psi()}
         leases = [_ad.Lease(host=ctx["host"], job_class=UTIL_CLASS, need=ctx["need"], at=ts)
                   for ts, n in self._ramp for _ in range(int(n))]
         allowance, verdict = 0, None
@@ -632,11 +632,14 @@ class LoadGate:
             allowance += 1
             leases.append(_ad.Lease(host=ctx["host"], job_class=UTIL_CLASS, need=ctx["need"], at=now))
         ceiling, why = ctx["ceiling"], None
-        if ceiling is not None:
-            room = max(0, ceiling - (self.running or 0))
+        if ceiling is not None and self.running is None:
+            # a CEILING on running workers with the count unknown fails closed (Prism 710b1c8865a5)
+            allowance, why = 0, f"ceiling: running count unknown under kanban ceiling {ceiling}"
+        elif ceiling is not None:
+            room = max(0, ceiling - self.running)
             if room < allowance:
                 allowance = room
-                why = f"ceiling: {self.running or 0} running of kanban ceiling {ceiling} ({ctx['ceiling_reason']})"
+                why = f"ceiling: {self.running} running of kanban ceiling {ceiling} ({ctx['ceiling_reason']})"
         if allowance == 0 and why is None:
             why = f"utilization: {verdict.reason} (binding {verdict.binding})" if verdict else "utilization: no room"
         self.util = {"host": ctx["host"], "need": {"cpus": ctx["need"].cpus, "ram_gb": ctx["need"].ram_gb,
@@ -1256,6 +1259,23 @@ def _os_name() -> str:
     return "darwin" if sys.platform == "darwin" else ("linux" if sys.platform.startswith("linux") else sys.platform)
 
 
+def sample_psi(root: str = "/proc/pressure") -> dict:
+    """PSI ``some avg10`` for cpu / memory / io as ``psi_<x>_some10`` (Linux). An unreadable file is left out, so
+    admission.admit() refuses it as unmeasured rather than reading 0; darwin has no /proc/pressure and admit()
+    exempts those axes there (Prism 8952c3f1bbe9 / 616c5f0203bd)."""
+    out: dict = {}
+    for res, key in (("cpu", "psi_cpu_some10"), ("memory", "psi_mem_some10"), ("io", "psi_io_some10")):
+        try:
+            with open(os.path.join(root, res), encoding="utf-8") as fh:
+                for ln in fh:
+                    if ln.startswith("some "):
+                        out[key] = float(dict(kv.split("=", 1) for kv in ln.split()[1:])["avg10"])
+                        break
+        except (OSError, ValueError, KeyError):
+            continue
+    return out
+
+
 def utilization_context() -> dict:
     """This host's inputs for the utilization path: its row of the placement
     table (via the ``local`` alias), the kanban ceiling + reason, memory from
@@ -1289,7 +1309,8 @@ def utilization_context() -> dict:
     except Exception:
         pass
     limits = _ad.Limits(mem_reserve_gb=spec.mem_reserve_gb if spec else 0.0,
-                        cpu_saturable=bool(spec.cpu_saturable) if spec else False)
+                        cpu_saturable=bool(spec.cpu_saturable) if spec else False,
+                        unmeasurable=tuple(a for a in (spec.unmeasurable_axes if spec else ()) if a.startswith("psi_")))
     return {"host": host, "ceiling": ceiling, "ceiling_reason": reason or "no reason recorded", "need": need,
             "limits": limits, "mem_available_gb": avail, "mem_total_gb": total}
 

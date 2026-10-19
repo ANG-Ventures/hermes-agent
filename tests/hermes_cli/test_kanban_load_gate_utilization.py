@@ -25,6 +25,8 @@ def ctx(monkeypatch):
          "need": ad.Estimate(cpus=1.0, ram_gb=3.0, source="prior"),
          "limits": ad.Limits(mem_reserve_gb=128.0), "mem_available_gb": 360.0, "mem_total_gb": 512.0}
     monkeypatch.setattr(klg, "utilization_context", lambda: dict(c))
+    # hermetic PSI: the Linux CI host's own /proc/pressure must not decide these tests
+    monkeypatch.setattr(klg, "sample_psi", lambda: {"psi_cpu_some10": 0.0, "psi_mem_some10": 0.0, "psi_io_some10": 0.0})
     return c
 
 
@@ -80,6 +82,35 @@ def test_unmeasured_cpu_refuses(ctx):
     g = _gate("utilization")
     a, why = g.admit(1.0, now=1000.0, running=0, cpu_busy=None)
     assert a == 0 and "unmeasured:cpu_busy" in why
+
+
+def test_ceiling_with_unknown_running_fails_closed(ctx):
+    """Prism 710b1c8865a5: a ceiling on running workers with the count unknown admits nothing."""
+    g = _gate("utilization")
+    a, why = g.admit(1.0, now=1000.0, running=None, cpu_busy=0.05)
+    assert a == 0 and why.startswith("ceiling: running count unknown")
+    ctx["ceiling"] = None
+    a, _ = g.admit(1.0, now=1000.0, running=None, cpu_busy=0.05)
+    assert a > 0                                          # no ceiling: nothing to count against
+
+
+def test_linux_sample_carries_psi_and_refuses_on_it(ctx, monkeypatch):
+    """Prism 8952c3f1bbe9 / 616c5f0203bd: on Linux the PSI axes are sampled, so an idle host admits and a
+    memory-stalled one refuses (never unmeasured:psi_* on every tick)."""
+    monkeypatch.setattr(klg, "_os_name", lambda: "linux")
+    g = _gate("utilization")
+    a, why = g.admit(1.0, now=1000.0, running=0, cpu_busy=0.05)
+    assert a == 2, why
+    monkeypatch.setattr(klg, "sample_psi", lambda: {"psi_cpu_some10": 0.0, "psi_mem_some10": 25.0, "psi_io_some10": 0.0})
+    a, why = g.admit(1.0, now=1000.0, running=0, cpu_busy=0.05)
+    assert a == 0 and "saturated:psi_mem_some10" in why
+
+
+def test_sample_psi_reads_proc_pressure(tmp_path):
+    (tmp_path / "cpu").write_text("some avg10=3.10 avg60=2.00 avg300=1.00 total=1\n", encoding="utf-8")
+    (tmp_path / "memory").write_text("some avg10=21.50 avg60=0 avg300=0 total=1\nfull avg10=9.0 avg60=0 avg300=0 total=1\n",
+                                     encoding="utf-8")
+    assert klg.sample_psi(str(tmp_path)) == {"psi_cpu_some10": 3.1, "psi_mem_some10": 21.5}   # io absent = unmeasured
 
 
 def test_gate_from_config_reads_the_kill_switch():
