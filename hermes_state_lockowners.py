@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import stat
 import sys
 import threading
 import time
@@ -137,6 +139,14 @@ _holds_lock = threading.Lock()
 _publish_lock = threading.Lock()
 _active_holds: Dict[int, dict] = {}
 _hold_seq = 0
+# Highest hold seq published per ledger dir by THIS process (its own <pid>.json). A descheduled older
+# writer's hold_ended() must not replace a newer writer's record (Prism "reordered publication").
+_published_seq: Dict[str, int] = {}
+# Only names this module writes are ever pruned: <pid>.json and its <pid>.json.<tid>.tmp.
+_LEDGER_NAME_RE = re.compile(r"^\d+\.json(\.\d+\.tmp)?$")
+_DIR_FD_OK = (all(f in os.supports_dir_fd for f in (os.open, os.unlink, os.stat, os.rename))  # os.replace shares rename's renameat
+              and os.listdir in os.supports_fd and os.stat in os.supports_follow_symlinks
+              and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY"))
 _watchdog_running = False
 _watchdog_pid = 0
 _last_timeout: Dict[str, Tuple[float, str]] = {}
@@ -149,9 +159,9 @@ _Thread = threading.Thread
 def _reset_after_fork() -> None:
     """A fork child inherits the locks in whatever state another parent thread left them, and no
     watchdog thread: start from scratch (Prism c0c7a990a4d6)."""
-    global _holds_lock, _publish_lock, _active_holds, _watchdog_running, _watchdog_pid
+    global _holds_lock, _publish_lock, _active_holds, _published_seq, _watchdog_running, _watchdog_pid
     _holds_lock, _publish_lock = threading.Lock(), threading.Lock()
-    _active_holds = {}
+    _active_holds, _published_seq = {}, {}
     _watchdog_running, _watchdog_pid = False, 0
 
 
@@ -163,8 +173,27 @@ def _ledger_dir(db_path) -> str:
     return os.path.realpath(os.fspath(db_path)) + _LEDGER_SUFFIX
 
 
+def _open_ledger(ledger: str, *, create: bool) -> Optional[int]:
+    """fd of the ledger dir, or None when it is missing or not ours. Never follows a symlink: a
+    planted ``<db>.lockholders`` link must not steer writes or the 24 h prune into its target. The
+    ledger is diagnostic only, so a wrong dir is skipped, never repaired or deleted."""
+    if create:
+        try:
+            os.mkdir(ledger, 0o700)
+        except FileExistsError:
+            pass
+    fd = os.open(ledger, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)  # ELOOP on a symlink
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:  # windows-footgun: ok — POSIX only (_DIR_FD_OK)
+        os.close(fd)
+        logger.debug("state.db lock-holder ledger %s skipped: not a private dir owned by this user", ledger)
+        return None
+    return fd
+
+
 def _write_record(hold: dict, **fields) -> None:
-    """Atomic per-pid write of *hold* plus *fields*; never raises (attribution must not break a write)."""
+    """Atomic per-pid write of *hold* plus *fields*; never raises (attribution must not break a write).
+    Callers hold _publish_lock."""
     try:
         if hold["ledger"] is None:  # resolved lazily: only holds >= _HOLD_RECORD_MIN_S pay for it
             from hermes_state_holders import describe_holder_pid
@@ -172,23 +201,52 @@ def _write_record(hold: dict, **fields) -> None:
             hold["ledger"] = _ledger_dir(hold["db_path"])
             hold["who"] = describe_holder_pid(hold["pid"])
         ledger = hold["ledger"]
-        os.makedirs(ledger, mode=0o700, exist_ok=True)
-        target = os.path.join(ledger, f"{hold['pid']}.json")
-        tmp = f"{target}.{threading.get_ident()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"pid": hold["pid"], "who": hold["who"], "op": hold["op"], "since": hold["since"],
-                       **fields}, handle)
-        os.replace(tmp, target)
-        cutoff = time.time() - _LEDGER_MAX_AGE_S
-        for name in os.listdir(ledger):
-            path = os.path.join(ledger, name)
-            try:
-                if os.stat(path).st_mtime < cutoff:
-                    os.unlink(path)
-            except OSError:
-                pass
+        if hold["seq"] < _published_seq.get(ledger, 0):
+            return  # a newer hold of this process already owns <pid>.json
+        if not _DIR_FD_OK:  # Windows: no dir_fd / O_NOFOLLOW; write only, never prune
+            if os.path.lexists(ledger) and (os.path.islink(ledger) or not os.path.isdir(ledger)):
+                return
+            os.makedirs(ledger, exist_ok=True)
+            _write_json(os.path.join(ledger, f"{hold['pid']}.json"), hold, fields)
+            _published_seq[ledger] = hold["seq"]
+            return
+        fd = _open_ledger(ledger, create=True)
+        if fd is None:
+            return
+        try:
+            name = f"{hold['pid']}.json"
+            tmp = f"{name}.{threading.get_ident()}.tmp"
+            out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+            with os.fdopen(out, "w", encoding="utf-8") as handle:
+                json.dump(_record(hold, fields), handle)
+            os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+            _published_seq[ledger] = hold["seq"]
+            cutoff = time.time() - _LEDGER_MAX_AGE_S
+            for entry in os.listdir(fd):
+                if not _LEDGER_NAME_RE.match(entry):
+                    continue
+                try:
+                    st = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+                    if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                        os.unlink(entry, dir_fd=fd)
+                except OSError:
+                    pass
+        finally:
+            os.close(fd)
     except Exception:
         logger.debug("state.db lock-holder ledger write failed", exc_info=True)
+
+
+def _record(hold: dict, fields: dict) -> dict:
+    return {"pid": hold["pid"], "seq": hold["seq"], "who": hold["who"], "op": hold["op"], "since": hold["since"],
+            **fields}
+
+
+def _write_json(target: str, hold: dict, fields: dict) -> None:
+    tmp = f"{target}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(_record(hold, fields), handle)
+    os.replace(tmp, target)
 
 
 def _select_due_holds() -> Optional[List[dict]]:
@@ -231,7 +289,7 @@ def hold_started(db_path, op: str) -> Optional[int]:
             token = _hold_seq
             _active_holds[token] = {"db_path": db_path, "op": op, "t0": time.monotonic(), "since": time.time(),
                                     "marked": False, "ended": False, "pid": os.getpid(), "who": None,
-                                    "ledger": None}
+                                    "ledger": None, "seq": token}
             if not _watchdog_running or _watchdog_pid != os.getpid():
                 try:
                     _Thread(target=_watchdog_loop, name="state-db-lock-ledger", daemon=True).start()
@@ -270,6 +328,8 @@ def _pid_alive(pid: int) -> bool:
 def recent_ledger_holders(db_path, window_s: float, *, exclude_pid: Optional[int] = None) -> List[str]:
     """Ledger lines for holds that are still open (live pid) or ended within the last *window_s*."""
     ledger = _ledger_dir(db_path)
+    if os.path.islink(ledger):
+        return []
     try:
         names = os.listdir(ledger)
     except OSError:

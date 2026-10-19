@@ -294,3 +294,65 @@ def test_fork_child_does_not_inherit_a_held_registry_lock(tmp_path):
                 os._exit(3)
     _, status = os.waitpid(pid, 0)
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+
+
+@pytest.mark.platforms("posix")
+def test_symlinked_ledger_is_skipped_and_its_target_never_pruned(db, tmp_path, monkeypatch):
+    """Prism "unsafe cleanup": a planted ``<db>.lockholders`` symlink must not steer the write or the
+    24 h prune into its target. The ledger is skipped; the old file in the target survives."""
+    monkeypatch.setattr(lockowners, "_HOLD_RECORD_MIN_S", 0.0)
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    os.chmod(target, 0o700)  # passes the owner/mode check: only the no-follow open can refuse it
+    victim = target / "123.json"  # a name the prune would otherwise match
+    victim.write_text("{}", encoding="utf-8")
+    old = time.time() - 3 * 86400
+    os.utime(victim, (old, old))
+    _ledger(db.db_path).symlink_to(target, target_is_directory=True)
+    db.create_session("s1", "cli")
+    assert victim.exists()
+    assert sorted(p.name for p in target.iterdir()) == ["123.json"]  # nothing written through the link
+    assert lockowners.recent_ledger_holders(db.db_path, 60.0) == []
+
+
+@pytest.mark.platforms("posix")
+def test_group_writable_ledger_dir_is_skipped(db, monkeypatch):
+    monkeypatch.setattr(lockowners, "_HOLD_RECORD_MIN_S", 0.0)
+    ledger = _ledger(db.db_path)
+    ledger.mkdir(mode=0o700)
+    os.chmod(ledger, 0o777)
+    db.create_session("s1", "cli")
+    assert list(ledger.iterdir()) == []
+
+
+def test_prune_removes_only_old_ledger_records(db, monkeypatch):
+    monkeypatch.setattr(lockowners, "_HOLD_RECORD_MIN_S", 0.0)
+    ledger = _ledger(db.db_path)
+    ledger.mkdir(mode=0o700)
+    old = time.time() - 3 * 86400
+    for name in ("99999.json", "notes.txt"):
+        (ledger / name).write_text("{}", encoding="utf-8")
+        os.utime(ledger / name, (old, old))
+    db.create_session("s1", "cli")
+    names = sorted(p.name for p in ledger.iterdir())
+    assert "99999.json" not in names and "notes.txt" in names and f"{os.getpid()}.json" in names, names
+
+
+def test_older_hold_end_never_overwrites_a_newer_holding_record(db, monkeypatch):
+    """Prism "reordered publication": writer A starts and commits, writer B starts and is published as
+    holding, then A's descheduled hold_ended() runs. The record must still be B's."""
+    monkeypatch.setattr(lockowners, "_HOLD_RECORD_MIN_S", 0.0)
+    monkeypatch.setattr(lockowners, "_watchdog_running", True)  # no real watchdog: we play it by hand
+    monkeypatch.setattr(lockowners, "_watchdog_pid", os.getpid())
+    token_a = lockowners.hold_started(db.db_path, "writer_a")
+    token_b = lockowners.hold_started(db.db_path, "writer_b")
+    due = lockowners._select_due_holds()
+    for hold in due:
+        if hold["op"] == "writer_b":
+            lockowners._publish_holding(hold)
+    lockowners.hold_ended(token_a)  # A's end lands late
+    rec = json.loads((_ledger(db.db_path) / f"{os.getpid()}.json").read_text(encoding="utf-8-sig"))
+    assert rec["op"] == "writer_b" and rec["state"] == "holding", rec
+    lockowners.hold_ended(token_b)
+    rec = json.loads((_ledger(db.db_path) / f"{os.getpid()}.json").read_text(encoding="utf-8-sig"))
+    assert rec["op"] == "writer_b" and rec["state"] == "released", rec
