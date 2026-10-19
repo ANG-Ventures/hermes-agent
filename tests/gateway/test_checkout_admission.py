@@ -1076,12 +1076,55 @@ def test_lease_reused_pid_leftover_is_not_a_second_publisher(store):
     unexpected live consumer -- whatever /proc says about that pid."""
     store.hold("op", [SERVE], mode="freeze")
     _leased_leftover(store, SERVE, age=3600)
-    _leased_leftover(store, GW2, age=3600)  # unlisted consumer, same shape
     me = _gate(store, SERVE)
     assert "shared_with" not in me.publish()
     assert "shared_with" not in me.publish()
     rep = ca.evaluate(store)
     assert rep["verdict"] == QUIESCENT, rep
+
+
+def test_lease_unlisted_expired_record_on_reused_pid_fails_safe(store):
+    """The one remaining pid-trust edge: an UNLISTED consumer's expired lease
+    falls back to the pid probe (an expired lease alone does not prove a
+    stalled/SIGSTOPped publisher gone), so a reused live pid reads UNKNOWN --
+    an extra DEFER, never a mutation under a live consumer."""
+    store.hold("op", [SERVE], mode="freeze")
+    _leased_leftover(store, GW2, age=3600)
+    _gate(store, SERVE).publish()
+    rep = ca.evaluate(store)
+    assert rep["verdict"] == UNKNOWN, rep
+    assert any(r["consumer"] == GW2 for r in rep["consumers"]), rep
+
+
+def test_lease_unlisted_expired_record_of_dead_pid_is_ignored(store):
+    """Same record whose pid is dead: the fallback ignores it."""
+    store.hold("op", [SERVE], mode="freeze")
+    left = _leased_leftover(store, GW2, age=3600)
+    _gate(store, SERVE).publish()
+    rep = ca.evaluate(store, pid_alive=lambda pid: pid != left.pid)
+    assert rep["verdict"] == QUIESCENT, rep
+
+
+def test_lease_unlisted_released_record_of_live_pid_is_ignored(store):
+    """A clean stop (released lease) clears an unlisted consumer at once,
+    even though its pid (this test process) is still alive."""
+    store.hold("op", [SERVE], mode="freeze")
+    gone = _gate(store, GW2)
+    gone.publish()
+    gone.stop_lease()
+    _gate(store, SERVE).publish()
+    rep = ca.evaluate(store)
+    assert rep["verdict"] == QUIESCENT, rep
+
+
+def test_lease_unverifiable_age_is_not_liveness_for_listed(store, monkeypatch):
+    """Prism 33713d41b9c3: an unreadable store clock leaves a listed
+    consumer's lease unverified -> UNKNOWN, never QUIESCENT."""
+    store.hold("op", [SERVE], mode="freeze")
+    _gate(store, SERVE).publish()
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+    monkeypatch.setattr(type(store), "record_age", lambda self, name: None)
+    assert ca.evaluate(store)["verdict"] == UNKNOWN
 
 
 def test_lease_fresh_foreign_publisher_is_shared(store):

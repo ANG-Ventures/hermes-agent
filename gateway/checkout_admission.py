@@ -501,11 +501,12 @@ def _is_leased(rec: Mapping[str, Any]) -> bool:
     return isinstance(tok, str) and bool(tok)
 
 
-def _lease_fresh(store: HoldStore, name: str, rec: Mapping[str, Any]) -> bool:
+def _lease_fresh(store: HoldStore, name: str, rec: Mapping[str, Any]) -> Optional[bool]:
     """One-shot reader (no history): a leased record is live while its
-    store-relative age is under the lease expiry. Unreadable age = live."""
+    store-relative age is under the lease expiry. None = age unreadable
+    (unverifiable, never proof of liveness)."""
     age = store.record_age(name)
-    return age is None or age < _lease_expiry(rec, DEFAULT_LEASE_S)
+    return None if age is None else age < _lease_expiry(rec, DEFAULT_LEASE_S)
 
 
 # ---------------------------------------------------------------------------
@@ -926,10 +927,25 @@ def _not_live_why(store: HoldStore, name: str, rec: Mapping[str, Any],
     if _is_leased(rec):
         if rec.get("lease_released"):
             return "publisher released its lease (stopped)"
-        if not _lease_fresh(store, name, rec):
+        fresh = _lease_fresh(store, name, rec)
+        if fresh is None:
+            return "publisher lease age unverifiable (store clock unreadable)"
+        if not fresh:
             return "publisher lease expired"
         return None
     return None if pid_alive(rec.get("pid")) else "publishing pid is not alive"
+
+
+def _unlisted_may_be_live(rec: Mapping[str, Any], pid_alive: Callable[[int], bool]) -> bool:
+    """An UNLISTED consumer blocks unless we can show it is gone. A lease does
+    not prove that by expiring (a SIGSTOPped or stalled publisher stops
+    renewing but still holds work), so the same-host pid probe decides: a dead
+    pid cannot be the writer -> ignore; a live one -> live, unless its lease
+    was released. A reused pid therefore reads live: fail safe (an extra
+    DEFER), and only for consumers the hold does not name."""
+    if not pid_alive(rec.get("pid")):
+        return False
+    return not (_is_leased(rec) and rec.get("lease_released"))
 
 
 def _consumer_verdict(name: str, rec: Optional[dict], hold: HoldState, *, now: float,
@@ -1017,9 +1033,9 @@ def evaluate(store: HoldStore, *, now: Optional[float] = None,
         if not rec:
             continue
         # Freshness of published_at is NOT a filter here: a live publisher whose
-        # serving loop stalled may still hold work (C7 k90); its lease thread
-        # keeps the lease fresh, so only a released or expired lease clears it.
-        if rec.get("host") == host and _not_live_why(store, name, rec, pid_alive) is None:
+        # serving loop stalled may still hold work (C7 k90). A released lease
+        # clears it; an expired one needs the pid probe to show it dead.
+        if rec.get("host") == host and _unlisted_may_be_live(rec, pid_alive):
             rows.append({"consumer": name, "state": UNKNOWN, "work": None,
                          "why": "live consumer not in the hold's expected set"})
     states = {r["state"] for r in rows}
