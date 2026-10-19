@@ -127,7 +127,11 @@ def test_vacuum_is_recorded_as_a_vacuum_hold(db, monkeypatch):
 def test_ledger_names_the_public_method_that_held_the_lock(db, monkeypatch):
     monkeypatch.setattr(lockowners, "_HOLD_RECORD_MIN_S", 0.0)
     db.create_session("s1", "cli")
-    db.prune_sessions(older_than_days=90)
+    # A prune with nothing to delete takes no write lock; give it one old ended session.
+    old = time.time() - 200 * 86400
+    db._conn.execute("UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = 's1'", (old, old))
+    db._conn.commit()
+    assert db.prune_sessions(older_than_days=90) == 1
     rec = json.loads((_ledger(db.db_path) / f"{os.getpid()}.json").read_text(encoding="utf-8-sig"))
     assert rec["op"] == "prune_sessions", rec
 
