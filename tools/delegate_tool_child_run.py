@@ -855,6 +855,10 @@ class _ChildRun:
         # Resolved after seed_workspace so a multimodal goal's text part carries the worktree note too.
         _images = list(getattr(child, "_delegate_images", None) or [])
         user_message: Any = _build_child_goal_message(self.goal, _images, child) if _images else self.goal
+        # Boomerang v2 fork: the frame turn over the parent's transcript (no-op for every other child).
+        from tools.delegate_tool_fork import fork_run_inputs
+        user_message, fork_history = fork_run_inputs(child, user_message)
+        run_kwargs: Dict[str, Any] = {"conversation_history": fork_history} if fork_history is not None else {}
 
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
@@ -862,6 +866,7 @@ class _ChildRun:
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
+                    **run_kwargs,
                 )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)

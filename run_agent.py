@@ -1484,6 +1484,7 @@ class AIAgent(
             max_iterations=function_args.get("max_iterations"), role=function_args.get("role"),
             background=not (getattr(self, "_delegate_depth", 0) > 0), images=function_args.get("images"),
             inherit_context=function_args.get("inherit_context"),
+            inherit_mode=function_args.get("inherit_mode"),
             skills=function_args.get("skills"),
             model=function_args.get("model"),
             provider=function_args.get("provider"),
