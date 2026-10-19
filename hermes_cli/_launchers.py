@@ -378,10 +378,65 @@ def _publish_conveniences(root: Path, out_dir: Path, names, *, create: bool = Tr
     return published
 
 
+def _shell_launcher_python(target: Path) -> Path | None:
+    """The interpreter an existing POSIX store launcher execs, or None."""
+    try:
+        if target.is_symlink():
+            return None
+        lines = target.read_text(encoding="utf-8").split("\n", 1)
+        if lines[0] != "#!/bin/sh" or len(lines) < 2:
+            return None
+        tokens = shlex.split(lines[1])
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if len(tokens) >= 4 and tokens[0] == "exec" and tokens[2:4] == ["-I", "-c"]:
+        return Path(tokens[1])
+    return None
+
+
+def _foreign_store_rebind(target: Path, store_python: Path, repo_root: Path) -> Path | None:
+    """The live interpreter ``target`` already execs when ``store_python`` is in another store.
+
+    The store follows HERMES_HOME, so a process with a test or scratch home
+    (pytest's tmp_path) resolves a different store than the install's. Its
+    launcher self-heal must not rebind the install's shared launcher there:
+    the tmp store is deleted and every command exits 127 (t_968b018f). A
+    repin inside the same store, or a launcher whose interpreter is gone,
+    still republishes. Only a launcher bound to a real PM store (its
+    ``<store>/<entry>/bin/python3`` has the store's facts.json) is kept;
+    legacy venv and developer interpreters migrate as before.
+    """
+    current = _shell_launcher_python(target)
+    if current is None or not current.is_file():
+        return None
+    try:
+        old_store = current.parents[2]
+        if not (old_store / "facts.json").is_file():
+            return None
+        new_store = store_root(repo_root)
+        if old_store.resolve() == new_store.resolve():
+            return None
+        if store_python.resolve().is_relative_to(old_store.resolve()):
+            return None
+    except (IndexError, OSError, RuntimeError, ValueError):
+        return None
+    return current
+
+
 def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
     """Publish one launcher bound to store Python, or refuse missing tools."""
     repo_root = Path(repo_root)
     store_python = resolve_store_python(repo_root)
+    if store_python is not None and not _is_windows():
+        target = Path(out_dir) / name
+        kept = _foreign_store_rebind(target, store_python, repo_root)
+        if kept is not None:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "launchers: %s keeps %s; not rebinding to %s (another store, e.g. a test HERMES_HOME)",
+                target, kept, store_python)
+            return target
     if store_python is not None:
         path = mint_launcher(name, repo_root, out_dir, store_python, None)
         if path is not None and path.suffix == ".cmd":
