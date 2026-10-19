@@ -1213,6 +1213,7 @@
     ],
     "paths": [
       "hermes_cli/commands.py",
+      "hermes_cli/commands_*.py",
       "ui-tui/src/app/slash/commands/core.ts",
       "ui-tui/src/app/slash/commands/ops.ts",
       "ui-tui/src/app/slash/commands/session.ts",
