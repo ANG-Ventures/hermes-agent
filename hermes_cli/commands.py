@@ -113,8 +113,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Session", aliases=("fork",), args_hint="[--here] [--fresh] [name]"),
     CommandDef("merge", "Merge a summary of this session into another session (branched thread, or a named session)", "Session",
                gateway_only=True, args_hint="[name]"),
-    CommandDef("boomerang", "Run a task autonomously in an isolated subagent that inherits this "
-               "session's context; a summary returns here when it finishes", "Session",
+    # Description stays <= 100 chars (Discord/Telegram menu cap); full flag usage prints on bare /boomerang.
+    CommandDef("boomerang", "Run a task in a subagent inheriting this session (fork; --summary folds); "
+               "summary returns here", "Session",
                args_hint="<task>"),
     CommandDef("autohandle", "Auto-handle mechanical kanban wakes for cards homed in this session "
                "(on/off/status)", "Session", gateway_only=True, busy_policy="dispatch",
