@@ -34,7 +34,8 @@ Contract
   was written. That is the late-arrival guarantee; it does not depend on poll
   timing.
 * Verdict. :func:`evaluate` returns ``QUIESCENT`` only when a FREEZE hold is
-  present and EVERY expected consumer has a fresh record, a live pid on this host, an
+  present and EVERY expected consumer has a fresh record, a live publisher
+  lease (legacy records without one: a live pid) on this host, an
   acknowledgment of the CURRENT epoch and zero work. Missing, stale, corrupt,
   unacknowledged, foreign-host or unexpected-live-consumer evidence is
   ``UNKNOWN``; nonzero work is ``BUSY``; zero work under a drain hold is
@@ -52,6 +53,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -75,6 +77,15 @@ SCHEMA = 1
 MODES = ("drain", "freeze")
 DEFAULT_STALE_AFTER = 20.0
 DEFAULT_PUBLISH_INTERVAL = 2.0
+# Publisher lease (t_eceadca2): every record carries a per-process random
+# ``token``; a thread independent of the serving loop rewrites the record at
+# least every LEASE_S. A record is live while its lease is younger than
+# LEASE_EXPIRY_FACTOR * LEASE_S, measured on the store's own mtime clock (a
+# reader) or on the gate's monotonic clock (a same-name peer). No pid, /proc
+# or writer wall clock is involved, so pid reuse, namespaces and cross-host
+# skew cannot fake or hide liveness.
+DEFAULT_LEASE_S = 30.0
+LEASE_EXPIRY_FACTOR = 3
 QUIESCENT, DRAINED, BUSY, UNKNOWN, NOT_HELD, DEFER = (
     "QUIESCENT", "DRAINED", "BUSY", "UNKNOWN", "NOT_HELD", "DEFER",
 )
@@ -255,7 +266,10 @@ def _create_time(pid: int) -> Optional[float]:
 
 
 def _same_live_process(pid: Any, rec: Mapping[str, Any]) -> bool:
-    """True unless there is positive evidence that ``pid`` is no longer the
+    """LEGACY records only (no lease ``token``; written before t_eceadca2;
+    remove after one release). Leased records never reach this.
+
+    True unless there is positive evidence that ``pid`` is no longer the
     process that wrote ``rec`` (dead, other host boot, or a reused pid).
 
     Inconclusive evidence (missing/non-finite fields, psutil errors) keeps the
@@ -455,6 +469,44 @@ class HoldStore:
             return []
         return [f.name[:-5].replace("@", ":") for f in files]
 
+    def record_age(self, name: str) -> Optional[float]:
+        """Seconds since ``name``'s record was last written, on the STORE's
+        clock: a scratch file is created (and removed) in the same directory
+        and the two mtimes are compared, so writer/reader wall-clock skew never
+        enters. None when either mtime cannot be read (inconclusive)."""
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=".lease-clock.", dir=str(self.consumers_dir))
+        except OSError:
+            return None
+        try:
+            now = os.fstat(fd).st_mtime
+            written = os.stat(self.consumer_path(name)).st_mtime
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+        return now - written
+
+
+def _lease_expiry(rec: Mapping[str, Any], default_lease_s: float) -> float:
+    lease_s = rec.get("lease_s")
+    ok = _finite(lease_s) and float(lease_s) > 0  # type: ignore[arg-type]
+    return LEASE_EXPIRY_FACTOR * (float(lease_s) if ok else default_lease_s)  # type: ignore[arg-type]
+
+
+def _is_leased(rec: Mapping[str, Any]) -> bool:
+    tok = rec.get("token")
+    return isinstance(tok, str) and bool(tok)
+
+
+def _lease_fresh(store: HoldStore, name: str, rec: Mapping[str, Any]) -> bool:
+    """One-shot reader (no history): a leased record is live while its
+    store-relative age is under the lease expiry. Unreadable age = live."""
+    age = store.record_age(name)
+    return age is None or age < _lease_expiry(rec, DEFAULT_LEASE_S)
+
 
 # ---------------------------------------------------------------------------
 # Consumer side
@@ -483,10 +535,21 @@ class AdmissionGate:
     def __init__(self, store: HoldStore, consumer: str, *,
                  active_work: Optional[ActiveWork] = None,
                  serving: Optional[Callable[[], Mapping[str, Any]]] = None,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time,
+                 lease_s: float = DEFAULT_LEASE_S,
+                 monotonic: Callable[[], float] = time.monotonic):
         self.store = store
         self.consumer = validate_consumer_name(consumer)
         self.instance = uuid.uuid4().hex
+        self.token = secrets.token_hex(16)  # lease identity, random per process start
+        self.lease_s = float(lease_s)
+        self._mono = monotonic
+        self._write_lock = threading.RLock()  # mark + write, loop vs lease thread
+        self._last_record: Optional[dict] = None
+        self._lease_stop = threading.Event()
+        self._lease_thread: Optional[threading.Thread] = None
+        # foreign lease token -> {"pid", "instance", "alive_at" (our monotonic), "expiry" (s)}
+        self._peers: dict = {}
         self.pid = os.getpid()
         self.host = socket.gethostname()
         self.boot_ts = clock()
@@ -609,6 +672,7 @@ class AdmissionGate:
                 "schema": SCHEMA, "consumer": self.consumer, "pid": self.pid,
                 "host": self.host, "instance": self.instance, "boot_ts": self.boot_ts,
                 "boot_id": self.boot_id, "start_offset": self.start_offset, "create_time": self.create_time, "time_ns": self.time_ns, "pid_ns": self.pid_ns,
+                "token": self.token, "lease_s": self.lease_s,
                 "published_at": self._clock(), "hold_epoch": hold_epoch,
                 "hold_error": hold_error, "tickets": tickets,
                 "active_work": work_total, "active_work_detail": work_detail,
@@ -616,47 +680,143 @@ class AdmissionGate:
             }
 
     def _mark_shared_record(self, record: dict) -> dict:
-        """Flag a consumer name another LIVE process also publishes under.
+        """Flag a consumer name another LIVE publisher also writes under.
 
         Two processes configured with the same name overwrite one record, so
-        an idle snapshot could hide the other's work. Once a foreign live
-        instance is seen the flag stays set while that same process lives
-        (sticky, so our own back-to-back writes cannot clear it) and
-        ``evaluate`` reads the record as UNKNOWN. "Same process" is re-checked
-        on every publish (``_same_live_process``), so a pid an unrelated
-        process reused after a reboot never pins the flag.
+        an idle snapshot could hide the other's work. Liveness of the other
+        publisher is its LEASE, never its pid (t_eceadca2): a record carrying
+        a lease ``token`` that is not ours is a peer. The peer stays live,
+        sticky across our own writes, until LEASE_EXPIRY_FACTOR * its
+        ``lease_s`` passes on our monotonic clock without its token showing up
+        in the record again (or it writes a released record); then
+        ``evaluate`` stops reading UNKNOWN.
+
+        Records with no token predate the lease and keep the pid-identity
+        check (``_same_live_process``) for one release.
         """
+        now = self._mono()
         try:
             prev = self.store.read_consumer(self.consumer)
         except Exception:
             prev = None
-        if (isinstance(prev, dict) and prev.get("instance") not in (None, self.instance)
+        if isinstance(prev, dict) and _is_leased(prev):
+            tok = prev["token"]
+            if prev.get("lease_released"):
+                self._peers.pop(tok, None)
+            elif tok != self.token:
+                # Known peer: its token is back in the record after our own
+                # last write, so it wrote since then; alive now on our
+                # monotonic clock, no wall/mtime comparison (a clock step can
+                # never expire a live peer). First sight: the record may be a
+                # crashed publisher's leftover (a pid reused after reboot), so
+                # age it on the store's own mtime clock.
+                if tok in self._peers:
+                    alive_at = now
+                else:
+                    age = self.store.record_age(self.consumer)
+                    alive_at = now if age is None else now - max(0.0, age)
+                self._peers[tok] = {
+                    "pid": prev.get("pid"), "instance": prev.get("instance"),
+                    "alive_at": alive_at, "expiry": _lease_expiry(prev, self.lease_s),
+                }
+        elif (isinstance(prev, dict) and prev.get("instance") not in (None, self.instance)
                 and prev.get("host") == self.host and prev.get("pid") != self.pid):
             self._foreign = (prev.get("pid"), prev.get("instance"),
                              {k: prev[k] for k in ("boot_id", "start_offset", "create_time", "time_ns", "pid_ns") if k in prev})
+        for tok, peer in list(self._peers.items()):
+            if now - peer["alive_at"] >= peer["expiry"]:
+                del self._peers[tok]
         foreign = self._foreign
         if foreign is not None and not _same_live_process(foreign[0], foreign[2]):
             self._foreign = foreign = None
-        if foreign is not None:
+        if self._peers:
+            peer = max(self._peers.values(), key=lambda p: p["alive_at"])
+            record["shared_with"] = {"pid": peer["pid"], "instance": peer["instance"]}
+        elif foreign is not None:
             record["shared_with"] = {"pid": foreign[0], "instance": foreign[1]}
         return record
 
+    def _write(self, record: dict, *, release: bool = False) -> dict:
+        """Mark + write as one step (the serving loop and the lease thread
+        both write); stamps the lease on success."""
+        with self._write_lock:
+            record = dict(record)
+            record.pop("shared_with", None)
+            record.pop("lease_released", None)
+            record = self._mark_shared_record(record)
+            if release:
+                record["lease_released"] = True
+            self.store.write_consumer(self.consumer, record)
+            self._last_record = record
+            return record
+
+    def renew_lease(self) -> Optional[dict]:
+        """Rewrite the last record so the lease stays fresh even while the
+        serving loop is stalled (its ``published_at`` still ages, so a stalled
+        loop reads stale, while a peer still sees this process as alive).
+        A renewal racing a stop is dropped so it cannot undo the release."""
+        with self._write_lock:
+            last = self._last_record
+            if last is None or self._lease_stop.is_set():
+                return None
+            return self._write(last)
+
+    def start_lease(self) -> threading.Thread:
+        """Renew the lease every ``lease_s`` from a thread independent of the
+        serving loop. Idempotent."""
+        th = self._lease_thread
+        if th is not None and th.is_alive():
+            return th
+        self._lease_stop.clear()
+
+        def _loop():
+            while not self._lease_stop.wait(self.lease_s):
+                try:
+                    self.renew_lease()
+                except Exception:
+                    logger.warning("checkout admission lease renewal failed", exc_info=True)
+
+        th = threading.Thread(target=_loop, name=f"checkout-admission-lease:{self.consumer}", daemon=True)
+        th.start()
+        self._lease_thread = th
+        return th
+
+    def stop_lease(self) -> None:
+        """Stop renewing and, if we ever published, write a released record so
+        a same-name successor (a restart) does not wait out our lease. A crash
+        skips this; its lease then expires after LEASE_EXPIRY_FACTOR * lease_s."""
+        self._lease_stop.set()
+        last = self._last_record
+        if last is None:
+            return
+        try:
+            with self._write_lock:
+                cur = self.store.read_consumer(self.consumer)
+                # Only release a record that is still ours: a successor that
+                # already published under this name must not be overwritten.
+                if isinstance(cur, dict) and cur.get("token") == self.token:
+                    self._write(last, release=True)
+        except Exception:
+            logger.warning("checkout admission lease release failed", exc_info=True)
+
     def publish(self) -> dict:
-        record = self._mark_shared_record(self.snapshot())
-        self.store.write_consumer(self.consumer, record)
-        return record
+        return self._write(self.snapshot())
 
     def start_publisher_thread(self, interval: float = DEFAULT_PUBLISH_INTERVAL,
                                stop: Optional[threading.Event] = None) -> threading.Thread:
         stop = stop or threading.Event()
+        self.start_lease()
 
         def _loop():
-            while not stop.is_set():
-                try:
-                    self.publish()
-                except Exception:
-                    logger.warning("checkout admission publish failed", exc_info=True)
-                stop.wait(interval)
+            try:
+                while not stop.is_set():
+                    try:
+                        self.publish()
+                    except Exception:
+                        logger.warning("checkout admission publish failed", exc_info=True)
+                    stop.wait(interval)
+            finally:
+                self.stop_lease()
 
         th = threading.Thread(target=_loop, name=f"checkout-admission:{self.consumer}", daemon=True)
         th.start()
@@ -665,19 +825,23 @@ class AdmissionGate:
     async def publish_forever(self, interval: float = DEFAULT_PUBLISH_INTERVAL) -> None:
         """Asyncio publisher: the snapshot runs ON the loop (so it cannot
         interleave with loop-thread check-and-register code) and its freshness
-        proves the loop itself is serving. Only the file write is offloaded."""
+        proves the loop itself is serving. Only the file write is offloaded;
+        the lease is renewed off-loop."""
         import asyncio
 
-        while True:
-            try:
-                record = self.snapshot()
-                record = await asyncio.to_thread(self._mark_shared_record, record)
-                await asyncio.to_thread(self.store.write_consumer, self.consumer, record)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning("checkout admission publish failed", exc_info=True)
-            await asyncio.sleep(interval)
+        self.start_lease()
+        try:
+            while True:
+                try:
+                    record = self.snapshot()
+                    await asyncio.to_thread(self._write, record)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("checkout admission publish failed", exc_info=True)
+                await asyncio.sleep(interval)
+        finally:
+            self.stop_lease()
 
 
 # ---------------------------------------------------------------------------
@@ -754,9 +918,24 @@ def _reset_process_gates_for_tests() -> None:
 # ---------------------------------------------------------------------------
 # Operator side
 # ---------------------------------------------------------------------------
+def _not_live_why(store: HoldStore, name: str, rec: Mapping[str, Any],
+                  pid_alive: Callable[[int], bool]) -> Optional[str]:
+    """Why ``rec``'s publisher is not live, or None. A leased record is judged
+    by its lease only (released, or older than its expiry on the store's mtime
+    clock); ``pid_alive`` is consulted only for a legacy record without one."""
+    if _is_leased(rec):
+        if rec.get("lease_released"):
+            return "publisher released its lease (stopped)"
+        if not _lease_fresh(store, name, rec):
+            return "publisher lease expired"
+        return None
+    return None if pid_alive(rec.get("pid")) else "publishing pid is not alive"
+
+
 def _consumer_verdict(name: str, rec: Optional[dict], hold: HoldState, *, now: float,
                       stale_after: float, host: str,
-                      pid_alive: Callable[[int], bool]) -> dict:
+                      pid_alive: Callable[[int], bool],
+                      store: HoldStore) -> dict:
     out: dict = {"consumer": name, "state": UNKNOWN, "why": None, "work": None}
     if rec is None:
         out["why"] = "no acknowledgment record"
@@ -769,8 +948,9 @@ def _consumer_verdict(name: str, rec: Optional[dict], hold: HoldState, *, now: f
     if rec.get("host") != host:
         out["why"] = f"record from foreign host {rec.get('host')!r}; pid liveness unverifiable"
         return out
-    if not pid_alive(rec.get("pid")):
-        out["why"] = "publishing pid is not alive"
+    why = _not_live_why(store, name, rec, pid_alive)
+    if why:
+        out["why"] = why
         return out
     try:
         age = now - float(rec.get("published_at"))
@@ -822,7 +1002,7 @@ def evaluate(store: HoldStore, *, now: Optional[float] = None,
             rows.append({"consumer": name, "state": UNKNOWN, "why": f"record unreadable: {exc}", "work": None})
             continue
         rows.append(_consumer_verdict(name, rec, hold, now=now, stale_after=stale_after,
-                                      host=host, pid_alive=pid_alive))
+                                      host=host, pid_alive=pid_alive, store=store))
     # A live consumer the operator forgot to list would be mutated under.
     for name in store.consumer_names():
         if name in hold.expected:
@@ -836,9 +1016,10 @@ def evaluate(store: HoldStore, *, now: Optional[float] = None,
             continue
         if not rec:
             continue
-        # Freshness is NOT a filter here: a live pid whose publisher stalled
-        # may still hold work, so a stale record proves nothing (C7 k90).
-        if rec.get("host") == host and pid_alive(rec.get("pid")):
+        # Freshness of published_at is NOT a filter here: a live publisher whose
+        # serving loop stalled may still hold work (C7 k90); its lease thread
+        # keeps the lease fresh, so only a released or expired lease clears it.
+        if rec.get("host") == host and _not_live_why(store, name, rec, pid_alive) is None:
             rows.append({"consumer": name, "state": UNKNOWN, "work": None,
                          "why": "live consumer not in the hold's expected set"})
     states = {r["state"] for r in rows}
@@ -892,8 +1073,8 @@ def probe(store: HoldStore, consumer: str, *, url: Optional[str] = None,
     age = now - float(rec.get("published_at") or 0)
     out.update(pid=rec.get("pid"), instance=rec.get("instance"), age=round(age, 3),
                serving=rec.get("serving"), hold_epoch=rec.get("hold_epoch"))
-    if rec.get("host") != socket.gethostname() or not pid_alive(rec.get("pid")):
-        out["why"] = "publisher pid not alive on this host"
+    if rec.get("host") != socket.gethostname() or _not_live_why(store, consumer, rec, pid_alive):
+        out["why"] = "publisher not alive on this host"
         return out
     if age > stale_after:
         out["why"] = f"record stale ({age:.1f}s): serving loop not publishing"

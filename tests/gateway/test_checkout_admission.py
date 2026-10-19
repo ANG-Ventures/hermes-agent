@@ -270,7 +270,11 @@ def test_stale_record_is_unknown(store):
 
 
 def test_dead_pid_is_unknown(store):
+    """Legacy (pre-lease) record: liveness is still the pid."""
     _held_and_acked(store)
+    rec = store.read_consumer(GW)
+    rec.pop("token")
+    store.write_consumer(GW, rec)
     assert ca.evaluate(store, pid_alive=lambda pid: False)["verdict"] == UNKNOWN
 
 
@@ -335,6 +339,7 @@ def test_hold_persists_across_consumer_restart_with_no_gap(store):
     store.hold("op", [GW], mode="freeze")
     old = _gate(store, GW)
     old.publish()
+    old.stop_lease()  # the old process exits cleanly (publish_forever's finally)
     new = _gate(store, GW)  # restarted process, never published yet
     with pytest.raises(AdmissionRefused):
         new.admit("first-message-after-boot")
@@ -343,6 +348,19 @@ def test_hold_persists_across_consumer_restart_with_no_gap(store):
     rep = ca.evaluate(store)
     assert rep["verdict"] == QUIESCENT
     assert rep["consumers"][0]["instance"] == new.instance
+
+
+def test_unclean_restart_defers_for_at_most_three_leases(store):
+    """A predecessor that died without releasing (SIGKILL) is indistinguishable
+    from a live peer until its lease expires: UNKNOWN for 3*lease_s, then clear."""
+    store.hold("op", [GW], mode="freeze")
+    _gate(store, GW).publish()  # killed: no stop_lease
+    mono = _Mono()
+    new = AdmissionGate(store, GW, active_work=Work(), monotonic=mono)
+    assert new.publish().get("shared_with")
+    mono.t += ca.LEASE_EXPIRY_FACTOR * ca.DEFAULT_LEASE_S
+    assert "shared_with" not in new.publish()
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
 
 
 def test_hold_has_no_ttl_and_only_owner_releases(store):
@@ -804,7 +822,9 @@ def test_consumer_name_shared_by_two_live_processes_is_unknown(store):
 def _foreign_record(store, name, **fields):
     """Publish under ``name`` as another instance whose pid (our parent) is
     alive on this host; ``fields`` override the start-identity fields. A
-    field set to ``...`` is dropped (legacy record shape)."""
+    field set to ``...`` is dropped (legacy record shape). The record is
+    written in the LEGACY (pre-lease, no ``token``) shape: these tests cover
+    the pid-identity fallback kept for one release."""
     other = _gate(store, name)
     other.pid = os.getppid()
     other.instance = "other-instance"
@@ -812,6 +832,7 @@ def _foreign_record(store, name, **fields):
     other.time_ns = ca._time_ns_id() if other.start_offset is not None else None
     other.create_time = ca._create_time(other.pid)
     rec = other.snapshot()
+    rec.update({"token": ..., "lease_s": ...})
     rec.update(fields)
     rec = {k: v for k, v in rec.items() if v is not ...}
     store.write_consumer(name, rec)
@@ -1013,6 +1034,202 @@ def test_sticky_shared_flag_clears_when_foreign_pid_is_reused(store):
     pid, inst, evidence = me._foreign
     me._foreign = (pid, inst, dict(evidence, start_offset=evidence["start_offset"] - 60))
     assert "shared_with" not in me.publish()
+
+
+# ------------------------------------------------- publisher lease (t_eceadca2)
+class _Mono:
+    """Injected monotonic clock for a gate."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def _age_record(store, name, seconds):
+    """Move the record's mtime (the store's lease clock) ``seconds`` into the past."""
+    p = store.consumer_path(name)
+    st = os.stat(p)
+    os.utime(p, (st.st_atime - seconds, st.st_mtime - seconds))
+
+
+def _leased_leftover(store, name, *, age):
+    """A leased record whose pid is ALIVE and carries that process's genuine
+    pid identity (boot id, namespaces, start offset): everything a /proc
+    comparison could see says "same process". Only its lease is old."""
+    other = _gate(store, name)
+    other.pid = os.getppid()
+    other.instance = "previous-boot-instance"
+    other.start_offset = ca._start_offset(other.pid)
+    other.time_ns = ca._time_ns_id() if other.start_offset is not None else None
+    other.create_time = ca._create_time(other.pid)
+    store.write_consumer(name, other.snapshot())
+    _age_record(store, name, age)
+    return other
+
+
+def test_lease_reused_pid_leftover_is_not_a_second_publisher(store):
+    """The wireplumber case: serve:clanker's record from before the reboot
+    names a pid that a different, live process now holds. Its lease is long
+    expired on the store's clock, so it is neither a sharing peer nor an
+    unexpected live consumer -- whatever /proc says about that pid."""
+    store.hold("op", [SERVE], mode="freeze")
+    _leased_leftover(store, SERVE, age=3600)
+    _leased_leftover(store, GW2, age=3600)  # unlisted consumer, same shape
+    me = _gate(store, SERVE)
+    assert "shared_with" not in me.publish()
+    assert "shared_with" not in me.publish()
+    rep = ca.evaluate(store)
+    assert rep["verdict"] == QUIESCENT, rep
+
+
+def test_lease_fresh_foreign_publisher_is_shared(store):
+    """Control arm for the reuse test: the same record with a FRESH lease is
+    a live second publisher."""
+    store.hold("op", [SERVE], mode="freeze")
+    _leased_leftover(store, SERVE, age=0)
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
+    assert ca.evaluate(store)["verdict"] == UNKNOWN
+
+
+def test_lease_killed_publisher_expires_after_three_leases(store):
+    """A peer that stops renewing (kill -9: no release) keeps the flag for
+    3*lease_s on the gate's monotonic clock, then the record goes QUIESCENT."""
+    store.hold("op", [SERVE], mode="freeze")
+    mono = _Mono()
+    peer = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30)
+    peer.pid = os.getppid()
+    me = AdmissionGate(store, SERVE, active_work=Work(), lease_s=30, monotonic=mono)
+    peer.publish()
+    assert me.publish().get("shared_with")
+    peer.publish()  # still alive: renews
+    mono.t += 60
+    assert me.publish().get("shared_with")
+    # peer is killed -9 here: it never writes again
+    mono.t += 89
+    assert me.publish().get("shared_with")
+    mono.t += 2
+    assert "shared_with" not in me.publish()
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
+def test_lease_released_publisher_clears_at_once(store):
+    """A clean stop writes a released record: no wait for expiry."""
+    store.hold("op", [SERVE], mode="freeze")
+    peer = _gate(store, SERVE)
+    peer.pid = os.getppid()
+    me = _gate(store, SERVE)
+    peer.publish()
+    assert me.publish().get("shared_with")
+    peer.publish()
+    peer.stop_lease()
+    assert store.read_consumer(SERVE)["lease_released"] is True
+    assert "shared_with" not in me.publish()
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
+def test_lease_release_never_overwrites_a_successor(store):
+    old = _gate(store, SERVE)
+    old.publish()
+    new = _gate(store, SERVE)
+    new.publish()
+    old.stop_lease()
+    rec = store.read_consumer(SERVE)
+    assert rec["token"] == new.token and not rec.get("lease_released")
+
+
+def test_lease_live_publisher_under_clock_step_stays_live(store):
+    """Neither a wall-clock nor a store-clock step can expire a live peer:
+    a known peer is aged on the gate's monotonic clock, and a reader's mtime
+    age of a record written after a backward step is negative (fresh)."""
+    store.hold("op", [SERVE], mode="freeze")
+    mono = _Mono()
+    peer = _gate(store, SERVE)
+    peer.pid = os.getppid()
+    me = AdmissionGate(store, SERVE, active_work=Work(), monotonic=mono)
+    peer.publish()
+    assert me.publish().get("shared_with")
+    peer.publish()
+    _age_record(store, SERVE, 3600)  # store clock stepped forward an hour since the write
+    assert me.publish().get("shared_with")  # known peer: monotonic, not mtime
+    # reader: a live publisher that wrote while the clock ran an hour ahead
+    solo = HoldStore(store.directory.parent / "solo")
+    solo.hold("op", [SERVE], mode="freeze")
+    g = _gate(solo, SERVE)
+    g.publish()
+    _age_record(solo, SERVE, -3600)
+    assert ca.evaluate(solo)["verdict"] == QUIESCENT  # judged by its lease, it is live
+    assert ca.probe(solo, SERVE)["ok"] is True
+
+
+def test_lease_thread_renews_while_serving_loop_is_stalled(store):
+    """The lease is renewed off the serving loop: published_at stays put (a
+    stalled loop still reads stale) while the record keeps being rewritten."""
+    g = AdmissionGate(store, SERVE, active_work=Work(), lease_s=0.05)
+    first = g.publish()
+    _age_record(store, SERVE, 3600)
+    g.start_lease()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and (store.record_age(SERVE) or 0) > 60:
+            time.sleep(0.02)
+        assert store.record_age(SERVE) < 60
+        rec = store.read_consumer(SERVE)
+        assert rec["token"] == g.token and rec["published_at"] == first["published_at"]
+    finally:
+        g.stop_lease()
+
+
+def test_lease_real_publisher_killed_9_goes_quiescent(store, tmp_path):
+    """Real process: a second publisher under our name, then SIGKILL. Its
+    lease expires after 3*lease_s and the shared flag clears."""
+    import signal
+    import subprocess
+    import sys
+
+    lease_s = 0.3
+    store.hold("op", [SERVE], mode="freeze")
+    ready = tmp_path / "ready"
+    code = (
+        "import sys, time, threading\n"
+        "from pathlib import Path\n"
+        "import gateway.checkout_admission as ca\n"
+        f"g = ca.AdmissionGate(ca.HoldStore({str(store.directory)!r}), {SERVE!r}, "
+        f"active_work=lambda: 0, lease_s={lease_s})\n"
+        "g.start_publisher_thread(interval=0.05)\n"
+        "time.sleep(0.3)\n"
+        f"Path({str(ready)!r}).write_text('1')\n"
+        "time.sleep(600)\n"
+    )
+    repo = Path(ca.__file__).resolve().parents[1]
+    proc = subprocess.Popen([sys.executable, "-c", code], cwd=str(repo),
+                            env=dict(os.environ, PYTHONPATH=str(repo)))
+    try:
+        deadline = time.monotonic() + 120
+        while not ready.exists():
+            assert proc.poll() is None and time.monotonic() < deadline, "publisher did not start"
+            time.sleep(0.05)
+        me = AdmissionGate(store, SERVE, active_work=Work(), lease_s=lease_s)
+        assert me.publish().get("shared_with"), "live second publisher not flagged"
+        assert ca.evaluate(store)["verdict"] == UNKNOWN
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=30)
+        killed_at = time.monotonic()
+        cleared_at = None
+        while time.monotonic() - killed_at < 3 * lease_s * 10:
+            if "shared_with" not in me.publish():
+                cleared_at = time.monotonic()
+                break
+            time.sleep(0.05)
+        assert cleared_at is not None, "flag never cleared after SIGKILL"
+        assert cleared_at - killed_at >= 3 * lease_s - 0.2  # not before the lease could expire
+        assert ca.evaluate(store)["verdict"] == QUIESCENT
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=30)
 
 
 def test_unreadable_unexpected_consumer_record_is_unknown(store):
