@@ -3318,6 +3318,10 @@ def _prepare_job_prompt(
             cancel_event=cancel_event,
         )
         _ran_ok, _script_output = prerun_script
+        from cron.scheduler_shutdown_skip import is_shutdown_refused
+        if not _ran_ok and is_shutdown_refused(job_id):
+            # Refused by the shutdown gate: do not hand "Script Error" to an agent.
+            return (False, f"# Cron Job: {job_name}\n\n{_script_output}\n", "", _script_output), None
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
             note_cron_skipped(job)
@@ -4687,6 +4691,12 @@ def _run_one_job_body(
             _teardown_deferred()
             raise
 
+        from cron.scheduler_shutdown_skip import consume_shutdown_refused, record_shutdown_skip
+        if not success and consume_shutdown_refused(job["id"]):
+            _teardown_deferred()
+            record_shutdown_skip(job, fire_owner, execution_id)
+            return True
+
         if _fire_claim_ownership_lost():
             _teardown_deferred()
             _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
@@ -5573,6 +5583,9 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     if job.get(LATE_FIRE_KEY):
         claimed_job[LATE_FIRE_KEY] = job[LATE_FIRE_KEY]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    # The due slot (pre-advance), restored if the shutdown gate refuses the run.
+    from cron.scheduler_shutdown_skip import DUE_NEXT_RUN_KEY
+    claimed_job[DUE_NEXT_RUN_KEY] = job.get("next_run_at")
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
