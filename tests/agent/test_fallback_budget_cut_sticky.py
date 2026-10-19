@@ -64,7 +64,7 @@ def test_budget_cut_arms_sticky_and_next_turn_stays_on_fallback(wired):
     # Ledger class and the loud label survive: not relabelled quota / conn.
     assert row["trigger_class"] == BUDGET
     assert row["sticky_until_epoch"] == pytest.approx(st.until_epoch)
-    assert "no first byte" in row["notice_text"]
+    assert "no reply in 606 s" in row["notice_text"]
     assert calls["gate"] == 0  # not a quota event: no quota-registry gate
     assert _restore(a) is False  # same agent, next turn
     assert (a.provider, a.model) == OPUS
