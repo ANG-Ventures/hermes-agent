@@ -23,9 +23,10 @@ CFG = {"fallback": {"still_waiting_notice_seconds": 120, "no_first_byte_budget_s
 
 @pytest.fixture(autouse=True)
 def _clean_relay_streaming():
-    rh.reset_relay_streaming()
+    reset = getattr(rh, "reset_relay_streaming", lambda: None)
+    reset()
     yield
-    rh.reset_relay_streaming()
+    reset()
 
 
 def _resp(url: str, headers: dict) -> httpx.Response:
