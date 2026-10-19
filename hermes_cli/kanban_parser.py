@@ -361,6 +361,10 @@ _SPECS = [
                   "review). Best for open-ended cards one shot rarely finishes."),
         _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
              help="Turn budget for --goal workers (default 20). Ignored without --goal."),
+        _arg("--auto-handle", choices=("true", "false"), dest="auto_handle", default=None,
+             help="Boomerang v2: let mechanical wakes on this card be auto-handled by a "
+                  "background child (true) or always surface (false). Omit to inherit the "
+                  "home session's /autohandle, then the board default (off)."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
@@ -662,6 +666,10 @@ _SPECS = [
             _arg("--worker-ok", action="store_const", const=False, dest="no_worker",
                  help="Clear the no-worker flag"),
         ),
+        _arg("--auto-handle", choices=("true", "false", "inherit"), dest="auto_handle",
+             default=None,
+             help="Boomerang v2 auto-handle flag: true / false, or inherit to clear it "
+                  "(home session /autohandle, then board default, then off)."),
         # fork #1614: per-card skill list; fork #1612: needs-input pager opt-out.
         _arg("--skill", action="append", default=[], dest="skills", metavar="NAME",
              help="Append a skill to force-load into the worker (repeatable; "

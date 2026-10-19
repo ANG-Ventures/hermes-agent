@@ -1,0 +1,38 @@
+{
+  "_comment": [
+    "Cross-step plan for run.py. Every kanban argv is appended to BV2_KANBAN_CMD (default 'hermes kanban').",
+    "Placeholders: {board} {session} {chat} {card} {title}.",
+    "set_auto_handle: P4 (t_bcd2f011) owns the CLI flag name; the spec only says kanban_create/update gain auto_handle.",
+    "  If the live run aborts at set_auto_handle, fix the argv here, not run.py.",
+    "inject_failure: the spec names no fault-injection seam for a forced child exception (AC-7 second half).",
+    "  null = step 1 reports that check as SKIP. Set it to the argv P3 ships (an env/config hook) to arm it.",
+    "expect.*: the restart line is today's real boot line; the re-surface regex is NOT in the spec contract",
+    "  (5.7 names deliver_wake + the origin-chat 'auto-handle lost' line, not a log line). Tune it once P3 lands."
+  ],
+  "board": "bv2-smoke",
+  "commands": {
+    "board_create": ["boards", "create", "{board}", "--name", "BV2 smoke (scratch)",
+                     "--description", "Boomerang v2 smoke harness scratch board (t_989cde1b); safe to archive"],
+    "create": ["--board", "{board}", "create", "{title}", "--session", "{session}", "--json"],
+    "notify_subscribe": ["--board", "{board}", "notify-subscribe", "{card}", "--platform", "discord",
+                         "--chat-id", "{chat}", "--chat-type", "channel", "--delivery-mode", "notify+wake"],
+    "set_auto_handle": ["--board", "{board}", "edit", "{card}", "--auto-handle"],
+    "complete": ["--board", "{board}", "complete", "{card}", "--summary", "bv2 smoke: forced completed event"],
+    "block_needs_input": ["--board", "{board}", "block", "{card}", "--kind", "needs_input",
+                          "bv2 smoke: forced needs_input event. unblock_when: after:+1d"],
+    "inject_failure": null
+  },
+  "expect": {
+    "restart_log_regex": "Gateway running with \\d+ platform",
+    "resurface_log_regex": "re-?surfac\\w*\\b.*{card}"
+  },
+  "dry_run_cards": {
+    "s1_completed": "t_5m0ce001",
+    "s1_needs_input": "t_5m0ce002",
+    "s1_failure": "t_5m0ce003",
+    "s2_fork_off": "t_5m0ce004",
+    "s2_auto_off": "t_5m0ce005",
+    "s3_fork": "t_5m0ce006",
+    "s4_restart": "t_5m0ce007"
+  }
+}
