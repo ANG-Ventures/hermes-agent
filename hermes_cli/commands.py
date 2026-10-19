@@ -116,6 +116,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("boomerang", "Run a task autonomously in an isolated subagent that inherits this "
                "session's context; a summary returns here when it finishes", "Session",
                args_hint="<task>"),
+    CommandDef("autohandle", "Auto-handle mechanical kanban wakes for cards homed in this session "
+               "(on/off/status)", "Session", gateway_only=True, busy_policy="dispatch",
+               args_hint="[on|off|status]", subcommands=("on", "off", "status")),
     CommandDef("worktree", "Show, list, create, or prune isolated git worktrees", "Session",
                cli_only=True, args_hint="[new [name]|list|prune [--dry-run]]",
                subcommands=("new", "list", "prune")),

@@ -2583,6 +2583,9 @@ class Task:
     origin_host: Optional[str] = None
     # Task whose workspace this card works in (``--workspace-of``, t_6d5bc652).
     workspace_of: Optional[str] = None
+    # Boomerang v2 D-15 tri-state: True/False = the card decides; None = inherit
+    # (home session /autohandle -> board default -> off).
+    auto_handle: Optional[bool] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2608,6 +2611,7 @@ class Task:
             pin_sub_fallback=bool(g("pin_sub_fallback")),
             next_eligible_at=g("next_eligible_at"),
             no_worker=bool(g("no_worker")),
+            auto_handle=None if g("auto_handle") is None else bool(g("auto_handle")),
         )
 
 # Columns every schema version has (KeyError if the SELECT omitted them).
@@ -2875,7 +2879,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- workspace this card works IN (``--workspace-of``; kind + path copied).
     -- A placement constraint (co-locate via bind_host) and a retention key;
     -- never an owner of the directory. NULL = its own workspace.
-    workspace_of         TEXT
+    workspace_of         TEXT,
+    -- Boomerang v2 P3 (D-15): may a mechanical wake on this card be handled by an
+    -- auto boomerang child? 1/0 = the card decides; NULL (default) = inherit the
+    -- home session's /autohandle, then the board default, then off.
+    auto_handle          INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -5980,6 +5988,7 @@ def create_task(
     i_mean_blocks: bool = False,
     continues: Optional[str] = None,
     workspace_of: Optional[str] = None,
+    auto_handle: Optional[bool] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -6478,8 +6487,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, pin_sub_reason, pin_sub_fallback,
                         goal_mode, goal_max_turns, session_id, completion_contract, brain,
-                        workspace_of
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        workspace_of, auto_handle
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -6510,6 +6519,7 @@ def create_task(
                         completion_contract,
                         brain,
                         workspace_of,
+                        None if auto_handle is None else (1 if auto_handle else 0),
                     ),
                 )
                 for pid in parents:
@@ -6550,6 +6560,7 @@ def create_task(
                         "provider_override": provider_override,
                         "minted_by": _minted_by(create_origin),
                         **({"brain": brain} if brain else {}),
+                        **({"auto_handle": bool(auto_handle)} if auto_handle is not None else {}),
                         **({"pin_sub_reason": pin_sub_reason,
                             "pin_sub_fallback": bool(pin_sub_fallback)}
                            if pin_sub_reason else {}),
@@ -6977,6 +6988,32 @@ def _set_no_worker_locked(
     _append_event(
         conn, task_id, "no_worker_set" if flag else "no_worker_cleared", payload,
     )
+    return True
+
+
+def set_task_auto_handle(
+    conn: sqlite3.Connection,
+    task_id: str,
+    value: Optional[bool],
+    *,
+    operator: Optional[str] = None,
+) -> bool:
+    """Set a card's ``auto_handle`` tri-state (Boomerang v2 D-15): True/False, or None
+    to clear it back to inherit. False for an unknown id. A change records
+    ``auto_handle_set``; writing the current value is a silent no-op."""
+    stored = None if value is None else (1 if value else 0)
+    with write_txn(conn):
+        row = conn.execute("SELECT auto_handle FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        if row["auto_handle"] == stored:
+            return True
+        conn.execute("UPDATE tasks SET auto_handle = ? WHERE id = ?", (stored, task_id))
+        payload: dict = {"auto_handle": None if value is None else bool(value)}
+        if operator:
+            payload["operator"] = operator
+        _append_event(conn, task_id, "auto_handle_set", payload)
+    notify_task_updated(conn, task_id, ("auto_handle",))
     return True
 
 
