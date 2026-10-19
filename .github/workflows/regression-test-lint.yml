@@ -1,0 +1,29 @@
+# Regression-test lint — thin caller (t_d1ac622f). A FIX PR (fix/hotfix/bug/regress/repair/restore/parity
+# title or branch) that changes code must add or change a test file, or carry ONE body line
+#   no-regression-test: <reason, >= 15 chars>
+# Copy to .github/workflows/regression-test-lint.yml. Pin `uses:` to an IMMUTABLE 40-hex commit SHA of
+# ANG-Ventures/fleet-floor-workflows (never a moving tag).
+#
+# Placeholders:
+#   __FLOOR_SHA__   40-char commit SHA of the central repo
+#   __RUNNER__      private ANG-Ventures repo: ${{ vars.CI_RUNNER || 'hermes-ci' }} (x64 only).
+#                   Public or Kyzcreig repo: ubuntu-latest.
+name: regression-test-lint
+
+# path-filter-exempt: whole-tree-scan t_d1ac622f no `paths:` on purpose. The lint reads the PR as a whole (a test file anywhere
+# satisfies a code change anywhere), and GitHub drops a filtered workflow on a >3,000-file diff whose
+# matches sort late. It reads only the REST file list (no checkout) and finishes in seconds. Not a
+# required check (making it one is Apollo's call).
+on:
+  pull_request:  # no-paths-ok: reads the PR title/body/file list, not the tree; see path-filter-exempt above
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  regression_test_lint:
+    uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/regression-test-lint.yml@2b1b1d7440b6937ace1cda234c08990c66aab601
+    with:
+      runner: ubuntu-latest
