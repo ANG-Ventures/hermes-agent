@@ -1,8 +1,8 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
-VENDORED from hermes-home ``scripts/lib/placement.py`` @ 2fe117cbcb (hermes-home#4462 merge, t_dc9a0f9a + t_314b3ea5;
-sha256 8ae48f3b603d7c20507575e533fe0d7d7bdc3812422428a5390a6a1c57e09070) for the kanban dispatcher (t_d6ce856e) and its
-alloc_client route (t_4187c8f1): the fork may not import hermes-home code. The ONLY local changes are
+VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole for scorer v2, t_f8a3b6c3; first vendored
+@ 2fe117cbcb, hermes-home#4462) for the kanban dispatcher (t_d6ce856e) and its alloc_client route (t_4187c8f1): the
+fork may not import hermes-home code. The ONLY local changes are
 ``fleet_root()`` plus ``encoding="utf-8"`` on two ``open()`` calls (the fork's PLW1514 lint);
 ``tests/hermes_cli/test_kanban_headroom_placement.py`` checks the rest against the canonical file.
 
@@ -111,6 +111,19 @@ DEFAULT_CLOSED_WHEN = {"psi_mem_some10": 10.0, "psi_cpu_some10": 40.0, "system_p
 # Axes a sample MUST carry to be eligible (an unmeasured safety axis is CLOSED, never "ok"). The sampler row
 # (fleet-pressure.json) carries all of them; a direct probe that cannot read PSI passes a narrower set explicitly.
 REQUIRED_AXES = ("mem_available_gb", "load1", "load5", "psi_cpu_some10", "psi_mem_some10", "system_pct")
+# ── scorer v2 (FWA R2c, t_f8a3b6c3; spec plans/2026-10-18_test-gate-onto-allocation-router-spec.md R2c) ──────────
+# The kill switch is the table's top-level ``scorer: v1|v2`` (env PLACEMENT_SCORER beats it, for drills and the
+# replay). v1 = the cpu axis as it was (physical cores - load - reserved threads, ``scorer_v1.cpu_saturable`` hosts
+# penalised instead of refused). v2 = capacity cores x mt_yield, occupancy = runnable work, CLOSED on CPU stall (PSI),
+# and speed enters the CHOICE (score = headroom_fraction x st_speed^alpha), never the gate.
+SCORERS = ("v1", "v2")
+DEFAULT_SCORER = "v1"
+SPEED_REL = Path("var") / "placement" / "host-speed.json"     # written by R2b (host-speed-derive); read-only here
+SEED_MT_YIELD_SMT2 = 1.3     # Ace 10-18 09:48: ci-box 166 = 128 x 1.3 until measured; SMT2 hosts only, else 1.0
+# CLOSED on PSI cpu some avg10 >= 40 is closed_when (DEFAULT_CLOSED_WHEN, both scorers); v2 adds avg60 >= 25
+V2_PSI_CPU_SOME60 = 25.0
+ALPHA_DEFAULT, ALPHA_FAST, ALPHA_WIDE = 0.5, 1.0, 0.0     # D2: P0/P1 or core_class fast = 1, wide = 0
+OCCUPANCY_TAU_S = 60.0       # the sampler's EWMA time constant for procs_running - 1
 
 
 class PlacementError(ValueError):
@@ -199,7 +212,18 @@ class HostSpec:
     clock_mhz: float = 0.0           # max single-core clock (core_class "fast")
     default_preference: str = "normal"   # "low" = the headroom layer takes it only when no normal host has headroom
     unmeasurable_axes: tuple = ()        # axes this host's OS cannot report (darwin: no PSI, no %system); never required
-    cpu_saturable: bool = False          # negative cpu headroom is a score penalty here, not a refusal (t_bfb88c23)
+    cpu_saturable: bool = False          # v1 only: negative cpu headroom is a score penalty, not a refusal (t_bfb88c23)
+    # scorer v2 (t_f8a3b6c3): the active scorer and the host's MEASURED speed (var/placement/host-speed.json, R2b),
+    # or the seed when unmeasured (mt_yield 1.3 on SMT2, else 1.0; st_speed 1.0). ``speed_src`` names which.
+    scorer: str = DEFAULT_SCORER
+    mt_yield: float = 1.0
+    st_speed: float = 1.0
+    speed_src: str = "seed"
+
+    @property
+    def cpu_capacity(self) -> float:
+        """v2 cpu capacity in cores: physical cores x mt_yield - cores_reserve."""
+        return self.cores * self.mt_yield - self.cores_reserve
 
     def slots_for(self, consumer: str) -> Optional[int]:
         s = self.slots.get(consumer)
@@ -217,6 +241,7 @@ class HostTable:
     # {consumer: {profile: Footprint}}: per-PROFILE classes (``footprints.<c>.profiles``, t_edc220cc); a profile not
     # listed keeps the consumer's own class
     profile_footprints: Mapping[str, Mapping[str, Footprint]] = dataclasses.field(default_factory=dict)
+    scorer: str = DEFAULT_SCORER                 # the kill switch (v1|v2); active_scorer() applies PLACEMENT_SCORER
 
     def resolve(self, name: str) -> Optional[str]:
         """Canonical host id for ``name`` or one of its aliases (case-folded), else None."""
@@ -328,10 +353,29 @@ def validate(doc) -> List[str]:
         if isinstance(h, dict) and h.get("default_preference", "normal") not in ("normal", "low"):
             errs.append(f"hosts.{hid}.default_preference must be normal|low (never an ordinal)")
         if isinstance(h, dict) and "cpu_saturable" in h:
+            # LEGACY (pre-R2c tables): still read for v1 so a tree that has the new code but not yet the new table
+            # keeps today's decisions; the shipped table carries scorer_v1.cpu_saturable instead
             if not isinstance(h["cpu_saturable"], bool):
                 errs.append(f"hosts.{hid}.cpu_saturable must be true|false")
             elif h["cpu_saturable"] and _num(h.get("cores_reserve")) and h["cores_reserve"] > 0:
                 errs.append(f"hosts.{hid}: cpu_saturable with cores_reserve {h['cores_reserve']} > 0 (a saturable cpu axis keeps no cores back)")
+    sc = doc.get("scorer", DEFAULT_SCORER)
+    if sc not in SCORERS:
+        errs.append(f"scorer must be one of {list(SCORERS)}, not {sc!r}")
+    v1 = doc.get("scorer_v1", {})
+    if not isinstance(v1, dict):
+        errs.append("scorer_v1 must be an object")
+    else:
+        sat = v1.get("cpu_saturable", [])
+        if not isinstance(sat, list) or not all(isinstance(x, str) for x in sat):
+            errs.append("scorer_v1.cpu_saturable must be a list of host ids")
+        else:
+            for x in sat:
+                h = hosts.get(x)
+                if not isinstance(h, dict):
+                    errs.append(f"scorer_v1.cpu_saturable names {x!r}, not a host in hosts")
+                elif _num(h.get("cores_reserve")) and h["cores_reserve"] > 0:
+                    errs.append(f"hosts.{x}: cpu_saturable with cores_reserve {h['cores_reserve']} > 0 (a saturable cpu axis keeps no cores back)")
     cw = doc.get("closed_when", {})
     if not isinstance(cw, dict) or any(not _num(v) or v < 0 for k, v in cw.items() if not k.startswith("_")):
         errs.append("closed_when must map axis -> number >= 0")
@@ -343,7 +387,51 @@ def validate(doc) -> List[str]:
     return errs
 
 
-def load_hosts(path=None) -> HostTable:
+def read_host_speed(path=None) -> Dict[str, dict]:
+    """{host: {"st_speed": x, "mt_yield": y}} from var/placement/host-speed.json (R2b, t_ea50af1c), values > 0 only.
+
+    Accepted shapes (the R2b contract is the first): ``{"hosts": {h: {"st_speed": 1.0, "mt_yield": 1.3, ...}}}``,
+    or the same rows at top level; a value may also be ``{"value": x, ...}``. MISSING file = {} (every host on the
+    seed); an unreadable / malformed file is ALSO {} plus one stderr line: speed only orders eligible hosts and the
+    capacity seed is the ruled default, so a bad speed file must not close the fleet."""
+    p = Path(path) if path is not None else fleet_root() / SPEED_REL
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"placement: {p}: unreadable ({type(exc).__name__}); every host on the speed seed\n")
+        return {}
+    rows = doc.get("hosts", doc) if isinstance(doc, dict) else None
+    if not isinstance(rows, dict):
+        return {}
+    out: Dict[str, dict] = {}
+    for hid, row in rows.items():
+        if not isinstance(row, dict) or str(hid).startswith("_"):
+            continue
+        vals = {}
+        for k in ("st_speed", "mt_yield"):
+            v = row.get(k)
+            v = v.get("value") if isinstance(v, dict) else v
+            if _num(v) and v > 0:
+                vals[k] = float(v)
+        if vals:
+            out[str(hid)] = vals
+    return out
+
+
+def active_scorer(doc_scorer=None) -> str:
+    """PLACEMENT_SCORER (v1|v2) beats the table's ``scorer``; an unknown env value is refused, never guessed."""
+    env = os.environ.get("PLACEMENT_SCORER", "").strip()
+    if env:
+        if env not in SCORERS:
+            raise PlacementError(f"PLACEMENT_SCORER must be one of {list(SCORERS)}, not {env!r}")
+        return env
+    return doc_scorer or DEFAULT_SCORER
+
+
+def load_hosts(path=None, *, speed_path=None, scorer: Optional[str] = None) -> HostTable:
+    """The host table. ``scorer`` (v1|v2) beats PLACEMENT_SCORER and the table's key (the replay compares both)."""
     p = Path(path) if path is not None else fleet_root() / TABLE_REL
     try:
         doc = json.loads(p.read_text(encoding="utf-8"))
@@ -354,23 +442,38 @@ def load_hosts(path=None) -> HostTable:
     errs = validate(doc)
     if errs:
         raise PlacementError(f"{p}: {len(errs)} error(s): " + "; ".join(errs))
+    if scorer is not None and scorer not in SCORERS:
+        raise PlacementError(f"scorer must be one of {list(SCORERS)}, not {scorer!r}")
+    scorer = scorer or active_scorer(doc.get("scorer"))
+    saturable = set((doc.get("scorer_v1") or {}).get("cpu_saturable", [])) \
+        | {hid for hid, h in doc["hosts"].items() if h.get("cpu_saturable") is True}
+    # the speed file sits next to the table's state root (var/placement/), so a test table in tmp_path never reads
+    # the live fleet's measurements
+    speed = read_host_speed(speed_path if speed_path is not None else p.parent.parent / SPEED_REL) \
+        if scorer == "v2" else {}
     hosts = {}
     for hid, h in doc["hosts"].items():
+        cores, threads = int(h["cores"]), int(h["threads"])
+        meas = speed.get(hid) or {}
         hosts[hid] = HostSpec(
-            name=hid, cores=int(h["cores"]), threads=int(h["threads"]), mem_total_gb=float(h["mem_total_gb"]),
+            name=hid, cores=cores, threads=threads, mem_total_gb=float(h["mem_total_gb"]),
             mem_reserve_gb=float(h["mem_reserve_gb"]), cores_reserve=float(h["cores_reserve"]),
             slots={c: int(v["slots"]) for c, v in h["consumers"].items()},
             aliases=tuple(h.get("aliases", [])), clock_mhz=float(h.get("clock_mhz", 0.0)),
             default_preference=str(h.get("default_preference", "normal")),
             unmeasurable_axes=tuple(h.get("unmeasurable_axes", [])),
-            cpu_saturable=h.get("cpu_saturable") is True)
+            cpu_saturable=hid in saturable, scorer=scorer,
+            mt_yield=meas.get("mt_yield", SEED_MT_YIELD_SMT2 if threads == 2 * cores else 1.0),
+            st_speed=meas.get("st_speed", 1.0),
+            speed_src="measured" if meas else "seed")
     fps = {c: Footprint.of(fp) for c, fp in doc["footprints"].items() if not c.startswith("_")}
     pfps = {c: {pn: Footprint.of(pf) for pn, pf in fp["profiles"].items() if not pn.startswith("_")}
             for c, fp in doc["footprints"].items() if not c.startswith("_") and isinstance(fp.get("profiles"), dict)}
     cw = dict(DEFAULT_CLOSED_WHEN)
     cw.update({k: float(v) for k, v in (doc.get("closed_when") or {}).items() if not k.startswith("_")})
     return HostTable(hosts=hosts, footprints=fps, closed_when=cw, path=p, default_first=doc.get("default_first"),
-                     saturate_to=float(doc.get("saturate_to", DEFAULT_SATURATE_TO)), profile_footprints=pfps)
+                     saturate_to=float(doc.get("saturate_to", DEFAULT_SATURATE_TO)), profile_footprints=pfps,
+                     scorer=scorer)
 
 
 class ExclusionsError(PlacementError):
@@ -434,10 +537,28 @@ class Sample:
     status: str = "fresh"          # fresh | absent | stale (anything but fresh = closed)
     note: str = ""
     scratch_free_gb: Optional[float] = None   # gates footprint.scratch_gb when measured
+    d_threads: Optional[float] = None         # threads in D state at sample time (Linux sampler); None = not counted
+    # scorer v2 inputs (Linux sampler, FWA R2a/R2c; absent = v2 falls back to ``load`` and says so on the line)
+    runnable_ewma: Optional[float] = None     # EWMA (~60 s) of procs_running - 1: R-state only, so net of D-state
+    procs_running: Optional[float] = None     # instantaneous /proc/stat procs_running (used when no EWMA)
+    psi_cpu_some60: Optional[float] = None    # PSI cpu some avg60 (v2 closes at >= 25 when measured)
+
+    @property
+    def occupancy(self) -> tuple:
+        """(cores of runnable work, source) for scorer v2: the sampler's EWMA of procs_running - 1, else the
+        instantaneous procs_running - 1, else ``load`` (load1/load5 net of D-state; Mac and pre-R2a rows)."""
+        if _num(self.runnable_ewma):
+            return max(0.0, float(self.runnable_ewma)), "runnable_ewma"
+        if _num(self.procs_running):
+            return max(0.0, float(self.procs_running) - 1.0), "procs_running"
+        return self.load, "load"
 
     @property
     def load(self) -> Optional[float]:
-        vals = [float(v) for v in (self.load1, self.load5) if _num(v)]
+        """Runnable load: load1/load5 net of the D-state threads, which hold no CPU (t_e47d8d9a: 65 NFS-wedged
+        threads read load1 65.9 on a 97 %-idle 32-thread box). Each term clamps at 0."""
+        d = float(self.d_threads) if _num(self.d_threads) and self.d_threads > 0 else 0.0
+        vals = [max(0.0, float(v) - d) for v in (self.load1, self.load5) if _num(v)]
         return max(vals) if vals else None
 
 
@@ -472,6 +593,10 @@ def samples_from_pressure(doc: Mapping, *, now: float, stale_after_s: Optional[f
             system_pct=row.get("system_pct") if _num(row.get("system_pct")) else None,
             at=float(row["at"]) if _num(row.get("at")) else None,
             scratch_free_gb=row.get("scratch_free_gb") if _num(row.get("scratch_free_gb")) else None,
+            d_threads=row.get("d_threads") if _num(row.get("d_threads")) else None,
+            runnable_ewma=row.get("runnable_ewma") if _num(row.get("runnable_ewma")) else None,
+            procs_running=row.get("procs_running") if _num(row.get("procs_running")) else None,
+            psi_cpu_some60=row.get("psi_cpu_some60") if _num(row.get("psi_cpu_some60")) else None,
         )
         if row.get("status") not in (None, "fresh"):
             s.status, s.note = "absent", str(row.get("status"))
@@ -519,9 +644,20 @@ class Headroom:
     reserved_gb: float = 0.0          # live reservations already promised on the host
     reserved_threads: float = 0.0
     scratch_gb: Optional[float] = None   # scratch_free - reserved - footprint, when the sample measured scratch
+    # scorer v2 only (None under v1, so v1 lines and rows are unchanged byte for byte)
+    occupancy: Optional[float] = None    # cores of runnable work (Sample.occupancy)
+    occupancy_src: str = ""
+    capacity: Optional[float] = None     # cores x mt_yield - cores_reserve
+    psi_cpu_some10: Optional[float] = None
+    psi_cpu_some60: Optional[float] = None
+    fraction: Optional[float] = None     # binding headroom fraction before speed
+    alpha: Optional[float] = None        # the speed exponent choose() applied
 
     def line(self, spec: HostSpec) -> str:
-        """`<host> load N / Cc.Tt, avail X GB, headroom Y GB / Z cores (binding axis), score S` or the refusal."""
+        """`<host> load N / Cc.Tt, avail X GB, headroom Y GB / Z cores (binding axis), score S` or the refusal.
+        Scorer v2: `<host> occupancy O / K (Cc.Tt, yield y), load N, PSI a/b, st_speed s, avail ..., headroom ...`."""
+        if spec.scorer == "v2":
+            return self._line_v2(spec)
         load = "?" if self.load is None else f"{self.load:g}"
         avail = "?" if self.mem_available_gb is None else f"{self.mem_available_gb:.1f}"
         res = f", reserved {self.reserved_gb:g} GB / {self.reserved_threads:g} thr" if (self.reserved_gb or self.reserved_threads) else ""
@@ -529,6 +665,25 @@ class Headroom:
                 f"{res}, headroom {self.mem_gb:.1f} GB / {self.cores:.1f} cores ({self.binding or '-'})")
         tail = f", score {self.score:.3f}" if self.eligible else f", {self.reason}"
         return f"{self.host} load {load} / {spec.cores}c.{spec.threads}t, avail {avail} GB{head}{tail}"
+
+    def _line_v2(self, spec: HostSpec) -> str:
+        def g(v, fmt="{:g}"):
+            return "?" if v is None else fmt.format(v)
+        cap = spec.cpu_capacity
+        occ = g(None if self.occupancy is None else round(self.occupancy, 1))
+        src = f" {self.occupancy_src}" if self.occupancy_src and self.occupancy_src != "runnable_ewma" else ""
+        load = g(self.load)
+        psi = f"{g(self.psi_cpu_some10)}/{g(self.psi_cpu_some60)}"
+        avail = g(self.mem_available_gb, "{:.1f}")
+        res = f", reserved {self.reserved_gb:g} GB / {self.reserved_threads:g} thr" if (self.reserved_gb or self.reserved_threads) else ""
+        head = ("" if self.mem_gb is None else
+                f"{res}, headroom {self.mem_gb:.1f} GB / {self.cores:.1f} cores ({self.binding or '-'})")
+        tail = (f", score {self.score:.3f}" + (f" (frac {self.fraction:.3f} x st_speed^{self.alpha:g})"
+                                              if self.fraction is not None and self.alpha is not None else "")
+                if self.eligible else f", {self.reason}")
+        return (f"{self.host} occupancy {occ}{src} / {cap:g} ({spec.cores}c.{spec.threads}t, yield {spec.mt_yield:g}"
+                f"{'' if spec.speed_src == 'measured' else ' seed'}), load {load}, PSI {psi}, st_speed "
+                f"{spec.st_speed:g}{'' if spec.speed_src == 'measured' else ' seed'}, avail {avail} GB{head}{tail}")
 
 
 def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: str,
@@ -576,6 +731,11 @@ def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consume
     if h.load is None or h.mem_available_gb is None:
         h.reason = "closed:unmeasured " + ("load" if h.load is None else "memory")
         return h
+    if spec.scorer == "v2":
+        # the denominators print on every v2 line, a closed host's included (doctrine rule 2)
+        h.psi_cpu_some10, h.psi_cpu_some60 = sample.psi_cpu_some10, sample.psi_cpu_some60
+        h.occupancy, h.occupancy_src = sample.occupancy
+        h.capacity = spec.cpu_capacity
     missing = [a for a in require_axes if a not in spec.unmeasurable_axes and not _num(getattr(sample, a, None))]
     if missing:
         h.reason = "closed:unmeasured " + ",".join(missing)
@@ -594,6 +754,8 @@ def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consume
     r_mem, r_thr = (reserved.ram_gb, reserved.threads) if reserved else (0.0, 0.0)
     h.reserved_gb, h.reserved_threads = r_mem, r_thr
     h.mem_gb = h.mem_available_gb - spec.mem_reserve_gb - r_mem - fp.ram_gb
+    if spec.scorer == "v2":
+        return _headroom_v2(h, spec, sample, fp, reserved)
     h.cores = spec.cores - spec.cores_reserve - h.load - r_thr - fp.threads
     if fp.scratch_gb > 0 and _num(sample.scratch_free_gb):
         h.scratch_gb = float(sample.scratch_free_gb) - (reserved.scratch_gb if reserved else 0.0) - fp.scratch_gb
@@ -615,6 +777,52 @@ def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consume
         return h
     h.eligible = True
     return h
+
+
+def _headroom_v2(h: Headroom, spec: HostSpec, sample: Sample, fp: Footprint,
+                 reserved: Optional[Footprint]) -> Headroom:
+    """Scorer v2 cpu axis (R2c). Capacity = cores x mt_yield - cores_reserve; occupancy = runnable work
+    (Sample.occupancy: EWMA of procs_running - 1, net of D-state by construction; else load net of D-state);
+    CLOSED on CPU stall: PSI cpu some avg10 >= 40 (closed_when) or avg60 >= 25 (load itself never closes a host). A negative
+    cpu headroom REFUSES (headroom is the hard gate, 10-12 17:08): with SMT capacity and runnable-only occupancy the
+    axis no longer reads a 59 %-busy 256-thread box as 'over', which is what cpu_saturable papered over. The score
+    is the binding fraction; choose() multiplies it by st_speed^alpha among the eligible."""
+    occ = h.occupancy
+    p60 = sample.psi_cpu_some60       # avg10 >= 40 already closed the host above (closed_when)
+    if _num(p60) and float(p60) >= V2_PSI_CPU_SOME60:
+        h.reason = f"closed:psi_cpu_some60 {p60:g} >= {V2_PSI_CPU_SOME60:g}"
+        return h
+    if occ is None:
+        h.reason = "closed:unmeasured occupancy"
+        return h
+    r_thr = reserved.threads if reserved else 0.0
+    h.cores = h.capacity - occ - r_thr - fp.threads
+    if fp.scratch_gb > 0 and _num(sample.scratch_free_gb):
+        h.scratch_gb = float(sample.scratch_free_gb) - (reserved.scratch_gb if reserved else 0.0) - fp.scratch_gb
+    mem_frac = h.mem_gb / spec.mem_total_gb
+    cpu_frac = h.cores / h.capacity if h.capacity > 0 else float("-inf")
+    h.score, h.binding = (mem_frac, "mem") if mem_frac <= cpu_frac else (cpu_frac, "cpu")
+    h.fraction = h.score
+    if h.mem_gb < 0:
+        h.reason = f"no_headroom:mem {h.mem_gb:.1f} GB"
+        return h
+    if h.cores < 0:
+        h.reason = f"no_headroom:cpu {h.cores:.1f} cores"
+        return h
+    if h.scratch_gb is not None and h.scratch_gb < 0:
+        h.reason = f"no_headroom:scratch {h.scratch_gb:.1f} GB"
+        return h
+    h.eligible = True
+    return h
+
+
+def speed_alpha(job: Optional["Job"]) -> float:
+    """D2: alpha 1 for priority <= 1 or core_class fast, 0 for core_class wide (batch), 0.5 otherwise."""
+    if job is not None and job.core_class == "wide":
+        return ALPHA_WIDE
+    if job is not None and (job.core_class == "fast" or (job.priority is not None and job.priority <= 1)):
+        return ALPHA_FAST
+    return ALPHA_DEFAULT
 
 
 # ── bands: a NAME for the admission vector, never a second scorer (allocation §2.2, t_260e8379) ──────
@@ -749,6 +957,7 @@ class Decision:
     footprint: Footprint
     kept_previous: bool = False
     rule: str = ""                           # which layer picked: affinity | continuity | priority | core_class:<c> | default_first | headroom
+    scorer: str = DEFAULT_SCORER             # which scorer produced it (v2 adds denominators to as_row)
 
     def lines(self, table: HostTable) -> List[str]:
         return [r.line(table.hosts[r.host]) for r in self.rows]
@@ -760,16 +969,27 @@ class Decision:
                + "; ".join(self.lines(table))
 
     def as_row(self) -> dict:
-        return {"picked": self.host, "why": self.reason or None, "rule": self.rule or None, "kept_previous": self.kept_previous,
-                "consumer": self.consumer, "footprint": dataclasses.asdict(self.footprint),
-                "hosts": {r.host: {"eligible": r.eligible, "reason": r.reason or None, "load": r.load,
-                                   "band": band_of(r, self.footprint),
-                                   "memavail_gb": r.mem_available_gb,
-                                   "reserved_gb": r.reserved_gb, "reserved_threads": r.reserved_threads,
-                                   "headroom_gb": None if r.mem_gb is None else round(r.mem_gb, 1),
-                                   "headroom_cores": None if r.cores is None else round(r.cores, 1),
-                                   "score": None if not r.eligible else round(r.score, 4), "binding": r.binding or None}
-                          for r in self.rows}}
+        row = {"picked": self.host, "why": self.reason or None, "rule": self.rule or None, "kept_previous": self.kept_previous,
+               "consumer": self.consumer, "footprint": dataclasses.asdict(self.footprint),
+               "hosts": {r.host: {"eligible": r.eligible, "reason": r.reason or None, "load": r.load,
+                                  "band": band_of(r, self.footprint),
+                                  "memavail_gb": r.mem_available_gb,
+                                  "reserved_gb": r.reserved_gb, "reserved_threads": r.reserved_threads,
+                                  "headroom_gb": None if r.mem_gb is None else round(r.mem_gb, 1),
+                                  "headroom_cores": None if r.cores is None else round(r.cores, 1),
+                                  "score": None if not r.eligible else round(r.score, 4), "binding": r.binding or None}
+                         for r in self.rows}}
+        if self.scorer == "v2":
+            # v2 denominators on every host row (doctrine rule 2); a v1 row stays byte for byte what it was
+            row["scorer"] = "v2"
+            for r in self.rows:
+                row["hosts"][r.host].update({
+                    "occupancy": None if r.occupancy is None else round(r.occupancy, 2),
+                    "occupancy_src": r.occupancy_src or None,
+                    "capacity": None if r.capacity is None else round(r.capacity, 2),
+                    "psi_cpu_some10": r.psi_cpu_some10, "psi_cpu_some60": r.psi_cpu_some60,
+                    "fraction": None if r.fraction is None else round(r.fraction, 4), "alpha": r.alpha})
+        return row
 
 
 def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample]], *,
@@ -834,26 +1054,41 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
                              require_axes=require_axes, slots_used=used.get(hid, 0.0),
                              now=now, stale_after_s=stale_after_s))
     eligible = [r for r in rows if r.eligible]
+    v2 = table.scorer == "v2"
+
+    def done(d: Decision) -> Decision:
+        d.scorer = table.scorer
+        return d
     if not rows:
-        return Decision(None, "no_candidates", rows, consumer, fp)
+        return done(Decision(None, "no_candidates", rows, consumer, fp))
     if not eligible:
         why = "no_headroom" if any(r.reason.startswith("no_headroom") for r in rows) else "all_closed"
-        return Decision(None, why, rows, consumer, fp)
+        return done(Decision(None, why, rows, consumer, fp))
     by_id = {r.host: r for r in eligible}
+    job = job or Job()
+    if v2:
+        # speed enters the CHOICE, never the gate: score = headroom_fraction x st_speed^alpha (R2c, D2)
+        alpha = speed_alpha(job)
+        for r in eligible:
+            r.alpha = alpha
+            r.score = r.fraction * (table.hosts[r.host].st_speed ** alpha)
 
     def pick(row: Headroom, rule: str, kept: bool = False) -> Decision:
-        return Decision(row.host, "", rows, consumer, fp, kept_previous=kept, rule=rule)
+        return done(Decision(row.host, "", rows, consumer, fp, kept_previous=kept, rule=rule))
 
     # layer 3: per-job overrides (an ineligible target falls through; the gate always wins)
-    job = job or Job()
     for field in ("affinity", "continuity"):
         want = table.resolve(getattr(job, field) or "")
         if want and want in by_id:
             return pick(by_id[want], field)
     core_class = job.core_class or ("fast" if job.priority is not None and job.priority <= 1 else None)
     if core_class == "fast":
+        rule = "priority" if job.core_class is None else "core_class:fast"
+        if v2 and any(table.hosts[r.host].speed_src == "measured" for r in eligible):
+            # measured st_speed (alpha 1) replaces the lscpu clock; until R2b measures, the clock rule stands
+            return pick(max(eligible, key=lambda r: (r.score, table.hosts[r.host].clock_mhz, r.host)), rule)
         best = max(eligible, key=lambda r: (table.hosts[r.host].clock_mhz, r.score, r.host))
-        return pick(best, "priority" if job.core_class is None else "core_class:fast")
+        return pick(best, rule)
     if core_class == "wide":
         best = max(eligible, key=lambda r: (table.hosts[r.host].threads, r.score, r.host))
         return pick(best, "core_class:wide")
@@ -861,8 +1096,13 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     df = table.default_first
     if df and df in by_id:
         spec, row = table.hosts[df], by_id[df]
-        # pending admissions count against the ceiling (Prism prism-router#511 838b2eb6)
-        if row.load is not None and row.load + row.reserved_threads + fp.threads <= table.saturate_to * spec.cores:
+        # pending admissions count against the ceiling (Prism prism-router#511 838b2eb6); v2 measures the ceiling in
+        # runnable work against cores x mt_yield, v1 in load against physical cores
+        if v2:
+            if row.occupancy is not None and row.occupancy + row.reserved_threads + fp.threads \
+                    <= table.saturate_to * spec.cpu_capacity:
+                return pick(row, "default_first")
+        elif row.load is not None and row.load + row.reserved_threads + fp.threads <= table.saturate_to * spec.cores:
             return pick(row, "default_first")
     # then the most headroom among normal-preference hosts; a low-preference host (the Studio) only when none
     # of them has headroom (Ace 18:1x: "prioritize them lower unless there's a good reason")
@@ -1128,7 +1368,9 @@ def _deferred_line(ap: Path, d: Decision, *, job_id, now: float) -> List[dict]:
     DEFERRED_REEMIT_S (a card waiting through 60 ticks is one line, not 60)."""
     why = "; ".join(f"{r.host} {r.reason}" for r in d.rows if not r.eligible)
     reason = f"{d.reason}: {why}" if why else d.reason
-    key, sig = (str(ap), d.consumer, job_id), reason
+    # the signature is the refusal CLASS, not its magnitude: "no_headroom:cpu -2.0 cores" and "-12.0 cores" are the
+    # same reason, or a storm re-logs every retry as the live load moves (t_39c8a948, drill D5)
+    key, sig = (str(ap), d.consumer, job_id), re.sub(r"-?\d+(?:\.\d+)?", "#", reason)
     seen = _DEFERRED_SEEN.get(key)
     if job_id is not None and seen and seen[0] == sig and now - seen[1] < DEFERRED_REEMIT_S:
         return []
