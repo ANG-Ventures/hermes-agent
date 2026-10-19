@@ -132,7 +132,8 @@ def note_relay_streaming(response) -> None:
     if headers is None or request is None:
         return
     try:
-        if headers.get("x-pool-route-id") is None and headers.get(RELAY_STREAMING_HEADER) is None:
+        if (headers.get("x-pool-route-id") is None and headers.get("x-pool-served-by") is None
+                and headers.get(RELAY_STREAMING_HEADER) is None):
             return
         origin = _relay_origin(request.url)
         if origin:

@@ -57,7 +57,7 @@ def test_rollback_restores_the_buffering_wording():
     _snapshot_pool_headers(_resp("http://127.0.0.1:18810/v1/messages", {"x-relay-streaming": "1"}))
     assert "buffering" not in _notice(_agent("claude-alr", "http://127.0.0.1:18810/v1"))
     _snapshot_pool_headers(_resp("http://127.0.0.1:18810/v1/messages",
-                                 {"x-pool-served-by": "sub-vps-1"}))
+                                 {"x-pool-served-by": "sub-vps-1", "x-pool-route-id": "r1"}))
     assert "buffering lane" in _notice(_agent("claude-alr", "http://127.0.0.1:18810/v1"))
 
 
