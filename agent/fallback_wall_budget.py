@@ -231,9 +231,13 @@ def notice_due(agent: Any, now: Optional[float] = None) -> Optional[str]:
 def _buffering_lane(agent: Any) -> bool:
     """The claude pool relays (alr/dtlr/btpr/bpr faces) buffer the whole upstream body,
     so no byte is visible here until the turn ends (t_e35032e2): a long healthy turn
-    reads as "no first reply". Wording only; the clock and the cut are unchanged."""
-    from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS
-    return (getattr(agent, "provider", "") or "").strip().lower() in _POOL_CAPABILITY_PROVIDERS
+    reads as "no first reply". Wording only; the clock and the cut are unchanged.
+    t_8d6b8e30: a relay that says ``x-relay-streaming: 1`` streams after its commit
+    point, so its wait IS a real no-first-byte wait and keeps the plain wording."""
+    from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS, relay_streams
+    if (getattr(agent, "provider", "") or "").strip().lower() not in _POOL_CAPABILITY_PROVIDERS:
+        return False
+    return not relay_streams(getattr(agent, "base_url", "") or "")
 
 
 def _ahead_suffix(agent: Any) -> str:

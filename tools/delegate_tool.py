@@ -1952,9 +1952,13 @@ def _build_child_agent(
     # child's compact skills index (see agent/system_prompt.py). None/empty =
     # pure names-only index.
     skills: Optional[List[str]] = None,
+    # Boomerang v2 (spec §5.1, D-2/D-16): "fork"|"branch"|"summary"|None. None keeps
+    # inherit_context's v1 meaning (true -> "summary"), so existing callers are unchanged.
+    inherit_mode: Optional[str] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
+    _call_args = dict(locals())  # fork post-construction downgrade rebuilds with the same args
     import uuid as _uuid
     from run_agent import AIAgent
     from agent.delegation_context import delegated_child_context
@@ -2031,6 +2035,22 @@ def _build_child_agent(
     else:
         request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
     parent_sid = getattr(parent_agent, "session_id", None)
+    # ── Boomerang v2 fork (spec §5.1): eligibility decides, downgrade = v1 fold ──
+    from tools import delegate_tool_fork as _fork
+    mode = None if materialized_prefill_messages is not None else _fork.resolve_inherit_mode(inherit_context, inherit_mode)
+    if mode == "fork":
+        # A fork FORCES the parent's lane/model/thinking/overrides, ignoring delegation.model/provider.
+        _fork_rt = _fork.build_fork_runtime(_resolve_child_runtime(
+            parent_agent, delegation_cfg, parent_api_key, model=None, override_provider=None,
+            override_base_url=None, override_api_key=None, override_api_mode=None,
+            override_acp_command=None, override_acp_args=None, routing_cfg=routing_cfg,
+        ), parent_agent)
+        _ok, _reason = _fork.fork_eligible(parent_agent, _fork_rt, delegation_cfg)
+        if _ok:
+            rt = _fork_rt
+        else:
+            _fork.log_ineligible(_reason, parent_agent)
+            mode = "summary"
     # ── Boomerang context inheritance (spec v0.8 D-4 / P0.3) ────────────
     # When inherit_context is set, fold the PARENT's conversation history into
     # ONE user-role context message and seed the child with it. Verbatim copy of
@@ -2040,7 +2060,7 @@ def _build_child_agent(
     child_prefill_messages: Any = getattr(parent_agent, "prefill_messages", None)
     if materialized_prefill_messages is not None:
         child_prefill_messages = copy.deepcopy(materialized_prefill_messages)
-    elif inherit_context:
+    elif mode == "summary":
         try:
             _boom = (delegation_cfg.get("boomerang") or {}) if isinstance(delegation_cfg, dict) else {}
             _max_tokens = int(_boom.get("inherit_max_tokens", 50000) or 50000)
@@ -2067,22 +2087,30 @@ def _build_child_agent(
                 child_prefill_messages = [_folded]
         except Exception as _inh_exc:
             logger.warning("boomerang inherit_context fold failed (continuing without): %s", _inh_exc)
+    # Fork: the parent's ephemeral prompt / prefill / request_overrides, not the slim child build (INV-2).
+    _prefix_kwargs = {
+        "prefill_messages": child_prefill_messages, "ephemeral_system_prompt": child_prompt,
+        "request_overrides": request_overrides,
+    }
+    if mode == "fork":
+        _prefix_kwargs = _fork.fork_constructor_overrides(parent_agent)
     child_session_db = _open_child_session_db(parent_agent)
     with delegated_child_context():
         try:
             child = AIAgent(
-                **rt, max_iterations=max_iterations, prefill_messages=child_prefill_messages,
+                **rt, max_iterations=max_iterations,
                 enabled_toolsets=child_toolsets, disabled_toolsets=child_disabled_toolsets, quiet_mode=True,
-                ephemeral_system_prompt=child_prompt, log_prefix=f"[subagent-{task_index}]", platform="subagent",
+                log_prefix=f"[subagent-{task_index}]", platform="subagent",
                 side_agent=True,
                 skip_context_files=True, skip_memory=True, clarify_callback=None,
                 thinking_callback=(
                     (lambda text: _safe_progress(child_progress_cb, "_thinking", text) if text else None)
                     if child_progress_cb else None
                 ),
-                session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
+                session_db=child_session_db, parent_session_id=parent_sid,
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
+                **_prefix_kwargs,
             )
         except BaseException:
             # No child close() will ever run: release the dedicated handle here.
@@ -2092,9 +2120,25 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
-    _apply_child_cache_ttl(child)
-    if not override_provider:
-        _regate_inherited_child_tier(child, parent_agent, explicit_tier_overrides)
+    if mode == "fork":
+        # _apply_child_cache_ttl and _regate_inherited_child_tier are SKIPPED: both rewrite request bytes.
+        _fork.apply_fork_overlay(child, parent_agent)
+        _parent_fp = _fork.request_fingerprint(parent_agent)
+        _diff = [k for k, v in _fork.request_fingerprint(child).items() if v != _parent_fp[k]]
+        if _diff:
+            _fork.log_ineligible("same_request_params:" + ",".join(_diff), parent_agent)
+            with _quiet("fork downgrade: child close failed", exc_info=True):
+                child.close()
+            if child_session_db is not None and not getattr(child, "_owns_session_db", False):
+                with _quiet(None):
+                    from hermes_state_registry import release_or_close
+                    release_or_close(child_session_db)
+            return _build_child_agent(**{**_call_args, "inherit_mode": "summary", "inherit_context": True})
+        _arm_first_request_pin(child, parent_agent, "fork")
+    else:
+        _apply_child_cache_ttl(child)
+        if not override_provider:
+            _regate_inherited_child_tier(child, parent_agent, explicit_tier_overrides)
     # Per-task skill promotion (see agent/system_prompt.py): names the brief
     # wants re-promoted to full descriptions in the child's compact index.
     # Set BEFORE the first request — the system prompt is built lazily.
@@ -3743,6 +3787,7 @@ def delegate_task(
     skills: Optional[List[str]] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     model: Optional[str] = None,
+    inherit_mode: Optional[str] = None,
     provider: Optional[str] = None,
     allow_flagship_reason: Optional[str] = None,
     force_model: Optional[str] = None,
@@ -3954,6 +3999,8 @@ def delegate_task(
             "goal": goal, "context": context, "role": top_role,
             "inherit_context": inherit_context, "skills": skills,
         }
+        if inherit_mode is not None:
+            single_task["inherit_mode"] = inherit_mode
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -4111,6 +4158,7 @@ def delegate_task(
                     if "inherit_context" in t
                     else inherit_context
                 ),
+                inherit_mode=(t.get("inherit_mode") if "inherit_mode" in t else inherit_mode),
                 materialized_prefill_messages=t.get("materialized_prefill_messages"),
                 recovery_max_spawn_depth=recovery_max_spawn,
                 recovery_orchestrator_enabled=(
@@ -4886,6 +4934,10 @@ DELEGATE_TASK_SCHEMA = {
                             "Per-task boomerang inheritance override. See top-level 'inherit_context'. Defaults to the "
                             "top-level value.",
                         ),
+                        "inherit_mode": _p(
+                            "string", "Per-task inheritance mode override. See top-level 'inherit_mode'.",
+                            enum=["fork", "branch", "summary"],
+                        ),
                         "skills": _p(
                             "array", "Per-task skill promotion override. See top-level 'skills'.", items={"type": "string"},
                         ),
@@ -4903,6 +4955,14 @@ DELEGATE_TASK_SCHEMA = {
                 "Boomerang: when true, fold this conversation's recent history into a single background context "
                 "message the subagent inherits, so it sees the current session state without you writing a brief. "
                 "Default false (the subagent starts blank + your goal/context).",
+            ),
+            "inherit_mode": _p(
+                "string",
+                "Boomerang inheritance mode (implies inheritance). 'fork' (alias 'branch'): the subagent continues "
+                "THIS conversation with its exact context and prompt cache, falling back to 'summary' automatically "
+                "when a cache-identical fork is not possible. 'summary': the folded-history behaviour of "
+                "inherit_context=true. Omitted: inherit_context alone decides (true = 'summary').",
+                enum=["fork", "branch", "summary"],
             ),
             "skills": _p(
                 "array",
@@ -4983,6 +5043,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         inherit_context=args.get("inherit_context"), skills=args.get("skills"), output_schema=args.get("output_schema"),
+        inherit_mode=args.get("inherit_mode"),
         model=args.get("model"), provider=args.get("provider"), allow_flagship_reason=args.get("allow_flagship_reason"),
         force_model=args.get("force_model"), images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         parent_agent=kw.get("parent_agent"),

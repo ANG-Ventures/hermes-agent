@@ -400,3 +400,92 @@ def test_w14_worker_needs_input_block_still_wakes_and_kill_switch_restores(env):
     _handback(t2, 2114)
     more = _tick(env)[len(turns):]
     assert _paths(more) == ["owner-wake"], _msg("W14", "actionable_only:false must restore the wake", more)
+
+
+# --- W15-W17: terminal-pending review cards (t_26ebe71a) ----------------------
+
+
+HEAD_TP = "3806e0d8a3f043f550f0d5858e89926f5cd5129b"
+
+
+def _approved_and_landing(env, tid, *, land=True):
+    """An operator APPROVE at HEAD_TP on the card and (``land``) an open land request for it at that head."""
+    for pr in (2115, 2116, 2117):   # green: the handback itself is not what these rows count
+        env["health"][(REPO, pr)] = {"state": "open", "mergeable_state": "clean", "failing": [], "head": HEAD_TP}
+    rec = {"verdict": "APPROVE", "head_sha": HEAD_TP, "reviewer": "human:apollo", "findings": 0, "items": []}
+    with kb.connect_closing() as conn:
+        kb.add_comment(conn, tid, "default", "review_coverage: " + json.dumps(rec))
+    if land:
+        d = kb.kanban_home() / "var" / "land-requests"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "01CANARYW15.json").write_text(json.dumps(
+            {"ulid": "01CANARYW15", "repo": REPO, "pr": 2115, "review_head_sha": HEAD_TP, "card": tid}))
+
+
+def _gave_up(tid):
+    """The 10-13 shape: the TTL sweep's breaker trip on a review card (dispatcher-written, no session)."""
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "gave_up", {  # noqa: SLF001
+            "failures": 2, "effective_limit": 2, "limit_source": "dispatcher", "retry_status": "review",
+            "error": "stale_lock=mac-studio-m3u:4224", "trigger_outcome": "reclaimed"})
+
+
+@pytest.fixture
+def tp_env(env, tmp_path):
+    env["monkeypatch"].setenv("HERMES_KANBAN_HOME", str(tmp_path / "board-home"))
+    (tmp_path / "board-home").mkdir()
+    return env
+
+
+def test_w15_gave_up_on_approved_landing_card_with_wake_sub_is_zero_turns_and_a_receipt(tp_env):
+    """t_26ebe71a (t_75fdedd4 07:11, 10-13): a review card approved at its head with a land in flight is the
+    lander's. RED-PROVABLE: drop the terminal-pending branch in the notifier -> one notifier gave_up turn."""
+    env = tp_env
+    tid = _card(env)
+    _sub(tid)
+    _approved_and_landing(env, tid)
+    _handback(tid, 2115)
+    _tick(env)
+    before = len(env["adapter"].handled)
+    _gave_up(tid)
+    turns = _tick(env)[before:]
+    assert turns == [], _msg("W15", "a gave_up on an approved+landing card woke its owner", turns)
+    assert ("terminal-pending", "notifier-wake") in _reasons(tid), _reasons(tid)
+
+
+def test_w16_gave_up_on_approved_landing_card_without_sub_is_zero_owner_wakes(tp_env):
+    """RED-PROVABLE: drop terminal_pending_items from the owner-wake tick -> one owner-wake stuck turn."""
+    env = tp_env
+    tid = _card(env)
+    _approved_and_landing(env, tid)
+    _handback(tid, 2116)
+    _gave_up(tid)
+    turns = _tick(env)
+    assert turns == [], _msg("W16", "owner-wake fired stuck on an approved+landing card", turns)
+    assert ("terminal-pending", "owner-wake") in _reasons(tid), _reasons(tid)
+
+
+def test_w16b_owner_wake_terminal_pending_honours_the_kill_switch(tp_env):
+    """Prism 93c774f94d98: ``notify_suppress.enabled: false`` (or ``actionable_only: false``) restores the stuck
+    wake on the owner-wake path too, as it does on the notifier's. RED-PROVABLE: drop the cfg gate -> 0 turns."""
+    env = tp_env
+    from hermes_constants import get_hermes_home
+    (get_hermes_home() / "config.yaml").write_text("kanban:\n  notify_suppress:\n    enabled: false\n")
+    tid = _card(env)
+    _approved_and_landing(env, tid)
+    _handback(tid, 2116)
+    _gave_up(tid)
+    turns = _tick(env)
+    assert _paths(turns) == ["owner-wake"], _msg("W16b", "kill switch off must restore the owner wake", turns)
+    assert ("terminal-pending", "owner-wake") not in _reasons(tid), _reasons(tid)
+
+
+def test_w17_gave_up_on_approved_card_with_no_land_still_wakes(tp_env):
+    """Guard for W15/W16: an APPROVE alone, no land in flight, is a card nobody is landing; the owner hears it."""
+    env = tp_env
+    tid = _card(env)
+    _approved_and_landing(env, tid, land=False)
+    _handback(tid, 2117)
+    _gave_up(tid)
+    turns = _tick(env)
+    assert _paths(turns) == ["owner-wake"], _msg("W17", "a gave_up with no land in flight must wake once", turns)
