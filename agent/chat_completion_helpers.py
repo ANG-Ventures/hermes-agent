@@ -66,7 +66,9 @@ from agent.fork_ext.relay_headers import (
     call_id_of,
     consume_first_request_headers,
     merge_pool_capability_headers,
+    note_main_turn_cache_split,
     note_main_turn_served_by,
+    note_relay_streaming,
     route_id_of,
     stamp_call_id,
     stamp_correlation_headers,
@@ -145,6 +147,7 @@ def _snapshot_pool_headers(response: Any) -> dict[str, str]:
     source = getattr(response, "headers", None)
     if source is None:
         return {}
+    note_relay_streaming(response)
     snapshot: dict[str, str] = {}
     for name in _POOL_HEADER_NAMES:
         try:
@@ -585,6 +588,7 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
 
     _fw.note_success(agent, headers if isinstance(headers, dict) else None)
     note_main_turn_served_by(agent, provider, headers)
+    note_main_turn_cache_split(agent, getattr(response, "usage", None))
     seq = _emit_api_call_record(
         agent,
         usage=getattr(response, "usage", None),
