@@ -177,8 +177,43 @@ def _skill_search_dirs() -> Tuple[list, list, Path]:
     project_dirs = list(get_project_skills_dirs())
     active_skills_dir = _skills_dir()
     all_dirs = project_dirs + ([active_skills_dir] if active_skills_dir.exists() else [])
-    all_dirs += get_external_skills_dirs()
+    external = get_external_skills_dirs()
+    all_dirs += external
+    all_dirs += [d for d in _session_skill_group_dirs(external) if d not in all_dirs]
     return project_dirs, all_dirs, active_skills_dir
+
+
+SESSION_SKILL_GROUPS_FILE = "skill-groups"
+
+
+def _session_skill_group_dirs(external_dirs: list) -> list:
+    """Extra skill dirs THIS session pulled in, read from ``<session scratch>/skill-groups`` (one
+    absolute dir per line; written by a terminal child via $HERMES_SESSION_SCRATCH). Session-scoped
+    by construction and never touches config. Only a SIBLING of a configured external dir is
+    honoured (an unsubscribed group next to subscribed ones), so the file cannot point skill_view
+    at an arbitrary tree. Serves skill_view/skills_list only; the system-prompt index is unchanged."""
+    if not external_dirs:
+        return []
+    try:
+        from gateway.session_context import resolve_current_session_id
+        from hermes_constants import get_session_scratch_dir
+        session_id = resolve_current_session_id()
+        scratch = get_session_scratch_dir(session_id, create=False) if session_id else None
+        if scratch is None:
+            return []
+        lines = (scratch / SESSION_SKILL_GROUPS_FILE).read_text(encoding="utf-8").splitlines()
+    except (OSError, ImportError, UnicodeDecodeError):
+        return []
+    parents = {d.resolve().parent for d in external_dirs}
+    out: list = []
+    for line in lines:
+        entry = line.strip()
+        if not entry or not os.path.isabs(entry):
+            continue
+        p = Path(entry).resolve()
+        if p.parent in parents and p.is_dir() and p not in out and not p.name.startswith((".", "_")):
+            out.append(p)
+    return out
 
 
 def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
