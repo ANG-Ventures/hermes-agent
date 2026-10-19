@@ -173,3 +173,34 @@ def test_human_owner_still_needs_dispatcher_proc_paused_on_cpu_axis(tmp_path):
                  state_file=tmp_path / "wake_gate.json")
     assert g.downgrade_reason("apollo", now=0) == "host cpu 97% busy (load1 172)"
     assert g.downgrade_reason("apollo", now=0, human_owner=True) is None
+
+
+class CpuDelta:
+    """A sampler that reports busy only from a REAL previous snapshot: (busy, snap)."""
+
+    def __init__(self, busy):
+        self.busy, self.calls = busy, []
+
+    def __call__(self, prev=None):
+        self.calls.append(prev)
+        return (None if prev is None else self.busy), object()
+
+
+def test_stale_cpu_baseline_is_dropped_not_averaged(tmp_path):
+    """Prism ef086d30d8c4: wakes hours apart must not judge 'now' by an hours-long average."""
+    cpu = CpuDelta(0.95)
+    g = _gate(Load(1), tmp_path, cfg=CPU_CFG, cpu=cpu)
+    assert g.downgrade_reason(None, now=0) is None          # first sample: no baseline
+    assert g.downgrade_reason(None, now=60).startswith("host cpu 95% busy")  # fresh 60 s delta
+    assert g.downgrade_reason(None, now=60 + 3 * 3600) is None  # 3 h gap: baseline dropped
+    assert cpu.calls[-1] is None
+    assert g.downgrade_reason(None, now=60 + 3 * 3600 + 30).startswith("host cpu 95%")
+
+
+def test_cpu_max_interval_is_configurable(tmp_path):
+    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "cpu_pause": 0.90},
+                      "wake_load_gate": {"cpu_max_interval": 30}}}
+    cpu = CpuDelta(0.95)
+    g = _gate(Load(1), tmp_path, cfg=cfg, cpu=cpu)
+    g.downgrade_reason(None, now=0)
+    assert g.downgrade_reason(None, now=45) is None          # 45 s > 30 s window

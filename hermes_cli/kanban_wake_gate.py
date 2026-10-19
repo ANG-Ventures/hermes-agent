@@ -60,6 +60,7 @@ _log = logging.getLogger(__name__)
 STATE_FILENAME = "wake_gate.json"
 DEFAULT_SAMPLE_SECONDS = 15.0
 DEFAULT_CPU_PAUSE = 0.90
+DEFAULT_CPU_MAX_INTERVAL = 300.0  # seconds; an older CPU baseline is not "now"
 HOST_AXES = ("cpu", "load1")
 LANE_CACHE_SECONDS = 60.0
 
@@ -80,6 +81,7 @@ def _merged_cfg(config: Optional[dict]) -> dict:
         "sample_seconds": own.get("sample_seconds", DEFAULT_SAMPLE_SECONDS),
         "host_axis": own.get("host_axis", "cpu"),
         "cpu_pause": own.get("cpu_pause") or dispatch.get("cpu_pause") or DEFAULT_CPU_PAUSE,
+        "cpu_max_interval": own.get("cpu_max_interval", DEFAULT_CPU_MAX_INTERVAL),
     }
     return merged
 
@@ -110,6 +112,11 @@ class WakeGate:
             self.cpu_pause = DEFAULT_CPU_PAUSE
         self._cpu_sampler = cpu_sampler
         self._cpu_prev = None
+        self._cpu_prev_at: Optional[float] = None
+        try:
+            self.cpu_max_interval = max(1.0, float(cfg["cpu_max_interval"]))
+        except (TypeError, ValueError):
+            self.cpu_max_interval = DEFAULT_CPU_MAX_INTERVAL
         self.cpu_busy: Optional[float] = None
         try:
             self.sample_seconds = max(0.0, float(cfg["sample_seconds"]))
@@ -163,10 +170,18 @@ class WakeGate:
             if self.load1 is not None:
                 self._gate.update(self.load1, self.load5)
             if self.host_axis == "cpu":
+                # Busy is an average over [prev, now]. Wakes can be hours apart, and an
+                # hours-long average says nothing about the CPU right now: a baseline
+                # older than cpu_max_interval is dropped and this sample fails open
+                # toward WAKE (the next event inside the window reads a fresh delta).
+                if (self._cpu_prev_at is not None
+                        and now - self._cpu_prev_at > self.cpu_max_interval):
+                    self._cpu_prev = None
                 try:
                     self.cpu_busy, self._cpu_prev = self._cpu_sampler(self._cpu_prev)
                 except Exception:
                     self.cpu_busy = None
+                self._cpu_prev_at = now if self._cpu_prev is not None else None
             self._write_state()
         if self.host_axis == "cpu":
             if self._cpu_saturated():
