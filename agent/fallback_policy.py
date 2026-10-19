@@ -1289,14 +1289,17 @@ def _bridge_code_body(row: Mapping[str, Any], seat: str, cause: str) -> str:
             f"{seat_seg}{detail}{_pool_context(row)}")
 
 
-BUDGET_CUT_BEFORE_HEADERS = "seat unknown — cut before headers"
+BUDGET_CUT_BEFORE_HEADERS = "relay sent no headers before the cut"
+BUDGET_CUT_HEAD = "no reply within the turn budget"
 
 
 def _budget_cut_body(row: Mapping[str, Any], seat_names: bool) -> str:
     """``no first byte in 600 s on claude-alr (sub-vps-5)`` for a wall-budget cut
     (t_778185f3). The seat is the relay's ``x-pool-served-by`` when it answered
-    headers before the cut; a cut before any header says so. A lane with no seat
-    concept (cpa, openrouter, ...) gets no seat clause."""
+    headers before the cut; a cut before any header says so in words. A pool
+    relay buffers the whole reply, so there it is ``no reply`` (no byte is ever
+    visible before the turn ends), never a "first byte" claim (t_94a2b0e4). A
+    lane with no seat concept (cpa, openrouter, ...) gets no seat clause."""
     cut = row.get("budget_cut") if isinstance(row.get("budget_cut"), Mapping) else {}
     lane = str(cut.get("lane") or row.get("from_provider") or "").strip() or "the lane"
     try:
@@ -1309,10 +1312,34 @@ def _budget_cut_body(row: Mapping[str, Any], seat_names: bool) -> str:
     elif _plain_provider({"from_provider": lane}):
         seat_seg = ""
     elif cut.get("headers_seen"):
-        seat_seg = f" ({SUB_UNKNOWN})"
+        seat_seg = f" ({row.get('seat_absent') or SUB_UNKNOWN})"
     else:
         seat_seg = f" ({BUDGET_CUT_BEFORE_HEADERS})"
-    return f"no first byte{took} on {lane}{seat_seg}"
+    from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS
+
+    what = "no reply" if lane.lower() in _POOL_CAPABILITY_PROVIDERS else "no first byte"
+    return f"{what}{took} on {lane}{seat_seg}"
+
+
+CREDITS_CAUSE = "out of credits"
+_CREDIT_NEEDLES = ("run out of credits", "out of credits", "spending-limit", "spending limit",
+                   "insufficient credits", "credit balance")
+_WINDOW_WORDS = {"5h": "5h limit", "7d": "weekly limit", "7d_oi": "weekly (7d_oi) limit",
+                 "7d_sonnet": "Sonnet weekly limit"}
+
+
+def _window_cause(row: Mapping[str, Any], t: str) -> Optional[str]:
+    """``Fable 5h limit`` / ``weekly limit`` from the quota window the response
+    named (``row["quota_window"]``, carried by the ledger from
+    ``x-relay-quota-window`` or Anthropic's unified headers, t_94a2b0e4). None
+    when the row carries no window: the text-derived wording stays."""
+    words = _WINDOW_WORDS.get(str(row.get("quota_window") or ""))
+    if not words:
+        return None
+    fable = "fable" in t or "fable" in str(row.get("from_model") or "").lower()
+    if fable and not words.startswith("Sonnet"):
+        return f"Fable {words}"
+    return words
 
 
 def _cause_phrase(row: Mapping[str, Any]) -> str:
@@ -1376,6 +1403,10 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
             return "model budget capped"
         if "no eligible sub" in t:
             return "no eligible sub for the model"
+        windowed = _window_cause(row, t)
+        if windowed and quota_window_from_text(t) is None:
+            # The text names no window; the response headers did (t_94a2b0e4).
+            return windowed
         weekly = quota_window_from_text(t) == "7d"
         if "fable" in t:
             return "Fable weekly limit" if weekly else "Fable limit"
@@ -1384,8 +1415,15 @@ def _cause_phrase(row: Mapping[str, Any]) -> str:
         if weekly:
             return "weekly limit"
         return "model quota exhausted" if cls == "quota_model" else "seat quota exhausted"
+    if cls == "rate_upstream" and row.get("quota_window"):
+        # A 429 whose response named a quota window is a spent allowance, not
+        # request-rate limiting (spec §F1/§F3 defense in depth, t_94a2b0e4).
+        return _window_cause(row, t) or "account rate limit"
     if cls == "auth" and "third-party apps" in t:
         return THIRD_PARTY_CAUSE
+    if cls == "auth" and any(n in t for n in _CREDIT_NEEDLES):
+        # "credit exhausted" over "OAuth revoked (401)" (t_94a2b0e4): one cause.
+        return CREDITS_CAUSE
     return {
         "rate_upstream": "account rate limit",
         "refusal": "content policy refusal",
@@ -1474,7 +1512,48 @@ def format_cause_rider(row: Mapping[str, Any], *, seat_names: bool = True,
     body, hit = _cause_body(row, seat_names, tz)
     if floors is not None:
         floors.extend(hit)
+    body = _seat_absent_words(row, body)
+    wait = _cause_wait_clause(row)
+    if wait:
+        m = _TRAILING_WINDOW_RE.search(body)
+        body = f"{body[:m.start()]}{wait}{body[m.start():]}" if m else body + wait
     return body + same_error_rider(row, seat_names=seat_names, tz=tz)
+
+
+_TRAILING_WINDOW_RE = re.compile(r", (?:\d\d:\d\d:\d\d[-:\d]*|time \?)$")
+
+
+def _cause_wait_clause(row: Mapping[str, Any]) -> str:
+    """t_94a2b0e4 (spec §F1): the attempt block ended on a harness timer after a
+    recorded error. The rider above names that error; this states the wait, so
+    a Retry-After sleep never reads as "no first byte" or a stall."""
+    cw = row.get("cause_wait")
+    if not isinstance(cw, Mapping):
+        return ""
+
+    def _s(v: Any) -> Optional[int]:
+        try:
+            return int(round(float(v)))
+        except (TypeError, ValueError):
+            return None
+
+    slept, moved = _s(cw.get("slept_s")), _s(cw.get("cut_elapsed_s")) or _s(cw.get("waited_s"))
+    if slept:
+        return f"; retried after a {slept} s wait, moved on at {moved} s" if moved else \
+            f"; retried after a {slept} s wait"
+    return f"; moved on after {moved} s" if moved else ""
+
+
+def _seat_absent_words(row: Mapping[str, Any], body: str) -> str:
+    """t_94a2b0e4 (spec §F2): a pooled row with no seat says WHY in words
+    (``relay sent no seat`` / ``relay sent no headers``, set by the ledger from
+    the attempt block's relay headers), never a bare ``sub unknown``. A row
+    without that evidence (hand-built, recovery) keeps the old wording."""
+    absent = row.get("seat_absent")
+    if not absent or row.get("seat"):
+        return body
+    return body.replace(f"({SUB_UNKNOWN})", f"({absent})").replace(
+        _HOP_SUB_UNKNOWN_SEG, f"({HOP_UNKNOWN}, {absent})")
 
 
 def cause_rider_with_floors(row: Mapping[str, Any], *, seat_names: bool = True,
@@ -1758,6 +1837,17 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
         head = BRIDGE_ERROR_CODES[bcode].head
         if head:
             return head
+        # No head of its own: the label is the rider's cause, from the same
+        # table row ("connection issue" over "relay box at session capacity",
+        # t_94a2b0e4).
+        if BRIDGE_ERROR_CODES[bcode].cause:
+            return BRIDGE_ERROR_CODES[bcode].cause
+    windowed = (_window_cause(row, str(row.get("err_head") or "").lower())
+                if cls in ("quota_model", "quota_seat", "rate_upstream") else None)
+    if cls == NO_FIRST_BYTE_BUDGET_CLASS:
+        # A cut with no prior error in the block (a recorded error renders from
+        # its own class): a timer ended a silent wait, it saw no "stall".
+        return BUDGET_CUT_HEAD
     if cls == INVALID_RESPONSE_CLASS:
         # t_6eddafcd: say what came back, and that the relay already retried.
         fl = row.get("floor") if isinstance(row.get("floor"), Mapping) else {}
@@ -1776,13 +1866,24 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
         return "relay deploying"
     if cls == "pool_pressure" and _cause_phrase(row).startswith(SESSION_DEMOTED_CAUSE):
         return "session demoted"
+    fa = row.get("fable_allowance")
+    if windowed and not (isinstance(fa, Mapping) and isinstance(fa.get("exhausted"), int)
+                         and fa["exhausted"] > 0):
+        # The response named the quota window (relay or Anthropic headers): the
+        # label says which limit, never a windowless "rate limit" (t_94a2b0e4).
+        return windowed
     if not relay_sourced:
         return None
     if cls in ("quota_model", "quota_seat"):
         # A relay quota refusal is a spent allowance, not request-rate
         # limiting: never "rate limit" (t_d6227140).
         return _relay_quota_head(row)
-    return {"conn": "connection issue", "pool_pressure": "relay busy"}.get(cls)
+    if cls == "pool_pressure":
+        # The label is the rider's own cause ("relay busy" over "seat drained",
+        # t_94a2b0e4); "relay busy" stays the generic one.
+        cause = _cause_phrase(row)
+        return "relay busy" if cause == "pool at capacity" else cause
+    return {"conn": "connection issue"}.get(cls)
 
 
 def _relay_quota_head(row: Mapping[str, Any]) -> str:

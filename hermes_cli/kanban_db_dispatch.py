@@ -3708,11 +3708,14 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
     Used by the multi-board sweep to count OTHER boards' workers against the
     host-level budget — the memory-derived cap bounds the machine, not the
     board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
+    A terminal-pending review lease (no worker) holds no slot (t_26ebe71a).
     """
+    from hermes_cli.kanban_terminal_pending import NOT_EXTENDED_LEASE_SQL
+
     try:
         return int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                f"SELECT COUNT(*) FROM tasks WHERE status = 'running' AND {NOT_EXTENDED_LEASE_SQL}"
             ).fetchone()[0]
         )
     except Exception:
@@ -5974,9 +5977,11 @@ def _dispatch_once_locked(
 
     _per_profile_running: dict[str, int] = {}
     if _per_profile_cap is not None:
+        from hermes_cli.kanban_terminal_pending import NOT_EXTENDED_LEASE_SQL
+
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
+            f"WHERE status = 'running' AND assignee IS NOT NULL AND {NOT_EXTENDED_LEASE_SQL} "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])

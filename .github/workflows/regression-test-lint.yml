@@ -24,6 +24,6 @@ permissions:
 
 jobs:
   regression_test_lint:
-    uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/regression-test-lint.yml@2b1b1d7440b6937ace1cda234c08990c66aab601
+    uses: ANG-Ventures/fleet-floor-workflows/.github/workflows/regression-test-lint.yml@38d6a1cb2f634d0b24fa81369eb28780c0e16776
     with:
       runner: ubuntu-latest

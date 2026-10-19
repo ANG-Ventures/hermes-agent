@@ -86,3 +86,37 @@ def test_prune_keeps_the_compressed_segments_of_a_chat_still_in_use(tmp_path, ca
         assert db.prune_sessions(older_than_days=90) == len(idle)
         assert db.get_compression_lineage("live-3") == ["live", "live-2", "live-3"]
         assert not any(db.get_session(sid) for sid in idle)
+
+
+def test_prune_commits_per_chunk_not_one_transaction(tmp_path, monkeypatch):
+    """A prune over more than one row budget commits each chunk on its own, so no single write-lock hold spans
+    the whole prune (one BEGIN IMMEDIATE held 61.5 s for 872 sessions at load 160, t_0b0c41e3)."""
+    import hermes_state_maintenance as maint
+    monkeypatch.setattr(maint, "_PRUNE_TXN_ROW_BUDGET", 10)
+    with closing(SessionDB(tmp_path / "state.db")) as db:
+        old = time.time() - 120 * 86400
+        for i in range(6):  # 6 sessions x (1 row + 4 messages) = 30 rows -> 3 chunks of 2 sessions
+            sid = f"old-{i}"
+            db.create_session(sid, source="cli")
+            for j in range(4):
+                db.append_message(sid, "user", f"m{j}", timestamp=old)
+            db.end_session(sid, "done")
+            db._conn.execute("UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?", (old, old, sid))
+            db._conn.commit()
+        db.create_session("recent", source="cli")
+
+        commits = []
+        orig = db._execute_write
+
+        def counting(fn, patience_s=None):
+            def wrapped(conn):
+                result = fn(conn)
+                commits.append(conn.execute("SELECT COUNT(*) FROM sessions WHERE id LIKE 'old-%'").fetchone()[0])
+                return result
+            return orig(wrapped, patience_s=patience_s)
+
+        monkeypatch.setattr(db, "_execute_write", counting)
+        assert db.prune_sessions(older_than_days=90) == 6
+        # 3 delete chunks, each committed with fewer old rows than before, then one recompute/cleanup txn.
+        assert commits == [4, 2, 0, 0], commits
+        assert db.get_session("recent") is not None

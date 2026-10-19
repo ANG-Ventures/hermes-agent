@@ -1085,6 +1085,11 @@ def stash_api_error(agent: Any, api_error: BaseException,
                 "route_id": cut_headers.get("x-pool-route-id"),
             }
         pend = agent._pending_fallback_error
+        # t_94a2b0e4: the attempt block's first error is the cause; a later timer
+        # never overwrites it, and the relay attribution is carried to the row.
+        from agent import fallback_cause
+
+        fallback_cause.note_error(agent, pend, api_error, headers)
         if pend["status"] is None:
             # t_b2e9ef12: a no-status failure used to log nothing parseable.
             logger.warning(
@@ -1287,6 +1292,9 @@ def clear_pending(agent: Any) -> None:
         agent._pending_fallback_error = None
     except Exception:  # noqa: BLE001
         pass
+    from agent import fallback_cause
+
+    fallback_cause.clear(agent)
 
 
 def _consume_pending(agent: Any) -> Optional[Dict[str, Any]]:
@@ -1334,12 +1342,24 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
     ``extra`` carries the Phase 2 policy fields (``sticky_until_epoch``,
     ``return_branch``, ``dwell_s``, ``notice_text``, …); its keys win."""
     pending = _consume_pending(agent) if consume else None
+    # t_94a2b0e4 (spec §F1/§F2): the attempt block's first error, and the relay
+    # attribution carried across it. A block that ended on a harness timer is
+    # classified and rendered from its first error; the timer only ends the wait.
+    from agent import fallback_cause
+
+    cause, carry = (fallback_cause.take(agent) if consume and kind == "failover"
+                    else (None, {}))
+    timer_pending = pending if (pending and pending.get("exc") in fallback_cause.TIMER_EXCS
+                                and cause is not None) else None
+    pending = fallback_cause.effective(pending, cause)
     status = pending.get("status") if pending else None
     headers = pending.get("headers") if pending else {}
     body = pending.get("body") if pending else None
     text = (pending.get("text") if pending else None) or (
         str((error_context or {}).get("message") or "") or None)
     reason_s = _reason_value(reason)
+    if timer_pending is not None and cause.reason:
+        reason_s = cause.reason
     if kind == "failover":
         trigger_class, class_source = classify_trigger(
             text=text, http_status=status, headers=headers, body=body,
@@ -1503,6 +1523,7 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
             row.setdefault("exc_name", pending.get("exc"))
             row.setdefault("socket_cause", pending.get("socket_cause"))
             row.setdefault("floor_site", (pending.get("floor") or {}).get("site"))
+        _stamp_cause_and_carry(row, cause, carry, timer_pending, observed=bool(pending))
         # Raw evidence for the dead-letter ledger (t_a716610d). Not a column.
         row["_dead_letter"] = {
             "exc": pending.get("exc") if pending else None,
@@ -1515,6 +1536,51 @@ def build_row(agent: Any, kind: str, *, from_provider: Any, from_model: Any,
             "floor": dict(pending.get("floor") or {}) if pending else {},
         }
     return row
+
+
+SEAT_ABSENT_NO_SEAT = "relay sent no seat"
+SEAT_ABSENT_NO_HEADERS = "relay sent no headers"
+
+
+def _stamp_cause_and_carry(row: Dict[str, Any], cause: Any, carry: Dict[str, Any],
+                           timer_pending: Optional[Dict[str, Any]], *,
+                           observed: bool = True) -> None:
+    """t_94a2b0e4 (spec §F1/§F2) on one failover row.
+
+    * seat / route id / quota window: the last relay attribution seen in the
+      attempt block, when the failing call itself carried none (a timer cut).
+    * ``seat_absent``: why a pooled row has no seat, in words (notice only).
+    * ``cause_wait``: the block ended on a harness timer after a recorded error;
+      the rider names that error and states the wait (notice only).
+
+    With no failing call observed through ``stash_api_error`` (``observed``
+    False, or an empty carry: a rejected-200 floor, a hand-built row) nothing is
+    known about the relay's headers, and the row keeps ``sub unknown``."""
+    carry = carry or {}
+    if carry.get("seat") and (not row.get("seat") or row.get("seat") == "unknown"):
+        row["seat"] = carry["seat"]
+    if carry.get("route_id") and not row.get("route_id"):
+        row["route_id"] = carry["route_id"]
+    window = carry.get("quota_window")
+    if not window and timer_pending is not None:
+        # Only a row rendered FROM the cause may take the cause's window; a later,
+        # different error keeps its own (Prism 5152328892a7).
+        window = getattr(cause, "quota_window", None)
+    if window and not row.get("quota_window"):
+        row["quota_window"] = window
+    if observed and carry and not row.get("seat"):
+        row["seat_absent"] = SEAT_ABSENT_NO_SEAT if carry.get("relay_answered") \
+            else SEAT_ABSENT_NO_HEADERS
+    if timer_pending is not None and cause is not None:
+        cut = timer_pending.get("budget_cut") if isinstance(timer_pending.get("budget_cut"), dict) else {}
+        row["cause_wait"] = {
+            "ended_by": timer_pending.get("exc"),
+            "waited_s": _round_s(cause.waited_s(float(timer_pending.get("at") or time.monotonic()))),
+            "slept_s": _round_s(cause.slept_s),
+            "cut_lane": cut.get("lane"),
+            "cut_elapsed_s": cut.get("elapsed_s"),
+        }
+        row.setdefault("first_err_ts", cause.at)
 
 
 def write_row(row: Dict[str, Any]) -> None:
