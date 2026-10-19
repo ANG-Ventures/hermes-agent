@@ -187,14 +187,69 @@ def note_error(agent: Any, pending: Dict[str, Any], api_error: Any, raw_headers:
         logger.debug("failover cause: note failed", exc_info=True)
 
 
+def note_sleep(agent: Any, seconds: Any, now_mono: Optional[float] = None) -> None:
+    """A retry sleep on the lane is about to start (Retry-After / backoff): the
+    wall-budget notice reads it instead of claiming a request is in flight."""
+    try:
+        cause = getattr(agent, "_failover_cause", None)
+        if isinstance(cause, FailoverCause) and float(seconds) > 0:
+            now = time.monotonic() if now_mono is None else now_mono
+            cause.extra["sleep_until"] = now + float(seconds)
+            cause.extra["sleep_s"] = float(seconds)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def note_wait(agent: Any, seconds: Any) -> None:
     """A retry sleep was taken on the lane after the cause (Retry-After / backoff)."""
     try:
         cause = getattr(agent, "_failover_cause", None)
-        if isinstance(cause, FailoverCause) and float(seconds) > 0:
-            cause.slept_s += float(seconds)
+        if isinstance(cause, FailoverCause):
+            cause.extra.pop("sleep_until", None)
+            if float(seconds) > 0:
+                cause.slept_s += float(seconds)
     except Exception:  # noqa: BLE001
         pass
+
+
+def cause_text(agent: Any, cause: "FailoverCause") -> str:
+    """``Fable 5h limit on sub-vps-10 (Anthropic 429)``: the cause phrase from the
+    same table the failover rider uses (``fallback_policy._cause_phrase``)."""
+    from agent import fallback_policy as fp
+
+    ev = cause.evidence or {}
+    row = {"trigger_class": cause.trigger_class, "http_status": cause.http_status,
+           "err_head": str(ev.get("text") or "")[:400], "quota_window": cause.quota_window,
+           "from_provider": cause.lane, "from_model": getattr(agent, "model", None),
+           "seat": cause.seat}
+    text = fp._cause_phrase(row)
+    if cause.seat:
+        text += f" on {cause.seat}"
+    if cause.http_status:
+        text += f" (Anthropic {cause.http_status})" if str(cause.lane or "").startswith("claude-") \
+            else f" (HTTP {cause.http_status})"
+    return text
+
+
+def wait_notice(agent: Any, now_mono: Optional[float] = None) -> Optional[str]:
+    """The wall-budget notice while the lane's attempt block holds a recorded
+    error (t_94a2b0e4, Ace 2026-10-18 21:16): in a retry sleep it says it is
+    waiting and why; on the retry after one it says so. None when the lane has
+    no recorded cause (the notice keeps its in-flight wording)."""
+    cause = peek(agent)
+    lane = str(getattr(agent, "provider", "") or "") or None
+    if cause is None or cause.lane != lane:
+        return None
+    now = time.monotonic() if now_mono is None else now_mono
+    why = cause_text(agent, cause)
+    until = cause.extra.get("sleep_until")
+    if isinstance(until, (int, float)) and until > now:
+        return (f"⏳ waiting {int(round(cause.extra.get('sleep_s') or (until - now)))} s: {why}, "
+                f"retrying then falling back")
+    route = f"{lane or '?'}/{getattr(agent, 'model', '') or '?'}"
+    if cause.slept_s > 0:
+        return f"⏳ retrying {route} after a {int(round(cause.slept_s))} s wait: {why}"
+    return f"⏳ retrying {route}: {why}"
 
 
 def peek(agent: Any) -> Optional[FailoverCause]:

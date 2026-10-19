@@ -318,3 +318,106 @@ def test_turn_loop_15_45_sequence_renders_the_true_banner(monkeypatch, tmp_path)
     assert "retried after a 600 s wait, moved on at 614 s" in text, text
     for banned in ("no first byte", "stalled", "unknown", "cut before headers"):
         assert banned not in text, text
+
+
+# ── notice side: a retry sleep is never "turn in progress" (Ace 2026-10-18 21:16) ──
+
+
+def _armed_alr(waited_s):
+    from agent import fallback_wall_budget as wb
+    a = _agent()
+    a._fallback_chain = [{"provider": "claude-dtlr", "model": FABLE}]
+    a._fallback_index = 0
+    a._wall_budget = None
+    wb.arm(a, now=time.monotonic() - waited_s)
+    return a, wb
+
+
+def _live_2112_429():
+    """agent.log 21:12:15 session 20260927_135034_52aefa: 429, "Retrying API call in 150.0s"."""
+    return _live_429(**{"retry-after": "150"})
+
+
+def test_notice_during_a_retry_sleep_names_the_wait_and_the_cause():
+    a, wb = _armed_alr(256)
+    fbe.stash_api_error(a, _live_2112_429(), 429, None)
+    _fbc().note_sleep(a, 150.0)
+    notice = wb.notice_due(a)
+    assert notice is not None
+    assert notice.startswith("⏳ waiting 150 s: Fable 5h limit on sub-vps-10 (Anthropic 429), "
+                             "retrying then falling back"), notice
+    for banned in ("turn in progress", "buffering lane", "first byte", "first reply"):
+        assert banned not in notice, notice
+
+
+def test_notice_on_the_retry_after_a_sleep_says_it_is_a_retry():
+    a, wb = _armed_alr(400)
+    fbe.stash_api_error(a, _live_2112_429(), 429, None)
+    _fbc().note_sleep(a, 150.0)
+    _fbc().note_wait(a, 150.0)
+    notice = wb.notice_due(a)
+    assert notice.startswith("⏳ retrying claude-alr/claude-fable-5-1 after a 150 s wait: "
+                             "Fable 5h limit on sub-vps-10 (Anthropic 429)"), notice
+    assert "turn in progress" not in notice
+
+
+def test_notice_with_no_recorded_error_keeps_the_in_flight_wording():
+    a, wb = _armed_alr(256)
+    notice = wb.notice_due(a)
+    assert notice.startswith("⏳ turn in progress on claude-alr/claude-fable-5-1"), notice
+
+
+def test_turn_loop_2112_sleep_posts_the_waiting_notice(monkeypatch, tmp_path):
+    """The real turn loop: 429 + Retry-After 150 with the clock already 256 s old.
+    Mutation guard: drop the note_sleep / notice read in turn_api_error and the
+    status reads "turn in progress" (or nothing)."""
+    from unittest.mock import patch
+
+    import agent.auxiliary_client as ac
+    from tests.agent.test_relay_quota_retry_handoff import make_agent
+    from tests.run_agent.test_pool_capacity_503_retry import _FakeClock, _fallback_client, _response
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ac.clear_runtime_main()
+    statuses: list = []
+    agent = make_agent(statuses)
+    agent.model = FABLE
+    sleeps: list = []
+    clock = _FakeClock(sleeps)
+    script = [_live_2112_429()]
+    emitted: list = []
+
+    def wire(*_a, **_k):
+        from agent import fallback_wall_budget as wb
+        if script:
+            # The no-first-byte clock has run 256 s when the 429 lands.
+            st = getattr(agent, "_wall_budget", None)
+            if isinstance(st, dict):
+                st["started"] = time.monotonic() - 256
+            raise script.pop(0)
+        return _response("served", agent.model)
+
+    agent._disable_streaming = True
+    try:
+        with (
+            patch("agent.chat_completion_helpers.should_use_direct_api_call", return_value=True),
+            patch.object(agent, "_interruptible_api_call", side_effect=wire),
+            patch.object(agent, "_emit_diagnostic_status", side_effect=emitted.append),
+            patch.object(agent, "_persist_session"), patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  side_effect=lambda *args, **kw: (_fallback_client(), kw.get("model", agent.model))),
+            patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m),
+            patch("agent.model_metadata.get_model_context_length", return_value=200000),
+            patch("hermes_cli.config.read_raw_config",
+                  return_value={"model": {"announce_route_change": True}}),
+            patch("agent.turn_recovery.time", clock),
+        ):
+            result = agent.run_conversation("hello")
+    finally:
+        ac.clear_runtime_main()
+    assert result["completed"] is True, result
+    waits = [m for m in emitted if isinstance(m, str) and m.startswith("⏳")]
+    assert waits, emitted
+    assert waits[0].startswith("⏳ waiting 150 s: Fable 5h limit on sub-vps-10 (Anthropic 429)"), waits
+    assert not any("turn in progress" in m or "buffering lane" in m for m in waits), waits

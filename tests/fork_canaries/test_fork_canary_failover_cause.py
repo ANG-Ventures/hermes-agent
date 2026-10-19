@@ -24,6 +24,7 @@ from agent import fallback_policy as fp
 from tests.agent.test_fallback_failover_cause import (
     ROUTE, _agent, _live_429, _live_cut, _row, _sleep_then_cut,
     test_turn_loop_15_45_sequence_renders_the_true_banner as _turn_loop,
+    test_turn_loop_2112_sleep_posts_the_waiting_notice as _notice_loop,
 )
 
 UTC = dt.timezone.utc
@@ -68,3 +69,11 @@ def test_turn_loop_sleep_is_credited_to_the_cause(monkeypatch, tmp_path):
     banner loses "retried after a 600 s wait". Or drop the ``ledger_row["reason"]``
     block in ``_emit_fallback_announce``: the label reads "pool sub stalled"."""
     _turn_loop(monkeypatch, tmp_path)
+
+
+def test_retry_sleep_notice_names_the_wait(monkeypatch, tmp_path):
+    """RED-PROVABLE: resolve ``agent/turn_api_error.py`` toward upstream (drop the
+    ``note_sleep`` + ``notice_due`` lines before ``interruptible_backoff_sleep``), or
+    drop the ``wait_notice`` read in ``fallback_wall_budget.notice_due``: the 21:12
+    sleep posts "turn in progress (buffering lane)" with nothing in flight."""
+    _notice_loop(monkeypatch, tmp_path)

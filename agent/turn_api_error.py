@@ -474,6 +474,14 @@ def settle_unrecovered_error(
     )
     # Same preserve-redirect rule as the invalid-response wait: a steering correction
     # must survive backoff, not die as "Operation interrupted".
+    # t_94a2b0e4: the wall-budget notice reads the sleep (it is not polled during
+    # one), and a notice due now names the wait instead of an in-flight turn.
+    from agent.fallback_cause import note_sleep
+    from agent.fallback_wall_budget import notice_due as _wb_notice_due
+    note_sleep(agent, wait_time)
+    _wb_notice = _wb_notice_due(agent)
+    if _wb_notice:
+        agent._emit_diagnostic_status(_wb_notice)
     _interrupted = interruptible_backoff_sleep(
         agent, wait_time, _retry, messages=messages, conversation_history=conversation_history,
         api_call_count=api_call_count,
