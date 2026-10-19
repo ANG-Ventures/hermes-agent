@@ -28,6 +28,7 @@ pending: the predicate fails open to today's behaviour, never to a claim that ca
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -48,6 +49,8 @@ REASON_LEASE_LAPSE = "review-lease-lapse"
 # and left its file behind must not keep a review claim alive forever.
 ARMED_HORIZON_S = 6 * 3600
 ARMED_STATUSES = frozenset({"ARMED", "QUEUED"})
+# A timestamp further in the future than this is not fresh: a far-future value would never age out either.
+_CLOCK_SKEW_S = 300
 _OPEN_SUFFIXES = (".parked.json", ".inflight", ".json")
 _CLOSED_SUFFIXES = (".done.json", ".result.json", ".unparked.json", ".cancel.json", ".superseded.json")
 _HEX_RE = re.compile(r"^[0-9a-f]{7,40}$")
@@ -110,13 +113,27 @@ def _read(path: Path) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
-def _fresh(path: Path, at: object, now: float) -> bool:
-    """Inside :data:`ARMED_HORIZON_S`, by the row's own timestamp, else the file's mtime. Unknown age = stale."""
+def _epoch(value: object) -> Optional[float]:
+    """A usable epoch timestamp, or None. ``Infinity`` / ``nan`` / <= 0 parse as floats but would make an intent
+    fresh forever (Prism 3bc827d1f2e5), so they are rejected like any unparseable value."""
     try:
-        ts = float(at) if at else path.stat().st_mtime
-    except (OSError, TypeError, ValueError):
-        return False
-    return now - ts <= ARMED_HORIZON_S
+        ts = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return ts if math.isfinite(ts) and ts > 0 else None
+
+
+def _fresh(path: Path, at: object, now: float) -> bool:
+    """Inside :data:`ARMED_HORIZON_S`, by the row's own timestamp, else (field absent or empty) the file's mtime.
+    Unknown, non-finite, non-positive or future-dated age = stale."""
+    if at is None or at == "":
+        try:
+            ts = _epoch(path.stat().st_mtime)
+        except OSError:
+            return False
+    else:
+        ts = _epoch(at)
+    return ts is not None and -_CLOCK_SKEW_S <= now - ts <= ARMED_HORIZON_S
 
 
 def _land_requests(root: Path, task_id: str, head: str, now: float) -> Optional[dict]:
@@ -153,9 +170,9 @@ def _land_requests(root: Path, task_id: str, head: str, now: float) -> Optional[
         req = _read(d / name.replace(".result.json", ".done.json"))
         if not res or not req:
             continue
-        try:  # one malformed result skips that entry, never the whole lookup (Prism d6f16f45db8f)
-            at = float(res.get("finished_at") or 0)
-        except (TypeError, ValueError):
+        # one malformed result skips that entry, never the whole lookup (Prism d6f16f45db8f, 3bc827d1f2e5)
+        at = _epoch(res.get("finished_at") or 0)
+        if at is None:
             continue
         key = (str(req.get("repo") or "").lower(), str(req.get("pr")))
         if key not in newest or at > newest[key][0]:

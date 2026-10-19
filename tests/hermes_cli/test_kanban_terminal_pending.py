@@ -197,6 +197,73 @@ def test_stale_open_land_intent_ages_out(home, shape):
         assert kb.get_task(conn, tid).status == "review"
 
 
+@pytest.mark.parametrize("value", ["Infinity", "inf", "nan", "-1", 0, -1, 1e18, "1e18"])
+@pytest.mark.parametrize("where", ["request", "queue-row", "armed-result"])
+def test_non_finite_or_nonpositive_timestamp_is_not_fresh(home, where, value):
+    """Prism 3bc827d1f2e5: float('Infinity') parses and ``now - inf`` is always inside the horizon, so an abandoned
+    request carrying it extended the claim on every sweep. The file is FRESH by mtime here: the bad value itself
+    must be what makes it stale, not a fallback."""
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        _approve(conn, tid)
+        if where == "queue-row":
+            d = home / "state" / "apollo-land-queue"
+            d.mkdir(parents=True)
+            (d / "q.json").write_text(json.dumps({"id": "q", "card": tid, "status": "pending",
+                                                  "merging_sha": HEAD, "enqueued_at": value}))
+        elif where == "request":
+            path = _land_request(home, tid) / "01TESTLANDREQ.json"
+            req = json.loads(path.read_text())
+            req["created_at"] = value
+            path.write_text(json.dumps(req))
+        else:
+            d = _land_request(home, tid, suffix=".done.json")
+            (d / "01TESTLANDREQ.result.json").write_text(json.dumps(
+                {"ulid": "01TESTLANDREQ", "status": "ARMED", "rc": 0, "finished_at": value}))
+        assert tp.terminal_pending(conn, tid) is None
+        assert kb.release_stale_claims(conn) == 1
+        assert kb.get_task(conn, tid).status == "review"
+
+
+@pytest.mark.parametrize("value", ["", None, "missing"])
+def test_empty_or_missing_timestamp_falls_back_to_mtime(home, value):
+    """An absent/empty created_at uses the file mtime (old mtime = stale, fresh mtime = fresh); it never reads as
+    fresh by itself."""
+    old = time.time() - tp.ARMED_HORIZON_S - 60
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        _approve(conn, tid)
+        path = _land_request(home, tid) / "01TESTLANDREQ.json"
+        req = json.loads(path.read_text())
+        if value == "missing":
+            req.pop("created_at")
+        else:
+            req["created_at"] = value
+        path.write_text(json.dumps(req))
+        assert tp.terminal_pending(conn, tid) is not None
+        os.utime(path, (old, old))
+        assert tp.terminal_pending(conn, tid) is None
+        assert kb.release_stale_claims(conn) == 1
+
+
+def test_finite_result_beside_a_non_finite_one_still_counts(home):
+    """A non-finite finished_at skips that entry only; another PR's valid ARMED result for the card still counts."""
+    with kb.connect() as conn:
+        tid = _operator_review_claim(conn)
+        _approve(conn, tid)
+        d = _land_request(home, tid, suffix=".done.json", ulid="01BAD")
+        (d / "01BAD.result.json").write_text(json.dumps({"ulid": "01BAD", "status": "ARMED",
+                                                         "finished_at": "Infinity"}))
+        _land_request(home, tid, suffix=".done.json", ulid="01GOOD")
+        good = json.loads((d / "01GOOD.done.json").read_text())
+        good["pr"] = 4050
+        (d / "01GOOD.done.json").write_text(json.dumps(good))
+        (d / "01GOOD.result.json").write_text(json.dumps({"ulid": "01GOOD", "status": "ARMED",
+                                                          "finished_at": time.time()}))
+        pending = tp.terminal_pending(conn, tid)
+        assert pending is not None and pending["land"]["id"] == "01GOOD"
+
+
 @pytest.mark.parametrize("row", [
     {"status": "pending"},                                    # no verified head yet
     {"status": None, "rc_posted_sha": OTHER},                 # verified, but a different (unapproved) head
