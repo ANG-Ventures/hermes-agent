@@ -66,7 +66,9 @@ from agent.fork_ext.relay_headers import (
     call_id_of,
     consume_first_request_headers,
     merge_pool_capability_headers,
+    note_main_turn_cache_split,
     note_main_turn_served_by,
+    note_relay_streaming,
     route_id_of,
     stamp_call_id,
     stamp_correlation_headers,
@@ -145,6 +147,7 @@ def _snapshot_pool_headers(response: Any) -> dict[str, str]:
     source = getattr(response, "headers", None)
     if source is None:
         return {}
+    note_relay_streaming(response)
     snapshot: dict[str, str] = {}
     for name in _POOL_HEADER_NAMES:
         try:
@@ -564,6 +567,8 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
     # A served call means the last stashed API error recovered in place; it
     # must not be attributed to a later, unrelated failover.
     agent._pending_fallback_error = None
+    from agent import fallback_cause as _fbc
+    _fbc.clear(agent)   # the attempt block ended served: its cause recovered
     # The route the call went out on, not the live agent (FleetReview
     # 73d9dc1df836): a switch to/from a pooled provider mid-flight must not
     # drop or mis-gate this call's ledger row.
@@ -583,6 +588,7 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
 
     _fw.note_success(agent, headers if isinstance(headers, dict) else None)
     note_main_turn_served_by(agent, provider, headers)
+    note_main_turn_cache_split(agent, getattr(response, "usage", None))
     seq = _emit_api_call_record(
         agent,
         usage=getattr(response, "usage", None),
@@ -2967,6 +2973,13 @@ def _emit_fallback_announce(
     if kind == "recovery":
         _reason_suffix = f" ({recovery_via})" if recovery_via else ""
     else:
+        if isinstance(ledger_row, dict) and ledger_row.get("cause_wait") and ledger_row.get("reason"):
+            # t_94a2b0e4: the attempt ended on a harness timer after a recorded
+            # error; the label names that error, never the timer.
+            try:
+                reason = FailoverReason(ledger_row["reason"])
+            except (ValueError, TypeError):
+                reason = ledger_row["reason"]
         _reason_label = _fallback_reason_label(reason)
         _head_floor = _fallback_reason_label_is_floor(reason)
         # §4.8 head-label override: a relay-sourced conn / pool_pressure names

@@ -214,6 +214,12 @@ def notice_due(agent: Any, now: Optional[float] = None) -> Optional[str]:
     st["notices"] = due
     lanes = st["lanes"]
     route = f"{getattr(agent, 'provider', '') or '?'}/{getattr(agent, 'model', '') or '?'}"
+    # t_94a2b0e4: the lane holds a recorded error (a 429/503 and its Retry-After
+    # sleep): say what we are waiting on, never "turn in progress / buffering".
+    from agent.fallback_cause import wait_notice
+    waiting = wait_notice(agent)
+    if waiting:
+        return f"{waiting}; {int(waited)}s elapsed{_ahead_suffix(agent)}"
     if _buffering_lane(agent):
         return (f"⏳ turn in progress on {route} (buffering lane, first byte not visible until "
                 f"the turn ends): {int(waited)}s elapsed; long outputs run 2–4 min; "
@@ -225,9 +231,13 @@ def notice_due(agent: Any, now: Optional[float] = None) -> Optional[str]:
 def _buffering_lane(agent: Any) -> bool:
     """The claude pool relays (alr/dtlr/btpr/bpr faces) buffer the whole upstream body,
     so no byte is visible here until the turn ends (t_e35032e2): a long healthy turn
-    reads as "no first reply". Wording only; the clock and the cut are unchanged."""
-    from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS
-    return (getattr(agent, "provider", "") or "").strip().lower() in _POOL_CAPABILITY_PROVIDERS
+    reads as "no first reply". Wording only; the clock and the cut are unchanged.
+    t_8d6b8e30: a relay that says ``x-relay-streaming: 1`` streams after its commit
+    point, so its wait IS a real no-first-byte wait and keeps the plain wording."""
+    from agent.fork_ext.relay_headers import _POOL_CAPABILITY_PROVIDERS, relay_streams
+    if (getattr(agent, "provider", "") or "").strip().lower() not in _POOL_CAPABILITY_PROVIDERS:
+        return False
+    return not relay_streams(getattr(agent, "base_url", "") or "")
 
 
 def _ahead_suffix(agent: Any) -> str:
