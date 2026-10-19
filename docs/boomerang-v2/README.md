@@ -177,9 +177,58 @@ wake. Re-surfacing happens at most once per entry; after that it is an ordinary 
 A handoff that arrived from a child after the reconciler cancelled it. It is tagged and not
 rendered in the origin chat. What to do: nothing; the re-surfaced wake is the live one.
 
-Log lines (gateway log): `boomerang.fork_ineligible reason=…`,
-`boomerang.fork served_by=… read_share=…`, `kanban notifier: auto-handled <card> disposition=…`.
+## 6. Who writes the board: the child proposes, the gateway signs (D-19, spec §5.8)
+
+A boomerang child, fork or summary, runs inside the delegated-child kanban fence
+(`hermes_cli/kanban_db.py::_assert_not_delegated_child_mutation`). It opens board DBs read-only,
+and its only write is a comment tagged ` (subagent)`, which the review machinery treats as
+machine-written. So an auto-handle child cannot complete, send back, re-dispatch or approve
+anything itself.
+
+Instead, the child ends its final message with ONE verdict block:
+
+```
+<<<BOOMERANG-VERDICT nonce=<hex16>>>>
+{"action": "complete" | "request_changes" | "redispatch" | "retry" | "surface",
+ "evidence": ["<command + result>", ...], "findings": ["..."], "summary": "<line>"}
+<<<END-VERDICT>>>
+```
+
+The gateway's executor (`gateway/kanban_auto_handle.py::execute_verdict`) does at most ONE
+board write for it:
+
+- **Accept only a real verdict.** The block must be the only one in the child's final message,
+  must come last, and must carry the nonce minted for this dispatch. The nonce is never on the
+  board, so a worker cannot pre-forge a verdict.
+- **Only allowed actions.** The action must be allowed for the wake row recorded at claim time:
+  - `completed`: complete, request_changes or surface.
+  - `own_repo_review_red`: request_changes, redispatch or surface.
+  - `changes_requested`: redispatch or surface.
+  - `crash_first_occurrence`: retry or surface.
+  The executor never lands, merges, approves a PR, edits config or touches another card.
+- **Card, PR and assignee come from the board, never from the child.** If the card moved since
+  the claim, nothing is written and the wake is re-surfaced (`reason: state moved`). Moved means a
+  newer event other than the child's own comment, a status change, or a new PR head. Redispatch
+  goes to the card's current assignee only.
+- **Signed as a machine.** Every write carries `operator_kind: machine`, `via: auto-handle` and the
+  `delegation_id`, and every comment starts with `[auto-handle]`. The review machinery
+  (hermes-home `scripts/lib/operator_identity.py` / `our_authors.py`) therefore never reads an
+  executor write as a human hold.
+- **Crash-safe.** The state goes `executing` → write → `terminal`. After a restart, the reconciler
+  counts only the executor's own `auto_handle_executed` receipt as proof the write happened.
+  Quoted text never counts.
+
+Anything rejected writes nothing. You see the `⚠️ auto-handle failed <card>: <reason>` line, and
+the original wake is re-surfaced.
+
+**Residual (accepted):** the fence is cooperative scoping, not confinement. A full-toolset fork
+(D-11) with `terminal` could still write the board's SQLite file directly. That gap existed
+before v2; D-19 does not claim a hard boundary.
+
+Log lines (`logs/agent.log`, from `tools.delegate_tool`): `boomerang.fork_ineligible reason=…`,
+`boomerang.fork served_by=… read_share=…`. In `logs/gateway.log`:
+`kanban notifier: auto-handled <card> disposition=…`.
 
 ## Decisions cited
 
-D-1, D-2, D-6, D-7, D-8, D-9, D-11, D-13, D-14, D-15, D-16, D-17, D-18 — all in spec §4.
+D-1, D-2, D-6, D-7, D-8, D-9, D-11, D-13, D-14, D-15, D-16, D-17, D-18, D-19 — all in spec §4.
