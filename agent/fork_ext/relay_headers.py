@@ -7,6 +7,7 @@ import re
 import secrets
 from contextlib import contextmanager
 from contextvars import ContextVar
+from urllib.parse import urlsplit
 
 
 def _pool_lane(agent, aux_task=None) -> str:
@@ -102,6 +103,52 @@ _POOL_CAPABILITY_PROVIDERS = frozenset({
 })
 POOL_ACCEPTS_HEADER = "x-hermes-accepts"
 POOL_ACCEPTS_VALUE = "error-class-v2"
+
+# t_8d6b8e30: a claude-pool face with `stream_after_commit` on streams after the
+# commit point and stamps `x-relay-streaming: 1` on every response. The notice that
+# needs it fires before the current attempt's head exists (the relay sends its head
+# at commit), so the last value seen per relay origin (scheme://host:port; one relay
+# process per port) answers. Unknown origin = today's assumption (buffering).
+RELAY_STREAMING_HEADER = "x-relay-streaming"
+_RELAY_STREAMING: dict[str, bool] = {}
+
+
+def _relay_origin(url) -> str:
+    try:
+        u = urlsplit(str(url))
+        host = (u.hostname or "").lower()
+        host = "127.0.0.1" if host in ("localhost", "::1") else host
+        port = u.port or (443 if u.scheme == "https" else 80)
+        return f"{u.scheme}://{host}:{port}" if host else ""
+    except Exception:
+        return ""
+
+
+def note_relay_streaming(response) -> None:
+    """Record whether the relay that sent ``response`` (an httpx response carrying
+    ``x-pool-*`` headers) streams. Only relay responses count."""
+    headers = getattr(response, "headers", None)
+    request = getattr(response, "request", None)
+    if headers is None or request is None:
+        return
+    try:
+        if (headers.get("x-pool-route-id") is None and headers.get("x-pool-served-by") is None
+                and headers.get(RELAY_STREAMING_HEADER) is None):
+            return
+        origin = _relay_origin(request.url)
+        if origin:
+            _RELAY_STREAMING[origin] = headers.get(RELAY_STREAMING_HEADER) == "1"
+    except Exception:
+        return
+
+
+def relay_streams(base_url) -> bool:
+    """True when the relay at ``base_url`` last said it streams."""
+    return _RELAY_STREAMING.get(_relay_origin(base_url), False)
+
+
+def reset_relay_streaming() -> None:
+    _RELAY_STREAMING.clear()
 
 
 def _pool_capability_headers(agent) -> dict:
