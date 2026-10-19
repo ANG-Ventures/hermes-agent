@@ -44,6 +44,7 @@ class GatewayGoalCommandsMixin:
             return None
 
         def dispatch():
+            mgr.reload()  # re-read under the lock: the pre-lock snapshot may be stale
             return dispatch_goal_command(
                 mgr, event.get_command_args() or "", authorize_gate=authorize_gate,
                 render=lambda key, default, **values: t(key, **values),
@@ -52,7 +53,9 @@ class GatewayGoalCommandsMixin:
 
         # Drafting resolves profile-scoped credentials. Keep ContextVars across the
         # executor hop; manager I/O must also stay off the messaging event loop.
-        result = await self._run_in_executor_with_context(dispatch)
+        # Serialized with the idle-wake watcher so neither saves over the other's goal state.
+        async with self._goal_session_lock(mgr.session_id):
+            result = await self._run_in_executor_with_context(dispatch)
         if result.clear_pending:
             self._clear_goal_continuations(event, result.clear_pending)
         if result.prompt:

@@ -1325,6 +1325,11 @@ class GoalManager:
         self._state, self._stored = _load_goal_raw(session_id)
         self._evaluating = False
 
+    def reload(self) -> Optional[GoalState]:
+        """Re-read the persisted goal, dropping this manager's snapshot (another writer may have saved)."""
+        self._state = load_goal(self.session_id)
+        return self._state
+
     # --- introspection ------------------------------------------------
 
     @property
