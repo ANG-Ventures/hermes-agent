@@ -12,6 +12,7 @@ from hermes_state_common import (
     escape_like as _escape_like
 )
 from hermes_startup_watchdog import report_startup_progress
+from hermes_state_lockowners import hold_ended, hold_started
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
@@ -393,7 +394,11 @@ class SessionMaintenanceMixin:
             # PASSIVE, not TRUNCATE: a manual `hermes sessions vacuum` runs in a transient CLI
             # process; a TRUNCATE reset here would race a live gateway writer.
             self._try_checkpoint("PASSIVE", "WAL checkpoint (PASSIVE) before VACUUM failed: %s")
-            self._conn.execute("VACUUM")
+            hold = hold_started(self.db_path, "vacuum")  # holder-side lock ledger (hermes_state_lockowners)
+            try:
+                self._conn.execute("VACUUM")
+            finally:
+                hold_ended(hold)
             # VACUUM rewrites every page THROUGH the WAL; without this TRUNCATE a 3 GB DB leaves a 3 GB -wal.
             self._try_checkpoint("TRUNCATE", "WAL checkpoint (TRUNCATE) after VACUUM failed: %s")
             # TRUNCATE may replace the WAL inode; adopt the new sidecars so the
