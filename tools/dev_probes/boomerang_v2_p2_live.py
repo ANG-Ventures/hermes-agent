@@ -169,7 +169,7 @@ def cmd_cache(a):
             "age_s": round(time.time() - parent.last_served_at, 1), "pass": mode == "fork" and share >= 0.85,
         }
         passed += row["pass"]
-        with out.open("a") as fh:
+        with out.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
         print(json.dumps(row), flush=True)
     print(json.dumps({"summary": {"trials": a.trials, "passed": passed}}), flush=True)
@@ -226,7 +226,7 @@ def cmd_cost(a):
             }
             # Keep the parent warm between children: reads within the 1h window refresh it.
         row["fork_le_fold"] = row["fork"]["cost_input_equiv"] <= row["summary"]["cost_input_equiv"]
-        with out.open("a") as fh:
+        with out.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
         print(json.dumps(row), flush=True)
 
