@@ -389,6 +389,17 @@ class Ctx:
         rep.notes.append(f"card `{role}` = `{card}`")
         return card
 
+    def force(self, rep: StepReport, key: str, **vals: str) -> None:
+        """Run a FORCING kanban transition; abort the step if it fails (Prism 7d1bf9b6fa33).
+
+        A negative check ("no auto-handle within one tick") trivially passes when the event it
+        waits on was never generated, so a failed transition is an abort, never a PASS.
+        """
+        rc, _ = self.kanban_cmd(rep, key, **vals)
+        if self.live and rc != 0:
+            raise StepAbort(f"forcing transition `{key}` failed (exit {rc}) for {vals}; "
+                            f"no event was generated, so this step cannot assert anything")
+
     def poll(self, fn: Callable[[], object], window: float) -> object:
         """Call fn until it returns truthy or the window closes; dry-run reads once."""
         if not self.live:
@@ -479,11 +490,11 @@ def step1(ctx: Ctx) -> StepReport:
     fail_card = (ctx.make_card(rep, "s1_failure", "bv2 smoke s1: forced child failure -> warning")
                  if arm_failure else "<no fault hook>")
 
-    ctx.kanban_cmd(rep, "complete", card=done_card)
-    ctx.kanban_cmd(rep, "block_needs_input", card=ni_card)
+    ctx.force(rep, "complete", card=done_card)
+    ctx.force(rep, "block_needs_input", card=ni_card)
     if inject:
-        ctx.kanban_cmd(rep, "inject_failure", card=fail_card)
-        ctx.kanban_cmd(rep, "complete", card=fail_card)
+        ctx.force(rep, "inject_failure", card=fail_card)
+        ctx.force(rep, "complete", card=fail_card)
 
     win = ctx.timeout
     hit = ctx.poll(lambda: find_chat(chat, re_auto_handled_line(done_card)), win)
@@ -613,7 +624,7 @@ def step2(ctx: Ctx) -> StepReport:
     if flip(SWITCH_FORK, False, "fork_enabled=false"):
         t = now()
         card = ctx.make_card(rep, "s2_fork_off", "bv2 smoke s2: fork_enabled=false -> summary")
-        ctx.kanban_cmd(rep, "complete", card=card)
+        ctx.force(rep, "complete", card=card)
         line = ctx.poll(lambda: find_log(log, RE_FORK_INELIGIBLE, after_ts=t if ctx.live else None,
                                          pred=lambda m: m.group("reason") == "fork_enabled"), ctx.timeout)
         rep.check("gateway log: `boomerang.fork_ineligible reason=fork_enabled` after the flip",
@@ -631,7 +642,7 @@ def step2(ctx: Ctx) -> StepReport:
     # (b) auto_handle_enabled=false: the next wake on an auto_handle card is NOT auto-handled.
     if flip(SWITCH_AUTO, False, "auto_handle_enabled=false"):
         card = ctx.make_card(rep, "s2_auto_off", "bv2 smoke s2: auto_handle_enabled=false -> surface")
-        ctx.kanban_cmd(rep, "complete", card=card)
+        ctx.force(rep, "complete", card=card)
         neg = ctx.poll(lambda: find_chat(chat, re_auto_handled_line(card)) or
                        _auto_disp(find_log(log, re_notifier_line(card)), card), ctx.tick_window)
         detail = getattr(neg, "content", neg) if neg else f"no auto-handle ({ctx.window_label()})"
@@ -692,6 +703,31 @@ def _rec_ts(rec: dict) -> float | None:
     return None
 
 
+# The relay names the Studio's own seat three ways: `local`, `sub-0`, and wire `sub: 0`.
+_LOCAL_SEAT_ALIASES = frozenset({"local", "sub-0", "0"})
+
+
+def _norm_seat(v: object) -> str | None:
+    if isinstance(v, bool) or v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    if s in _LOCAL_SEAT_ALIASES:
+        return "local"
+    return s if s.startswith("sub-") or not s.isdigit() else f"sub-{s}"
+
+
+def _rec_seat(rec: dict) -> str | None:
+    """The serving seat a wire record belongs to (relay-wire-forensics `served_by`/`seat`/`sub`), normalized."""
+    meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
+    for v in (rec.get("served_by"), rec.get("seat"), meta.get("served_by"), rec.get("sub")):
+        n = _norm_seat(v)
+        if n:
+            return n
+    return None
+
+
 def _header_names(rec: dict) -> list[str]:
     req = rec.get("req") or {}
     names: list[str] = []
@@ -716,7 +752,7 @@ def step3(ctx: Ctx) -> StepReport:
 
     if not ctx.args.no_trigger:
         card = ctx.make_card(rep, "s3_fork", "bv2 smoke s3: one fork turn for wire capture")
-        ctx.kanban_cmd(rep, "complete", card=card)
+        ctx.force(rep, "complete", card=card)
     served = ctx.poll(lambda: find_log(log, RE_FORK_SERVED), ctx.timeout)
     seat = RE_FORK_SERVED.search(served).group("seat") if served else None
     rep.check("gateway log: `boomerang.fork served_by=<seat>` (a fork turn happened)",
@@ -736,12 +772,22 @@ def step3(ctx: Ctx) -> StepReport:
         ts = _rec_ts(rec)
         if ctx.live and (ts is None or ts < t0 - 1):
             continue
+        # Prism 7555e6381e68: only records from the box that SERVED the fork count as coverage;
+        # unrelated clean traffic from another seat must not stand in for the fork request.
+        if seat and _rec_seat(rec) not in (None, _norm_seat(seat)):
+            continue
         recs.append(rec)
     if not recs:
         rep.check("wire records captured in the fork-turn window", INCOMPLETE,
-                  f"0 records under {root}: no visibility is not a clean result (coverage gap?)")
+                  f"0 records under {root} attributable to seat `{seat}`: no visibility is not a "
+                  f"clean result (coverage gap, or the serving box's capture is not synced)")
         return rep
-    rep.check("wire records captured in the fork-turn window", PASS, f"{len(recs)} record(s)")
+    if seat and not any(_rec_seat(r) == _norm_seat(seat) for r in recs):
+        rep.check("wire records attributable to the serving seat", INCOMPLETE,
+                  f"{len(recs)} record(s) in the window but none carries seat `{seat}`; cannot prove "
+                  f"the fork request was inspected")
+        return rep
+    rep.check("wire records captured in the fork-turn window", PASS, f"{len(recs)} record(s), seat `{seat}`")
     leaks = []
     for rec in recs:
         bad = sorted({n for n in _header_names(rec) if n.lower().startswith(HERMES_HEADER_PREFIX)})
@@ -776,7 +822,7 @@ def step4(ctx: Ctx) -> StepReport:
     re_restart = re.compile(ctx.plan["expect"]["restart_log_regex"])
 
     card = ctx.make_card(rep, "s4_restart", "bv2 smoke s4: child in flight across a gateway restart")
-    ctx.kanban_cmd(rep, "complete", card=card)
+    ctx.force(rep, "complete", card=card)
     dispatched = ctx.poll(lambda: _auto_disp(find_log(log, re_notifier_line(card)), card), ctx.timeout)
     rep.check(f"auto-handle child dispatched for {card} (disposition=auto)", PASS if dispatched else FAIL,
               dispatched or f"absent after {ctx.timeout:.0f}s")
@@ -824,9 +870,11 @@ def step4(ctx: Ctx) -> StepReport:
     lost = ctx.poll(lambda: find_chat(chat, re_lost_line(card)), ctx.tick_window + ctx.tick)
     rep.check(f"origin chat: `warning auto-handle lost {card} (reason: gateway restart)`",
               PASS if lost else FAIL, lost.content if lost else "absent")
-    late = find_chat(chat, re_auto_handled_line(card))
-    rep.check(f"no late `[auto-handled] {card}` rendered after the re-surface", FAIL if late else PASS,
-              late.content if late else "none")
+    # Prism b2a4a7e824f7: watch for a stale child's late completion for a FULL tick window after the
+    # lost-warning, not a single read; a post one second after the last read must still fail the drill.
+    late = ctx.poll(lambda: find_chat(chat, re_auto_handled_line(card)), ctx.tick_window)
+    rep.check(f"no late `[auto-handled] {card}` within {ctx.window_label()} after the re-surface",
+              FAIL if late else PASS, late.content if late else "none")
     return rep
 
 

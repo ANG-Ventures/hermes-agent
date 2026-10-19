@@ -192,11 +192,12 @@ def test_v2_hop_ascii_normalized_to_notice_enum(hosts, raw, enum):
 
 @pytest.mark.parametrize("seat", ["none", "unknown", ""])
 def test_v2_unstated_seat_stays_sub_unknown(hosts, seat):
-    """The relay sends ``none`` when no seat was tried; that is not a seat."""
+    """The relay sends ``none`` when no seat was tried; that is not a seat. The
+    banner says so in words, never a bare "unknown" (t_94a2b0e4)."""
     row = _pooled_row(_v2_agent("claude-bpr", dict(V2_HEADERS, **{"x-relay-seat": seat})))
     assert row.get("seat") is None
     assert fp.format_cause_rider(row, tz=UTC).endswith(
-        "at the relay (sub unknown), " + fp._hms(row["ts"], UTC).strftime("%H:%M:%S"))
+        "at the relay (relay sent no seat), " + fp._hms(row["ts"], UTC).strftime("%H:%M:%S"))
 
 
 @pytest.mark.parametrize("nested", [False, True])
