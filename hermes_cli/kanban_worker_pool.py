@@ -436,10 +436,25 @@ def read_caps(fleet_dir: Path, *, now: Optional[float] = None,
     return out
 
 
-def needs_allowed_hosts(body: Optional[str], pool) -> Optional[Tuple[str, ...]]:
+def declares_requirements(body: Optional[str]) -> bool:
+    """True when the body's line-anchored ``requires:`` lines name something
+    the capability layer judges (``none`` or a capability word). The
+    ``control-plane-read`` access word alone does not count: portable() owns
+    it, and it says nothing about the prose needs."""
+    from hermes_cli import kanban_host_capabilities as _khc
+    return any(w != _reasons.ACCESS_CONTROL_PLANE_READ for w in _khc.declared_words(body))
+
+
+def needs_allowed_hosts(body: Optional[str], pool, *,
+                        honor_declared: bool = False) -> Optional[Tuple[str, ...]]:
     """None when the body names no Studio-only resource; else the enabled
     pool hosts whose fresh reach-matrix ``caps`` cover every need (``()`` =
-    none: the card runs on the Studio or waits, never spills)."""
+    none: the card runs on the Studio or waits, never spills).
+    ``honor_declared`` (the capability layer enforces this tick): a body with
+    an explicit ``requires:`` line is judged by that line, not by prose
+    (None, t_6d9e7d90)."""
+    if honor_declared and declares_requirements(body):
+        return None
     needs = card_needs(body)
     if not needs:
         return None
@@ -1000,7 +1015,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
              manifest: Optional[Mapping[str, str]] = None,
              targets: Optional[Mapping[str, str]] = None,
              requires: Optional[Tuple[Optional[str], Optional[str]]] = None,
-             body_signals: bool = True) -> Tuple[bool, Optional[str], Optional[str]]:
+             body_signals: bool = True,
+             worktree_hosts: Optional[Tuple[str, ...]] = None) -> Tuple[bool, Optional[str], Optional[str]]:
     """``(portable, not_portable_rule, route_class)``; route_class in
     {'pin', 'any', 'policy'} when portable, else None.
 
@@ -1031,8 +1047,14 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
     portable; ``manifest`` carries the skill-manifest half of that check.
     ``targets`` (``{skill: host}``, manifest ``host_affinity: <host>``) makes
     the card host-bound to those hosts (:func:`reach_allowed_hosts`).
+
+    ``worktree_hosts`` (t_6d9e7d90, :mod:`kanban_worktree_port`): the pool
+    hosts holding a git mirror of a ``worktree`` card's repo. Non-empty, the
+    card is judged like a scratch card (the dispatcher clones it on the
+    chosen host); a pin to a host outside that set keeps it local.
     """
-    if (workspace_kind or "scratch") != "scratch":
+    kind = workspace_kind or "scratch"
+    if kind != "scratch" and not (kind == "worktree" and worktree_hosts):
         return False, _reasons.WORKSPACE_KIND, None
     bind_rule, _bind_other, bind_host = workspace_bind or (None, None, None)
     if bind_rule and bind_host is None:
@@ -1070,6 +1092,8 @@ def portable(*, workspace_kind: Optional[str], workspace_has_content: bool,
         pin, ignored = bind_host.lower(), None
     if pin == PIN_STUDIO:
         return False, _reasons.HOST_STUDIO, None
+    if kind == "worktree" and pin not in (None, PIN_ANY) and pin not in worktree_hosts:
+        return False, _reasons.WORKSPACE_KIND, None  # no mirror on the pinned host
     if pin is None and ignored is not None:
         # A host: line that names no host (typo, unregistered name): never
         # portable, a typo must not widen the blast radius (t_cb2b888d).
@@ -1163,12 +1187,18 @@ def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
         why = (manifest or {}).get(s)
         if why:
             return "studio_manifest", f"skill:{s} ({why})"
+    if not body_signals and declares_requirements(body):
+        # The capability layer enforces this tick (``body_signals`` False) and
+        # judges the card's explicit ``requires:`` line; prose words never
+        # outrank it (t_6d9e7d90). With the layer off the declaration is
+        # enforced by nothing, so the prose signals stay (Prism cf1b3bd689e8).
+        return None
     m = STUDIO_BODY_RE.search(body or "") if body_signals else None
     if m:
         return "studio_body", f"body:{m.group(0)}"
     # Studio-only resources the body names (t_aea826a9): bound unless some
     # pool host's fresh reach-matrix caps cover every one of them.
-    if needs_allowed_hosts(body, pool) == ():
+    if needs_allowed_hosts(body, pool, honor_declared=not body_signals) == ():
         return STUDIO_NEEDS_RULE, "needs:" + ",".join(sorted(card_needs(body)))
     return None
 
