@@ -78,12 +78,18 @@ def test_ecore_indices_m3_ultra_and_plain_hosts():
     def sysctl(table):
         return lambda name: table[name]
 
-    ultra = sysctl({"hw.perflevel1.logicalcpu": 8, "hw.packages": 1})
-    assert klg.ecore_cpu_indices(ultra, ncpu=32) == (0, 1, 2, 3, 16, 17, 18, 19)
-    single = sysctl({"hw.perflevel1.logicalcpu": 4, "hw.packages": 1})
-    assert klg.ecore_cpu_indices(single, ncpu=12) == (0, 1, 2, 3)
-    none = sysctl({"hw.perflevel1.logicalcpu": 0, "hw.packages": 1})
-    assert klg.ecore_cpu_indices(none, ncpu=16) == ()
+    def mac(brand, e_n):
+        return sysctl({"hw.perflevel1.logicalcpu": e_n, "hw.packages": 1,
+                       "machdep.cpu.brand_string": brand})
+
+    assert klg.ecore_cpu_indices(mac("Apple M3 Ultra", 8), ncpu=32) == (0, 1, 2, 3, 16, 17, 18, 19)
+    # Prism 400ac2841de6: an Ultra under 32 cores is still two dies
+    assert klg.ecore_cpu_indices(mac("Apple M2 Ultra", 8), ncpu=24) == (0, 1, 2, 3, 12, 13, 14, 15)
+    assert klg.ecore_cpu_indices(mac("Apple M1 Ultra", 4), ncpu=20) == (0, 1, 10, 11)
+    # a 32-thread non-Ultra stays one die
+    assert klg.ecore_cpu_indices(mac("Apple M4 Max", 4), ncpu=16) == (0, 1, 2, 3)
+    assert klg.ecore_cpu_indices(mac("Apple M2 Pro", 4), ncpu=12) == (0, 1, 2, 3)
+    assert klg.ecore_cpu_indices(mac("Apple M2 Pro", 0), ncpu=16) == ()
 
 
 def test_sample_ecore_busy_reads_only_the_ecore_deltas(monkeypatch):

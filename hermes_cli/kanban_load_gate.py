@@ -1031,8 +1031,11 @@ def ecore_cpu_indices(sysctl=None, ncpu: Optional[int] = None) -> "tuple[int, ..
     """Logical cpu indices of the efficiency cores, or () when the host has none.
 
     Apple silicon lists each die's E-cores first (M3 Ultra, 2 dies x 16: 0-3
-    and 16-19; ``hw.packages`` still says 1). Verified live on the Studio
-    2026-10-18: cpus 0-3 and 16-19 at 100% while the P-cores sat at 9-76%.
+    and 16-19). An Ultra is two dies behind one package (``hw.packages`` says
+    1), so the die count comes from ``machdep.cpu.brand_string``, never from
+    the core count (M1 Ultra 20, M2 Ultra 24, M3 Ultra 32). Verified live on
+    the Studio 2026-10-18: cpus 0-3 and 16-19 at 100% while the P-cores sat
+    at 9-76%.
     """
     import sys
 
@@ -1043,18 +1046,18 @@ def ecore_cpu_indices(sysctl=None, ncpu: Optional[int] = None) -> "tuple[int, ..
         def sysctl(name):
             import subprocess
 
-            out = subprocess.run(["sysctl", "-n", name], capture_output=True,
-                                 text=True, timeout=5).stdout.strip()
-            return int(out or 0)
+            return subprocess.run(["sysctl", "-n", name], capture_output=True,
+                                  text=True, timeout=5).stdout.strip()
     try:
         e_n = int(sysctl("hw.perflevel1.logicalcpu") or 0)
         dies = max(1, int(sysctl("hw.packages") or 1))
+        brand = str(sysctl("machdep.cpu.brand_string") or "")
     except Exception:
         return ()
     n = int(ncpu or os.cpu_count() or 0)
     if not e_n or e_n >= n:
         return ()
-    if dies == 1 and n >= 32 and e_n % 2 == 0 and n % 2 == 0:
+    if dies == 1 and "ultra" in brand.lower():
         dies = 2  # Ultra: two dies behind one package
     if n % dies or e_n % dies:
         dies = 1
