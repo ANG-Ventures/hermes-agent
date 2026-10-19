@@ -214,11 +214,12 @@ class HostSpec:
     unmeasurable_axes: tuple = ()        # axes this host's OS cannot report (darwin: no PSI, no %system); never required
     cpu_saturable: bool = False          # v1 only: negative cpu headroom is a score penalty, not a refusal (t_bfb88c23)
     # scorer v2 (t_f8a3b6c3): the active scorer and the host's MEASURED speed (var/placement/host-speed.json, R2b),
-    # or the seed when unmeasured (mt_yield 1.3 on SMT2, else 1.0; st_speed 1.0). ``speed_src`` names which.
+    # or the seed when unmeasured (mt_yield 1.3 on SMT2, else 1.0; st_speed 1.0). ``speed_src`` / ``st_speed_src`` name which.
     scorer: str = DEFAULT_SCORER
     mt_yield: float = 1.0
     st_speed: float = 1.0
-    speed_src: str = "seed"
+    speed_src: str = "seed"              # mt_yield: measured | seed
+    st_speed_src: str = "seed"           # st_speed: measured | seed (Prism e0c016b8: tracked apart from mt_yield)
 
     @property
     def cpu_capacity(self) -> float:
@@ -465,7 +466,8 @@ def load_hosts(path=None, *, speed_path=None, scorer: Optional[str] = None) -> H
             cpu_saturable=hid in saturable, scorer=scorer,
             mt_yield=meas.get("mt_yield", SEED_MT_YIELD_SMT2 if threads == 2 * cores else 1.0),
             st_speed=meas.get("st_speed", 1.0),
-            speed_src="measured" if meas else "seed")
+            speed_src="measured" if "mt_yield" in meas else "seed",
+            st_speed_src="measured" if "st_speed" in meas else "seed")
     fps = {c: Footprint.of(fp) for c, fp in doc["footprints"].items() if not c.startswith("_")}
     pfps = {c: {pn: Footprint.of(pf) for pn, pf in fp["profiles"].items() if not pn.startswith("_")}
             for c, fp in doc["footprints"].items() if not c.startswith("_") and isinstance(fp.get("profiles"), dict)}
@@ -655,7 +657,7 @@ class Headroom:
 
     def line(self, spec: HostSpec) -> str:
         """`<host> load N / Cc.Tt, avail X GB, headroom Y GB / Z cores (binding axis), score S` or the refusal.
-        Scorer v2: `<host> occupancy O / K (Cc.Tt, yield y), load N, PSI a/b, st_speed s, avail ..., headroom ...`."""
+        Scorer v2: `<host> occupancy O / K (Cc.Tt, yield y), load N / Cc.Tt, PSI a/b, st_speed s, avail ..., headroom ...`."""
         if spec.scorer == "v2":
             return self._line_v2(spec)
         load = "?" if self.load is None else f"{self.load:g}"
@@ -676,14 +678,15 @@ class Headroom:
         psi = f"{g(self.psi_cpu_some10)}/{g(self.psi_cpu_some60)}"
         avail = g(self.mem_available_gb, "{:.1f}")
         res = f", reserved {self.reserved_gb:g} GB / {self.reserved_threads:g} thr" if (self.reserved_gb or self.reserved_threads) else ""
+        # a v2 closure (PSI avg60, unmeasured occupancy) returns after mem_gb is set but before cores (Prism 5c45efe6)
         head = ("" if self.mem_gb is None else
-                f"{res}, headroom {self.mem_gb:.1f} GB / {self.cores:.1f} cores ({self.binding or '-'})")
+                f"{res}, headroom {self.mem_gb:.1f} GB / {g(self.cores, '{:.1f}')} cores ({self.binding or '-'})")
         tail = (f", score {self.score:.3f}" + (f" (frac {self.fraction:.3f} x st_speed^{self.alpha:g})"
                                               if self.fraction is not None and self.alpha is not None else "")
                 if self.eligible else f", {self.reason}")
         return (f"{self.host} occupancy {occ}{src} / {cap:g} ({spec.cores}c.{spec.threads}t, yield {spec.mt_yield:g}"
-                f"{'' if spec.speed_src == 'measured' else ' seed'}), load {load}, PSI {psi}, st_speed "
-                f"{spec.st_speed:g}{'' if spec.speed_src == 'measured' else ' seed'}, avail {avail} GB{head}{tail}")
+                f"{'' if spec.speed_src == 'measured' else ' seed'}), load {load} / {spec.cores}c.{spec.threads}t, PSI {psi}, st_speed "
+                f"{spec.st_speed:g}{'' if spec.st_speed_src == 'measured' else ' seed'}, avail {avail} GB{head}{tail}")
 
 
 def headroom(spec: HostSpec, sample: Optional[Sample], fp: Footprint, *, consumer: str,
@@ -1084,7 +1087,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     core_class = job.core_class or ("fast" if job.priority is not None and job.priority <= 1 else None)
     if core_class == "fast":
         rule = "priority" if job.core_class is None else "core_class:fast"
-        if v2 and any(table.hosts[r.host].speed_src == "measured" for r in eligible):
+        if v2 and any(table.hosts[r.host].st_speed_src == "measured" for r in eligible):
             # measured st_speed (alpha 1) replaces the lscpu clock; until R2b measures, the clock rule stands
             return pick(max(eligible, key=lambda r: (r.score, table.hosts[r.host].clock_mhz, r.host)), rule)
         best = max(eligible, key=lambda r: (table.hosts[r.host].clock_mhz, r.score, r.host))
