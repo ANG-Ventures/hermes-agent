@@ -147,7 +147,55 @@ def test_recoverable_or_unproven_errors_keep_existing_wait(provider, error, wait
     assert sum(sleeps) == pytest.approx(wait, abs=0.21)
 
 
-@pytest.mark.parametrize("cls", ["conn", "pool_pressure", "rate_upstream", "unknown"])
+def _old_relay_1545_error():
+    """2026-10-18 15:45:20 as a pre-fix relay emitted it (route d4c7ed55...):
+    429, five_hour rejected, Anthropic's account-rate-limit text, classed
+    rate_upstream from that text; the seat's own Retry-After (next seat 881 s)."""
+    return RelayError(
+        429, {"type": "error", "error": {"type": "rate_limit_error",
+              "message": "This request would exceed your account's rate limit."}},
+        {"retry-after": "881", "x-relay-error-class": "rate_upstream",
+         "x-relay-seat": "sub-vps-10",
+         "anthropic-ratelimit-unified-status": "rejected",
+         "anthropic-ratelimit-unified-5h-status": "rejected",
+         "anthropic-ratelimit-unified-representative-claim": "five_hour"})
+
+
+def test_rate_upstream_with_rejected_window_advances_lane_without_sleep():
+    """Defense in depth for old relays (t_97c3a1b1): rate_upstream plus a
+    rejected unified window is a long quota, so the next lane serves with
+    zero sleep instead of a 600 s same-lane wait."""
+    agent = make_agent([])
+    sleeps = []
+    result, activate, call, attempts = run(agent, _old_relay_1545_error(), sleeps)
+    assert result["completed"] is True
+    assert activate.called
+    assert [p for p, _ in attempts] == ["claude-alr", "claude-dtlr"]
+    assert sum(sleeps) == 0
+
+
+def test_fixed_relay_1545_quota_seat_881_advances_lane_without_sleep():
+    """The same turn from a fixed relay: quota_seat + Retry-After 881."""
+    error = _old_relay_1545_error()
+    error.response.headers["x-relay-error-class"] = "quota_seat"
+    error.response.headers["x-relay-quota-window"] = "five_hour"
+    agent = make_agent([])
+    sleeps = []
+    result, _, call, attempts = run(agent, error, sleeps)
+    assert [p for p, _ in attempts] == ["claude-alr", "claude-dtlr"]
+    assert sum(sleeps) == 0
+
+
+def test_rate_upstream_without_rejected_window_keeps_wait():
+    from agent.error_classifier import classify_api_error
+    from agent.fork_ext.relay_quota import relay_quota_outlasts_retry_window
+    error = _old_relay_1545_error()
+    del error.response.headers["anthropic-ratelimit-unified-5h-status"]
+    assert not relay_quota_outlasts_retry_window(
+        SimpleNamespace(provider="claude-alr"), error, classify_api_error(error, provider="claude-alr"))
+
+
+@pytest.mark.parametrize("cls", ["conn", "pool_pressure", "unknown"])
 def test_relay_class_precedes_quota_header_or_text(cls):
     from agent.error_classifier import classify_api_error
     from agent.fork_ext.relay_quota import relay_quota_outlasts_retry_window

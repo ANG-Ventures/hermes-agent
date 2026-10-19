@@ -24,4 +24,11 @@ def build_backup_parser(subparsers, *, cmd_backup: Callable) -> None:
         "-k", "--keep", type=int, default=3, metavar="N",
         help="After a full backup, delete older hermes-backup-*.zip files in the output "
              "directory beyond the newest N (default 3; 0 keeps everything)")
+    backup_parser.add_argument(
+        "--census-out", metavar="PATH",
+        help="Full backup only: after the scan, write the would-carry census (files, bytes, per-dir) as JSON here")
+    backup_parser.add_argument(
+        "--census-gate", metavar="CMD",
+        help="Full backup only (needs --census-out): run CMD (no shell) after the census and before the zip "
+             "opens; a nonzero exit aborts with that exit status (75 = refused) and writes no archive")
     backup_parser.set_defaults(func=cmd_backup)
