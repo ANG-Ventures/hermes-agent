@@ -6,7 +6,8 @@ verb on one surface can never be enqueued as a prompt on another (duplicated-nor
 
 Arity rule (unchanged from the CLI, upstream ce318290bdd): a leading verb is management ONLY when
 its arguments fit — ``list``/``clear``/``run`` stand alone; ``edit N …``/``rm N``/``move A B`` need a
-leading number. Anything else (``clear the cache``, ``run the tests``, ``rm``) is a prompt.
+leading number. Anything else (``clear the cache``, ``run the tests``, ``rm 3 things``) is a prompt.
+Two rm shapes need no number (Ace 2026-10-18): bare ``rm`` lists the removable items, ``rm all`` clears.
 ``add <prompt>`` forces enqueueing a prompt that starts with a verb word.
 """
 
@@ -60,6 +61,13 @@ def parse_queue_payload(payload: str) -> QueueOp:
     kind, takes_index = entry
     if not takes_index:
         return QueueOp(kind) if not rest else QueueOp("add", text=payload)
+    if kind == "rm":
+        # Bare `rm` lists what can be removed (handler renders list + hint); `rm all` is `clear`
+        # (Ace 2026-10-18). Any other trailing words still fall through to the exact-shape rule below.
+        if not rest:
+            return QueueOp("rm")
+        if rest.lower() == "all":
+            return QueueOp("clear")
     first = rest.split(None, 1)[0] if rest else ""
     if not first.isdigit():
         return QueueOp("add", text=payload)

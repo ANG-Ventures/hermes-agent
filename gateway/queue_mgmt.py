@@ -222,6 +222,11 @@ def apply_management(runner: Any, op: QueueOp, key: str, adapter: Any) -> str:
         return format_list(runner, key, adapter)
     if op.kind == "help":
         return t("gateway.queue.help")
+    if op.kind == "rm" and op.index is None:
+        # Bare `/queue rm`: show what can be removed, change nothing (Ace 2026-10-18).
+        listing = format_list(runner, key, adapter)
+        _which, _items = _store_for_verbs(runner, key, adapter)
+        return listing if not _items else listing + "\n" + t("gateway.queue.rm_pick")
     which, items = _store_for_verbs(runner, key, adapter)
     before = len(items)
     if op.kind == "clear":
