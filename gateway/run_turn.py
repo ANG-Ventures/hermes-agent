@@ -2137,6 +2137,9 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        # The /goal no-progress stop reads this (streamed turns return None, so not from the result).
+        with suppress(Exception):
+            event._goal_turn_api_calls = int(agent_result.get("api_calls", 0) or 0)
         if diagnostic_wake_muted(event):
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
