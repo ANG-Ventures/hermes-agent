@@ -113,6 +113,16 @@ def test_sample_psi_reads_proc_pressure(tmp_path):
     assert klg.sample_psi(str(tmp_path)) == {"psi_cpu_some10": 3.1, "psi_mem_some10": 21.5}   # io absent = unmeasured
 
 
+def test_slice_memory_is_a_second_memory_axis(ctx, monkeypatch):
+    """Prism 616c5f0203bd: host memory plentiful, kanbanw.slice full -> refused on slice_mem_gb."""
+    monkeypatch.setattr(ad, "read_slice_memory",
+                        lambda **k: ad.SliceMem(name="kanbanw.slice", limit_gb=24.0, current_gb=23.0,
+                                                classes=k.get("classes", ("kanban",))))
+    g = _gate("utilization")
+    a, why = g.admit(1.0, now=1000.0, running=0, cpu_busy=0.05)
+    assert a == 0 and "slice_mem_gb" in why
+
+
 def test_gate_from_config_reads_the_kill_switch():
     assert klg.gate_from_config({"kanban": {"admission": "utilization"}}).admission == "utilization"
     assert klg.gate_from_config({"kanban": {"admission": "bogus"}}).admission == "legacy"

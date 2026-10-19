@@ -216,9 +216,11 @@ def _cli_utilization_gate(conn, args, gate, out, emit, load1):
     now_wall, now_mono = time.time(), time.monotonic()
     running = None
     try:
+        # LOCAL starts only: a run with a worker_placed event ran on a pool host (Prism 9f811a3f59ff)
         rows = conn.execute(
-            "SELECT started_at FROM task_runs WHERE started_at >= ?",
-            (int(now_wall - _ad.DEFAULT_SETTLE_S),),
+            "SELECT r.started_at FROM task_runs r WHERE r.started_at >= ? AND NOT EXISTS ("
+            "SELECT 1 FROM task_events e WHERE e.run_id = r.id AND e.kind = ?)",
+            (int(now_wall - _ad.DEFAULT_SETTLE_S), _kwp.PLACED_EVENT),
         ).fetchall()
         for row in rows:
             gate.record_spawns(1, now=now_mono - max(0.0, now_wall - float(row[0])))

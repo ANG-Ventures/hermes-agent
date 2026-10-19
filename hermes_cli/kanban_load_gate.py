@@ -624,8 +624,10 @@ class LoadGate:
         leases = [_ad.Lease(host=ctx["host"], job_class=UTIL_CLASS, need=ctx["need"], at=ts)
                   for ts, n in self._ramp for _ in range(int(n))]
         allowance, verdict = 0, None
+        # the worker slice's own memory cap (Linux kanbanw.slice; None elsewhere = host axis only, Prism 616c5f0203bd)
+        slice_mem = _ad.read_slice_memory(classes=(UTIL_CLASS,))
         for _ in range(self.max_spawn_per_tick):
-            v = _ad.admit(sample, ctx["need"], leases, host=ctx["host"], limits=ctx["limits"])
+            v = _ad.admit(sample, ctx["need"], leases, host=ctx["host"], limits=ctx["limits"], slice_mem=slice_mem)
             if not v.ok:
                 verdict = v
                 break

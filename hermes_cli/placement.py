@@ -1,7 +1,7 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
 VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole for the utilization wiring, t_da6f84f7, from
-ANG-Ventures/hermes-home#5183 rebased on main; sha256 43a67bfd1ed5fdc5d951066185bc437a0f707687d5b5e85bde0729a928789963; first vendored @ 2fe117cbcb,
+ANG-Ventures/hermes-home#5183 rebased on main; sha256 5cbe715fbcaee30ee67fa97bee578619a2c3f8e99dd6bd9cbd59a639e945f24e; first vendored @ 2fe117cbcb,
 hermes-home#4462) for the kanban dispatcher (t_d6ce856e) and its alloc_client route (t_4187c8f1): the fork may not
 import hermes-home code. The ONLY local changes are ``fleet_root()`` plus ``encoding="utf-8"`` on two ``open()`` calls
 (the fork's PLW1514 lint); ``tests/hermes_cli/test_kanban_headroom_placement.py`` checks the rest against the canonical
@@ -1410,7 +1410,7 @@ def ledger_leases(path=None, *, now: Optional[float] = None, table: Optional[Hos
         host = (table.resolve(row["host"]) or row["host"]) if table else row["host"]
         need = admission.Estimate(cpus=float(row["threads"]), ram_gb=float(row["ram_gb"]),
                                   gpu_mib=float(row.get("gpu_mb") or 0.0), source="lease")
-        out.append(admission.Lease(host=host, job_class=str(row.get("job_class") or row["consumer"]), need=need,
+        out.append(admission.Lease(host=host, job_class=str(row.get("job_class") or job_class_for(row["consumer"])), need=need,
                                    at=float(row["at"]) if _num(row.get("at")) else float("inf"),
                                    job_id=row.get("job_id")))
     return out
@@ -1815,7 +1815,7 @@ def record_usage(row: Mapping, actual: Mapping, *, now: float, path=None) -> Opt
         vals["gpu_mib"] = float(actual.get("gpu_mib") or 0.0)
         if not all(math.isfinite(v) and v >= 0 for v in vals.values()):
             raise ValueError(f"actual must be finite numbers >= 0, not {dict(actual)!r}")
-        return admission.record_actual(class_usage_path(path), job_class=str(row.get("job_class") or row["consumer"]),
+        return admission.record_actual(class_usage_path(path), job_class=str(row.get("job_class") or job_class_for(row["consumer"])),
                                        host=row["host"], at=now, job_id=row.get("job_id"), estimated=est, **vals)
     except (OSError, ValueError, TypeError) as exc:
         sys.stderr.write(f"placement: class usage not recorded for {row.get('id')}: {exc}\n")
