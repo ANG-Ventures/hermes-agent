@@ -91,6 +91,22 @@ the D1 ruling) changes nothing and logs ``kanban load gate (dry): ...
 would-refuse N``; ``on`` refuses. Hosts without a perflevel split (Linux,
 Intel) have no E-core sample and the knob is inert there.
 
+2026-10-18 (t_da6f84f7, Ace 14:33 / 15:5x, ruling t_0b33557c): ``kanban.admission:
+utilization`` (read per tick; absent or ``legacy`` = everything above, byte for
+byte) replaces the load1 pause, the CPU-headroom row and ``worker_cpu_cost``
+with the ONE fleet predicate, ``hermes_cli.admission.admit()``, over this
+host's own sample: cpu_busy (psutil cpu_times delta), MemAvailable after the
+host table's ``mem_reserve_gb``, procs / RLIMIT_NPROC (PSI is not measured on
+darwin and is not required). Each worker spawned within ``admission.
+DEFAULT_SETTLE_S`` is a lease of the measured estimate for its class on this
+host (p90 of var/placement/class-usage.jsonl, the table footprint as prior), so
+one tick's admits see each other. ``consumers.kanban.slots`` on this host's
+row of config/fleet-hosts.json (the Studio: 2, ``_ceiling_reason``) stays a
+CEILING on running workers. The interim keys (pause_above, resume_below,
+cpu_busy_pause, worker_cpu_cost, the spill keys) stay readable but are inert in
+this mode; a refusal is band ``spilling`` (the pool takes the work) and the
+process-slot pause still wins.
+
 ``kanban.max_spawn`` stays the hard concurrency ceiling; this gate is the
 governor that decides how fast the host is allowed to approach it.
 
@@ -133,6 +149,9 @@ SPILL_INERT = 1.0
 SPILL_KEYS_WARN_INTERVAL_SECONDS = 300.0
 SUMMARY_INTERVAL_SECONDS = 300.0
 STATE_FILENAME = "load_gate.json"
+ADMISSION_MODES = ("legacy", "utilization")
+UTIL_CLASS = "kanban-worker-llm-wait"
+UTIL_HOST_ALIAS = "local"     # the dispatcher's own row of config/fleet-hosts.json (mac-studio carries it)
 
 
 def _denom(ncpu: Any = None) -> str:
@@ -311,6 +330,10 @@ class LoadGate:
         # Per-board split of the last tick (gateway dispatcher, t_f78d1938):
         # {slug: {ready, quota, spawned, starved_since}}.
         self.boards: dict = {}
+        # kanban.admission (t_da6f84f7): set per tick by the caller from the
+        # live config; anything but "utilization" is the legacy gate.
+        self.admission = "legacy"
+        self.util: dict = {}
 
     # -- hysteresis (hard pause) -------------------------------------------
     def update(self, load1: float, load5: Optional[float] = None) -> Optional[str]:
@@ -514,6 +537,8 @@ class LoadGate:
             self.ecore_busy = None
         self.ecore_would_refuse = 0
         self.running = None
+        if self.admission == "utilization":
+            return self._admit_utilization(now, running, procs, proc_limit)
         self.observe(load1, running, now)
         measured = self.measured_cost(now)
         self.cost = measured if measured is not None else self.worker_load_cost
@@ -568,6 +593,64 @@ class LoadGate:
             )
             return 0, self.last_reason
         self.state, self.last_reason = "admitting", None
+        return allowance, None
+
+    def _admit_utilization(
+        self, now: float, running: Optional[int], procs: Optional[int], proc_limit: Optional[int],
+    ) -> "tuple[int, Optional[str]]":
+        """``kanban.admission: utilization``: admission.admit() over this host's
+        sample, one lease per spawn the sample cannot show yet, under the host
+        table's kanban ceiling. load1 and the interim CPU keys are not read."""
+        from hermes_cli import admission as _ad
+
+        try:
+            self.running = int(running) if running is not None else None
+        except (TypeError, ValueError):
+            self.running = None
+        self.paused, self.reason, self.spilling = False, None, False
+        self.pending_ramp = 0.0
+        self._prune(now)
+        proc_hard = self.update_procs(procs, proc_limit)
+        self.remote_allowed = not proc_hard
+        if proc_hard:
+            self.state, self.allowance, self.last_reason = "proc_paused", 0, proc_hard
+            self.band, self.spill_reason = "proc_paused", None
+            self.pool = {"planned": False, "reason": "proc_paused"}
+            return 0, proc_hard
+        ctx = utilization_context()
+        sample = {"host": ctx["host"], "os": _os_name(), "at": now, "ncpu": self.ncpu, "cpu_busy": self.cpu_busy,
+                  "mem_available_gb": ctx["mem_available_gb"], "mem_total_gb": ctx["mem_total_gb"],
+                  "procs": self.procs, "maxproc": self.proc_limit}
+        leases = [_ad.Lease(host=ctx["host"], job_class=UTIL_CLASS, need=ctx["need"], at=ts)
+                  for ts, n in self._ramp for _ in range(int(n))]
+        allowance, verdict = 0, None
+        for _ in range(self.max_spawn_per_tick):
+            v = _ad.admit(sample, ctx["need"], leases, host=ctx["host"], limits=ctx["limits"])
+            if not v.ok:
+                verdict = v
+                break
+            allowance += 1
+            leases.append(_ad.Lease(host=ctx["host"], job_class=UTIL_CLASS, need=ctx["need"], at=now))
+        ceiling, why = ctx["ceiling"], None
+        if ceiling is not None:
+            room = max(0, ceiling - (self.running or 0))
+            if room < allowance:
+                allowance = room
+                why = f"ceiling: {self.running or 0} running of kanban ceiling {ceiling} ({ctx['ceiling_reason']})"
+        if allowance == 0 and why is None:
+            why = f"utilization: {verdict.reason} (binding {verdict.binding})" if verdict else "utilization: no room"
+        self.util = {"host": ctx["host"], "need": {"cpus": ctx["need"].cpus, "ram_gb": ctx["need"].ram_gb,
+                                                   "source": ctx["need"].source},
+                     "ceiling": ceiling, "leases": len(leases) - allowance,
+                     "binding": verdict.binding if verdict else None,
+                     "free": {k: round(float(x), 3) for k, x in (verdict.free if verdict else {}).items()}}
+        self.allowance = allowance
+        if allowance == 0:
+            self.state, self.last_reason = "saturated", why
+            self.band, self.spill_reason = "spilling", "utilization"
+            return 0, why
+        self.state, self.last_reason = "admitting", None
+        self.band, self.spill_reason = "admitting", None
         return allowance, None
 
     def _mark_unreadable(self) -> None:
@@ -758,6 +841,8 @@ class LoadGate:
             if self.enabled:
                 self._mark_unreadable()
             return None, None
+        if self.admission == "utilization" and self._cpu_prev is None:
+            cpu_block = max(cpu_block, 0.25)     # the predicate refuses on an unmeasured cpu_busy
         busy, self._cpu_prev = sample_cpu_busy(self._cpu_prev, block=cpu_block)
         procs, proc_limit = sample_user_procs() if self.enabled else (None, None)
         ecore = None
@@ -835,6 +920,8 @@ class LoadGate:
             "cpu_pause": self.cpu_pause,
             "spill_keys_error": self.spill_keys_error,
             "pool": pool,
+            "admission": self.admission,
+            "util": self.util,
             "updated_at": now,
         }
 
@@ -1157,6 +1244,56 @@ def count_running_workers() -> "Optional[int]":
         return None
 
 
+def admission_mode(value: Any) -> str:
+    """``kanban.admission``: "utilization" or "legacy" (absent / anything else)."""
+    v = value.strip().lower() if isinstance(value, str) else ""
+    return v if v in ADMISSION_MODES else "legacy"
+
+
+def _os_name() -> str:
+    import sys
+
+    return "darwin" if sys.platform == "darwin" else ("linux" if sys.platform.startswith("linux") else sys.platform)
+
+
+def utilization_context() -> dict:
+    """This host's inputs for the utilization path: its row of the placement
+    table (via the ``local`` alias), the kanban ceiling + reason, memory from
+    psutil, and the measured estimate for a kanban worker here."""
+    from hermes_cli import admission as _ad
+    from hermes_cli import placement as _pl
+
+    host, spec, ceiling, reason, prior = "local", None, None, "", _ad.Estimate(cpus=1.0, ram_gb=3.0)
+    try:
+        table = _pl.load_hosts()
+        hid = table.resolve(UTIL_HOST_ALIAS)
+        if hid:
+            host, spec = hid, table.hosts[hid]
+            ceiling = spec.slots_for("kanban")
+            reason = str(((json.loads(table.path.read_text(encoding="utf-8"))["hosts"][hid].get("consumers") or {})
+                          .get("kanban") or {}).get("_ceiling_reason") or "")
+        prior = _pl.need_of(table.footprint("kanban"))
+    except Exception as exc:  # no table = no ceiling, the prior footprint; never a crash in the tick
+        _log.debug("kanban load gate: placement table unavailable: %s", exc)
+    try:
+        hist = _ad.read_history(_pl.class_usage_path(), since=time.time() - _pl.CLASS_USAGE_WINDOW_S)
+    except Exception:
+        hist = []
+    need = _ad.estimate(UTIL_CLASS, host, hist, prior=prior)
+    avail = total = None
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        avail, total = vm.available / 2 ** 30, vm.total / 2 ** 30
+    except Exception:
+        pass
+    limits = _ad.Limits(mem_reserve_gb=spec.mem_reserve_gb if spec else 0.0,
+                        cpu_saturable=bool(spec.cpu_saturable) if spec else False)
+    return {"host": host, "ceiling": ceiling, "ceiling_reason": reason or "no reason recorded", "need": need,
+            "limits": limits, "mem_available_gb": avail, "mem_total_gb": total}
+
+
 def gate_from_config(config: Optional[dict] = None) -> LoadGate:
     """Build the gate from ``kanban.dispatch_load_gate`` in config.yaml."""
     if config is None:
@@ -1168,7 +1305,9 @@ def gate_from_config(config: Optional[dict] = None) -> LoadGate:
             config = {}
     kanban_cfg = (config or {}).get("kanban") if isinstance(config, dict) else None
     kanban_cfg = kanban_cfg if isinstance(kanban_cfg, dict) else {}
-    return LoadGate(kanban_cfg.get("dispatch_load_gate"), os.cpu_count() or 1)
+    gate = LoadGate(kanban_cfg.get("dispatch_load_gate"), os.cpu_count() or 1)
+    gate.admission = admission_mode(kanban_cfg.get("admission"))
+    return gate
 
 
 def state_path() -> Path:
