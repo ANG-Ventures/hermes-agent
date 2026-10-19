@@ -102,3 +102,43 @@ async def test_busy_gateway_s_dispatches_stop_handler():
     event, source = _ev("/s")
     handled, result = await runner._hm_busy_slash_or_photo(event, source, "k")
     assert (handled, result, called) == (True, "stopped", ["stop"])
+
+
+# ── TUI / Desktop JSON-RPC (tui_gateway) ───────────────────────────────────────────────────────
+# Prism P1s on #2116: slash.exec keyed its routing on the RAW typed name, so a new alias routed
+# differently from its command. /st skipped the pending-input bypass (steer) and fell into the slash
+# worker, which has no reader for that queue; /m <model> ran in the worker but skipped the live
+# _apply_model_switch mirror, so Desktop's live session never switched.
+
+
+def _tui_session(**extra):
+    import threading
+    return {"agent": SimpleNamespace(), "session_key": "k", "history": [], "history_lock": threading.Lock(),
+            "history_version": 0, "running": False, "attached_images": [], "image_counter": 0, "cols": 80,
+            "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", **extra}
+
+
+# Red if: slash.exec stops canonicalizing before the _PENDING_INPUT_COMMANDS check (/st -> worker).
+@pytest.mark.parametrize("typed, canonical", [("st", "steer"), ("q", "queue"), ("steer", "steer")])
+def test_tui_slash_exec_routes_alias_like_its_command(monkeypatch, typed, canonical):
+    from tui_gateway import server
+    seen = []
+    monkeypatch.setitem(server._methods, "command.dispatch",
+                        lambda rid, params: seen.append(params["name"]) or {"result": {"type": "exec"}})
+    server._sessions["sid"] = _tui_session()
+    try:
+        server._methods["slash.exec"]("1", {"session_id": "sid", "command": f"/{typed} check the logs"})
+    finally:
+        server._sessions.pop("sid", None)
+    assert seen == [canonical], f"/{typed} must reach command.dispatch as {canonical}, not the slash worker"
+
+
+# Red if: the live side-effect mirror keys on the raw name again (/m <model> never switches live).
+@pytest.mark.parametrize("typed", ["m", "model"])
+def test_tui_model_alias_applies_live_switch(monkeypatch, typed):
+    from tui_gateway import server
+    calls = []
+    monkeypatch.setattr(server, "_apply_model_switch", lambda sid, sess, raw, **kw: calls.append(raw) or {})
+    session = _tui_session(agent=SimpleNamespace(model="old"))
+    server._mirror_slash_side_effects("sid", session, f"/{typed} gpt-5.5 --provider openrouter")
+    assert calls == ["gpt-5.5 --provider openrouter"]
