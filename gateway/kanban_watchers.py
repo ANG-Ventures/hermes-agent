@@ -2405,6 +2405,14 @@ class GatewayKanbanWatchersMixin:
                             )
                             mode = "notify"
                     wake_agent = mode in ("notify+wake", "wake")
+                    # Host load1 alone never stops an auto-handle child: the child REPLACES the
+                    # session's wake turn, so downgrading it saves nothing, and on a box idling
+                    # above the band auto-handle never ran (smoke 2026-10-19: load 55-75 for
+                    # hours). Same rule as a human-owned wake (t_b7b31563): dispatcher
+                    # proc_paused and a capped lane still downgrade. Only AUTO events use it.
+                    _ah_load_exempt = bool(
+                        d.get("auto") and wake_downgrade and str(wake_downgrade).startswith("host load")
+                    )
                     send_passive = mode != "wake"
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
@@ -2968,7 +2976,12 @@ class GatewayKanbanWatchersMixin:
                             # t_b7b31563: a deferred wake builds its text here
                             # too; it is parked (not delivered) further down.
                             if (wake_agent or _defer_pending)
-                            else set()
+                            # load-exempt: only the auto events, for the child; the
+                            # rest still go nowhere (cleared below if no claim takes them).
+                            else ({ev.kind for ev in d["events"] if ev.id in d["auto"]
+                                   and ev.kind in _WAKE_KINDS and ev.id not in _self_ids
+                                   and ev.id not in _suppressed_ids and ev.id not in _noise}
+                                  if _ah_load_exempt else set())
                         )
                         if _wake_kinds:
                             # t_07ffc6cb: re-read the card at SEND time; a wake
@@ -3107,7 +3120,7 @@ class GatewayKanbanWatchersMixin:
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
                             )
-                        if _wake_kinds and d.get("auto") and (wake_agent or _defer_pending):
+                        if _wake_kinds and d.get("auto") and (wake_agent or _defer_pending or _ah_load_exempt):
                             # Boomerang v2 P3b: a claimed auto event is the child's, not the
                             # session's: its wake is withheld. A failed dispatch stays here
                             # and wakes as today (INV-6).
@@ -3116,6 +3129,9 @@ class GatewayKanbanWatchersMixin:
                             _wake_kinds = await _ah.notifier_dispatch(
                                 self, d, sub, board_slug, task, _wake_kinds, _synth,
                             )
+                        if _ah_load_exempt and not (wake_agent or _defer_pending):
+                            # whatever no claim took stays a notify, as today (INV-6 at load)
+                            _wake_kinds = set()
 
                         if _defer_pending and _wake_kinds and not wake_agent:
                             # t_b7b31563: park the downgraded human-owner
