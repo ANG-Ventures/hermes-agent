@@ -307,8 +307,11 @@ def validate(doc) -> List[str]:
             errs.append(f"hosts.{hid} must be an object")
             continue
         for k in ("cores", "threads"):
-            if not isinstance(h.get(k), int) or isinstance(h.get(k), bool) or h[k] < 1:
+            # FWA R2a: cores/threads are DISCOVERED (var/placement/host-inventory.json); a table value is optional
+            if k in h and (not isinstance(h.get(k), int) or isinstance(h.get(k), bool) or h[k] < 1):
                 errs.append(f"hosts.{hid}.{k} must be an int >= 1")
+        if h.get("count_cores", "physical") not in ("physical", "performance"):
+            errs.append(f"hosts.{hid}.count_cores must be physical|performance")
         if isinstance(h.get("cores"), int) and isinstance(h.get("threads"), int) and h["threads"] < h["cores"]:
             errs.append(f"hosts.{hid}: threads {h['threads']} < cores {h['cores']}")
         for k in ("mem_total_gb", "mem_reserve_gb", "cores_reserve"):
@@ -431,8 +434,72 @@ def active_scorer(doc_scorer=None) -> str:
     return doc_scorer or DEFAULT_SCORER
 
 
-def load_hosts(path=None, *, speed_path=None, scorer: Optional[str] = None) -> HostTable:
-    """The host table. ``scorer`` (v1|v2) beats PLACEMENT_SCORER and the table's key (the replay compares both)."""
+INVENTORY_REL = Path("var") / "placement" / "host-inventory.json"
+# FWA R2a (t_e3f34b3e): HostSpec field -> discovered field. Discovered wins; the table is the fallback.
+INVENTORY_FACTS = (("cores", "physical_cores"), ("threads", "threads"), ("clock_mhz", "max_mhz"))
+_PRINTED_ONCE: set = set()
+
+
+def _print_once(key, line: str) -> None:
+    if key not in _PRINTED_ONCE:
+        _PRINTED_ONCE.add(key)
+        print(line, file=sys.stderr)
+
+
+def inventory_path(table_path) -> Optional[Path]:
+    """The discovered inventory beside the table: <root>/var/placement/host-inventory.json for <root>/config/<table>.
+    PLACEMENT_INVENTORY overrides it (an empty value = no inventory)."""
+    env = os.environ.get("PLACEMENT_INVENTORY")
+    if env is not None:
+        return Path(env) if env else None
+    p = Path(table_path)
+    return p.parent.parent / INVENTORY_REL if p.parent.name == "config" else None
+
+
+def read_inventory(path) -> Dict[str, dict]:
+    """{host: discovered facts} from host-inventory.json (placement-collector), {} when missing or unreadable."""
+    if path is None:
+        return {}
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    hosts = doc.get("hosts") if isinstance(doc, dict) else None
+    return {h: r for h, r in hosts.items() if isinstance(r, dict)} if isinstance(hosts, dict) else {}
+
+
+def _discovered(field: str, row: Mapping, h: Mapping):
+    """One discovered value, or None. `count_cores: performance` (the Studio: macOS queues background QoS work on
+    the E cores) makes `cores` the P-core count."""
+    src = "p_cores" if field == "cores" and h.get("count_cores") == "performance" else dict(INVENTORY_FACTS)[field]
+    v = row.get(src)
+    if field == "clock_mhz":
+        return float(v) if _num(v) and v > 0 else None
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 1 else None
+
+
+def host_facts(hid: str, h: Mapping, inv: Mapping) -> Dict[str, float]:
+    """cores / threads / clock_mhz for one host: DISCOVERED first, the hand-typed table second (FWA R2a, Ace
+    10-18 09:48). A discovered/table disagreement prints ONCE per process to stderr."""
+    row = next((inv[n] for n in [hid, *(h.get("aliases") or [])] if isinstance(inv.get(n), dict)), None)
+    out = {}
+    for field, _src in INVENTORY_FACTS:
+        disc, typed = (_discovered(field, row, h) if row else None), h.get(field)
+        if disc is not None and _num(typed) and float(disc) != float(typed):
+            _print_once((hid, field, disc, typed), f"placement: {hid}.{field} discovered {disc:g} != table "
+                                                   f"{typed:g}; discovered wins (var/placement/host-inventory.json)")
+        val = disc if disc is not None else typed
+        if val is not None:
+            out[field] = val
+    return out
+
+
+def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[str] = None) -> HostTable:
+    """The host table. ``scorer`` (v1|v2) beats PLACEMENT_SCORER and the table's key (the replay compares both).
+    Each host's cores / threads / clock come from ``inventory`` ({host: discovered row}; default
+    read_inventory(inventory_path(table))) first, the table second. A host with neither, or whose discovered facts
+    contradict its policy (threads < cores, cores_reserve >= cores), is LEFT OUT (closed: never picked), printed
+    once; it never fails the whole table."""
     p = Path(path) if path is not None else fleet_root() / TABLE_REL
     try:
         doc = json.loads(p.read_text(encoding="utf-8"))
@@ -452,15 +519,27 @@ def load_hosts(path=None, *, speed_path=None, scorer: Optional[str] = None) -> H
     # the live fleet's measurements
     speed = read_host_speed(speed_path if speed_path is not None else p.parent.parent / SPEED_REL) \
         if scorer == "v2" else {}
+    inv = read_inventory(inventory_path(p)) if inventory is None else inventory
     hosts = {}
     for hid, h in doc["hosts"].items():
-        cores, threads = int(h["cores"]), int(h["threads"])
+        f = host_facts(hid, h, inv)
+        why = None
+        if "cores" not in f or "threads" not in f:
+            why = "cores/threads neither discovered (var/placement/host-inventory.json) nor in the table"
+        elif f["threads"] < f["cores"]:
+            why = f"threads {f['threads']} < cores {f['cores']}"
+        elif float(h["cores_reserve"]) >= f["cores"]:
+            why = f"cores_reserve {h['cores_reserve']:g} >= cores {f['cores']}"
+        if why:
+            _print_once((hid, why), f"placement: host {hid} left out of the table (closed): {why}")
+            continue
+        cores, threads = int(f["cores"]), int(f["threads"])
         meas = speed.get(hid) or {}
         hosts[hid] = HostSpec(
             name=hid, cores=cores, threads=threads, mem_total_gb=float(h["mem_total_gb"]),
             mem_reserve_gb=float(h["mem_reserve_gb"]), cores_reserve=float(h["cores_reserve"]),
             slots={c: int(v["slots"]) for c, v in h["consumers"].items()},
-            aliases=tuple(h.get("aliases", [])), clock_mhz=float(h.get("clock_mhz", 0.0)),
+            aliases=tuple(h.get("aliases", [])), clock_mhz=float(f.get("clock_mhz", 0.0)),
             default_preference=str(h.get("default_preference", "normal")),
             unmeasurable_axes=tuple(h.get("unmeasurable_axes", [])),
             cpu_saturable=hid in saturable, scorer=scorer,

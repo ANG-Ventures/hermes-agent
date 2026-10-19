@@ -67,6 +67,7 @@ from agent.fork_ext.relay_headers import (
     consume_first_request_headers,
     merge_pool_capability_headers,
     note_main_turn_served_by,
+    note_relay_streaming,
     route_id_of,
     stamp_call_id,
     stamp_correlation_headers,
@@ -145,6 +146,7 @@ def _snapshot_pool_headers(response: Any) -> dict[str, str]:
     source = getattr(response, "headers", None)
     if source is None:
         return {}
+    note_relay_streaming(response)
     snapshot: dict[str, str] = {}
     for name in _POOL_HEADER_NAMES:
         try:
