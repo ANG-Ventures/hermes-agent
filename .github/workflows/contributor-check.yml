@@ -14,7 +14,7 @@ jobs:
   check-attribution:
     # Hosted by design: short, no LAN dependency, and its checkout is
     # already treeless. Keeps a 17-slot pool slot free for a test slice.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     outputs:
       review_status: ${{ steps.check-emails.outputs.review_status }}
