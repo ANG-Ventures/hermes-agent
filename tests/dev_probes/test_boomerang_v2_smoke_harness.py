@@ -102,7 +102,10 @@ def test_step1_fails_when_needs_input_is_auto_handled(env, monkeypatch):
 def test_step1_fails_without_the_auto_handled_line(env, monkeypatch):
     fx = _copy_fixtures(env["tmp"])
     chat = fx / "fake_origin_chat.jsonl"
-    chat.write_text("".join(ln + "\n" for ln in chat.read_text().splitlines() if "t_5m0ce001 \u2014" not in ln))
+    lines = chat.read_text().splitlines()
+    kept = [ln for ln in lines if not json.loads(ln)["content"].startswith("[auto-handled] t_5m0ce001")]
+    assert len(kept) == len(lines) - 1
+    chat.write_text("".join(ln + "\n" for ln in kept))
     monkeypatch.setenv("BV2_ORIGIN_CHAT", str(chat))
     assert run.main(["--step", "1", "--dry-run"]) == 1
 
