@@ -3,7 +3,9 @@ Bound onto ``GatewayRunner`` through ``GatewaySlashCommandsMixin``."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 
 from agent.i18n import t
 from gateway.platforms.event import MessageEvent, MessageType
@@ -61,6 +63,17 @@ class GatewayGoalCommandsMixin:
         if result.prompt:
             self._enqueue_goal_turn(event, result.prompt, label="command enqueue", kickoff=result.kickoff)
         return result.output
+
+    def _goal_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Per-session lock serializing goal-state read/mutate/save between /goal commands and the
+        idle-wake watcher (both hop to an executor, so the event loop alone does not order them)."""
+        locks = getattr(self, "_goal_session_locks", None)
+        if locks is None:
+            locks = self._goal_session_locks = weakref.WeakValueDictionary()
+        lock = locks.get(session_id)
+        if lock is None:
+            lock = locks[session_id] = asyncio.Lock()
+        return lock
 
     def _clear_goal_continuations(self, event: MessageEvent, verb: str) -> None:
         try:
