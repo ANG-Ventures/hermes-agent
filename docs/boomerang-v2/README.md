@@ -225,8 +225,9 @@ the original wake is re-surfaced.
 (D-11) with `terminal` could still write the board's SQLite file directly. That gap existed
 before v2; D-19 does not claim a hard boundary.
 
-Log lines (gateway log): `boomerang.fork_ineligible reason=…`,
-`boomerang.fork served_by=… read_share=…`, `kanban notifier: auto-handled <card> disposition=…`.
+Log lines (`logs/agent.log`, from `tools.delegate_tool`): `boomerang.fork_ineligible reason=…`,
+`boomerang.fork served_by=… read_share=…`. In `logs/gateway.log`:
+`kanban notifier: auto-handled <card> disposition=…`.
 
 ## Decisions cited
 
