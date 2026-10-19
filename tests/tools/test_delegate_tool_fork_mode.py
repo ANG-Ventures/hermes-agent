@@ -77,7 +77,7 @@ def _run(agent, text, history=None):
     """One real turn; returns (result, [captured provider kwargs])."""
     captured = []
 
-    def _create(kwargs, *, client=None):
+    def _create(kwargs, **_kw):
         captured.append(copy.deepcopy(kwargs))
         return _anthropic_response(f"reply to {text[:20]}")
 
@@ -141,6 +141,24 @@ def test_fork_first_request_prefix_byte_identical_to_parent_next_request():
     tail = json.dumps(child_req["messages"][-1], default=str)
     assert "BOOMERANG FORK" in tail and "verify the canary" in tail
     assert child_req["extra_headers"][_PIN] == _SEAT
+
+
+def test_fork_prefix_stops_at_last_complete_assistant_turn():
+    """D-8: a delegate_task issued mid-turn sees the in-flight user row (and possibly an
+    unfinished tool round) after the last complete assistant turn; none of it is copied."""
+    parent = _warm_parent()
+    completed = list(parent._session_messages)
+    parent._session_messages = completed + [
+        {"role": "user", "content": "IN_FLIGHT_MARKER now delegate it"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c9", "type": "function", "function": {"name": "delegate_task", "arguments": "{}"}}]},
+    ]
+    child = _build(parent)
+    assert child._inherit_mode == "fork"
+    child_req = _child_first_request(child)
+    assert "IN_FLIGHT_MARKER" not in json.dumps(child_req["messages"], default=str)
+    _, parent_next = _run(parent, "and the next thing", completed)
+    assert _prefix_digest(child_req) == _prefix_digest(parent_next[0])
 
 
 def test_one_system_byte_mutation_downgrades_with_log_line(caplog):
