@@ -2186,6 +2186,14 @@ class GatewayKanbanWatchersMixin:
                                             if _s5 and _ns.is_auto_route(_ev, _suppress_cfg):
                                                 wake_noise[_ev.id] = _ns.REASON_AUTO_ROUTE
                                                 continue
+                                            # t_26ebe71a: a gave_up / stuck run on a card approved at
+                                            # its head with a land in flight is the lander's, not news.
+                                            if _s5 and _ev.kind in _ow.STUCK_KINDS and getattr(
+                                                    task, "status", None) in ("review", "running"):
+                                                from hermes_cli import kanban_terminal_pending as _tp
+                                                if _tp.terminal_pending(conn, sub["task_id"]) is not None:
+                                                    wake_noise[_ev.id] = _tp.REASON
+                                                continue
                                             if _ev.kind != "review_requested":
                                                 continue
                                             try:
