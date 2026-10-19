@@ -324,6 +324,50 @@ async def test_busy_queue_verb_not_enqueued(rig):
 
 
 @pytest.mark.asyncio
+async def test_busy_bare_rm_lists_to_pick_and_changes_nothing(rig):
+    # Ace 2026-10-18: `/queue rm` with no number shows the numbered list, never queues "rm".
+    runner, adapter = rig
+    _seed(runner, adapter, "a", "b", "c")
+    reply = await runner._busy_queue_command(_cmd("/queue rm"), KEY, _source())
+    lines = reply.splitlines()
+    assert lines[:4] == ["Queue (3 pending):", "1. a", "2. b", "3. c"]
+    assert lines[-1].startswith("Nothing removed.") and "/queue rm all" in lines[-1]
+    assert _active(runner, adapter) == ["a", "b", "c"]
+    assert adapter._pending_messages[KEY].text == "a"                  # slot untouched
+
+
+@pytest.mark.asyncio
+async def test_busy_rm_all_clears_users_keeps_system(rig):
+    runner, adapter = rig
+    _seed(runner, adapter, "wake", "a", "b", internal_at=0)
+    reply = await runner._busy_queue_command(_cmd("/queue rm all"), KEY, _source())
+    assert reply == "Cleared 2 queued prompts."
+    assert _active(runner, adapter) == ["wake"]
+
+
+@pytest.mark.asyncio
+async def test_idle_bare_rm_on_empty_queue_and_rm_all_on_held(rig):
+    runner, adapter = rig
+    handled, reply = await runner._hm_cmd_queue(_cmd("/queue rm"), _source(), KEY)
+    assert (handled, reply) == (True, "Queue is empty.")
+    _seed(runner, adapter, "a", "b")
+    qm.hold_user_items(runner, KEY, adapter)
+    handled, reply = await runner._hm_cmd_queue(_cmd("/queue remove"), _source(), KEY)
+    assert handled is True and reply.startswith("Queue (2 held") and "Nothing removed." in reply
+    assert _held(runner) == ["a", "b"]
+    handled, reply = await runner._hm_cmd_queue(_cmd("/queue RM ALL"), _source(), KEY)
+    assert (handled, reply) == (True, "Cleared 2 queued prompts.") and _held(runner) == []
+
+
+@pytest.mark.asyncio
+async def test_rm_all_with_extra_words_is_still_a_prompt(rig):
+    runner, adapter = rig
+    _seed(runner, adapter, "a")
+    await runner._busy_queue_command(_cmd("/queue rm all of them"), KEY, _source())
+    assert _active(runner, adapter) == ["a", "rm all of them"]
+
+
+@pytest.mark.asyncio
 async def test_busy_queue_prompt_joins_held_when_held(rig):
     runner, adapter = rig
     _seed(runner, adapter, "a")
