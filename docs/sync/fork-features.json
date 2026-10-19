@@ -1141,5 +1141,41 @@
       "cli"
     ],
     "proposed_canary": "tests/hermes_cli/test_kanban_pr_acceptance.py (RED-proven 2026-10-18 t_f34a6e21: `if not assignee or _is_human_lane(assignee):` -> `if not assignee:` in hermes_cli/kanban_pr_acceptance.py -> 3 failed, 1 passed; restored -> 4 passed)"
+  },
+  {
+    "feature": "/queue verbs on every surface + /stop holds the queue + /queue run release + bare `rm` lists / `rm all` clears",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_queue_contract.py::test_verb_shape_is_exact",
+      "tests/fork_canaries/test_fork_canary_queue_contract.py::test_cli_and_gateway_share_the_one_parser",
+      "tests/fork_canaries/test_fork_canary_queue_contract.py::test_busy_list_is_management_not_a_prompt",
+      "tests/fork_canaries/test_fork_canary_queue_contract.py::test_idle_list_is_management_not_a_prompt",
+      "tests/fork_canaries/test_fork_canary_queue_contract.py::test_bare_rm_lists_and_changes_nothing",
+      "tests/fork_canaries/test_fork_canary_queue_contract.py::test_rm_all_clears_users_and_keeps_system_items",
+      "tests/fork_canaries/test_fork_canary_queue_contract.py::test_cli_bare_rm_and_rm_all",
+      "tests/fork_canaries/test_fork_canary_queue_contract.py::test_stop_holds_user_items_keeps_system_and_arms_nothing",
+      "tests/fork_canaries/test_fork_canary_queue_contract.py::test_verbs_on_held_store_never_arm_the_slot",
+      "tests/fork_canaries/test_fork_canary_queue_contract.py::test_run_releases_oldest_first",
+      "tests/fork_canaries/test_fork_canary_queue_contract.py::test_merged_release_is_one_turn_in_order_and_marked",
+      "tests/fork_canaries/test_fork_canary_queue_contract.py::test_user_reset_drops_and_reports_auto_reset_carries"
+    ],
+    "paths": [
+      "gateway/queue_mgmt.py",
+      "hermes_cli/queue_verbs.py",
+      "gateway/run_busy.py",
+      "gateway/run_inbound.py",
+      "gateway/run_inbound_*.py",
+      "hermes_cli/cli_loops_mixin.py"
+    ],
+    "why": "Ace rulings 2026-10-12/13/18. Before #1948 every gateway `/queue list|rm|edit` was queued as PROMPT TEXT and the model faked the result; /stop silently dropped queued item 1 and ran 2..N as orphans ahead of the next message. Upstream has neither gateway/queue_mgmt.py nor hermes_cli/queue_verbs.py (checked upstream/main 2026-10-18), so resolving run_busy.py / run_inbound.py / cli_loops_mixin.py toward upstream reverts all of it with no import error. PRs #1948 #1962 #1957 #1973 #2103. Upstream PR shape: port queue_verbs.py + queue_mgmt.py with the busy/idle dispatch hooks.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway",
+      "telegram",
+      "discord"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_queue_contract.py (RED-proven 2026-10-18 t_36288a8e on ACE-MEDIA, 9 mutations each red then restored green: bare-rm->prompt in queue_verbs 3 red; rm-all not clear 3; verbs swallow trailing words 2; apply_management bare-rm branch removed 1; run_busy is_management routing removed 3; hold_user_items returns 0 (/stop drops) 3; MERGE_SEPARATOR changed 1; CLI bare-rm branch removed 1; run_inbound is_management routing removed 1; baseline + restored 26 passed)"
   }
 ]
