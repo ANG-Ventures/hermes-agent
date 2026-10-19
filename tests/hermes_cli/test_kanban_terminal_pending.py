@@ -247,7 +247,8 @@ def test_empty_or_missing_timestamp_falls_back_to_mtime(home, value):
 
 
 def test_finite_result_beside_a_non_finite_one_still_counts(home):
-    """A non-finite finished_at skips that entry only; another PR's valid ARMED result for the card still counts."""
+    """A non-finite finished_at skips that entry only. For the SAME PR it must not win the newest-result sort
+    (inf > any real time) and hide the valid ARMED result."""
     with kb.connect() as conn:
         tid = _operator_review_claim(conn)
         _approve(conn, tid)
@@ -255,9 +256,6 @@ def test_finite_result_beside_a_non_finite_one_still_counts(home):
         (d / "01BAD.result.json").write_text(json.dumps({"ulid": "01BAD", "status": "ARMED",
                                                          "finished_at": "Infinity"}))
         _land_request(home, tid, suffix=".done.json", ulid="01GOOD")
-        good = json.loads((d / "01GOOD.done.json").read_text())
-        good["pr"] = 4050
-        (d / "01GOOD.done.json").write_text(json.dumps(good))
         (d / "01GOOD.result.json").write_text(json.dumps({"ulid": "01GOOD", "status": "ARMED",
                                                           "finished_at": time.time()}))
         pending = tp.terminal_pending(conn, tid)

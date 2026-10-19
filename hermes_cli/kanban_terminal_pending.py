@@ -178,7 +178,7 @@ def _land_requests(root: Path, task_id: str, head: str, now: float) -> Optional[
         if key not in newest or at > newest[key][0]:
             newest[key] = (at, res, req)
     for at, res, req in newest.values():
-        if (str(res.get("status") or "").upper() in ARMED_STATUSES and now - at <= ARMED_HORIZON_S
+        if (str(res.get("status") or "").upper() in ARMED_STATUSES and -_CLOCK_SKEW_S <= now - at <= ARMED_HORIZON_S
                 and req.get("card") == task_id and _same_head(req.get("review_head_sha"), head)):
             return {"source": "land-request", "id": res.get("ulid"), "repo": req.get("repo"), "pr": req.get("pr"),
                     "head": req.get("review_head_sha"), "state": str(res.get("status")).lower(),
