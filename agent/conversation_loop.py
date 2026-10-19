@@ -1454,6 +1454,9 @@ class _LoopState:
     # turn so a runaway interrupt/redirect that keeps re-arming a restart flag cannot
     # refund the iteration budget forever and hold the turn lease indefinitely.
     restart_count: int = 0
+    # Routes a rebuilt-for-fallback restart already moved to this turn: a new route gets a
+    # fresh ``restart_count`` allowance (t_5e3d611f), a repeat keeps counting.
+    restart_routes: set = field(default_factory=set)
     _outer_error_count: int = 0  # outer-loop exceptions this turn (#92450), see _MAX_OUTER_LOOP_ERRORS
     truncated_tool_call_retries: int = 0
     truncated_response_parts: List[tuple[str, bool]] = field(default_factory=list)

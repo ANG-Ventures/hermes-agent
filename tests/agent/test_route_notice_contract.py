@@ -59,8 +59,9 @@ def test_rider_carries_all_four_fields(cls, hop, seat, attempts):
     if cls == "no_first_byte_budget":
         # t_778185f3: the HARNESS cut the attempt, so there is no relay hop to name;
         # the seat is the relay's served-by, or says the cut came before headers.
-        assert rider.startswith(f"{'3x ' if attempts > 1 else ''}no first byte"), rider
-        assert ("(sub-vps-9)" if seat else "(seat unknown — cut before headers)") in rider, rider
+        # t_94a2b0e4: a pool relay buffers the reply, so "no reply", never "first byte".
+        assert rider.startswith(f"{'3x ' if attempts > 1 else ''}no reply"), rider
+        assert ("(sub-vps-9)" if seat else "(relay sent no headers before the cut)") in rider, rider
         assert _TIME_RE.search(rider) and "?" not in rider, rider
         return
     assert _CAUSE_RE.search(rider)
