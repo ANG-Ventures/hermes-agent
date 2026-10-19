@@ -169,6 +169,14 @@ interrupting the live session, unless the wake needs human judgment.
   wrong); `⚠️ auto-handle failed for <card>: <reason>` or `⚠️ auto-handle lost <card> (reason:
   …)` → the original wake was re-surfaced; handle it like any wake.
 
+- **The child cannot write the board (D-19).** It runs inside the delegated-child kanban fence:
+  board reads only, plus ` (subagent)` comments. It verifies and ends its final message with one
+  `<<<BOOMERANG-VERDICT nonce=…>>>` block (`complete|request_changes|redispatch|retry|surface`
+  + evidence). The gateway executor checks the nonce, the allowed-action list and that the card
+  has not moved, then does the ONE write, signed `[auto-handle]` as a machine. It never lands,
+  merges or approves. If you are the child: no verdict block, or a malformed one, means nothing
+  is written and the wake goes back to the session.
+
 Full tables and downstream effects: `docs/boomerang-v2/README.md`.
 
 ## Contract with the user

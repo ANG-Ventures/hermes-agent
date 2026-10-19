@@ -78,6 +78,35 @@ allowance is ``min(load allowance against spill_above, CPU allowance against
 cpu_pause)`` (option D). ``cpu >= cpu_pause`` is the CPU twin of the hard
 pause. ``cpu_headroom`` keeps its own allowance and is a ``spilling`` row.
 
+2026-10-18 (t_a7978f86): load1 325 with the CPU 54% idle, P-cores 33% busy
+and the 8 E-cores 100% busy. The ``cpu_headroom`` row read the mean over
+all 32 cores (0.41-0.50 < ``cpu_busy_pause``) and kept admitting 17-26 local
+spawns an hour, while the background QoS band (the E-cores on Apple
+silicon: test-gate's nice-19 runs, launchd Background agents, dpx units)
+got no slice and dpx ``/health`` took 8 s. ``ecore_gate`` (``off`` |
+``report`` | ``on``) reads E-core busy from per-cpu ``psutil.cpu_times``
+deltas; at ``ecore_busy_pause`` (default 0.95) or above, a CPU-headroom
+allowance is NO headroom for local spawns. ``report`` (the default until
+the D1 ruling) changes nothing and logs ``kanban load gate (dry): ...
+would-refuse N``; ``on`` refuses. Hosts without a perflevel split (Linux,
+Intel) have no E-core sample and the knob is inert there.
+
+2026-10-18 (t_da6f84f7, Ace 14:33 / 15:5x, ruling t_0b33557c): ``kanban.admission:
+utilization`` (read per tick; absent or ``legacy`` = everything above, byte for
+byte) replaces the load1 pause, the CPU-headroom row and ``worker_cpu_cost``
+with the ONE fleet predicate, ``hermes_cli.admission.admit()``, over this
+host's own sample: cpu_busy (psutil cpu_times delta), MemAvailable after the
+host table's ``mem_reserve_gb``, procs / RLIMIT_NPROC (PSI is not measured on
+darwin and is not required). Each worker spawned within ``admission.
+DEFAULT_SETTLE_S`` is a lease of the measured estimate for its class on this
+host (p90 of var/placement/class-usage.jsonl, the table footprint as prior), so
+one tick's admits see each other. ``consumers.kanban.slots`` on this host's
+row of config/fleet-hosts.json (the Studio: 2, ``_ceiling_reason``) stays a
+CEILING on running workers. The interim keys (pause_above, resume_below,
+cpu_busy_pause, worker_cpu_cost, the spill keys) stay readable but are inert in
+this mode; a refusal is band ``spilling`` (the pool takes the work) and the
+process-slot pause still wins.
+
 ``kanban.max_spawn`` stays the hard concurrency ceiling; this gate is the
 governor that decides how fast the host is allowed to approach it.
 
@@ -104,6 +133,9 @@ DEFAULT_WORKER_LOAD_COST_MAX = 4.0
 DEFAULT_RAMP_SECONDS = 600.0
 DEFAULT_SLOPE_WINDOW_SECONDS = 600.0
 DEFAULT_CPU_BUSY_PAUSE = 0.70
+DEFAULT_ECORE_BUSY_PAUSE = 0.95
+ECORE_GATE_MODES = ("off", "report", "on")
+DEFAULT_ECORE_GATE = "report"
 DEFAULT_WORKER_CPU_COST = 1.0
 SLOPE_MIN_SAMPLES = 5
 SLOPE_MIN_X_STDEV = 1.0
@@ -117,6 +149,9 @@ SPILL_INERT = 1.0
 SPILL_KEYS_WARN_INTERVAL_SECONDS = 300.0
 SUMMARY_INTERVAL_SECONDS = 300.0
 STATE_FILENAME = "load_gate.json"
+ADMISSION_MODES = ("legacy", "utilization")
+UTIL_CLASS = "kanban-worker-llm-wait"
+UTIL_HOST_ALIAS = "local"     # the dispatcher's own row of config/fleet-hosts.json (mac-studio carries it)
 
 
 def _denom(ncpu: Any = None) -> str:
@@ -224,6 +259,17 @@ class LoadGate:
         self.worker_cpu_cost = _num(
             cfg.get("worker_cpu_cost"), DEFAULT_WORKER_CPU_COST
         )
+        raw = cfg.get("ecore_gate", DEFAULT_ECORE_GATE)
+        # YAML 1.1 reads a bare `on` / `off` as True / False (Prism 3d10a4bc87be): map the bool back to the mode
+        mode = ("on" if raw else "off") if isinstance(raw, bool) else str(raw).strip().lower()
+        self.ecore_gate = mode if mode in ECORE_GATE_MODES else DEFAULT_ECORE_GATE
+        eb = _num(cfg.get("ecore_busy_pause"), DEFAULT_ECORE_BUSY_PAUSE)
+        self.ecore_busy_pause = eb if 0.0 < eb <= 1.0 else DEFAULT_ECORE_BUSY_PAUSE
+        self.ecore_busy: Optional[float] = None
+        self.ecore_would_refuse = 0     # local spawns the E-core leg refused / would refuse this tick
+        self._ecore_prev = None
+        self._ecore_cpus: "Optional[tuple[int, ...]]" = None
+        self._ecore_reported_at: Optional[float] = None
         pf = _num(cfg.get("proc_pause_fraction"), DEFAULT_PROC_PAUSE_FRACTION)
         self.proc_pause_fraction = pf if pf < 1.0 else DEFAULT_PROC_PAUSE_FRACTION
         rf = _num(cfg.get("proc_resume_fraction"), DEFAULT_PROC_RESUME_FRACTION)
@@ -284,6 +330,10 @@ class LoadGate:
         # Per-board split of the last tick (gateway dispatcher, t_f78d1938):
         # {slug: {ready, quota, spawned, starved_since}}.
         self.boards: dict = {}
+        # kanban.admission (t_da6f84f7): set per tick by the caller from the
+        # live config; anything but "utilization" is the legacy gate.
+        self.admission = "legacy"
+        self.util: dict = {}
 
     # -- hysteresis (hard pause) -------------------------------------------
     def update(self, load1: float, load5: Optional[float] = None) -> Optional[str]:
@@ -443,6 +493,7 @@ class LoadGate:
         cpu_busy: Optional[float] = None,
         procs: Optional[int] = None,
         proc_limit: Optional[int] = None,
+        ecore_busy: Optional[float] = None,
     ) -> "tuple[Optional[int], Optional[str]]":
         """Return ``(allowance, reason)`` for this tick.
 
@@ -453,6 +504,7 @@ class LoadGate:
         (0..1 of all cores) corroborates a load1 pause. Both are optional.
         ``procs`` / ``proc_limit`` (this uid's process count and its limit)
         drive the process-slot pause; either missing = no process gate.
+        ``ecore_busy`` (0..1 of the E-cores) is the ``ecore_gate`` leg.
         """
         self.pool = {"planned": False, "reason": "not_needed"}
         if not self.enabled:
@@ -477,7 +529,16 @@ class LoadGate:
             )
         except (TypeError, ValueError):
             self.cpu_busy = None
+        try:
+            self.ecore_busy = (
+                min(1.0, max(0.0, float(ecore_busy))) if ecore_busy is not None else None
+            )
+        except (TypeError, ValueError):
+            self.ecore_busy = None
+        self.ecore_would_refuse = 0
         self.running = None
+        if self.admission == "utilization":
+            return self._admit_utilization(now, running, procs, proc_limit)
         self.observe(load1, running, now)
         measured = self.measured_cost(now)
         self.cost = measured if measured is not None else self.worker_load_cost
@@ -512,7 +573,8 @@ class LoadGate:
                 if allowance == 0:
                     self.last_reason = (
                         f"{hard}; cpu_busy={self.cpu_busy:.2f} < {self.cpu_busy_pause:.2f} "
-                        f"but pending cpu={pending_cpu:.1f} cores fills the headroom"
+                        + (self._ecore_reason() if self._ecore_blocks() else
+                           f"but pending cpu={pending_cpu:.1f} cores fills the headroom")
                     )
                     return 0, self.last_reason
                 self.last_reason = None
@@ -531,6 +593,69 @@ class LoadGate:
             )
             return 0, self.last_reason
         self.state, self.last_reason = "admitting", None
+        return allowance, None
+
+    def _admit_utilization(
+        self, now: float, running: Optional[int], procs: Optional[int], proc_limit: Optional[int],
+    ) -> "tuple[int, Optional[str]]":
+        """``kanban.admission: utilization``: admission.admit() over this host's
+        sample, one lease per spawn the sample cannot show yet, under the host
+        table's kanban ceiling. load1 and the interim CPU keys are not read."""
+        from hermes_cli import admission as _ad
+
+        try:
+            self.running = int(running) if running is not None else None
+        except (TypeError, ValueError):
+            self.running = None
+        self.paused, self.reason, self.spilling = False, None, False
+        self.pending_ramp = 0.0
+        self._prune(now)
+        proc_hard = self.update_procs(procs, proc_limit)
+        self.remote_allowed = not proc_hard
+        if proc_hard:
+            self.state, self.allowance, self.last_reason = "proc_paused", 0, proc_hard
+            self.band, self.spill_reason = "proc_paused", None
+            self.pool = {"planned": False, "reason": "proc_paused"}
+            return 0, proc_hard
+        ctx = utilization_context()
+        sample = {"host": ctx["host"], "os": _os_name(), "at": now, "ncpu": self.ncpu, "cpu_busy": self.cpu_busy,
+                  "mem_available_gb": ctx["mem_available_gb"], "mem_total_gb": ctx["mem_total_gb"],
+                  "procs": self.procs, "maxproc": self.proc_limit, **sample_psi()}
+        leases = [_ad.Lease(host=ctx["host"], job_class=UTIL_CLASS, need=ctx["need"], at=ts)
+                  for ts, n in self._ramp for _ in range(int(n))]
+        allowance, verdict = 0, None
+        # the worker slice's own memory cap (Linux kanbanw.slice; None elsewhere = host axis only, Prism 616c5f0203bd)
+        slice_mem = _ad.read_slice_memory(classes=(UTIL_CLASS,))
+        for _ in range(self.max_spawn_per_tick):
+            v = _ad.admit(sample, ctx["need"], leases, host=ctx["host"], limits=ctx["limits"], slice_mem=slice_mem)
+            if not v.ok:
+                verdict = v
+                break
+            allowance += 1
+            leases.append(_ad.Lease(host=ctx["host"], job_class=UTIL_CLASS, need=ctx["need"], at=now))
+        ceiling, why = ctx["ceiling"], None
+        if ceiling is not None and self.running is None:
+            # a CEILING on running workers with the count unknown fails closed (Prism 710b1c8865a5)
+            allowance, why = 0, f"ceiling: running count unknown under kanban ceiling {ceiling}"
+        elif ceiling is not None:
+            room = max(0, ceiling - self.running)
+            if room < allowance:
+                allowance = room
+                why = f"ceiling: {self.running} running of kanban ceiling {ceiling} ({ctx['ceiling_reason']})"
+        if allowance == 0 and why is None:
+            why = f"utilization: {verdict.reason} (binding {verdict.binding})" if verdict else "utilization: no room"
+        self.util = {"host": ctx["host"], "need": {"cpus": ctx["need"].cpus, "ram_gb": ctx["need"].ram_gb,
+                                                   "source": ctx["need"].source},
+                     "ceiling": ceiling, "leases": len(leases) - allowance,
+                     "binding": verdict.binding if verdict else None,
+                     "free": {k: round(float(x), 3) for k, x in (verdict.free if verdict else {}).items()}}
+        self.allowance = allowance
+        if allowance == 0:
+            self.state, self.last_reason = "saturated", why
+            self.band, self.spill_reason = "spilling", "utilization"
+            return 0, why
+        self.state, self.last_reason = "admitting", None
+        self.band, self.spill_reason = "admitting", None
         return allowance, None
 
     def _mark_unreadable(self) -> None:
@@ -627,6 +752,7 @@ class LoadGate:
                 f"spilling ({self.spill_reason}): projected load1={projected:.1f} vs "
                 f"spill_above={self.spill_above:.1f}, cpu_busy={cpu} vs "
                 f"cpu_pause={self.cpu_pause:.2f} leave no local worker"
+                + (f"; {self._ecore_reason()}" if self._ecore_blocks() else "")
             )
             return 0, self.last_reason
         self.state, self.last_reason = "admitting", None
@@ -668,7 +794,29 @@ class LoadGate:
         if headroom > 0:
             allowance = int(math.floor(headroom / self.worker_cpu_cost))
             allowance = max(allowance, self._empty_host_floor(now))
-        return max(0, min(allowance, self.max_spawn_per_tick)), pending_cpu
+        allowance = max(0, min(allowance, self.max_spawn_per_tick))
+        if allowance and self._ecore_saturated():
+            # t_a7978f86: the mean hides a saturated E-core band. report: count only; on: no headroom.
+            self.ecore_would_refuse = max(self.ecore_would_refuse, allowance)
+            if self.ecore_gate == "on":
+                allowance = 0
+        return allowance, pending_cpu
+
+    def _ecore_saturated(self) -> bool:
+        return (
+            self.ecore_gate != "off"
+            and self.ecore_busy is not None
+            and self.ecore_busy >= self.ecore_busy_pause
+        )
+
+    def _ecore_blocks(self) -> bool:
+        return self.ecore_gate == "on" and self.ecore_would_refuse > 0
+
+    def _ecore_reason(self) -> str:
+        return (
+            f"but ecore_busy={self.ecore_busy:.2f} >= ecore_busy_pause="
+            f"{self.ecore_busy_pause:.2f} (E-core band saturated; no local headroom)"
+        )
 
     def record_spawns(self, n: int, now: Optional[float] = None) -> None:
         """Book ``n`` workers actually spawned this tick into the ramp window."""
@@ -698,11 +846,19 @@ class LoadGate:
             if self.enabled:
                 self._mark_unreadable()
             return None, None
+        if self.admission == "utilization" and self._cpu_prev is None:
+            cpu_block = max(cpu_block, 0.25)     # the predicate refuses on an unmeasured cpu_busy
         busy, self._cpu_prev = sample_cpu_busy(self._cpu_prev, block=cpu_block)
         procs, proc_limit = sample_user_procs() if self.enabled else (None, None)
+        ecore = None
+        if self.enabled and self.ecore_gate != "off":
+            if self._ecore_cpus is None:
+                self._ecore_cpus = ecore_cpu_indices()
+            ecore, self._ecore_prev = sample_ecore_busy(
+                self._ecore_cpus, self._ecore_prev, block=cpu_block)
         return self.admit(
             load1, load5=load5, running=running, cpu_busy=busy,
-            procs=procs, proc_limit=proc_limit,
+            procs=procs, proc_limit=proc_limit, ecore_busy=ecore,
         )
 
     def finish_tick(self, spawned: int, logger=None, path=None) -> None:
@@ -749,6 +905,10 @@ class LoadGate:
             "running": self.running,
             "cpu_busy": None if self.cpu_busy is None else round(self.cpu_busy, 3),
             "cpu_busy_pause": self.cpu_busy_pause,
+            "ecore_gate": self.ecore_gate,
+            "ecore_busy": None if self.ecore_busy is None else round(self.ecore_busy, 3),
+            "ecore_busy_pause": self.ecore_busy_pause,
+            "ecore_would_refuse": self.ecore_would_refuse,
             "procs": self.procs,
             "proc_limit": self.proc_limit,
             "proc_pause_fraction": self.proc_pause_fraction,
@@ -765,6 +925,8 @@ class LoadGate:
             "cpu_pause": self.cpu_pause,
             "spill_keys_error": self.spill_keys_error,
             "pool": pool,
+            "admission": self.admission,
+            "util": self.util,
             "updated_at": now,
         }
 
@@ -798,6 +960,19 @@ class LoadGate:
                 self.spill_keys_error,
             )
             self._spill_warned_at = now
+        if self.ecore_would_refuse and (
+            self._ecore_reported_at is None
+            or now - self._ecore_reported_at >= SUMMARY_INTERVAL_SECONDS
+        ):
+            logger.warning(
+                "kanban load gate%s: ecore_busy=%.2f >= %.2f with cpu_busy=%s: %s %d local (%s)",
+                "" if self.ecore_gate == "on" else " (dry)", self.ecore_busy,
+                self.ecore_busy_pause,
+                "?" if self.cpu_busy is None else f"{self.cpu_busy:.2f}",
+                "refused" if self.ecore_gate == "on" else "would-refuse",
+                self.ecore_would_refuse, self._line(),
+            )
+            self._ecore_reported_at = now
         if self.state != self._last_logged_state:
             level = logger.warning if self.state == "paused" else logger.info
             if self.state == "proc_paused":
@@ -946,6 +1121,72 @@ def sample_cpu_busy(prev=None, block: float = 0.0):
     return min(1.0, max(0.0, 1.0 - idle / total)), cur
 
 
+def ecore_cpu_indices(sysctl=None, ncpu: Optional[int] = None) -> "tuple[int, ...]":
+    """Logical cpu indices of the efficiency cores, or () when the host has none.
+
+    Apple silicon lists each die's E-cores first (M3 Ultra, 2 dies x 16: 0-3
+    and 16-19). An Ultra is two dies behind one package (``hw.packages`` says
+    1), so the die count comes from ``machdep.cpu.brand_string``, never from
+    the core count (M1 Ultra 20, M2 Ultra 24, M3 Ultra 32). Verified live on
+    the Studio 2026-10-18: cpus 0-3 and 16-19 at 100% while the P-cores sat
+    at 9-76%.
+    """
+    import sys
+
+    if sysctl is None:
+        if sys.platform != "darwin":
+            return ()
+
+        def sysctl(name):
+            import subprocess
+
+            return subprocess.run(["sysctl", "-n", name], capture_output=True,
+                                  text=True, timeout=5).stdout.strip()
+    try:
+        e_n = int(sysctl("hw.perflevel1.logicalcpu") or 0)
+        dies = max(1, int(sysctl("hw.packages") or 1))
+        brand = str(sysctl("machdep.cpu.brand_string") or "")
+    except Exception:
+        return ()
+    n = int(ncpu or os.cpu_count() or 0)
+    if not e_n or e_n >= n:
+        return ()
+    if dies == 1 and "ultra" in brand.lower():
+        dies = 2  # Ultra: two dies behind one package
+    if n % dies or e_n % dies:
+        dies = 1
+    per, e_per = n // dies, e_n // dies
+    return tuple(d * per + i for d in range(dies) for i in range(e_per))
+
+
+def sample_ecore_busy(cpus, prev=None, block: float = 0.0):
+    """``(busy_fraction | None, snapshot)``: mean busy of ``cpus`` from per-cpu
+    ``psutil.cpu_times`` deltas. None with no E-cores, no psutil or no delta."""
+    if not cpus:
+        return None, None
+    try:
+        import psutil
+    except Exception:
+        return None, None
+    try:
+        cur = psutil.cpu_times(percpu=True)
+        if prev is None and block > 0:
+            prev = cur
+            time.sleep(block)
+            cur = psutil.cpu_times(percpu=True)
+    except Exception:
+        return None, prev
+    if prev is None or len(prev) != len(cur) or max(cpus) >= len(cur):
+        return None, cur
+    total = idle = 0.0
+    for i in cpus:
+        total += sum(cur[i]) - sum(prev[i])
+        idle += cur[i].idle - prev[i].idle
+    if total <= 0:
+        return None, cur
+    return min(1.0, max(0.0, 1.0 - idle / total)), cur
+
+
 def sample_user_procs() -> "tuple[Optional[int], Optional[int]]":
     """(this uid's process count, its process limit) or None for either.
 
@@ -1008,6 +1249,74 @@ def count_running_workers() -> "Optional[int]":
         return None
 
 
+def admission_mode(value: Any) -> str:
+    """``kanban.admission``: "utilization" or "legacy" (absent / anything else)."""
+    v = value.strip().lower() if isinstance(value, str) else ""
+    return v if v in ADMISSION_MODES else "legacy"
+
+
+def _os_name() -> str:
+    import sys
+
+    return "darwin" if sys.platform == "darwin" else ("linux" if sys.platform.startswith("linux") else sys.platform)
+
+
+def sample_psi(root: str = "/proc/pressure") -> dict:
+    """PSI ``some avg10`` for cpu / memory / io as ``psi_<x>_some10`` (Linux). An unreadable file is left out, so
+    admission.admit() refuses it as unmeasured rather than reading 0; darwin has no /proc/pressure and admit()
+    exempts those axes there (Prism 8952c3f1bbe9 / 616c5f0203bd)."""
+    out: dict = {}
+    for res, key in (("cpu", "psi_cpu_some10"), ("memory", "psi_mem_some10"), ("io", "psi_io_some10")):
+        try:
+            with open(os.path.join(root, res), encoding="utf-8") as fh:
+                for ln in fh:
+                    if ln.startswith("some "):
+                        out[key] = float(dict(kv.split("=", 1) for kv in ln.split()[1:])["avg10"])
+                        break
+        except (OSError, ValueError, KeyError):
+            continue
+    return out
+
+
+def utilization_context() -> dict:
+    """This host's inputs for the utilization path: its row of the placement
+    table (via the ``local`` alias), the kanban ceiling + reason, memory from
+    psutil, and the measured estimate for a kanban worker here."""
+    from hermes_cli import admission as _ad
+    from hermes_cli import placement as _pl
+
+    host, spec, ceiling, reason, prior = "local", None, None, "", _ad.Estimate(cpus=1.0, ram_gb=3.0)
+    try:
+        table = _pl.load_hosts()
+        hid = table.resolve(UTIL_HOST_ALIAS)
+        if hid:
+            host, spec = hid, table.hosts[hid]
+            ceiling = spec.slots_for("kanban")
+            reason = str(((json.loads(table.path.read_text(encoding="utf-8"))["hosts"][hid].get("consumers") or {})
+                          .get("kanban") or {}).get("_ceiling_reason") or "")
+        prior = _pl.need_of(table.footprint("kanban"))
+    except Exception as exc:  # no table = no ceiling, the prior footprint; never a crash in the tick
+        _log.debug("kanban load gate: placement table unavailable: %s", exc)
+    try:
+        hist = _ad.read_history(_pl.class_usage_path(), since=time.time() - _pl.CLASS_USAGE_WINDOW_S)
+    except Exception:
+        hist = []
+    need = _ad.estimate(UTIL_CLASS, host, hist, prior=prior)
+    avail = total = None
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        avail, total = vm.available / 2 ** 30, vm.total / 2 ** 30
+    except Exception:
+        pass
+    limits = _ad.Limits(mem_reserve_gb=spec.mem_reserve_gb if spec else 0.0,
+                        cpu_saturable=bool(spec.cpu_saturable) if spec else False,
+                        unmeasurable=tuple(a for a in (spec.unmeasurable_axes if spec else ()) if a.startswith("psi_")))
+    return {"host": host, "ceiling": ceiling, "ceiling_reason": reason or "no reason recorded", "need": need,
+            "limits": limits, "mem_available_gb": avail, "mem_total_gb": total}
+
+
 def gate_from_config(config: Optional[dict] = None) -> LoadGate:
     """Build the gate from ``kanban.dispatch_load_gate`` in config.yaml."""
     if config is None:
@@ -1019,7 +1328,9 @@ def gate_from_config(config: Optional[dict] = None) -> LoadGate:
             config = {}
     kanban_cfg = (config or {}).get("kanban") if isinstance(config, dict) else None
     kanban_cfg = kanban_cfg if isinstance(kanban_cfg, dict) else {}
-    return LoadGate(kanban_cfg.get("dispatch_load_gate"), os.cpu_count() or 1)
+    gate = LoadGate(kanban_cfg.get("dispatch_load_gate"), os.cpu_count() or 1)
+    gate.admission = admission_mode(kanban_cfg.get("admission"))
+    return gate
 
 
 def state_path() -> Path:

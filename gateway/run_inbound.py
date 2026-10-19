@@ -1079,29 +1079,21 @@ class GatewayInboundMixin:
         # normal dispatch so it runs as an agent turn (the /moa event.text-rewrite pattern). The skill
         # tells the agent to delegate_task(inherit_context=true, ...) with the autonomous-execution
         # contract; the child's summary re-enters this session asynchronously when it finishes.
-        boomerang_task = event.get_command_args().strip()
+        from hermes_cli.boomerang_command import USAGE, build_boomerang_seed, parse_boomerang_args
+        try:
+            mode, boomerang_task = parse_boomerang_args(event.get_command_args())
+        except ValueError as _boom_arg_exc:
+            return True, str(_boom_arg_exc)
         if not boomerang_task:
-            return True, (
-                "Usage: /boomerang <task>\n"
-                "Runs the task autonomously in an isolated subagent that inherits this session's "
-                "context; a summary returns here when it finishes."
-            )
+            return True, USAGE
         try:
             from agent.skill_commands import build_skill_invocation_message, resolve_skill_command_key
             cmd_key = resolve_skill_command_key("boomerang")
-            msg = build_skill_invocation_message(cmd_key, boomerang_task) if cmd_key else None
-            if not msg:
-                # Skill not installed — degrade to an inline instruction so the feature still works.
-                msg = (
-                    f"Boomerang this task: {boomerang_task}\n\n"
-                    "Use delegate_task with inherit_context=true so the subagent inherits this "
-                    "conversation's context. Instruct it to execute autonomously (make reasonable "
-                    "assumptions, do NOT stop to ask; if blocked, complete what you can and report the "
-                    "blocker), and to end with a structured summary (Outcome / Changed / "
-                    "Commands+validation / Blockers). Its summary will re-enter this session when it "
-                    "finishes — acknowledge the dispatch and continue."
-                )
-            event.text = msg
+            # Skill not installed -> build_boomerang_seed degrades to an inline instruction.
+            event.text = build_boomerang_seed(
+                mode, boomerang_task,
+                lambda instr: build_skill_invocation_message(cmd_key, instr) if cmd_key else None,
+            )
         except Exception as _boom_exc:
             logger.warning("boomerang command rewrite failed: %s", _boom_exc)
             return True, "Failed to prepare the boomerang turn."

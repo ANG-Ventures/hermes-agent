@@ -113,8 +113,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Session", aliases=("fork",), args_hint="[--here] [--fresh] [name]"),
     CommandDef("merge", "Merge a summary of this session into another session (branched thread, or a named session)", "Session",
                gateway_only=True, args_hint="[name]"),
-    CommandDef("boomerang", "Run a task autonomously in an isolated subagent that inherits this "
-               "session's context; a summary returns here when it finishes", "Session",
+    # Description stays <= 100 chars (Discord/Telegram menu cap); full flag usage prints on bare /boomerang.
+    CommandDef("boomerang", "Run a task in a subagent inheriting this session (fork; --summary folds); "
+               "summary returns here", "Session",
                args_hint="<task>"),
     CommandDef("autohandle", "Auto-handle mechanical kanban wakes for cards homed in this session "
                "(on/off/status)", "Session", gateway_only=True, busy_policy="dispatch",
@@ -133,7 +134,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="[profile] [-o output.tar.gz]"),
     CommandDef("import", "Import a shared profile archive as a new profile", "Configuration",
                cli_only=True, args_hint="<archive.tar.gz> [--name <name>]"),
-    CommandDef("stop", "Kill all running background processes", "Session",
+    CommandDef("stop", "Kill all running background processes", "Session", aliases=("s",),
                busy_policy="interrupt_then_dispatch", busy_handler="stop"),
     CommandDef("pause", "Pause new work globally (emergency stop); '/pause off' resumes", "Session",
                gateway_only=True, args_hint="[reason | off]", busy_policy="dispatch"),
@@ -157,7 +158,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("list", "edit", "rm", "move", "clear", "run", "add", "help"),
                busy_policy="dispatch", busy_handler="queue"),
     CommandDef("steer", "Inject a message after the next tool call without interrupting", "Session",
-               aliases=("s",), args_hint="<prompt>", busy_policy="dispatch", busy_handler="steer"),
+               aliases=("st",), args_hint="<prompt>", busy_policy="dispatch", busy_handler="steer"),
     CommandDef("goal", "Set a standing goal Hermes works on across turns until achieved", "Session",
                args_hint="[text | draft <text> | show | gate add <cmd> | pause | resume | clear | status | wait <pid> | unwait]",
                argument_mode="mixed", busy_policy="dispatch", busy_handler="goal"),
@@ -201,7 +202,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True, desktop="terminal"),
-    CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
+    CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration", aliases=("m",),
                args_hint="[model] [--provider name] [--reasoning level] [--global|--session] [--refresh]",
                busy_policy="reject", busy_handler="model", desktop="hidden"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
@@ -234,7 +235,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("approvals", "Show or set the persistent dangerous-command approval mode",
                "Configuration", args_hint="[manual|smart|off]",
                subcommands=("manual", "smart", "off")),
-    CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
+    CommandDef("reasoning", "Manage reasoning effort and display", "Configuration", aliases=("r",),
                args_hint="[level|show|hide|full|clamp] [--global]",
                subcommands=("none", *VALID_REASONING_EFFORTS, "show", "hide", "on", "off", "full", "clamp", "--global")),
     CommandDef("fast", "Fast mode — OpenAI Priority Processing / Anthropic Fast Mode (normal/fast/auto/cold)", "Configuration",

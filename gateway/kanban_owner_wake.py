@@ -677,6 +677,44 @@ def actionable_red_items(card: dict, items: list[dict], status: Optional[str],
     return keep
 
 
+def is_review_lease_lapse(item: dict) -> bool:
+    """A ``reclaimed`` of an operator ``claim --review`` lease that ran out (no worker pid, and the reclaimer's
+    ``dead_claimer_release_basis`` is ``operator_claim_no_worker``; a NULL pid alone can be a failed reviewer launch).
+    No worker existed, so nothing is stuck; its ``heartbeat_stale`` is the implementer run's old heartbeat
+    (2026-10-13: every one of the 8 ``stuck (reclaimed)`` wakes 07:00-08:30 was this shape)."""
+    p = item.get("payload") or {}
+    return (item.get("kind") == "reclaimed" and p.get("retry_status") == "review"
+            and "worker_pid" in p and p.get("worker_pid") is None
+            and p.get("dead_claimer_release_basis") == "operator_claim_no_worker")
+
+
+def terminal_pending_items(kb: Any, card: dict, items: list[dict], status: Optional[str]) -> list[dict]:
+    """t_26ebe71a: ``stuck`` items (gave_up / reclaimed / ...) of a review card approved at its PR head with a land
+    in flight there are withheld with a ``terminal-pending`` receipt; the lander owns the card, not the owner.
+    A pid-less review-claim lapse is withheld with a ``review-lease-lapse`` receipt. Blocking; worker thread."""
+    from hermes_cli import kanban_terminal_pending as _tp
+
+    lapses = [i for i in items if i.get("trigger") == TRIGGER_STUCK and is_review_lease_lapse(i)]
+    if lapses:
+        unrecorded = _record_noise(card, lapses, _tp.REASON_LEASE_LAPSE)
+        items = [i for i in items if not any(i is x for x in lapses)] + unrecorded
+    stuck = [i for i in items if i.get("trigger") == TRIGGER_STUCK]
+    if not stuck or status not in ("review", "running"):
+        return items
+    try:
+        conn = kb.connect_readonly(board=card["board"])
+    except Exception:
+        return items
+    try:
+        pending = _tp.terminal_pending(conn, card["task_id"])
+    finally:
+        conn.close()
+    if pending is None:
+        return items
+    unrecorded = _record_noise(card, stuck, _tp.REASON)
+    return [i for i in items if i.get("trigger") != TRIGGER_STUCK] + unrecorded
+
+
 def resolve_settings() -> tuple[bool, tuple[str, ...]]:
     """(``kanban.wake_owner_session``, ``kanban.wake_owner_profiles``). Errors -> defaults."""
     try:
@@ -1094,6 +1132,9 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         pr_health = default_pr_health()
     await asyncio.to_thread(scan, state, now, pr_health)
 
+    from gateway import kanban_auto_handle as _ah
+
+    auto_on = _ah.enabled()
     store = getattr(runner, "session_store", None)
     by_session: dict[str, tuple[Any, list[tuple[str, dict]]]] = {}
     for key, card in list(state.pending.items()):
@@ -1180,6 +1221,17 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             if suppress_cfgs[owner_profile].actionable_only:
                 items = await asyncio.to_thread(
                     actionable_red_items, card, items, current.get("status"), state.red_seen)
+        if items and any(i.get("trigger") == TRIGGER_STUCK for i in items):
+            if owner_profile not in suppress_cfgs:
+                suppress_cfgs[owner_profile] = await asyncio.to_thread(
+                    _ns.resolve_config, _owner_home(runner, entry, owner_profile))
+            # Same kill switch as the notifier's terminal-pending branch (``_s5``).
+            if suppress_cfgs[owner_profile].enabled and suppress_cfgs[owner_profile].actionable_only:
+                items = await asyncio.to_thread(terminal_pending_items, kb, card, items, current.get("status"))
+        # Boomerang v2 P3b (spec §5.5), AFTER the suppressor: an auto-handled item is a
+        # child's, not a turn; one the notifier already claimed is skipped here.
+        if items:
+            items = await _ah.owner_wake_filter(runner, card, items, entry, dispatch_on=auto_on)
         if not items:
             state.pending.pop(key, None)
             continue
