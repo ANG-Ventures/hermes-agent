@@ -133,6 +133,12 @@ def _carry(agent: Any, attr: Dict[str, Optional[str]]) -> None:
     carry = getattr(agent, "_failover_carry", None)
     if not isinstance(carry, dict) or carry.get("lane") != lane:
         carry = {"lane": lane}   # another lane's seat is not this lane's
+    for key in ("seat", "route_id"):
+        if attr.get(key) and carry.get(key) and attr[key] != carry[key]:
+            # A different seat/route answered: the old one's window/route is not
+            # this answer's (Prism e20f57909f40).
+            carry = {"lane": lane}
+            break
     for k, v in attr.items():
         if v:
             carry[k] = v

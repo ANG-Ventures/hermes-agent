@@ -153,6 +153,19 @@ def test_timer_cut_carries_the_last_relay_headers():
     assert row["seat"] == "sub-vps-10" and row["route_id"] == ROUTE and row["quota_window"] == "5h"
 
 
+def test_a_different_seat_drops_the_old_seats_window_and_route():
+    """Prism e20f57909f40: seat A said 5h; seat B (no window, no route) must not
+    inherit A's window or route."""
+    a = _agent()
+    fbe.stash_api_error(a, _live_429(), 429, None)
+    fbe.stash_api_error(a, RelayError(429, {"type": "error", "error": {
+        "type": "rate_limit_error", "message": ANTHROPIC_RATE_TEXT}},
+        {"x-relay-error-class": "rate_upstream", "x-relay-seat": "sub-vps-11"}), 429, None)
+    carry = a._failover_carry
+    assert carry["seat"] == "sub-vps-11"
+    assert "quota_window" not in carry and "route_id" not in carry, carry
+
+
 def test_no_rendered_banner_says_unknown_when_the_seat_header_was_present():
     """Every pooled shape: x-relay-seat present -> the banner names it."""
     shapes = [
