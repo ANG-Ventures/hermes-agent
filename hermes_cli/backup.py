@@ -185,6 +185,10 @@ _EXCLUDED_ROOT_PATH_GLOBS = (
     ("runtime", "hermes-agent"),           # deploy checkout of the fork, advanced by fleet/deploy.sh
     ("kanban", "workspaces-aside"),         # parked kanban scratch workspaces (same class as workspaces/)
     ("state", "test-gate", "cache"),        # test-gate PASS cache, keyed by tree hash
+    # 2026-10-18 (Apollo ruling, t_5bea54fb): 420.6 GiB of sub-VPS failure evidence, 59 % of the post-fix full. Its
+    # off-box copy is the weekly forensics lane (forensics-weekly-archive.sh -> NAS tank/backups/forensics,
+    # forensics-archive-deadman.py), not this zip tier.
+    ("forensics-archive",),                 # carried by the weekly forensics -> NAS lane
 )
 
 # Root-level rollback copies of a DB (`kanban.db.bak-notify-sweep-<ts>`, `state.db.bak-<tag>`, ...). Pre-change
@@ -968,6 +972,43 @@ def run_backup(args) -> bool:
         raise SystemExit(2) from exc
 
 
+def _census_gate(files_to_add, census_out: str, gate_cmd: Optional[str]) -> None:
+    """Write the would-carry census of THIS scan and let an external gate refuse the run before the zip opens.
+
+    t_5bea54fb: the fleet runner's growth tripwire used to walk the tree itself and then let this command walk it
+    again (>15 min each at load ~220). Reusing the scan's own list makes it one walk. Census shape (consumed by
+    fleet-backup-rehome scripts/lib/full-tier-preflight.py --census-json): {"files", "bytes", "dirs":
+    {"<dir, depth <= 2>": [files, bytes]}, "at"}. The gate is a command line run with no shell; its exit status
+    is propagated as this command's exit status when nonzero (75 = refused, EX_TEMPFAIL), and no archive is made.
+    """
+    dirs: dict = {}
+    files = size = 0
+    for abs_path, rel in files_to_add:
+        try:
+            st = os.lstat(abs_path)
+        except OSError:
+            continue
+        files += 1
+        size += st.st_size
+        parts = Path(rel).parts[:-1]
+        for d in range(0, min(2, len(parts)) + 1):
+            acc = dirs.setdefault("/".join(parts[:d]) or ".", [0, 0])
+            acc[0] += 1
+            acc[1] += st.st_size
+    tmp = f"{census_out}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"files": files, "bytes": size, "dirs": dirs, "at": int(time.time())}, f)
+    os.replace(tmp, census_out)
+    print(f"Census: {files} files, {size} bytes -> {census_out}")
+    if not gate_cmd:
+        return
+    import shlex
+    rc = subprocess.run(shlex.split(gate_cmd), check=False).returncode
+    if rc != 0:
+        print(f"Census gate refused the backup (exit {rc}); no archive written.")
+        raise SystemExit(rc)
+
+
 def _run_backup_locked(args, hermes_root: Path) -> bool:
     """Write a full backup while the cross-process backup slot is held."""
     out_path = _resolve_backup_output_path(args.output)
@@ -985,6 +1026,8 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
     file_count = len(files_to_add) + len(external_to_add)
     logger.info("backup phase=scan status=complete duration_ms=%.1f files=%d",
                 (time.monotonic() - scan_started) * 1000, file_count)
+    if getattr(args, "census_out", None):
+        _census_gate(files_to_add, args.census_out, getattr(args, "census_gate", None))
     logger.info("backup phase=archive status=started files=%d", file_count)
     print(f"Backing up {file_count} files ...")
     errors = []
