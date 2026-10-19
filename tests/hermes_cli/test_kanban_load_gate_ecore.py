@@ -105,3 +105,39 @@ def test_sample_ecore_busy_reads_only_the_ecore_deltas(monkeypatch):
     busy, _ = klg.sample_ecore_busy((0, 2), prev)
     assert abs(busy - 0.75) < 1e-9          # cpu0 100% + cpu2 50%; idle cpu1 ignored
     assert klg.sample_ecore_busy((), None) == (None, None)
+
+
+def test_yaml_bare_on_off_bools_map_to_modes():
+    """Prism 3d10a4bc87be: YAML 1.1 parses a bare `on`/`off` as True/False; they must not fall back to report."""
+    from hermes_cli import kanban_load_gate as klg
+    for raw, want in ((True, "on"), (False, "off"), ("on", "on"), ("OFF", "off"), ("bogus", "report")):
+        g = klg.LoadGate({"enabled": True, "ecore_gate": raw}, 32)
+        assert g.ecore_gate == want, (raw, g.ecore_gate)
+
+
+def test_one_shot_dispatch_admission_samples_the_ecores(monkeypatch):
+    """Prism 3b7cbf596c2e: `hermes kanban dispatch` (one-shot admission) feeds the E-core sample to admit(), so
+    ecore_gate=on refuses there too instead of seeing no sample."""
+    import sqlite3, types
+    from hermes_cli import kanban_load_gate as klg
+    from hermes_cli import kanban_ops
+    seen = {}
+    real_admit = klg.LoadGate.admit
+
+    def spy(self, *a, **kw):
+        seen["ecore_busy"] = kw.get("ecore_busy")
+        return real_admit(self, *a, **kw)
+
+    monkeypatch.setattr(klg.LoadGate, "admit", spy)
+    monkeypatch.setattr(klg, "ecore_cpu_indices", lambda: (0, 1))
+    monkeypatch.setattr(klg, "sample_ecore_busy", lambda cpus, prev=None, block=0.0: (0.99, None))
+    monkeypatch.setattr(klg, "sample_loadavg", lambda: (1.0, 1.0))
+    monkeypatch.setattr(klg, "sample_cpu_busy", lambda prev=None, block=0.0: (0.10, None))
+    monkeypatch.setattr(klg, "sample_user_procs", lambda: (None, None))
+    monkeypatch.setattr(klg, "count_running_workers", lambda: 0)
+    conn = sqlite3.connect(":memory:")
+    conn.execute("create table task_runs (started_at integer)")
+    cfg = {"kanban": {"dispatch_load_gate": {"enabled": True, "ecore_gate": "on"}}}
+    out = kanban_ops._one_shot_load_gate(conn, types.SimpleNamespace(json=True), cfg, None)
+    assert out.get("gate") is not None and out["gate"].enabled, out
+    assert seen.get("ecore_busy") == 0.99, seen

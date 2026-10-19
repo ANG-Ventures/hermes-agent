@@ -240,7 +240,9 @@ class LoadGate:
         self.worker_cpu_cost = _num(
             cfg.get("worker_cpu_cost"), DEFAULT_WORKER_CPU_COST
         )
-        mode = str(cfg.get("ecore_gate", DEFAULT_ECORE_GATE)).strip().lower()
+        raw = cfg.get("ecore_gate", DEFAULT_ECORE_GATE)
+        # YAML 1.1 reads a bare `on` / `off` as True / False (Prism 3d10a4bc87be): map the bool back to the mode
+        mode = ("on" if raw else "off") if isinstance(raw, bool) else str(raw).strip().lower()
         self.ecore_gate = mode if mode in ECORE_GATE_MODES else DEFAULT_ECORE_GATE
         eb = _num(cfg.get("ecore_busy_pause"), DEFAULT_ECORE_BUSY_PAUSE)
         self.ecore_busy_pause = eb if 0.0 < eb <= 1.0 else DEFAULT_ECORE_BUSY_PAUSE
