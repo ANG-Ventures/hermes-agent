@@ -61,7 +61,8 @@ async def _drive_progress(monkeypatch, items, header, grouping="grouped"):
     for item in items:
         q.put(item)
     ctx = TurnContext(source=SimpleNamespace(chat_id="c", platform=Platform.TELEGRAM), progress_queue=q,
-                      _run_still_current=lambda: True, progress_grouping=grouping, wake_progress_header=header)
+                      _run_still_current=lambda: True, progress_grouping=grouping)
+    ctx.wake_progress_header = header
     runner = SimpleNamespace(_delivery_adapter_for=lambda source: adapter)
     task = asyncio.create_task(TurnRunner(runner, ctx).send_progress_messages())
     for _ in range(100):  # drain the queue, then let the last send/typing tick settle
@@ -111,8 +112,8 @@ async def test_overflow_first_group_keeps_header(monkeypatch):
     from gateway.run_turn_runner import TurnRunner
     from tests.gateway.test_run_progress_topics import SmallLimitProgressAdapter
 
-    ctx = TurnContext(source=SimpleNamespace(chat_id="c", platform=Platform.TELEGRAM),
-                      wake_progress_header="🔔 wake · kanban wake")
+    ctx = TurnContext(source=SimpleNamespace(chat_id="c", platform=Platform.TELEGRAM))
+    ctx.wake_progress_header = "🔔 wake · kanban wake"
     adapter = SmallLimitProgressAdapter()
     tr = TurnRunner(SimpleNamespace(), ctx)
     st = tr._progress_edit_state(adapter)
@@ -169,8 +170,8 @@ async def test_heartbeat_text_opens_with_header(monkeypatch, header):
     disp = MagicMock()
     disp._display_surface_mode.return_value = "on"
     disp.resolve_display_setting.return_value = False
-    ctx = TurnContext(source=SimpleNamespace(chat_id="c", platform="telegram"), session_key="sess",
-                      wake_progress_header=header)
+    ctx = TurnContext(source=SimpleNamespace(chat_id="c", platform="telegram"), session_key="sess")
+    ctx.wake_progress_header = header
     ctx.agent_holder[0] = agent
     await asyncio.wait_for(runner._run_agent_notify_long_running(disp, ctx, [None]), 5)
     assert len(sends) == 1
