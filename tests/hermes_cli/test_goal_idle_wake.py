@@ -43,7 +43,39 @@ def test_process_park_is_left_to_the_completion_turn_until_the_age_cap(hermes_ho
     assert mgr.idle_wake_prompt(since + goals._MAX_BARRIER_WAIT_S - 1) is None
     prompt = mgr.idle_wake_prompt(since + goals._MAX_BARRIER_WAIT_S + 1)
     assert prompt and "ship it" in prompt
+    assert prompt.startswith(goals.GOAL_CHECKIN_PREFIX)           # the "check what's stuck" check-in
+    assert "session proc_x" in prompt and "watcher" in prompt
     assert mgr.state.waiting_on_session is None
+    assert mgr.state.idle_wakes == 1                              # counts against the cap
+
+
+def test_stuck_process_rechecks_back_off_and_cap(hermes_home):
+    mgr = _goal("stuck")
+    m = 60
+    t = time.time()
+    for n, gap in ((1, 30), (2, 60), (3, 120)):
+        mgr._park("build", waiting_on_pid=999999)
+        mgr.state.waiting_since = t
+        mgr._save()
+        assert mgr.idle_wake_prompt(t + (gap - 1) * m) is None
+        prompt = mgr.idle_wake_prompt(t + gap * m)
+        assert prompt and f"{n}/3" in prompt
+        t += gap * m
+    mgr._park("build", waiting_on_pid=999999)
+    mgr.state.waiting_since = t
+    mgr._save()
+    assert mgr.idle_wake_prompt(t + 240 * m) is None              # capped until a real event (inside the 6 h horizon)
+
+
+def test_per_goal_checkin_minutes_overrides_and_disables(hermes_home):
+    mgr = _goal("per-goal")
+    t0 = mgr.state.last_turn_at = time.time()
+    mgr.set_checkin_minutes(10)
+    assert goals.load_goal("per-goal").checkin_minutes == 10      # persisted
+    assert mgr.idle_wake_prompt(t0 + 9 * 60, checkin_minutes=30) is None
+    assert mgr.idle_wake_prompt(t0 + 10 * 60, checkin_minutes=30)
+    mgr.set_checkin_minutes(0)
+    assert mgr.idle_wake_prompt(t0 + 10 * 3600, checkin_minutes=30) is None
 
 
 def test_quiet_goal_checkins_back_off_and_cap_until_a_real_event(hermes_home):

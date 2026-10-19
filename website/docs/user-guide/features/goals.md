@@ -177,10 +177,11 @@ The barrier (pid- or time-based) is persisted with the goal in `SessionDB.state_
 
 Process exits and returned subagent results deliver their own turns, which resume the goal. Two cases have no such event, so the gateway polls for them every 15 seconds and, if the session is idle, starts the goal's next turn itself:
 
-- **A timed park whose deadline passed** (`wait_for_seconds`), or **a pid/session park older than 30 minutes**. The goal resumes with its normal continuation prompt.
+- **A timed park whose deadline passed** (`wait_for_seconds`). The goal resumes with its normal continuation prompt.
+- **Background work still running after the check-in interval** (a pid/session park): a check-in that names what the goal is waiting on and asks the agent to read its output, keep waiting if healthy, or fix/stop it if stuck (Claude Code's background-work check-in). Counted against the check-in cap below.
 - **A quiet active goal** (not parked, no continuation queued, e.g. after a judge error or a lost queue entry). The gateway sends a check-in after `goals.checkin_minutes` (30), then after 2x and 4x that interval, at most `goals.max_idle_checkins` (3) times between real events. A real event is any turn the goal loop did not start: a message from you, or a worker/process result. This mirrors Claude Code's `/goal` check-ins (30 min, doubling to 2 h, 3 idle check-ins).
 
-Goals idle for more than 6 hours are never woken. Set `goals.checkin_minutes: 0` to turn idle wakes off. The classic CLI has its own idle hook for parked goals.
+A goal can carry its own interval (`GoalManager.set_checkin_minutes(n)`; `0` = off for that goal), which overrides `goals.checkin_minutes`. Goals idle for more than 6 hours are never woken. Set `goals.checkin_minutes: 0` to turn idle wakes off. The classic CLI has its own idle hook for parked goals.
 
 ### No-progress stop
 
