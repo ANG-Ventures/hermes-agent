@@ -56,6 +56,32 @@ def lint_paths(repo: Path, manifest_path: Path) -> list[str]:
     return errors
 
 
+def lint_facade_siblings(repo: Path, manifest_path: Path) -> list[str]:
+    """A literal ``<stem>.py`` path whose code was split into ``<stem>_*.py`` siblings is a dead facade.
+
+    The canary lane's scoped mode skips a PR whose changed files match no ``paths`` pattern, so a row
+    that names only ``gateway/run.py`` lets a PR that edits ``gateway/run_shutdown.py`` skip the lane
+    (Prism d61fae171cd6). Every sibling that exists at HEAD must be matched by one of the entry's own
+    patterns; ``<stem>_*.py`` next to ``<stem>.py`` is the usual remedy.
+    """
+    errors: list[str] = []
+    for feature in forkdelta.load_manifest(manifest_path):
+        for pattern in feature.paths:
+            if not pattern.endswith(".py") or any(ch in pattern for ch in "*?["):
+                continue
+            stem = pattern[: -len(".py")]
+            siblings = sorted(
+                str(path.relative_to(repo)) for path in repo.glob(f"{stem}_*.py") if path.is_file()
+            )
+            uncovered = [s for s in siblings if not forkdelta.covered_path(s, [feature])]
+            if uncovered:
+                errors.append(
+                    f"path names a split facade: {pattern} for {feature.feature!r}; "
+                    f"siblings not covered: {', '.join(uncovered)} (add '{stem}_*.py' or list them)"
+                )
+    return errors
+
+
 def lint_schema(manifest_path: Path) -> list[str]:
     errors: list[str] = []
     expected = ", ".join(sorted(forkdelta.LIFECYCLES))
@@ -235,6 +261,7 @@ def lint_manifest(
     errors.extend(lint_census(manifest))
     errors.extend(lint_call_sites(manifest))
     errors.extend(lint_paths(repo, manifest))
+    errors.extend(lint_facade_siblings(repo, manifest))
     nodeids = forkdelta.manifest_nodeids(manifest)
     errors.extend(lint_nodeids(repo, nodeids))
     if base is not None and touched_paths is not None:
