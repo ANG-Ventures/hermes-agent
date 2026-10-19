@@ -27,6 +27,27 @@ timestamp) and show in the gate detail as "acknowledged".
 6. `python -m hermes_parity finish --worktree <worktree>`
 7. A human lands the PR with a merge commit.
 
+## canary-lane and parity-pr-check (the parity-merge gate)
+
+`python -m scripts.hermes_parity canary-lane [--group plain|ptb] [--changed-from <base>]`
+runs every nodeid registered in `docs/sync/fork-features.json`, one pytest process
+per test file, and reads each item's outcome. Passed or strict-xfailed = covered.
+Failed = RED. Skipped on this platform = RED (not covered; a skipped member of a
+file/class registration is a WARN while a sibling runs). Not collected = RED
+("repoint or record coverage_gap"). `*_ptb.py` nodeids need a real
+python-telegram-bot interpreter (`--ptb-python`, or `--group ptb` under one).
+With `--changed-from`/`--changed-file-list` it prints `not affected` and exits 0
+when the change touches no registry input, canary, registered test file or
+registered `paths` glob.
+
+`python -m scripts.hermes_parity parity-pr-check --base <fork main sha> --upstream <upstream ref>`
+is for a sync PR (`parity-classify` decides: `sync/upstream-*` / `parity-merge-*`
+heads, "parity sync" / "upstream sync" titles, > 1,000 commits). Every commit the
+branch itself authored whose subject says fix/restore/regress and that changes
+code outside `tests/` must touch a test file a registry entry names at the head,
+or carry `Canary-Exempt: <reason>` (printed, never silent). Both run in
+`.github/workflows/fork-canary-lane.yml`.
+
 ## status
 
 Fetches `origin` and `fork`, then prints branch, fork/upstream ahead-behind
