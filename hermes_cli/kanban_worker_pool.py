@@ -1425,6 +1425,10 @@ class TargetSignal:
     placement_live: Optional[Mapping[str, Any]] = None
     # kanban.placement.allocd (t_4187c8f1): off | shadow | on, read per tick.
     allocd: str = "off"
+    # kanban.admission (t_da6f84f7): "utilization" = the load_ratio band streak
+    # (placement-policy classes.linux-shared.kanban warm/hot) is reported, never
+    # a refusal: the placement scorer's admission.admit() is the one gate.
+    admission: str = "legacy"
 
     def kanban_cpu_est(self) -> float:
         if self.cpu_est is not None and self.cpu_est > 0:
@@ -2048,7 +2052,7 @@ def _plan_with_signal(hosts, running_by_host, *, probe, disabled, planned_at, co
         hot = bool(isinstance(st, Mapping) and st.get("hot")) and band not in (None, BAND_UNKNOWN)
         if band == BAND_UNKNOWN:
             free = 0
-        elif hot:
+        elif hot and signal.admission != "utilization":
             free = 0
             why = f"band hot (streak {policy.kanban_band(h.name).hot_streak}, {band} now)"
         else:
