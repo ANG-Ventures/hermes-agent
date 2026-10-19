@@ -29,7 +29,7 @@ from pathlib import Path
 import pytest
 
 from tests.hermes_cli.test_kanban_headroom_placement import (  # noqa: F401  (fixture)
-    TABLE, Fleet, _plan, home,
+    FAKE_PID, TABLE, Fleet, _plan, home,
 )
 from hermes_cli import alloc_client
 from hermes_cli import kanban_db as kb
@@ -431,7 +431,7 @@ def test_dispatch_on_marks_the_reservation_and_run_end_releases_through_alloc_cl
     plan.signal.allocd = kh.ALLOCD_ON
 
     def spawn(task, workspace, *, board=None, placement=None):
-        return 4242
+        return FAKE_PID
 
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="c", assignee="alpha")
@@ -513,7 +513,7 @@ def test_replacement_reservation_survives_a_restart(home, allocd, monkeypatch):
     rpath = home / placement.RESERVATIONS_REL
 
     def spawn(task, workspace, *, board=None, placement=None):
-        return 4242
+        return FAKE_PID
 
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="c", assignee="alpha")
@@ -564,7 +564,7 @@ def test_replacement_set_on_a_failed_renew_is_persisted(home, allocd, monkeypatc
     rpath = home / placement.RESERVATIONS_REL
 
     def spawn(task, workspace, *, board=None, placement=None):
-        return 4242
+        return FAKE_PID
 
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="c", assignee="alpha")
@@ -603,7 +603,7 @@ def test_dispatch_off_worker_placed_has_no_route_marker(home, monkeypatch):
     plan = _plan(home, Fleet(), now=time.time())
 
     def spawn(task, workspace, *, board=None, placement=None):
-        return 4242
+        return FAKE_PID
 
     try:
         with kb.connect_closing() as conn:
