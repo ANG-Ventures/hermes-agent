@@ -448,6 +448,8 @@ class GatewayGoalsMixin:
             session_key = self._session_key_for_source(source)
         if session_key and session_key in self._running_agents:
             return  # busy — stays due, next scan retries
+        if session_key and self._stop_latched(session_key):
+            return  # /stop latched: hold the tick (stays due) instead of firing it into the held queue
         if goal_blocks_loop_tick(sid):
             return
 
@@ -583,6 +585,13 @@ class GatewayGoalsMixin:
             except Exception as exc:
                 logger.debug("goal idle wake for %s failed: %s", entry.session_key, exc)
 
+    def _stop_latched(self, session_key: str) -> bool:
+        """True while the user's /stop holds automatic turns for this session (in-memory latch)."""
+        try:
+            return self._session_state(session_key).conversation.automatic_turns_paused is True
+        except Exception:
+            return False
+
     async def _goal_idle_wake_one(self, entry: Any, checkin_minutes: int, max_checkins: int) -> None:
         quick_key, session_id = entry.session_key, entry.session_id
         source = self._restored_source(entry)
@@ -597,6 +606,8 @@ class GatewayGoalsMixin:
             or self._queue_depth(quick_key, adapter=adapter) > 0
         ):
             return  # busy: the running turn's own post-turn judge owns the next step
+        if getattr(entry, "user_stopped_at", None) is not None or self._stop_latched(quick_key):
+            return  # /stop latched: only a human turn resumes automatic work
         with self._profile_scope_for_source(source):
             from hermes_cli.goals import GoalManager
 

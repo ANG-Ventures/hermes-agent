@@ -57,6 +57,9 @@ def rig(tmp_path, monkeypatch):
         return None
 
     runner._warm_goals_session_db = _warm
+    states = {}
+    runner._session_state = lambda k: states.setdefault(
+        k, SimpleNamespace(conversation=SimpleNamespace(automatic_turns_paused=None)))
     yield runner, adapter, received, key
     goals._DB_CACHE.clear()
 
@@ -108,4 +111,44 @@ async def test_checkins_off_in_config_disables_the_poller(rig):
     mgr.state.waiting_until = time.time() - 1
     mgr._save()
     await runner._goal_idle_wake_scan()
+    assert received == []
+
+
+def _due(sid="goal-sess"):
+    mgr = goals.GoalManager(sid)
+    mgr.set("g")
+    mgr.wait_for_seconds(1, reason="x")
+    mgr.state.waiting_until = time.time() - 1
+    mgr._save()
+    return mgr
+
+
+@pytest.mark.asyncio
+async def test_user_stop_latch_blocks_idle_wakes(rig):
+    """Ace's /stop (or "stop the goal") must hold: a latched session is never woken by the poller."""
+    runner, adapter, received, key = rig
+    _due()
+    runner._session_state(key).conversation.automatic_turns_paused = True
+    await runner._goal_idle_wake_scan()
+    assert received == []
+    runner._session_state(key).conversation.automatic_turns_paused = None
+    entry = runner.session_store.list_sessions()[0]
+    entry.user_stopped_at = time.time()                      # durable marker after a restart
+    await runner._goal_idle_wake_scan()
+    assert received == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ["clear", "pause", "done"])
+async def test_ended_goals_are_never_woken(rig, end):
+    """Goal reached, /goal pause, or /goal clear: the poller has nothing to resume."""
+    runner, adapter, received, key = rig
+    mgr = _due()
+    if end == "done":
+        mgr.state.status = "done"
+        mgr._save()
+    else:
+        getattr(mgr, end)()
+    await runner._goal_idle_wake_scan()
+    await _drain(adapter)
     assert received == []
