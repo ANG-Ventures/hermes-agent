@@ -512,8 +512,11 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
     if ctx is None:
         return Verdict()
     reqs, none = derive(body, skills, ctx.cmap)
-    if none:
-        reqs = [r for r in reqs if r.strength == HARD]   # F12: none overrides soft only
+    if none or any(r.matched_by == DECLARED for r in reqs):
+        # F12: ``none`` overrides soft only. Any explicit ``requires:`` line
+        # does too (t_6d9e7d90): the author named what the card needs, so a
+        # sniffed prose word ("docker compose", "SSH keys") no longer adds one.
+        reqs = [r for r in reqs if r.strength == HARD]
     # An identity-only capability is never "satisfied by every pool host" for
     # an unpinned card: the Studio must not take it as portable overflow even
     # when the whole pool advertises it (spec v0.3 §3.4).

@@ -412,6 +412,47 @@ async def anote_aux_http_response(response) -> None:
     note_aux_http_response(response)
 
 
+# Boomerang v2 P1 (spec D-3 / INV-3): the relay serves a request carrying this header
+# on the named seat or refuses it, never reroutes (claude_pool_relay ``_PIN_HEADER``).
+# Routing-only, stripped by the relay; only ever stamped on a pool-affinity lane.
+POOL_PIN_SUB_HEADER = "x-hermes-pin-sub"
+
+
+def note_main_turn_served_by(agent, provider, headers) -> None:
+    """Record the seat that served a successful MAIN-turn call on a pool lane.
+
+    ``agent.last_served_by`` / ``agent.last_served_at`` feed a fork child's
+    first-request pin. Non-pool lanes and absent/invalid seats leave both
+    fields untouched (the last known seat stays the parent's truth).
+    """
+    if provider not in _POOL_AFFINITY_PROVIDERS or not isinstance(headers, dict):
+        return
+    served_by = headers.get(_POOL_SERVED_BY_HEADER)
+    from agent.chat_completion_helpers import _POOL_SUB_KEY_RE
+
+    if not (isinstance(served_by, str) and _POOL_SUB_KEY_RE.fullmatch(served_by)):
+        return
+    import time
+
+    agent.last_served_by = served_by
+    agent.last_served_at = time.time()
+
+
+def consume_first_request_headers(agent) -> dict:
+    """Pop the one-shot first-request headers (fork seat pin) off ``agent``.
+
+    Consumed on the first request build whatever the provider, so a later turn
+    can never carry it; returned only on a pool-affinity lane (INV-8).
+    """
+    pending = getattr(agent, "_first_request_extra_headers", None)
+    if not pending:
+        return {}
+    agent._first_request_extra_headers = None
+    if (getattr(agent, "provider", "") or "").strip().lower() not in _POOL_AFFINITY_PROVIDERS:
+        return {}
+    return dict(pending)
+
+
 def _pool_affinity_headers(agent, aux_task=None) -> dict:
     """Return the routing-only headers for the claude relay POOL: the x-hermes-session
     affinity id AND the x-hermes-lane / x-hermes-lane-src lane classification.
