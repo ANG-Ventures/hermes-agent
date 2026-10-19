@@ -481,6 +481,11 @@ def settle_unrecovered_error(
         interrupt_text=f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries}).",
         activity_label=f"error retry backoff ({retry_count}/{max_retries})",
     )
+    # t_94a2b0e4: the sleep belongs to the recorded cause, so a later timer cut
+    # renders it as a wait, never as "no first byte".
+    if _interrupted is None and not _retry.restart_with_redirected_messages:
+        from agent.fallback_cause import note_wait
+        note_wait(agent, wait_time)
     if _interrupted is not None:
         return _verdict("return", _interrupted)
     if _retry.restart_with_redirected_messages:
