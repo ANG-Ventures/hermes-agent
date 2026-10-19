@@ -819,25 +819,27 @@ class GatewayGoalsMixin:
             # under the session's goal lock: a /goal pause|clear that committed before this point is
             # what we read, so the save below cannot undo it.
             mgr = GoalManager(session_id=session_id, default_max_turns=max_turns)
-            return mgr, mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins)
+            before = mgr.idle_wake_snapshot()
+            return mgr, mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins), before
 
         with self._profile_scope_for_source(source):
             async with self._goal_session_lock(session_id):
-                mgr, prompt = await self._run_in_executor_with_context(_wake)
+                mgr, prompt, before = await self._run_in_executor_with_context(_wake)
                 if not prompt:
                     return
-                # Re-check eligibility after the hop: a real message, /stop or a goal change
-                # that landed meanwhile owns the next step.
-                from hermes_cli.goals import load_goal
-
-                current = await self._run_in_executor_with_context(lambda: load_goal(session_id))
+                # Re-check eligibility after the hop: a real message or /stop that landed meanwhile
+                # owns the next step, and the wake recorded in the hop is given back (it never ran).
                 if (
-                    current is None or current.status != "active"
-                    or quick_key in getattr(self, "_running_agents", {})
+                    quick_key in getattr(self, "_running_agents", {})
                     or quick_key in adapter._active_sessions
                     or self._queue_depth(quick_key, adapter=adapter) > 0
                     or self._stop_latched(quick_key)
                 ):
+                    after = mgr.idle_wake_snapshot()
+                    await self._run_in_executor_with_context(lambda: mgr.undo_idle_wake(before, after))
+                    return
+                # Writers outside this lock (another surface on the same session) may have ended it.
+                if not await self._run_in_executor_with_context(lambda: mgr.reload() is not None and mgr.is_active()):
                     return
         logger.info(
             "goal idle wake #%s for %s (session %s): %s", mgr.state.idle_wakes if mgr.state else "?",

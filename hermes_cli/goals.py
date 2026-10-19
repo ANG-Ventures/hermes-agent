@@ -557,6 +557,13 @@ class GoalState:
 
 # ── Persistence (SessionDB state_meta) ────────────────────────────────
 
+# GoalState fields an idle wake mutates (accounting + the wait barrier it consumes).
+_IDLE_WAKE_FIELDS = (
+    "idle_wakes", "last_idle_wake_at", "waiting_on_pid", "waiting_on_session", "waiting_until",
+    "waiting_on_delegations", "waiting_reason", "waiting_since",
+)
+
+
 def _meta_key(session_id: str) -> str:
     return f"goal:{session_id}"
 
@@ -1974,6 +1981,25 @@ class GoalManager:
         s.last_idle_wake_at = now
         self._save()
         return prompt
+
+    def idle_wake_snapshot(self) -> Dict[str, Any]:
+        """The fields ``idle_wake_prompt`` may change, for ``undo_idle_wake``."""
+        s = self._state
+        return {} if s is None else {f: getattr(s, f) for f in _IDLE_WAKE_FIELDS}
+
+    def undo_idle_wake(self, before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+        """Give back a recorded wake that was never dispatched (the session turned busy or was
+        /stop-ped meanwhile), so it does not consume a check-in. Reloads first and restores a field
+        only while it still holds the value the wake wrote: anything saved since then wins."""
+        s = self.reload()
+        if not before or s is None or s.status != "active":
+            return False
+        changed = [f for f in _IDLE_WAKE_FIELDS if f in before and getattr(s, f) == after.get(f) != before[f]]
+        for field in changed:
+            setattr(s, field, before[field])
+        if changed:
+            self._save()
+        return bool(changed)
 
     def set_checkin_minutes(self, minutes: int) -> GoalState:
         """Per-goal check-in interval (minutes; 0 = off for this goal; -1 = config default)."""

@@ -245,3 +245,37 @@ async def test_goal_command_waits_for_an_in_flight_idle_wake_and_reads_its_save(
     state = await asyncio.to_thread(goals.load_goal, "goal-sess")
     assert state.status == "paused"
     assert state.last_idle_wake_at > 0                       # the wake's save was not clobbered
+
+
+@pytest.mark.asyncio
+async def test_wake_abandoned_for_a_busy_session_does_not_consume_the_checkin(rig):
+    """The session turned busy during the hop: no dispatch, and the recorded wake is given back so
+    the last allowed check-in is still available once the session is idle again."""
+    runner, adapter, received, key = rig
+
+    def _quiet_due():
+        mgr = goals.GoalManager("goal-sess")
+        mgr.set("g")
+        mgr.state.created_at = mgr.state.last_turn_at = time.time() - 31 * 60
+        mgr._save()
+
+    await asyncio.to_thread(_quiet_due)
+    real_hop = runner._run_in_executor_with_context
+
+    async def hop_then_busy(fn, *args):
+        runner._run_in_executor_with_context = real_hop
+        result = await real_hop(fn, *args)
+        runner._running_agents[key] = object()
+        return result
+
+    runner._run_in_executor_with_context = hop_then_busy
+    entry = runner.session_store.list_sessions()[0]
+    await runner._goal_idle_wake_one(entry, 30, 1)
+    await _drain(adapter)
+    assert received == []
+    state = await asyncio.to_thread(goals.load_goal, "goal-sess")
+    assert (state.idle_wakes, state.last_idle_wake_at) == (0, 0.0)
+    runner._running_agents.pop(key)
+    await runner._goal_idle_wake_one(entry, 30, 1)          # idle again: the sole check-in fires
+    await _drain(adapter)
+    assert len(received) == 1
