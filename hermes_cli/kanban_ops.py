@@ -204,29 +204,50 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
     return out
 
 
+def _recent_local_starts(since: float) -> list:
+    """``started_at`` of every run started at/after ``since`` on ANY live board of
+    this host that did NOT run on a pool host (no worker_placed event; Prism
+    9f811a3f59ff). Cross-board, like the running count: another board's spawn
+    is the same load on this host (Prism d88c700fe427). Each DB file once; an
+    unreadable board contributes nothing (its running count reads unknown)."""
+    from gateway.kanban_gate_tick import live_boards
+    from hermes_cli import kanban_worker_pool as _kwp
+
+    out, seen = [], set()
+    for meta in kb.enumerating_each(live_boards()):
+        slug = (meta.get("slug") if isinstance(meta, dict) else None) or kb.DEFAULT_BOARD
+        try:
+            path = str(kb.kanban_db_path(slug).expanduser().resolve())
+            if path in seen:
+                continue
+            seen.add(path)
+            with kbc.connect_closing(board=slug) as bconn:
+                out.extend(float(r[0]) for r in bconn.execute(
+                    "SELECT r.started_at FROM task_runs r WHERE r.started_at >= ? AND NOT EXISTS ("
+                    "SELECT 1 FROM task_events e WHERE e.run_id = r.id AND e.kind = ?)",
+                    (int(since), _kwp.PLACED_EVENT)).fetchall())
+        except Exception:
+            continue
+    return out
+
+
 def _cli_utilization_gate(conn, args, gate, out, emit, load1):
     """``kanban.admission: utilization`` for the one-shot CLI: the gateway's
-    utilization admit() with a 0.25 s cpu_busy sample, this board's run starts
-    inside admission.DEFAULT_SETTLE_S booked as leases, and the LOCAL running
-    count (placed-remote runs excluded) under the host's kanban ceiling."""
+    utilization admit() with a 0.25 s cpu_busy sample, every board's LOCAL run
+    starts inside admission.DEFAULT_SETTLE_S booked as leases, and the LOCAL
+    running count from the gateway's all-board snapshot (count_running_by_placement
+    + running_split: every board's remote placements out of every board's total)
+    under the host's kanban ceiling."""
+    from gateway.kanban_gate_tick import live_boards, running_split
     from hermes_cli import admission as _ad
     from hermes_cli import kanban_load_gate as _klg
-    from hermes_cli import kanban_worker_pool as _kwp
 
     now_wall, now_mono = time.time(), time.monotonic()
     running = None
     try:
-        # LOCAL starts only: a run with a worker_placed event ran on a pool host (Prism 9f811a3f59ff)
-        rows = conn.execute(
-            "SELECT r.started_at FROM task_runs r WHERE r.started_at >= ? AND NOT EXISTS ("
-            "SELECT 1 FROM task_events e WHERE e.run_id = r.id AND e.kind = ?)",
-            (int(now_wall - _ad.DEFAULT_SETTLE_S), _kwp.PLACED_EVENT),
-        ).fetchall()
-        for row in rows:
-            gate.record_spawns(1, now=now_mono - max(0.0, now_wall - float(row[0])))
-        total = _klg.count_running_workers()
-        if total is not None:
-            running = max(0, int(total) - sum(_kwp.running_by_host(conn).values()))
+        for started in _recent_local_starts(now_wall - _ad.DEFAULT_SETTLE_S):
+            gate.record_spawns(1, now=now_mono - max(0.0, now_wall - started))
+        running, _remote = running_split(kb.count_running_by_placement(live_boards()))
     except Exception:
         running = None
     cpu_busy, _ = _klg.sample_cpu_busy(None, block=0.25)
