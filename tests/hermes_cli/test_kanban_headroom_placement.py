@@ -28,6 +28,19 @@ POLICY = pp.PlacementPolicy()
 T0 = 1_791_850_000.0
 HOSTS = ("ci-box", "ace-ai", "ace-media")
 
+
+def _dead_pid() -> int:
+    """A pid no live process owns. A fixed fake pid (4242) is a real process on some hosts
+    (dnsmasq on ace-ai), so ``complete_task`` saw a live worker claim and raised LiveClaimError."""
+    import subprocess
+    import sys
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+FAKE_PID = _dead_pid()
+
 # The #3945 table, trimmed to what the scorer reads.
 TABLE = {
     "schema": 1, "default_first": "ci-box", "saturate_to": 1.0,
@@ -183,7 +196,7 @@ def test_dispatch_reserves_each_spawn_and_run_end_releases_it(home):
 
     def spawn(task, workspace, *, board=None, placement=None):
         spawned.append((task.id, placement.name if placement else None))
-        return 4242
+        return FAKE_PID
 
     with kb.connect_closing() as conn:
         ids = [kb.create_task(conn, title=f"c{i}", assignee="alpha") for i in range(3)]
@@ -427,7 +440,7 @@ def test_run_end_releases_only_after_commit(home):
     plan = _plan(home, Fleet(), now=_t.time())
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="c", assignee="alpha")
-        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242, max_spawn=8, spawn_paused=None, spawn_limit=0,
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: FAKE_PID, max_spawn=8, spawn_paused=None, spawn_limit=0,
                           spillover=plan, reconcile_orphans=False)
         assert [r["job_id"] for r in _ledger_rows(home)] == [tid]
         with pytest.raises(RuntimeError, match="boom"):
@@ -488,7 +501,7 @@ def test_live_run_reservation_is_renewed_past_the_admission_ttl(home):
     plan = _plan(home, Fleet(), now=now)
     with kb.connect_closing() as conn:
         ids = [kb.create_task(conn, title=f"c{i}", assignee="alpha") for i in range(2)]
-        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242, max_spawn=8, spawn_paused=None, spawn_limit=0,
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: FAKE_PID, max_spawn=8, spawn_paused=None, spawn_limit=0,
                           spillover=plan, reconcile_orphans=False)
     ledger = home / placement.RESERVATIONS_REL
     assert sorted(r["job_id"] for r in _ledger_rows(home)) == sorted(ids)
@@ -628,7 +641,7 @@ def test_dispatch_books_the_assignees_profile_class(home):
         b = kb.create_task(conn, title="b", assignee="beta")
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (a,)).fetchone()
         assert kh.job_for_row(conn, row).profile == "alpha"
-        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242, max_spawn=64, spawn_paused=None, spawn_limit=0,
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: FAKE_PID, max_spawn=64, spawn_paused=None, spawn_limit=0,
                           spillover=plan, reconcile_orphans=False)
     rows = json.loads((home / placement.RESERVATIONS_REL).read_text(encoding="utf-8"))["rows"]
     booked = {r["job_id"]: r["ram_gb"] for r in rows}
