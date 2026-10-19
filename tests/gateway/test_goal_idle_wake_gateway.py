@@ -86,15 +86,11 @@ async def test_timer_parked_goal_is_woken_when_the_deadline_passes(rig):
 @pytest.mark.asyncio
 async def test_busy_session_is_never_woken(rig):
     runner, adapter, received, key = rig
-    mgr = goals.GoalManager("goal-sess")
-    mgr.set("g")
-    mgr.wait_for_seconds(1, reason="x")
-    mgr.state.waiting_until = time.time() - 1
-    mgr._save()
+    await asyncio.to_thread(_due)                         # off-loop: no SessionDB bootstrap window
     runner._running_agents[key] = object()
     await runner._goal_idle_wake_scan()
     assert received == []
-    assert goals.load_goal("goal-sess").waiting_until > 0     # barrier untouched for the live turn
+    assert (await asyncio.to_thread(goals.load_goal, "goal-sess")).waiting_until > 0  # barrier untouched
 
 
 @pytest.mark.asyncio
@@ -279,3 +275,24 @@ async def test_wake_abandoned_for_a_busy_session_does_not_consume_the_checkin(ri
     await runner._goal_idle_wake_one(entry, 30, 1)          # idle again: the sole check-in fires
     await _drain(adapter)
     assert len(received) == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_wake_undo_never_reactivates_a_goal_paused_from_another_surface(rig):
+    """The give-back is one transaction against the stored row: a pause from a surface outside the
+    gateway lock that landed after the wake was recorded is kept (no stale active state saved)."""
+    def _scenario():
+        mgr = goals.GoalManager("goal-sess")
+        mgr.set("g")
+        mgr.state.created_at = mgr.state.last_turn_at = time.time() - 31 * 60
+        mgr._save()
+        before = mgr.idle_wake_snapshot()
+        assert mgr.idle_wake_prompt(checkin_minutes=30, max_checkins=1)
+        after = mgr.idle_wake_snapshot()
+        goals.GoalManager("goal-sess").pause()                # CLI / other surface
+        undone = goals.undo_idle_wake("goal-sess", before, after)
+        return undone, goals.load_goal("goal-sess")
+
+    undone, state = await asyncio.to_thread(_scenario)
+    assert undone is False
+    assert state.status == "paused"

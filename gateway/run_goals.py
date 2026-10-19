@@ -12,7 +12,6 @@ import contextvars
 import dataclasses
 import logging
 import time
-import weakref
 from contextlib import nullcontext, suppress
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -776,17 +775,6 @@ class GatewayGoalsMixin:
             except Exception as exc:
                 logger.debug("goal idle wake for %s failed: %s", entry.session_key, exc)
 
-    def _goal_session_lock(self, session_id: str) -> asyncio.Lock:
-        """Per-session lock serializing goal-state read/mutate/save between /goal commands and the
-        idle-wake watcher (both hop to an executor, so the event loop alone does not order them)."""
-        locks = getattr(self, "_goal_session_locks", None)
-        if locks is None:
-            locks = self._goal_session_locks = weakref.WeakValueDictionary()
-        lock = locks.get(session_id)
-        if lock is None:
-            lock = locks[session_id] = asyncio.Lock()
-        return lock
-
     def _stop_latched(self, session_key: str) -> bool:
         """True while the user's /stop holds automatic turns for this session (in-memory latch)."""
         try:
@@ -822,6 +810,8 @@ class GatewayGoalsMixin:
             before = mgr.idle_wake_snapshot()
             return mgr, mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins), before
 
+        from hermes_cli.goals import undo_idle_wake
+
         with self._profile_scope_for_source(source):
             async with self._goal_session_lock(session_id):
                 mgr, prompt, before = await self._run_in_executor_with_context(_wake)
@@ -836,7 +826,7 @@ class GatewayGoalsMixin:
                     or self._stop_latched(quick_key)
                 ):
                     after = mgr.idle_wake_snapshot()
-                    await self._run_in_executor_with_context(lambda: mgr.undo_idle_wake(before, after))
+                    await self._run_in_executor_with_context(lambda: undo_idle_wake(session_id, before, after))
                     return
                 # Writers outside this lock (another surface on the same session) may have ended it.
                 if not await self._run_in_executor_with_context(lambda: mgr.reload() is not None and mgr.is_active()):
