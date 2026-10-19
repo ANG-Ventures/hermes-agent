@@ -489,3 +489,70 @@ def test_w17_gave_up_on_approved_card_with_no_land_still_wakes(tp_env):
     _gave_up(tid)
     turns = _tick(env)
     assert _paths(turns) == ["owner-wake"], _msg("W17", "a gave_up with no land in flight must wake once", turns)
+
+
+# --- W18-W20: Boomerang v2 auto-dispatch (t_0736cfd7, spec §5.5) ---------------------------
+
+
+def _auto_on(env, on=True):
+    from hermes_constants import get_hermes_home
+    (get_hermes_home() / "config.yaml").write_text(
+        f"delegation:\n  boomerang:\n    auto_handle_enabled: {'true' if on else 'false'}\n")
+
+
+@pytest.fixture
+def auto_env(env):
+    from gateway import kanban_auto_handle as ah
+
+    seen: list = []
+
+    async def record(_runner, entry, _state):
+        seen.append(entry)
+
+    keys = lambda: {e["key"] for e in seen}  # noqa: E731 -- recorded children stay "running"
+    env["monkeypatch"].setattr(ah, "run_entry", record)
+    env["monkeypatch"].setattr(ah, "_INFLIGHT", {})
+    env["monkeypatch"].setattr(ah, "_alive", lambda key: key in keys())
+    env["dispatched"] = seen
+    _auto_on(env)
+    return env
+
+
+def _auto_card(env, **kw) -> str:
+    return _card(env, auto_handle=True, **kw)
+
+
+def test_w18_auto_handled_red_handback_is_one_dispatch_zero_turns(auto_env):
+    """One event through both paths (notifier sub + owner-wake reason e) = ONE child, no turn.
+
+    RED-PROVABLE: drop the claim check in owner_wake_filter -> two dispatches."""
+    env = auto_env
+    env["health"][(REPO, 2118)] = {"state": "open", "mergeable_state": "clean", "failing": ["lint"]}
+    tid = _auto_card(env)
+    _sub(tid)
+    _handback(tid, 2118)
+    turns = _tick(env)
+    assert turns == [], _msg("W18", "an auto-handled red handback still woke the owner", turns)
+    assert len(env["dispatched"]) == 1, f"FORK CANARY {FEATURE} W18: dispatches={env['dispatched']}"
+
+
+def test_w19_auto_handle_needs_input_still_one_notifier_turn(auto_env):
+    """INV-5: a judgment event on an opted-in card is today's one turn, never a child."""
+    env = auto_env
+    tid = _auto_card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        kb._append_event(conn, tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})  # noqa: SLF001
+    turns = _tick(env)
+    assert _paths(turns) == ["notifier"] and env["dispatched"] == [], _msg("W19", "needs_input auto-handled", turns)
+
+
+def test_w20_kill_switch_off_auto_card_wakes_as_today(auto_env):
+    """INV-7: auto_handle_enabled=false -> an opted-in card is today's one turn, no claim."""
+    env = auto_env
+    _auto_on(env, False)
+    tid = _auto_card(env)
+    _sub(tid)
+    _close(tid, sid=WORKER_SID, profile="worker", summary="worker finished")
+    turns = _tick(env)
+    assert _paths(turns) == ["notifier"] and env["dispatched"] == [], _msg("W20", "switch off still dispatched", turns)
