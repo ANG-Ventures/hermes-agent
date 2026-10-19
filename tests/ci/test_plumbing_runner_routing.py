@@ -15,6 +15,17 @@ WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
 PLUMBING = "CI_PLUMBING_RUNNER"
 MIRROR_LABELS = '["self-hosted","hermes-ci"]'
 HOSTED_LINUX = re.compile(r"^ubuntu-(latest|\d\d\.\d\d)$")
+# Jobs that need root (sudo apt-get) or a docker socket. The self-hosted pool has neither
+# (no-new-privileges, no socket), so the plumbing var must not move them there: they stay
+# literal hosted. On the private mirror GitHub refuses them (no hosted budget), which the
+# mirror reports as "not started", never as a green.
+NEEDS_ROOT_OR_DOCKER = {
+    ("docker-lint.yml", "hadolint"),          # hadolint-action is a container action
+    ("rust-tests.yml", "bootstrap-installer"),  # sudo apt-get webkit2gtk
+    ("js-tests.yml", "check"),                # sudo apt-get xvfb/gtk
+    ("js-tests.yml", "ui-tests"),             # sudo apt-get xvfb/gtk
+    ("e2e-desktop.yml", "e2e"),               # sudo apt-get gtk/nss/xvfb
+}
 _USES = re.compile(r"^\./\.github/workflows/([A-Za-z0-9._-]+\.ya?ml)$")
 
 
@@ -51,9 +62,16 @@ def test_ci_graph_has_no_literal_hosted_linux_runner():
     # A literal hosted label cannot be moved off GitHub-hosted runners by any repo var, so the
     # private mirror could not run it at all. Hosted-by-default jobs take the plumbing var.
     literal = [(w, j) for w, j, job in _ci_graph_jobs()
-               if any(isinstance(v, str) and HOSTED_LINUX.match(v)
+               if (w, j) not in NEEDS_ROOT_OR_DOCKER and any(isinstance(v, str) and HOSTED_LINUX.match(v)
                       for v in (job["runs-on"] if isinstance(job["runs-on"], list) else [job["runs-on"]]))]
     assert literal == []
+
+
+def test_root_or_docker_jobs_never_take_the_plumbing_var():
+    jobs = {(w, j): job["runs-on"] for w, j, job in _ci_graph_jobs()}
+    for key in NEEDS_ROOT_OR_DOCKER:
+        assert key in jobs, key
+        assert _resolve(jobs[key], {PLUMBING: MIRROR_LABELS}) == "ubuntu-latest", key
 
 
 @pytest.mark.parametrize("workflow,job_id,runs_on", _plumbing_routed(), ids=lambda v: str(v)[:40])
