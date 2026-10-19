@@ -49,6 +49,7 @@ import argparse
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -177,6 +178,133 @@ def _pid_alive(pid: int) -> bool:
     import psutil  # core dependency; os.kill(pid, 0) is not a probe on Windows
 
     return bool(psutil.pid_exists(pid))
+
+
+def _finite(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _host_boot_id() -> Optional[str]:
+    """Kernel boot UUID (Linux): unlike any timestamp, immune to clock steps."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip() or None
+    except OSError:
+        return None
+
+
+def _pid_ns_id() -> Optional[str]:
+    """Identity of this process's PID namespace (Linux ``/proc/self/ns/pid``). A recorded pid only names a process
+    we can inspect when it was recorded in OUR pid namespace (Prism f-0d05a4e1ac34ca32: containers can share
+    hostname, store, boot id and time namespace but not pids). None where unsupported."""
+    try:
+        return os.readlink("/proc/self/ns/pid") or None
+    except OSError:
+        return None
+
+
+def _time_ns_id() -> Optional[str]:
+    """Identity of this process's time namespace (Linux ``/proc/self/ns/time``, e.g. ``time:[4026531834]``).
+    ``/proc/<pid>/stat`` start times are relative to the READER's time namespace, so a boot-relative offset
+    only compares across publishers in the same one (Prism f-4c7533074d58f2a7). None where unsupported."""
+    try:
+        return os.readlink("/proc/self/ns/time") or None
+    except OSError:
+        return None
+
+
+def _start_offset(pid: int) -> Optional[float]:
+    """Seconds from host boot to ``pid``'s start, on a basis a wall-clock step
+    cannot move: the kernel's own boot-relative ``starttime`` (field 22 of
+    ``/proc/<pid>/stat``, clock ticks since boot) read directly, so no boot
+    timestamp enters the arithmetic at all (Prism bc03ae51308a: psutil < 6
+    computed ``create_time`` from a CACHED btime while ``boot_time()`` read a
+    fresh one, so the two terms could straddle a clock step). None where there
+    is no procfs: the identity there is ``_create_time``."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+        # comm may contain spaces/parens: split after the LAST ')'. starttime is
+        # field 22 (1-based) = index 19 of the fields after state.
+        fields = data[data.rfind(b")") + 2:].split()
+        return int(fields[19]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, IndexError, ValueError, AttributeError):
+        return None
+
+
+def _create_time_is_stable() -> bool:
+    """Whether psutil's create_time() is a kernel-stored timestamp (macOS, Windows, BSD: yes) rather than
+    ``btime + starttime/CLK_TCK`` recomputed from the CURRENT wall clock (Linux: no, so a clock step between
+    the publisher's sample and ours shifts it; Prism f-0d05a4e1ac34ca32). Only a stable create_time may
+    clear the collision flag."""
+    return not sys.platform.startswith("linux")
+
+
+def _create_time(pid: int) -> Optional[float]:
+    """Fallback identity without procfs (macOS, Windows): psutil's absolute
+    process creation timestamp. The kernel stores it once at process start and
+    a later clock step does not rewrite it, so both sides of the comparison read
+    the same stored value; ``boot_time()`` never enters (Prism: a
+    ``create_time - boot_time`` difference moved with the clock on these hosts
+    and rejected a genuine live publisher)."""
+    import psutil
+
+    try:
+        return float(psutil.Process(pid).create_time())
+    except psutil.Error:
+        return None
+
+
+def _same_live_process(pid: Any, rec: Mapping[str, Any]) -> bool:
+    """True unless there is positive evidence that ``pid`` is no longer the
+    process that wrote ``rec`` (dead, other host boot, or a reused pid).
+
+    Inconclusive evidence (missing/non-finite fields, psutil errors) keeps the
+    record live: a false "shared" defers a deploy, a false "gone" lets it
+    mutate under a busy consumer.
+    """
+    # The pid names a process we can inspect ONLY inside our own PID namespace (Prism f-0d05a4e1ac34ca32: containers
+    # share hostname, store, boot id and time namespace, not pids). A recorded namespace that differs from ours, or is
+    # absent while the kernel exposes one, means every local read of that pid (liveness, start time) is about an
+    # unrelated process: inconclusive, the record stays live.
+    cur_pns = _pid_ns_id()
+    if cur_pns and rec.get("pid_ns") != cur_pns:
+        return True
+    if not _pid_alive(pid):
+        return False
+    import psutil
+
+    try:
+        boot_id, off, ct = rec.get("boot_id"), rec.get("start_offset"), rec.get("create_time")
+        cur_boot = _host_boot_id()
+        # An EMPTY recorded boot_id is missing evidence, not another boot (Prism f-6a6148c60a0851c2).
+        if isinstance(boot_id, str) and boot_id and cur_boot and boot_id != cur_boot:
+            return False
+        if _finite(off):
+            # The offset is only comparable inside one time namespace (Prism f-4c7533074d58f2a7): a recorded
+            # namespace that differs from ours, or is missing on either side, makes the offset inconclusive
+            # (keep the record live); then only a recorded absolute create_time may clear it.
+            tns, cur_tns = rec.get("time_ns"), _time_ns_id()
+            if tns and cur_tns and tns == cur_tns:
+                cur = _start_offset(pid)
+                if cur is not None and abs(cur - off) > 1:
+                    return False
+            elif _finite(ct) and _create_time_is_stable():
+                cur = _create_time(pid)
+                if cur is not None and abs(cur - ct) > 1:
+                    return False
+            # Linux with an incomparable offset: NOTHING clock-step-safe is left to compare, so the record
+            # stays live (Prism f-0d05a4e1ac34ca32 / f-78f5d20661de8262). A stale record ages out via boot_id.
+        elif _finite(ct) and _create_time_is_stable():
+            cur = _create_time(pid)
+            if cur is not None and abs(cur - ct) > 1:
+                return False
+        # A record from a pre-boot_id publisher carries only wall-clock
+        # boot_ts, which a clock step can make look stale: keep it live.
+        return True
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.Error:
+        return True
 
 
 @dataclass(frozen=True)
@@ -362,6 +490,16 @@ class AdmissionGate:
         self.pid = os.getpid()
         self.host = socket.gethostname()
         self.boot_ts = clock()
+        self.boot_id = _host_boot_id()
+        try:
+            self.start_offset: Optional[float] = _start_offset(self.pid)
+        except Exception:
+            self.start_offset = None
+        self.time_ns = _time_ns_id() if self.start_offset is not None else None
+        self.pid_ns = _pid_ns_id()
+        # create_time is ALWAYS recorded (Prism f-4c7533074d58f2a7): the absolute timestamp is the fallback
+        # identity when a reader cannot compare the boot-relative offset (other time namespace, no procfs).
+        self.create_time: Optional[float] = _create_time(self.pid)
         self._clock = clock
         self._active_work = active_work
         self._serving = serving
@@ -470,6 +608,7 @@ class AdmissionGate:
             return {
                 "schema": SCHEMA, "consumer": self.consumer, "pid": self.pid,
                 "host": self.host, "instance": self.instance, "boot_ts": self.boot_ts,
+                "boot_id": self.boot_id, "start_offset": self.start_offset, "create_time": self.create_time, "time_ns": self.time_ns, "pid_ns": self.pid_ns,
                 "published_at": self._clock(), "hold_epoch": hold_epoch,
                 "hold_error": hold_error, "tickets": tickets,
                 "active_work": work_total, "active_work_detail": work_detail,
@@ -481,9 +620,11 @@ class AdmissionGate:
 
         Two processes configured with the same name overwrite one record, so
         an idle snapshot could hide the other's work. Once a foreign live
-        instance is seen the flag stays set while its pid lives (sticky, so
-        our own back-to-back writes cannot clear it) and ``evaluate`` reads
-        the record as UNKNOWN.
+        instance is seen the flag stays set while that same process lives
+        (sticky, so our own back-to-back writes cannot clear it) and
+        ``evaluate`` reads the record as UNKNOWN. "Same process" is re-checked
+        on every publish (``_same_live_process``), so a pid an unrelated
+        process reused after a reboot never pins the flag.
         """
         try:
             prev = self.store.read_consumer(self.consumer)
@@ -491,9 +632,12 @@ class AdmissionGate:
             prev = None
         if (isinstance(prev, dict) and prev.get("instance") not in (None, self.instance)
                 and prev.get("host") == self.host and prev.get("pid") != self.pid):
-            self._foreign = (prev.get("pid"), prev.get("instance"))
+            self._foreign = (prev.get("pid"), prev.get("instance"),
+                             {k: prev[k] for k in ("boot_id", "start_offset", "create_time", "time_ns", "pid_ns") if k in prev})
         foreign = self._foreign
-        if foreign is not None and _pid_alive(foreign[0]):
+        if foreign is not None and not _same_live_process(foreign[0], foreign[2]):
+            self._foreign = foreign = None
+        if foreign is not None:
             record["shared_with"] = {"pid": foreign[0], "instance": foreign[1]}
         return record
 
