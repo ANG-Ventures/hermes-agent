@@ -366,7 +366,7 @@ def test_budget_cut_banner_names_lane_elapsed_and_seat():
     row, rider, floors = _budget_cut_rider(exc)
     assert (row["trigger_class"], row["class_source"]) == ("no_first_byte_budget", "harness")
     assert row["seat"] == "sub-vps-5" and row["route_id"] == "65a4c896ecf1"
-    assert rider == "no first byte in 600 s on claude-alr (sub-vps-5), 23:26:32"
+    assert rider == "no reply in 600 s on claude-alr (sub-vps-5), 23:26:32"
     assert floors == [], "a classified cut is not a dead-letter floor"
 
 
@@ -374,8 +374,9 @@ def test_budget_cut_before_headers_says_so():
     from agent.fallback_wall_budget import FallbackWallBudgetExceeded
     exc = FallbackWallBudgetExceeded("cut", lane="claude-alr", elapsed_s=600.0, pool_headers={})
     _row, rider, _floors = _budget_cut_rider(exc)
-    assert rider == "no first byte in 600 s on claude-alr (seat unknown — cut before headers), 23:26:32"
-    assert "unclassified" not in rider and "hop unknown" not in rider
+    assert rider == \
+        "no reply in 600 s on claude-alr (relay sent no headers before the cut), 23:26:32"
+    assert "unclassified" not in rider and "unknown" not in rider
 
 
 # ── streaming: the monitor cuts a silent attempt and posts the notice ──────
