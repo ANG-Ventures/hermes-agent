@@ -1024,6 +1024,35 @@ def test_record_from_another_pid_namespace_is_never_cleared(store, monkeypatch):
     assert _gate(store, SERVE).publish().get("shared_with")
 
 
+def test_dead_pre_pid_ns_record_clears_on_a_pid_ns_kernel(store, monkeypatch):
+    """Prism ff3c2cf86472: the first restart onto pid_ns-aware code reads its dead predecessor's record, which
+    has no pid_ns. A dead pid clears it (the pre-#2075 behaviour); the sticky flag must not pin it forever.
+    A recorded pid_ns that differs from ours stays inconclusive even with the local pid dead."""
+    import subprocess
+    import sys as _sys
+
+    monkeypatch.setattr(ca, "_pid_ns_id", lambda: "pid:[4026531836]")  # a kernel that exposes one
+    child = subprocess.Popen([_sys.executable, "-c", "pass"])
+    child.wait()
+    dead = child.pid
+    assert not ca._pid_alive(dead)
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE, pid=dead, pid_ns=...)
+    me = _gate(store, SERVE)
+    assert "shared_with" not in me.publish()
+    assert me._foreign is None
+    _foreign_record(store, SERVE, pid=dead, pid_ns="pid:[1]")
+    assert _gate(store, SERVE).publish().get("shared_with")
+
+
+def test_android_create_time_is_not_stable(monkeypatch):
+    """Prism 1865f7896adc: Android runs the Linux kernel; its create_time is btime-derived, not kernel-stored."""
+    monkeypatch.setattr(ca.sys, "platform", "android")
+    assert ca._create_time_is_stable() is False
+    monkeypatch.setattr(ca.sys, "platform", "darwin")
+    assert ca._create_time_is_stable() is True
+
+
 def test_sticky_shared_flag_clears_when_foreign_pid_is_reused(store):
     """t_2882f0c1: the sticky flag is re-checked every publish, so once the
     recorded process is gone and its pid reused the flag drops."""

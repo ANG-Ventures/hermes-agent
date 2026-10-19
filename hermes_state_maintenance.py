@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_state_common import (
-    AUTO_VACUUM_MIN_FREELIST_RATIO, _SQL_IN_CHUNK, _id_chunks, _non_continuation_child_sql, _placeholders,
-    _sql_session_last_active,
+    AUTO_VACUUM_MIN_FREELIST_RATIO, _id_chunks, _non_continuation_child_sql, _placeholders, _sql_session_last_active,
     escape_like as _escape_like
 )
 from hermes_startup_watchdog import report_startup_progress
@@ -91,42 +90,6 @@ def _continued_ancestors_sql(candidates_where: str) -> str:
             " SELECT p.id FROM kept k JOIN sessions c ON c.id = k.id JOIN sessions p ON p.id = c.parent_session_id"
             f" WHERE {_CONTINUATION_EDGE_SQL}"
             ") SELECT id FROM kept")
-
-
-# Rows (messages + sessions) one prune transaction may delete. FTS + trigram triggers fire per message:
-# ~0.3 ms/row uncontended, ~1.8 ms/row at load 160 (t_0b0c41e3), so 2,000 rows holds the lock ~4 s there.
-_PRUNE_TXN_ROW_BUDGET = 2000
-# Pause between prune chunks: back to back, the pruner re-took the lock before a waiting writer's busy
-# handler polled, so a 4 s cap per hold still locked a second process out for 56 s. Same duty-cycle idea
-# as the chunked FTS rebuild: sleep max(MIN, hold x FACTOR).
-_PRUNE_CHUNK_MIN_PAUSE_S = 0.2
-_PRUNE_CHUNK_PAUSE_FACTOR = 0.25
-
-
-def _prune_chunks(candidates, budget: Optional[int] = None, max_ids: int = _SQL_IN_CHUNK):
-    """Group prune candidates (rows with ``id``, ``parent_session_id``, ``n_messages``) into per-transaction id
-    lists of at most ``max_ids`` ids and about ``budget`` deleted rows (a single larger session is its own chunk).
-    Descendants come before their ancestors, so each chunk's re-check sees whether a continuation survived."""
-    budget = _PRUNE_TXN_ROW_BUDGET if budget is None else budget
-    parent = {row["id"]: row["parent_session_id"] for row in candidates}
-
-    def depth(sid):
-        seen, d = {sid}, 0
-        while (sid := parent.get(sid)) in parent and sid not in seen:
-            seen.add(sid)
-            d += 1
-        return d
-
-    chunk, rows = [], 0
-    for row in sorted(candidates, key=lambda r: depth(r["id"]), reverse=True):
-        cost = 1 + int(row["n_messages"] or 0)
-        if chunk and (rows + cost > budget or len(chunk) >= max_ids):
-            yield chunk
-            chunk, rows = [], 0
-        chunk.append(row["id"])
-        rows += cost
-    if chunk:
-        yield chunk
 
 
 class SessionMaintenanceMixin:
@@ -347,48 +310,31 @@ class SessionMaintenanceMixin:
         or compression lock while expired/dead holders are reclaimed and fenced.  A compression
         ancestor is deleted only together with every continuation after it (``whole_lineages``)."""
         where, where_params = self._prune_where(older_than_days, source, filters, whole_lineages=True)
-        # Selection is a read; every delete commits per chunk. One BEGIN IMMEDIATE over the whole prune
-        # held the write lock 61.5 s for 872 sessions / 34,880 messages at load 160 (t_0b0c41e3).
-        candidates = self._read_all(
-            f"SELECT s.id, s.parent_session_id,"
-            f" (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS n_messages"
-            f" FROM sessions s WHERE {where}", where_params)
         removed_ids: list[str] = []
-        orphan_targets: list[str] = []
-        last_hold = None
-        for chunk in _prune_chunks(candidates):
-            if last_hold is not None:
-                time.sleep(max(_PRUNE_CHUNK_MIN_PAUSE_S, last_hold * _PRUNE_CHUNK_PAUSE_FACTOR))
-            started = time.monotonic()
-            ph = _placeholders(chunk)
-            def _do(conn, chunk=chunk, ph=ph):
-                # Re-check under the write lock: the row may have been resumed, pinned or leased since
-                # the read, and an earlier chunk may have changed which ancestors are still continued.
-                ids = [row["id"] for row in conn.execute(
-                    f"SELECT s.id FROM sessions s WHERE s.id IN ({ph}) AND {where}", [*chunk, *where_params])]
-                if exclude_active_write_guards and ids:
-                    guarded = self._guarded_ids(conn, ids)
-                    ids = [sid for sid in ids if sid not in guarded]
-                if not ids:
-                    return [], []
-                orphaned_child_ids, affected_root_ids = self._collect_orphan_effective_last_active_targets(conn, ids)
-                ph_ids = _placeholders(ids)
-                conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph_ids})", ids)
-                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph_ids})", ids)
-                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph_ids})", ids)
-                return ids, affected_root_ids + orphaned_child_ids
-            ids, targets = self._execute_write(_do)
-            last_hold = time.monotonic() - started
-            removed_ids.extend(ids)
-            orphan_targets.extend(targets)
-        if removed_ids:
-            def _do(conn):
-                self._recompute_effective_last_active_many(conn, orphan_targets)
-                self._delete_unreferenced_system_prompts(conn)
-            self._execute_write(_do)
+        def _do(conn):
+            cursor = conn.execute(f"SELECT s.id FROM sessions s WHERE {where}", where_params)
+            session_ids = {row["id"] for row in cursor.fetchall()}
+            if exclude_active_write_guards:
+                session_ids -= self._guarded_ids(conn, session_ids)
+            if not session_ids:
+                return 0
+            orphaned_child_ids, affected_root_ids = self._collect_orphan_effective_last_active_targets(
+                conn, list(session_ids)
+            )
+            # Batched: a cron-heavy store prunes tens of thousands of ids in one call.
+            for chunk in _id_chunks(session_ids):
+                ph = _placeholders(chunk)
+                conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", chunk)
+                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
+                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
+                removed_ids.extend(chunk)
+            self._recompute_effective_last_active_many(conn, affected_root_ids + orphaned_child_ids)
+            self._delete_unreferenced_system_prompts(conn)
+            return len(session_ids)
+        count = self._execute_write(_do)
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
-        return len(removed_ids)
+        return count
 
     def _page_pragmas(self, names: Tuple[str, ...], fail_msg: str) -> Optional[list]:
         """Integer PRAGMAs over the existing connection (never a byte probe); None + debug log on failure."""

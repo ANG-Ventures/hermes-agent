@@ -247,7 +247,7 @@ def _create_time_is_stable() -> bool:
     ``btime + starttime/CLK_TCK`` recomputed from the CURRENT wall clock (Linux: no, so a clock step between
     the publisher's sample and ours shifts it; Prism f-0d05a4e1ac34ca32). Only a stable create_time may
     clear the collision flag."""
-    return not sys.platform.startswith("linux")
+    return not (sys.platform.startswith("linux") or sys.platform == "android")  # Android: Linux kernel (Prism 1865f7896adc)
 
 
 def _create_time(pid: int) -> Optional[float]:
@@ -282,7 +282,10 @@ def _same_live_process(pid: Any, rec: Mapping[str, Any]) -> bool:
     # unrelated process: inconclusive, the record stays live.
     cur_pns = _pid_ns_id()
     if cur_pns and rec.get("pid_ns") != cur_pns:
-        return True
+        # A record with NO pid_ns predates #2075: a dead pid still clears it, as before #2075, or the first
+        # restart onto this code pins the sticky flag on its dead predecessor forever (Prism ff3c2cf86472).
+        # A live pid there stays inconclusive.
+        return "pid_ns" in rec or _pid_alive(pid)
     if not _pid_alive(pid):
         return False
     import psutil

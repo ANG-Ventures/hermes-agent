@@ -462,6 +462,7 @@ def apply_retry_restarts(
     final_response: Any, retry_count: Any, max_retries: Any, api_call_count: Any,
     restart_count: Any, length_continue_retries: Any,
     _preflight_compression_blocked: Any, _turn_exit_reason: Any,
+    restart_routes: Any = None,
 ) -> RetryRestartVerdict:
     """Consume the ``TurnRetryState`` restart flags after the retry loop, in the original
     priority order. Refunds the iteration budget/count for restarts that produced no valid
@@ -545,6 +546,15 @@ def apply_retry_restarts(
         return _verdict("continue")
 
     if _retry.restart_with_rebuilt_messages:
+        # A hop onto a route not yet tried this turn starts a fresh allowance: the failed
+        # attempts on earlier routes must not starve the next one (t_5e3d611f, chiron fable
+        # capped -> opus ended rebuilt_restart_limit_exceeded with opus never called). Routes
+        # are finite and a repeat still counts, so a ping-pong stays bounded.
+        _route = (getattr(agent, "provider", None), getattr(agent, "model", None),
+                  getattr(agent, "base_url", None))
+        if restart_routes is not None and _route not in restart_routes:
+            restart_routes.add(_route)
+            restart_count = 0
         restart_count += 1
         if restart_count > max_retries:
             # A stall/failure keeps re-escalating to the fallback chain: stop refunding the
