@@ -2437,6 +2437,11 @@ DEFAULT_CONFIG = {
             "cpu_corroborate": True,
             "cpu_busy_pause": 0.70,
             "worker_cpu_cost": 1.0,
+            # t_a7978f86: E-core band saturation (Apple silicon) at or above
+            # ecore_busy_pause is no local CPU headroom. off | report (log
+            # "would-refuse" only; D1: flips to on on Ace's yes) | on.
+            "ecore_gate": "report",
+            "ecore_busy_pause": 0.95,
             # t_b660edb6: pause spawns (state proc_paused, #alerts page) at
             # proc_pause_fraction of this uid's process limit (RLIMIT_NPROC,
             # or proc_limit when set); resume below proc_resume_fraction.
