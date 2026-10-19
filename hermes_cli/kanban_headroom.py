@@ -105,6 +105,11 @@ def _num(v) -> Optional[float]:
     return float(v)
 
 
+# host-pressure.json fields the scorer reads beyond the v1 axes: D-state netting (#4696) and scorer v2's
+# occupancy / PSI avg60 (t_f8a3b6c3). Absent from a probe = None, which the scorer treats as unmeasured.
+V2_FIELDS = ("d_threads", "runnable_ewma", "procs_running", "psi_cpu_some60")
+
+
 def sample_fields(load5: Optional[float], remote_now: Optional[float], text: str, *,
                   stale_after_s: float, local_now: Optional[float] = None) -> Dict[str, Any]:
     """The placement inputs one probe carries, for the plan's ``detail`` row.
@@ -115,13 +120,14 @@ def sample_fields(load5: Optional[float], remote_now: Optional[float], text: str
     out: Dict[str, Any] = {"load5": load5, "mem_available_gb": None, "psi_cpu_some10": None,
                            "psi_mem_some10": None, "system_pct": None, "sample_at": None,
                            "sample_status": "absent"}
+    out.update({k: None for k in V2_FIELDS})
     try:
         doc = json.loads(text) if text else None
     except ValueError:
         doc = None
     if not isinstance(doc, dict):
         return out
-    for k in ("mem_available_gb", "psi_cpu_some10", "psi_mem_some10", "system_pct"):
+    for k in ("mem_available_gb", "psi_cpu_some10", "psi_mem_some10", "system_pct") + V2_FIELDS:
         out[k] = _num(doc.get(k))
     at = _num(doc.get("at"))
     if at is None or remote_now is None or not math.isfinite(remote_now):
@@ -142,7 +148,8 @@ def sample_from_detail(d: Mapping) -> Optional[placement.Sample]:
         load5=_num(d.get("load5")), psi_cpu_some10=_num(d.get("psi_cpu_some10")),
         psi_mem_some10=_num(d.get("psi_mem_some10")), system_pct=_num(d.get("system_pct")),
         at=_num(d.get("sample_at")), status=str(status),
-        note="" if status == "fresh" else str(d.get("pressure") or ""))
+        note="" if status == "fresh" else str(d.get("pressure") or ""),
+        **{k: _num(d.get(k)) for k in V2_FIELDS})
 
 
 def job_priority(card_priority) -> Optional[int]:
