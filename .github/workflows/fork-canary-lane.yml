@@ -1,0 +1,115 @@
+# Fork-feature canary lane (t_f34a6e21): every nodeid registered in docs/sync/fork-features.json must
+# COLLECT and EXECUTE on this runner. Skipped here = not covered = RED; renamed/deleted = RED ("repoint
+# or record coverage_gap"); a red canary = RED. On a parity/upstream sync PR the full lane always runs
+# and parity-pr-check also requires every fork fix/restore commit on the branch to add or update a
+# registry row naming its test. Spec + rationale: scripts/hermes_parity/canary_lane.py,
+# scripts/hermes_parity/parity_pr_check.py. Merge enforcement lives in fleet-merge (see that card).
+name: fork-canary-lane
+
+# path-filter-exempt: a registry `paths` glob can match any file, so the scope decision is the lane's own
+# (`canary-lane --changed-file-list`, rc 0 "not affected"), never a static paths: filter.
+on:
+  pull_request:
+    # edited: a retitle can turn a PR into a parity PR (title-classified), which must re-run the full lane
+    # and parity-pr-check without a new push
+    types: [opened, synchronize, reopened, edited]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-canary-lane-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  scope:
+    name: canary scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      parity: ${{ steps.classify.outputs.parity }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - name: parity classification
+        id: classify
+        env:
+          TITLE: ${{ github.event.pull_request.title || '' }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
+          COMMITS: ${{ github.event.pull_request.commits || 0 }}
+        run: |
+          parity=$(python3 -m scripts.hermes_parity parity-classify --title "$TITLE" --head-ref "$HEAD_REF" --commits "$COMMITS")
+          echo "parity=$parity" >> "$GITHUB_OUTPUT"
+          echo "parity PR: $parity"
+
+  canary-lane:
+    name: fork canary lane
+    needs: scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+          prune-python-cache: true
+      - name: every registered nodeid outside *_ptb.py collects and executes
+        env:
+          PARITY: ${{ needs.scope.outputs.parity }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          # a parity PR, a merge group and a manual run always run the full lane; other PRs only when affected
+          scope=(--changed-from "$BASE_SHA")
+          if [ "$PARITY" = yes ] || [ -z "$BASE_SHA" ]; then scope=(); fi
+          "$HERMES_PYTHON" -m scripts.hermes_parity canary-lane --group plain --jobs 4 "${scope[@]}"
+
+  canary-lane-ptb:
+    name: fork canary lane (real PTB)
+    needs: scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "telegram"]'
+          test-environment: 'true'
+          prune-python-cache: true
+      - name: every registered *_ptb.py nodeid collects and executes under real python-telegram-bot
+        env:
+          PARITY: ${{ needs.scope.outputs.parity }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+        run: |
+          "$HERMES_PYTHON" -c "import telegram; print('python-telegram-bot', telegram.__version__)"
+          # a parity PR, a merge group and a manual run always run the full lane; other PRs only when affected
+          scope=(--changed-from "$BASE_SHA")
+          if [ "$PARITY" = yes ] || [ -z "$BASE_SHA" ]; then scope=(); fi
+          "$HERMES_PYTHON" -m scripts.hermes_parity canary-lane --group ptb --jobs 4 "${scope[@]}"
+
+  parity-pr-check:
+    name: parity PR registers its repairs
+    needs: scope
+    if: needs.scope.outputs.parity == 'yes' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: every fork fix/restore commit on the sync branch adds or updates a registry row naming its test
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git main:refs/remotes/upstream/main
+          python3 -m scripts.hermes_parity parity-pr-check --worktree . --base "$BASE_SHA" --head HEAD --upstream upstream/main
