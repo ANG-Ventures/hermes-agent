@@ -7,6 +7,7 @@ directory; modality tests drive the real ingress seams (gateway messaging
 ``tui_gateway.ws.handle_ws``).
 """
 from __future__ import annotations
+from pathlib import Path
 
 import asyncio
 import json
@@ -798,6 +799,220 @@ def test_consumer_name_shared_by_two_live_processes_is_unknown(store):
     rep = ca.evaluate(store)
     assert rep["verdict"] == UNKNOWN
     assert "shared" in rep["consumers"][0]["why"]
+
+
+def _foreign_record(store, name, **fields):
+    """Publish under ``name`` as another instance whose pid (our parent) is
+    alive on this host; ``fields`` override the start-identity fields. A
+    field set to ``...`` is dropped (legacy record shape)."""
+    other = _gate(store, name)
+    other.pid = os.getppid()
+    other.instance = "other-instance"
+    other.start_offset = ca._start_offset(other.pid)  # genuine by default
+    other.time_ns = ca._time_ns_id() if other.start_offset is not None else None
+    other.create_time = ca._create_time(other.pid)
+    rec = other.snapshot()
+    rec.update(fields)
+    rec = {k: v for k, v in rec.items() if v is not ...}
+    store.write_consumer(name, rec)
+
+
+@pytest.mark.parametrize("fields", [
+    pytest.param({}, id="genuine"),
+    pytest.param({"start_offset": float("nan"), "boot_ts": float("nan")}, id="nan-fails-closed"),
+    pytest.param({"boot_id": ..., "start_offset": ...}, id="legacy-record-stays-live"),
+])
+def test_genuine_or_inconclusive_foreign_record_is_shared(store, fields):
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE, **fields)
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
+    assert ca.evaluate(store)["verdict"] == UNKNOWN
+
+
+def test_reused_pid_started_after_record_is_not_shared(store):
+    """t_2882f0c1: a live pid that is a different process than the record's
+    publisher (wireplumber reusing serve-clanker's pid) is not shared."""
+    kw = {"start_offset": ca._start_offset(os.getppid()) - 60}
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE, **kw)
+    me = _gate(store, SERVE)
+    assert "shared_with" not in me.publish()
+    assert "shared_with" not in me.publish()
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
+def test_record_from_before_host_boot_is_not_shared(store, monkeypatch):
+    """t_2882f0c1: a record written in a previous host boot is never a live
+    foreign publisher, whatever now holds its pid."""
+    monkeypatch.setattr(ca, "_host_boot_id", lambda: "current-boot")
+    kw = {"boot_id": "previous-boot"}
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE, **kw)
+    me = _gate(store, SERVE)
+    assert "shared_with" not in me.publish()
+    assert ca.evaluate(store)["verdict"] == QUIESCENT
+
+
+def test_wall_clock_step_keeps_genuine_foreign_publisher_shared(store, monkeypatch):
+    """A forward clock step moves psutil's boot_time and create_time together
+    (Linux derives both from btime); the boot-relative start offset must
+    still identify the genuine foreign publisher."""
+    import psutil
+
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    real_boot, real_ct = psutil.boot_time, psutil.Process.create_time
+    monkeypatch.setattr(psutil, "boot_time", lambda: real_boot() + 3600)
+    monkeypatch.setattr(psutil.Process, "create_time", lambda self: real_ct(self) + 3600)
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
+
+
+def test_clock_step_between_psutil_terms_keeps_genuine_foreign_publisher_shared(store, monkeypatch):
+    """Prism bc03ae51308a: older psutil computed create_time from a CACHED btime
+    while boot_time() re-read a fresh one, so after a clock step the two terms
+    straddled it and the offset was off by the step. The offset must not depend
+    on psutil's wall-clock terms at all: step ONLY boot_time (the cache-miss
+    shape) and the genuine publisher must stay flagged."""
+    import psutil
+
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    real_boot = psutil.boot_time
+    monkeypatch.setattr(psutil, "boot_time", lambda: real_boot() + 3600)   # create_time NOT stepped
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
+
+
+def test_start_offset_reads_the_kernel_boot_relative_starttime(tmp_path, monkeypatch):
+    """On Linux the offset comes straight from /proc/<pid>/stat field 22 (ticks
+    since boot), with a comm that contains spaces and parens."""
+    if not Path("/proc").exists():
+        pytest.skip("no procfs")
+    pid = os.getpid()
+    off = ca._start_offset(pid)
+    assert off > 0
+    import psutil
+    assert abs(off - (psutil.Process(pid).create_time() - psutil.boot_time())) < 1
+
+
+def test_no_procfs_fallback_identity_is_clock_step_safe(store, monkeypatch):
+    """Prism (round 3 on #2075): without procfs the identity is psutil's stored
+    absolute create_time, compared against itself; boot_time() never enters.
+    Step boot_time by an hour with procfs hidden: the genuine foreign publisher
+    stays flagged, and a reused pid (create_time off by an hour) still clears."""
+    import psutil
+
+    monkeypatch.setattr(ca, "_start_offset", lambda pid: None)  # no procfs
+    monkeypatch.setattr(ca, "_create_time_is_stable", lambda: True)  # the no-procfs hosts (macOS/Windows) store it
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    real_boot = psutil.boot_time
+    monkeypatch.setattr(psutil, "boot_time", lambda: real_boot() + 3600)
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")  # genuine, flagged
+    # the recorded process was replaced by one born an hour later: not the same
+    rec = store.read_consumer(SERVE)
+    assert rec.get("start_offset") is None and ca._finite(rec.get("create_time"))
+    _foreign_record(store, SERVE, create_time=rec["create_time"] - 3600)
+    me = _gate(store, SERVE)
+    assert "shared_with" not in me.publish()
+
+
+def test_fallback_offset_never_mixes_boot_time(monkeypatch):
+    """The no-procfs path must not compute create_time - boot_time: with
+    boot_time patched to raise, the identity still resolves."""
+    import psutil
+
+    monkeypatch.setattr(ca, "_start_offset", lambda pid: None)
+    monkeypatch.setattr(psutil, "boot_time", lambda: (_ for _ in ()).throw(AssertionError("boot_time read")))
+    assert ca._finite(ca._create_time(os.getpid()))
+
+
+def test_empty_recorded_boot_id_is_missing_evidence_not_another_boot(store, monkeypatch):
+    """Prism f-6a6148c60a0851c2: boot_id "" on a live, busy foreign record must not clear the flag."""
+    monkeypatch.setattr(ca, "_host_boot_id", lambda: "current-boot")
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE, boot_id="")
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
+
+
+def test_offset_from_another_time_namespace_is_inconclusive(store, monkeypatch):
+    """Prism f-4c7533074d58f2a7: a recorded start_offset taken in a different time namespace is not
+    comparable; the absolute create_time decides, and a genuine publisher stays flagged even when the
+    offsets disagree by an hour."""
+    monkeypatch.setattr(ca, "_create_time_is_stable", lambda: True)   # macOS/Windows rule: create_time is kernel-stored
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    rec = store.read_consumer(SERVE)
+    if rec.get("start_offset") is None:
+        pytest.skip("no procfs offset on this host")
+    _foreign_record(store, SERVE, start_offset=rec["start_offset"] + 3600, time_ns="time:[1]")  # other namespace
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")  # genuine: create_time matches
+    # and a reused pid in that situation still clears (create_time off by an hour)
+    _foreign_record(store, SERVE, start_offset=rec["start_offset"] + 3600, time_ns="time:[1]",
+                    create_time=rec["create_time"] - 3600)
+    me = _gate(store, SERVE)
+    assert "shared_with" not in me.publish()
+
+
+def test_linux_incomparable_offset_never_clears_on_create_time(store, monkeypatch):
+    """Prism f-0d05a4e1ac34ca32 / f-78f5d20661de8262: on Linux create_time is btime + starttime/CLK_TCK
+    (clock-step sensitive), so with no comparable offset (other / missing time namespace) a create_time
+    mismatch of an hour must NOT read as a reused pid; the live foreign publisher stays flagged."""
+    monkeypatch.setattr(ca.sys, "platform", "linux")   # the Linux rule, exercised through the real predicate on every host
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    rec = store.read_consumer(SERVE)
+    if rec.get("start_offset") is None:
+        pytest.skip("no procfs offset on this host")
+    _foreign_record(store, SERVE, start_offset=rec["start_offset"] + 3600, time_ns="time:[1]",
+                    create_time=rec["create_time"] - 3600)
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
+    # and with NO time namespace on either side (pre-5.6 kernel) the same holds
+    _foreign_record(store, SERVE, start_offset=rec["start_offset"] + 3600, time_ns=None,
+                    create_time=rec["create_time"] - 3600)
+    monkeypatch.setattr(ca, "_time_ns_id", lambda: None)
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")
+
+
+def test_record_from_another_pid_namespace_is_never_cleared(store, monkeypatch):
+    """Prism f-0d05a4e1ac34ca32: a record written in another PID namespace names a pid we cannot inspect; a
+    local process at that number with a different start offset is unrelated, so the record stays live."""
+    if ca._pid_ns_id() is None:
+        pytest.skip("no /proc/self/ns/pid on this host")
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    rec = store.read_consumer(SERVE)
+    # same pid, same boot, same time namespace, offset off by an hour: in OUR namespace that is a reused pid...
+    _foreign_record(store, SERVE, start_offset=(rec.get("start_offset") or 0) + 3600,
+                    create_time=rec["create_time"] - 3600)
+    assert "shared_with" not in _gate(store, SERVE).publish()
+    # ...but recorded in ANOTHER pid namespace it is inconclusive and the busy publisher stays flagged
+    _foreign_record(store, SERVE, start_offset=(rec.get("start_offset") or 0) + 3600,
+                    create_time=rec["create_time"] - 3600, pid_ns="pid:[1]")
+    assert _gate(store, SERVE).publish().get("shared_with")
+    # a legacy record with no pid_ns at all, on a kernel that exposes one, is inconclusive too
+    _foreign_record(store, SERVE, start_offset=(rec.get("start_offset") or 0) + 3600,
+                    create_time=rec["create_time"] - 3600, pid_ns=...)
+    assert _gate(store, SERVE).publish().get("shared_with")
+
+
+def test_sticky_shared_flag_clears_when_foreign_pid_is_reused(store):
+    """t_2882f0c1: the sticky flag is re-checked every publish, so once the
+    recorded process is gone and its pid reused the flag drops."""
+    store.hold("op", [SERVE], mode="freeze")
+    _foreign_record(store, SERVE)
+    me = _gate(store, SERVE)
+    assert me.publish().get("shared_with")  # genuine: flagged
+    pid, inst, evidence = me._foreign
+    me._foreign = (pid, inst, dict(evidence, start_offset=evidence["start_offset"] - 60))
+    assert "shared_with" not in me.publish()
 
 
 def test_unreadable_unexpected_consumer_record_is_unknown(store):
