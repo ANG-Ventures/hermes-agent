@@ -1132,6 +1132,9 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         pr_health = default_pr_health()
     await asyncio.to_thread(scan, state, now, pr_health)
 
+    from gateway import kanban_auto_handle as _ah
+
+    auto_on = _ah.enabled()
     store = getattr(runner, "session_store", None)
     by_session: dict[str, tuple[Any, list[tuple[str, dict]]]] = {}
     for key, card in list(state.pending.items()):
@@ -1225,6 +1228,10 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             # Same kill switch as the notifier's terminal-pending branch (``_s5``).
             if suppress_cfgs[owner_profile].enabled and suppress_cfgs[owner_profile].actionable_only:
                 items = await asyncio.to_thread(terminal_pending_items, kb, card, items, current.get("status"))
+        # Boomerang v2 P3b (spec §5.5), AFTER the suppressor: an auto-handled item is a
+        # child's, not a turn; one the notifier already claimed is skipped here.
+        if items:
+            items = await _ah.owner_wake_filter(runner, card, items, entry, dispatch_on=auto_on)
         if not items:
             state.pending.pop(key, None)
             continue
