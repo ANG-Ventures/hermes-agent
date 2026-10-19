@@ -64,7 +64,9 @@ from agent.fork_ext.relay_headers import (
     _pool_lane,
     _pool_lane_src,
     call_id_of,
+    consume_first_request_headers,
     merge_pool_capability_headers,
+    note_main_turn_served_by,
     route_id_of,
     stamp_call_id,
     stamp_correlation_headers,
@@ -580,6 +582,7 @@ def _record_successful_api_call(agent: Any, response: Any, api_kwargs: Optional[
     from agent import fallback_wiring as _fw
 
     _fw.note_success(agent, headers if isinstance(headers, dict) else None)
+    note_main_turn_served_by(agent, provider, headers)
     seq = _emit_api_call_record(
         agent,
         usage=getattr(response, "usage", None),
@@ -2204,6 +2207,7 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
     # reset-weighted router can pin this conversation to one sub for the prompt
     # cache. Merges into any existing extra_headers (e.g. anthropic-beta).
     _aff = _pool_affinity_headers(agent)
+    _aff.update(consume_first_request_headers(agent))  # fork seat pin, first request only
     if _aff:
         _eh = dict(anthropic_kwargs.get("extra_headers") or {})
         _eh.update(_aff)

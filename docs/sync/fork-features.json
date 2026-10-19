@@ -11,9 +11,13 @@
     "paths": [
       "gateway/chat_model_pins.py",
       "gateway/session.py",
+      "gateway/session_*.py",
       "gateway/run.py",
+      "gateway/run_*.py",
       "plugins/platforms/discord/adapter.py",
+      "plugins/platforms/discord/adapter_*.py",
       "agent/chat_completion_helpers.py",
+      "agent/chat_completion_helpers_*.py",
       "hermes_cli/subcommands/model.py"
     ],
     "why": "Discord guild chats used group keys for inbound messages but channel keys for synthetic wakes, bypassing per-session model overrides. Destination pins and a durable reply-time notice protect the cross-session case even when no route transition occurs.",
@@ -30,6 +34,7 @@
     ],
     "paths": [
       "tools/approval.py",
+      "tools/approval_*.py",
       "gateway/session_context.py"
     ],
     "why": "ABSORBED 2026-08-31 (was fork-permanent). Upstream's _is_cron_approval_context() is already ContextVar-first (get_session_env('HERMES_CRON_SESSION')) with a raw-env fallback; the fork's ONLY remaining delta is a logger.error in the except branch (commentary, not mechanism). RENAMED-MECHANISM TRAP: greps for the fork's helpers (_bind_child_cron_session / _is_cron_child / set_cron_session) return 0 hits upstream, which reads as 'not absorbed' — WRONG. Upstream closes the same cross-executor hole generically via contextvars.copy_context()+ctx.run at BOTH delegate spawn sites, and via propagate_context_to_thread() in tools/async_delegation.py. MEASURED on origin/main: parent-in-cron=True; child via copy_context().run=True (marker SURVIVES); child via BARE submit=False (RED control, proves the boundary is real); end-to-end cron_mode=deny child decision approved=False/BLOCKED. Residual (audited, NOT a gap): agent/subagent_lifecycle.py:259 submits bare and does lose the marker, but falls through to interactive approval with no callback => FAILS CLOSED (approved=False under BOTH cron_mode=deny AND approve). No excessive-agency hole; optional consistency ticket only. DO NOT re-open as an upstream PR. Adjudicated 2026-08-31 against origin/main @ a0a63a1bc2 in a hermetic worktree (uv sync --extra all --extra dev). Evidence: /tmp/up-discord/REPORT-discord-platform-fixes.md + rerunnable probes.",
@@ -49,7 +54,8 @@
       "tests/gateway/test_gateway_shutdown.py::test_gateway_stop_systemd_service_restart_exits_cleanly"
     ],
     "paths": [
-      "gateway/run.py"
+      "gateway/run.py",
+      "gateway/run_*.py"
     ],
     "why": "FORK-PERMANENT BY DESIGN (deployment-model divergence). Re-adjudicated 2026-08-31: DO NOT UPSTREAM — porting this branch would REGRESS upstream. The fork's two stated premises are both FALSE against upstream's GENERATED service definitions (measured, not read): (L) 'launchd needs nonzero because KeepAlive.SuccessfulExit=false' — FALSE: upstream's plist emits an UNCONDITIONAL KeepAlive <true/> and never emits SuccessfulExit, so exit 0 and 75 relaunch identically. (S) 'exit 75 under systemd trips stepped restart backoff' — FALSE: upstream's unit emits RestartForceExitStatus=75 (75 IS the designed planned-restart signal) with StartLimitIntervalSec=0 (rate limiting disabled), and NEVER emits RestartSteps/RestartMaxDelaySec (those appear only in _SYSTEMD_OPTIONAL_DIRECTIVES, a stale-unit comparison normalization list). Exit 75 is a load-bearing upstream contract across 5 modules: gateway/restart.py:10, hermes_cli/gateway.py:3956,3994 (both unit templates), :1802 (ExecMainStatus=='75' -> reset-failed+start recovery), :4740 (diagnostics), gateway/shutdown_watchdog.py:122. Upstream PINS it unguarded in tests/gateway/test_gateway_shutdown.py::test_planned_service_exit_issues_no_restart_of_its_own (asserts _exit_code==75 on BOTH platforms, no skipif) — so the fork's change turns that test RED on Linux. The fork branch also depends on _launch_systemd_restart_shortcut(), a fork-only method (0 hits upstream) that works around backoff upstream does not generate. Re-open ONLY if upstream starts emitting RestartSteps or KeepAlive.SuccessfulExit=false. Adjudicated 2026-08-31 against origin/main @ a0a63a1bc2 in a hermetic worktree (uv sync --extra all --extra dev). Evidence: /tmp/up-discord/REPORT-discord-platform-fixes.md + rerunnable probes.",
     "lifecycle": "fork-permanent",
@@ -71,6 +77,7 @@
     ],
     "paths": [
       "gateway/run.py",
+      "gateway/run_*.py",
       "agent/fork_ext/compaction_ext.py",
       "tests/golden/compaction_ext/"
     ],
@@ -331,6 +338,7 @@
     ],
     "paths": [
       "tui_gateway/compute_host.py",
+      "tui_gateway/compute_host_*.py",
       "tui_gateway/host_supervisor.py",
       "tui_gateway/synthetic_turn.py",
       "scripts/iso-certify.py"
@@ -358,8 +366,10 @@
     "paths": [
       "hermes_undo.py",
       "hermes_cli/commands.py",
+      "hermes_cli/commands_*.py",
       "cli.py",
-      "gateway/run.py"
+      "gateway/run.py",
+      "gateway/run_*.py"
     ],
     "why": "Fork-authored half-turn rewind. COMMAND_REGISTRY is the single source every consumer derives from (/help, CLI autocomplete, Telegram command menu, Slack mapping, gateway dispatch), so deleting the two CommandDef rows in a commands.py merge resolution removes /undo and /redo from EVERY surface at once with no import error and no test failure — the shipped undo tests exercise the engine, not the routing. The registry-level canary closes exactly that gap.",
     "lifecycle": "fork-permanent",
@@ -383,9 +393,12 @@
     ],
     "paths": [
       "hermes_cli/commands.py",
+      "hermes_cli/commands_*.py",
       "cli.py",
       "gateway/run.py",
-      "plugins/platforms/discord/adapter.py"
+      "gateway/run_*.py",
+      "plugins/platforms/discord/adapter.py",
+      "plugins/platforms/discord/adapter_*.py"
     ],
     "why": "Session branching. On Discord /branch spawns a thread that inherits context while the parent channel keeps its own session; elsewhere it is a classic in-place switch. Two surfaces, one registry row, and the `fork` alias is documented in the slash-command reference — losing the alias is a silent UX regression that no existing test catches.",
     "lifecycle": "fork-permanent",
@@ -407,8 +420,11 @@
     ],
     "paths": [
       "hermes_cli/commands.py",
+      "hermes_cli/commands_*.py",
       "gateway/run.py",
-      "plugins/platforms/discord/adapter.py"
+      "gateway/run_*.py",
+      "plugins/platforms/discord/adapter.py",
+      "plugins/platforms/discord/adapter_*.py"
     ],
     "why": "Idempotent, owner-guarded fold-back of a branched session into its parent; writes ~/.hermes/merges/*.md. gateway_only=True is a load-bearing CONTRACT, not decoration: /merge has no branch/parent thread to fold into on the CLI surface. A merge that drops the flag makes it appear in the CLI where it cannot work. The canary asserts the flag AND the asymmetry against /branch (which must stay CLI-available).",
     "lifecycle": "fork-permanent",
@@ -429,8 +445,10 @@
     ],
     "paths": [
       "hermes_cli/commands.py",
+      "hermes_cli/commands_*.py",
       "gateway/fork_ext/route_identity.py",
-      "gateway/run.py"
+      "gateway/run.py",
+      "gateway/run_*.py"
     ],
     "why": "Per-session or --global priority-processing toggle. test_fast_command.py (41 tests) is cited by the 'route identity helpers' entry for a DIFFERENT reason (persisted route lookup), so the command's own registration and its normal|fast|status subcommand surface were unowned. The subcommands tuple is what makes the modes tab-completable — emptying it degrades the command silently.",
     "lifecycle": "fork-permanent",
@@ -471,7 +489,8 @@
       "tests/gateway/test_discord_quoted_mention_admission.py::test_effect_self_mention_rescues_leading_other_bot"
     ],
     "paths": [
-      "plugins/platforms/discord/adapter.py"
+      "plugins/platforms/discord/adapter.py",
+      "plugins/platforms/discord/adapter_*.py"
     ],
     "why": "ABSORBED 2026-08-31 (was fork-permanent). (1) SCALAR COERCION: upstream's _discord_free_response_channels() is BYTE-IDENTICAL to the fork's (AST full-body compare), including the fork's own explanatory comment; it landed upstream via cc8e5ec2af. MEASURED on origin/main: bare int 1491973769726791812 -> {'1491973769726791812'}; CSV, list, '*', None, '' all correct. Also byte-identical upstream: _discord_channel_keys, _discord_channel_keys_from_channel, _discord_message_admission, _dispatch_recovered_message, _missed_message_backfill_channels, and the _apply_yaml_config seeding block. (2) QUOTED-MENTION EXEMPTION: the fork's copy lives in _dispatch_incoming_message (a fork-only pre-extraction ingress helper); upstream refactored the same policy into _discord_message_admission, and OUR OWN OPEN PR #72014 already ports exactly this mechanism there (same is_free_response_channel precompute, same other_bot_mentions list, same leading <@ID>/<@!ID> direct-address carve-out). A second PR would DUPLICATE our own open PR, not stack on it. Fork-vs-upstream diff of _handle_message = 23 lines with ZERO free-response hunks — no free-response behavior exists fork-side that is not already on main or in #72014. Adjudicated 2026-08-31 against origin/main @ a0a63a1bc2 in a hermetic worktree (uv sync --extra all --extra dev). Evidence: /tmp/up-discord/REPORT-discord-platform-fixes.md + rerunnable probes.",
     "lifecycle": "absorbed",
@@ -602,7 +621,9 @@
     "paths": [
       "gateway/runtime_footer.py",
       "gateway/run_turn.py",
-      "gateway/run_turn_runner.py"
+      "gateway/run_turn_*.py",
+      "gateway/run_turn_runner.py",
+      "gateway/run_turn_runner_*.py"
     ],
     "why": "Census 2026-08-29: PR #80661 is still OUTSTANDING upstream (provider_model / context_full / reasoning are absent from upstream's gateway/runtime_footer.py) WHILE the sibling `latency` field from #71990 WAS ABSORBED via #77611. That makes this single file a live merge seam where upstream owns part and the fork owns the rest — the classic silent-drop shape: resolve toward upstream and the footer just renders shorter, no exception, no red test. Also locks the SKIP-SILENTLY doctrine (a field with missing data contributes nothing rather than '?%'), which is the byte-stability property upstream explicitly endorsed when absorbing the latency field on the same design — so keeping it is also what keeps #80661 landable.",
     "lifecycle": "upstream-intended",
@@ -627,9 +648,12 @@
     ],
     "paths": [
       "agent/chat_completion_helpers.py",
+      "agent/chat_completion_helpers_*.py",
       "agent/agent_runtime_helpers.py",
       "gateway/run.py",
-      "gateway/slash_commands.py"
+      "gateway/run_*.py",
+      "gateway/slash_commands.py",
+      "gateway/slash_commands_*.py"
     ],
     "why": "The September 2026 visibility audit found the re-init recovery helper orphaned from TurnRunner, and overlapping upstream/fork recovery notices emitting twice. The 503 no-eligible-sub x3 then 429 fallback branch itself already announced; do not replace the common emitter with per-error-branch notices. Manual switches must use their current command source, not the cached agent's previous-turn callback, and show the actual pre-switch route. Upstream has a buffered fallback notice and a single generic recovery notice; port the richer transition contract, not deletion of upstream's only notice.",
     "lifecycle": "upstream-intended",
@@ -651,8 +675,10 @@
     ],
     "paths": [
       "agent/chat_completion_helpers.py",
+      "agent/chat_completion_helpers_*.py",
       "agent/agent_runtime_helpers.py",
       "gateway/run.py",
+      "gateway/run_*.py",
       "gateway/session_state.py"
     ],
     "why": "Effort is part of the visible (provider, model, effort) identity, not merely a decorative rider. Equal provider/model must not suppress a changed effort; fallback and restore show both sides. Persist actual served effort for rebuilds, retain legacy rows without inventing unknown history, announce cached-agent config changes, and avoid replaying an already-delivered /reasoning announcement on re-init. Tests drive real fallback/restore and TurnRunner, not just an isolated formatter.",
@@ -671,6 +697,7 @@
       "agent/error_classifier.py",
       "agent/agent_runtime_helpers.py",
       "agent/chat_completion_helpers.py",
+      "agent/chat_completion_helpers_*.py",
       "agent/conversation_loop.py",
       "tests/agent/test_claude_cli_usage_cap_classification.py"
     ],
@@ -688,7 +715,9 @@
     ],
     "paths": [
       "agent/model_metadata.py",
+      "agent/model_metadata_*.py",
       "hermes_cli/models.py",
+      "hermes_cli/models_*.py",
       "providers/__init__.py"
     ],
     "why": "e8249c38cb (#816) made these lazy. Upstream kept eager forms: d143bf7a3b's _PROVIDER_PREFIXES plus the URL auto-extend in agent/model_metadata.py, and sync_plugin_provider_catalog() at import in hermes_cli/models_catalog_static.py. The 2026-09 parity tree (upstream main 439eb0395e) took those forms. On a fleet home, a process whose FIRST import is hermes_cli.models then registered 0/52 claude-apx/bpx providers, with 56 circular-import failures (t_39f3a794). Parity-merge rule: resolve both files so that no module body calls list_providers()/sync_plugin_provider_catalog(). Take upstream #122138 if it has merged; otherwise keep the fork's lazy classes. RED-proven 2026-09-25: an eager _PROVIDER_PREFIXES fails both cases, and an import-time _extend_canonical_from_plugins() fails the hermes_cli.models case.",
@@ -713,11 +742,15 @@
     "paths": [
       "hermes_cli/provider_seam.py",
       "hermes_cli/auth.py",
+      "hermes_cli/auth_*.py",
       "hermes_cli/models.py",
+      "hermes_cli/models_*.py",
       "hermes_cli/providers.py",
       "providers/__init__.py",
       "hermes_cli/model_switch.py",
+      "hermes_cli/model_switch_*.py",
       "hermes_cli/runtime_provider.py",
+      "hermes_cli/runtime_provider_*.py",
       "hermes_cli/provider_catalog.py"
     ],
     "why": "#1072 (860e58f818) added the seam that the pin-factory plugin's hot registration (plugins.pin_factory.hot_registration) publishes through. The seam module is a fork-only file. Every binding (GuardedDict/_Lazy* facade at a definition site) and every refresh(\"typed\"|\"picker\"|\"request\") trigger is ONE line in a contended upstream file, so a conflict resolved toward upstream silently removes it: the container reverts to a plain dict that tears under concurrent registration, or a provider registered after boot stops resolving on that path. Measured on upstream main cda237464a on 2026-09-25 (no seam): a reader iterating PROVIDER_REGISTRY during register_provider raised RuntimeError('dictionary changed size during iteration'), and a late-registered provider was missing from _KNOWN_PROVIDER_NAMES, so parse_model_input('late-probe:m1') routed to openrouter. Parity-merge rule: keep every facade binding and all refresh triggers. RED-proven 2026-09-25 by deleting each of the switch_model/resolve_runtime_provider/list_authenticated_providers triggers, rebinding auth.PROVIDER_REGISTRY to a plain dict, and deleting provider_seam.py.",
@@ -761,10 +794,12 @@
     "paths": [
       "agent/fallback_wall_budget.py",
       "agent/chat_completion_helpers.py",
+      "agent/chat_completion_helpers_*.py",
       "agent/chat_completion_stream_monitor.py",
       "agent/error_classifier.py",
       "agent/turn_api_request.py",
       "agent/turn_context.py",
+      "agent/turn_context_*.py",
       "hermes_cli/config_defaults.py"
     ],
     "why": "2026-10-11 01:59-02:34 PT (the 02:14 cascade): a fable turn walked alr -> dtlr -> btpr -> bpr and the user got zero bytes for 34 minutes, because every lane kept its own clock (relay per_attempt_timeout_s 420 s, stale floor 600-840 s) and nothing spanned the chain. One clock now arms when a call starts waiting, posts a still-waiting line every fallback.still_waiting_notice_seconds (120) and cuts the attempt once fallback.no_first_byte_budget_seconds (600) is spent with a usable lane ahead. Upstream has none of these modules; a parity merge resolving chat_completion_helpers.py / turn_api_request.py / error_classifier.py toward upstream drops the arm/cut/classify call sites with no import error. Canaries d-cut, f-credit, g-field in tests/fork_canaries/test_fork_canary_fallback_recovery.py. t_e35032e2 (2026-10-15): on the buffering claude relay lanes (agent.fork_ext.relay_headers._POOL_CAPABILITY_PROVIDERS: alr/dtlr/btpr/bpr faces) the notice reads 'turn in progress on <lane> (buffering lane, first byte not visible until the turn ends): Ns elapsed; long outputs run 2-4 min; cut at <budget>s; ahead: ...' because the relay holds the whole body and a healthy 4k-19k token turn ran 90-257 s with upstream ttfb 1-7 s. Wording only: clock, cadence, cut and banner class are unchanged; other lanes keep the 'still waiting for a first reply' text.",
@@ -787,7 +822,8 @@
     ],
     "paths": [
       "agent/fallback_wall_budget.py",
-      "agent/turn_recovery.py"
+      "agent/turn_recovery.py",
+      "agent/turn_recovery_*.py"
     ],
     "why": "2026-10-11 16:37 PT: merging claude-pool#249 drained the alr relay for 126 s (503 draining-for-deploy + Retry-After, x47); the harness waited in place as designed and the wall clock posted 'still waiting for a first reply: 124s' into a healthy session, and would have spent the budget on a wait the relay asked for. note_excused_wait() moves the clock forward by the real slept span. The call site lives in the fork's relay_draining branch of turn_recovery.py (draining-for-deploy is our relay's protocol), so fork-permanent. Canaries f-credit (module) and f-callsite (turn_recovery call site) in tests/fork_canaries/test_fork_canary_fallback_recovery.py.",
     "lifecycle": "fork-permanent",
@@ -810,6 +846,7 @@
     "paths": [
       "agent/fallback_wall_budget.py",
       "agent/chat_completion_helpers.py",
+      "agent/chat_completion_helpers_*.py",
       "agent/fallback_policy.py",
       "agent/fallback_events.py"
     ],
@@ -875,6 +912,7 @@
     "paths": [
       "gateway/kanban_notify_suppress.py",
       "gateway/kanban_watchers.py",
+      "gateway/kanban_watchers_*.py",
       "gateway/kanban_home_route.py"
     ],
     "why": "Cross-path contract: see row kanban-wake-contract (tests/fork_canaries/test_fork_canary_kanban_wake_contract.py). A completed/blocked/review line for a card the home session closed itself is withheld from the home chat (receipt event notify_suppressed, reason self-session/self-operator); a foreign subscriber still gets it (Prism P1 03f8b8156055). 2026-10-15 (t_d654c294): the home check compared home_from_row's target (thread_id == chat_id normalised to '') with the raw kanban_notify_subs row (Discord threads keep thread_id == chat_id), so it was never True in a thread and every thread-homed self-close echoed. kanban_home_route.same_chat normalises both sides; the _sub_is_home site in the notifier routes through it.",
@@ -892,7 +930,8 @@
     ],
     "paths": [
       "gateway/kanban_owner_wake.py",
-      "gateway/kanban_watchers.py"
+      "gateway/kanban_watchers.py",
+      "gateway/kanban_watchers_*.py"
     ],
     "why": "Cross-path contract: see row kanban-wake-contract (tests/fork_canaries/test_fork_canary_kanban_wake_contract.py). needs_input / precondition blocks, stuck workers, last-blocker-done, red/dirty handbacks and scheduled wakes on non-spawnable cards wake the card's home operator session (the lifecycle line alone notified only a human). 2026-10-15 (t_b1d26df7): a red handback on a card whose home chat holds a notify+wake sub woke twice (notifier review_requested + owner-wake red_handback, 2 s apart). The notifier now computes the red-PR state for review_requested on wake subs, appends it to its one wake turn and marks the event carried (kanban_owner_wake.mark_carried, keyed on board/task/event/chat) only after the wake was accepted; the owner-wake drops a carried review_requested. With no wake sub, an unread PR health, or a failed notifier wake, the owner-wake still fires alone.",
     "lifecycle": "fork-permanent",
@@ -909,6 +948,7 @@
     ],
     "paths": [
       "gateway/kanban_watchers.py",
+      "gateway/kanban_watchers_*.py",
       "gateway/kanban_owner_wake.py",
       "gateway/kanban_notify_suppress.py",
       "gateway/kanban_home_route.py"
@@ -934,7 +974,8 @@
       "agent/fallback_events.py",
       "agent/fallback_policy.py",
       "agent/turn_truncation.py",
-      "agent/chat_completion_helpers.py"
+      "agent/chat_completion_helpers.py",
+      "agent/chat_completion_helpers_*.py"
     ],
     "why": "A relay-200 refusal read 'content policy refusal (hop unknown, sub unknown)' (t_5d79bfea), then 'category=-' on every row (10-11, 10-13, 10-16 03:39 sub-vps-20) although the wire's message_delta carried stop_details {category: cyber, explanation}. The SDK's Delta model does not declare stop_details, so get_final_message() drops it; AnthropicStreamAccumulator only sees chunks on a Relay-MANAGED stream and the live stream ran unmanaged (no Relay consumer), so _call_anthropic also keeps stop_details from the message_delta it iterates (t_a123064d).",
     "lifecycle": "upstream-intended",
@@ -955,6 +996,7 @@
       "tools/delegate_tool_config.py",
       "hermes_cli/fallback_config.py",
       "hermes_cli/config.py",
+      "hermes_cli/config_*.py",
       "hermes_cli/config_defaults.py"
     ],
     "why": "Measured 2026-10-16: a subagent pinned by delegation.model got NO fallback chain (pinned children never borrow the parent's), so one lane outage failed every pinned child. #2043 (t_3b6cc34b) added delegation.fallback_providers: auto, resolved per spawn in _resolve_child_fallback_chain: unpinned child -> parent chain verbatim; pinned child -> parent lanes re-aimed at the child's model via fallback_config.remodel_chain_for_child (same-vendor rungs only, cross-vendor terminal rung kept, child's own route dropped, deduped); empty parent chain -> None + one WARNING; validate_config_structure refuses any other scalar without echoing it. Parity-merge risk: tools/delegate_tool_config.py is an upstream-refactored file (c47bf78d68 fallback refactor); a merge that takes upstream's resolver drops the is_auto_chain branch while every upstream test stays green, and 'auto' then silently reads as 'no usable routes'. The canary (D1-D8) drives _build_child_agent end to end and pins the absent/list/[]/auto table plus the validator; when upstream rewrites _resolve_child_fallback_chain, re-thread is_auto_chain/remodel_chain_for_child before taking the merge.",
@@ -980,8 +1022,11 @@
     "paths": [
       "gateway/response_filters.py",
       "gateway/run_turn.py",
+      "gateway/run_turn_*.py",
       "gateway/run_turn_runner.py",
+      "gateway/run_turn_runner_*.py",
       "gateway/stream_consumer.py",
+      "gateway/stream_consumer_*.py",
       "tools/process_registry_notifications.py",
       "hermes_cli/config_defaults.py"
     ],
@@ -1005,6 +1050,7 @@
     "paths": [
       "plugins/platforms/whatsapp/adapter.py",
       "gateway/status.py",
+      "gateway/status_*.py",
       "gateway/run_startup.py"
     ],
     "why": "Measured 2026-10-18: 7 gateways (aegis, argus, athena, cadmus, daedalus, daedalus-opus, momus) booted DEGRADED with whatsapp: fatal whatsapp_not_paired since >=2026-09-26 although none ever had WhatsApp. Their config carried only whatsapp: {gateway_restart_notification: false}. config_env._plugin_is_configured probes is_connected with a transient enabled=True, and whatsapp's _is_connected returned True for 'enabled and any extra', so the probe defeated the #31116 gate. _is_connected now means opt-in: WHATSAPP_ENABLED truthy; an explicit YAML enabled: true is already enabled and never probed; a leftover paired creds.json is not an opt-in (removing WHATSAPP_ENABLED is the documented disable, Prism #2069 r1). Swept every registered plugin's is_connected with the same transient view + behaviour keys: only whatsapp hit. Second half: the startup status write reloaded gateway_state.json and kept bare-key platform entries from the previous pid, so whatsapp: fatal outlived the disable; write_runtime_status(drop_stale_platforms=True) at startup drops entries whose writer (writer_pid + writer_start_time) is no longer running; a live writer keeps its entries (Prism #2069 r1). Parity-merge risk: upstream's whatsapp _is_connected carries the same 'enabled and extra' shape; a merge taking it brings the DEGRADED boot back with every upstream test green.",
@@ -1042,7 +1088,9 @@
     ],
     "paths": [
       "gateway/run_turn_runner.py",
-      "agent/turn_context.py"
+      "gateway/run_turn_runner_*.py",
+      "agent/turn_context.py",
+      "agent/turn_context_*.py"
     ],
     "why": "Dropped by parity merge aa27fd8be4 (#510, 2026-08-09): the gateway stopped passing persist_user_platform_id, so 0 of 4,880 Discord user rows carried platform_message_id (09-27..10-03) and the 10-03 11:09 restart backfill re-injected answered messages, one answered twice. Fixed by #1673 (t_3956b96e); backfilled by t_f34a6e21.",
     "lifecycle": "upstream-intended",
@@ -1062,6 +1110,7 @@
     ],
     "paths": [
       "gateway/run_turn_runner.py",
+      "gateway/run_turn_runner_*.py",
       "gateway/auto_resume.py"
     ],
     "why": "Dropped by parity merge #510 (2026-08-09): the only production call of _build_resume_pending_message vanished, _startup_resume_modes was written and never read, and every unattended resume got the report-and-ask note; on 2026-09-25 Apollo's #apollo owner session stopped instead of continuing after five mid-turn kills. Fixed by #1123; backfilled by t_f34a6e21.",
@@ -1081,7 +1130,8 @@
       "tests/hermes_cli/test_kanban_pr_acceptance.py::test_assigned_card_with_unresolvable_profile_is_auth_not_ambient"
     ],
     "paths": [
-      "hermes_cli/kanban_pr_acceptance.py"
+      "hermes_cli/kanban_pr_acceptance.py",
+      "hermes_cli/kanban_pr_acceptance_*.py"
     ],
     "why": "Regressed by parity merge #1624 (2026-10-01): _assignee_profile_home fed `human:apollo` to normalize_profile_name, which raises, so every review-lane completion was refused as `auth` before gh ran, even for MERGED PRs. Fixed by #1733; backfilled by t_f34a6e21.",
     "lifecycle": "fork-permanent",

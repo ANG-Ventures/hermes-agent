@@ -414,6 +414,36 @@ def test_lint_manifest_path_nodeid_and_vacuous_floor(tmp_path: Path) -> None:
     assert lint_manifest.lint_manifest(repo, base=base, fork_ref="fork-main", touched_paths={"fork_only.py"}, vacuous_ok=True).ok
 
 
+def test_lint_manifest_flags_a_path_that_names_a_split_facade(tmp_path: Path) -> None:
+    # Prism d61fae171cd6: a row naming only gateway/run.py lets a PR that edits gateway/run_shutdown.py
+    # skip the scoped canary lane, though the guarded branch lives there.
+    (tmp_path / "gateway").mkdir()
+    for name in ("run.py", "run_shutdown.py", "runner.py"):
+        (tmp_path / "gateway" / name).write_text("x = 1\n", encoding="utf-8")
+    entry = _schema_feature("systemd restart exit code", "fork-permanent")
+    entry["paths"] = ["gateway/run.py"]
+    manifest = _write_fork_manifest(tmp_path, [entry])
+
+    errors = lint_manifest.lint_facade_siblings(tmp_path, manifest)
+    assert len(errors) == 1
+    assert "gateway/run.py" in errors[0] and "gateway/run_shutdown.py" in errors[0]
+    assert "runner.py" not in errors[0]  # not a `<stem>_` sibling
+    assert not lint_manifest.lint_manifest(tmp_path).ok
+
+    entry["paths"] = ["gateway/run.py", "gateway/run_*.py"]
+    manifest.write_text(json.dumps([entry]), encoding="utf-8")
+    assert lint_manifest.lint_facade_siblings(tmp_path, manifest) == []
+    assert lint_manifest.lint_manifest(tmp_path).ok
+
+
+def test_live_registry_paths_name_current_files() -> None:
+    """Every `paths` pattern in the real registry matches a file at HEAD and covers its facade's siblings."""
+    repo = Path(__file__).resolve().parents[2]
+    manifest = repo / "docs" / "sync" / "fork-features.json"
+    assert lint_manifest.lint_paths(repo, manifest) == []
+    assert lint_manifest.lint_facade_siblings(repo, manifest) == []
+
+
 def _write_fork_manifest(repo: Path, entries: list[dict[str, object]]) -> Path:
     manifest = repo / "docs" / "sync" / "fork-features.json"
     manifest.parent.mkdir(parents=True)
