@@ -144,10 +144,13 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
     # has no previous sample, so take a 0.25 s one.
     cpu_busy, _ = _klg.sample_cpu_busy(None, block=0.25)
     procs, proc_limit = _klg.sample_user_procs()
+    ecore = None
+    if gate.enabled and gate.ecore_gate != "off":   # the same E-core leg as admit_now (Prism 3b7cbf596c2e)
+        ecore, _ = _klg.sample_ecore_busy(_klg.ecore_cpu_indices(), None, block=0.25)
     allowance, reason = gate.admit(
         load1, load5=load5, cpu_busy=cpu_busy,
         running=_klg.count_running_workers(),
-        procs=procs, proc_limit=proc_limit,
+        procs=procs, proc_limit=proc_limit, ecore_busy=ecore,
     )
     info = gate.snapshot()
     info.pop("boards", None)
