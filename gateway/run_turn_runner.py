@@ -679,6 +679,8 @@ class TurnRunner:
         if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
             _, base_msg, count = raw
             if len(st.progress_lines) <= len(self._fresh_progress_lines(st)):
+                if st.progress_lines:  # header-only bubble: never overwrite the header, never send it alone
+                    st.progress_lines.append(base_msg)
                 return base_msg
             st.progress_lines[-1] = f"{base_msg} (×{count + 1})"
             return st.progress_lines[-1]

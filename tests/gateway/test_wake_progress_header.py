@@ -137,8 +137,9 @@ def _bare_runner():
     return runner
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind,expected", [(INTERNAL, "🔔 wake · kanban review deadman · t_3f625862"), (None, None)])
-def test_turn_context_carries_header_for_internal_turns_only(kind, expected):
+async def test_turn_context_carries_header_for_internal_turns_only(kind, expected):
     disp = MagicMock()
     disp.resolve_display_setting.return_value = False
     ctx, _, _ = _bare_runner()._run_agent_build_turn_context(
