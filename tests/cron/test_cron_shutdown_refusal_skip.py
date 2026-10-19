@@ -83,3 +83,62 @@ def test_shutdown_refused_restart_refire_is_kept(env):
     assert row.get("last_status") != "error", row.get("last_error")
     assert row.get("manual_run_at") and row["next_run_at"] == row["manual_run_at"]
     assert [j for j in cj.get_due_jobs() if j["id"] == job["id"]], "re-fire lost"
+
+
+def test_provider_fire_refused_at_shutdown_keeps_its_occurrence(env):
+    """Same contract on the shared claim_fire -> fire_claimed path (webhook/provider fires)."""
+    import cron.jobs as cj
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    job = cj.create_job(prompt=None, schedule="every 15m", name="dpx-store-lock-watch",
+                        script="w.sh", no_agent=True, deliver="origin")
+    slot = (cj._hermes_now() - timedelta(seconds=20)).isoformat()
+    cj.update_job(job["id"], {"next_run_at": slot})
+    provider = InProcessCronScheduler()
+    claimed = provider.claim_fire(job["id"])
+    assert claimed is not None
+    sched.signal_shutdown("gateway shutdown drain")
+    provider.fire_claimed(claimed)
+    sched.clear_shutdown()
+
+    row = cj.get_job(job["id"])
+    assert env == []
+    assert row.get("last_status") != "error", row.get("last_error")
+    assert row["next_run_at"] == slot
+
+
+def test_shutdown_skip_never_releases_another_owners_claim(env):
+    import cron.jobs as cj
+    from cron.scheduler_shutdown_skip import _release_fire
+
+    job = cj.create_job(prompt=None, schedule="every 15m", name="x",
+                        script="w.sh", no_agent=True, deliver="origin")
+    foreign = {"at": cj._hermes_now().isoformat(), "by": "worker-B:abc"}
+    cj.update_job(job["id"], {"fire_claim": foreign})
+    for owner in (None, "worker-A:def"):
+        assert _release_fire(job["id"], owner, "2026-01-01T00:00:00+00:00") is False
+        row = cj.get_job(job["id"])
+        assert row["fire_claim"] == foreign
+        assert row["next_run_at"] != "2026-01-01T00:00:00+00:00"
+
+
+def test_shutdown_refusal_does_not_consume_a_monitor_change(env, monkeypatch):
+    """monitor_url + pre-run script: the URL change detected before the refused script must
+    still be a change for the next process."""
+    import cron.jobs as cj
+    import cron.monitor as mon
+
+    monkeypatch.setattr(mon, "_fetch_monitor_url", lambda url: (True, "v2"))
+    job = cj.create_job(prompt="report the change", schedule="every 15m", name="status-watch",
+                        script="w.sh", monitor_url="https://example.com/s", deliver="origin")
+    cj.update_job(job["id"], {"monitor_state": {"last_output_hash": mon.hash_monitor_output("v1")}})
+    mon._write_last_output(job["id"], "v1")
+    cj.update_job(job["id"], {"next_run_at": (cj._hermes_now() - timedelta(seconds=20)).isoformat()})
+
+    _dispatch_then_drain(job["id"])
+
+    assert env == []
+    row = cj.get_job(job["id"])
+    assert row["monitor_state"]["last_output_hash"] == mon.hash_monitor_output("v1")
+    assert mon.check_monitor(row).changed, "monitor change consumed by the refused run"

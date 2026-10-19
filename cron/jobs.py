@@ -3766,13 +3766,18 @@ def claim_job_for_fire(
         job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
         # Claimed: the occurrence is now owned by a run (its ledger row + fire claim carry it).
         job.pop("pending_slot", None)
+        claimed_slot = job.get("next_run_at")
         if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
             nxt = compute_next_run(job["schedule"], now.isoformat())
             if nxt:
                 _record_interval_fire(job, now)
                 job["next_run_at"] = nxt
         save_jobs(jobs)
-        return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
+        if not return_job:
+            return True
+        from cron.scheduler_shutdown_skip import DUE_NEXT_RUN_KEY
+        # Pre-advance slot: a run the shutdown gate refuses puts it back (every fire path).
+        return dict(copy.deepcopy(job), _scheduled_instant=instant, **{DUE_NEXT_RUN_KEY: claimed_slot})
 
     return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
 

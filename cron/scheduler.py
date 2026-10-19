@@ -3297,6 +3297,8 @@ def _prepare_job_prompt(
     if job_payload_is_empty(job):
         return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None
 
+    from cron.scheduler_shutdown_skip import monitor_checkpoint
+    _monitor_checkpoint = monitor_checkpoint(job)
     _early, extra_prompt, monitor_context = _apply_monitor_gate(job, job_id, job_name, extra_prompt)
     if _early is not None:
         return _early, None
@@ -3318,9 +3320,11 @@ def _prepare_job_prompt(
             cancel_event=cancel_event,
         )
         _ran_ok, _script_output = prerun_script
-        from cron.scheduler_shutdown_skip import is_shutdown_refused
+        from cron.scheduler_shutdown_skip import is_shutdown_refused, restore_monitor_checkpoint
         if not _ran_ok and is_shutdown_refused(job_id):
-            # Refused by the shutdown gate: do not hand "Script Error" to an agent.
+            # Refused by the shutdown gate: do not hand "Script Error" to an agent, and leave
+            # any monitor change unconsumed for the next process.
+            restore_monitor_checkpoint(job, _monitor_checkpoint)
             return (False, f"# Cron Job: {job_name}\n\n{_script_output}\n", "", _script_output), None
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
@@ -5583,7 +5587,8 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     if job.get(LATE_FIRE_KEY):
         claimed_job[LATE_FIRE_KEY] = job[LATE_FIRE_KEY]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
-    # The due slot (pre-advance), restored if the shutdown gate refuses the run.
+    # The due slot from the scan (the tick advanced it before the claim did), restored if the
+    # shutdown gate refuses the run.
     from cron.scheduler_shutdown_skip import DUE_NEXT_RUN_KEY
     claimed_job[DUE_NEXT_RUN_KEY] = job.get("next_run_at")
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)

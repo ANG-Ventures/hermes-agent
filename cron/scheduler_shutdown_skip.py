@@ -54,10 +54,11 @@ def _release_fire(job_id: str, fire_owner: Optional[str], next_run_at: Optional[
     from cron import jobs as cj
 
     def apply(jobs, _i, job):
-        if fire_owner is not None:
-            claim = job.get("fire_claim")
-            if not isinstance(claim, dict) or claim.get("by") != fire_owner:
-                return False
+        claim = job.get("fire_claim")
+        # A persisted claim is released only by its owner; no owner releases nothing it holds.
+        if claim and (not isinstance(claim, dict) or fire_owner is None
+                      or claim.get("by") != fire_owner):
+            return False
         job["fire_claim"] = None
         if job.get("run_claim") is not None:
             job["run_claim"] = None
@@ -73,6 +74,32 @@ def _release_fire(job_id: str, fire_owner: Optional[str], next_run_at: Optional[
         return True
 
     return bool(cj._under_fire_fence(job_id, lambda: cj._with_job(job_id, apply, False)))
+
+
+def monitor_checkpoint(job: dict) -> Optional[tuple]:
+    """Monitor state before the gate runs, for a job whose pre-run script may still be refused:
+    ``check_monitor`` commits a change before the script starts, and a refused run must not
+    consume it (the next process would see "unchanged" and never run the agent)."""
+    from cron.monitor import _read_last_output, job_has_monitor
+
+    if not (job.get("script") and job_has_monitor(job)):
+        return None
+    return job.get("monitor_state"), _read_last_output(str(job["id"]))
+
+
+def restore_monitor_checkpoint(job: dict, checkpoint: Optional[tuple]) -> None:
+    if checkpoint is None:
+        return
+    from cron.jobs import update_job
+    from cron.monitor import _write_last_output
+
+    state, last_output = checkpoint
+    job_id = str(job["id"])
+    try:
+        _write_last_output(job_id, last_output)
+        update_job(job_id, {"monitor_state": state})
+    except Exception:
+        logger.warning("Job '%s': monitor checkpoint restore failed", job_id, exc_info=True)
 
 
 def record_shutdown_skip(job: dict, fire_owner: Optional[str], execution_id: str) -> None:
