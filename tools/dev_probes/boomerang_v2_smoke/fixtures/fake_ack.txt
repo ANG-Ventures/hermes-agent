@@ -1,0 +1,4 @@
+fork_enabled=false
+auto_handle_enabled=false
+restart
+restore

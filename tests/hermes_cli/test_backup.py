@@ -251,6 +251,13 @@ class TestShouldExclude:
         assert not any(n.startswith((".worktrees/", "kanban/workspaces/", "var/ramscratch-stage-",
                                      "var/subvps-stage/")) for n in names), names
 
+    def test_root_forensics_archive_excluded(self):
+        """Apollo 2026-10-18 (t_5bea54fb): root forensics-archive/ (420.6 GiB) rides the weekly forensics -> NAS
+        lane, not the zip tier. Root-anchored: a nested dir of the same name is still archived."""
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path("forensics-archive/sub-vps-3/2026-10-01/journal.jsonl"))
+        assert not _should_exclude(Path("skills/x/forensics-archive/notes.md"))
+
     def test_excludes_cache_forensic_artifacts(self):
         """cache/forensic-*/ holds DELIBERATELY TORN forensic specimens — they are
         expected to fail PRAGMA integrity_check forever, by construction.
@@ -290,8 +297,8 @@ class TestShouldExclude:
         )
         # Durable content under the cache root is still archived (claude-usage = usage.ace ledger).
         assert not _should_exclude(Path("cache/claude-usage/summary.json"))
-        # A top-level forensics tree outside cache/ is NOT in scope of this rule.
-        assert not _should_exclude(Path("forensics-archive/box-1/report.md"))
+        # A forensics tree outside cache/ that is not the root forensics-archive/ is NOT in scope of this rule.
+        assert not _should_exclude(Path("skills/x/forensics-archive/box-1/report.md"))
 
     def test_excludes_state_snapshots_dir(self):
         """state-snapshots/ is excluded for the same reason as backups/: every
@@ -540,6 +547,78 @@ class TestIterBackupFiles:
 # ---------------------------------------------------------------------------
 # Backup tests
 # ---------------------------------------------------------------------------
+
+class TestCensusGate:
+    """t_5bea54fb (Ace 19:07): the full tier's growth tripwire reuses the zip's OWN scan. One walk, counted."""
+
+    def _home(self, tmp_path, monkeypatch):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        _make_hermes_tree(home)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        return home
+
+    def _count_walks(self, monkeypatch):
+        import hermes_cli.backup as backup_mod
+        calls = []
+        real = backup_mod._iter_backup_files
+
+        def _spy(*a, **kw):
+            calls.append(a[0])
+            return real(*a, **kw)
+
+        monkeypatch.setattr(backup_mod, "_iter_backup_files", _spy)
+        return calls
+
+    def test_census_written_and_tree_walked_once(self, tmp_path, monkeypatch):
+        import json
+        import sys as _sys
+        import zipfile
+        from hermes_cli.backup import run_backup
+        self._home(tmp_path, monkeypatch)
+        calls = self._count_walks(monkeypatch)
+        census, out_zip = tmp_path / "census.json", tmp_path / "out" / "full.zip"
+        out_zip.parent.mkdir()
+        gate = f"{_sys.executable} -c \"import json,sys; d=json.load(open(r'{census}')); sys.exit(0 if d['files'] else 9)\""
+        assert run_backup(Namespace(output=str(out_zip), census_out=str(census), census_gate=gate)) is True
+        assert len(calls) == 1, f"tree walked {len(calls)} times; the census must reuse the zip's scan"
+        data = json.loads(census.read_text())
+        names = [n for n in zipfile.ZipFile(out_zip).namelist() if not n.endswith("/")]
+        member_names = [n for n in names if not n.startswith("_hermes_backup")]
+        assert data["files"] > 0 and data["bytes"] > 0 and "." in data["dirs"]
+        assert data["dirs"]["."][0] == data["files"]
+        assert data["files"] <= len(member_names) + 5, (data["files"], len(member_names))
+
+    def test_gate_refusal_aborts_before_the_zip(self, tmp_path, monkeypatch):
+        import sys as _sys
+        from hermes_cli.backup import run_backup
+        self._home(tmp_path, monkeypatch)
+        calls = self._count_walks(monkeypatch)
+        out_zip = tmp_path / "out" / "full.zip"
+        out_zip.parent.mkdir()
+        with pytest.raises(SystemExit) as exc:
+            run_backup(Namespace(output=str(out_zip), census_out=str(tmp_path / "c.json"),
+                                 census_gate=f"{_sys.executable} -c \"raise SystemExit(75)\""))
+        assert exc.value.code == 75
+        assert not out_zip.exists() and not list(out_zip.parent.glob("*.partial"))
+        assert len(calls) == 1
+
+    def test_no_census_flags_keeps_old_behaviour(self, tmp_path, monkeypatch):
+        from hermes_cli.backup import run_backup
+        self._home(tmp_path, monkeypatch)
+        out_zip = tmp_path / "out.zip"
+        assert run_backup(Namespace(output=str(out_zip))) is True
+        assert out_zip.exists() and not (tmp_path / "census.json").exists()
+
+    def test_cli_parser_accepts_census_flags(self):
+        import argparse
+        from hermes_cli.subcommands.backup import build_backup_parser
+        p = argparse.ArgumentParser()
+        build_backup_parser(p.add_subparsers(), cmd_backup=lambda a: None)
+        a = p.parse_args(["backup", "-o", "x.zip", "--census-out", "c.json", "--census-gate", "true"])
+        assert (a.census_out, a.census_gate) == ("c.json", "true")
+
 
 class TestBackup:
 
