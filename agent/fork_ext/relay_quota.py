@@ -26,8 +26,12 @@ def relay_quota_outlasts_retry_window(agent, error, classified) -> bool:
         return True
     # Legacy passthrough 429s retain Anthropic's actual quota-window headers.
     # A generic 429, long Retry-After, or "quota" substring alone proves nothing.
-    # An explicit non-quota relay class takes precedence over upstream evidence.
-    if relay_class not in (None, "upstream_passthrough") or getattr(error, "status_code", None) != 429:
+    # An explicit non-quota relay class takes precedence over upstream evidence,
+    # except rate_upstream: older relays assigned it from Anthropic's "exceed
+    # your account's rate limit" wording even over a rejected 5h window
+    # (2026-10-18 15:45, t_97c3a1b1), so the window header decides there too.
+    if (relay_class not in (None, "upstream_passthrough", "rate_upstream")
+            or getattr(error, "status_code", None) != 429):
         return False
     return any(
         str(name).lower() in {

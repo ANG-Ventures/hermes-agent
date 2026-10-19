@@ -308,8 +308,9 @@ Multiple hermes processes (gateway + CLI sessions + worktree agents) share one
 
 - **Short SQLite timeout** (1 second) instead of the default 30s
 - **Time-budgeted application-level retry** with random jitter (20-150ms for the
-  first 2s, then 250ms-1s): 20s for routine writes, 60s for transcript writes
-  (their failure aborts the turn), 0.5s for observation-only activity writes
+  first 2s, then 250ms-1s): 20s for routine writes, 180s for transcript writes
+  (their failure aborts the turn; a WARNING naming the holder fires once the wait
+  passes 60s), 0.5s for observation-only activity writes
 - **BEGIN IMMEDIATE** transactions to surface lock contention at transaction start
 - **Periodic WAL checkpoints** every 50 successful writes (PASSIVE mode)
 
@@ -317,7 +318,7 @@ This avoids the "convoy effect" where SQLite's deterministic internal backoff
 causes all competing writers to retry at the same intervals.
 
 ```
-_WRITE_PATIENCE_S, _TRANSCRIPT_WRITE_PATIENCE_S, _ACTIVITY_WRITE_PATIENCE_S = 20.0, 60.0, 0.5
+_WRITE_PATIENCE_S, _TRANSCRIPT_WRITE_PATIENCE_S, _ACTIVITY_WRITE_PATIENCE_S = 20.0, 180.0, 0.5
 _WRITE_RETRY_MIN_S, _WRITE_RETRY_MAX_S = 0.020, 0.150
 _WRITE_RETRY_SLOW_MIN_S, _WRITE_RETRY_SLOW_MAX_S = 0.250, 1.000
 _CHECKPOINT_EVERY_N_WRITES = 50
@@ -333,6 +334,15 @@ in their offset (`state.db-shm` byte 120 = WAL write, 121 = checkpoint,
 PENDING/RESERVED/SHARED). The open-descriptor scan cannot make this distinction
 because every Hermes process has the DB open. Look for that line in
 `~/.hermes/logs/errors.log` next to the `database is locked` failure.
+
+`/proc/locks` only shows a holder that still holds at the deadline, and macOS has
+no `/proc/locks`. So every `SessionDB` writer also keeps a holder-side ledger:
+a write transaction (or VACUUM) still open after 2s is recorded as `holding`,
+and its end is recorded with its duration, in `state.db.lockholders/<pid>.json`
+(latest hold per process, files older than a day are removed). The deadline
+WARNING lists both sources, e.g. `PID 4242 (hermes gateway run) held the write
+lock for 74s (prune_sessions), released 3s ago`. A turn stopped as `locked` names
+the same holder at the end of its stop message.
 
 Lock contention is recognised by SQLite result code (`SQLITE_BUSY` /
 `SQLITE_LOCKED`, `hermes_state_errors.is_sqlite_lock_error`), not by message

@@ -214,6 +214,12 @@ def notice_due(agent: Any, now: Optional[float] = None) -> Optional[str]:
     st["notices"] = due
     lanes = st["lanes"]
     route = f"{getattr(agent, 'provider', '') or '?'}/{getattr(agent, 'model', '') or '?'}"
+    # t_94a2b0e4: the lane holds a recorded error (a 429/503 and its Retry-After
+    # sleep): say what we are waiting on, never "turn in progress / buffering".
+    from agent.fallback_cause import wait_notice
+    waiting = wait_notice(agent)
+    if waiting:
+        return f"{waiting}; {int(waited)}s elapsed{_ahead_suffix(agent)}"
     if _buffering_lane(agent):
         return (f"⏳ turn in progress on {route} (buffering lane, first byte not visible until "
                 f"the turn ends): {int(waited)}s elapsed; long outputs run 2–4 min; "

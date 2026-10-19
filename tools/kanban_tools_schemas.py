@@ -503,6 +503,13 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "open-ended cards where one shot rarely finishes the "
                 "work. Defaults to false (classic single-shot worker)."
         )),
+        "auto_handle": _prop("boolean", (
+            "Let mechanical wakes on this card (completed, changes requested, a red "
+            "own-repo handback, a first crash) be handled by a background boomerang "
+            "child instead of a turn in the home session. Judgment events and cards "
+            "tagged irreversible/spend/outbound always surface. Omit to inherit the "
+            "home session's /autohandle setting (default off)."
+        )),
         "unhomed": _prop("boolean", (
             "Mint the card with no home session on purpose. Without "
             "it, a create that resolves no home (no session, no homed "
