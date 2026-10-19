@@ -78,7 +78,7 @@ from hermes_state_profile_repair import SessionProfileRepairMixin
 from hermes_state_schema import SessionSchemaMixin, _FTS_TRIGRAM_TRIGGERS
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
-from hermes_state_lockowners import log_write_lock_holders
+from hermes_state_lockowners import describe_write_lock_holders, hold_ended, hold_started, log_write_lock_holders
 from hermes_state_dbfile import (
     _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
     _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
@@ -520,6 +520,31 @@ _NETWORK_DRIVE_ACTION = (
 )
 
 
+_WRITE_PLUMBING_FRAMES = frozenset({
+    "_execute_write", "_execute_transcript_write", "_write_sql", "_write_rowcount", "_attempt", "_do", "wrapped",
+})
+
+
+def _write_caller_name() -> str:
+    """Name of the SessionDB method that opened this write transaction (for the lock-holder ledger).
+    Diagnostic only: an audit hook that denies frame access (test_handle_diagnostics_unavailable_does_not_block_database)
+    must never block the write, so any failure here is "write"."""
+    frame = None
+    try:
+        frame = sys._getframe(2)
+        for _ in range(6):
+            if frame is None:
+                break
+            if frame.f_code.co_name not in _WRITE_PLUMBING_FRAMES:
+                return frame.f_code.co_name
+            frame = frame.f_back
+        return "write"
+    except Exception:
+        return "write"  # ledger attribution must not prevent the write
+    finally:
+        del frame
+
+
 def format_session_db_unavailable(
     prefix: str = "Hermes can't open its session history right now",
     *,
@@ -695,7 +720,11 @@ class SessionDB(
     # optimize); attempt-counted budgets destroyed turns on a healthy store. Transcript
     # writes (failure aborts the turn) get the long budget; observation-only activity
     # writes sit on the response-critical path and get a sub-second one.
-    _WRITE_PATIENCE_S, _TRANSCRIPT_WRITE_PATIENCE_S, _ACTIVITY_WRITE_PATIENCE_S = 20.0, 60.0, 0.5
+    _WRITE_PATIENCE_S, _TRANSCRIPT_WRITE_PATIENCE_S, _ACTIVITY_WRITE_PATIENCE_S = 20.0, 180.0, 0.5
+    # Transcript patience is 180s (t_c54736c9, Apollo ruling): a 4.6 GB state.db at load 160 held the
+    # write lock for >60s and stopped live turns. The wait stays loud: one WARNING naming the holder
+    # once a transcript write has waited _LOCK_WAIT_WARN_S, then the stop message names it too.
+    _LOCK_WAIT_WARN_S = 60.0
     # A live compression lock gets a short wait (compression publishes in seconds), but the lease
     # is a correctness boundary: a writer still locked out afterwards is refused.
     # Observation-only activity heartbeat/label writes (#76354 review S1): these run on (or adjacent to) the
@@ -1226,6 +1255,7 @@ class SessionDB(
         # settlement unknown and must propagate — this helper owns non-idempotent transcript/counter
         # mutations, not just idempotent UPSERTs.
         ioerr_begin_retried = False
+        lock_wait_warned = False
         while True:
             self._raise_if_db_corrupt(storage=True)
             # NOTE: the replaced/generation live probe runs INSIDE the lock below,
@@ -1244,8 +1274,12 @@ class SessionDB(
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
+                    hold = None
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
+                        # Inside the rollback try: nothing between BEGIN and fn may leave the
+                        # transaction open (hold_started never raises; this is the backstop).
+                        hold = hold_started(self.db_path, _write_caller_name())  # holder-side lock ledger
                         fn_started = True
                         result = fn(self._conn)
                         self._conn.commit()
@@ -1255,6 +1289,8 @@ class SessionDB(
                         except Exception:
                             pass
                         raise
+                    finally:
+                        hold_ended(hold)
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -1307,6 +1343,13 @@ class SessionDB(
                 err_msg = str(exc).lower()
                 if isinstance(exc, sqlite3.OperationalError):
                     if is_sqlite_lock_error(exc):
+                        waited = time.monotonic() - (deadline - patience_s)
+                        if not lock_wait_warned and patience_s > self._LOCK_WAIT_WARN_S and waited >= self._LOCK_WAIT_WARN_S:
+                            lock_wait_warned = True
+                            logger.warning(
+                                "state.db write lock still busy after %.0fs; retrying for up to %.0fs more: %s",
+                                waited, max(deadline - time.monotonic(), 0.0),
+                                describe_write_lock_holders(self.db_path, waited + 5.0))
                         if self._sleep_before_write_retry(deadline, patience_s):
                             continue
                         # Say what actually happened, not disk/permission damage. The holder goes to
