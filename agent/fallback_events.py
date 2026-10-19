@@ -1561,7 +1561,11 @@ def _stamp_cause_and_carry(row: Dict[str, Any], cause: Any, carry: Dict[str, Any
         row["seat"] = carry["seat"]
     if carry.get("route_id") and not row.get("route_id"):
         row["route_id"] = carry["route_id"]
-    window = carry.get("quota_window") or getattr(cause, "quota_window", None)
+    window = carry.get("quota_window")
+    if not window and timer_pending is not None:
+        # Only a row rendered FROM the cause may take the cause's window; a later,
+        # different error keeps its own (Prism 5152328892a7).
+        window = getattr(cause, "quota_window", None)
     if window and not row.get("quota_window"):
         row["quota_window"] = window
     if observed and carry and not row.get("seat"):

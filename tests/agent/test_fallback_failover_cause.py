@@ -164,6 +164,10 @@ def test_a_different_seat_drops_the_old_seats_window_and_route():
     carry = a._failover_carry
     assert carry["seat"] == "sub-vps-11"
     assert "quota_window" not in carry and "route_id" not in carry, carry
+    # Prism 5152328892a7: B's own (non-timer) failover row does not get A's window.
+    row = _row(a, reason="rate_limit")
+    assert row["seat"] == "sub-vps-11" and not row.get("quota_window"), row
+    assert fp.head_label_override(row) is None
 
 
 def test_no_rendered_banner_says_unknown_when_the_seat_header_was_present():
