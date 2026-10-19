@@ -350,7 +350,10 @@
       "tests/test_undo_redo_stack.py",
       "tests/gateway/test_undo_redo_half_turn.py",
       "tests/gateway/test_undo_error_honesty.py",
-      "tests/gateway/test_undo_drain_guard.py"
+      "tests/gateway/test_undo_drain_guard.py",
+      "tests/fork_canaries/test_fork_canary_slash_registry.py::test_fork_slash_command_is_registered",
+      "tests/fork_canaries/test_fork_canary_slash_registry.py::test_undo_and_redo_accept_a_count_argument",
+      "tests/fork_canaries/test_fork_canary_slash_registry.py::test_no_fork_command_collides_with_an_alias"
     ],
     "paths": [
       "hermes_undo.py",
@@ -369,13 +372,14 @@
       "discord",
       "telegram"
     ],
-    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_slash_registry.py (RED-proven: delete the CommandDef row)"
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_slash_registry.py (RED-proven: delete the CommandDef row)"
   },
   {
     "feature": "slash command /branch (alias /fork) incl. Discord context-inheriting thread spawn",
     "tests": [
       "tests/hermes_cli/test_branch_command.py",
-      "tests/gateway/test_discord_branch_thread_merge.py::TestBranchDiscordThread"
+      "tests/gateway/test_discord_branch_thread_merge.py::TestBranchDiscordThread",
+      "tests/fork_canaries/test_fork_canary_slash_registry.py::test_branch_keeps_the_fork_alias"
     ],
     "paths": [
       "hermes_cli/commands.py",
@@ -393,12 +397,13 @@
       "gateway",
       "discord"
     ],
-    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_slash_registry.py::test_branch_keeps_the_fork_alias"
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_slash_registry.py::test_branch_keeps_the_fork_alias"
   },
   {
     "feature": "slash command /merge (fold a branch summary into its parent session)",
     "tests": [
-      "tests/gateway/test_discord_branch_thread_merge.py::TestMergeCommand"
+      "tests/gateway/test_discord_branch_thread_merge.py::TestMergeCommand",
+      "tests/fork_canaries/test_fork_canary_slash_registry.py::test_merge_is_gateway_only_and_branch_is_not"
     ],
     "paths": [
       "hermes_cli/commands.py",
@@ -414,12 +419,13 @@
       "gateway",
       "discord"
     ],
-    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_slash_registry.py::test_merge_is_gateway_only_and_branch_is_not"
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_slash_registry.py::test_merge_is_gateway_only_and_branch_is_not"
   },
   {
     "feature": "slash command /fast (OpenAI Priority Processing / Anthropic Fast Mode toggle)",
     "tests": [
-      "tests/gateway/test_fast_command.py"
+      "tests/gateway/test_fast_command.py",
+      "tests/fork_canaries/test_fork_canary_slash_registry.py::test_fast_exposes_its_mode_subcommands"
     ],
     "paths": [
       "hermes_cli/commands.py",
@@ -435,7 +441,7 @@
       "cli",
       "gateway"
     ],
-    "proposed_canary": "/tmp/fork-e2e-lane/tests/test_fork_canary_slash_registry.py::test_fast_exposes_its_mode_subcommands"
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_slash_registry.py::test_fast_exposes_its_mode_subcommands"
   },
   {
     "feature": "discord free-response channels: scalar coercion + quoted-bot-mention exemption",
@@ -1009,5 +1015,81 @@
       "gateway"
     ],
     "proposed_canary": "tests/fork_canaries/test_fork_canary_plugin_platform_optin.py (every registered plugin is_connected vs behaviour-only extras; whatsapp end to end + positive controls) and tests/fork_canaries/test_fork_canary_gateway_state_stale_platforms.py (RED-proven 2026-10-18 t_83ff59d4: _is_connected reverted to enabled-and-extra -> whatsapp param + display-key test; drop_stale_platforms removed -> 5 of 6; on fork/main sources 15 failed, 30 passed)"
+  },
+  {
+    "feature": "model-switch registry pins: inline provider-PROFILE aliases switch to their profile; the picker binds ONE provider_seam snapshot per listing",
+    "tests": [
+      "tests/hermes_cli/test_registry_pins_parity_regressions.py"
+    ],
+    "paths": [
+      "hermes_cli/model_switch.py",
+      "hermes_cli/model_switch_providers.py"
+    ],
+    "why": "Regressed by parity merge 2d966948b07 (#1624, 2026-10-01): `claude-api-proxy-f3/claude-opus-5` stopped switching to claude-apx-3 (the inline match fell back to exact id only) and list_authenticated_providers read module globals per section, so a hot registration could tear one picker listing across generations. Fixed by #1792 (t_91575e79) with tests nothing registered; backfilled by t_f34a6e21 so the next sync cannot drop it silently.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "gateway"
+    ],
+    "proposed_canary": "tests/hermes_cli/test_registry_pins_parity_regressions.py (RED-proven 2026-10-18 t_f34a6e21: `git apply -R` of #1792's source diff -> 5 failed, 1 passed; restored -> 6 passed)"
+  },
+  {
+    "feature": "gateway persists the inbound platform_message_id on the user row (restart backfill / re-delivery dedupe authority)",
+    "tests": [
+      "tests/gateway/test_persist_user_platform_id_threaded.py"
+    ],
+    "paths": [
+      "gateway/run_turn_runner.py",
+      "agent/turn_context.py"
+    ],
+    "why": "Dropped by parity merge aa27fd8be4 (#510, 2026-08-09): the gateway stopped passing persist_user_platform_id, so 0 of 4,880 Discord user rows carried platform_message_id (09-27..10-03) and the 10-03 11:09 restart backfill re-injected answered messages, one answered twice. Fixed by #1673 (t_3956b96e); backfilled by t_f34a6e21.",
+    "lifecycle": "upstream-intended",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "discord",
+      "telegram"
+    ],
+    "proposed_canary": "tests/gateway/test_persist_user_platform_id_threaded.py (RED-proven 2026-10-18 t_f34a6e21: drop the `kwargs[\"persist_user_platform_id\"]` stamp in gateway/run_turn_runner.py TurnRunner -> 1 failed, 1 passed; restored -> 2 passed)"
+  },
+  {
+    "feature": "resume-pending guidance consumes the boot scheduler's per-session disposition (auto/always resumes continue, in-flight tool calls named)",
+    "tests": [
+      "tests/gateway/test_resume_inflight_guidance.py"
+    ],
+    "paths": [
+      "gateway/run_turn_runner.py",
+      "gateway/auto_resume.py"
+    ],
+    "why": "Dropped by parity merge #510 (2026-08-09): the only production call of _build_resume_pending_message vanished, _startup_resume_modes was written and never read, and every unattended resume got the report-and-ask note; on 2026-09-25 Apollo's #apollo owner session stopped instead of continuing after five mid-turn kills. Fixed by #1123; backfilled by t_f34a6e21.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ],
+    "proposed_canary": "tests/gateway/test_resume_inflight_guidance.py (RED-proven 2026-10-18 t_f34a6e21: `disposition = {}` in place of the _startup_resume_modes read in gateway/run_turn_runner.py -> 1 failed (test_dispatch_site_consumes_the_scheduler_disposition), 8 passed; restored -> 9 passed)"
+  },
+  {
+    "feature": "kanban PR acceptance gate: the human review lane (`human` / `human:<name>`) reads with the ambient login, never as a profile",
+    "tests": [
+      "tests/hermes_cli/test_kanban_pr_acceptance.py::test_human_review_lane_reads_with_the_ambient_login",
+      "tests/hermes_cli/test_kanban_pr_acceptance.py::test_assignee_profile_home_lane_contract",
+      "tests/hermes_cli/test_kanban_pr_acceptance.py::test_assigned_card_with_unresolvable_profile_is_auth_not_ambient"
+    ],
+    "paths": [
+      "hermes_cli/kanban_pr_acceptance.py"
+    ],
+    "why": "Regressed by parity merge #1624 (2026-10-01): _assignee_profile_home fed `human:apollo` to normalize_profile_name, which raises, so every review-lane completion was refused as `auth` before gh ran, even for MERGED PRs. Fixed by #1733; backfilled by t_f34a6e21.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli"
+    ],
+    "proposed_canary": "tests/hermes_cli/test_kanban_pr_acceptance.py (RED-proven 2026-10-18 t_f34a6e21: `if not assignee or _is_human_lane(assignee):` -> `if not assignee:` in hermes_cli/kanban_pr_acceptance.py -> 3 failed, 1 passed; restored -> 4 passed)"
   }
 ]
