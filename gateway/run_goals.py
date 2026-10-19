@@ -11,6 +11,7 @@ import asyncio
 import dataclasses
 import logging
 import time
+import weakref
 from contextlib import nullcontext, suppress
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -585,6 +586,17 @@ class GatewayGoalsMixin:
             except Exception as exc:
                 logger.debug("goal idle wake for %s failed: %s", entry.session_key, exc)
 
+    def _goal_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Per-session lock serializing goal-state read/mutate/save between /goal commands and the
+        idle-wake watcher (both hop to an executor, so the event loop alone does not order them)."""
+        locks = getattr(self, "_goal_session_locks", None)
+        if locks is None:
+            locks = self._goal_session_locks = weakref.WeakValueDictionary()
+        lock = locks.get(session_id)
+        if lock is None:
+            lock = locks[session_id] = asyncio.Lock()
+        return lock
+
     def _stop_latched(self, session_key: str) -> bool:
         """True while the user's /stop holds automatic turns for this session (in-memory latch)."""
         try:
@@ -608,15 +620,34 @@ class GatewayGoalsMixin:
             return  # busy: the running turn's own post-turn judge owns the next step
         if getattr(entry, "user_stopped_at", None) is not None or self._stop_latched(quick_key):
             return  # /stop latched: only a human turn resumes automatic work
-        with self._profile_scope_for_source(source):
+        max_turns = self._goal_max_turns_from_config()
+
+        def _wake():
             from hermes_cli.goals import GoalManager
 
-            mgr = GoalManager(session_id=session_id, default_max_turns=self._goal_max_turns_from_config())
-            prompt = await self._run_in_executor_with_context(
-                lambda: mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins),
-            )
-        if not prompt:
-            return
+            # Load inside the hop and under the session's goal lock: a /goal pause|clear that
+            # committed before this point is what we read, so the save below cannot undo it.
+            mgr = GoalManager(session_id=session_id, default_max_turns=max_turns)
+            return mgr, mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins)
+
+        with self._profile_scope_for_source(source):
+            async with self._goal_session_lock(session_id):
+                mgr, prompt = await self._run_in_executor_with_context(_wake)
+                if not prompt:
+                    return
+                # Re-check eligibility after the hop: a real message, /stop or a goal change
+                # that landed meanwhile owns the next step.
+                from hermes_cli.goals import load_goal
+
+                current = await self._run_in_executor_with_context(lambda: load_goal(session_id))
+                if (
+                    current is None or current.status != "active"
+                    or quick_key in getattr(self, "_running_agents", {})
+                    or quick_key in adapter._active_sessions
+                    or self._queue_depth(quick_key, adapter=adapter) > 0
+                    or self._stop_latched(quick_key)
+                ):
+                    return
         logger.info(
             "goal idle wake #%s for %s (session %s): %s", mgr.state.idle_wakes if mgr.state else "?",
             quick_key, session_id, prompt.splitlines()[0][:80],

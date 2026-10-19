@@ -1278,6 +1278,11 @@ class GoalManager:
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
         self._state: Optional[GoalState] = load_goal(session_id)
 
+    def reload(self) -> Optional[GoalState]:
+        """Re-read the persisted goal, dropping this manager's snapshot (another writer may have saved)."""
+        self._state = load_goal(self.session_id)
+        return self._state
+
     # --- introspection ------------------------------------------------
 
     @property
