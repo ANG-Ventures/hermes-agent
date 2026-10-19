@@ -549,3 +549,65 @@ def test_ac14_live_child_past_max_cancelled_first_late_handoff_dropped(env):
         f"⚠️ auto-handle lost {tid} (reason: timeout)"]
     with kb.connect_closing() as conn:
         assert not any(e.kind == ah.RECEIPT_KIND for e in kb.list_events(conn, tid))
+
+
+# --- wake load gate (smoke 2026-10-19: a box idling above the band never auto-handled) ---------
+
+
+def _gate(env, tmp_path, *, load: float, lane=None):
+    from hermes_cli.kanban_wake_gate import WakeGate
+
+    env["runner"]._kanban_wake_gate = WakeGate(
+        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48}}},
+        ncpu=32, loadavg=lambda: (load, load, load), lane_probe=lambda p: lane,
+        state_file=tmp_path / "wake_gate.json")
+
+
+def test_host_load_alone_does_not_stop_the_auto_handle_child(env, tmp_path):
+    """Above the host band the session's wake is a notify, but the child still dispatches: it
+    replaces that wake turn, so downgrading it saves nothing."""
+    _gate(env, tmp_path, load=71.0)
+    tid = _card(env)
+    _sub(tid)
+    _worker_close(tid)
+    turns = _tick(env)
+    assert [e["task_id"] for e in env["dispatched"]] == [tid]
+    assert turns == [], "no session wake turn either way"
+    assert any("(notify: host load 71)" in s for s in env["adapter"].sent), env["adapter"].sent
+
+
+def test_capped_lane_still_stops_the_auto_handle_child(env, tmp_path):
+    """A capped lane is a real cost for the child too: no dispatch, the line posts as a notify."""
+    _gate(env, tmp_path, load=10.0, lane="lane prov-x capped")
+    tid = _card(env)
+    _sub(tid)
+    _worker_close(tid)
+    turns = _tick(env)
+    assert env["dispatched"] == [] and _claims() == {} and turns == []
+    assert any("(notify: lane prov-x capped)" in s for s in env["adapter"].sent), env["adapter"].sent
+
+
+def test_failed_dispatch_under_host_load_stays_a_notify(env, tmp_path):
+    """INV-6 at load: a raised dispatch posts the warning; the wake it falls back to is still
+    downgraded (a notify, no session turn), exactly as without auto-handle."""
+    def boom(*_a, **_k):
+        raise OSError("ledger disk full")
+
+    env["monkeypatch"].setattr(ah, "ledger_append", boom)
+    _gate(env, tmp_path, load=71.0)
+    tid = _card(env)
+    _sub(tid)
+    _worker_close(tid)
+    turns = _tick(env)
+    assert turns == []
+    assert any(s.startswith(f"⚠️ auto-handle failed {tid}") for s in env["adapter"].sent), env["adapter"].sent
+
+
+def test_unflagged_card_under_host_load_is_unchanged(env, tmp_path):
+    """No auto candidate: the exemption never engages (notify, no turn, no claim)."""
+    _gate(env, tmp_path, load=71.0)
+    tid = _card(env, auto=False)
+    _sub(tid)
+    _worker_close(tid)
+    turns = _tick(env)
+    assert env["dispatched"] == [] and _claims() == {} and turns == []
