@@ -703,7 +703,7 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
-    aliases: ['s'],
+    aliases: ['st'],
     help: 'inject a message after the next tool call (no interrupt)',
     name: 'steer',
     run: (arg, ctx) => {

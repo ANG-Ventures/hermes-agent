@@ -1201,5 +1201,35 @@
       "cron"
     ],
     "proposed_canary": "tests/fork_canaries/test_fork_canary_failover_cause.py (four arms, each names its merge-shaped red edit)"
+  },
+  {
+    "feature": "Fork slash shortcuts: /s -> /stop, /st -> /steer, /m -> /model, /r -> /reasoning (plus /q -> /queue) as registry aliases",
+    "tests": [
+      "tests/fork_canaries/test_fork_canary_short_aliases.py::test_shortcut_resolves_to_its_command",
+      "tests/fork_canaries/test_fork_canary_short_aliases.py::test_full_names_still_resolve_to_themselves",
+      "tests/fork_canaries/test_fork_canary_short_aliases.py::test_gateway_resolves_typed_shortcut",
+      "tests/fork_canaries/test_fork_canary_short_aliases.py::test_busy_gateway_s_dispatches_stop_handler",
+      "tests/hermes_cli/test_slash_shortcuts_doc.py::test_committed_shortcuts_doc_matches_registry"
+    ],
+    "paths": [
+      "hermes_cli/commands.py",
+      "hermes_cli/commands_*.py",
+      "ui-tui/src/app/slash/commands/core.ts",
+      "ui-tui/src/app/slash/commands/ops.ts",
+      "ui-tui/src/app/slash/commands/session.ts",
+      "docs/sync/slash-shortcuts.md"
+    ],
+    "why": "Ace 2026-10-18 (Discord #alerts thread 1561599505181446277): \"make /s a shortcut for /stop, /q for /queue\", /steer gets \"st\", and \"add regression testing for all of those new aliases ... so we don't lose them whenever we update Hermes to upstream parity, eg /m and /r\". Upstream binds aliases=(\"s\",) to steer and has no st/m/r, so resolving commands.py toward upstream silently repoints /s to /steer (no interrupt) and drops /m /r /st with no error. /m and /r used to be config quick_commands, which die silently if a builtin ever claims the name and never worked on CLI/TUI. Ace's usage: /model 93, /stop 88, /queue 24, /reasoning 15, /s and /steer 0. TUI local registry is pinned by ui-tui/src/__tests__/slashParity.test.ts.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "cli",
+      "tui",
+      "gateway",
+      "discord",
+      "telegram"
+    ],
+    "proposed_canary": "tests/fork_canaries/test_fork_canary_short_aliases.py (RED-proof: see card t_92c49fb6)"
   }
 ]
