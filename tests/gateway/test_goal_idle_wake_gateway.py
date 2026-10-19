@@ -46,7 +46,6 @@ def rig(tmp_path, monkeypatch):
     entry = SimpleNamespace(session_key=key, session_id="goal-sess", origin=source, suspended=False)
     runner = object.__new__(GatewayRunner)
     runner.config = {"goals": {"checkin_minutes": 30, "max_idle_checkins": 3}}
-    runner._running_agents = {}
     runner._queued_events = {}
     runner.session_store = SimpleNamespace(list_sessions=lambda: [entry])
     runner._restored_source = lambda e: e.origin
@@ -57,9 +56,6 @@ def rig(tmp_path, monkeypatch):
         return None
 
     runner._warm_goals_session_db = _warm
-    states = {}
-    runner._session_state = lambda k: states.setdefault(
-        k, SimpleNamespace(conversation=SimpleNamespace(automatic_turns_paused=None)))
     yield runner, adapter, received, key
     goals._DB_CACHE.clear()
 
@@ -128,10 +124,10 @@ async def test_user_stop_latch_blocks_idle_wakes(rig):
     """Ace's /stop (or "stop the goal") must hold: a latched session is never woken by the poller."""
     runner, adapter, received, key = rig
     _due()
-    runner._session_state(key).conversation.automatic_turns_paused = True
+    runner._stop_latched = lambda k: k == key                # in-memory /stop latch
     await runner._goal_idle_wake_scan()
     assert received == []
-    runner._session_state(key).conversation.automatic_turns_paused = None
+    runner._stop_latched = lambda k: False
     entry = runner.session_store.list_sessions()[0]
     entry.user_stopped_at = time.time()                      # durable marker after a restart
     await runner._goal_idle_wake_scan()
