@@ -94,9 +94,16 @@ def origin_slug(repo: Path, runner: Callable = subprocess.run) -> Optional[str]:
 
 
 def anchor_repo(task_id: str, workspace_path: Optional[str],
-                board_default: Optional[str]) -> Optional[Path]:
-    """The repo root a worktree card would anchor on, or None (not portable)."""
-    from hermes_cli.kanban_db_workspace import _git_toplevel
+                board_default: Optional[str], branch: Optional[str] = None,
+                runner: Callable = subprocess.run) -> Optional[Path]:
+    """The repo root a worktree card would anchor on, or None (not portable).
+
+    None for: a concrete target path; a LINKED worktree (a prior Studio run
+    persisted ``<repo>/.worktrees/<id>``, whose toplevel is itself, Prism
+    4a24c6d61776); an existing ``<repo>/.worktrees/<id>``; and a card branch
+    that exists locally with commits origin does not have (or no origin ref
+    at all), since the clone could not start from them (Prism 044612a3554e)."""
+    from hermes_cli.kanban_db_workspace import _git_toplevel, _is_linked_worktree_checkout
     raw = (workspace_path or "").strip() or (board_default or "").strip()
     if not raw:
         return None
@@ -104,22 +111,37 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
     if not p.is_absolute() or not p.is_dir():
         return None
     top = _git_toplevel(p)
-    if top is None or top != p.resolve():
-        return None  # a concrete target path, not an anchor: keep it local
+    if top is None or top != p.resolve() or _is_linked_worktree_checkout(top):
+        return None  # a concrete target or a linked worktree: keep it local
     if (top / ".worktrees" / task_id).exists():
         return None  # a prior run's local worktree: its work stays where it is
+    b = (branch or "").strip() or f"wt/{task_id}"
+
+    def _git(*args):
+        try:
+            return runner(["git", "-C", str(top), *args], capture_output=True, text=True,
+                          timeout=10, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None
+    local = _git("rev-parse", "-q", "--verify", f"refs/heads/{b}")
+    if local is None:
+        return None
+    if getattr(local, "returncode", 1) == 0:
+        ahead = _git("rev-list", "--count", f"refs/remotes/origin/{b}..refs/heads/{b}")
+        if ahead is None or getattr(ahead, "returncode", 1) != 0 or (ahead.stdout or "").strip() != "0":
+            return None  # local commits (or no origin ref): only the Studio has the baseline
     return top
 
 
 def port_for(task_id: str, workspace_path: Optional[str], board_default: Optional[str],
-             fleet_dir: Path, runner: Callable = subprocess.run
-             ) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
+             fleet_dir: Path, runner: Callable = subprocess.run, *,
+             branch: Optional[str] = None) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
     """``(owner/repo, mirror, hosts)`` when this worktree card may run on a
     pool host, else None."""
     mirrors = read_mirrors(fleet_dir)
     if not mirrors:
         return None
-    repo = anchor_repo(task_id, workspace_path, board_default)
+    repo = anchor_repo(task_id, workspace_path, board_default, branch, runner)
     slug = origin_slug(repo, runner) if repo is not None else None
     row = mirrors.get(slug.lower()) if slug else None
     return (slug, row[0], row[1]) if row else None

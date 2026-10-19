@@ -219,3 +219,43 @@ def test_a_checkout_of_another_origin_is_refused(tmp_path):
     _git("clone", "-q", str(origin), str(ws), cwd=tmp_path)
     sc = kwt.clone_script(str(ws), SLUG, str(mirror), "feature", url="https://github.com/x/y.git")
     assert subprocess.run(["sh", "-c", sc]).returncode == 3
+
+
+def _commit(repo, name):
+    (repo / name).write_text(name)
+    _git("add", name, cwd=repo)
+    _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", name, cwd=repo)
+
+
+def test_a_linked_worktree_path_is_not_an_anchor(kanban_home, anchor):
+    """Prism 4a24c6d61776: a rerun whose persisted path is the Studio's
+    .worktrees/<id> keeps its tree; it is never re-cloned on a pool host."""
+    _mirrors(kanban_home)
+    _commit(anchor, "base")
+    with kb.connect_closing() as conn:
+        tid = _worktree_card(conn, anchor)
+        wt = anchor / ".worktrees" / tid
+        _git("worktree", "add", "-q", "-b", f"wt/{tid}", str(wt), cwd=anchor)
+        conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(wt), tid))
+        conn.commit()
+        assert kwt.anchor_repo(tid, str(wt), None) is None
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2))[0] == "local"
+
+
+def test_a_local_branch_ahead_of_origin_keeps_the_card_local(kanban_home, anchor):
+    """Prism 044612a3554e: the card's branch has commits only the Studio has."""
+    _mirrors(kanban_home)
+    _commit(anchor, "base")
+    _git("update-ref", "refs/remotes/origin/feature", "HEAD", cwd=anchor)
+    _git("checkout", "-q", "-b", "feature", cwd=anchor)
+    _commit(anchor, "local-only")
+    _git("checkout", "-q", "main", cwd=anchor)
+    assert kwt.anchor_repo("t_x", str(anchor), None, "feature") is None
+    # in step with origin: portable
+    _git("update-ref", "refs/remotes/origin/feature", "feature", cwd=anchor)
+    assert kwt.anchor_repo("t_x", str(anchor), None, "feature") == anchor.resolve()
+    # a local branch origin never saw: local
+    _git("branch", "only-here", cwd=anchor)
+    assert kwt.anchor_repo("t_x", str(anchor), None, "only-here") is None
+    # no local branch at all: the clone makes it, portable
+    assert kwt.anchor_repo("t_x", str(anchor), None, "wt/t_x") == anchor.resolve()

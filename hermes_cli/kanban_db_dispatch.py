@@ -4634,7 +4634,8 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     if (row["workspace_kind"] or "scratch") == "worktree" and allowlisted and not linked and bind is None:
         from hermes_cli import kanban_worktree_port as _kwt
         port = _kwt.port_for(row["id"], row["workspace_path"],
-                             _kwt.board_default_workdir(board), _kb.kanban_home() / "fleet")
+                             _kwt.board_default_workdir(board), _kb.kanban_home() / "fleet",
+                             branch=_kb._row_get(row, "branch_name"))
         if port is not None:
             wt_hosts = port[2]
             if worktree_out is not None:
@@ -5794,7 +5795,7 @@ def _dispatch_once_locked(
             hosts={h.name for h in spillover.config.pool_hosts})
     ready_rows = conn.execute(
         "SELECT id, assignee, body, skills, workspace_kind, workspace_path, no_worker, priority, "
-        "origin_host, workspace_of "
+        "origin_host, workspace_of, branch_name "
         "FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
