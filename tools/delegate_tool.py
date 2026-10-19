@@ -148,6 +148,28 @@ def _apply_child_cache_ttl(child) -> None:
         child._cache_ttl = "5m"
 
 
+def _should_pin_first_request(parent, mode) -> bool:
+    """Boomerang v2 D-3: only a FORK child pins, and only when the parent's seat is known."""
+    from agent.chat_completion_helpers import _POOL_SUB_KEY_RE
+
+    seat = getattr(parent, "last_served_by", None)
+    return mode == "fork" and isinstance(seat, str) and bool(_POOL_SUB_KEY_RE.fullmatch(seat))
+
+
+def _arm_first_request_pin(child, parent, mode) -> None:
+    """Stage ``x-hermes-pin-sub: <parent seat>`` for the child's FIRST request only.
+
+    The request builder pops it (``consume_first_request_headers``), so later
+    turns are unpinned; a fold child is never armed (INV-3). P2 calls this from
+    ``_build_child_agent`` once ``inherit_mode`` exists.
+    """
+    if not _should_pin_first_request(parent, mode):
+        return
+    from agent.fork_ext.relay_headers import POOL_PIN_SUB_HEADER
+
+    child._first_request_extra_headers = {POOL_PIN_SUB_HEADER: parent.last_served_by}
+
+
 _CHILD_CAP_MIN = 16_000  # below this a child compresses on every call; treat as a config error
 
 

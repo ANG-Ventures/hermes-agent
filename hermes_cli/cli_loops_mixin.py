@@ -418,6 +418,12 @@ class CLILoopsMixin:
             # bare `/queue` prints the usage hint under an empty list; `/queue list` does not
             self._queue_list(payload.strip())
             return
+        if op.kind == "rm" and op.index is None:
+            # bare `/queue rm`: list what can be removed, change nothing (Ace 2026-10-18)
+            self._queue_list("rm")
+            if self._pending_input_items():
+                _cprint(f"  {t('cli.queue.rm_pick')}")
+            return
         # Handlers keep their original string contract: "N" (rm), "N text" (edit), "A B" (move).
         rest = f"{op.index} {op.text}".strip() if op.kind == "edit" else op.text
         getattr(self, _QUEUE_HANDLERS[op.kind])(rest)
