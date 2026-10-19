@@ -4604,6 +4604,14 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
     if binds is None:
         binds = _workspace_binds(conn, [row])
     bind = binds.get(row["id"])
+    if bind is None and (row["workspace_kind"] or "scratch") == "scratch":
+        # A ported worktree card's clone lives on the host it was ported to
+        # (t_6d9e7d90, Prism 5487e612d7e8): every rerun binds there, whatever
+        # placement.continuation says; an absent host waits, never re-clones.
+        from hermes_cli import kanban_worktree_port as _kwt
+        _ported = _kwt.ported_host(conn, row["id"], row["workspace_path"])
+        if _ported:
+            bind = (_kwt.PORT_BIND_RULE, row["id"], _ported)
     # An unassigned card is routed as the assignee the loop will give it.
     assignee = row["assignee"] or default_assignee
     allowlisted = bool(assignee) and assignee in tuple(plan.config.profiles or ())
@@ -6730,7 +6738,9 @@ def _dispatch_once_locked(
                     _job = _kh_job.job_for_row(conn, row, affinity_targets=_targets)
                 # A body naming Studio-only resources lands only on a host
                 # whose caps cover them (t_aea826a9); never widen ``_only``.
-                _need_hosts = _kwp_take.needs_allowed_hosts(row["body"], spillover.config)
+                _need_hosts = _kwp_take.needs_allowed_hosts(
+                    row["body"], spillover.config,
+                    honor_declared=_caps is not None and not _caps.legacy_body)
                 if _need_hosts is not None:
                     _only = _need_hosts if _only is None else tuple(
                         h for h in _only if h.lower() in {n.lower() for n in _need_hosts})

@@ -125,12 +125,19 @@ def test_explicit_requires_line_outranks_sniffed_prose_needs():
     to the Studio. ``requires: none`` and a real capability word both count."""
     pool = kwp.PoolConfig(hosts=("ci-box",), profiles=("alpha",), pool_hosts=(_host("ci-box"),))
 
-    def port(body):
+    def port(body, layer_enforces=True):
         return kwp.portable(workspace_kind="scratch", has_links=False, workspace_has_content=False,
-                            assignee="alpha", body=body, pool=pool)
+                            assignee="alpha", body=body, pool=pool,
+                            body_signals=not layer_enforces)
     for decl in ("requires: none\n", "requires: fleet-ssh\n"):
         assert port(decl + DEC6D40F) == (True, None, "policy"), decl
-        assert kwp.needs_allowed_hosts(decl + DEC6D40F, pool) is None
+        assert kwp.needs_allowed_hosts(decl + DEC6D40F, pool, honor_declared=True) is None
+        # Prism cf1b3bd689e8: with the capability layer off nothing enforces
+        # the declaration, so the prose needs still bind.
+        assert port(decl + DEC6D40F, layer_enforces=False)[1] == "studio_needs", decl
+        assert kwp.needs_allowed_hosts(decl + DEC6D40F, pool) == ()
+    # the access word alone is not a capability declaration
+    assert port("requires: control-plane-read\n" + DEC6D40F)[0] is False
     # prose that only MENTIONS the word keeps binding (not line-anchored)
     assert port("note: requires: none is not set here\n" + DEC6D40F)[1] == "studio_needs"
 

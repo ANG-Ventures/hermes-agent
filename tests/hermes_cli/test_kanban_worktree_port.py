@@ -80,6 +80,13 @@ def test_worktree_card_with_a_mirror_is_portable_and_clones_on_the_host(
     assert row["branch_name"] == f"wt/{tid}"
     assert json.loads(ev[0])["host"] == "ace-ai"
     assert not (anchor / ".worktrees" / tid).exists()  # no Studio worktree made
+    # A rerun binds to the host holding the clone (Prism 5487e612d7e8).
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL WHERE id=?", (tid,))
+        conn.commit()
+        rules: dict = {}
+        assert kbd._route_row(conn, _row(conn, tid), _plan(free=2), rules_out=rules) == ("pin", "ace-ai")
+        assert rules[tid].startswith("bind_host:ace-ai")
 
 
 def test_worktree_card_pinned_to_a_host_without_the_mirror_stays_local(kanban_home, anchor):
@@ -138,7 +145,8 @@ def test_clone_script_against_a_real_local_origin(tmp_path):
     out = subprocess.run(["git", "-C", str(ws), "branch", "--show-current"],
                          capture_output=True, text=True).stdout.strip()
     assert out == "wt/t_x" and (ws / "f").read_text() == "x"
-    assert (ws / ".git" / "objects" / "info" / "alternates").exists()
+    # --dissociate: nothing borrowed from the mirror survives the clone
+    assert not (ws / ".git" / "objects" / "info" / "alternates").exists()
     assert subprocess.run(["sh", "-c", script]).returncode == 0  # idempotent
     other = tmp_path / "ws" / "busy"
     other.mkdir()
@@ -146,3 +154,68 @@ def test_clone_script_against_a_real_local_origin(tmp_path):
     bad = kwt.clone_script(str(other), SLUG, str(mirror), "b", url=str(origin))
     assert subprocess.run(["sh", "-c", bad]).returncode == 3
     assert (other / "keep").read_text() == "1"
+
+
+@pytest.mark.parametrize("url, slug", [
+    ("https://github.com/ANG-Ventures/hermes-home.git", "ANG-Ventures/hermes-home"),
+    ("https://github.com/ANG-Ventures/hermes-agent", "ANG-Ventures/hermes-agent"),
+    ("git@github.com:ANG-Ventures/hermes-home.git", "ANG-Ventures/hermes-home"),
+    ("ssh://git@github.com/acme/repo.git", "acme/repo"),
+    ("https://notgithub.com/acme/repo.git", None),           # Prism afc85da13a79
+    ("https://evil.example/github.com/acme/repo.git", None),
+    ("https://github.com.evil/acme/repo.git", None),
+])
+def test_origin_slug_matches_github_only(tmp_path, url, slug):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    _git("remote", "add", "origin", url, cwd=repo)
+    kwt._origin_cache.clear()
+    assert kwt.origin_slug(repo) == slug
+
+
+def _origin_with_feature(tmp_path):
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    ident = ("-c", "user.email=t@t", "-c", "user.name=t")
+    _git("init", "-q", "-b", "main", cwd=origin)
+    (origin / "f").write_text("main")
+    _git("add", "f", cwd=origin)
+    _git(*ident, "commit", "-qm", "m", cwd=origin)
+    _git("checkout", "-q", "-b", "feature", cwd=origin)
+    (origin / "f").write_text("feature")
+    _git(*ident, "commit", "-qam", "f", cwd=origin)
+    _git("checkout", "-q", "main", cwd=origin)
+    mirror = tmp_path / "mirror.git"
+    _git("clone", "-q", "--mirror", str(origin), str(mirror), cwd=tmp_path)
+    return origin, mirror
+
+
+def test_existing_remote_branch_is_the_baseline(tmp_path):
+    """Prism 9b397aa5183d: the baseline is the clone's own origin/<branch>."""
+    origin, mirror = _origin_with_feature(tmp_path)
+    ws = tmp_path / "ws"
+    sc = kwt.clone_script(str(ws), SLUG, str(mirror), "feature", url=str(origin))
+    assert subprocess.run(["sh", "-c", sc]).returncode == 0
+    assert (ws / "f").read_text() == "feature"
+
+
+def test_rerun_after_an_interrupted_checkout_finishes_it(tmp_path):
+    """Prism f43e48b43fc3: a clone left on main by a failed checkout is
+    finished on the retry, never reported done on the wrong branch."""
+    origin, mirror = _origin_with_feature(tmp_path)
+    ws = tmp_path / "ws"
+    _git("clone", "-q", str(origin), str(ws), cwd=tmp_path)   # clone ok, checkout "failed"
+    sc = kwt.clone_script(str(ws), SLUG, str(mirror), "feature", url=str(origin))
+    assert subprocess.run(["sh", "-c", sc]).returncode == 0
+    out = subprocess.run(["git", "-C", str(ws), "branch", "--show-current"],
+                         capture_output=True, text=True).stdout.strip()
+    assert out == "feature" and (ws / "f").read_text() == "feature"
+
+
+def test_a_checkout_of_another_origin_is_refused(tmp_path):
+    origin, mirror = _origin_with_feature(tmp_path)
+    ws = tmp_path / "ws"
+    _git("clone", "-q", str(origin), str(ws), cwd=tmp_path)
+    sc = kwt.clone_script(str(ws), SLUG, str(mirror), "feature", url="https://github.com/x/y.git")
+    assert subprocess.run(["sh", "-c", sc]).returncode == 3

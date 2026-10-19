@@ -437,18 +437,23 @@ def read_caps(fleet_dir: Path, *, now: Optional[float] = None,
 
 
 def declares_requirements(body: Optional[str]) -> bool:
-    """True when the body carries a line-anchored ``requires:`` line."""
+    """True when the body's line-anchored ``requires:`` lines name something
+    the capability layer judges (``none`` or a capability word). The
+    ``control-plane-read`` access word alone does not count: portable() owns
+    it, and it says nothing about the prose needs."""
     from hermes_cli import kanban_host_capabilities as _khc
-    return bool(_khc.declared_words(body))
+    return any(w != _reasons.ACCESS_CONTROL_PLANE_READ for w in _khc.declared_words(body))
 
 
-def needs_allowed_hosts(body: Optional[str], pool) -> Optional[Tuple[str, ...]]:
+def needs_allowed_hosts(body: Optional[str], pool, *,
+                        honor_declared: bool = False) -> Optional[Tuple[str, ...]]:
     """None when the body names no Studio-only resource; else the enabled
     pool hosts whose fresh reach-matrix ``caps`` cover every need (``()`` =
-    none: the card runs on the Studio or waits, never spills). A body with
+    none: the card runs on the Studio or waits, never spills).
+    ``honor_declared`` (the capability layer enforces this tick): a body with
     an explicit ``requires:`` line is judged by that line, not by prose
     (None, t_6d9e7d90)."""
-    if declares_requirements(body):
+    if honor_declared and declares_requirements(body):
         return None
     needs = card_needs(body)
     if not needs:
@@ -1182,17 +1187,18 @@ def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,
         why = (manifest or {}).get(s)
         if why:
             return "studio_manifest", f"skill:{s} ({why})"
-    if declares_requirements(body):
-        # An explicit ``requires:`` line (``none`` included) is the author's
-        # statement of what the card needs; prose words never outrank it
-        # (t_6d9e7d90: "SSH keys", "docker compose", "vault" in a docs card).
+    if not body_signals and declares_requirements(body):
+        # The capability layer enforces this tick (``body_signals`` False) and
+        # judges the card's explicit ``requires:`` line; prose words never
+        # outrank it (t_6d9e7d90). With the layer off the declaration is
+        # enforced by nothing, so the prose signals stay (Prism cf1b3bd689e8).
         return None
     m = STUDIO_BODY_RE.search(body or "") if body_signals else None
     if m:
         return "studio_body", f"body:{m.group(0)}"
     # Studio-only resources the body names (t_aea826a9): bound unless some
     # pool host's fresh reach-matrix caps cover every one of them.
-    if needs_allowed_hosts(body, pool) == ():
+    if needs_allowed_hosts(body, pool, honor_declared=not body_signals) == ():
         return STUDIO_NEEDS_RULE, "needs:" + ",".join(sorted(card_needs(body)))
     return None
 
