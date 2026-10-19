@@ -250,3 +250,45 @@ def test_step1_live_against_fake_gateway_kanban(env, monkeypatch):
     assert block[block.index("--kind") + 1] == "needs_input"
     # the stale pre-run log line for t_fa4e0001 was not counted: live reads only new log bytes
     assert "kanban notifier: auto-handled t_fa4e0000 disposition=auto" in text
+
+
+# --- Prism round 1 regressions (#2102 @7e312ccc) -------------------------------------------------
+
+def test_step3_unrelated_seat_traffic_is_not_coverage(env, monkeypatch):
+    """Prism 7555e6381e68: a clean record from ANOTHER seat must not stand in for the fork request."""
+    fx = _copy_fixtures(env["tmp"])
+    log = fx / "fake_gateway.log"
+    log.write_text(log.read_text().replace("served_by=local", "served_by=sub-vps-7"))
+    monkeypatch.setenv("BV2_GATEWAY_LOG", str(log))
+    monkeypatch.setenv("BV2_WIRELOG_DIR", str(fx / "fake_wirelog"))   # only a local (sub 0) record
+    assert run.main(["--step", "3", "--dry-run"]) == 3                 # INCOMPLETE, never PASS
+    assert "attributable to seat `sub-vps-7`" in env["evidence"].read_text()
+
+
+def test_seat_aliases_normalize():
+    assert run._norm_seat(0) == run._norm_seat("local") == run._norm_seat("sub-0") == "local"
+    assert run._norm_seat("sub-vps-7") == "sub-vps-7" and run._norm_seat(5) == "sub-5"
+    assert run._rec_seat({"sub": 0}) == "local" and run._rec_seat({}) is None
+
+
+def test_failed_forcing_transition_aborts_not_passes(env, monkeypatch):
+    """Prism 7d1bf9b6fa33: a `complete` that exits 1 generates no wake; the step must abort."""
+    ctx = run.Ctx.__new__(run.Ctx)
+    ctx.live = True
+    ctx.kanban_cmd = lambda rep, key, **v: (1, "")
+    with pytest.raises(run.StepAbort, match="forcing transition `complete` failed"):
+        run.Ctx.force(ctx, None, "complete", card="t_x")
+
+
+def test_step4_late_completion_is_watched_for_a_full_window(env, monkeypatch):
+    """Prism b2a4a7e824f7: the negative check polls for the tick window, it does not read once."""
+    seen = []
+    class _C:
+        live = True
+        tick_window = 7.0
+        def poll(self, fn, window):
+            seen.append(window)
+            return fn()
+    src = (HARNESS_DIR / "run.py").read_text()
+    i = src.index("no late `[auto-handled]")
+    assert "ctx.poll(lambda: find_chat(chat, re_auto_handled_line(card)), ctx.tick_window)" in src[i - 400:i]
