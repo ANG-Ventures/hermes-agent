@@ -28,9 +28,9 @@ class GatewayGoalsMixin:
     """Goal/heartbeat continuation, post-turn hooks and loop-wakeup watcher methods for GatewayRunner."""
 
     # ── /goal — persistent cross-turn goals (Ralph-style loop) ──────────
-    def _goal_max_turns_from_config(self) -> int:
-        """Configured /goal turn budget. GatewayRunner.config is a GatewayConfig dataclass, so the
-        top-level ``goals`` block is only reachable via hermes_cli.config.load_config()."""
+    def _goals_config(self) -> dict:
+        """The top-level ``goals`` config block. GatewayRunner.config is a GatewayConfig dataclass, so
+        the block is only reachable via hermes_cli.config.load_config()."""
         try:
             goals_cfg = (
                 (self.config or {}).get("goals", {})
@@ -41,9 +41,24 @@ class GatewayGoalsMixin:
                 from hermes_cli.config import load_config
 
                 goals_cfg = (load_config() or {}).get("goals") or {}
-            return int(goals_cfg.get("max_turns", 20) or 20)
+            return goals_cfg if isinstance(goals_cfg, dict) else {}
+        except Exception:
+            return {}
+
+    def _goal_max_turns_from_config(self) -> int:
+        """Configured /goal turn budget (default 20)."""
+        try:
+            return int(self._goals_config().get("max_turns", 20) or 20)
         except Exception:
             return 20
+
+    def _goal_int_setting(self, key: str, default: int) -> int:
+        """``goals.<key>`` as a non-negative int; ``default`` when unset or malformed (0 is honored)."""
+        try:
+            value = self._goals_config().get(key, default)
+            return max(0, int(default if value is None else value))
+        except Exception:
+            return default
 
     async def _warm_goals_session_db(self, label: str) -> None:
         """Warm the goals SessionDB cache off-loop (best-effort): a cold cache runs the state.db
@@ -269,7 +284,7 @@ class GatewayGoalsMixin:
         return factory(sid)
 
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, event: Any = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -293,10 +308,18 @@ class GatewayGoalsMixin:
         # judge_goal() is a synchronous aux-LLM HTTP call (10-40 s; would block Discord heartbeats).
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
+        from hermes_cli.goals import DEFAULT_NO_PROGRESS_TURNS, is_goal_synthetic_text
+        # A turn the goal loop did not start (user message, worker/process result) re-arms idle check-ins.
+        _real_event = event is not None and not is_goal_synthetic_text(getattr(event, "text", ""))
+        # api_calls > 1 means the model called at least one tool (each tool round is another API call).
+        _api_calls = getattr(event, "_goal_turn_api_calls", None) if event is not None else None
+        _made_tools = None if _api_calls is None else int(_api_calls) > 1
+        _no_progress = self._goal_int_setting("no_progress_turns", DEFAULT_NO_PROGRESS_TURNS)
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=True, background_processes=_bg_procs,
-                active_delegations=_active_deleg,
+                active_delegations=_active_deleg, real_event=_real_event,
+                made_tool_calls=_made_tools, no_progress_turns=_no_progress,
             ),
         )
         msg = decision.get("message") or ""
@@ -339,7 +362,8 @@ class GatewayGoalsMixin:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                extra = {"event": event} if label == "goal continuation" else {}
+                await hook(session_entry=session_entry, source=source, final_response=final_text, **extra)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
 
@@ -424,6 +448,8 @@ class GatewayGoalsMixin:
             session_key = self._session_key_for_source(source)
         if session_key and session_key in self._running_agents:
             return  # busy — stays due, next scan retries
+        if session_key and self._stop_latched(session_key):
+            return  # /stop latched: hold the tick (stays due) instead of firing it into the held queue
         if goal_blocks_loop_tick(sid):
             return
 
@@ -507,3 +533,94 @@ class GatewayGoalsMixin:
             except Exception as exc:
                 logger.debug("loop wakeup watcher error: %s", exc)
             await asyncio.sleep(interval)
+
+    # ── /goal idle wakes (gateway safety net) ───────────────────────────
+
+    async def _goal_idle_wake_watcher(self, interval: float = 15.0) -> None:
+        """Start a turn for an IDLE session whose active /goal would otherwise sit until an unrelated
+        message: a timed park whose deadline passed, a process park past its 30-min cap, or a quiet
+        unparked goal (Claude-Code-style check-ins: ``goals.checkin_minutes`` (30), doubling to 4x,
+        at most ``goals.max_idle_checkins`` (3) between real events; ``checkin_minutes: 0`` = off).
+        The CLI has its own idle hook (``_maybe_resume_parked_goal``); this is the gateway's."""
+        from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
+        await asyncio.sleep(5)  # let platforms finish connecting
+
+        def _scope(profile_home):
+            if profile_home is not None:
+                return _async_profile_runtime_scope(profile_home)
+            from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
+            return async_launch_profile_scope_if_multiplexed()
+
+        while self._running:
+            try:
+                for _profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
+                    async with _scope(profile_home):
+                        await self._goal_idle_wake_scan()
+            except Exception as exc:
+                logger.debug("goal idle-wake watcher error: %s", exc)
+            await asyncio.sleep(interval)
+
+    async def _goal_idle_wake_scan(self) -> None:
+        from hermes_cli.goals import (
+            DEFAULT_CHECKIN_MINUTES, DEFAULT_MAX_IDLE_CHECKINS, list_active_goal_session_ids,
+        )
+
+        checkin_minutes = self._goal_int_setting("checkin_minutes", DEFAULT_CHECKIN_MINUTES)
+        if not checkin_minutes:
+            return
+        max_checkins = self._goal_int_setting("max_idle_checkins", DEFAULT_MAX_IDLE_CHECKINS)
+        await self._warm_goals_session_db("goal idle wake")
+        sids = set(await self._run_in_executor_with_context(list_active_goal_session_ids))
+        if not sids:
+            return
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return
+        entries = await self._run_in_executor_with_context(store.list_sessions)
+        for entry in entries:
+            if entry.session_id not in sids or entry.origin is None or getattr(entry, "suspended", False):
+                continue
+            try:
+                await self._goal_idle_wake_one(entry, checkin_minutes, max_checkins)
+            except Exception as exc:
+                logger.debug("goal idle wake for %s failed: %s", entry.session_key, exc)
+
+    def _stop_latched(self, session_key: str) -> bool:
+        """True while the user's /stop holds automatic turns for this session (in-memory latch)."""
+        try:
+            return self._session_state(session_key).conversation.automatic_turns_paused is True
+        except Exception:
+            return False
+
+    async def _goal_idle_wake_one(self, entry: Any, checkin_minutes: int, max_checkins: int) -> None:
+        quick_key, session_id = entry.session_key, entry.session_id
+        source = self._restored_source(entry)
+        if source is None:
+            return
+        adapter = self._delivery_adapter_for(source)
+        if adapter is None or not getattr(adapter, "_message_handler", None):
+            return
+        if (
+            quick_key in getattr(self, "_running_agents", {})
+            or quick_key in adapter._active_sessions
+            or self._queue_depth(quick_key, adapter=adapter) > 0
+        ):
+            return  # busy: the running turn's own post-turn judge owns the next step
+        if getattr(entry, "user_stopped_at", None) is not None or self._stop_latched(quick_key):
+            return  # /stop latched: only a human turn resumes automatic work
+        with self._profile_scope_for_source(source):
+            from hermes_cli.goals import GoalManager
+
+            mgr = GoalManager(session_id=session_id, default_max_turns=self._goal_max_turns_from_config())
+            prompt = await self._run_in_executor_with_context(
+                lambda: mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins),
+            )
+        if not prompt:
+            return
+        logger.info(
+            "goal idle wake #%s for %s (session %s): %s", mgr.state.idle_wakes if mgr.state else "?",
+            quick_key, session_id, prompt.splitlines()[0][:80],
+        )
+        event = self._synthetic_prompt_event(source, prompt, internal=True)
+        event.metadata["gateway_session_key"] = quick_key
+        await adapter.handle_message(event)
