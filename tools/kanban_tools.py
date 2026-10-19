@@ -1430,6 +1430,7 @@ def _handle_create(args: dict, **kw) -> str:
             duplicate_guard=True, force_reason=force_reason,
             until=until, time_gate_guard=True, i_mean_blocks=i_mean_blocks)
         dup_warning = kb.near_duplicate_warning(conn, new_tid)
+        scope_warning = kb.inferred_scope_warning(kb.get_task(conn, new_tid).body)
         # Placeholder-assignee lint (``default``/``apollo``/``human:x``) runs inside
         # ``create_task`` so it can see the parent's lane (r16 K); read the remap back.
         _remap_row = conn.execute(
@@ -1444,7 +1445,8 @@ def _handle_create(args: dict, **kw) -> str:
                        conn, new_tid,
                        wake=args.get("wake") if isinstance(args.get("wake"), bool) else None),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
-                   **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}))
+                   **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
+                   **({"scope_warning": scope_warning} if scope_warning else {}))
 
 
 def _resolve_notify_target(*, require_platform_identity: bool = False,
