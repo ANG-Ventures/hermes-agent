@@ -485,6 +485,24 @@ def note_main_turn_served_by(agent, provider, headers) -> None:
     agent.last_served_at = time.time()
 
 
+def note_main_turn_cache_split(agent, usage) -> None:
+    """Record the 1h/5m split of a main-turn response's cache WRITE (spec §5.1 ``warm``, P0.4).
+
+    apx bills 1h unless the seat is in overage, whatever ttl the request asked for, so a
+    fork's warm window comes from this split, not ``_cache_ttl``. A response that wrote
+    nothing leaves the last split in place (a pure read keeps the earlier write's ttl)."""
+    creation = getattr(usage, "cache_creation", None) if usage is not None else None
+    if isinstance(creation, dict):
+        one_h, five_m = creation.get("ephemeral_1h_input_tokens"), creation.get("ephemeral_5m_input_tokens")
+    else:
+        one_h = getattr(creation, "ephemeral_1h_input_tokens", None)
+        five_m = getattr(creation, "ephemeral_5m_input_tokens", None)
+    one_h = one_h if isinstance(one_h, int) else 0
+    five_m = five_m if isinstance(five_m, int) else 0
+    if one_h or five_m:
+        agent._last_cache_creation_split = {"1h": one_h, "5m": five_m}
+
+
 def consume_first_request_headers(agent) -> dict:
     """Pop the one-shot first-request headers (fork seat pin) off ``agent``.
 
