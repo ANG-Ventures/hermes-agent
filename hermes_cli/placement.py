@@ -1,7 +1,7 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
 VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole for the utilization wiring, t_da6f84f7, from
-ANG-Ventures/hermes-home#5183 rebased on main; sha256 f80ba7babc55278487d7277f40e1d9b2395282f7bc90ebda5088c94fe1e4d008; first vendored @ 2fe117cbcb,
+ANG-Ventures/hermes-home#5183 rebased on main; sha256 37d925ba747e49c582409509b2765bfb71a03a5131bce7df032313c8c2da33ac; first vendored @ 2fe117cbcb,
 hermes-home#4462) for the kanban dispatcher (t_d6ce856e) and its alloc_client route (t_4187c8f1): the fork may not
 import hermes-home code. The ONLY local changes are ``fleet_root()`` plus ``encoding="utf-8"`` on two ``open()`` calls
 (the fork's PLW1514 lint); ``tests/hermes_cli/test_kanban_headroom_placement.py`` checks the rest against the canonical
@@ -1190,7 +1190,6 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     live rows) stand in for counts until the sample shows them.
     """
     stale_after_s = _stale_after(stale_after_s)
-    mode = admission_mode() if mode is None else mode
     fp = table.footprint(consumer, footprint if footprint is not None else (job.footprint if job else None),
                          profile=job.profile if job else None)
     names = list(candidates) if candidates is not None else list(table.hosts)
@@ -1200,6 +1199,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
         if hid is not None and (hid not in folded or folded[hid] is None):
             folded[hid] = v
     now = _now(now)
+    mode = admission_mode() if mode is None else mode     # after the input checks: a refused call reads nothing
     require_axes = tuple(require_axes)   # a generator would be exhausted by the first candidate (Prism P1 16d4270a)
     # live operator exclusions (var/placement/exclusions.json, TTL rows) ALWAYS apply; the caller's map adds to them
     # (Prism 95afdab6): a caller entry never REPLACES an operator row, and an empty reason still excludes
