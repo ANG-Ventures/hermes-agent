@@ -492,7 +492,7 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override reasoning_effort completion_contract last_failure_error".split())
+    "provider_override reasoning_effort completion_contract last_failure_error auto_handle".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override "
@@ -1421,6 +1421,9 @@ def _handle_create(args: dict, **kw) -> str:
             reasoning_effort=reasoning_effort,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
+            # Boomerang v2 D-15: absent = NULL (inherit), never coerced to False.
+            auto_handle=(None if args.get("auto_handle") is None
+                         else _parse_bool_arg(args, "auto_handle")),
             initial_status=str(args.get("initial_status") or "running"),
             # Fan-out brake: worker-created cards park per kanban.worker_created_status.
             forced_status=_worker_policy.resolve_park_status(
