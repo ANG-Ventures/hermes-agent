@@ -1145,7 +1145,9 @@ def _(rid, params: dict) -> dict:
     # Skill/bundle and _PENDING_INPUT_COMMANDS must NOT reach the slash worker. Plugin
     # commands also bypass it but return normal slash.exec output (TUI keeps the pager path).
     parts = cmd.lstrip("/").split(maxsplit=1)
-    base = (parts[0] if parts else "").lower()
+    # Registry aliases (/st, /m, /r, /q, /s) route exactly like their command: every name check below
+    # (live output, pending-input bypass, session-control) keys on the canonical name (t_92c49fb6).
+    base = _resolve_name((parts[0] if parts else "").lower())
     arg = parts[1] if len(parts) > 1 else ""
     sid = params.get("session_id", "")
     live_output = _live_slash_command_output(sid, session, base, arg)
