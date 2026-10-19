@@ -27,6 +27,7 @@ from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
+    wake_progress_header,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -3580,6 +3581,8 @@ class GatewayTurnMixin:
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
+        turn_ctx.wake_progress_header = wake_progress_header(
+            message, turn_ctx.persist_user_display_kind, turn_ctx.persist_user_display_metadata)
         turn_runner = TurnRunner(self, turn_ctx)
         turn_ctx.mute_notification_reply = diagnostic_turn_muted(
             turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
@@ -4779,6 +4782,8 @@ class GatewayTurnMixin:
                 if _long_running_mode == "generic"
                 else t("gateway.progress.working_heartbeat", minutes=_elapsed_mins, detail=_status_detail)
             )
+            if turn_ctx.wake_progress_header:
+                _heartbeat_text = f"{turn_ctx.wake_progress_header}\n{_heartbeat_text}"
             try:
                 _notify_res = None
                 if _heartbeat_msg_id:

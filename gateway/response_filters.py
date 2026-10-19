@@ -6,6 +6,7 @@ not what should be persisted in conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any, Optional
 
@@ -274,6 +275,39 @@ def is_machinery_display_kind(display_kind: Any) -> bool:
     authorize silence on a human turn.
     """
     return display_kind in MACHINERY_DISPLAY_KINDS
+
+
+# A wake's own bracket tag (``[kanban review deadman] ...``): a short word label, never a
+# ``[IMPORTANT: ...]`` / ``[ASYNC DELEGATION COMPLETE — id]`` sentence.
+_WAKE_TAG_RE = re.compile(r"\A\s*\[([A-Za-z][A-Za-z0-9 _-]{0,39})\]")
+_WAKE_CARD_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
+
+
+def _wake_fallback_label(text: str, metadata: dict) -> str:
+    head = text.lstrip()[:64].upper()
+    if metadata.get("delegation_id") or head.startswith("[ASYNC DELEGATION"):
+        return "delegation"
+    if (metadata.get("notification_origin") == "process_registry_synthetic"
+            or head.startswith(("[IMPORTANT: BACKGROUND PROCESS", "[BACKGROUND PROCESS"))):
+        return "background process"
+    return "internal"
+
+
+def wake_progress_header(message: Any, display_kind: Any, metadata: Optional[dict] = None) -> Optional[str]:
+    """The one header line opening an internal wake's progress bubbles, else ``None``.
+
+    Internal wakes share the human's chat; an unattributed tool bubble from a silent wake reads
+    as the agent dying mid-turn. Human turns get ``None`` so their bubbles stay unchanged.
+    """
+    if not is_machinery_display_kind(display_kind) or not isinstance(message, str) or not message.strip():
+        return None
+    tag = _WAKE_TAG_RE.match(message)
+    label = " ".join(tag.group(1).split()) if tag else _wake_fallback_label(message, metadata or {})
+    card = _WAKE_CARD_RE.search(message)
+    if card:
+        label = f"{label} · {card.group(0)}"
+    from agent.i18n import t
+    return t("gateway.progress.wake_head", label=label)
 
 
 def silence_allowed(display_kind: Any, reply_expected: Optional[bool] = None) -> bool:
