@@ -1158,6 +1158,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if _add_column_if_missing(conn, "tasks", "workspace_of", "workspace_of TEXT"):
             _kb._log.info("kanban migration: workspace_of backfill set %d decompose child(ren)",
                           backfill_workspace_of(conn))
+    if "auto_handle" not in cols:
+        # After workspace_of (fresh column order). Nullable tri-state, no backfill:
+        # NULL = inherit (Boomerang v2 D-15), which is what every existing card means.
+        _add_column_if_missing(conn, "tasks", "auto_handle", "auto_handle INTEGER")
     # Retention reads ``workspace_of = ?`` per GC decision (Momus pass 3 answer 4).
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_workspace_of ON tasks(workspace_of) "
                  "WHERE workspace_of IS NOT NULL")

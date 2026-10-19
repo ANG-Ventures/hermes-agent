@@ -984,6 +984,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 completion_contract=getattr(args, "completion_contract", None),
+                auto_handle=_AUTO_HANDLE_ARG.get(getattr(args, "auto_handle", None)),
                 initial_status=getattr(args, "initial_status", "running"),
                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                                  if is_dispatcher_owned_worker_context() else None),
@@ -3360,6 +3361,10 @@ def _cmd_priority(args: argparse.Namespace) -> int:
         return 0 if _set_priority(conn, args.task_id, args.priority) else 1
 
 
+# ``--auto-handle`` word -> stored tri-state (Boomerang v2 D-15); ``inherit`` clears to NULL.
+_AUTO_HANDLE_ARG = {"true": True, "false": False, "inherit": None}
+
+
 def _cmd_edit(args: argparse.Namespace) -> int:
     raw_meta = getattr(args, "metadata", None)
     metadata = None
@@ -3396,15 +3401,17 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     add_skills = list(getattr(args, "skills", None) or [])
     clear_skills = bool(getattr(args, "clear_skills", False))
     do_skills = bool(add_skills) or clear_skills
+    auto_handle_arg = getattr(args, "auto_handle", None)
 
     if result is None and (summary is not None or raw_meta is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
     if (not do_result and not do_fields and not do_model and not do_session
-            and no_worker is None and new_priority is None and page is None and not do_skills):
+            and no_worker is None and new_priority is None and page is None and not do_skills
+            and auto_handle_arg is None):
         return _err(
             "kanban: nothing to edit (pass --title, --body, --result, --model, --clear-model, "
             "--session, --priority, --no-worker, --worker-ok, --no-page, --page, "
-            "--skill or --clear-skills)", 2)
+            "--skill, --clear-skills or --auto-handle)", 2)
 
     rc = 0
     with kbc.connect_closing() as conn:
@@ -3419,6 +3426,12 @@ def _cmd_edit(args: argparse.Namespace) -> int:
                 f"{args.task_id}: dispatch: "
                 + ("operator-only (no-worker)" if no_worker else "worker-ok")
             )
+        if auto_handle_arg is not None:
+            if not kb.set_task_auto_handle(
+                conn, args.task_id, _AUTO_HANDLE_ARG[auto_handle_arg], operator=_profile_author(),
+            ):
+                return _err(f"cannot edit {args.task_id} (unknown id)")
+            print(f"{args.task_id}: auto-handle: {auto_handle_arg}")
         if page is not None:
             if not kb.set_needs_input_page(
                 conn, args.task_id, page, operator=_profile_author(),
