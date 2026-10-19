@@ -2135,6 +2135,7 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             return _build_child_agent(**{**_call_args, "inherit_mode": "summary", "inherit_context": True})
         _arm_first_request_pin(child, parent_agent, "fork")
+        child._boomerang_fork_log_pending = True   # one `boomerang.fork served_by=…` line
     else:
         _apply_child_cache_ttl(child)
         if not override_provider:
