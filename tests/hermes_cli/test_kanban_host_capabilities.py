@@ -207,6 +207,23 @@ def test_named_skill_overridden_by_requires_none(home, fleet, monkeypatch):
         assert _route(conn, hard)[0] == ("local", "studio_affinity:requires:browser-session")
 
 
+def test_body_sniff_overridden_by_any_explicit_requires_line(home, fleet, monkeypatch):
+    """t_6d9e7d90: an explicit ``requires:`` line (not only ``none``) drops
+    the SOFT body sniff. Here every pool host advertises the declared word
+    (docker), so the card is portable to them; the ``:9222`` prose that
+    alone pins it to the Studio (browser-session) no longer adds a need."""
+    doc = json.loads((fleet / khc.MAP_FILE).read_text())
+    for h in ("ace-ai", "ace-media"):
+        doc["hosts"][h]["capabilities"] = ["docker"]
+    (fleet / khc.MAP_FILE).write_text(json.dumps(doc))
+    _mode(monkeypatch)
+    with kb.connect_closing() as conn:
+        sniffed = _card(conn, body="add these to the cart on :9222")
+        declared = _card(conn, body="requires: docker\nadd these to the cart on :9222")
+        assert _route(conn, sniffed)[0] == ("local", "studio_affinity:requires:browser-session")
+        assert _route(conn, declared)[0] == ("portable", None)
+
+
 def test_skill_requires_not_overridden_by_host_any(home, fleet, monkeypatch):
     _mode(monkeypatch)
     with kb.connect_closing() as conn:
