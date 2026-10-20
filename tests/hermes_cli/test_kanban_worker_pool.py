@@ -9,6 +9,7 @@ host it runs on. Tests pass their own ``spawn_fn``.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -765,9 +766,11 @@ def test_dry_run_checks_the_pin_and_leaves_the_shared_plan_alone(kanban_home):
         (bad,) = _make(conn, 1, body="host:nope")
         (good,) = _make(conn, 1, body="host:ace-ai")
         res, _ = _tick(conn, spillover=plan, spawn_limit=4, dry_run=True)
-    # ``host:nope`` names no pool host: prose, not a pin (Apollo r4 A).
+    # ``host:nope`` names no pool host: refused, never run anywhere (t_229d6bca);
+    # a dry run only reports it.
     assert res.placed == [(good, "ace-ai")]
-    assert bad in [t for t, *_ in res.spawned] and bad not in res.placement_waits
+    assert bad not in [t for t, *_ in res.spawned]
+    assert res.placement_waits[bad].startswith("pin_unknown_host:nope")
     assert plan.budget == 1
 
 
@@ -1107,13 +1110,14 @@ def test_prose_host_line_with_no_pool_spawns_locally(kanban_home):
     assert spawned == [(tid, None)] and tid not in res.placement_waits
 
 
-def test_prose_host_line_with_a_pool_stays_local(kanban_home):
+def test_prose_host_line_with_a_pool_is_refused(kanban_home):
     """t_cb2b888d reverses the old 'prose routes by policy': a host: line
-    that names no host may be a typo, so it never widens to the pool. It runs
-    locally (local slot free) and is never placed."""
+    that names no host may be a typo, so it never widens to the pool;
+    t_229d6bca makes it a refusal (a pin is hard): not even run locally."""
     with kb.connect_closing() as conn:
         (tid,) = _make(conn, 1, body="Host: example.com")
-        res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=0, spawn_paused="test")
+        res, spawned = _tick(conn, spillover=_plan(free=1), spawn_limit=4)
+        assert kb.get_task(conn, tid).status == "blocked"
     assert spawned == [] and res.placed == []
     assert res.placement_waits[tid].startswith("pin_unknown_host:example.com")
 
@@ -1840,25 +1844,110 @@ def test_alias_pin_routes_to_the_canonical_pool_host(fleet_aliases):
     assert _portable(body="host:mac-studio-m3u", pool=pool) == (False, "host_studio", None)
 
 
-def test_typo_pin_is_held_local_with_one_latched_comment(fleet_aliases):
-    """host:mac-studio-m3 (typo): never spilled, placement_wait names the word
-    and suggestions, exactly one comment across ticks; a new word comments again."""
+def test_typo_pin_is_refused_with_one_comment_per_park(fleet_aliases):
+    """host:mac-studio-m3 (typo): never spawned anywhere, placement_wait names
+    the word and suggestions, the card parks needs_input with ONE comment; it
+    stays parked across ticks; unblocked with another bad word, it parks again."""
     with kb.connect_closing() as conn:
         (tid,) = _make(conn, 1, body="Do it.\nhost:mac-studio-m3\n")
-        for _ in range(3):
-            res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
-            assert spawned == [] and res.placed == []
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=4)
+        assert spawned == [] and res.placed == []
         reason = res.placement_waits[tid]
         assert reason.startswith("pin_unknown_host:mac-studio-m3 (did you mean: ")
         assert "mac-studio-m3u->studio" in reason
         ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = "
                           "'placement_wait' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
         assert json.loads(ev[0])["reason"] == reason
+        for _ in range(2):
+            _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=4)
+            assert spawned == []
+        assert kb.get_task(conn, tid).status == "blocked"
         comments = [c.body for c in kb.list_comments(conn, tid)]
-        assert len(comments) == 1 and "host:mac-studio-m3 is no pin" in comments[0]
+        assert len(comments) == 1 and "host:mac-studio-m3 names no host" in comments[0]
         conn.execute("UPDATE tasks SET body = ? WHERE id = ?", ("host:ace-ia", tid))
-        _tick(conn, spillover=_plan(free=2), spawn_limit=0, spawn_paused="test")
+        assert kb.unblock_task(conn, tid)
+        _res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=4)
+        # A second refusal is a recurrence: the block loop-breaker may route it to triage.
+        assert spawned == [] and kb.get_task(conn, tid).status in ("blocked", "triage")
         assert len(kb.list_comments(conn, tid)) == 2
+
+
+# -- pins are HARD: trailing spelling, fleet-hosts aliases, refusal (t_229d6bca) --
+
+def _write_fleet_hosts(home: Path):
+    (home / "config").mkdir(parents=True, exist_ok=True)
+    (home / "config" / "fleet-hosts.json").write_text(json.dumps({"schema": 1, "hosts": {
+        "ace-ai": {"aliases": ["aceai", "ace-ai.local"]},
+        "ace-media": {"aliases": ["ace-media-ubuntu"]},
+        "mac-studio": {"aliases": ["studio", "mac-studio-m3u", "local"]},
+    }}), encoding="utf-8")
+
+
+@pytest.fixture
+def fleet_hosts_home(kanban_home, monkeypatch):
+    """The Studio dispatcher's hostname is NOT one of the spellings, so a
+    mac-studio-m3u pin must come from config/fleet-hosts.json aliases."""
+    import socket
+    monkeypatch.setattr(socket, "gethostname", lambda: "elsewhere-box")
+    _write_pool(kanban_home / "fleet")
+    _write_fleet_hosts(kanban_home)
+    return kanban_home
+
+
+@pytest.mark.parametrize("body", [
+    "host: studio",
+    "host: mac-studio",
+    "host: mac-studio-m3u",
+    "host: STUDIO",
+    # The three cards of 2026-10-20 01:1x (t_e6452500, t_fbf79823, t_229d6bca):
+    # the pin trails the last sentence, so the line-anchored parser saw none.
+    "origin: Ace 23:46 ... Step 1 measured. Admin-merge lane. host: studio\n",
+    "Hand back with: PR, head sha, deviations (none expected). host: studio.\n\nscope: any",
+    "Then t_16b9087f pages on any pinned card placed elsewhere. host: mac-studio\n",
+])
+def test_every_studio_spelling_resolves_to_the_studio_pin(fleet_hosts_home, body):
+    fleet = fleet_hosts_home / "fleet"
+    assert kwp.resolve_pin(body, kwp.known_host_ids(fleet), kwp.pin_aliases(fleet)) == ("studio", None)
+
+
+def test_prose_mid_sentence_host_word_is_still_not_a_pin(fleet_hosts_home):
+    fleet = fleet_hosts_home / "fleet"
+    assert kwp.resolve_pin("set the header host: example.com on it", kwp.known_host_ids(fleet),
+                           kwp.pin_aliases(fleet)) == (None, None)
+
+
+def test_fleet_hosts_aliases_canonicalise_pool_hosts(fleet_hosts_home):
+    aliases = kwp.pin_aliases(fleet_hosts_home / "fleet")
+    assert aliases["aceai"] == "ace-ai" and aliases["ace-media-ubuntu"] == "ace-media"
+    assert aliases["mac-studio-m3u"] == "studio" and aliases["studio"] == "studio"
+
+
+def test_trailing_studio_pin_dispatches_to_the_studio_never_the_pool(fleet_hosts_home):
+    """Red on main: the trailing pin was no pin, the card was portable and the
+    pool took it (ace-ai here, ace-media tonight)."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="Do the thing on the live tree. host: studio\n")
+        res, spawned = _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=0,
+                             spawn_paused="test")
+        assert spawned == [] and res.placed == []
+        res, spawned = _tick(conn, spillover=_plan(free=2, band="spilling"), spawn_limit=4)
+    assert spawned == [(tid, None)] and res.placed == []
+
+
+def test_unknown_pin_blocks_the_card_naming_the_accepted_spellings(fleet_hosts_home):
+    """Red on main: an unknown word was held local and then ran locally."""
+    with kb.connect_closing() as conn:
+        (tid,) = _make(conn, 1, body="Do it.\nhost: nosuchbox\n")
+        res, spawned = _tick(conn, spillover=_plan(free=2), spawn_limit=4)
+        assert spawned == [] and res.placed == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        comments = [c.body for c in kb.list_comments(conn, tid)]
+    assert len(comments) == 1
+    line = comments[0]
+    assert "host:nosuchbox" in line
+    for word in ("studio", "mac-studio", "mac-studio-m3u", "ace-ai", "aceai", "ace-media", "any"):
+        assert re.search(rf"(?<![\w.-]){re.escape(word)}(?![\w-])", line), word
 
 
 def test_hostname_pin_runs_local_never_spills(fleet_aliases):

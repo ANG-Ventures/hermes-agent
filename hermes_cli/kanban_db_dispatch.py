@@ -4727,12 +4727,13 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             rules_out[row["id"]] = _pr.RULE_PIN if route_class == "pin" else _pr.RULE_POLICY
         return ("pin", pin) if route_class == "pin" else ("portable", None)
     if rule == _pr.PIN_UNKNOWN_HOST:
-        # A host: line naming no host: local only, named, never spilled (t_cb2b888d).
+        # A host: line naming no host: never runs anywhere, named, parked
+        # needs_input after the loop (t_cb2b888d, t_229d6bca: a pin is hard).
         if unknown_out is not None:
             unknown_out[row["id"]] = ignored
         if rules_out is not None:
             rules_out[row["id"]] = rule
-        return "local", _pr.pin_unknown_host(ignored, _kwp.pin_suggestions(
+        return "wait", _pr.pin_unknown_host(ignored, _kwp.pin_suggestions(
             ignored, plan.config.hosts or (), getattr(plan.config, "pin_aliases", None)))
     if rule == _pr.LINKED and link is not None and lineage_mode != _pr.LINEAGE_PINS_LEGACY:
         rule = _pr.linked(*link)  # name the edge that holds it (t_ae87edff)
@@ -5892,9 +5893,12 @@ def _dispatch_once_locked(
             _pin, _ignored = _kwp.resolve_pin(r["body"], _known, _aliases)
             if _ignored is not None:
                 _kwp.note_ignored_pin(r["id"], _ignored)
-                if _pin is None:
-                    # No plan: it runs locally anyway, but still says so (t_cb2b888d).
+                if _pin is None and _known:
+                    # No plan this tick, but a pool is configured: an unknown
+                    # pin is refused, never run locally (t_229d6bca).
+                    from hermes_cli import kanban_placement_reasons as _pr_np
                     result.unknown_pins[r["id"]] = _ignored
+                    row_route[r["id"]] = ("wait", _pr_np.pin_unknown_host(_ignored))
             # Not ``elif``: a prose ``Host:`` line above a real pin returns
             # BOTH, and the pin must still wait (Prism 56085b64).
             if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
@@ -7121,12 +7125,13 @@ def _dispatch_once_locked(
             notify_starved_holds(conn, result.placement_waits, int(time.time()))
         except Exception as exc:  # never break a dispatcher tick
             _kb._log.warning("kanban placement-starved notify failed: %s", exc)
-    if not dry_run and result.unknown_pins:
+    if result.unknown_pins:
         try:
-            from hermes_cli.kanban_unknown_pin import comment_unknown_pins
-            comment_unknown_pins(conn, result.unknown_pins)
+            from hermes_cli.kanban_unknown_pin import park_unknown_pins
+            park_unknown_pins(conn, result.unknown_pins, dry_run=dry_run,
+                              default_assignee=default_assignee)
         except Exception as exc:  # never break a dispatcher tick
-            _kb._log.warning("kanban unknown-pin comment failed: %s", exc)
+            _kb._log.warning("kanban unknown-pin park failed: %s", exc)
     _tick_routes(result, ready_rows, row_route, row_rules, spillover is not None, dry_run)
 
     # ---- review column dispatch ----
