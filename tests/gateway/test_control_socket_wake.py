@@ -448,7 +448,8 @@ def test_wake_downgraded_under_host_contention(store, tmp_path):
     adapter = RecordingAdapter()
     runner = _runner(store, adapter)
     runner._kanban_wake_gate = WakeGate(
-        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48}}},
+        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
+                    "wake_load_gate": {"host_axis": "load1"}}},
         ncpu=32, loadavg=lambda: (71.0, 70.0, 60.0), lane_probe=lambda p: None,
         state_file=tmp_path / "wake_gate.json",
     )
@@ -462,7 +463,8 @@ def _host_loaded_gate(tmp_path, proc_paused=False):
     from hermes_cli.kanban_wake_gate import WakeGate
 
     gate = WakeGate(
-        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48}}},
+        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
+                    "wake_load_gate": {"host_axis": "load1"}}},
         ncpu=32, loadavg=lambda: (71.0, 70.0, 60.0), lane_probe=lambda p: None,
         state_file=tmp_path / "wake_gate.json",
     )
@@ -514,7 +516,8 @@ def _lane_gate(tmp_path, capped_profile):
         return f"lane prov-{profile} capped" if profile == capped_profile else None
 
     gate = WakeGate(
-        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48}}},
+        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
+                    "wake_load_gate": {"host_axis": "load1"}}},
         ncpu=32, loadavg=lambda: (1.0, 1.0, 1.0), lane_probe=probe,
         state_file=tmp_path / "wake_gate.json",
     )

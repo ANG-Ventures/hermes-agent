@@ -89,20 +89,31 @@ HOST_PIN_RE = re.compile(r"^[ \t]*host:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*\
 PIN_ANY = "any"
 PIN_STUDIO = "studio"
 STUDIO_HOST = "mac-studio"
-# kanban.placement.default (Control-Plane Protection spec v0.3 §3.1, read per
-# tick): ``remote`` offers every portable row to the pool before a local slot;
-# anything else, or the key absent, keeps today's local-first order.
+# kanban.placement.default is RETIRED (t_82b4db80, Ace 2026-10-19 21:2x): every
+# portable row is offered to the pool (admission by measured headroom over every
+# eligible host, the Studio included) before a local slot. ``local`` pre-ordered
+# the Studio first, an ORDERING rather than a weight; the R10 armer flipped to it
+# on 10-18 15:31 and parked the fleet on the Studio for a day. The key is read
+# only to log that it is ignored. PLACEMENT_DEFAULT_LOCAL stays as the record
+# value for a plan that never ran the gate tick (``plan.default_remote`` False).
 PLACEMENT_DEFAULT_REMOTE = "remote"
 PLACEMENT_DEFAULT_LOCAL = "local"
+_placement_default_warned: set = set()
 
 
 def placement_default(kanban_cfg: Any) -> str:
-    """``kanban.placement.default``: ``remote`` only when the key says so."""
+    """Always ``remote``; a configured ``kanban.placement.default`` other than
+    remote is ignored with one deprecation line per distinct value."""
     pl = kanban_cfg.get("placement") if isinstance(kanban_cfg, Mapping) else None
     val = pl.get("default") if isinstance(pl, Mapping) else None
-    if isinstance(val, str) and val.strip().lower() == PLACEMENT_DEFAULT_REMOTE:
-        return PLACEMENT_DEFAULT_REMOTE
-    return PLACEMENT_DEFAULT_LOCAL
+    if val is not None and not (isinstance(val, str) and val.strip().lower() == PLACEMENT_DEFAULT_REMOTE):
+        key = repr(val)
+        if key not in _placement_default_warned:
+            _placement_default_warned.add(key)
+            logging.getLogger(__name__).warning(
+                "kanban.placement.default=%s is deprecated and ignored: placement is remote-first "
+                "(admission by measured headroom); remove the key (t_82b4db80)", key)
+    return PLACEMENT_DEFAULT_REMOTE
 
 # Words that name the dispatcher's own machine (resolve to PIN_STUDIO); the
 # live ``socket.gethostname()`` short form joins them at call time.
@@ -139,6 +150,8 @@ CARD_NEEDS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     ("studio_launchd", re.compile(r"\blaunchctl\b|Library/LaunchAgents\b")),
 )
 STUDIO_NEEDS_RULE = "studio_needs"
+# Card header lines that name where a card CAME FROM, never where it runs.
+_HEADER_LINE_RE = re.compile(r"^[ \t]*(?:origin|prism lineage|lineage)[ \t]*:", re.IGNORECASE)
 IGNORED_PIN_WARN_SECONDS = 300
 
 _log = logging.getLogger(__name__)
@@ -408,8 +421,16 @@ def read_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> PoolC
 
 
 def card_needs(body: Optional[str]) -> frozenset:
-    """The Studio-only resources a card body names (:data:`CARD_NEEDS`)."""
-    return frozenset(name for name, rx in CARD_NEEDS if rx.search(body or ""))
+    """The Studio-only resources a card body names (:data:`CARD_NEEDS`).
+    The origin/lineage header is provenance, never a need: an Obsidian note
+    title with "vault" in it pinned t_cb47a348 to the Studio (t_641d1ab8)."""
+    work = without_header_lines(body)
+    return frozenset(name for name, rx in CARD_NEEDS if rx.search(work))
+
+
+def without_header_lines(body: Optional[str]) -> str:
+    """``body`` minus its ``origin:`` / ``lineage:`` / ``Prism lineage:`` lines."""
+    return "\n".join(ln for ln in (body or "").splitlines() if not _HEADER_LINE_RE.match(ln))
 
 
 def read_caps(fleet_dir: Path, *, now: Optional[float] = None,
@@ -1157,11 +1178,57 @@ def reach_allowed_hosts(*, body: Optional[str], skills: Iterable[str], pool,
     wanted = tuple(dict.fromkeys(h.lower() for h in (targets or {}).values() if h))
     if not bound and not wanted:
         return None
-    # Unnamed host-bound skill: reach EVERY alias, plus the manifest targets
-    # (an unprobed target must still fail closed, Prism bf503f94e81a).
-    base = named if (named or not bound) else aliases
+    reach = getattr(pool, "reach", {}) or {}
+    base = named
+    if bound and not named:
+        # Unnamed host-bound skill (t_641d1ab8): the pool host the body names
+        # ("on ACE-AI", ``host: ace-ai``) is the target; only with none, every
+        # alias SOME pool host reaches. An alias nobody reaches (haos, unifi at
+        # rc 255 everywhere) would hold every such card forever.
+        base = body_host_targets(body, pool) or reached_aliases(reach, aliases, pool_hosts)
+        if not base:
+            return ()
+    # Manifest targets always join (an unprobed one still fails closed,
+    # Prism bf503f94e81a).
     named = tuple(dict.fromkeys([*base, *wanted]))
-    return reaching_hosts(getattr(pool, "reach", {}) or {}, named, aliases)
+    return reaching_hosts(reach, named, aliases)
+
+
+def body_host_targets(body: Optional[str], pool) -> Tuple[str, ...]:
+    """Pool hosts a body names, as canonical ids: a ``host:`` pin to a pool
+    host, then every whole-word mention of a pool host id or a separator-
+    bearing registry alias (``ACE-AI``, ``ci.ace``) outside the origin/lineage
+    header. ``ace-media-boot-heal.service`` is no mention (the id must end at
+    a non-word, non-dash char). Word-shaped aliases (``ci``, ``media``) never
+    count: they are English."""
+    hosts = {h.lower() for h in (getattr(pool, "hosts", ()) or ())}
+    if not hosts or not body:
+        return ()
+    alias_map = getattr(pool, "pin_aliases", None) or {}
+    words = {k.lower(): v.lower() for k, v in alias_map.items()
+             if isinstance(v, str) and v.lower() in hosts}
+    words.update({h: h for h in hosts})
+    words = {w: c for w, c in words.items() if not word_shaped_alias(w)}
+    out: List[str] = []
+    pin, _ignored = resolve_pin(body, hosts, alias_map)
+    if pin in hosts:
+        out.append(pin)
+    if words:
+        rx = re.compile(r"(?<![\w.-])(" + "|".join(
+            re.escape(w) for w in sorted(words, key=len, reverse=True)) + r")(?![\w-])",
+            re.IGNORECASE)
+        out += [words[m.group(1).lower()] for m in rx.finditer(without_header_lines(body))]
+    return tuple(dict.fromkeys(out))
+
+
+def reached_aliases(reach: Mapping[str, Mapping[str, int]], aliases: Iterable[str],
+                    pool_hosts: Iterable[str] = ()) -> Tuple[str, ...]:
+    """The aliases at least one fresh POOL-host row reaches (rc 0), in
+    ``aliases`` order. With no pool host named, every fresh row counts.
+    Empty matrix: ``()`` (fail closed)."""
+    hosts = {h.lower() for h in pool_hosts or ()}
+    rows = [row for h, row in reach.items() if not hosts or h.lower() in hosts]
+    return tuple(a for a in aliases if any(row.get(a) == 0 for row in rows))
 
 
 def studio_affinity(body: Optional[str], skills: Iterable[str], pool, *,

@@ -1054,6 +1054,7 @@ gateway:
     working_heartbeat: "⏳ En cours — {minutes} min{detail}"
     thinking_prefix: "💬 {text}"
     tool_head: "{emoji} {tool}"
+    wake_head: "🔔 wake · {label}"
     tool_verbose: |-
       {emoji} {tool}({keys})
       {args}

@@ -55,3 +55,25 @@ def test_absent_or_invalid_seat_keeps_last_known(headers):
     agent.last_served_by, agent.last_served_at = "sub-vps-7", 123.0
     cch._record_successful_api_call(agent, _response(**headers))
     assert (agent.last_served_by, agent.last_served_at) == ("sub-vps-7", 123.0)
+
+
+def test_fork_child_logs_served_by_and_read_share_once(caplog):
+    """The observable a fork turn leaves (README §5, smoke step 3): ONE line, first response only."""
+    agent = _agent("claude-alr")
+    agent._boomerang_fork_log_pending = True
+    agent.session_id = "child-1"
+    resp = SimpleNamespace(usage=SimpleNamespace(input_tokens=4, output_tokens=2, cache_read_input_tokens=990,
+                                                 cache_creation_input_tokens=6),
+                           pool_headers={"x-pool-served-by": "sub-vps-13"})
+    with caplog.at_level("INFO", logger="tools.delegate_tool"):
+        cch._record_successful_api_call(agent, resp)
+        cch._record_successful_api_call(agent, resp)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("boomerang.fork ")]
+    assert lines == ["boomerang.fork served_by=sub-vps-13 read_share=0.9900 prefix_tokens=1000 child_session=child-1"]
+
+
+def test_non_fork_agent_never_logs_the_fork_line(caplog):
+    agent = _agent("claude-alr")
+    with caplog.at_level("INFO", logger="tools.delegate_tool"):
+        cch._record_successful_api_call(agent, _response(**{"x-pool-served-by": "sub-vps-13"}))
+    assert not [r for r in caplog.records if r.getMessage().startswith("boomerang.fork ")]

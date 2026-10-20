@@ -685,7 +685,9 @@ jobs:
     # ubuntu-latest. Unset var -> no shard routes. 2026-10-04: routing all 31 shards to 2
     # one-slot runners serialised them, 180 min wall vs 16 hosted (run 37197359967). The
     # Studio gate opens the route only while idle slots >= 1 + len(CI_E2E_VM_SHARDS).
-    runs-on: ${{ vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && contains(format(',{0},', vars.CI_E2E_VM_SHARDS), format(',{0},', matrix.shard)) && matrix.shard != 'hosts/test_libc_musl' && matrix.shard != 'core/test_fresh_process_entrypoints' && fromJSON('["self-hosted","Linux","X64","ace-e2e-vm"]') || vars.CI_E2E_RUNNER || 'ubuntu-latest' }}
+    # ci-priv (t_df855b2a): with CI_PRIV_ENABLED + CI_PRIV_RUNNER (the private mirror only), those two
+    # shards run in a ci-priv KVM guest instead: a real docker daemon, and no /.dockerenv.
+    runs-on: ${{ vars.CI_E2E_VM_ENABLED == 'true' && vars.CI_E2E_VM_ROUTE == 'open' && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && contains(format(',{0},', vars.CI_E2E_VM_SHARDS), format(',{0},', matrix.shard)) && matrix.shard != 'hosts/test_libc_musl' && matrix.shard != 'core/test_fresh_process_entrypoints' && fromJSON('["self-hosted","Linux","X64","ace-e2e-vm"]') || vars.CI_PRIV_ENABLED == 'true' && vars.CI_PRIV_RUNNER && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && (matrix.shard == 'hosts/test_libc_musl' || matrix.shard == 'core/test_fresh_process_entrypoints') && fromJSON(vars.CI_PRIV_RUNNER) || vars.CI_E2E_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 360  # R1: ceiling, overrun pages (t_48fd37d3)
     strategy:
       fail-fast: false

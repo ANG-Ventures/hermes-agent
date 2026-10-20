@@ -170,6 +170,30 @@ def test_rlimit_env_zero_disables_the_process_ceiling(tmp_path):
     assert out.returncode == 0, out.stdout + out.stderr
 
 
+@pytest.mark.platforms("linux")
+def test_many_threads_do_not_spend_the_address_space_cap_on_malloc_arenas(tmp_path):
+    """t_485afb24: glibc's per-thread arenas (64 MiB of AS each, up to 8 x ncpu) filled the 6 GiB
+    cap on a 128-core host with ~100 threads and a <200 MiB RSS; the process then aborted."""
+    out = _run_child(tmp_path, '''
+        import threading
+        def test_threads_malloc():
+            gate = threading.Barrier(121, timeout=20)
+            def work():
+                blobs = [bytearray(4096) for _ in range(64)]  # small allocs land in this thread's arena
+                gate.wait()
+                del blobs
+            ts = [threading.Thread(target=work) for _ in range(120)]
+            for t in ts:
+                t.start()
+            gate.wait()
+            for t in ts:
+                t.join()
+            vm = [l for l in open("/proc/self/status") if l.startswith("VmPeak")][0].split()[1]
+            assert int(vm) < 3 * 1024 ** 2, vm  # kB; uncapped arenas on a many-core host reserve >= 7 GiB here
+    ''', env={bounds._RLIMIT_ENV: "6"})
+    assert out.returncode == 0, out.stdout + out.stderr
+
+
 def _fake_cgroups(monkeypatch, levels):
     """levels: [(path, memory.max or None, working set or None)], innermost first."""
     monkeypatch.setattr(bounds, "_cgroup_levels", lambda: [p for p, _, _ in levels])

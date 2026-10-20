@@ -143,3 +143,72 @@ def test_disabled_gate_leaves_cli_ungated(board, monkeypatch, capsys):
     _load(monkeypatch, 66.0)
     _run(max=5)
     assert _running() == 5
+
+
+def test_utilization_cli_leases_only_local_starts(board, monkeypatch):
+    """Prism 9f811a3f59ff: a run started on a pool host (worker_placed event) is not a lease on THIS host."""
+    import time as _t
+
+    from hermes_cli import kanban_ops as kops
+    from hermes_cli import kanban_worker_pool as kwp
+
+    _load(monkeypatch, 1.0, cpu_busy=0.1)
+    monkeypatch.setattr(klg, "count_running_workers", lambda: 0)
+    monkeypatch.setattr(klg, "sample_user_procs", lambda: (None, None))
+    _run(max=2)                                           # two local starts, now
+    with kb.connect_closing() as conn:
+        runs = [r[0] for r in conn.execute("SELECT id FROM task_runs ORDER BY id").fetchall()]
+        assert len(runs) == 2
+        tid = conn.execute("SELECT task_id FROM task_runs WHERE id=?", (runs[1],)).fetchone()[0]
+        conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
+                     (tid, runs[1], kwp.PLACED_EVENT, '{"host": "ace-ai"}', int(_t.time())))
+        conn.commit()
+        booked = []
+        gate = klg.LoadGate(dict(GATE), 32)
+        gate.admission = "utilization"
+        monkeypatch.setattr(gate, "record_spawns", lambda n, now=None: booked.append(n))
+        monkeypatch.setattr(gate, "admit", lambda *a, **k: (0, "stub"))
+        kops._cli_utilization_gate(conn, argparse.Namespace(ignore_load_gate=False), gate,
+                                   {"spawn_limit": None}, lambda m: None, 1.0)
+    assert booked == [1]                                  # the placed-remote start is not booked locally
+
+
+def test_utilization_cli_counts_and_leases_across_boards(board, monkeypatch):
+    """Prism d88c700fe427 / 9f811a3f59ff: the one-shot gate reads EVERY board, like the gateway tick.
+
+    Board ``default`` runs 2 local workers; board ``other`` runs 1 placed on ace-ai and 1 local. The local
+    running count is 3 (all boards' total 4 minus all boards' remote 1), not 4 - 0 (this board's remote out
+    of an all-board total), and ``other``'s local start inside the settle window is booked as a lease too.
+    """
+    import time as _t
+
+    from hermes_cli import kanban_ops as kops
+    from hermes_cli import kanban_worker_pool as kwp
+
+    _load(monkeypatch, 1.0, cpu_busy=0.1)
+    monkeypatch.setattr(klg, "sample_user_procs", lambda: (None, None))
+    _run(max=2)                                           # two local starts on default
+    kb.create_board(slug="other", name="Other")
+    with kb.connect_closing(board="other") as oc:
+        for i in range(2):
+            kb.create_task(oc, title=f"o{i}", assignee="alpha")
+        kbd.dispatch_once(oc, max_spawn=2)                # the fixture's stub spawn
+        tid, run_id = oc.execute(
+            "SELECT id, current_run_id FROM tasks WHERE status='running' ORDER BY id LIMIT 1").fetchone()
+        oc.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
+                   (tid, run_id, kwp.PLACED_EVENT, '{"host": "ace-ai"}', int(_t.time())))
+        oc.commit()
+    booked, seen = [], {}
+    gate = klg.LoadGate(dict(GATE), 32)
+    gate.admission = "utilization"
+    monkeypatch.setattr(gate, "record_spawns", lambda n, now=None: booked.append(n))
+
+    def admit(*a, **k):
+        seen.update(k)
+        return 0, "stub"
+    monkeypatch.setattr(gate, "admit", admit)
+    with kb.connect_closing() as conn:
+        kops._cli_utilization_gate(conn, argparse.Namespace(ignore_load_gate=False), gate,
+                                   {"spawn_limit": None}, lambda m: None, 1.0)
+    assert seen["running"] == 3                           # 2 + 2 running, 1 of them on ace-ai
+    assert len(booked) == 3                               # default's 2 local starts + other's 1 local start

@@ -56,6 +56,20 @@ _MAX_BARRIER_WAIT_S = 30 * 60
 # Bounded tail of a failed gate's combined stdout/stderr fed back to the agent.
 _GATE_OUTPUT_TAIL_CHARS = 3000
 
+# Idle wakes (gateway safety net, Claude Code /goal parity). A parked goal whose barrier lifts, or an
+# active goal left quiet with no queued continuation, gets a turn started for it instead of sitting
+# until an unrelated message arrives. Quiet check-ins back off: first after ``checkin_minutes``, then
+# 2x, then 4x (capped); at most ``max_idle_checkins`` idle wakes between real events (a user message,
+# a worker/process result, any turn the goal loop did not start itself). ``checkin_minutes: 0`` turns
+# idle wakes off. Goals idle longer than ``_IDLE_WAKE_HORIZON_S`` are never woken (stale/abandoned).
+DEFAULT_CHECKIN_MINUTES = 30
+DEFAULT_MAX_IDLE_CHECKINS = 3
+_CHECKIN_BACKOFF_CAP = 4
+_IDLE_WAKE_HORIZON_S = 6 * 3600
+# No-progress stop: this many judged-``continue`` turns in a row with no tool call (the agent is only
+# answering the judge) pauses the goal. 0 disables.
+DEFAULT_NO_PROGRESS_TURNS = 4
+
 
 CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
@@ -64,6 +78,32 @@ CONTINUATION_PROMPT_TEMPLATE = (
     "If you believe the goal is complete, state so explicitly and stop. "
     "If you are blocked and need input from the user, say so clearly and stop."
 )
+
+GOAL_CHECKIN_PREFIX = "[Goal check-in"
+GOAL_CHECKIN_PROMPT_TEMPLATE = (
+    GOAL_CHECKIN_PREFIX + " {n}/{max}: the session has been idle {idle_min} min with this goal still active]\n"
+    "Goal: {goal}\n\n"
+    "Check everything in flight (workers, background processes, PRs, CI, deploys): read its latest "
+    "output or state. Act on anything that finished; fix or stop anything stuck. Then take the next "
+    "concrete step toward the goal. If you are genuinely only waiting, name exactly what you are "
+    "waiting on and stop. After check-in {max}, check-ins pause until a new event arrives."
+)
+
+GOAL_STUCK_CHECKIN_PROMPT_TEMPLATE = (
+    GOAL_CHECKIN_PREFIX + " {n}/{max}: parked {age_min} min on {target} and it has not finished]\n"
+    "Goal: {goal}\n\n"
+    "Waiting on: {reason}\n"
+    "Read its latest output or state now. If it is progressing, say so and keep waiting (name it again so "
+    "the loop re-parks). If it is stuck, hung, or failed, fix it, restart it, or stop it, then take the "
+    "next concrete step toward the goal. After check-in {max}, check-ins pause until a new event arrives."
+)
+
+
+def is_goal_synthetic_text(text: Any) -> bool:
+    """True for turns the goal loop started itself (continuations and idle check-ins)."""
+    t = str(text or "")
+    return t.startswith("[Continuing toward your standing goal]\nGoal:") or t.startswith(GOAL_CHECKIN_PREFIX)
+
 
 # With a completion contract: the block tells the agent what "done" means, how to prove it, what
 # not to break, scope, and when to stop — so it targets the verification surface.
@@ -447,6 +487,14 @@ class GoalState:
     waiting_on_delegations: int = 0
     waiting_reason: Optional[str] = None
     waiting_since: float = 0.0
+    # Idle wakes since the last real event (see DEFAULT_CHECKIN_MINUTES) and when the last one fired.
+    idle_wakes: int = 0
+    last_idle_wake_at: float = 0.0
+    # Per-goal check-in interval in minutes (-1 = use goals.checkin_minutes; 0 = off for this goal). Also
+    # how long a pid/session park may hold before the gateway checks on the process.
+    checkin_minutes: int = -1
+    # Judged-continue turns in a row that made no tool call (no-progress stop).
+    toolless_turns: int = 0
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
@@ -458,8 +506,8 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations")}
-        floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "idle_wakes", "toolless_turns")}
+        floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "last_idle_wake_at")}
         return cls(
             goal=data.get("goal", ""),
             status=data.get("status", "active"),
@@ -471,6 +519,7 @@ class GoalState:
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_reason=data.get("waiting_reason"),
+            checkin_minutes=int(data["checkin_minutes"]) if data.get("checkin_minutes") is not None else -1,
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
                 GoalGate.from_dict(g) for g in (data.get("gates") or [])
@@ -651,6 +700,26 @@ def load_goal(session_id: str) -> Optional[GoalState]:
     except Exception as exc:
         logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
         return None
+
+
+def list_active_goal_session_ids() -> List[str]:
+    """Session ids with an ACTIVE goal row; ``[]`` on any DB error (gateway idle-wake scan)."""
+    db = _get_session_db()
+    if db is None:
+        return []
+    try:
+        rows = db.list_meta_prefix("goal:")
+    except Exception as exc:
+        logger.debug("GoalManager: list_meta_prefix failed: %s", exc)
+        return []
+    out = []
+    for key, raw in rows:
+        try:
+            if raw and json.loads(raw).get("status") == "active":
+                out.append(key[len("goal:"):])
+        except Exception:
+            continue
+    return out
 
 
 def save_goal(session_id: str, state: GoalState) -> None:
@@ -1594,14 +1663,23 @@ class GoalManager:
     def evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
-        active_delegations: int = 0,
+        active_delegations: int = 0, real_event: bool = False, made_tool_calls: Optional[bool] = None,
+        no_progress_turns: int = DEFAULT_NO_PROGRESS_TURNS,
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
-        own continuations increment ``turns_used`` — both consume model budget."""
+        own continuations increment ``turns_used`` — both consume model budget.
+
+        ``real_event``: the turn was NOT started by the goal loop (user message, worker/process result);
+        it re-arms the idle check-ins. ``made_tool_calls``: whether the turn called any tool (None =
+        unknown, not counted); ``no_progress_turns`` judged-continue turns in a row without one pause
+        the goal (0 disables)."""
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+        if real_event and state.idle_wakes:
+            state.idle_wakes = 0
+            self._save()
 
         # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
         if self.is_waiting():
@@ -1671,11 +1749,89 @@ class GoalManager:
         if state.turns_used >= state.max_turns:
             return self._budget_pause(state, "continue", reason)
 
+        if made_tool_calls is not None:
+            state.toolless_turns = 0 if made_tool_calls else state.toolless_turns + 1
+            if no_progress_turns and state.toolless_turns >= no_progress_turns:
+                n = state.toolless_turns
+                state.toolless_turns = 0
+                return self._pause_decision(
+                    f"no progress: {n} turns in a row without a tool call", "continue", reason,
+                    f"⏸ Goal paused — {n} turns in a row only answered the judge without doing anything "
+                    f"(no tool calls). Last judge reason: {reason} Resume with /goal resume.",
+                )
+
         self._save()
         return _decision(
             "active", True, self.next_continuation_prompt(), "continue", reason,
             f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",
         )
+
+    def idle_wake_prompt(
+        self, now: Optional[float] = None, *, checkin_minutes: float = DEFAULT_CHECKIN_MINUTES,
+        max_checkins: int = DEFAULT_MAX_IDLE_CHECKINS,
+    ) -> Optional[str]:
+        """Prompt for a turn the gateway should start in an IDLE session for this goal, or None.
+
+        - Timed park (``wait_for_seconds``) whose deadline passed: the normal continuation prompt. Not
+          capped: the judge chose the timer, and ``max_turns`` bounds the cycle.
+        - pid/session park still holding after the check-in interval (background work running long,
+          hung or stuck; Claude Code's background check-in): a check-in naming what it waits on.
+        - Active, unparked and quiet (no continuation queued, e.g. a lost FIFO entry or a judge
+          failure): a plain check-in.
+        Check-ins back off (interval, 2x, 4x cap) and at most ``max_checkins`` fire between real events
+        (``evaluate_after_turn(real_event=True)`` resets). The interval is the goal's own
+        ``checkin_minutes`` when set (>= 0), else the caller's. Process exits and delegation results
+        deliver their own turns, so they are never raced. The caller guarantees the session is idle;
+        the wake is recorded before returning, so overlapping polls cannot double-fire."""
+        s = self._state
+        if s is None or s.status != "active":
+            return None
+        minutes = s.checkin_minutes if s.checkin_minutes >= 0 else checkin_minutes
+        if not minutes or minutes <= 0:
+            return None
+        now = time.time() if now is None else now
+        if now - max(s.last_turn_at, s.last_idle_wake_at, s.waiting_since, s.created_at) > _IDLE_WAKE_HORIZON_S:
+            return None  # stale/abandoned goal: never wake it out of the blue
+        interval = minutes * 60 * min(2 ** s.idle_wakes, _CHECKIN_BACKOFF_CAP)
+        capped = s.idle_wakes >= max(0, int(max_checkins))
+        if s.waiting_until:
+            if now < s.waiting_until:
+                return None
+            self.stop_waiting()
+            prompt = self.next_continuation_prompt()
+            counted = False
+        elif s.waiting_on_pid is not None or s.waiting_on_session is not None:
+            age = now - (s.waiting_since or now)
+            if capped or age < interval:
+                return None
+            target = f"session {s.waiting_on_session}" if s.waiting_on_session else f"pid {s.waiting_on_pid}"
+            prompt = GOAL_STUCK_CHECKIN_PROMPT_TEMPLATE.format(
+                n=s.idle_wakes + 1, max=max_checkins, age_min=int(age // 60), target=target,
+                reason=s.waiting_reason or "(no reason recorded)", goal=s.goal,
+            )
+            self.stop_waiting()
+            counted = True
+        else:
+            quiet = now - max(s.last_turn_at, s.last_idle_wake_at, s.created_at)
+            if capped or quiet < interval:
+                return None
+            prompt = GOAL_CHECKIN_PROMPT_TEMPLATE.format(
+                n=s.idle_wakes + 1, max=max_checkins, goal=s.goal, idle_min=int(quiet // 60),
+            )
+            counted = True
+        if not prompt:
+            return None
+        if counted:
+            s.idle_wakes += 1
+        s.last_idle_wake_at = now
+        self._save()
+        return prompt
+
+    def set_checkin_minutes(self, minutes: int) -> GoalState:
+        """Per-goal check-in interval (minutes; 0 = off for this goal; -1 = config default)."""
+        state = self._require_active()
+        state.checkin_minutes = max(-1, int(minutes))
+        return self._save()
 
     def next_continuation_prompt(self) -> Optional[str]:
         s = self._state

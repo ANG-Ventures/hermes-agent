@@ -475,6 +475,9 @@ def _run_job_script(
     # otherwise dispatch a fresh long-running script a second before SIGTERM and hand the drain
     # brand-new work to wait out (fork #1307).
     if _sched.is_shutting_down():
+        # Not a job failure: the run body records it as a skip (cron/scheduler_shutdown_skip.py).
+        from cron.scheduler_shutdown_skip import note_shutdown_refused
+        note_shutdown_refused(job_id)
         return False, (
             f"Skipped: cron scheduler is shutting down (not starting {path.name})"
         )

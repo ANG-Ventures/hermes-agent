@@ -371,8 +371,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     if not parts:
         return ""
     name, arg, agent = parts[0], (parts[1].strip() if len(parts) > 1 else ""), session.get("agent")
-    if name == "compact":  # /compact aliases /compress; the compute-host control forwards the raw alias
-        name = "compress"
+    # Any registry alias (/compact, /m, /s, ...) mirrors as its command; the compute-host control
+    # still forwards the raw command text (t_92c49fb6: /m <model> skipped the live switch).
+    name = _resolve_name(name.lower())
     if name in _MUTATES_WHILE_RUNNING:
         if _session_uses_compute_host(session):
             return _compute_host_slash(sid, session, name, command)[1]

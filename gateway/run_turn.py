@@ -27,6 +27,7 @@ from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
+    wake_progress_header,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -2137,6 +2138,9 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        # The /goal no-progress stop reads this (streamed turns return None, so not from the result).
+        with suppress(Exception):
+            event._goal_turn_api_calls = int(agent_result.get("api_calls", 0) or 0)
         if diagnostic_wake_muted(event):
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
@@ -2337,6 +2341,9 @@ class GatewayTurnMixin:
         # earlier would falsely recover a message that never began processing.
         await self._mark_durable_active_turn(event, session_entry.session_key)
 
+        # A voice note from a turn /stop cancelled mid-STT is still being persisted: it must land
+        # before this turn's history is read, so it precedes this message (t_2f936364).
+        await self._await_voice_persist_barrier(session_entry.session_id)
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
         try:
@@ -2359,6 +2366,7 @@ class GatewayTurnMixin:
         # Auto-analyze user images so the model gets a description plus the local path.
         message_text = await self._prepare_profile_scoped_inbound_message_text(
             event=event, source=source, history=history, session_key=session_key,
+            session_id=session_entry.session_id,
         )
         if message_text is None:
             return None, _session_env_tokens
@@ -3580,6 +3588,8 @@ class GatewayTurnMixin:
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
+        turn_ctx.wake_progress_header = wake_progress_header(
+            message, turn_ctx.persist_user_display_kind, turn_ctx.persist_user_display_metadata)
         turn_runner = TurnRunner(self, turn_ctx)
         turn_ctx.mute_notification_reply = diagnostic_turn_muted(
             turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
@@ -4145,7 +4155,8 @@ class GatewayTurnMixin:
         )
 
     async def _run_agent_drain_pending(
-        self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str]
+        self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str],
+        session_id: Optional[str] = None,
     ) -> Tuple[Any, Optional[str]]:
         """Dequeue the adapter's pending / interrupt / leftover-steer follow-up as ``(pending_event, pending)``.
 
@@ -4177,9 +4188,11 @@ class GatewayTurnMixin:
                 # Transcribe audio BEFORE it becomes the next user turn (real transcript, not a path).
                 _pending_text = pending_event.text or ""
                 if self._pending_event_audio_paths(pending_event):
+                    # Dequeued already: a /stop during this STT must persist the note, not drop it.
                     pending, _ = await self._transcribe_and_echo_pending_voice(
                         pending_event, adapter, source, _pending_text, log_context="Voice-drain",
                         metadata={"thread_id": source.thread_id} if source.thread_id else None,
+                        persist_session_id=session_id,
                     )
                     pending = pending or _build_media_placeholder(pending_event)
                 else:
@@ -4375,6 +4388,7 @@ class GatewayTurnMixin:
                 )
             next_message = await self._prepare_profile_scoped_inbound_message_text(
                 event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
+                session_id=session_id,
             )
             if next_message is None:
                 return result
@@ -4779,6 +4793,8 @@ class GatewayTurnMixin:
                 if _long_running_mode == "generic"
                 else t("gateway.progress.working_heartbeat", minutes=_elapsed_mins, detail=_status_detail)
             )
+            if turn_ctx.wake_progress_header:
+                _heartbeat_text = f"{turn_ctx.wake_progress_header}\n{_heartbeat_text}"
             try:
                 _notify_res = None
                 if _heartbeat_msg_id:
@@ -4917,7 +4933,9 @@ class GatewayTurnMixin:
                 logger.info("PHASE=stale_drain_skipped session=%s gen=%s", session_key, turn_ctx.run_generation)
                 pending_event, pending = None, None
             else:
-                pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+                pending_event, pending = await self._run_agent_drain_pending(
+                    result, adapter, source, session_key, turn_ctx.session_id,
+                )
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,

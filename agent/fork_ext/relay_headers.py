@@ -503,6 +503,35 @@ def note_main_turn_cache_split(agent, usage) -> None:
         agent._last_cache_creation_split = {"1h": one_h, "5m": five_m}
 
 
+def _usage_int(usage, *names) -> int:
+    for name in names:
+        v = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+        if isinstance(v, int):
+            return v
+    return 0
+
+
+def note_fork_first_response(agent, headers, usage) -> None:
+    """Log ``boomerang.fork served_by=<seat> read_share=<r>`` once, on a fork child's FIRST
+    successful response (the observable docs/boomerang-v2/README.md §5 and smoke step 3 read).
+
+    ``read_share`` = cache_read / (uncached input + cache_read + cache_write) of that response."""
+    if not getattr(agent, "_boomerang_fork_log_pending", False):
+        return
+    agent._boomerang_fork_log_pending = False
+    seat = (headers or {}).get(_POOL_SERVED_BY_HEADER) if isinstance(headers, dict) else None
+    read = _usage_int(usage, "cache_read_input_tokens")
+    write = _usage_int(usage, "cache_creation_input_tokens")
+    fresh = _usage_int(usage, "input_tokens")
+    total = read + write + fresh
+    share = f"{read / total:.4f}" if total else "n/a"
+    import logging
+
+    logging.getLogger("tools.delegate_tool").info(
+        "boomerang.fork served_by=%s read_share=%s prefix_tokens=%d child_session=%s",
+        seat or "unknown", share, total, getattr(agent, "session_id", None))
+
+
 def consume_first_request_headers(agent) -> dict:
     """Pop the one-shot first-request headers (fork seat pin) off ``agent``.
 

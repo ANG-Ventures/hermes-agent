@@ -87,7 +87,10 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # over the prior 48 h was <= 30 min for unheld cards.
 PRIORITY_STARVATION_SECONDS = 2 * 3600
 _PRIORITY_STARVATION_MARKER = ".priority_starvation.json"
-_PRIORITY_STARVATION_HOLD_KINDS = ("respawn_guarded", "deferred", "parked_by_policy")
+# ``placement_wait`` (t_641d1ab8): the page said "Held by: none recorded" for
+# 16 h while the card carried 60 host_reach waits; the code is the reason.
+_PRIORITY_STARVATION_HOLD_KINDS = ("respawn_guarded", "deferred", "parked_by_policy",
+                                   "placement_wait")
 
 
 def find_priority_starved(
@@ -126,18 +129,29 @@ def find_priority_starved(
         ).fetchone()
         if lower is None:
             continue
-        hold = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN (%s) ORDER BY id DESC LIMIT 1"
+        # Newest first. A ``{"cleared": true}`` row ends the hold of ITS kind, so
+        # an older event of that kind is resolved and must not resurface
+        # (Prism e82c6a604cf9); judge the parsed payload, never a LIKE.
+        reason = "none recorded"
+        cleared_kinds: set = set()
+        for kind, raw in conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? AND created_at >= ? "
+            "AND kind IN (%s) ORDER BY id DESC"
             % ",".join("?" * len(_PRIORITY_STARVATION_HOLD_KINDS)),
             (row["id"], since, *_PRIORITY_STARVATION_HOLD_KINDS),
-        ).fetchone()
-        reason = "none recorded"
-        if hold is not None:
+        ):
+            if kind in cleared_kinds:
+                continue
             try:
-                reason = str((json.loads(hold[0] or "null") or {}).get("reason") or reason)
-            except (TypeError, ValueError, AttributeError):
-                pass
+                pl = json.loads(raw or "null")
+            except (TypeError, ValueError):
+                pl = None
+            pl = pl if isinstance(pl, dict) else {}
+            if pl.get("cleared"):
+                cleared_kinds.add(kind)
+                continue
+            reason = str(pl.get("reason") or reason)
+            break
         hits.append({
             "task_id": row["id"], "priority": prio, "assignee": row["assignee"],
             "ready_since": since, "ready_seconds": now - since, "reason": reason,
@@ -179,6 +193,10 @@ def _notify_priority_starved(
                 f"while lower priority was admitted (e.g. {h['lower_task_id']} "
                 f"p{h['lower_priority']}). Held by: {h['reason']}."
             )
+            from hermes_cli.kanban_placement_starvation import fix_for
+            if fix_for(h["reason"].split(" (", 1)[0]) is not None:
+                body += (" A structural hold: it will not clear on its own; the card comment "
+                         f"names the body fix (`kanban placement {h['task_id']}`).")
             _kb._log.warning("PHASE=kanban_priority_starved %s", body)
             delivered = None
             if script is not None:
@@ -7096,6 +7114,13 @@ def _dispatch_once_locked(
             notify_drained_pins(conn, board, result.placement_waits, int(time.time()))
         except Exception as exc:  # never break a dispatcher tick
             _kb._log.warning("kanban drained-pin notify failed: %s", exc)
+        try:
+            # A structural hold (host_reach, requires_unsatisfied, ...) never
+            # clears on its own: ONE comment names the body fix (t_641d1ab8).
+            from hermes_cli.kanban_placement_starvation import notify_starved_holds
+            notify_starved_holds(conn, result.placement_waits, int(time.time()))
+        except Exception as exc:  # never break a dispatcher tick
+            _kb._log.warning("kanban placement-starved notify failed: %s", exc)
     if not dry_run and result.unknown_pins:
         try:
             from hermes_cli.kanban_unknown_pin import comment_unknown_pins

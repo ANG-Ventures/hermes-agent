@@ -1648,6 +1648,9 @@ DEFAULT_CONFIG = {
                            # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
                            # explicitly for non-standard endpoints the URL heuristic can't identify.
         "resume_on_restart": True,  # recover gateway background delegations after restart
+        # Durable background units run in their own process and survive a gateway restart
+        # (docs/dev/delegate-detached-background.md). false = in-gateway threads (kill switch).
+        "detached_background": False,  # default OFF until the 20 open Prism P1s on #2135 are triaged (t_eaabba56)
         "surface_child_process_notifications": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
@@ -2022,7 +2025,9 @@ DEFAULT_CONFIG = {
     # website/docs/user-guide/features/hooks.md.
     # missing_hook_policy: what a hook whose script (or a tracked sibling) is ABSENT does —
     # restore_then_fail_closed | fail_closed | fail_open_and_page.
-    "hooks": {"missing_hook_policy": "restore_then_fail_closed"},
+    # batch_python_hooks: `<python> <script>.py` hooks of one event fire share one interpreter start
+    # (agent/shell_hooks_batch.py); false restores one process per hook.
+    "hooks": {"missing_hook_policy": "restore_then_fail_closed", "batch_python_hooks": True},
     # Auto-accept shell-hook registrations without a TTY prompt (also --accept-hooks or
     # HERMES_ACCEPT_HOOKS=1). Gateway/cron/non-interactive runs need one of these to pick up
     # newly-added hooks.
@@ -2417,6 +2422,11 @@ DEFAULT_CONFIG = {
                       # (promotion gate: n >= 50 answered, 0 disagreements). on = alloc_client.admit
                       # picks and books; release/renew go through alloc_client.
                       "allocd": "off"},
+        # Admission predicate (t_da6f84f7, read per tick by the gateway gate, `kanban dispatch` and the shared
+        # placement scorer): legacy = the load1 gate below; utilization = hermes_cli/admission.py admit() over the
+        # host's measured cpu_busy / memory / PSI / procs with one measured-estimate lease per recent spawn. In
+        # utilization the dispatch_load_gate load/CPU keys are inert (procs pause and max_spawn_per_tick still apply).
+        "admission": "legacy",
         "dispatch_load_gate": {
             "enabled": True,
             "pause_above": None,
@@ -2437,6 +2447,11 @@ DEFAULT_CONFIG = {
             "cpu_corroborate": True,
             "cpu_busy_pause": 0.70,
             "worker_cpu_cost": 1.0,
+            # t_a7978f86: E-core band saturation (Apple silicon) at or above
+            # ecore_busy_pause is no local CPU headroom. off | report (log
+            # "would-refuse" only; D1: flips to on on Ace's yes) | on.
+            "ecore_gate": "report",
+            "ecore_busy_pause": 0.95,
             # t_b660edb6: pause spawns (state proc_paused, #alerts page) at
             # proc_pause_fraction of this uid's process limit (RLIMIT_NPROC,
             # or proc_limit when set); resume below proc_resume_fraction.

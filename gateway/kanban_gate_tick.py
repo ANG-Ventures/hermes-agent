@@ -216,6 +216,8 @@ class GateTickBuilder:
 
     def build(self, boards) -> GateTick:
         gate = self.gate
+        # kanban.admission (t_da6f84f7), read per tick: utilization | legacy (default)
+        gate.admission = klg.admission_mode((self._kanban_cfg() or {}).get("admission"))
         running_local, remote_by_host = running_split(self._ledger(boards))
         self._remote_by_host = dict(remote_by_host)
         self._boards = boards

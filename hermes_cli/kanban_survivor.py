@@ -768,6 +768,13 @@ def _registered_nested(workspace):
     Every hit is confirmed present via :func:`_is_repo_on_disk` before it is
     returned; see there for why a bare registry entry is not proof.
 
+    A worktree registered UNDER the workspace's own git storage (``.git`` or
+    the resolved ``--git-common-dir``) is not nested content: it is part of
+    git's metadata, never of the tree, and the walk never descends there
+    either. ``home-autocommit`` keeps one at
+    ``.git/autocommit/main-gate-worktree``; counting it refused every
+    hermes-home ``--survivor-pr`` close (t_5a20f492).
+
     Used ONLY as a positive: a path Git lists AND that is a repository on disk
     really is a nested repository, so finding one is proof. The converse does
     not hold and must not be inferred -- a repo a worker cloned by hand is in
@@ -778,6 +785,15 @@ def _registered_nested(workspace):
     if not (workspace / ".git").exists():
         return []
     nested = []
+    storage = [(workspace / ".git").resolve()]
+    common = _git(workspace, "rev-parse", "--git-common-dir", check=False)
+    if common.returncode == 0 and common.stdout.strip():
+        try:
+            storage.append((workspace / os.fsdecode(common.stdout.strip())).resolve())
+        except OSError:
+            pass
+    storage = [git_dir for git_dir in storage
+               if git_dir != workspace and git_dir.is_relative_to(workspace)]
     listing = _git(workspace, "worktree", "list", "--porcelain", check=False)
     if listing.returncode == 0:
         for line in listing.stdout.decode("utf-8", "replace").splitlines():
@@ -786,6 +802,8 @@ def _registered_nested(workspace):
             try:
                 path = Path(line[len("worktree "):]).resolve()
             except OSError:
+                continue
+            if any(path.is_relative_to(git_dir) for git_dir in storage):
                 continue
             if path != workspace and path.is_relative_to(workspace) and _is_repo_on_disk(path):
                 nested.append(path)

@@ -284,9 +284,9 @@ def test_event_made_by_owner_session_is_not_news(env):
 
 def test_notify_wake_sub_on_owner_chat_is_not_doubled(env):
     tid = _card(env)
-    with kb.connect_closing() as conn:
-        kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=CHAT,
-                           chat_type="group", user_id=HUMAN, delivery_mode="notify+wake")
+    # t_156cc147: the sub's wake must be DELIVERED (accepted) to cover the block; a
+    # rejected or downgraded one leaves the owner-wake to fire.
+    _wake_sub_on_owner_chat(env, tid)
     _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
     handled = _tick(env)
     owner_turns = [e for e in handled if (e.metadata or {}).get("kanban_owner_wake")]
@@ -1042,3 +1042,77 @@ def test_owner_wake_receipt_failure_keeps_the_item(env, monkeypatch):
         conn.execute("UPDATE task_events SET actor_profile = 'default' WHERE task_id = ?", (tid,))
     # stalled is in NEVER_SUPPRESS anyway: protected kinds beat config -> wakes
     assert "stuck (stalled)" in _one_turn(env, _tick(env))
+
+
+# --- t_156cc147: t_e248dbe7's needs_input block (event 957601) reached no session ----------
+
+
+ROTATED_SID = "20261017_065006_4af9ab24"   # the card's home, rotated out of the store by compression
+
+
+def _replay_957601(env, monkeypatch, *, downgrade):
+    """The 2026-10-19 08:52 shape: a needs_input block on a card homed to a compression-rotated
+    raw session id, with a notify+wake sub on the owner's Discord chat. ``downgrade`` is the
+    contention gate's verdict for the sub's wake (the Studio sat at load1 > pause_above)."""
+    from gateway import kanban_watchers as kw
+
+    monkeypatch.setattr(kw, "_wake_downgrade_reason", lambda *a, **k: downgrade)
+    rows = {ROTATED_SID: {"source": "discord", "session_key": env["owner"].session_key}}
+    monkeypatch.setattr(hr, "read_session_row", lambda sid: rows.get(sid))
+    assert env["store"].lookup_by_session_id(ROTATED_SID) is None, "home sid must be rotated"
+    tid = _card(env, session=ROTATED_SID, title="skill re-layout C")
+    _wake_sub_on_owner_chat(env, tid)
+    _event(tid, "blocked", {
+        "kind": "needs_input", "recurrences": 1, "source_status": "ready",
+        "reason": "Wave 1 (generative-art) committed locally: branch daedalus/t_e248dbe7-wave1 @ "
+                  "2cbaeb8df856, verify PASS. Apollo lands it.\nunblock_when: ruling:wave1-live"})
+    return tid
+
+
+def test_957601_downgraded_sub_wake_still_wakes_the_owner(env, monkeypatch):
+    """RED before t_156cc147: the sub's wake went out as a notify, and has_wake_sub's
+    "a sub exists" cut still dropped the owner-wake: no turn anywhere, pending {}."""
+    tid = _replay_957601(env, monkeypatch, downgrade="host load 89")
+    handled = _tick(env)
+    owner_turns = [e for e in handled if (e.metadata or {}).get("kanban_owner_wake")]
+    assert len(owner_turns) == 1, [e.text for e in handled]
+    assert len(handled) == 1, "the downgraded sub delivered a line, not a turn"
+    text = owner_turns[0].text
+    assert tid in text and "needs_input" in text and "2cbaeb8df856" in text
+    assert owner_turns[0].metadata["gateway_session_key"] == env["owner"].session_key
+    assert [m["chat_id"] for m in env["adapter"].sent] == [CHAT], "the passive line still posts"
+
+
+def test_957601_delivered_sub_wake_is_one_turn(env, monkeypatch):
+    """The other half of the contract: when the sub's wake IS delivered, it is the one turn."""
+    tid = _replay_957601(env, monkeypatch, downgrade=None)
+    handled = _tick(env)
+    assert len(handled) == 1, [e.text for e in handled]
+    assert not (handled[0].metadata or {}).get("kanban_owner_wake"), "the notifier's wake is the turn"
+    assert tid in handled[0].text
+
+
+def test_needs_input_drop_logs_at_info(env, caplog):
+    """A needs_input item dropped without a delivered turn leaves an INFO line naming why."""
+    import logging
+
+    tid = _card(env, session="20261003_cron_000000")
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
+    with caplog.at_level(logging.INFO, logger="gateway.kanban_owner_wake"):
+        assert asyncio.run(ow.tick(env["runner"], now=1000.0, state=_held_state(env, 0))) == 0
+    lines = [r.getMessage() for r in caplog.records
+             if r.levelno == logging.INFO and "needs_input" in r.getMessage()]
+    assert len(lines) == 1 and tid in lines[0] and "no live session-store entry" in lines[0], lines
+
+
+def test_rejected_sub_wake_falls_back_to_the_owner_wake(env):
+    """t_156cc147: a sub wake the adapter does not accept (WakeNotAccepted) marks nothing, so the
+    owner still gets its turn. Before the fix the sub's existence alone withheld it."""
+    tid = _card(env)
+    with kb.connect_closing() as conn:
+        kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id=CHAT,
+                           chat_type="group", user_id=HUMAN, delivery_mode="notify+wake")
+    _event(tid, "blocked", {"kind": "needs_input", "reason": "ruling?"})
+    handled = _tick(env)
+    owner_turns = [e for e in handled if (e.metadata or {}).get("kanban_owner_wake")]
+    assert len(owner_turns) == 1 and tid in owner_turns[0].text, [e.text for e in handled]

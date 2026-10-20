@@ -108,6 +108,10 @@ def _num(v) -> Optional[float]:
 # host-pressure.json fields the scorer reads beyond the v1 axes: D-state netting (#4696) and scorer v2's
 # occupancy / PSI avg60 (t_f8a3b6c3). Absent from a probe = None, which the scorer treats as unmeasured.
 V2_FIELDS = ("d_threads", "runnable_ewma", "procs_running", "psi_cpu_some60")
+# kanban.admission: utilization axes (admission.admit; Prism a864560114d1). Absent = None = ``unmeasured:<axis>``.
+# ``ncpu`` is carried only when the pressure row has it: it is the denominator of that row's ``cpu_busy`` and,
+# when absent, the probe's own getconf count already in the detail row stands (never overwritten with None).
+UTIL_FIELDS = ("cpu_busy", "psi_io_some10")
 
 
 def sample_fields(load5: Optional[float], remote_now: Optional[float], text: str, *,
@@ -120,15 +124,19 @@ def sample_fields(load5: Optional[float], remote_now: Optional[float], text: str
     out: Dict[str, Any] = {"load5": load5, "mem_available_gb": None, "psi_cpu_some10": None,
                            "psi_mem_some10": None, "system_pct": None, "sample_at": None,
                            "sample_status": "absent"}
-    out.update({k: None for k in V2_FIELDS})
+    out.update({k: None for k in V2_FIELDS + UTIL_FIELDS})
     try:
         doc = json.loads(text) if text else None
     except ValueError:
         doc = None
     if not isinstance(doc, dict):
         return out
-    for k in ("mem_available_gb", "psi_cpu_some10", "psi_mem_some10", "system_pct") + V2_FIELDS:
+    for k in ("mem_available_gb", "psi_cpu_some10", "psi_mem_some10", "system_pct") + V2_FIELDS + UTIL_FIELDS:
         out[k] = _num(doc.get(k))
+    if _num(doc.get("ncpu")) is not None and doc["ncpu"] > 0:
+        out["ncpu"] = _num(doc["ncpu"])
+    if isinstance(doc.get("os"), str) and doc["os"]:
+        out["os"] = doc["os"]
     at = _num(doc.get("at"))
     if at is None or remote_now is None or not math.isfinite(remote_now):
         out["sample_status"] = "stale"
@@ -149,7 +157,8 @@ def sample_from_detail(d: Mapping) -> Optional[placement.Sample]:
         psi_mem_some10=_num(d.get("psi_mem_some10")), system_pct=_num(d.get("system_pct")),
         at=_num(d.get("sample_at")), status=str(status),
         note="" if status == "fresh" else str(d.get("pressure") or ""),
-        **{k: _num(d.get(k)) for k in V2_FIELDS})
+        ncpu=_num(d.get("ncpu")), os=d.get("os") if isinstance(d.get("os"), str) else None,
+        **{k: _num(d.get(k)) for k in V2_FIELDS + UTIL_FIELDS})
 
 
 def job_priority(card_priority) -> Optional[int]:

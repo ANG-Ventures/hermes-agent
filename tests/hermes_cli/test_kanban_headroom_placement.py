@@ -28,6 +28,19 @@ POLICY = pp.PlacementPolicy()
 T0 = 1_791_850_000.0
 HOSTS = ("ci-box", "ace-ai", "ace-media")
 
+
+def _dead_pid() -> int:
+    """A pid no live process owns. A fixed fake pid (4242) is a real process on some hosts
+    (dnsmasq on ace-ai), so ``complete_task`` saw a live worker claim and raised LiveClaimError."""
+    import subprocess
+    import sys
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+FAKE_PID = _dead_pid()
+
 # The #3945 table, trimmed to what the scorer reads.
 TABLE = {
     "schema": 1, "default_first": "ci-box", "saturate_to": 1.0,
@@ -183,7 +196,7 @@ def test_dispatch_reserves_each_spawn_and_run_end_releases_it(home):
 
     def spawn(task, workspace, *, board=None, placement=None):
         spawned.append((task.id, placement.name if placement else None))
-        return 4242
+        return FAKE_PID
 
     with kb.connect_closing() as conn:
         ids = [kb.create_task(conn, title=f"c{i}", assignee="alpha") for i in range(3)]
@@ -216,6 +229,32 @@ def test_continuity_from_previous_placed_run(home):
         job = kh.job_for_row(conn, row)
     assert job.continuity == "ace-media" and job.priority is None
     assert kh.job_priority(100) == 0 and kh.job_priority(95) == 1 and kh.job_priority(80) is None
+
+
+class UtilFleet(Fleet):
+    """Fleet whose host-pressure.json carries the utilization row (scripts/host-pressure.py fields)."""
+
+    def text(self, h):
+        doc = json.loads(super().text(h))
+        doc.update({"os": "linux", "ncpu": 32, "cpu_busy": 0.30, "psi_io_some10": 0.5})
+        return json.dumps(doc)
+
+
+def test_utilization_take_places_on_a_measured_pool_host(home):
+    """Prism a864560114d1 / e65f40aa5a69 / 14062df79154: under ``kanban.admission: utilization`` the probe's
+    pressure row reaches the Sample (ncpu, cpu_busy, psi_io_some10, os), so a real take() places remotely
+    instead of closing every host ``unmeasured:ncpu``."""
+    (home / "config.yaml").write_text("kanban:\n  admission: utilization\n", encoding="utf-8")
+    assert placement.admission_mode() == "utilization"
+    plan = _plan(home, UtilFleet())
+    host = plan.take("alpha")
+    rows = {r.host: r for r in plan.last_decision.rows}
+    assert host is not None, {h: r.reason for h, r in rows.items()}
+    assert all("unmeasured" not in r.reason for r in rows.values()), {h: r.reason for h, r in rows.items()}
+    picked = rows[host.name]
+    assert picked.eligible and picked.cpu_busy == 0.30 and picked.need is not None
+    s = kh.sample_from_detail(plan.detail[host.name])
+    assert (s.ncpu, s.cpu_busy, s.psi_io_some10, s.os) == (32, 0.30, 0.5, "linux")
 
 
 # -- vendored copy stays the canonical scorer -------------------------------
@@ -427,7 +466,7 @@ def test_run_end_releases_only_after_commit(home):
     plan = _plan(home, Fleet(), now=_t.time())
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="c", assignee="alpha")
-        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242, max_spawn=8, spawn_paused=None, spawn_limit=0,
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: FAKE_PID, max_spawn=8, spawn_paused=None, spawn_limit=0,
                           spillover=plan, reconcile_orphans=False)
         assert [r["job_id"] for r in _ledger_rows(home)] == [tid]
         with pytest.raises(RuntimeError, match="boom"):
@@ -488,7 +527,7 @@ def test_live_run_reservation_is_renewed_past_the_admission_ttl(home):
     plan = _plan(home, Fleet(), now=now)
     with kb.connect_closing() as conn:
         ids = [kb.create_task(conn, title=f"c{i}", assignee="alpha") for i in range(2)]
-        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242, max_spawn=8, spawn_paused=None, spawn_limit=0,
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: FAKE_PID, max_spawn=8, spawn_paused=None, spawn_limit=0,
                           spillover=plan, reconcile_orphans=False)
     ledger = home / placement.RESERVATIONS_REL
     assert sorted(r["job_id"] for r in _ledger_rows(home)) == sorted(ids)
@@ -628,7 +667,7 @@ def test_dispatch_books_the_assignees_profile_class(home):
         b = kb.create_task(conn, title="b", assignee="beta")
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (a,)).fetchone()
         assert kh.job_for_row(conn, row).profile == "alpha"
-        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242, max_spawn=64, spawn_paused=None, spawn_limit=0,
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: FAKE_PID, max_spawn=64, spawn_paused=None, spawn_limit=0,
                           spillover=plan, reconcile_orphans=False)
     rows = json.loads((home / placement.RESERVATIONS_REL).read_text(encoding="utf-8"))["rows"]
     booked = {r["job_id"]: r["ram_gb"] for r in rows}

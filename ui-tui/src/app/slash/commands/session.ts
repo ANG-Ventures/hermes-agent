@@ -125,6 +125,7 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
+    aliases: ['m'],
     help: 'change or show model',
     name: 'model',
     run: (arg, ctx) => {
@@ -569,6 +570,7 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
+    aliases: ['r'],
     help: 'inspect or set reasoning effort (updates live agent)',
     name: 'reasoning',
     run: (arg, ctx) => {

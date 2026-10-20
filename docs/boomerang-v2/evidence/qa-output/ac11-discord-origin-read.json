@@ -1,0 +1,31 @@
+{
+ "window": [
+  "00:03:00",
+  "00:30:00"
+ ],
+ "messages_scanned": 10,
+ "naming_card": [
+  {
+   "ts": "2026-10-20T00:05:30.497000-07:00",
+   "author_bot": true,
+   "text": "⚠️ auto-handle lost t_1b09baf2 (reason: gateway restart)"
+  },
+  {
+   "ts": "2026-10-20T00:05:33.360000-07:00",
+   "author_bot": true,
+   "text": "💻 terminal\n```\ncd ~/.hermes && date +%T; rtk ps -p 7...\n```\n```\ncd ~/.hermes && grep -aE \"t_1b09baf2\"...\n```\n```\ncd ~/.hermes/runtime/hermes-agent && ...\n``` (×2)\n```\ncd ~/.hermes/hermes-agent && timeout ...\n```\n```\ncd /Volumes/fleet-scratc"
+  },
+  {
+   "ts": "2026-10-20T00:13:43.164000-07:00",
+   "author_bot": true,
+   "text": "The step-4 drill worked: the restart cut a live fork child and the reconciler re-surfaced its wake correctly. The harness still printed FAIL on one check, because it gave up waiting 2.5 seconds before the log line landed. I'm treating step "
+  },
+  {
+   "ts": "2026-10-20T00:14:19.749000-07:00",
+   "author_bot": true,
+   "text": "No action needed on `t_1b09baf2`. This wake is what step 4 was checking for. The 00:05 restart cut the auto-handle child mid-run, and at 00:05:30 the reconciler handed the card's original \"completed\" event back to this session as a normal w"
+  }
+ ],
+ "lost_lines": 1,
+ "auto_handled_lines": 0
+}

@@ -1926,7 +1926,10 @@ class GatewayKanbanWatchersMixin:
                     from hermes_cli import kanban_open_pr as _open_pr
 
                     _cg_query = getattr(self, "_kanban_close_gate_query", None) or _open_pr.memo_query()
+                    from gateway import kanban_auto_handle as _ah
                     from gateway import kanban_owner_wake as _ow
+
+                    _auto_on = _ah.enabled()
 
                     _red_health = _ow.default_pr_health()
                     _red_memo: dict = {}
@@ -2232,6 +2235,22 @@ class GatewayKanbanWatchersMixin:
                                                 _kids = []
                                             if _kids:
                                                 ready_state[_ev.id] = _kids
+                                    # Boomerang v2 P3b (spec §5.5): events whose wake an
+                                    # auto-handle child takes instead. AFTER the suppressor;
+                                    # only when the kill switch is on (read every tick).
+                                    auto: dict = {}
+                                    if _auto_on and _wake_mode:
+                                        try:
+                                            auto = _ah.collect_candidates(
+                                                _kb, conn, slug, task, events, _home_sid,
+                                                getattr(self, "session_store", None),
+                                                skip=set(suppressed) | set(wake_noise),
+                                                pr_health=_red_health, memo=_red_memo,
+                                            )
+                                        except Exception as _ah_exc:
+                                            logger.warning("kanban notifier: auto-handle gate for %s failed "
+                                                           "(%s); surfacing", sub["task_id"], _ah_exc)
+                                            auto = {}
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -2252,6 +2271,7 @@ class GatewayKanbanWatchersMixin:
                                         "ready_state": ready_state,
                                         "self_event_ids": _self_ids,
                                         "suppressed": suppressed,
+                                        **({"auto": auto} if auto else {}),
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -2385,6 +2405,17 @@ class GatewayKanbanWatchersMixin:
                             )
                             mode = "notify"
                     wake_agent = mode in ("notify+wake", "wake")
+                    # Host load1 alone never stops an auto-handle child: the child REPLACES the
+                    # session's wake turn, so downgrading it saves nothing, and on a box idling
+                    # above the band auto-handle never ran (smoke 2026-10-19: load 55-75 for
+                    # hours). Same rule as a human-owned wake (t_b7b31563): dispatcher
+                    # proc_paused and a capped lane still downgrade. Only AUTO events use it.
+                    # Host contention alone (load1 band OR measured cpu busy, t_0e52c7ab #2114 made cpu
+                    # the default axis) never stops an auto-handle child; lane / proc_paused still do.
+                    _ah_load_exempt = bool(
+                        d.get("auto") and wake_downgrade
+                        and str(wake_downgrade).startswith(("host load", "host cpu"))
+                    )
                     send_passive = mode != "wake"
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
@@ -2587,6 +2618,8 @@ class GatewayKanbanWatchersMixin:
                             continue
                         if d.get("home"):
                             msg += "\n" + d["home"]
+                        if ev.id in (d.get("auto") or {}):
+                            msg = _hr.tag_line(msg, "auto-handling…")
                         if wake_downgrade:
                             msg += f"\n(notify: {wake_downgrade})"
                         delivery_metadata = sub.get("delivery_metadata")
@@ -2946,7 +2979,12 @@ class GatewayKanbanWatchersMixin:
                             # t_b7b31563: a deferred wake builds its text here
                             # too; it is parked (not delivered) further down.
                             if (wake_agent or _defer_pending)
-                            else set()
+                            # load-exempt: only the auto events, for the child; the
+                            # rest still go nowhere (cleared below if no claim takes them).
+                            else ({ev.kind for ev in d["events"] if ev.id in d["auto"]
+                                   and ev.kind in _WAKE_KINDS and ev.id not in _self_ids
+                                   and ev.id not in _suppressed_ids and ev.id not in _noise}
+                                  if _ah_load_exempt else set())
                         )
                         if _wake_kinds:
                             # t_07ffc6cb: re-read the card at SEND time; a wake
@@ -3074,9 +3112,29 @@ class GatewayKanbanWatchersMixin:
                                     "unblocked: arm or dispatch them."
                                 )
                             _red_ids = _red_ids + _ready_ids
+                            # t_156cc147: a block / stuck wake DELIVERED here is the owner's
+                            # turn; the owner-wake now skips only these marked ids, never on
+                            # the sub's existence (a downgraded wake marks nothing).
+                            from gateway import kanban_owner_wake as _ow_kinds
+                            _red_ids = _red_ids + [
+                                ev.id for ev in d["events"]
+                                if ev.kind in _ow_kinds.SUB_WAKE_KINDS and ev.kind in _wake_kinds
+                            ]
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
                             )
+                        if _wake_kinds and d.get("auto") and (wake_agent or _defer_pending or _ah_load_exempt):
+                            # Boomerang v2 P3b: a claimed auto event is the child's, not the
+                            # session's: its wake is withheld. A failed dispatch stays here
+                            # and wakes as today (INV-6).
+                            from gateway import kanban_auto_handle as _ah
+
+                            _wake_kinds = await _ah.notifier_dispatch(
+                                self, d, sub, board_slug, task, _wake_kinds, _synth,
+                            )
+                        if _ah_load_exempt and not (wake_agent or _defer_pending):
+                            # whatever no claim took stays a notify, as today (INV-6 at load)
+                            _wake_kinds = set()
 
                         if _defer_pending and _wake_kinds and not wake_agent:
                             # t_b7b31563: park the downgraded human-owner
@@ -3317,6 +3375,15 @@ class GatewayKanbanWatchersMixin:
                 await _owner_wake.tick(self)
             except Exception as exc:
                 logger.warning("kanban owner-wake tick failed: %s", exc)
+            # Boomerang v2 P3b (spec §5.7): open auto-handle claims whose child died (a
+            # restart empties the in-process registry, so the first tick after startup
+            # re-surfaces them) or outlived max_minutes. A no-op with no claim file.
+            try:
+                from gateway import kanban_auto_handle as _ah_rec
+
+                await _ah_rec.reconcile(self)
+            except Exception as exc:
+                logger.warning("kanban auto-handle reconcile failed: %s", exc)
             # t_b7b31563: fire deferred human-owner wakes once the gate clears
             # or their ceiling passes.
             try:
