@@ -130,6 +130,6 @@ json.dump({"case": case, "n_child_requests": len(child_reqs),
            "child_requests": [_norm(k) for k in child_reqs],
            "result_status": [r.get("status") for r in (parsed or {}).get("results", [])] if isinstance(parsed, dict) else None,
            "raw_result": parsed if parsed is not None else str(res)[:4000]},
-          open(out, "w"), indent=1, sort_keys=True, default=str)
+          open(out, "w", encoding="utf-8"), indent=1, sort_keys=True, default=str)
 print(case, "child_requests", len(child_reqs), "pin_headers",
       [(k.get("extra_headers") or {}).get("x-hermes-pin-sub") for k in child_reqs])
