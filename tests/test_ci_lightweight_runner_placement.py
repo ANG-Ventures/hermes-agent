@@ -18,8 +18,10 @@ WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
     ],
 )
 def test_portable_required_gate_has_hosted_runner(workflow: str, job: str) -> None:
-    jobs = yaml.safe_load((WORKFLOWS / workflow).read_text())["jobs"]
-    assert jobs[job]["runs-on"] == "ubuntu-latest"
+    runs_on = yaml.safe_load((WORKFLOWS / workflow).read_text())["jobs"][job]["runs-on"]
+    # Literal, or the plumbing var that only the private CI mirror sets (tests/ci/test_plumbing_runner_routing.py).
+    if runs_on != "ubuntu-latest":
+        assert runs_on == "${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}"
 
 
 def test_heavy_python_jobs_remain_variable_routed() -> None:

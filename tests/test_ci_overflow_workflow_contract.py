@@ -373,7 +373,7 @@ def test_if_predicates_exact():
 def test_placement_job_shape_and_permissions_exact():
     job = _tests_yml()["jobs"]["placement"]
     assert job["needs"] == "generate"
-    assert job["runs-on"] == "ubuntu-latest"
+    assert evaluate(job["runs-on"], {"vars": {"CI_RUNNER_LABELS": '["self-hosted"]'}}, {}) == "ubuntu-latest"
     assert job["timeout-minutes"] == 5
     assert job["permissions"] == {"contents": "read"}
     assert job["continue-on-error"] is True  # a dead placement must not fail required checks

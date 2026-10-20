@@ -40,7 +40,7 @@ jobs:
     # left on the pool displaces a test slice. This job's checkout is already
     # blobless, which is what made it viable on the pool; it is equally viable
     # hosted, where it never competes with the matrix.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Checkout code
@@ -152,7 +152,7 @@ jobs:
     # the diff comment even when enforcement fails.
     name: ruff enforcement (blocking)
     # Hosted by design — short, no LAN dependency. See `lint-diff` above.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Checkout code
@@ -181,7 +181,7 @@ jobs:
     # See scripts/check-windows-footguns.py for the full rule list.
     name: Windows footguns (blocking)
     # Hosted by design — short, no LAN dependency. See `lint-diff` above.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Checkout code

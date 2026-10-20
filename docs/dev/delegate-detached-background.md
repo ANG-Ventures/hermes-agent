@@ -25,7 +25,20 @@ Detached mode is taken only when the spawn is restart-safe on this host:
 `process_registry.restart_safe_gateway_child_argv(..., outlives_parent=True,
 require_restart_safe_scope=False)` returns mode `in_process` (not systemd: own session suffices —
 the kanban precedent on launchd) or `scoped` (systemd user scope). On `degraded` (systemd without a
-user bus) the unit runs as a thread exactly as today (CB-2).
+user bus) the unit runs as a thread exactly as today (CB-2). Native Windows is always `degraded`: there is no
+process-group cancel (`os.killpg`), so `/stop` could not reach the child. A unit with a `fork`/`branch` child
+also stays a thread: the fork's live transcript, cache snapshot and served seat cannot cross the process
+boundary. An explicit `inherit_mode="summary"` persists the built child's fold (`materialized_prefill_messages`).
+
+Process identity is `(pid, kernel start time)`; a pid without a start time is never signalled (only adopted
+when its argv carries the exact `--job <dir>` pair). SIGKILL escalation also reaches group members captured at
+SIGTERM time that outlived the leader. A dispatcher standing an un-advertised child down first fences the
+attempt in the registry (`stand_down_detached`); if an overlapping boot already adopted it, the child is left
+running for that boot. A fence whose outcome stays unknown (the registry raises on every retry) never kills:
+the child and its job dir are left running, marked `stand-down-unknown.json`, and the next boot's adoption pass
+decides. A live owned record adopts it (marker cleared); a dir no live record owns is an orphan, killed and
+removed. The detached worker writes its process checkpoint into its job dir, never the
+gateway's `<home>/processes.json`.
 
 Out of scope: synchronous delegation (thread), depth>0 (always synchronous already), TUI/CLI
 sessions (no durable spec, unchanged), kanban, cross-host.
@@ -34,7 +47,7 @@ sessions (no durable spec, unchanged), kanban, cross-host.
 
 - Spawn site: the unit's runner on the async executor (`_dispatch_admitted._worker` -> runner), after
   `persist_dispatch` + `mark_submitted`, so the attempt id exists.
-- Argv: `[sys.executable, "-m", "tools.delegate_detached", "--job", <job_dir>]` through the helper above.
+- Argv: `[sys.executable, "-P", "-m", "tools.delegate_detached", "--job", <job_dir>]` (`-P`: the workspace cwd never shadows `tools`) through the helper above.
 - `Popen(start_new_session=True, stdin=DEVNULL, stdout/stderr -> <job_dir>/child.log, cwd=<workspace_hint
   if it is a dir, else None>)`.
 - Env: `environments/local.py::served_profile_child_env(target_home=<owning profile home>,
