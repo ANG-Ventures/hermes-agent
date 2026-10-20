@@ -1097,7 +1097,8 @@ def _clean_discord_id(entry: str) -> str:
 # propagates) and falls back to os.getenv only outside multiplex.
 _GATE_ENV_KEYS = (
     "DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES", "DISCORD_ALLOWED_CHANNELS",
-    "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_THREAD_CHANNELS",
+    "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
     "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
 )
@@ -6311,6 +6312,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """This adapter's DISCORD_NO_THREAD_CHANNELS list (per-profile)."""
         return self._gate_csv_set(self._gate_raw("no_thread_channels", "DISCORD_NO_THREAD_CHANNELS"))
 
+    def _get_thread_channels(self) -> set:
+        """This adapter's DISCORD_THREAD_CHANNELS list (per-profile): always thread, even replies."""
+        return self._gate_csv_set(self._gate_raw("thread_channels", "DISCORD_THREAD_CHANNELS"))
+
     def _get_allowed_users(self) -> set:
         """This adapter's DISCORD_ALLOWED_USERS entries (per-profile, cleaned)."""
         raw = self._gate_raw("allow_from", "DISCORD_ALLOWED_USERS")
@@ -7801,6 +7806,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
         #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
         #   discord.free_response_auto_thread: Free-response channels also auto-thread (default: false)
+        #   discord.thread_channels: Channel IDs where every top-level message (replies included) gets its
+        #       own thread even with auto_thread off; no_thread_channels still wins
         thread_id = None
         parent_channel_id = None
         is_thread = isinstance(message.channel, discord.Thread)
@@ -7891,7 +7898,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             )
             auto_thread = self._extra_or_env_flag("auto_thread", "DISCORD_AUTO_THREAD", "true", truthy=True)
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
+            # A pages-only channel (#alerts) must never host a session inline: thread_channels overrides
+            # the global switch, the free-response default and the reply exclusion.
+            forced_thread = bool(channel_keys & self._get_thread_channels()) and not bool(
+                channel_keys & no_thread_channels
+            )
+            if (forced_thread and not is_voice_linked_channel) or (
+                auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message
+            ):
                 thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)
@@ -9242,6 +9256,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     _gate("ignored_channels", "DISCORD_IGNORED_CHANNELS", from_platform_extra=False)
     _gate("allowed_channels", "DISCORD_ALLOWED_CHANNELS", from_platform_extra=False)
     _gate("no_thread_channels", "DISCORD_NO_THREAD_CHANNELS", from_platform_extra=False)
+    _gate("thread_channels", "DISCORD_THREAD_CHANNELS", from_platform_extra=False)
     # history_backfill: recover mention-gated channel messages between bot turns.
     if "history_backfill" in discord_cfg:
         seeded_extra["history_backfill"] = discord_cfg["history_backfill"]
