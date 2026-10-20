@@ -295,3 +295,169 @@ def test_step4_late_completion_is_watched_for_a_full_window(env, monkeypatch):
     src = (HARNESS_DIR / "run.py").read_text()
     i = src.index("no late `[auto-handled]")
     assert "ctx.poll(lambda: find_chat(chat, re_auto_handled_line(card)), ctx.tick_window)" in src[i - 400:i]
+
+
+# --- t_480d08ce: AC-9 positive control (canary) + AC-7 live re-surface fault -----------------------
+
+def _wire(fx: Path) -> Path:
+    return fx / "fake_wirelog" / "apx" / "2026-10-18.jsonl"
+
+
+def _drop_canary(path: Path) -> None:
+    kept = [ln for ln in path.read_text().splitlines() if "lane_src" not in json.loads(ln)]
+    path.write_text("".join(ln + "\n" for ln in kept))
+
+
+def test_step3_canary_seen_and_no_leak_is_pass(env):
+    assert run.main(["--step", "3", "--dry-run"]) == 0
+    text = env["evidence"].read_text()
+    assert "positive control: canary `bv2canary0123456789ab` recorded" in text
+    assert "fake-canary-1" in text and "| PASS |" in text
+
+
+def test_step3_canary_absent_is_incomplete_not_pass(env, monkeypatch):
+    """No canary = the capture's view of fleet headers is unproven: a clean scan is blind."""
+    fx = _copy_fixtures(env["tmp"])
+    _drop_canary(_wire(fx))
+    monkeypatch.setenv("BV2_WIRELOG_DIR", str(fx / "fake_wirelog"))
+    assert run.main(["--step", "3", "--dry-run"]) == 3
+    text = env["evidence"].read_text()
+    assert "- verdict: **INCOMPLETE**" in text
+    assert "recorded (fleet header reached the capture) | INCOMPLETE |" in text
+    # the fork record itself is still clean: the INCOMPLETE comes from the missing control alone
+    assert "no `x-hermes-*` header in any upstream request | PASS |" in text
+
+
+def test_step3_canary_present_with_leak_is_fail(env, monkeypatch):
+    fx = _copy_fixtures(env["tmp"])
+    path = _wire(fx)
+    rec = json.loads(path.read_text().splitlines()[0])
+    rec["id"] = "leaky"
+    rec["req"]["headers"].append(["x-hermes-session", "s"])
+    with open(path, "a") as fh:
+        fh.write(json.dumps(rec) + "\n")
+    monkeypatch.setenv("BV2_WIRELOG_DIR", str(fx / "fake_wirelog"))
+    assert run.main(["--step", "3", "--dry-run"]) == 1
+    text = env["evidence"].read_text()
+    assert "recorded (fleet header reached the capture) | PASS |" in text
+    assert "leaky: x-hermes-session" in text
+
+
+def test_step3_canary_record_carrying_a_fleet_header_is_fail(env, monkeypatch):
+    """The canary's own upstream header set is scanned: a lane that let it through is a leak."""
+    fx = _copy_fixtures(env["tmp"])
+    path = _wire(fx)
+    lines = path.read_text().splitlines()
+    out = []
+    for ln in lines:
+        rec = json.loads(ln)
+        if "lane_src" in rec:
+            rec["req"]["headers"].append(["x-hermes-qa-canary", "bv2canary0123456789ab"])
+        out.append(json.dumps(rec))
+    path.write_text("\n".join(out) + "\n")
+    monkeypatch.setenv("BV2_WIRELOG_DIR", str(fx / "fake_wirelog"))
+    assert run.main(["--step", "3", "--dry-run"]) == 1
+    assert "fake-canary-1: x-hermes-qa-canary" in env["evidence"].read_text()
+
+
+def test_step1_fault_asserts_warning_and_resurfaced_wake(env):
+    assert run.main(["--step", "1", "--dry-run"]) == 0
+    text = env["evidence"].read_text()
+    assert "warning reason is the injected fault (/state moved/) | PASS |" in text
+    assert "home session: re-delivered wake turn for t_5m0ce003 | PASS |" in text
+    assert "msg='[kanban] Task t_5m0ce003 completed." in text
+    assert "no `no live home for t_5m0ce003` line | PASS |" in text
+
+
+def test_step1_fault_without_resurfaced_wake_fails(env, monkeypatch):
+    """The old live result: warning posted, home not live, wake not re-surfaced -> FAIL now."""
+    fx = _copy_fixtures(env["tmp"])
+    log = fx / "fake_gateway.log"
+    keep = [ln for ln in log.read_text().splitlines() if "[kanban] Task t_5m0ce003" not in ln]
+    keep.append("2026-10-18 20:01:31,000 WARNING gateway.kanban_auto_handle: kanban auto-handle: "
+                "no live home for t_5m0ce003; wake not re-surfaced")
+    log.write_text("\n".join(keep) + "\n")
+    monkeypatch.setenv("BV2_GATEWAY_LOG", str(log))
+    assert run.main(["--step", "1", "--dry-run"]) == 1
+    text = env["evidence"].read_text()
+    assert "home session: re-delivered wake turn for t_5m0ce003 | FAIL |" in text
+    assert "no `no live home for t_5m0ce003` line | FAIL |" in text
+
+
+def test_step1_fault_with_a_different_reason_fails(env, monkeypatch):
+    """A warning from some other failure (e.g. the old rehome fault) is not the injected one."""
+    fx = _copy_fixtures(env["tmp"])
+    chat = fx / "fake_origin_chat.jsonl"
+    chat.write_text(chat.read_text().replace("write refused: state moved",
+                                             "child failed: dispatch failed: home session not live here"))
+    monkeypatch.setenv("BV2_ORIGIN_CHAT", str(chat))
+    assert run.main(["--step", "1", "--dry-run"]) == 1
+    assert "warning reason is the injected fault (/state moved/) | FAIL |" in env["evidence"].read_text()
+
+
+FAKE_FAULT_KANBAN = r"""#!/usr/bin/env python3
+# Fake kanban CLI + gateway for the AC-7 fault: the failure card's `complete` dispatches only;
+# the `comment` (inject_failure) refuses its verdict: warning line + re-delivered home wake.
+import json, os, sys, time
+argv = sys.argv[1:]
+state = os.environ["FAKE_STATE"]
+with open(os.path.join(state, "calls.jsonl"), "a") as fh:
+    fh.write(json.dumps(argv) + "\n")
+verbs = {"boards", "create", "notify-subscribe", "edit", "complete", "block", "comment"}
+verb = next((a for a in argv if a in verbs), None)
+stamp = time.strftime("%Y-%m-%d %H:%M:%S") + ",000"
+log, chat = os.environ["BV2_GATEWAY_LOG"], os.environ["BV2_ORIGIN_CHAT"]
+def logline(s):
+    with open(log, "a") as fh:
+        fh.write(f"{stamp} INFO {s}\n")
+def say(s):
+    with open(chat, "a") as fh:
+        fh.write(json.dumps({"ts": time.time(), "content": s}) + "\n")
+if verb == "create":
+    title = argv[argv.index("create") + 1]
+    n = len(os.listdir(os.path.join(state, "cards")))
+    card = "t_fa4e%04d" % n
+    with open(os.path.join(state, "cards", card), "w") as fh:
+        fh.write(title)
+    print(json.dumps({"id": card}))
+elif verb == "complete":
+    card = argv[argv.index("complete") + 1]
+    title = open(os.path.join(state, "cards", card)).read()
+    logline(f"gateway.kanban_auto_handle: kanban notifier: auto-handled {card} disposition=auto")
+    if "forced child failure" not in title:
+        say(f"[auto-handled] {card} \u2014 verified")
+elif verb == "comment":
+    card = argv[argv.index("comment") + 1]
+    say(f"\u26a0\ufe0f auto-handle failed {card}: write refused: state moved")
+    logline(f"gateway.run: inbound message: platform=discord user=u chat=c msg='[kanban] Task {card} completed. "
+            f"Title: x' reply_to_id=None reply_to_text=''")
+"""
+
+
+def test_step1_live_fault_against_fake_gateway(env, monkeypatch):
+    """Live path: the fault runs only after the dispatch line, and both INV-6 halves are read."""
+    tmp = env["tmp"]
+    state = tmp / "state"
+    (state / "cards").mkdir(parents=True)
+    fake = tmp / "fake_kanban.py"
+    fake.write_text(FAKE_FAULT_KANBAN)
+    log, chat = tmp / "gateway.log", tmp / "chat.jsonl"
+    log.write_text("")
+    chat.write_text("")
+    for k, v in {"BV2_KANBAN_CMD": f"{sys.executable} {fake}", "FAKE_STATE": str(state),
+                 "BV2_GATEWAY_LOG": str(log), "BV2_ORIGIN_CHAT": str(chat),
+                 "BV2_HOME_SESSION": "sess-fake", "BV2_SCRATCH_BOARD": "bv2-smoke-test"}.items():
+        monkeypatch.setenv(k, v)
+    rc = run.main(["--step", "1", "--live", "--tick-seconds", "0.05", "--slack-seconds", "0.1",
+                   "--timeout", "5"])
+    text = env["evidence"].read_text()
+    assert rc == 0, text
+    calls = [json.loads(ln) for ln in (state / "calls.jsonl").read_text().splitlines()]
+    verbs = [next(a for a in c if a in {"boards", "create", "notify-subscribe", "edit", "complete",
+                                        "block", "comment"}) for c in calls]
+    fail_card = "t_fa4e0002"
+    i_complete = next(i for i, c in enumerate(calls) if "complete" in c and fail_card in c)
+    i_comment = verbs.index("comment")
+    assert calls[i_comment][calls[i_comment].index("comment") + 1] == fail_card
+    assert i_complete < i_comment  # the fault lands after the dispatch, never before
+    assert f"home session: re-delivered wake turn for {fail_card} | PASS |" in text
