@@ -167,3 +167,61 @@ def test_shutdown_refusal_does_not_consume_a_monitor_change(env, monkeypatch):
     row = cj.get_job(job["id"])
     assert row["monitor_state"]["last_output_hash"] == mon.hash_monitor_output("v1")
     assert mon.check_monitor(row).changed, "monitor change consumed by the refused run"
+
+
+def test_monitor_rollback_never_overwrites_a_run_that_took_the_claim(env, monkeypatch):
+    """Prism daa521022dcb (reviewer): worker B takes over the claim and stores v3 before A's refused
+    script returns; A's rollback must leave B's monitor state and last output alone."""
+    import cron.jobs as cj
+    import cron.monitor as mon
+    import cron.scheduler_script as ss
+
+    monkeypatch.setattr(mon, "_fetch_monitor_url", lambda url: (True, "v2"))
+    job = cj.create_job(prompt="report the change", schedule="every 15m", name="status-watch",
+                        script="w.sh", monitor_url="https://example.com/s", deliver="origin")
+    cj.update_job(job["id"], {"monitor_state": {"last_output_hash": mon.hash_monitor_output("v1")}})
+    mon._write_last_output(job["id"], "v1")
+    cj.update_job(job["id"], {"next_run_at": (cj._hermes_now() - timedelta(seconds=20)).isoformat()})
+    v3 = {"last_output_hash": mon.hash_monitor_output("v3")}
+    real = ss._run_job_script
+
+    def refuse_after_takeover(*a, **kw):
+        out = real(*a, **kw)
+        cj.update_job(job["id"], {"fire_claim": {"at": cj._hermes_now().isoformat(), "by": "worker-B:xyz"},
+                                  "monitor_state": v3})
+        mon._write_last_output(job["id"], "v3")
+        return out
+
+    monkeypatch.setattr(ss, "_run_job_script", refuse_after_takeover)
+    _dispatch_then_drain(job["id"])
+
+    row = cj.get_job(job["id"])
+    assert row["monitor_state"] == v3, "A's rollback overwrote B's monitor state"
+    assert mon._read_last_output(job["id"]) == "v3"
+
+
+def test_schedule_edited_during_refused_run_keeps_its_new_next_run(env, monkeypatch):
+    """Prism 6d15940f4ae6 (reviewer): an every-15m job edited to every-1d mid-run must not get the
+    old 15m slot back (it would fire immediately after the restart)."""
+    import cron.jobs as cj
+    import cron.scheduler_script as ss
+
+    job = cj.create_job(prompt=None, schedule="every 15m", name="mirrors-refresh",
+                        script="w.sh", no_agent=True, deliver="origin")
+    slot = (cj._hermes_now() - timedelta(seconds=20)).isoformat()
+    cj.update_job(job["id"], {"next_run_at": slot})
+    real = ss._run_job_script
+    edited = {}
+
+    def refuse_after_edit(*a, **kw):
+        out = real(*a, **kw)
+        edited.update(cj.update_job(job["id"], {"schedule": "every 1d"}) or {})
+        return out
+
+    monkeypatch.setattr(ss, "_run_job_script", refuse_after_edit)
+    _dispatch_then_drain(job["id"])
+
+    row = cj.get_job(job["id"])
+    assert row["next_run_at"] != slot, "old-schedule occurrence restored over the edit"
+    assert row["next_run_at"] == edited.get("next_run_at")
+    assert not row.get("fire_claim"), "claim still released"

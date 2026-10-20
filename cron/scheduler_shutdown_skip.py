@@ -49,8 +49,13 @@ def consume_shutdown_refused(job_id: Any) -> bool:
     return False
 
 
-def _release_fire(job_id: str, fire_owner: Optional[str], next_run_at: Optional[str]) -> bool:
-    """Undo the claim-time bookkeeping of a run that never started; status fields untouched."""
+def _release_fire(job_id: str, fire_owner: Optional[str], next_run_at: Optional[str],
+                  claimed_schedule: Any = None) -> bool:
+    """Undo the claim-time bookkeeping of a run that never started; status fields untouched.
+
+    The due slot goes back only while the stored schedule is still the claimed one: a schedule edited
+    during the run already recomputed next_run_at, and an old-schedule instant would fire it at once
+    after the restart (Prism 6d15940f4ae6). The claim is released either way."""
     from cron import jobs as cj
 
     def apply(jobs, _i, job):
@@ -68,7 +73,7 @@ def _release_fire(job_id: str, fire_owner: Optional[str], next_run_at: Optional[
             repeat = job.get("repeat") or {}
             if repeat.get("times") and int(repeat.get("completed") or 0) > 0:
                 repeat["completed"] = int(repeat["completed"]) - 1
-        elif next_run_at:
+        elif next_run_at and (claimed_schedule is None or job.get("schedule") == claimed_schedule):
             job["next_run_at"] = next_run_at
         cj.save_jobs(jobs)
         return True
@@ -90,14 +95,31 @@ def monitor_checkpoint(job: dict) -> Optional[tuple]:
 def restore_monitor_checkpoint(job: dict, checkpoint: Optional[tuple]) -> None:
     if checkpoint is None:
         return
-    from cron.jobs import update_job
     from cron.monitor import _write_last_output
+
+    from cron import jobs as cj
 
     state, last_output = checkpoint
     job_id = str(job["id"])
-    try:
+    claim = job.get("fire_claim")
+    owner = claim.get("by") if isinstance(claim, dict) else None
+    if not owner:
+        return  # no claim of ours to vouch for: never roll back state another run may own
+
+    def apply(jobs, _i, stored):
+        # fenced + owner-checked: a run that took the claim over may already have processed a newer
+        # change, and rolling its monitor state back would replay it (Prism daa521022dcb)
+        held = stored.get("fire_claim")
+        if not isinstance(held, dict) or held.get("by") != owner:
+            return False
         _write_last_output(job_id, last_output)
-        update_job(job_id, {"monitor_state": state})
+        stored["monitor_state"] = state
+        cj.save_jobs(jobs)
+        return True
+
+    try:
+        if not cj._under_fire_fence(job_id, lambda: cj._with_job(job_id, apply, False)):
+            logger.info("Job '%s': monitor checkpoint not restored (claim no longer ours)", job_id)
     except Exception:
         logger.warning("Job '%s': monitor checkpoint restore failed", job_id, exc_info=True)
 
@@ -117,7 +139,7 @@ def record_shutdown_skip(job: dict, fire_owner: Optional[str], execution_id: str
     if restored is None:
         return False
     try:
-        released = _release_fire(job_id, fire_owner, restored)
+        released = _release_fire(job_id, fire_owner, restored, job.get("schedule"))
     except Exception:
         logger.warning("Job '%s': shutdown skip could not release its fire", job_id, exc_info=True)
         released = False
