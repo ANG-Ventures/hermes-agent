@@ -846,8 +846,10 @@ class AdmissionGate:
                 await asyncio.sleep(interval)
         finally:
             # The released-record write fsyncs; keep it off the loop like every other write here.
-            # A to_thread worker runs to completion even if this await is cancelled again.
-            await asyncio.to_thread(self.stop_lease)
+            # Shielded: a second cancel (shutdown under a saturated default executor) would otherwise
+            # cancel the still-QUEUED to_thread job before it starts and the released record is never
+            # written (Prism ad88cba956ad). A started worker runs to completion either way.
+            await asyncio.shield(asyncio.to_thread(self.stop_lease))
 
 
 # ---------------------------------------------------------------------------
