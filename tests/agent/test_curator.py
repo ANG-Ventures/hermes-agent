@@ -413,6 +413,85 @@ def test_background_delete_of_manifest_listed_skill_is_refused(curator_env, monk
     assert g._curator_consolidation_delete_guard("orphan", "some-umbrella") is None
 
 
+def test_unreadable_manifest_fails_closed_no_archive_this_tick(curator_env, monkeypatch, caplog):
+    """Prism e04f0ee7ddc5: a malformed manifest hides which skills it lists. A 200-day-inactive skill it
+    would list must not be archived; nothing is archived that tick, and one log line names the file."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    for name in ("listed-in-manifest", "orphan"):
+        _write_skill(skills_dir, name)
+        _backdate(u, name, 200)
+    _write_harness_manifests(curator_env["home"])
+    broken = curator_env["home"] / "skills-harness-manifests" / "claude-code.yaml"
+    broken.write_text("skills:\n  - listed-in-manifest\n  bad: [unclosed\n", encoding="utf-8")
+    monkeypatch.setattr(c, "_cron_referenced_skills", lambda: set())
+
+    with caplog.at_level("WARNING", logger=c.logger.name):
+        counts = c.apply_automatic_transitions()
+
+    usage = u.load_usage()
+    assert counts["archived"] == 0
+    assert usage["listed-in-manifest"]["state"] != u.STATE_ARCHIVED
+    assert usage["orphan"]["state"] != u.STATE_ARCHIVED
+    assert (skills_dir / "listed-in-manifest").is_dir() and (skills_dir / "orphan").is_dir()
+    assert any("claude-code.yaml" in r.getMessage() and "skipping archive" in r.getMessage()
+               for r in caplog.records)
+    assert c._read_harness_manifests()[1] == [str(broken)]
+
+
+def test_background_writes_to_manifest_listed_skill_are_refused(curator_env, monkeypatch):
+    """Prism d51f90ce8fe8: pinned=yes in the LLM prompt must match the write guard, or the review fork
+    can empty a manifest-listed skill via patch/write_file/remove_file before any delete check."""
+    import json
+    from tools import skill_manager_tool as smt
+    from tools.skill_manager_guards import _reset_background_review_read_marks, mark_background_review_skill_read
+    from tools.skill_provenance import BACKGROUND_REVIEW, reset_current_write_origin, set_current_write_origin
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    for name in ("listed-in-manifest", "orphan"):
+        d = _write_skill(skills_dir, name)
+        (d / "references").mkdir()
+        (d / "references" / "notes.md").write_text("keep\n", encoding="utf-8")
+        u.mark_agent_created(name)
+    _write_harness_manifests(curator_env["home"])
+    monkeypatch.setattr(smt, "_skills_dir", lambda: skills_dir, raising=False)
+
+    _reset_background_review_read_marks()
+    token = set_current_write_origin(BACKGROUND_REVIEW)
+    try:
+        for name in ("listed-in-manifest", "orphan"):  # satisfy read-before-write so only the pin gate decides
+            mark_background_review_skill_read(skills_dir / name / "SKILL.md")
+            mark_background_review_skill_read(skills_dir / name / "references" / "notes.md")
+        listed = json.loads(smt.skill_manage(action="remove_file", name="listed-in-manifest",
+                                             file_path="references/notes.md"))
+        patched = json.loads(smt.skill_manage(action="patch", name="listed-in-manifest",
+                                              old_string="description: x", new_string="description: y"))
+        orphan = json.loads(smt.skill_manage(action="remove_file", name="orphan",
+                                             file_path="references/notes.md"))
+    finally:
+        reset_current_write_origin(token)
+        _reset_background_review_read_marks()
+
+    for r in (listed, patched):
+        assert r["success"] is False and "skills-harness-manifests" in r["error"], r
+    assert (skills_dir / "listed-in-manifest" / "references" / "notes.md").is_file()
+    assert "description: x" in (skills_dir / "listed-in-manifest" / "SKILL.md").read_text()
+    # control: the gate is not blanket; the same remove_file on an unlisted agent skill goes through
+    assert orphan["success"] is True, orphan
+    assert not (skills_dir / "orphan" / "references" / "notes.md").exists()
+
+
+def test_background_guards_fail_closed_on_unreadable_manifest(curator_env, monkeypatch):
+    from tools import skill_manager_guards as g
+    _write_harness_manifests(curator_env["home"])
+    (curator_env["home"] / "skills-harness-manifests" / "codex.yaml").write_text("- [", encoding="utf-8")
+    monkeypatch.setattr(g, "_is_background_review", lambda: True)
+    for refused in (g._curator_consolidation_delete_guard("orphan", "some-umbrella"),
+                    g._background_review_write_guard("orphan", curator_env["home"] / "skills" / "orphan", "patch")):
+        assert refused and refused["success"] is False and "codex.yaml" in refused["error"]
+
+
 
 
 

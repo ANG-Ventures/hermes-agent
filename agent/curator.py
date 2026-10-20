@@ -253,9 +253,16 @@ def _manifest_dir() -> Path:
 def _harness_manifest_skills() -> Set[str]:
     """Skill names listed anywhere in ``skills-harness-manifests/*.yaml`` (pins, skills, every group in _groups.yaml,
     projects). skills-harness-sync REFUSES a listed name that resolves to no directory and exits 1, so archiving one
-    breaks the sync. Over-collects on purpose (unused groups count). Best-effort: a missing dir or bad YAML yields
-    what parsed, never a crash."""
+    breaks the sync. Over-collects on purpose (unused groups count). A missing dir or bad YAML yields what parsed,
+    never a crash; callers that archive must also check ``_read_harness_manifests()[1]`` and fail closed."""
+    return _read_harness_manifests()[0]
+
+
+def _read_harness_manifests() -> "tuple[Set[str], List[str]]":
+    """``(names, unreadable)``: listed skill names, plus the manifest files that exist but could not be
+    listed/read/parsed (a non-mapping top level counts as unreadable). Never raises."""
     names: Set[str] = set()
+    unreadable: List[str] = []
 
     def _add(entries: Any) -> None:  # an entry is a name or {name: ..., soft/variant: ...}
         for e in entries if isinstance(entries, list) else ():
@@ -277,24 +284,36 @@ def _harness_manifest_skills() -> Set[str]:
             if isinstance(p, dict):
                 _add(p.get("skills"))
 
+    mdir: Any = None
     try:
+        mdir = _manifest_dir()
+        if not mdir.exists():
+            return names, unreadable
         import yaml
-        files = sorted(_manifest_dir().glob("*.yaml"))
+        files = sorted(mdir.glob("*.yaml"))
     except Exception as e:
         logger.debug("Curator could not list harness manifests: %s", e, exc_info=True)
-        return names
+        return names, [str(mdir or "skills-harness-manifests")]
     for f in files:
         try:
-            _collect(yaml.safe_load(f.read_text(encoding="utf-8")))
+            data = yaml.safe_load(f.read_text(encoding="utf-8"))
         except Exception as e:
             logger.debug("Curator could not read harness manifest %s: %s", f, e, exc_info=True)
+            unreadable.append(str(f))
+            continue
+        if data is not None and not isinstance(data, dict):
+            unreadable.append(str(f))
+            continue
+        _collect(data)
     names.discard("")
-    return names
+    return names, unreadable
 
 
-def _protected_skills() -> Set[str]:
-    """Skills treated as pinned by every curator pass: cron-referenced + harness-manifest-listed."""
-    return _cron_referenced_skills() | _harness_manifest_skills()
+def _protected_skills() -> "tuple[Set[str], List[str]]":
+    """``(protected, unreadable_manifests)``: skills treated as pinned by every curator pass (cron-referenced +
+    harness-manifest-listed), plus any manifest that failed to parse (its names are unknown, so archive must stop)."""
+    listed, unreadable = _read_harness_manifests()
+    return _cron_referenced_skills() | listed, unreadable
 
 
 def _archive_as_curator(_u, name: str) -> bool:
@@ -324,7 +343,12 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
     # Cron-referenced skills are in use by definition (usage only bumps when a
     # job fires, so paused/rare jobs would age them out). Treat as pinned. Same for
     # skills-harness-manifests entries: archiving one makes skills-harness-sync REFUSE + exit 1.
-    protected = _protected_skills()
+    protected, unreadable_manifests = _protected_skills()
+    # Fail closed: an unparseable manifest hides which skills it lists, and archiving is irreversible
+    # (fixing the YAML does not bring the directory back). Skip every archive this tick.
+    if unreadable_manifests:
+        logger.warning("Curator: skipping archive transitions this tick; unreadable harness manifest(s): %s",
+                       ", ".join(unreadable_manifests))
     counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0}
 
     def _set(name: str, state: str, key: str) -> None:
@@ -359,7 +383,7 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
                 _set(name, _u.STATE_ACTIVE, "reactivated")
             continue
         if anchor <= archive_cutoff and current != _u.STATE_ARCHIVED:
-            if _archive_as_curator(_u, name):
+            if not unreadable_manifests and _archive_as_curator(_u, name):
                 counts["archived"] += 1
         elif anchor <= stale_cutoff and current == _u.STATE_ACTIVE:
             _set(name, _u.STATE_STALE, "marked_stale")

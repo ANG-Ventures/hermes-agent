@@ -161,10 +161,27 @@ def _pinned_guard(name: str) -> Optional[str]:
     return None
 
 
+def _harness_manifest_block(name: str) -> Optional[str]:
+    """Why *name* must be treated as pinned by the review fork, else None: it is listed in
+    skills-harness-manifests, or a manifest is unreadable (fail closed). A lookup error also fails closed."""
+    try:
+        from agent.curator import _read_harness_manifests
+        listed, unreadable = _read_harness_manifests()
+    except Exception:
+        logger.warning("harness-manifest guard lookup failed for %s", name, exc_info=True)
+        return "skills-harness-manifests could not be read"
+    if name in listed:
+        return ("it is listed in skills-harness-manifests, and skills-harness-sync fails on a listed "
+                "name that no longer resolves. Treat it as pinned")
+    if unreadable:
+        return "skills-harness-manifests has unreadable file(s) (%s)" % ", ".join(unreadable)
+    return None
+
+
 def _background_review_write_guard(
     name: str, skill_dir: Path, action: str) -> Optional[Dict[str, Any]]:
     """Refuse autonomous curator writes to anything but curator-owned sediment. The review fork
-    has no user in the loop, so it is also blocked on pinned/external/bundled/hub skills."""
+    has no user in the loop, so it is also blocked on pinned/manifest-listed/external/bundled/hub skills."""
     if not _is_background_review():
         return None
     refuse = f"Refusing background curator {action} for"
@@ -173,6 +190,10 @@ def _background_review_write_guard(
             f"{refuse} pinned skill '{name}': pinned skills "
             f"are off-limits to autonomous maintenance. Ask the user to run `hermes curator "
             f"unpin {name}` if they want it changed.")
+    if (why := _harness_manifest_block(name)) is not None:
+        return _refusal(
+            f"{refuse} skill '{name}': {why}. Manifest-listed skills are pinned and off-limits to "
+            f"autonomous maintenance.", _fail_closed=True)
     try:
         from agent.skill_utils import is_external_skill_path, is_shared_curatable_path
         # Fork: a shared skills tree the operator opted INTO curation (skills.shared scope) is
@@ -262,16 +283,10 @@ def _curator_consolidation_delete_guard(
     """
     if not _is_background_review():
         return None
-    try:
-        from agent.curator import _harness_manifest_skills
-        if name in _harness_manifest_skills():
-            return _refusal(
-                f"Refusing background curator delete of skill '{name}': it is listed in "
-                f"skills-harness-manifests, and skills-harness-sync fails on a listed name that no longer "
-                f"resolves. Treat it as pinned. Keeping '{name}' active.",
-                _fail_closed=True)
-    except Exception:
-        logger.debug("harness-manifest guard lookup failed for %s", name, exc_info=True)
+    if (why := _harness_manifest_block(name)) is not None:
+        return _refusal(
+            f"Refusing background curator delete of skill '{name}': {why}. Keeping '{name}' active.",
+            _fail_closed=True)
     if isinstance(absorbed_into, str) and absorbed_into.strip():
         return None
     return _refusal(
