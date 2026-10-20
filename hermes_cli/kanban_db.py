@@ -12331,6 +12331,14 @@ def _task_has_live_run(
     return False
 
 
+def _remote_spellings_overlap(a: str, b: str) -> bool:
+    """Lexical overlap of two REMOTE-host paths: equal, or one inside the other (a nested
+    workspace belongs to its ancestor too). Remote ownership is lexical on purpose: the
+    Studio's inode identity says nothing about another host's filesystem."""
+    a, b = os.path.normpath(a), os.path.normpath(b)
+    return a == b or a.startswith(b + os.sep) or b.startswith(a + os.sep)
+
+
 def safe_remove_workspace_dir(
     path: Path,
     *,
@@ -12378,16 +12386,10 @@ def safe_remove_workspace_dir(
             _audit_workspace_deletion(Path(path), task_id=task_id, reason=reason, allowed=False,
                                       detail='active-children-need-handoff remote=' + remote_host.name)
             return False
-        # Remote lexical ownership: never consult the Studio's inode identity.
-        target = os.path.normpath(str(path))
         for owner in conn.execute('SELECT id,workspace_path,workspace_of FROM tasks '
                                   'WHERE workspace_path IS NOT NULL'):
-            stored = os.path.normpath(owner['workspace_path'])
-            # Overlap in either direction: equal, inside the target, or
-            # containing it (a nested workspace belongs to its ancestor too).
             # A --workspace-of reader never co-owns (R-1); only a live one refuses.
-            if owner['id'] != task_id and (stored == target or stored.startswith(target + os.sep)
-                                           or target.startswith(stored + os.sep)) and (
+            if owner['id'] != task_id and _remote_spellings_overlap(owner['workspace_path'], str(path)) and (
                     not owner['workspace_of'] or _task_has_live_run(conn, owner['id'])):
                 return False
         from hermes_cli.kanban_survivor import remove_workspace_dir

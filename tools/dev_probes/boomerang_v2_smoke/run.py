@@ -355,7 +355,7 @@ class Ctx:
             rep.commands.append(shown + "   # dry-run: not executed")
             return 0, ""
         print(shown, flush=True)
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
         out = (proc.stdout or "") + (proc.stderr or "")
         rep.commands.append(shown + f"   # exit {proc.returncode}")
         rep.raw.append(f"--- {key} (exit {proc.returncode})\n{out.strip()[:4000]}")

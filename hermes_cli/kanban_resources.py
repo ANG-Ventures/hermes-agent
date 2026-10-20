@@ -199,7 +199,7 @@ def _stop_argv(res: dict) -> list[str]:
 
 def _default_runner(argv: list[str]) -> tuple[int, str]:
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=STOP_TIMEOUT_S, stdin=subprocess.DEVNULL)
+        p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", timeout=STOP_TIMEOUT_S, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as exc:
         return 255, f"{type(exc).__name__}: {exc}"
     tail = ((p.stderr or p.stdout or "").strip().splitlines() or [""])[-1]
