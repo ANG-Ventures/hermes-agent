@@ -734,7 +734,13 @@ def _norm_seat(v: object) -> str | None:
         return None
     if s in _LOCAL_SEAT_ALIASES:
         return "local"
-    return s if s.startswith("sub-") or not s.isdigit() else f"sub-{s}"
+    # The relay's `x-pool-served-by` names the box (`sub-vps-16`); its wire records carry `sub: "16"`
+    # (plus `host: sub-vps-16`). Both are the same seat: compare on the bare number (live 2026-10-19:
+    # every step-3 run read "0 records attributable to sub-vps-16" against 22 records from that box).
+    m = re.fullmatch(r"sub-(?:vps-)?(\d+)", s)
+    if m:
+        return "local" if m.group(1) == "0" else f"sub-{m.group(1)}"
+    return f"sub-{s}" if s.isdigit() else s
 
 
 def _rec_seat(rec: dict) -> str | None:
@@ -841,6 +847,11 @@ def step4(ctx: Ctx) -> StepReport:
     re_restart = re.compile(ctx.plan["expect"]["restart_log_regex"])
 
     card = ctx.make_card(rep, "s4_restart", "bv2 smoke s4: child in flight across a gateway restart")
+    if "s4_hold" in ctx.plan.get("commands", {}):
+        # The drill needs a child that is STILL RUNNING when the restart lands. A forced completion is
+        # accepted in ~40 s, faster than safe-restart's drain + relaunch (~70 s live, 2026-10-19 18:58),
+        # so the plan can give the card a body that keeps the child busy for a few minutes.
+        ctx.force(rep, "s4_hold", card=card)
     ctx.force(rep, "complete", card=card)
     dispatched = ctx.poll(lambda: _auto_disp(find_log(log, re_notifier_line(card)), card), ctx.timeout)
     rep.check(f"auto-handle child dispatched for {card} (disposition=auto)", PASS if dispatched else FAIL,
