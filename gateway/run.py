@@ -5975,14 +5975,9 @@ class GatewayRunner(
 
         from hermes_cli.config import load_config
         from hermes_cli.profiles import profiles_to_serve
-        from run_agent import AIAgent
         from tools.async_delegation import (
             enqueue_pending_outbox,
             recover_async_delegations,
-        )
-        from tools.delegate_tool import (
-            _resolve_delegation_credentials,
-            build_recovered_delegation_runner,
         )
 
         totals = {"claimed": 0, "queued": 0, "exhausted": 0, "failed_validation": 0}
@@ -6002,113 +5997,16 @@ class GatewayRunner(
                     )
 
                     def _runner_factory(record: dict, continuation: str):
-                        execution = record.get("execution") or {}
-                        route = record.get("route") or {}
-                        credential_ref = execution.get("credential_ref") or {}
-                        if credential_ref.get("source") == "delegation_config":
-                            from types import SimpleNamespace
+                        # One reconstruction shared with the detached child process
+                        # (tools/delegate_detached.py, docs/dev/delegate-detached-background.md).
+                        from tools.delegate_detached import build_parent_and_runner
 
-                            parent_provider = credential_ref.get("parent_provider")
-                            current_direct_key = str(
-                                delegation_cfg.get("api_key") or ""
-                            ).strip() or None
-                            if current_direct_key:
-                                parent_runtime = {}
-                            elif parent_provider:
-                                parent_runtime = _resolve_runtime_agent_kwargs_for_provider(
-                                    str(parent_provider)
-                                )
-                            else:
-                                parent_runtime = _resolve_runtime_agent_kwargs()
-                            direct_cfg = {
-                                "model": execution.get("model"),
-                                "base_url": execution.get("base_url"),
-                                "api_mode": execution.get("api_mode"),
-                                # Read the current secret from config; never use a
-                                # credential value from the persisted record.
-                                "api_key": current_direct_key,
-                            }
-                            direct = _resolve_delegation_credentials(
-                                direct_cfg,
-                                SimpleNamespace(**parent_runtime),
-                            )
-                            runtime = {
-                                "api_key": direct.get("api_key")
-                                or parent_runtime.get("api_key"),
-                                "base_url": direct.get("base_url"),
-                                "provider": direct.get("provider"),
-                                "api_mode": direct.get("api_mode"),
-                                "command": direct.get("command"),
-                                "args": list(direct.get("args") or []),
-                                "credential_pool": None,
-                            }
-                        else:
-                            requested_provider = (
-                                credential_ref.get("provider")
-                                or execution.get("provider")
-                            )
-                            if requested_provider:
-                                runtime = _resolve_runtime_agent_kwargs_for_provider(
-                                    str(requested_provider)
-                                )
-                            else:
-                                runtime = _resolve_runtime_agent_kwargs()
-                        agent_kwargs = {
-                            **runtime,
-                            "model": execution.get("model") or "",
-                            "max_iterations": int(
-                                execution.get("max_iterations") or 45
-                            ),
-                            "provider_require_parameters": bool(
-                                execution.get("provider_require_parameters", False)
-                            ),
-                            "skip_memory": True,
-                            "skip_context_files": True,
-                        }
-                        if execution.get("acp_command"):
-                            agent_kwargs["command"] = execution["acp_command"]
-                            agent_kwargs["args"] = list(execution.get("acp_args") or [])
-                        for key, value in {
-                            "enabled_toolsets": execution.get("toolsets"),
-                            "platform": route.get("platform"),
-                            "session_id": route.get("parent_session_id"),
-                            "reasoning_config": execution.get("reasoning_config"),
-                            "service_tier": execution.get("service_tier"),
-                            "fallback_model": execution.get("fallback_chain"),
-                            "providers_allowed": execution.get("providers_allowed"),
-                            "providers_ignored": execution.get("providers_ignored"),
-                            "providers_order": execution.get("providers_order"),
-                            "provider_sort": execution.get("provider_sort"),
-                            "provider_data_collection": execution.get(
-                                "provider_data_collection"
-                            ),
-                            "openrouter_min_coding_score": execution.get(
-                                "openrouter_min_coding_score"
-                            ),
-                        }.items():
-                            if value is not None:
-                                agent_kwargs[key] = value
-                        parent = AIAgent(**agent_kwargs)
-                        setattr(
-                            parent,
-                            "_delegate_depth",
-                            int(execution.get("parent_depth") or 0),
+                        recovered_runner, interrupt_parent, _parent = build_parent_and_runner(
+                            record, continuation, delegation_cfg,
+                            resolve_default=_resolve_runtime_agent_kwargs,
+                            resolve_for_provider=_resolve_runtime_agent_kwargs_for_provider,
                         )
-                        setattr(
-                            parent,
-                            "terminal_cwd",
-                            execution.get("workspace_hint") or None,
-                        )
-                        recovered_runner = build_recovered_delegation_runner(
-                            record,
-                            continuation,
-                            parent,
-                        )
-
-                        def _interrupt_recovered_parent() -> None:
-                            parent.interrupt("Recovered async delegation cancelled")
-
-                        return recovered_runner, _interrupt_recovered_parent
+                        return recovered_runner, interrupt_parent
 
                     summary = recover_async_delegations(
                         current_boot_id=boot_id,

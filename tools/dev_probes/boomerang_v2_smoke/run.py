@@ -352,6 +352,7 @@ class Ctx:
             else FIXTURES / "fake_ack.txt"))
         self.tick = float(args.tick_seconds)
         self.slack = float(args.slack_seconds)
+        self.first_tick = float(getattr(args, "first_tick_seconds", 90.0))
         self.timeout = float(args.timeout)
         self._dry_cards = dict(self.plan.get("dry_run_cards", {}))
         self.board_ready = False
@@ -734,7 +735,13 @@ def _norm_seat(v: object) -> str | None:
         return None
     if s in _LOCAL_SEAT_ALIASES:
         return "local"
-    return s if s.startswith("sub-") or not s.isdigit() else f"sub-{s}"
+    # The relay's `x-pool-served-by` names the box (`sub-vps-16`); its wire records carry `sub: "16"`
+    # (plus `host: sub-vps-16`). Both are the same seat: compare on the bare number (live 2026-10-19:
+    # every step-3 run read "0 records attributable to sub-vps-16" against 22 records from that box).
+    m = re.fullmatch(r"sub-(?:vps-)?(\d+)", s)
+    if m:
+        return "local" if m.group(1) == "0" else f"sub-{m.group(1)}"
+    return f"sub-{s}" if s.isdigit() else s
 
 
 def _rec_seat(rec: dict) -> str | None:
@@ -841,6 +848,11 @@ def step4(ctx: Ctx) -> StepReport:
     re_restart = re.compile(ctx.plan["expect"]["restart_log_regex"])
 
     card = ctx.make_card(rep, "s4_restart", "bv2 smoke s4: child in flight across a gateway restart")
+    if "s4_hold" in ctx.plan.get("commands", {}):
+        # The drill needs a child that is STILL RUNNING when the restart lands. A forced completion is
+        # accepted in ~40 s, faster than safe-restart's drain + relaunch (~70 s live, 2026-10-19 18:58),
+        # so the plan can give the card a body that keeps the child busy for a few minutes.
+        ctx.force(rep, "s4_hold", card=card)
     ctx.force(rep, "complete", card=card)
     dispatched = ctx.poll(lambda: _auto_disp(find_log(log, re_notifier_line(card)), card), ctx.timeout)
     rep.check(f"auto-handle child dispatched for {card} (disposition=auto)", PASS if dispatched else FAIL,
@@ -874,8 +886,13 @@ def step4(ctx: Ctx) -> StepReport:
         return rep
 
     re_resurface = re.compile(ctx.plan["expect"]["resurface_log_regex"].format(card=re.escape(card)))
+    # §5.7: the reconciler runs at the END of the first notifier tick after boot. That tick starts
+    # after the watcher wiring + the notifier's 5 s initial delay and, on a loaded host, one full tick
+    # over every subscription takes tens of seconds (live 2026-10-20 00:05: line at +27.5 s, load ~70).
+    # The window is "the first tick after startup", bounded by --first-tick-seconds, not one idle tick.
+    first_tick = ctx.first_tick if ctx.live else ctx.tick_window + ctx.tick
     resurf = ctx.poll(lambda: find_log(log, re_resurface, after_ts=restart_ts if ctx.live else None),
-                      ctx.tick_window + ctx.tick)
+                      first_tick)
     rep.check(f"reconciler re-surfaced the wake for {card}", PASS if resurf else FAIL,
               resurf or f"no line matching /{re_resurface.pattern}/")
     if resurf:
@@ -883,9 +900,10 @@ def step4(ctx: Ctx) -> StepReport:
         rts = log_line_ts(resurf)
         if ctx.live and rts is not None and restart_ts is not None:
             lag = rts - restart_ts
-            limit = ctx.tick_window + ctx.tick
-            rep.check("re-surface within one tick of the restart", PASS if lag <= limit else FAIL,
-                      f"{lag:.1f}s after `{restart_line[:19]}` (limit {limit:.0f}s = startup + tick + slack)")
+            limit = first_tick
+            rep.check("re-surface on the first notifier tick after the restart", PASS if lag <= limit else FAIL,
+                      f"{lag:.1f}s after `{restart_line[:19]}` (limit {limit:.0f}s = wiring + 5 s initial delay "
+                      f"+ one full notifier tick, --first-tick-seconds)")
     lost = ctx.poll(lambda: find_chat(chat, re_lost_line(card)), ctx.tick_window + ctx.tick)
     rep.check(f"origin chat: `warning auto-handle lost {card} (reason: gateway restart)`",
               PASS if lost else FAIL, lost.content if lost else "absent")
@@ -915,6 +933,9 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--live", action="store_true", help="run against the scratch board and live sources")
     p.add_argument("--tick-seconds", type=float, default=5.0,
                    help="kanban notifier tick (gateway/kanban_watchers.py interval, default 5)")
+    p.add_argument("--first-tick-seconds", type=float, default=90.0,
+                   help="step 4: bound on the FIRST notifier tick after a gateway boot (wiring + 5 s "
+                        "initial delay + one full tick over every subscription); default 90")
     p.add_argument("--slack-seconds", type=float, default=10.0,
                    help="latency allowance on top of a tick (dispatch, Discord REST); default 10")
     p.add_argument("--timeout", type=float, default=600.0,

@@ -1707,6 +1707,9 @@ Shell hooks are registered by calling `agent.shell_hooks.register_from_config(cf
 ```yaml
 hooks:
   missing_hook_policy: restore_then_fail_closed # Default; fail_open_and_page is explicit opt-in
+  batch_python_hooks: true       # Default; `<python> <script>.py` hooks of one event fire share one
+                                 # interpreter start (each still runs in its own forked process with
+                                 # its own stdin/stdout/stderr/exit code). false = one process per hook.
   <event_name>:                  # Must be in VALID_HOOKS
     - matcher: "<regex>"         # Optional; used for pre/post_tool_call only
       command: "<shell command>" # Required; runs via shlex.split, shell=False

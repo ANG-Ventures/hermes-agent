@@ -138,6 +138,8 @@ def _patch_delegate(monkeypatch):
     monkeypatch.setattr(dt, "_build_child_agent", clobbering_build_child)
     monkeypatch.setattr(dt, "_run_single_child", fast_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    # The children are in-process doubles: pin the in-gateway path (detached runs a real process).
+    monkeypatch.setattr(dt, "_get_detached_background", lambda: False)
     return dt
 
 

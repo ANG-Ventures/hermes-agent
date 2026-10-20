@@ -129,19 +129,29 @@ def find_priority_starved(
         ).fetchone()
         if lower is None:
             continue
-        hold = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN (%s) AND COALESCE(payload, '') NOT LIKE '%%\"cleared\": true%%' "
-            "ORDER BY id DESC LIMIT 1"
+        # Newest first. A ``{"cleared": true}`` row ends the hold of ITS kind, so
+        # an older event of that kind is resolved and must not resurface
+        # (Prism e82c6a604cf9); judge the parsed payload, never a LIKE.
+        reason = "none recorded"
+        cleared_kinds: set = set()
+        for kind, raw in conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? AND created_at >= ? "
+            "AND kind IN (%s) ORDER BY id DESC"
             % ",".join("?" * len(_PRIORITY_STARVATION_HOLD_KINDS)),
             (row["id"], since, *_PRIORITY_STARVATION_HOLD_KINDS),
-        ).fetchone()
-        reason = "none recorded"
-        if hold is not None:
+        ):
+            if kind in cleared_kinds:
+                continue
             try:
-                reason = str((json.loads(hold[0] or "null") or {}).get("reason") or reason)
-            except (TypeError, ValueError, AttributeError):
-                pass
+                pl = json.loads(raw or "null")
+            except (TypeError, ValueError):
+                pl = None
+            pl = pl if isinstance(pl, dict) else {}
+            if pl.get("cleared"):
+                cleared_kinds.add(kind)
+                continue
+            reason = str(pl.get("reason") or reason)
+            break
         hits.append({
             "task_id": row["id"], "priority": prio, "assignee": row["assignee"],
             "ready_since": since, "ready_seconds": now - since, "reason": reason,

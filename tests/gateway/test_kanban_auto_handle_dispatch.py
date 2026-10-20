@@ -14,6 +14,7 @@ import threading
 import time
 
 import pytest
+from types import SimpleNamespace
 
 from gateway import kanban_auto_handle as ah
 from gateway import kanban_home_route as hr
@@ -490,13 +491,17 @@ def test_ac15e_replayed_handoff_on_terminal_entry_writes_nothing(env):
 # --- AC-14: reconciler -----------------------------------------------------------------------
 
 
-def test_reconciler_dead_child_resurfaced_once(env):
+def test_reconciler_dead_child_resurfaced_once(env, caplog):
     tid = _card(env)
     _worker_close(tid)
     entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
     _kill(env, entry)
-    assert asyncio.run(ah.reconcile(env["runner"])) == 1
-    assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    with caplog.at_level("INFO", logger="gateway.kanban_auto_handle"):
+        assert asyncio.run(ah.reconcile(env["runner"])) == 1
+        assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    assert [r.getMessage() for r in caplog.records if " lost reason=" in r.getMessage()] == [
+        f"kanban auto-handle: {tid} lost reason=gateway restart resurfaced delivered=True "
+        f"delegation={entry['delegation_id']}"]
     assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
     assert [s for s in env["adapter"].sent if "auto-handle lost" in s] == [
         f"⚠️ auto-handle lost {tid} (reason: gateway restart)"]
@@ -554,13 +559,27 @@ def test_ac14_live_child_past_max_cancelled_first_late_handoff_dropped(env):
 # --- wake load gate (smoke 2026-10-19: a box idling above the band never auto-handled) ---------
 
 
-def _gate(env, tmp_path, *, load: float, lane=None):
+def _gate(env, tmp_path, *, load: float, lane=None, axis="load1", cpu=None):
     from hermes_cli.kanban_wake_gate import WakeGate
 
+    kw = {"cpu_sampler": (lambda prev: (cpu, object()))} if cpu is not None else {}
     env["runner"]._kanban_wake_gate = WakeGate(
-        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48}}},
+        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
+                    "wake_load_gate": {"host_axis": axis}}},
         ncpu=32, loadavg=lambda: (load, load, load), lane_probe=lambda p: lane,
-        state_file=tmp_path / "wake_gate.json")
+        state_file=tmp_path / "wake_gate.json", **kw)
+
+
+def test_cpu_axis_contention_alone_does_not_stop_the_auto_handle_child(env, tmp_path):
+    """The DEFAULT host axis is measured cpu busy (t_0e52c7ab): its reason is `host cpu N% busy`,
+    and it must exempt an auto child exactly like the load1 band does."""
+    _gate(env, tmp_path, load=71.0, axis="cpu", cpu=0.99)
+    tid = _card(env)
+    _sub(tid)
+    _worker_close(tid)
+    turns = _tick(env)
+    assert any("(notify: host cpu" in s for s in env["adapter"].sent), env["adapter"].sent
+    assert [e["task_id"] for e in env["dispatched"]] == [tid] and turns == []
 
 
 def test_host_load_alone_does_not_stop_the_auto_handle_child(env, tmp_path):
@@ -611,3 +630,43 @@ def test_unflagged_card_under_host_load_is_unchanged(env, tmp_path):
     _worker_close(tid)
     turns = _tick(env)
     assert env["dispatched"] == [] and _claims() == {} and turns == []
+
+
+# --- t_a6d74b90: the two silent summary folds now say why -------------------------------------
+
+
+class _Runner:
+    def __init__(self, running=None, cache=None):
+        self._running_agents = running or {}
+        self._agent_cache = cache or {}
+        self._agent_cache_lock = None
+        self.session_store = None
+
+
+def _resolve(monkeypatch, runner, *, mode="fork", wait_s=0.0):
+    home = SimpleNamespace(session_key="k1", session_id="20261020_000000_parent")
+    monkeypatch.setattr(ow, "resolve_owner", lambda *_a, **_k: home)
+    monkeypatch.setattr(ah, "_db_parent", lambda *_a, **_k: "db-parent")
+    return asyncio.run(ah.resolve_parent(runner, {"home_sid": home.session_id, "mode": mode}, wait_s=wait_s))
+
+
+def test_busy_parent_fold_logs_parent_busy(monkeypatch, caplog):
+    with caplog.at_level("INFO", logger="tools.delegate_tool"):
+        out = _resolve(monkeypatch, _Runner(running={"k1": object()}))
+    assert out == ("db-parent", "summary")
+    assert "boomerang.fork_ineligible reason=parent_busy parent_session=20261020_000000_parent" in caplog.text
+
+
+def test_no_live_parent_fold_logs_no_live_parent(monkeypatch, caplog):
+    with caplog.at_level("INFO", logger="tools.delegate_tool"):
+        out = _resolve(monkeypatch, _Runner())
+    assert out == ("db-parent", "summary")
+    assert "boomerang.fork_ineligible reason=no_live_parent" in caplog.text
+
+
+def test_summary_row_and_idle_parent_log_nothing(monkeypatch, caplog):
+    idle = object()
+    with caplog.at_level("INFO", logger="tools.delegate_tool"):
+        assert _resolve(monkeypatch, _Runner(), mode="summary") == ("db-parent", "summary")
+        assert _resolve(monkeypatch, _Runner(cache={"k1": (idle, 0)})) == (idle, "fork")
+    assert "fork_ineligible" not in caplog.text

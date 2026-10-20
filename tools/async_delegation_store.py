@@ -1121,6 +1121,8 @@ def claim_recoveries(
                 )
                 summary["failed_validation"] += 1
                 continue
+            if isinstance(record.get("detached"), dict):
+                continue  # a live detached child: adopted (claim_detached_adoptions), never re-run
             owner = str(attempt.get("owner_boot_id") or "")
             if state == "running" and owner == current_boot_id:
                 continue
@@ -1199,6 +1201,105 @@ def claim_recoveries(
                 attempt["redispatch_count"],
             )
     return claimed, summary
+
+
+def set_detached_block(
+    delegation_id: str, attempt_id: str, block: dict[str, Any], *, profile_home: Path | None = None,
+) -> bool:
+    """Record the spawned detached child on the current attempt (False: cancelled/superseded). A record a
+    racing shutdown already marked ``recoverable`` still takes the block: the next boot adopts it."""
+    with locked_registry(profile_home) as registry:
+        record = registry["records"].get(delegation_id)
+        if (not isinstance(record, dict) or record.get("state") not in {"running", "recoverable"}
+                or (record.get("attempt") or {}).get("attempt_id") != attempt_id):
+            return False
+        record["detached"] = dict(block)
+        append_lifecycle_event(record, "detached_spawned", f"pid={block.get('pid')} attempt={attempt_id}")
+        return True
+
+
+def clear_detached(delegation_id: str, attempt_id: str, *, profile_home: Path | None = None) -> bool:
+    """A unit that fell back to an in-process thread is no longer a detached unit."""
+    with locked_registry(profile_home) as registry:
+        record = registry["records"].get(delegation_id)
+        if (not isinstance(record, dict)
+                or (record.get("attempt") or {}).get("attempt_id") != attempt_id
+                or not isinstance(record.get("execution"), dict)):
+            return False
+        record["execution"]["detached"] = False
+        record.pop("detached", None)
+        append_lifecycle_event(record, "detached_fallback", f"attempt={attempt_id}")
+        return True
+
+
+def claim_detached_adoptions(
+    *, current_boot_id: str, profile_home: Path | None = None, owner_alive=is_boot_id_alive,
+    probe=None, identity=None, job_dir_for=None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Adopt detached units whose owner is gone (docs/dev/delegate-detached-background.md).
+
+    Returns ``(adopted, kill)``: adopted record copies (owner rewritten to this boot, same attempt) and
+    ``{pid, create_time}`` identities of children that must be signalled (cancelled or past the age cap).
+    A detached unit whose child is dead with no result loses its ``detached`` block and is left to
+    ``claim_recoveries`` (normal re-dispatch). Runs regardless of ``resume_on_restart``."""
+    adopted: list[dict[str, Any]] = []
+    kill: list[dict[str, Any]] = []
+    if not registry_path(profile_home).exists():
+        return adopted, kill
+    home = registry_path(profile_home).parent.parent
+    now = time.time()
+    with locked_registry(profile_home) as registry:
+        invalid_record_ids = set(registry.get("_invalid_record_ids", []))
+        for delegation_id, record in registry["records"].items():
+            if str(delegation_id) in invalid_record_ids or not isinstance(record, dict):
+                continue
+            execution = record.get("execution")
+            attempt = record.get("attempt")
+            if not isinstance(execution, dict) or not execution.get("detached") or not isinstance(attempt, dict):
+                continue
+            state = record.get("state")
+            block = record.get("detached") if isinstance(record.get("detached"), dict) else None
+            job_dir = Path(block["job_dir"]) if block and block.get("job_dir") else job_dir_for(
+                home, str(attempt.get("attempt_id") or ""))
+            if state == "cancelled":
+                ident = identity(job_dir, block)
+                if ident:
+                    kill.append(ident)
+                    record.pop("detached", None)
+                    append_lifecycle_event(record, "detached_orphan_killed", f"pid={ident.get('pid')}", now=now)
+                continue
+            if state not in {"running", "recoverable"}:
+                continue
+            owner = str(attempt.get("owner_boot_id") or "")
+            if state == "running" and (owner == current_boot_id or owner_alive(owner)):
+                continue
+            if now - float(record.get("created_at") or now) > ACTIVE_STALE_SECONDS:
+                ident = identity(job_dir, block)
+                if ident:
+                    kill.append(ident)
+                record.pop("detached", None)
+                _fail_recovery_record(record, "stale_record", now, emit_event=True, event_suffix="stale")
+                continue
+            status = probe(job_dir, block)
+            if status == "dead":
+                record.pop("detached", None)
+                append_lifecycle_event(record, "detached_lost", f"attempt={attempt.get('attempt_id')}", now=now)
+                continue
+            if block is None:
+                ident = identity(job_dir, None) or {}
+                block = {"pid": ident.get("pid"), "create_time": ident.get("create_time"),
+                         "job_dir": str(job_dir), "attempt_id": attempt.get("attempt_id"), "spawned_at": None}
+                record["detached"] = block
+            attempt["owner_boot_id"] = current_boot_id
+            record["state"] = "running"
+            record["updated_at"] = now
+            append_lifecycle_event(record, "adopted", f"boot={current_boot_id} child={status}", now=now)
+            adopted.append(copy.deepcopy(record))
+            logger.info(
+                "async_delegation_detached_adopted delegation_id=%s attempt_id=%s pid=%s child=%s",
+                delegation_id, attempt.get("attempt_id"), block.get("pid"), status,
+            )
+    return adopted, kill
 
 
 _MISSING = object()
