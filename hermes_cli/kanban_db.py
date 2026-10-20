@@ -14465,6 +14465,9 @@ def reopen_task(
                 "voided_result": (row["result"] or "")[:500] or None,
             },
         )
+        # Completion reaped the scratch tree; drop the dead binding so the next
+        # dispatch mints a fresh dir instead of refusing it as mount loss.
+        _release_reaped_scratch_binding(conn, task_id, actor=actor, reason="reopened")
 
         # This task is no longer ``done``, so any child promoted on that
         # premise now violates the invariant the dispatcher trusts: a ``ready``
@@ -15593,6 +15596,29 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
                 return _workspace_admission_refused(
                     conn, task_id, result, board=board, dry_run=dry_run,
                 )
+        # ``stranded_by_mount_loss`` is only reached after ``validate_mount``
+        # passed: the mount is present, the card's dir is not. When no worker
+        # has spawned since the card's last completion, kanban itself reaped
+        # that dir (any done -> ready/review path: reopen, dashboard drag), so
+        # re-mint without a page. Other dir-missing cases stay fail-closed.
+        if (
+            not dry_run
+            and reason.startswith("stranded_by_mount_loss:")
+            and task.status in ("ready", "review")
+            and _reaped_after_completion(conn, task_id)
+        ):
+            with write_txn(conn):
+                released = _release_reaped_scratch_binding(
+                    conn, task_id, actor="dispatcher", reason="reaped_after_completion",
+                )
+            if released:
+                _log.warning(
+                    "kanban dispatch: workspace re-minted task=%s (dir reaped at "
+                    "completion, mount present: %s)", task_id, reason,
+                )
+                return _workspace_admission_refused(
+                    conn, task_id, result, board=board, dry_run=dry_run,
+                )
         if (
             not dry_run
             and reason.startswith("stranded_by_mount_loss:")
@@ -15660,6 +15686,55 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
 _WORKSPACE_RESET_STATUSES = frozenset(
     {"triage", "todo", "scheduled", "ready", "blocked", "review"}
 )
+
+
+def _release_reaped_scratch_binding(conn, task_id: str, *, actor: str, reason: str) -> bool:
+    """Clear a done/archived card's scratch ``workspace_path`` when the tree is gone.
+
+    Completion (and archive) reaps a scratch workspace but keeps the path on
+    the row. A card returned to the queue would then be refused every tick as
+    ``stranded_by_mount_loss`` although the mount is fine (t_391fe8d8). Only
+    an ABSENT scratch path is cleared: a tree kept by child retention still
+    holds handoff artifacts and stays bound. Caller holds the write txn.
+    """
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
+    if (
+        row is None
+        or (row["workspace_kind"] or "scratch") != "scratch"
+        or not row["workspace_path"]
+        or os.path.lexists(Path(row["workspace_path"]).expanduser())
+    ):
+        return False
+    conn.execute(
+        "UPDATE tasks SET workspace_path = NULL WHERE id = ? AND workspace_path = ?",
+        (task_id, row["workspace_path"]),
+    )
+    baseline = _reset_survivor_baseline(conn, task_id)
+    _append_event(conn, task_id, "workspace_reset", {
+        "actor": actor,
+        "reason": f"{reason}: scratch workspace reaped at completion",
+        "previous_path": row["workspace_path"],
+        "survivor_baseline": baseline,
+    })
+    return True
+
+
+def _reaped_after_completion(conn, task_id: str) -> bool:
+    """True when no worker has spawned since the card's last completion.
+
+    ``complete_task`` reaps the scratch tree after survivor preservation, so a
+    missing dir in that state is kanban's own cleanup, never lost work.
+    """
+    row = conn.execute(
+        "SELECT MAX(CASE WHEN kind='completed' THEN id END), "
+        "       MAX(CASE WHEN kind='spawned' THEN id END) "
+        "FROM task_events WHERE task_id=? AND kind IN ('completed', 'spawned')",
+        (task_id,),
+    ).fetchone()
+    completed, spawned = row[0], row[1]
+    return completed is not None and (spawned is None or completed > spawned)
 
 
 def _unstrand_evidence(conn, task_id: str) -> Optional[str]:
