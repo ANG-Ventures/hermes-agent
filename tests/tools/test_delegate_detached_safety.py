@@ -48,6 +48,11 @@ def _isolated(tmp_path, monkeypatch):
     _drain()
 
 
+def _idents(kill: list) -> list:
+    """Kill entries reduced to the identity they signal (entries also carry their job_dir)."""
+    return [{"pid": k.get("pid"), "create_time": k.get("create_time")} for k in kill]
+
+
 def _drain() -> list:
     out = []
     while not process_registry.completion_queue.empty():
@@ -445,8 +450,8 @@ def test_an_age_capped_orphan_is_killed_by_the_next_boot_too(_isolated, tmp_path
     # boot B dies after the registry commit, before it signals ``first``
     _, second = ad._store.claim_detached_adoptions(current_boot_id="boot-c:1.0", **kw)
 
-    assert first == [ident]
-    assert second == [ident], "the next boot no longer knows about the still-running orphan"
+    assert _idents(first) == [ident]
+    assert _idents(second) == [ident], "the next boot no longer knows about the still-running orphan"
     assert _load("deleg_old")["state"] == "failed"
 
 
@@ -644,7 +649,7 @@ def test_a_failed_orphan_is_rekilled_by_every_boot_until_it_is_dead(_isolated, t
     _, c = ad._store.claim_detached_adoptions(current_boot_id="boot-c:1.0", **kw)  # dies before signalling
     _, d = ad._store.claim_detached_adoptions(current_boot_id="boot-d:1.0", **kw)
 
-    assert b == c == d == [ident], "a later boot lost the identity of a still-running orphan"
+    assert _idents(b) == _idents(c) == _idents(d) == [ident], "a later boot lost the identity of a still-running orphan"
     proc.kill()
     proc.wait(timeout=5)
     _, e = ad._store.claim_detached_adoptions(current_boot_id="boot-e:1.0", **kw)
@@ -827,6 +832,13 @@ def test_an_unreadable_argv_makes_the_job_scan_unknown(monkeypatch, tmp_path):
     class _Proc:
         def __init__(self, info):
             self.info = info
+            self.pid = info["pid"]
+
+        def status(self):
+            return self.info["status"]
+
+        def cmdline(self):
+            raise psutil.AccessDenied(self.pid)
 
     me = psutil.Process(os.getpid())
     unreadable = _Proc({"pid": 4242, "cmdline": None, "create_time": 1.0, "status": "sleeping", "uids": me.uids()})
@@ -851,10 +863,10 @@ def test_a_cancelled_unadvertised_childs_identity_is_persisted_until_dead(_isola
     kw = dict(profile_home=tmp_path, probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for)
 
     _, b = ad._store.claim_detached_adoptions(current_boot_id="boot-b:1.0", **kw)  # dies before signalling
-    assert b == [ident]
+    assert _idents(b) == [ident]
     assert _load("deleg_cx")["detached"]["pid"] == proc.pid, "the discovered identity was not persisted"
     _, c = ad._store.claim_detached_adoptions(current_boot_id="boot-c:1.0", **kw)
-    assert c == [ident]
+    assert _idents(c) == [ident]
 
 
 # an exit is confirmed only once every tool of the child's group is gone, not just the leader
@@ -1154,6 +1166,52 @@ def test_a_fenced_attempt_with_an_uncaptured_live_tool_keeps_its_fence(_isolated
         assert at_redispatch == [False], (
             "generation 1 was dispatched while generation 0's tool was still running")
         _wait_for_event("deleg_fz")
+    finally:
+        try:
+            os.kill(tool_pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+# a1d5038f5040 (P0, Prism at 5fd0ac40): a cancelled attempt's dead leader left a tool in its group; a fresh
+# boot (no in-memory members, no members.json) must still reach and kill that tool
+@pytest.mark.platforms("posix")  # process groups
+@pytest.mark.live_system_guard_bypass  # the surviving tool is reparented to init: real delivery is the point
+def test_a_cancelled_attempts_surviving_tool_is_killed_by_a_fresh_boot(_isolated, tmp_path):
+    record = _record("deleg_cq", owner=DEAD_BOOT, state="cancelled")
+    attempt_id = record["attempt"]["attempt_id"]
+    job_dir = dd.job_dir_for(tmp_path, attempt_id)
+    job_dir.mkdir(parents=True)
+    marker = tmp_path / "tool.pid"
+    leader_code = (
+        "import subprocess,sys,time\n"
+        "t=subprocess.Popen([sys.executable,'-c','import time; time.sleep(120)'])\n"
+        f"open({str(marker)!r},'w').write(str(t.pid))\n"
+        "time.sleep(120)\n")
+    leader = subprocess.Popen([sys.executable, "-c", leader_code], start_new_session=True)
+    _isolated.append(leader)
+    deadline = time.time() + 10
+    while not marker.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.3)
+    tool_pid = int(marker.read_text())
+    tool_ct = dd.process_create_time(tool_pid)
+    record["detached"] = {"pid": leader.pid, "create_time": dd.process_create_time(leader.pid),
+                          "job_dir": str(job_dir), "attempt_id": attempt_id, "spawned_at": time.time()}
+    _write(record)
+    (job_dir / "heartbeat.json").write_text(json.dumps({"schema_version": dd.SCHEMA_VERSION, "token": None,
+                                                        "in_tool": True, "ts": time.time()}))
+    leader.kill()
+    leader.wait(timeout=5)
+    with dd._terminated_members_lock:
+        dd._terminated_members.clear()  # a fresh gateway process: nothing captured in memory
+    try:
+        ad.recover_async_delegations(current_boot_id="boot-b:1.0", profile_home=tmp_path,
+                                     runner_factory=lambda *a: pytest.fail("a cancelled unit is never re-run"))
+        deadline = time.time() + 10
+        while dd.pid_state(tool_pid, tool_ct) is not False and time.time() < deadline:
+            time.sleep(0.05)
+        assert dd.pid_state(tool_pid, tool_ct) is False, "the cancelled delegation's tool keeps running"
     finally:
         try:
             os.kill(tool_pid, signal.SIGKILL)

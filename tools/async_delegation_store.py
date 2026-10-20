@@ -1346,7 +1346,7 @@ def claim_detached_adoptions(
                     retained_dirs.add(str(job_dir))  # unknown is not dead: keep the block, retry next pass
                     continue
                 if ident and _child_alive(probe, alive, job_dir, block, ident):
-                    kill.append(ident)
+                    kill.append({**ident, "job_dir": str(job_dir)})
                     # Persisted even when it was only recovered from the job dir (cancelled before the
                     # block was advertised): a boot that dies before signalling must not lose it.
                     record["detached"] = {**(block or {}), **ident, "job_dir": str(job_dir),
@@ -1368,7 +1368,7 @@ def claim_detached_adoptions(
                 killed_dirs.add(str(job_dir))
                 ident, known = _lookup_identity(identity, job_dir, block)
                 if ident:
-                    kill.append(ident)
+                    kill.append({**ident, "job_dir": str(job_dir)})
                     record["detached"] = {**(block or {}), **ident, "job_dir": str(job_dir)}
                 elif not known:
                     # Unknown is not dead: keep a block so the failed+block branch re-checks it every boot.

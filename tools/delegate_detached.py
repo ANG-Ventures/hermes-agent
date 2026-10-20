@@ -142,7 +142,7 @@ def find_job_process(job_dir: Path) -> Optional[Dict[str, Any]]:
         raise IdentityUnavailable("psutil is unavailable") from exc
     target = str(job_dir)
     euid = os.geteuid() if hasattr(os, "geteuid") else None
-    unreadable = 0
+    unreadable: list = []
     try:
         for proc in psutil.process_iter(["pid", "cmdline", "create_time", "status", "uids"], ad_value=None):
             try:
@@ -153,16 +153,27 @@ def find_job_process(job_dir: Path) -> Optional[Dict[str, Any]]:
                     uids = proc.info.get("uids")
                     if proc.info.get("status") != psutil.STATUS_ZOMBIE and (
                             euid is None or uids is None or uids.effective == euid):
-                        unreadable += 1
+                        unreadable.append(proc)
                     continue
                 if _argv_has_job(cmdline, target):
                     return {"pid": proc.info["pid"], "create_time": proc.info["create_time"]}
             except Exception:
-                unreadable += 1
+                unreadable.append(proc)
     except Exception as exc:
         raise IdentityUnavailable(f"process scan failed: {exc}") from exc
-    if unreadable:
-        raise IdentityUnavailable(f"{unreadable} process(es) of this user had an unreadable argv")
+    still_unknown = 0
+    for proc in unreadable:  # one direct re-read: a process that exited mid-scan is gone, not unknown
+        try:
+            if proc.status() == psutil.STATUS_ZOMBIE:
+                continue
+            if _argv_has_job(proc.cmdline(), target):
+                return {"pid": proc.pid, "create_time": proc.create_time()}
+        except psutil.NoSuchProcess:  # ZombieProcess subclasses it
+            continue
+        except Exception:
+            still_unknown += 1
+    if still_unknown:
+        raise IdentityUnavailable(f"{still_unknown} process(es) of this user had an unreadable argv")
     return None
 
 
