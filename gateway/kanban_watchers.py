@@ -3109,6 +3109,14 @@ class GatewayKanbanWatchersMixin:
                                     "unblocked: arm or dispatch them."
                                 )
                             _red_ids = _red_ids + _ready_ids
+                            # t_156cc147: a block / stuck wake DELIVERED here is the owner's
+                            # turn; the owner-wake now skips only these marked ids, never on
+                            # the sub's existence (a downgraded wake marks nothing).
+                            from gateway import kanban_owner_wake as _ow_kinds
+                            _red_ids = _red_ids + [
+                                ev.id for ev in d["events"]
+                                if ev.kind in _ow_kinds.SUB_WAKE_KINDS and ev.kind in _wake_kinds
+                            ]
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
                             )
