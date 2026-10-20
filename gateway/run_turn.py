@@ -2363,6 +2363,7 @@ class GatewayTurnMixin:
         # Auto-analyze user images so the model gets a description plus the local path.
         message_text = await self._prepare_profile_scoped_inbound_message_text(
             event=event, source=source, history=history, session_key=session_key,
+            session_id=session_entry.session_id,
         )
         if message_text is None:
             return None, _session_env_tokens
@@ -4381,6 +4382,7 @@ class GatewayTurnMixin:
                 )
             next_message = await self._prepare_profile_scoped_inbound_message_text(
                 event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
+                session_id=session_id,
             )
             if next_message is None:
                 return result

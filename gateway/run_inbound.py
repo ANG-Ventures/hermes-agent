@@ -50,10 +50,24 @@ logger = logging.getLogger("gateway.run")
 # lines pair with the ``[voice Ns]`` inbound line for log readers. Fork tests import it from
 # ``gateway.run`` (FOLLOWUP: re-export there).
 _STT_LOG_CHAT: "ContextVar[str]" = ContextVar("_STT_LOG_CHAT", default="unknown")
+# Mutable cell shared with the shielded STT task: the handler flips ``stopped`` when /stop (or
+# /new, /reset) cancels it mid-transcription, so the task's outcome lines say "after /stop".
+_STT_STOP_CELL: "ContextVar[Optional[Dict[str, bool]]]" = ContextVar("_STT_STOP_CELL", default=None)
+
+# How long a cancelled turn waits for its in-flight voice STT before giving up on the transcript
+# and persisting the "could not be transcribed" marker instead (2026-10-19: a 281 s note was lost
+# to a /stop 2 s into STT; Parakeet needs seconds for it).
+STT_AFTER_STOP_TIMEOUT_S = 120.0
+
+
+def _stt_after_stop() -> bool:
+    cell = _STT_STOP_CELL.get()
+    return bool(cell and cell.get("stopped"))
 
 
 def _stt_log_failed(why: str, started: float) -> None:
-    logger.info("stt FAILED: chat=%s after %.1fs: %s", _STT_LOG_CHAT.get(), time.monotonic() - started, why)
+    label = "stt FAILED (after /stop)" if _stt_after_stop() else "stt FAILED"
+    logger.info("%s: chat=%s after %.1fs: %s", label, _STT_LOG_CHAT.get(), time.monotonic() - started, why)
 
 
 def rehome_inbound_media(event: MessageEvent) -> None:
@@ -1689,14 +1703,24 @@ class GatewayInboundMixin:
                 logger.debug("%s echo failed (non-fatal): %s", log_context, echo_exc)
 
     async def _enrich_inbound_voice(
-        self, event: MessageEvent, source: SessionSource, message_text: str, audio_paths: list[str]
+        self, event: MessageEvent, source: SessionSource, message_text: str, audio_paths: list[str],
+        *, session_id: Optional[str] = None,
     ) -> str:
         _stt_chat_token = _STT_LOG_CHAT.set(str(getattr(source, "chat_id", None) or "unknown"))
+        _stop_cell: Dict[str, bool] = {"stopped": False}
+        _stop_cell_token = _STT_STOP_CELL.set(_stop_cell)
         try:
-            message_text, _successful_transcripts = await self._enrich_message_with_transcription(
-                message_text, audio_paths,
-            )
+            # Its own task (context copied now, so it sees the chat + stop cell): a /stop, /new or
+            # /reset cancelling this handler must not abandon the transcription (Ace 2026-10-19).
+            stt = asyncio.ensure_future(self._enrich_message_with_transcription(message_text, audio_paths))
+            try:
+                message_text, _successful_transcripts = await asyncio.shield(stt)
+            except asyncio.CancelledError:
+                _stop_cell["stopped"] = True
+                await self._persist_voice_after_stop(event, stt, message_text, audio_paths, session_id)
+                raise
         finally:
+            _STT_STOP_CELL.reset(_stop_cell_token)
             _STT_LOG_CHAT.reset(_stt_chat_token)
         # Echo each successful transcript back immediately when configured so users can verify STT
         # quality in real time. On transcription failure do NOT send a hardcoded notice: that
@@ -1711,6 +1735,45 @@ class GatewayInboundMixin:
                     event, _echo_adapter, source, _successful_transcripts, metadata=_echo_meta,
                 )
         return message_text
+
+    async def _persist_voice_after_stop(
+        self, event: MessageEvent, stt: "asyncio.Future", message_text: str, audio_paths: list[str],
+        session_id: Optional[str],
+    ) -> None:
+        """The turn was cancelled mid-STT. Let the transcription finish (bounded), then persist the
+        note as this turn's user row in the session the turn STARTED in; no model call follows.
+        The next human row is merged into it by ``repair_message_sequence`` (user;user), so the
+        agent hears the note with the next message. A ``/new`` therefore leaves it in the old session."""
+        waited_from = time.monotonic()
+        try:
+            text, _ = await asyncio.wait_for(asyncio.shield(stt), timeout=STT_AFTER_STOP_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            stt.cancel()
+            _stt_log_failed("timeout after stop", waited_from)
+            text = self._prepend_media_prefix(
+                "\n\n".join(self._untranscribed_audio_note(p) for p in dict.fromkeys(audio_paths)), message_text,
+            )
+        except asyncio.CancelledError:
+            # A second cancel while waiting: the STT task keeps running unobserved; nothing to persist.
+            logger.info("stt after /stop: chat=%s abandoned by a second cancel", _STT_LOG_CHAT.get())
+            raise
+        if not session_id:
+            logger.warning("stt after /stop: chat=%s no turn session id; note not persisted", _STT_LOG_CHAT.get())
+            return
+        from gateway.response_filters import display_kind_for_event
+        _, persist_text, persist_ts = self._hmwa_apply_message_timestamp(event, text)
+        row: Dict[str, Any] = {
+            "role": "user",
+            "content": persist_text if persist_text is not None else text,
+            "timestamp": persist_ts if persist_ts is not None else time.time(),
+        }
+        if display_kind_for_event(event):
+            row["display_kind"] = display_kind_for_event(event)
+        if getattr(event, "message_id", None):
+            row["message_id"] = str(event.message_id)
+        await self.async_session_store.append_to_transcript(session_id, row)
+        logger.info("stt after /stop: chat=%s note persisted to session %s (no reply)",
+                    _STT_LOG_CHAT.get(), session_id)
 
     @staticmethod
     def _inbound_attachment_display_name(path: str) -> Tuple[str, str]:
@@ -1892,7 +1955,7 @@ class GatewayInboundMixin:
 
     async def _prepare_inbound_message_text(
         self, *, event: MessageEvent, source: SessionSource, history: List[Dict[str, Any]],
-        session_key: Optional[str] = None,
+        session_key: Optional[str] = None, session_id: Optional[str] = None,
     ) -> Optional[str]:
         """Prepare inbound event text for the agent. Shared by the normal inbound and queued
         follow-up paths so attribution, image enrichment, STT, document notes, reply context and
@@ -1912,7 +1975,11 @@ class GatewayInboundMixin:
         if image_paths:
             message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
         if audio_paths:
-            message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
+            # ``session_id`` is the session this turn started in: a /stop mid-STT persists the note
+            # there, never into a session a /new rotated in meanwhile.
+            message_text = await self._enrich_inbound_voice(
+                event, source, message_text, audio_paths, session_id=session_id,
+            )
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
         if "@" in message_text:
@@ -1925,11 +1992,11 @@ class GatewayInboundMixin:
 
     async def _prepare_profile_scoped_inbound_message_text(
         self, *, event: MessageEvent, source: SessionSource, history: List[Dict[str, Any]],
-        session_key: Optional[str] = None,
+        session_key: Optional[str] = None, session_id: Optional[str] = None,
     ) -> Optional[str]:
         """Run inbound preprocessing under the routed profile when multiplexed."""
         from gateway.run import _async_profile_runtime_scope
-        kwargs = dict(event=event, source=source, history=history, session_key=session_key)
+        kwargs = dict(event=event, source=source, history=history, session_key=session_key, session_id=session_id)
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             async with _async_profile_runtime_scope(self._resolve_profile_home_for_source(source)):
                 return await self._prepare_inbound_message_text(**kwargs)
@@ -2286,7 +2353,8 @@ class GatewayInboundMixin:
                     # INFO carries size + latency only: the words are the user's speech (passwords,
                     # PII) and INFO logs are long-lived (fork, Backfill C3).
                     logger.info(
-                        "stt: chat=%s transcribed %d chars in %.1fs",
+                        "%s: chat=%s transcribed %d chars in %.1fs",
+                        "stt ok (completed after /stop)" if _stt_after_stop() else "stt",
                         _STT_LOG_CHAT.get(), len(transcript), time.monotonic() - _stt_started,
                     )
                 enriched_parts.append(note)
