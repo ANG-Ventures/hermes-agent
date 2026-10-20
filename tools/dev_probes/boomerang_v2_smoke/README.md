@@ -15,7 +15,7 @@ tool: `tools/dev_probes/` has no `__init__.py`, so tool discovery never imports 
 |---|---|---|---|
 | 1 | AC-7, INV-5, INV-6 | Mints 3 cards on the scratch board (`auto_handle`, origin chat subscribed `notify+wake`), forces `completed` / `blocked --kind needs_input` / (optional) a forced child failure through the kanban CLI, then reads the origin chat and gateway log for `[auto-handled] <card> - <Outcome>`, `kanban notifier: auto-handled <card> disposition=auto`, no auto-handle on the needs_input card, and `warning auto-handle failed <card>: <reason>`. | no |
 | 2 | AC-8, INV-7 | Kill switches. Precondition: `delegation.boomerang.auto_handle_enabled: true` and `fork_enabled: true` (or unset). Prints the one-line config diff, waits for the ack, re-reads config, forces an event, asserts `boomerang.fork_ineligible reason=fork_enabled` (fork off) and no auto-handle within one tick (auto-handle off). Then asks for the restore. | **yes: 3 config flips** (`fork_enabled=false`, `auto_handle_enabled=false`, `restore`) |
-| 3 | AC-9, INV-8 | Forces one fork turn (or observes one with `--no-trigger`), waits for `boomerang.fork served_by=<seat>`, then scans the relay wire capture (relay-wire-forensics JSONL, `req.headers` / `req.headerOrder`) for any `x-hermes-*` header. Zero captured records is INCOMPLETE, never PASS. | no |
+| 3 | AC-9, INV-8 | Sends a canary request (positive control, below), forces one fork turn (or observes one with `--no-trigger`), waits for `boomerang.fork served_by=<seat>`, then scans the relay wire capture (relay-wire-forensics JSONL, `req.headers` / `req.headerOrder`) for any `x-hermes-*` header. Zero captured records is INCOMPLETE, never PASS. | no |
 | 4 | AC-11, 5.7 | Restart drill observer. Forces an event, waits for the auto-handle dispatch, asks Apollo to restart, then waits for a fresh boot line after the dispatch, the reconciler's re-surface line within startup + one tick, `warning auto-handle lost <card> (reason: gateway restart)` in the origin chat, and no late `[auto-handled]` line. It never restarts anything. | **yes: 1 gateway restart** (`restart`) |
 
 The harness never edits config, never restarts the gateway, and refuses any board whose slug
@@ -59,6 +59,18 @@ empty ack file: a stale token from an earlier run acks immediately.
 `--tick-seconds` (notifier tick, default 5), `--slack-seconds` (default 10), `--timeout` (max wait
 for a child to finish, default 600).
 
+Step 3 positive control (AC-9): before the scan the harness POSTs one `max_tokens: 1` request to
+`canary_url` (default the apr relay `:18810`, `BV2_CANARY_URL` overrides) carrying
+`x-hermes-lane-src: platform=bv2canary<nonce>;...` and `x-hermes-qa-canary: <nonce>`, then runs
+`commands.wirelog_sync` for the seat that served it. No hop passes an unknown `x-hermes-*` header
+(the relay forwards `content-type`/`anthropic-version`/`anthropic-beta` plus its own route-id and
+lane-src, `claude_pool_relay.py:881,1322`; apx's outbound allowlist drops the rest,
+`proxy.js:755-766,951`), so `x-hermes-qa-canary` can never reach a capture. `x-hermes-lane-src`
+is the one fleet header the box records (as the record's top-level `lane_src`), so a record with
+`lane_src.platform == <nonce>` proves a fleet header reached the capture point, and its
+`req.headers` is scanned like the fork's. Canary seen + clean = PASS, canary missing = INCOMPLETE
+(blind), any `x-hermes-*` name in `req.headers` = FAIL.
+
 Step 3: if the fork is served by a remote seat, its capture is on that box. Run
 `wirelog-fleet.py sync` and point `BV2_WIRELOG_DIR` at `~/.claude-wirelog-fleet`, and run
 `wirelog-coverage-check.py` first (the harness prints both).
@@ -77,9 +89,15 @@ Two contract gaps are parameters, not code:
 - `commands.set_auto_handle` assumes P4's CLI flag is `hermes kanban edit <id> --auto-handle`.
   The spec only says `kanban_create/update` gain `auto_handle`. If step 1 aborts at
   `set_auto_handle`, fix the argv in the plan.
-- `commands.inject_failure` is `null`: the spec names no seam for forcing a child exception
-  (second half of AC-7). Live, that check reports SKIP (exit 3) until P3's hook is configured
-  here. Dry-run still exercises the matcher.
+- `commands.inject_failure` is the AC-7 live fault: a `kanban comment` on the failure card, run
+  only after its auto-handle child is dispatched. The comment is a board event by another session
+  past the claim cursor, so the verdict executor refuses it (`write refused: state moved`,
+  `gateway/kanban_auto_handle.py::_moved`) and `_fail` posts the warning AND re-surfaces the wake
+  into the home session, which stays live. Step 1 then asserts the warning reason, a
+  `inbound message: ... msg='[kanban] Task <card>` turn in the gateway log, and no
+  `no live home for <card>` line. The old fault (`edit --session <bogus>`) proved only the warning.
+  If the child finishes before the comment lands the check is INCOMPLETE; give the card a slow
+  body with `commands.s1_fault_hold`. `null` = SKIP live.
 - `expect.resurface_log_regex` is a guess (5.7 names `deliver_wake` and the chat line, not a log
   line). Tune it to the line P3 emits.
 
