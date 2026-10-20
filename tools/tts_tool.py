@@ -127,6 +127,16 @@ def _default_output_dir() -> str:
     return _get_default_output_dir()
 
 
+def voice_temp_dir() -> str:
+    """Scratch dir for auto-TTS / voice-mode audio, created on demand. Per-uid: a fixed
+    ``<tmp>/hermes_voice`` is first-creator-owns-it on a shared host, and every other user's
+    synthesis then fails with EACCES (same reasoning as ``profiles.py`` profile exports)."""
+    uid_suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
+    path = os.path.join(tempfile.gettempdir(), f"hermes_voice{uid_suffix}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _load_tts_config() -> Dict[str, Any]:
     """Return the ``tts`` config section ({} when unavailable)."""
     try:
