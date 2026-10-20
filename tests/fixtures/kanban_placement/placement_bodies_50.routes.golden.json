@@ -241,8 +241,8 @@ null
 ],
 [
 48,
-"portable",
-null
+"local",
+"studio_affinity:studio_needs(studio_tree)"
 ],
 [
 49,
