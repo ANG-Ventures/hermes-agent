@@ -15,6 +15,7 @@ import asyncio
 import logging
 import threading
 import time
+from contextlib import suppress
 from unittest.mock import patch
 
 import pytest
@@ -84,11 +85,13 @@ def _slow_stt(started, transcripts, delay=0.3, fail=False):
     return stt
 
 
-async def _cancel_once_started(task, started):
+async def _cancel_once_started(task, started, runner=None, session_id="sess-old"):
     await asyncio.wait_for(started.wait(), 5)
     task.cancel()  # what cancel_session_processing does on /stop
     with pytest.raises(asyncio.CancelledError):
         await task
+    if runner is not None:  # what the session's next turn does before load_transcript
+        await runner._await_voice_persist_barrier(session_id)
 
 
 def _stt_lines(caplog):
@@ -102,7 +105,7 @@ async def test_stop_mid_stt_persists_note_and_continue_hears_it(caplog):
     stt = _slow_stt(started, {"/cache/audio/long.ogg": "my four questions"})
     with caplog.at_level(logging.INFO, logger="gateway.run"), patch(_STT, side_effect=stt):
         task = _start_turn(runner, _voice())
-        await _cancel_once_started(task, started)
+        await _cancel_once_started(task, started, runner)
 
     rows = runner.session_store.rows["sess-old"]
     assert len(rows) == 1 and rows[0]["role"] == "user"
@@ -134,7 +137,7 @@ async def test_stop_during_second_clip_persists_both():
 
     with patch(_STT, side_effect=stt):
         task = _start_turn(runner, _voice(("/a.ogg", "/b.ogg")))
-        await _cancel_once_started(task, started)
+        await _cancel_once_started(task, started, runner)
     rows = runner.session_store.rows["sess-old"]
     assert len(rows) == 1
     assert '"first clip"' in rows[0]["content"] and '"second clip"' in rows[0]["content"]
@@ -180,6 +183,7 @@ async def test_new_mid_stt_lands_in_old_session_only():
         await adapter._dispatch_active_session_command(new_cmd, _KEY, "new")  # real order: reply, then cancel
         with pytest.raises(asyncio.CancelledError):
             await task
+        await runner._await_voice_persist_barrier("sess-old")
     assert '"old instructions"' in store.rows["sess-old"][0]["content"]
     assert "sess-new" not in store.rows
 
@@ -199,7 +203,7 @@ async def test_stt_failure_after_stop_persists_marker(caplog):
         _STT, side_effect=_slow_stt(started, {}, fail=True),
     ), patch(_LOCAL, return_value={"success": False, "error": "no local"}):
         task = _start_turn(runner, _voice())
-        await _cancel_once_started(task, started)
+        await _cancel_once_started(task, started, runner)
     content = runner.session_store.rows["sess-old"][0]["content"]
     assert "could not be transcribed" in content and "long.ogg" in content
     assert any(line.startswith("stt FAILED (after /stop): chat=1") for line in _stt_lines(caplog))
@@ -220,7 +224,7 @@ async def test_stt_past_the_bound_persists_marker_and_exits(caplog, monkeypatch)
     try:
         with caplog.at_level(logging.INFO, logger="gateway.run"), patch(_STT, side_effect=hung_stt):
             task = _start_turn(runner, _voice())
-            await asyncio.wait_for(_cancel_once_started(task, started), 5)
+            await asyncio.wait_for(_cancel_once_started(task, started, runner), 5)
     finally:
         release.set()
     content = runner.session_store.rows["sess-old"][0]["content"]
@@ -263,3 +267,73 @@ async def test_next_turn_waits_for_pending_note_before_loading_history():
         await runner._await_voice_persist_barrier("sess-old")  # what the next turn does before load_transcript
         assert '"first"' in runner.session_store.rows["sess-old"][0]["content"]
     await runner._await_voice_persist_barrier("sess-old")  # nothing pending: returns at once
+
+
+@pytest.mark.asyncio
+async def test_cancelled_handler_exits_without_waiting_for_stt():
+    """Apollo round 2 (A): ``cancel_session_processing`` waits 5 s for the cancelled task. A long
+    note's STT outlives that, so the handler must re-raise at once and leave STT + persist to the
+    runner-owned task, not hold /stop's command path until transcription ends."""
+    runner = _runner()
+    started = asyncio.Event()
+    with patch(_STT, side_effect=_slow_stt(started, {"/cache/audio/long.ogg": "late words"}, delay=1.5)):
+        task = _start_turn(runner, _voice())
+        await asyncio.wait_for(started.wait(), 5)
+        t0 = time.monotonic()
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)  # cancel_session_processing's wait
+        exit_s = time.monotonic() - t0
+        assert "sess-old" not in runner.session_store.rows  # STT still running in the background
+        await runner._await_voice_persist_barrier("sess-old")
+    assert exit_s < 0.5, exit_s
+    assert '"late words"' in runner.session_store.rows["sess-old"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_stop_during_queued_voice_drain_stt_persists_note():
+    """Prism 2f704a13d404 (B): a voice note queued behind a running turn is popped off the queue by
+    ``_run_agent_drain_pending`` and transcribed there. A /stop during that STT must persist it to
+    the draining turn's session; the drain never returns, so no follow-up turn (model call) runs."""
+    runner = _runner()
+    started = asyncio.Event()
+    queued = _voice()
+
+    class _Pending:
+        _pending_messages = {_KEY: queued}
+
+        def get_pending_message(self, key):
+            return self._pending_messages.pop(key, None)
+
+    runner._overflow_queue = lambda key: []
+    runner._draining = False
+    with patch(_STT, side_effect=_slow_stt(started, {"/cache/audio/long.ogg": "queued words"})):
+        drain = asyncio.ensure_future(runner._run_agent_drain_pending(
+            {"final_response": "done"}, _Pending(), _source(), _KEY, "sess-old",
+        ))
+        await _cancel_once_started(drain, started, runner)
+    assert _KEY not in _Pending._pending_messages  # off the queue: the persisted row is all that's left
+    rows = runner.session_store.rows["sess-old"]
+    assert len(rows) == 1 and '"queued words"' in rows[0]["content"]
+
+
+def test_post_stop_note_row_keeps_the_stop_marker():
+    """Apollo round 2 (C): the note row lands after ``user_stopped.last_message_id``; it must not
+    count as the user speaking after /stop, or a restart auto-resumes (and replies to) the turn."""
+    from gateway.auto_resume import POST_STOP_VOICE_NOTE_KEY, user_stop_blocks_resume
+
+    marker = 10
+    note = {"id": 11, "role": "user", "content": 'voice: "x"', "display_metadata": {POST_STOP_VOICE_NOTE_KEY: True}}
+    assert user_stop_blocks_resume(marker, [note]) is True
+    assert user_stop_blocks_resume(marker, [note, {"id": 12, "role": "user", "content": "Continue"}]) is False
+
+
+@pytest.mark.asyncio
+async def test_persisted_note_row_carries_the_post_stop_flag():
+    from gateway.auto_resume import POST_STOP_VOICE_NOTE_KEY
+
+    runner = _runner()
+    started = asyncio.Event()
+    with patch(_STT, side_effect=_slow_stt(started, {"/cache/audio/long.ogg": "w"})):
+        await _cancel_once_started(_start_turn(runner, _voice()), started, runner)
+    assert runner.session_store.rows["sess-old"][0]["display_metadata"] == {POST_STOP_VOICE_NOTE_KEY: True}

@@ -1707,27 +1707,11 @@ class GatewayInboundMixin:
         *, session_id: Optional[str] = None,
     ) -> str:
         _stt_chat_token = _STT_LOG_CHAT.set(str(getattr(source, "chat_id", None) or "unknown"))
-        _stop_cell: Dict[str, bool] = {"stopped": False}
-        _stop_cell_token = _STT_STOP_CELL.set(_stop_cell)
         try:
-            # Its own task (context copied now, so it sees the chat + stop cell): a /stop, /new or
-            # /reset cancelling this handler must not abandon the transcription (Ace 2026-10-19).
-            stt = asyncio.ensure_future(self._enrich_message_with_transcription(message_text, audio_paths))
-            try:
-                message_text, _successful_transcripts = await asyncio.shield(stt)
-            except asyncio.CancelledError:
-                _stop_cell["stopped"] = True
-                # Owned by the runner, not this handler: a second /stop or /reset cannot abandon it,
-                # and the session's next turn waits on it before loading history.
-                persist = asyncio.ensure_future(
-                    self._persist_voice_after_stop(event, stt, message_text, audio_paths, session_id),
-                )
-                self._register_voice_persist_barrier(session_id, persist)
-                with suppress(asyncio.CancelledError):
-                    await asyncio.shield(persist)
-                raise
+            message_text, _successful_transcripts = await self._stt_surviving_stop(
+                event, message_text, audio_paths, session_id,
+            )
         finally:
-            _STT_STOP_CELL.reset(_stop_cell_token)
             _STT_LOG_CHAT.reset(_stt_chat_token)
         # Echo each successful transcript back immediately when configured so users can verify STT
         # quality in real time. On transcription failure do NOT send a hardcoded notice: that
@@ -1742,6 +1726,31 @@ class GatewayInboundMixin:
                     event, _echo_adapter, source, _successful_transcripts, metadata=_echo_meta,
                 )
         return message_text
+
+    async def _stt_surviving_stop(
+        self, event: MessageEvent, message_text: str, audio_paths: list[str], session_id: Optional[str],
+    ) -> tuple[str, List[str]]:
+        """``_enrich_message_with_transcription`` that a /stop, /new or /reset cannot abandon.
+
+        STT runs in its own task (context copied now: chat label + stop cell). If the caller is
+        cancelled, a runner-owned task finishes STT and persists the note to ``session_id``; the
+        caller re-raises at once, so the cancelled turn exits without waiting on transcription.
+        The session's next turn waits on that task before loading history."""
+        stop_cell: Dict[str, bool] = {"stopped": False}
+        token = _STT_STOP_CELL.set(stop_cell)
+        try:
+            stt = asyncio.ensure_future(self._enrich_message_with_transcription(message_text, audio_paths))
+            try:
+                return await asyncio.shield(stt)
+            except asyncio.CancelledError:
+                stop_cell["stopped"] = True
+                persist = asyncio.ensure_future(
+                    self._persist_voice_after_stop(event, stt, message_text, audio_paths, session_id),
+                )
+                self._register_voice_persist_barrier(session_id, persist)
+                raise
+        finally:
+            _STT_STOP_CELL.reset(token)
 
     async def _persist_voice_after_stop(
         self, event: MessageEvent, stt: "asyncio.Future", message_text: str, audio_paths: list[str],
@@ -1763,12 +1772,15 @@ class GatewayInboundMixin:
         if not session_id:
             logger.warning("stt after /stop: chat=%s no turn session id; note not persisted", _STT_LOG_CHAT.get())
             return
+        from gateway.auto_resume import POST_STOP_VOICE_NOTE_KEY
         from gateway.response_filters import display_kind_for_event
         _, persist_text, persist_ts = self._hmwa_apply_message_timestamp(event, text)
         row: Dict[str, Any] = {
             "role": "user",
             "content": persist_text if persist_text is not None else text,
             "timestamp": persist_ts if persist_ts is not None else time.time(),
+            # Not "the user spoke after /stop": must leave the user_stopped marker in force.
+            "display_metadata": {POST_STOP_VOICE_NOTE_KEY: True},
         }
         if display_kind_for_event(event):
             row["display_kind"] = display_kind_for_event(event)
@@ -2409,10 +2421,12 @@ class GatewayInboundMixin:
         ]
 
     async def _transcribe_pending_audio_event_once(
-        self, event, user_text: Optional[str] = None
+        self, event, user_text: Optional[str] = None, *, persist_session_id: Optional[str] = None,
     ) -> tuple[str | None, List[str]]:
         """Transcribe a pending audio event once and cache the result on the event: the interrupt
-        monitor and the pending-drain path both need it — one STT call and one echo per message."""
+        monitor and the pending-drain path both need it — one STT call and one echo per message.
+        ``persist_session_id``: the event is already off the queue, so a cancel must not lose it;
+        STT survives the cancel and the note is persisted there (``_stt_surviving_stop``)."""
         if hasattr(event, "_gateway_pending_stt_text"):
             return event._gateway_pending_stt_text, list(getattr(event, "_gateway_pending_stt_transcripts", []) or [])
         audio_paths = self._pending_event_audio_paths(event)
@@ -2423,7 +2437,12 @@ class GatewayInboundMixin:
             str(getattr(getattr(event, "source", None), "chat_id", None) or "unknown")
         )
         try:
-            enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
+            if persist_session_id:
+                enriched_text, successful_transcripts = await self._stt_surviving_stop(
+                    event, text, audio_paths, persist_session_id,
+                )
+            else:
+                enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
         finally:
             _STT_LOG_CHAT.reset(_stt_chat_token)
         event._gateway_pending_stt_text = enriched_text
@@ -2448,15 +2467,19 @@ class GatewayInboundMixin:
         )
 
     async def _transcribe_and_echo_pending_voice(
-        self, event, adapter, source, text: str, *, log_context: str, metadata=_UNSET
+        self, event, adapter, source, text: str, *, log_context: str, metadata=_UNSET,
+        persist_session_id: Optional[str] = None,
     ) -> tuple[str, List[str]]:
         """Transcribe a pending voice event and echo transcripts once → ``(enriched_text,
         transcripts)`` for ``agent.interrupt()`` or the pending-drain flow; ``(text, [])`` when there
-        is no STT-eligible media (caller owns the ``_build_media_placeholder`` fallback)."""
+        is no STT-eligible media (caller owns the ``_build_media_placeholder`` fallback).
+        ``persist_session_id``: see ``_transcribe_pending_audio_event_once`` (dequeued events only)."""
         if not self._pending_event_audio_paths(event):
             return text, []
         try:
-            enriched_text, transcripts = await self._transcribe_pending_audio_event_once(event, text)
+            enriched_text, transcripts = await self._transcribe_pending_audio_event_once(
+                event, text, persist_session_id=persist_session_id,
+            )
             if metadata is _UNSET:
                 metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
             await self._echo_pending_stt_transcripts_once(
