@@ -4,8 +4,12 @@
     "Placeholders: {board} {session} {chat} {card} {title}.",
     "set_auto_handle: P4 (t_bcd2f011) owns the CLI flag name; the spec only says kanban_create/update gain auto_handle.",
     "  If the live run aborts at set_auto_handle, fix the argv here, not run.py.",
-    "inject_failure: the spec names no fault-injection seam for a forced child exception (AC-7 second half).",
-    "  null = step 1 reports that check as SKIP. Set it to the argv P3 ships (an env/config hook) to arm it.",
+    "inject_failure: the AC-7 live fault (t_480d08ce), run AFTER the failure card's child is dispatched. A comment by",
+    "  another session moves the card past the claim cursor, so the verdict executor refuses it ('state moved', _moved)",
+    "  and run_entry -> _fail posts the warning AND re-surfaces the wake into the still-live home. null = SKIP (live).",
+    "  Never rehome the card (edit --session <bogus>): that proves only the warning half ('no live home').",
+    "s1_fault_hold (optional): a --body that keeps the failure card's child busy so the fault lands first.",
+    "wirelog_sync: run after the step-3 canary when a remote seat served it ({sub} = the bare seat number).",
     "expect.*: the restart line is today's real boot line; the re-surface regex is NOT in the spec contract",
     "  (5.7 names deliver_wake + the origin-chat 'auto-handle lost' line, not a log line). Tune it once P3 lands."
   ],
@@ -20,12 +24,19 @@
     "complete": ["--board", "{board}", "complete", "{card}", "--summary", "bv2 smoke: forced completed event"],
     "block_needs_input": ["--board", "{board}", "block", "{card}", "--kind", "needs_input",
                           "bv2 smoke: forced needs_input event. unblock_when: after:+1d"],
-    "inject_failure": null
+    "inject_failure": ["--board", "{board}", "comment", "{card}", "--body",
+                       "bv2 smoke s1 fault: board write after the auto-handle claim; the verdict must be refused (state moved) and the wake re-surfaced"],
+    "wirelog_sync": ["python3", "~/.hermes/scripts/wirelog-fleet.py", "sync", "--sub", "{sub}"]
   },
   "expect": {
     "restart_log_regex": "Gateway running with \\d+ platform",
-    "resurface_log_regex": "re-?surfac\\w*\\b.*{card}"
+    "resurface_log_regex": "re-?surfac\\w*\\b.*{card}",
+    "fault_reason_regex": "state moved",
+    "resurface_wake_log_regex": "inbound message: .*msg=.\\[kanban\\] Task {card}\\b"
   },
+  "canary_url": "http://127.0.0.1:18810/v1/messages",
+  "canary_model": "claude-haiku-4-5",
+  "dry_run_canary": "bv2canary0123456789ab",
   "dry_run_cards": {
     "s1_completed": "t_5m0ce001",
     "s1_needs_input": "t_5m0ce002",
