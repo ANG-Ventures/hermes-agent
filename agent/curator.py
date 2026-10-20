@@ -244,6 +244,59 @@ def _cron_referenced_skills() -> Set[str]:
         return set()
 
 
+def _manifest_dir() -> Path:
+    """``<root hermes home>/skills-harness-manifests`` (sibling of the shared skills tree, shared by every profile)."""
+    from agent.skill_utils import get_shared_skills_root
+    return get_shared_skills_root().parent / "skills-harness-manifests"
+
+
+def _harness_manifest_skills() -> Set[str]:
+    """Skill names listed anywhere in ``skills-harness-manifests/*.yaml`` (pins, skills, every group in _groups.yaml,
+    projects). skills-harness-sync REFUSES a listed name that resolves to no directory and exits 1, so archiving one
+    breaks the sync. Over-collects on purpose (unused groups count). Best-effort: a missing dir or bad YAML yields
+    what parsed, never a crash."""
+    names: Set[str] = set()
+
+    def _add(entries: Any) -> None:  # an entry is a name or {name: ..., soft/variant: ...}
+        for e in entries if isinstance(entries, list) else ():
+            n = e.get("name") if isinstance(e, dict) else e
+            if isinstance(n, str):
+                names.add(n.strip())
+
+    def _values(node: Any) -> list:
+        return list(node.values()) if isinstance(node, dict) else []
+
+    def _collect(data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        _add(data.get("pins"))
+        _add(data.get("skills"))
+        for g in _values(data.get("groups")):  # _groups.yaml
+            _add(g)
+        for p in _values(data.get("projects")):
+            if isinstance(p, dict):
+                _add(p.get("skills"))
+
+    try:
+        import yaml
+        files = sorted(_manifest_dir().glob("*.yaml"))
+    except Exception as e:
+        logger.debug("Curator could not list harness manifests: %s", e, exc_info=True)
+        return names
+    for f in files:
+        try:
+            _collect(yaml.safe_load(f.read_text(encoding="utf-8")))
+        except Exception as e:
+            logger.debug("Curator could not read harness manifest %s: %s", f, e, exc_info=True)
+    names.discard("")
+    return names
+
+
+def _protected_skills() -> Set[str]:
+    """Skills treated as pinned by every curator pass: cron-referenced + harness-manifest-listed."""
+    return _cron_referenced_skills() | _harness_manifest_skills()
+
+
 def _archive_as_curator(_u, name: str) -> bool:
     """Archive via skill_usage with the ledger actor tagged 'curator', so the ledger entry reads as an autonomous transition, not a foreground call."""
     try:
@@ -269,8 +322,9 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
     stale_cutoff = now - timedelta(days=get_stale_after_days())
     archive_cutoff = now - timedelta(days=get_archive_after_days())
     # Cron-referenced skills are in use by definition (usage only bumps when a
-    # job fires, so paused/rare jobs would age them out). Treat as pinned.
-    protected = _cron_referenced_skills()
+    # job fires, so paused/rare jobs would age them out). Treat as pinned. Same for
+    # skills-harness-manifests entries: archiving one makes skills-harness-sync REFUSE + exit 1.
+    protected = _protected_skills()
     counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0}
 
     def _set(name: str, state: str, key: str) -> None:
@@ -1119,6 +1173,7 @@ def _render_shared_candidate_list() -> str:
     if not dirs:
         return ""
     lines = [f"\nShared (skills-shared/) skills in curator scope ({len(dirs)}):\n"]
+    manifest_listed = _harness_manifest_skills()
     for d in dirs:
         try:
             size = (d / "SKILL.md").stat().st_size
@@ -1126,6 +1181,7 @@ def _render_shared_candidate_list() -> str:
             size = 0
         lines.append(
             f"- {d.name}  source=shared  group={_shared_group_of(d)}  "
+            f"pinned={'yes' if d.name in manifest_listed else 'no'}  "
             f"skill_md_bytes={size}"
         )
     return "\n".join(lines)
@@ -1164,9 +1220,11 @@ def _render_candidate_list() -> str:
     if not rows:
         return "No agent-created skills to review."
     cron_referenced = _cron_referenced_skills()
+    manifest_listed = _harness_manifest_skills()  # shown as pinned=yes: the LLM pass must not archive/absorb them
     return "\n".join([f"Agent-created skills ({len(rows)}):\n"] + [
         f"- {r['name']}  provenance={r.get('provenance', 'agent')}  state={r['state']}  "
-        f"pinned={'yes' if r.get('pinned') else 'no'}  cron={'yes' if r['name'] in cron_referenced else 'no'}  "
+        f"pinned={'yes' if r.get('pinned') or r['name'] in manifest_listed else 'no'}  "
+        f"cron={'yes' if r['name'] in cron_referenced else 'no'}  "
         f"activity={r.get('activity_count', 0)}  use={r.get('use_count', 0)}  view={r.get('view_count', 0)}  "
         f"patches={r.get('patch_count', 0)}  last_activity={r.get('last_activity_at') or 'never'}"
         for r in rows

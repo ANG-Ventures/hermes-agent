@@ -260,7 +260,19 @@ def _curator_consolidation_delete_guard(
     with zero verified consolidations (``consolidated_this_run == 0``), leaving active automations pointing
     at names that no longer resolve. Refuse it; keep the skill active.
     """
-    if not _is_background_review() or (isinstance(absorbed_into, str) and absorbed_into.strip()):
+    if not _is_background_review():
+        return None
+    try:
+        from agent.curator import _harness_manifest_skills
+        if name in _harness_manifest_skills():
+            return _refusal(
+                f"Refusing background curator delete of skill '{name}': it is listed in "
+                f"skills-harness-manifests, and skills-harness-sync fails on a listed name that no longer "
+                f"resolves. Treat it as pinned. Keeping '{name}' active.",
+                _fail_closed=True)
+    except Exception:
+        logger.debug("harness-manifest guard lookup failed for %s", name, exc_info=True)
+    if isinstance(absorbed_into, str) and absorbed_into.strip():
         return None
     return _refusal(
         f"Refusing background curator delete of skill '{name}': the consolidation pass may only "

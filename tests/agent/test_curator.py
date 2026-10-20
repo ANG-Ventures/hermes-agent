@@ -339,6 +339,80 @@ def test_unreferenced_skill_is_still_archived(curator_env, monkeypatch):
     assert usage["orphan"]["state"] == u.STATE_ARCHIVED
 
 
+def _write_harness_manifests(home: Path) -> None:
+    """Real-shaped skills-harness-manifests: a plain name in `skills`, a {name, soft} pin, and a group entry."""
+    mdir = home / "skills-harness-manifests"
+    mdir.mkdir(parents=True, exist_ok=True)
+    (mdir / "claude-code.yaml").write_text(
+        "harness: claude-code\ntarget_dir: ~/.claude/skills\nbudget_chars: 15000\n"
+        "allowed_tiers: [portable]\npins:\n  - {name: pinned-in-manifest, soft: true}\n"
+        "use_groups: [coding-review]\nskills:\n  - listed-in-manifest\n"
+        "projects:\n  topic:\n    target_dir: ~/x\n    skills: [project-listed]\n",
+        encoding="utf-8")
+    (mdir / "_groups.yaml").write_text(
+        "groups:\n  coding-review:\n    - grouped-in-manifest\n    - name: variant-in-manifest\n      variant: portable\n",
+        encoding="utf-8")
+
+
+def test_harness_manifest_skills_parse_every_entry_shape(curator_env):
+    c = curator_env["curator"]
+    _write_harness_manifests(curator_env["home"])
+    assert c._harness_manifest_skills() == {
+        "pinned-in-manifest", "listed-in-manifest", "project-listed",
+        "grouped-in-manifest", "variant-in-manifest"}
+
+
+def test_harness_manifest_skills_missing_dir_is_empty(curator_env):
+    assert curator_env["curator"]._harness_manifest_skills() == set()
+
+
+def test_manifest_listed_skill_survives_inactivity(curator_env, monkeypatch):
+    """t_8dbf7a56: the curator archived github-code-review while 3 harness manifests listed it, so
+    skills-harness-sync REFUSED it ('resolves to 0 directories'), exited 1 and paged #alerts."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    for name in ("listed-in-manifest", "grouped-in-manifest", "orphan"):
+        _write_skill(skills_dir, name)
+        _backdate(u, name, 200)
+    _write_harness_manifests(curator_env["home"])
+    monkeypatch.setattr(c, "_cron_referenced_skills", lambda: set())
+
+    c.apply_automatic_transitions()
+
+    usage = u.load_usage()
+    assert usage["listed-in-manifest"]["state"] == u.STATE_ACTIVE
+    assert usage["grouped-in-manifest"]["state"] == u.STATE_ACTIVE
+    assert (skills_dir / "listed-in-manifest").is_dir()
+    assert usage["orphan"]["state"] == u.STATE_ARCHIVED  # control: protection is not blanket
+
+
+def test_manifest_listed_skill_is_pinned_in_llm_candidate_list(curator_env, monkeypatch):
+    """The LLM consolidation pass must see a manifest-listed skill as pinned=yes (prompt hard rule 3)."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    for name in ("listed-in-manifest", "orphan"):
+        _write_skill(skills_dir, name)
+        u.mark_agent_created(name)
+    _write_harness_manifests(curator_env["home"])
+    monkeypatch.setattr(c, "_cron_referenced_skills", lambda: set())
+
+    rows = {line.split()[1]: line for line in c._render_candidate_list().splitlines() if line.startswith("- ")}
+    assert "pinned=yes" in rows["listed-in-manifest"]
+    assert "pinned=no" in rows["orphan"]
+
+
+def test_background_delete_of_manifest_listed_skill_is_refused(curator_env, monkeypatch):
+    """Even a declared consolidation (absorbed_into=...) may not archive a manifest-listed skill."""
+    from tools import skill_manager_guards as g
+    _write_harness_manifests(curator_env["home"])
+    monkeypatch.setattr(g, "_is_background_review", lambda: True)
+    refused = g._curator_consolidation_delete_guard("grouped-in-manifest", "some-umbrella")
+    assert refused and refused["success"] is False and "skills-harness-manifests" in refused["error"]
+    assert g._curator_consolidation_delete_guard("orphan", "some-umbrella") is None
+
+
 
 
 
