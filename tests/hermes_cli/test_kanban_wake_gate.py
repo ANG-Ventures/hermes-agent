@@ -197,6 +197,44 @@ def test_stale_cpu_baseline_is_dropped_not_averaged(tmp_path):
     assert g.downgrade_reason(None, now=60 + 3 * 3600 + 30).startswith("host cpu 95%")
 
 
+def test_failed_cpu_sample_does_not_refresh_the_baseline_age(tmp_path):
+    """Prism eb61a0216806: a failed read must not stamp an old snapshot as fresh."""
+    state = {"fail": False}
+    snaps = []
+
+    def sampler(prev=None):
+        if state["fail"]:
+            return None, prev           # the real sample_cpu_busy's failure shape
+        snap = object()
+        snaps.append(snap)
+        return (None if prev is None else 0.95), snap
+
+    g = _gate(Load(1), tmp_path, cfg=CPU_CFG, cpu=sampler)
+    g.downgrade_reason(None, now=0)                      # baseline A at t=0
+    state["fail"] = True
+    g.downgrade_reason(None, now=200)                    # failed read; A must keep age 0
+    g.downgrade_reason(None, now=290)                    # failed read again
+    state["fail"] = False
+    # t=400: A is 400 s old (> 300 s window) -> dropped, fail open; not a 400 s average
+    assert g.downgrade_reason(None, now=400) is None
+
+
+def test_raising_cpu_sampler_does_not_refresh_the_baseline_age(tmp_path):
+    state = {"boom": False}
+
+    def sampler(prev=None):
+        if state["boom"]:
+            raise RuntimeError("psutil hiccup")
+        return (None if prev is None else 0.95), object()
+
+    g = _gate(Load(1), tmp_path, cfg=CPU_CFG, cpu=sampler)
+    g.downgrade_reason(None, now=0)
+    state["boom"] = True
+    g.downgrade_reason(None, now=250)
+    state["boom"] = False
+    assert g.downgrade_reason(None, now=400) is None
+
+
 def test_cpu_max_interval_is_configurable(tmp_path):
     cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "cpu_pause": 0.90},
                       "wake_load_gate": {"cpu_max_interval": 30}}}

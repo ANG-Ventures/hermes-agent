@@ -177,11 +177,18 @@ class WakeGate:
                 if (self._cpu_prev_at is not None
                         and now - self._cpu_prev_at > self.cpu_max_interval):
                     self._cpu_prev = None
+                before = self._cpu_prev
                 try:
-                    self.cpu_busy, self._cpu_prev = self._cpu_sampler(self._cpu_prev)
+                    self.cpu_busy, self._cpu_prev = self._cpu_sampler(before)
                 except Exception:
                     self.cpu_busy = None
-                self._cpu_prev_at = now if self._cpu_prev is not None else None
+                # Stamp the baseline only when the sampler handed back a NEW snapshot. A
+                # failed read keeps the old snapshot (or returns it unchanged); stamping it
+                # `now` would let an hours-old baseline pass as fresh (Prism eb61a0216806).
+                if self._cpu_prev is None:
+                    self._cpu_prev_at = None
+                elif self._cpu_prev is not before:
+                    self._cpu_prev_at = now
             self._write_state()
         if self.host_axis == "cpu":
             if self._cpu_saturated():
