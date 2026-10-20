@@ -490,13 +490,17 @@ def test_ac15e_replayed_handoff_on_terminal_entry_writes_nothing(env):
 # --- AC-14: reconciler -----------------------------------------------------------------------
 
 
-def test_reconciler_dead_child_resurfaced_once(env):
+def test_reconciler_dead_child_resurfaced_once(env, caplog):
     tid = _card(env)
     _worker_close(tid)
     entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
     _kill(env, entry)
-    assert asyncio.run(ah.reconcile(env["runner"])) == 1
-    assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    with caplog.at_level("INFO", logger="gateway.kanban_auto_handle"):
+        assert asyncio.run(ah.reconcile(env["runner"])) == 1
+        assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    assert [r.getMessage() for r in caplog.records if " lost reason=" in r.getMessage()] == [
+        f"kanban auto-handle: {tid} lost reason=gateway restart resurfaced delivered=True "
+        f"delegation={entry['delegation_id']}"]
     assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
     assert [s for s in env["adapter"].sent if "auto-handle lost" in s] == [
         f"⚠️ auto-handle lost {tid} (reason: gateway restart)"]
