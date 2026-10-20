@@ -903,7 +903,16 @@ def _canary_control(ctx: Ctx, rep: StepReport) -> str:
     status, served, detail = send_canary(url, token, model)
     rep.commands.append(shown + f"   # HTTP {status} served_by={served}")
     rep.raw.append(f"--- canary\nHTTP {status} served_by={served} {detail}")
-    seat = _norm_seat(served) if served else None
+    _sync_seat(ctx, rep, _norm_seat(served) if served else None, "canary")
+    return token
+
+
+def _sync_seat(ctx: Ctx, rep: StepReport, seat: str | None, what: str) -> None:
+    """Pull a remote seat's wire capture locally (``plan.commands.wirelog_sync``) so the scan can
+    see the request it served. Used for the canary's seat AND the fork's: the pool pins the fork
+    to the parent's seat, which is only known from the ``served_by=`` line, so the lane that
+    drives the harness cannot sync it beforehand (t_b901c171, 2026-10-20: a step-3 run went
+    INCOMPLETE on `sub-vps-9` with the canary green on `sub-19`)."""
     sync = ctx.plan.get("commands", {}).get("wirelog_sync")
     m = re.fullmatch(r"sub-(\d+)", seat or "")
     if sync and m:
@@ -918,12 +927,11 @@ def _canary_control(ctx: Ctx, rep: StepReport) -> str:
             rc, out = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
         except subprocess.TimeoutExpired as exc:
             rc, out = 124, f"wirelog_sync timed out after {budget:.0f}s (BV2_SYNC_TIMEOUT): {exc}"
-        rep.commands.append("$ " + shlex.join(argv) + f"   # exit {rc}")
-        rep.raw.append(f"--- wirelog_sync (exit {rc})\n" + out.strip()[-2000:])
+        rep.commands.append("$ " + shlex.join(argv) + f"   # {what} seat, exit {rc}")
+        rep.raw.append(f"--- wirelog_sync {what} {seat} (exit {rc})\n" + out.strip()[-2000:])
     elif seat and seat != "local":
-        rep.notes.append(f"canary served by `{seat}`: no plan.commands.wirelog_sync, so its record is only "
+        rep.notes.append(f"{what} served by `{seat}`: no plan.commands.wirelog_sync, so its record is only "
                          f"visible after `wirelog-fleet.py sync --sub {seat[4:]}`")
-    return token
 
 
 def step3(ctx: Ctx) -> StepReport:
@@ -948,6 +956,8 @@ def step3(ctx: Ctx) -> StepReport:
     if seat and seat not in {"local", "sub-0", "0"}:
         rep.notes.append(f"served by `{seat}`: its capture is on that box; run `wirelog-fleet.py sync` and "
                          f"point BV2_WIRELOG_DIR at ~/.claude-wirelog-fleet before trusting step 3")
+        if ctx.live:
+            _sync_seat(ctx, rep, _norm_seat(seat), "fork")
 
     # give the box a moment to flush the record (live), then read the window
     t_end = now() + (ctx.slack if ctx.live else 0)
