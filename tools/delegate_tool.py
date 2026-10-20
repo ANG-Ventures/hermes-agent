@@ -30,7 +30,7 @@ from tools.delegate_tool_child_run import (  # noqa: F401
 )
 from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
-    _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
+    _get_detached_background, _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
     _resolve_child_runtime, _resolve_delegation_credentials,
     _subagent_auto_approve, _subagent_auto_deny,
@@ -1463,6 +1463,9 @@ def _apply_output_schema(
                 retry_exc,
             )
         if isinstance(retry_result, dict):
+            # A fork child's continuation is its own evidence only (Prism 1503421f1fa6).
+            from tools.delegate_tool_fork import strip_inherited_from_result
+            retry_result = strip_inherited_from_result(retry_result, getattr(child, "_fork_history", None))
             retry_text = retry_result.get("final_response") or ""
             if retry_text.strip():
                 result["final_response"] = retry_text
@@ -2135,6 +2138,7 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             return _build_child_agent(**{**_call_args, "inherit_mode": "summary", "inherit_context": True})
         _arm_first_request_pin(child, parent_agent, "fork")
+        child._boomerang_fork_log_pending = True   # one `boomerang.fork served_by=…` line
     else:
         _apply_child_cache_ttl(child)
         if not override_provider:
@@ -2675,11 +2679,24 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Child text relay failed: %s", e)
 
+        # Boomerang v2 fork (QA F-1, t_230d37a3): THIS is the live supervisor, not
+        # _ChildRun.await_child, so the first turn must carry the inherited transcript +
+        # the frame turn here too. Only the FIRST turn: late-path follow-ups (schema
+        # correction) continue the child's own conversation via _child_turn(message).
+        from tools.delegate_tool_fork import fork_run_inputs, strip_inherited_from_result
+
+        _first_message, _fork_history = fork_run_inputs(child, goal)
+
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            return _child_turn(goal)
+            # The inherited rows feed the model request only; the returned messages
+            # (tool_trace, output_tail, subagent_stop, late delivery) are the child's own.
+            return strip_inherited_from_result(
+                _child_turn(_first_message, conversation_history=_fork_history),
+                _fork_history,
+            )
 
-        def _child_turn(user_message):
+        def _child_turn(user_message, conversation_history=None):
             # One child turn with the spawn-time bindings. Also the late
             # path's schema-correction turn (it must not run bare).
             # Bind the routing-only send-origin so the child's bare send_message/
@@ -2700,6 +2717,8 @@ def _run_single_child(
                         user_message=user_message,
                         task_id=child_task_id,
                         stream_callback=_relay_child_text,
+                        **({"conversation_history": conversation_history}
+                           if conversation_history is not None else {}),
                     )
             finally:
                 _clear_child_send_origin(_origin_tokens)
@@ -3612,6 +3631,15 @@ def _build_durable_background_spec(
             effective_agent, "openrouter_min_coding_score", None
         ),
         "toolsets": list(parent_toolsets) if parent_toolsets else None,
+        # The DISPATCHING parent's toolsets (``toolsets`` above is child 0's, already role-stripped);
+        # reconstruction prefers these so each task's role is applied by the normal child builder.
+        "parent_toolsets": (list(parent_agent.enabled_toolsets)
+                            if isinstance(getattr(parent_agent, "enabled_toolsets", None), (list, tuple, set))
+                            else None),
+        "parent_disabled_toolsets": (list(parent_agent.disabled_toolsets)
+                                     if isinstance(getattr(parent_agent, "disabled_toolsets", None),
+                                                   (list, tuple, set))
+                                     else None),
         "max_iterations": max_iterations,
         "parent_depth": int(getattr(parent_agent, "_delegate_depth", 0) or 0),
         "max_spawn_depth": _get_max_spawn_depth(),
@@ -3652,13 +3680,18 @@ def _build_durable_background_spec(
 
 def build_recovered_delegation_runner(
     record: Dict[str, Any],
-    continuation: str,
+    continuation: Optional[str],
     parent_agent,
+    source: str = "gateway_recovery",
 ) -> Callable[[], Dict[str, Any]]:
-    """Reconstruct one persisted single/batch unit through ``delegate_task``."""
+    """Reconstruct one persisted single/batch unit through ``delegate_task``. ``continuation`` None = a
+    first run (detached child, docs/dev/delegate-detached-background.md): task contexts stay as dispatched."""
+    session_source = source
     source = record.get("source") or {}
     tasks = copy.deepcopy(source.get("tasks") or [])
     for task in tasks:
+        if continuation is None:
+            break
         original = task.get("context")
         task["context"] = f"{original}\n\n{continuation}" if original else continuation
 
@@ -3669,7 +3702,7 @@ def build_recovered_delegation_runner(
         execution = record.get("execution") or {}
         tokens = set_session_vars(
             platform=str(route.get("platform") or ""),
-            source="gateway_recovery",
+            source=session_source,
             chat_id=str(route.get("chat_id") or ""),
             thread_id=str(route.get("thread_id") or ""),
             user_id=str(route.get("user_id") or ""),
@@ -4077,7 +4110,9 @@ def delegate_task(
     )
 
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list, context, model=creds.get("model"), provider=creds.get("provider"),
+        # A detached child writes the transcripts its dispatch advertised.
+        delegation_id=(_recovery_spec or {}).get("live_delegation_id") or None,
     )
     # Upstream 0cb996d977: announce the batch tag once so interleaved ``[set N · i/n]`` lines
     # from several fan-outs on one console stay attributable.
@@ -4631,6 +4666,22 @@ def delegate_task(
                     "the subagent(s) ran SYNCHRONOUSLY and the result is included above."
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
+        # Detached mode (docs/dev/delegate-detached-background.md): a durable unit runs its children in
+        # its own process so a gateway restart neither kills nor re-runs it. Only on a restart-safe spawn.
+        _detached = None
+        if _durable_spec is not None and _get_detached_background():
+            from tools.delegate_detached import spawn_mode
+
+            if spawn_mode() != "degraded":
+                _durable_spec["execution"]["detached"] = True
+
+                def _on_detached_spawned():
+                    # The gateway-built children never run; close them through the one teardown door.
+                    for _c in _child_agents:
+                        with _quiet("detached: gateway child close failed", exc_info=True):
+                            _teardown(_c, "detached_spawned")
+
+                _detached = {"live_delegation_id": live_deleg_id, "on_spawned": _on_detached_spawned}
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -4648,6 +4699,7 @@ def delegate_task(
             max_async_children=_get_max_async_children(),
             durable_spec=_durable_spec,
             current_boot_id=_gateway_boot_id,
+            detached=_detached,
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
@@ -4698,7 +4750,13 @@ def delegate_task(
             _sids = [
                 getattr(_c, "_subagent_id", None) for _c in _child_agents
             ]
-            if any(isinstance(s, str) and s for s in _sids):
+            if _detached is not None:
+                payload["detached"] = True
+                payload["control_hint"] = (
+                    "This background unit runs in its own process and survives a gateway restart. "
+                    "steer/list are not available for it; /stop still cancels it."
+                )
+            elif any(isinstance(s, str) and s for s in _sids):
                 payload["subagent_ids"] = _sids
                 payload["control_hint"] = (
                     "While a child runs you can orchestrate it live with this "

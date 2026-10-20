@@ -173,6 +173,20 @@ You don't type anything for this — it's the judge's decision, made from the pr
 
 The barrier (pid- or time-based) is persisted with the goal in `SessionDB.state_meta`, so it survives `/resume`. `/goal pause`, `/goal resume`, and `/goal clear` all drop it. If the PID is already dead when the barrier is set (or dies while parked), or the time deadline passes, the barrier clears on the next check — a stale barrier can never wedge the loop.
 
+### Idle wakes: what resumes a parked or quiet goal in a messaging gateway
+
+Process exits and returned subagent results deliver their own turns, which resume the goal. Two cases have no such event, so the gateway polls for them every 15 seconds and, if the session is idle, starts the goal's next turn itself:
+
+- **A timed park whose deadline passed** (`wait_for_seconds`). The goal resumes with its normal continuation prompt.
+- **Background work still running after the check-in interval** (a pid/session park): a check-in that names what the goal is waiting on and asks the agent to read its output, keep waiting if healthy, or fix/stop it if stuck (Claude Code's background-work check-in). Counted against the check-in cap below.
+- **A quiet active goal** (not parked, no continuation queued, e.g. after a judge error or a lost queue entry). The gateway sends a check-in after `goals.checkin_minutes` (30), then after 2x and 4x that interval, at most `goals.max_idle_checkins` (3) times between real events. A real event is any turn the goal loop did not start: a message from you, or a worker/process result. This mirrors Claude Code's `/goal` check-ins (30 min, doubling to 2 h, 3 idle check-ins).
+
+A goal can carry its own interval (`GoalManager.set_checkin_minutes(n)`; `0` = off for that goal), which overrides `goals.checkin_minutes`. Goals idle for more than 6 hours are never woken. Set `goals.checkin_minutes: 0` to turn idle wakes off. The classic CLI has its own idle hook for parked goals.
+
+### No-progress stop
+
+If `goals.no_progress_turns` (4) judged-continue turns in a row make no tool call (the agent is only answering the judge), the goal pauses with a `⏸ Goal paused — … without doing anything` notice. `/goal resume` continues it; `0` disables the check.
+
 Typical flow: the agent pushes a PR, starts a CI watcher with `terminal(background=true, notify_on_complete=true)`, and reports "watching CI." The judge sees the watcher process still running, returns `wait` on its pid, and the loop goes quiet — then picks back up the instant CI finishes and judges the goal against the actual result. Parking a goal on a process marks it `completion_required`, so this completion turn is delivered even in messaging gateways where `display.background_process_agent_notify` (default `off`) suppresses other background exit turns.
 
 ## Behavior details
@@ -231,6 +245,13 @@ goals:
   # /goal resume. Default 20. Lower this if you want tighter loops;
   # raise it for long-running refactors.
   max_turns: 20
+  # Idle wakes for a quiet goal: first check-in after N minutes, then 2x, 4x.
+  # 0 turns idle wakes (and timed-park resumes) off in the gateway.
+  checkin_minutes: 30
+  # Check-ins between real events (a user message or a worker/process result).
+  max_idle_checkins: 3
+  # Pause after this many judged-continue turns in a row with no tool call (0 = off).
+  no_progress_turns: 4
 ```
 
 ### Choosing the judge model

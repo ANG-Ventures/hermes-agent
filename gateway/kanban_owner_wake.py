@@ -79,14 +79,16 @@ SCAN_KINDS = (
     "completed", "review_requested", "skipped_nonspawnable",
 )
 STUCK_KINDS = frozenset({"stalled", "crashed", "gave_up", "timed_out"})
-# Kinds the per-subscription notify+wake path already turns into a wake. A
-# card with such a sub on the owner's chat gets its plain wake from there;
-# this module adds only (d) children-ready and (e) red/dirty PR.
+# Kinds the per-subscription notify+wake path turns into a wake. The owner-wake
+# defers to it only when that wake was DELIVERED into the owner's chat
+# (mark_carried), never on the sub's existence: under host load the contention
+# gate sends the sub's wake as a plain notify, and the block then reached no
+# session (t_156cc147: t_e248dbe7's needs_input block, 2026-10-19 08:52, 1h40m).
 SUB_WAKE_KINDS = frozenset({"blocked", "crashed", "gave_up", "timed_out"})
 # (e) red handback: the notifier's wake carries the red-PR state itself and
 # marks the event (mark_carried); only an uncarried one wakes from here.
 # (d) children-ready rides the notifier's ``completed`` wake the same way.
-CARRIED_KINDS = frozenset({"review_requested", "completed"})
+CARRIED_KINDS = frozenset({"review_requested", "completed"}) | SUB_WAKE_KINDS
 
 TRIGGER_NEEDS_INPUT = "needs_input"
 TRIGGER_PRECONDITION = "blocked_precondition"
@@ -920,50 +922,14 @@ def is_chat_origin(entry: Any) -> bool:
     return plat.lower() not in _NON_CHAT_PLATFORMS
 
 
-def has_wake_sub(kb: Any, board: str, task_id: str, origin: Any, profile: str) -> bool:
-    """A notify+wake / wake sub already wakes the OWNER's session for this card.
-
-    Only a sub that positively names the owner (same platform, chat, thread,
-    participant and notifier profile) counts. A sub naming another participant
-    wakes that participant's session, and an identity-less sub resolves at wake
-    time; neither proves the owner was woken, so the owner wake stays (a
-    duplicate turn is the safe failure, a lost one is not)."""
-    try:
-        conn = kb.connect_readonly(board=board)
-    except Exception:
-        return False
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            "SELECT * FROM kanban_notify_subs WHERE task_id = ?",
-            (task_id,),
-        ).fetchall()
-    except Exception:
-        return False
-    finally:
-        conn.close()
-    def _s(v: Any) -> str:
-        return str(v or "").strip()
-
-    plat = _s(getattr(getattr(origin, "platform", None), "value", "")).lower()
-    chat = _s(getattr(origin, "chat_id", ""))
-    thread = _s(getattr(origin, "thread_id", ""))
-    if thread == chat:
-        thread = ""
-    who = {_s(getattr(origin, "user_id", "")), _s(getattr(origin, "user_id_alt", ""))} - {""}
-    for r in rows:
-        r = dict(r)
-        if _s(r.get("delivery_mode")) not in ("notify+wake", "wake"):
-            continue
-        sub_thread = _s(r.get("thread_id"))
-        if sub_thread == chat:
-            sub_thread = ""
-        sub_who = {_s(r.get("user_id")), _s(r.get("user_id_alt"))} - {""}
-        if (_s(r.get("platform")).lower() == plat and _s(r.get("chat_id")) == chat
-                and sub_thread == thread and sub_who and sub_who & who
-                and (_s(r.get("notifier_profile")) or "default") == (profile or "default")):
-            return True
-    return False
+def _log_needs_input_cut(key: str, before: list[dict], after: list[dict], why: str) -> None:
+    """INFO line for each needs_input item a stage removes (t_156cc147: the 08:52 drop left no line)."""
+    kept = {id(i) for i in after}
+    ids = [i.get("event_id") for i in before
+           if i.get("trigger") == TRIGGER_NEEDS_INPUT and id(i) not in kept]
+    if ids:
+        logger.info("kanban owner-wake: needs_input event(s) %s of %s dropped without an owner-wake turn: %s",
+                    ",".join(str(x) for x in ids), key, why)
 
 
 def mark_carried(runner: Any, board: str, task_id: str, event_ids: Iterable[int],
@@ -971,10 +937,11 @@ def mark_carried(runner: Any, board: str, task_id: str, event_ids: Iterable[int]
                  now: Optional[float] = None, who: Iterable[Any] = (),
                  profile: Any = "") -> None:
     """t_b1d26df7: the notifier's DELIVERED wake into this chat already carried the
-    red-PR state (or, t_f3323c8a, the ready children) of these events, so the
-    owner-wake must not wake that chat again. ``who``/``profile`` are the sub's
-    participant ids and notifier profile: the same proof :func:`has_wake_sub` asks
-    for, kept here because a terminal ``completed`` unsubscribes the sub before the
+    red-PR state (or, t_f3323c8a, the ready children; t_156cc147, a block or stuck
+    wake) of these events, so the owner-wake must not wake that chat again.
+    ``who``/``profile`` are the sub's participant ids and notifier profile (same
+    platform, chat, thread, participant and profile must match the owner), kept
+    here because a terminal ``completed`` unsubscribes the sub before the
     owner-wake runs. In-memory: a restart loses it (cost: one duplicate turn)."""
     now = time.time() if now is None else now
     seen = getattr(runner, "_kanban_red_carried", None)
@@ -1132,6 +1099,9 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         pr_health = default_pr_health()
     await asyncio.to_thread(scan, state, now, pr_health)
 
+    from gateway import kanban_auto_handle as _ah
+
+    auto_on = _ah.enabled()
     store = getattr(runner, "session_store", None)
     by_session: dict[str, tuple[Any, list[tuple[str, dict]]]] = {}
     for key, card in list(state.pending.items()):
@@ -1181,6 +1151,10 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         owner_profile = str(getattr(getattr(entry, "origin", None), "profile", None)
                             or active or "default")
         if entry is None or not is_chat_origin(entry) or owner_profile not in profiles:
+            why = ("no live session-store entry for home " + repr(card["home_sid"]) if entry is None
+                   else "home is not a chat origin" if not is_chat_origin(entry)
+                   else f"owner profile {owner_profile!r} is not an operator profile")
+            _log_needs_input_cut(key, card["items"], [], why)
             logger.debug("kanban owner-wake: %s has no live operator home here; line only", key)
             state.pending.pop(key, None)
             continue
@@ -1190,6 +1164,7 @@ async def tick(runner: Any, *, now: Optional[float] = None,
         items = [i for i in card["items"]
                  if i.get("trigger") in _ns.NEVER_SUPPRESS_TRIGGERS
                  or not (i.get("actor_sid") and i["actor_sid"] in own)]
+        _log_needs_input_cut(key, card["items"], items, "made by the owner session itself")
         # t_4c7da648: the shared redundancy predicate (operator profile / closer
         # after the operator's APPROVE). Protected triggers never drop here.
         if items:
@@ -1198,18 +1173,20 @@ async def tick(runner: Any, *, now: Optional[float] = None,
                 suppress_cfgs[owner_profile] = await asyncio.to_thread(
                     _ns.resolve_config, _owner_home(runner, entry, owner_profile))
             if suppress_cfgs[owner_profile].enabled:
+                before = items
                 items = await asyncio.to_thread(
                     _drop_redundant, kb, card, items, own, owner_profile, suppress_cfgs[owner_profile])
-        # t_b1d26df7 / t_f3323c8a W8c: a red handback or a children-ready close
-        # the notifier's wake already carried into the owner's session (same
-        # event id, delivered) is one wake, not two.
+                _log_needs_input_cut(key, before, items, "redundant (notify_suppressed receipt)")
+        # t_b1d26df7 / t_f3323c8a W8c / t_156cc147: an event the notifier's wake
+        # already DELIVERED into the owner's session (same event id, marked by
+        # mark_carried) is one wake, not two. A sub whose wake the contention gate
+        # sent as a notify marks nothing, so the owner-wake still fires for it.
+        before = items
         items = [i for i in items
                  if not (i["kind"] in CARRIED_KINDS
                          and is_carried(runner, card["board"], card["task_id"], i["event_id"],
                                         entry.origin, owner_profile))]
-        if items and await asyncio.to_thread(has_wake_sub, kb, card["board"], card["task_id"],
-                                             entry.origin, owner_profile):
-            items = [i for i in items if i["kind"] not in SUB_WAKE_KINDS]
+        _log_needs_input_cut(key, before, items, "the notifier's delivered wake carried it")
         # S5 (t_4f6afb67): a red handback the owner cannot act on is a ledger row.
         if items and any(i.get("trigger") == TRIGGER_RED_HANDBACK for i in items):
             if owner_profile not in suppress_cfgs:
@@ -1225,6 +1202,12 @@ async def tick(runner: Any, *, now: Optional[float] = None,
             # Same kill switch as the notifier's terminal-pending branch (``_s5``).
             if suppress_cfgs[owner_profile].enabled and suppress_cfgs[owner_profile].actionable_only:
                 items = await asyncio.to_thread(terminal_pending_items, kb, card, items, current.get("status"))
+        # Boomerang v2 P3b (spec §5.5), AFTER the suppressor: an auto-handled item is a
+        # child's, not a turn; one the notifier already claimed is skipped here.
+        if items:
+            before = items
+            items = await _ah.owner_wake_filter(runner, card, items, entry, dispatch_on=auto_on)
+            _log_needs_input_cut(key, before, items, "an auto-handle claim owns it")
         if not items:
             state.pending.pop(key, None)
             continue

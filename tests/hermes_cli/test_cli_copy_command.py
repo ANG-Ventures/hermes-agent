@@ -2,7 +2,19 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cli import HermesCLI
+
+
+@pytest.fixture(autouse=True)
+def _local_shell(monkeypatch):
+    """/copy routes to OSC 52 instead of the native clipboard inside an SSH session, so the
+    native-path tests below are only meaningful in a LOCAL shell. Pin that, or the suite goes
+    red whenever it runs over SSH (off-box CI receipts do). The two remote/local tests at the
+    bottom patch is_remote_shell_session themselves and override this."""
+    for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
+        monkeypatch.delenv(var, raising=False)
 
 
 def _make_cli() -> HermesCLI:

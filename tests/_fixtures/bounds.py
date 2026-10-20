@@ -420,6 +420,8 @@ def _apply_process_rlimit() -> str | None:
         # measured on 26.7); only the per-test RSS watchdog bounds memory there.
         return f"{sys.platform} cannot lower RLIMIT_AS"
     cap = int(gib * _GIB)
+    # Before the early return: a child pytest inherits the parent's soft cap and still needs it.
+    _bound_malloc_arenas()
     soft, hard = resource.getrlimit(resource.RLIMIT_AS)
     if soft != resource.RLIM_INFINITY and soft <= cap:
         return None
@@ -431,6 +433,28 @@ def _apply_process_rlimit() -> str | None:
     _RLIMIT_AS_SAVED = (soft, hard)
     _exempt_browser_children()
     return None
+
+
+# glibc gives each new thread its own malloc arena, up to 8 x ncpu, and every arena reserves
+# a 64 MiB heap of ADDRESS SPACE up front. On a 128-core host (ci-box: limit 1024 arenas) a
+# test process with ~100 threads (plugin loaders, env-probe, executors) reserves ~6 GiB
+# while its RSS is under 200 MiB: measured 2026-10-19, VmSize pinned at 6.00 GiB under the
+# cap above, then "can't start new thread", "failed to map segment from shared object", and
+# a SIGABRT core dump (t_485afb24). Uncapped, the same test peaked at 8.86 GiB VmSize. A
+# Mac or a 32-core box never got near the cap, which is why it only failed off-box. Capping
+# the arena count keeps the address-space ceiling about memory the test USES. 8 arenas,
+# not 1: threads still spread across arenas, so lock contention barely changes.
+_MALLOC_ARENA_MAX = 8
+_M_ARENA_MAX = -8  # glibc <malloc.h>
+
+
+def _bound_malloc_arenas() -> None:
+    try:
+        libc = ctypes.CDLL(None)
+        mallopt = libc.mallopt
+    except (OSError, AttributeError):  # not glibc (musl has no per-thread arenas)
+        return
+    mallopt(_M_ARENA_MAX, _MALLOC_ARENA_MAX)
 
 
 # A soft RLIMIT_AS is inherited across fork/exec. Chromium reserves far more address space

@@ -1487,30 +1487,27 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         return True
 
     def _handle_boomerang_command(self, cmd_original: str) -> bool:
-        """/boomerang <task>: queue a boomerang skill invocation as the next agent turn. The skill
-        drives delegate_task(inherit_context=true, ...) with the autonomous-execution contract; the
-        child's summary re-enters the session when it finishes."""
+        """/boomerang [--summary|--fork|--branch] <task>: queue a boomerang skill invocation as the
+        next agent turn. Default inherit_mode is fork (D-1); the child's summary re-enters the
+        session when it finishes."""
+        from hermes_cli.boomerang_command import USAGE, build_boomerang_seed, parse_boomerang_args
         parts = cmd_original.split(None, 1)
-        payload = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            mode, payload = parse_boomerang_args(parts[1] if len(parts) > 1 else "")
+        except ValueError as _boom_arg_exc:
+            _cprint(f"  {_boom_arg_exc}")
+            return True
         if not payload:
-            _cprint("  Usage: /boomerang <task>")
-            _cprint("  Runs the task autonomously in an isolated subagent that "
-                    "inherits this session's context; a summary returns when done.")
+            for _line in USAGE.splitlines():
+                _cprint(f"  {_line}")
             return True
         try:
             from agent.skill_commands import resolve_skill_command_key
             cmd_key = resolve_skill_command_key("boomerang")
-            seed = build_skill_invocation_message(cmd_key, payload) if cmd_key else None
-            if not seed:
-                seed = (
-                    f"Boomerang this task: {payload}\n\n"
-                    "Use delegate_task with inherit_context=true so the subagent "
-                    "inherits this conversation's context. Instruct it to execute "
-                    "autonomously (reasonable assumptions, do NOT stop to ask; if "
-                    "blocked, complete what you can and report the blocker) and end "
-                    "with a structured summary (Outcome / Changed / Commands+validation "
-                    "/ Blockers). Its summary re-enters this session when it finishes."
-                )
+            seed = build_boomerang_seed(
+                mode, payload,
+                lambda instr: build_skill_invocation_message(cmd_key, instr) if cmd_key else None,
+            )
             self._pending_agent_seed = seed
             _cprint("  🔁 Boomerang queued — the subagent inherits this session; a summary returns when it finishes.")
         except Exception as _boom_exc:

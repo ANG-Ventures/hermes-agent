@@ -12,12 +12,22 @@ double carrying exactly the attributes it reads) over a REAL background
 dispatch, and assert on the completion event that lands on the shared queue.
 
 Contrast with an explicit ``/stop``: that goes through
-``async_delegation.interrupt_for_session`` and IS terminal by design. The last
-test pins that asymmetry so a future change can't quietly collapse the two.
+``async_delegation.interrupt_for_session`` and IS terminal by design. The
+stop tests pin that asymmetry so a future change can't quietly collapse the two.
+
+The first three tests pin the in-gateway thread path (``delegation.
+detached_background`` off). The ``detached`` tests pin the same three
+contracts on the default detached path (docs/dev/delegate-detached-background.md),
+where the unit runs in its own process: the child here is a real detached OS
+process standing in for ``python -m tools.delegate_detached`` (it writes the
+job's ``result.json``); no agent is built.
 """
 
 import json
+import subprocess
+import sys
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -136,6 +146,8 @@ def _patch_delegate(monkeypatch, child_body):
     monkeypatch.setattr(dt, "_build_child_agent", _registering_build_child)
     monkeypatch.setattr(dt, "_run_single_child", child_body)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    # ``child_body`` runs in THIS process: pin the in-gateway thread path.
+    monkeypatch.setattr(dt, "_get_detached_background", lambda: False)
     return dt
 
 
@@ -345,3 +357,167 @@ def test_explicit_stop_still_cancels_the_background_batch(monkeypatch):
     )
     cancelled.set()
     assert n == 1, "explicit /stop must still reach the background batch"
+
+
+# ── The same contracts on the detached path (the default) ───────────────────
+
+_FAKE_CHILD = r'''
+import json, os, pathlib, signal, sys, time
+job = pathlib.Path(sys.argv[1]); n = int(sys.argv[2])
+def write(status, summary):
+    body = {"schema_version": int(sys.argv[3]), "total_duration_seconds": 0.1, "results": [
+        {"task_index": i, "status": status, "summary": summary(i), "api_calls": 1,
+         "duration_seconds": 0.1, "model": "m", "exit_reason": status} for i in range(n)]}
+    tmp = job / ".r"; tmp.write_text(json.dumps(body)); os.replace(tmp, job / "result.json")
+def on_term(*_):
+    (job / "sigterm").write_text("1")
+    write("interrupted", lambda i: None)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, on_term)
+(job / "started").write_text(str(os.getpid()))
+deadline = time.time() + 60
+while not (job / "release").exists() and time.time() < deadline:
+    time.sleep(0.05)
+write("completed", lambda i: f"detached-done-{i}")
+'''
+
+
+@pytest.fixture
+def detached_child(monkeypatch):
+    """Route the detached spawn to a real detached process running ``_FAKE_CHILD``."""
+    from tools import delegate_detached as dd
+
+    box = {"procs": []}
+
+    def fake_spawn(*, record, attempt_id, profile_home, continuation, live_delegation_id):
+        job_dir = dd.job_dir_for(profile_home, attempt_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        n = len((record.get("source") or {}).get("tasks") or [])
+        proc = subprocess.Popen([sys.executable, "-c", _FAKE_CHILD, str(job_dir), str(n), str(dd.SCHEMA_VERSION)],
+                                start_new_session=True)
+        box["procs"].append(proc)
+        box["job_dir"] = job_dir
+        return dd.DetachedSpawn(job_dir, proc.pid, dd.process_create_time(proc.pid), proc)
+
+    monkeypatch.setattr(dd, "spawn_child", fake_spawn)
+    monkeypatch.setattr(dd, "spawn_mode", lambda: "in_process")
+
+    def wait_started(timeout=20.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            job_dir = box.get("job_dir")
+            if job_dir is not None and (job_dir / "started").exists():
+                return job_dir
+            time.sleep(0.05)
+        raise AssertionError("detached child never started")
+
+    box["wait_started"] = wait_started
+    yield box
+    for proc in box["procs"]:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def _patch_detached_delegate(monkeypatch):
+    """The gateway side of a detached dispatch: children are built (then closed), never run here."""
+    dt = _patch_delegate(monkeypatch, lambda *a, **k: pytest.fail("a detached unit must not run in-process"))
+    monkeypatch.setattr(dt, "_get_detached_background", lambda: True)
+    return dt
+
+
+def _drain_for(delegation_id, timeout=30.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            evt = process_registry.completion_queue.get(timeout=0.2)
+        except Exception:
+            continue
+        if evt.get("delegation_id") == delegation_id and evt.get("type") == "async_delegation":
+            return evt
+    raise AssertionError(f"no completion for {delegation_id}")
+
+
+def test_detached_child_survives_mid_turn_interrupt_and_delivers(monkeypatch, detached_child):
+    import run_agent
+
+    dt = _patch_detached_delegate(monkeypatch)
+    _bind_tui_session()
+    parent = _interruptible_parent()
+
+    out = json.loads(dt.delegate_task(
+        goal="long background job", context="ctx", background=True, parent_agent=parent,
+    ))
+    assert out["status"] == "dispatched", out
+    assert out.get("detached") is True, out
+    job_dir = detached_child["wait_started"]()
+    with parent._active_children_lock:
+        assert parent._active_children == []
+
+    run_agent.AIAgent.interrupt(parent, "wait, also check the other thing")
+    assert parent._interrupt_requested is True
+    time.sleep(0.5)
+    child = detached_child["procs"][0]
+    assert child.poll() is None, "a turn interrupt must not reach the detached child"
+    assert not (job_dir / "sigterm").exists()
+
+    (job_dir / "release").write_text("1")
+    evt = _drain_for(out["delegation_id"])
+    assert evt["status"] == "completed", evt
+    assert [r["summary"] for r in evt.get("results") or []] == ["detached-done-0"], evt
+
+
+def test_detached_batch_runs_with_parent_interrupt_already_set(monkeypatch, detached_child):
+    import run_agent
+
+    dt = _patch_detached_delegate(monkeypatch)
+    _bind_tui_session()
+    parent = _interruptible_parent()
+    run_agent.AIAgent.interrupt(parent, "another message")
+    assert parent._interrupt_requested is True
+
+    out = json.loads(dt.delegate_task(
+        tasks=[{"goal": "first background task to run in parallel"},
+               {"goal": "second background task to run in parallel"}],
+        context="ctx", background=True, parent_agent=parent,
+    ))
+    assert out["status"] == "dispatched", out
+    job_dir = detached_child["wait_started"]()
+    (job_dir / "release").write_text("1")
+
+    evt = _drain_for(out["delegation_id"])
+    results = evt.get("results") or []
+    assert [r["status"] for r in results] == ["completed", "completed"], evt
+    assert not (job_dir / "sigterm").exists()
+
+
+def test_explicit_stop_signals_the_detached_childs_process_group(monkeypatch, detached_child):
+    from tools import async_delegation
+
+    dt = _patch_detached_delegate(monkeypatch)
+    _bind_tui_session(session_key="stop-detached-sess")
+    parent = _interruptible_parent()
+    parent.session_id = "stop-detached-sess"
+
+    out = json.loads(dt.delegate_task(
+        goal="cancel me: a detached background job the operator stops", context="ctx",
+        background=True, parent_agent=parent,
+    ))
+    assert out["status"] == "dispatched", out
+    job_dir = detached_child["wait_started"]()
+    child = detached_child["procs"][0]
+    # The supervisor installs the process-group cancel right after the spawn returns.
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        rec = async_delegation._records.get(out["delegation_id"]) or {}
+        if rec.get("detached_unit"):
+            break
+        time.sleep(0.05)
+    assert rec.get("detached_unit"), rec
+
+    n = async_delegation.interrupt_for_session(
+        session_key="stop-detached-sess", parent_session_id="stop-detached-sess", reason="stop_command")
+
+    assert n == 1, "explicit /stop must reach the detached unit"
+    assert child.wait(timeout=20) == 0
+    assert (job_dir / "sigterm").exists(), "/stop must SIGTERM the child's process group"

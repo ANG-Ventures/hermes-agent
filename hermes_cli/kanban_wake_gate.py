@@ -34,6 +34,13 @@ host load counts only while the dispatcher's own LoadGate is ``proc_paused``
 (read from ``load_gate.json``); the lane-headroom probe still applies. The
 notifier then DEFERS such a downgrade (``gateway.kanban_wake_defer``) instead
 of dropping it.
+
+2026-10-18 (t_0e52c7ab, Ace 22:22): "overloaded" is measured, not load1. The
+Studio ran load1 166-180 with CPU 53 % idle (a run queue of short-lived
+processes), and the load band silenced every advisor completion wake. The host
+half now reads CPU busy from ``cpu_times()`` tick deltas, the dispatcher's own
+axis (``sample_cpu_busy``), and trips at the dispatcher's ``cpu_pause`` (0.90).
+``kanban.wake_load_gate.host_axis: load1`` restores the load band (kill switch).
 """
 
 from __future__ import annotations
@@ -46,12 +53,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
-from hermes_cli.kanban_load_gate import LoadGate, _denom
+from hermes_cli.kanban_load_gate import LoadGate, _denom, sample_cpu_busy
 
 _log = logging.getLogger(__name__)
 
 STATE_FILENAME = "wake_gate.json"
 DEFAULT_SAMPLE_SECONDS = 15.0
+DEFAULT_CPU_PAUSE = 0.90
+DEFAULT_CPU_MAX_INTERVAL = 300.0  # seconds; an older CPU baseline is not "now"
+HOST_AXES = ("cpu", "load1")
 LANE_CACHE_SECONDS = 60.0
 
 
@@ -69,6 +79,9 @@ def _merged_cfg(config: Optional[dict]) -> dict:
         "load5_floor": own.get("load5_floor", dispatch.get("load5_floor", True)),
         "lane_headroom": own.get("lane_headroom", True),
         "sample_seconds": own.get("sample_seconds", DEFAULT_SAMPLE_SECONDS),
+        "host_axis": own.get("host_axis", "cpu"),
+        "cpu_pause": own.get("cpu_pause") or dispatch.get("cpu_pause") or DEFAULT_CPU_PAUSE,
+        "cpu_max_interval": own.get("cpu_max_interval", DEFAULT_CPU_MAX_INTERVAL),
     }
     return merged
 
@@ -82,6 +95,7 @@ class WakeGate:
         *,
         ncpu: Optional[int] = None,
         loadavg: Callable[[], tuple] = os.getloadavg,
+        cpu_sampler: Callable = sample_cpu_busy,
         lane_probe: Optional[Callable[[str], Optional[str]]] = None,
         dispatcher_state: Optional[Callable[[], Optional[dict]]] = None,
         state_file: Optional[Path] = None,
@@ -90,10 +104,29 @@ class WakeGate:
         self.enabled = bool(cfg["enabled"])
         self.host_gate = self.enabled and cfg["pause_above"] is not None
         self.lane_headroom = bool(cfg["lane_headroom"])
+        axis = str(cfg["host_axis"]).strip().lower()
+        self.host_axis = axis if axis in HOST_AXES else "cpu"
+        try:
+            self.cpu_pause = float(cfg["cpu_pause"])
+        except (TypeError, ValueError):
+            self.cpu_pause = DEFAULT_CPU_PAUSE
+        self._cpu_sampler = cpu_sampler
+        self._cpu_prev = None
+        self._cpu_prev_at: Optional[float] = None
+        try:
+            self.cpu_max_interval = max(1.0, float(cfg["cpu_max_interval"]))
+        except (TypeError, ValueError):
+            self.cpu_max_interval = DEFAULT_CPU_MAX_INTERVAL
+        self.cpu_busy: Optional[float] = None
         try:
             self.sample_seconds = max(0.0, float(cfg["sample_seconds"]))
         except (TypeError, ValueError):
             self.sample_seconds = DEFAULT_SAMPLE_SECONDS
+        # A baseline is only refreshed once per sample_seconds, so a max interval
+        # shorter than that (plus a poll's slack) expires EVERY baseline before the
+        # next sample can use it and the CPU axis never trips (Prism 6360f05606ba).
+        # Floor it at twice the sampling cadence.
+        self.cpu_max_interval = max(self.cpu_max_interval, 2.0 * self.sample_seconds)
         self._gate = LoadGate(
             {
                 "enabled": self.host_gate,
@@ -123,7 +156,12 @@ class WakeGate:
 
     # -- host load ---------------------------------------------------------
     def host_contended(self, now: Optional[float] = None) -> Optional[str]:
-        """``"host load 71"`` while the load band is tripped, else None."""
+        """``"host cpu 95% busy (load1 172)"`` while the CPU is saturated, else None.
+
+        ``host_axis: load1`` (kill switch) answers ``"host load 71"`` from the
+        load band instead. On the cpu axis an unreadable CPU sample (no psutil,
+        first sample, empty interval) is not evidence of contention.
+        """
         if not self.host_gate:
             return None
         now = time.monotonic() if now is None else float(now)
@@ -136,11 +174,39 @@ class WakeGate:
             self._sampled_at = now
             if self.load1 is not None:
                 self._gate.update(self.load1, self.load5)
+            if self.host_axis == "cpu":
+                # Busy is an average over [prev, now]. Wakes can be hours apart, and an
+                # hours-long average says nothing about the CPU right now: a baseline
+                # older than cpu_max_interval is dropped and this sample fails open
+                # toward WAKE (the next event inside the window reads a fresh delta).
+                if (self._cpu_prev_at is not None
+                        and now - self._cpu_prev_at > self.cpu_max_interval):
+                    self._cpu_prev = None
+                before = self._cpu_prev
+                try:
+                    self.cpu_busy, self._cpu_prev = self._cpu_sampler(before)
+                except Exception:
+                    self.cpu_busy = None
+                # Stamp the baseline only when the sampler handed back a NEW snapshot. A
+                # failed read keeps the old snapshot (or returns it unchanged); stamping it
+                # `now` would let an hours-old baseline pass as fresh (Prism eb61a0216806).
+                if self._cpu_prev is None:
+                    self._cpu_prev_at = None
+                elif self._cpu_prev is not before:
+                    self._cpu_prev_at = now
             self._write_state()
+        if self.host_axis == "cpu":
+            if self._cpu_saturated():
+                load = f" (load1 {self.load1:.0f})" if self.load1 is not None else ""
+                return f"host cpu {self.cpu_busy * 100:.0f}% busy{load}"
+            return None
         if self._gate.paused:
             shown = self.load1 if self.load1 is not None else self.pause_above
             return f"host load {shown:.0f}"
         return None
+
+    def _cpu_saturated(self) -> bool:
+        return self.cpu_busy is not None and self.cpu_busy >= self.cpu_pause
 
     # -- lane headroom -----------------------------------------------------
     def lane_contended(self, profile: Optional[str], now: Optional[float] = None) -> Optional[str]:
@@ -189,9 +255,17 @@ class WakeGate:
 
     # -- observability -----------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
-        mode = "off" if not self.host_gate else ("notify" if self._gate.paused else "wake")
+        if not self.host_gate:
+            mode = "off"
+        elif self.host_axis == "cpu":
+            mode = "notify" if self._cpu_saturated() else "wake"
+        else:
+            mode = "notify" if self._gate.paused else "wake"
         return {
             "mode": mode,
+            "host_axis": self.host_axis,
+            "cpu_busy": self.cpu_busy,
+            "cpu_pause": self.cpu_pause,
             "load1": self.load1,
             "load5": self.load5,
             "pause_above": self.pause_above,
@@ -221,9 +295,10 @@ class WakeGate:
         if snap["mode"] != self._last_written:
             if self._last_written is not None:
                 _log.info(
-                    "kanban wake gate: mode %s -> %s (load1=%s, pause_above=%.0f, "
-                    "resume_below=%.0f; load %s tasks / %s)",
-                    self._last_written, snap["mode"], snap["load1"],
+                    "kanban wake gate: mode %s -> %s (axis=%s, cpu_busy=%s, cpu_pause=%.2f, "
+                    "load1=%s, pause_above=%.0f, resume_below=%.0f; load %s tasks / %s)",
+                    self._last_written, snap["mode"], self.host_axis, snap["cpu_busy"],
+                    self.cpu_pause, snap["load1"],
                     self.pause_above, self.resume_below, snap["load1"], _denom(self._gate.ncpu),
                 )
             self._last_written = snap["mode"]

@@ -127,6 +127,10 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
         return out
     out["gate"] = gate
     load1, load5 = _klg.sample_loadavg()
+    if gate.enabled and gate.admission == "utilization":
+        # t_da6f84f7: the SAME predicate as the gateway tick (admission.admit over cpu_busy / memory / procs,
+        # measured-estimate leases, the host's kanban ceiling); load1 is printed, never read
+        return _cli_utilization_gate(conn, args, gate, out, emit, load1)
     if not gate.enabled or load1 is None:
         out["info"] = {"state": "disabled" if not gate.enabled else "unavailable"}
         return out
@@ -144,10 +148,13 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
     # has no previous sample, so take a 0.25 s one.
     cpu_busy, _ = _klg.sample_cpu_busy(None, block=0.25)
     procs, proc_limit = _klg.sample_user_procs()
+    ecore = None
+    if gate.enabled and gate.ecore_gate != "off":   # the same E-core leg as admit_now (Prism 3b7cbf596c2e)
+        ecore, _ = _klg.sample_ecore_busy(_klg.ecore_cpu_indices(), None, block=0.25)
     allowance, reason = gate.admit(
         load1, load5=load5, cpu_busy=cpu_busy,
         running=_klg.count_running_workers(),
-        procs=procs, proc_limit=proc_limit,
+        procs=procs, proc_limit=proc_limit, ecore_busy=ecore,
     )
     info = gate.snapshot()
     info.pop("boards", None)
@@ -191,6 +198,83 @@ def _one_shot_load_gate(conn, args, config, additive, defer=False):
         f"allowance={allowance} (pause_above={gate.pause_above:.1f}, "
         f"max_spawn_per_tick={gate.max_spawn_per_tick}; load {load1:.1f} tasks / {_klg._denom(gate.ncpu)})"
     )
+    if allowance is not None and (additive is None or allowance < additive):
+        out["spawn_limit"] = allowance
+        out["limit_source"] = "load gate allowance"
+    return out
+
+
+def _recent_local_starts(since: float) -> list:
+    """``started_at`` of every run started at/after ``since`` on ANY live board of
+    this host that did NOT run on a pool host (no worker_placed event; Prism
+    9f811a3f59ff). Cross-board, like the running count: another board's spawn
+    is the same load on this host (Prism d88c700fe427). Each DB file once; an
+    unreadable board contributes nothing (its running count reads unknown)."""
+    from gateway.kanban_gate_tick import live_boards
+    from hermes_cli import kanban_worker_pool as _kwp
+
+    out, seen = [], set()
+    for meta in kb.enumerating_each(live_boards()):
+        slug = (meta.get("slug") if isinstance(meta, dict) else None) or kb.DEFAULT_BOARD
+        try:
+            path = str(kb.kanban_db_path(slug).expanduser().resolve())
+            if path in seen:
+                continue
+            seen.add(path)
+            with kbc.connect_closing(board=slug) as bconn:
+                out.extend(float(r[0]) for r in bconn.execute(
+                    "SELECT r.started_at FROM task_runs r WHERE r.started_at >= ? AND NOT EXISTS ("
+                    "SELECT 1 FROM task_events e WHERE e.run_id = r.id AND e.kind = ?)",
+                    (int(since), _kwp.PLACED_EVENT)).fetchall())
+        except Exception:
+            continue
+    return out
+
+
+def _cli_utilization_gate(conn, args, gate, out, emit, load1):
+    """``kanban.admission: utilization`` for the one-shot CLI: the gateway's
+    utilization admit() with a 0.25 s cpu_busy sample, every board's LOCAL run
+    starts inside admission.DEFAULT_SETTLE_S booked as leases, and the LOCAL
+    running count from the gateway's all-board snapshot (count_running_by_placement
+    + running_split: every board's remote placements out of every board's total)
+    under the host's kanban ceiling."""
+    from gateway.kanban_gate_tick import live_boards, running_split
+    from hermes_cli import admission as _ad
+    from hermes_cli import kanban_load_gate as _klg
+
+    now_wall, now_mono = time.time(), time.monotonic()
+    running = None
+    try:
+        for started in _recent_local_starts(now_wall - _ad.DEFAULT_SETTLE_S):
+            gate.record_spawns(1, now=now_mono - max(0.0, now_wall - started))
+        running, _remote = running_split(kb.count_running_by_placement(live_boards()))
+    except Exception:
+        running = None
+    cpu_busy, _ = _klg.sample_cpu_busy(None, block=0.25)
+    procs, proc_limit = _klg.sample_user_procs()
+    allowance, reason = gate.admit(
+        load1 if load1 is not None else 0.0, cpu_busy=cpu_busy, running=running,
+        procs=procs, proc_limit=proc_limit, now=now_mono,
+    )
+    info = gate.snapshot()
+    info.pop("boards", None)
+    out["info"] = info
+    l1 = "?" if load1 is None else f"{load1:.1f}"
+    busy = "?" if cpu_busy is None else f"{cpu_busy:.2f}"
+    if getattr(args, "ignore_load_gate", False):
+        out["override"] = {"source": "cli dispatch --ignore-load-gate", "admission": "utilization",
+                           "cpu_busy": cpu_busy, "gate_state": gate.state, "gate_allowance": allowance}
+        emit(f"Load gate: utilization OVERRIDE (--ignore-load-gate; would have allowed {allowance}; cpu_busy={busy})")
+        return out
+    if reason:
+        emit(f"Load gate: utilization SATURATED cpu_busy={busy} (load {l1} not read) - spawning 0 this call: {reason}")
+        out["spawn_paused"] = reason
+        out["spawn_limit"] = 0
+        out["limit_source"] = "load gate"
+        return out
+    emit(f"Load gate: utilization admitting cpu_busy={busy} allowance={allowance} "
+         f"(need {gate.util.get('need')}, ceiling {gate.util.get('ceiling')}; load {l1} not read)")
+    additive = out["spawn_limit"]
     if allowance is not None and (additive is None or allowance < additive):
         out["spawn_limit"] = allowance
         out["limit_source"] = "load gate allowance"

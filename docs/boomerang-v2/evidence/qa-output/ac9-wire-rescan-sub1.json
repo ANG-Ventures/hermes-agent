@@ -1,0 +1,746 @@
+{
+ "records": 30,
+ "records_with_any_x_hermes": 0,
+ "fork_like_records(cache_read>=300k)": 8,
+ "fork_like_with_x_hermes": 0,
+ "rows": [
+  {
+   "id": "916331-6959",
+   "ts": "2026-10-20T05:58:01.833Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 53,
+   "cache_read": 92350,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6960",
+   "ts": "2026-10-20T05:58:15.076Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 55,
+   "cache_read": 92350,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6961",
+   "ts": "2026-10-20T05:58:44.037Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 265,
+   "cache_read": 337685,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6962",
+   "ts": "2026-10-20T05:58:47.591Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 57,
+   "cache_read": 92350,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6963",
+   "ts": "2026-10-20T05:58:56.286Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 59,
+   "cache_read": 136708,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6964",
+   "ts": "2026-10-20T05:58:59.858Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 267,
+   "cache_read": 340570,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6965",
+   "ts": "2026-10-20T05:59:14.789Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 441,
+   "cache_read": 335531,
+   "input": 4,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6966",
+   "ts": "2026-10-20T05:59:20.879Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 61,
+   "cache_read": 136708,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6967",
+   "ts": "2026-10-20T05:59:38.670Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 443,
+   "cache_read": 340821,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6968",
+   "ts": "2026-10-20T05:59:42.505Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 1,
+   "cache_read": 15550,
+   "input": 4,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6969",
+   "ts": "2026-10-20T05:59:52.251Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 97,
+   "cache_read": 177631,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988"
+   ]
+  },
+  {
+   "id": "916331-6970",
+   "ts": "2026-10-20T05:59:55.537Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 445,
+   "cache_read": 340821,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6971",
+   "ts": "2026-10-20T05:59:56.650Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 107,
+   "cache_read": 168507,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6972",
+   "ts": "2026-10-20T05:59:57.551Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 3,
+   "cache_read": 94111,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916331-6973",
+   "ts": "2026-10-20T06:00:11.312Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 1,
+   "cache_read": 0,
+   "input": 664,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"system[0].text\", \"identity\": \"sha256:f5aa5dc2659605745ef662655455f256da1d7b648f3e8d07ac65bfe",
+    "{\"target\": \"body\", \"path\": \"system[1].text\", \"identity\": \"sha256:2719b7a469d904b3281d8488976f33103944211279bddf04c05bca4",
+    "{\"target\": \"body\", \"path\": \"metadata.user_id\", \"identity\": \"sha256:2e7f0df722cd7dcf0e03bd4abc505411dae7617183754d43c47aa"
+   ]
+  },
+  {
+   "id": "916331-6974",
+   "ts": "2026-10-20T06:00:22.428Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 181,
+   "cache_read": 301471,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916333-1857",
+   "ts": "2026-10-20T06:00:43.518Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 2,
+   "cache_read": 1170,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"system[0].text\", \"identity\": \"sha256:f5aa5dc2659605745ef662655455f256da1d7b648f3e8d07ac65bfe",
+    "{\"target\": \"body\", \"path\": \"system[1].text\", \"identity\": \"sha256:2719b7a469d904b3281d8488976f33103944211279bddf04c05bca4",
+    "{\"target\": \"body\", \"path\": \"metadata.user_id\", \"identity\": \"sha256:2e7f0df722cd7dcf0e03bd4abc505411dae7617183754d43c47aa"
+   ]
+  },
+  {
+   "id": "916331-6975",
+   "ts": "2026-10-20T06:00:46.240Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 99,
+   "cache_read": 177631,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988"
+   ]
+  },
+  {
+   "id": "916333-1858",
+   "ts": "2026-10-20T06:00:48.617Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 2,
+   "cache_read": 3998,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"system[0].text\", \"identity\": \"sha256:f5aa5dc2659605745ef662655455f256da1d7b648f3e8d07ac65bfe",
+    "{\"target\": \"body\", \"path\": \"system[1].text\", \"identity\": \"sha256:2719b7a469d904b3281d8488976f33103944211279bddf04c05bca4",
+    "{\"target\": \"body\", \"path\": \"metadata.user_id\", \"identity\": \"sha256:2e7f0df722cd7dcf0e03bd4abc505411dae7617183754d43c47aa"
+   ]
+  },
+  {
+   "id": "916331-6976",
+   "ts": "2026-10-20T06:00:50.939Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 183,
+   "cache_read": 302606,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  },
+  {
+   "id": "916333-1859",
+   "ts": "2026-10-20T06:00:52.039Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 5,
+   "cache_read": 7071,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988"
+   ]
+  },
+  {
+   "id": "916333-1860",
+   "ts": "2026-10-20T06:00:55.218Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 8,
+   "cache_read": 16259,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988"
+   ]
+  },
+  {
+   "id": "916333-1861",
+   "ts": "2026-10-20T06:01:00.229Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 11,
+   "cache_read": 18071,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988"
+   ]
+  },
+  {
+   "id": "916333-1862",
+   "ts": "2026-10-20T06:01:02.860Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 14,
+   "cache_read": 22689,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988"
+   ]
+  },
+  {
+   "id": "916333-1863",
+   "ts": "2026-10-20T06:01:08.744Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 17,
+   "cache_read": 23694,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988"
+   ]
+  },
+  {
+   "id": "916333-1864",
+   "ts": "2026-10-20T06:01:15.108Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 2,
+   "cache_read": 1170,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"system[0].text\", \"identity\": \"sha256:f5aa5dc2659605745ef662655455f256da1d7b648f3e8d07ac65bfe",
+    "{\"target\": \"body\", \"path\": \"system[1].text\", \"identity\": \"sha256:2719b7a469d904b3281d8488976f33103944211279bddf04c05bca4",
+    "{\"target\": \"body\", \"path\": \"metadata.user_id\", \"identity\": \"sha256:2e7f0df722cd7dcf0e03bd4abc505411dae7617183754d43c47aa"
+   ]
+  },
+  {
+   "id": "916333-1865",
+   "ts": "2026-10-20T06:01:19.300Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 2,
+   "cache_read": 3998,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"system[0].text\", \"identity\": \"sha256:f5aa5dc2659605745ef662655455f256da1d7b648f3e8d07ac65bfe",
+    "{\"target\": \"body\", \"path\": \"system[1].text\", \"identity\": \"sha256:2719b7a469d904b3281d8488976f33103944211279bddf04c05bca4",
+    "{\"target\": \"body\", \"path\": \"metadata.user_id\", \"identity\": \"sha256:2e7f0df722cd7dcf0e03bd4abc505411dae7617183754d43c47aa"
+   ]
+  },
+  {
+   "id": "916333-1866",
+   "ts": "2026-10-20T06:01:19.757Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 2,
+   "cache_read": 3998,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"system[0].text\", \"identity\": \"sha256:f5aa5dc2659605745ef662655455f256da1d7b648f3e8d07ac65bfe",
+    "{\"target\": \"body\", \"path\": \"system[1].text\", \"identity\": \"sha256:2719b7a469d904b3281d8488976f33103944211279bddf04c05bca4",
+    "{\"target\": \"body\", \"path\": \"metadata.user_id\", \"identity\": \"sha256:2e7f0df722cd7dcf0e03bd4abc505411dae7617183754d43c47aa"
+   ]
+  },
+  {
+   "id": "916333-1868",
+   "ts": "2026-10-20T06:01:22.300Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 5,
+   "cache_read": 7985,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:263a94d2ccbc8d57dcb241a216311245902832875634541b3ebb62e45e78988",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:78569faf9025d4152e11458f018807db4e58646fa4969a033404a8df24ae491",
+    "{\"target\": \"body\", \"path\": \"system[0].text\", \"identity\": \"sha256:f5aa5dc2659605745ef662655455f256da1d7b648f3e8d07ac65bfe",
+    "{\"target\": \"body\", \"path\": \"system[1].text\", \"identity\": \"sha256:2719b7a469d904b3281d8488976f33103944211279bddf04c05bca4"
+   ]
+  },
+  {
+   "id": "916331-6977",
+   "ts": "2026-10-20T06:01:25.045Z",
+   "lane": "apx",
+   "sub": "1",
+   "model": "claude-opus-5-5",
+   "n_msgs": 185,
+   "cache_read": 302606,
+   "input": 2,
+   "n_header_names": {
+    "headers": 21,
+    "headerOrder": 21,
+    "rawNames": 0,
+    "outHeaders": 0
+   },
+   "x_hermes": {},
+   "mutations": [
+    "{\"target\": \"body\", \"path\": \"tool_choice\", \"identity\": \"sha256:c78db4bd12e5be8059f8e2ee13107cf8a9b530cbe2eb34d5944cecd25b",
+    "{\"target\": \"body\", \"path\": \"messages[].content[].name\", \"identity\": \"sha256:e9709d0e2f887710a41728aa58f20b4bf33aa8d2d947",
+    "{\"target\": \"body\", \"path\": \"messages[first-user].content\", \"identity\": \"sha256:0296361e9b7a65638b37e13176105eb4c58129b6c",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3",
+    "{\"target\": \"body\", \"path\": \"body.*\", \"identity\": \"sha256:8e1556cff371db61bb8c9062121f51e398e40cf83bbc8288483e2a432ee2cc3"
+   ]
+  }
+ ]
+}

@@ -83,8 +83,12 @@ class TestResolveCommandAliases:
         cmd = resolve_command("q")
         assert cmd is not None and cmd.name == "queue"
 
-    def test_s_resolves_to_steer(self):
+    def test_s_resolves_to_stop(self):
         cmd = resolve_command("s")
+        assert cmd is not None and cmd.name == "stop"
+
+    def test_st_resolves_to_steer(self):
+        cmd = resolve_command("st")
         assert cmd is not None and cmd.name == "steer"
 
     def test_exact_names_still_win_over_the_alias(self):

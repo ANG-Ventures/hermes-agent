@@ -67,7 +67,8 @@ def _runner(adapter, load, tmp_path, *, dispatcher=None):
     runner._kanban_sub_fail_counts = {}
     runner._kanban_dispatcher_lock_handle = object()
     runner._kanban_wake_gate = WakeGate(
-        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48}}},
+        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
+                    "wake_load_gate": {"host_axis": "load1"}}},
         ncpu=32, loadavg=lambda: (load, load, load), lane_probe=lambda p: None,
         dispatcher_state=dispatcher or FakeDispatcher("admitting"),
         state_file=tmp_path / "wake_gate.json",
