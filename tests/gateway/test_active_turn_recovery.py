@@ -565,6 +565,30 @@ async def test_unclean_restart_resumes_a_turn_whose_tail_is_only_the_interrupt_c
     _close_store_db(store)
 
 
+@pytest.mark.asyncio
+async def test_unclean_restart_resumes_a_turn_killed_with_an_unanswered_tool_call(tmp_path):
+    """Killed while a tool ran: the last durable row is an assistant step whose narration rides on a
+    tool call that never got its result. The replay read's alternation repair prunes that unanswered
+    call, so the step read as a final reply: the fragment ("Closing #5559, since ...:") was mailed as
+    a recovered reply and the turn never resumed (2026-10-19 20:16, ace-inbound-watch CRITICAL)."""
+    from gateway.delivery_ledger import sweep_recoverable
+
+    runner, store = _db_runner(tmp_path)
+    source = _turn(store, "mid-tool", marked=True, reply=None)
+    entry = _entry_for(store, source)
+    store._db.append_message(
+        session_id=entry.session_id, role="assistant", content="Closing the PR, since it swept in edits:",
+        tool_calls=[{"id": "call_1", "type": "function",
+                     "function": {"name": "terminal", "arguments": "{}"}}])
+
+    assert await runner._recover_unclean_sessions() == (1, 0)
+
+    entry = _entry_for(store, source)
+    assert (entry.resume_pending, entry.resume_reason) == (True, "restart_interrupted")
+    assert sweep_recoverable(deliverable_platforms={"discord"}) == []
+    _close_store_db(store)
+
+
 _WAKE = {"display_kind": "internal_notification"}
 
 

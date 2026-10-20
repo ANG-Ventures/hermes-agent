@@ -1103,7 +1103,9 @@ class GatewayStartupMixin:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
                 continue
-            text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
+            # Durable rows, not the replay read: its alternation repair prunes an unanswered tool call,
+            # so a step killed mid-tool would read as a final reply (2026-10-19, t_097b14b1).
+            text = self._crash_left_reply(await self.async_session_store.load_transcript_rows(session_id),
                                           started, origin)
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
