@@ -14417,7 +14417,8 @@ def reopen_task(
         return False, "a reason is required to reverse a terminal state"
 
     row = conn.execute(
-        "SELECT status, result FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, result, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -14426,6 +14427,14 @@ def reopen_task(
             f"task {task_id} is {row['status']!r}; reopen only applies to "
             f"'done' tasks (use unblock/promote for other states)"
         )
+    # complete_task removed the scratch tree. Left on the card, the dead path is
+    # refused next tick as stranded_by_mount_loss and pages #alerts (t_b259e24e).
+    # Only when its parent dir exists: an absent parent may be an unmounted volume.
+    dead_scratch = None
+    if (row["workspace_kind"] or "scratch") == "scratch" and row["workspace_path"]:
+        wp = Path(row["workspace_path"]).expanduser()
+        if not os.path.lexists(wp) and wp.parent.is_dir():
+            dead_scratch = row["workspace_path"]
 
     # ``review`` (t_36d0114e): a card closed ``done`` while its PR is still
     # OPEN goes back to the review lane -- owned by kanban.review_assignee --
@@ -14442,6 +14451,17 @@ def reopen_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} changed state concurrently; retry"
+        if dead_scratch is not None:
+            conn.execute(
+                "UPDATE tasks SET workspace_path = NULL WHERE id = ? AND workspace_path = ?",
+                (task_id, dead_scratch),
+            )
+            _append_event(conn, task_id, "workspace_reset", {
+                "actor": actor,
+                "reason": "reopen: scratch workspace removed at completion",
+                "previous_path": dead_scratch,
+                "survivor_baseline": _reset_survivor_baseline(conn, task_id),
+            })
         run_id = conn.execute(
             "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
             "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
