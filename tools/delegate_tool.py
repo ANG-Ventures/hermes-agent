@@ -2131,7 +2131,7 @@ def _build_child_agent(
         if _diff:
             _fork.log_ineligible("same_request_params:" + ",".join(_diff), parent_agent)
             with _quiet("fork downgrade: child close failed", exc_info=True):
-                child.close()
+                _teardown(child, "fork downgrade before first run")
             if child_session_db is not None and not getattr(child, "_owns_session_db", False):
                 with _quiet(None):
                     from hermes_state_registry import release_or_close

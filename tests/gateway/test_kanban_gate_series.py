@@ -190,7 +190,7 @@ def test_rotation_renames_once_per_utc_day_and_keeps_14(tmp_path):
     t0 = 1_791_000_000.0
     for i in range(17):
         now = t0 + i * day
-        series.append(p, {"ts": now}, now=now)
+        series.append_record(p, {"ts": now}, now=now)
         os.utime(p, (now, now))
     rotated = sorted(p.parent.glob("gate-ticks.????-??-??.jsonl"))
     assert len(rotated) == 14
@@ -207,9 +207,9 @@ def test_rotation_never_overwrites_an_existing_archive(tmp_path):
     next rotation replace the day's archive."""
     p = tmp_path / "var" / series.SERIES_FILE
     t0 = 1_791_000_000.0
-    series.append(p, {"n": 1}, now=t0)
+    series.append_record(p, {"n": 1}, now=t0)
     os.utime(p, (t0, t0))
-    series.append(p, {"n": 2}, now=t0 + 86400)       # rotates day0 -> archive
+    series.append_record(p, {"n": 2}, now=t0 + 86400)       # rotates day0 -> archive
     os.utime(p, (t0, t0))                             # clock stepped back: live file dated day0 again
     series.rotate(p, t0 + 86400)
     (arch,) = p.parent.glob("gate-ticks.????-??-??.jsonl")
@@ -219,7 +219,7 @@ def test_rotation_never_overwrites_an_existing_archive(tmp_path):
 def test_failed_append_rolls_back_the_partial_line(tmp_path, monkeypatch):
     """Prism 12af5c33fcb9: a short write is completed, a failed one truncated."""
     p = tmp_path / "var" / series.SERIES_FILE
-    series.append(p, {"n": 1})
+    series.append_record(p, {"n": 1})
     real = os.write
     calls = {"n": 0}
 
@@ -231,9 +231,9 @@ def test_failed_append_rolls_back_the_partial_line(tmp_path, monkeypatch):
 
     monkeypatch.setattr(series.os, "write", short_then_fail)
     with pytest.raises(OSError):
-        series.append(p, {"n": 2})
+        series.append_record(p, {"n": 2})
     monkeypatch.setattr(series.os, "write", real)
-    series.append(p, {"n": 3})
+    series.append_record(p, {"n": 3})
     assert [json.loads(l)["n"] for l in p.read_text().splitlines()] == [1, 3]
 
 
@@ -242,9 +242,9 @@ def test_failed_rotation_merge_leaves_the_archive_untouched(tmp_path, monkeypatc
     back, so a retried rotation neither truncates nor duplicates lines."""
     p = tmp_path / "var" / series.SERIES_FILE
     t0 = 1_791_000_000.0
-    series.append(p, {"n": 1}, now=t0)
+    series.append_record(p, {"n": 1}, now=t0)
     os.utime(p, (t0, t0))
-    series.append(p, {"n": 2}, now=t0 + 86400)
+    series.append_record(p, {"n": 2}, now=t0 + 86400)
     os.utime(p, (t0, t0))
     (arch,) = p.parent.glob("gate-ticks.????-??-??.jsonl")
     before = arch.read_bytes()
@@ -264,9 +264,9 @@ def test_crash_between_merge_and_unlink_never_duplicates_records(tmp_path, monke
     same ticks on the next rotation (the I-0 query sums this series)."""
     p = tmp_path / "var" / series.SERIES_FILE
     t0 = 1_791_000_000.0
-    series.append(p, {"n": 1}, now=t0)
+    series.append_record(p, {"n": 1}, now=t0)
     os.utime(p, (t0, t0))
-    series.append(p, {"n": 2}, now=t0 + 86400)       # day0 archive holds n=1
+    series.append_record(p, {"n": 2}, now=t0 + 86400)       # day0 archive holds n=1
     os.utime(p, (t0, t0))                             # clock step back: live dated day0
     (arch,) = p.parent.glob("gate-ticks.????-??-??.jsonl")
     real_unlink = Path.unlink
