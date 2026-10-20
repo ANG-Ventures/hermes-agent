@@ -121,17 +121,30 @@ def test_flag_on_offers_the_pool_first(home):
         assert rec["reason"] == "pool" and rec["route_class"] == "portable"
 
 
-@pytest.mark.parametrize("raw, want", [
-    (None, "local"), ({}, "local"), ({"placement": {"default": "local"}}, "local"),
-    ({"placement": {"default": "Remote "}}, "remote"), ({"placement": {"default": True}}, "local"),
+@pytest.mark.parametrize("raw", [
+    None, {}, {"placement": {"default": "local"}}, {"placement": {"default": "Remote "}},
+    {"placement": {"default": True}}, {"placement": {"default": "wait"}},
 ])
-def test_placement_default_parse(raw, want):
-    assert kwp.placement_default(raw) == want
+def test_placement_default_is_always_remote(raw):
+    """t_82b4db80 (Ace 2026-10-19 21:2x): the local/remote ORDERING knob is
+    retired. Absent, `local`, junk: every value reads remote. MUTATION: restore
+    the old parse and the absent/local/junk rows go red."""
+    assert kwp.placement_default(raw) == kwp.PLACEMENT_DEFAULT_REMOTE
+
+
+def test_a_retired_local_value_logs_one_deprecation_line(caplog, monkeypatch):
+    monkeypatch.setattr(kwp, "_placement_default_warned", set())
+    with caplog.at_level("WARNING", logger=kwp.__name__):
+        for _ in range(3):
+            assert kwp.placement_default({"placement": {"default": "local"}}) == "remote"
+        assert kwp.placement_default({"placement": {"default": "remote"}}) == "remote"
+    lines = [r.getMessage() for r in caplog.records if "placement.default" in r.getMessage()]
+    assert len(lines) == 1 and "'local'" in lines[0] and "ignored" in lines[0], lines
 
 
 def test_plan_pool_reads_the_flag_per_tick(home, monkeypatch):
-    """The flag is read on every plan (no restart); default: remote turns
-    pins_only off even with worker_pool.overflow false."""
+    """t_82b4db80: remote-first on every plan whatever the key says; pins_only
+    stays off even with worker_pool.overflow false."""
     monkeypatch.setattr(kgt, "any_remote_pin", lambda *a, **k: True)
     monkeypatch.setattr(kgt, "any_ready", lambda *a, **k: True)
     fleet = home / "fleet"
@@ -147,10 +160,10 @@ def test_plan_pool_reads_the_flag_per_tick(home, monkeypatch):
                             ledger=lambda boards: {}, connect=lambda board=None: None,
                             probe=lambda h: (1.0, 16))
     plan = b.plan_pool([], {})
-    assert plan.pins_only is True and plan.default_remote is False
-    cfg["placement"]["default"] = "remote"
+    assert plan.pins_only is False and plan.default_remote is True     # key absent: remote
+    cfg["placement"]["default"] = "local"
     plan = b.plan_pool([], {})
-    assert plan.pins_only is False and plan.default_remote is True
+    assert plan.pins_only is False and plan.default_remote is True     # retired value ignored
 
 
 # -- AC-3 hermetic (R3): the ineligible-slot fixture ------------------------------
@@ -529,8 +542,8 @@ def _builder(home, cfg, connect):
 @pytest.mark.parametrize("remote", [True, False])
 def test_a_scheduled_card_woken_inside_dispatch_gets_the_plan(home, remote):
     """Apollo review cafa4cce2458: no ready card, one portable card whose timed
-    wake is due. Under default: remote the tick still plans, and dispatch_once
-    (which wakes it) places it on the pool; under local nothing changes."""
+    wake is due. The tick still plans, and dispatch_once (which wakes it)
+    places it on the pool; t_82b4db80: a retired `local` value changes nothing."""
     with kb.connect_closing() as conn:
         (tid,) = _cards(conn, PORTABLE)
         assert kb.schedule_task(conn, tid, reason="later")
@@ -541,9 +554,6 @@ def test_a_scheduled_card_woken_inside_dispatch_gets_the_plan(home, remote):
            "worker_pool": {"overflow": False}}
     b, gate = _builder(home, cfg, lambda board=None: kb.connect(board=board))
     plan = b.plan_pool([{"slug": "default"}], {})
-    if not remote:
-        assert plan is None and gate.pool["reason"] == "not_needed"
-        return
     assert plan is not None and plan.default_remote is True
     with kb.connect_closing() as conn:
         res, spawned = _tick(conn, plan)

@@ -30,7 +30,10 @@ jobs:
     # step dies with "failed to connect to the docker API at
     # unix:///var/run/docker.sock". The shellcheck job below is a JS action with
     # no container, so it stays on the pool. Stays GitHub-hosted.
-    runs-on: ubuntu-latest
+    # ci-priv (t_df855b2a): on the private CI mirror, CI_PRIV_ENABLED + CI_PRIV_RUNNER move this job to the
+    # ci-priv class (a fresh KVM guest per job: real sudo + its own docker daemon; fleet-ops-scripts
+    # ci-runners/ci-priv). Trusted events only. Both vars unset (the fork) -> ubuntu-latest.
+    runs-on: ${{ vars.CI_PRIV_ENABLED == 'true' && vars.CI_PRIV_RUNNER && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PRIV_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Checkout code

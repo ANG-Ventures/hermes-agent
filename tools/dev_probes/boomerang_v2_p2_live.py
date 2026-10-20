@@ -133,12 +133,16 @@ def _child(parent, goal: str, mode: str, max_iterations: int):
     return child
 
 
-def _run_child(child, goal: str):
-    from tools.delegate_tool_fork import fork_run_inputs
+def _run_child(child, goal: str, parent=None):
+    """Run the child through the LIVE supervisor ``delegate_tool._run_single_child``.
 
-    user_message, history = fork_run_inputs(child, goal)
-    kwargs = {"conversation_history": history} if history is not None else {}
-    return child.run_conversation(user_message, **kwargs)
+    QA F-1 (t_230d37a3): the first AC-4/AC-4b pack called ``fork_run_inputs`` here itself, so it
+    measured a path production never took (the live supervisor ran forks on the bare goal). Going
+    through ``_run_single_child`` measures exactly what a delegate_task fork sends."""
+    from tools import delegate_tool
+
+    out = delegate_tool._run_single_child(0, goal, child=child, parent_agent=parent)
+    return {"final_response": (out or {}).get("summary") or ""}
 
 
 def cmd_cache(a):
@@ -153,7 +157,7 @@ def cmd_cache(a):
         child = _child(parent, goal, "fork", 1)
         mode = getattr(child, "_inherit_mode", None)
         try:
-            _run_child(child, goal)
+            _run_child(child, goal, parent)
         finally:
             calls = _calls_for(child)
             child.close()
@@ -211,7 +215,7 @@ def cmd_cost(a):
         for mode in ("fork", "summary"):
             child = _child(parent, goal, mode, a.max_iterations)
             try:
-                res = _run_child(child, goal)
+                res = _run_child(child, goal, parent)
             finally:
                 calls = _calls_for(child)
                 child.close()
