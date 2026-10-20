@@ -558,13 +558,27 @@ def test_ac14_live_child_past_max_cancelled_first_late_handoff_dropped(env):
 # --- wake load gate (smoke 2026-10-19: a box idling above the band never auto-handled) ---------
 
 
-def _gate(env, tmp_path, *, load: float, lane=None):
+def _gate(env, tmp_path, *, load: float, lane=None, axis="load1", cpu=None):
     from hermes_cli.kanban_wake_gate import WakeGate
 
+    kw = {"cpu_sampler": (lambda prev: (cpu, object()))} if cpu is not None else {}
     env["runner"]._kanban_wake_gate = WakeGate(
-        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48}}},
+        {"kanban": {"dispatch_load_gate": {"pause_above": 64, "resume_below": 48},
+                    "wake_load_gate": {"host_axis": axis}}},
         ncpu=32, loadavg=lambda: (load, load, load), lane_probe=lambda p: lane,
-        state_file=tmp_path / "wake_gate.json")
+        state_file=tmp_path / "wake_gate.json", **kw)
+
+
+def test_cpu_axis_contention_alone_does_not_stop_the_auto_handle_child(env, tmp_path):
+    """The DEFAULT host axis is measured cpu busy (t_0e52c7ab): its reason is `host cpu N% busy`,
+    and it must exempt an auto child exactly like the load1 band does."""
+    _gate(env, tmp_path, load=71.0, axis="cpu", cpu=0.99)
+    tid = _card(env)
+    _sub(tid)
+    _worker_close(tid)
+    turns = _tick(env)
+    assert any("(notify: host cpu" in s for s in env["adapter"].sent), env["adapter"].sent
+    assert [e["task_id"] for e in env["dispatched"]] == [tid] and turns == []
 
 
 def test_host_load_alone_does_not_stop_the_auto_handle_child(env, tmp_path):
