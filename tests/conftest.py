@@ -30,6 +30,12 @@ from pathlib import Path
 
 import pytest
 
+# 5. **Bounded Tokio runtime.** The NeMo Relay plugin builds a Tokio runtime with one worker thread per CPU; on a
+#    256-thread host (ci-box) the first ``initialize()`` inside a test never completes and the 60 s wall kills it,
+#    while the same tests pass in ~12 s with a small pool (measured 2026-10-19, handoff gilded-inlet-8d4c). Set it
+#    before ANY nemo_relay import; an explicit caller value still wins (setdefault).
+os.environ.setdefault("TOKIO_WORKER_THREADS", "4")
+
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
