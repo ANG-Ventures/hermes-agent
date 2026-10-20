@@ -1009,6 +1009,10 @@ def _alive(key: str) -> bool:
 
 async def _lost(runner: Any, entry: dict, reason: str, state: AutoHandleState) -> None:
     ok = await resurface(runner, entry)
+    # The reconciler's observable (README §5, smoke step 4 / AC-11): it was the only auto-handle
+    # outcome with no log line, so a correct re-surface read as FAIL live (2026-10-19 23:07).
+    logger.info("kanban auto-handle: %s lost reason=%s resurfaced delivered=%s delegation=%s",
+                entry["task_id"], reason, ok, entry.get("delegation_id"))
     await post_line(runner, entry, f"⚠️ auto-handle lost {entry['task_id']} (reason: {reason})")
     await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="lost",
                             reason=reason, resurfaced=True, resurface_delivered=ok)

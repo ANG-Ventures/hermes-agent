@@ -103,6 +103,8 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(dt, "_load_config", lambda: {})
     monkeypatch.setattr(dt, "_get_max_concurrent_children", lambda: 2)
     monkeypatch.setattr(dt, "_get_worktree_isolation", lambda: False)
+    # These children are in-process doubles: pin the in-gateway path (detached runs a real process).
+    monkeypatch.setattr(dt, "_get_detached_background", lambda: False)
     monkeypatch.setattr(dt, "_get_child_timeout", lambda: 4)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *_a, **_k: {
         "model": "test-model", "provider": None, "base_url": None,
