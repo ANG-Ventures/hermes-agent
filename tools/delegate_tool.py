@@ -2676,11 +2676,19 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Child text relay failed: %s", e)
 
+        # Boomerang v2 fork (QA F-1, t_230d37a3): THIS is the live supervisor, not
+        # _ChildRun.await_child, so the first turn must carry the inherited transcript +
+        # the frame turn here too. Only the FIRST turn: late-path follow-ups (schema
+        # correction) continue the child's own conversation via _child_turn(message).
+        from tools.delegate_tool_fork import fork_run_inputs
+
+        _first_message, _fork_history = fork_run_inputs(child, goal)
+
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            return _child_turn(goal)
+            return _child_turn(_first_message, conversation_history=_fork_history)
 
-        def _child_turn(user_message):
+        def _child_turn(user_message, conversation_history=None):
             # One child turn with the spawn-time bindings. Also the late
             # path's schema-correction turn (it must not run bare).
             # Bind the routing-only send-origin so the child's bare send_message/
@@ -2701,6 +2709,8 @@ def _run_single_child(
                         user_message=user_message,
                         task_id=child_task_id,
                         stream_callback=_relay_child_text,
+                        **({"conversation_history": conversation_history}
+                           if conversation_history is not None else {}),
                     )
             finally:
                 _clear_child_send_origin(_origin_tokens)
