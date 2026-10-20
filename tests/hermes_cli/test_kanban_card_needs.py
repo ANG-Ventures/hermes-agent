@@ -84,6 +84,41 @@ def _host(name):
                         state="active", enabled=True, priority=0)
 
 
+# t_50f2fa37 (run 33487, 2026-10-20): spilled to ci-box, which has no
+# ~/.hermes, measured nothing and blocked (t_40abb42b).
+FIFTY_F2FA37 = (
+    "Continuation of t_f1184bc8 (step 6, 7-day acceptance). The detector is armed: "
+    "~/.hermes/config/dpx-alias-key-leak.json page_after=1791169971.\n"
+    "DO: run `~/.hermes/scripts/dpx-alias-key-leak-lint.py --hours 168 --dry-run --json`.\n"
+)
+REPO_SCRIPT = (
+    "Fix scripts/x.py in ANG-Ventures/hermes-home and run `python3 scripts/x.py --check`.\n"
+    "The live copy lands in ~/.hermes/scripts/x.py after deploy.\n"
+)
+
+
+@pytest.mark.parametrize("body", [
+    FIFTY_F2FA37,
+    "python3 ~/.hermes/scripts/lib/ups_pulled.py set --until tomorrow",
+    "bash ~/.hermes/var/oneshot/main-red-reasons.sh 39064362674",
+    "run /Users/someone/.hermes/state/pager/x.json through jq",
+])
+def test_running_a_home_tree_path_needs_the_studio_tree(body):
+    assert "studio_tree" in kwp.card_needs(body)
+
+
+def test_studio_tree_card_places_on_the_studio_and_a_repo_script_card_anywhere():
+    pool = kwp.PoolConfig(hosts=("ci-box",), profiles=("alpha",), pool_hosts=(_host("ci-box"),))
+
+    def port(body):
+        return kwp.portable(workspace_kind="scratch", has_links=False, workspace_has_content=False,
+                            assignee="alpha", body=body, pool=pool)
+    assert port(FIFTY_F2FA37) == (False, "studio_needs", None)
+    assert kwp.needs_allowed_hosts(FIFTY_F2FA37, pool) == ()
+    assert port(REPO_SCRIPT) == (True, None, "policy")
+    assert kwp.card_needs(REPO_SCRIPT) == set()
+
+
 def test_read_caps_fails_closed(tmp_path):
     fleet = tmp_path / "fleet"
     assert kwp.read_caps(fleet, now=NOW) == {}                       # absent
