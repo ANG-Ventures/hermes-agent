@@ -192,6 +192,7 @@ def test_dead_child_without_result_is_redispatched(_isolated, tmp_path, monkeypa
     record["detached"] = _detached_block(child, job_dir, record["attempt"]["attempt_id"])
     record["detached"]["create_time"] = 1.0  # the pid is gone (or recycled)
     _write(record)
+    monkeypatch.setattr(ad, "_detached_enabled", lambda: True)  # the contract, independent of the default
     respawned = []
     monkeypatch.setattr(dd, "spawn_child", lambda **kw: respawned.append(kw["attempt_id"]))  # -> in-process
     calls = []
