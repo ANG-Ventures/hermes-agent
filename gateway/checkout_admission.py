@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import json
 import logging
 import math
@@ -850,7 +851,9 @@ class AdmissionGate:
             # wraps it in its own Task, and asyncio.run() shutdown cancels every pending Task. Under a
             # saturated default executor that cancel drops the still-QUEUED job and the released record
             # is never written (Prism ad88cba956ad). shutdown_default_executor() drains a queued future.
-            await asyncio.shield(asyncio.get_running_loop().run_in_executor(None, self.stop_lease))
+            # copy_context().run: keep to_thread's contextvar hand-off (Prism 0d646d6f5979 class).
+            await asyncio.shield(asyncio.get_running_loop().run_in_executor(
+                None, contextvars.copy_context().run, self.stop_lease))
 
 
 # ---------------------------------------------------------------------------
