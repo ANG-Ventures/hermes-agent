@@ -59,11 +59,14 @@ def test_gateway_recovery_runs_once_and_reresolves_current_credentials(tmp_path,
     runner.__dict__["config"] = SimpleNamespace(multiplex_profiles=False)
     runner._current_boot_id = MagicMock(return_value="200:2.0")
     built_parent = MagicMock()
-    returned_runner = MagicMock()
+    returned_runner = MagicMock(return_value={"results": []})
 
     def recover_side_effect(**kwargs):
         produced = kwargs["runner_factory"](_record(), "CONTINUE after restart")
-        assert produced[0] is returned_runner
+        # The factory's runner runs the recovered delegation (wrapped to bind the profile's SessionDB).
+        with patch("tools.delegate_detached._acquire_session_db", return_value=None):
+            assert produced[0]() == {"results": []}
+        returned_runner.assert_called_once()
         produced[1]()
         return {"claimed": 1, "exhausted": 0, "failed_validation": 0}
 

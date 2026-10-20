@@ -1285,6 +1285,12 @@ def claim_detached_adoptions(
     if not registry_path(profile_home).exists():
         return adopted, kill
     home = registry_path(profile_home).parent.parent
+    unfenced = stand_down_unknown(home) if stand_down_unknown else []
+    with locked_registry(profile_home, write=False) as snapshot:
+        any_detached = any(isinstance(r, dict) and isinstance(r.get("execution"), dict)
+                           and r["execution"].get("detached") for r in snapshot["records"].values())
+    if not any_detached and not unfenced:
+        return adopted, kill  # nothing to adopt or kill: never rewrite a registry this pass does not own
     now = time.time()
     owned_dirs: set[str] = set()
     adopted_dirs: set[str] = set()
