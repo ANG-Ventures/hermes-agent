@@ -112,6 +112,6 @@ Two contract gaps are parameters, not code:
 
 ## Tests
 
-`tests/dev_probes/test_boomerang_v2_smoke_harness.py` runs every step in `--dry-run` on the
+`tests/tools/dev_probes/test_boomerang_v2_smoke_harness.py` runs every step in `--dry-run` on the
 fixtures, breaks each contract once to prove the step goes red, and runs step 1 `--live` against
 a fake kanban CLI that plays the gateway.

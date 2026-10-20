@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 HARNESS_DIR = REPO / "tools" / "dev_probes" / "boomerang_v2_smoke"
 RUN_PY = HARNESS_DIR / "run.py"
 FIXTURES = HARNESS_DIR / "fixtures"

@@ -379,7 +379,7 @@ class Ctx:
             rep.commands.append(shown + "   # dry-run: not executed")
             return 0, ""
         print(shown, flush=True)
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
         out = (proc.stdout or "") + (proc.stderr or "")
         rep.commands.append(shown + f"   # exit {proc.returncode}")
         rep.raw.append(f"--- {key} (exit {proc.returncode})\n{out.strip()[:4000]}")
@@ -636,6 +636,19 @@ def _read_config(ctx: Ctx, stage: int) -> dict:
         path = hermes_root() / "config.yaml" if ctx.live else FIXTURES / "fake_config"
     if path.is_dir():  # fake: one snapshot per stage
         path = path / f"stage{stage}.yaml"
+    elif ctx.live:
+        # The switches are asserted against the GATEWAY's view: its loader (managed overlay,
+        # ${VAR} expansion), not a raw parse that can disagree with it.
+        try:
+            from hermes_cli.config_effective import load_user_config_effective  # noqa: PLC0415
+        except ImportError:
+            pass
+        else:
+            return load_user_config_effective(path)
+    return _parse_snapshot(path)
+
+
+def _parse_snapshot(path: Path) -> dict:
     text = path.read_text(encoding="utf-8")
     try:
         import yaml  # noqa: PLC0415 - optional, the venv carries it
