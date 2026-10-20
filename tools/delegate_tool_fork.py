@@ -284,3 +284,57 @@ def fork_run_inputs(child: Any, goal: Any) -> Tuple[Any, Optional[List[Dict[str,
         return goal, None
     frame = build_fork_frame(goal, getattr(child, "_fork_parent_session_id", None), getattr(child, "_delegation_id", None))
     return frame, copy.deepcopy(history)
+
+
+def _tool_call_ids(msg: Any) -> List[str]:
+    if not isinstance(msg, dict):
+        return []
+    ids = [msg.get("tool_call_id")] if msg.get("role") == "tool" else []
+    for tc in msg.get("tool_calls") or []:
+        ids.append(tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None))
+    return [i for i in ids if i]
+
+
+def child_generated_messages(messages: Any, history: Any) -> Any:
+    """``messages`` minus the inherited fork prefix (Prism f5ff1cc07dca).
+
+    ``run_conversation(conversation_history=history)`` returns history + the child's own
+    rows, but the parent's old tool rounds are not the child's execution evidence: they
+    must not reach ``tool_trace``, ``output_tail``, the interrupted-partial pick or the
+    ``subagent_stop`` hooks. The model request still carries the history; only the
+    result is trimmed. Positional when the prefix is intact (same length, same roles and
+    tool_call ids, then the frame user turn); otherwise (in-turn compression rewrote it)
+    drop every row whose tool_call ids or content came from the inherited history."""
+    if not isinstance(messages, list) or not isinstance(history, list) or not history:
+        return messages
+    n = len(history)
+
+    def _key(m: Any) -> Tuple[Any, Tuple[str, ...]]:
+        return (m.get("role") if isinstance(m, dict) else None, tuple(_tool_call_ids(m)))
+
+    if (
+        len(messages) > n
+        and isinstance(messages[n], dict) and messages[n].get("role") == "user"
+        and all(_key(a) == _key(b) for a, b in zip(messages[:n], history))
+    ):
+        return messages[n:]
+    inherited_ids = {i for m in history for i in _tool_call_ids(m)}
+    inherited_rows = {_json(m) for m in history}
+    return [
+        m for m in messages
+        if not (set(_tool_call_ids(m)) & inherited_ids) and _json(m) not in inherited_rows
+    ]
+
+
+def strip_inherited_from_result(result: Any, history: Any) -> Any:
+    """A child-turn result whose ``messages`` holds only the child's own rows (a fork turn
+    run over ``history``); any other result is returned unchanged."""
+    if not isinstance(result, dict) or not isinstance(history, list) or not history:
+        return result
+    messages = result.get("messages")
+    trimmed = child_generated_messages(messages, history)
+    if trimmed is messages:
+        return result
+    out = dict(result)
+    out["messages"] = trimmed
+    return out

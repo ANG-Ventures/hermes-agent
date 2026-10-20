@@ -2680,13 +2680,18 @@ def _run_single_child(
         # _ChildRun.await_child, so the first turn must carry the inherited transcript +
         # the frame turn here too. Only the FIRST turn: late-path follow-ups (schema
         # correction) continue the child's own conversation via _child_turn(message).
-        from tools.delegate_tool_fork import fork_run_inputs
+        from tools.delegate_tool_fork import fork_run_inputs, strip_inherited_from_result
 
         _first_message, _fork_history = fork_run_inputs(child, goal)
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            return _child_turn(_first_message, conversation_history=_fork_history)
+            # The inherited rows feed the model request only; the returned messages
+            # (tool_trace, output_tail, subagent_stop, late delivery) are the child's own.
+            return strip_inherited_from_result(
+                _child_turn(_first_message, conversation_history=_fork_history),
+                _fork_history,
+            )
 
         def _child_turn(user_message, conversation_history=None):
             # One child turn with the spawn-time bindings. Also the late

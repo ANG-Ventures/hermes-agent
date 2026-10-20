@@ -856,7 +856,7 @@ class _ChildRun:
         _images = list(getattr(child, "_delegate_images", None) or [])
         user_message: Any = _build_child_goal_message(self.goal, _images, child) if _images else self.goal
         # Boomerang v2 fork: the frame turn over the parent's transcript (no-op for every other child).
-        from tools.delegate_tool_fork import fork_run_inputs
+        from tools.delegate_tool_fork import fork_run_inputs, strip_inherited_from_result
         user_message, fork_history = fork_run_inputs(child, user_message)
         run_kwargs: Dict[str, Any] = {"conversation_history": fork_history} if fork_history is not None else {}
 
@@ -864,10 +864,11 @@ class _ChildRun:
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
+                # Inherited rows feed the request only; the result carries the child's own rows.
+                return strip_inherited_from_result(child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
                     **run_kwargs,
-                )
+                ), fork_history)
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
