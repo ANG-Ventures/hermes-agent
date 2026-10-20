@@ -404,7 +404,9 @@ class Ctx:
                 raise StepAbort(f"card create failed for {role} (exit {rc})")
         else:
             card = self._dry_cards.get(role) or f"t_dry{role}"
-        self.kanban_cmd(rep, "notify_subscribe", card=card)
+        rc, _ = self.kanban_cmd(rep, "notify_subscribe", card=card)
+        if self.live and rc != 0:   # no subscription = no wake: every negative check would pass vacuously
+            raise StepAbort(f"notify_subscribe failed for {card} (exit {rc})")
         if auto_handle:
             rc, _ = self.kanban_cmd(rep, "set_auto_handle", card=card)
             if self.live and rc != 0:
@@ -916,16 +918,23 @@ def _canary_control(ctx: Ctx, rep: StepReport) -> str:
     status, served, detail = send_canary(url, token, model)
     rep.commands.append(shown + f"   # HTTP {status} served_by={served}")
     rep.raw.append(f"--- canary\nHTTP {status} served_by={served} {detail}")
-    _sync_seat(ctx, rep, _norm_seat(served) if served else None, "canary")
+    gap = _sync_seat(ctx, rep, _norm_seat(served) if served else None, "canary")
+    if gap:   # the canary check matches its own token, so a missing record is already INCOMPLETE
+        rep.notes.append(f"canary seat capture not pulled: {gap}")
     return token
 
 
-def _sync_seat(ctx: Ctx, rep: StepReport, seat: str | None, what: str) -> None:
+def _sync_seat(ctx: Ctx, rep: StepReport, seat: str | None, what: str) -> str | None:
     """Pull a remote seat's wire capture locally (``plan.commands.wirelog_sync``) so the scan can
     see the request it served. Used for the canary's seat AND the fork's: the pool pins the fork
     to the parent's seat, which is only known from the ``served_by=`` line, so the lane that
     drives the harness cannot sync it beforehand (t_b901c171, 2026-10-20: a step-3 run went
-    INCOMPLETE on `sub-vps-9` with the canary green on `sub-19`)."""
+    INCOMPLETE on `sub-vps-9` with the canary green on `sub-19`).
+
+    Returns None when the seat's capture is local or was pulled with exit 0, else the reason it was
+    not (non-zero exit, timeout, no sync command). Prism ae1cccf47944: callers must turn that into a
+    non-PASS check, or a partial pull lets unrelated clean traffic from the seat stand in for the
+    request that was never copied."""
     sync = ctx.plan.get("commands", {}).get("wirelog_sync")
     m = re.fullmatch(r"sub-(\d+)", seat or "")
     if sync and m:
@@ -942,9 +951,12 @@ def _sync_seat(ctx: Ctx, rep: StepReport, seat: str | None, what: str) -> None:
             rc, out = 124, f"wirelog_sync timed out after {budget:.0f}s (BV2_SYNC_TIMEOUT): {exc}"
         rep.commands.append("$ " + shlex.join(argv) + f"   # {what} seat, exit {rc}")
         rep.raw.append(f"--- wirelog_sync {what} {seat} (exit {rc})\n" + out.strip()[-2000:])
-    elif seat and seat != "local":
+        return None if rc == 0 else f"`{shlex.join(argv)}` exit {rc}"
+    if seat and seat != "local":
         rep.notes.append(f"{what} served by `{seat}`: no plan.commands.wirelog_sync, so its record is only "
                          f"visible after `wirelog-fleet.py sync --sub {seat[4:]}`")
+        return f"no plan.commands.wirelog_sync for remote seat `{seat}`"
+    return None
 
 
 def step3(ctx: Ctx) -> StepReport:
@@ -970,7 +982,11 @@ def step3(ctx: Ctx) -> StepReport:
         rep.notes.append(f"served by `{seat}`: its capture is on that box; run `wirelog-fleet.py sync` and "
                          f"point BV2_WIRELOG_DIR at ~/.claude-wirelog-fleet before trusting step 3")
         if ctx.live:
-            _sync_seat(ctx, rep, _norm_seat(seat), "fork")
+            gap = _sync_seat(ctx, rep, _norm_seat(seat), "fork")
+            # Prism ae1cccf47944: a failed/partial pull may have dropped the fork request itself, and
+            # nothing in a seat's records singles that request out, so the scan cannot be a PASS.
+            rep.check(f"fork seat `{seat}` capture pulled after the fork turn", INCOMPLETE if gap else PASS,
+                      f"{gap}: the fork request may be missing from the scan" if gap else "wirelog_sync exit 0")
 
     # give the box a moment to flush the record (live), then read the window
     t_end = now() + (ctx.slack if ctx.live else 0)

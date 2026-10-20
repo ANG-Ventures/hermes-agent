@@ -2764,6 +2764,42 @@ def _hold(conn, task_id, reason):
     _log.warning("Workspace HELD for task %s: %s", task_id, reason)
 
 
+def _landed_claims(explicit):
+    """True when every verified explicit claim is LANDED on its remote's default branch.
+
+    A merged PR, a ``--survivor-ref`` proven reachable from the default branch,
+    or superseded content already on main. An open PR or a bare branch tip is
+    published but not landed, and keeps the nested refusal.
+    """
+    return bool(explicit) and all(
+        ref.get("state") == "MERGED" or ref.get("reachable_from")
+        or ref.get("corroborated_by") == "superseded-content"
+        for ref in explicit.values()
+    )
+
+
+def _nested_beside_landed(conn, task_id, metadata, evidence, explicit, previous,
+                          workspace, nested):
+    """Complete on a landed explicit survivor; leave the nested repo to cleanup.
+
+    The nested-repository refusal guards a capture that cannot be expressed as
+    one patch, and a workspace deletion that would lose the inner repo's bytes.
+    Neither applies to the COMPLETION when the operator named work the remote
+    proves landed: nothing is captured or deleted here, and the cleanup pass
+    (``cleanup=True``) still reaches this refusal and HOLDS the workspace
+    (t_3d376252: t_3ecbb73d, merged hermes-home#5702, refused on
+    ``repo/mainwt``, a linked worktree inside its own main checkout).
+    """
+    log.warning(
+        "kanban survivor: %s completes on a landed explicit survivor; nested repository "
+        "%s is left for workspace recovery", task_id, nested.relative_to(workspace),
+    )
+    return _record(conn, task_id, _external(
+        conn, task_id, metadata, evidence, (), explicit,
+        discover=False, cleanup=False, previous=previous,
+    ), previous)
+
+
 def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
              survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=(),
              survivor_none=False, survivor_reason=None, content_survivor=None):
@@ -2930,6 +2966,9 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             registered = [path for path in registered if not foreign.foreign(path)]
         pins = {}
         registered = _drop_pinned_submodules(registered, lambda _path: workspace, pins)
+        if registered and not cleanup and _landed_claims(explicit):
+            return _nested_beside_landed(conn, task_id, metadata, evidence, explicit,
+                                         previous, workspace, registered[0])
         if registered:
             raise SurvivorUnavailable(
                 "survivor_unavailable: nested repository requires separate recovery "
@@ -2953,7 +2992,11 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
             key=lambda other: len(other.parts), default=None), pins)
         stage = "pinned submodule retention check"
         unretained = _unretained_pins(pins, workspace)
-        if any(a != b and a.is_relative_to(b) for a in repos for b in repos):
+        nested = next((a for a in repos for b in repos if a != b and a.is_relative_to(b)), None)
+        if nested is not None and not cleanup and _landed_claims(explicit):
+            return _nested_beside_landed(conn, task_id, metadata, evidence, explicit,
+                                         previous, workspace, nested)
+        if nested is not None:
             # A patch cannot add a gitlink and files below the same path.
             raise SurvivorUnavailable("survivor_unavailable: nested repository requires separate recovery")
         keys = {str(r.relative_to(workspace)) for r in repos}
