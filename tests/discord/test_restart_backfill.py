@@ -515,6 +515,9 @@ async def test_backfill_reinjected_message_hits_full_auth_path(_tmp_home, monkey
 
     adapter._handle_message = _handler_spy
     adapter._dispatch_incoming_message = DiscordAdapter._dispatch_incoming_message.__get__(adapter)
+    # Backfill only ever runs from on_ready, after _ready_event is set; the live dispatch path
+    # otherwise waits up to 30 s per message for READY.
+    adapter._ready_event.set()
 
     # Lock the allowlist: only user 11111 is allowed.
     # parity 2026-10-01: re-inject now routes through _discord_message_admission (the live
