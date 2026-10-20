@@ -215,6 +215,7 @@ import asyncio  # noqa: E402
 import re  # noqa: E402
 import secrets  # noqa: E402
 import time as _time  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
 from datetime import datetime  # noqa: E402
 from typing import Any  # noqa: E402
 
@@ -757,13 +758,23 @@ async def resolve_parent(runner: Any, entry: dict, *, wait_s: float = PARENT_BUS
     if home is None:
         raise RuntimeError("home session not live here")
     deadline = _time.monotonic() + wait_s
+    waited_busy = False
     while True:
         agent, busy = _live_agent(runner, home.session_key)
         if agent is not None and not busy:
             return agent, entry.get("mode") or "fork"
         if not busy or _time.monotonic() >= deadline:
             break
+        waited_busy = True
         await asyncio.sleep(1.0)
+    # The two silent summary folds (t_a6d74b90): the parent stayed mid-turn past the wait, or
+    # there is no live agent at all (e.g. the first child after a gateway boot). Same line shape
+    # as every other fork downgrade so `grep fork_ineligible` explains every summary child.
+    if entry.get("mode", "fork") == "fork":
+        from tools.delegate_tool_fork import log_ineligible
+
+        log_ineligible("parent_busy" if (busy or waited_busy) else "no_live_parent",
+                       SimpleNamespace(session_id=getattr(home, "session_id", None) or entry.get("home_sid")))
     return await asyncio.to_thread(_db_parent, runner, home), "summary"
 
 
