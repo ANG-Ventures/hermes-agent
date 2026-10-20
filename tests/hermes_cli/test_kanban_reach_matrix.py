@@ -161,8 +161,11 @@ def test_host_bound_card_portable_only_to_a_reaching_host(tmp_path):
     assert kwp.reach_allowed_hosts(body=body + "\nssh unifi", skills=(), pool=pool) == ("ace-media",)
     # Nobody reaches mac-studio-m3u: local.
     assert _portable(pool, body="ssh mac-studio-m3u 'uptime'") == (False, "host_reach", None)
-    # A skill-bound card with no named alias needs a host reaching EVERYTHING.
-    assert _portable(pool, skills=("ssh-machines",)) == (False, "host_reach", None)
+    # A skill-bound card with no named alias needs a host reaching every alias
+    # SOME pool host reaches (t_641d1ab8: ace-ai + unifi here; mac-studio-m3u
+    # and ace-media, reached by nobody, cannot hold it forever).
+    assert kwp.reach_allowed_hosts(body=None, skills=("ssh-machines",), pool=pool) == ("ace-media",)
+    assert _portable(pool, skills=("ssh-machines",)) == (True, None, "policy")
     # A remote pin to a non-reaching host is refused (waits), host:any rides the rule.
     assert _portable(pool, body="host: ace-ai\nssh ace-ai", ) == (False, "host_reach", None)
     assert _portable(pool, body="host: ci-box\nssh ace-ai") == (True, None, "pin")
