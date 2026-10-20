@@ -231,6 +231,32 @@ def test_continuity_from_previous_placed_run(home):
     assert kh.job_priority(100) == 0 and kh.job_priority(95) == 1 and kh.job_priority(80) is None
 
 
+class UtilFleet(Fleet):
+    """Fleet whose host-pressure.json carries the utilization row (scripts/host-pressure.py fields)."""
+
+    def text(self, h):
+        doc = json.loads(super().text(h))
+        doc.update({"os": "linux", "ncpu": 32, "cpu_busy": 0.30, "psi_io_some10": 0.5})
+        return json.dumps(doc)
+
+
+def test_utilization_take_places_on_a_measured_pool_host(home):
+    """Prism a864560114d1 / e65f40aa5a69 / 14062df79154: under ``kanban.admission: utilization`` the probe's
+    pressure row reaches the Sample (ncpu, cpu_busy, psi_io_some10, os), so a real take() places remotely
+    instead of closing every host ``unmeasured:ncpu``."""
+    (home / "config.yaml").write_text("kanban:\n  admission: utilization\n", encoding="utf-8")
+    assert placement.admission_mode() == "utilization"
+    plan = _plan(home, UtilFleet())
+    host = plan.take("alpha")
+    rows = {r.host: r for r in plan.last_decision.rows}
+    assert host is not None, {h: r.reason for h, r in rows.items()}
+    assert all("unmeasured" not in r.reason for r in rows.values()), {h: r.reason for h, r in rows.items()}
+    picked = rows[host.name]
+    assert picked.eligible and picked.cpu_busy == 0.30 and picked.need is not None
+    s = kh.sample_from_detail(plan.detail[host.name])
+    assert (s.ncpu, s.cpu_busy, s.psi_io_some10, s.os) == (32, 0.30, 0.5, "linux")
+
+
 # -- vendored copy stays the canonical scorer -------------------------------
 
 def test_vendored_placement_matches_canonical():

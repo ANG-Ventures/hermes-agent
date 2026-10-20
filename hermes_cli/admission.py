@@ -79,7 +79,7 @@ class SliceMem:
     """The consumer's own cgroup memory cap, sampled with the host sample (read_slice_memory())."""
     name: str                          # e.g. "kanbanw.slice"
     limit_gb: float                    # the lower of the finite MemoryHigh / MemoryMax
-    current_gb: float                  # the slice's memory.current at the sample
+    current_gb: Optional[float]        # the slice's memory.current at the sample; None = unreadable (admit refuses)
     classes: tuple = ("kanban",)       # job_class prefixes whose leases live inside this slice
 
 
@@ -216,15 +216,18 @@ def read_slice_memory(name: str = "kanbanw.slice", *, cgroup_root="/sys/fs/cgrou
                       classes: tuple = ("kanban",)) -> Optional[SliceMem]:
     """The slice's memory cap + use from cgroup v2 (the lower finite one of memory.high / memory.max;
     memory.current; Prism 8081ac5d7bce). None when the
-    slice does not exist or has no finite cap (no slice axis: the host axis alone applies)."""
+    slice does not exist or has no finite cap (no slice axis: the host axis alone applies). A finite cap with an
+    unreadable memory.current keeps the axis with ``current_gb=None``, so admit() refuses ``unmeasured:slice_mem_gb``
+    instead of dropping the slice (fail closed, Prism b137e9c52918)."""
     d = Path(cgroup_root) / name
     cur = _cg_bytes(d / "memory.current")
     high, mx = _cg_bytes(d / "memory.high"), _cg_bytes(d / "memory.max")
     finite = [x for x in (high, mx) if x is not None]
     limit = min(finite) if finite else None
-    if cur is None or limit is None:
+    if limit is None:
         return None
-    return SliceMem(name=name, limit_gb=limit / _GB, current_gb=cur / _GB, classes=tuple(classes))
+    return SliceMem(name=name, limit_gb=limit / _GB, current_gb=None if cur is None else cur / _GB,
+                    classes=tuple(classes))
 
 
 # ── estimates: measured per (class, host), improved by every run (Ace 15:5x point 4) ─────────────────────────────

@@ -1,7 +1,7 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
-VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole for the utilization wiring, t_da6f84f7, from
-ANG-Ventures/hermes-home#5183 rebased on main; sha256 5cbe715fbcaee30ee67fa97bee578619a2c3f8e99dd6bd9cbd59a639e945f24e; first vendored @ 2fe117cbcb,
+VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole for the utilization wiring, t_da6f84f7, and its
+flip prerequisites, t_39a267cb; sha256 40091fa0577302e00cc67ab1660fb41970155a940055099524a756ef29d2d38e; first vendored @ 2fe117cbcb,
 hermes-home#4462) for the kanban dispatcher (t_d6ce856e) and its alloc_client route (t_4187c8f1): the fork may not
 import hermes-home code. The ONLY local changes are ``fleet_root()`` plus ``encoding="utf-8"`` on two ``open()`` calls
 (the fork's PLW1514 lint); ``tests/hermes_cli/test_kanban_headroom_placement.py`` checks the rest against the canonical
@@ -1715,8 +1715,11 @@ def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample
             resv[hid] = resv[hid].plus(v) if hid in resv else v
         used = live_slots(consumer, p, now=now, table=table)     # positive slot caps count live admissions (696cce63)
         mode = choose_kw.pop("mode", None) or admission_mode()
-        if mode == "utilization" and "leases" not in choose_kw:
-            choose_kw["leases"] = ledger_leases(p, now=now, table=table) + held_leases(extra_reserved, table)
+        if mode == "utilization":
+            # the held-back reserve is a lease whether or not the caller supplied its own (Prism 8d9b939dcb9f)
+            base = choose_kw.get("leases")
+            choose_kw["leases"] = (list(base) if base is not None else ledger_leases(p, now=now, table=table)) \
+                + held_leases(extra_reserved, table)
         d = choose(table, consumer, samples, reservations=resv, slots_used=used, now=now,
                    stale_after_s=stale_after_s, mode=mode, **choose_kw)
         if not d.host:

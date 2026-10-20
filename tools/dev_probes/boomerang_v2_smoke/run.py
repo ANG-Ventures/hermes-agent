@@ -207,8 +207,27 @@ def write_evidence(rep: StepReport) -> Path:
 # --- sources -----------------------------------------------------------------------------------
 
 class GatewayLog:
-    """Gateway log lines. Live: only lines written after construction. Dry-run: the whole file."""
+    """Gateway log lines. Live: only lines written after construction. Dry-run: the whole file.
 
+    Live, the gateway's ``agent.log`` sibling is read too: hermes_logging routes only
+    ``gateway.*`` loggers into gateway.log, while the fork lines (``boomerang.fork …``,
+    ``boomerang.fork_ineligible …``) come from ``tools.delegate_tool`` and land in agent.log."""
+
+    def __init__(self, path: Path, live: bool):
+        self.path = path
+        self._parts = [_LogFile(path, live)]
+        sib = path.with_name("agent.log")
+        if live and sib != path:
+            self._parts.append(_LogFile(sib, live))
+
+    def lines(self) -> list[str]:
+        out: list[str] = []
+        for part in self._parts:
+            out.extend(part.lines())
+        return out
+
+
+class _LogFile:
     def __init__(self, path: Path, live: bool):
         self.path = path
         self.offset = path.stat().st_size if (live and path.exists()) else 0
