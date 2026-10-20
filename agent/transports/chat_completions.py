@@ -454,7 +454,9 @@ class ChatCompletionsTransport(ProviderTransport):
         strip_extra_content = not _model_consumes_thought_signature(kwargs.get("model"))
         # A profile declaring a native carrier type consumes replayed details by contract.
         native_type = getattr(kwargs.get("provider_profile"), "native_reasoning_details_type", None) or None
-        strip_reasoning_details = not (native_type or _route_replays_reasoning_details(kwargs.get("base_url")))
+        replays = bool(getattr(kwargs.get("provider_profile"), "replays_reasoning_details", False))
+        strip_reasoning_details = not (native_type or replays
+                                       or _route_replays_reasoning_details(kwargs.get("base_url")))
         sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content, strip_reasoning_details, native_type))
                            for m in messages]
         if all(s is None for _, s in sanitized_pairs):
