@@ -337,3 +337,34 @@ async def test_persisted_note_row_carries_the_post_stop_flag():
     with patch(_STT, side_effect=_slow_stt(started, {"/cache/audio/long.ogg": "w"})):
         await _cancel_once_started(_start_turn(runner, _voice()), started, runner)
     assert runner.session_store.rows["sess-old"][0]["display_metadata"] == {POST_STOP_VOICE_NOTE_KEY: True}
+
+
+@pytest.mark.asyncio
+async def test_queued_voice_drain_echo_keeps_thread_routing():
+    """Apollo review (round 3): threading ``persist_session_id`` through the drain must not change
+    the echo's send metadata. Adapters route a thread reply by ``metadata["thread_id"]``; a
+    ``session_id`` key sends the transcript echo to the parent channel instead of the thread."""
+    runner = _runner()
+    runner._should_echo_stt_transcripts = lambda: True
+    src = SessionSource(
+        platform=Platform.DISCORD, chat_id="1", chat_type="thread", user_id="42", user_name="Ace", thread_id="t-9",
+    )
+    queued = _voice()
+    queued.source = src
+    sent = []
+
+    class _Pending:
+        _pending_messages = {_KEY: queued}
+
+        def get_pending_message(self, key):
+            return self._pending_messages.pop(key, None)
+
+    async def _capture(adapter, source, transcripts, *, metadata=None, log_context="Transcript"):
+        sent.append(metadata)
+
+    runner._overflow_queue = lambda key: []
+    runner._draining = False
+    runner._echo_stt_transcripts = _capture
+    with patch(_STT, return_value={"success": True, "transcript": "queued words"}):
+        await runner._run_agent_drain_pending({"final_response": "done"}, _Pending(), src, _KEY, "sess-old")
+    assert sent and sent[0] == {"thread_id": "t-9"}

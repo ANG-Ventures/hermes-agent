@@ -4191,7 +4191,7 @@ class GatewayTurnMixin:
                     # Dequeued already: a /stop during this STT must persist the note, not drop it.
                     pending, _ = await self._transcribe_and_echo_pending_voice(
                         pending_event, adapter, source, _pending_text, log_context="Voice-drain",
-                        metadata={"session_id": source.thread_id} if source.thread_id else None,
+                        metadata={"thread_id": source.thread_id} if source.thread_id else None,
                         persist_session_id=session_id,
                     )
                     pending = pending or _build_media_placeholder(pending_event)
