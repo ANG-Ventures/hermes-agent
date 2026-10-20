@@ -184,7 +184,16 @@ def test_shutdown_hands_off_a_live_detached_unit_and_the_next_boot_delivers(_iso
     assert not _drain(), "exactly one completion: the adopter's"
 
 
+def _pin_detached_background(monkeypatch, enabled: bool) -> None:
+    """Pin delegation.detached_background: the production default is OFF (#2153), so a test that needs the
+    detached re-dispatch path must turn it on explicitly instead of inheriting the default."""
+    from tools import delegate_tool_config as dtc
+
+    monkeypatch.setattr(dtc, "_get_detached_background", lambda: enabled)
+
+
 def test_dead_child_without_result_is_redispatched(_isolated, tmp_path, monkeypatch):
+    _pin_detached_background(monkeypatch, True)
     record = _record("deleg_dead", owner=DEAD_BOOT)
     job_dir = dd.job_dir_for(tmp_path, record["attempt"]["attempt_id"])
     child = _fake_child(_isolated, job_dir, seconds=0, write_result=False)
@@ -207,6 +216,33 @@ def test_dead_child_without_result_is_redispatched(_isolated, tmp_path, monkeypa
     assert calls == [1]
     assert _wait_for_event("deleg_dead", timeout=60)["summary"] == "re-run"
     assert len(respawned) == 1 and respawned[0].startswith("deleg_dead:g1:"), "re-dispatch spawns a new child"
+
+
+def test_dead_child_redispatch_runs_in_process_when_detached_background_is_off(_isolated, tmp_path, monkeypatch):
+    """Knob off (the production default): the dead detached unit still re-runs, but as a gateway thread."""
+    _pin_detached_background(monkeypatch, False)
+    record = _record("deleg_dead_off", owner=DEAD_BOOT)
+    job_dir = dd.job_dir_for(tmp_path, record["attempt"]["attempt_id"])
+    child = _fake_child(_isolated, job_dir, seconds=0, write_result=False)
+    child.wait(timeout=10)
+    record["detached"] = _detached_block(child, job_dir, record["attempt"]["attempt_id"])
+    record["detached"]["create_time"] = 1.0
+    _write(record)
+    respawned = []
+    monkeypatch.setattr(dd, "spawn_child", lambda **kw: respawned.append(kw["attempt_id"]))
+    calls = []
+
+    def factory(rec, continuation):
+        calls.append(rec["attempt"]["generation"])
+        return lambda: {"status": "completed", "summary": "re-run in-process"}
+
+    summary = ad.recover_async_delegations(current_boot_id="new-boot:1.0", runner_factory=factory,
+                                           profile_home=tmp_path)
+
+    assert summary["claimed"] == 1
+    assert calls == [1]
+    assert _wait_for_event("deleg_dead_off", timeout=60)["summary"] == "re-run in-process"
+    assert respawned == [], "knob off: no detached child is spawned"
 
 
 def test_spawn_window_child_found_by_argv_is_adopted(_isolated, tmp_path):
