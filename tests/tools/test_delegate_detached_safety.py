@@ -239,6 +239,70 @@ def test_stand_down_never_kills_a_child_another_boot_already_adopted(_isolated, 
     assert not _drain(), "boot A must not finalize boot B's unit"
 
 
+# ── 987614e4d2a0 (#2160 Prism): an unknown stand-down outcome must not kill ──
+def _dispatch_with_unreadable_fence(_isolated) -> tuple:
+    holder: dict = {"fence_calls": 0, "terminated": []}
+
+    def fake_spawn(*, record, attempt_id, profile_home, continuation, live_delegation_id):
+        job_dir = dd.job_dir_for(profile_home, attempt_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        proc = _sleeper(_isolated, 30)
+        holder.update(proc=proc, job_dir=job_dir)
+        spawned = dd.DetachedSpawn(job_dir, proc.pid, dd.process_create_time(proc.pid), proc)
+        (job_dir / "pid.json").write_text(json.dumps({"pid": proc.pid, "create_time": spawned.create_time}))
+        return spawned
+
+    def broken_fence(*a, **k):
+        holder["fence_calls"] += 1
+        raise OSError("registry unreadable")
+
+    real_terminate = dd.terminate_group
+    with pytest.MonkeyPatch.context() as mp:  # scoped: the next boot reads a healthy registry
+        mp.setattr(ad, "current_boot_id", lambda: "boot-a:1.0")
+        mp.setattr(ad, "_STAND_DOWN_RETRY_DELAYS", (0.0, 0.0), raising=False)
+        mp.setattr(ad, "_install_detached_supervision", lambda *a, **k: False)
+        mp.setattr(ad._store, "stand_down_detached", broken_fence)
+        mp.setattr(dd, "terminate_group", lambda *a, **k: holder["terminated"].append(a) or real_terminate(*a, **k))
+        delegation_id = _dispatch(mp, fake_spawn)
+        deadline = time.time() + 10
+        while holder["fence_calls"] < 3 and time.time() < deadline:
+            time.sleep(0.05)
+        time.sleep(1.0)
+    return delegation_id, holder
+
+
+def test_an_unfenceable_child_is_left_running_and_adopted_by_the_next_boot(_isolated, tmp_path, monkeypatch):
+    delegation_id, holder = _dispatch_with_unreadable_fence(_isolated)
+
+    assert holder["fence_calls"] == 3, "the fence is retried before the outcome is called unknown"
+    assert holder["terminated"] == [], "an unknown stand-down outcome signalled the child"
+    assert holder["proc"].poll() is None
+    assert holder["job_dir"].exists(), "an unknown stand-down outcome removed the job dir"
+    assert not _drain(), "an unknown stand-down outcome finalized the unit"
+
+    adopted, kill = ad._store.claim_detached_adoptions(
+        current_boot_id="boot-b:1.0", profile_home=tmp_path, owner_alive=lambda boot: False,
+        probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for,
+        stand_down_unknown=dd.stand_down_unknown_dirs)
+
+    assert [r["delegation_id"] for r in adopted] == [delegation_id] and kill == []
+    assert adopted[0]["detached"]["pid"] == holder["proc"].pid
+    assert dd.stand_down_unknown_dirs(tmp_path) == []
+
+
+def test_an_unfenceable_child_nobody_owns_is_killed_by_the_next_boot(_isolated, tmp_path, monkeypatch):
+    delegation_id, holder = _dispatch_with_unreadable_fence(_isolated)
+    assert holder["proc"].poll() is None
+    ad._store.cancel_matching(all_active=True, owner_boot_id="", reason="test", caller="test")
+    ad._reset_for_tests()
+
+    ad.recover_async_delegations(current_boot_id="boot-b:1.0", profile_home=tmp_path,
+                                 runner_factory=lambda *a: pytest.fail("an orphan is never re-run"))
+
+    holder["proc"].wait(timeout=10)
+    assert not holder["job_dir"].exists()
+
+
 def test_a_stood_down_attempt_is_not_adoptable(_isolated, tmp_path):
     record = _record("deleg_fence", owner="boot-a:1.0", state="recoverable")
     job_dir = dd.job_dir_for(tmp_path, record["attempt"]["attempt_id"])

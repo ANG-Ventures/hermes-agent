@@ -34,7 +34,10 @@ Process identity is `(pid, kernel start time)`; a pid without a start time is ne
 when its argv carries the exact `--job <dir>` pair). SIGKILL escalation also reaches group members captured at
 SIGTERM time that outlived the leader. A dispatcher standing an un-advertised child down first fences the
 attempt in the registry (`stand_down_detached`); if an overlapping boot already adopted it, the child is left
-running for that boot. The detached worker writes its process checkpoint into its job dir, never the
+running for that boot. A fence whose outcome stays unknown (the registry raises on every retry) never kills:
+the child and its job dir are left running, marked `stand-down-unknown.json`, and the next boot's adoption pass
+decides. A live owned record adopts it (marker cleared); a dir no live record owns is an orphan, killed and
+removed. The detached worker writes its process checkpoint into its job dir, never the
 gateway's `<home>/processes.json`.
 
 Out of scope: synchronous delegation (thread), depth>0 (always synchronous already), TUI/CLI

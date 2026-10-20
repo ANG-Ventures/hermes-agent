@@ -1252,20 +1252,26 @@ def stand_down_detached(
 
 def claim_detached_adoptions(
     *, current_boot_id: str, profile_home: Path | None = None, owner_alive=is_boot_id_alive,
-    probe=None, identity=None, job_dir_for=None,
+    probe=None, identity=None, job_dir_for=None, stand_down_unknown=None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Adopt detached units whose owner is gone (docs/dev/delegate-detached-background.md).
 
     Returns ``(adopted, kill)``: adopted record copies (owner rewritten to this boot, same attempt) and
     ``{pid, create_time}`` identities of children that must be signalled (cancelled or past the age cap).
     A detached unit whose child is dead with no result loses its ``detached`` block and is left to
-    ``claim_recoveries`` (normal re-dispatch). Runs regardless of ``resume_on_restart``."""
+    ``claim_recoveries`` (normal re-dispatch). Runs regardless of ``resume_on_restart``.
+
+    ``stand_down_unknown(home)`` lists job dirs whose dispatcher could not fence its child (registry
+    error): one no live record owns is an orphan, killed (``kill`` entry carries ``remove_job_dir``)."""
     adopted: list[dict[str, Any]] = []
     kill: list[dict[str, Any]] = []
     if not registry_path(profile_home).exists():
         return adopted, kill
     home = registry_path(profile_home).parent.parent
     now = time.time()
+    owned_dirs: set[str] = set()
+    adopted_dirs: set[str] = set()
+    killed_dirs: set[str] = set()
     with locked_registry(profile_home) as registry:
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
         for delegation_id, record in registry["records"].items():
@@ -1282,6 +1288,7 @@ def claim_detached_adoptions(
             if state == "cancelled" or (state == "failed" and block is not None):
                 # Terminal-without-result: a still-live child is an orphan. ``failed`` + block is the age cap
                 # below, which keeps the block so a kill its gateway died before sending is re-sent here.
+                killed_dirs.add(str(job_dir))
                 ident = identity(job_dir, block)
                 if ident:
                     kill.append(ident)
@@ -1292,10 +1299,12 @@ def claim_detached_adoptions(
                 continue
             if record.get("detached_fence") == attempt.get("attempt_id"):
                 continue  # its dispatcher stood this attempt down; claim_recoveries re-dispatches it
+            owned_dirs.add(str(job_dir))
             owner = str(attempt.get("owner_boot_id") or "")
             if state == "running" and (owner == current_boot_id or owner_alive(owner)):
                 continue
             if now - float(record.get("created_at") or now) > ACTIVE_STALE_SECONDS:
+                killed_dirs.add(str(job_dir))
                 ident = identity(job_dir, block)
                 if ident:
                     kill.append(ident)
@@ -1321,10 +1330,21 @@ def claim_detached_adoptions(
             record["updated_at"] = now
             append_lifecycle_event(record, "adopted", f"boot={current_boot_id} child={status}", now=now)
             adopted.append(copy.deepcopy(record))
+            adopted_dirs.add(str(job_dir))
             logger.info(
                 "async_delegation_detached_adopted delegation_id=%s attempt_id=%s pid=%s child=%s",
                 delegation_id, attempt.get("attempt_id"), block.get("pid"), status,
             )
+        # Decided under the same lock, so no boot can adopt a dir between this check and the kill.
+        for job_dir in (stand_down_unknown(home) if stand_down_unknown else []):
+            if str(job_dir) in adopted_dirs:
+                Path(job_dir, "stand-down-unknown.json").unlink(missing_ok=True)
+            elif str(job_dir) not in owned_dirs:
+                # Already signalled above (cancelled / age cap): only the dir is left to remove.
+                ident = {} if str(job_dir) in killed_dirs else identity(Path(job_dir), None) or {}
+                kill.append({**ident, "job_dir": str(job_dir), "remove_job_dir": True})
+                logger.warning("async_delegation_detached_unfenced_orphan job_dir=%s pid=%s",
+                               job_dir, ident.get("pid"))
     return adopted, kill
 
 

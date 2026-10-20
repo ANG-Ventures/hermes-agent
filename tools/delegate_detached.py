@@ -65,6 +65,25 @@ def remove_job_dir(job_dir: Path) -> None:
     shutil.rmtree(job_dir, ignore_errors=True)
 
 
+STAND_DOWN_UNKNOWN = "stand-down-unknown.json"
+
+
+def mark_stand_down_unknown(job_dir: Path) -> None:
+    """Its dispatcher could not fence this child (registry unreadable): the next boot decides its fate."""
+    try:
+        _write_json(Path(job_dir) / STAND_DOWN_UNKNOWN, {"marked_at": time.time(), "pid": os.getpid()})
+    except OSError:
+        logger.warning("could not mark %s stand-down-unknown", job_dir, exc_info=True)
+
+
+def stand_down_unknown_dirs(profile_home: Path) -> list:
+    root = jobs_root(profile_home)
+    try:
+        return sorted(p.parent for p in root.glob(f"*/{STAND_DOWN_UNKNOWN}"))
+    except OSError:
+        return []
+
+
 # ── process identity ────────────────────────────────────────────────────────
 def process_create_time(pid: int) -> Optional[float]:
     try:

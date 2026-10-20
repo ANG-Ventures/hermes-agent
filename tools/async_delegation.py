@@ -1478,6 +1478,24 @@ def _handed_off_check(delegation_id: str) -> Callable[[], bool]:
     return _check
 
 
+_STAND_DOWN_RETRY_DELAYS = (0.2, 0.5, 1.0)
+
+
+def _fence_stand_down(delegation_id: str, attempt_id: str, profile_home: Optional[Path]) -> Optional[bool]:
+    """``_store.stand_down_detached`` retried with a short backoff; None when the outcome stays unknown
+    (a registry error says nothing about whether another boot already adopted the attempt)."""
+    for delay in (*_STAND_DOWN_RETRY_DELAYS, None):
+        try:
+            return _store.stand_down_detached(
+                delegation_id, attempt_id, _owner_boot_id(delegation_id), profile_home=profile_home)
+        except Exception:
+            logger.warning("async_delegation_detached_stand_down_failed delegation_id=%s",
+                           delegation_id, exc_info=True)
+        if delay is not None:
+            time.sleep(delay)
+    return None
+
+
 def _run_detached_unit(
     delegation_id: str, attempt_id: str, profile_home: Optional[Path], *, continuation: Optional[str],
     live_delegation_id: Optional[str], fallback_runner: Callable[[], Any],
@@ -1526,13 +1544,19 @@ def _run_detached_unit(
         # Cancelled, superseded or shutting down between persist and spawn: the child must not run on,
         # and its job dir must not look adoptable (a shutdown re-dispatches the unit on the next boot).
         # Fence it first: an overlapping boot that already adopted this attempt owns the child now.
-        try:
-            stand_down = _store.stand_down_detached(
-                delegation_id, attempt_id, _owner_boot_id(delegation_id), profile_home=profile_home)
-        except Exception:
-            logger.warning("async_delegation_detached_stand_down_failed delegation_id=%s",
-                           delegation_id, exc_info=True)
-            stand_down = True  # nobody can have adopted what the registry cannot even read
+        stand_down = _fence_stand_down(delegation_id, attempt_id, profile_home)
+        if stand_down is None:
+            # Unknown: another boot may own the child. Never kill on an unknown; leave the child and its
+            # job dir to the next boot's adoption pass (adopts it, or kills it if cancelled/age-capped).
+            logger.warning("async_delegation_detached_stand_down_unknown delegation_id=%s pid=%s: "
+                           "leaving the child for the next boot", delegation_id, spawned.pid)
+            dd.mark_stand_down_unknown(spawned.job_dir)
+            with _records_lock:
+                rec = _records.get(delegation_id)
+                if rec is not None:  # frees the slot; the durable record is the next boot's to decide
+                    rec.update(detached_handed_off=True, interrupt_fn=None, progress_fn=None,
+                               status="interrupted", completed_at=time.time())
+            raise dd.HandedOff(str(spawned.job_dir))
         if not stand_down:
             logger.info("async_delegation_detached_adopted_elsewhere delegation_id=%s pid=%s",
                         delegation_id, spawned.pid)
@@ -1980,9 +2004,13 @@ def recover_async_delegations(
     # through to claim_recoveries below as a normal re-dispatch.
     adopted, kill = _store.claim_detached_adoptions(
         current_boot_id=current_boot_id, profile_home=profile_home, owner_alive=is_boot_id_alive,
-        probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for)
+        probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for,
+        stand_down_unknown=dd.stand_down_unknown_dirs)
     for ident in kill:
-        dd.terminate_group(ident.get("pid"), ident.get("create_time"))
+        if ident.get("pid") is not None:
+            dd.terminate_group(ident.get("pid"), ident.get("create_time"))
+        if ident.get("remove_job_dir"):
+            dd.remove_job_dir(Path(ident["job_dir"]))
     for durable in adopted:
         _adopt_detached(durable, profile_home, max_async_children)
     claimed, summary = _store.claim_recoveries(
