@@ -1040,12 +1040,12 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # Per tick: auto-decompose triage scan, load-gate demand probe, the
-    # dispatch connect, and the ready-work probe (ready + review share one
-    # connection). The second tick skips the dispatch connect AND the demand
-    # probe because the corrupt board fingerprint is quarantined (#1468): the
-    # pre-scan must not re-open a board the dispatch tick skips. 4 + 2 = 6.
-    assert calls["connect"] == 6
+    # One tick reaches the stop threshold: auto-decompose triage scan, the
+    # placement ledger, the pool plan's any_ready AND any_waking probes
+    # (placement is remote-first since #2148 / t_82b4db80, so any_waking always
+    # runs when nothing is ready), the demand probe, the dispatch connect, and
+    # the ready-work probe (ready + review share one connection). 7.
+    assert calls["connect"] == 7
 
 
 # ---------------------------------------------------------------------------
