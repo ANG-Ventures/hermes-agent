@@ -1717,7 +1717,14 @@ class GatewayInboundMixin:
                 message_text, _successful_transcripts = await asyncio.shield(stt)
             except asyncio.CancelledError:
                 _stop_cell["stopped"] = True
-                await self._persist_voice_after_stop(event, stt, message_text, audio_paths, session_id)
+                # Owned by the runner, not this handler: a second /stop or /reset cannot abandon it,
+                # and the session's next turn waits on it before loading history.
+                persist = asyncio.ensure_future(
+                    self._persist_voice_after_stop(event, stt, message_text, audio_paths, session_id),
+                )
+                self._register_voice_persist_barrier(session_id, persist)
+                with suppress(asyncio.CancelledError):
+                    await asyncio.shield(persist)
                 raise
         finally:
             _STT_STOP_CELL.reset(_stop_cell_token)
@@ -1753,10 +1760,6 @@ class GatewayInboundMixin:
             text = self._prepend_media_prefix(
                 "\n\n".join(self._untranscribed_audio_note(p) for p in dict.fromkeys(audio_paths)), message_text,
             )
-        except asyncio.CancelledError:
-            # A second cancel while waiting: the STT task keeps running unobserved; nothing to persist.
-            logger.info("stt after /stop: chat=%s abandoned by a second cancel", _STT_LOG_CHAT.get())
-            raise
         if not session_id:
             logger.warning("stt after /stop: chat=%s no turn session id; note not persisted", _STT_LOG_CHAT.get())
             return
@@ -1774,6 +1777,36 @@ class GatewayInboundMixin:
         await self.async_session_store.append_to_transcript(session_id, row)
         logger.info("stt after /stop: chat=%s note persisted to session %s (no reply)",
                     _STT_LOG_CHAT.get(), session_id)
+
+    def _register_voice_persist_barrier(self, session_id: Optional[str], task: "asyncio.Future") -> None:
+        """Hold a strong ref to the post-stop persist task, keyed by the session it writes to."""
+        if not session_id:
+            return
+        barriers = self.__dict__.setdefault("_voice_persist_barriers", {})
+        barriers.setdefault(session_id, []).append(task)
+
+        def _done(t, sid=session_id):
+            if not t.cancelled() and t.exception() is not None:
+                logger.warning("stt after /stop: session %s voice note not persisted: %r", sid, t.exception())
+            pending = barriers.get(sid)
+            if pending is not None and t in pending:
+                pending.remove(t)
+                if not pending:
+                    barriers.pop(sid, None)
+        task.add_done_callback(_done)
+
+    async def _await_voice_persist_barrier(self, session_id: Optional[str]) -> None:
+        """Before a turn loads history: wait for a stopped turn's voice note to land first, so the
+        note precedes the new message instead of being appended after the newer conversation."""
+        pending = list((self.__dict__.get("_voice_persist_barriers") or {}).get(session_id or "", ()))
+        if not pending:
+            return
+        logger.info("stt after /stop: session %s waiting for %d pending voice note(s) before history load",
+                    session_id, len(pending))
+        _, still = await asyncio.wait(pending, timeout=STT_AFTER_STOP_TIMEOUT_S + 10)
+        if still:
+            logger.warning("stt after /stop: session %s voice note still pending; turn proceeds without it",
+                           session_id)
 
     @staticmethod
     def _inbound_attachment_display_name(path: str) -> Tuple[str, str]:

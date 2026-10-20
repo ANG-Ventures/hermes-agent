@@ -226,3 +226,40 @@ async def test_stt_past_the_bound_persists_marker_and_exits(caplog, monkeypatch)
     content = runner.session_store.rows["sess-old"][0]["content"]
     assert "could not be transcribed" in content and "long.ogg" in content
     assert any("timeout after stop" in line for line in _stt_lines(caplog))
+
+
+@pytest.mark.asyncio
+async def test_second_cancel_during_post_stop_wait_still_persists():
+    """Prism 071af0f232bd: /stop twice (or /stop then /reset) must not abandon the note."""
+    runner = _runner()
+    started = asyncio.Event()
+    with patch(_STT, side_effect=_slow_stt(started, {"/cache/audio/long.ogg": "keep me"}, delay=0.5)):
+        task = _start_turn(runner, _voice())
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0.05)  # handler is now waiting on the persist task
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await runner._await_voice_persist_barrier("sess-old")
+    assert '"keep me"' in runner.session_store.rows["sess-old"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_next_turn_waits_for_pending_note_before_loading_history():
+    """Prism 5acffc356efe: the adapter stops waiting for a cancelled task after 5 s, so the next
+    turn can start while STT is still running. It must wait for the note before reading history."""
+    runner = _runner()
+    started = asyncio.Event()
+    with patch(_STT, side_effect=_slow_stt(started, {"/cache/audio/long.ogg": "first"}, delay=0.5)):
+        task = _start_turn(runner, _voice())
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        task.cancel()  # the handler is gone; only the persist task remains
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert "sess-old" not in runner.session_store.rows  # STT still running
+        await runner._await_voice_persist_barrier("sess-old")  # what the next turn does before load_transcript
+        assert '"first"' in runner.session_store.rows["sess-old"][0]["content"]
+    await runner._await_voice_persist_barrier("sess-old")  # nothing pending: returns at once

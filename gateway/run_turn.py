@@ -2341,6 +2341,9 @@ class GatewayTurnMixin:
         # earlier would falsely recover a message that never began processing.
         await self._mark_durable_active_turn(event, session_entry.session_key)
 
+        # A voice note from a turn /stop cancelled mid-STT is still being persisted: it must land
+        # before this turn's history is read, so it precedes this message (t_2f936364).
+        await self._await_voice_persist_barrier(session_entry.session_id)
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
         try:
