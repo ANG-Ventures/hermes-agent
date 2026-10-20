@@ -2222,9 +2222,38 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
         anthropic_kwargs["extra_headers"] = _eh
     # error-class-v2 negotiation (apr and bpr; fallback spec Phase 1b).
     merge_pool_capability_headers(agent, anthropic_kwargs)
+    _merge_profile_anthropic_extras(agent, anthropic_kwargs)
     # Portal reads ``tags`` / ``session_id`` on its Messages route too, but the profile hook
     # is only consulted by the OpenAI-wire transport — merge here to keep sticky routing.
     return _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs)
+
+
+def _merge_profile_anthropic_extras(agent, anthropic_kwargs: dict) -> dict:
+    """Merge the provider profile's ``build_anthropic_kwargs_extras`` (per-request
+    ``metadata`` / ``extra_headers``) onto an Anthropic Messages kwargs dict.
+
+    t_814ad411: a stateful bridge pool row switched to ``transport: anthropic_messages``
+    keys its CLI session on ``metadata.user_id`` and still needs its mode header; the
+    Anthropic client is built without the profile's ``default_headers``, so both ride
+    here. Headers already set (affinity, capability) win over the profile's."""
+    try:
+        from providers import get_provider_profile
+        profile = get_provider_profile(getattr(agent, "provider", None))
+        hook = getattr(profile, "build_anthropic_kwargs_extras", None) if profile else None
+        extras = hook(session_id=getattr(agent, "session_id", None),
+                      bridge_route_suffix=getattr(agent, "_bridge_route_suffix", None)) if hook else None
+    except Exception as exc:  # noqa: BLE001 — a profile hook never blocks a turn
+        logger.debug("anthropic profile extras skipped: %s", exc)
+        return anthropic_kwargs
+    if not isinstance(extras, dict) or not extras:
+        return anthropic_kwargs
+    meta = extras.get("metadata")
+    if isinstance(meta, dict) and meta:
+        anthropic_kwargs["metadata"] = {**meta, **dict(anthropic_kwargs.get("metadata") or {})}
+    hdrs = extras.get("extra_headers")
+    if isinstance(hdrs, dict) and hdrs:
+        anthropic_kwargs["extra_headers"] = {**hdrs, **dict(anthropic_kwargs.get("extra_headers") or {})}
+    return anthropic_kwargs
 
 
 def _build_bedrock_kwargs(agent, api_messages, tools_for_api):
@@ -2317,9 +2346,9 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     if _profile:
         # Profiles handle per-provider quirks via hooks fed the context above.
         # error-class-v2 negotiation headers (relay-pool lanes) on both paths.
-        return merge_pool_capability_headers(
+        return _merge_pool_affinity_headers(agent, merge_pool_capability_headers(
             agent, transport.build_kwargs(provider_profile=_profile, **_common),
-        )
+        ))
 
     # Legacy flag path: only for a provider absent from the providers/ registry.
     return merge_pool_capability_headers(agent, transport.build_kwargs(
@@ -2340,6 +2369,17 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         provider_name=agent.provider,
     ))
+
+
+def _merge_pool_affinity_headers(agent, api_kwargs):
+    """t_814ad411: an a-family pool row switched to ``transport: openai_chat`` (alr in
+    OpenAI mode) keeps the apr relay's session affinity + lane headers. The helper is
+    provider-gated to the a-family pool names, so it is a no-op for every other
+    chat_completions route; already-set headers win."""
+    aff = _pool_affinity_headers(agent)
+    if aff and isinstance(api_kwargs, dict):
+        api_kwargs["extra_headers"] = {**aff, **dict(api_kwargs.get("extra_headers") or {})}
+    return api_kwargs
 
 
 def _legacy_effort_route(agent):
