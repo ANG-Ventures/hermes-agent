@@ -14491,9 +14491,6 @@ def reopen_task(
                 "voided_result": (row["result"] or "")[:500] or None,
             },
         )
-        # Completion reaped the scratch tree; drop the dead binding so the next
-        # dispatch mints a fresh dir instead of refusing it as mount loss.
-        _release_reaped_scratch_binding(conn, task_id, actor=actor, reason="reopened")
 
         # This task is no longer ``done``, so any child promoted on that
         # premise now violates the invariant the dispatcher trusts: a ``ready``
