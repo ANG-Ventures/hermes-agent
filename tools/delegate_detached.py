@@ -344,6 +344,9 @@ def terminate_group(pid: Any, create_time: Any, *, grace: float = SIGKILL_GRACE_
     members = _recorded_members(pid, job_dir)
     if pid_alive(pid, create_time):
         members = sorted({*members, *((int(m), c) for m, c in _group_members(int(pid)))}, key=lambda m: m[0])
+    elif job_dir is not None and pid_state(pid, create_time) is False:
+        # Leader already gone: tools still in its group that nothing captured are signalled one by one.
+        members = sorted({*members, *(group_survivors(job_dir, pid, create_time) or [])}, key=lambda m: m[0])
     with _terminated_members_lock:
         _terminated_members[int(pid)] = members
     if job_dir is not None and members:
@@ -378,6 +381,8 @@ def wait_for_exit(pid: Any, create_time: Any, *, popen: Optional[subprocess.Pope
             gone = all(pid_state(m_pid, m_ct) is False for m_pid, m_ct in _recorded_members(pid, job_dir))
         else:
             gone = group_state(pid, create_time, job_dir) is False
+        if gone and job_dir is not None:
+            gone = group_survivors(job_dir, pid, create_time) == []  # uncaptured tools; unknown is not gone
         if gone:
             with _terminated_members_lock:
                 _terminated_members.pop(int(pid), None)

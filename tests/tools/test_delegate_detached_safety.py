@@ -1108,3 +1108,54 @@ def test_a_dead_leader_with_live_tools_is_neither_redispatched_nor_released(_iso
             os.kill(tool_pid, signal.SIGKILL)
         except OSError:
             pass
+
+
+# a1d5038f5040 (P0, Prism at 52dfa7fc): a fenced attempt whose leader died with no members.json is
+# re-dispatched only after the tool it left running in its process group is killed and confirmed gone
+@pytest.mark.platforms("posix")  # process groups
+@pytest.mark.live_system_guard_bypass  # the surviving tool is reparented to init: real delivery is the point
+def test_a_fenced_attempt_with_an_uncaptured_live_tool_keeps_its_fence(_isolated, tmp_path, monkeypatch):
+    monkeypatch.setattr(ad, "_detached_enabled", lambda: False)
+    record = _record("deleg_fz", owner="boot-a:1.0", state="recoverable")
+    attempt_id = record["attempt"]["attempt_id"]
+    job_dir = dd.job_dir_for(tmp_path, attempt_id)
+    job_dir.mkdir(parents=True)
+    marker = tmp_path / "tool.pid"
+    leader_code = (
+        "import subprocess,sys,time\n"
+        "t=subprocess.Popen([sys.executable,'-c','import time; time.sleep(120)'])\n"
+        f"open({str(marker)!r},'w').write(str(t.pid))\n"
+        "time.sleep(120)\n")
+    leader = subprocess.Popen([sys.executable, "-c", leader_code], start_new_session=True)
+    _isolated.append(leader)
+    deadline = time.time() + 10
+    while not marker.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.3)
+    tool_pid = int(marker.read_text())
+    record["detached"] = {"pid": leader.pid, "create_time": dd.process_create_time(leader.pid),
+                          "job_dir": str(job_dir), "attempt_id": attempt_id, "spawned_at": time.time()}
+    _write(record)
+    (job_dir / "heartbeat.json").write_text(json.dumps({"schema_version": dd.SCHEMA_VERSION, "token": None,
+                                                        "in_tool": True, "ts": time.time()}))
+    # Boot A fences its child and dies before the kill (no members.json); the leader then dies, the tool runs on.
+    assert ad._store.stand_down_detached("deleg_fz", attempt_id, "boot-a:1.0", profile_home=tmp_path) is True
+    leader.kill()
+    leader.wait(timeout=5)
+    tool_ct = dd.process_create_time(tool_pid)
+    at_redispatch: list = []
+
+    def factory(rec, cont):
+        at_redispatch.append(dd.pid_state(tool_pid, tool_ct))
+        return lambda: {}
+
+    try:
+        ad.recover_async_delegations(current_boot_id="boot-b:1.0", profile_home=tmp_path, runner_factory=factory)
+        assert at_redispatch == [False], (
+            "generation 1 was dispatched while generation 0's tool was still running")
+        _wait_for_event("deleg_fz")
+    finally:
+        try:
+            os.kill(tool_pid, signal.SIGKILL)
+        except OSError:
+            pass

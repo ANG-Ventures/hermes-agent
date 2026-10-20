@@ -2032,6 +2032,22 @@ def _schedule_recovery_retry(kwargs: Dict[str, Any], undecided: List[str]) -> No
     timer.start()
 
 
+def _detached_attempt_alive(ident: Dict[str, Any]) -> bool:
+    """Is anything of this attempt possibly still running? Its leader, a recorded tool, or a tool still in
+    the leader's process group that no members.json captured (the dispatcher died before its kill).
+    Unknown counts as alive: this only decides whether a fence / block may be released, never a signal."""
+    from tools import delegate_detached as dd
+
+    pid, create_time = ident.get("pid"), ident.get("create_time")
+    job_dir = Path(ident["job_dir"]) if ident.get("job_dir") else None
+    if dd.group_state(pid, create_time, job_dir) is not False:
+        return True
+    if job_dir is None:
+        return False
+    left = dd.group_survivors(job_dir, pid, create_time)
+    return left is None or bool(left)
+
+
 def recover_async_delegations(
     *,
     current_boot_id: str,
@@ -2052,8 +2068,7 @@ def recover_async_delegations(
         current_boot_id=current_boot_id, profile_home=profile_home, owner_alive=is_boot_id_alive,
         probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for,
         stand_down_unknown=dd.stand_down_unknown_dirs, undecided=undecided, survivors=dd.group_survivors,
-        alive=lambda ident: dd.group_state(ident.get("pid"), ident.get("create_time"),
-                                           Path(ident["job_dir"]) if ident.get("job_dir") else None) is not False)
+        alive=_detached_attempt_alive)
     for ident in kill:
         job_dir = Path(ident["job_dir"]) if ident.get("job_dir") else None
         if ident.get("pid") is not None:
