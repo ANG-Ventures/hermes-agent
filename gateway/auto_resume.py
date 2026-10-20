@@ -206,6 +206,12 @@ def has_resumable_work(messages: Iterable[dict[str, Any]]) -> bool:
     return content in (None, [], {}, "")
 
 
+# ``display_metadata`` flag on a voice note persisted AFTER its turn was /stopped (run_inbound
+# ``_persist_voice_after_stop``). It is the user's speech but not a message sent after the stop,
+# so it must not supersede the ``user_stopped`` marker (t_2f936364).
+POST_STOP_VOICE_NOTE_KEY = "post_stop_voice_note"
+
+
 def user_stop_blocks_resume(
     stopped_at_message_id: int | None,
     messages: Iterable[dict[str, Any]],
@@ -237,6 +243,9 @@ def user_stop_blocks_resume(
         if not isinstance(row, dict):
             continue
         if not _is_nonempty_human_message(row):
+            continue
+        meta = row.get("display_metadata")
+        if isinstance(meta, dict) and meta.get(POST_STOP_VOICE_NOTE_KEY):
             continue
         rowid = _message_id(row)
         if rowid is not None and rowid > stopped_at_message_id:
