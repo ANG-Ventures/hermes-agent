@@ -2291,7 +2291,11 @@ DEFAULT_CONFIG = {
         # (2026-09-20: a worker's runaway busy-loops drove the host to load
         # 538/32 cores and starved the resident gateway's event loop into two
         # watchdog hard-exits and a 12-minute boot.)
-        "worker_cpu_priority": "background",
+        # Default "normal" since 2026-10-19 (Ace 21:52: the dev pipeline,
+        # kanban workers included, is first-class on all cores): no nice, no
+        # QoS clamp. "background"/"idle" are opt-in per host; admission
+        # (dispatch_load_gate) is the lever against a slow gateway.
+        "worker_cpu_priority": "normal",
         # Process bounds for worker trees (t_368e9873). A scratch bench that
         # re-spawned itself 18,818 times on 2026-10-01 filled the uid's
         # process table (10,340 / 10,666) and every fork on the host failed.

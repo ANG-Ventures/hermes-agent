@@ -8228,10 +8228,10 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
-    # Background CPU priority for the worker gateway. Niceness is inherited
-    # across fork/exec, so this covers every process the worker later spawns
-    # (terminal-tool children included) without policing them individually —
-    # the seam the 2026-09-20 load-538 incident escaped through.
+    # Worker CPU priority (kanban.worker_cpu_priority; default "normal" = no
+    # nice, no QoS clamp since 2026-10-19). When an operator opts a host into
+    # "background"/"idle", niceness is inherited across fork/exec, so it covers
+    # every process the worker later spawns (terminal-tool children included).
     cpu_priority_mode, cpu_nice = _kb.worker_cpu_priority_config()
     priority_preexec = _kb._build_worker_priority_preexec(cpu_nice)
     # Process-table ceiling for the whole worker tree (t_368e9873): a
