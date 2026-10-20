@@ -210,7 +210,17 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     if mdev_info is not None:
         ov = overlay or HermesOverlay()
         env_vars = list(mdev_info.env)
-        for ev in ov.extra_env_vars:
+        extra = list(ov.extra_env_vars)
+        if overlay is None:
+            # A provider that ships its own plugin profile and is LATER catalogued by models.dev
+            # (commandcode: models.dev names CMD_API_KEY, the profile and our docs COMMANDCODE_API_KEY)
+            # keeps the profile's key and base-URL vars, or existing setups silently lose their key.
+            plug = _plugin_profile_pdef(canonical)
+            if plug is not None:
+                extra += plug.api_key_env_vars
+                if plug.base_url_env_var:
+                    ov = HermesOverlay(transport=ov.transport, base_url_env_var=plug.base_url_env_var)
+        for ev in extra:
             if ev not in env_vars:
                 env_vars.append(ev)
         return _overlay_pdef(canonical, ov, mdev_info.name, tuple(env_vars), ov.base_url_override or mdev_info.api,

@@ -4727,12 +4727,13 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             rules_out[row["id"]] = _pr.RULE_PIN if route_class == "pin" else _pr.RULE_POLICY
         return ("pin", pin) if route_class == "pin" else ("portable", None)
     if rule == _pr.PIN_UNKNOWN_HOST:
-        # A host: line naming no host: local only, named, never spilled (t_cb2b888d).
+        # A host: line naming no host: never runs anywhere, named, parked
+        # needs_input after the loop (t_cb2b888d, t_229d6bca: a pin is hard).
         if unknown_out is not None:
             unknown_out[row["id"]] = ignored
         if rules_out is not None:
             rules_out[row["id"]] = rule
-        return "local", _pr.pin_unknown_host(ignored, _kwp.pin_suggestions(
+        return "wait", _pr.pin_unknown_host(ignored, _kwp.pin_suggestions(
             ignored, plan.config.hosts or (), getattr(plan.config, "pin_aliases", None)))
     if rule == _pr.LINKED and link is not None and lineage_mode != _pr.LINEAGE_PINS_LEGACY:
         rule = _pr.linked(*link)  # name the edge that holds it (t_ae87edff)
@@ -4941,7 +4942,7 @@ def _browser_relay_create(host: str, card: str, run: str, source_host: str) -> d
     try:
         out = subprocess.run([sys.executable, str(script), "create-ephemeral", "--host", host, "--card", card,
                               "--run", run, "--source-host", source_host],
-                             capture_output=True, text=True, timeout=260, stdin=subprocess.DEVNULL)
+                             capture_output=True, text=True, encoding="utf-8", timeout=260, stdin=subprocess.DEVNULL)
         resp = json.loads(((out.stdout or "").strip().splitlines() or ["{}"])[-1])
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return {"ok": False, "refusal": "BROWSER_RELAY_TRANSPORT", "detail": type(exc).__name__}
@@ -5087,7 +5088,7 @@ def _browser_release_lease(host: str, token: str) -> dict:
     try:
         out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
                               "/usr/local/bin/browserctl --lease-token-stdin --json release"],
-                             input=token + "\n", capture_output=True, text=True, timeout=60)
+                             input=token + "\n", capture_output=True, text=True, encoding="utf-8", timeout=60)
     except (OSError, subprocess.SubprocessError) as exc:
         return {"ok": False, "refusal": "BROWSER_RELAY_TRANSPORT", "detail": type(exc).__name__}
     return {"ok": out.returncode == 0, "rc": out.returncode}
@@ -5892,9 +5893,12 @@ def _dispatch_once_locked(
             _pin, _ignored = _kwp.resolve_pin(r["body"], _known, _aliases)
             if _ignored is not None:
                 _kwp.note_ignored_pin(r["id"], _ignored)
-                if _pin is None:
-                    # No plan: it runs locally anyway, but still says so (t_cb2b888d).
+                if _pin is None and _known:
+                    # No plan this tick, but a pool is configured: an unknown
+                    # pin is refused, never run locally (t_229d6bca).
+                    from hermes_cli import kanban_placement_reasons as _pr_np
                     result.unknown_pins[r["id"]] = _ignored
+                    row_route[r["id"]] = ("wait", _pr_np.pin_unknown_host(_ignored))
             # Not ``elif``: a prose ``Host:`` line above a real pin returns
             # BOTH, and the pin must still wait (Prism 56085b64).
             if _pin is not None and _pin not in (_kwp.PIN_ANY, _kwp.PIN_STUDIO):
@@ -7121,12 +7125,13 @@ def _dispatch_once_locked(
             notify_starved_holds(conn, result.placement_waits, int(time.time()))
         except Exception as exc:  # never break a dispatcher tick
             _kb._log.warning("kanban placement-starved notify failed: %s", exc)
-    if not dry_run and result.unknown_pins:
+    if result.unknown_pins:
         try:
-            from hermes_cli.kanban_unknown_pin import comment_unknown_pins
-            comment_unknown_pins(conn, result.unknown_pins)
+            from hermes_cli.kanban_unknown_pin import park_unknown_pins
+            park_unknown_pins(conn, result.unknown_pins, dry_run=dry_run,
+                              default_assignee=default_assignee)
         except Exception as exc:  # never break a dispatcher tick
-            _kb._log.warning("kanban unknown-pin comment failed: %s", exc)
+            _kb._log.warning("kanban unknown-pin park failed: %s", exc)
     _tick_routes(result, ready_rows, row_route, row_rules, spillover is not None, dry_run)
 
     # ---- review column dispatch ----
@@ -8228,10 +8233,10 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
-    # Background CPU priority for the worker gateway. Niceness is inherited
-    # across fork/exec, so this covers every process the worker later spawns
-    # (terminal-tool children included) without policing them individually —
-    # the seam the 2026-09-20 load-538 incident escaped through.
+    # Worker CPU priority (kanban.worker_cpu_priority; default "normal" = no
+    # nice, no QoS clamp since 2026-10-19). When an operator opts a host into
+    # "background"/"idle", niceness is inherited across fork/exec, so it covers
+    # every process the worker later spawns (terminal-tool children included).
     cpu_priority_mode, cpu_nice = _kb.worker_cpu_priority_config()
     priority_preexec = _kb._build_worker_priority_preexec(cpu_nice)
     # Process-table ceiling for the whole worker tree (t_368e9873): a

@@ -115,6 +115,7 @@ def adapter(monkeypatch):
         "DISCORD_FREE_RESPONSE_AUTO_THREAD",
         "DISCORD_AUTO_THREAD",
         "DISCORD_NO_THREAD_CHANNELS",
+        "DISCORD_THREAD_CHANNELS",
         "DISCORD_ALLOWED_CHANNELS",
         "DISCORD_IGNORED_CHANNELS",
         "DISCORD_HISTORY_BACKFILL",
@@ -482,6 +483,72 @@ def test_discord_free_response_auto_thread_yaml_bridge(adapter, monkeypatch):
     assert os.environ["DISCORD_FREE_RESPONSE_AUTO_THREAD"] == "true"
     adapter.config.extra["free_response_auto_thread"] = True
     assert adapter._discord_free_response_auto_thread() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("free_response", [False, True])
+async def test_discord_thread_channels_threads_replies_with_auto_thread_off(adapter, monkeypatch, free_response):
+    """A Discord reply to a page in a thread_channels channel starts a thread, not an inline session.
+
+    Every inline path is on here: auto_thread off, a reply-type message, and (one row) a
+    free-response channel without the opt-in.
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_THREAD_CHANNELS", "777")
+    if free_response:
+        monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "777")
+    adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=4242, name="t"))
+
+    reply = make_message(
+        channel=FakeTextChannel(channel_id=777),
+        content="handle alerts as they come up",
+        msg_type=discord_platform.discord.MessageType.reply,
+    )
+    await adapter._handle_message(reply)
+
+    adapter._auto_create_thread.assert_awaited_once_with(reply)
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.chat_id == "4242"
+
+    # A channel not in the list keeps the inline behaviour.
+    adapter._auto_create_thread.reset_mock()
+    adapter.handle_message.reset_mock()
+    await adapter._handle_message(
+        make_message(
+            channel=FakeTextChannel(channel_id=778),
+            content="elsewhere",
+            msg_type=discord_platform.discord.MessageType.reply,
+        ),
+    )
+    adapter._auto_create_thread.assert_not_awaited()
+    assert adapter.handle_message.await_args.args[0].source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_discord_no_thread_channels_wins_over_thread_channels(adapter, monkeypatch):
+    """A channel in both lists replies inline: the explicit inline opt-out wins."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_THREAD_CHANNELS", "777")
+    monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "777")
+    adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=4242, name="t"))
+
+    await adapter._handle_message(make_message(channel=FakeTextChannel(channel_id=777), content="inline"))
+
+    adapter._auto_create_thread.assert_not_awaited()
+    assert adapter.handle_message.await_args.args[0].source.chat_type == "group"
+
+
+def test_discord_thread_channels_yaml_bridge(adapter, monkeypatch):
+    """``config.yaml`` ``discord.thread_channels`` reaches ``extra`` and the adapter's gate read."""
+    seeded = discord_platform._apply_yaml_config({}, {"thread_channels": [1480528231286181948]})
+
+    assert seeded is not None and seeded["thread_channels"] == "1480528231286181948"
+    assert os.environ["DISCORD_THREAD_CHANNELS"] == "1480528231286181948"
+    monkeypatch.delenv("DISCORD_THREAD_CHANNELS")
+    adapter.config.extra["thread_channels"] = seeded["thread_channels"]
+    assert adapter._get_thread_channels() == {"1480528231286181948"}
 
 
 @pytest.mark.asyncio

@@ -28,7 +28,7 @@ permissions:
 
 jobs:
   check-no-committed-infographics:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     outputs:
       review_status: ${{ steps.infographic-check.outputs.review_status }}

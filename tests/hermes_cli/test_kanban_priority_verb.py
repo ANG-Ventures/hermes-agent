@@ -100,4 +100,6 @@ def test_dry_run_dispatch_orders_by_priority_and_shows_prio(kanban_home, capsys)
     spawned = [ln for ln in out.splitlines() if ln.strip().startswith("- t_")]
     assert len(spawned) == 1, out
     assert newer in spawned[0] and "prio=200" in spawned[0]
-    assert older not in out.split("Spawned:")[1]
+    # The older card is not spawned; the placement plan below the spawn list reports it held.
+    assert not any(older in ln for ln in spawned), out
+    assert any(older in ln and "holds" in ln for ln in out.splitlines()), out

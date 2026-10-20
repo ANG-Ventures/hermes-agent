@@ -2291,7 +2291,11 @@ DEFAULT_CONFIG = {
         # (2026-09-20: a worker's runaway busy-loops drove the host to load
         # 538/32 cores and starved the resident gateway's event loop into two
         # watchdog hard-exits and a 12-minute boot.)
-        "worker_cpu_priority": "background",
+        # Default "normal" since 2026-10-19 (Ace 21:52: the dev pipeline,
+        # kanban workers included, is first-class on all cores): no nice, no
+        # QoS clamp. "background"/"idle" are opt-in per host; admission
+        # (dispatch_load_gate) is the lever against a slow gateway.
+        "worker_cpu_priority": "normal",
         # Process bounds for worker trees (t_368e9873). A scratch bench that
         # re-spawned itself 18,818 times on 2026-10-01 filled the uid's
         # process table (10,340 / 10,666) and every fork on the host failed.
@@ -3154,6 +3158,12 @@ DEFAULT_CONFIG = {
         # kernel when a holder dies.  0 = unlimited.
         "max_servers_per_host": 3,
         "servers": {},
+    },
+    # write_file/patch syntax tier. shell: `bash -n` on .sh/.bash/bash-shebang writes plus
+    # bash-3.2 warnings (unguarded "${arr[@]}" under set -u, declare -A, mapfile, ${x,,});
+    # never blocks a write. false = shell files are not linted.
+    "file_lint": {
+        "shell": True,
     },
     # X (Twitter) Search via xAI's x_search Responses tool. Registers when xAI creds exist
     # (SuperGrok OAuth or XAI_API_KEY) AND the toolset is enabled in `hermes tools`.

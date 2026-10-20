@@ -152,6 +152,31 @@ STATE_FILENAME = "load_gate.json"
 ADMISSION_MODES = ("legacy", "utilization")
 UTIL_CLASS = "kanban-worker-llm-wait"
 UTIL_HOST_ALIAS = "local"     # the dispatcher's own row of config/fleet-hosts.json (mac-studio carries it)
+# Every attribute this module reads off the vendored placement modules. A re-vendor that drops one
+# (af0437b0a63 dropped admission.estimate, t_865feb4e) is logged at import and fails
+# tests/hermes_cli/test_kanban_load_gate_admission_contract.py.
+VENDORED_CONTRACT = {
+    "admission": ("Estimate", "Lease", "Limits", "admit", "read_slice_memory", "read_history"),
+    "placement": ("load_hosts", "need_of", "class_usage_path", "CLASS_USAGE_WINDOW_S"),
+    "work_estimate": ("estimate",),
+}
+
+
+def missing_contract() -> list[str]:
+    """``module.name`` for each VENDORED_CONTRACT attribute the vendored modules do not define."""
+    import importlib
+
+    out = []
+    for mod, names in VENDORED_CONTRACT.items():
+        m = importlib.import_module(f"hermes_cli.{mod}")
+        out.extend(f"{mod}.{n}" for n in names if not hasattr(m, n))
+    return out
+
+
+_MISSING = missing_contract()
+if _MISSING:
+    _log.error("kanban load gate: vendored placement modules lack %s; the utilization path will fail",
+               ", ".join(_MISSING))
 
 
 def _denom(ncpu: Any = None) -> str:
@@ -1141,7 +1166,7 @@ def ecore_cpu_indices(sysctl=None, ncpu: Optional[int] = None) -> "tuple[int, ..
             import subprocess
 
             return subprocess.run(["sysctl", "-n", name], capture_output=True,
-                                  text=True, timeout=5).stdout.strip()
+                                  text=True, encoding="utf-8", timeout=5).stdout.strip()
     try:
         e_n = int(sysctl("hw.perflevel1.logicalcpu") or 0)
         dies = max(1, int(sysctl("hw.packages") or 1))
@@ -1284,6 +1309,7 @@ def utilization_context() -> dict:
     psutil, and the measured estimate for a kanban worker here."""
     from hermes_cli import admission as _ad
     from hermes_cli import placement as _pl
+    from hermes_cli import work_estimate as _we
 
     host, spec, ceiling, reason, prior = "local", None, None, "", _ad.Estimate(cpus=1.0, ram_gb=3.0)
     try:
@@ -1301,7 +1327,7 @@ def utilization_context() -> dict:
         hist = _ad.read_history(_pl.class_usage_path(), since=time.time() - _pl.CLASS_USAGE_WINDOW_S)
     except Exception:
         hist = []
-    need = _ad.estimate(UTIL_CLASS, host, hist, prior=prior)
+    need = _we.estimate(UTIL_CLASS, host, hist, seed=prior)
     avail = total = None
     try:
         import psutil

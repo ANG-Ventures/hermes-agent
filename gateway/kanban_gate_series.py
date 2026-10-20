@@ -106,7 +106,7 @@ def _merge_into(dest: Path, live: Path) -> None:
     live.unlink()
 
 
-def append(path: Path, record: Mapping[str, Any], now: Optional[float] = None) -> None:
+def append_record(path: Path, record: Mapping[str, Any], now: Optional[float] = None) -> None:
     """Append one JSON line (rotating first). Single ``write`` of a line under
     ``O_APPEND``: one gateway writes, so lines never interleave."""
     now = time.time() if now is None else now

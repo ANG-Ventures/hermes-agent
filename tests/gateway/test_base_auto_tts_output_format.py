@@ -12,6 +12,8 @@ voice bubble). The fix passes an explicit output path from
 
 import asyncio
 import json
+import os
+import tempfile
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -82,6 +84,25 @@ def _hold_typing():
 def test_output_path_is_mp3_for_non_opus_platforms(platform):
     path = build_auto_tts_output_path(platform)
     assert path.endswith(".mp3"), path
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory modes")
+def test_output_path_is_writable_beside_another_users_voice_dir(tmp_path, monkeypatch):
+    """A shared host: another user already created the temp voice dir (the offbox sweep ran as
+    `fleetw` beside `ace`'s /tmp/hermes_voice, 0775), so every auto voice reply failed EACCES.
+    Our path must be ours and writable."""
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    foreign = tmp_path / "hermes_voice"
+    foreign.mkdir()
+    foreign.chmod(0o555)  # not writable by us, as another uid's dir is
+    try:
+        path = build_auto_tts_output_path(Platform.MATRIX)
+        with open(path, "wb") as fh:
+            fh.write(b"ogg")
+        assert os.stat(os.path.dirname(path)).st_uid == os.getuid()
+    finally:
+        foreign.chmod(0o755)
 
 
 # ---------------------------------------------------------------------------

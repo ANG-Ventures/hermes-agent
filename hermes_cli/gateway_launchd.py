@@ -432,8 +432,9 @@ def generate_launchd_plist() -> str:
          TASK_APPTYPE_DAEMON_STANDARD and clamps the WHOLE job — gateway and
          every child it spawns — to utility QoS (latency tier 3, E-core
          biased, disk iotier 1). The user-facing gateway must not share a
-         class with its own batch workers; kanban workers are re-clamped to
-         utility at spawn (kanban.worker_cpu_priority). -->
+         class with its own batch workers. Kanban workers run unclamped by
+         default since 2026-10-19 (kanban.worker_cpu_priority: normal); the
+         gateway still wins ties at Interactive. -->
     <key>ProcessType</key>
     <string>Interactive</string>
 
