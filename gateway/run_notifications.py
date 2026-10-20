@@ -1741,7 +1741,10 @@ class GatewayNotificationsMixin:
             # primary and siblings together, off the loop. Receipts are the only awaited step after
             # acceptance, so a cancelled awaiter cannot undo the delivery (``accepted`` is already set).
             receipts = [(evt, claim.claim_id), *sibling_claims]
-            await asyncio.shield(asyncio.to_thread(self._acknowledge_accepted_completions, receipts))
+            # A bare executor future: shield(to_thread(...)) wraps a separately cancellable Task that
+            # loop shutdown cancels, dropping a still-queued receipt write (Prism ad88cba956ad class).
+            await asyncio.shield(asyncio.get_running_loop().run_in_executor(
+                None, self._acknowledge_accepted_completions, receipts))
             return True
         except WakeNotAccepted:
             refused = True
