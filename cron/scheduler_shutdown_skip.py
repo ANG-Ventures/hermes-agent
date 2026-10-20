@@ -55,9 +55,9 @@ def _release_fire(job_id: str, fire_owner: Optional[str], next_run_at: Optional[
 
     def apply(jobs, _i, job):
         claim = job.get("fire_claim")
-        # A persisted claim is released only by its owner; no owner releases nothing it holds.
-        if claim and (not isinstance(claim, dict) or fire_owner is None
-                      or claim.get("by") != fire_owner):
+        # Only this run's own live claim is released: a missing owner, or a claim that is gone or
+        # held by another run, means a newer tick owns the job and its next_run_at.
+        if fire_owner is None or not isinstance(claim, dict) or claim.get("by") != fire_owner:
             return False
         job["fire_claim"] = None
         if job.get("run_claim") is not None:
@@ -102,23 +102,32 @@ def restore_monitor_checkpoint(job: dict, checkpoint: Optional[tuple]) -> None:
         logger.warning("Job '%s': monitor checkpoint restore failed", job_id, exc_info=True)
 
 
-def record_shutdown_skip(job: dict, fire_owner: Optional[str], execution_id: str) -> None:
-    """Bookkeeping for a run refused by the shutdown gate: no error status, no page."""
+def record_shutdown_skip(job: dict, fire_owner: Optional[str], execution_id: str) -> bool:
+    """Bookkeeping for a run refused by the shutdown gate: no error status, no page.
+
+    Only when this process put the occurrence back (the local due-scan path carries the slot and
+    still owns the claim). Otherwise returns False and the caller records the ordinary failure:
+    a refused run is never dropped silently (provider/webhook fires carry no slot to restore).
+    """
     from cron.scheduler import finish_execution
     from hermes_cli.observability.shared_metrics_gateway import note_cron_skipped
 
     job_id = str(job["id"])
     restored = job.get(DUE_NEXT_RUN_KEY)
+    if restored is None:
+        return False
     try:
         released = _release_fire(job_id, fire_owner, restored)
     except Exception:
         logger.warning("Job '%s': shutdown skip could not release its fire", job_id, exc_info=True)
         released = False
+    if not released:
+        return False
     logger.info(
         "PHASE=cron_shutdown_skip job=%s: not started, scheduler is shutting down; "
-        "left for the next process (next_run_at=%s, released=%s)",
-        job.get("name") or job_id, restored, released)
+        "left for the next process (next_run_at=%s)", job.get("name") or job_id, restored)
     note_cron_skipped(job)
     finish_execution(
         execution_id, success=False,
         error="Skipped: cron scheduler is shutting down; left for the next process.")
+    return True

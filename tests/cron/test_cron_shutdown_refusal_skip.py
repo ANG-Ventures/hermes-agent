@@ -85,8 +85,9 @@ def test_shutdown_refused_restart_refire_is_kept(env):
     assert [j for j in cj.get_due_jobs() if j["id"] == job["id"]], "re-fire lost"
 
 
-def test_provider_fire_refused_at_shutdown_keeps_its_occurrence(env):
-    """Same contract on the shared claim_fire -> fire_claimed path (webhook/provider fires)."""
+def test_provider_fire_refused_at_shutdown_stays_loud(env):
+    """claim_fire -> fire_claimed (webhook/provider fires) carries no due slot this process can put
+    back, so the refusal must not be silenced: the failure notice is still delivered."""
     import cron.jobs as cj
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
@@ -102,10 +103,34 @@ def test_provider_fire_refused_at_shutdown_keeps_its_occurrence(env):
     provider.fire_claimed(claimed)
     sched.clear_shutdown()
 
+    assert [ok for _c, ok in env] == [False], f"unrestored refusal was silenced: {env!r}"
+
+
+def test_shutdown_skip_after_claim_taken_by_another_tick_touches_nothing(env, monkeypatch):
+    """The refused run's claim was cleared/re-taken before cleanup: its stale owner must neither
+    rewind next_run_at nor clear the newer run_claim."""
+    import cron.jobs as cj
+    import cron.scheduler_script as ss
+
+    job = cj.create_job(prompt=None, schedule="every 15m", name="studio-ceiling-watch",
+                        script="w.sh", no_agent=True, deliver="origin")
+    slot = (cj._hermes_now() - timedelta(seconds=20)).isoformat()
+    cj.update_job(job["id"], {"next_run_at": slot})
+    newer = {"next_run_at": "2099-01-01T00:00:00+00:00", "fire_claim": None,
+             "run_claim": {"at": cj._hermes_now().isoformat(), "by": "worker-B:xyz"}}
+    real = ss._run_job_script
+
+    def refuse_after_another_tick(*a, **kw):
+        out = real(*a, **kw)
+        cj.update_job(job["id"], newer)
+        return out
+
+    monkeypatch.setattr(ss, "_run_job_script", refuse_after_another_tick)
+    _dispatch_then_drain(job["id"])
+
     row = cj.get_job(job["id"])
-    assert env == []
-    assert row.get("last_status") != "error", row.get("last_error")
-    assert row["next_run_at"] == slot
+    assert row["next_run_at"] == newer["next_run_at"], "stale owner rewound next_run_at"
+    assert row.get("run_claim") == newer["run_claim"], "stale owner cleared a newer run_claim"
 
 
 def test_shutdown_skip_never_releases_another_owners_claim(env):

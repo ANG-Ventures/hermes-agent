@@ -4696,14 +4696,15 @@ def _run_one_job_body(
             raise
 
         from cron.scheduler_shutdown_skip import consume_shutdown_refused, record_shutdown_skip
-        if not success and consume_shutdown_refused(job["id"]):
-            _teardown_deferred()
-            record_shutdown_skip(job, fire_owner, execution_id)
-            return True
+        shutdown_refused = not success and consume_shutdown_refused(job["id"])
 
         if _fire_claim_ownership_lost():
             _teardown_deferred()
             _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
+            return True
+
+        if shutdown_refused and record_shutdown_skip(job, fire_owner, execution_id):
+            _teardown_deferred()
             return True
 
         # An agent can finish its own turn after a delegated child has failed. Let it explicitly
