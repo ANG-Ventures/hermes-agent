@@ -1,0 +1,4 @@
+[subagent-0] ⚠️  Attempt 1/3, not retryable failed: HTTP 400: argus-probe: captured first request
+[subagent-0] ❌ claude-alr rejected the request and retrying won't help: HTTP 400: argus-probe: captured first request
+[subagent-0]    💡 Fix: pick another model (/model), or check `/Volumes/fleet-scratch/tmp/inv1-home-5heg8qbz/logs/agent.log`.
+fork child_requests 1 pin_headers ['sub-vps-16']
