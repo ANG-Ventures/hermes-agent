@@ -3159,6 +3159,12 @@ DEFAULT_CONFIG = {
         "max_servers_per_host": 3,
         "servers": {},
     },
+    # write_file/patch syntax tier. shell: `bash -n` on .sh/.bash/bash-shebang writes plus
+    # bash-3.2 warnings (unguarded "${arr[@]}" under set -u, declare -A, mapfile, ${x,,});
+    # never blocks a write. false = shell files are not linted.
+    "file_lint": {
+        "shell": True,
+    },
     # X (Twitter) Search via xAI's x_search Responses tool. Registers when xAI creds exist
     # (SuperGrok OAuth or XAI_API_KEY) AND the toolset is enabled in `hermes tools`.
     "x_search": {
