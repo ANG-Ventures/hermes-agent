@@ -54,7 +54,10 @@ jobs:
     # have fixed the observed failure, and would have deepened that host
     # oversubscription. Re-pointing this at the pool needs the mid-flight death
     # root-caused first, not a bigger box.
-    runs-on: ubuntu-latest
+    # ci-priv (t_df855b2a): on the private CI mirror, CI_PRIV_ENABLED + CI_PRIV_RUNNER move this job to the
+    # ci-priv class (a fresh KVM guest per job: real sudo + its own docker daemon; fleet-ops-scripts
+    # ci-runners/ci-priv). Trusted events only. Both vars unset (the fork) -> ubuntu-latest.
+    runs-on: ${{ vars.CI_PRIV_ENABLED == 'true' && vars.CI_PRIV_RUNNER && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PRIV_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -155,7 +158,10 @@ jobs:
     name: UI tests (shard ${{ matrix.shard }}/3)
     # desktop-ci: skipped on the fork by default (Ace 2026-10-03); flip CI_DESKTOP_JOBS=on to run; revisit at the next parity sync or when the desktop app is in use
     if: inputs.desktop
-    runs-on: ubuntu-latest
+    # ci-priv (t_df855b2a): on the private CI mirror, CI_PRIV_ENABLED + CI_PRIV_RUNNER move this job to the
+    # ci-priv class (a fresh KVM guest per job: real sudo + its own docker daemon; fleet-ops-scripts
+    # ci-runners/ci-priv). Trusted events only. Both vars unset (the fork) -> ubuntu-latest.
+    runs-on: ${{ vars.CI_PRIV_ENABLED == 'true' && vars.CI_PRIV_RUNNER && (github.event_name == 'push' || github.event_name == 'merge_group' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PRIV_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
