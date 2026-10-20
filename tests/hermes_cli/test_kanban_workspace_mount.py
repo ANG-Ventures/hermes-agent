@@ -719,3 +719,98 @@ def test_survivor_pointer_stops_proving_anything_once_the_recreated_tree_is_used
         assert kb._unstrand_evidence(conn, task_id) == 'survivor_recorded'
         kb._append_event(conn, task_id, 'spawned', {'pid': 4343})
         assert kb._unstrand_evidence(conn, task_id) is None
+
+
+def _completed_after_real_run(conn, root):
+    """The incident shape (t_391fe8d8): dispatched into a fresh scratch dir,
+    completed, and the dir reaped by completion."""
+    task_id = kb.create_task(conn, title='reading', assignee='default')
+    calls = []
+    kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+    assert calls == [task_id]
+    path = Path(kb.get_task(conn, task_id).workspace_path)
+    assert path.is_dir() and path.parent.parent == root
+    assert kb.complete_task(conn, task_id, summary='attempt 1', force=True)
+    assert kb.get_task(conn, task_id).status == 'done'
+    assert not path.exists(), 'completion reaps the scratch tree'
+    return task_id, path
+
+
+def _reopen_verb(conn, task_id):
+    assert kb.reopen_task(
+        conn, task_id, actor='relay', reason='relay rejected attempt 1',
+    ) == (True, None)
+
+
+def _direct_status_flip(conn, task_id):
+    # A done -> ready path that skips reopen_task (the dashboard PATCH writes
+    # the row plus a ``status`` event): the stale binding survives, so the
+    # dispatcher itself must re-mint.
+    conn.execute("UPDATE tasks SET status='ready', completed_at=NULL WHERE id=?", (task_id,))
+    kb._append_event(conn, task_id, 'status', {'status': 'ready', 'requested_status': 'ready'})
+    assert kb.get_task(conn, task_id).workspace_path is not None
+
+
+@pytest.mark.parametrize(
+    'reopen', [_reopen_verb, _direct_status_flip], ids=['reopen_verb', 'status_flip'],
+)
+def test_reopened_after_completion_dispatches_next_tick_without_page(home, monkeypatch, reopen):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _completed_after_real_run(conn, root)
+        reopen(conn, task_id)
+        assert kb.get_task(conn, task_id).status == 'ready'
+        calls = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        assert task_id in calls
+        assert task_id not in result.stranded_by_mount_loss
+        assert task_id not in [t for t, _ in result.workspace_refused]
+        assert kb.claim_workspace_refusal_pages(conn, result.workspace_refused) == []
+        kinds = [r[0] for r in conn.execute(
+            'SELECT kind FROM task_events WHERE task_id=? ORDER BY id', (task_id,))]
+        assert 'stranded_by_mount_loss' not in kinds
+        assert 'workspace_refusal_paged' not in kinds
+        assert 'workspace_reset' in kinds
+        fresh = Path(kb.get_task(conn, task_id).workspace_path)
+        assert fresh.is_dir() and fresh == path
+
+
+def test_reopen_keeps_binding_when_retention_kept_the_tree(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _stranded_card(conn, root)
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+        _reopen_verb(conn, task_id)
+        assert path.is_dir()
+        assert kb.get_task(conn, task_id).workspace_path == str(path)
+
+
+def test_reopened_card_with_mount_absent_still_refuses(home, monkeypatch):
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _completed_after_real_run(conn, root)
+        _direct_status_flip(conn, task_id)
+        shutil.rmtree(root)
+        monkeypatch.setattr('os.path.ismount', lambda p: False)
+        calls = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_a, **_k: calls.append(task.id))
+        assert not calls
+        assert task_id in result.stranded_by_mount_loss
+        assert any(
+            r.startswith('workspaces_root_unmounted')
+            for t, r in result.workspace_refused if t == task_id
+        )
+        assert kb.get_task(conn, task_id).workspace_path == str(path)
+
+
+def test_dir_lost_after_a_post_completion_spawn_stays_stranded(home, monkeypatch):
+    # A worker ran in the tree after the completion: its dir going missing is
+    # not kanban's own cleanup, so admission stays fail-closed.
+    root = _mounted_root(home, monkeypatch)
+    with kb.connect_closing() as conn:
+        task_id, path = _completed_after_real_run(conn, root)
+        _direct_status_flip(conn, task_id)
+        kb._append_event(conn, task_id, 'spawned', {'pid': 4242})
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: None)
+        assert task_id in result.stranded_by_mount_loss
+        assert kb.get_task(conn, task_id).workspace_path == str(path)
