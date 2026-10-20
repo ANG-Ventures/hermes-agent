@@ -68,6 +68,9 @@ def hermetic_env(home: Path, hermes_home: Path | None = None, proxy: str | None 
         TERM="dumb",
         # A pytest-descendant child treats $HOME/.hermes/state.db as production; that HOME is ours.
         HERMES_STATE_DB_GUARD_BYPASS="1",
+        # tests/conftest.py sets this for the suite; the HERMES_ strip above drops it, and the child
+        # then lazy-installs tirith (and pm's managed Python, ~600 MB) into the tmp home.
+        HERMES_DISABLE_LAZY_INSTALLS="1",
     )
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
         env.pop(var, None)
