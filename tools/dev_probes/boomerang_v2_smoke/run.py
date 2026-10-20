@@ -17,6 +17,8 @@ override so the test path runs on fakes:
   BV2_CONFIG         config.yaml, or a dir of stage<N>.yaml snapshots (fake)
   BV2_WIRELOG_DIR    relay wire capture root              (default: ~/.claude-wirelog)
   BV2_ACK_FILE       ack file Apollo appends to           (default: <scratch>/bv2-smoke.ack)
+  BV2_ACK_CMD        scripted acker argv prefix: run as `<cmd> <token>`, does the action, exit 0
+                     (isolated scratch gateway lane; see puppet-lane bv2-smoke-lane.sh)
   BV2_EVIDENCE       evidence markdown                    (default: docs/boomerang-v2/evidence/smoke.md)
   BV2_PLAN           command/expectation plan             (default: fixtures/plan.json)
 
@@ -433,11 +435,37 @@ class Ctx:
             time.sleep(min(1.0, max(0.05, self.tick / 2)))
 
     def wait_ack(self, rep: StepReport, token: str, instruction: str) -> float | None:
-        """Print the action for Apollo; wait for `token` as a whole line in the ack file."""
+        """Print the action for Apollo; wait for `token` as a whole line in the ack file.
+
+        ``BV2_ACK_CMD`` (an argv prefix) names a scripted operator: it is run as
+        ``<cmd> <token>`` and must perform the action itself (a config flip, a restart of the
+        gateway UNDER TEST) and exit 0. On exit 0 the token is appended to the ack file, so the
+        evidence reads the same as a human ack; any other exit is a FAIL (never a silent pass).
+        This is how an isolated scratch gateway (puppet-lane) drives steps 2 and 4 with no human.
+        """
         banner = (f"\n>>> APOLLO ACTION ({rep.title}):\n    {instruction}\n"
                   f">>> then: echo {shlex.quote(token)} >> {self.ack}\n")
         print(banner, flush=True)
         rep.raw.append(f"--- ack request\n{instruction}\nack: echo {token} >> {self.ack}")
+        ack_cmd = os.environ.get("BV2_ACK_CMD", "").strip()
+        if ack_cmd and self.live:
+            argv = shlex.split(ack_cmd) + [token]
+            shown = "$ " + shlex.join(argv)
+            print(shown, flush=True)
+            try:
+                proc = subprocess.run(argv, capture_output=True, text=True, timeout=self.args.ack_timeout)
+                rc, out = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                rc, out = 127, f"{type(exc).__name__}: {exc}"
+            rep.commands.append(shown + f"   # scripted ack, exit {rc}")
+            rep.raw.append(f"--- ack cmd {token} (exit {rc})\n{out.strip()[:4000]}")
+            if rc == 0:
+                self.ack.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.ack, "a", encoding="utf-8") as fh:
+                    fh.write(token + "\n")
+            else:
+                rep.check(f"ack `{token}` received", FAIL, f"BV2_ACK_CMD exit {rc}: {out.strip()[-300:]}")
+                return None
 
         def seen() -> float | None:
             if not self.ack.exists():
