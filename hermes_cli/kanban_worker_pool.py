@@ -89,20 +89,31 @@ HOST_PIN_RE = re.compile(r"^[ \t]*host:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*\
 PIN_ANY = "any"
 PIN_STUDIO = "studio"
 STUDIO_HOST = "mac-studio"
-# kanban.placement.default (Control-Plane Protection spec v0.3 §3.1, read per
-# tick): ``remote`` offers every portable row to the pool before a local slot;
-# anything else, or the key absent, keeps today's local-first order.
+# kanban.placement.default is RETIRED (t_82b4db80, Ace 2026-10-19 21:2x): every
+# portable row is offered to the pool (admission by measured headroom over every
+# eligible host, the Studio included) before a local slot. ``local`` pre-ordered
+# the Studio first, an ORDERING rather than a weight; the R10 armer flipped to it
+# on 10-18 15:31 and parked the fleet on the Studio for a day. The key is read
+# only to log that it is ignored. PLACEMENT_DEFAULT_LOCAL stays as the record
+# value for a plan that never ran the gate tick (``plan.default_remote`` False).
 PLACEMENT_DEFAULT_REMOTE = "remote"
 PLACEMENT_DEFAULT_LOCAL = "local"
+_placement_default_warned: set = set()
 
 
 def placement_default(kanban_cfg: Any) -> str:
-    """``kanban.placement.default``: ``remote`` only when the key says so."""
+    """Always ``remote``; a configured ``kanban.placement.default`` other than
+    remote is ignored with one deprecation line per distinct value."""
     pl = kanban_cfg.get("placement") if isinstance(kanban_cfg, Mapping) else None
     val = pl.get("default") if isinstance(pl, Mapping) else None
-    if isinstance(val, str) and val.strip().lower() == PLACEMENT_DEFAULT_REMOTE:
-        return PLACEMENT_DEFAULT_REMOTE
-    return PLACEMENT_DEFAULT_LOCAL
+    if val is not None and not (isinstance(val, str) and val.strip().lower() == PLACEMENT_DEFAULT_REMOTE):
+        key = repr(val)
+        if key not in _placement_default_warned:
+            _placement_default_warned.add(key)
+            logging.getLogger(__name__).warning(
+                "kanban.placement.default=%s is deprecated and ignored: placement is remote-first "
+                "(admission by measured headroom); remove the key (t_82b4db80)", key)
+    return PLACEMENT_DEFAULT_REMOTE
 
 # Words that name the dispatcher's own machine (resolve to PIN_STUDIO); the
 # live ``socket.gethostname()`` short form joins them at call time.
