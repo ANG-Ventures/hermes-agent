@@ -34,7 +34,12 @@ that container is never reused across processes. An explicit `inherit_mode="summ
 child's fold (`materialized_prefill_messages`).
 
 Process identity is `(pid, kernel start time)`; a pid without a start time is never signalled (only adopted
-when its argv carries the exact `--job <dir>` pair). SIGKILL escalation also reaches group members captured at
+when its argv carries the exact `--job <dir>` pair). A start time unknown at spawn is re-read from the job dir
+(`child.json`) when the cancel hook fires (`terminate_job`), so it never makes the child uncancellable.
+An identity lookup that FAILS (process inspection error) is unknown, never dead: `probe_job` returns
+`unknown`, `wait_for_exit` does not confirm an exit, and the adoption pass keeps the record's block, the
+fence, or an unfenced orphan's dir + marker untouched for the next pass (no adopt, no re-dispatch, no
+removal). SIGKILL escalation also reaches group members captured at
 SIGTERM time that outlived the leader. A dispatcher standing an un-advertised child down first fences the
 attempt in the registry (`stand_down_detached`); if an overlapping boot already adopted it, the child is left
 running for that boot. The fence keeps the child's identity on the record (`detached_fenced`) until its death

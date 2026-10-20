@@ -1295,6 +1295,7 @@ def claim_detached_adoptions(
     owned_dirs: set[str] = set()
     adopted_dirs: set[str] = set()
     killed_dirs: set[str] = set()
+    retained_dirs: set[str] = set()  # identity unknown this pass: nothing about them is decided
     with locked_registry(profile_home) as registry:
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
         for delegation_id, record in registry["records"].items():
@@ -1315,7 +1316,10 @@ def claim_detached_adoptions(
                 # until ``detached_fenced`` is cleared, so no second generation runs beside it.
                 fenced_dir = Path(fenced["job_dir"]) if fenced.get("job_dir") else job_dir
                 killed_dirs.add(str(fenced_dir))
-                ident = identity(fenced_dir, fenced if fenced.get("pid") else None)
+                ident, known = _lookup_identity(identity, fenced_dir, fenced if fenced.get("pid") else None)
+                if not known:
+                    retained_dirs.add(str(fenced_dir))  # unknown is not dead: keep the fence, retry next pass
+                    continue
                 if ident and _child_alive(probe, alive, fenced_dir, fenced, ident):
                     kill.append({**ident, "job_dir": str(fenced_dir), "fenced": str(delegation_id),
                                  "attempt_id": fenced.get("attempt_id")})
@@ -1330,7 +1334,10 @@ def claim_detached_adoptions(
                 # below. The block stays until the child is confirmed dead, so a kill a gateway died before
                 # sending is re-sent by every later boot, not only the next one.
                 killed_dirs.add(str(job_dir))
-                ident = identity(job_dir, block)
+                ident, known = _lookup_identity(identity, job_dir, block)
+                if not known:
+                    retained_dirs.add(str(job_dir))  # unknown is not dead: keep the block, retry next pass
+                    continue
                 if ident and _child_alive(probe, alive, job_dir, block, ident):
                     kill.append(ident)
                     if block is not None:
@@ -1349,10 +1356,15 @@ def claim_detached_adoptions(
                 continue
             if now - float(record.get("created_at") or now) > ACTIVE_STALE_SECONDS:
                 killed_dirs.add(str(job_dir))
-                ident = identity(job_dir, block)
+                ident, known = _lookup_identity(identity, job_dir, block)
                 if ident:
                     kill.append(ident)
                     record["detached"] = {**(block or {}), **ident, "job_dir": str(job_dir)}
+                elif not known:
+                    # Unknown is not dead: keep a block so the failed+block branch re-checks it every boot.
+                    retained_dirs.add(str(job_dir))
+                    record["detached"] = {**(block or {}), "job_dir": str(job_dir),
+                                          "attempt_id": attempt.get("attempt_id")}
                 else:
                     record.pop("detached", None)
                 _fail_recovery_record(record, "stale_record", now, emit_event=True, event_suffix="stale")
@@ -1362,9 +1374,22 @@ def claim_detached_adoptions(
                 record.pop("detached", None)
                 append_lifecycle_event(record, "detached_lost", f"attempt={attempt.get('attempt_id')}", now=now)
                 continue
+            ident, known = ({}, True)
+            if status != "unknown" and (block is None or block.get("create_time") is None):
+                ident, known = _lookup_identity(identity, job_dir, block)
+            if status == "unknown" or not known:
+                # Process inspection failed: neither adopt nor let claim_recoveries re-run the unit beside a
+                # child that may be alive. A held block keeps it out of re-dispatch; the next pass retries.
+                retained_dirs.add(str(job_dir))
+                if block is None:
+                    record["detached"] = {"pid": None, "create_time": None, "job_dir": str(job_dir),
+                                          "attempt_id": attempt.get("attempt_id"), "spawned_at": None}
+                logger.warning("async_delegation_detached_identity_unknown delegation_id=%s job_dir=%s: "
+                               "left for the next pass", delegation_id, job_dir)
+                continue
             if block is None or block.get("create_time") is None:
                 # Adopt by a VERIFIED identity (pid + start time); an unverifiable one is never signalled.
-                ident = identity(job_dir, block) or {}
+                ident = ident or {}
                 block = {**(block or {"spawned_at": None}), "pid": ident.get("pid"),
                          "create_time": ident.get("create_time"), "job_dir": str(job_dir),
                          "attempt_id": attempt.get("attempt_id")}
@@ -1383,9 +1408,18 @@ def claim_detached_adoptions(
         for job_dir in (stand_down_unknown(home) if stand_down_unknown else []):
             if str(job_dir) in adopted_dirs:
                 Path(job_dir, "stand-down-unknown.json").unlink(missing_ok=True)
+            elif str(job_dir) in retained_dirs:
+                continue  # its child's identity is unknown this pass: keep the dir and marker for a retry
             elif str(job_dir) not in owned_dirs:
                 # Already signalled above (cancelled / age cap): only the dir is left to remove.
-                ident = {} if str(job_dir) in killed_dirs else identity(Path(job_dir), None) or {}
+                ident, known = ({}, True) if str(job_dir) in killed_dirs else _lookup_identity(
+                    identity, Path(job_dir), None)
+                if not known:
+                    # Unknown is not dead: removing the dir and marker now would strand a live child with
+                    # no recovery or cancellation path. Keep both; the next pass retries.
+                    logger.warning("async_delegation_detached_unfenced_orphan_unknown job_dir=%s: kept", job_dir)
+                    continue
+                ident = ident or {}
                 kill.append({**ident, "job_dir": str(job_dir), "remove_job_dir": True})
                 logger.warning("async_delegation_detached_unfenced_orphan job_dir=%s pid=%s",
                                job_dir, ident.get("pid"))
@@ -1393,10 +1427,21 @@ def claim_detached_adoptions(
 
 
 def _child_alive(probe, alive, job_dir: Path, block, ident: dict[str, Any]) -> bool:
-    """Is the identified child still running? ``alive(ident)`` (pid + start time) when supplied."""
+    """Is the identified child still running? ``alive(ident)`` (pid + start time) when supplied.
+    An ``unknown`` probe counts as alive: the kill is re-checked against pid + start time anyway."""
     if alive is not None:
         return bool(alive(ident))
-    return probe(job_dir, block) == "alive"
+    return probe(job_dir, block) in {"alive", "unknown"}
+
+
+def _lookup_identity(identity, job_dir: Path, block) -> tuple[dict[str, Any] | None, bool]:
+    """``(identity, known)``. ``known`` False when the lookup itself failed (process inspection
+    error): the child may be alive, so the caller must not treat it as dead."""
+    try:
+        return identity(job_dir, block), True
+    except Exception:
+        logger.warning("async_delegation_detached_identity_lookup_failed job_dir=%s", job_dir, exc_info=True)
+        return None, False
 
 
 _MISSING = object()

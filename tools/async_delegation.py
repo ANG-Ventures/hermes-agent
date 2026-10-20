@@ -1455,7 +1455,7 @@ def _install_detached_supervision(delegation_id: str, pid: Any, create_time: Any
         if rec is None or rec.get("detached_handed_off") or rec.get("recover_on_shutdown"):
             return False
         rec.update(
-            interrupt_fn=lambda: dd.terminate_group(pid, create_time),
+            interrupt_fn=lambda: dd.terminate_job(job_dir, pid, create_time),
             progress_fn=dd.heartbeat_progress_fn(lambda: job_dir),
             detached_unit=True, _started=started, _progress_token=None, _progress_ts=time.time())
     _ensure_stale_monitor()
@@ -1565,7 +1565,7 @@ def _run_detached_unit(
             logger.info("async_delegation_detached_adopted_elsewhere delegation_id=%s pid=%s",
                         delegation_id, spawned.pid)
             raise dd.HandedOff(str(spawned.job_dir))
-        dd.terminate_group(spawned.pid, spawned.create_time)
+        dd.terminate_job(spawned.job_dir, spawned.pid, spawned.create_time)
         if dd.wait_for_exit(spawned.pid, spawned.create_time, popen=spawned.popen):
             # Confirmed dead: only now may a later generation run (the fence held it back until here).
             try:
@@ -2013,7 +2013,7 @@ def recover_async_delegations(
         current_boot_id=current_boot_id, profile_home=profile_home, owner_alive=is_boot_id_alive,
         probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for,
         stand_down_unknown=dd.stand_down_unknown_dirs,
-        alive=lambda ident: dd.pid_alive(ident.get("pid"), ident.get("create_time")))
+        alive=lambda ident: dd.pid_state(ident.get("pid"), ident.get("create_time")) is not False)
     for ident in kill:
         if ident.get("pid") is not None:
             dd.terminate_group(ident.get("pid"), ident.get("create_time"))

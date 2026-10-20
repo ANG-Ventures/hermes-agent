@@ -95,20 +95,31 @@ def process_create_time(pid: int) -> Optional[float]:
         return None
 
 
-def pid_alive(pid: Any, create_time: Any) -> bool:
-    """Same pid AND same kernel start time (pid reuse safe); a zombie counts as dead. An identity
-    with no start time is unverifiable and never matches: a recycled pid must not be signalled."""
+def pid_state(pid: Any, create_time: Any) -> Optional[bool]:
+    """True: same pid AND same kernel start time (pid reuse safe). False: confirmed gone (no such
+    process, a zombie, or a different process on the pid). None: UNKNOWN, either no start time to
+    verify against or process inspection failed. Unknown is never dead and never signallable."""
     if create_time is None:
-        return False
+        return None
     try:
         import psutil
-
+    except Exception:
+        return None
+    try:
         proc = psutil.Process(int(pid))
         if proc.status() == psutil.STATUS_ZOMBIE:
             return False
         return abs(proc.create_time() - float(create_time)) < 0.01
-    except Exception:
+    except (psutil.NoSuchProcess, ValueError, TypeError):  # ZombieProcess subclasses NoSuchProcess
         return False
+    except Exception:
+        return None
+
+
+def pid_alive(pid: Any, create_time: Any) -> bool:
+    """May this identity be signalled? Only when verified alive (``pid_state`` True): a recycled or
+    unverifiable pid must not be signalled. Not a death test: use ``pid_state(...) is False``."""
+    return pid_state(pid, create_time) is True
 
 
 def _argv_has_job(cmdline: list, job_dir: str) -> bool:
@@ -116,46 +127,82 @@ def _argv_has_job(cmdline: list, job_dir: str) -> bool:
                for i, a in enumerate(cmdline))
 
 
+class IdentityUnavailable(Exception):
+    """Process inspection itself failed: the child's identity is UNKNOWN, which never means dead."""
+
+
 def find_job_process(job_dir: Path) -> Optional[Dict[str, Any]]:
     """Process whose argv carries the exact element pair ``--job <job_dir>`` (crash window between
-    ``spawn.json`` and ``pid.json``). Exact element equality on a unique path, never a substring."""
+    ``spawn.json`` and ``pid.json``). Exact element equality on a unique path, never a substring.
+    None only after a completed scan found no such process; a scan that could not run raises
+    ``IdentityUnavailable`` (a live child must not read as gone because inspection failed)."""
     try:
         import psutil
-    except Exception:
-        return None
+    except Exception as exc:
+        raise IdentityUnavailable("psutil is unavailable") from exc
     target = str(job_dir)
-    for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
-        try:
-            if _argv_has_job(proc.info.get("cmdline") or [], target):
-                return {"pid": proc.info["pid"], "create_time": proc.info["create_time"]}
-        except Exception:
-            continue
+    try:
+        for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
+            try:
+                if _argv_has_job(proc.info.get("cmdline") or [], target):
+                    return {"pid": proc.info["pid"], "create_time": proc.info["create_time"]}
+            except Exception:
+                continue
+    except Exception as exc:
+        raise IdentityUnavailable(f"process scan failed: {exc}") from exc
     return None
 
 
 def job_identity(job_dir: Path, detached_block: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """``{pid, create_time}`` for the job's child: registry block, then pid.json, child.json, argv scan.
-    A recorded pid without a start time is verified by the exact ``--job <dir>`` argv instead."""
+    """``{pid, create_time}`` for the job's child: registry block, then pid.json, then child.json (the
+    child's own record), then the argv scan. The first source with a start time wins, so a start time
+    unknown at spawn is recovered from what the child publishes. A recorded pid with no start time
+    anywhere is verified by the exact ``--job <dir>`` argv. Raises ``IdentityUnavailable`` when that
+    scan cannot run."""
+    recorded_pid = None
     for source in (detached_block, _read_json(job_dir / "pid.json"), _read_json(job_dir / "child.json")):
         if isinstance(source, dict) and source.get("pid"):
             if source.get("create_time") is not None:
                 return {"pid": int(source["pid"]), "create_time": source.get("create_time")}
-            found = find_job_process(job_dir)
-            return found if found and int(found["pid"]) == int(source["pid"]) else None
+            if recorded_pid is None:
+                recorded_pid = int(source["pid"])
+    if recorded_pid is not None:
+        found = find_job_process(job_dir)
+        return found if found and int(found["pid"]) == recorded_pid else None
     if (job_dir / "spawn.json").exists():
         return find_job_process(job_dir)
     return None
 
 
+def current_identity(job_dir: Path, pid: Any, create_time: Any) -> tuple:
+    """``(pid, create_time)`` to act on NOW: the captured identity when it is verified, else re-read
+    from the job dir. A start time that was unknown at spawn therefore never makes the child
+    uncancellable. Stays unverified (``create_time`` None: never signalled) while it cannot be read."""
+    if create_time is not None:
+        return pid, create_time
+    try:
+        ident = job_identity(Path(job_dir), {"pid": pid, "create_time": None} if pid else None)
+    except IdentityUnavailable:
+        ident = None
+    return (ident["pid"], ident["create_time"]) if ident else (pid, None)
+
+
 def probe_job(job_dir: Path, detached_block: Optional[Dict[str, Any]] = None) -> str:
-    """``result`` (result.json present) | ``alive`` | ``dead``. A child that publishes its result and
-    exits between the two checks reads as ``result``, never ``dead`` (that would re-run finished work)."""
+    """``result`` (result.json present) | ``alive`` | ``dead`` | ``unknown`` (process inspection
+    failed: never treated as dead). A child that publishes its result and exits between the two
+    checks reads as ``result``, never ``dead`` (that would re-run finished work)."""
     if (job_dir / "result.json").exists():
         return "result"
-    ident = job_identity(job_dir, detached_block)
-    if ident and pid_alive(ident["pid"], ident["create_time"]):
+    try:
+        ident = job_identity(job_dir, detached_block)
+    except IdentityUnavailable:
+        return "result" if (job_dir / "result.json").exists() else "unknown"
+    state = pid_state(ident["pid"], ident["create_time"]) if ident else False
+    if state is True:
         return "alive"
-    return "result" if (job_dir / "result.json").exists() else "dead"
+    if (job_dir / "result.json").exists():
+        return "result"
+    return "dead" if state is False else "unknown"
 
 
 def _group_members(pid: int) -> list:
@@ -229,11 +276,18 @@ def wait_for_exit(pid: Any, create_time: Any, *, popen: Optional[subprocess.Pope
         if popen is not None:
             if popen.poll() is not None:
                 return True
-        elif not pid_alive(pid, create_time):
+        elif pid_state(pid, create_time) is False:  # unknown is not a confirmed exit
             return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(poll)
+
+
+def terminate_job(job_dir: Path, pid: Any, create_time: Any, **kwargs) -> bool:
+    """``terminate_group`` on the job's identity as known NOW (``current_identity``), so a start time
+    unknown when the caller captured it (spawn-time lookup failed) does not make the child unkillable."""
+    pid, create_time = current_identity(job_dir, pid, create_time)
+    return terminate_group(pid, create_time, **kwargs)
 
 
 # ── liveness ────────────────────────────────────────────────────────────────
@@ -531,8 +585,18 @@ def wait_for_result(job_dir: Path, pid: int, create_time: Optional[float],
         if popen is not None:
             if popen.poll() is not None:
                 break
-        elif not pid_alive(pid, create_time):
-            break
+        else:
+            if create_time is None:  # unverified at adoption: re-read what the child published
+                try:
+                    ident = job_identity(job_dir, {"pid": pid, "create_time": None} if pid else None)
+                except IdentityUnavailable:
+                    time.sleep(poll)
+                    continue  # inspection failed: unknown is not an exit, keep waiting
+                if not ident:
+                    break  # a completed lookup found no such child
+                pid, create_time = ident["pid"], ident["create_time"]
+            if pid_state(pid, create_time) is False:
+                break  # confirmed gone; an inspection error (None) keeps waiting
         time.sleep(poll)
     result = _read_json(job_dir / "result.json")
     if result is not None:

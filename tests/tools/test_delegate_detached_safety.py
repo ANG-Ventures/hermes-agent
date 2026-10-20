@@ -673,3 +673,99 @@ def test_patch_locks_serialize_the_same_file_across_processes(tmp_path):
         assert holder.poll() is not None or waited >= 2.0, "a second process entered the same file's lock"
     finally:
         holder.wait(timeout=20)
+
+
+# ── #2160 post-merge Prism (t_f69309df): an identity lookup that FAILED is unknown, never dead ──
+def _psutil_unavailable(monkeypatch):
+    """Process inspection fails transiently (``import psutil`` raises), as on a starved or sandboxed host."""
+    monkeypatch.setitem(sys.modules, "psutil", None)
+
+
+# 88eb7f2543d5: a start time unknown at spawn must not make the child uncancellable
+def test_a_child_spawned_without_a_start_time_is_still_cancellable(_isolated, tmp_path):
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    proc = _sleeper(_isolated, 60)
+    with ad._records_lock:
+        ad._records["deleg_ct"] = {"delegation_id": "deleg_ct", "status": "running"}
+    # spawn_child's process_create_time() failed: the supervision hook is installed with create_time=None.
+    assert ad._install_detached_supervision("deleg_ct", proc.pid, None, job_dir) is True
+    # The live child then publishes its own verified identity (what _child_main writes first).
+    (job_dir / "child.json").write_text(json.dumps({"pid": proc.pid, "create_time": dd.process_create_time(proc.pid)}))
+
+    with ad._records_lock:
+        interrupt = ad._records["deleg_ct"]["interrupt_fn"]
+    interrupt()
+
+    assert proc.wait(timeout=10) == -signal.SIGTERM, "cancel was a silent no-op on a verifiable live child"
+
+
+def test_an_unverifiable_child_is_still_never_signalled_by_cancel(_isolated, tmp_path):
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    proc = _sleeper(_isolated, 60)  # its argv does not name the job: a recycled pid looks exactly like this
+    with ad._records_lock:
+        ad._records["deleg_ct2"] = {"delegation_id": "deleg_ct2", "status": "running"}
+    assert ad._install_detached_supervision("deleg_ct2", proc.pid, None, job_dir) is True
+    with ad._records_lock:
+        ad._records["deleg_ct2"]["interrupt_fn"]()
+    time.sleep(0.3)
+    assert proc.poll() is None, "the PID-reuse guard was weakened"
+
+
+# 2027aadba6a8: an unfenced orphan whose identity cannot be read keeps its dir + marker for a retry
+def test_an_unfenced_orphan_with_an_unreadable_identity_is_kept_for_the_next_pass(_isolated, tmp_path, monkeypatch):
+    _write()  # a registry exists; no live record owns the orphan's job dir
+    job_dir = dd.job_dir_for(tmp_path, "deleg_gone:g0:a")
+    job_dir.mkdir(parents=True)
+    (job_dir / "spawn.json").write_text("{}")
+    dd.mark_stand_down_unknown(job_dir)
+    proc = _sleeper(_isolated, 60, extra_argv=("--job", str(job_dir)))
+    terminated: list = []
+    real_terminate = dd.terminate_group
+    monkeypatch.setattr(dd, "terminate_group", lambda *a, **k: terminated.append(a) or real_terminate(*a, **k))
+
+    with pytest.MonkeyPatch.context() as mp:
+        _psutil_unavailable(mp)
+        ad.recover_async_delegations(current_boot_id="boot-b:1.0", profile_home=tmp_path,
+                                     runner_factory=lambda *a: pytest.fail("an orphan is never re-run"))
+    assert job_dir.exists() and dd.stand_down_unknown_dirs(tmp_path) == [job_dir], (
+        "the orphan's dir and marker were removed while its child may be alive")
+    assert proc.poll() is None and terminated == []
+
+    ad.recover_async_delegations(current_boot_id="boot-c:1.0", profile_home=tmp_path,
+                                 runner_factory=lambda *a: pytest.fail("an orphan is never re-run"))
+    assert proc.wait(timeout=10) == -signal.SIGTERM, "the retry pass did not kill the orphan"
+    assert not job_dir.exists()
+
+
+# Same class: an adoption pass that cannot inspect processes must not call a live child dead
+def test_a_detached_child_is_not_lost_when_process_inspection_fails(_isolated, tmp_path, monkeypatch):
+    record = _record("deleg_insp", owner=DEAD_BOOT)
+    job_dir = dd.job_dir_for(tmp_path, record["attempt"]["attempt_id"])
+    job_dir.mkdir(parents=True)
+    proc = _sleeper(_isolated, 60)
+    block = {"pid": proc.pid, "create_time": dd.process_create_time(proc.pid), "job_dir": str(job_dir),
+             "attempt_id": record["attempt"]["attempt_id"], "spawned_at": time.time()}
+    record["detached"] = block
+    _write(record)
+    kw = dict(profile_home=tmp_path, probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for)
+
+    with pytest.MonkeyPatch.context() as mp:
+        _psutil_unavailable(mp)
+        adopted, kill = ad._store.claim_detached_adoptions(current_boot_id="boot-b:1.0", **kw)
+        claimed, _ = ad._store.claim_recoveries(current_boot_id="boot-b:1.0", resume_enabled=True,
+                                                profile_home=tmp_path, owner_alive=lambda b: False)
+    assert (adopted, kill, claimed) == ([], [], []), "a second generation would run beside a live child"
+    assert _load("deleg_insp")["detached"]["pid"] == proc.pid
+
+    adopted, _ = ad._store.claim_detached_adoptions(current_boot_id="boot-c:1.0", **kw)
+    assert [r["delegation_id"] for r in adopted] == ["deleg_insp"], "the healthy retry pass adopts it"
+
+
+def test_an_exit_is_never_confirmed_from_a_failed_inspection(_isolated, monkeypatch):
+    proc = _sleeper(_isolated, 60)
+    ct = dd.process_create_time(proc.pid)
+    _psutil_unavailable(monkeypatch)
+    assert dd.wait_for_exit(proc.pid, ct, timeout=0.3) is False
+    assert dd.wait_for_exit(proc.pid, None, timeout=0.3) is False
