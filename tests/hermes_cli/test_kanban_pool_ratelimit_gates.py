@@ -736,6 +736,17 @@ def test_gateway_tick_threads_one_budget_cache_through_every_board():
     tree = ast.parse(inspect.getsource(kanban_watchers))
     funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
     tick = funcs["_tick_once"]
+    # The per-tick board loop lives in the body _tick_once calls (split out so the tick-series
+    # cost brackets build() through the loop).
+    if not any(getattr(c.func, "id", None) == "_tick_once_for_board"
+               for c in ast.walk(tick) if isinstance(c, ast.Call)):
+        callees = {c.func.id for c in ast.walk(tick) if isinstance(c, ast.Call)
+                   and isinstance(c.func, ast.Name) and c.func.id in funcs}
+        bodies = [funcs[n] for n in sorted(callees) if any(
+            getattr(c.func, "id", None) == "_tick_once_for_board"
+            for c in ast.walk(funcs[n]) if isinstance(c, ast.Call))]
+        assert len(bodies) == 1, callees
+        tick = bodies[0]
     loop_calls = [c for c in ast.walk(tick) if isinstance(c, ast.Call)
                   and getattr(c.func, "id", None) == "_tick_once_for_board"]
     assert loop_calls and all(

@@ -4942,7 +4942,7 @@ def _browser_relay_create(host: str, card: str, run: str, source_host: str) -> d
     try:
         out = subprocess.run([sys.executable, str(script), "create-ephemeral", "--host", host, "--card", card,
                               "--run", run, "--source-host", source_host],
-                             capture_output=True, text=True, timeout=260, stdin=subprocess.DEVNULL)
+                             capture_output=True, text=True, encoding="utf-8", timeout=260, stdin=subprocess.DEVNULL)
         resp = json.loads(((out.stdout or "").strip().splitlines() or ["{}"])[-1])
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return {"ok": False, "refusal": "BROWSER_RELAY_TRANSPORT", "detail": type(exc).__name__}
@@ -5088,7 +5088,7 @@ def _browser_release_lease(host: str, token: str) -> dict:
     try:
         out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
                               "/usr/local/bin/browserctl --lease-token-stdin --json release"],
-                             input=token + "\n", capture_output=True, text=True, timeout=60)
+                             input=token + "\n", capture_output=True, text=True, encoding="utf-8", timeout=60)
     except (OSError, subprocess.SubprocessError) as exc:
         return {"ok": False, "refusal": "BROWSER_RELAY_TRANSPORT", "detail": type(exc).__name__}
     return {"ok": out.returncode == 0, "rc": out.returncode}

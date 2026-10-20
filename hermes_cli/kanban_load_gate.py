@@ -1141,7 +1141,7 @@ def ecore_cpu_indices(sysctl=None, ncpu: Optional[int] = None) -> "tuple[int, ..
             import subprocess
 
             return subprocess.run(["sysctl", "-n", name], capture_output=True,
-                                  text=True, timeout=5).stdout.strip()
+                                  text=True, encoding="utf-8", timeout=5).stdout.strip()
     try:
         e_n = int(sysctl("hw.perflevel1.logicalcpu") or 0)
         dies = max(1, int(sysctl("hw.packages") or 1))

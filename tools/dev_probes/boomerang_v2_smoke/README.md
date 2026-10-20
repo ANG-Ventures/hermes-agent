@@ -60,7 +60,7 @@ A non-zero exit is a FAIL for that ack, never a pass. Dry-run ignores it.
 | `BV2_WIRELOG_DIR` | wire capture root (step 3) | `~/.claude-wirelog` |
 | `BV2_ACK_FILE` | ack file | `$TMPDIR/bv2-smoke.ack` |
 | `BV2_ACK_CMD` | scripted acker argv prefix, run as `<cmd> <token>` (see Ack mechanism) | unset = wait for a human |
-| `BV2_SYNC_TIMEOUT` | seconds allowed for `plan.commands.wirelog_sync` (a timeout is a non-zero exit in the evidence) | `600` |
+| `BV2_SYNC_TIMEOUT` | seconds allowed for `plan.commands.wirelog_sync` (a timeout is exit 124 in the evidence; on the fork's seat any non-zero exit makes step 3 INCOMPLETE) | `600` |
 | `BV2_EVIDENCE` | evidence markdown | `docs/boomerang-v2/evidence/smoke.md` |
 | `BV2_PLAN` | command/expectation plan | `fixtures/plan.json` |
 
@@ -83,6 +83,10 @@ is the one fleet header the box records (as the record's top-level `lane_src`), 
 Step 3: if the fork is served by a remote seat, its capture is on that box. Run
 `wirelog-fleet.py sync` and point `BV2_WIRELOG_DIR` at `~/.claude-wirelog-fleet`, and run
 `wirelog-coverage-check.py` first (the harness prints both).
+Live, the harness runs `commands.wirelog_sync` for the fork's seat itself; if that pull exits
+non-zero, times out, or no sync command is configured, the check `fork seat ... capture pulled`
+is INCOMPLETE: a partial pull can miss the fork request while other clean records from the seat
+remain, so the header scan cannot be a PASS.
 
 ## Evidence
 
@@ -112,6 +116,6 @@ Two contract gaps are parameters, not code:
 
 ## Tests
 
-`tests/dev_probes/test_boomerang_v2_smoke_harness.py` runs every step in `--dry-run` on the
+`tests/tools/dev_probes/test_boomerang_v2_smoke_harness.py` runs every step in `--dry-run` on the
 fixtures, breaks each contract once to prove the step goes red, and runs step 1 `--live` against
 a fake kanban CLI that plays the gateway.

@@ -75,6 +75,10 @@ EXCLUDED_MODULES: dict[str, str] = {
         "PM CLI entry after interpreter selection: mutates sys.path and imports truststore at "
         "import; only ever run as a subprocess, never inside a gateway"
     ),
+    "tools.dev_probes": (
+        "operator-run dev probes (no __init__.py: never imported by tool discovery); "
+        "boomerang_v2_inv4_probe inserts its own directory into sys.path at import"
+    ),
     "repro_rollback_store": (
         "repro script: runs `git show` in a subprocess and executes the result at import"
     ),
