@@ -290,7 +290,7 @@ def _is_hermes_internal_secret(key: str) -> bool:
 # ``HERMES_ALLOW_PRIVATE_URLS`` are process settings, not adapter gates).
 _PROFILE_GATE_ENV_MARKERS = (
     "_ALLOWED_", "_ALLOW_ALL_", "_ALLOW_FROM", "_ALLOW_BOTS", "_ALLOW_PUBLIC_", "_IGNORED_CHANNELS",
-    "_NO_THREAD_CHANNELS", "_FREE_RESPONSE_CHANNELS", "_BACKFILL_CHANNELS", "_GROUP_ALLOWED",
+    "_THREAD_CHANNELS", "_FREE_RESPONSE_CHANNELS", "_BACKFILL_CHANNELS", "_GROUP_ALLOWED",
 )
 # Gate owners that are not a ``Platform`` value: the cross-platform pairing gate and adapters whose
 # env prefix differs from their platform name (``qqbot`` reads ``QQ_*``).
