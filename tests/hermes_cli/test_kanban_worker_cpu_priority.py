@@ -1,4 +1,10 @@
-"""Kanban worker gateways must run at BACKGROUND CPU priority (2026-09-20 incident).
+"""Kanban worker CPU priority: default NORMAL since 2026-10-19; background/idle opt-in.
+
+2026-10-19 (Ace 21:52, card t_6ffdd0c4): the dev pipeline, kanban workers included, is
+first-class: the default spawn carries no ``taskpolicy`` prefix and no nice. The history
+below is why ``background``/``idle`` still exist as per-host opt-ins.
+
+Originally (2026-09-20 incident), worker gateways ran at BACKGROUND CPU priority.
 
 A daedalus-opus kanban worker launched 384 busy-loops in the background on the
 production Mac Studio and never reaped them. Load average reached 538 for 55
@@ -12,7 +18,8 @@ The class fix is priority, not policing: a kanban worker is batch work and must
 never be able to outbid the interactive gateway for CPU. ``_default_spawn``
 applies ``nice 19`` (and SCHED_IDLE where available) in a ``preexec_fn``, so
 every descendant the worker spawns — its terminal-tool children included —
-inherits the deprioritisation. ``kanban.worker_cpu_priority: normal`` opts out.
+inherits the deprioritisation. Since 2026-10-19 that is opt-in
+(``kanban.worker_cpu_priority: background``).
 
 The detector half is in ``tests/gateway/test_loop_liveness_load_context.py``.
 """
@@ -109,6 +116,7 @@ def test_worker_preexec_applies_nice_19_in_a_real_child(fresh_home, monkeypatch)
     and reads the priority back from inside that child via ``os.getpriority``.
     A hook that is wired but inert would return 0 here.
     """
+    monkeypatch.setattr(kb, "worker_cpu_priority_config", lambda cfg=None: ("background", 19))
     captured = _spawn_and_capture_kwargs(fresh_home, monkeypatch)
     preexec = captured.get("preexec_fn")
     assert preexec is not None, (
@@ -149,6 +157,7 @@ def test_nice_is_inherited_by_forked_grandchildren(fresh_home, monkeypatch):
     survives both fork and exec, which is exactly why the preexec hook is the
     right seam; this test pins that property rather than assuming it.
     """
+    monkeypatch.setattr(kb, "worker_cpu_priority_config", lambda cfg=None: ("background", 19))
     captured = _spawn_and_capture_kwargs(fresh_home, monkeypatch, "t_fork")
     preexec = captured.get("preexec_fn")
     assert preexec is not None
@@ -183,16 +192,34 @@ def test_nice_is_inherited_by_forked_grandchildren(fresh_home, monkeypatch):
     assert int(execed_nice) == 19, f"exec'd great-grandchild at nice {execed_nice}"
 
 
-def test_worker_cpu_priority_resolves_background_by_default():
+def test_worker_cpu_priority_resolves_normal_by_default():
+    """t_6ffdd0c4 (Ace 2026-10-19 21:52): the dev pipeline is first-class by default."""
     mode, nice = kb.worker_cpu_priority_config({})
-    assert mode == "background"
-    assert nice == 19
+    assert (mode, nice) == ("normal", 0)
 
 
-def test_worker_cpu_priority_invalid_value_falls_back_to_background():
+def test_worker_cpu_priority_invalid_value_falls_back_to_normal():
+    """A typo must never silently demote the dev pipeline ("unsure goes up")."""
     mode, nice = kb.worker_cpu_priority_config({"worker_cpu_priority": "turbo"})
-    assert mode == "background"
-    assert nice == 19
+    assert (mode, nice) == ("normal", 0)
+
+
+def test_worker_cpu_priority_background_is_still_an_opt_in():
+    assert kb.worker_cpu_priority_config({"worker_cpu_priority": "background"}) == ("background", 19)
+
+
+def test_default_spawn_argv_has_no_taskpolicy_prefix_and_no_nice(fresh_home, monkeypatch):
+    """RED on the pre-2026-10-19 default: the real resolver (no stub) on darwin with taskpolicy present
+    must hand Popen the bare worker argv and a child at the dispatcher's own nice."""
+    monkeypatch.setattr(kb.sys, "platform", "darwin")  # os-marker: ok — fork test pins the darwin branch as data so it runs on every lane
+    monkeypatch.setattr(kb.os, "access", lambda path, flag: True)
+    monkeypatch.setattr(kb, "worker_cpu_priority_config",
+                        lambda cfg=None, _real=kb.worker_cpu_priority_config: _real({}))
+    from hermes_cli import kanban_proc_bounds as kpb
+    monkeypatch.setattr(kpb, "resolve_worker_nproc_limit", lambda *a, **k: None)
+    captured = _spawn_and_capture_kwargs(fresh_home, monkeypatch, "t_default")
+    assert "/usr/sbin/taskpolicy" not in captured["cmd"], captured["cmd"][:4]
+    assert captured.get("preexec_fn") is None, "default spawn must not renice the worker"
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +296,7 @@ def test_knob_is_declared_in_config_defaults():
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
     assert "worker_cpu_priority" in DEFAULT_CONFIG["kanban"]
-    assert DEFAULT_CONFIG["kanban"]["worker_cpu_priority"] == "background"
+    assert DEFAULT_CONFIG["kanban"]["worker_cpu_priority"] == "normal"
 
 
 # ---------------------------------------------------------------------------

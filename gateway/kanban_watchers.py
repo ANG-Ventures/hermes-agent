@@ -1278,10 +1278,25 @@ def _notify_send(script: Path, message: str, extra: list) -> bool:
     return proc.returncode == 0
 
 
+_NEEDS_INPUT_ALERTS_CHANNEL = "1480528231286181948"  # fleet #alerts
+_NEEDS_INPUT_LOGS_CHANNEL = "1480525090331561984"    # fleet #logs
+
+
+def _needs_input_channels() -> "tuple[str, str]":
+    """``(#alerts, #logs)`` ids: the notify.py env names, else the fleet ids."""
+    return (os.environ.get("DISCORD_ALERTS_CHANNEL") or _NEEDS_INPUT_ALERTS_CHANNEL,
+            os.environ.get("DISCORD_LOGS_CHANNEL") or _NEEDS_INPUT_LOGS_CHANNEL)
+
+
 def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) -> bool:
     """Post to the card's origin channel (numeric id); mirror to #alerts at
     priority >= 200. A card with no origin channel pages #alerts instead, so
-    a priority >= 100 card is never silent. True when the primary post landed."""
+    a priority >= 100 card is never silent. True when the primary post landed.
+
+    #alerts gets ONE page per (card, reason) from a card homed there or with no
+    home (t_081bb603): its "still waiting" re-page goes to #logs instead (a
+    standing wait is a report, not a page), and a card whose origin IS #alerts
+    is not mirrored there a second time."""
     script = _alert_notify_script()
     if script is None:
         logger.error("kanban dispatcher: notify.py unavailable; needs-input page not delivered")
@@ -1298,11 +1313,17 @@ def _send_needs_input_page(board: str, item: dict, still_waiting: bool = False) 
     channel = item.get("channel")
     if channel is not None and not str(channel).isdigit():
         channel = None  # numeric channel ids only
+    alerts_ch, logs_ch = _needs_input_channels()
+    if channel and still_waiting and str(channel) == alerts_ch:
+        return _notify_send(script, message, ["--target", logs_ch])
     if channel:
         ok = _notify_send(script, message, ["--target", str(channel)])
-        if item.get("alerts") and not _notify_send(script, message, ["--sev", "error"]):
+        if (item.get("alerts") and str(channel) != alerts_ch
+                and not _notify_send(script, message, ["--sev", "error"])):
             logger.error("kanban dispatcher: needs-input #alerts mirror failed for %s", tid)
         return ok
+    if still_waiting:
+        return _notify_send(script, message, ["--target", logs_ch])
     return _notify_send(script, message, ["--sev", "error"])
 
 

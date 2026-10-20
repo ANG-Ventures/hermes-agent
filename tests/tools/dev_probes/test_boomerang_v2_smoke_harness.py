@@ -461,3 +461,45 @@ def test_step1_live_fault_against_fake_gateway(env, monkeypatch):
     assert calls[i_comment][calls[i_comment].index("comment") + 1] == fail_card
     assert i_complete < i_comment  # the fault lands after the dispatch, never before
     assert f"home session: re-delivered wake turn for {fail_card} | PASS |" in text
+
+
+
+
+# --- BV2_ACK_CMD: scripted operator for an isolated scratch gateway (t_b901c171) -----------------
+
+def _ack_ctx(tmp, ack_timeout=5.0):
+    ctx = run.Ctx.__new__(run.Ctx)
+    ctx.live = True
+    ctx.ack = tmp / "scripted.ack"
+    ctx.tick = 0.05
+    ctx.args = type("A", (), {"ack_timeout": ack_timeout})()
+    return ctx
+
+
+def test_ack_cmd_runs_the_action_and_appends_the_token(env, monkeypatch):
+    tmp = env["tmp"]
+    acker = tmp / "acker.sh"
+    acker.write_text(f"#!/bin/sh\necho \"$1\" >> {tmp / 'acted'}\nexit 0\n")
+    acker.chmod(acker.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("BV2_ACK_CMD", str(acker))
+    ctx = _ack_ctx(tmp)
+    rep = run.StepReport(2, "t", "live")
+    assert run.Ctx.wait_ack(ctx, rep, "fork_enabled=false", "flip it")
+    assert (tmp / "acted").read_text().strip() == "fork_enabled=false"      # the action ran
+    assert ctx.ack.read_text().splitlines() == ["fork_enabled=false"]       # the token was appended
+    assert [c.result for c in rep.checks] == [run.PASS]
+    assert any("scripted ack, exit 0" in c for c in rep.commands)
+
+
+def test_ack_cmd_nonzero_exit_is_a_fail_not_a_pass(env, monkeypatch):
+    tmp = env["tmp"]
+    acker = tmp / "acker.sh"
+    acker.write_text("#!/bin/sh\necho boom >&2\nexit 3\n")
+    acker.chmod(acker.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("BV2_ACK_CMD", str(acker))
+    ctx = _ack_ctx(tmp)
+    rep = run.StepReport(4, "t", "live")
+    assert run.Ctx.wait_ack(ctx, rep, "restart", "restart it") is None
+    assert not ctx.ack.exists()                                             # no token on failure
+    assert [c.result for c in rep.checks] == [run.FAIL]
+    assert "exit 3" in rep.checks[0].detail and "boom" in rep.checks[0].detail

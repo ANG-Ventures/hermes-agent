@@ -19632,7 +19632,7 @@ def _reevaluate_pr_gates_for_tick(
             "continuing this tick",
             type(exc).__name__, exc,
         )
-WORKER_CPU_PRIORITY_DEFAULT = "background"
+WORKER_CPU_PRIORITY_DEFAULT = "normal"
 WORKER_BACKGROUND_NICE = 19
 
 
@@ -19641,8 +19641,16 @@ def worker_cpu_priority_config(
 ) -> "tuple[str, int]":
     """Return ``(mode, nice_value)`` for dispatcher-spawned worker gateways.
 
-    ``background`` (the default) runs each worker at ``nice 19`` so batch
-    worker load can never outbid a RESIDENT gateway on the same host for CPU.
+    ``normal`` (the default since 2026-10-19, Ace 21:52: "Kanban workers,
+    Prism, FleetReview, CI ... can run on all cores and all computers") leaves
+    the worker at the dispatcher's own priority: no nice, no macOS QoS clamp.
+    The dev pipeline is first-class; the lever against a slow gateway is
+    ADMISSION (``dispatch_load_gate``), never priority. Gateways stay
+    ``ProcessType=Interactive`` and still win ties. Fleet rule: skill
+    ``dev-pipeline-scheduling-priority``.
+
+    ``background`` (opt-in, for a host the operator names) runs each worker at
+    ``nice 19`` so batch worker load can never outbid a RESIDENT gateway.
     Because niceness is inherited across ``fork``/``exec``, deprioritising the
     worker gateway deprioritises everything it later spawns — its terminal-tool
     children included, which is the seam the 2026-09-20 incident escaped
@@ -19650,10 +19658,8 @@ def worker_cpu_priority_config(
     cores and starved the resident gateway's event loop into two watchdog
     hard-exits).
 
-    ``normal`` opts out and leaves the child at the dispatcher's own priority.
-    An unrecognised value falls back to ``background``: this knob guards
-    interactive responsiveness, so a typo must fail SAFE (still niced), never
-    silently re-arm the incident.
+    An unrecognised value falls back to the default (``normal``): a typo must
+    never silently demote the dev pipeline (the ruling is "unsure goes up").
     """
     if kanban_cfg is None:
         try:
@@ -19668,7 +19674,9 @@ def worker_cpu_priority_config(
         return ("normal", 0)
     if mode == "idle":
         return ("idle", WORKER_BACKGROUND_NICE)
-    return ("background", WORKER_BACKGROUND_NICE)
+    if mode == "background":
+        return ("background", WORKER_BACKGROUND_NICE)
+    return ("normal", 0)
 
 # macOS: nice(2) only reorders threads INSIDE one scheduling class. Darwin's
 # real levers are the task QoS clamp and the darwin-BG flag, which also set
@@ -19684,6 +19692,9 @@ def worker_cpu_priority_config(
 # "background" = utility clamp: batch work sits strictly below an
 # Interactive gateway without collapsing worker throughput. "idle" = darwin
 # BG for hosts where the gateway must win at any cost to worker speed.
+# Both are OPT-IN since 2026-10-19 (default "normal" = no prefix): measured
+# that day, a 1 ms wake at Utility costs p95 30 ms under Studio load vs
+# 0.5 ms at Default, and every worker tool call pays it.
 WORKER_DARWIN_TASKPOLICY = "/usr/sbin/taskpolicy"
 _WORKER_DARWIN_POLICY_ARGS = {
     "background": ("-c", "utility"),

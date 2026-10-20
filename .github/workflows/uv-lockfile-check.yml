@@ -62,7 +62,7 @@ jobs:
     name: python -m pm.build_env --source . --check-lock
     # Hosted by design: `uv lock --check` is a network round-trip to PyPI,
     # not a LAN-bound job. Keeps a 17-slot pool slot free for a test slice.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       review_status: ${{ steps.verify.outputs.review_status }}

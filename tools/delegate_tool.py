@@ -3541,6 +3541,7 @@ def _build_durable_background_spec(
     origin_session_id: str = "",
     max_iterations: int,
     children: Optional[List[Any]] = None,
+    inherit_mode: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Build the non-secret restart intent for a routable gateway session."""
     if not is_truthy_value(cfg.get("resume_on_restart"), default=True):
@@ -3575,7 +3576,13 @@ def _build_durable_background_spec(
             if "inherit_context" in task
             else inherit_context
         )
-        if persisted["inherit_context"] and children and index < len(children):
+        # An explicit inherit_mode implies inheritance even with inherit_context omitted; the built
+        # child's fold is the only copy of that context a reconstructed (history-less) parent can reuse.
+        from tools import delegate_tool_fork as _fork
+
+        _mode = _fork.resolve_inherit_mode(
+            persisted["inherit_context"], task.get("inherit_mode") if "inherit_mode" in task else inherit_mode)
+        if _mode is not None and children and index < len(children):
             persisted["materialized_prefill_messages"] = copy.deepcopy(
                 getattr(children[index], "prefill_messages", None)
             )
@@ -4652,6 +4659,7 @@ def delegate_task(
                 origin_session_id=_wake_sid,
                 max_iterations=effective_max_iter,
                 children=_child_agents,
+                inherit_mode=inherit_mode,
             )
         except Exception as exc:
             logger.error(
@@ -4669,7 +4677,10 @@ def delegate_task(
         # Detached mode (docs/dev/delegate-detached-background.md): a durable unit runs its children in
         # its own process so a gateway restart neither kills nor re-runs it. Only on a restart-safe spawn.
         _detached = None
-        if _durable_spec is not None and _get_detached_background():
+        # A fork child carries the parent's live transcript, cache snapshot and served seat, none of
+        # which a reconstructed parent in another process has: it stays an in-process unit.
+        _has_fork_child = any(getattr(_c, "_inherit_mode", None) == "fork" for _c in _child_agents)
+        if _durable_spec is not None and _get_detached_background() and not _has_fork_child:
             from tools.delegate_detached import spawn_mode
 
             if spawn_mode() != "degraded":
