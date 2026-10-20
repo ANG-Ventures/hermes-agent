@@ -142,6 +142,8 @@ class ShellHookSpec(_ToolMatcherMixin):
     timeout: int = DEFAULT_TIMEOUT_SECONDS
     fail_closed: bool = False
     missing_hook_policy: str = _missing.DEFAULT_MISSING_HOOK_POLICY
+    # hooks.batch_python_hooks: run with the call's other Python hooks in one interpreter (shell_hooks_batch).
+    batch: bool = False
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
 
@@ -231,9 +233,14 @@ def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
             ", ".join(_missing.MISSING_HOOK_POLICIES), policy, _missing.DEFAULT_MISSING_HOOK_POLICY,
         )
         policy = _missing.DEFAULT_MISSING_HOOK_POLICY
+    # One interpreter per tool call for Python hooks (agent/shell_hooks_batch.py); false = one process per hook.
+    batch = hooks_cfg.get("batch_python_hooks", True)
+    if not isinstance(batch, bool):
+        logger.warning("hooks.batch_python_hooks must be a boolean; got %r — using true", batch)
+        batch = True
     specs: List[ShellHookSpec] = []
     for event_name, entries in hooks_cfg.items():
-        if event_name in ("output_spill", "outbound", "missing_hook_policy"):  # reserved non-event sub-sections under `hooks:`
+        if event_name in ("output_spill", "outbound", "missing_hook_policy", "batch_python_hooks"):  # reserved non-event keys under `hooks:`
             continue
         if event_name in SHELL_UNSUPPORTED_HOOKS:  # _parse_response has no channel for these directives — refuse loudly
             logger.warning("hook event %r is Python-plugin-only: shell hooks cannot return its directive, "
@@ -253,6 +260,7 @@ def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
             continue
         for spec in filter(None, (_parse_single_entry(event_name, i, raw) for i, raw in enumerate(entries))):
             spec.missing_hook_policy = policy
+            spec.batch = batch
             specs.append(spec)
     return specs
 
@@ -336,12 +344,31 @@ def _hook_script(spec: ShellHookSpec) -> Optional[Path]:
     return script if script.suffix.lower() in _SCRIPT_EXTENSIONS else None
 
 
-def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
+def _spawn(spec: ShellHookSpec, stdin_json: str, tool_name: Optional[str] = None) -> Dict[str, Any]:
     """Run the hook, first repairing absent tracked hook files (agent/shell_hooks_missing.py).
     A result carrying ``infra_failure`` means the hook's files were absent on disk and could not
     be restored. That result is never a policy verdict.
+
+    The first run inside an ``invoke_hook`` call takes its result from the call's shared dispatcher
+    run (agent/shell_hooks_batch.py) when the hook is eligible; a re-run after a restore, or a hook
+    the dispatcher did not answer for, spawns on its own as before.
     """
-    return _missing.spawn_with_self_heal(spec, stdin_json, _spawn_once, _hook_script(spec))
+    first = [True]
+
+    def spawn_once(s: ShellHookSpec, payload: str) -> Dict[str, Any]:
+        if first[0]:
+            first[0] = False
+            try:
+                from agent.shell_hooks_batch import batched_result
+                result = batched_result(s, payload, tool_name)
+            except Exception as exc:
+                logger.warning("shell hook batch failed (%s); spawning on its own", type(exc).__name__)
+                result = None
+            if result is not None:
+                return result
+        return _spawn_once(s, payload)
+
+    return _missing.spawn_with_self_heal(spec, stdin_json, spawn_once, _hook_script(spec))
 
 
 def _spawn_once(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
@@ -422,7 +449,7 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
         try:
             if spec.event in _TOOL_EVENTS and not spec.matches_tool(kwargs.get("tool_name")):
                 return None
-            return _evaluate_result(spec, _spawn(spec, _serialize_payload(spec.event, kwargs)))
+            return _evaluate_result(spec, _spawn(spec, _serialize_payload(spec.event, kwargs), kwargs.get("tool_name")))
         except Exception as exc:
             # A crashed callback must still fail closed on a blocking fail_closed hook (fork #819).
             logger.warning("shell hook callback failed (event=%s command=%s): %s", spec.event, spec.command, exc)
@@ -433,6 +460,7 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
     # Secret-free name: hook commands carry inline credentials (fork #841).
     _callback.__name__ = _callback.__qualname__ = f"shell_hook[{spec.event}:{hook_display_name(spec.command)}]"
     setattr(_callback, "_hermes_timeout_fail_closed", spec.fail_closed)
+    setattr(_callback, "_hermes_shell_spec", spec)  # shell_hooks_batch finds the call's other hooks by it
     return _callback
 
 

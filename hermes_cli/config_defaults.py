@@ -2022,7 +2022,9 @@ DEFAULT_CONFIG = {
     # website/docs/user-guide/features/hooks.md.
     # missing_hook_policy: what a hook whose script (or a tracked sibling) is ABSENT does —
     # restore_then_fail_closed | fail_closed | fail_open_and_page.
-    "hooks": {"missing_hook_policy": "restore_then_fail_closed"},
+    # batch_python_hooks: `<python> <script>.py` hooks of one event fire share one interpreter start
+    # (agent/shell_hooks_batch.py); false restores one process per hook.
+    "hooks": {"missing_hook_policy": "restore_then_fail_closed", "batch_python_hooks": True},
     # Auto-accept shell-hook registrations without a TTY prompt (also --accept-hooks or
     # HERMES_ACCEPT_HOOKS=1). Gateway/cron/non-interactive runs need one of these to pick up
     # newly-added hooks.
