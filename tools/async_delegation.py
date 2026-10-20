@@ -1284,6 +1284,7 @@ def _dispatch_admitted(
         from tools.delegate_detached import HandedOff
 
         job_dir = None
+        handed_off = False
         try:
             if detached is not None and record.get("attempt_id"):
                 raw, job_dir = _run_detached_unit(
@@ -1295,15 +1296,18 @@ def _dispatch_admitted(
             result = _coerce_runner_result(raw, label.strip() + " " if label else "")
             status = classify(result)
         except HandedOff:
-            return  # shutdown handed the unit to the next boot; it adopts and finalizes
+            # Shutdown handed the unit to the next boot; it adopts and finalizes. ``finally`` still runs:
+            # an adopter may already own the live record, so this supervisor must not touch it.
+            handed_off = True
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
             result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
             status = "error"
         finally:
-            _finalize(delegation_id, result, status)
-            if job_dir is not None:
-                _cleanup_detached_job(delegation_id, job_dir, _record_profile_home(record))
+            if not handed_off:
+                _finalize(delegation_id, result, status)
+                if job_dir is not None:
+                    _cleanup_detached_job(delegation_id, job_dir, _record_profile_home(record))
 
     from hermes_cli.backend_retirement import retirement
 
@@ -1493,9 +1497,16 @@ def _run_detached_unit(
             logger.debug("detached on_spawned hook failed", exc_info=True)
     # Flag the live record BEFORE the registry advertises the child, so a shutdown racing this spawn
     # either sees a detached unit (hand-off) or stood this one down (terminate below; re-dispatch).
-    installed = _install_detached_supervision(delegation_id, spawned.pid, spawned.create_time, spawned.job_dir)
-    if not (installed and _store.set_detached_block(
-            delegation_id, attempt_id, spawned.block(attempt_id), profile_home=profile_home)):
+    try:
+        advertised = _install_detached_supervision(
+            delegation_id, spawned.pid, spawned.create_time, spawned.job_dir) and _store.set_detached_block(
+                delegation_id, attempt_id, spawned.block(attempt_id), profile_home=profile_home)
+    except Exception:
+        # A child nobody supervises or can adopt must not run on (its side effects would repeat on retry).
+        logger.warning("async_delegation_detached_supervision_failed delegation_id=%s pid=%s",
+                       delegation_id, spawned.pid, exc_info=True)
+        advertised = False
+    if not advertised:
         # Cancelled, superseded or shutting down between persist and spawn: the child must not run on,
         # and its job dir must not look adoptable (a shutdown re-dispatches the unit on the next boot).
         dd.terminate_group(spawned.pid, spawned.create_time)
@@ -1504,8 +1515,8 @@ def _run_detached_unit(
         except Exception:
             pass
         dd.remove_job_dir(spawned.job_dir)
-        return {"status": "interrupted", "summary": None,
-                "error": "Background delegation stopped before its detached child started work."}, None
+        # Raise, not return: a returned payload with no per-task results classifies as a completed batch.
+        raise RuntimeError("Background delegation stopped before its detached child started work.")
     abort = _handed_off_check(delegation_id)
     try:
         return dd.wait_for_result(spawned.job_dir, spawned.pid, spawned.create_time, spawned.popen,
@@ -1559,17 +1570,19 @@ def _adopt_detached(
     def _supervise() -> None:
         result: Dict[str, Any] = {}
         status = "error"
+        handed_off = False
         try:
             result = dd.wait_for_result(job_dir, pid, create_time, abort=abort)
             status = _batch_status(result) if "results" in result else _single_status(result)
         except dd.HandedOff:
-            return  # handed to the next boot at shutdown; it adopts and finalizes
+            handed_off = True  # handed to the next boot at shutdown; it adopts and finalizes
         except Exception as exc:  # noqa: BLE001
             result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
         finally:
-            _finalize(delegation_id, result, status, attempt_id=attempt_id,
-                      registry_path=_store.registry_path(profile_home))
-            _cleanup_detached_job(delegation_id, job_dir, profile_home)
+            if not handed_off:
+                _finalize(delegation_id, result, status, attempt_id=attempt_id,
+                          registry_path=_store.registry_path(profile_home))
+                _cleanup_detached_job(delegation_id, job_dir, profile_home)
 
     executor.submit(propagate_context_to_thread(_supervise))
 

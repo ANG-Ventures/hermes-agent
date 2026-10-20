@@ -326,3 +326,64 @@ def test_reconstruction_prefers_the_dispatching_parents_toolsets(monkeypatch):
 
     assert built["enabled_toolsets"] == ["file", "terminal", "delegation"]
     assert built["disabled_toolsets"] == ["kanban"]
+
+
+def _dispatch_with_fake_child(_isolated, monkeypatch, *, seconds: float, summary: str = "child done"):
+    holder: dict = {}
+
+    def fake_spawn(*, record, attempt_id, profile_home, continuation, live_delegation_id):
+        job_dir = dd.job_dir_for(profile_home, attempt_id)
+        proc = _fake_child(_isolated, job_dir, seconds=seconds, summary=summary)
+        holder.update(proc=proc, job_dir=job_dir)
+        return dd.DetachedSpawn(job_dir, proc.pid, dd.process_create_time(proc.pid), proc)
+
+    monkeypatch.setattr(dd, "spawn_child", fake_spawn)
+    spec = {k: v for k, v in _record("x", owner="boot-a:1.0").items() if k in {"profile", "source", "execution", "route"}}
+    handle = ad.dispatch_async_delegation_batch(
+        goals=["port the module"], context=None, toolsets=None, role="leaf", model="test-model",
+        session_key="agent:main:telegram:dm:123", parent_session_id="parent-1",
+        runner=lambda: pytest.fail("a detached unit must not run in-process"),
+        durable_spec=spec, current_boot_id="boot-a:1.0", detached={"live_delegation_id": None},
+    )
+    assert handle["status"] == "dispatched"
+    return handle["delegation_id"], holder
+
+
+def test_failed_registry_advertise_terminates_the_spawned_child(_isolated, tmp_path, monkeypatch):
+    """A child nobody can supervise or adopt must not keep running (Prism P1 4eb695d627ba)."""
+    monkeypatch.setattr(ad, "current_boot_id", lambda: "boot-a:1.0")
+
+    def _enospc(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ad._store, "set_detached_block", _enospc)
+    delegation_id, holder = _dispatch_with_fake_child(_isolated, monkeypatch, seconds=30)
+
+    evt = _wait_for_event(delegation_id, timeout=60)
+    assert holder["proc"].wait(timeout=20) == -signal.SIGTERM
+    assert evt["status"] != "completed"
+    assert not holder["job_dir"].exists(), "an un-advertised job dir must not look adoptable"
+
+
+def test_outgoing_supervisor_leaves_an_adopters_record_alone(_isolated, tmp_path, monkeypatch):
+    """Recovery replaced the live record before the handed-off supervisor noticed: the outgoing
+    supervisor must neither finalize the adopter's record nor delete the job dir (Prism P1 dec1da79aa87)."""
+    monkeypatch.setattr(ad, "current_boot_id", lambda: "boot-a:1.0")
+    delegation_id, holder = _dispatch_with_fake_child(_isolated, monkeypatch, seconds=10)
+    deadline = time.time() + 10
+    while "detached" not in _load(delegation_id) and time.time() < deadline:
+        time.sleep(0.05)
+    with ad._records_lock:
+        attempt_id = ad._records[delegation_id]["attempt_id"]
+
+    ad.interrupt_all(reason="gateway shutdown (restart)", recoverable=True)
+    adopter = {"delegation_id": delegation_id, "status": "running", "attempt_id": attempt_id,
+               "registry_profile_home": str(tmp_path), "slot_key": delegation_id}
+    with ad._records_lock:
+        ad._records[delegation_id] = adopter  # boot B's adoption, same process
+    time.sleep(dd.POLL_SECONDS * 2.5)  # A's supervisor observes the hand-off and exits
+
+    assert adopter["status"] == "running", "the outgoing supervisor finalized the adopter's record"
+    assert holder["job_dir"].exists(), "the outgoing supervisor deleted the live child's job dir"
+    assert holder["proc"].poll() is None
+    assert not _drain()

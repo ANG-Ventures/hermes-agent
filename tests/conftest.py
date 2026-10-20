@@ -665,6 +665,35 @@ def _isolate_fallback_sticky_store():
 
 
 @pytest.fixture(autouse=True)
+def _refuse_real_detached_delegation_child(request, monkeypatch):
+    """A background delegate_task in a gateway-bound session spawns a REAL ``python -m
+    tools.delegate_detached`` process by default (``delegation.detached_background``). It never runs
+    a test's patched in-process seams, so the test hangs on a real agent build and leaves a stray
+    process behind (PPID 1). Refuse the spawn (no process starts) and fail the test: either turn the
+    knob off to pin the in-process path, or monkeypatch ``spawn_child`` with a fake child."""
+    try:
+        from tools import delegate_detached as _dd
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    attempts = []
+
+    def _refuse(**kwargs):
+        attempts.append(kwargs.get("attempt_id"))
+        return None  # the dispatcher falls back to an in-process thread
+
+    monkeypatch.setattr(_dd, "spawn_child", _refuse)
+    yield
+    if attempts:
+        pytest.fail(
+            f"{request.node.nodeid} reached a real detached delegation spawn ({len(attempts)}x). "
+            "Set delegation.detached_background off (tools.delegate_tool._get_detached_background) "
+            "or monkeypatch tools.delegate_detached.spawn_child with a fake child.",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_session_contextvars():
     """Reset every gateway session ContextVar to ``_UNSET`` around each test.
 
