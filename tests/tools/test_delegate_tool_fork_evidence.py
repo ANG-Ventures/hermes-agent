@@ -41,14 +41,15 @@ def _parent_with_tool_round():
     return parent
 
 
-def _delegate(parent, **kw):
-    """Run delegate_task for real; every child provider call answers with plain text (no tools)."""
+def _delegate(parent, replies=("done: the canary is fine",), **kw):
+    """Run delegate_task for real; child provider calls answer with ``replies`` in order
+    (plain text, no tools; the last one repeats)."""
     requests: list = []
     hook_calls: list = []
 
     def _create(self, kwargs, **_kw):
         requests.append(copy.deepcopy(kwargs))
-        return _anthropic_response("done: the canary is fine")
+        return _anthropic_response(replies[min(len(requests), len(replies)) - 1])
 
     real_build = delegate_tool._build_child_agent
 
@@ -104,9 +105,40 @@ def test_child_generated_messages_positional_and_fallback():
     rewritten = [{"role": "user", "content": "[summary of earlier turns]"}] + copy.deepcopy(history[1:]) + own
     got = fork.child_generated_messages(rewritten, history)
     assert all("toolu_parent_1" not in json.dumps(m) for m in got)
-    assert own[1] in got and own[2] in got
+    assert own[1] in got and own[2] in got and own[3] in got
+    # With the loop's exported boundary, the turn's rows are exactly its own.
+    assert fork.child_generated_messages(rewritten, history, len(rewritten) - len(own)) == own
     # Non-fork turns are untouched (same object).
     msgs = list(own)
     assert fork.child_generated_messages(msgs, None) is msgs
     result = {"messages": msgs, "final_response": "done"}
     assert fork.strip_inherited_from_result(result, None) is result
+
+
+def test_child_answer_equal_to_an_inherited_answer_is_kept():
+    """Prism bec64a4205fe repro: compression dropped the prefix and the child's answer equals
+    an old parent answer. Ownership is positional, so the child's answer survives."""
+    msgs = [{"role": "user", "content": "summary"}, {"role": "user", "content": "frame"},
+            {"role": "assistant", "content": "done"}]
+    history = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "done"}]
+    assert {"role": "assistant", "content": "done"} in fork.child_generated_messages(msgs, history)
+    assert fork.child_generated_messages(msgs, history, 1) == msgs[1:]
+    # The real result envelope carries the boundary; strip_inherited_from_result uses it.
+    out = fork.strip_inherited_from_result({"messages": msgs, "current_turn_user_idx": 1}, history)
+    assert out["messages"] == msgs[1:]
+
+
+def test_fork_schema_correction_turn_carries_no_inherited_tool_rounds():
+    """Prism 1503421f1fa6: the schema-correction continuation's rows are trimmed too."""
+    parent = _parent_with_tool_round()
+    schema = {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}
+    result, requests, hook_calls = _delegate(
+        parent, replies=("not json", '{"ok": true}'),
+        inherit_context=True, inherit_mode="fork", output_schema=schema,
+    )
+    assert len(requests) >= 2, "the schema-correction turn never ran"
+    entry = result["results"][0]
+    assert entry.get("schema_valid") is True, entry
+    assert entry["tool_trace"] == [], entry["tool_trace"]
+    assert _PARENT_TOOL_OUTPUT not in json.dumps(entry, default=str)
+    assert hook_calls and hook_calls[-1]["tool_call_history"] == []

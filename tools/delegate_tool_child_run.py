@@ -510,6 +510,9 @@ def _validate_child_output_schema(
     except Exception as _retry_exc:
         logger.warning("Subagent %d schema-retry turn failed: %s", task_index, _retry_exc)
     if isinstance(_retry_result, dict):
+        # A fork child's continuation is its own evidence only (Prism 1503421f1fa6).
+        from tools.delegate_tool_fork import strip_inherited_from_result
+        _retry_result = strip_inherited_from_result(_retry_result, getattr(child, "_fork_history", None))
         _retry_text = _retry_result.get("final_response") or ""
         if _retry_text.strip():
             result["final_response"] = _retry_text
