@@ -1566,7 +1566,7 @@ def _run_detached_unit(
                         delegation_id, spawned.pid)
             raise dd.HandedOff(str(spawned.job_dir))
         dd.terminate_job(spawned.job_dir, spawned.pid, spawned.create_time)
-        if dd.wait_for_exit(spawned.pid, spawned.create_time, popen=spawned.popen):
+        if dd.wait_for_exit(spawned.pid, spawned.create_time, popen=spawned.popen, job_dir=spawned.job_dir):
             # Confirmed dead: only now may a later generation run (the fence held it back until here).
             try:
                 _store.clear_detached_fenced(delegation_id, attempt_id, profile_home=profile_home)
@@ -1994,6 +1994,44 @@ _RESTART_CONTINUATION = (
 )
 
 
+# Detached units a recovery pass could not settle (identity unknown, a kill not yet confirmed) are
+# re-checked in the same boot: the startup pass runs once per boot, so without this one transient
+# inspection failure would leave a live child unsupervised (and its result undelivered) until restart.
+_RECOVERY_RETRY_DELAYS = (15.0, 30.0, 60.0, 120.0, 300.0)  # the last delay repeats while undecided
+_recovery_retry_pending: Dict[str, threading.Timer] = {}
+_recovery_retry_attempts: Dict[str, int] = {}
+_recovery_retries_lock = threading.Lock()
+
+
+def _schedule_recovery_retry(kwargs: Dict[str, Any], undecided: List[str]) -> None:
+    key = str(kwargs["profile_home"])
+    with _recovery_retries_lock:
+        if key in _recovery_retry_pending:
+            return
+        attempt = _recovery_retry_attempts.get(key, 0)
+        _recovery_retry_attempts[key] = attempt + 1
+    delay = _RECOVERY_RETRY_DELAYS[min(attempt, len(_RECOVERY_RETRY_DELAYS) - 1)]
+    logger.info("async_delegation_detached_recovery_retry home=%s undecided=%d in=%.0fs",
+                key, len(undecided), delay)
+
+    def _retry() -> None:
+        with _recovery_retries_lock:
+            _recovery_retry_pending.pop(key, None)
+        if str(current_boot_id()) != str(kwargs["current_boot_id"]):
+            return  # this process no longer owns that boot
+        try:
+            recover_async_delegations(**kwargs)
+        except Exception:
+            logger.warning("async_delegation_detached_recovery_retry_failed home=%s", key, exc_info=True)
+            _schedule_recovery_retry(kwargs, undecided)
+
+    timer = threading.Timer(delay, propagate_context_to_thread(_retry))
+    timer.daemon = True
+    with _recovery_retries_lock:
+        _recovery_retry_pending[key] = timer
+    timer.start()
+
+
 def recover_async_delegations(
     *,
     current_boot_id: str,
@@ -2009,24 +2047,35 @@ def recover_async_delegations(
     # Detached units first, unconditionally (resume_on_restart / detached_background do not gate a child
     # that is already running): adopt live/finished children; a dead child loses its block and falls
     # through to claim_recoveries below as a normal re-dispatch.
+    undecided: List[str] = []
     adopted, kill = _store.claim_detached_adoptions(
         current_boot_id=current_boot_id, profile_home=profile_home, owner_alive=is_boot_id_alive,
         probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for,
-        stand_down_unknown=dd.stand_down_unknown_dirs,
-        alive=lambda ident: dd.pid_state(ident.get("pid"), ident.get("create_time")) is not False)
+        stand_down_unknown=dd.stand_down_unknown_dirs, undecided=undecided, survivors=dd.group_survivors,
+        alive=lambda ident: dd.group_state(ident.get("pid"), ident.get("create_time"),
+                                           Path(ident["job_dir"]) if ident.get("job_dir") else None) is not False)
     for ident in kill:
+        job_dir = Path(ident["job_dir"]) if ident.get("job_dir") else None
         if ident.get("pid") is not None:
-            dd.terminate_group(ident.get("pid"), ident.get("create_time"))
+            dd.terminate_group(ident.get("pid"), ident.get("create_time"), job_dir=job_dir)
         if ident.get("fenced"):
-            # A stood-down child whose dispatcher died before the kill: confirm it dead before the
-            # re-dispatch below may run its unit again (claim_recoveries skips it until cleared).
-            if dd.wait_for_exit(ident.get("pid"), ident.get("create_time")):
+            # A stood-down child whose dispatcher died before the kill: confirm it (and every tool it
+            # started) dead before the re-dispatch below may run its unit again.
+            if dd.wait_for_exit(ident.get("pid"), ident.get("create_time"), job_dir=job_dir):
                 _store.clear_detached_fenced(ident["fenced"], ident["attempt_id"], profile_home=profile_home)
-                dd.remove_job_dir(Path(ident["job_dir"]))
-        if ident.get("remove_job_dir"):
-            dd.remove_job_dir(Path(ident["job_dir"]))
+                dd.remove_job_dir(job_dir)
+        elif ident.get("remove_job_dir") and (
+                ident.get("pid") is None
+                or dd.group_state(ident.get("pid"), ident.get("create_time"), job_dir) is False):
+            # An unowned orphan's dir + marker are its only identity: removed only once it is confirmed
+            # gone. A child just signalled keeps them; the next pass finds it dead and removes them.
+            dd.remove_job_dir(job_dir)
     for durable in adopted:
         _adopt_detached(durable, profile_home, max_async_children)
+    if undecided:
+        _schedule_recovery_retry(dict(
+            current_boot_id=current_boot_id, runner_factory=runner_factory, resume_enabled=resume_enabled,
+            profile_home=profile_home, max_async_children=max_async_children), undecided)
     claimed, summary = _store.claim_recoveries(
         current_boot_id=current_boot_id,
         resume_enabled=resume_enabled,
@@ -2442,6 +2491,11 @@ def _reset_for_tests() -> None:
         thread.join(timeout=2)
     with _records_lock:
         _records.clear()
+    with _recovery_retries_lock:
+        for timer in _recovery_retry_pending.values():
+            timer.cancel()
+        _recovery_retry_pending.clear()
+        _recovery_retry_attempts.clear()
     with _orphan_lock:
         _offered.clear()
         _last_orphan_sweep.clear()

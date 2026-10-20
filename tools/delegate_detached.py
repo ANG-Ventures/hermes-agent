@@ -141,15 +141,28 @@ def find_job_process(job_dir: Path) -> Optional[Dict[str, Any]]:
     except Exception as exc:
         raise IdentityUnavailable("psutil is unavailable") from exc
     target = str(job_dir)
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    unreadable = 0
     try:
-        for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
+        for proc in psutil.process_iter(["pid", "cmdline", "create_time", "status", "uids"], ad_value=None):
             try:
-                if _argv_has_job(proc.info.get("cmdline") or [], target):
+                cmdline = proc.info.get("cmdline")
+                if cmdline is None:
+                    # An argv we could not read is not "a process that is not this job": a process of
+                    # ours (same effective uid, or uid unreadable) may be the child. Zombies hold no argv.
+                    uids = proc.info.get("uids")
+                    if proc.info.get("status") != psutil.STATUS_ZOMBIE and (
+                            euid is None or uids is None or uids.effective == euid):
+                        unreadable += 1
+                    continue
+                if _argv_has_job(cmdline, target):
                     return {"pid": proc.info["pid"], "create_time": proc.info["create_time"]}
             except Exception:
-                continue
+                unreadable += 1
     except Exception as exc:
         raise IdentityUnavailable(f"process scan failed: {exc}") from exc
+    if unreadable:
+        raise IdentityUnavailable(f"{unreadable} process(es) of this user had an unreadable argv")
     return None
 
 
@@ -228,7 +241,9 @@ def _group_members(pid: int) -> list:
 
 
 def signal_group(pid: Any, create_time: Any, sig: int) -> bool:
-    """Signal the child's process group (it is its own session leader) iff it is still the same process."""
+    """Signal the child's process group (it is its own session leader) iff it is still the same process.
+    A group whose leader is gone is never signalled by its number (the id may belong to another session
+    by now); its surviving tools are reached one by one through their captured identities."""
     if not pid_alive(pid, create_time):
         return False
     try:
@@ -255,11 +270,95 @@ def _kill_members(pid: Any, create_time: Any, members: list) -> None:
                 pass
 
 
+# Members captured by terminate_group (each a verified ``(pid, create_time)``), keyed by the leader's pid,
+# and persisted to ``<job_dir>/members.json`` so a boot that dies before the escalation leaves them to the
+# next one: an exit is confirmed only once every one of them is gone too.
+MEMBERS_FILE = "members.json"
+_terminated_members: Dict[int, list] = {}
+_terminated_members_lock = threading.Lock()
+
+
+def _recorded_members(pid: Any, job_dir: Optional[Path]) -> list:
+    with _terminated_members_lock:
+        members = {tuple(m) for m in _terminated_members.get(int(pid), [])}
+    if job_dir is not None:
+        data = _read_json(Path(job_dir) / MEMBERS_FILE) or {}
+        if data.get("leader") == int(pid):
+            members |= {(int(m[0]), m[1]) for m in data.get("members") or [] if isinstance(m, list) and len(m) == 2}
+    return sorted(members, key=lambda m: m[0])
+
+
+def group_survivors(job_dir: Path, pid: Any, create_time: Any) -> Optional[list]:
+    """Leader confirmed gone: ``(pid, create_time)`` of every non-zombie process still in its process
+    group (tools it started). Only processes started inside the job's lifetime (after the leader, and no
+    later than shortly after its last heartbeat) count, so a group id reused by an unrelated session after
+    the job's group emptied is never claimed. None: inspection failed (unknown, never "none left")."""
+    if pid is None or create_time is None or not hasattr(os, "getpgid"):
+        return []
+    try:
+        import psutil
+    except Exception:
+        return None
+    beat = _read_json(Path(job_dir) / "heartbeat.json") or {}
+    try:
+        upper = float(beat["ts"]) + 3 * HEARTBEAT_SECONDS
+    except (KeyError, TypeError, ValueError):
+        upper = None
+    out = []
+    try:
+        for proc in psutil.process_iter(["pid", "create_time", "status"]):
+            info = proc.info
+            if info.get("status") == psutil.STATUS_ZOMBIE or info.get("create_time") is None:
+                continue
+            try:
+                if os.getpgid(info["pid"]) != int(pid):
+                    continue
+            except ProcessLookupError:
+                continue
+            ct = float(info["create_time"])
+            if ct + 0.01 < float(create_time) or (upper is not None and ct > upper):
+                continue
+            out.append((int(info["pid"]), ct))
+    except Exception:
+        return None
+    return out
+
+
+def group_state(pid: Any, create_time: Any, job_dir: Optional[Path] = None) -> Optional[bool]:
+    """Is anything of this child still running? True: its leader, or a captured tool (pid + start time).
+    False: all of it confirmed gone. None: unknown (never dead)."""
+    leader = pid_state(pid, create_time)
+    if leader is not False:
+        return leader
+    states = [pid_state(m_pid, m_ct) for m_pid, m_ct in _recorded_members(pid, job_dir)]
+    if any(s is True for s in states):
+        return True
+    return None if any(s is None for s in states) else False
+
+
 def terminate_group(pid: Any, create_time: Any, *, grace: float = SIGKILL_GRACE_SECONDS,
-                    timer_factory: Callable[..., Any] = threading.Timer) -> bool:
-    """SIGTERM now, SIGKILL after ``grace`` on a timer thread; never blocks the caller."""
-    members = _group_members(int(pid)) if pid_alive(pid, create_time) else []
+                    timer_factory: Callable[..., Any] = threading.Timer,
+                    job_dir: Optional[Path] = None) -> bool:
+    """SIGTERM now, SIGKILL after ``grace`` on a timer thread; never blocks the caller. Tools that
+    outlived an earlier SIGTERM'd leader (recorded members) are signalled one by one."""
+    members = _recorded_members(pid, job_dir)
+    if pid_alive(pid, create_time):
+        members = sorted({*members, *((int(m), c) for m, c in _group_members(int(pid)))}, key=lambda m: m[0])
+    with _terminated_members_lock:
+        _terminated_members[int(pid)] = members
+    if job_dir is not None and members:
+        try:
+            _write_json(Path(job_dir) / MEMBERS_FILE, {"leader": int(pid), "members": [list(m) for m in members]})
+        except OSError:
+            logger.warning("could not record the tool processes of %s", job_dir, exc_info=True)
     sent = signal_group(pid, create_time, signal.SIGTERM)
+    for member_pid, member_ct in members:
+        if member_pid != int(pid) and pid_alive(member_pid, member_ct):
+            try:
+                os.kill(int(member_pid), signal.SIGTERM)
+                sent = True
+            except OSError:
+                pass
     if sent:
         timer = timer_factory(grace, _kill_members, args=(pid, create_time, members))
         timer.daemon = True
@@ -268,15 +367,20 @@ def terminate_group(pid: Any, create_time: Any, *, grace: float = SIGKILL_GRACE_
 
 
 def wait_for_exit(pid: Any, create_time: Any, *, popen: Optional[subprocess.Popen] = None,
-                  timeout: Optional[float] = None, poll: float = 0.2) -> bool:
-    """True once the process is confirmed gone (reaped, or no longer the same pid + start time) within
-    ``timeout`` (default: past the SIGKILL escalation of ``terminate_group``)."""
+                  timeout: Optional[float] = None, poll: float = 0.2, job_dir: Optional[Path] = None) -> bool:
+    """True once the process AND every tool captured from it are confirmed gone within ``timeout``
+    (default: past the SIGKILL escalation of ``terminate_group``). Unknown is never a confirmed exit."""
     deadline = time.monotonic() + (SIGKILL_GRACE_SECONDS + 5 if timeout is None else timeout)
     while True:
-        if popen is not None:
-            if popen.poll() is not None:
-                return True
-        elif pid_state(pid, create_time) is False:  # unknown is not a confirmed exit
+        if popen is not None and popen.poll() is None:
+            gone = False
+        elif popen is not None:  # leader reaped: only its captured tools are left to confirm
+            gone = all(pid_state(m_pid, m_ct) is False for m_pid, m_ct in _recorded_members(pid, job_dir))
+        else:
+            gone = group_state(pid, create_time, job_dir) is False
+        if gone:
+            with _terminated_members_lock:
+                _terminated_members.pop(int(pid), None)
             return True
         if time.monotonic() >= deadline:
             return False
@@ -287,7 +391,7 @@ def terminate_job(job_dir: Path, pid: Any, create_time: Any, **kwargs) -> bool:
     """``terminate_group`` on the job's identity as known NOW (``current_identity``), so a start time
     unknown when the caller captured it (spawn-time lookup failed) does not make the child unkillable."""
     pid, create_time = current_identity(job_dir, pid, create_time)
-    return terminate_group(pid, create_time, **kwargs)
+    return terminate_group(pid, create_time, job_dir=job_dir, **kwargs)
 
 
 # ── liveness ────────────────────────────────────────────────────────────────
@@ -586,6 +690,8 @@ def wait_for_result(job_dir: Path, pid: int, create_time: Optional[float],
             if popen.poll() is not None:
                 break
         else:
+            if (job_dir / "result.json").exists():
+                break  # published: the result needs no process inspection (an unverifiable child is done)
             if create_time is None:  # unverified at adoption: re-read what the child published
                 try:
                     ident = job_identity(job_dir, {"pid": pid, "create_time": None} if pid else None)
@@ -599,6 +705,10 @@ def wait_for_result(job_dir: Path, pid: int, create_time: Optional[float],
                 break  # confirmed gone; an inspection error (None) keeps waiting
         time.sleep(poll)
     result = _read_json(job_dir / "result.json")
+    if result is None:
+        # The leader died without a result: tools it started must not run on unowned.
+        for m_pid, m_ct in group_survivors(job_dir, pid, create_time) or []:
+            terminate_group(m_pid, m_ct, job_dir=job_dir)
     if result is not None:
         if result.pop("schema_version", None) != SCHEMA_VERSION:
             return {"status": "error", "summary": None,

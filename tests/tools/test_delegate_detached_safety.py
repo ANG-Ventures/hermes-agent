@@ -300,6 +300,9 @@ def test_an_unfenceable_child_nobody_owns_is_killed_by_the_next_boot(_isolated, 
                                  runner_factory=lambda *a: pytest.fail("an orphan is never re-run"))
 
     holder["proc"].wait(timeout=10)
+    # Its dir + marker are the orphan's only identity: removed by the pass that finds it confirmed dead.
+    ad.recover_async_delegations(current_boot_id="boot-b:1.0", profile_home=tmp_path,
+                                 runner_factory=lambda *a: pytest.fail("an orphan is never re-run"))
     assert not holder["job_dir"].exists()
 
 
@@ -475,7 +478,7 @@ def test_windows_runs_detached_units_in_process(tmp_path):
 
 
 # ── #2160 Prism round 1 (t_7ccdc21b) ───────────────────────────────────────
-def _background_spec_for(monkeypatch, tmp_path, **call) -> dict:
+def _background_spec_for(monkeypatch, tmp_path, _prefill=None, **call) -> dict:
     """Run delegate_task(background=True) in a routable gateway session up to the dispatch and return
     the durable spec it persisted (children are stand-ins; nothing runs)."""
     import types
@@ -488,7 +491,7 @@ def _background_spec_for(monkeypatch, tmp_path, **call) -> dict:
     monkeypatch.setattr(gateway_status, "get_current_boot_id", lambda: "boot-a:1.0")
     monkeypatch.setattr(dt, "_build_child_preserving_parent_tools",
                         lambda **kw: types.SimpleNamespace(_subagent_id=None, provider="p", model="m",
-                                                           prefill_messages=None))
+                                                           prefill_messages=_prefill))
     monkeypatch.setattr(ad, "dispatch_async_delegation_batch",
                         lambda **kw: captured.update(kw) or {"status": "dispatched", "delegation_id": "d1"})
     parent = types.SimpleNamespace(model="m", provider="p", base_url=None, api_mode=None, session_id="parent-1",
@@ -736,6 +739,8 @@ def test_an_unfenced_orphan_with_an_unreadable_identity_is_kept_for_the_next_pas
     ad.recover_async_delegations(current_boot_id="boot-c:1.0", profile_home=tmp_path,
                                  runner_factory=lambda *a: pytest.fail("an orphan is never re-run"))
     assert proc.wait(timeout=10) == -signal.SIGTERM, "the retry pass did not kill the orphan"
+    ad.recover_async_delegations(current_boot_id="boot-c:1.0", profile_home=tmp_path,
+                                 runner_factory=lambda *a: pytest.fail("an orphan is never re-run"))
     assert not job_dir.exists()
 
 
@@ -769,3 +774,337 @@ def test_an_exit_is_never_confirmed_from_a_failed_inspection(_isolated, monkeypa
     _psutil_unavailable(monkeypatch)
     assert dd.wait_for_exit(proc.pid, ct, timeout=0.3) is False
     assert dd.wait_for_exit(proc.pid, None, timeout=0.3) is False
+
+
+# ── #2170 Prism round at 9e05dacd (t_7ccdc21b): unknown is not dead at EVERY step ──
+# 1ec6308a1929: a published result needs no process inspection
+def test_a_published_result_is_adopted_when_identity_cannot_be_read(_isolated, tmp_path, monkeypatch):
+    record = _record("deleg_res", owner=DEAD_BOOT)
+    job_dir = dd.job_dir_for(tmp_path, record["attempt"]["attempt_id"])
+    job_dir.mkdir(parents=True)
+    (job_dir / "spawn.json").write_text("{}")
+    (job_dir / "result.json").write_text(json.dumps({"schema_version": dd.SCHEMA_VERSION, "status": "completed",
+                                                     "summary": "done", "results": []}))
+    record["detached"] = {"pid": None, "create_time": None, "job_dir": str(job_dir),
+                          "attempt_id": record["attempt"]["attempt_id"], "spawned_at": None}
+    _write(record)
+    kw = dict(profile_home=tmp_path, probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for)
+
+    with pytest.MonkeyPatch.context() as mp:
+        _psutil_unavailable(mp)
+        adopted, kill = ad._store.claim_detached_adoptions(current_boot_id="boot-b:1.0", **kw)
+        assert [r["delegation_id"] for r in adopted] == ["deleg_res"], "a finished result was withheld"
+        assert kill == []
+        assert dd.wait_for_result(job_dir, None, None, poll=0.01)["summary"] == "done"
+
+
+# 0aedbcdd5178: a fenced child whose exit is not confirmed keeps its job dir (stand-down-unknown marker too)
+def test_a_live_fenced_child_keeps_its_job_dir_when_its_exit_is_unconfirmed(_isolated, tmp_path, monkeypatch):
+    monkeypatch.setattr(ad, "_detached_enabled", lambda: False)
+    record = _record("deleg_fd", owner="boot-a:1.0", state="recoverable")
+    attempt_id = record["attempt"]["attempt_id"]
+    job_dir = dd.job_dir_for(tmp_path, attempt_id)
+    job_dir.mkdir(parents=True)
+    proc = _sleeper(_isolated, 60)
+    record["detached"] = {"pid": proc.pid, "create_time": dd.process_create_time(proc.pid), "job_dir": str(job_dir),
+                          "attempt_id": attempt_id, "spawned_at": time.time()}
+    _write(record)
+    assert ad._store.stand_down_detached("deleg_fd", attempt_id, "boot-a:1.0", profile_home=tmp_path) is True
+    dd.mark_stand_down_unknown(job_dir)
+    monkeypatch.setattr(dd, "wait_for_exit", lambda *a, **k: False)  # the child outlives the wait
+
+    ad.recover_async_delegations(current_boot_id="boot-b:1.0", profile_home=tmp_path,
+                                 runner_factory=lambda *a: pytest.fail("no re-dispatch beside a live child"))
+
+    assert job_dir.exists(), "the still-live fenced child's job dir and identity files were deleted"
+    assert "detached_fenced" in _load("deleg_fd")
+
+
+# an argv the scan could not read is UNKNOWN, never "not this job"
+def test_an_unreadable_argv_makes_the_job_scan_unknown(monkeypatch, tmp_path):
+    import psutil
+
+    class _Proc:
+        def __init__(self, info):
+            self.info = info
+
+    me = psutil.Process(os.getpid())
+    unreadable = _Proc({"pid": 4242, "cmdline": None, "create_time": 1.0, "status": "sleeping", "uids": me.uids()})
+    monkeypatch.setattr(psutil, "process_iter", lambda *a, **k: iter([unreadable]))
+
+    with pytest.raises(dd.IdentityUnavailable):
+        dd.find_job_process(tmp_path / "job")
+    zombie = _Proc({**unreadable.info, "status": psutil.STATUS_ZOMBIE})
+    monkeypatch.setattr(psutil, "process_iter", lambda *a, **k: iter([zombie]))
+    assert dd.find_job_process(tmp_path / "job") is None, "a zombie holds no argv and is no live child"
+
+
+# a cancelled child found only by its argv keeps that identity on the record
+def test_a_cancelled_unadvertised_childs_identity_is_persisted_until_dead(_isolated, tmp_path):
+    record = _record("deleg_cx", owner=DEAD_BOOT, state="cancelled")
+    job_dir = dd.job_dir_for(tmp_path, record["attempt"]["attempt_id"])
+    job_dir.mkdir(parents=True)
+    (job_dir / "spawn.json").write_text("{}")
+    proc = _sleeper(_isolated, 60, extra_argv=("--job", str(job_dir)))
+    ident = {"pid": proc.pid, "create_time": dd.process_create_time(proc.pid)}
+    _write(record)  # cancelled before the detached block was advertised: no block on the record
+    kw = dict(profile_home=tmp_path, probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for)
+
+    _, b = ad._store.claim_detached_adoptions(current_boot_id="boot-b:1.0", **kw)  # dies before signalling
+    assert b == [ident]
+    assert _load("deleg_cx")["detached"]["pid"] == proc.pid, "the discovered identity was not persisted"
+    _, c = ad._store.claim_detached_adoptions(current_boot_id="boot-c:1.0", **kw)
+    assert c == [ident]
+
+
+# an exit is confirmed only once every tool of the child's group is gone, not just the leader
+@pytest.mark.platforms("posix")  # process groups
+@pytest.mark.live_system_guard_bypass  # the surviving worker is reparented to init: real delivery is the point
+def test_an_exit_is_not_confirmed_while_a_tool_outlives_its_leader(_isolated, tmp_path):
+    marker = tmp_path / "worker.pid"
+    leader_code = (
+        "import signal,subprocess,sys,time,os\n"
+        "w=subprocess.Popen([sys.executable,'-c',"
+        "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)'])\n"
+        f"open({str(marker)!r},'w').write(str(w.pid))\n"
+        "signal.signal(signal.SIGTERM, lambda *a: os._exit(0))\n"
+        "time.sleep(120)\n")
+    leader = subprocess.Popen([sys.executable, "-c", leader_code], start_new_session=True)
+    _isolated.append(leader)
+    deadline = time.time() + 10
+    while not marker.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.3)
+    worker_pid = int(marker.read_text())
+    leader_ct = dd.process_create_time(leader.pid)
+    _Timer.created = []
+    try:
+        assert dd.terminate_group(leader.pid, leader_ct, timer_factory=_Timer) is True
+        assert leader.wait(timeout=10) == 0
+        assert dd.pid_alive(worker_pid, dd.process_create_time(worker_pid)), "the tool ignores SIGTERM"
+
+        assert dd.group_state(leader.pid, leader_ct) is True, "a running tool read as a dead child"
+        # a2561fce2f02 / 90f22da2db3f: a group whose leader is gone is never signalled by its number
+        assert dd.signal_group(leader.pid, leader_ct, 0) is False
+        assert dd.wait_for_exit(leader.pid, leader_ct, timeout=1.0) is False, (
+            "exit confirmed while a tool of the group still runs: the fence would release")
+        assert dd.wait_for_exit(leader.pid, leader_ct, popen=leader, timeout=1.0) is False
+
+        _Timer.created[0].fn(*_Timer.created[0].args)  # the SIGKILL escalation fires
+        assert dd.wait_for_exit(leader.pid, leader_ct, timeout=10) is True
+    finally:
+        try:
+            os.kill(worker_pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+# the stale sibling-edit refusal holds across detached worker processes
+@pytest.mark.platforms("posix")  # detached workers are POSIX-only (Windows runs units in-process)
+def test_a_sibling_write_in_another_live_process_refuses_a_stale_edit(_isolated, tmp_path):
+    from tools import file_state
+
+    target = tmp_path / "shared.txt"
+    target.write_text("v1")
+    reg = file_state.FileStateRegistry()
+    reg.record_read("me", str(target))
+    time.sleep(0.05)
+    done = tmp_path / "written"
+    code = (
+        "import sys,time,pathlib\n"
+        "from tools import file_state\n"
+        "p=sys.argv[1]; pathlib.Path(p).write_text('v2')\n"
+        "file_state.note_write('sibling', p)\n"
+        "pathlib.Path(sys.argv[2]).write_text('1')\n"
+        "time.sleep(60)\n")
+    env = {**os.environ, "PYTHONPATH": str(Path(dd.__file__).resolve().parent.parent)}
+    sibling = subprocess.Popen([sys.executable, "-c", code, str(target), str(done)], env=env)
+    _isolated.append(sibling)
+    deadline = time.time() + 20
+    while not done.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    assert done.exists()
+
+    conflict = reg.sibling_write_conflict("me", str(target))
+    assert conflict and "sibling" in conflict, "a sibling's write in another process did not refuse the edit"
+    sibling.kill()
+    sibling.wait(timeout=5)
+    assert reg.sibling_write_conflict("me", str(target)) is None, "a finished worker is not a concurrent sibling"
+
+
+# a84f9eaf7ff8 (P2): a filesystem without flock keeps the thread-lock behaviour
+@pytest.mark.platforms("posix")  # fcntl
+def test_lock_path_survives_a_filesystem_that_rejects_flock(_isolated, tmp_path, monkeypatch):
+    import errno
+
+    import fcntl
+
+    from tools import file_state
+
+    def _no_flock(*_a):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(fcntl, "flock", _no_flock)
+    entered = []
+    with file_state.lock_path(str(tmp_path / "x.txt")):
+        entered.append(True)
+    assert entered == [True]
+
+
+# b1177741eb00: an unowned orphan whose kill could not be sent keeps its dir and marker
+def test_an_unowned_orphan_keeps_its_identity_until_it_is_confirmed_gone(_isolated, tmp_path, monkeypatch):
+    _write()
+    job_dir = dd.job_dir_for(tmp_path, "deleg_lost:g0:a")
+    job_dir.mkdir(parents=True)
+    proc = _sleeper(_isolated, 60)
+    (job_dir / "child.json").write_text(json.dumps({"pid": proc.pid, "create_time": dd.process_create_time(proc.pid)}))
+    dd.mark_stand_down_unknown(job_dir)
+    monkeypatch.setattr(dd, "terminate_group", lambda *a, **k: False)  # signalling failed
+
+    ad.recover_async_delegations(current_boot_id="boot-b:1.0", profile_home=tmp_path,
+                                 runner_factory=lambda *a: pytest.fail("an orphan is never re-run"))
+
+    assert job_dir.exists() and dd.stand_down_unknown_dirs(tmp_path) == [job_dir], (
+        "the only identity of a still-running orphan was deleted")
+
+
+# 1ec6308a1929 (round 2): an undecided pass is retried within the same boot
+def test_an_undecided_recovery_pass_is_retried_in_the_same_boot(_isolated, tmp_path, monkeypatch):
+    record = _record("deleg_retry", owner=DEAD_BOOT)
+    job_dir = dd.job_dir_for(tmp_path, record["attempt"]["attempt_id"])
+    job_dir.mkdir(parents=True)
+    proc = _sleeper(_isolated, 60)
+    record["detached"] = {"pid": proc.pid, "create_time": dd.process_create_time(proc.pid), "job_dir": str(job_dir),
+                          "attempt_id": record["attempt"]["attempt_id"], "spawned_at": time.time()}
+    _write(record)
+    monkeypatch.setattr(ad, "current_boot_id", lambda: "boot-b:1.0")
+    monkeypatch.setattr(ad, "_RECOVERY_RETRY_DELAYS", (0.2,))
+    adopted: list = []
+    monkeypatch.setattr(ad, "_adopt_detached", lambda durable, *a: adopted.append(durable["delegation_id"]))
+
+    with pytest.MonkeyPatch.context() as mp:
+        _psutil_unavailable(mp)
+        ad.recover_async_delegations(current_boot_id="boot-b:1.0", profile_home=tmp_path,
+                                     runner_factory=lambda *a: pytest.fail("no re-run beside a live child"))
+        assert adopted == []
+    deadline = time.time() + 10
+    while not adopted and time.time() < deadline:
+        time.sleep(0.05)
+    assert adopted == ["deleg_retry"], "the child stayed unsupervised for the rest of the boot"
+
+
+# 4cd9e879cf0e: a child's ordinary (non-inherited) prefill reaches the reconstructed worker
+def test_a_plain_childs_prefill_is_persisted_into_the_detached_task(monkeypatch, tmp_path):
+    prefill = [{"role": "user", "content": "Document: the approved budget is $7"}]
+
+    spec = _background_spec_for(monkeypatch, tmp_path, _prefill=prefill,
+                                tasks=[{"goal": "What is the approved budget?"}])
+
+    assert spec["source"]["tasks"][0].get("materialized_prefill_messages") == prefill, (
+        "the reconstructed parent has no prefill: the detached child would run without the document")
+
+
+# 3cebba6972e4: a task's writer-record cleanup runs under the cross-process path lock writers publish under
+@pytest.mark.platforms("posix")  # fcntl
+def test_forget_task_removes_its_writer_record_only_under_the_path_lock(tmp_path, monkeypatch):
+    import fcntl
+
+    from tools import file_state
+
+    target = str(tmp_path / "f.txt")
+    (tmp_path / "f.txt").write_text("x")
+    reg = file_state.FileStateRegistry()
+    reg.note_write("a", target)
+    lock_file = file_state._lock_file_for(target)
+    held: list = []
+    real_forget = file_state._forget_published
+
+    def probing_forget(path, task_id):
+        fd = os.open(lock_file, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held.append(False)  # nobody holds it: a sibling could publish between check and unlink
+        except BlockingIOError:
+            held.append(True)
+        finally:
+            os.close(fd)
+        real_forget(path, task_id)
+
+    monkeypatch.setattr(file_state, "_forget_published", probing_forget)
+    reg.forget_task("a")
+
+    assert held == [True], "the check-and-unlink races a sibling's publish"
+    assert not lock_file.with_name(lock_file.name + ".writer").exists()
+
+
+# 12d0c5da2421: an inherited route stays inherited on reconstruction (routing filters survive)
+def test_an_inherited_route_is_not_turned_into_a_pin_on_reconstruction(monkeypatch, tmp_path):
+    import types
+
+    from tools import delegate_tool as dt
+
+    spec = _background_spec_for(monkeypatch, tmp_path, tasks=[{"goal": "summarize the doc"}])
+    assert spec["execution"]["credential_ref"].get("inherited_route") is True
+    record = {**_record("deleg_route", owner="boot-a:1.0"), **spec}
+
+    seen: dict = {}
+
+    def capture(**kw):
+        seen.update(kw)
+        raise RuntimeError("stop after the build")
+
+    monkeypatch.setattr(dt, "_build_child_preserving_parent_tools", capture)
+    parent = types.SimpleNamespace(model="m", provider="openrouter", base_url=None, api_mode=None,
+                                   session_id="parent-1", enabled_toolsets=["file"], _delegate_depth=0,
+                                   terminal_cwd=str(tmp_path), providers_allowed=["Anthropic"],
+                                   provider_data_collection="deny")
+    try:
+        dt.delegate_task(tasks=record["source"]["tasks"], background=False, parent_agent=parent,
+                         _recovery_spec=record)
+    except Exception:
+        pass
+    assert "override_provider" in seen, "the child build was never reached"
+    assert not seen["override_provider"], (
+        "reconstruction pinned the provider: the children reset the allowlist / no-training filters")
+
+
+# 566a2590230e: a dead leader whose tools still run is not a dead attempt
+@pytest.mark.platforms("posix")  # process groups
+@pytest.mark.live_system_guard_bypass  # the surviving tool is reparented to init: real delivery is the point
+def test_a_dead_leader_with_live_tools_is_neither_redispatched_nor_released(_isolated, tmp_path):
+    record = _record("deleg_tools", owner=DEAD_BOOT)
+    job_dir = dd.job_dir_for(tmp_path, record["attempt"]["attempt_id"])
+    job_dir.mkdir(parents=True)
+    marker = tmp_path / "tool.pid"
+    leader_code = (
+        "import subprocess,sys,time\n"
+        "t=subprocess.Popen([sys.executable,'-c','import time; time.sleep(120)'])\n"
+        f"open({str(marker)!r},'w').write(str(t.pid))\n"
+        "time.sleep(120)\n")
+    leader = subprocess.Popen([sys.executable, "-c", leader_code], start_new_session=True)
+    _isolated.append(leader)
+    deadline = time.time() + 10
+    while not marker.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.3)
+    tool_pid = int(marker.read_text())
+    leader_ct = dd.process_create_time(leader.pid)
+    record["detached"] = {"pid": leader.pid, "create_time": leader_ct, "job_dir": str(job_dir),
+                          "attempt_id": record["attempt"]["attempt_id"], "spawned_at": time.time()}
+    _write(record)
+    leader.kill()  # the worker dies without a result; its tool keeps running
+    leader.wait(timeout=5)
+    try:
+        kw = dict(profile_home=tmp_path, probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for,
+                  survivors=dd.group_survivors)
+        adopted, kill = ad._store.claim_detached_adoptions(current_boot_id="boot-b:1.0", **kw)
+        claimed, _ = ad._store.claim_recoveries(current_boot_id="boot-b:1.0", resume_enabled=True,
+                                                profile_home=tmp_path, owner_alive=lambda b: False)
+        assert claimed == [], "a second generation would run beside the first one's still-running tool"
+        assert [k["pid"] for k in kill] == [tool_pid], "the surviving tool was not scheduled for termination"
+        assert _load("deleg_tools").get("detached"), "the attempt's fence was released"
+    finally:
+        try:
+            os.kill(tool_pid, signal.SIGKILL)
+        except OSError:
+            pass
