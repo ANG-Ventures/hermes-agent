@@ -83,7 +83,7 @@ def origin_slug(repo: Path, runner: Callable = subprocess.run) -> Optional[str]:
     slug = None
     try:
         proc = runner(["git", "-C", key, "remote", "get-url", "origin"], capture_output=True,
-                      text=True, timeout=10, stdin=subprocess.DEVNULL)
+                      text=True, encoding="utf-8", timeout=10, stdin=subprocess.DEVNULL)
         if getattr(proc, "returncode", 1) == 0:
             m = _SLUG_RE.match((proc.stdout or "").strip())
             slug = m.group(1) if m else None
@@ -119,7 +119,7 @@ def anchor_repo(task_id: str, workspace_path: Optional[str],
 
     def _git(*args):
         try:
-            return runner(["git", "-C", str(top), *args], capture_output=True, text=True,
+            return runner(["git", "-C", str(top), *args], capture_output=True, text=True, encoding="utf-8",
                           timeout=10, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError):
             return None

@@ -160,7 +160,7 @@ def run_arm(arm: str, env: dict, puppet, dc, target_id: str) -> bool:
     nonce = secrets.token_hex(3)
     home, head = env["PUPPET_LANE_HOME"], env.get("PUPPET_HEAD_SHA", "?")[:12]
     thread = dc.req("POST", f"/channels/{env['PUPPET_CH']}/threads",
-                    {"name": f"t_bb4059d2 e2e {arm} {nonce}", "auto_archive_duration": 60, "type": 11})
+                    {"name": f"t_bb4059d2 e2e {arm} {nonce}", "auto_archive_duration": 10080, "type": 11})
     tid = thread["id"]
     with open(env["PUPPET_THREADS"], "a", encoding="utf-8") as fh:
         fh.write(f"{tid}\n")

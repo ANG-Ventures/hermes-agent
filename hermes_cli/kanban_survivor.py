@@ -3302,7 +3302,8 @@ except Exception as e:
 '''
             proc = subprocess.run(
                 _ssh_argv(remote_host, 'python3 -c ' + shlex.quote(script) + ' ' + shlex.quote(str(path))),
-                capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, encoding="utf-8", timeout=60, stdin=subprocess.DEVNULL,
+                cwd=_ext.neutral_cwd(),
             )
             if proc.returncode != 0:
                 raise SurvivorUnavailable('survivor_unavailable: remote workspace held: ' + (proc.stderr or '')[:200])

@@ -194,7 +194,7 @@ def remote_workspace_has_content(placement_raw: Optional[str],
                   '[ -z "$o" ] && exit 0; exit 3; fi; '
                   '[ -d "$p" ] && [ -x "$p" ] && [ -r "$p" ] || exit 5; exit 0')
         proc = runner(argv + [target, script],
-                      capture_output=True, text=True, timeout=_PROBE_TIMEOUT_SECONDS,
+                      capture_output=True, text=True, encoding="utf-8", timeout=_PROBE_TIMEOUT_SECONDS,
                       stdin=subprocess.DEVNULL)
         return getattr(proc, "returncode", 1) != 0
     except Exception:

@@ -68,7 +68,7 @@ def test_is_management_only_false_for_add():
     assert not parse_queue_payload("hello").is_management
 
 
-def test_alias_table_is_the_only_definition():
+def test_alias_table_is_the_only_definition():  # noqa: source-proxy structural single-definition contract (I10); the verbs are exercised behaviourally in this file
     """One table (I10): the CLI mixin must not carry its own verb dict any more."""
     import inspect
     import hermes_cli.cli_loops_mixin as m

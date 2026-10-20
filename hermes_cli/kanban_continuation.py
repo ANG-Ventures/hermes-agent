@@ -337,7 +337,7 @@ def inventory(conn, task_id: str) -> list:
     script = 'import os,json; print(json.dumps(os.listdir(' + repr(row[1]) + ')))'
     try:
         proc = subprocess.run(kwp._ssh_argv(host, 'python3 -c ' + shlex.quote(script)),
-                              capture_output=True, text=True, timeout=8, stdin=subprocess.DEVNULL)
+                              capture_output=True, text=True, encoding="utf-8", timeout=8, stdin=subprocess.DEVNULL)
         result = json.loads(proc.stdout) if proc.returncode == 0 else None
         if isinstance(result, list) and all(isinstance(p, str) for p in result):
             return result
