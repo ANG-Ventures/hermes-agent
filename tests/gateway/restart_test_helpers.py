@@ -165,6 +165,9 @@ def make_restart_runner(
     runner.pairing_store = MagicMock()
     runner.session_store = MagicMock()
     runner.session_store._entries = {}
+    # No durable /stop marker: a bare MagicMock entry would fabricate a truthy user_stopped_at,
+    # and queue_mgmt.gate_stopped_event would then hold every internal wake.
+    runner.session_store.lookup_by_session_key.return_value = None
     runner.delivery_router = MagicMock()
 
     platform_adapter = adapter or RestartTestAdapter()

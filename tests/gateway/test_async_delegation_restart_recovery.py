@@ -59,14 +59,14 @@ def test_gateway_recovery_runs_once_and_reresolves_current_credentials(tmp_path,
     runner.__dict__["config"] = SimpleNamespace(multiplex_profiles=False)
     runner._current_boot_id = MagicMock(return_value="200:2.0")
     built_parent = MagicMock()
-    returned_runner = MagicMock(return_value={"results": []})
+    returned_runner = MagicMock()
 
     def recover_side_effect(**kwargs):
         produced = kwargs["runner_factory"](_record(), "CONTINUE after restart")
-        # The factory's runner runs the recovered delegation (wrapped to bind the profile's SessionDB).
-        with patch("tools.delegate_detached._acquire_session_db", return_value=None):
-            assert produced[0]() == {"results": []}
-        returned_runner.assert_called_once()
+        # #2160 (t_31528621): the factory returns a wrapper that binds the profile's
+        # SessionDB around the recovered runner, so assert it RUNS that runner.
+        produced[0]()
+        returned_runner.assert_called_once_with()
         produced[1]()
         return {"claimed": 1, "exhausted": 0, "failed_validation": 0}
 
@@ -86,6 +86,7 @@ def test_gateway_recovery_runs_once_and_reresolves_current_credentials(tmp_path,
          patch("tools.async_delegation.enqueue_pending_outbox", return_value=2) as replay, \
          patch("gateway.run._resolve_runtime_agent_kwargs_for_provider", return_value=runtime) as resolve, \
          patch("run_agent.AIAgent", return_value=built_parent) as agent_cls, \
+         patch("tools.delegate_detached._acquire_session_db", return_value=None), \
          patch("tools.delegate_tool.build_recovered_delegation_runner", return_value=returned_runner) as build:
         first = runner._recover_async_delegations_once()
         second = runner._recover_async_delegations_once()

@@ -35,7 +35,8 @@ DTYPE = "int16"
 SAMPLE_WIDTH = 2  # bytes per sample (int16)
 SILENCE_RMS_THRESHOLD = 200  # RMS below this = silence (int16 range 0-32767)
 SILENCE_DURATION_SECONDS = 3.0  # continuous silence before auto-stop
-_TEMP_DIR = os.path.join(tempfile.gettempdir(), "hermes_voice")
+# Per-uid, same name as tools.tts_tool.voice_temp_dir (a shared fixed dir is EACCES for every other user).
+_TEMP_DIR = os.path.join(tempfile.gettempdir(), "hermes_voice" + (f"-{os.getuid()}" if hasattr(os, "getuid") else ""))
 
 
 # ── Lazy audio imports ──

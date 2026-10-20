@@ -12331,6 +12331,14 @@ def _task_has_live_run(
     return False
 
 
+def _remote_spellings_overlap(a: str, b: str) -> bool:
+    """Lexical overlap of two REMOTE-host paths: equal, or one inside the other (a nested
+    workspace belongs to its ancestor too). Remote ownership is lexical on purpose: the
+    Studio's inode identity says nothing about another host's filesystem."""
+    a, b = os.path.normpath(a), os.path.normpath(b)
+    return a == b or a.startswith(b + os.sep) or b.startswith(a + os.sep)
+
+
 def safe_remove_workspace_dir(
     path: Path,
     *,
@@ -12378,16 +12386,10 @@ def safe_remove_workspace_dir(
             _audit_workspace_deletion(Path(path), task_id=task_id, reason=reason, allowed=False,
                                       detail='active-children-need-handoff remote=' + remote_host.name)
             return False
-        # Remote lexical ownership: never consult the Studio's inode identity.
-        target = os.path.normpath(str(path))
         for owner in conn.execute('SELECT id,workspace_path,workspace_of FROM tasks '
                                   'WHERE workspace_path IS NOT NULL'):
-            stored = os.path.normpath(owner['workspace_path'])
-            # Overlap in either direction: equal, inside the target, or
-            # containing it (a nested workspace belongs to its ancestor too).
             # A --workspace-of reader never co-owns (R-1); only a live one refuses.
-            if owner['id'] != task_id and (stored == target or stored.startswith(target + os.sep)
-                                           or target.startswith(stored + os.sep)) and (
+            if owner['id'] != task_id and _remote_spellings_overlap(owner['workspace_path'], str(path)) and (
                     not owner['workspace_of'] or _task_has_live_run(conn, owner['id'])):
                 return False
         from hermes_cli.kanban_survivor import remove_workspace_dir
@@ -14417,7 +14419,8 @@ def reopen_task(
         return False, "a reason is required to reverse a terminal state"
 
     row = conn.execute(
-        "SELECT status, result FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, result, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -14426,6 +14429,14 @@ def reopen_task(
             f"task {task_id} is {row['status']!r}; reopen only applies to "
             f"'done' tasks (use unblock/promote for other states)"
         )
+    # complete_task removed the scratch tree. Left on the card, the dead path is
+    # refused next tick as stranded_by_mount_loss and pages #alerts (t_b259e24e).
+    # Only when its parent dir exists: an absent parent may be an unmounted volume.
+    dead_scratch = None
+    if (row["workspace_kind"] or "scratch") == "scratch" and row["workspace_path"]:
+        wp = Path(row["workspace_path"]).expanduser()
+        if not os.path.lexists(wp) and wp.parent.is_dir():
+            dead_scratch = row["workspace_path"]
 
     # ``review`` (t_36d0114e): a card closed ``done`` while its PR is still
     # OPEN goes back to the review lane -- owned by kanban.review_assignee --
@@ -14442,6 +14453,17 @@ def reopen_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} changed state concurrently; retry"
+        if dead_scratch is not None:
+            conn.execute(
+                "UPDATE tasks SET workspace_path = NULL WHERE id = ? AND workspace_path = ?",
+                (task_id, dead_scratch),
+            )
+            _append_event(conn, task_id, "workspace_reset", {
+                "actor": actor,
+                "reason": "reopen: scratch workspace removed at completion",
+                "previous_path": dead_scratch,
+                "survivor_baseline": _reset_survivor_baseline(conn, task_id),
+            })
         run_id = conn.execute(
             "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
             "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
@@ -14465,9 +14487,6 @@ def reopen_task(
                 "voided_result": (row["result"] or "")[:500] or None,
             },
         )
-        # Completion reaped the scratch tree; drop the dead binding so the next
-        # dispatch mints a fresh dir instead of refusing it as mount loss.
-        _release_reaped_scratch_binding(conn, task_id, actor=actor, reason="reopened")
 
         # This task is no longer ``done``, so any child promoted on that
         # premise now violates the invariant the dispatcher trusts: a ``ready``

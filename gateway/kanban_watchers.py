@@ -4230,7 +4230,7 @@ class GatewayKanbanWatchersMixin:
                     tick_ms_wall=wall_s * 1000.0, boards=len(boards or ()),
                     queries=queries,
                 )
-                _gate_series.append(_gate_series.series_path(_kb.kanban_home()), rec)
+                _gate_series.append_record(_gate_series.series_path(_kb.kanban_home()), rec)
             except Exception as exc:
                 logger.debug("kanban gate series: append failed: %s", exc)
             finally:
