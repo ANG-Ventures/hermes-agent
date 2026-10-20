@@ -35,6 +35,7 @@ HEARTBEAT_SECONDS = 10.0
 SIGKILL_GRACE_SECONDS = 30.0
 POLL_SECONDS = 1.0
 _RUNTIME_ROOT = Path(__file__).resolve().parent.parent
+WORKER_BOOT_MARKER = "_HERMES_DETACHED_WORKER_BOOT"  # set by spawn_child, consumed by _boot_dependencies
 
 
 # ── job dir ─────────────────────────────────────────────────────────────────
@@ -217,6 +218,22 @@ def terminate_group(pid: Any, create_time: Any, *, grace: float = SIGKILL_GRACE_
         timer.daemon = True
         timer.start()
     return sent
+
+
+def wait_for_exit(pid: Any, create_time: Any, *, popen: Optional[subprocess.Popen] = None,
+                  timeout: Optional[float] = None, poll: float = 0.2) -> bool:
+    """True once the process is confirmed gone (reaped, or no longer the same pid + start time) within
+    ``timeout`` (default: past the SIGKILL escalation of ``terminate_group``)."""
+    deadline = time.monotonic() + (SIGKILL_GRACE_SECONDS + 5 if timeout is None else timeout)
+    while True:
+        if popen is not None:
+            if popen.poll() is not None:
+                return True
+        elif not pid_alive(pid, create_time):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
 
 
 # ── liveness ────────────────────────────────────────────────────────────────
@@ -471,7 +488,12 @@ def spawn_child(*, record: Dict[str, Any], attempt_id: str, profile_home: Path,
     _write_json(job_dir / "spec.json", spec)
     _write_json(job_dir / "spawn.json", {"attempt_id": attempt_id, "intent_at": time.time()})
     env = served_profile_child_env(target_home=str(profile_home), inherit_credentials=True)
-    env["PYTHONPATH"] = str(_RUNTIME_ROOT)
+    # Same boot as the cron external worker (cron/worker_bootstrap.py): pin this checkout and PM's
+    # committed dependency generation, and mark the child so main() leases + activates it first.
+    from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+
+    env = pin_hermes_tree_on_pythonpath(env, _RUNTIME_ROOT)
+    env[WORKER_BOOT_MARKER] = "1"
     workspace = (record.get("execution") or {}).get("workspace_hint")
     log_f = open(job_dir / "child.log", "ab")
     try:
@@ -538,6 +560,12 @@ def _isolate_process_checkpoint(job_dir: Path) -> None:
     import tools.process_registry as process_registry_module
 
     process_registry_module.CHECKPOINT_PATH = job_dir / "processes.json"
+    # The gateway cannot adopt a process from this registry, and this worker (with its checkpoint)
+    # is gone once the unit returns: refuse the handoff rather than report a transfer that never lands.
+    process_registry_module.HANDOFF_UNAVAILABLE = (
+        "handoff is unavailable in a detached background subagent: your parent runs in another process "
+        "and cannot take over this one. Wait for the process to finish (process_manage wait/poll) and "
+        "report its result, or kill it.")
 
 
 def _child_main(job_dir: Path) -> int:
@@ -609,10 +637,23 @@ def _child_main(job_dir: Path) -> int:
     return 0
 
 
+def _boot_dependencies() -> None:
+    """PM's dependency boot (``hermes_bootstrap`` never ran here), before the first third-party
+    import: it leases the committed generation for this process's lifetime. Only in a child
+    ``spawn_child`` marked; the marker is consumed so this worker's own children never re-boot.
+    A failed activation propagates: the child exits without a result and the gateway reports it."""
+    if not os.environ.pop(WORKER_BOOT_MARKER, None):
+        return
+    from pm.environments import activate_dependencies
+
+    activate_dependencies(_RUNTIME_ROOT)
+
+
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m tools.delegate_detached")
     parser.add_argument("--job", required=True)
     args = parser.parse_args(argv)
+    _boot_dependencies()
     return _child_main(Path(args.job))
 
 

@@ -1169,7 +1169,9 @@ def _single_status(result: Dict[str, Any]) -> str:
 
 
 def _envelope_status(result: Dict[str, Any]) -> str:
-    return _batch_status(result) if "results" in result else _single_status(result)
+    # Field presence through the store's safe reader: ``in`` runs a runner-controlled ``__contains__``.
+    has_results = _store._safe_get(result, "results", _store._MISSING) is not _store._MISSING
+    return _batch_status(result) if has_results else _single_status(result)
 
 
 def _dispatch(**kwargs) -> Dict[str, Any]:
@@ -1481,13 +1483,15 @@ def _handed_off_check(delegation_id: str) -> Callable[[], bool]:
 _STAND_DOWN_RETRY_DELAYS = (0.2, 0.5, 1.0)
 
 
-def _fence_stand_down(delegation_id: str, attempt_id: str, profile_home: Optional[Path]) -> Optional[bool]:
+def _fence_stand_down(delegation_id: str, attempt_id: str, profile_home: Optional[Path],
+                      block: Optional[Dict[str, Any]] = None) -> Optional[bool]:
     """``_store.stand_down_detached`` retried with a short backoff; None when the outcome stays unknown
     (a registry error says nothing about whether another boot already adopted the attempt)."""
     for delay in (*_STAND_DOWN_RETRY_DELAYS, None):
         try:
             return _store.stand_down_detached(
-                delegation_id, attempt_id, _owner_boot_id(delegation_id), profile_home=profile_home)
+                delegation_id, attempt_id, _owner_boot_id(delegation_id), profile_home=profile_home,
+                block=block)
         except Exception:
             logger.warning("async_delegation_detached_stand_down_failed delegation_id=%s",
                            delegation_id, exc_info=True)
@@ -1544,7 +1548,7 @@ def _run_detached_unit(
         # Cancelled, superseded or shutting down between persist and spawn: the child must not run on,
         # and its job dir must not look adoptable (a shutdown re-dispatches the unit on the next boot).
         # Fence it first: an overlapping boot that already adopted this attempt owns the child now.
-        stand_down = _fence_stand_down(delegation_id, attempt_id, profile_home)
+        stand_down = _fence_stand_down(delegation_id, attempt_id, profile_home, spawned.block(attempt_id))
         if stand_down is None:
             # Unknown: another boot may own the child. Never kill on an unknown; leave the child and its
             # job dir to the next boot's adoption pass (adopts it, or kills it if cancelled/age-capped).
@@ -1562,11 +1566,14 @@ def _run_detached_unit(
                         delegation_id, spawned.pid)
             raise dd.HandedOff(str(spawned.job_dir))
         dd.terminate_group(spawned.pid, spawned.create_time)
-        try:
-            spawned.popen.wait(timeout=dd.SIGKILL_GRACE_SECONDS + 5)
-        except Exception:
-            pass
-        dd.remove_job_dir(spawned.job_dir)
+        if dd.wait_for_exit(spawned.pid, spawned.create_time, popen=spawned.popen):
+            # Confirmed dead: only now may a later generation run (the fence held it back until here).
+            try:
+                _store.clear_detached_fenced(delegation_id, attempt_id, profile_home=profile_home)
+            except Exception:
+                logger.warning("could not clear the stood-down fence of %s; the next boot re-checks it",
+                               delegation_id, exc_info=True)
+            dd.remove_job_dir(spawned.job_dir)
         # Raise, not return: a returned payload with no per-task results classifies as a completed batch.
         raise RuntimeError("Background delegation stopped before its detached child started work.")
     abort = _handed_off_check(delegation_id)
@@ -2005,10 +2012,17 @@ def recover_async_delegations(
     adopted, kill = _store.claim_detached_adoptions(
         current_boot_id=current_boot_id, profile_home=profile_home, owner_alive=is_boot_id_alive,
         probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for,
-        stand_down_unknown=dd.stand_down_unknown_dirs)
+        stand_down_unknown=dd.stand_down_unknown_dirs,
+        alive=lambda ident: dd.pid_alive(ident.get("pid"), ident.get("create_time")))
     for ident in kill:
         if ident.get("pid") is not None:
             dd.terminate_group(ident.get("pid"), ident.get("create_time"))
+        if ident.get("fenced"):
+            # A stood-down child whose dispatcher died before the kill: confirm it dead before the
+            # re-dispatch below may run its unit again (claim_recoveries skips it until cleared).
+            if dd.wait_for_exit(ident.get("pid"), ident.get("create_time")):
+                _store.clear_detached_fenced(ident["fenced"], ident["attempt_id"], profile_home=profile_home)
+                dd.remove_job_dir(Path(ident["job_dir"]))
         if ident.get("remove_job_dir"):
             dd.remove_job_dir(Path(ident["job_dir"]))
     for durable in adopted:

@@ -3542,8 +3542,13 @@ def _build_durable_background_spec(
     max_iterations: int,
     children: Optional[List[Any]] = None,
     inherit_mode: Optional[str] = None,
+    task_images: Optional[List[Optional[List[str]]]] = None,
+    task_schemas: Optional[List[Optional[Dict[str, Any]]]] = None,
+    skills: Optional[List[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Build the non-secret restart intent for a routable gateway session."""
+    """Build the non-secret restart intent for a routable gateway session. Call-level inputs that
+    delegate_task applies outside ``task_list`` (top-level ``images`` / ``output_schema`` / ``skills``)
+    are written into each persisted task: reconstruction rebuilds the children from the tasks alone."""
     if not is_truthy_value(cfg.get("resume_on_restart"), default=True):
         return None, None
     try:
@@ -3586,6 +3591,12 @@ def _build_durable_background_spec(
             persisted["materialized_prefill_messages"] = copy.deepcopy(
                 getattr(children[index], "prefill_messages", None)
             )
+        if task_images and index < len(task_images) and task_images[index]:
+            persisted["images"] = list(task_images[index])
+        if task_schemas and index < len(task_schemas) and task_schemas[index] is not None:
+            persisted["output_schema"] = copy.deepcopy(task_schemas[index])
+        if "skills" not in task and skills is not None:
+            persisted["skills"] = list(skills)
         persisted_tasks.append(persisted)
 
     effective_agent = children[0] if children else parent_agent
@@ -3683,6 +3694,18 @@ def _build_durable_background_spec(
             "profile": profile,
         },
     }, str(boot_id)
+
+
+def _terminal_session_isolated() -> bool:
+    """The terminal backend keys a sandbox per live session (``_SessionScope.session_isolated``).
+    Unreadable counts as isolated: the unit then stays in-process, the pre-detached behaviour."""
+    try:
+        from tools.terminal_tool import _session_scope
+
+        return bool(_session_scope().session_isolated)
+    except Exception:
+        logger.debug("terminal session scope unreadable; keeping the unit in-process", exc_info=True)
+        return True
 
 
 def build_recovered_delegation_runner(
@@ -4660,6 +4683,9 @@ def delegate_task(
                 max_iterations=effective_max_iter,
                 children=_child_agents,
                 inherit_mode=inherit_mode,
+                task_images=task_images,
+                task_schemas=task_schemas,
+                skills=skills,
             )
         except Exception as exc:
             logger.error(
@@ -4680,7 +4706,11 @@ def delegate_task(
         # A fork child carries the parent's live transcript, cache snapshot and served seat, none of
         # which a reconstructed parent in another process has: it stays an in-process unit.
         _has_fork_child = any(getattr(_c, "_inherit_mode", None) == "fork" for _c in _child_agents)
-        if _durable_spec is not None and _get_detached_background() and not _has_fork_child:
+        # So does a session-isolated sandbox (docker + container_persistent: false): children alias the
+        # parent's per-session container by its live task id, and that container is never reused across
+        # processes, so a detached worker would land in a fresh "default" sandbox without the session's files.
+        if _durable_spec is not None and _get_detached_background() and not _has_fork_child \
+                and not _terminal_session_isolated():
             from tools.delegate_detached import spawn_mode
 
             if spawn_mode() != "degraded":

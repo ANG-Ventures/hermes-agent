@@ -1123,6 +1123,8 @@ def claim_recoveries(
                 continue
             if isinstance(record.get("detached"), dict):
                 continue  # a live detached child: adopted (claim_detached_adoptions), never re-run
+            if isinstance(record.get("detached_fenced"), dict):
+                continue  # a stood-down child not yet confirmed dead: never run a second generation beside it
             owner = str(attempt.get("owner_boot_id") or "")
             if state == "running" and owner == current_boot_id:
                 continue
@@ -1234,10 +1236,13 @@ def clear_detached(delegation_id: str, attempt_id: str, *, profile_home: Path | 
 
 def stand_down_detached(
     delegation_id: str, attempt_id: str, owner_boot_id: str, *, profile_home: Path | None = None,
+    block: dict[str, Any] | None = None,
 ) -> bool:
     """Fence an un-advertised child before its dispatcher kills it: False when another boot already
     adopted this attempt (the child is theirs now; leave it running). True otherwise, and adoption of
-    this attempt is refused from now on (``detached_fence``); the next generation re-dispatches."""
+    this attempt is refused from now on (``detached_fence``). The child's identity stays on the record
+    (``detached_fenced``) until its death is confirmed (``clear_detached_fenced``): until then no boot
+    re-dispatches the unit, and any boot's adoption pass re-sends the kill."""
     with locked_registry(profile_home) as registry:
         record = registry["records"].get(delegation_id)
         if not isinstance(record, dict) or (record.get("attempt") or {}).get("attempt_id") != attempt_id:
@@ -1245,14 +1250,26 @@ def stand_down_detached(
         if str((record.get("attempt") or {}).get("owner_boot_id") or "") != str(owner_boot_id or ""):
             return False
         record["detached_fence"] = attempt_id
-        record.pop("detached", None)
+        record["detached_fenced"] = {**(record.pop("detached", None) or {}), **(block or {}),
+                                     "attempt_id": attempt_id}
         append_lifecycle_event(record, "detached_stood_down", f"attempt={attempt_id}")
+        return True
+
+
+def clear_detached_fenced(delegation_id: str, attempt_id: str, *, profile_home: Path | None = None) -> bool:
+    """The stood-down child of ``attempt_id`` is confirmed dead: the unit may be re-dispatched."""
+    with locked_registry(profile_home) as registry:
+        record = registry["records"].get(delegation_id)
+        if not isinstance(record, dict) or (record.get("detached_fenced") or {}).get("attempt_id") != attempt_id:
+            return False
+        record.pop("detached_fenced", None)
+        append_lifecycle_event(record, "detached_fenced_dead", f"attempt={attempt_id}")
         return True
 
 
 def claim_detached_adoptions(
     *, current_boot_id: str, profile_home: Path | None = None, owner_alive=is_boot_id_alive,
-    probe=None, identity=None, job_dir_for=None, stand_down_unknown=None,
+    probe=None, identity=None, job_dir_for=None, stand_down_unknown=None, alive=None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Adopt detached units whose owner is gone (docs/dev/delegate-detached-background.md).
 
@@ -1285,15 +1302,36 @@ def claim_detached_adoptions(
             block = record.get("detached") if isinstance(record.get("detached"), dict) else None
             job_dir = Path(block["job_dir"]) if block and block.get("job_dir") else job_dir_for(
                 home, str(attempt.get("attempt_id") or ""))
+            fenced = record.get("detached_fenced")
+            if isinstance(fenced, dict):
+                # A stood-down child (any state) whose death nobody confirmed yet: its dispatcher may have
+                # died between the fence and the kill. Kill it (again); claim_recoveries holds the unit back
+                # until ``detached_fenced`` is cleared, so no second generation runs beside it.
+                fenced_dir = Path(fenced["job_dir"]) if fenced.get("job_dir") else job_dir
+                killed_dirs.add(str(fenced_dir))
+                ident = identity(fenced_dir, fenced if fenced.get("pid") else None)
+                if ident and _child_alive(probe, alive, fenced_dir, fenced, ident):
+                    kill.append({**ident, "job_dir": str(fenced_dir), "fenced": str(delegation_id),
+                                 "attempt_id": fenced.get("attempt_id")})
+                else:
+                    record.pop("detached_fenced", None)
+                    append_lifecycle_event(record, "detached_fenced_dead", f"attempt={fenced.get('attempt_id')}",
+                                           now=now)
+                    kill.append({"job_dir": str(fenced_dir), "remove_job_dir": True})
+                continue
             if state == "cancelled" or (state == "failed" and block is not None):
                 # Terminal-without-result: a still-live child is an orphan. ``failed`` + block is the age cap
-                # below, which keeps the block so a kill its gateway died before sending is re-sent here.
+                # below. The block stays until the child is confirmed dead, so a kill a gateway died before
+                # sending is re-sent by every later boot, not only the next one.
                 killed_dirs.add(str(job_dir))
                 ident = identity(job_dir, block)
-                if ident:
+                if ident and _child_alive(probe, alive, job_dir, block, ident):
                     kill.append(ident)
-                    record.pop("detached", None)
+                    if block is not None:
+                        record["detached"] = {**block, **ident}
                     append_lifecycle_event(record, "detached_orphan_killed", f"pid={ident.get('pid')}", now=now)
+                else:
+                    record.pop("detached", None)
                 continue
             if state not in {"running", "recoverable"}:
                 continue
@@ -1346,6 +1384,13 @@ def claim_detached_adoptions(
                 logger.warning("async_delegation_detached_unfenced_orphan job_dir=%s pid=%s",
                                job_dir, ident.get("pid"))
     return adopted, kill
+
+
+def _child_alive(probe, alive, job_dir: Path, block, ident: dict[str, Any]) -> bool:
+    """Is the identified child still running? ``alive(ident)`` (pid + start time) when supplied."""
+    if alive is not None:
+        return bool(alive(ident))
+    return probe(job_dir, block) == "alive"
 
 
 _MISSING = object()

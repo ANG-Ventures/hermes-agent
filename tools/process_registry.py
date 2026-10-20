@@ -3092,6 +3092,8 @@ def _handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dic
     no-op, so a PID mentioned in prose can't masquerade as a transfer."""
     from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
     from tools.terminal_tool import _resolve_container_task_id
+    if HANDOFF_UNAVAILABLE:
+        return {"error": HANDOFF_UNAVAILABLE}
     with _active_subagents_lock:
         record = _active_subagents.get(str(task_id or ""))
     child = record.get("agent") if record else None
@@ -3124,6 +3126,10 @@ def _handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dic
 
 
 _MAX_HANDOFFS_PER_CHILD = 3
+# Set (to the refusal text) in a process whose real parent agent lives in another process: a detached
+# delegation worker (tools/delegate_detached.py). Its in-process "parent" is a reconstruction that
+# exits with the worker, so a handoff there would promise a completion nobody receives.
+HANDOFF_UNAVAILABLE: Optional[str] = None
 
 
 def _handle_process(args, **kw):

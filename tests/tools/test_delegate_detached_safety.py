@@ -317,8 +317,9 @@ def test_a_stood_down_attempt_is_not_adoptable(_isolated, tmp_path):
         current_boot_id="boot-b:1.0", profile_home=tmp_path, probe=dd.probe_job,
         identity=dd.job_identity, job_dir_for=dd.job_dir_for)
 
-    assert adopted == [] and kill == []
-    assert proc.poll() is None
+    # Never adopted; the fenced child itself is killed (its dispatcher may have died before doing so).
+    assert adopted == []
+    assert [k.get("pid") for k in kill] == [proc.pid] and kill[0].get("fenced") == "deleg_fence"
 
 
 # ── cea4126db419: adopted supervisors queued behind a full pool ─────────────
@@ -471,3 +472,204 @@ def test_windows_runs_detached_units_in_process(tmp_path):
     assert dd.spawn_mode() == "degraded"
     assert _REAL_SPAWN_CHILD(record=record, attempt_id=record["attempt"]["attempt_id"], profile_home=tmp_path,
                              continuation=None, live_delegation_id=None) is None
+
+
+# ── #2160 Prism round 1 (t_7ccdc21b) ───────────────────────────────────────
+def _background_spec_for(monkeypatch, tmp_path, **call) -> dict:
+    """Run delegate_task(background=True) in a routable gateway session up to the dispatch and return
+    the durable spec it persisted (children are stand-ins; nothing runs)."""
+    import types
+
+    from gateway import status as gateway_status
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import delegate_tool as dt
+
+    captured: dict = {}
+    monkeypatch.setattr(gateway_status, "get_current_boot_id", lambda: "boot-a:1.0")
+    monkeypatch.setattr(dt, "_build_child_preserving_parent_tools",
+                        lambda **kw: types.SimpleNamespace(_subagent_id=None, provider="p", model="m",
+                                                           prefill_messages=None))
+    monkeypatch.setattr(ad, "dispatch_async_delegation_batch",
+                        lambda **kw: captured.update(kw) or {"status": "dispatched", "delegation_id": "d1"})
+    parent = types.SimpleNamespace(model="m", provider="p", base_url=None, api_mode=None, session_id="parent-1",
+                                   enabled_toolsets=["file"], _delegate_depth=0, terminal_cwd=str(tmp_path))
+    tokens = set_session_vars(platform="telegram", source="gateway", chat_id="123", async_delivery=True,
+                              session_key="agent:main:telegram:dm:123", session_id="parent-1", profile="default")
+    try:
+        out = json.loads(dt.delegate_task(background=True, parent_agent=parent, **call))
+    finally:
+        clear_session_vars(tokens)
+    assert out.get("status") == "dispatched", out
+    return captured["durable_spec"]
+
+
+# 234cda575be4 / 43bfa6936050: call-level inputs reach the reconstructed worker
+def test_call_level_images_and_skills_are_persisted_into_the_detached_task(monkeypatch, tmp_path):
+    image = tmp_path / "diagram.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    spec = _background_spec_for(monkeypatch, tmp_path, tasks=[{"goal": "Describe the attached diagram"}],
+                                images=[str(image)], skills=["diagram-reading"])
+
+    task = spec["source"]["tasks"][0]
+    assert task.get("images") == [str(image)], "the detached worker would run without the image"
+    assert task.get("skills") == ["diagram-reading"], "the detached worker would run without the skills"
+
+
+# 689f06f8643e: a session-isolated sandbox stays in-process
+def test_a_session_isolated_sandbox_keeps_the_unit_in_process(monkeypatch, tmp_path):
+    from tools import delegate_tool as dt
+
+    monkeypatch.setattr(dt, "_get_detached_background", lambda: True)
+    monkeypatch.setattr("tools.delegate_detached.spawn_mode", lambda: "in_process")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
+
+    spec = _background_spec_for(monkeypatch, tmp_path, tasks=[{"goal": "Read /workspace/session-only.txt"}])
+
+    assert not spec["execution"].get("detached"), "the child would alias 'default', not the session's container"
+
+
+# ca62d9c4cab7 / be9a89e1a7e1: no handoff that cannot cross the process boundary
+def test_the_detached_worker_refuses_a_process_handoff_it_cannot_deliver(tmp_path, monkeypatch):
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(pr, "CHECKPOINT_PATH", pr.CHECKPOINT_PATH)
+    monkeypatch.setattr(pr, "HANDOFF_UNAVAILABLE", getattr(pr, "HANDOFF_UNAVAILABLE", None), raising=False)
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / "spec.json").write_text(json.dumps({"schema_version": -1}))
+    monkeypatch.setattr(dd, "HEARTBEAT_SECONDS", 3600.0)
+    assert dd._child_main(job_dir) == 1
+
+    import weakref
+
+    from tools.delegate_tool import _register_subagent, _unregister_subagent
+
+    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", False)
+    class _Agent:
+        pass
+
+    parent = _Agent()
+    parent.session_id, parent._current_task_id = "reconstructed-parent", "parent-turn"
+    child = _Agent()
+    child._delegate_parent_ref = weakref.ref(parent)
+    sid = "sa-0-detachedhandoff"
+    _register_subagent({"subagent_id": sid, "parent_id": None, "depth": 0, "goal": "g", "model": "m",
+                        "started_at": time.time(), "status": "running", "tool_count": 0, "agent": child})
+    proc = pr.process_registry.spawn_local("sleep 30", task_id=sid, owner_task_id=sid)
+    try:
+        out = json.loads(pr._handle_process({"action": "handoff", "session_id": proc.id, "data": "collect it"},
+                                            task_id=sid))
+        assert out.get("status") != "handed_off", "a handoff the gateway can never receive was reported done"
+        assert "detached" in out.get("error", "")
+        assert proc.owner_task_id == sid, "ownership moved to a parent that exits with this worker"
+    finally:
+        pr.process_registry.kill_process(proc.id)
+        _unregister_subagent(sid)
+
+
+# 65089d8d2a59: the worker runs PM's dependency boot (lease + activate) before its imports
+def test_spawned_worker_is_marked_to_boot_pm_dependencies(_isolated, tmp_path, monkeypatch):
+    seen: dict = {}
+    real_popen = subprocess.Popen
+
+    def _popen(argv, **kwargs):
+        seen["env"] = kwargs["env"]
+        proc = real_popen([sys.executable, "-c", "pass"])
+        _isolated.append(proc)
+        return proc
+
+    monkeypatch.setattr(dd.subprocess, "Popen", _popen)
+    record = _record("deleg_pm", owner="boot-a:1.0")
+    _REAL_SPAWN_CHILD(record=record, attempt_id=record["attempt"]["attempt_id"], profile_home=tmp_path,
+                      continuation=None, live_delegation_id=None)
+    assert seen["env"].get(dd.WORKER_BOOT_MARKER) == "1"
+
+    booted: list = []
+    import pm.environments
+    monkeypatch.setattr(pm.environments, "activate_dependencies", booted.append)
+    monkeypatch.setattr(dd, "_child_main", lambda job_dir: booted.append(("child_main", job_dir)) or 0)
+    monkeypatch.setenv(dd.WORKER_BOOT_MARKER, "1")
+
+    assert dd.main(["--job", str(tmp_path / "j")]) == 0
+    assert booted[0] == dd._RUNTIME_ROOT and booted[1][0] == "child_main", "deps must activate before the run"
+    assert dd.WORKER_BOOT_MARKER not in os.environ, "the worker's own children must not re-boot"
+
+
+# 50036c4daf58 / 44539ffc4253: a fenced child is resolved before its unit can run again
+def test_a_fenced_child_left_alive_blocks_redispatch_until_the_next_boot_kills_it(_isolated, tmp_path, monkeypatch):
+    monkeypatch.setattr(ad, "_detached_enabled", lambda: False)  # the re-dispatch runs the stub in-process
+    record = _record("deleg_fenced", owner="boot-a:1.0", state="recoverable")
+    attempt_id = record["attempt"]["attempt_id"]
+    job_dir = dd.job_dir_for(tmp_path, attempt_id)
+    job_dir.mkdir(parents=True)
+    proc = _sleeper(_isolated, 60)
+    block = {"pid": proc.pid, "create_time": dd.process_create_time(proc.pid), "job_dir": str(job_dir),
+             "attempt_id": attempt_id, "spawned_at": time.time()}
+    record["detached"] = block
+    _write(record)
+    # Boot A fences its un-advertised child, then dies before terminate_group.
+    assert ad._store.stand_down_detached("deleg_fenced", attempt_id, "boot-a:1.0", profile_home=tmp_path) is True
+
+    claimed, _ = ad._store.claim_recoveries(current_boot_id="boot-b:1.0", resume_enabled=True,
+                                            profile_home=tmp_path, owner_alive=lambda b: False)
+    assert claimed == [], "generation 1 would run beside the still-live generation 0"
+
+    redispatched: list = []
+    ad.recover_async_delegations(current_boot_id="boot-b:1.0", profile_home=tmp_path,
+                                 runner_factory=lambda rec, cont: redispatched.append(rec) or (lambda: {}))
+    assert proc.wait(timeout=10) == -signal.SIGTERM, "the fenced child was never killed"
+    assert [r["attempt"]["generation"] for r in redispatched] == [1], "re-dispatch only after it is dead"
+    assert "detached_fenced" not in _load("deleg_fenced")
+    _wait_for_event("deleg_fenced")  # the re-dispatched stub finishes inside this test
+
+
+# 0863b09af7bd: a failed orphan's identity survives every boot that dies before signalling
+def test_a_failed_orphan_is_rekilled_by_every_boot_until_it_is_dead(_isolated, tmp_path):
+    record = _record("deleg_old2", owner=DEAD_BOOT, created_at=time.time() - 30 * 86400)
+    job_dir = dd.job_dir_for(tmp_path, record["attempt"]["attempt_id"])
+    job_dir.mkdir(parents=True)
+    proc = _sleeper(_isolated, 60)
+    ident = {"pid": proc.pid, "create_time": dd.process_create_time(proc.pid)}
+    record["detached"] = {**ident, "job_dir": str(job_dir), "attempt_id": record["attempt"]["attempt_id"],
+                          "spawned_at": time.time()}
+    _write(record)
+    kw = dict(profile_home=tmp_path, probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for)
+
+    _, b = ad._store.claim_detached_adoptions(current_boot_id="boot-b:1.0", **kw)  # dies before signalling
+    _, c = ad._store.claim_detached_adoptions(current_boot_id="boot-c:1.0", **kw)  # dies before signalling
+    _, d = ad._store.claim_detached_adoptions(current_boot_id="boot-d:1.0", **kw)
+
+    assert b == c == d == [ident], "a later boot lost the identity of a still-running orphan"
+    proc.kill()
+    proc.wait(timeout=5)
+    _, e = ad._store.claim_detached_adoptions(current_boot_id="boot-e:1.0", **kw)
+    assert e == [] and "detached" not in _load("deleg_old2"), "a confirmed-dead orphan is released"
+
+
+# 33b3f07f6558: one file's read-modify-write is serialized across processes
+def test_patch_locks_serialize_the_same_file_across_processes(tmp_path):
+    target = tmp_path / "shared.txt"
+    hold = tmp_path / "held"
+    code = (
+        "import sys,time,pathlib\n"
+        "from tools import file_state\n"
+        "with file_state.lock_path(sys.argv[1]):\n"
+        "    pathlib.Path(sys.argv[2]).write_text('1')\n"
+        "    time.sleep(3)\n")
+    env = {**os.environ, "PYTHONPATH": str(Path(dd.__file__).resolve().parent.parent)}
+    holder = subprocess.Popen([sys.executable, "-c", code, str(target), str(hold)], env=env)
+    try:
+        deadline = time.time() + 20
+        while not hold.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert hold.exists()
+        from tools import file_state
+
+        started = time.monotonic()
+        with file_state.lock_path(str(target)):
+            waited = time.monotonic() - started
+        assert holder.poll() is not None or waited >= 2.0, "a second process entered the same file's lock"
+    finally:
+        holder.wait(timeout=20)

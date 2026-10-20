@@ -63,6 +63,45 @@ def _evict_oldest(container, cap: int) -> None:
             break
 
 
+def _lock_file_for(resolved: str) -> Optional[Path]:
+    """Lock file shared by every process of this install (all profiles, like the process-wide
+    registry): ``<hermes root>/state/file-locks/<sha256 of the path>``."""
+    import hashlib
+
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = get_default_hermes_root() / "state" / "file-locks"
+        root.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    return root / hashlib.sha256(resolved.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+@contextmanager
+def _cross_process_lock(resolved: str):
+    """Exclusive ``flock`` on the path's lock file; a no-op where it cannot be taken (no fcntl on
+    Windows, where detached units run in-process anyway; unwritable state dir)."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    lock_file = _lock_file_for(resolved)
+    try:
+        fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600) if lock_file else None
+    except OSError:
+        fd = None
+    if fd is None:
+        yield
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the only descriptor releases the flock
+
+
 class FileStateRegistry:
     """Process-wide coordinator for cross-agent file edits."""
 
@@ -77,13 +116,17 @@ class FileStateRegistry:
     @contextmanager
     def lock_path(self, resolved: str):
         """Per-path lock: threads on the same path serialize, different paths proceed.
-        The lock entry is dropped once the last holder/waiter exits."""
+        The lock entry is dropped once the last holder/waiter exits. Inside it, an advisory
+        ``flock`` serializes the same path across processes (detached delegation workers,
+        tools/delegate_detached.py): the thread lock is taken first, so one process never
+        holds two descriptors on one lock file."""
         with self._meta_lock:
             lock = self._path_locks.setdefault(resolved, threading.Lock())
             self._path_lock_users[resolved] = self._path_lock_users.get(resolved, 0) + 1
         lock.acquire()
         try:
-            yield
+            with _cross_process_lock(resolved):
+                yield
         finally:
             lock.release()
             with self._meta_lock:
