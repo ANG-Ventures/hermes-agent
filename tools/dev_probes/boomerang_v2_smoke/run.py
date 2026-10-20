@@ -19,6 +19,7 @@ override so the test path runs on fakes:
   BV2_ACK_FILE       ack file Apollo appends to           (default: <scratch>/bv2-smoke.ack)
   BV2_ACK_CMD        scripted acker argv prefix: run as `<cmd> <token>`, does the action, exit 0
                      (isolated scratch gateway lane; see puppet-lane bv2-smoke-lane.sh)
+  BV2_SYNC_TIMEOUT   seconds allowed for plan.commands.wirelog_sync (default 600)
   BV2_EVIDENCE       evidence markdown                    (default: docs/boomerang-v2/evidence/smoke.md)
   BV2_PLAN           command/expectation plan             (default: fixtures/plan.json)
 
@@ -908,10 +909,17 @@ def _canary_control(ctx: Ctx, rep: StepReport) -> str:
     if sync and m:
         time.sleep(ctx.slack)   # let the box flush the record before the pull
         argv = [os.path.expanduser(a) for a in fill(sync, sub=m.group(1))]
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=600)
-        rep.commands.append("$ " + shlex.join(argv) + f"   # exit {proc.returncode}")
-        rep.raw.append(f"--- wirelog_sync (exit {proc.returncode})\n"
-                       + ((proc.stdout or "") + (proc.stderr or "")).strip()[-2000:])
+        # BV2_SYNC_TIMEOUT: a one-seat `wirelog-fleet.py sync` measured 21m50s wall on the Studio
+        # at load ~80 (2026-10-20 07:1x; the retention reference walk dominates), past the old
+        # hard 600 s. A timeout is recorded as a non-zero exit, never swallowed.
+        budget = float(os.environ.get("BV2_SYNC_TIMEOUT") or 600)
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=budget)
+            rc, out = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        except subprocess.TimeoutExpired as exc:
+            rc, out = 124, f"wirelog_sync timed out after {budget:.0f}s (BV2_SYNC_TIMEOUT): {exc}"
+        rep.commands.append("$ " + shlex.join(argv) + f"   # exit {rc}")
+        rep.raw.append(f"--- wirelog_sync (exit {rc})\n" + out.strip()[-2000:])
     elif seat and seat != "local":
         rep.notes.append(f"canary served by `{seat}`: no plan.commands.wirelog_sync, so its record is only "
                          f"visible after `wirelog-fleet.py sync --sub {seat[4:]}`")

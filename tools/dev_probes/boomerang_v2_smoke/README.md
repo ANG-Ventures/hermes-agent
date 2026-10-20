@@ -60,6 +60,7 @@ A non-zero exit is a FAIL for that ack, never a pass. Dry-run ignores it.
 | `BV2_WIRELOG_DIR` | wire capture root (step 3) | `~/.claude-wirelog` |
 | `BV2_ACK_FILE` | ack file | `$TMPDIR/bv2-smoke.ack` |
 | `BV2_ACK_CMD` | scripted acker argv prefix, run as `<cmd> <token>` (see Ack mechanism) | unset = wait for a human |
+| `BV2_SYNC_TIMEOUT` | seconds allowed for `plan.commands.wirelog_sync` (a timeout is a non-zero exit in the evidence) | `600` |
 | `BV2_EVIDENCE` | evidence markdown | `docs/boomerang-v2/evidence/smoke.md` |
 | `BV2_PLAN` | command/expectation plan | `fixtures/plan.json` |
 
