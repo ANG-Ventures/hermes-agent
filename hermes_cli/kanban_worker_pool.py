@@ -86,6 +86,17 @@ _STATES = ("active", "draining")
 # mentions a pin is not one.
 HOST_PIN_RE = re.compile(r"^[ \t]*host:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*\r?$",
                          re.IGNORECASE | re.MULTILINE)
+# What resolve_pin reads (t_229d6bca): a HOST_PIN_RE line, the same with a
+# trailing full stop, or a pin that ENDS a line after a sentence
+# (``... Admin-merge lane. host: studio``). Three cards on 2026-10-20 carried
+# that shape, the anchored regex saw no pin and the pool took them as overflow.
+# A ``host:`` in the middle of a sentence is still prose.
+PIN_LINE_RE = re.compile(
+    r"(?:^[ \t]*|[.;!?)][ \t]+)host:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*\r?$",
+    re.IGNORECASE | re.MULTILINE)
+# The placement table (<root>/config/fleet-hosts.json, t_d6ce856e) carries the
+# per-host ``aliases`` a pin may use (t_229d6bca).
+FLEET_HOSTS_FILE = "fleet-hosts.json"
 PIN_ANY = "any"
 PIN_STUDIO = "studio"
 STUDIO_HOST = "mac-studio"
@@ -894,8 +905,8 @@ def load_pool(fleet_dir: Path, *, kanban_cfg: Optional[Mapping] = None) -> Tuple
 def card_pin(body: Optional[str]) -> Optional[str]:
     """The card's raw ``host:<x>`` line, lower-cased (first line-anchored
     match). Raw: use :func:`resolve_pin` to decide whether it IS a pin."""
-    m = HOST_PIN_RE.search(body or "")
-    return m.group(1).lower() if m else None
+    m = PIN_LINE_RE.search(body or "")
+    return m.group(1).rstrip(".").lower() if m else None
 
 
 def resolve_pin(body: Optional[str], known_hosts: Iterable[str],
@@ -914,8 +925,8 @@ def resolve_pin(body: Optional[str], known_hosts: Iterable[str],
     # Every line-anchored host: line, in order: prose lines (an HTTP header
     # pasted above the real pin) are skipped, the first REAL pin wins
     # (Prism r8 "skip prose host lines before choosing the effective pin").
-    for m in HOST_PIN_RE.finditer(body or ""):
-        raw = m.group(1).lower()
+    for m in PIN_LINE_RE.finditer(body or ""):
+        raw = m.group(1).rstrip(".").lower()
         if raw == PIN_ANY or raw in known:
             return raw, ignored
         if raw in studio:
@@ -942,7 +953,9 @@ def pin_aliases(fleet_dir: Path) -> Dict[str, str]:
     """``{alias: canonical pin}`` from the registry (t_cb2b888d), the ONE
     alias source. For every host the pool files know (:func:`known_host_ids`)
     and every ``ci-hosts.json`` row: the id, its ``ssh_alias`` and
-    ``host_label``, and the first DNS label of each (``ci.ace`` -> ``ci``).
+    ``host_label``, and the first DNS label of each (``ci.ace`` -> ``ci``);
+    plus every ``aliases`` entry of a ``<root>/config/fleet-hosts.json`` row
+    (``mac-studio`` is the Studio, t_229d6bca).
     A row with ``transport: local`` is the Studio (``studio``). A row that is
     neither a known pool host nor local adds nothing. An alias two hosts
     claim is dropped (ambiguous: it stays unknown, never guesses). Matching
@@ -972,6 +985,24 @@ def pin_aliases(fleet_dir: Path) -> Dict[str, str]:
         if canon is None:
             continue
         for word in (hid, row.get("ssh_alias"), row.get("host_label")):
+            claim(word, canon)
+    # config/fleet-hosts.json ``hosts.<id>.aliases`` (t_229d6bca): the Studio
+    # row (mac-studio) lists studio / mac-studio-m3u / local, a pool host row
+    # its own spellings. A row that is neither adds nothing.
+    try:
+        table = _read_json(Path(fleet_dir).parent / "config" / FLEET_HOSTS_FILE)
+    except (OSError, ValueError):
+        table = None
+    rows = table.get("hosts") if isinstance(table, dict) else None
+    for hid, row in (rows.items() if isinstance(rows, dict) else ()):
+        if not isinstance(hid, str) or not isinstance(row, dict):
+            continue
+        canon = (PIN_STUDIO if hid.lower() == STUDIO_HOST
+                 else hid.lower() if hid.lower() in known else None)
+        if canon is None:
+            continue
+        al = row.get("aliases")
+        for word in (hid, *(al if isinstance(al, list) else ())):
             claim(word, canon)
     return {w: next(iter(c)) for w, c in sorted(claims.items()) if len(c) == 1}
 
