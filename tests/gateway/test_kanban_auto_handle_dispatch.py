@@ -14,6 +14,7 @@ import threading
 import time
 
 import pytest
+from types import SimpleNamespace
 
 from gateway import kanban_auto_handle as ah
 from gateway import kanban_home_route as hr
@@ -629,3 +630,43 @@ def test_unflagged_card_under_host_load_is_unchanged(env, tmp_path):
     _worker_close(tid)
     turns = _tick(env)
     assert env["dispatched"] == [] and _claims() == {} and turns == []
+
+
+# --- t_a6d74b90: the two silent summary folds now say why -------------------------------------
+
+
+class _Runner:
+    def __init__(self, running=None, cache=None):
+        self._running_agents = running or {}
+        self._agent_cache = cache or {}
+        self._agent_cache_lock = None
+        self.session_store = None
+
+
+def _resolve(monkeypatch, runner, *, mode="fork", wait_s=0.0):
+    home = SimpleNamespace(session_key="k1", session_id="20261020_000000_parent")
+    monkeypatch.setattr(ow, "resolve_owner", lambda *_a, **_k: home)
+    monkeypatch.setattr(ah, "_db_parent", lambda *_a, **_k: "db-parent")
+    return asyncio.run(ah.resolve_parent(runner, {"home_sid": home.session_id, "mode": mode}, wait_s=wait_s))
+
+
+def test_busy_parent_fold_logs_parent_busy(monkeypatch, caplog):
+    with caplog.at_level("INFO", logger="tools.delegate_tool"):
+        out = _resolve(monkeypatch, _Runner(running={"k1": object()}))
+    assert out == ("db-parent", "summary")
+    assert "boomerang.fork_ineligible reason=parent_busy parent_session=20261020_000000_parent" in caplog.text
+
+
+def test_no_live_parent_fold_logs_no_live_parent(monkeypatch, caplog):
+    with caplog.at_level("INFO", logger="tools.delegate_tool"):
+        out = _resolve(monkeypatch, _Runner())
+    assert out == ("db-parent", "summary")
+    assert "boomerang.fork_ineligible reason=no_live_parent" in caplog.text
+
+
+def test_summary_row_and_idle_parent_log_nothing(monkeypatch, caplog):
+    idle = object()
+    with caplog.at_level("INFO", logger="tools.delegate_tool"):
+        assert _resolve(monkeypatch, _Runner(), mode="summary") == ("db-parent", "summary")
+        assert _resolve(monkeypatch, _Runner(cache={"k1": (idle, 0)})) == (idle, "fork")
+    assert "fork_ineligible" not in caplog.text
