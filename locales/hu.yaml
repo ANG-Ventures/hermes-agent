@@ -917,6 +917,7 @@ gateway:
     working_heartbeat: "⏳ Dolgozom — {minutes} perc{detail}"
     thinking_prefix: "💬 {text}"
     tool_head: "{emoji} {tool}"
+    wake_head: "🔔 wake · {label}"
     tool_verbose: "{emoji} {tool}({keys})\n{args}"
     tool_preview: "{emoji} {tool}: \"{preview}\""
     tool_pending: "{emoji} {tool}..."

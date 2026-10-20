@@ -567,6 +567,12 @@ class TurnRunner:
         _progress_len_fn: Any
         _PROGRESS_TEXT_LIMIT: int
         _edit_accepts_metadata: bool
+        # Internal-wake header: line 0 of every new editable bubble ("separate" mode: first message only).
+        wake_head: Optional[str] = None
+        wake_head_sent: bool = False
+
+    def _fresh_progress_lines(self, st) -> list:
+        return [st.wake_head] if st.wake_head and st.can_edit else []
 
     def _progress_edit_state(self, adapter) -> "TurnRunner._ProgressEditState":
         ctx = self._ctx
@@ -581,7 +587,7 @@ class TurnRunner:
             with suppress(Exception):
                 raw_limit = int(adapter.max_message_length_for_chat(ctx.source.chat_id) or 4000)
                 len_fn = adapter.message_len_fn_for_chat(ctx.source.chat_id)
-        return self._ProgressEditState(
+        st = self._ProgressEditState(
             adapter=adapter, progress_lines=[], progress_msg_id=None,
             # "separate" = one message per tool (pre-v0.9 behavior)
             can_edit=ctx.progress_grouping != "separate",
@@ -590,7 +596,10 @@ class TurnRunner:
             _PROGRESS_TEXT_LIMIT=max(1, raw_limit - (64 if raw_limit > 128 else 0)),
             # Overflow edits pass metadata (Telegram topic/thread routing) only when edit_message takes it.
             _edit_accepts_metadata=bool(ctx._progress_metadata) and _accepts_keyword(adapter.edit_message, "metadata"),
+            wake_head=ctx.wake_progress_header,
         )
+        st.progress_lines = self._fresh_progress_lines(st)
+        return st
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
         ctx = self._ctx
@@ -662,14 +671,16 @@ class TurnRunner:
     def _reset_progress_bubble(self, st) -> None:
         """Content bubble landed — close the tool-progress bubble so the next tool starts fresh
         below it; else tool edits hit the ORIGINAL message above (out of order)."""
-        st.progress_msg_id, st.progress_lines = None, []
+        st.progress_msg_id, st.progress_lines = None, self._fresh_progress_lines(st)
         self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = None, 0
 
     def _progress_absorb(self, st, raw) -> Any:
         """Fold a queue item into the bubble buffer; returns the line to render this tick."""
         if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
             _, base_msg, count = raw
-            if not st.progress_lines:
+            if len(st.progress_lines) <= len(self._fresh_progress_lines(st)):
+                if st.progress_lines:  # header-only bubble: never overwrite the header, never send it alone
+                    st.progress_lines.append(base_msg)
                 return base_msg
             st.progress_lines[-1] = f"{base_msg} (×{count + 1})"
             return st.progress_lines[-1]
@@ -726,7 +737,11 @@ class TurnRunner:
             await self._send_progress_text(st, msg)
             return True
         # First tool: send all accumulated text as a new message; editing unsupported: just this line.
-        result = await self._send_progress_text(st, "\n".join(st.progress_lines) if st.can_edit else msg)
+        text = "\n".join(st.progress_lines) if st.can_edit else msg
+        if not st.can_edit and st.wake_head and not st.wake_head_sent:
+            text = f"{st.wake_head}\n{text}"
+        st.wake_head_sent = True
+        result = await self._send_progress_text(st, text)
         if result.success and result.message_id:
             st.progress_msg_id = result.message_id
         return True
