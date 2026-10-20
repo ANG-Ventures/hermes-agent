@@ -565,6 +565,69 @@ async def test_unclean_restart_resumes_a_turn_whose_tail_is_only_the_interrupt_c
     _close_store_db(store)
 
 
+def _shutdown_cut_turn(store: SessionStore, chat_id: str, *, final: str | None) -> SessionSource:
+    """A marked turn the shutdown drain marked resume_pending, then the watchdog force-exited
+    (no clean-exit receipt, so the turn marker survives). ``final=None``: the tail is narration
+    written right before a still-running ``terminal`` call (no tool result yet); else the turn
+    finished with ``final`` and only its delivery was lost."""
+    source = _turn(store, chat_id, marked=True, reply=None)
+    entry = _entry_for(store, source)
+    call = {"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}
+    if final is None:
+        store._db.append_message(session_id=entry.session_id, role="assistant",
+                                 content="Closing #5559, since it swept in other sessions' skill edits:",
+                                 tool_calls=[call], finish_reason="tool_calls")
+    else:
+        store._db.append_message(session_id=entry.session_id, role="assistant", content="Checking.",
+                                 tool_calls=[call], finish_reason="tool_calls")
+        store._db.append_message(session_id=entry.session_id, role="tool", content="ok", tool_call_id="call_1")
+        store._db.append_message(session_id=entry.session_id, role="assistant", content=final)
+    assert store.mark_resume_pending(entry.session_key, "shutdown_timeout")
+    return source
+
+
+def _claim_runner(runner: GatewayRunner) -> GatewayRunner:
+    runner.adapters = {Platform.DISCORD: object()}
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_unclean_restart_resumes_a_turn_cut_while_a_tool_call_ran_after_narration(tmp_path):
+    """2026-10-19: a drain-timed-out turn whose tail was narration + an unanswered ``terminal`` call
+    was read through the alternation repair, which pruned the call and left the narration looking like
+    a final reply. It was ledgered, the boot sweep claimed it, and claiming cleared resume_pending: the
+    session never resumed. The narration is not an answer: nothing is ledgered, the session resumes."""
+    from gateway.delivery_ledger import sweep_recoverable
+
+    runner, store = _db_runner(tmp_path)
+    source = _shutdown_cut_turn(store, "cut-during-tool", final=None)
+
+    # Already resume-marked by the drain, so nothing is newly promoted; what matters is nothing is ledgered.
+    assert (await runner._recover_unclean_sessions())[1] == 0
+    assert await _claim_runner(runner)._claim_pending_obligations() == []
+
+    entry = _entry_for(store, source)
+    assert entry.resume_pending is True
+    assert sweep_recoverable(deliverable_platforms={"discord"}) == []
+    _close_store_db(store)
+
+
+@pytest.mark.asyncio
+async def test_unclean_restart_redelivers_a_finished_turn_instead_of_resuming_it(tmp_path):
+    """No regression: a turn that DID finish with a final answer (after its tool round) and only lost
+    the delivery is redelivered from the ledger and its shutdown resume mark is cleared, not resumed."""
+    runner, store = _db_runner(tmp_path)
+    source = _shutdown_cut_turn(store, "finished-undelivered", final="the final answer")
+
+    assert (await runner._recover_unclean_sessions())[1] == 1
+    claimed = await _claim_runner(runner)._claim_pending_obligations()
+
+    assert [r["content"] for r in claimed] == ["the final answer"]
+    entry = _entry_for(store, source)
+    assert (entry.resume_pending, entry.active_turn_token) == (False, None)
+    _close_store_db(store)
+
+
 _WAKE = {"display_kind": "internal_notification"}
 
 
