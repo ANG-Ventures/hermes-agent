@@ -284,3 +284,66 @@ def fork_run_inputs(child: Any, goal: Any) -> Tuple[Any, Optional[List[Dict[str,
         return goal, None
     frame = build_fork_frame(goal, getattr(child, "_fork_parent_session_id", None), getattr(child, "_delegation_id", None))
     return frame, copy.deepcopy(history)
+
+
+def _tool_call_ids(msg: Any) -> List[str]:
+    if not isinstance(msg, dict):
+        return []
+    ids = [msg.get("tool_call_id")] if msg.get("role") == "tool" else []
+    for tc in msg.get("tool_calls") or []:
+        ids.append(tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None))
+    return [i for i in ids if i]
+
+
+def child_generated_messages(messages: Any, history: Any, boundary: Any = None) -> Any:
+    """``messages`` minus the inherited fork prefix (Prism f5ff1cc07dca, bec64a4205fe).
+
+    ``run_conversation(conversation_history=history)`` returns history + the child's own
+    rows, but the parent's old tool rounds are not the child's execution evidence: they
+    must not reach ``tool_trace``, ``output_tail``, the interrupted-partial pick or the
+    ``subagent_stop`` hooks. The model request still carries the history; only the result
+    is trimmed. Ownership is decided by position, never by content (a child answer equal
+    to an old parent answer is still the child's):
+
+    1. ``boundary`` = the turn's exported ``current_turn_user_idx``, computed by the loop
+       on the final list after any compression: the turn's own rows start there.
+    2. Else the prefix is intact (same roles + tool_call ids, then a user row): slice at
+       ``len(history)``.
+    3. Else drop only rows carrying an inherited tool_call id (ids are unique per call),
+       so no inherited tool round can surface as child evidence and no child row is lost.
+    """
+    if not isinstance(messages, list) or not isinstance(history, list) or not history:
+        return messages
+    if (
+        isinstance(boundary, int) and not isinstance(boundary, bool) and 0 <= boundary < len(messages)
+        and isinstance(messages[boundary], dict) and messages[boundary].get("role") == "user"
+    ):
+        return messages[boundary:]
+    n = len(history)
+
+    def _key(m: Any) -> Tuple[Any, Tuple[str, ...]]:
+        return (m.get("role") if isinstance(m, dict) else None, tuple(_tool_call_ids(m)))
+
+    if (
+        len(messages) > n
+        and isinstance(messages[n], dict) and messages[n].get("role") == "user"
+        and all(_key(a) == _key(b) for a, b in zip(messages[:n], history))
+    ):
+        return messages[n:]
+    inherited_ids = {i for m in history for i in _tool_call_ids(m)}
+    return [m for m in messages if not (set(_tool_call_ids(m)) & inherited_ids)]
+
+
+def strip_inherited_from_result(result: Any, history: Any) -> Any:
+    """A child-turn result whose ``messages`` holds only that turn's own rows, for EVERY turn
+    of a fork child (the first turn over ``history`` and any continuation, e.g. the
+    schema-correction retry); a non-fork result (``history`` not a list) is unchanged."""
+    if not isinstance(result, dict) or not isinstance(history, list) or not history:
+        return result
+    messages = result.get("messages")
+    trimmed = child_generated_messages(messages, history, result.get("current_turn_user_idx"))
+    if trimmed is messages:
+        return result
+    out = dict(result)
+    out["messages"] = trimmed
+    return out

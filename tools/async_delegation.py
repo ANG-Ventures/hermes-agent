@@ -444,6 +444,9 @@ def _recover_abandoned_delegations(registry, invalid_ids=None) -> int:
                 conn.commit()
                 continue
             canonical = registry["records"].get(delegation_id) or {}
+            if (canonical.get("state") in {"running", "recoverable"}
+                    and (canonical.get("execution") or {}).get("detached")):
+                continue  # its child outlives the owner; the adopting boot owns the outcome
             if canonical.get("state") in {"done", "failed", "cancelled"}:
                 metadata = canonical.get("terminal")
                 if metadata is not None and metadata.get("completed_at") is not None:
@@ -1184,6 +1187,7 @@ def _dispatch_admitted(
     task_transcripts: Optional[Dict[str, str]] = None,
     durable_spec: Optional[Dict[str, Any]] = None,
     current_boot_id: Optional[str] = None,
+    detached: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
@@ -1277,15 +1281,33 @@ def _dispatch_admitted(
                     record["attempt_id"],
                 )
                 return
+        from tools.delegate_detached import HandedOff
+
+        job_dir = None
+        handed_off = False
         try:
-            result = _coerce_runner_result(runner(), label.strip() + " " if label else "")
+            if detached is not None and record.get("attempt_id"):
+                raw, job_dir = _run_detached_unit(
+                    delegation_id, record["attempt_id"], _record_profile_home(record), continuation=None,
+                    live_delegation_id=detached.get("live_delegation_id"), fallback_runner=runner,
+                    on_spawned=detached.get("on_spawned"))
+            else:
+                raw = runner()
+            result = _coerce_runner_result(raw, label.strip() + " " if label else "")
             status = classify(result)
+        except HandedOff:
+            # Shutdown handed the unit to the next boot; it adopts and finalizes. ``finally`` still runs:
+            # an adopter may already own the live record, so this supervisor must not touch it.
+            handed_off = True
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
             result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
             status = "error"
         finally:
-            _finalize(delegation_id, result, status)
+            if not handed_off:
+                _finalize(delegation_id, result, status)
+                if job_dir is not None:
+                    _cleanup_detached_job(delegation_id, job_dir, _record_profile_home(record))
 
     from hermes_cli.backend_retirement import retirement
 
@@ -1367,6 +1389,7 @@ def dispatch_async_delegation_batch(
     task_indexes: Optional[List[int]] = None,
     task_transcripts: Optional[Dict[str, str]] = None,
     durable_spec: Optional[Dict[str, Any]] = None, current_boot_id: Optional[str] = None,
+    detached: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
@@ -1385,7 +1408,7 @@ def dispatch_async_delegation_batch(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         task_indexes=task_indexes, task_transcripts=task_transcripts,
-        durable_spec=durable_spec, current_boot_id=current_boot_id,
+        durable_spec=durable_spec, current_boot_id=current_boot_id, detached=detached,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
@@ -1394,6 +1417,174 @@ def dispatch_async_delegation_batch(
         logger.info("Dispatched async delegation batch %s (%d task(s), session_key=%s)",
                     delegation_id, n, session_key or "<cli>")
     return handle
+
+
+# ── Detached units (docs/dev/delegate-detached-background.md) ───────────────
+
+
+def _durable_record(delegation_id: str, profile_home: Optional[Path]) -> Optional[Dict[str, Any]]:
+    with _store.locked_registry(profile_home, write=False) as registry:
+        record = registry["records"].get(delegation_id)
+        return json.loads(json.dumps(record)) if isinstance(record, dict) else None
+
+
+def _handed_off_ids() -> List[str]:
+    with _records_lock:
+        return [r["delegation_id"] for r in _records.values()
+                if r.get("detached_handed_off") and r.get("attempt_id")]
+
+
+def _install_detached_supervision(delegation_id: str, pid: Any, create_time: Any, job_dir: Path) -> bool:
+    """Point the live record's cancel + liveness at the child process and arm the stale monitor.
+    False when shutdown already began for this record (it stays a plain recoverable unit)."""
+    from tools import delegate_detached as dd
+
+    with _records_lock:
+        rec = _records.get(delegation_id)
+        if rec is None or rec.get("detached_handed_off") or rec.get("recover_on_shutdown"):
+            return False
+        rec.update(
+            interrupt_fn=lambda: dd.terminate_group(pid, create_time),
+            progress_fn=dd.heartbeat_progress_fn(lambda: job_dir),
+            detached_unit=True, _started=True, _progress_token=None, _progress_ts=time.time())
+    _ensure_stale_monitor()
+    return True
+
+
+def _handed_off_check(delegation_id: str) -> Callable[[], bool]:
+    """True once THIS process's live record for the unit was handed to the next boot (or replaced)."""
+    with _records_lock:
+        mine = _records.get(delegation_id)
+
+    def _check() -> bool:
+        with _records_lock:
+            return mine is None or bool(mine.get("detached_handed_off")) or _records.get(delegation_id) is not mine
+    return _check
+
+
+def _run_detached_unit(
+    delegation_id: str, attempt_id: str, profile_home: Optional[Path], *, continuation: Optional[str],
+    live_delegation_id: Optional[str], fallback_runner: Callable[[], Any],
+    on_spawned: Optional[Callable[[], None]] = None,
+) -> tuple:
+    """Spawn the unit's detached child and wait for its result: ``(result, job_dir)``. A spawn the host
+    cannot make restart-safe, or a failed spawn, runs ``fallback_runner`` in-process (``job_dir`` None)."""
+    from tools import delegate_detached as dd
+
+    spawned = None
+    try:
+        durable = _durable_record(delegation_id, profile_home)
+        if durable is not None:
+            spawned = dd.spawn_child(
+                record=durable, attempt_id=attempt_id,
+                profile_home=Path(profile_home or _registry_path().parent.parent),
+                continuation=continuation, live_delegation_id=live_delegation_id)
+    except Exception:
+        logger.warning("async_delegation_detached_spawn_failed delegation_id=%s attempt_id=%s",
+                       delegation_id, attempt_id, exc_info=True)
+        spawned = None
+    if spawned is None:
+        logger.info("async_delegation_detached_fallback delegation_id=%s: running in-process", delegation_id)
+        try:
+            _store.clear_detached(delegation_id, attempt_id, profile_home=profile_home)
+        except Exception:
+            logger.debug("could not clear execution.detached for %s", delegation_id, exc_info=True)
+        return fallback_runner(), None
+    if on_spawned is not None:  # the gateway-built children never run: close them
+        try:
+            on_spawned()
+        except Exception:
+            logger.debug("detached on_spawned hook failed", exc_info=True)
+    # Flag the live record BEFORE the registry advertises the child, so a shutdown racing this spawn
+    # either sees a detached unit (hand-off) or stood this one down (terminate below; re-dispatch).
+    try:
+        advertised = _install_detached_supervision(
+            delegation_id, spawned.pid, spawned.create_time, spawned.job_dir) and _store.set_detached_block(
+                delegation_id, attempt_id, spawned.block(attempt_id), profile_home=profile_home)
+    except Exception:
+        # A child nobody supervises or can adopt must not run on (its side effects would repeat on retry).
+        logger.warning("async_delegation_detached_supervision_failed delegation_id=%s pid=%s",
+                       delegation_id, spawned.pid, exc_info=True)
+        advertised = False
+    if not advertised:
+        # Cancelled, superseded or shutting down between persist and spawn: the child must not run on,
+        # and its job dir must not look adoptable (a shutdown re-dispatches the unit on the next boot).
+        dd.terminate_group(spawned.pid, spawned.create_time)
+        try:
+            spawned.popen.wait(timeout=dd.SIGKILL_GRACE_SECONDS + 5)
+        except Exception:
+            pass
+        dd.remove_job_dir(spawned.job_dir)
+        # Raise, not return: a returned payload with no per-task results classifies as a completed batch.
+        raise RuntimeError("Background delegation stopped before its detached child started work.")
+    abort = _handed_off_check(delegation_id)
+    try:
+        return dd.wait_for_result(spawned.job_dir, spawned.pid, spawned.create_time, spawned.popen,
+                                  abort=abort), spawned.job_dir
+    except dd.HandedOff:
+        logger.info("async_delegation_detached_handed_off delegation_id=%s pid=%s", delegation_id, spawned.pid)
+        raise
+
+
+def _cleanup_detached_job(delegation_id: str, job_dir: Path, profile_home: Optional[Path]) -> None:
+    """Remove the job dir once its result is owned by a terminal record; a result refused by a shutdown
+    handoff (record ``recoverable``) stays on disk for the adopting boot."""
+    from tools import delegate_detached as dd
+
+    try:
+        record = _durable_record(delegation_id, profile_home) or {}
+    except Exception:
+        return
+    if record.get("state") in {"done", "failed", "cancelled"} or not record:
+        dd.remove_job_dir(job_dir)
+
+
+def _adopt_detached(
+    durable: Dict[str, Any], profile_home: Path, executor: ThreadPoolExecutor,
+) -> None:
+    """Register + supervise one adopted detached unit (same live record shape as the dispatcher's)."""
+    from tools import delegate_detached as dd
+
+    delegation_id = durable["delegation_id"]
+    attempt_id = durable["attempt"]["attempt_id"]
+    block = durable.get("detached") or {}
+    job_dir = Path(block.get("job_dir") or dd.job_dir_for(profile_home, attempt_id))
+    pid, create_time = block.get("pid"), block.get("create_time")
+    source = durable.get("source") or {}
+    route = durable.get("route") or {}
+    goals = [str(t.get("goal") or "") for t in source.get("tasks") or [] if isinstance(t, dict)]
+    with _records_lock:
+        _records[delegation_id] = {
+            "delegation_id": delegation_id, "goal": goals[0] if len(goals) == 1 else f"{len(goals)} parallel subagents",
+            "goals": goals, "context": source.get("shared_context"), "role": "leaf",
+            "model": (durable.get("execution") or {}).get("model"),
+            "session_key": route.get("session_key", ""), "origin_ui_session_id": route.get("origin_ui_session_id", ""),
+            "parent_session_id": route.get("parent_session_id"), "status": "running",
+            "dispatched_at": durable.get("created_at"), "completed_at": None,
+            "is_batch": source.get("kind") == "batch" or len(goals) > 1, "attempt_id": attempt_id,
+            "registry_profile_home": str(profile_home), "slot_key": delegation_id,
+            "_context": contextvars.copy_context()}
+    _install_detached_supervision(delegation_id, pid, create_time, job_dir)
+    abort = _handed_off_check(delegation_id)
+
+    def _supervise() -> None:
+        result: Dict[str, Any] = {}
+        status = "error"
+        handed_off = False
+        try:
+            result = dd.wait_for_result(job_dir, pid, create_time, abort=abort)
+            status = _batch_status(result) if "results" in result else _single_status(result)
+        except dd.HandedOff:
+            handed_off = True  # handed to the next boot at shutdown; it adopts and finalizes
+        except Exception as exc:  # noqa: BLE001
+            result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            if not handed_off:
+                _finalize(delegation_id, result, status, attempt_id=attempt_id,
+                          registry_path=_store.registry_path(profile_home))
+                _cleanup_detached_job(delegation_id, job_dir, profile_home)
+
+    executor.submit(propagate_context_to_thread(_supervise))
 
 
 # ── Finalization + completion events ────────────────────────────────────────
@@ -1421,6 +1612,8 @@ def _finalize(
         expected_attempt = attempt_id or record.get("attempt_id")
         if expected_attempt and record.get("attempt_id") not in {None, expected_attempt}:
             return
+        if record.get("detached_handed_off"):
+            return  # shutdown handed this detached unit to the next boot (interrupt_all recoverable)
         record["status"] = "finalizing"
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None  # drop the closure; child is done
@@ -1744,6 +1937,20 @@ def recover_async_delegations(
 ) -> Dict[str, int]:
     """Claim and submit restartable records once for one profile/boot."""
     profile_home = _store.registry_path(profile_home).parent.parent
+    from tools import delegate_detached as dd
+
+    # Detached units first, unconditionally (resume_on_restart / detached_background do not gate a child
+    # that is already running): adopt live/finished children; a dead child loses its block and falls
+    # through to claim_recoveries below as a normal re-dispatch.
+    adopted, kill = _store.claim_detached_adoptions(
+        current_boot_id=current_boot_id, profile_home=profile_home, owner_alive=is_boot_id_alive,
+        probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for)
+    for ident in kill:
+        dd.terminate_group(ident.get("pid"), ident.get("create_time"))
+    if adopted:
+        adopt_executor = _get_executor(max(max_async_children, len(adopted)))
+        for durable in adopted:
+            _adopt_detached(durable, profile_home, adopt_executor)
     claimed, summary = _store.claim_recoveries(
         current_boot_id=current_boot_id,
         resume_enabled=resume_enabled,
@@ -1769,6 +1976,11 @@ def recover_async_delegations(
                 runner, interrupt_fn = produced, None
             if not callable(runner):
                 raise TypeError("resume runner factory did not return a callable")
+            if ((durable.get("execution") or {}).get("detached") and _detached_enabled()
+                    and dd.spawn_mode() != "degraded"):
+                # A detached unit whose child died re-dispatches as a new detached child.
+                runner = _detached_recovery_runner(
+                    delegation_id, attempt_id, profile_home, continuation, runner)
         except Exception as exc:
             payload = _store.fail_attempt(
                 delegation_id,
@@ -1815,6 +2027,7 @@ def recover_async_delegations(
         ) -> None:
             result: Dict[str, Any] = {}
             status = "error"
+            handed_off = False
             try:
                 submitted = _store.mark_submitted(
                     _delegation_id,
@@ -1844,6 +2057,8 @@ def recover_async_delegations(
                     status = "error"
                 else:
                     status = result.get("status") or "completed"
+            except dd.HandedOff:
+                handed_off = True  # shutdown handed the re-dispatched child to the next boot
             except Exception as exc:
                 logger.exception(
                     "Recovered async delegation %s crashed", _delegation_id
@@ -1853,13 +2068,14 @@ def recover_async_delegations(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             finally:
-                _finalize(
-                    _delegation_id,
-                    result,
-                    status,
-                    attempt_id=_attempt_id,
-                    registry_path=_store.registry_path(profile_home),
-                )
+                if not handed_off:
+                    _finalize(
+                        _delegation_id,
+                        result,
+                        status,
+                        attempt_id=_attempt_id,
+                        registry_path=_store.registry_path(profile_home),
+                    )
 
         try:
             executor.submit(propagate_context_to_thread(_worker))
@@ -1878,6 +2094,25 @@ def recover_async_delegations(
                 payload["_registry_profile_home"] = str(profile_home or "")
                 process_registry.completion_queue.put(payload)
     return summary
+
+
+def _detached_enabled() -> bool:
+    from tools.delegate_tool_config import _get_detached_background
+
+    return _get_detached_background()
+
+
+def _detached_recovery_runner(delegation_id, attempt_id, profile_home, continuation, fallback_runner):
+    """Re-dispatch of a detached unit whose child died: spawn a new child for the new attempt."""
+    def _runner() -> Dict[str, Any]:
+        result, job_dir = _run_detached_unit(
+            delegation_id, attempt_id, profile_home, continuation=continuation,
+            live_delegation_id=None, fallback_runner=fallback_runner)
+        if job_dir is not None:
+            # Cleanup after _finalize: the job dir is removed once the record is terminal.
+            threading.Timer(5.0, _cleanup_detached_job, args=(delegation_id, job_dir, profile_home)).start()
+        return result
+    return _runner
 
 
 def enqueue_pending_outbox(
@@ -2064,7 +2299,19 @@ def interrupt_all(
         if recoverable:
             for record in targets:
                 record["recover_on_shutdown"] = True
+                if record.get("detached_unit"):
+                    # A detached unit's child is its own process: it keeps running across the restart
+                    # and the next boot adopts it (docs/dev/delegate-detached-background.md). Mark it
+                    # recoverable, never signal it, and hand it off: this process's supervisor must
+                    # neither finalize nor signal it again (the adopter reuses the same attempt id, so
+                    # append_terminal alone would not fence us off).
+                    record.update(detached_handed_off=True, interrupt_fn=None, progress_fn=None)
+            targets = [r for r in targets if not r.get("detached_unit")]
+        # Snapshot under the lock: a detached unit installing its supervision after this point
+        # (it sees recover_on_shutdown and stands down) must not have its child signalled here.
+        targets = [dict(r) for r in targets]
     durable_ids = [r["delegation_id"] for r in targets if r.get("attempt_id")]
+    durable_ids += [d for d in _handed_off_ids() if d not in durable_ids] if recoverable else []
     if recoverable and durable_ids:
         # Best-effort optimization only. Lock acquisition is bounded so shutdown
         # never stalls; running+dead-boot recovery is the guaranteed equivalent.

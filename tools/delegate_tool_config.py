@@ -112,6 +112,11 @@ def _get_independent_completions() -> bool:
     completion messages that land as each finishes. Off = one consolidated message when the whole call is done."""
     return is_truthy_value(_cfg().get("independent_completions", False))
 
+def _get_detached_background() -> bool:
+    """delegation.detached_background (bool, default False until the t_eaabba56 P1 triage lands): a restart-durable background unit runs in its own
+    process and survives a gateway restart (docs/dev/delegate-detached-background.md). False = gateway threads."""
+    return is_truthy_value(_cfg().get("detached_background", False))
+
 def _get_worktree_isolation() -> bool:
     """delegation.worktree_isolation (bool, default False): each child gets its own
     git worktree off the parent's HEAD so parallel children never contend for one

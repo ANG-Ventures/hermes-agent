@@ -1648,6 +1648,9 @@ DEFAULT_CONFIG = {
                            # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
                            # explicitly for non-standard endpoints the URL heuristic can't identify.
         "resume_on_restart": True,  # recover gateway background delegations after restart
+        # Durable background units run in their own process and survive a gateway restart
+        # (docs/dev/delegate-detached-background.md). false = in-gateway threads (kill switch).
+        "detached_background": False,  # default OFF until the 20 open Prism P1s on #2135 are triaged (t_eaabba56)
         "surface_child_process_notifications": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
@@ -2022,7 +2025,9 @@ DEFAULT_CONFIG = {
     # website/docs/user-guide/features/hooks.md.
     # missing_hook_policy: what a hook whose script (or a tracked sibling) is ABSENT does —
     # restore_then_fail_closed | fail_closed | fail_open_and_page.
-    "hooks": {"missing_hook_policy": "restore_then_fail_closed"},
+    # batch_python_hooks: `<python> <script>.py` hooks of one event fire share one interpreter start
+    # (agent/shell_hooks_batch.py); false restores one process per hook.
+    "hooks": {"missing_hook_policy": "restore_then_fail_closed", "batch_python_hooks": True},
     # Auto-accept shell-hook registrations without a TTY prompt (also --accept-hooks or
     # HERMES_ACCEPT_HOOKS=1). Gateway/cron/non-interactive runs need one of these to pick up
     # newly-added hooks.
