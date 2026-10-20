@@ -76,14 +76,17 @@ def process_create_time(pid: int) -> Optional[float]:
 
 
 def pid_alive(pid: Any, create_time: Any) -> bool:
-    """Same pid AND same kernel start time (pid reuse safe); a zombie counts as dead."""
+    """Same pid AND same kernel start time (pid reuse safe); a zombie counts as dead. An identity
+    with no start time is unverifiable and never matches: a recycled pid must not be signalled."""
+    if create_time is None:
+        return False
     try:
         import psutil
 
         proc = psutil.Process(int(pid))
         if proc.status() == psutil.STATUS_ZOMBIE:
             return False
-        return create_time is None or abs(proc.create_time() - float(create_time)) < 0.01
+        return abs(proc.create_time() - float(create_time)) < 0.01
     except Exception:
         return False
 
@@ -111,23 +114,50 @@ def find_job_process(job_dir: Path) -> Optional[Dict[str, Any]]:
 
 
 def job_identity(job_dir: Path, detached_block: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """``{pid, create_time}`` for the job's child: registry block, then pid.json, child.json, argv scan."""
+    """``{pid, create_time}`` for the job's child: registry block, then pid.json, child.json, argv scan.
+    A recorded pid without a start time is verified by the exact ``--job <dir>`` argv instead."""
     for source in (detached_block, _read_json(job_dir / "pid.json"), _read_json(job_dir / "child.json")):
         if isinstance(source, dict) and source.get("pid"):
-            return {"pid": int(source["pid"]), "create_time": source.get("create_time")}
+            if source.get("create_time") is not None:
+                return {"pid": int(source["pid"]), "create_time": source.get("create_time")}
+            found = find_job_process(job_dir)
+            return found if found and int(found["pid"]) == int(source["pid"]) else None
     if (job_dir / "spawn.json").exists():
         return find_job_process(job_dir)
     return None
 
 
 def probe_job(job_dir: Path, detached_block: Optional[Dict[str, Any]] = None) -> str:
-    """``result`` (result.json present) | ``alive`` | ``dead``."""
+    """``result`` (result.json present) | ``alive`` | ``dead``. A child that publishes its result and
+    exits between the two checks reads as ``result``, never ``dead`` (that would re-run finished work)."""
     if (job_dir / "result.json").exists():
         return "result"
     ident = job_identity(job_dir, detached_block)
     if ident and pid_alive(ident["pid"], ident["create_time"]):
         return "alive"
-    return "dead"
+    return "result" if (job_dir / "result.json").exists() else "dead"
+
+
+def _group_members(pid: int) -> list:
+    """``(pid, create_time)`` of every process in the child's group/session plus its descendants."""
+    try:
+        import psutil
+    except Exception:
+        return []
+    members = {}
+    try:
+        leader = psutil.Process(int(pid))
+        for proc in [leader, *leader.children(recursive=True)]:
+            members[proc.pid] = proc.create_time()
+    except Exception:
+        pass
+    for proc in psutil.process_iter(["pid", "create_time"]):
+        try:
+            if proc.info["pid"] not in members and os.getpgid(proc.info["pid"]) == int(pid):
+                members[proc.info["pid"]] = proc.info["create_time"]
+        except Exception:
+            continue
+    return list(members.items())
 
 
 def signal_group(pid: Any, create_time: Any, sig: int) -> bool:
@@ -135,9 +165,9 @@ def signal_group(pid: Any, create_time: Any, sig: int) -> bool:
     if not pid_alive(pid, create_time):
         return False
     try:
-        os.killpg(int(pid), sig)
+        os.killpg(int(pid), sig)  # AttributeError on Windows (no process groups): plain kill below
         return True
-    except (ProcessLookupError, PermissionError, OSError):
+    except (ProcessLookupError, PermissionError, OSError, AttributeError):
         try:
             os.kill(int(pid), sig)
             return True
@@ -145,12 +175,26 @@ def signal_group(pid: Any, create_time: Any, sig: int) -> bool:
             return False
 
 
+def _kill_members(pid: Any, create_time: Any, members: list) -> None:
+    """SIGKILL escalation: the group while its leader is still the same process, then every member
+    captured at SIGTERM time that is still that same process (tools outliving their leader)."""
+    kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+    signal_group(pid, create_time, kill_sig)
+    for member_pid, member_ct in members:
+        if pid_alive(member_pid, member_ct):
+            try:
+                os.kill(int(member_pid), kill_sig)
+            except OSError:
+                pass
+
+
 def terminate_group(pid: Any, create_time: Any, *, grace: float = SIGKILL_GRACE_SECONDS,
                     timer_factory: Callable[..., Any] = threading.Timer) -> bool:
     """SIGTERM now, SIGKILL after ``grace`` on a timer thread; never blocks the caller."""
+    members = _group_members(int(pid)) if pid_alive(pid, create_time) else []
     sent = signal_group(pid, create_time, signal.SIGTERM)
     if sent:
-        timer = timer_factory(grace, signal_group, args=(pid, create_time, signal.SIGKILL))
+        timer = timer_factory(grace, _kill_members, args=(pid, create_time, members))
         timer.daemon = True
         timer.start()
     return sent
@@ -307,7 +351,20 @@ def build_parent_and_runner(
     parent = AIAgent(**agent_kwargs)
     setattr(parent, "_delegate_depth", int(execution.get("parent_depth") or 0))
     setattr(parent, "terminal_cwd", execution.get("workspace_hint") or None)
-    runner = build_recovered_delegation_runner(record, continuation, parent, source=source)
+    recovered = build_recovered_delegation_runner(record, continuation, parent, source=source)
+
+    def runner() -> Dict[str, Any]:
+        # The owning profile's SessionDB for the run only: children open their dedicated handle on the
+        # parent's db file (delegate_tool._open_child_session_db); a parent without one runs every child
+        # unpersisted. Acquired here, not at build time, so a runner that never starts holds nothing.
+        session_db = _acquire_session_db()
+        setattr(parent, "_session_db", session_db)
+        setattr(parent, "_end_session_on_close", False)  # the parent never runs a turn; its row is the gateway's
+        try:
+            return recovered()
+        finally:
+            setattr(parent, "_session_db", None)
+            _release_session_db(session_db)
 
     def _interrupt_parent() -> None:
         parent.interrupt("Recovered async delegation cancelled")
@@ -315,11 +372,36 @@ def build_parent_and_runner(
     return runner, _interrupt_parent, parent
 
 
+def _acquire_session_db():
+    try:
+        from hermes_state_registry import acquire
+
+        return acquire()
+    except Exception:
+        logger.warning("detached delegation: SessionDB unavailable; child transcripts will not persist",
+                       exc_info=True)
+        return None
+
+
+def _release_session_db(session_db) -> None:
+    if session_db is None:
+        return
+    try:
+        from hermes_state_registry import release_or_close
+
+        release_or_close(session_db)
+    except Exception:
+        logger.debug("detached delegation: SessionDB release failed", exc_info=True)
+
+
 # ── gateway side: spawn + supervise ─────────────────────────────────────────
 def spawn_mode() -> str:
-    """``in_process`` / ``scoped`` (restart-safe) or ``degraded`` (systemd without a user bus: stay a thread)."""
-    from tools.process_registry import restart_safe_gateway_child_argv
+    """``in_process`` / ``scoped`` (restart-safe) or ``degraded`` (stay a thread): systemd without a user
+    bus, or native Windows, where the child cannot be cancelled as a process group (no ``killpg``)."""
+    from tools.process_registry import _IS_WINDOWS, restart_safe_gateway_child_argv
 
+    if _IS_WINDOWS:
+        return "degraded"
     try:
         return restart_safe_gateway_child_argv(
             [sys.executable, "-c", "pass"], unit_suffix="delegation-probe",
@@ -344,15 +426,18 @@ def spawn_child(*, record: Dict[str, Any], attempt_id: str, profile_home: Path,
                 continuation: Optional[str], live_delegation_id: Optional[str]) -> Optional[DetachedSpawn]:
     """Spawn the detached child for one attempt; None when the host cannot make it restart-safe."""
     from tools.environments.local import served_profile_child_env
-    from tools.process_registry import restart_safe_gateway_child_argv
+    from tools.process_registry import _IS_WINDOWS, restart_safe_gateway_child_argv
 
+    if _IS_WINDOWS:
+        return None  # no process-group cancel (spawn_mode); the unit runs in-process
     job_dir = job_dir_for(profile_home, attempt_id)
     job_dir.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(job_dir, 0o700)
     except OSError:
         pass
-    command = [sys.executable, "-m", "tools.delegate_detached", "--job", str(job_dir)]
+    # -P: the workspace cwd is never on sys.path, so a workspace ``tools`` package cannot shadow the worker.
+    command = [sys.executable, "-P", "-m", "tools.delegate_detached", "--job", str(job_dir)]
     dispatch = restart_safe_gateway_child_argv(
         command, unit_suffix=f"delegation-{job_dir.name}",
         require_restart_safe_scope=False, outlives_parent=True,
@@ -379,7 +464,13 @@ def spawn_child(*, record: Dict[str, Any], attempt_id: str, profile_home: Path,
     finally:
         log_f.close()
     spawned = DetachedSpawn(job_dir, popen.pid, process_create_time(popen.pid), popen)
-    _write_json(job_dir / "pid.json", {"pid": spawned.pid, "create_time": spawned.create_time})
+    try:
+        # Redundant with the registry block the caller writes next; a failure here must not lose the
+        # handle to a child that is already running (the caller supervises or terminates it).
+        _write_json(job_dir / "pid.json", {"pid": spawned.pid, "create_time": spawned.create_time})
+    except OSError:
+        logger.warning("async_delegation_detached_pid_file_failed attempt_id=%s pid=%s",
+                       attempt_id, spawned.pid, exc_info=True)
     logger.info("async_delegation_detached_spawned attempt_id=%s pid=%s job_dir=%s",
                 attempt_id, spawned.pid, job_dir)
     return spawned
@@ -410,7 +501,10 @@ def wait_for_result(job_dir: Path, pid: int, create_time: Optional[float],
                              "(gateway upgraded mid-run?); its output is in " + str(job_dir / "child.log")}
         return result
     try:
-        tail = (job_dir / "child.log").read_bytes()[-2048:].decode("utf-8", "replace")
+        with open(job_dir / "child.log", "rb") as log_f:
+            log_f.seek(0, os.SEEK_END)
+            log_f.seek(max(0, log_f.tell() - 2048))
+            tail = log_f.read().decode("utf-8", "replace")
     except OSError:
         tail = ""
     code = popen.returncode if popen is not None else None
@@ -419,8 +513,17 @@ def wait_for_result(job_dir: Path, pid: int, create_time: Optional[float],
 
 
 # ── child process entry ─────────────────────────────────────────────────────
+def _isolate_process_checkpoint(job_dir: Path) -> None:
+    """This process has its own ProcessRegistry; its checkpoint must not replace the gateway's
+    ``<home>/processes.json`` (``_write_checkpoint`` writes only the caller's own entries)."""
+    import tools.process_registry as process_registry_module
+
+    process_registry_module.CHECKPOINT_PATH = job_dir / "processes.json"
+
+
 def _child_main(job_dir: Path) -> int:
     _write_json(job_dir / "child.json", {"pid": os.getpid(), "create_time": process_create_time(os.getpid())})
+    _isolate_process_checkpoint(job_dir)
     heartbeat = _Heartbeat(job_dir)
     heartbeat.start()
     spec = _read_json(job_dir / "spec.json") or {}

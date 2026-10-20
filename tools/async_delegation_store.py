@@ -1232,6 +1232,24 @@ def clear_detached(delegation_id: str, attempt_id: str, *, profile_home: Path | 
         return True
 
 
+def stand_down_detached(
+    delegation_id: str, attempt_id: str, owner_boot_id: str, *, profile_home: Path | None = None,
+) -> bool:
+    """Fence an un-advertised child before its dispatcher kills it: False when another boot already
+    adopted this attempt (the child is theirs now; leave it running). True otherwise, and adoption of
+    this attempt is refused from now on (``detached_fence``); the next generation re-dispatches."""
+    with locked_registry(profile_home) as registry:
+        record = registry["records"].get(delegation_id)
+        if not isinstance(record, dict) or (record.get("attempt") or {}).get("attempt_id") != attempt_id:
+            return True
+        if str((record.get("attempt") or {}).get("owner_boot_id") or "") != str(owner_boot_id or ""):
+            return False
+        record["detached_fence"] = attempt_id
+        record.pop("detached", None)
+        append_lifecycle_event(record, "detached_stood_down", f"attempt={attempt_id}")
+        return True
+
+
 def claim_detached_adoptions(
     *, current_boot_id: str, profile_home: Path | None = None, owner_alive=is_boot_id_alive,
     probe=None, identity=None, job_dir_for=None,
@@ -1261,7 +1279,9 @@ def claim_detached_adoptions(
             block = record.get("detached") if isinstance(record.get("detached"), dict) else None
             job_dir = Path(block["job_dir"]) if block and block.get("job_dir") else job_dir_for(
                 home, str(attempt.get("attempt_id") or ""))
-            if state == "cancelled":
+            if state == "cancelled" or (state == "failed" and block is not None):
+                # Terminal-without-result: a still-live child is an orphan. ``failed`` + block is the age cap
+                # below, which keeps the block so a kill its gateway died before sending is re-sent here.
                 ident = identity(job_dir, block)
                 if ident:
                     kill.append(ident)
@@ -1270,6 +1290,8 @@ def claim_detached_adoptions(
                 continue
             if state not in {"running", "recoverable"}:
                 continue
+            if record.get("detached_fence") == attempt.get("attempt_id"):
+                continue  # its dispatcher stood this attempt down; claim_recoveries re-dispatches it
             owner = str(attempt.get("owner_boot_id") or "")
             if state == "running" and (owner == current_boot_id or owner_alive(owner)):
                 continue
@@ -1277,7 +1299,9 @@ def claim_detached_adoptions(
                 ident = identity(job_dir, block)
                 if ident:
                     kill.append(ident)
-                record.pop("detached", None)
+                    record["detached"] = {**(block or {}), **ident, "job_dir": str(job_dir)}
+                else:
+                    record.pop("detached", None)
                 _fail_recovery_record(record, "stale_record", now, emit_event=True, event_suffix="stale")
                 continue
             status = probe(job_dir, block)
@@ -1285,10 +1309,12 @@ def claim_detached_adoptions(
                 record.pop("detached", None)
                 append_lifecycle_event(record, "detached_lost", f"attempt={attempt.get('attempt_id')}", now=now)
                 continue
-            if block is None:
-                ident = identity(job_dir, None) or {}
-                block = {"pid": ident.get("pid"), "create_time": ident.get("create_time"),
-                         "job_dir": str(job_dir), "attempt_id": attempt.get("attempt_id"), "spawned_at": None}
+            if block is None or block.get("create_time") is None:
+                # Adopt by a VERIFIED identity (pid + start time); an unverifiable one is never signalled.
+                ident = identity(job_dir, block) or {}
+                block = {**(block or {"spawned_at": None}), "pid": ident.get("pid"),
+                         "create_time": ident.get("create_time"), "job_dir": str(job_dir),
+                         "attempt_id": attempt.get("attempt_id")}
                 record["detached"] = block
             attempt["owner_boot_id"] = current_boot_id
             record["state"] = "running"
