@@ -95,7 +95,7 @@ def test_gateway_recovery_runs_once_and_reresolves_current_credentials(tmp_path,
     assert agent_cls.call_args.kwargs["api_key"] == "CURRENT-KEY"
     assert agent_cls.call_args.kwargs["model"] == "persisted-model"
     built_parent.interrupt.assert_called_once()
-    build.assert_called_once_with(_record(), "CONTINUE after restart", built_parent)
+    build.assert_called_once_with(_record(), "CONTINUE after restart", built_parent, source="gateway_recovery")
 
 
 @pytest.mark.asyncio
