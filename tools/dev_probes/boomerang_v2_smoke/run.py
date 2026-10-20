@@ -17,6 +17,9 @@ override so the test path runs on fakes:
   BV2_CONFIG         config.yaml, or a dir of stage<N>.yaml snapshots (fake)
   BV2_WIRELOG_DIR    relay wire capture root              (default: ~/.claude-wirelog)
   BV2_ACK_FILE       ack file Apollo appends to           (default: <scratch>/bv2-smoke.ack)
+  BV2_ACK_CMD        scripted acker argv prefix: run as `<cmd> <token>`, does the action, exit 0
+                     (isolated scratch gateway lane; see puppet-lane bv2-smoke-lane.sh)
+  BV2_SYNC_TIMEOUT   seconds allowed for plan.commands.wirelog_sync (default 600)
   BV2_EVIDENCE       evidence markdown                    (default: docs/boomerang-v2/evidence/smoke.md)
   BV2_PLAN           command/expectation plan             (default: fixtures/plan.json)
 
@@ -433,11 +436,37 @@ class Ctx:
             time.sleep(min(1.0, max(0.05, self.tick / 2)))
 
     def wait_ack(self, rep: StepReport, token: str, instruction: str) -> float | None:
-        """Print the action for Apollo; wait for `token` as a whole line in the ack file."""
+        """Print the action for Apollo; wait for `token` as a whole line in the ack file.
+
+        ``BV2_ACK_CMD`` (an argv prefix) names a scripted operator: it is run as
+        ``<cmd> <token>`` and must perform the action itself (a config flip, a restart of the
+        gateway UNDER TEST) and exit 0. On exit 0 the token is appended to the ack file, so the
+        evidence reads the same as a human ack; any other exit is a FAIL (never a silent pass).
+        This is how an isolated scratch gateway (puppet-lane) drives steps 2 and 4 with no human.
+        """
         banner = (f"\n>>> APOLLO ACTION ({rep.title}):\n    {instruction}\n"
                   f">>> then: echo {shlex.quote(token)} >> {self.ack}\n")
         print(banner, flush=True)
         rep.raw.append(f"--- ack request\n{instruction}\nack: echo {token} >> {self.ack}")
+        ack_cmd = os.environ.get("BV2_ACK_CMD", "").strip()
+        if ack_cmd and self.live:
+            argv = shlex.split(ack_cmd) + [token]
+            shown = "$ " + shlex.join(argv)
+            print(shown, flush=True)
+            try:
+                proc = subprocess.run(argv, capture_output=True, text=True, timeout=self.args.ack_timeout)
+                rc, out = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                rc, out = 127, f"{type(exc).__name__}: {exc}"
+            rep.commands.append(shown + f"   # scripted ack, exit {rc}")
+            rep.raw.append(f"--- ack cmd {token} (exit {rc})\n{out.strip()[:4000]}")
+            if rc == 0:
+                self.ack.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.ack, "a", encoding="utf-8") as fh:
+                    fh.write(token + "\n")
+            else:
+                rep.check(f"ack `{token}` received", FAIL, f"BV2_ACK_CMD exit {rc}: {out.strip()[-300:]}")
+                return None
 
         def seen() -> float | None:
             if not self.ack.exists():
@@ -874,20 +903,35 @@ def _canary_control(ctx: Ctx, rep: StepReport) -> str:
     status, served, detail = send_canary(url, token, model)
     rep.commands.append(shown + f"   # HTTP {status} served_by={served}")
     rep.raw.append(f"--- canary\nHTTP {status} served_by={served} {detail}")
-    seat = _norm_seat(served) if served else None
+    _sync_seat(ctx, rep, _norm_seat(served) if served else None, "canary")
+    return token
+
+
+def _sync_seat(ctx: Ctx, rep: StepReport, seat: str | None, what: str) -> None:
+    """Pull a remote seat's wire capture locally (``plan.commands.wirelog_sync``) so the scan can
+    see the request it served. Used for the canary's seat AND the fork's: the pool pins the fork
+    to the parent's seat, which is only known from the ``served_by=`` line, so the lane that
+    drives the harness cannot sync it beforehand (t_b901c171, 2026-10-20: a step-3 run went
+    INCOMPLETE on `sub-vps-9` with the canary green on `sub-19`)."""
     sync = ctx.plan.get("commands", {}).get("wirelog_sync")
     m = re.fullmatch(r"sub-(\d+)", seat or "")
     if sync and m:
         time.sleep(ctx.slack)   # let the box flush the record before the pull
         argv = [os.path.expanduser(a) for a in fill(sync, sub=m.group(1))]
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=600)
-        rep.commands.append("$ " + shlex.join(argv) + f"   # exit {proc.returncode}")
-        rep.raw.append(f"--- wirelog_sync (exit {proc.returncode})\n"
-                       + ((proc.stdout or "") + (proc.stderr or "")).strip()[-2000:])
+        # BV2_SYNC_TIMEOUT: a one-seat `wirelog-fleet.py sync` measured 21m50s wall on the Studio
+        # at load ~80 (2026-10-20 07:1x; the retention reference walk dominates), past the old
+        # hard 600 s. A timeout is recorded as a non-zero exit, never swallowed.
+        budget = float(os.environ.get("BV2_SYNC_TIMEOUT") or 600)
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=budget)
+            rc, out = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        except subprocess.TimeoutExpired as exc:
+            rc, out = 124, f"wirelog_sync timed out after {budget:.0f}s (BV2_SYNC_TIMEOUT): {exc}"
+        rep.commands.append("$ " + shlex.join(argv) + f"   # {what} seat, exit {rc}")
+        rep.raw.append(f"--- wirelog_sync {what} {seat} (exit {rc})\n" + out.strip()[-2000:])
     elif seat and seat != "local":
-        rep.notes.append(f"canary served by `{seat}`: no plan.commands.wirelog_sync, so its record is only "
+        rep.notes.append(f"{what} served by `{seat}`: no plan.commands.wirelog_sync, so its record is only "
                          f"visible after `wirelog-fleet.py sync --sub {seat[4:]}`")
-    return token
 
 
 def step3(ctx: Ctx) -> StepReport:
@@ -912,6 +956,8 @@ def step3(ctx: Ctx) -> StepReport:
     if seat and seat not in {"local", "sub-0", "0"}:
         rep.notes.append(f"served by `{seat}`: its capture is on that box; run `wirelog-fleet.py sync` and "
                          f"point BV2_WIRELOG_DIR at ~/.claude-wirelog-fleet before trusting step 3")
+        if ctx.live:
+            _sync_seat(ctx, rep, _norm_seat(seat), "fork")
 
     # give the box a moment to flush the record (live), then read the window
     t_end = now() + (ctx.slack if ctx.live else 0)
