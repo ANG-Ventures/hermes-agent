@@ -9,7 +9,8 @@ admit(sample, need, leases) -> Verdict
            at, os, ncpu, cpu_busy (0..1, /proc/stat or host_statistics delta; never load1), mem_available_gb,
            psi_cpu_some10, psi_mem_some10, psi_io_some10 (Linux; None on darwin), optional procs/maxproc,
            gpu_free_mib, slo_breach (a latency-SLO guard, e.g. the ACE-AI voice hub: True = saturated).
-  need     Estimate for THIS job class on THIS host: cpus, ram_gb, gpu_mib (from estimate(); never a constant).
+  need     Estimate for THIS job class on THIS host: cpus, ram_gb, gpu_mib (from work_estimate.estimate(), the ONE
+           estimator every consumer uses (t_9e395789); never a constant).
   leases   estimates already admitted on this host whose job the sample does not show yet (Lease.at > sample.at -
            settle_s): the lease is the ONLY stand-in for a count (doctrine rule 3/4).
 Every axis must have room; the first saturated axis is `binding`. An axis the host's OS cannot measure (PSI on
@@ -37,8 +38,6 @@ from typing import Iterable, List, Mapping, Optional, Sequence
 
 SCHEMA = 1
 DEFAULT_SETTLE_S = 90.0     # a lease older than (sample.at - this) is assumed inside the sample (2 x 30 s sampler + slack)
-DEFAULT_P = 0.90            # the estimate is the p90 of recorded peaks for (class, host)
-MIN_HISTORY = 5             # fewer rows than this on (class, host): fall back to the class across hosts, then the prior
 DARWIN_UNMEASURABLE = ("psi_cpu_some10", "psi_mem_some10", "psi_io_some10")
 
 
@@ -47,7 +46,9 @@ class Estimate:
     cpus: float = 0.0          # CPUs the job keeps busy at its p90 (1.0 = one CPU fully busy)
     ram_gb: float = 0.0
     gpu_mib: float = 0.0
-    source: str = "prior"      # "p90:<class>@<host> n=<k>" | "p90:<class>@fleet n=<k>" | "prior"
+    source: str = "prior"      # work_estimate: "p75:<class>@<host> n=<k>" | "p75:<class>@fleet n=<k>" | "seed"
+    cpu_s: Optional[float] = None    # expected cpu-seconds per run (work_estimate; not an admit() axis)
+    wall_s: Optional[float] = None   # expected wall seconds per run (work_estimate; not an admit() axis)
 
     def plus(self, o: "Estimate") -> "Estimate":
         return Estimate(self.cpus + o.cpus, self.ram_gb + o.ram_gb, self.gpu_mib + o.gpu_mib, "sum")
@@ -230,37 +231,18 @@ def read_slice_memory(name: str = "kanbanw.slice", *, cgroup_root="/sys/fs/cgrou
                     classes=tuple(classes))
 
 
-# ── estimates: measured per (class, host), improved by every run (Ace 15:5x point 4) ─────────────────────────────
-def _pctl(xs: Sequence[float], p: float) -> float:
-    s = sorted(xs)
-    if not s:
-        return 0.0
-    k = max(0, min(len(s) - 1, math.ceil(p * len(s)) - 1))
-    return float(s[k])
-
-
-def estimate(job_class: str, host: str, history: Iterable[Mapping], prior: Optional[Estimate] = None, *,
-             p: float = DEFAULT_P, min_rows: int = MIN_HISTORY) -> Estimate:
-    """p90 of the recorded PEAK usage of ``job_class`` on ``host``; too few rows there -> the class across every host;
-    too few anywhere -> ``prior`` (the host table's footprint for the consumer: a starting point, replaced by
-    measurement as runs accumulate). ``history`` rows: {class, host, cpus, ram_gb, gpu_mib, at}."""
-    rows = [r for r in history if r.get("class") == job_class]
-    here = [r for r in rows if r.get("host") == host]
-    for pick, where in ((here, host), (rows, "fleet")):
-        if len(pick) >= min_rows:
-            return Estimate(cpus=_pctl([float(r.get("cpus") or 0) for r in pick], p),
-                            ram_gb=_pctl([float(r.get("ram_gb") or 0) for r in pick], p),
-                            gpu_mib=_pctl([float(r.get("gpu_mib") or 0) for r in pick], p),
-                            source=f"p{int(p * 100)}:{job_class}@{where} n={len(pick)}")
-    return dataclasses.replace(prior or Estimate(), source="prior")
-
-
+# ── the estimate-vs-actual ledger (the estimator itself is scripts/lib/work_estimate.py, t_9e395789) ──────────────
 def record_actual(path, *, job_class: str, host: str, cpus: float, ram_gb: float, gpu_mib: float = 0.0,
-                  at: float, job_id: Optional[str] = None, estimated: Optional[Estimate] = None) -> dict:
+                  at: float, job_id: Optional[str] = None, estimated: Optional[Estimate] = None,
+                  cpu_s: Optional[float] = None, wall_s: Optional[float] = None) -> dict:
     """Append one measured peak to the history ledger (jsonl). ``estimated`` is kept on the row so the FWA status page
-    can show estimate-vs-actual per class (a bad estimate is visible, not silent)."""
+    can show estimate-vs-actual per class (a bad estimate is visible, not silent). ``cpu_s`` / ``wall_s`` (optional:
+    the run's cpu-seconds and wall seconds) feed work_estimate's cpu_s / wall_s; absent = not measured, never 0."""
     row = {"schema": SCHEMA, "class": job_class, "host": host, "cpus": round(float(cpus), 3),
            "ram_gb": round(float(ram_gb), 3), "gpu_mib": round(float(gpu_mib), 1), "at": float(at), "job_id": job_id}
+    for k, v in (("cpu_s", cpu_s), ("wall_s", wall_s)):
+        if v is not None:
+            row[k] = round(float(v), 3)
     if estimated is not None:
         row["estimated"] = {"cpus": estimated.cpus, "ram_gb": estimated.ram_gb, "gpu_mib": estimated.gpu_mib,
                             "source": estimated.source}
