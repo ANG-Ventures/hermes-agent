@@ -1355,3 +1355,40 @@ def test_cancelling_work_counts_are_unknown_not_quiescent(store):
     rep = ca.evaluate(store)
     assert rep["verdict"] == UNKNOWN
     assert "negative" in rep["consumers"][0]["why"]
+
+
+def test_publish_forever_release_survives_shutdown_cancel_on_saturated_executor(store):
+    """Prism ad88cba956ad: ``asyncio.run()`` shutdown cancels every pending task,
+    including the one ``shield(to_thread(...))`` creates internally. With the
+    default executor saturated that cancel drops the still-QUEUED ``stop_lease``
+    job and the released record is never written. The release must be a bare
+    executor future (not a task) so shutdown cannot cancel it."""
+    import concurrent.futures
+
+    gate = AdmissionGate(store, GW, active_work=Work(), lease_s=3600)
+    unblock = threading.Event()
+    timer = threading.Timer(0.5, unblock.set)
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+        pub = asyncio.create_task(gate.publish_forever(interval=3600))
+        deadline = time.monotonic() + 5
+        while gate._last_record is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert gate._last_record is not None
+        loop.run_in_executor(None, unblock.wait)  # saturate the only worker
+        pub.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)  # the publisher's finally queues the release
+        timer.start()  # free the worker while asyncio.run() shuts the executor down
+        # return now: asyncio.run() cancels every task still pending
+
+    try:
+        asyncio.run(main())
+        rec = store.read_consumer(GW)
+        assert rec.get("lease_released") is True, rec
+    finally:
+        unblock.set()
+        timer.cancel()
+        gate._lease_stop.set()
