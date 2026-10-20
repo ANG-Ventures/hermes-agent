@@ -2083,6 +2083,15 @@ class SessionMessagesMixin:
             "SELECT 1 FROM messages WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
             (session_id, platform_message_id)) is not None
 
+    def active_user_row_ids_flagged(self, session_id: str, platform_message_id: str, flag: str) -> List[int]:
+        """Ids of the active user rows carrying *platform_message_id* whose ``display_metadata`` sets
+        *flag* (the gateway's post-/stop voice note, upgraded in place once STT finishes)."""
+        return [int(r[0]) for r in self._read_all(
+            "SELECT id FROM messages WHERE session_id = ? AND platform_message_id = ? AND role = 'user' "
+            "AND active = 1 AND CASE WHEN json_valid(display_metadata) "
+            "THEN json_extract(display_metadata, '$.' || ?) END ORDER BY id",
+            (session_id, platform_message_id, flag))]
+
     def has_steered_platform_message_id(self, session_id: str, platform_message_id: str) -> bool:
         """True when a user row carries *platform_message_id* inside the gateway steer origin envelope.
 

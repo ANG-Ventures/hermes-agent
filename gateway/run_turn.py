@@ -2341,9 +2341,10 @@ class GatewayTurnMixin:
         # earlier would falsely recover a message that never began processing.
         await self._mark_durable_active_turn(event, session_entry.session_key)
 
-        # A voice note from a turn /stop cancelled mid-STT is still being persisted: it must land
-        # before this turn's history is read, so it precedes this message (t_2f936364).
-        await self._await_voice_persist_barrier(session_entry.session_id)
+        # A voice note from a turn /stop cancelled mid-STT is persisted already; give its transcript
+        # upgrade a bounded chance to land before history is read (t_2f936364, t_61b3a5a1). A /stop
+        # during this wait must not drop THIS event's voice note either: it takes the post-stop path.
+        await self._await_voice_persist_barrier_for_turn(event, session_entry.session_id, session_key)
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
         try:
@@ -4192,7 +4193,7 @@ class GatewayTurnMixin:
                     pending, _ = await self._transcribe_and_echo_pending_voice(
                         pending_event, adapter, source, _pending_text, log_context="Voice-drain",
                         metadata={"thread_id": source.thread_id} if source.thread_id else None,
-                        persist_session_id=session_id,
+                        persist_session_id=session_id, persist_owner_key=session_key,
                     )
                     pending = pending or _build_media_placeholder(pending_event)
                 else:
