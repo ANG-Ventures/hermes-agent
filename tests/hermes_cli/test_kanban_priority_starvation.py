@@ -156,3 +156,35 @@ def test_failed_page_is_retried_next_tick(board, monkeypatch):
         _tick(conn)
         kinds = [e.kind for e in kb.list_events(conn, held)]
     assert len(sent) == 2 and kinds.count("priority_starved") == 1
+
+
+def _starved_reason(conn, held, events):
+    """Seed ``events`` on ``held`` (oldest first) and read the guard's reason."""
+    with kb.write_txn(conn):
+        for kind, payload in events:
+            kb._append_event(conn, held, kind, payload)
+    hits = {h["task_id"]: h for h in kbd.find_priority_starved(conn)}
+    return hits[held]["reason"]
+
+
+@pytest.mark.parametrize("events,want", [
+    # Prism e82c6a604cf9: the clear must not expose the hold it resolved.
+    ([("placement_wait", {"reason": "not_portable:host_reach"}),
+      ("placement_wait", {"cleared": True})], "none recorded"),
+    # A newer hold after the clear is the live one.
+    ([("placement_wait", {"reason": "not_portable:host_reach"}),
+      ("placement_wait", {"cleared": True}),
+      ("placement_wait", {"reason": "pool_full"})], "pool_full"),
+    # A clear ends only its own kind's hold.
+    ([("respawn_guarded", {"reason": "active_pr"}),
+      ("placement_wait", {"reason": "not_portable:host_reach"}),
+      ("placement_wait", {"cleared": True})], "active_pr"),
+    ([("placement_wait", {"reason": "not_portable:host_reach"})], "not_portable:host_reach"),
+])
+def test_cleared_hold_does_not_resurface(board, events, want):
+    with kb.connect_closing() as conn:
+        held = kb.create_task(conn, title="held", assignee="daedalus", priority=85)
+        _backdate(conn, held, THREE_HOURS)
+        low = kb.create_task(conn, title="low", assignee="daedalus", priority=10)
+        kb.claim_task(conn, low)
+        assert _starved_reason(conn, held, events) == want
