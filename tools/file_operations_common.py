@@ -167,11 +167,16 @@ class LintResult:
     skipped: bool = False
     output: str = ""
     message: str = ""
+    # Non-blocking findings (``file:line: ...``) on a file that parses: status "warning".
+    warnings: str = ""
 
     def to_dict(self) -> dict:
         if self.skipped:
             return {"status": "skipped", "message": self.message}
-        result = {"status": "ok" if self.success else "error", "output": self.output}
+        status = "error" if not self.success else "warning" if self.warnings else "ok"
+        result = {"status": status, "output": self.output}
+        if self.warnings:
+            result["warnings"] = self.warnings
         if self.message:
             result["message"] = self.message
         return result

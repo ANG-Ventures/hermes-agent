@@ -473,6 +473,24 @@ class SessionTranscriptMixin:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
 
+    def transcript_route(self, session_id: str) -> str:
+        """The session id ``load_transcript`` reads for *session_id* (reroutes, then compression tip)."""
+        return self._compression_tip_for_session_id(self._follow_reroutes(session_id)) or session_id
+
+    def upgrade_post_stop_voice_note(self, session_id: str, message_id: str, content: str) -> bool:
+        """Replace the content of the post-/stop voice note row (written at cancel time with the
+        could-not-be-transcribed marker) with its transcript, in place, on the route
+        ``load_transcript`` reads. False when the row is gone (rewritten, compacted away): the marker
+        and its audio path then stay as the record."""
+        from gateway.auto_resume import POST_STOP_VOICE_NOTE_KEY
+        with self._get_transcript_drain_lock():
+            session_id = self.transcript_route(session_id)
+            db = self._db_for_session_id(session_id)
+            if db is None:
+                return False
+            row_ids = db.active_user_row_ids_flagged(session_id, str(message_id), POST_STOP_VOICE_NOTE_KEY)
+            return bool(row_ids) and db.set_user_message_content(session_id, row_ids[-1], content) > 0
+
     def transcript_tail_role(self, session_id: str) -> Optional[str]:
         """Role of the newest live conversation row on the route ``load_transcript`` reads (``None``
         when empty, no DB, or the read fails — the boundary write would fail the same way)."""

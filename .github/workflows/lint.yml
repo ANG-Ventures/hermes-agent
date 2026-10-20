@@ -40,7 +40,7 @@ jobs:
     # left on the pool displaces a test slice. This job's checkout is already
     # blobless, which is what made it viable on the pool; it is equally viable
     # hosted, where it never competes with the matrix.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Checkout code
@@ -152,7 +152,7 @@ jobs:
     # the diff comment even when enforcement fails.
     name: ruff enforcement (blocking)
     # Hosted by design — short, no LAN dependency. See `lint-diff` above.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Checkout code
@@ -181,7 +181,7 @@ jobs:
     # See scripts/check-windows-footguns.py for the full rule list.
     name: Windows footguns (blocking)
     # Hosted by design — short, no LAN dependency. See `lint-diff` above.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Checkout code
@@ -215,6 +215,21 @@ jobs:
       # script is the burn-down list of pre-existing hits.
       - name: Forbid literal /tmp paths outside the baseline
         run: python scripts/check_no_tmp_literals.py
+
+      # t_21a7ace3 (Ace 2026-10-20 05:0x): the word slots leaves fleet work allocation. No NEW slot/slots token in
+      # the allocation paths of scripts/lints/slots-vocabulary.json; its per-file baseline only shrinks (graded
+      # against the PR base copy). Same lint bytes as hermes-home, prism-router, fleet-ops-scripts.
+      - name: Refuse new slots vocabulary in the allocation paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python scripts/lints/slots-vocabulary-lint.py --selftest
+          set --
+          if [ -n "$BASE_SHA" ]; then
+            git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            set -- --base-ref "$BASE_SHA"
+          fi
+          python scripts/lints/slots-vocabulary-lint.py "$@"
 
       # PRD-portability AC5 (t_c0586226): the mem0 store is reached by name (mem0.json host / https://mem0.ace),
       # never a loopback/LAN literal; a host move leaves a literal client writing to the retired box.

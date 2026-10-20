@@ -197,6 +197,13 @@ class SessionPersistenceMixin:
             pass  # bare stores / foreign entry objects in suites
         return (getattr(self, "_session_owner_hints", None) or {}).get(session_id)
 
+    def hint_session_owner(self, session_id: Optional[str], session_key: Optional[str]) -> None:
+        """Keep *session_id* resolvable to *session_key*'s store after the route moves on (a /new
+        rotates the entry while a write for the old session is still due). The published index
+        still wins while it names an owner (``_owner_key_for_session_id`` reads it first)."""
+        if session_id and session_key:
+            self._lazy("_session_owner_hints", dict)[session_id] = session_key
+
     def _db_for_session_id(self, session_id: Optional[str]):
         """The SessionDB holding *session_id*'s row (owner from the index or a pre-published hint;
         unknown ids fall back to the ambient store)."""

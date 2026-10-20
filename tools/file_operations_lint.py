@@ -144,6 +144,9 @@ class LintMixin:
         """Syntax-check ``path``: in-process linter when one matches the
         extension (``content`` avoids a re-read), else the shell linter table."""
         ext = os.path.splitext(path)[1].lower()
+        shell = self._shell_lint(path, ext, content)
+        if shell is not None:
+            return shell
         inproc = LINTERS_INPROC.get(ext)
         if inproc is not None:
             if content is None:
@@ -190,6 +193,24 @@ class LintMixin:
             first_line = next((ln.strip() for ln in cleaned.splitlines() if ln.strip()), cleaned[:120])
             return LintResult(skipped=True, message=f"{base_cmd} not usable: {first_line[:200]}")
         return LintResult(success=result.exit_code == 0, output=result.stdout.strip())
+
+    def _shell_lint(self, path: str, ext: str, content: Optional[str]) -> Optional[LintResult]:
+        """Shell tier for ``.sh``/``.bash`` and bash-shebang files; None = not a shell file
+        (or ``file_lint.shell: false``), so the extension tables decide. An extensionless
+        file is only recognised from ``content`` (never re-read just to sniff a shebang)."""
+        from tools.file_operations_lint_shell import SHELL_EXTS, lint_shell, shell_dialect, shell_lint_enabled
+
+        if content is None:
+            if ext not in SHELL_EXTS:
+                return None
+            read_result = self._exec(f"cat {self._escape_shell_arg(path)} 2>/dev/null")
+            if read_result.exit_code != 0:
+                return LintResult(skipped=True, message=f"Failed to read {path} for lint")
+            content = read_result.stdout
+        dialect = shell_dialect(ext, content.split("\n", 1)[0])
+        if dialect is None or not shell_lint_enabled():
+            return None
+        return lint_shell(path, content, dialect)
 
     def _run_managed_node_linter(self, ext: str, path: str) -> Optional[ExecuteResult]:
         """Run the ``ext`` Node linter on the host under PM's Node; None when PM has none."""

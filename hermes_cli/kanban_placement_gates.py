@@ -35,6 +35,7 @@ import time
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+from hermes_cli import kanban_db_capability_gap as _gap
 from hermes_cli import kanban_placement_reasons as _pr
 from hermes_cli import kanban_worker_pool as _kwp
 
@@ -243,7 +244,7 @@ SELECT r.id, r.task_id, r.outcome, r.ended_at, coalesce(r.error,''), coalesce(r.
 FROM task_runs r JOIN task_events p ON p.run_id = r.id AND p.kind = 'worker_placed'
 WHERE r.ended_at >= :since AND r.ended_at < :until
 """
-_R10_EVENTS = ("worker_capability_gap", "placement_reroute", "placement_custody_hold")
+_R10_EVENTS = (_gap.EVENT_KIND, "placement_reroute", "placement_custody_hold")
 
 
 def missing_capability_runs(conn: sqlite3.Connection, since: float, until: float) -> List[dict]:

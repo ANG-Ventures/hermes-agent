@@ -845,7 +845,11 @@ class AdmissionGate:
                     logger.warning("checkout admission publish failed", exc_info=True)
                 await asyncio.sleep(interval)
         finally:
-            self.stop_lease()
+            # The released-record write fsyncs; keep it off the loop like every other write here.
+            # Shielded: a second cancel (shutdown under a saturated default executor) would otherwise
+            # cancel the still-QUEUED to_thread job before it starts and the released record is never
+            # written (Prism ad88cba956ad). A started worker runs to completion either way.
+            await asyncio.shield(asyncio.to_thread(self.stop_lease))
 
 
 # ---------------------------------------------------------------------------

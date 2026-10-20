@@ -136,6 +136,13 @@ class ProviderProfile:
     # other providers (including an unregistered fallback) get ordinary details only.
     native_reasoning_details_type: str | None = None
 
+    # replays_reasoning_details: this OpenAI-wire route reads replayed
+    # ``reasoning_details`` (signed thinking) back into the upstream request, so the
+    # chat_completions transport keeps the field on the wire. A capability flag for
+    # routes ``_route_replays_reasoning_details`` cannot know by host, e.g. a loopback
+    # relay rendering Anthropic as OpenAI (claude-pool dual-wire, t_814ad411).
+    replays_reasoning_details: bool = False
+
     # supports_reasoning_effort: the chat-completions wire takes OpenAI's top-level
     # ``reasoning_effort`` field. Capability, not identity: the transport emits the
     # user's effort (clamped onto ``supported_reasoning_efforts(model)``, default the
@@ -281,6 +288,16 @@ class ProviderProfile:
         Default: ({}, {}).
         """
         return {}, {}
+
+    def build_anthropic_kwargs_extras(self, **context: Any) -> dict[str, Any]:
+        """Per-request additions for an ``anthropic_messages`` request (the Anthropic-wire
+        twin of :meth:`build_api_kwargs_extras`, which only the chat_completions transport
+        consults). ``context`` carries ``session_id`` and ``bridge_route_suffix``.
+
+        Recognised keys: ``metadata`` (merged into the request's ``metadata``) and
+        ``extra_headers`` (merged under any header already set). Default: ``{}``.
+        """
+        return {}
 
     def build_client_kwargs_extras(self, **context: Any) -> dict[str, Any]:
         """Provider-specific OpenAI client keyword arguments.

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 HARNESS_DIR = REPO / "tools" / "dev_probes" / "boomerang_v2_smoke"
 RUN_PY = HARNESS_DIR / "run.py"
 FIXTURES = HARNESS_DIR / "fixtures"
@@ -461,3 +461,129 @@ def test_step1_live_fault_against_fake_gateway(env, monkeypatch):
     assert calls[i_comment][calls[i_comment].index("comment") + 1] == fail_card
     assert i_complete < i_comment  # the fault lands after the dispatch, never before
     assert f"home session: re-delivered wake turn for {fail_card} | PASS |" in text
+
+
+
+
+# --- BV2_ACK_CMD: scripted operator for an isolated scratch gateway (t_b901c171) -----------------
+
+def _ack_ctx(tmp, ack_timeout=5.0):
+    ctx = run.Ctx.__new__(run.Ctx)
+    ctx.live = True
+    ctx.ack = tmp / "scripted.ack"
+    ctx.tick = 0.05
+    ctx.args = type("A", (), {"ack_timeout": ack_timeout})()
+    return ctx
+
+
+def test_ack_cmd_runs_the_action_and_appends_the_token(env, monkeypatch):
+    tmp = env["tmp"]
+    acker = tmp / "acker.sh"
+    acker.write_text(f"#!/bin/sh\necho \"$1\" >> {tmp / 'acted'}\nexit 0\n")
+    acker.chmod(acker.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("BV2_ACK_CMD", str(acker))
+    ctx = _ack_ctx(tmp)
+    rep = run.StepReport(2, "t", "live")
+    assert run.Ctx.wait_ack(ctx, rep, "fork_enabled=false", "flip it")
+    assert (tmp / "acted").read_text().strip() == "fork_enabled=false"      # the action ran
+    assert ctx.ack.read_text().splitlines() == ["fork_enabled=false"]       # the token was appended
+    assert [c.result for c in rep.checks] == [run.PASS]
+    assert any("scripted ack, exit 0" in c for c in rep.commands)
+
+
+def test_ack_cmd_nonzero_exit_is_a_fail_not_a_pass(env, monkeypatch):
+    tmp = env["tmp"]
+    acker = tmp / "acker.sh"
+    acker.write_text("#!/bin/sh\necho boom >&2\nexit 3\n")
+    acker.chmod(acker.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("BV2_ACK_CMD", str(acker))
+    ctx = _ack_ctx(tmp)
+    rep = run.StepReport(4, "t", "live")
+    assert run.Ctx.wait_ack(ctx, rep, "restart", "restart it") is None
+    assert not ctx.ack.exists()                                             # no token on failure
+    assert [c.result for c in rep.checks] == [run.FAIL]
+    assert "exit 3" in rep.checks[0].detail and "boom" in rep.checks[0].detail
+
+
+# --- Prism ae1cccf47944 (#2168 @1b5ae360): a failed fork-seat sync must not certify step 3 ---------
+
+def _step3_live_remote_seat(env, monkeypatch, sync_body):
+    """Live step 3 on remote seat sub-vps-9 (the finding's repro): the canary and one clean post-start
+    `sub: 9` record are already in the capture root; only `wirelog_sync` varies. Nothing real is
+    contacted: send_canary is faked and the sync command is a local script."""
+    tmp = env["tmp"]
+    wire = tmp / "wire" / "apx" / "today.jsonl"
+    wire.parent.mkdir(parents=True)
+    log = tmp / "gateway.log"
+    log.write_text("")
+    calls = tmp / "sync-calls"
+    plan = json.loads((FIXTURES / "plan.json").read_text())
+    if sync_body is None:
+        plan["commands"].pop("wirelog_sync", None)
+    else:
+        sync = tmp / "sync.sh"
+        # 1st call = the canary's seat (succeeds); 2nd call = the fork's seat (the variant under test)
+        sync.write_text(f"#!/bin/sh\necho x >> {calls}\n[ \"$(wc -l < {calls})\" -le 1 ] && exit 0\n{sync_body}\n")
+        sync.chmod(sync.stat().st_mode | stat.S_IEXEC)
+        plan["commands"]["wirelog_sync"] = [str(sync), "{sub}"]
+    plan_path = tmp / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    token = "bv2canaryfeedfacecafe"
+    hdrs = [["content-type", "application/json"], ["anthropic-version", "2023-06-01"]]
+
+    def fake_send(url, tok, model, timeout=120.0):
+        ts = run._dt.datetime.now(run._dt.timezone.utc).isoformat()
+        with open(wire, "a") as fh:
+            fh.write(json.dumps({"id": "canary", "sub": "9", "ts": ts, "req": {"headers": hdrs},
+                                 "lane_src": {"platform": tok}}) + "\n")
+            fh.write(json.dumps({"id": "unrelated-clean", "sub": "9", "ts": ts, "req": {"headers": hdrs}}) + "\n")
+        with open(log, "a") as fh:   # the fork turn is logged after the harness started reading
+            fh.write(run.time.strftime("%Y-%m-%d %H:%M:%S") + ",000 INFO tools.delegate_tool: "
+                     "boomerang.fork served_by=sub-vps-9 read_share=1\n")
+        return 200, "sub-vps-9", "ok"
+
+    monkeypatch.setattr(run, "send_canary", fake_send)
+    monkeypatch.setattr(run, "canary_token", lambda live, plan: token)
+    for k, v in {"BV2_PLAN": str(plan_path), "BV2_GATEWAY_LOG": str(log),
+                 "BV2_WIRELOG_DIR": str(tmp / "wire"), "BV2_HOME_SESSION": "sess-fake",
+                 "BV2_ORIGIN_CHAT": str(tmp / "chat.jsonl"), "BV2_SYNC_TIMEOUT": "1"}.items():
+        monkeypatch.setenv(k, v)
+    rc = run.main(["--step", "3", "--live", "--no-trigger", "--tick-seconds", "0.05",
+                   "--slack-seconds", "0", "--timeout", "3"])
+    return rc, env["evidence"].read_text()
+
+
+def test_step3_fork_seat_sync_ok_still_passes(env, monkeypatch):
+    rc, text = _step3_live_remote_seat(env, monkeypatch, "exit 0")
+    assert rc == 0, text
+    assert "fork seat `sub-vps-9` capture pulled after the fork turn | PASS |" in text
+
+
+@pytest.mark.parametrize("body,why", [("sleep 5", "exit 124"), ("exit 2", "exit 2")])
+def test_step3_failed_fork_seat_sync_is_not_pass(env, monkeypatch, body, why):
+    """A timed-out or failing pull may have dropped the fork request; unrelated clean `sub: 9`
+    traffic plus the canary must not add up to a PASS."""
+    rc, text = _step3_live_remote_seat(env, monkeypatch, body)
+    assert rc == 3, text                                   # INCOMPLETE, never PASS
+    assert "- verdict: **INCOMPLETE**" in text
+    assert "fork seat `sub-vps-9` capture pulled after the fork turn | INCOMPLETE |" in text
+    assert why in text
+
+
+def test_failed_notify_subscribe_aborts_not_passes():
+    """Same class, make_card: a subscription that exits non-zero means no wake is ever delivered,
+    so step 1's negative checks would pass vacuously; abort like set_auto_handle does."""
+    ctx = run.Ctx.__new__(run.Ctx)
+    ctx.live = True
+    ctx.board_ready = True
+    ctx.kanban_cmd = lambda rep, key, **v: (0, '{"id": "t_abc12345"}') if key == "create" else (
+        (1, "") if key == "notify_subscribe" else (0, ""))
+    rep = run.StepReport(1, "t", "live")
+    with pytest.raises(run.StepAbort, match="notify_subscribe failed for t_abc12345"):
+        run.Ctx.make_card(ctx, rep, "s1", "title")
+
+
+def test_step3_remote_fork_seat_without_sync_command_is_not_pass(env, monkeypatch):
+    rc, text = _step3_live_remote_seat(env, monkeypatch, None)
+    assert rc == 3, text
+    assert "no plan.commands.wirelog_sync for remote seat `sub-9`" in text

@@ -12333,6 +12333,14 @@ def _task_has_live_run(
     return False
 
 
+def _remote_spellings_overlap(a: str, b: str) -> bool:
+    """Lexical overlap of two REMOTE-host paths: equal, or one inside the other (a nested
+    workspace belongs to its ancestor too). Remote ownership is lexical on purpose: the
+    Studio's inode identity says nothing about another host's filesystem."""
+    a, b = os.path.normpath(a), os.path.normpath(b)
+    return a == b or a.startswith(b + os.sep) or b.startswith(a + os.sep)
+
+
 def safe_remove_workspace_dir(
     path: Path,
     *,
@@ -12380,16 +12388,10 @@ def safe_remove_workspace_dir(
             _audit_workspace_deletion(Path(path), task_id=task_id, reason=reason, allowed=False,
                                       detail='active-children-need-handoff remote=' + remote_host.name)
             return False
-        # Remote lexical ownership: never consult the Studio's inode identity.
-        target = os.path.normpath(str(path))
         for owner in conn.execute('SELECT id,workspace_path,workspace_of FROM tasks '
                                   'WHERE workspace_path IS NOT NULL'):
-            stored = os.path.normpath(owner['workspace_path'])
-            # Overlap in either direction: equal, inside the target, or
-            # containing it (a nested workspace belongs to its ancestor too).
             # A --workspace-of reader never co-owns (R-1); only a live one refuses.
-            if owner['id'] != task_id and (stored == target or stored.startswith(target + os.sep)
-                                           or target.startswith(stored + os.sep)) and (
+            if owner['id'] != task_id and _remote_spellings_overlap(owner['workspace_path'], str(path)) and (
                     not owner['workspace_of'] or _task_has_live_run(conn, owner['id'])):
                 return False
         from hermes_cli.kanban_survivor import remove_workspace_dir
@@ -14419,7 +14421,8 @@ def reopen_task(
         return False, "a reason is required to reverse a terminal state"
 
     row = conn.execute(
-        "SELECT status, result FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, result, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -14428,6 +14431,14 @@ def reopen_task(
             f"task {task_id} is {row['status']!r}; reopen only applies to "
             f"'done' tasks (use unblock/promote for other states)"
         )
+    # complete_task removed the scratch tree. Left on the card, the dead path is
+    # refused next tick as stranded_by_mount_loss and pages #alerts (t_b259e24e).
+    # Only when its parent dir exists: an absent parent may be an unmounted volume.
+    dead_scratch = None
+    if (row["workspace_kind"] or "scratch") == "scratch" and row["workspace_path"]:
+        wp = Path(row["workspace_path"]).expanduser()
+        if not os.path.lexists(wp) and wp.parent.is_dir():
+            dead_scratch = row["workspace_path"]
 
     # ``review`` (t_36d0114e): a card closed ``done`` while its PR is still
     # OPEN goes back to the review lane -- owned by kanban.review_assignee --
@@ -14444,6 +14455,17 @@ def reopen_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} changed state concurrently; retry"
+        if dead_scratch is not None:
+            conn.execute(
+                "UPDATE tasks SET workspace_path = NULL WHERE id = ? AND workspace_path = ?",
+                (task_id, dead_scratch),
+            )
+            _append_event(conn, task_id, "workspace_reset", {
+                "actor": actor,
+                "reason": "reopen: scratch workspace removed at completion",
+                "previous_path": dead_scratch,
+                "survivor_baseline": _reset_survivor_baseline(conn, task_id),
+            })
         run_id = conn.execute(
             "SELECT id FROM task_runs WHERE task_id = ? AND outcome IN " + _SUCCESS_RUN_OUTCOMES_SQL + " "
             "ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC LIMIT 1",
@@ -15595,6 +15617,29 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
                 return _workspace_admission_refused(
                     conn, task_id, result, board=board, dry_run=dry_run,
                 )
+        # ``stranded_by_mount_loss`` is only reached after ``validate_mount``
+        # passed: the mount is present, the card's dir is not. When no worker
+        # has spawned since the card's last completion, kanban itself reaped
+        # that dir (any done -> ready/review path: reopen, dashboard drag), so
+        # re-mint without a page. Other dir-missing cases stay fail-closed.
+        if (
+            not dry_run
+            and reason.startswith("stranded_by_mount_loss:")
+            and task.status in ("ready", "review")
+            and _reaped_after_completion(conn, task_id)
+        ):
+            with write_txn(conn):
+                released = _release_reaped_scratch_binding(
+                    conn, task_id, actor="dispatcher", reason="reaped_after_completion",
+                )
+            if released:
+                _log.warning(
+                    "kanban dispatch: workspace re-minted task=%s (dir reaped at "
+                    "completion, mount present: %s)", task_id, reason,
+                )
+                return _workspace_admission_refused(
+                    conn, task_id, result, board=board, dry_run=dry_run,
+                )
         if (
             not dry_run
             and reason.startswith("stranded_by_mount_loss:")
@@ -15662,6 +15707,55 @@ def _workspace_admission_refused(conn, task_id, result, *, board, dry_run):
 _WORKSPACE_RESET_STATUSES = frozenset(
     {"triage", "todo", "scheduled", "ready", "blocked", "review"}
 )
+
+
+def _release_reaped_scratch_binding(conn, task_id: str, *, actor: str, reason: str) -> bool:
+    """Clear a done/archived card's scratch ``workspace_path`` when the tree is gone.
+
+    Completion (and archive) reaps a scratch workspace but keeps the path on
+    the row. A card returned to the queue would then be refused every tick as
+    ``stranded_by_mount_loss`` although the mount is fine (t_391fe8d8). Only
+    an ABSENT scratch path is cleared: a tree kept by child retention still
+    holds handoff artifacts and stays bound. Caller holds the write txn.
+    """
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
+    if (
+        row is None
+        or (row["workspace_kind"] or "scratch") != "scratch"
+        or not row["workspace_path"]
+        or os.path.lexists(Path(row["workspace_path"]).expanduser())
+    ):
+        return False
+    conn.execute(
+        "UPDATE tasks SET workspace_path = NULL WHERE id = ? AND workspace_path = ?",
+        (task_id, row["workspace_path"]),
+    )
+    baseline = _reset_survivor_baseline(conn, task_id)
+    _append_event(conn, task_id, "workspace_reset", {
+        "actor": actor,
+        "reason": f"{reason}: scratch workspace reaped at completion",
+        "previous_path": row["workspace_path"],
+        "survivor_baseline": baseline,
+    })
+    return True
+
+
+def _reaped_after_completion(conn, task_id: str) -> bool:
+    """True when no worker has spawned since the card's last completion.
+
+    ``complete_task`` reaps the scratch tree after survivor preservation, so a
+    missing dir in that state is kanban's own cleanup, never lost work.
+    """
+    row = conn.execute(
+        "SELECT MAX(CASE WHEN kind='completed' THEN id END), "
+        "       MAX(CASE WHEN kind='spawned' THEN id END) "
+        "FROM task_events WHERE task_id=? AND kind IN ('completed', 'spawned')",
+        (task_id,),
+    ).fetchone()
+    completed, spawned = row[0], row[1]
+    return completed is not None and (spawned is None or completed > spawned)
 
 
 def _unstrand_evidence(conn, task_id: str) -> Optional[str]:
@@ -19632,7 +19726,7 @@ def _reevaluate_pr_gates_for_tick(
             "continuing this tick",
             type(exc).__name__, exc,
         )
-WORKER_CPU_PRIORITY_DEFAULT = "background"
+WORKER_CPU_PRIORITY_DEFAULT = "normal"
 WORKER_BACKGROUND_NICE = 19
 
 
@@ -19641,8 +19735,16 @@ def worker_cpu_priority_config(
 ) -> "tuple[str, int]":
     """Return ``(mode, nice_value)`` for dispatcher-spawned worker gateways.
 
-    ``background`` (the default) runs each worker at ``nice 19`` so batch
-    worker load can never outbid a RESIDENT gateway on the same host for CPU.
+    ``normal`` (the default since 2026-10-19, Ace 21:52: "Kanban workers,
+    Prism, FleetReview, CI ... can run on all cores and all computers") leaves
+    the worker at the dispatcher's own priority: no nice, no macOS QoS clamp.
+    The dev pipeline is first-class; the lever against a slow gateway is
+    ADMISSION (``dispatch_load_gate``), never priority. Gateways stay
+    ``ProcessType=Interactive`` and still win ties. Fleet rule: skill
+    ``dev-pipeline-scheduling-priority``.
+
+    ``background`` (opt-in, for a host the operator names) runs each worker at
+    ``nice 19`` so batch worker load can never outbid a RESIDENT gateway.
     Because niceness is inherited across ``fork``/``exec``, deprioritising the
     worker gateway deprioritises everything it later spawns — its terminal-tool
     children included, which is the seam the 2026-09-20 incident escaped
@@ -19650,10 +19752,8 @@ def worker_cpu_priority_config(
     cores and starved the resident gateway's event loop into two watchdog
     hard-exits).
 
-    ``normal`` opts out and leaves the child at the dispatcher's own priority.
-    An unrecognised value falls back to ``background``: this knob guards
-    interactive responsiveness, so a typo must fail SAFE (still niced), never
-    silently re-arm the incident.
+    An unrecognised value falls back to the default (``normal``): a typo must
+    never silently demote the dev pipeline (the ruling is "unsure goes up").
     """
     if kanban_cfg is None:
         try:
@@ -19668,7 +19768,9 @@ def worker_cpu_priority_config(
         return ("normal", 0)
     if mode == "idle":
         return ("idle", WORKER_BACKGROUND_NICE)
-    return ("background", WORKER_BACKGROUND_NICE)
+    if mode == "background":
+        return ("background", WORKER_BACKGROUND_NICE)
+    return ("normal", 0)
 
 # macOS: nice(2) only reorders threads INSIDE one scheduling class. Darwin's
 # real levers are the task QoS clamp and the darwin-BG flag, which also set
@@ -19684,6 +19786,9 @@ def worker_cpu_priority_config(
 # "background" = utility clamp: batch work sits strictly below an
 # Interactive gateway without collapsing worker throughput. "idle" = darwin
 # BG for hosts where the gateway must win at any cost to worker speed.
+# Both are OPT-IN since 2026-10-19 (default "normal" = no prefix): measured
+# that day, a 1 ms wake at Utility costs p95 30 ms under Studio load vs
+# 0.5 ms at Default, and every worker tool call pays it.
 WORKER_DARWIN_TASKPOLICY = "/usr/sbin/taskpolicy"
 _WORKER_DARWIN_POLICY_ARGS = {
     "background": ("-c", "utility"),

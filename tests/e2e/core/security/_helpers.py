@@ -73,6 +73,10 @@ def hermetic_env(home: Path, extra: dict[str, str] | None = None) -> dict[str, s
         # this HOME is the test's own tmp dir (asserted above).
         HERMES_STATE_DB_GUARD_BYPASS="1",
         HERMES_ACCEPT_HOOKS="1",
+        # tests/conftest.py sets this for the suite; the HERMES_ strip above drops it, and the child
+        # then lazy-installs tirith (and pm's managed Python, ~600 MB) into the tmp home, which
+        # collect() then reads whole.
+        HERMES_DISABLE_LAZY_INSTALLS="1",
     )
     env.update(extra or {})
     return env

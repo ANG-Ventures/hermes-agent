@@ -1168,6 +1168,10 @@ def _single_status(result: Dict[str, Any]) -> str:
     return status
 
 
+def _envelope_status(result: Dict[str, Any]) -> str:
+    return _batch_status(result) if "results" in result else _single_status(result)
+
+
 def _dispatch(**kwargs) -> Dict[str, Any]:
     from hermes_cli.backend_retirement import retirement
 
@@ -1201,7 +1205,9 @@ def _dispatch_admitted(
     back to a synchronous run."""
     is_batch = goals is not None
     label = " batch" if is_batch else ""
-    classify = _batch_status if is_batch else _single_status
+    # A batch result without ``results`` is an envelope (a detached child's infrastructure error):
+    # its own top-level status decides, exactly as adoption classifies it (_adopt_detached).
+    classify = _envelope_status if is_batch else _single_status
     crash_result = _batch_crash if is_batch else _single_crash
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -1245,6 +1251,7 @@ def _dispatch_admitted(
                     "error": "Durable async delegation registry unavailable; run synchronously.",
                 }
             record["attempt_id"] = durable["attempt"]["attempt_id"]
+            record["owner_boot_id"] = current_boot_id or ""
             record["registry_profile_home"] = str(profile_home)
         _records[delegation_id] = record
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
@@ -1434,9 +1441,11 @@ def _handed_off_ids() -> List[str]:
                 if r.get("detached_handed_off") and r.get("attempt_id")]
 
 
-def _install_detached_supervision(delegation_id: str, pid: Any, create_time: Any, job_dir: Path) -> bool:
+def _install_detached_supervision(delegation_id: str, pid: Any, create_time: Any, job_dir: Path, *,
+                                  started: bool = True) -> bool:
     """Point the live record's cancel + liveness at the child process and arm the stale monitor.
-    False when shutdown already began for this record (it stays a plain recoverable unit)."""
+    False when shutdown already began for this record (it stays a plain recoverable unit).
+    ``started=False`` (adoption): the stall clock arms when the supervisor thread actually runs."""
     from tools import delegate_detached as dd
 
     with _records_lock:
@@ -1446,9 +1455,16 @@ def _install_detached_supervision(delegation_id: str, pid: Any, create_time: Any
         rec.update(
             interrupt_fn=lambda: dd.terminate_group(pid, create_time),
             progress_fn=dd.heartbeat_progress_fn(lambda: job_dir),
-            detached_unit=True, _started=True, _progress_token=None, _progress_ts=time.time())
+            detached_unit=True, _started=started, _progress_token=None, _progress_ts=time.time())
     _ensure_stale_monitor()
     return True
+
+
+def _owner_boot_id(delegation_id: str) -> str:
+    """The boot that dispatched THIS process's live record (its durable owner unless adopted away)."""
+    with _records_lock:
+        rec = _records.get(delegation_id) or {}
+    return str(rec.get("owner_boot_id") or current_boot_id())
 
 
 def _handed_off_check(delegation_id: str) -> Callable[[], bool]:
@@ -1460,6 +1476,24 @@ def _handed_off_check(delegation_id: str) -> Callable[[], bool]:
         with _records_lock:
             return mine is None or bool(mine.get("detached_handed_off")) or _records.get(delegation_id) is not mine
     return _check
+
+
+_STAND_DOWN_RETRY_DELAYS = (0.2, 0.5, 1.0)
+
+
+def _fence_stand_down(delegation_id: str, attempt_id: str, profile_home: Optional[Path]) -> Optional[bool]:
+    """``_store.stand_down_detached`` retried with a short backoff; None when the outcome stays unknown
+    (a registry error says nothing about whether another boot already adopted the attempt)."""
+    for delay in (*_STAND_DOWN_RETRY_DELAYS, None):
+        try:
+            return _store.stand_down_detached(
+                delegation_id, attempt_id, _owner_boot_id(delegation_id), profile_home=profile_home)
+        except Exception:
+            logger.warning("async_delegation_detached_stand_down_failed delegation_id=%s",
+                           delegation_id, exc_info=True)
+        if delay is not None:
+            time.sleep(delay)
+    return None
 
 
 def _run_detached_unit(
@@ -1509,6 +1543,24 @@ def _run_detached_unit(
     if not advertised:
         # Cancelled, superseded or shutting down between persist and spawn: the child must not run on,
         # and its job dir must not look adoptable (a shutdown re-dispatches the unit on the next boot).
+        # Fence it first: an overlapping boot that already adopted this attempt owns the child now.
+        stand_down = _fence_stand_down(delegation_id, attempt_id, profile_home)
+        if stand_down is None:
+            # Unknown: another boot may own the child. Never kill on an unknown; leave the child and its
+            # job dir to the next boot's adoption pass (adopts it, or kills it if cancelled/age-capped).
+            logger.warning("async_delegation_detached_stand_down_unknown delegation_id=%s pid=%s: "
+                           "leaving the child for the next boot", delegation_id, spawned.pid)
+            dd.mark_stand_down_unknown(spawned.job_dir)
+            with _records_lock:
+                rec = _records.get(delegation_id)
+                if rec is not None:  # frees the slot; the durable record is the next boot's to decide
+                    rec.update(detached_handed_off=True, interrupt_fn=None, progress_fn=None,
+                               status="interrupted", completed_at=time.time())
+            raise dd.HandedOff(str(spawned.job_dir))
+        if not stand_down:
+            logger.info("async_delegation_detached_adopted_elsewhere delegation_id=%s pid=%s",
+                        delegation_id, spawned.pid)
+            raise dd.HandedOff(str(spawned.job_dir))
         dd.terminate_group(spawned.pid, spawned.create_time)
         try:
             spawned.popen.wait(timeout=dd.SIGKILL_GRACE_SECONDS + 5)
@@ -1540,7 +1592,7 @@ def _cleanup_detached_job(delegation_id: str, job_dir: Path, profile_home: Optio
 
 
 def _adopt_detached(
-    durable: Dict[str, Any], profile_home: Path, executor: ThreadPoolExecutor,
+    durable: Dict[str, Any], profile_home: Path, max_async_children: int,
 ) -> None:
     """Register + supervise one adopted detached unit (same live record shape as the dispatcher's)."""
     from tools import delegate_detached as dd
@@ -1563,17 +1615,25 @@ def _adopt_detached(
             "dispatched_at": durable.get("created_at"), "completed_at": None,
             "is_batch": source.get("kind") == "batch" or len(goals) > 1, "attempt_id": attempt_id,
             "registry_profile_home": str(profile_home), "slot_key": delegation_id,
+            "owner_boot_id": (durable.get("attempt") or {}).get("owner_boot_id"),
             "_context": contextvars.copy_context()}
-    _install_detached_supervision(delegation_id, pid, create_time, job_dir)
+        # The pool is process-wide (every served profile): size it by every live unit, not this profile's.
+        live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
+    _install_detached_supervision(delegation_id, pid, create_time, job_dir, started=False)
     abort = _handed_off_check(delegation_id)
+    executor = _get_executor(max(max_async_children, live_units))
 
     def _supervise() -> None:
         result: Dict[str, Any] = {}
         status = "error"
         handed_off = False
+        with _records_lock:
+            rec = _records.get(delegation_id)
+            if rec is not None:
+                rec.update(_started=True, _progress_ts=time.time())  # a queued supervisor is not stalled
         try:
             result = dd.wait_for_result(job_dir, pid, create_time, abort=abort)
-            status = _batch_status(result) if "results" in result else _single_status(result)
+            status = _envelope_status(result)
         except dd.HandedOff:
             handed_off = True  # handed to the next boot at shutdown; it adopts and finalizes
         except Exception as exc:  # noqa: BLE001
@@ -1944,13 +2004,15 @@ def recover_async_delegations(
     # through to claim_recoveries below as a normal re-dispatch.
     adopted, kill = _store.claim_detached_adoptions(
         current_boot_id=current_boot_id, profile_home=profile_home, owner_alive=is_boot_id_alive,
-        probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for)
+        probe=dd.probe_job, identity=dd.job_identity, job_dir_for=dd.job_dir_for,
+        stand_down_unknown=dd.stand_down_unknown_dirs)
     for ident in kill:
-        dd.terminate_group(ident.get("pid"), ident.get("create_time"))
-    if adopted:
-        adopt_executor = _get_executor(max(max_async_children, len(adopted)))
-        for durable in adopted:
-            _adopt_detached(durable, profile_home, adopt_executor)
+        if ident.get("pid") is not None:
+            dd.terminate_group(ident.get("pid"), ident.get("create_time"))
+        if ident.get("remove_job_dir"):
+            dd.remove_job_dir(Path(ident["job_dir"]))
+    for durable in adopted:
+        _adopt_detached(durable, profile_home, max_async_children)
     claimed, summary = _store.claim_recoveries(
         current_boot_id=current_boot_id,
         resume_enabled=resume_enabled,
@@ -2013,6 +2075,7 @@ def recover_async_delegations(
             "interrupt_fn": interrupt_fn,
             "is_batch": source.get("kind") == "batch" or len(goals) > 1,
             "attempt_id": attempt_id,
+            "owner_boot_id": current_boot_id,
             "registry_profile_home": str(
                 profile_home or _registry_path().parent.parent
             ),

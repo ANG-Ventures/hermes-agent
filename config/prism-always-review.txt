@@ -6,3 +6,11 @@ hermes_cli/kanban_pr_freshness.py
 hermes_cli/kanban_*.py
 tools/skill_manager_tool.py
 tools/terminal_tool.py
+# t_ac6a8055 (2026-10-20): #2135 landed over 20 open P1s on delegation process-kill/adoption paths. Delegation and
+# the process-supervision code (process registry, gateway supervised restart, local runtime supervisor):
+tools/delegate*.py
+tools/async_delegation*.py
+tools/process_registry*.py
+tools/mcp_death_supervisor.py
+hermes_cli/gateway_supervised_restart.py
+hermes_cli/local_runtime/supervisor.py
