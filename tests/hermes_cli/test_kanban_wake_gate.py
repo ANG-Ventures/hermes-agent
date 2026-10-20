@@ -235,6 +235,16 @@ def test_raising_cpu_sampler_does_not_refresh_the_baseline_age(tmp_path):
     assert g.downgrade_reason(None, now=400) is None
 
 
+def test_max_interval_below_sample_cadence_still_trips(tmp_path):
+    """Prism 6360f05606ba: cpu_max_interval < sample_seconds must not disable the CPU axis."""
+    cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "cpu_pause": 0.90},
+                      "wake_load_gate": {"cpu_max_interval": 1}}}
+    g = _gate(Load(1), tmp_path, cfg=cfg, cpu=CpuDelta(0.95))
+    assert g.cpu_max_interval >= 2 * g.sample_seconds
+    results = [g.downgrade_reason(None, now=t) for t in range(1000, 1046)]
+    assert any(r and r.startswith("host cpu 95%") for r in results)
+
+
 def test_cpu_max_interval_is_configurable(tmp_path):
     cfg = {"kanban": {"dispatch_load_gate": {"pause_above": 32, "cpu_pause": 0.90},
                       "wake_load_gate": {"cpu_max_interval": 30}}}

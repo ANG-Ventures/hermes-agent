@@ -122,6 +122,11 @@ class WakeGate:
             self.sample_seconds = max(0.0, float(cfg["sample_seconds"]))
         except (TypeError, ValueError):
             self.sample_seconds = DEFAULT_SAMPLE_SECONDS
+        # A baseline is only refreshed once per sample_seconds, so a max interval
+        # shorter than that (plus a poll's slack) expires EVERY baseline before the
+        # next sample can use it and the CPU axis never trips (Prism 6360f05606ba).
+        # Floor it at twice the sampling cadence.
+        self.cpu_max_interval = max(self.cpu_max_interval, 2.0 * self.sample_seconds)
         self._gate = LoadGate(
             {
                 "enabled": self.host_gate,
