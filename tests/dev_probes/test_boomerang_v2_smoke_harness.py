@@ -267,8 +267,11 @@ def test_step3_unrelated_seat_traffic_is_not_coverage(env, monkeypatch):
 
 def test_seat_aliases_normalize():
     assert run._norm_seat(0) == run._norm_seat("local") == run._norm_seat("sub-0") == "local"
-    assert run._norm_seat("sub-vps-7") == "sub-vps-7" and run._norm_seat(5) == "sub-5"
+    assert run._norm_seat("sub-vps-7") == run._norm_seat("sub-7") == run._norm_seat(7) == "sub-7"
+    assert run._norm_seat(5) == "sub-5" and run._norm_seat("sub-vps-5") != run._norm_seat("sub-vps-7")
     assert run._rec_seat({"sub": 0}) == "local" and run._rec_seat({}) is None
+    # live shape: relay record `sub: "16"` belongs to the seat the log names `sub-vps-16`
+    assert run._rec_seat({"sub": "16", "host": "sub-vps-16"}) == run._norm_seat("sub-vps-16")
 
 
 def test_failed_forcing_transition_aborts_not_passes(env, monkeypatch):
