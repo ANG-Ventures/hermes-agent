@@ -1,11 +1,13 @@
 """placement -- ONE placement scorer: balance by measured HEADROOM and reservations, never by rank.
 
-VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole for the utilization wiring, t_da6f84f7, and its
-flip prerequisites, t_39a267cb; sha256 40091fa0577302e00cc67ab1660fb41970155a940055099524a756ef29d2d38e; first vendored @ 2fe117cbcb,
-hermes-home#4462) for the kanban dispatcher (t_d6ce856e) and its alloc_client route (t_4187c8f1): the fork may not
-import hermes-home code. The ONLY local changes are ``fleet_root()`` plus ``encoding="utf-8"`` on two ``open()`` calls
-(the fork's PLW1514 lint); ``tests/hermes_cli/test_kanban_headroom_placement.py`` checks the rest against the canonical
-file. ``hermes_cli/admission.py`` is the same bytes as hermes-home ``scripts/lib/admission.py``.
+VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole @ d74c191170 = hermes-home#5688 for the ONE
+work estimator, t_9e395789 / t_82e15796; sha256 54c757ebc03bc739cf4872af5ae6bf1376b89fa49950e26ac6b2ac085bd933b8; earlier
+re-vendors t_da6f84f7, t_39a267cb; first vendored @ 2fe117cbcb, hermes-home#4462) for the kanban dispatcher (t_d6ce856e)
+and its alloc_client route (t_4187c8f1): the fork may not import hermes-home code. The ONLY local changes are
+``fleet_root()`` plus ``encoding="utf-8"`` on two ``open()`` calls (the fork's PLW1514 lint);
+``tests/hermes_cli/test_kanban_headroom_placement.py`` checks the rest against the canonical file.
+``hermes_cli/admission.py`` and ``hermes_cli/work_estimate.py`` are the same bytes as hermes-home
+``scripts/lib/admission.py`` / ``scripts/lib/work_estimate.py`` @ d74c191170.
 
 Card t_499e107f (Ace 2026-10-12 16:34: "ace ai doesn't need to be last pick, we just need load balancing
 instead"). PR #3925 made ace-ai the last pick for remote test-gate runs and the allocation handoff
@@ -92,9 +94,10 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional
 
 if __package__:                      # hermes_cli.placement (the fork's vendored copy) / lib.placement
-    from . import admission
+    from . import admission, work_estimate
 else:                                # scripts/lib on sys.path (every hermes-home caller)
     import admission
+    import work_estimate
 
 SCHEMA = 1
 TABLE_REL = Path("config") / "fleet-hosts.json"
@@ -105,12 +108,11 @@ ADMISSIONS_REL = Path("var") / "placement" / "admissions.jsonl"
 # ``kanban.admission: utilization|legacy`` (read per call, mtime-cached); absent / unreadable / anything else = legacy,
 # which is the pre-R2 path byte for byte. utilization = admission.admit() over the pushed sample + measured estimates.
 CONFIG_REL = Path("config.yaml")
-CLASS_USAGE_REL = Path("var") / "placement" / "class-usage.jsonl"
+CLASS_USAGE_REL = work_estimate.CLASS_USAGE_REL
 ADMISSION_MODES = ("legacy", "utilization")
-CLASS_USAGE_WINDOW_S = 14 * 86400.0
-# consumer -> the measured job class its estimate is keyed on (a Job.job_class overrides, e.g. kanban-worker-pytest-heavy)
-CONSUMER_CLASS = {"kanban": "kanban-worker-llm-wait", "athena": "kanban-worker-llm-wait", "test-gate": "test-gate-run",
-                  "prism": "prism-seat", "ci": "ci-suite-shard"}
+CLASS_USAGE_WINDOW_S = work_estimate.CLASS_USAGE_WINDOW_S
+# consumer -> the measured job class: owned by work_estimate (the ONE estimator, t_9e395789); re-exported for callers
+CONSUMER_CLASS = work_estimate.CONSUMER_CLASS
 RANK_KEYS = frozenset({"prio", "ladder", "order", "rank", "last", "last_pick", "preference", "preferred"})
 DEFAULT_SATURATE_TO = 1.0   # the default-first host is "comfortable" while load <= saturate_to x physical cores
 DEFAULT_STALE_AFTER_S = 60.0
@@ -284,6 +286,41 @@ class HostTable:
         return Footprint(**{k: float(v) for k, v in vals.items()})
 
 
+COORDINATION_HOST = "_fleet"   # allocd /lease fence rows (prism-portable R-4): zero need, never a work admission
+MAX_CEILING = 64     # prism-portable R-2 (t_24b005e5): the router's MAX_SLOTS_CEILING; an eligible row without a ceiling
+
+
+def _eligible_errors(hid, c, cv) -> List[str]:
+    """``consumers.<c>`` = {eligible: bool, ceiling: 1..64 optional} XOR the legacy ``slots`` (prism-portable R-1);
+    ``source`` lives only in the top-level ``consumers_<c>`` block, never in a host row (Q5(b))."""
+    errs = []
+    if "source" in cv:
+        errs.append(f"hosts.{hid}.consumers.{c}.source: the source switch is top-level consumers_{c}.source only")
+    if "eligible" in cv and "slots" in cv:
+        errs.append(f"hosts.{hid}.consumers.{c}: eligible and slots are exclusive (one key per row)")
+    if "eligible" in cv and not isinstance(cv["eligible"], bool):
+        errs.append(f"hosts.{hid}.consumers.{c}.eligible must be true|false")
+    if "ceiling" in cv:
+        cl = cv["ceiling"]
+        if "eligible" not in cv:
+            errs.append(f"hosts.{hid}.consumers.{c}.ceiling needs eligible")
+        if not isinstance(cl, int) or isinstance(cl, bool) or not 1 <= cl <= MAX_CEILING:
+            errs.append(f"hosts.{hid}.consumers.{c}.ceiling must be an int 1..{MAX_CEILING}")
+    return errs
+
+
+def slot_cap(cv: Mapping) -> Optional[int]:
+    """The live-admission cap a consumer row means: ``slots`` as written; ``eligible: false`` = 0 (excluded);
+    ``eligible: true`` + ``ceiling`` = that ceiling; otherwise no cap (headroom alone)."""
+    if "slots" in cv:
+        return int(cv["slots"])
+    if cv.get("eligible") is False:
+        return 0
+    if cv.get("eligible") is True and "ceiling" in cv:
+        return int(cv["ceiling"])
+    return None
+
+
 def validate(doc) -> List[str]:
     if not isinstance(doc, dict):
         return ["top level must be an object"]
@@ -347,6 +384,8 @@ def validate(doc) -> List[str]:
                 if not isinstance(cv, dict) or ("slots" in cv and (not isinstance(cv["slots"], int)
                                                                    or isinstance(cv["slots"], bool) or cv["slots"] < 0)):
                     errs.append(f"hosts.{hid}.consumers.{c}.slots must be an int >= 0 when present (absent = no ceiling)")
+                    continue
+                errs.extend(_eligible_errors(hid, c, cv))
         al = h.get("aliases", [])
         if not isinstance(al, list) or not all(isinstance(a, str) and a for a in al):
             errs.append(f"hosts.{hid}.aliases must be a list of names")
@@ -360,6 +399,10 @@ def validate(doc) -> List[str]:
                 errs.append(f"hosts.{hid}: name {name!r} also names hosts.{owner[name]} (ids and aliases must be unique)")
             owner.setdefault(name, hid)
     df = doc.get("default_first")
+    cp = doc.get("consumers_prism")
+    if cp is not None and (not isinstance(cp, dict) or cp.get("source") not in ("fwa", "legacy")
+                           or set(k for k in cp if not k.startswith("_")) != {"source"}):
+        errs.append("consumers_prism must be {source: fwa|legacy} (prism-portable D-5)")
     if df is not None and (not isinstance(df, str) or df not in hosts):
         errs.append(f"default_first {df!r} must name one host in hosts")
     st = doc.get("saturate_to", DEFAULT_SATURATE_TO)
@@ -456,7 +499,10 @@ def _discovered(field: str, row: Mapping, h: Mapping):
 def host_facts(hid: str, h: Mapping, inv: Mapping) -> Dict[str, float]:
     """cores / threads / clock_mhz for one host: DISCOVERED first, the hand-typed table second (FWA R2a, Ace
     10-18 09:48). A discovered/table disagreement prints ONCE per process to stderr."""
-    row = next((inv[n] for n in [hid, *(h.get("aliases") or [])] if isinstance(inv.get(n), dict)), None)
+    rows = [inv[n] for n in [hid, *(h.get("aliases") or [])] if isinstance(inv.get(n), dict)]
+    # the NEWEST measured row wins (Prism P1 234ba6246f42): merged_inventory() keeps a stale canonical-id row
+    # beside a fresh alias row after a collector rename; canonical first on a tie or with no `at`
+    row = max(rows, key=lambda r: r["at"] if _num(r.get("at")) else float("-inf"), default=None)
     out = {}
     for field, _src in INVENTORY_FACTS:
         disc, typed = (_discovered(field, row, h) if row else None), h.get(field)
@@ -556,7 +602,7 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
         hosts[hid] = HostSpec(
             name=hid, cores=cores, threads=threads, mem_total_gb=float(h["mem_total_gb"]),
             mem_reserve_gb=float(h["mem_reserve_gb"]), cores_reserve=float(h["cores_reserve"]),
-            slots={c: int(v["slots"]) for c, v in h["consumers"].items() if "slots" in v},
+            slots={c: slot_cap(v) for c, v in h["consumers"].items() if slot_cap(v) is not None},
             aliases=tuple(h.get("aliases", [])), clock_mhz=float(f.get("clock_mhz", 0.0)),
             default_preference=str(h.get("default_preference", "normal")),
             unmeasurable_axes=tuple(h.get("unmeasurable_axes", [])),
@@ -1185,9 +1231,9 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     ``stale_after_s`` (default 60 s) re-checks every sample's age against ``now`` at decision time (Prism fda1ea43);
     pass None only when the caller has just produced the samples itself and vouches for their freshness.
     ``mode`` (default: config.yaml ``kanban.admission``, legacy when unset) "utilization" gates every host with
-    admission.admit(): the job's estimate is the p90 of its class on that host from ``history`` (default: the
-    class-usage ledger) with the declared footprint as the prior, and ``leases`` (default: the reservation ledger's
-    live rows) stand in for counts until the sample shows them.
+    admission.admit(): the job's estimate is work_estimate.estimate() for its class on that host (p75 of the last
+    runs in ``history``, default the class-usage ledger; the declared footprint is the seed), and ``leases``
+    (default: the reservation ledger's live rows) stand in for counts until the sample shows them.
     """
     stale_after_s = _stale_after(stale_after_s)
     fp = table.footprint(consumer, footprint if footprint is not None else (job.footprint if job else None),
@@ -1235,7 +1281,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
             continue
         seen.add(hid)
         if util:
-            need = admission.estimate(jclass, hid, hist, prior=need_of(fp))
+            need = work_estimate.estimate(jclass, hid, hist, seed=need_of(fp))
             rows.append(headroom(table.hosts[hid], folded.get(hid), fp, consumer=consumer,
                                  closed_when=table.closed_when, excluded=excl.get(hid), reserved=resv.get(hid),
                                  require_axes=require_axes, slots_used=used.get(hid, 0.0), now=now,
@@ -1387,10 +1433,10 @@ def class_usage_path(path=None) -> Path:
 
 
 def job_class_for(consumer: str, job: Optional["Job"] = None) -> str:
-    """The measured class a job's estimate is keyed on: Job.job_class, else the consumer's default class."""
-    if job is not None and job.job_class:
-        return str(job.job_class)
-    return CONSUMER_CLASS.get(consumer, consumer)
+    """The measured class a job's estimate is keyed on (work_estimate.job_class): Job.job_class, else the consumer's
+    class, per profile for a kanban-family job that names one."""
+    return work_estimate.job_class(consumer, explicit=job.job_class if job is not None else None,
+                                   profile=job.profile if job is not None else None)
 
 
 def held_leases(extra: Mapping[str, Footprint], table: Optional[HostTable] = None) -> List["admission.Lease"]:
@@ -1707,7 +1753,10 @@ def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample
         now = _now(now)
         if reuse_job and job_id is not None:
             for row in _read_ledger(p)["rows"]:
-                if _row_live(row, now) and row["consumer"] == consumer and row.get("job_id") == job_id:
+                # a coordination row (allocd /lease, host _fleet) is never work: a /admit whose job_id equals a fence
+                # holder must not get the fence back (Prism b6542bbfc43b on #5643)
+                if _row_live(row, now) and row["consumer"] == consumer and row.get("job_id") == job_id \
+                        and row["host"] != COORDINATION_HOST:
                     return Decision(row["host"], "", [], consumer, _row_footprint(row), rule="reuse"), row["id"]
         resv = live_reservations(p, now=now, table=table, cpu_seen_after_s=LOAD1_WINDOW_S)
         for k, v in extra_reserved.items():
