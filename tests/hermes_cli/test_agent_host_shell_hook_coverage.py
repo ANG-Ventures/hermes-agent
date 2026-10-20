@@ -45,6 +45,7 @@ AGENT_CONSTRUCTION_HOSTS: dict[str, str] = {
     "agent/curator.py": CHILD,
     "batch_runner.py": EXEMPT + ": standalone trajectory-generation runner, not a profile agent host",
     "cron/scheduler.py": CRON,
+    "gateway/kanban_auto_handle.py": GATEWAY + "; the auto-handle summary parent runs on the gateway's kanban ticker",
     "gateway/platforms/api_server.py": GATEWAY,
     "gateway/run.py": GATEWAY,
     "gateway/run_turn.py": GATEWAY,
@@ -57,6 +58,7 @@ AGENT_CONSTRUCTION_HOSTS: dict[str, str] = {
     "plugins/platforms/feishu/feishu_comment.py": GATEWAY,
     "run_agent.py": EXEMPT + ": `python run_agent.py` dev entrypoint",
     "tools/delegate_tool.py": CHILD,
+    "tools/dev_probes/boomerang_v2_p2_live.py": EXEMPT + ": operator-run dev probe against a scratch home, never imported",
     "tui_gateway/methods_prompt.py": TUI_GATEWAY + "; background agents reuse the session agent's home",
     "tui_gateway/server.py": TUI_GATEWAY,
 }
