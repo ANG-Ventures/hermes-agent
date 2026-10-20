@@ -429,8 +429,27 @@ def _apply_process_rlimit() -> str | None:
         return f"setrlimit(RLIMIT_AS) refused: {exc}"
     global _RLIMIT_AS_SAVED
     _RLIMIT_AS_SAVED = (soft, hard)
+    _cap_malloc_arenas()
     _exempt_browser_children()
     return None
+
+
+# glibc gives each new thread its own malloc arena (up to 8 x ncpu), and every arena RESERVES
+# 64 MiB of address space it may never touch. Under the AS cap that reservation, not memory use,
+# runs out first: on ACE-AI (32 cores) tests/e2e/core/tenancy/test_routing_truth_table.py failed
+# 13-18 of 19 with "can't start new thread" and passed 19/19 with MALLOC_ARENA_MAX=4 (t_ec8eb05d).
+# The env var is read only at malloc init, so set the same limit at runtime with mallopt.
+_M_ARENA_MAX = -8
+_ARENA_MAX = 4
+
+
+def _cap_malloc_arenas() -> None:
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None)
+        libc.mallopt(_M_ARENA_MAX, _ARENA_MAX)
+    except (OSError, AttributeError):  # not glibc (musl has no arenas to cap)
+        pass
 
 
 # A soft RLIMIT_AS is inherited across fork/exec. Chromium reserves far more address space
