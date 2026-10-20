@@ -2410,8 +2410,11 @@ class GatewayKanbanWatchersMixin:
                     # above the band auto-handle never ran (smoke 2026-10-19: load 55-75 for
                     # hours). Same rule as a human-owned wake (t_b7b31563): dispatcher
                     # proc_paused and a capped lane still downgrade. Only AUTO events use it.
+                    # Host contention alone (load1 band OR measured cpu busy, t_0e52c7ab #2114 made cpu
+                    # the default axis) never stops an auto-handle child; lane / proc_paused still do.
                     _ah_load_exempt = bool(
-                        d.get("auto") and wake_downgrade and str(wake_downgrade).startswith("host load")
+                        d.get("auto") and wake_downgrade
+                        and str(wake_downgrade).startswith(("host load", "host cpu"))
                     )
                     send_passive = mode != "wake"
                     # Worker handoff carried into the synthetic wake turn below

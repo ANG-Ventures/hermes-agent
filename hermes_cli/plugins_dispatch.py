@@ -223,6 +223,22 @@ def _hook_call_identity(kwargs: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+class HookInvocation:
+    """One ``invoke_hook`` call, visible to its callbacks through :data:`current_hook_invocation`.
+    ``callbacks`` are the ones this call will run (suppressed ones left out); ``shared`` is scratch
+    space for callbacks that pool work across the call (agent/shell_hooks_batch.py)."""
+    __slots__ = ("hook_name", "callbacks", "shared")
+
+    def __init__(self, hook_name: str, callbacks: List[Callable]) -> None:
+        self.hook_name = hook_name
+        self.callbacks = callbacks
+        self.shared: Dict[Any, Any] = {}
+
+
+current_hook_invocation: "contextvars.ContextVar[Optional[HookInvocation]]" = contextvars.ContextVar(
+    "hermes_current_hook_invocation", default=None)
+
+
 def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
     """Whether *hook_name* should run under the non-blocking timeout path."""
     if timeout <= 0 or hook_name in _HOOK_CALLER_THREAD_HOOKS:
@@ -275,7 +291,29 @@ class PluginDispatchMixin:
         results: List[Any] = []
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
-        for cb in self._hooks.get(hook_name, []):
+        callbacks = list(self._hooks.get(hook_name, []))
+        invocation = HookInvocation(
+            hook_name, [cb for cb in callbacks if not use_timeout or self._hook_callback_runnable(hook_name, cb)])
+        invocation_token = current_hook_invocation.set(invocation)
+        try:
+            return self._invoke_hook_callbacks(hook_name, callbacks, kwargs, results, timeout, use_timeout)
+        finally:
+            current_hook_invocation.reset(invocation_token)
+
+    def _hook_callback_runnable(self, hook_name: str, cb: Callable) -> bool:
+        """False when the bounded path would skip *cb* right now (post-timeout cooldown, or its
+        abandoned-worker cap); a cheap read, the gate itself is still the bounded runner."""
+        key = (hook_name, id(cb))
+        with self._hook_timeout_lock:
+            until = self._hook_timeout_suppressed_until.get(key)
+            if until is not None and until > time.monotonic():
+                return False
+            abandoned = self._hook_abandoned.get(key)
+            return not (abandoned and len(abandoned) >= _HOOK_MAX_ABANDONED_WORKERS)
+
+    def _invoke_hook_callbacks(self, hook_name: str, callbacks: List[Callable], kwargs: Dict[str, Any],
+                               results: List[Any], timeout: float, use_timeout: bool) -> List[Any]:
+        for cb in callbacks:
             fail_closed = _callback_fail_closed(cb, hook_name)
             try:
                 if use_timeout:
@@ -566,7 +604,16 @@ class PluginDispatchMixin:
         results: List[Any] = []
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
-        for cb in self._hooks.get(hook_name, []):
+        callbacks = list(self._hooks.get(hook_name, []))
+        invocation_token = current_hook_invocation.set(HookInvocation(hook_name, callbacks))
+        try:
+            return await self._ainvoke_hook_callbacks(hook_name, callbacks, kwargs, results, timeout, use_timeout)
+        finally:
+            current_hook_invocation.reset(invocation_token)
+
+    async def _ainvoke_hook_callbacks(self, hook_name: str, callbacks: List[Callable], kwargs: Dict[str, Any],
+                                      results: List[Any], timeout: float, use_timeout: bool) -> List[Any]:
+        for cb in callbacks:
             callback_name = _callback_label(cb)
             fail_closed = _callback_fail_closed(cb, hook_name)
             started_at = time.monotonic()
