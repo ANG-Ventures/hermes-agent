@@ -118,7 +118,7 @@ def test_draining_predecessor_entry_goes_after_it_exits(tmp_path, monkeypatch):
     assert status.read_runtime_status()["platforms"] == {}
 
 
-def test_gateway_startup_write_passes_the_flag():
+def test_gateway_startup_write_passes_the_flag():  # noqa: source-proxy fork canary: the fork kwarg on the upstream startup write deep in start(); drop_stale_platforms behaviour is exercised above
     import inspect
 
     from gateway import run_startup

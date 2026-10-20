@@ -448,7 +448,7 @@ def test_ac16_review_rows_never_routed_or_held(kanban_home, monkeypatch):
         assert spawned == [(rev, None)]
 
 
-def test_ac16_route_row_only_sees_ready_rows():
+def test_ac16_route_row_only_sees_ready_rows():  # noqa: source-proxy structural call-graph check over every _route_row call site (AC-16)
     """Call-graph check: every ``_route_row`` call in ``_dispatch_once_locked``
     iterates ``ready_rows``, which only ever holds ``status = 'ready'``."""
     src = textwrap.dedent(inspect.getsource(kbd._dispatch_once_locked))

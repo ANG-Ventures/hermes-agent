@@ -107,7 +107,7 @@ def test_corrupt_file_degrades_to_empty_and_is_rewritten(state):
     assert _disk(state) == ["a"]
 
 
-def test_discord_connect_reloads_the_registry():
+def test_discord_connect_reloads_the_registry():  # noqa: source-proxy ordering inside connect(), which needs a live Discord gateway; the reload itself is exercised in this file
     """connect() must re-read the registry before it starts serving (source contract)."""
     import inspect
 

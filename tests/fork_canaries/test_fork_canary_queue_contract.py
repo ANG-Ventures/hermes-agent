@@ -102,7 +102,7 @@ def test_verb_shape_is_exact(payload, kind):
     assert parse_queue_payload(payload).kind == kind
 
 
-def test_cli_and_gateway_share_the_one_parser():
+def test_cli_and_gateway_share_the_one_parser():  # noqa: source-proxy structural: one parser shared by both surfaces; the parsed behaviour is exercised by the R2 tests below
     # Red if cli_loops_mixin.py or queue_mgmt.classify stop calling parse_queue_payload.
     import inspect
 
