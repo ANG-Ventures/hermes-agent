@@ -1,12 +1,86 @@
 """Gate/plumbing scheduling must not wait for a self-hosted test slot."""
 
+import re
 from pathlib import Path
 
 import pytest
 import yaml
 
+from tests.test_ci_overflow_workflow_contract import evaluate
 
 WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+# The fork leaves CI_PLUMBING_RUNNER unset (hosted, as before). The private CI mirror
+# ANG-Ventures/hermes-agent-ci sets it to self-hosted labels: a private repo's hosted
+# minutes are billed, and the org's Actions budget is a $0 hard stop.
+PLUMBING = "CI_PLUMBING_RUNNER"
+MIRROR_LABELS = '["self-hosted","hermes-ci"]'
+HOSTED_LINUX = re.compile(r"^ubuntu-(latest|\d\d\.\d\d)$")
+# Jobs that need root (sudo apt-get) or a docker socket. The self-hosted pool has neither
+# (no-new-privileges, no socket), so the plumbing var must not move them there: they stay
+# literal hosted. On the private mirror GitHub refuses them (no hosted budget), which the
+# mirror reports as "not started", never as a green.
+NEEDS_ROOT_OR_DOCKER = {
+    ("docker-lint.yml", "hadolint"),          # hadolint-action is a container action
+    ("rust-tests.yml", "bootstrap-installer"),  # sudo apt-get webkit2gtk
+    ("js-tests.yml", "check"),                # sudo apt-get xvfb/gtk
+    ("js-tests.yml", "ui-tests"),             # sudo apt-get xvfb/gtk
+    ("e2e-desktop.yml", "e2e"),               # sudo apt-get gtk/nss/xvfb
+}
+_USES = re.compile(r"^\./\.github/workflows/([A-Za-z0-9._-]+\.ya?ml)$")
+
+
+def _resolve(runs_on, variables):
+    if isinstance(runs_on, str) and runs_on.strip().startswith("${{"):
+        return evaluate(runs_on, {"vars": variables}, {})
+    return runs_on
+
+
+def _ci_graph_jobs():
+    """(workflow, job_id, job) for every job reachable from ci.yaml through local `uses:`."""
+    seen, todo, out = set(), ["ci.yaml"], []
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for job_id, job in yaml.safe_load((WORKFLOWS / name).read_text())["jobs"].items():
+            m = _USES.match(job.get("uses", ""))
+            if m:
+                todo.append(m.group(1))
+            elif "runs-on" in job:
+                out.append((name, job_id, job))
+    assert "tests.yml" in seen and len(out) > 10, "ci.yaml graph discovery must not silently shrink"
+    return out
+
+
+def _plumbing_routed():
+    return [(w, j, job["runs-on"]) for w, j, job in _ci_graph_jobs()
+            if isinstance(job["runs-on"], str) and PLUMBING in job["runs-on"]]
+
+
+def test_ci_graph_has_no_literal_hosted_linux_runner():
+    # A literal hosted label cannot be moved off GitHub-hosted runners by any repo var, so the
+    # private mirror could not run it at all. Hosted-by-default jobs take the plumbing var.
+    literal = [(w, j) for w, j, job in _ci_graph_jobs()
+               if (w, j) not in NEEDS_ROOT_OR_DOCKER and any(isinstance(v, str) and HOSTED_LINUX.match(v)
+                      for v in (job["runs-on"] if isinstance(job["runs-on"], list) else [job["runs-on"]]))]
+    assert literal == []
+
+
+def test_root_or_docker_jobs_never_take_the_plumbing_var():
+    jobs = {(w, j): job["runs-on"] for w, j, job in _ci_graph_jobs()}
+    for key in NEEDS_ROOT_OR_DOCKER:
+        assert key in jobs, key
+        assert _resolve(jobs[key], {PLUMBING: MIRROR_LABELS}) == "ubuntu-latest", key
+
+
+@pytest.mark.parametrize("workflow,job_id,runs_on", _plumbing_routed(), ids=lambda v: str(v)[:40])
+def test_plumbing_routed_job_is_hosted_unless_the_var_is_set(workflow, job_id, runs_on):
+    assert HOSTED_LINUX.match(_resolve(runs_on, {})), (workflow, job_id)
+    assert _resolve(runs_on, {PLUMBING: ""}) == _resolve(runs_on, {})
+    assert _resolve(runs_on, {PLUMBING: MIRROR_LABELS}) == ["self-hosted", "hermes-ci"]
+    # Never the heavy-job pool var: a saturated CI_RUNNER_LABELS pool must not strand plumbing.
+    assert "CI_RUNNER_LABELS" not in runs_on
 
 
 @pytest.mark.parametrize(
@@ -22,10 +96,11 @@ WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
     ],
 )
 def test_plumbing_job_is_unconditionally_hosted(workflow, job_id):
-    # Assert the actual scheduling declaration, not a simulated default:
-    # CI_RUNNER_LABELS may point at a saturated self-hosted pool.
-    jobs = yaml.safe_load((WORKFLOWS / workflow).read_text())["jobs"]
-    assert jobs[job_id]["runs-on"] == "ubuntu-latest"
+    # Assert the actual scheduling declaration: CI_RUNNER_LABELS may point at a saturated
+    # self-hosted pool, so only the plumbing var (unset on the fork) may move these.
+    runs_on = yaml.safe_load((WORKFLOWS / workflow).read_text())["jobs"][job_id]["runs-on"]
+    assert _resolve(runs_on, {}) == "ubuntu-latest"
+    assert _resolve(runs_on, {"CI_RUNNER_LABELS": MIRROR_LABELS}) == "ubuntu-latest"
 
 
 def test_every_workflow_parses():

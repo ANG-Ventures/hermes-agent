@@ -50,7 +50,7 @@ jobs:
   generate:
     name: "Generate slices"
     # Local Python + GitHub cache only; start hosted overflow without the pool.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     outputs:
       # The static split (CI_RUNNER_LABELS + CI_SELF_HOSTED_SLOTS). Every
@@ -224,7 +224,7 @@ jobs:
     # Phase-2 static-routing switch: absent/invalid stays on the existing K/ARM
     # split until Apollo explicitly activates managed placement in Phase 4.
     if: github.event_name == 'merge_group' && vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     # A dead placement (checkout/runner failure, 5-min kill) must not fail the
     # required check: the static-split fallback still runs every slice. Only a
@@ -432,7 +432,7 @@ jobs:
     # every push:main run since #938 (last cache written 2026-09-24T15:30Z).
     if: "!cancelled() && needs.test.result == 'success' && github.ref == 'refs/heads/main'"
     # Artifact/cache plumbing needs no LAN or self-hosted test slot.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Download all slice durations
@@ -486,7 +486,7 @@ jobs:
   # (run_tests_parallel._noop_guard), so a missing PTB cannot read green.
   ptb-tests:
     name: Run tests (real PTB)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - name: Checkout code
@@ -628,7 +628,7 @@ jobs:
     # The run step still accepts a bare directory name, so a hand-dispatched
     # "git" shard keeps working. Skipping this job skips every shard with it.
     if: inputs.e2e_upgrade
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
@@ -845,7 +845,7 @@ jobs:
     name: Tests complete
     needs: [generate, placement, test, ptb-tests, e2e, e2e-upgrade-plan, e2e-upgrade]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       contents: read
