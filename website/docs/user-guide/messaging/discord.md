@@ -367,6 +367,7 @@ discord:
   reactions: true                 # Add emoji reactions during processing
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
+  thread_channels: []             # Channel IDs where every message gets its own thread (replies too)
   history_backfill: true          # Prepend recent channel scrollback on mention (default: true)
   history_backfill_limit: 50      # Max messages to scan backwards (default: 50)
   missed_message_backfill:        # Replay messages missed while disconnected (opt-in)
@@ -503,6 +504,18 @@ discord:
 ```
 
 Useful for channels dedicated to bot interaction where threads would add unnecessary noise.
+
+#### `discord.thread_channels`
+
+**Type:** string or list — **Default:** `[]`
+
+Channel IDs where every top-level message the bot answers gets its own thread, even when `auto_thread` is `false`, the channel is a free-response channel, or the message is a Discord reply. Use it for a channel that must stay free of conversation, such as a pages-only alerts channel: replying to a page there starts a thread off that page instead of a session that answers inline in the channel. `no_thread_channels` still wins, and voice-linked text channels still reply inline.
+
+```yaml
+discord:
+  thread_channels:
+    - 1234567890  # Sessions started here always live in a thread
+```
 
 #### `discord.channel_prompts`
 
