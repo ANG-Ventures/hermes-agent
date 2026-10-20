@@ -10,7 +10,7 @@ jobs:
   docs-site-checks:
     # Hosted by design: npm/node docs build, no LAN dependency.
     # Keeps a 17-slot pool slot free for a test slice.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
