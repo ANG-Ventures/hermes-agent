@@ -41,6 +41,7 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -509,14 +510,26 @@ def step1(ctx: Ctx) -> StepReport:
     arm_failure = bool(inject) or not ctx.live
     fail_card = (ctx.make_card(rep, "s1_failure", "bv2 smoke s1: forced child failure -> warning")
                  if arm_failure else "<no fault hook>")
+    if inject and "s1_fault_hold" in ctx.plan["commands"]:
+        ctx.force(rep, "s1_fault_hold", card=fail_card)  # keeps the child busy past the fault
 
     ctx.force(rep, "complete", card=done_card)
     ctx.force(rep, "block_needs_input", card=ni_card)
-    if inject:
-        ctx.force(rep, "inject_failure", card=fail_card)
-        ctx.force(rep, "complete", card=fail_card)
-
     win = ctx.timeout
+    fail_dispatch = None
+    if inject:
+        # AC-7 live fault (t_480d08ce): the home stays live and the DISPATCHED child's verdict is
+        # refused. A board write by another session after the claim (inject_failure = a kanban
+        # comment) makes the executor's freshness check (kanban_auto_handle._moved) return
+        # "state moved", so run_entry -> _fail posts the warning AND re-surfaces the wake into the
+        # live home. Rehoming the card (the old fault) only proved the warning half.
+        ctx.force(rep, "complete", card=fail_card)
+        fail_dispatch = ctx.poll(lambda: _auto_disp(find_log(log, re_notifier_line(fail_card)), fail_card), win)
+        rep.check(f"failure card {fail_card}: auto-handle child dispatched before the fault",
+                  PASS if fail_dispatch else FAIL, fail_dispatch or f"absent after {win:.0f}s")
+        if fail_dispatch:
+            ctx.force(rep, "inject_failure", card=fail_card)
+
     hit = ctx.poll(lambda: find_chat(chat, re_auto_handled_line(done_card)), win)
     rep.check(f"origin chat: `[auto-handled] {done_card} - <Outcome>`", PASS if hit else FAIL,
               hit.content if hit else f"absent after {win:.0f}s")
@@ -549,7 +562,39 @@ def step1(ctx: Ctx) -> StepReport:
                   warn.content if warn else f"absent after {win:.0f}s")
         if warn:
             rep.raw.append(f"--- chat match\n{warn.content}")
+        if inject:
+            _check_live_resurface(ctx, rep, log, chat, fail_card, warn, fail_dispatch)
     return rep
+
+
+def _check_live_resurface(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, card: str,
+                          warn: "ChatMessage | None", dispatched: str | None) -> None:
+    """INV-6 second half, live: the injected fault left the home live, so the original wake
+    must come back into the home session as a turn (not `no live home ...`)."""
+    expect = ctx.plan.get("expect", {})
+    reason_re = re.compile(expect.get("fault_reason_regex", r"state moved"))
+    reason = re_failed_line(card).search(warn.content).group("reason") if warn else None
+    rep.check(f"failure card {card}: warning reason is the injected fault (/{reason_re.pattern}/)",
+              PASS if reason and reason_re.search(reason) else FAIL, reason or "no warning line")
+    early = find_chat(chat, re_auto_handled_line(card))
+    if early:
+        rep.check(f"failure card {card}: fault landed before the verdict", INCOMPLETE,
+                  f"`{early.content}` posted: the child finished before inject_failure; re-run "
+                  f"(or set commands.s1_fault_hold)")
+        return
+    after = log_line_ts(dispatched) if (ctx.live and dispatched) else None
+    re_wake = re.compile(expect.get("resurface_wake_log_regex",
+                                    r"inbound message: .*msg=.\[kanban\] Task {card}\b").format(card=re.escape(card)))
+    # a positive expectation: a busy home queues the turn until its current turn ends (AC-11 row 2166658)
+    wake = ctx.poll(lambda: find_log(log, re_wake, after_ts=after), ctx.timeout)
+    rep.check(f"home session: re-delivered wake turn for {card}", PASS if wake else FAIL,
+              wake or f"no line matching /{re_wake.pattern}/")
+    if wake:
+        rep.raw.append(f"--- log match\n{wake}")
+    re_dead = re.compile(r"no live home for " + re.escape(card) + r"\b")
+    dead = find_log(log, re_dead, after_ts=after)
+    rep.check(f"home stayed live: no `no live home for {card}` line", FAIL if dead else PASS,
+              dead or "none")
 
 
 # --- step 2: AC-8 / INV-7 ------------------------------------------------------------------------
@@ -780,6 +825,84 @@ def _header_names(rec: dict) -> list[str]:
     return names
 
 
+# --- AC-9 positive control (Argus caveat 2, t_480d08ce) ------------------------------------------
+# Which hop passes an UNKNOWN `x-hermes-*` header? None does:
+#   - claude-pool relay: partition_headers forwards only _FORWARD_HEADERS (content-type,
+#     anthropic-version, anthropic-beta; claude_pool_relay.py:881, :1162) and http_send adds only
+#     the box-bound _CORRELATION_HEADERS x-hermes-route-id / x-hermes-lane-src (:897-899, :1322).
+#   - apx box: OUTBOUND_HEADER_ALLOWLIST drops every x-hermes-* (proxy.js:755-766, :9167-9175) and
+#     assertNoFleetHeaders re-strips the final wire set (proxy.js:951, :9986). The wirelog records
+#     `getHeaders()` of that outbound request (wirelog.js:1239), i.e. AFTER the strip.
+# So an `x-hermes-qa-canary` header can never reach a capture. The control therefore uses the one
+# caller-supplied x-hermes-* header the relay DOES carry to the box and the box DOES record:
+# `x-hermes-lane-src`, which apx parses into the record's top-level `lane_src` (proxy.js:906-915,
+# wirelog.js:1041). A nonce in `lane_src.platform` proves a fleet header reached the capture point
+# for that very request; its `req.headers` must still carry no x-hermes-* name.
+CANARY_LANE_SRC_HEADER = "x-hermes-lane-src"
+CANARY_HEADER = "x-hermes-qa-canary"   # sent too; expected dropped by the relay, never recorded
+CANARY_PREFIX = "bv2canary"
+
+
+def canary_token(live: bool, plan: dict) -> str:
+    if not live:
+        return str(plan.get("dry_run_canary") or f"{CANARY_PREFIX}000000000000")
+    import secrets  # noqa: PLC0415
+
+    return CANARY_PREFIX + secrets.token_hex(6)
+
+
+def _rec_canary(rec: dict) -> str | None:
+    lane = rec.get("lane_src")
+    plat = lane.get("platform") if isinstance(lane, dict) else None
+    return str(plat) if isinstance(plat, str) and plat.startswith(CANARY_PREFIX) else None
+
+
+def send_canary(url: str, token: str, model: str, timeout: float = 120.0) -> tuple[int, str | None, str]:
+    """One minimal Messages request through the relay. Returns (status, served_by, detail)."""
+    body = json.dumps({"model": model, "max_tokens": 1,
+                       "messages": [{"role": "user", "content": "Reply with: ok"}]}).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "content-type": "application/json", "anthropic-version": "2023-06-01",
+        CANARY_LANE_SRC_HEADER: f"platform={token};delegate_depth=0;aux_task=-",
+        CANARY_HEADER: token, "user-agent": "bv2-smoke-canary"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.headers.get("x-pool-served-by"), "ok"
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers.get("x-pool-served-by") if exc.headers else None, str(exc)
+    except (OSError, ValueError) as exc:
+        return 0, None, f"{type(exc).__name__}: {exc}"
+
+
+def _canary_control(ctx: Ctx, rep: StepReport) -> str:
+    """Send the canary (live) and sync its seat; returns the token the scan must find."""
+    token = canary_token(ctx.live, ctx.plan)
+    url = os.environ.get("BV2_CANARY_URL") or ctx.plan.get("canary_url") or "http://127.0.0.1:18810/v1/messages"
+    model = ctx.plan.get("canary_model") or "claude-haiku-4-5"
+    shown = (f"$ POST {url}  {CANARY_LANE_SRC_HEADER}: platform={token};delegate_depth=0;aux_task=-  "
+             f"{CANARY_HEADER}: {token}  model={model} max_tokens=1")
+    if not ctx.live:
+        rep.commands.append(shown + "   # dry-run: not sent")
+        return token
+    status, served, detail = send_canary(url, token, model)
+    rep.commands.append(shown + f"   # HTTP {status} served_by={served}")
+    rep.raw.append(f"--- canary\nHTTP {status} served_by={served} {detail}")
+    seat = _norm_seat(served) if served else None
+    sync = ctx.plan.get("commands", {}).get("wirelog_sync")
+    m = re.fullmatch(r"sub-(\d+)", seat or "")
+    if sync and m:
+        time.sleep(ctx.slack)   # let the box flush the record before the pull
+        argv = [os.path.expanduser(a) for a in fill(sync, sub=m.group(1))]
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+        rep.commands.append("$ " + shlex.join(argv) + f"   # exit {proc.returncode}")
+        rep.raw.append(f"--- wirelog_sync (exit {proc.returncode})\n"
+                       + ((proc.stdout or "") + (proc.stderr or "")).strip()[-2000:])
+    elif seat and seat != "local":
+        rep.notes.append(f"canary served by `{seat}`: no plan.commands.wirelog_sync, so its record is only "
+                         f"visible after `wirelog-fleet.py sync --sub {seat[4:]}`")
+    return token
+
+
 def step3(ctx: Ctx) -> StepReport:
     rep = StepReport(3, "no x-hermes-* header upstream on a fork turn (AC-9, INV-8)", ctx.mode)
     t0 = now()
@@ -788,6 +911,7 @@ def step3(ctx: Ctx) -> StepReport:
     rep.notes.append(f"wire capture root `{root}` (relay-wire-forensics apx/bpx JSONL schema)")
     rep.commands.append(f"$ python3 ~/.hermes/scripts/wirelog-coverage-check.py   # confirm the serving "
                         f"lane is capturing before trusting a clean result")
+    canary = _canary_control(ctx, rep)
 
     if not ctx.args.no_trigger:
         card = ctx.make_card(rep, "s3_fork", "bv2 smoke s3: one fork turn for wire capture")
@@ -807,15 +931,28 @@ def step3(ctx: Ctx) -> StepReport:
     if ctx.live:
         time.sleep(max(0.0, t_end - now()))
     recs = []
+    canary_recs = []
     for rec in _iter_wire_records(root):
         ts = _rec_ts(rec)
         if ctx.live and (ts is None or ts < t0 - 1):
+            continue
+        if _rec_canary(rec) == canary:   # the control may be served by any seat
+            canary_recs.append(rec)
             continue
         # Prism 7555e6381e68: only records from the box that SERVED the fork count as coverage;
         # unrelated clean traffic from another seat must not stand in for the fork request.
         if seat and _rec_seat(rec) not in (None, _norm_seat(seat)):
             continue
         recs.append(rec)
+    # Positive control BEFORE the scan: without a seen canary, "0 leaks" may be blindness.
+    if canary_recs:
+        c = canary_recs[0]
+        rep.check(f"positive control: canary `{canary}` recorded (fleet header reached the capture)", PASS,
+                  f"{c.get('id', '?')} lane={c.get('lane')} sub={c.get('sub')} lane_src.platform={canary}")
+    else:
+        rep.check(f"positive control: canary `{canary}` recorded (fleet header reached the capture)",
+                  INCOMPLETE, f"no record under {root} with lane_src.platform={canary}: the capture's "
+                  f"view of x-hermes-* headers is unproven, so a clean scan is blind, not a PASS")
     if not recs:
         rep.check("wire records captured in the fork-turn window", INCOMPLETE,
                   f"0 records under {root} attributable to seat `{seat}`: no visibility is not a "
@@ -828,7 +965,7 @@ def step3(ctx: Ctx) -> StepReport:
         return rep
     rep.check("wire records captured in the fork-turn window", PASS, f"{len(recs)} record(s), seat `{seat}`")
     leaks = []
-    for rec in recs:
+    for rec in canary_recs + recs:   # the canary's upstream header set must be clean too
         bad = sorted({n for n in _header_names(rec) if n.lower().startswith(HERMES_HEADER_PREFIX)})
         if bad:
             leaks.append(f"{rec.get('id', '?')}: {', '.join(bad)}")
