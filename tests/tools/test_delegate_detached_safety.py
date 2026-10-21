@@ -472,6 +472,49 @@ def test_the_detached_worker_never_writes_the_gateways_process_checkpoint(tmp_pa
     assert pr._checkpoint_path() != gateway_checkpoint
 
 
+# ── shell hooks: the child is its own process, so it arms them itself ──────
+def test_the_detached_child_arms_the_profiles_shell_hooks_before_building_the_parent(tmp_path, monkeypatch):
+    """Red without the _child_main registration: the gateway's per-home plugin manager is not
+    inherited by the child, so its children's tool calls ran with no pre_tool_call policy."""
+    import shlex
+
+    import hermes_yaml as yaml
+    from agent import shell_hooks
+    from hermes_cli import plugins
+
+    script = tmp_path / "guard.py"
+    script.write_text('import json\nprint(json.dumps({"decision":"block","reason":"detached-policy"}))\n')
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"hooks_auto_accept": True, "hooks": {"pre_tool_call": [
+        {"command": shlex.join([sys.executable, str(script)]), "matcher": "write_file", "fail_closed": True}]}}))
+    monkeypatch.delenv("HERMES_ACCEPT_HOOKS", raising=False)
+    import tools.process_registry as pr
+
+    monkeypatch.setattr(pr, "CHECKPOINT_PATH", pr.CHECKPOINT_PATH)  # _child_main repoints it
+    monkeypatch.setattr(dd.signal, "signal", lambda *_a: None)  # no SIGTERM handler left on the test process
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(dd, "HEARTBEAT_SECONDS", 3600.0)
+    monkeypatch.setattr("hermes_cli.mcp_startup._discover_mcp_tools_without_interactive_oauth", lambda: None)
+    plugins._reset_plugin_managers_for_tests()
+    shell_hooks.reset_for_tests()
+    seen = {}
+
+    def _build(*_a, **_k):
+        seen["block"] = plugins.get_pre_tool_call_block_message("write_file", {"path": "x", "content": "y"})
+        raise RuntimeError("stop after the parent would be built")
+
+    monkeypatch.setattr(dd, "build_parent_and_runner", _build)
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / "spec.json").write_text(json.dumps({"schema_version": dd.SCHEMA_VERSION, "record": {}}))
+    try:
+        assert dd._child_main(job_dir) == 0
+    finally:
+        plugins._reset_plugin_managers_for_tests()
+        shell_hooks.reset_for_tests()
+
+    assert seen["block"] == "detached-policy", "the detached child's tool calls would run with no shell-hook policy"
+
+
 # ── c5a334c727d0: Windows has no process-group cancel ──────────────────────
 @pytest.mark.platforms("windows")
 def test_windows_runs_detached_units_in_process(tmp_path):

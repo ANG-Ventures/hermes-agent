@@ -799,6 +799,13 @@ def _child_main(job_dir: Path) -> int:
             _discover_mcp_tools_without_interactive_oauth()
         except Exception:
             logger.debug("detached child MCP discovery failed", exc_info=True)
+        heartbeat.set_phase("hooks")
+        # A fresh process: the gateway's per-home plugin manager (and its config.yaml shell hooks)
+        # is not shared, so the reconstructed parent's children would run every tool call ungated.
+        from gateway.run_startup import GatewayStartupMixin
+
+        GatewayStartupMixin._register_config_hooks(
+            "shell-hook/webhook registration failed in detached delegation child", level=logging.WARNING)
         heartbeat.set_phase("agent")
         from hermes_cli.config import load_config
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider
