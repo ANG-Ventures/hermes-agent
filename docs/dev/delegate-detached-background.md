@@ -2,7 +2,7 @@
 
 Status: rev 4, built (t_eaabba56). Momus: pass-1 BLOCK, pass-2 BLOCK, pass-3 APPROVE-WITH-CHANGES; the pass-3
 RCs (RC-E hand-off fencing, RC-F fallback reclassification, RC-G protocol version) are folded below.
-Knob: `delegation.detached_background` (default `true`; `false` = today's threads, byte-identical path).
+Knob: `delegation.detached_background` (default `false` = threads, byte-identical path; t_414b4d92 replaces this mechanism).
 
 ## Problem
 

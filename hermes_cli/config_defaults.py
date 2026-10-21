@@ -1650,7 +1650,7 @@ DEFAULT_CONFIG = {
         "resume_on_restart": True,  # recover gateway background delegations after restart
         # Durable background units run in their own process and survive a gateway restart
         # (docs/dev/delegate-detached-background.md). false = in-gateway threads (kill switch).
-        "detached_background": True,
+        "detached_background": False,  # default OFF (Ace ruling option B, t_7ccdc21b); the replacement is t_414b4d92
         "surface_child_process_notifications": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of

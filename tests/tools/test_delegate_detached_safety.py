@@ -48,6 +48,27 @@ def _isolated(tmp_path, monkeypatch):
     _drain()
 
 
+def _detached_knob_on(home: Path) -> None:
+    """``delegation.detached_background: true`` in the test home's config.yaml, so this process AND any
+    subprocess spawned with the inherited HERMES_HOME see the cross-process file-state layer."""
+    cfg = home / "config.yaml"
+    cfg.write_text("delegation:\n  detached_background: true\n", encoding="utf-8")
+
+
+def _kill_if_same(pid: int, create_time) -> None:
+    """Test cleanup: SIGKILL ``pid`` only while it is still the process started at ``create_time``, so a
+    reaped-and-reused pid is never signalled (psutil re-checks the identity at kill time)."""
+    try:
+        import psutil
+
+        proc = psutil.Process(pid)
+        if create_time is None or abs(proc.create_time() - float(create_time)) >= 0.01:
+            return
+        proc.kill()
+    except Exception:  # noqa: BLE001 -- already gone (or inspection failed): nothing to clean up
+        pass
+
+
 def _idents(kill: list) -> list:
     """Kill entries reduced to the identity they signal (entries also carry their job_dir)."""
     return [{"pid": k.get("pid"), "create_time": k.get("create_time")} for k in kill]
@@ -402,7 +423,7 @@ def test_reconstructed_parent_runs_its_children_on_the_profiles_session_db(monke
 
     runner, _interrupt, parent = dd.build_parent_and_runner(
         _record("deleg_db", owner=DEAD_BOOT), None, {}, resolve_default=dict,
-        resolve_for_provider=lambda _p: {"provider": "test-provider"})
+        resolve_for_provider=lambda _p, **_kw: {"provider": "test-provider"})
     runner()
 
     assert seen["db"] is sentinel, "children built from this parent would run unpersisted"
@@ -526,7 +547,7 @@ def test_windows_runs_detached_units_in_process(tmp_path):
 
 
 # ── #2160 Prism round 1 (t_7ccdc21b) ───────────────────────────────────────
-def _background_spec_for(monkeypatch, tmp_path, _prefill=None, **call) -> dict:
+def _background_spec_for(monkeypatch, tmp_path, _prefill=None, _child_attrs=None, **call) -> dict:
     """Run delegate_task(background=True) in a routable gateway session up to the dispatch and return
     the durable spec it persisted (children are stand-ins; nothing runs)."""
     import types
@@ -538,8 +559,8 @@ def _background_spec_for(monkeypatch, tmp_path, _prefill=None, **call) -> dict:
     captured: dict = {}
     monkeypatch.setattr(gateway_status, "get_current_boot_id", lambda: "boot-a:1.0")
     monkeypatch.setattr(dt, "_build_child_preserving_parent_tools",
-                        lambda **kw: types.SimpleNamespace(_subagent_id=None, provider="p", model="m",
-                                                           prefill_messages=_prefill))
+                        lambda **kw: types.SimpleNamespace(**{"_subagent_id": None, "provider": "p", "model": "m",
+                                                              "prefill_messages": _prefill, **(_child_attrs or {})}))
     monkeypatch.setattr(ad, "dispatch_async_delegation_batch",
                         lambda **kw: captured.update(kw) or {"status": "dispatched", "delegation_id": "d1"})
     parent = types.SimpleNamespace(model="m", provider="p", base_url=None, api_mode=None, session_id="parent-1",
@@ -701,6 +722,7 @@ def test_a_failed_orphan_is_rekilled_by_every_boot_until_it_is_dead(_isolated, t
 
 # 33b3f07f6558: one file's read-modify-write is serialized across processes
 def test_patch_locks_serialize_the_same_file_across_processes(tmp_path):
+    _detached_knob_on(tmp_path)
     target = tmp_path / "shared.txt"
     hold = tmp_path / "held"
     code = (
@@ -931,6 +953,7 @@ def test_an_exit_is_not_confirmed_while_a_tool_outlives_its_leader(_isolated, tm
         time.sleep(0.05)
     time.sleep(0.3)
     worker_pid = int(marker.read_text())
+    worker_ct = dd.process_create_time(worker_pid)
     leader_ct = dd.process_create_time(leader.pid)
     _Timer.created = []
     try:
@@ -948,15 +971,13 @@ def test_an_exit_is_not_confirmed_while_a_tool_outlives_its_leader(_isolated, tm
         _Timer.created[0].fn(*_Timer.created[0].args)  # the SIGKILL escalation fires
         assert dd.wait_for_exit(leader.pid, leader_ct, timeout=10) is True
     finally:
-        try:
-            os.kill(worker_pid, signal.SIGKILL)
-        except OSError:
-            pass
+        _kill_if_same(worker_pid, worker_ct)
 
 
 # the stale sibling-edit refusal holds across detached worker processes
 @pytest.mark.platforms("posix")  # detached workers are POSIX-only (Windows runs units in-process)
 def test_a_sibling_write_in_another_live_process_refuses_a_stale_edit(_isolated, tmp_path):
+    _detached_knob_on(tmp_path)
     from tools import file_state
 
     target = tmp_path / "shared.txt"
@@ -990,6 +1011,7 @@ def test_a_sibling_write_in_another_live_process_refuses_a_stale_edit(_isolated,
 # a84f9eaf7ff8 (P2): a filesystem without flock keeps the thread-lock behaviour
 @pytest.mark.platforms("posix")  # fcntl
 def test_lock_path_survives_a_filesystem_that_rejects_flock(_isolated, tmp_path, monkeypatch):
+    _detached_knob_on(tmp_path)
     import errno
 
     import fcntl
@@ -1062,6 +1084,7 @@ def test_a_plain_childs_prefill_is_persisted_into_the_detached_task(monkeypatch,
 # 3cebba6972e4: a task's writer-record cleanup runs under the cross-process path lock writers publish under
 @pytest.mark.platforms("posix")  # fcntl
 def test_forget_task_removes_its_writer_record_only_under_the_path_lock(tmp_path, monkeypatch):
+    _detached_knob_on(tmp_path)
     import fcntl
 
     from tools import file_state
@@ -1143,6 +1166,7 @@ def test_a_dead_leader_with_live_tools_is_neither_redispatched_nor_released(_iso
         time.sleep(0.05)
     time.sleep(0.3)
     tool_pid = int(marker.read_text())
+    tool_ct = dd.process_create_time(tool_pid)
     leader_ct = dd.process_create_time(leader.pid)
     record["detached"] = {"pid": leader.pid, "create_time": leader_ct, "job_dir": str(job_dir),
                           "attempt_id": record["attempt"]["attempt_id"], "spawned_at": time.time()}
@@ -1159,10 +1183,7 @@ def test_a_dead_leader_with_live_tools_is_neither_redispatched_nor_released(_iso
         assert [k["pid"] for k in kill] == [tool_pid], "the surviving tool was not scheduled for termination"
         assert _load("deleg_tools").get("detached"), "the attempt's fence was released"
     finally:
-        try:
-            os.kill(tool_pid, signal.SIGKILL)
-        except OSError:
-            pass
+        _kill_if_same(tool_pid, tool_ct)
 
 
 # a1d5038f5040 (P0, Prism at 52dfa7fc): a fenced attempt whose leader died with no members.json is
@@ -1210,10 +1231,7 @@ def test_a_fenced_attempt_with_an_uncaptured_live_tool_keeps_its_fence(_isolated
             "generation 1 was dispatched while generation 0's tool was still running")
         _wait_for_event("deleg_fz")
     finally:
-        try:
-            os.kill(tool_pid, signal.SIGKILL)
-        except OSError:
-            pass
+        _kill_if_same(tool_pid, tool_ct)
 
 
 # a1d5038f5040 (P0, Prism at 5fd0ac40): a cancelled attempt's dead leader left a tool in its group; a fresh
@@ -1256,7 +1274,104 @@ def test_a_cancelled_attempts_surviving_tool_is_killed_by_a_fresh_boot(_isolated
             time.sleep(0.05)
         assert dd.pid_state(tool_pid, tool_ct) is False, "the cancelled delegation's tool keeps running"
     finally:
-        try:
-            os.kill(tool_pid, signal.SIGKILL)
-        except OSError:
-            pass
+        _kill_if_same(tool_pid, tool_ct)
+
+
+# ── t_7ccdc21b option B: the P1s reachable with delegation.detached_background OFF ──
+# 3a5ef8faf345 / 3cebba6972e4 / 444d95518090: with the knob off, file edits are process-local exactly as
+# before the detached work: no install-wide lock file, no published writer, no foreign-writer refusal.
+@pytest.mark.platforms("posix")  # a sibling process
+def test_with_detached_background_off_file_state_stays_process_local(_isolated, tmp_path):
+    from tools import file_state
+
+    assert not (tmp_path / "config.yaml").exists(), "the default must be OFF"
+    target = tmp_path / "shared.txt"
+    target.write_text("v1")
+    reg = file_state.FileStateRegistry()
+    reg.record_read("me", str(target))
+    time.sleep(0.05)
+    done = tmp_path / "written"
+    code = (
+        "import sys,time,pathlib\n"
+        "from tools import file_state\n"
+        "p=sys.argv[1]; pathlib.Path(p).write_text('v2')\n"
+        "with file_state.lock_path(p):\n"
+        "    file_state.note_write('sibling', p)\n"
+        "    pathlib.Path(sys.argv[2]).write_text('1')\n"
+        "    time.sleep(60)\n")
+    env = {**os.environ, "PYTHONPATH": str(Path(dd.__file__).resolve().parent.parent)}
+    sibling = subprocess.Popen([sys.executable, "-c", code, str(target), str(done)], env=env)
+    _isolated.append(sibling)
+    deadline = time.time() + 20
+    while not done.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    assert done.exists()
+
+    assert reg.sibling_write_conflict("me", str(target)) is None, (
+        "another process's write refused this one with detached_background off")
+    started = time.monotonic()
+    with reg.lock_path(str(target)):
+        assert time.monotonic() - started < 2.0, "lock_path took a cross-process lock with the knob off"
+    assert not (tmp_path / "state" / "file-locks").exists(), "an install-wide lock dir was created"
+
+
+# e6da1be9848f: a recovery factory retained for a retry keeps ITS profile's delegation config
+def test_a_retained_recovery_factory_keeps_its_own_profiles_delegation_config(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.__dict__["config"] = SimpleNamespace(multiplex_profiles=True)
+    runner._current_boot_id = MagicMock(return_value="200:2.0")
+    homes = {"a": tmp_path / "a", "b": tmp_path / "b"}
+    cfgs = iter([{"delegation": {"api_key": "KEY-A"}}, {"delegation": {"api_key": "KEY-B"}}])
+    factories: dict = {}
+
+    def recover(**kw):
+        factories[str(kw["profile_home"])] = kw["runner_factory"]
+        return {"claimed": 0}
+
+    seen: list = []
+
+    def build(record, continuation, delegation_cfg, **_kw):
+        seen.append(delegation_cfg.get("api_key"))
+        return (lambda: {}), (lambda: None), None
+
+    with patch("hermes_cli.profiles.profiles_to_serve", return_value=list(homes.items())), \
+         patch("hermes_cli.config.load_config", side_effect=lambda: next(cfgs)), \
+         patch("tools.async_delegation.recover_async_delegations", side_effect=recover), \
+         patch("tools.async_delegation.enqueue_pending_outbox", return_value=0), \
+         patch("tools.delegate_detached.build_parent_and_runner", side_effect=build):
+        runner._recover_async_delegations_once()
+        factories[str(homes["a"])]({}, "continue")  # a retry timer for profile A, after the loop moved to B
+
+    assert seen == ["KEY-A"], "profile A's retained factory reconstructed with profile B's delegation config"
+
+
+# ef968436cb9d: reconstruction resolves the provider for the PERSISTED model, not the profile default
+def test_reconstruction_resolves_the_provider_for_the_persisted_model(monkeypatch):
+    import run_agent
+
+    seen: dict = {}
+
+    def resolve_for_provider(provider, target_model=None):
+        seen.update(provider=provider, target_model=target_model)
+        return {"provider": provider}
+
+    monkeypatch.setattr(run_agent, "AIAgent", lambda **kw: type("P", (), {"interrupt": lambda *a: None})())
+    monkeypatch.setattr("tools.delegate_tool.build_recovered_delegation_runner", lambda *a, **k: (lambda: {}))
+    record = {"execution": {"model": "claude-sonnet-4-6",
+                            "credential_ref": {"source": "provider", "provider": "opencode-zen"}}, "route": {}}
+    dd.build_parent_and_runner(record, None, {}, resolve_default=lambda: {},
+                               resolve_for_provider=resolve_for_provider)
+    assert seen == {"provider": "opencode-zen", "target_model": "claude-sonnet-4-6"}
+
+
+# 3e4a53f5c897: a named custom endpoint persists its endpoint-scoped identity, not the generic "custom"
+def test_a_named_custom_endpoint_persists_its_named_identity(monkeypatch, tmp_path):
+    spec = _background_spec_for(monkeypatch, tmp_path, tasks=[{"goal": "read the private doc"}],
+                                _child_attrs={"provider": "custom", "requested_provider": "custom:private-lab"})
+    assert spec["execution"]["credential_ref"]["provider"] == "custom:private-lab", (
+        "recovery would re-resolve the generic 'custom' (the profile default endpoint)")

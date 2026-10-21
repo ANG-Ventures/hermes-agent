@@ -479,7 +479,7 @@ class _Heartbeat:
 # ── reconstruction (shared with gateway restart recovery) ───────────────────
 def build_parent_and_runner(
     record: Dict[str, Any], continuation: Optional[str], delegation_cfg: Dict[str, Any], *,
-    resolve_default: Callable[[], dict], resolve_for_provider: Callable[[str], dict],
+    resolve_default: Callable[[], dict], resolve_for_provider: Callable[..., dict],
     source: str = "gateway_recovery",
 ):
     """Rebuild the parent AIAgent from a durable record and return ``(runner, interrupt_fn, parent)``.
@@ -525,7 +525,10 @@ def build_parent_and_runner(
         }
     else:
         requested_provider = credential_ref.get("provider") or execution.get("provider")
-        runtime = resolve_for_provider(str(requested_provider)) if requested_provider else resolve_default()
+        # The persisted model picks the transport on model-keyed providers (OpenCode Zen/Go: api_mode +
+        # URL shape); without it the resolver answers for the profile's default model instead.
+        runtime = (resolve_for_provider(str(requested_provider), target_model=execution.get("model") or None)
+                   if requested_provider else resolve_default())
     runtime = {k: v for k, v in runtime.items() if k != "_fallback_notice"}
     agent_kwargs = {
         **runtime,

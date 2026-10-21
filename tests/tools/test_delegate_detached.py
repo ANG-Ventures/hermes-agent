@@ -323,7 +323,7 @@ def test_reconstruction_prefers_the_dispatching_parents_toolsets(monkeypatch):
                                parent_disabled_toolsets=["kanban"])
 
     dd.build_parent_and_runner(record, None, {}, resolve_default=dict,
-                               resolve_for_provider=lambda _p: {"provider": "test-provider"})
+                               resolve_for_provider=lambda _p, **_kw: {"provider": "test-provider"})
 
     assert built["enabled_toolsets"] == ["file", "terminal", "delegation"]
     assert built["disabled_toolsets"] == ["kanban"]

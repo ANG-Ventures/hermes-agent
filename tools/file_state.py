@@ -64,11 +64,26 @@ def _evict_oldest(container, cap: int) -> None:
             break
 
 
+def _cross_process_enabled() -> bool:
+    """The cross-process layer (flock + published last writer) exists only for detached delegation
+    workers (``delegation.detached_background``). Off, every process keeps its pre-detached,
+    process-local behaviour: no flock, and another process's write never refuses this one's edit."""
+    try:
+        from tools.delegate_tool_config import _get_detached_background
+
+        return bool(_get_detached_background())
+    except Exception:
+        return False
+
+
 def _lock_file_for(resolved: str) -> Optional[Path]:
     """Lock file shared by every process of this install (all profiles, like the process-wide
-    registry): ``<hermes root>/state/file-locks/<sha256 of the path>``."""
+    registry): ``<hermes root>/state/file-locks/<sha256 of the path>``. None while the
+    cross-process layer is off."""
     import hashlib
 
+    if not _cross_process_enabled():
+        return None
     try:
         from hermes_constants import get_default_hermes_root
 
@@ -362,7 +377,7 @@ class FileStateRegistry:
             owned = [p for p, (writer_tid, _ts) in self._last_writer.items() if writer_tid == task_id]
             for p in owned:
                 del self._last_writer[p]
-        for p in owned:
+        for p in owned if _cross_process_enabled() else ():
             # Under the path lock writers publish under, so a sibling's record published between the
             # ownership check and the unlink is never the one removed.
             with self.lock_path(p):

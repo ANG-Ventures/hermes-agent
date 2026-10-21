@@ -3603,6 +3603,12 @@ def _build_durable_background_spec(
 
     effective_agent = children[0] if children else parent_agent
     effective_provider = creds.get("provider") or getattr(effective_agent, "provider", None)
+    # A named custom endpoint resolves to the generic "custom"; its endpoint-scoped identity
+    # (``custom:<name>``) is ``requested_provider``. Recovery re-resolves by this name, so the
+    # generic one would land the unit on the profile's default endpoint.
+    _requested = getattr(effective_agent, "requested_provider", None)
+    named_provider = (_requested if not creds.get("provider") and effective_provider == _RUNTIME_PROVIDER_CUSTOM
+                      and isinstance(_requested, str) and _requested.startswith("custom:") else effective_provider)
     if cfg.get("base_url"):
         credential_ref = {
             "source": "delegation_config",
@@ -3614,7 +3620,7 @@ def _build_durable_background_spec(
     else:
         credential_ref = {
             "source": "provider",
-            "provider": cfg.get("provider") or effective_provider,
+            "provider": cfg.get("provider") or named_provider,
             "custom_provider": getattr(effective_agent, "custom_provider", None),
             # The children inherited the parent's route (no delegation.provider/base_url pin): on
             # reconstruction they must inherit it again, routing filters included, not become a pin.
