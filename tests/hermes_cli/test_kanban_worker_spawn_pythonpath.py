@@ -11,6 +11,7 @@ never reached any worker: 25/25 post-cutover handoffs routed to review/human,
 """
 
 import os
+import pathlib
 import subprocess
 import sys
 
@@ -102,3 +103,31 @@ def test_worker_interpreter_does_not_import_the_pinned_release(spawn_env):
     )
     assert out.returncode == 0, out.stderr[-2000:]
     assert str(decoy) not in out.stdout, out.stdout
+
+
+def test_worker_argv_keeps_workspace_off_its_own_sys_path(tmp_path):
+    """A helper in the task workspace named like a package (attr.py) must not
+    be imported by the worker; a tool subprocess still sees its script dir."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    (tmp_path / "attr.py").write_text("raise SystemExit('workspace attr.py imported')\n")
+    argv = kbd._module_hermes_argv()
+    assert argv[1] == "-P"
+    probe = subprocess.run(
+        [argv[0], "-P", "-c", "import attr; print(attr.__file__)"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60,
+    )
+    assert "workspace attr.py" not in probe.stderr + probe.stdout
+    boot = subprocess.run(
+        argv + ["--help"], cwd=tmp_path, capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PYTHONPATH": str(pathlib.Path(kbd.__file__).resolve().parents[1])},
+    )
+    assert "workspace attr.py" not in boot.stderr + boot.stdout
+    assert boot.returncode == 0, boot.stderr[-1500:]
+
+    # negative: plain tool subprocess (no -P) still imports siblings of its script
+    (tmp_path / "sib.py").write_text("X = 1\n")
+    (tmp_path / "tool.py").write_text("import sib; print(sib.X)\n")
+    tool = subprocess.run([sys.executable, str(tmp_path / "tool.py")], cwd="/",
+                          capture_output=True, text=True, timeout=60)
+    assert tool.stdout.strip() == "1", tool.stderr

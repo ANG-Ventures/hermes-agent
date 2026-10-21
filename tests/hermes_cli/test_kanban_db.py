@@ -3415,7 +3415,7 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    assert kbd._resolve_hermes_argv() == [sys.executable, "-P", "-m", "hermes_cli.main"]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
@@ -3423,7 +3423,7 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
 
 
 
-def test_resolve_hermes_argv_module_actually_runs():
+def test_resolve_hermes_argv_module_actually_runs(tmp_path):
     """The fallback module name must be importable + runnable.
 
     A unit test that pins the literal string is necessary but not
@@ -3441,7 +3441,14 @@ def test_resolve_hermes_argv_module_actually_runs():
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
             argv = kbd._resolve_hermes_argv()
-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
+    # -P drops cwd from sys.path, so boot it the way the dispatcher does: import
+    # root propagated into env, cwd = a task workspace (never the repo).
+    env = dict(os.environ)
+    kbd._propagate_module_import_root(argv, env)
+    r = subprocess.run(
+        argv + ["--version"], capture_output=True, text=True, timeout=30,
+        env=env, cwd=tmp_path,
+    )
     assert r.returncode == 0, (
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
@@ -3491,7 +3498,7 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
         claim_expires=None, tenant=None, branch_name=None,
     )
 
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-P", "-m", "hermes_cli.main"])
     kbd._default_spawn(task, str(tmp_path / "ws"))
     assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
 
