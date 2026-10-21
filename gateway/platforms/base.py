@@ -3085,6 +3085,26 @@ class BasePlatformAdapter(ABC):
         before handling un-mentioned replies)."""
         self._session_store = session_store
 
+    def mark_platform_message_held(self, message_id: Any) -> None:
+        """Record a platform message id the gateway already HOLDS for delivery
+        (a restart follow-up replayed from the spool, a ``/queue`` item restored
+        to the held store). Such a message is not yet in the session transcript,
+        so a reconnect backfill sweep that uses the transcript as its dedup
+        authority would read it as "absent" and re-inject it: one ``/queue``
+        straddling a restart became two queue entries (2026-10-20 23:57).
+        Adapters consult :meth:`platform_message_is_held` before recovering."""
+        mid = str(message_id or "").strip()
+        if not mid:
+            return
+        held = getattr(self, "_held_platform_message_ids", None)
+        if held is None:
+            held = self._held_platform_message_ids = set()
+        held.add(mid)
+
+    def platform_message_is_held(self, message_id: Any) -> bool:
+        held = getattr(self, "_held_platform_message_ids", None)
+        return bool(held) and str(message_id or "").strip() in held
+
     def set_owner_profile(self, profile_name: Optional[str]) -> None:
         """Declare the owning multiplex profile (secondary profiles only); read by
         :meth:`_session_key_profile` so adapter-level keys leave ``agent:main:``."""

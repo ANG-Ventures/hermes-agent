@@ -1301,6 +1301,13 @@ class GatewayAdapterLifecycleMixin:
         adapter.set_message_handler(message_handler or self._primary_message_handler())
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
+        # Follow-ups replayed from the restart spool before this adapter existed: hand the held
+        # platform message ids over so the reconnect backfill skips them (see _note_held_platform_message).
+        for mid in (getattr(self, "_held_platform_message_ids", None) or {}).get(
+            getattr(adapter, "platform", None), ()
+        ):
+            with suppress(Exception):
+                adapter.mark_platform_message_held(mid)
         adapter.set_busy_session_handler(busy_session_handler or self._primary_busy_session_handler())
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
