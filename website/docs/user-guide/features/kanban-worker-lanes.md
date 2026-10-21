@@ -36,7 +36,6 @@ For Hermes profile lanes, the dispatcher's `_default_spawn` runs `hermes -p <ass
 |---|---|
 | `HERMES_KANBAN_TASK` | the task id the worker is operating on |
 | `HERMES_KANBAN_DB` | absolute path to the per-board SQLite file |
-| `HERMES_KANBAN_BOARD` | board slug |
 | `HERMES_KANBAN_WORKSPACES_ROOT` | root of the board's workspace tree |
 | `HERMES_KANBAN_WORKSPACE` | absolute path to *this* task's workspace |
 | `HERMES_KANBAN_RUN_ID` | the current run's id (for the lifecycle gate) |
@@ -141,3 +140,4 @@ So lane authors don't have to reimplement these:
 - [Kanban overview](./kanban) — the user-facing intro.
 - [Kanban tutorial](./kanban-tutorial) — walkthrough with the dashboard open.
 - [`KANBAN_GUIDANCE`](https://github.com/NousResearch/hermes-agent/blob/main/agent/prompt_builder.py) — the worker + orchestrator lifecycle injected into every kanban worker's system prompt.
+
