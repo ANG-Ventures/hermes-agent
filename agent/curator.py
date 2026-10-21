@@ -287,10 +287,14 @@ def _read_harness_manifests() -> "tuple[Set[str], List[str]]":
     mdir: Any = None
     try:
         mdir = _manifest_dir()
-        if not mdir.exists():
-            return names, unreadable
         import yaml
-        files = sorted(mdir.glob("*.yaml"))
+        # os.listdir, not Path.exists()/glob(): those swallow PermissionError and report an unlistable dir as
+        # empty/absent, which would drop every protection silently. Only a genuinely missing dir is "no manifests".
+        try:
+            entries = os.listdir(mdir)
+        except FileNotFoundError:
+            return names, unreadable
+        files = sorted(mdir / n for n in entries if n.endswith(".yaml"))
     except Exception as e:
         logger.debug("Curator could not list harness manifests: %s", e, exc_info=True)
         return names, [str(mdir or "skills-harness-manifests")]

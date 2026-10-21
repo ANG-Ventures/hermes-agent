@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -438,6 +439,35 @@ def test_unreadable_manifest_fails_closed_no_archive_this_tick(curator_env, monk
     assert any("claude-code.yaml" in r.getMessage() and "skipping archive" in r.getMessage()
                for r in caplog.records)
     assert c._read_harness_manifests()[1] == [str(broken)]
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root bypasses dir permissions")
+def test_unlistable_manifest_dir_fails_closed_no_archive(curator_env, monkeypatch):
+    """Prism 9b16c88f5b60: Path.glob() returns [] on a mode-000 dir (no exception), which made protection
+    empty AND unflagged. An unlistable manifest dir must be reported unreadable and archive nothing."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    for name in ("listed-in-manifest", "orphan"):
+        _write_skill(skills_dir, name)
+        _backdate(u, name, 200)
+    _write_harness_manifests(curator_env["home"])
+    mdir = curator_env["home"] / "skills-harness-manifests"
+    monkeypatch.setattr(c, "_cron_referenced_skills", lambda: set())
+    mode = mdir.stat().st_mode
+    os.chmod(mdir, 0o000)
+    try:
+        names, unreadable = c._read_harness_manifests()
+        assert unreadable == [str(mdir)]
+        counts = c.apply_automatic_transitions()
+    finally:
+        os.chmod(mdir, mode)
+
+    usage = u.load_usage()
+    assert counts["archived"] == 0
+    assert usage["listed-in-manifest"]["state"] != u.STATE_ARCHIVED
+    assert usage["orphan"]["state"] != u.STATE_ARCHIVED
+    assert (skills_dir / "listed-in-manifest").is_dir()
 
 
 def test_background_writes_to_manifest_listed_skill_are_refused(curator_env, monkeypatch):
