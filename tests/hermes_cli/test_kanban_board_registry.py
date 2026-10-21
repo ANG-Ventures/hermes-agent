@@ -75,7 +75,7 @@ def test_registry_imports_first_in_a_fresh_interpreter():
     proc = subprocess.run(
         [sys.executable, "-c", "from hermes_cli import kanban_db_board_registry as r; "
                                "print(r.PINNED_SLUG)"],
-        cwd=repo, capture_output=True, text=True, timeout=120,
+        cwd=repo, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "override"
