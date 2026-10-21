@@ -15,7 +15,13 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from hermes_cli import kanban_db as _kb  # noqa: E402  (facade imports this module at its tail)
+
+def _facade():
+    # Late: the facade imports this module at its tail, so a module-level import would be
+    # circular whichever of the two is imported first.
+    from hermes_cli import kanban_db
+
+    return kanban_db
 
 _log = logging.getLogger(__name__)
 
@@ -51,6 +57,7 @@ class KanbanBoardUnreadable(KanbanBoardDerivationError):
 
 def raw_db_pin() -> str:
     """The ``HERMES_KANBAN_DB`` pin as set; ``""`` when absent or sandboxed. Never raises."""
+    _kb = _facade()
     return _kb._kanban_path_override("HERMES_KANBAN_DB").strip()
 
 
@@ -61,6 +68,7 @@ def board_db_layout() -> list[tuple[str, Path]]:
     ``kanban_home()`` resolution costs ~4 ms a board at the live count (S7 RC-2). A dir named for
     a slug IS that board's dir; aliases redirect retired names, which have no dir.
     """
+    _kb = _facade()
     home = _kb.kanban_home()
     out: list[tuple[str, Path]] = [(_kb.DEFAULT_BOARD, home / "kanban.db")]
     root = home / "kanban" / "boards"
@@ -79,6 +87,7 @@ def board_db_layout() -> list[tuple[str, Path]]:
 
 
 def _board_archived(board_path: Path, slug: str) -> bool:
+    _kb = _facade()
     if slug == _kb.DEFAULT_BOARD:
         return False
     try:
@@ -113,6 +122,7 @@ def board_named_by_pin(raw: str) -> str:
     case-variant spelling of a board's DB names that board. Memoised on (pin, root, boards/
     mtime): a new board dir changes the mtime, so a process pays one scan per pin.
     """
+    _kb = _facade()
     try:
         root = _kb.boards_root()
         try:
@@ -157,9 +167,10 @@ def board_of_task(task_id: str) -> str:
     Never guesses (S7 D3, GT6): zero hits -> :class:`KanbanCardNotFound`; two or more ->
     :class:`KanbanCardAmbiguous` (archived hits marked); any unreadable board ->
     :class:`KanbanBoardUnreadable` (fail closed: the card might be on it). A board dir with no
-    ``kanban.db`` holds no cards. Each probe is ``connect_readonly`` (``mode=ro``, no init, no
+    ``kanban.db`` holds no cards. Each probe is a ``mode=ro`` open (no init, no
     migration, no mkdir) on the board's layout path.
     """
+    _kb = _facade()
     tid = str(task_id or "").strip()
     if not tid:
         raise KanbanCardNotFound("kanban: a card id is required to derive its board.")
@@ -167,10 +178,14 @@ def board_of_task(task_id: str) -> str:
     with _kb.enumerating_boards():
         boards = board_db_layout()
         for slug, path in boards:
-            try:
-                conn = _kb.connect_readonly(db_path=path)
-            except FileNotFoundError:
+            if not path.exists():
                 continue
+            # One indexed SELECT per board on a ``mode=ro`` open (never creates, never migrates).
+            # A file without a ``tasks`` table (0-byte phantom, foreign sqlite) fails it with
+            # ``no such table``: the same not-a-board verdict as ``connect_readonly``'s
+            # ``assert_is_board_db``, without its second query per board (RC-2 cost).
+            try:
+                conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
             except Exception as exc:
                 raise _unreadable(slug, exc) from exc
             try:
@@ -192,6 +207,7 @@ def board_of_task(task_id: str) -> str:
 def locate(task_id: str) -> tuple[str, str]:
     """``(slug, db_path)`` for ``hermes kanban locate``. Under a pin: the pin's board and the pin
     itself (a pinned process addresses that DB whatever the card says; D2 step 2)."""
+    _kb = _facade()
     raw = raw_db_pin()
     if raw:
         return board_named_by_pin(raw), raw

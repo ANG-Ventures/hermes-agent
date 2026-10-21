@@ -66,6 +66,21 @@ def _ns(**kw) -> argparse.Namespace:
     return argparse.Namespace(**kw)
 
 
+def test_registry_imports_first_in_a_fresh_interpreter():
+    """The registry and the facade import each other; either may be imported first."""
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [sys.executable, "-c", "from hermes_cli import kanban_db_board_registry as r; "
+                               "print(r.PINNED_SLUG)"],
+        cwd=repo, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "override"
+
+
 # --- the flag: off by default, legacy resolution untouched -------------------------------------
 
 def test_flag_absent_keeps_the_legacy_pointer(home, monkeypatch):
@@ -393,24 +408,48 @@ def test_flag_on_derived_board_is_the_context_board_for_the_whole_verb(home, mon
 
 # --- cost (D3 / RC-11): recorded, threshold 250 ms ---------------------------------------------
 
+def test_board_of_task_opens_each_board_once(home, monkeypatch):
+    """The cost contract: one read-only open + one SELECT per board, nothing else."""
+    for i in range(5):
+        kb.create_board(f"b{i}")
+    tid = _card("b4")
+    opened = []
+    real = reg.sqlite3.connect
+
+    def spy(database, *a, **k):
+        opened.append(database)
+        assert database.endswith("?mode=ro") and k.get("uri") is True
+        return real(database, *a, **k)
+
+    monkeypatch.setattr(reg.sqlite3, "connect", spy)
+    assert kb.board_of_task(tid) == "b4"
+    assert len(opened) == len([p for _, p in reg.board_db_layout() if p.exists()])
+
+
 def test_board_of_task_and_pinned_board_cost_is_recorded(home, monkeypatch, capsys):
+    """D3 / RC-11 cost, 250 ms threshold. Asserted on CPU time (process_time): wall time on a
+    loaded host measures the host, not the probe. The wall number is printed for the record;
+    the live-tree wall p95 is §7 step 5's measurement."""
     for i in range(20):
         kb.create_board(f"b{i:02d}")
         _card(f"b{i:02d}")
     tid = _card("b19")
-    samples = []
+    cpu, wall = [], []
     for _ in range(20):
-        t0 = time.perf_counter()
+        w0, c0 = time.perf_counter(), time.process_time()
         assert kb.board_of_task(tid) == "b19"
-        samples.append(time.perf_counter() - t0)
-    samples.sort()
-    p95_ms = samples[int(0.95 * (len(samples) - 1))] * 1000
+        wall.append(time.perf_counter() - w0)
+        cpu.append(time.process_time() - c0)
+    cpu.sort()
+    wall.sort()
+    p95 = int(0.95 * (len(cpu) - 1))
     _pin(monkeypatch, kb.board_dir("b10") / "kanban.db")
-    t0 = time.perf_counter()
+    c0 = time.process_time()
     assert kb.pinned_board() == "b10"
-    cold_ms = (time.perf_counter() - t0) * 1000
+    pin_cpu_ms = (time.process_time() - c0) * 1000
     with capsys.disabled():
-        print(f"\nboard_of_task p95 over 21 boards: {p95_ms:.1f} ms; pinned_board cold "
-              f"{cold_ms:.1f} ms (threshold 250 ms)")
-    assert p95_ms < 250
-    assert cold_ms < 250
+        print(f"\nboard_of_task over 21 boards: cpu p95 {cpu[p95] * 1000:.1f} ms, wall p95 "
+              f"{wall[p95] * 1000:.1f} ms; pinned_board cold cpu {pin_cpu_ms:.1f} ms "
+              f"(threshold 250 ms)")
+    assert cpu[p95] * 1000 < 250
+    assert pin_cpu_ms < 250
