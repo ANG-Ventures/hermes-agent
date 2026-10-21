@@ -13,6 +13,7 @@ def test_excludes_regenerable_bulk():
     for p in (
         "var/scratch/offbox-ci/hermes-agent-1918-33b1c5cd/run_agent.py",
         "var/gh-app/readcache/0a1b.json", "var/gh-app/callers/pid-1.json", "var/gh-app/raw/pgid-7.json",
+        "var/gh-app/etag/4f/abc.json", "var/oneshot/t_6d07a184/rt/contributors/emails/x",  # 2026-10-21
         "var/lines-portal/repos/hermes-agent/README.md", "var/graphify/fleetreview-hermes-agent/g.json",
         "mirrors/ANG-Ventures/hermes-agent.git/HEAD", "runtime/hermes-agent/run_agent.py",
         "kanban/workspaces-aside/t_1a75a536-home-slice-sparse-clone/a.py",
@@ -20,13 +21,15 @@ def test_excludes_regenerable_bulk():
     ):
         assert _should_exclude(Path(p)), p
     # the walk prunes the dir itself (prune sites pass a trailing "_" sentinel)
-    for d in ("var/scratch", "var/gh-app/readcache", "mirrors", "runtime/hermes-agent"):
+    for d in ("var/scratch", "var/gh-app/readcache", "var/gh-app/etag", "var/oneshot/t_any", "mirrors",
+              "runtime/hermes-agent"):
         assert _matches_path_glob((*Path(d).parts, "_")), d
 
 
 def test_keeps_siblings_and_deeper_same_names():
     for p in ("var/gh-app/ang-fleet-ci-actuators.164943290.json", "var/lines-portal/generate.py",
               "runtime/active_sessions.json", "state/test-gate/remote-000b.lock", "var/scratch-notes.md",
+              "var/oneshot/land-5882.sh", "var/gh-app/cap/watchers.1.json",  # loose one-shots + cap state stay
               "skills/x/mirrors/SKILL.md", "profiles/p/runtime/hermes-agent/a.py"):
         assert not _should_exclude(Path(p)), p
 
