@@ -648,16 +648,14 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     bundled built-ins only with ``curator.prune_builtins`` (and then suppressed from re-seeding)."""
     skill_dir = _find_skill_dir(skill_name)
     if skill_dir is None and (ext_dir := _find_external_skill_dir(skill_name)) is not None:
-        # In-scope SHARED skills (``curator.include_shared_dirs``) archive IN-TREE to
-        # ``skills-shared/<group>/.archive/<name>/`` via ``agent.curator_shared.archive_shared_skill``
-        # — never to the local archive (other agents sharing the tree would lose the skill).
+        # In-scope SHARED skills (``curator.include_shared_dirs``) are NEVER archived (Ace 2026-10-19,
+        # t_776ae7bc): an idle one (skill_tier.DEFAULT_IDLE_DAYS) is unsubscribed to ``<group>-aux/`` via
+        # ``agent.curator_shared.unsubscribe_shared_skill``; a recently used one is refused and stays put.
         from agent.skill_utils import is_shared_curatable_path
         if not is_shared_curatable_path(ext_dir) or not is_curation_eligible(skill_name, ext_dir):
             return False, _external_read_only_message(skill_name)
-        from agent.curator_shared import archive_shared_skill
-        ok, msg, _touched = archive_shared_skill(ext_dir)
-        if ok:
-            set_state(skill_name, STATE_ARCHIVED)
+        from agent.curator_shared import unsubscribe_shared_skill
+        ok, msg, _touched = unsubscribe_shared_skill(ext_dir, record=load_usage().get(skill_name))
         return ok, msg
     if not is_curation_eligible(skill_name, skill_dir):
         if is_protected_builtin(skill_name):
