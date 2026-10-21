@@ -1015,6 +1015,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 ),
                 session_id=_resolve_session_flag(getattr(args, "session", None)),
                 session_explicit=getattr(args, "session", None) is not None,
+                home_with_parent=bool(getattr(args, "home_with_parent", False)),
                 require_home=True,
                 duplicate_guard=True,
                 force_reason=getattr(args, "force_reason", None),
@@ -1049,7 +1050,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     if getattr(args, "json", False):
-        _print_json(_task_to_dict(task))
+        # t_d59f722a: the home the card was BORN with, so a loader can assert it.
+        _print_json(dict(_task_to_dict(task), home=("unhomed" if task.unhomed else task.session_id)))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
         if auto_added:

@@ -4117,11 +4117,18 @@ def _resolve_birth_session(
     *,
     explicit: bool = False,
     creator_task_id: Optional[str] = None,
+    caller_over_foreign_parent: bool = False,
 ) -> tuple[str, Optional[str]]:
     """THE home a new card is born with, plus the ``origin:`` line it inherits.
 
     0. ``explicit`` (the caller NAMED the session, e.g. ``create --session``):
        that session wins over every parent.
+    0b. ``caller_over_foreign_parent`` (``hermes kanban create`` without
+       ``--home-with-parent``, t_d59f722a): a caller WITH a session, outside a
+       worker run, whose first homed parent belongs to ANOTHER session's home
+       keeps the child in its own session. A child born into someone else's
+       home cannot be driven by the session that made it (the Forge L0 loader,
+       10-21: every block refused ``home session is ...``).
     1. The first homed parent, then the ``creator_task_id`` (durable lineage
        without a dependency edge), then the card the creating kanban worker run
        was dispatched for: fan-out belongs to the HUMAN home of its lineage.
@@ -4139,6 +4146,18 @@ def _resolve_birth_session(
         return (sid or UNHOMED_SESSION), None
     worker_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     creator_tid = (str(creator_task_id).strip() if creator_task_id else "")
+    caller_sid = (str(session_id).strip() if session_id else "")
+    if (caller_over_foreign_parent and caller_sid and not is_unhomed(caller_sid)
+            and not worker_tid and not creator_tid):
+        for tid in (parents or ()):
+            row = conn.execute(
+                "SELECT session_id FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+            home = (row["session_id"] or "").strip() if row is not None else ""
+            if home and not is_unhomed(home):
+                if home not in home_ids(caller_sid):
+                    return caller_sid, None
+                break
     for tid in (
         *(parents or ()),
         *((creator_tid,) if creator_tid else ()),
@@ -5994,6 +6013,7 @@ def create_task(
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
     session_explicit: bool = False,
+    home_with_parent: bool = True,
     duplicate_guard: bool = False,
     force_reason: Optional[str] = None,
     require_home: bool = False,
@@ -6176,6 +6196,7 @@ def create_task(
     birth = _resolve_birth_session(
         conn, session_id, parents, explicit=session_explicit,
         creator_task_id=creator_task_id,
+        caller_over_foreign_parent=not home_with_parent,
     )
     session_id, inherited_origin = birth
     # ``require_home`` (the ``hermes kanban create`` CLI and the
@@ -6318,6 +6339,7 @@ def create_task(
                 rebirth = _resolve_birth_session(
                     conn, requested_session_id, parents, explicit=session_explicit,
                     creator_task_id=creator_task_id,
+                    caller_over_foreign_parent=not home_with_parent,
                 )
                 if rebirth != birth:
                     birth = rebirth
