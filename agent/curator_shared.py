@@ -29,10 +29,12 @@ recorded in the lockfile is diagnostic only.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import subprocess
+import sys
 import tarfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -489,23 +491,78 @@ def attempt_crash_recovery(
     return True, "restored self-inflicted dirt from git/manifest"
 
 
-def archive_shared_skill(
+# Ace's standing rulings (2026-10-18; 2026-10-19 13:45 PT, msg 1561842711190053015): a shared skill is NEVER
+# archived or deleted. One with 0 loads in the idle window may be UNSUBSCRIBED by moving it to
+# skills-shared/<group>-aux/ (still on disk, loadable via skill-finder GROUP mode); one used within it stays.
+UNSUBSCRIBE_OPERATOR = "Ace ruling 2026-10-19 13:45 PT msg 1561842711190053015 (curator idle unsubscribe)"
+SKILL_GROUP_SCRIPT = ("hermes-harness", "skill-finder", "scripts", "skill-group.py")
+SKILL_TIER_LIB = ("scripts", "lib", "skill_tier.py")
+
+
+def _load_skill_tier(fleet_root: Path):
+    """The fleet's ONE tier module (``<root>/scripts/lib/skill_tier.py``): idle threshold + last-used reader."""
+    import importlib.util
+
+    path = fleet_root.joinpath(*SKILL_TIER_LIB)
+    spec = importlib.util.spec_from_file_location("_fleet_skill_tier", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"no skill_tier module at {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _iso_ts(value) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def shared_skill_idle_days(name: str, fleet_root: Path, record: Optional[Dict[str, Any]] = None,
+                           now: Optional[float] = None) -> Tuple[Optional[float], float, str]:
+    """(idle days or None when unknown, threshold days, why) for a shared skill.
+
+    Last use = max over the tier module's sources (fleet ``skills/.usage.json`` + ``var/skills-portal/
+    stats-model.json``) and this profile's usage *record* (last use/view/patch, else created_at). The
+    threshold is ``skill_tier.DEFAULT_IDLE_DAYS`` (one source). No timestamp anywhere AND no fleet
+    stats file = unknown (the caller refuses)."""
+    import time as _time
+
+    tier = _load_skill_tier(fleet_root)
+    threshold = float(tier.DEFAULT_IDLE_DAYS)
+    stats = fleet_root / "var" / "skills-portal" / "stats-model.json"
+    last, created = tier.load_last_used(fleet_root / "skills" / ".usage.json", stats)
+    stamps = [t for t in (last.get(name), created.get(name)) if t]
+    rec = record or {}
+    for key in ("last_used_at", "last_viewed_at", "last_patched_at", "last_activity_at", "created_at"):
+        ts = _iso_ts(rec.get(key))
+        if ts:
+            stamps.append(ts)
+    now = _time.time() if now is None else now
+    if stamps:
+        return (now - max(stamps)) / 86400.0, threshold, "last activity"
+    if stats.is_file():
+        return float("inf"), threshold, "no load recorded fleet-wide"
+    return None, threshold, "no usage evidence (no record, no fleet stats-model.json)"
+
+
+def unsubscribe_shared_skill(
     skill_dir: Path,
     *,
     shared_root: Optional[Path] = None,
+    record: Optional[Dict[str, Any]] = None,
+    now: Optional[float] = None,
 ) -> Tuple[bool, str, List[Path]]:
-    """Archive a shared skill in-tree: ``skills-shared/<group>/.archive/<name>/``.
+    """The curator's ONLY idle action on a shared skill: move ``<group>/<name>`` to ``<group>-aux/<name>``.
 
-    A plain rename INSIDE the shared tree so the run-commit's explicit
-    pathspec captures both the deletion and the .archive addition — a
-    ``git revert`` of the run-commit restores the skill for the whole fleet.
-    Never moves the skill to the local ``skills/.archive/`` (other agents
-    would lose it). Returns (ok, message, touched_paths).
-    
-    P1 FIX: This function now goes through the FULL safety contract (lock,
-    precheck, snapshot, commit) to prevent dirty-tree corruption. The raw
-    rename logic is now in _archive_shared_skill_impl; this wrapper enforces
-    the git safety gates.
+    Never ``.archive`` (t_776ae7bc). Refused when the skill was used within ``skill_tier.DEFAULT_IDLE_DAYS``,
+    when its idle time is unknown, or when it already sits in an ``-aux`` group. The move itself is
+    ``skill-group.py move --in-place`` (the fleet's one mover), run under the full safety contract
+    (lock, scoped precheck, snapshot, explicit-pathspec ``curator:`` commit). Returns (ok, message, touched).
     """
     root = shared_root or _shared_root()
     skill_dir = Path(skill_dir)
@@ -513,141 +570,76 @@ def archive_shared_skill(
         rel = skill_dir.resolve().relative_to(root.resolve())
     except ValueError:
         return False, f"{skill_dir} is not under the shared tree", []
-    if not rel.parts or len(rel.parts) < 2:
+    if len(rel.parts) != 2:
         return False, f"{skill_dir} is not a <group>/<skill> dir", []
-    
-    # P1 FIX: Acquire lock, precheck, snapshot, commit
+    group, dname = rel.parts
+    if group.endswith("-aux"):
+        return False, f"{dname} is already unsubscribed ({group}); shared skills are never archived", []
+    fleet_root = root.resolve().parent
+    mover = root.joinpath(*SKILL_GROUP_SCRIPT)
+    try:
+        idle, threshold, why = shared_skill_idle_days(dname, fleet_root, record=record, now=now)
+    except Exception as e:  # no tier module = no threshold: refuse, never fall back to a second number
+        return False, f"refused: cannot read the idle threshold ({e}); shared skills are never archived", []
+    if idle is None or idle < threshold:
+        shown = "unknown" if idle is None else f"{idle:.0f}d"
+        return False, (f"refused: {dname} idle {shown} ({why}) < {threshold:g}d: stays subscribed in {group}; "
+                       "shared skills are never archived"), []
+    if not mover.is_file():
+        return False, f"refused: mover {mover} missing; shared skills are never archived", []
+    dest_dir = root / f"{group}-aux"
+    dest = dest_dir / dname
+    readme = dest_dir / "README.md"
+    new_group = not dest_dir.exists()
+
     with shared_pass_lock(root) as acquired:
         if not acquired:
             return False, "lock contention (another curator holds shared lock)", []
-        
-        # Scope the clean-tree gate to the paths this archive will touch:
-        # the skill dir itself and the group's .archive/ destination. Dirt
-        # elsewhere in the shared tree (sibling skills, unrelated fleet churn)
-        # is recorded and threaded into the commit drift-allowance instead of
-        # blocking the archive (2026-07-25: whole-tree gate failed ~always on
-        # a live agent home).
-        group_pre = rel.parts[0]
-        scope = [skill_dir, root / group_pre / ".archive"]
-        ok, reason, dirty = git_precheck_shared(root, scope_paths=scope)
+        ok, reason, dirty = git_precheck_shared(root, scope_paths=[skill_dir, dest_dir])
         if not ok and reason == "dirty working tree":
-            recovered, why = attempt_crash_recovery(root)
+            recovered, _why = attempt_crash_recovery(root)
             if recovered:
-                ok, reason, dirty = git_precheck_shared(root, scope_paths=scope)
+                ok, reason, dirty = git_precheck_shared(root, scope_paths=[skill_dir, dest_dir])
         if not ok:
             return False, f"precheck failed ({reason})", []
-        
-        # Compute intended paths BEFORE the rename (for drift detection)
         repo = _git_toplevel(root)
         if repo is None:
             return False, "no git repo", []
-        
         repo_resolved = repo.resolve()
-        group = rel.parts[0]
-        archive_root_path = root / group / ".archive"
-        dest_name = skill_dir.name
-        # Check if dest already exists and would get timestamped
-        dest_path = archive_root_path / dest_name
-        if dest_path.exists():
-            from datetime import datetime, timezone
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            dest_path = archive_root_path / f"{dest_name}-{stamp}"
-        
-        # Pre-compute ALL files that will be dirty after rename (recursively)
-        intended_pre = []
-        # All files in source dir
+        intended_pre: List[str] = []
         for item in skill_dir.rglob("*"):
             if item.is_file():
-                try:
-                    intended_pre.append(str(item.resolve().relative_to(repo_resolved)))
-                except ValueError:
-                    pass
-        # All files in dest dir (mirror structure)
-        for item in skill_dir.rglob("*"):
-            if item.is_file():
-                try:
-                    rel_in_skill = item.relative_to(skill_dir)
-                    dest_file = dest_path / rel_in_skill
-                    intended_pre.append(str(dest_file.resolve(strict=False).relative_to(repo_resolved)))
-                except ValueError:
-                    pass
-        
-        precheck_dirty = (dirty or []) + intended_pre
-        
-        # P1 FIX (Greptile): Take snapshot BEFORE rename (invariant: manifest before mutation)
+                sub = item.relative_to(skill_dir)
+                for base in (skill_dir, dest):
+                    with contextlib.suppress(ValueError):
+                        intended_pre.append(str((base / sub).resolve(strict=False).relative_to(repo_resolved)))
+        if new_group:
+            intended_pre.append(str(readme.resolve(strict=False).relative_to(repo_resolved)))
         snap = snapshot_shared([skill_dir.parent], intended_pre, shared_root=root)
         if snap is None:
             return False, "shared snapshot failed (hard gate)", []
-        
-        # Perform the rename (AFTER snapshot is safe)
-        ok_rename, msg_rename, touched = _archive_shared_skill_impl(
-            skill_dir, shared_root=root
+        p = subprocess.run(
+            [sys.executable, str(mover), "--home", str(fleet_root), "move", dname, dest_dir.name,
+             "--in-place", "--create", "--json", "--operator", UNSUBSCRIBE_OPERATOR],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+            env={**os.environ, "HERMES_FLEET_HOME": str(fleet_root)},
         )
-        if not ok_rename:
-            return False, msg_rename, []
-        
-        # Build intended list from actual touched paths
-        intended = []
-        for p in touched:
-            try:
-                intended.append(str(p.resolve().relative_to(repo_resolved)))
-            except ValueError:
-                pass
-        
-        # Commit the archive operation (pass precheck_dirty for drift detection)
+        try:
+            out = json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {}
+        except ValueError:
+            out = {}
+        if p.returncode != 0 or not out.get("ok") or not dest.is_dir():
+            return False, f"skill-group move rc={p.returncode}: {(out.get('error') or p.stderr).strip()[:300]}", []
+        touched = [skill_dir, dest] + ([readme] if out.get("created_group") else [])
         ok_commit, msg_commit = commit_shared(
-            f"archive shared skill {skill_dir.name}",
-            touched,
-            precheck_dirty=precheck_dirty,
-            shared_root=root,
+            f"unsubscribe idle shared skill {dname} {group} -> {dest_dir.name}",
+            touched, precheck_dirty=(dirty or []) + intended_pre, shared_root=root,
         )
         if not ok_commit:
-            # Rollback
-            try:
-                dest = touched[1] if len(touched) > 1 else None
-                if dest and dest.exists():
-                    dest.rename(skill_dir)
-            except OSError:
-                pass
+            with contextlib.suppress(OSError):
+                dest.rename(skill_dir)
+                if out.get("created_group"):
+                    readme.unlink()
+                    dest_dir.rmdir()
             return False, f"commit failed: {msg_commit}", []
-        
-        return True, f"archived to {touched[1] if len(touched) > 1 else '?'}", touched
-
-
-def _archive_shared_skill_impl(
-    skill_dir: Path,
-    *,
-    shared_root: Optional[Path] = None,
-) -> Tuple[bool, str, List[Path]]:
-    """Implementation of shared skill archival (rename only, no git ops).
-    
-    Used internally by archive_shared_skill after the safety contract is acquired.
-    """
-    root = shared_root or _shared_root()
-    skill_dir = Path(skill_dir)
-    try:
-        rel = skill_dir.resolve().relative_to(root.resolve())
-    except ValueError:
-        return False, f"{skill_dir} is not under the shared tree", []
-    if not rel.parts or len(rel.parts) < 2:
-        return False, f"{skill_dir} is not a <group>/<skill> dir", []
-    group = rel.parts[0]
-    archive_root = root / group / ".archive"
-    try:
-        archive_root.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        return False, f"failed to create shared archive dir: {e}", []
-    dest = archive_root / skill_dir.name
-    if dest.exists():
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        dest = archive_root / f"{skill_dir.name}-{stamp}"
-    try:
-        skill_dir.rename(dest)
-    except OSError:
-        import shutil
-
-        try:
-            shutil.move(str(skill_dir), str(dest))
-        except Exception as e:
-            return False, f"failed to archive shared skill: {e}", []
-    return True, f"archived to {dest}", [skill_dir, dest]
+        return True, f"unsubscribed to {dest} (idle {idle:.0f}d >= {threshold:g}d)", touched

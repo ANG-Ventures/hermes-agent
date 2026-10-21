@@ -3,7 +3,7 @@
 Tests cover:
 1. P0 Path traversal in skill_split.join_split_skill (line 434)
 2. P1 Unauthenticated manifest trust in crash recovery (line 376)
-3. P1 Archive bypasses git safety (line 733)
+3. P1 Archive bypasses git safety (line 733); now the shared idle move to <group>-aux
 4. P2 Fail-open lock on non-Linux platforms (line 125)
 """
 import json
@@ -15,9 +15,9 @@ from unittest.mock import patch
 import pytest
 
 from agent.curator_shared import (
-    archive_shared_skill,
     attempt_crash_recovery,
     shared_pass_lock,
+    unsubscribe_shared_skill,
 )
 from agent.skill_split import join_split_skill
 
@@ -272,37 +272,43 @@ class TestManifestTrustProtection:
 
 
 class TestArchiveGitSafety:
-    """P1: archive_shared_skill must go through the git safety contract."""
+    """P1: the shared idle move (unsubscribe_shared_skill, ex archive_shared_skill) goes through the git
+    safety contract. t_776ae7bc: it lands in <group>-aux, never <group>/.archive."""
 
-    def test_archive_goes_through_safety_contract(self, tmp_path):
-        """Archiving creates a git commit (proving safety contract ran)."""
+    def test_unsubscribe_goes_through_safety_contract(self, tmp_path):
+        """The move creates a curator commit (proving the safety contract ran)."""
+        from datetime import datetime, timedelta, timezone
+
+        from tests.agent.test_curator_shared_git import plant_fleet_tier
+
         shared_root = tmp_path / "skills-shared"
         group_dir = shared_root / "devops"
         skill_dir = group_dir / "test-skill"
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text("test", encoding="utf-8")
+        plant_fleet_tier(tmp_path)
 
-        os.system(f"cd {shared_root} && git init -q && git config user.email test@test.com && git config user.name Test")
-        os.system(f"cd {shared_root} && git add . && git commit -q -m init")
+        os.system(f"cd {tmp_path} && git init -q && git config user.email test@test.com && git config user.name Test")
+        os.system(f"cd {tmp_path} && git add . && git commit -q -m init")
 
-        # Archive should succeed and create a commit
-        ok, msg, paths = archive_shared_skill(skill_dir, shared_root=shared_root)
-        
-        assert ok, f"Archive failed: {msg}"
-        
-        # Verify commit was created
-        result = os.popen(f"cd {shared_root} && git log --format=%s -1").read().strip()
-        assert "archive" in result.lower()
-        
-        # Verify the skill was moved
-        archive_dir = group_dir / ".archive" / "test-skill"
-        assert archive_dir.exists()
+        old = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        ok, msg, paths = unsubscribe_shared_skill(skill_dir, shared_root=shared_root,
+                                                  record={"last_used_at": old})
+        assert ok, f"unsubscribe failed: {msg}"
+
+        result = os.popen(f"cd {tmp_path} && git log --format=%s -1").read().strip()
+        assert result.startswith("curator: unsubscribe")
+
+        assert (shared_root / "devops-aux" / "test-skill" / "SKILL.md").exists()
         assert not skill_dir.exists()
-        
-        # Verify both old and new paths are in the commit
-        files_in_commit = os.popen(f"cd {shared_root} && git show --name-only --format='' HEAD").read()
-        # The commit should show deletion of old path and addition of new path
-        assert "devops/test-skill" in files_in_commit or "devops/.archive" in files_in_commit
+        assert not (group_dir / ".archive").exists()
+
+        # both sides are in the commit: a rename (old path gone from HEAD, new path present)
+        status = os.popen(f"cd {tmp_path} && git show -M --name-status --format='' HEAD").read()
+        assert "R100\tskills-shared/devops/test-skill/SKILL.md\tskills-shared/devops-aux/test-skill/SKILL.md" in status
+        left = [ln for ln in os.popen(f"cd {tmp_path} && git status --porcelain -- skills-shared").read().splitlines()
+                if not ln.endswith(".curator.lock")]
+        assert left == []
 
 
 class TestFailClosedLock:
