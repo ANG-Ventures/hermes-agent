@@ -3166,7 +3166,14 @@ class BasePlatformAdapter(ABC):
             report_refused_followup(source, "profile_route_rejected")
             # Dropped, not held: let a later backfill recover it (runner path: _report_refused_restart_followup).
             if getattr(source, "_restart_followup_session", None):
-                self.release_platform_message_hold(getattr(source, "_restart_followup_message_id", None))
+                mid = getattr(source, "_restart_followup_message_id", None)
+                # The runner's registry too: _wire_adapter_handlers hands its held ids to a
+                # replacement adapter (reconnect), which would reinstate this stale hold.
+                release = getattr(getattr(self, "gateway_runner", None), "_release_held_platform_message", None)
+                if callable(release):
+                    with contextlib.suppress(Exception):
+                        release(source, mid)
+                self.release_platform_message_hold(mid)
         return True
 
     def _session_key_profile(self, source: Optional[Any] = None) -> Optional[str]:

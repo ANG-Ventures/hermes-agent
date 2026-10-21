@@ -165,6 +165,8 @@ def test_landed_shortcut_completes_when_every_vanished_repo_is_named(board, remo
     assert kb.complete_task(board, tid, summary="approved",
                             survivor_pr=[f"gone1={PR}", f"gone2={PR}"])
     assert kb.get_task(board, tid).status == "done"
+    saved = kb.latest_run(board, tid).metadata["survivor"]
+    assert sorted(ref["repository"] for ref in saved["refs"]) == ["gone1", "gone2"]
 
 
 def test_unqualified_claim_is_bound_to_the_single_vanished_repo(board, remote, tmp_path, shape):
@@ -194,4 +196,22 @@ def test_directory_without_git_still_counts_as_vanished(board, remote, tmp_path,
 
     with pytest.raises(ValueError, match="gone2"):
         kb.complete_task(board, tid, summary="approved", survivor_pr=[f"gone1={PR}"])
+    assert kb.get_task(board, tid).status != "done"
+
+
+def test_qualifier_naming_a_present_repo_is_refused(board, remote, tmp_path, shape):
+    """Same class as Prism c7eccc58634e: the ordinary missing branch refuses an operator
+    claim for a repository still on disk; the shortcut must not record it either."""
+    tid, ws = nested_card(board, tmp_path, remote, shape)
+    kept = str(repo_of(ws, shape).relative_to(ws)) or "."
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases",
+            (tid, json.dumps({kept: HEAD, "gone": HEAD})),
+        )
+
+    with pytest.raises(ValueError, match="still present"):
+        kb.complete_task(board, tid, summary="approved",
+                         survivor_pr=[f"gone={PR}", f"{kept}={PR}"])
     assert kb.get_task(board, tid).status != "done"

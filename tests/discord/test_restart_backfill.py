@@ -797,3 +797,37 @@ async def test_adapter_drop_of_restart_followup_releases_adapter_hold():
     adapter._canonicalize = lambda _src: None
     assert adapter._drop_unresolved(SimpleNamespace(source=source)) is True
     assert not adapter.platform_message_is_held("70010")
+
+
+def test_adapter_drop_of_restart_followup_releases_runner_hold_before_rewire():
+    """Prism P1 f12841cf98cb (#2201): the adapter-level drop must clear the RUNNER's held
+    registry too; otherwise ``_wire_adapter_handlers`` hands the stale id to a replacement
+    adapter (reconnect) and its backfill skips a message whose replay was already dropped."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    from tests.e2e.conftest import _make_discord_adapter_wired
+
+    adapter, _ = _make_discord_adapter_wired()
+    runner = SimpleNamespace(adapters={Platform.DISCORD: adapter})
+    runner._release_held_platform_message = GatewayRunner._release_held_platform_message.__get__(runner)
+    adapter.gateway_runner = runner
+    source = SimpleNamespace(
+        platform=Platform.DISCORD,
+        profile_route_rejected=True,
+        chat_id="987011",
+        _restart_followup_session="agent:main:discord:group:987011",
+        _restart_followup_message_id="70010",
+    )
+    GatewayRunner._note_held_platform_message(runner, source, "70010")
+    assert adapter.platform_message_is_held("70010")
+
+    adapter._canonicalize = lambda _src: None
+    assert adapter._drop_unresolved(SimpleNamespace(source=source)) is True
+    assert not adapter.platform_message_is_held("70010")
+    assert runner._held_platform_message_ids == {Platform.DISCORD: set()}
+
+    # Replacement adapter wired through the runner's handoff: nothing stale to reinstate.
+    replacement, _ = _make_discord_adapter_wired()
+    for mid in runner._held_platform_message_ids.get(replacement.platform, ()):
+        replacement.mark_platform_message_held(mid)
+    assert not replacement.platform_message_is_held("70010")
