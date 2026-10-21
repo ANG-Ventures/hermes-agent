@@ -137,7 +137,6 @@ Each is a downgrade to `summary`, not a failure.
 | `same_model` | Child wire kwargs still differ from the parent's after the fork forced model/tier/provider. | Bug report; defence-in-depth tripped. |
 | `same_request_params` | Tools/schemas, thinking/effort, system bytes, or cache TTL differ. | Expected after a mid-session tool/skill/effort change; else bug report. |
 | `turn_complete` | Parent had in-flight tool calls at dispatch (D-8). | Retry after the turn, or accept the fold. |
-| `prefix_le_cap` | Prefix > `min(fork_max_prefix_tokens` 600k`, 0.6 × child window)` (D-9). | Accept the fold; don't raise the cap. |
 | `seat_known` | No `last_served_by` recorded for the parent. | Nothing. |
 | `warm` | `now − last_served_at ≥ ttl_s − 300 s`; cache expired or about to. | Nothing; a cold fork costs more than the fold. |
 | `fork_enabled` | `delegation.boomerang.fork_enabled: false` (kill switch). | Intended if flipped. |

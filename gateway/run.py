@@ -8463,6 +8463,22 @@ class GatewayRunner(
             )
         return reconciled
 
+    def _note_held_platform_message(self, source: Any, message_id: Any) -> None:
+        """Remember a platform message id the gateway holds for delivery, per platform, until the
+        adapter is wired (``_wire_adapter_handlers`` pushes the set into the adapter)."""
+        mid = str(message_id or "").strip()
+        platform = getattr(source, "platform", None)
+        if not mid or platform is None:
+            return
+        held = getattr(self, "_held_platform_message_ids", None)
+        if held is None:
+            held = self._held_platform_message_ids = {}
+        held.setdefault(platform, set()).add(mid)
+        adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
+        if adapter is not None:
+            with suppress(Exception):
+                adapter.mark_platform_message_held(mid)
+
     async def _load_restart_followups(self) -> int:
         """Queue follow-ups spooled by the previous life into startup restore."""
         try:
@@ -8494,6 +8510,10 @@ class GatewayRunner(
                     **kwargs,
                 )
                 event._hermes_restart_followup_path = record["_spool_path"]
+                # The replayed follow-up is HELD by the gateway, not yet in the transcript: tell the
+                # platform adapter (once it exists) so its reconnect backfill does not read the same
+                # message as "absent" and re-inject it (one /queue became two, 2026-10-20 23:57).
+                self._note_held_platform_message(source, getattr(event, "message_id", None))
                 if record.get("reason") == "queue_held":
                     # A /queue item held by /stop before the restart: back into the held store,
                     # never replayed as a turn (spec 2026-10-12 D22/I13).

@@ -60,7 +60,6 @@ you expected a fork and the cost matters.
 | `same_model` | After construction the child's wire kwargs (model, tier, provider, request overrides) still differ from the parent's. A fork FORCES the parent's model and ignores `delegation.model/provider`, so this means something mutated the request. | File a bug with the log line: it is defence-in-depth tripping, not a config choice. |
 | `same_request_params` | Something in the prefix differs: tool list or schemas, thinking/effort config, system prompt bytes, or cache-control TTL. | If you changed tools/effort/skills mid-session, expect it. Otherwise file a bug: a near-fork was caught. |
 | `turn_complete` | The parent's last turn had in-flight tool calls at dispatch (D-8). | Retry after the parent's turn ends, or accept the fold. |
-| `prefix_le_cap` | Parent prefix > `min(fork_max_prefix_tokens` (600k)`, 0.6 × child model context window)` (D-9). | Accept the fold, or compress the parent session first. Do not raise the cap to force it. |
 | `seat_known` | The parent has no `last_served_by` (no seat recorded for its last turn, e.g. a fresh session or a non-pool response). | Nothing; the next fork after one served parent turn can pin. |
 | `warm` | `now − parent.last_served_at ≥ ttl_s − 300 s`. The parent's cache has expired or is about to. | Nothing. A cold fork would write the whole prefix; the fold is cheaper. |
 | `fork_enabled` | `delegation.boomerang.fork_enabled` is `false` (the P2 kill switch, §4 below). | Intended if someone flipped it. Flip it back to re-enable forks. |
@@ -231,4 +230,4 @@ Log lines (`logs/agent.log`, from `tools.delegate_tool`): `boomerang.fork_inelig
 
 ## Decisions cited
 
-D-1, D-2, D-6, D-7, D-8, D-9, D-11, D-13, D-14, D-15, D-16, D-17, D-18, D-19 — all in spec §4.
+D-1, D-2, D-6, D-7, D-8, D-9 (superseded 2026-10-21: no prefix ceiling), D-11, D-13, D-14, D-15, D-16, D-17, D-18, D-19 — all in spec §4.
