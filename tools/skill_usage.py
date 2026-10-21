@@ -648,14 +648,17 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     bundled built-ins only with ``curator.prune_builtins`` (and then suppressed from re-seeding)."""
     skill_dir = _find_skill_dir(skill_name)
     if skill_dir is None and (ext_dir := _find_external_skill_dir(skill_name)) is not None:
-        # In-scope SHARED skills (``curator.include_shared_dirs``) are NEVER archived (Ace 2026-10-19,
-        # t_776ae7bc): an idle one (skill_tier.DEFAULT_IDLE_DAYS) is unsubscribed to ``<group>-aux/`` via
-        # ``agent.curator_shared.unsubscribe_shared_skill``; a recently used one is refused and stays put.
+        # In-scope SHARED skills (``curator.include_shared_dirs``) walk the idle ladder (Ace 2026-10-21 02:47,
+        # t_776ae7bc) in ``agent.curator_shared.retire_shared_skill``: 120 d idle + no inbound pointer/pin/
+        # manifest -> <group>/.archive; else 60 d idle -> <group>-aux; else refused and it stays put.
         from agent.skill_utils import is_shared_curatable_path
         if not is_shared_curatable_path(ext_dir) or not is_curation_eligible(skill_name, ext_dir):
             return False, _external_read_only_message(skill_name)
-        from agent.curator_shared import unsubscribe_shared_skill
-        ok, msg, _touched = unsubscribe_shared_skill(ext_dir, record=load_usage().get(skill_name))
+        from agent.curator_shared import retire_shared_skill
+        ok, msg, _touched, action = retire_shared_skill(ext_dir, record=load_usage().get(skill_name),
+                                                        aliases=(skill_name,))
+        if action == "archived":
+            set_state(skill_name, STATE_ARCHIVED)
         return ok, msg
     if not is_curation_eligible(skill_name, skill_dir):
         if is_protected_builtin(skill_name):
@@ -667,6 +670,14 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
         return False, f"skill '{skill_name}' not found"
     if is_external_skill_path(skill_dir):
         return False, _external_read_only_message(skill_name)
+    # On a fleet tree an own-profile skill takes the same archive guards as a shared one (Ace 2026-10-21
+    # 02:47, t_776ae7bc): no inbound pointer, pin or manifest listing. A plain install has no gate.
+    from agent import curator_shared as _cs
+    try:
+        if (refusal := _cs.local_archive_refusal({skill_name, skill_dir.name})) is not None:
+            return False, f"skill '{skill_name}' kept out of .archive: {refusal}"
+    except Exception as e:  # the gate itself failed: fail closed, the skill stays
+        return False, f"skill '{skill_name}' kept out of .archive: archive gate failed ({e})"
     # Flatten under the skill NAME, not the directory name: `mlops/training/accelerate` is the skill
     # `huggingface-accelerate`, and restore/list/purge all key on the name.
     dest = _archive_dir() / skill_name
@@ -678,7 +689,11 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
         dest = dest.with_name(f"{skill_dir.name}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}")
     # complete_package: consolidation may have re-homed support files first, so a disk-only capture can come
     # back hollow; the fill from the newest curator backup keeps rollback restorable.
-    return _relocate(skill_dir, dest, skill_name, "archive", complete_package=True, skill=skill_name)
+    ok, msg = _relocate(skill_dir, dest, skill_name, "archive", complete_package=True, skill=skill_name)
+    if ok and _cs.fleet_root().joinpath(*_cs.SKILL_TIER_LIB).is_file():
+        with suppress(Exception):
+            _cs.note_archived(f"local/{skill_name}")
+    return ok, msg
 
 
 def restore_skill(skill_name: str) -> Tuple[bool, str]:
