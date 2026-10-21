@@ -2778,23 +2778,56 @@ def _landed_claims(explicit):
     )
 
 
-def _uncovered_vanished(bases, workspace, explicit):
-    """Recorded repositories that vanished and that no explicit claim names.
+def _repository_present(workspace, key):
+    """``key`` is a repository on disk, by the rule the ``missing`` branch uses.
+
+    That branch's ``keys`` come from :func:`_walk` (a ``.git`` file or
+    directory) plus :func:`_with_enclosing` for ``.``. A bare directory is not
+    a repository: ``gone/`` left behind after ``gone/.git`` was removed is a
+    vanished repository (Prism 8e6fc262130b on #2183).
+    """
+    path = workspace if key == "." else workspace / key
+    if _is_repo_on_disk(path):
+        return True
+    return key == "." and bool(_with_enclosing(workspace, []))
+
+
+def _bind_vanished(bases, workspace, explicit):
+    """Explicit claims re-keyed to the vanished repositories they stand for.
 
     The nested shortcuts return before the ``missing = set(bases) - keys``
-    coverage check below. Without this, a merged PR qualified for ONE vanished
-    repository vouched for every other vanished one the moment a nested
-    worktree sat under a surviving repository (Prism 2e98d07648a3 on #2175).
-    Returns the uncovered keys; the caller refuses on any. An unqualified
-    claim (key ``None``) covers at most one vanished repository, as the
-    ``missing`` branch rules.
+    branch, so they apply its rules here: every vanished repository needs a
+    claim (Prism 2e98d07648a3 on #2175); an unqualified claim (key ``None``)
+    stands for exactly one vanished repository and is RECORDED under it, not
+    as ``.`` (Prism c7eccc58634e on #2183); a qualifier naming a repository
+    still on disk is refused. With nothing vanished ``explicit`` is unchanged.
     """
-    vanished = {key for key in bases if not (workspace / key).is_dir()}
+    vanished = {key for key in bases if not _repository_present(workspace, key)}
     if not vanished:
-        return set()
+        return explicit
     if None in explicit:
-        return vanished if len(vanished) > 1 else set()
-    return vanished - set(explicit)
+        if len(vanished) > 1 or len(explicit) != 1:
+            raise SurvivorUnavailable(
+                "survivor_unavailable: one operator survivor cannot vouch for multiple "
+                f"missing repositories ({', '.join(sorted(vanished))}); qualify each claim "
+                f"as <repository>=<claim>, e.g. {_qualified_hint(vanished)}"
+            )
+        return {next(iter(vanished)): explicit[None]}
+    uncovered = vanished - set(explicit)
+    if uncovered:
+        raise SurvivorUnavailable(
+            "survivor_unavailable: no operator survivor names the missing "
+            f"repositories ({', '.join(sorted(uncovered))}); qualify each claim "
+            f"as <repository>=<claim>, e.g. {_qualified_hint(uncovered)}"
+        )
+    intruding = set(explicit) - vanished
+    if intruding:
+        raise SurvivorUnavailable(
+            "survivor_unavailable: operator survivors name repositories that are "
+            f"still present ({', '.join(sorted(intruding))}); qualify only the "
+            f"missing ones ({', '.join(sorted(vanished))})"
+        )
+    return explicit
 
 
 def _nested_beside_landed(conn, task_id, metadata, evidence, explicit, previous,
@@ -2809,13 +2842,7 @@ def _nested_beside_landed(conn, task_id, metadata, evidence, explicit, previous,
     (t_3d376252: t_3ecbb73d, merged hermes-home#5702, refused on
     ``repo/mainwt``, a linked worktree inside its own main checkout).
     """
-    uncovered = _uncovered_vanished(bases, workspace, explicit)
-    if uncovered:
-        raise SurvivorUnavailable(
-            "survivor_unavailable: no operator survivor names the missing "
-            f"repositories ({', '.join(sorted(uncovered))}); qualify each claim "
-            f"as <repository>=<claim>, e.g. {_qualified_hint(uncovered)}"
-        )
+    explicit = _bind_vanished(bases, workspace, explicit)
     log.warning(
         "kanban survivor: %s completes on a landed explicit survivor; nested repository "
         "%s is left for workspace recovery", task_id, nested.relative_to(workspace),
