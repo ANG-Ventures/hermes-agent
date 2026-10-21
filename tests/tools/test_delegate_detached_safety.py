@@ -1146,6 +1146,42 @@ def test_an_inherited_route_is_not_turned_into_a_pin_on_reconstruction(monkeypat
         "reconstruction pinned the provider: the children reset the allowlist / no-training filters")
 
 
+# 055a78a1ab97: an inherited-route unit recovered with the knob OFF keeps the provider+model pair it ran on
+def test_an_inherited_route_recovery_does_not_re_resolve_the_model_alias(monkeypatch, tmp_path):
+    import types
+
+    from tools import delegate_tool as dt
+    from hermes_cli import model_switch
+
+    spec = _background_spec_for(monkeypatch, tmp_path, tasks=[{"goal": "summarize the doc"}])
+    spec["execution"].update(model="gpt-5.5", provider="openai")
+    spec["execution"]["credential_ref"].update(provider="openai")
+    record = {**_record("deleg_alias", owner="boot-a:1.0"), **spec}
+
+    # The built-in alias: a bare gpt-5.5 with no provider resolves to Codex.
+    monkeypatch.setattr(model_switch, "resolve_model_pair_for_storage",
+                        lambda m, p=None: (m, p or ("openai-codex" if m == "gpt-5.5" else None)))
+    seen: dict = {}
+
+    def capture(**kw):
+        seen.update(kw)
+        raise RuntimeError("stop after the build")
+
+    monkeypatch.setattr(dt, "_build_child_preserving_parent_tools", capture)
+    parent = types.SimpleNamespace(model="gpt-5.5", provider="openai", base_url=None, api_mode=None,
+                                   session_id="parent-1", enabled_toolsets=["file"], _delegate_depth=0,
+                                   terminal_cwd=str(tmp_path))
+    try:
+        dt.delegate_task(tasks=record["source"]["tasks"], background=False, parent_agent=parent,
+                         _recovery_spec=record)
+    except Exception:
+        pass
+    assert "override_provider" in seen, "the child build was never reached"
+    assert seen["override_provider"] in (None, "", "openai"), (
+        f"recovery re-resolved the alias onto {seen['override_provider']!r}, not the provider the unit ran on")
+    assert seen.get("model") in (None, "", "gpt-5.5")
+
+
 # 566a2590230e: a dead leader whose tools still run is not a dead attempt
 @pytest.mark.platforms("posix")  # process groups
 @pytest.mark.live_system_guard_bypass  # the surviving tool is reparented to init: real delivery is the point

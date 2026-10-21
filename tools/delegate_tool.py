@@ -3993,10 +3993,12 @@ def delegate_task(
         )
         # An inherited route stays inherited: the reconstructed parent already carries the recorded
         # provider and its routing filters (allowlist, data_collection), which a pin would reset.
+        # The model is inherited with it: the parent was rebuilt on the persisted resolved model, and
+        # a model without its provider re-runs alias resolution (gpt-5.5 -> openai-codex).
         _inherited_route = bool(_credential_ref.get("inherited_route"))
         cfg = dict(cfg)
         cfg.update({
-            "model": _execution.get("model") or "",
+            "model": "" if _inherited_route else (_execution.get("model") or ""),
             "provider": "" if _inherited_route else _recovered_provider,
             "base_url": (_execution.get("base_url") or "") if _direct_endpoint and not _inherited_route else "",
             "api_key": "",
