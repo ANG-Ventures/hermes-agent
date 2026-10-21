@@ -717,8 +717,8 @@ def test_preseeded_never_used_builtin_is_reanchored_not_staled(curator_env, monk
     assert rec["state"] == "active" and rec["first_seen_at"] is not None
     assert datetime.fromisoformat(rec["created_at"]) > datetime.fromisoformat(super_old)
 
-    # One-shot: 15 days of continued non-use (past stale_after_days=14) → stale, not deferred forever.
-    counts = c.apply_automatic_transitions(now=t0 + timedelta(days=15))
+    # One-shot: 61 days of continued non-use (past stale_after_days=60) → stale, not deferred forever.
+    counts = c.apply_automatic_transitions(now=t0 + timedelta(days=61))
     assert counts["marked_stale"] == 1 and u.get_record("bundled-helper")["state"] == "stale"
 
 
@@ -1341,3 +1341,77 @@ def test_threaded_llm_pass_keeps_callers_profile_scope(curator_env, tmp_path, mo
     assert not (root / "skills" / ".curator_state").exists(), "thread wrote the ROOT home's state"
     state = json.loads((profile / "skills" / ".curator_state").read_text(encoding="utf-8-sig"))
     assert state["last_run_summary"].endswith("llm: stub")
+
+
+# --- Own-profile skills on the 60/120 ladder (Ace 2026-10-21 02:47, t_776ae7bc) -----------------------------
+
+_FLEET_TIER = "DEFAULT_IDLE_DAYS = 60\nDEFAULT_ARCHIVE_DAYS = 120\n"
+_FLEET_GATE = (
+    "import argparse, json, os\n"
+    "ap = argparse.ArgumentParser(); ap.add_argument('--home'); ap.add_argument('--json', action='store_true')\n"
+    "ap.add_argument('names', nargs='+'); a = ap.parse_args()\n"
+    "bl = json.load(open(os.path.join(a.home, 'gate-blockers.json'))) if os.path.exists("
+    "os.path.join(a.home, 'gate-blockers.json')) else {}\n"
+    "print(json.dumps({'ok': True, 'skills': {n: {'archivable': not bl.get(n), 'blockers': bl.get(n, [])}"
+    " for n in a.names}}))\n"
+)
+
+
+def _plant_fleet(home: Path, blockers=None):
+    (home / "scripts" / "lib").mkdir(parents=True, exist_ok=True)
+    (home / "scripts" / "lib" / "skill_tier.py").write_text(_FLEET_TIER, encoding="utf-8")
+    (home / "scripts" / "skill-archive-gate.py").write_text(_FLEET_GATE, encoding="utf-8")
+    if blockers:
+        (home / "gate-blockers.json").write_text(json.dumps(blockers), encoding="utf-8")
+
+
+def test_own_profile_skill_at_31_days_is_not_archived(curator_env):
+    """The old 14/30 windows archived a 31 d idle skill; the ladder leaves it active (60 d stale, 120 d archive)."""
+    c, u = curator_env["curator"], curator_env["usage"]
+    _write_skill(curator_env["home"] / "skills", "month-idle")
+    _backdate(u, "month-idle", 31)
+    counts = c.apply_automatic_transitions()
+    assert counts["archived"] == 0 and counts["marked_stale"] == 0
+    assert (curator_env["home"] / "skills" / "month-idle" / "SKILL.md").is_file()
+    assert u.get_record("month-idle")["state"] == "active"
+
+
+def test_own_profile_ladder_windows_plain_install(curator_env):
+    c, u = curator_env["curator"], curator_env["usage"]
+    assert (c.get_stale_after_days(), c.get_archive_after_days()) == (60, 120)
+    for name, days in (("idle-61", 61), ("idle-121", 121)):
+        _write_skill(curator_env["home"] / "skills", name)
+        _backdate(u, name, days)
+    counts = c.apply_automatic_transitions()
+    assert counts["marked_stale"] == 1 and counts["archived"] == 1
+    assert u.get_record("idle-61")["state"] == "stale"
+    assert (curator_env["home"] / "skills" / ".archive" / "idle-121").is_dir()
+
+
+def test_fleet_tree_windows_come_from_skill_tier_not_config(curator_env, monkeypatch):
+    c = curator_env["curator"]
+    _plant_fleet(curator_env["home"])
+    monkeypatch.setattr(c, "_load_config", lambda: {"stale_after_days": 14, "archive_after_days": 30})
+    assert (c.get_stale_after_days(), c.get_archive_after_days()) == (60, 120)
+
+
+def test_own_profile_121_days_with_inbound_pointer_stays(curator_env, monkeypatch):
+    """On a fleet tree an own-profile skill takes the shared archive guards: a pointed-to skill is not archived
+    (it is marked stale instead), an unpointed one is, and the batch posts ONE #logs line naming it."""
+    c, u = curator_env["curator"], curator_env["usage"]
+    home = curator_env["home"]
+    _plant_fleet(home, blockers={"pointed": ["pointed to by skills-shared/general/x/SKILL.md"]})
+    import agent.curator_shared as cs
+    posted = []
+    monkeypatch.setattr(cs, "post_archive_logs", lambda moved, root=None: posted.append(list(moved)) or True)
+    for name in ("pointed", "lonely"):
+        _write_skill(home / "skills", name)
+        _backdate(u, name, 121)
+    counts = c.apply_automatic_transitions()
+    assert counts["archived"] == 1
+    assert (home / "skills" / "pointed" / "SKILL.md").is_file()
+    assert u.get_record("pointed")["state"] == "stale"
+    assert (home / "skills" / ".archive" / "lonely").is_dir()
+    assert posted == [["local/lonely"]]
+    ok, msg = u.archive_skill("pointed")
+    assert not ok and "pointed to by" in msg
