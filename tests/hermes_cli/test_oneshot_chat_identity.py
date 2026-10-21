@@ -14,9 +14,13 @@ def _capture_agent_kwargs(monkeypatch, *, task=None, board=None):
     else:
         monkeypatch.setenv("HERMES_KANBAN_TASK", task)
     if board is None:
-        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     else:
-        monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+        # S7: the worker's board name derives from its DB pin, not a board env var.
+        from hermes_cli import kanban_db as kb
+
+        kb.create_board(board.strip())
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir(board.strip()) / "kanban.db"))
 
     class FakeAgent:
         def __init__(self, **kwargs):

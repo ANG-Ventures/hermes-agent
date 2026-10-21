@@ -790,16 +790,16 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 
 | Flag | Purpose |
 |------|---------|
-| `--board <slug>` | Operate on a specific board. Defaults to the current board (set via `hermes kanban boards switch`, the `HERMES_KANBAN_BOARD` env var, or `default`). |
+| `--board <slug>` | Operate on a specific board. Required unless a card id or the worker's DB pin names it; there is no current board. |
 
-**This is the human / scripting surface.** Agent workers spawned by the dispatcher drive the board through a dedicated `kanban_*` [toolset](../user-guide/features/kanban.md#how-workers-interact-with-the-board) (`kanban_show`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_create`, `kanban_link`, `kanban_comment`, `kanban_heartbeat`; orchestrator profiles also get `kanban_list` and `kanban_unblock`) instead of shelling to `hermes kanban`. Workers have `HERMES_KANBAN_BOARD` pinned in their env so they physically cannot see other boards.
+**This is the human / scripting surface.** Agent workers spawned by the dispatcher drive the board through a dedicated `kanban_*` [toolset](../user-guide/features/kanban.md#how-workers-interact-with-the-board) (`kanban_show`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_create`, `kanban_link`, `kanban_comment`, `kanban_heartbeat`; orchestrator profiles also get `kanban_list` and `kanban_unblock`) instead of shelling to `hermes kanban`. Workers have `HERMES_KANBAN_DB` pinned to their board's DB so they physically cannot see other boards.
 
 | Action | Purpose |
 |--------|---------|
 | `init` | Create `kanban.db` if missing. Idempotent. |
 | `boards list` / `boards ls` | List all boards with task counts. `--json`, `--all` (include archived). |
-| `boards create <slug>` | Create a new board. Flags: `--name`, `--description`, `--icon`, `--color`, `--switch` (make active). Slug is kebab-case, auto-downcased. |
-| `boards switch <slug>` / `boards use` | Persist `<slug>` as the active board (writes `~/.hermes/kanban/current`). |
+| `boards create <slug>` | Create a new board. Flags: `--name`, `--description`, `--icon`, `--color`. Slug is kebab-case, auto-downcased. |
+| `locate <id>` | Print the board holding a card as `<slug>\t<db_path>`; exit 2 if it is on no board, on two, or a board is unreadable. |
 | `boards show` / `boards current` | Print the currently-active board's name, DB path, and task counts. |
 | `boards rename <slug> "<name>"` | Change a board's display name. Slug is immutable. |
 | `boards rm <slug>` | Archive (default) or hard-delete a board. `--delete` skips the archive step. Archived boards move to `boards/_archived/<slug>-<ts>/`. Refused for `default`. |
@@ -833,16 +833,15 @@ Examples:
 hermes kanban boards create atm10-server --name "ATM10 Server" --icon 🎮
 hermes kanban --board atm10-server create "Restart server" --assignee ops
 
-# Switch the active board for subsequent calls.
-hermes kanban boards switch atm10-server
-hermes kanban list                  # shows atm10-server tasks
+# Every verb names its board (or a card it derives the board from).
+hermes kanban --board atm10-server list
 
 # Archive a board (recoverable) or hard-delete it.
 hermes kanban boards rm atm10-server
 hermes kanban boards rm atm10-server --delete
 ```
 
-Board resolution order (highest precedence first): `--board <slug>` flag → `HERMES_KANBAN_BOARD` env var → `~/.hermes/kanban/current` file → `default`.
+Board resolution (first match wins): `--board <slug>` flag → the worker's `HERMES_KANBAN_DB` pin → the card id the verb names → `create --parent <card>` → refused with the next command. There is no current board.
 
 All actions are also available as a slash command in the gateway (`/kanban …`), with the same argument surface — including `boards` subcommands and the `--board` flag.
 

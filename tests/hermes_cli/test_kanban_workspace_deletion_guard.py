@@ -518,83 +518,6 @@ def test_remove_board_archive_refuses_while_a_card_is_running(kanban_home):
     ), _audit_lines()
 
 
-def test_remove_board_refusal_leaves_the_active_board_pin_intact(kanban_home):
-    """A REFUSED removal must not silently re-point the operator at `default`.
-
-    FleetReview on #785: ``remove_board`` cleared ``<root>/kanban/current``
-    before running the liveness gate, so an operator who ran
-    ``boards switch mine`` then ``boards rm mine`` while a card was running
-    got the (correct) refusal -- and every subsequent ``kanban add`` / ``list``
-    / ``dispatch`` silently addressed the DEFAULT board, with no message
-    saying the pin had moved.
-    """
-    kb.create_board("pinned", name="Pinned")
-    kb.set_current_board("pinned")
-    assert kb.get_current_board() == "pinned"
-
-    with kb.connect_closing(board="pinned") as conn:
-        task_id = kb.create_task(conn, title="live", assignee="daedalus")
-        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
-        conn.commit()
-
-    with pytest.raises(ValueError, match="running or holding"):
-        kb.remove_board("pinned", archive=True)
-
-    assert kb.board_dir("pinned").is_dir()
-    assert kb.get_current_board() == "pinned", (
-        "a refused removal reset the operator's active-board pin"
-    )
-
-
-@pytest.mark.parametrize("archive", [False, True], ids=["delete", "archive"])
-def test_remove_board_failure_leaves_the_active_board_pin_intact(
-    kanban_home, monkeypatch, archive
-):
-    """The pin moves only after the board directory actually goes away."""
-    kb.create_board("pinned", name="Pinned")
-    kb.set_current_board("pinned")
-    bdir = kb.board_dir("pinned")
-
-    if archive:
-        original_rename = Path.rename
-
-        def fail_board_rename(path, target):
-            if path == bdir:
-                raise OSError("forced archive failure")
-            return original_rename(path, target)
-
-        monkeypatch.setattr(Path, "rename", fail_board_rename)
-        expected = OSError
-    else:
-        monkeypatch.setattr(
-            "hermes_cli.kanban_survivor.remove_workspace_dir",
-            lambda *_args, **_kwargs: False,
-        )
-        expected = ValueError
-
-    with pytest.raises(expected):
-        kb.remove_board("pinned", archive=archive)
-
-    assert bdir.is_dir()
-    assert kb.get_current_board() == "pinned", (
-        "a failed removal reset the operator's active-board pin"
-    )
-
-
-@pytest.mark.parametrize("archive", [False, True], ids=["delete", "archive"])
-def test_successful_remove_board_clears_the_active_board_pin(kanban_home, archive):
-    """ALLOW control: a successful removal still reverts the pin to default."""
-    kb.create_board("pinned", name="Pinned")
-    kb.set_current_board("pinned")
-    bdir = kb.board_dir("pinned")
-
-    result = kb.remove_board("pinned", archive=archive)
-
-    assert result["action"] == ("archived" if archive else "deleted")
-    assert not bdir.exists()
-    assert kb.get_current_board() == "default"
-
-
 def test_board_liveness_gate_ignores_an_ambient_db_pin(kanban_home, monkeypatch):
     """``HERMES_KANBAN_DB`` must not be able to answer for another board.
 
@@ -707,8 +630,8 @@ def test_remove_board_archive_audit_survives_the_move(kanban_home):
 # Two measured defects in the round-3 audit, both on the board lane:
 #
 # * The destination was inferred, and _managed_scratch_path_info cannot infer
-#   a board from a board ROOT (it only matches scratch descendants). With
-#   HERMES_KANBAN_BOARD pinned to the board being deleted, worker_logs_dir(None)
+#   a board from a board ROOT (it only matches scratch descendants). With the
+#   context board set to the board being deleted, worker_logs_dir(None)
 #   resolved INTO the doomed directory, so a successful deletion destroyed its
 #   own audit: `action='deleted'`, remaining audit files `[]`.
 # * DELETE was written BEFORE the executor ran. A survivor-held board left a
@@ -734,12 +657,12 @@ def _all_audit_lines(home: Path) -> list:
 def test_board_delete_audit_survives_when_the_active_board_is_the_target(
     kanban_home, monkeypatch
 ):
-    """The env-pinned named-board case: the audit must outlive the board."""
+    """The context-board named-board case: the audit must outlive the board."""
     kb.create_board("idle-audit", name="Idle audit")
-    monkeypatch.setenv("HERMES_KANBAN_BOARD", "idle-audit")
 
     bdir = kb.board_dir("idle-audit")
-    res = kb.remove_board("idle-audit", archive=False)
+    with kb.scoped_current_board("idle-audit"):
+        res = kb.remove_board("idle-audit", archive=False)
     assert res["action"] == "deleted"
     assert not bdir.exists()
 
@@ -1245,13 +1168,12 @@ def test_real_kanban_gc_cli_does_not_reap_the_deletion_audit(kanban_home):
 
     env = dict(os.environ)
     env["HERMES_HOME"] = str(kanban_home)
-    env.pop("HERMES_KANBAN_BOARD", None)
     repo_root = Path(kb.__file__).resolve().parents[1]
     env["PYTHONPATH"] = os.pathsep.join(
         [str(repo_root), env.get("PYTHONPATH", "")]
     ).rstrip(os.pathsep)
     res = subprocess.run(
-        [sys.executable, "-m", "hermes_cli.main", "kanban", "gc"],
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "--board", "default", "gc"],
         cwd=str(repo_root), env=env, capture_output=True, text=True, timeout=300,
     )
 

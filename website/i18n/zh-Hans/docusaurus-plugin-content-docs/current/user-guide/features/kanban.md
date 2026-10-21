@@ -62,7 +62,7 @@ Hermes Kanban 是一个持久化任务看板，在所有 Hermes 配置文件之�
   - `scratch`（默认）—— 在 `~/.hermes/kanban/workspaces/<id>/` 下（非默认看板为 `~/.hermes/kanban/boards/<slug>/workspaces/<id>/`）创建的临时目录。**任务完成时删除** —— scratch 按设计是临时性的。通过 `kanban_complete(artifacts=[...])` 明确声明的文件会在清理前复制到持久的任务附件存储；旧版完成摘要中已存在的交付文件路径也会得到同样处理。其他 scratch 文件仍会被删除。如果声明的 scratch 交付文件不存在，任务会保持进行中，worker 可修正路径后重试。需要保留整个工作区时，请使用 `worktree:` 或 `dir:<path>`。在某次安装中首次创建 scratch 工作区时，调度器会记录警告并在任务上发出 `tip_scratch_workspace` 事件（可通过 `hermes kanban show <id>` 查看）。
   - `dir:<path>` —— 现有的共享目录（Obsidian vault、邮件运维目录、每账号文件夹）。**必须是绝对路径。** 像 `dir:../tenants/foo/` 这样的相对路径在调度时会被拒绝，因为它们会相对于调度器碰巧所在的 CWD 解析，这是模糊的，也是混淆代理（confused-deputy）逃逸向量。路径本身是受信任的 —— 这是你的机器、你的文件系统，worker 以你的 uid 运行。这是受信任本地用户的威胁模型；kanban 设计为单主机。**完成时保留。**
   - `worktree` —— 用于编码任务的 git worktree，位于 `.worktrees/<id>/` 下。使用 `worktree:<path>` 固定确切的目标路径。Worker 端的 `git worktree add` 创建它，提供 `--branch` 时使用该分支。**完成时保留。**
-- **Dispatcher（调度器）** —— 一个长期运行的循环，每 N 秒（默认 60 秒）执行一次：回收过期的认领、回收崩溃的 worker（PID 消失但 TTL 尚未过期）、推进就绪任务、原子性认领、启动已分配的配置文件。默认**在 gateway 内部运行**（`kanban.dispatch_in_gateway: true`）。每次 tick 一个调度器扫描所有看板；worker 启动时固定了 `HERMES_KANBAN_BOARD`，因此无法看到其他看板。在同一任务上连续启动失败 `kanban.failure_limit` 次（默认：2）后，调度器会以最后一个错误为原因自动阻塞该任务 —— 防止因配置文件不存在、工作区无法挂载等原因导致的反复抖动。
+- **Dispatcher（调度器）** —— 一个长期运行的循环，每 N 秒（默认 60 秒）执行一次：回收过期的认领、回收崩溃的 worker（PID 消失但 TTL 尚未过期）、推进就绪任务、原子性认领、启动已分配的配置文件。默认**在 gateway 内部运行**（`kanban.dispatch_in_gateway: true`）。每次 tick 一个调度器扫描所有看板；worker 启动时固定了 `HERMES_KANBAN_DB`（其看板的数据库），因此无法看到其他看板。在同一任务上连续启动失败 `kanban.failure_limit` 次（默认：2）后，调度器会以最后一个错误为原因自动阻塞该任务 —— 防止因配置文件不存在、工作区无法挂载等原因导致的反复抖动。
 - **Tenant（租户）** —— 看板*内*的可选字符串命名空间。一个专家团队可以通过工作区路径和内存键前缀为多个业务提供数据隔离服务（`--tenant business-a`）。租户是软过滤器；看板是硬隔离边界。
 
 ## 看板（多项目） {#boards-multi-project}
@@ -73,7 +73,7 @@ Hermes Kanban 是一个持久化任务看板，在所有 Hermes 配置文件之�
 
 - 每个看板有独立的 SQLite DB（`~/.hermes/kanban/boards/<slug>/kanban.db`）。
 - 独立的 `workspaces/` 和 `logs/` 目录。
-- 为任务启动的 Worker 只能看到**其所在看板**的任务 —— 调度器在子进程环境中设置 `HERMES_KANBAN_BOARD`，worker 可访问的每个 `kanban_*` 工具都会读取它。
+- 为任务启动的 Worker 只能看到**其所在看板**的任务 —— 调度器在子进程环境中将 `HERMES_KANBAN_DB` 固定为该看板的数据库，worker 可访问的每个 `kanban_*` 工具都由它推导看板。
 - 不允许跨看板链接任务（保持 schema 简单；如果确实需要跨项目引用，请使用自由文本提及并通过 id 手动查找）。
 
 ### 通过 CLI 管理看板
@@ -86,16 +86,13 @@ hermes kanban boards list
 hermes kanban boards create atm10-server \
     --name "ATM10 Server" \
     --description "Minecraft modded server ops" \
-    --icon 🎮 \
-    --switch                   # 可选：将其设为活动看板
+    --icon 🎮
 
-# 在不切换的情况下操作特定看板。
+# 每个命令都指明其看板，或指明可推导看板的卡片。
 hermes kanban --board atm10-server list
 hermes kanban --board atm10-server create "Restart ATM server" --assignee ops
-
-# 更改后续调用的"当前"看板。
-hermes kanban boards switch atm10-server
-hermes kanban boards show             # 当前活动的是哪个？
+hermes kanban comment t_abc123 "done"     # 由卡片推导看板
+hermes kanban locate t_abc123             # 哪个看板持有该卡片？
 
 # 重命名显示名称（slug 是不可变的 —— 它是目录名）。
 hermes kanban boards rename atm10-server "ATM10 (Prod)"
@@ -108,12 +105,13 @@ hermes kanban boards rm atm10-server
 hermes kanban boards rm atm10-server --delete
 ```
 
-看板解析顺序（优先级从高到低）：
+看板解析顺序（先匹配者胜）。不存在“当前看板”，也没有看板环境变量；一个会话永远无法移动另一个会话的看板：
 
-1. CLI 调用中的显式 `--board <slug>`。
-2. `HERMES_KANBAN_BOARD` 环境变量（调度器在启动 worker 时设置，因此 worker 无法看到其他看板）。
-3. `~/.hermes/kanban/current` —— 由 `hermes kanban boards switch` 持久化的 slug。
-4. `default`。
+1. CLI 调用中的显式 `--board <slug>`（工具调用的 `board=`、仪表盘 API 的 `?board=`）。在 `HERMES_KANBAN_DB` 固定下，它必须指向被固定的看板，否则拒绝。
+2. `HERMES_KANBAN_DB` 固定（调度器在启动 worker 时设置）：其数据库所属的看板。
+3. 命令操作的卡片 id（`show`、`comment`、`complete` 等）：持有该卡片的唯一看板。卡片不在任何看板、在两个看板上，或某个看板不可读时拒绝；传 `--board` 可绕过。
+4. `create --parent <card>`（或 `--continues` / `--workspace-of`）：该卡片的看板。
+5. 否则拒绝并给出修复命令。根 `config.yaml` 的 `kanban.bare_verb: default`（紧急开关）会将这类调用发往 `default`。
 
 Slug 经过验证：小写字母数字 + 连字符 + 下划线，1-64 个字符，必须以字母数字开头。大写输入会自动转为小写。其他任何内容（斜杠、空格、点、`..`）在 CLI 层被拒绝，以防止路径遍历技巧命名看板。
 
@@ -121,8 +119,8 @@ Slug 经过验证：小写字母数字 + 连字符 + 下划线，1-64 个字符�
 
 `hermes dashboard` → Kanban 标签页在存在多个看板（或任何看板有任务）时，顶部会显示看板切换器。单看板用户只看到一个小的 `+ New board` 按钮；切换器在需要时才显示。
 
-- **看板下拉菜单** —— 选择活动看板。你的选择保存在浏览器的 `localStorage` 中，因此在重新加载后仍然有效，不会影响你打开的终端中 CLI 的 `current` 指针。
-- **+ New board** —— 打开一个模态框，询问 slug、显示名称、描述和图标。可选择自动切换到新看板。
+- **看板下拉菜单** —— 选择活动看板。你的选择保存在浏览器的 `localStorage` 中，因此在重新加载后仍然有效，不会影响任何终端（不存在服务器端的当前看板）。
+- **+ New board** —— 打开一个模态框，询问 slug、显示名称、描述和图标。
 - **Archive** —— 仅在非 `default` 看板上显示。确认后，将看板目录移动到 `boards/_archived/`。
 
 所有仪表盘 API 端点接受 `?board=<slug>` 进行看板范围限定。事件 WebSocket 在连接时固定到一个看板；在 UI 中切换会针对新看板打开一个新的 WS。

@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def _create(kanban_identity, env: dict | None = None) -> subprocess.CompletedProcess:
     env = kanban_identity.env if env is None else env
     return subprocess.run(
-        [sys.executable, "-m", "hermes_cli.main", "kanban", "create", "probe", "--json"],
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "--board", "default", "create", "probe", "--json"],
         env={**env, "PYTHONPATH": str(ROOT)}, cwd=str(ROOT), stdin=subprocess.DEVNULL,
         capture_output=True, text=True, timeout=120)
 

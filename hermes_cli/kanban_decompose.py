@@ -307,16 +307,23 @@ def _apply_fanout(
 def decompose_task(
     task_id: str,
     *,
+    board: Optional[str] = None,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
     (not in triage, no aux client, API error, malformed/empty reply) surface
-    as ``ok=False``."""
-    # Resolve the active board ONCE, up front, so the write connections (and
-    # the decompose upgrade's default_workdir lookup) can't disagree if a
-    # concurrent `boards switch` moves the ambient board mid-call.
-    board = kb.get_current_board()
+    as ``ok=False``. ``board`` names the board (S7 D4); omitted, the context board is used."""
+    if board is not None:
+        with kb.scoped_current_board(board):
+            return _decompose_task(task_id, board=board, author=author, timeout=timeout)
+    # Resolve the context board ONCE, up front, so the write connections (and the decompose
+    # upgrade's default_workdir lookup) cannot disagree mid-call.
+    return _decompose_task(task_id, board=kb.get_current_board(), author=author, timeout=timeout)
+
+
+def _decompose_task(task_id: str, *, board: str, author: Optional[str],
+                    timeout: Optional[int]) -> DecomposeOutcome:
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
@@ -344,8 +351,8 @@ def decompose_task(
     return _apply_fanout(task_id, parsed, routing, audit_author, board=board)
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
-    with kbc.connect_closing() as conn:
+def list_triage_ids(*, tenant: Optional[str] = None, board: Optional[str] = None) -> list[str]:
+    """Return task ids currently in the triage column of ``board`` (default: the context board)."""
+    with kbc.connect_closing(board=board) as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
     return [row.id for row in rows]

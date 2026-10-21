@@ -11,12 +11,10 @@ _DESC_TASK_ID_DEFAULT = (
 )
 
 _DESC_BOARD = (
-    "Kanban board slug to target. When omitted, the call resolves the "
-    "active board the usual way: the board database path and board slug "
-    "from the process env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "Kanban board slug to target. When omitted, the board comes from the "
+    "dispatched worker's DB pin, else from the card id this call names; a "
+    "call that names neither (e.g. create without parents, list) is refused "
+    "and must pass board. There is no current board."
 )
 
 

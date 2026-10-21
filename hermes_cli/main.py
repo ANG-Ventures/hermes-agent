@@ -942,7 +942,6 @@ from hermes_cli.main_web_build import (  # frozen updater surface: update_cmd*.p
 )
 from hermes_cli.main_tui_launch import (
     _launch_tui,
-    _pin_kanban_board_env,
     _resolve_use_tui,
     _sync_bundled_skills_quietly,
 )
@@ -1908,7 +1907,6 @@ def cmd_chat(args):
         # runs must keep it (see run_agent._session_source_for_agent).
         os.environ["HERMES_SESSION_SOURCE_EXPLICIT"] = "1"
 
-    _pin_kanban_board_env()
     from hermes_cli.observability.shared_metrics_consent import offer_consent_before_chat
 
     offer_consent_before_chat(args)

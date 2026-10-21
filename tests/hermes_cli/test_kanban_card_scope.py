@@ -234,7 +234,7 @@ def test_cli_create_prints_scope_warning(tmp_path):
                                 "HERMES_CRON", "HERMES_DELEGATED", "_HERMES_GATEWAY"))}
     env.update(HERMES_HOME=str(home), HOME=str(tmp_path), PYTHONPATH=str(REPO))
     proc = subprocess.run(
-        [sys.executable, "-m", "hermes_cli.main", "kanban", "create", "prose card",
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "--board", "default", "create", "prose card",
          "--assignee", "worker1", "--home", "operator", "--body", PROSE_BODY],
         env=env, capture_output=True, text=True, timeout=180, cwd=str(REPO))
     assert proc.returncode == 0, proc.stderr

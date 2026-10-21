@@ -2,8 +2,9 @@
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
 back-compat), other boards at ``<root>/kanban/boards/<slug>/``; a worker on one board never sees
-another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_BOARD`` > ``HERMES_KANBAN_DB`` (pins the
-file path) > ``<root>/kanban/current`` > ``default``; the dispatcher injects these into workers.
+another. Board resolution: ``board=`` arg > ``HERMES_KANBAN_DB`` (pins the file path; the slug is
+derived from it, :func:`pinned_board`) > ``default``. There is no current-board file and no board env
+var (S7): a surface verb names its board, or a card id derives it (``kanban_board_select``).
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
 locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
@@ -1513,66 +1514,111 @@ def boards_root() -> Path:
     return kanban_home() / "kanban" / "boards"
 
 
-def current_board_path() -> Path:
-    """``<root>/kanban/current`` — one-line slug written by ``boards switch``; absent = ``default``."""
-    return kanban_home() / "kanban" / "current"
+# A ``HERMES_KANBAN_DB`` pin that agrees with no board's layout path still IS the DB every open
+# uses; only its NAME is unknown. One encoding of that name, shared with
+# scripts/kanban_board_resolve.py's ``'override'`` (S7 D1, RC-7).
+PINNED_SLUG = "override"
+
+_PINNED_BOARD_MEMO: dict[tuple, str] = {}
+_PINNED_BOARD_ERROR_LOGGED: set[str] = set()
+# raw pin -> why naming it failed (not memoised: the next call retries). The surface reads this
+# to refuse the verb with the next command instead of acting under an unnamed pin (RC-11).
+_PINNED_BOARD_ERRORS: dict[str, str] = {}
+
+
+def _existing_board_slug(candidate: str) -> Optional[str]:
+    if not candidate:
+        return None
+    try:
+        normed = _normalize_board_slug(candidate)
+    except ValueError:
+        return None
+    return normed if normed and board_exists(normed) else None
 
 
 def get_current_board() -> str:
-    """Active slug: context override -> ``HERMES_KANBAN_BOARD`` -> ``<root>/kanban/current``
-    (only while that board exists) -> ``DEFAULT_BOARD``. A malformed/stale slug
-    falls through — the dispatcher must never crash on a hand-edited file."""
-    def _existing(candidate: str) -> Optional[str]:
-        if not candidate:
-            return None
-        try:
-            normed = _normalize_board_slug(candidate)
-        except ValueError:
-            return None
-        return normed if normed and board_exists(normed) else None
+    """The board THIS call is scoped to. "current" is historical: there is no current board.
 
-    for candidate in (
-        (_CURRENT_BOARD_OVERRIDE.get() or "").strip(),
-        os.environ.get("HERMES_KANBAN_BOARD", "").strip(),
-    ):
-        found = _existing(candidate)
-        if found:
-            return found
-    try:
-        f = current_board_path()
-        if f.exists():
-            # utf-8-sig read fix (ours): tolerate BOM-persisted current-board files.
-            val = f.read_text(encoding="utf-8-sig").strip()
-            if val:
-                try:
-                    normed = _normalize_board_slug(val)
-                    if normed and board_exists(normed):
-                        return normed
-                except ValueError:
-                    pass
-    except OSError:
-        pass
+    Context override (:func:`scoped_current_board`, installed by every surface around the verb)
+    -> the board the ``HERMES_KANBAN_DB`` pin names (:func:`pinned_board`) -> ``DEFAULT_BOARD``.
+    Reads no file and no board env var (S7). Never raises: a stale override falls through.
+
+    A pin that names no board (:data:`PINNED_SLUG`) falls to ``DEFAULT_BOARD`` here: library
+    callers build layout paths from this slug, and ``default`` is what they used before S7 (the
+    pointer said ``default``). Every DB open still takes the pin's path. Names that must say
+    "this is a pin" (worker chat identity, ``boards show``) read :func:`pinned_board` directly.
+    """
+    found = _existing_board_slug((_CURRENT_BOARD_OVERRIDE.get() or "").strip())
+    if found:
+        return found
+    pinned = pinned_board()
+    if pinned and (pinned != PINNED_SLUG or board_exists(PINNED_SLUG)):
+        return pinned
     return DEFAULT_BOARD
 
 
-def set_current_board(slug: str) -> Path:
-    """Persist ``slug`` as the active board; returns the file written. Does NOT
-    check the board exists — callers do (so ``boards switch <typo>`` errors)."""
-    _assert_not_delegated_child_mutation()
-    normed = _require_slug(slug)
-    path = current_board_path()
-    _assert_live_board_tree_write_allowed(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(normed + "\n", encoding="utf-8")
-    return path
+def _raw_db_pin() -> str:
+    """The ``HERMES_KANBAN_DB`` pin as set, ``""`` when absent or sandboxed. Never raises."""
+    if kanban_sandbox_enabled():
+        return ""
+    return os.environ.get("HERMES_KANBAN_DB", "").strip()
 
 
-def clear_current_board() -> None:
-    """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
-    _assert_not_delegated_child_mutation()
-    _assert_live_board_tree_write_allowed(current_board_path())
-    with contextlib.suppress(FileNotFoundError):
-        current_board_path().unlink()
+def pinned_board() -> Optional[str]:
+    """Slug of the board ``HERMES_KANBAN_DB`` names; ``None`` only when there is no pin.
+
+    The spelling-blind inverse of :func:`_board_db_path_ignoring_pin`: the first listed board
+    (archived included) whose layout path :func:`_pin_file_agrees` with the pin. A pin that
+    agrees with no board -> :data:`PINNED_SLUG` (the pin is still the DB for every open).
+
+    Total (RC-11): any error while listing or comparing -> :data:`PINNED_SLUG`, logged once per
+    pin, and recorded in ``_PINNED_BOARD_ERRORS`` so a surface verb refuses with the next command
+    (``kanban_board_select``) rather than act under a pin it could not name. Memoised on (pin,
+    root, boards/ mtime), so a process pays one scan per pin (measured: ~16 ms cold, <1 ms hit at
+    65 boards); the pin is spawn-time env and a new board dir changes the mtime.
+    """
+    raw = _raw_db_pin()
+    return board_named_by_pin(raw) if raw else None
+
+
+def board_named_by_pin(raw: str) -> str:
+    """The board whose layout DB path is the file ``raw`` names, else :data:`PINNED_SLUG`.
+
+    The inverse behind :func:`pinned_board`, taking the pin string explicitly so a caller holding
+    a child's env mapping (worker chat identity) derives the same name. Total; see
+    :func:`pinned_board`.
+    """
+    try:
+        root = boards_root()
+        try:
+            stamp = root.stat().st_mtime_ns
+        except FileNotFoundError:
+            stamp = None
+        key = (raw, str(kanban_home()), stamp)
+        hit = _PINNED_BOARD_MEMO.get(key)
+        if hit is not None:
+            return hit
+        pin = Path(raw).expanduser().resolve(strict=False)
+        found = PINNED_SLUG
+        with enumerating_boards():
+            for slug, path in _board_db_layout():
+                if _pin_file_agrees(path.resolve(strict=False), pin):
+                    found = slug
+                    break
+        if len(_PINNED_BOARD_MEMO) > 256:
+            _PINNED_BOARD_MEMO.clear()
+        _PINNED_BOARD_MEMO[key] = found
+        _PINNED_BOARD_ERRORS.pop(raw, None)
+        return found
+    except Exception as exc:  # RC-11: total; the pin still routes every open.
+        _PINNED_BOARD_ERRORS[raw] = f"{type(exc).__name__}: {exc}"
+        if raw not in _PINNED_BOARD_ERROR_LOGGED:
+            _PINNED_BOARD_ERROR_LOGGED.add(raw)
+            _log.warning("kanban: could not name the board HERMES_KANBAN_DB=%s pins (%s: %s); "
+                         "using %r", raw, type(exc).__name__, exc, PINNED_SLUG)
+        return PINNED_SLUG
+
+
 _BOARD_ALIAS_CACHE: tuple[Optional[tuple[int, int]], dict[str, str]] = (None, {})
 
 
@@ -2338,12 +2384,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     #
     # Checked BEFORE the cache invalidation below: it opens the board DB
     # (which would re-populate _INITIALIZED_PATHS) and it can abort, so no
-    # state may be torn down ahead of it -- INCLUDING the active-board pin,
-    # which used to be cleared above this gate. A refused removal that had
-    # already unlinked <root>/kanban/current left get_current_board() falling
-    # through to DEFAULT_BOARD, so every later `kanban add` / `list` /
-    # `dispatch` silently addressed the default board with nothing saying the
-    # pin had moved (FleetReview on PR #785, measured).
+    # state may be torn down ahead of it.
     live = _board_has_live_cards(normed)
     if live:
         verb = "archive" if archive else "delete"
@@ -2358,12 +2399,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             f"{verb} its directory, which contains their workspaces. "
             "Wait for the cards to finish, or stop them first."
         )
-
-    # Remember the active pin while the board still exists. It is cleared only
-    # after the archive/delete succeeds; either operation has later failure
-    # boundaries (rename errors and survivor-held hard deletes) that must leave
-    # the operator pointed at the still-present board.
-    was_current_board = get_current_board() == normed
 
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
@@ -2414,8 +2449,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             detail=f"board={normed} action=archive dest={target}",
             board=normed,
         )
-        if was_current_board:
-            clear_current_board()
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
         from hermes_cli.kanban_survivor import remove_workspace_dir
@@ -2456,8 +2489,6 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             d, task_id=None, reason="remove_board", outcome=AUDIT_DELETE,
             detail=f"board={normed}", board=normed,
         )
-        if was_current_board:
-            clear_current_board()
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
@@ -3395,7 +3426,7 @@ def _refuse_live_kanban_write(target: Path, live_root: Path, action: str) -> Non
         return
     pins = ", ".join(
         f"{k}={os.environ[k]}"
-        for k in (*_KANBAN_PATH_PIN_ENV_VARS, "HERMES_KANBAN_BOARD")
+        for k in _KANBAN_PATH_PIN_ENV_VARS
         if os.environ.get(k, "").strip()
     ) or "<none>"
     raise LiveBoardWriteRefused(
@@ -3425,7 +3456,7 @@ def _assert_live_board_tree_write_allowed(path: Path) -> None:
     ``connect()``'s guard only sees ``kanban.db``. ``create_board()`` writes
     ``board.json`` (and mkdirs the board dir) BEFORE it reaches ``connect()``,
     so a refused create still left a board that ``list_boards()`` surfaces;
-    ``set_current_board()`` / ``remove_board()`` never touch the DB at all.
+    ``remove_board()`` never touches the DB at all.
     That is how ten fixture boards (alpha, curr, spawntest, slug-immutable, …)
     landed in the live ``kanban/boards/`` on 2026-09-22 (card t_216b74e0).
     Same production-root list and R1/R2 predicate as the DB guard, and the same
@@ -3472,6 +3503,103 @@ def connect_readonly(
         conn.close()
         raise
     return conn
+
+
+class KanbanBoardDerivationError(ValueError):
+    """A card id could not be mapped to exactly one board (S7 D3). ``code`` is M8's code."""
+
+    code = "BOARD_DERIVATION"
+
+
+class KanbanCardNotFound(KanbanBoardDerivationError):
+    code = "CARD_NOT_FOUND"
+
+
+class KanbanCardAmbiguous(KanbanBoardDerivationError):
+    code = "CARD_AMBIGUOUS"
+
+
+class KanbanBoardUnreadable(KanbanBoardDerivationError):
+    code = "BOARD_UNREADABLE"
+
+
+def _board_db_layout() -> list[tuple[str, Path]]:
+    """``(slug, layout DB path)`` for every board on disk, archived included, ``default`` first.
+
+    The same set :func:`list_boards` enumerates, but resolved from ONE root read: per-board
+    :func:`kanban_home` resolution (via ``board_dir``/``read_board_metadata``) cost ~4 ms a board
+    and pushed :func:`board_of_task` past its 250 ms budget at the live board count (S7 RC-2).
+    A dir named for a slug IS that board's dir; aliases redirect retired names, which have none.
+    """
+    home = kanban_home()
+    out: list[tuple[str, Path]] = [(DEFAULT_BOARD, home / "kanban.db")]
+    root = home / "kanban" / "boards"
+    if not root.is_dir():
+        return out
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        try:
+            slug = _normalize_board_slug(child.name)
+        except ValueError:
+            continue
+        if not slug or slug == DEFAULT_BOARD or not child.is_dir():
+            continue
+        if (child / "kanban.db").exists() or (child / "board.json").exists():
+            out.append((slug, child / "kanban.db"))
+    return out
+
+
+def _board_archived(board_path: Path, slug: str) -> bool:
+    if slug == DEFAULT_BOARD:
+        return False
+    try:
+        return bool(json.loads((board_path / "board.json").read_text(encoding="utf-8-sig")).get("archived"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def board_of_task(task_id: str) -> str:
+    """The ONE board holding ``task_id``, probed read-only across every board on disk.
+
+    Never guesses (S7 D3): zero hits -> :class:`KanbanCardNotFound`, two or more ->
+    :class:`KanbanCardAmbiguous` (archived hits marked), any unreadable board ->
+    :class:`KanbanBoardUnreadable` (fail closed: the card might be on it). A board dir with no
+    ``kanban.db`` holds no cards (no hit). Each probe opens the board's LAYOUT path
+    (:func:`_board_db_path_ignoring_pin`), never :func:`kanban_db_path`, so a ``HERMES_KANBAN_DB``
+    pin cannot collapse every probe onto one file.
+    """
+    tid = str(task_id or "").strip()
+    if not tid:
+        raise KanbanCardNotFound("kanban: a card id is required to derive its board.")
+    hits: list[tuple[str, bool]] = []
+    with enumerating_boards():
+        boards = _board_db_layout()
+        for slug, path in boards:
+            try:
+                conn = connect_readonly(db_path=path)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                raise KanbanBoardUnreadable(
+                    f"kanban: board {slug} is unreadable ({type(exc).__name__}: {exc}); fix it or "
+                    f"pass --board <slug> to bypass derivation."
+                ) from exc
+            try:
+                row = conn.execute("SELECT 1 FROM tasks WHERE id = ? LIMIT 1", (tid,)).fetchone()
+            except sqlite3.Error as exc:
+                raise KanbanBoardUnreadable(
+                    f"kanban: board {slug} is unreadable ({type(exc).__name__}: {exc}); fix it or "
+                    f"pass --board <slug> to bypass derivation."
+                ) from exc
+            finally:
+                conn.close()
+            if row is not None:
+                hits.append((slug, _board_archived(path.parent, slug)))
+    if not hits:
+        raise KanbanCardNotFound(f"kanban: {tid} is on no board (checked {len(boards)} boards).")
+    if len(hits) > 1:
+        named = ", ".join(f"{s} (archived)" if arch else s for s, arch in hits)
+        raise KanbanCardAmbiguous(f"kanban: {tid} exists on {named}; pass --board <slug>.")
+    return hits[0][0]
 
 
 def _discard_stub_db(path: Path) -> None:

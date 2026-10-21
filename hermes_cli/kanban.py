@@ -333,30 +333,27 @@ def kanban_command(args: argparse.Namespace) -> int:
         _record_refused_block(args, refusal)
         return _err(f"kanban: {refusal}")
 
-    # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
-    # the `--board` routing override (else `--board beta boards show` reports beta).
+    # `boards …` manages board metadata itself (there is no current board, S7); `boards show`
+    # reads `--board` itself, every other `boards` verb names its slug positionally.
     if action == "boards":
         return _dispatch_boards(args)
 
-    # `--board <slug>` pins HERMES_KANBAN_BOARD for the duration of this call so it inherits the
-    # exact resolution the dispatcher uses for workers.
-    board_override = getattr(args, "board", None)
-    board_scope = contextlib.nullcontext()
-    # `is not None`: an explicit empty selector (empty $BOARD in a script) is refused below,
-    # never treated as "no selector" and routed to the current board.
-    if board_override is not None:
-        try:
-            normed = kb._normalize_board_slug(board_override)
-        except ValueError as exc:
-            return _err(f"kanban: {exc}", 2)
-        if not normed:
-            return _err("kanban: --board requires a slug", 2)
-        # Boards other than 'default' must already exist — typoed slugs would otherwise silently
-        # create an empty board.
-        if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
-            return _err(f"kanban: board {normed!r} does not exist. "
-                        f"Create it with `hermes kanban boards create {normed}`.")
-        board_scope = kb.scoped_current_board(normed)
+    # S7: the verb names its board, or the DB pin or its card id does; otherwise it is refused
+    # with the next command. The resolved slug is installed as the context board for the whole
+    # verb, so every library caller below sees the board the connection is on.
+    from hermes_cli import kanban_board_select as kbsel
+
+    try:
+        resolved = kbsel.resolve(args)
+    except kbsel.BoardRequired as exc:
+        return _err(str(exc), 2)
+    except kbsel.BoardNotFound as exc:
+        return _err(str(exc))
+    except (ValueError, kb.KanbanPinDivergenceError) as exc:
+        msg = str(exc)
+        return _err(msg if msg.startswith("kanban") else f"kanban: {msg}", 2)
+    board_scope = (kb.scoped_current_board(resolved) if resolved and resolved != kb.PINNED_SLUG
+                   else contextlib.nullcontext())
 
     with board_scope:
         # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises
@@ -1348,6 +1345,25 @@ def _print_section(title: str, lines) -> None:
     print(title)
     for line in lines:
         print(line)
+
+
+def _cmd_locate(args: argparse.Namespace) -> int:
+    """``kanban locate <id>``: the ONE board holding a card (S7 D3, Q2). The registry's single
+    encoding; ``scripts/kanban_board_resolve.py`` wraps this verb. Output contract (tested):
+    stdout ``<slug>\\t<db_path>``; rc 2 with ``<CODE>: <message>`` on stderr otherwise."""
+    pinned = kb.pinned_board()
+    if pinned:
+        raw = kb._raw_db_pin()
+        print(f"{pinned}\t{raw}")
+        return 0
+    try:
+        slug = kb.board_of_task(args.task_id)
+    except kb.KanbanBoardDerivationError as exc:
+        print(f"{exc.code}: {exc}", file=sys.stderr)
+        return 2
+    with kb.enumerating_boards():
+        print(f"{slug}\t{kb._board_db_path_ignoring_pin(slug)}")
+    return 0
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
@@ -4953,7 +4969,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "budget": _cmd_budget, "swarm": _cmd_swarm,
-    "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
+    "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show, "locate": _cmd_locate,
     "assign": _cmd_assign, "set-model": _cmd_set_model, "priority": _cmd_priority,
     "lane-model": _cmd_lane_model, "pins": _cmd_pins,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,

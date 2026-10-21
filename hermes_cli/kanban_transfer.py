@@ -121,7 +121,9 @@ def export_board(
     """Export ``board`` to a ``tar.gz`` (suffix optional on ``output_path``);
     returns a summary dict. Workspaces are never included — large,
     machine-local, rebuilt on demand."""
-    slug = kb._normalize_board_slug(board) or kb.get_current_board()
+    slug = kb._normalize_board_slug(board)
+    if not slug:
+        raise ValueError("export needs a board slug (there is no current board)")
     if not kb.board_exists(slug):
         raise ValueError(f"board {slug!r} does not exist")
 
@@ -327,8 +329,6 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
 def import_board(
     archive_path: str,
     slug: Optional[str] = None,
-    *,
-    activate: bool = False,
 ) -> dict[str, Any]:
     """Import an archive as a NEW board (``slug`` overrides the archive's;
     either way it auto-suffixes if taken). Returns a summary dict."""
@@ -396,9 +396,6 @@ def import_board(
         stats, warnings = _relocate_imported_rows(conn, target)
         counts = _count_rows(conn)
 
-    if activate:
-        kb.set_current_board(target)
-
     return {
         "board": target,
         "requested_board": requested,
@@ -415,5 +412,4 @@ def import_board(
         "attachments_restored": stats["attachments"],
         "tasks_parked": stats["parked"],
         "warnings": warnings,
-        "activated": bool(activate),
     }

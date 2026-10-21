@@ -272,10 +272,8 @@
   const DOCS_URL = "https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban";
   const DOCS_TUTORIAL_URL = "https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban-tutorial";
 
-  // localStorage key for the user's selected board. Independent of the
-  // CLI's on-disk ``<root>/kanban/current`` pointer so browser users
-  // can inspect any board without shifting the CLI's active board out
-  // from under a terminal they left open.
+  // localStorage key for the user's selected board. The server has no
+  // current board (S7): every request names one, ``default`` when unset.
   const LS_BOARD_KEY = "hermes.kanban.selectedBoard";
   const viewerSession = new URLSearchParams(window.location.search).get("session") || "";
 
@@ -305,13 +303,10 @@
   }
 
   function withBoard(url, board) {
-    // Always append ?board=<slug> when we have one picked — including
-    // "default". Omitting the param would fall through to the backend's
-    // resolution chain (env var → ``current`` file → default), which
-    // means the dashboard's tab selection gets silently overridden by
-    // whatever board the CLI or "switch" checkbox last activated.
-    // Regression: #20879.
-    if (!board) return url;
+    // Always append ?board=<slug>. The server has no current board (S7) and
+    // answers an omitted board with 400, so an unset selection means "default".
+    board = board || "default";
+
     const sep = url.indexOf("?") >= 0 ? "&" : "?";
     return `${url}${sep}board=${encodeURIComponent(board)}`;
   }
@@ -628,7 +623,7 @@
   function KanbanPage() {
     const { t } = useI18n();
     const kanbanDialogs = useKanbanDialogs(t);
-    const [board, setBoard] = useState(() => readSelectedBoard() || null);
+    const [board, setBoard] = useState(() => readSelectedBoard() || "default");
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
     const [showBoardSettings, setShowBoardSettings] = useState(false);
@@ -712,12 +707,7 @@
       return SDK.fetchJSON(withBoard(`${API}/boards`, board))
         .then(function (data) {
           const boards = (data && data.boards) || [];
-          const storedBoard = readSelectedBoard();
           setBoardList(boards);
-          if (!storedBoard && !board && data && data.current) {
-            setBoard(data.current);
-            return;
-          }
           // If the stored slug isn't in the list any longer (board was
           // deleted in the CLI while dashboard was open), fall back to
           // default so the UI doesn't hang on a 404.
@@ -764,11 +754,9 @@
         // mode mints a fresh ticket per connect), so resolve then open.
         const wsParams = { since: String(cursorRef.current || 0) };
         // Pin the WS stream to the currently-selected board so events
-        // from other boards don't bleed in. Includes "default" so the
-        // dashboard's own board pin always wins over the server-side
-        // ``current`` file — same rationale as ``withBoard()`` above.
-        // Regression: #20879.
-        if (board) wsParams.board = board;
+        // from other boards don't bleed in. Always named: the server has
+        // no current board (S7), same as ``withBoard()`` above.
+        wsParams.board = board || "default";
         SDK.buildWsUrl(`${API}/events`, wsParams).then(function (url) {
           if (wsClosedRef.current) return;
           let ws;
@@ -1239,7 +1227,7 @@
        destructive: true,
      }).then(function (r) {
        if (!r.confirmed) return null;
-       return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
+       return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
          method: "DELETE",
        }).then(function () {
          loadBoard();
@@ -1265,7 +1253,7 @@
         const ids = Array.from(selectedIds);
         setSelectedIds(new Set());
         return Promise.all(ids.map(function (id) {
-          return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
+          return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(id)}`, board), { method: "DELETE" });
         })).then(function () {
           loadBoard();
         }).catch(function (e) { setError(String(e.message || e)); });

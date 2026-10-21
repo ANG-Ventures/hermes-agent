@@ -52,16 +52,15 @@ def test_rename_board_keeps_slug(client):
     assert listed["name"] == "Gadget"
 
 
-def test_delete_board_archives_and_reverts_current(client):
+def test_delete_board_archives(client):
     client.post("/api/plugins/kanban/boards", json={"slug": "widget", "name": "Widget"})
     client.post("/api/plugins/kanban/tasks?board=widget", json={"title": "do the thing"})
-    kb.set_current_board("widget")
 
     r = client.delete("/api/plugins/kanban/boards/widget")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["result"]["action"] == "archived"
-    assert body["current"] == "default"
+    assert "current" not in body  # S7 D5: there is no current board
 
     # The switcher shows this path, so it must point at real recoverable data.
     archived = Path(body["result"]["new_path"])
@@ -85,3 +84,35 @@ def test_delete_default_board_is_refused(client):
     r = client.delete("/api/plugins/kanban/boards/default")
     assert r.status_code == 400
     assert "default" in r.json()["detail"]
+
+
+# --- S7 D5: no current board on the dashboard ------------------------------------------------
+
+@pytest.mark.kanban_bare_verb_refuse
+def test_board_query_omitted_is_400_with_the_next_command(client):
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 400
+    assert "board required" in r.json()["detail"]
+    assert "--board <slug>" in r.json()["detail"]
+    assert client.get("/api/plugins/kanban/board?board=default").status_code == 200
+
+
+@pytest.mark.kanban_bare_verb_refuse
+def test_kill_switch_default_serves_the_default_board(client, tmp_path):
+    (tmp_path / ".hermes" / "config.yaml").write_text("kanban:\n  bare_verb: default\n", encoding="utf-8")
+    assert client.get("/api/plugins/kanban/board").status_code == 200
+
+
+def test_set_current_endpoint_and_field_are_gone(client):
+    client.post("/api/plugins/kanban/boards", json={"slug": "widget"})
+    assert client.post("/api/plugins/kanban/boards/widget/switch").status_code in (404, 405)
+    body = client.get("/api/plugins/kanban/boards").json()
+    assert "current" not in body
+    assert all("is_current" not in b for b in body["boards"])
+    assert not (tmp_path_of(client) / "kanban" / "current").exists()
+
+
+def tmp_path_of(_client) -> Path:
+    import os
+
+    return Path(os.environ["HERMES_HOME"])

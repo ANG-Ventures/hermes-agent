@@ -37,8 +37,7 @@ vi.mock('./api', async importOriginal => ({
     boards: [
       { name: 'Shipping', project_id: null, slug: 'shipping', total: 3 },
       { name: 'Research', project_id: null, slug: 'research', total: 1 }
-    ],
-    current: 'shipping'
+    ]
   })),
   fetchBoard: vi.fn(async () => ({ assignees: [], columns: [], tenants: [] })),
   fetchOrchestration: vi.fn(async () => ({ default_assignee: '' })),
@@ -56,6 +55,8 @@ let queryClient = new QueryClient()
 beforeEach(() => {
   queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   disposeLocales = registerPluginLocales('kanban', KANBAN_LOCALES)
+  // No server-side current board (S7): the selection names the board.
+  $boardSlug.set('shipping')
   disposePage = registry.register({
     area: 'routes',
     id: 'kanban:page',

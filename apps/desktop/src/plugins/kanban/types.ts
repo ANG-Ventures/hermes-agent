@@ -147,12 +147,11 @@ export interface KanbanTaskDetail {
   runs: KanbanRun[]
 }
 
-/** GET /boards — every board on disk + which one is the server's current. */
+/** GET /boards — every board on disk (there is no server-side current board, S7). */
 export interface BoardMeta {
   slug: string
   name?: null | string
   description?: null | string
-  is_current?: boolean
   total?: number
   /** Board-level project directory new tasks inherit (empty = none). */
   default_workdir?: null | string
@@ -204,7 +203,6 @@ export interface TaskEstimate {
 }
 export interface BoardsResponse {
   boards: BoardMeta[]
-  current: string
 }
 
 /** GET /tasks/:id/log — the worker's stdout/stderr tail. */

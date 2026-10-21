@@ -23,10 +23,22 @@ _log = logging.getLogger(__name__)
 def resolve_kanban_worker_chat_identity(
     env: Mapping[str, str] | None = None,
 ) -> tuple[str, str]:
-    """Return ``(chat_id, chat_name)`` from the worker's pinned environment."""
+    """Return ``(chat_id, chat_name)`` from the worker's pinned environment.
+
+    The board segment is derived from the ``HERMES_KANBAN_DB`` pin (S7: there is no board env
+    var); ``override`` when the pin names no board's layout path, as kanban_board_resolve prints.
+    """
     source = os.environ if env is None else env
     task_id = (source.get("HERMES_KANBAN_TASK") or "").strip()
-    board = (source.get("HERMES_KANBAN_BOARD") or "").strip()
+    board = ""
+    pin = (source.get("HERMES_KANBAN_DB") or "").strip()
+    if task_id and pin:
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            board = _kb.board_named_by_pin(pin)
+        except Exception:
+            board = ""
     chat_name = (
         " / ".join(part for part in ("kanban", board, task_id) if part)
         if task_id

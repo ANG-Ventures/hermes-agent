@@ -50,7 +50,10 @@ type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
 let rest: null | Rest = null
 let os: null | PluginOs = null
 
-/** Selected board slug ('' = the server's current board). Persisted. */
+/** Mirrors `kanban_db.DEFAULT_BOARD`: what an unselected ('') board means. */
+export const DEFAULT_BOARD_SLUG = 'default'
+
+/** Selected board slug ('' = the default board; the server has no current board, S7). Persisted. */
 export const $boardSlug = atom<string>('')
 
 /** Whether the "how this board works" intro was dismissed. Persisted. */
@@ -127,7 +130,7 @@ function eventsUrl(slug: string, since: number | undefined): string {
 }
 
 function boardSnapshotPath(slug: string): string {
-  return slug ? `/board?board=${encodeURIComponent(slug)}` : '/board'
+  return `/board?board=${encodeURIComponent(slug || DEFAULT_BOARD_SLUG)}`
 }
 
 /** Cache-scope id for the active connection — the segment every query key
@@ -289,18 +292,8 @@ export function bindApi(
         })
     }
 
-    if (selectedSlug) {
-      openResolved(selectedSlug)
-
-      return
-    }
-
-    // Resolve the alias BEFORE the handshake: /events is pinned to its board
-    // when opened. Resolving on each frame could classify an old socket's
-    // events against a different server-current board's cursor.
-    void r<BoardsResponse>('/boards')
-      .then(boards => openResolved(typeof boards.current === 'string' ? boards.current : ''))
-      .catch(() => openResolved('')) // Keep live cache invalidation; notifications fail closed.
+    // '' is the default board: the server has no current board to ask for (S7).
+    openResolved(selectedSlug || DEFAULT_BOARD_SLUG)
   }
 
   // The local connection keeps the BARE key (the bare-local rule of
@@ -355,14 +348,11 @@ function call<T>(path: string, opts?: PluginRestOptions): Promise<T> {
   return rest ? rest<T>(path, opts) : Promise.reject(new Error('kanban api not ready'))
 }
 
-/** Append the selected board (and other params) to a path. */
+/** Append the selected board (and other params) to a path. Always names a board: the server
+ *  refuses an omitted one (S7, there is no current board); '' selects `default`. */
 function withBoard(path: string, params: Record<string, string> = {}): string {
   const search = new URLSearchParams(params)
-  const slug = $boardSlug.get()
-
-  if (slug) {
-    search.set('board', slug)
-  }
+  search.set('board', $boardSlug.get() || DEFAULT_BOARD_SLUG)
 
   const qs = search.toString()
 

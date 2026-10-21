@@ -402,8 +402,8 @@ def test_repair_db_still_repairs_for_a_real_operator(
 # (alpha, curr, my-proj, persist, recycle, slug-immutable, spawntest, hascards,
 # proja, real) landed in the live kanban/boards/: create_board() writes
 # board.json and mkdirs the board dir BEFORE connect() runs, so even a refused
-# create left a board list_boards() surfaces. set_current_board() and
-# remove_board() never reach connect() at all.
+# create left a board list_boards() surfaces. remove_board() never reaches
+# connect() at all. (The current-board pointer and its writers are gone, S7.)
 
 
 def _files_under(root: Path) -> list[str]:
@@ -434,21 +434,6 @@ def test_board_metadata_write_on_live_root_is_refused(kanban_on_live_root):
     assert _files_under(kanban_on_live_root) == []
 
 
-def test_live_current_board_pointer_cannot_be_moved(kanban_on_live_root):
-    with pytest.raises(kb.LiveBoardWriteRefused):
-        kb.set_current_board("curr")
-    assert not (kanban_on_live_root / "kanban" / "current").exists()
-
-
-def test_live_current_board_pointer_cannot_be_cleared(kanban_on_live_root):
-    current = kanban_on_live_root / "kanban" / "current"
-    current.parent.mkdir(parents=True)
-    current.write_text("real-board\n", encoding="utf-8")
-    with pytest.raises(kb.LiveBoardWriteRefused):
-        kb.clear_current_board()
-    assert current.read_text(encoding="utf-8") == "real-board\n"
-
-
 def test_live_board_cannot_be_archived_or_deleted(kanban_on_live_root):
     board = kanban_on_live_root / "kanban" / "boards" / "real-board"
     board.mkdir(parents=True)
@@ -470,9 +455,6 @@ def test_board_lifecycle_still_works_for_a_production_process(
     kanban_on_live_root, as_production_process
 ):
     kb.create_board("ops")
-    kb.set_current_board("ops")
-    assert kb.get_current_board() == "ops"
-    kb.clear_current_board()
     res = kb.remove_board("ops")
     assert res["action"] == "archived"
     assert [b["slug"] for b in kb.list_boards()] == ["default"]
@@ -485,7 +467,6 @@ def test_board_lifecycle_under_a_hermetic_home_is_untouched(
     home.mkdir()
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     kb.create_board("alpha")
-    kb.set_current_board("alpha")
     kb.remove_board("alpha")
     assert _files_under(live_root) == []
 
@@ -493,8 +474,8 @@ def test_board_lifecycle_under_a_hermetic_home_is_untouched(
 def test_board_tree_guard_sees_a_symlinked_live_kanban_dir(live_root, tmp_path, monkeypatch):
     """``<live>/kanban -> /mnt/k``: resolved paths leave the root (Prism #1881 73c944bd05e2).
 
-    create_board/set_current_board/remove_board reach only the board-tree guard,
-    which compared the resolved spelling alone and let all three through.
+    create_board/remove_board reach only the board-tree guard, which compared the
+    resolved spelling alone and let them through.
     """
     external = tmp_path / "mnt-kanban"
     board = external / "boards" / "real-board"
@@ -508,8 +489,6 @@ def test_board_tree_guard_sees_a_symlinked_live_kanban_dir(live_root, tmp_path, 
     before = _files_under(external)
     with pytest.raises(kb.LiveBoardWriteRefused):
         kb.create_board("spawntest")
-    with pytest.raises(kb.LiveBoardWriteRefused):
-        kb.set_current_board("real-board")
     for archive in (True, False):
         with pytest.raises(kb.LiveBoardWriteRefused):
             kb.remove_board("real-board", archive=archive)

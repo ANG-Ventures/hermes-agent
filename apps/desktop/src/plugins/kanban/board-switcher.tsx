@@ -335,7 +335,7 @@ export function BoardSwitcher() {
     return null
   }
 
-  const currentSlug = slug || boards.current
+  const currentSlug = slug || DEFAULT_BOARD
   const current = boards.boards.find(meta => meta.slug === currentSlug)
   const label = current?.name || current?.slug || k.board
 
@@ -364,7 +364,7 @@ export function BoardSwitcher() {
           {boards.boards.map(meta => (
             <DropdownMenuItem
               key={meta.slug}
-              onSelect={() => $boardSlug.set(meta.slug === boards.current ? '' : meta.slug)}
+              onSelect={() => $boardSlug.set(meta.slug === DEFAULT_BOARD ? '' : meta.slug)}
             >
               {meta.name || meta.slug}
               {typeof meta.total === 'number' && (
