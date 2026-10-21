@@ -46,6 +46,19 @@ def _contains(path: str, prefix: str) -> bool:
     return prefix.startswith(path) if path == os.sep else prefix.startswith(path + os.sep)
 
 
+def _sqlite_uri_path(database):
+    """The file a ``uri=True`` sqlite database names: ``file:///abs?mode=ro`` opens ``/abs``.
+    Checked as the URI text it would read as a cwd-relative path (wrong both ways)."""
+    text = os.fsdecode(database) if isinstance(database, (str, bytes, os.PathLike)) else database
+    if not isinstance(text, str) or not text.startswith("file:"):
+        return database
+    from urllib.parse import urlsplit  # noqa: PLC0415
+    from urllib.request import url2pathname  # noqa: PLC0415
+
+    path = urlsplit(text).path
+    return url2pathname(path) if path else None
+
+
 class HomeIOGuard:
     def __init__(self, roots, installed_apps=lambda: ()):
         self.roots = roots
@@ -185,7 +198,16 @@ class HomeIOGuard:
         for name in ("rename", "replace"):
             wrap(os, name, (("src", "src_dir_fd"), ("dst", "dst_dir_fd")), destructive=True)
         wrap(shutil, "rmtree", (("path", "dir_fd"),), destructive=True)
-        wrap(sqlite3, "connect", (("database", None),))
+        original_connect = sqlite3.connect
+
+        @wraps(original_connect)
+        def guarded_connect(*args, **kwargs):
+            database = args[0] if args else kwargs.get("database")
+            uri = args[7] if len(args) > 7 else kwargs.get("uri", False)
+            self.check(_sqlite_uri_path(database) if uri else database)
+            return original_connect(*args, **kwargs)
+
+        monkeypatch.setattr(sqlite3, "connect", guarded_connect)
 
         original_open, original_close = os.open, os.close
 
