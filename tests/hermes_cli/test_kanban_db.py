@@ -3423,7 +3423,7 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
 
 
 
-def test_resolve_hermes_argv_module_actually_runs():
+def test_resolve_hermes_argv_module_actually_runs(tmp_path):
     """The fallback module name must be importable + runnable.
 
     A unit test that pins the literal string is necessary but not
@@ -3441,7 +3441,14 @@ def test_resolve_hermes_argv_module_actually_runs():
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
             argv = kbd._resolve_hermes_argv()
-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
+    # -P drops cwd from sys.path, so boot it the way the dispatcher does: import
+    # root propagated into env, cwd = a task workspace (never the repo).
+    env = dict(os.environ)
+    kbd._propagate_module_import_root(argv, env)
+    r = subprocess.run(
+        argv + ["--version"], capture_output=True, text=True, timeout=30,
+        env=env, cwd=tmp_path,
+    )
     assert r.returncode == 0, (
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
