@@ -284,6 +284,65 @@ def test_k3_spawn_failure_parks_the_card(home):
         assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_k3_spawn_now_refuses_a_conn_on_another_board(home):
+    """The board argument names delegations but ``conn`` is another board's file (Prism 60090edde10b)."""
+    with _conn(OTHER) as conn:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        with pytest.raises(ValueError):
+            kbd.spawn_now(conn, tid, board=BOARD, spawn_fn=lambda *a, **k: None)
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready" and task.current_run_id is None
+
+
+def test_k3_post_launch_failure_stops_the_worker(home, monkeypatch):
+    """The pid write raises after the process exists: it is stopped, the card parks (Prism 6a23557fb4be)."""
+    import sqlite3
+
+    procs = []
+
+    def spawn(task, workspace, **kw):
+        procs.append(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]))
+        return procs[-1].pid
+
+    def pid_write_fails(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(kbd, "_set_worker_pid", pid_write_fails)
+    with _conn(BOARD) as conn:
+        tid = kb.create_task(conn, title="unit", assignee="worker")
+        try:
+            with pytest.raises(kbd.SpawnNowError):
+                kbd.spawn_now(conn, tid, board=BOARD, spawn_fn=spawn)
+            assert procs[0].wait(timeout=15) is not None
+            assert kb.get_task(conn, tid).status == "blocked"
+        finally:
+            if procs and procs[0].poll() is None:
+                procs[0].kill()
+                procs[0].wait(timeout=10)
+
+
+def test_k3_stale_spawn_failure_leaves_the_successor_run(home, monkeypatch):
+    """Run A's workspace failure must not end run B, which claimed the card meanwhile (Prism f2afc6f28e76)."""
+    successor = {}
+
+    def resolve_then_lose_the_card(task, **kw):
+        with _conn(BOARD) as other:
+            other.execute("UPDATE tasks SET status = 'ready', claim_lock = NULL WHERE id = ?", (task.id,))
+            other.commit()
+            successor["task"] = kb.claim_task(other, task.id)
+        raise OSError("workspace gone")
+
+    monkeypatch.setattr(kbd._kbw, "resolve_workspace", resolve_then_lose_the_card)
+    with _conn(BOARD) as conn:
+        tid = kb.create_task(conn, title="unit", assignee="worker")
+        with pytest.raises(kbd.SpawnNowError):
+            kbd.spawn_now(conn, tid, board=BOARD, spawn_fn=lambda *a, **k: None)
+        run_b = successor["task"].current_run_id
+        task = kb.get_task(conn, tid)
+        assert task.status == "running" and task.current_run_id == run_b
+        assert conn.execute("SELECT ended_at FROM task_runs WHERE id = ?", (run_b,)).fetchone()[0] is None
+
+
 # --------------------------------------------------------------------------
 # K4 budget isolation
 # --------------------------------------------------------------------------

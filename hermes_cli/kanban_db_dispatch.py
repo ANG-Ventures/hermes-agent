@@ -4021,6 +4021,9 @@ def spawn_now(
     """
     if not _kdb.is_delegations_board(board):
         raise ValueError(f"spawn_now serves the {_kdb.DELEGATIONS_BOARD!r} board only, not {board!r}")
+    # Every mutation goes through ``conn``: its file decides, not the argument (Prism 60090edde10b).
+    if not _kdb.conn_is_delegations(conn):
+        raise ValueError(f"spawn_now: conn is not open on the {_kdb.DELEGATIONS_BOARD!r} board")
     db_path = _kb.kanban_db_path(board=board)
     deadline = time.monotonic() + max(0.0, float(lock_wait_seconds))
     while True:
@@ -4045,7 +4048,8 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
         workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
         _record_task_failure(conn, claimed.id, f"workspace: {exc}", outcome="spawn_failed",
-                             release_claim=True, end_run=True)
+                             release_claim=True, end_run=True,
+                             expected_run_id=claimed.current_run_id)
         raise SpawnNowError(f"{task_id}: workspace: {exc}") from exc
     _kbw.set_workspace_path(conn, claimed.id, str(workspace))
     spawn = spawn_fn if spawn_fn is not None else _default_spawn
@@ -4063,10 +4067,15 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
             ),
         )
     except Exception as exc:
+        if state.launched and state.pid:
+            # Failed after the process started (pid/placement write): stop it before the run
+            # is ended, so a reported failure never leaves a unit running (Prism 6a23557fb4be).
+            _kb._abort_lost_claim_spawn(conn, claimed, int(state.pid))
         host_fault = _host_fault(exc)
         _record_task_failure(
             conn, claimed.id, str(exc), outcome="spawn_failed", release_claim=True, end_run=True,
             infrastructure=host_fault is not None, run_metadata_extra=host_fault or None,
+            expected_run_id=claimed.current_run_id,
         )
         raise SpawnNowError(f"{task_id}: spawn failed: {exc}") from exc
     if outcome != _LAUNCH_OK:
