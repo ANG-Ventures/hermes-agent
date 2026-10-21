@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 NAME = "HERMES_KANBAN_LINEAGE"
 CONST = "KANBAN_LINEAGE_ENV"
 SUPPRESS = "# lineage-reader: ok"
+SELF = "scripts/check_kanban_lineage_readers.py"  # names the tag to look for it
 
 
 def _mentions(node: ast.AST) -> bool:
@@ -91,7 +92,7 @@ def main(argv: list[str]) -> int:
             rel = path.relative_to(ROOT).as_posix()
         except ValueError:
             rel = str(path)
-        if rel.startswith("tests/") or not path.is_file():
+        if rel.startswith("tests/") or rel == SELF or not path.is_file():
             continue
         problems.extend(scan_source(path.read_text(encoding="utf-8-sig"), rel))
     for p in problems:
