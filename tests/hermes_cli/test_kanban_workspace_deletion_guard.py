@@ -1168,13 +1168,12 @@ def test_real_kanban_gc_cli_does_not_reap_the_deletion_audit(kanban_home):
 
     env = dict(os.environ)
     env["HERMES_HOME"] = str(kanban_home)
-    env.pop("HERMES_KANBAN_BOARD", None)
     repo_root = Path(kb.__file__).resolve().parents[1]
     env["PYTHONPATH"] = os.pathsep.join(
         [str(repo_root), env.get("PYTHONPATH", "")]
     ).rstrip(os.pathsep)
     res = subprocess.run(
-        [sys.executable, "-m", "hermes_cli.main", "kanban", "gc"],
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "--board", "default", "gc"],
         cwd=str(repo_root), env=env, capture_output=True, text=True, timeout=300,
     )
 
