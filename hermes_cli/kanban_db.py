@@ -1521,6 +1521,9 @@ PINNED_SLUG = "override"
 
 _PINNED_BOARD_MEMO: dict[tuple, str] = {}
 _PINNED_BOARD_ERROR_LOGGED: set[str] = set()
+# raw pin -> why naming it failed (not memoised: the next call retries). The surface reads this
+# to refuse the verb with the next command instead of acting under an unnamed pin (RC-11).
+_PINNED_BOARD_ERRORS: dict[str, str] = {}
 
 
 def _existing_board_slug(candidate: str) -> Optional[str]:
@@ -1569,8 +1572,10 @@ def pinned_board() -> Optional[str]:
     agrees with no board -> :data:`PINNED_SLUG` (the pin is still the DB for every open).
 
     Total (RC-11): any error while listing or comparing -> :data:`PINNED_SLUG`, logged once per
-    pin. Memoised on (pin, root, boards/ mtime), so a process pays one scan per pin; the pin is
-    spawn-time env and a new board dir changes the mtime.
+    pin, and recorded in ``_PINNED_BOARD_ERRORS`` so a surface verb refuses with the next command
+    (``kanban_board_select``) rather than act under a pin it could not name. Memoised on (pin,
+    root, boards/ mtime), so a process pays one scan per pin (measured: ~16 ms cold, <1 ms hit at
+    65 boards); the pin is spawn-time env and a new board dir changes the mtime.
     """
     raw = _raw_db_pin()
     return board_named_by_pin(raw) if raw else None
@@ -1603,8 +1608,10 @@ def board_named_by_pin(raw: str) -> str:
         if len(_PINNED_BOARD_MEMO) > 256:
             _PINNED_BOARD_MEMO.clear()
         _PINNED_BOARD_MEMO[key] = found
+        _PINNED_BOARD_ERRORS.pop(raw, None)
         return found
     except Exception as exc:  # RC-11: total; the pin still routes every open.
+        _PINNED_BOARD_ERRORS[raw] = f"{type(exc).__name__}: {exc}"
         if raw not in _PINNED_BOARD_ERROR_LOGGED:
             _PINNED_BOARD_ERROR_LOGGED.add(raw)
             _log.warning("kanban: could not name the board HERMES_KANBAN_DB=%s pins (%s: %s); "

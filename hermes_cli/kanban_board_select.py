@@ -95,6 +95,13 @@ def resolve_slug(board: Optional[str], *, verb: str, card_ids: Iterable[str] = (
         return _check_explicit(normed)
     pinned = kb.pinned_board()
     if pinned:
+        raw = kb._raw_db_pin()
+        failed = kb._PINNED_BOARD_ERRORS.get(raw) if pinned == kb.PINNED_SLUG else None
+        if failed:  # RC-11: never act under a pin whose board could not be named
+            raise BoardRequired(
+                f"kanban: could not name the board HERMES_KANBAN_DB={raw} pins ({failed}); "
+                f"pass --board <the slug that DB belongs to> (boards: hermes kanban boards list)."
+            )
         return pinned
     for card in card_ids:
         card = str(card or "").strip()

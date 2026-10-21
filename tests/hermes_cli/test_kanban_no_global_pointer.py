@@ -34,6 +34,7 @@ def home(tmp_path, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     kb._INITIALIZED_PATHS.clear()
     kb._PINNED_BOARD_MEMO.clear()
+    kb._PINNED_BOARD_ERRORS.clear()
     return h
 
 
@@ -154,6 +155,9 @@ def test_pinned_board_is_total_on_an_unreadable_boards_dir(home, monkeypatch):
     monkeypatch.setattr(kb, "_board_db_layout", boom)
     assert kb.pinned_board() == kb.PINNED_SLUG
     assert kb.get_current_board() == kb.DEFAULT_BOARD
+    # ...and the surface refuses the verb with the one next command instead of acting (RC-11).
+    with pytest.raises(kbsel.BoardRequired, match="could not name the board.*pass --board"):
+        kbsel.resolve(_ns(kanban_action="list", board=None))
 
 
 def test_pinned_board_cost_is_paid_once_per_pin(home, monkeypatch):
