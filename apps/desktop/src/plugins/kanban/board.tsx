@@ -71,6 +71,7 @@ import {
   boardsKey,
   bulkTasks,
   createTask,
+  DEFAULT_BOARD_SLUG,
   deleteTask,
   estimateNew,
   fetchBoard,
@@ -568,7 +569,7 @@ function NewTaskDialog({
   // board switcher's "Board settings…".
   const selectedSlug = useValue($boardSlug)
   const { data: boards } = useQuery({ queryKey: boardsKey(scope), queryFn: fetchBoards, staleTime: 30_000 })
-  const currentBoard = boards?.boards.find(b => b.slug === (selectedSlug || boards.current))
+  const currentBoard = boards?.boards.find(b => b.slug === (selectedSlug || DEFAULT_BOARD_SLUG))
   const boardDefaultKind = currentBoard?.default_workspace_kind || 'scratch'
   const boardDefaultDir = currentBoard?.default_workdir || ''
 
