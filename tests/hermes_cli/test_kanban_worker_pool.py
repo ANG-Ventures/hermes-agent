@@ -951,7 +951,8 @@ def test_cli_dispatch_places_a_pin_through_the_gateway_plan(kanban_home, monkeyp
     monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
     kb_cli._cmd_dispatch(argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False))
     plan = captured["spillover"]
-    assert isinstance(plan, kwp.SpilloverPlan) and plan.pins_only is True
+    # Remote-first (#2148, t_82b4db80): overflow off no longer narrows the plan to pins.
+    assert isinstance(plan, kwp.SpilloverPlan) and plan.pins_only is False and plan.default_remote is True
     assert plan.take("alpha", pin="ace-media").name == "ace-media"
 
 
@@ -2032,9 +2033,10 @@ def test_admitting_band_plans_the_pool_for_a_bare_ready_card(kanban_home):
     gate, b = _admitting_builder(kanban_home / "fleet", V01)
     plan = b.plan_pool([{"slug": "default"}], {})
     assert isinstance(plan, kwp.SpilloverPlan) and plan.pins_only is False and plan.budget == 8
+    # Remote-first (#2148, t_82b4db80): overflow off plans the same card too.
     gate, b = _admitting_builder(kanban_home / "fleet", {**V01, "worker_pool": {"overflow": False}})
-    assert b.plan_pool([{"slug": "default"}], {}) is None
-    assert gate.pool == {"planned": False, "reason": "not_needed"}
+    plan = b.plan_pool([{"slug": "default"}], {})
+    assert isinstance(plan, kwp.SpilloverPlan) and plan.pins_only is False
 
 
 def test_admitting_band_with_nothing_ready_does_not_probe(kanban_home):
