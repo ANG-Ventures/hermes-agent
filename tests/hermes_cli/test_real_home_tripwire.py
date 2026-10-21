@@ -184,6 +184,21 @@ def test_relative_path_metadata_exemption_tracks_working_directory(protected_hom
         guard.check(target, metadata=True)
 
 
+def test_sqlite_uri_is_checked_as_the_file_it_names(protected_home, tmp_path, monkeypatch):
+    """``sqlite3.connect("file:///abs?mode=ro", uri=True)`` opens /abs. The guard must check
+    that path, not the URI text, which it would read as relative and join to the cwd (a refusal
+    of every URI from a cwd inside the root, a pass for a URI into the root from outside it)."""
+    allowed = tmp_path / "allowed.db"
+    sqlite3.connect(allowed).close()
+    monkeypatch.chdir(protected_home)
+    sqlite3.connect(allowed.resolve().as_uri() + "?mode=ro", uri=True).close()
+    monkeypatch.chdir(tmp_path)
+    target = protected_home / "state.db"
+    for uri in (target.as_uri() + "?mode=ro", f"file:{target}?mode=ro"):
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            sqlite3.connect(uri, uri=True)
+
+
 def test_checkout_inside_a_guarded_root_is_not_hermes_state():
     """The default install checks the repo out INSIDE the home (install.sh:
     INSTALL_DIR=$HERMES_HOME/hermes-agent): the checkout, its .venv and test
