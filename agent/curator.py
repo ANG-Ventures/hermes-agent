@@ -1137,8 +1137,10 @@ SHARED_SCOPE_NOTE = (
     "curatable this pass, overriding hard rule #1 for SHARED external-dir "
     "skills ONLY. Bundled and hub-installed skills remain strictly "
     "read-only. Every shared mutation is snapshotted and committed with "
-    "curator provenance; archiving a shared skill moves it to "
-    "skills-shared/<group>/.archive/<name>/ (never the local archive)."
+    "curator provenance. A shared skill is NEVER archived: deleting one "
+    "only unsubscribes it to skills-shared/<group>-aux/<name>/, and only "
+    "when it is idle past the fleet window (scripts/lib/skill_tier.py); a "
+    "recently used one is refused."
 )
 
 def _render_candidate_list() -> str:
