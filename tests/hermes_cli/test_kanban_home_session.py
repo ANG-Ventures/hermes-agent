@@ -1392,6 +1392,38 @@ def test_cli_create_child_with_session_none_stays_unhomed(kanban_home, monkeypat
     assert inherited["session_id"] == HOME
 
 
+def test_cli_create_under_foreign_parent_homes_to_the_caller(kanban_home, monkeypatch):
+    """t_d59f722a (Forge L0 loader, 10-21): a session creating a child under ANOTHER
+    session's card keeps the child in its own session, so it can drive it; --json
+    prints the home. --home-with-parent restores inheritance."""
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="root", assignee="w", session_id=OTHER)
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    out = kc.run_slash(f"create kid --parent {root} --json")
+    kid = json.loads(out[out.index("{"):])
+    assert kid["session_id"] == HOME and kid["home"] == HOME
+    with kb.connect_closing() as conn:
+        t = kb.get_task(conn, kid["id"])
+        assert t.session_id == HOME
+        assert f"session {HOME}" in t.body.splitlines()[0]
+        assert [p for p in kb.parent_ids(conn, kid["id"])] == [root]
+    out2 = kc.run_slash(f"create kid2 --parent {root} --home-with-parent --json")
+    kid2 = json.loads(out2[out2.index("{"):])
+    assert kid2["session_id"] == OTHER and kid2["home"] == OTHER
+
+
+def test_create_under_foreign_parent_inside_worker_run_keeps_lineage_home(kanban_home, monkeypatch):
+    """Worker fan-out still belongs to the lineage's human home (rule 1)."""
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="root", assignee="w", session_id=OTHER)
+    monkeypatch.setenv("HERMES_SESSION_ID", HOME)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", root)
+    with kb.connect_closing() as conn:
+        kid = kb.create_task(conn, title="kid", assignee="w", parents=(root,),
+                             session_id=HOME, home_with_parent=False)
+        assert kb.get_task(conn, kid).session_id == OTHER
+
+
 # --- C5 races: ownership re-checked inside the write txn -------------------
 
 

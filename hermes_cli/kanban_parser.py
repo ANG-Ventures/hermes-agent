@@ -378,6 +378,10 @@ _SPECS = [
                   "any operator-profile session may act on. For cron/script minters with no "
                   "session of their own: create REFUSES a card that would be born unhomed. "
                   "Accepts 'operator' or 'operator:<name>'; exclusive with --session."),
+        _arg("--home-with-parent", action="store_true", default=False, dest="home_with_parent",
+             help="Home the child on its --parent's session even when that is ANOTHER session's "
+                  "home. Without it a caller with a session keeps a child of a foreign parent in "
+                  "its own session (t_d59f722a). No effect inside a worker run or with --session."),
         _arg("--unhomed", action="store_true", default=False,
              help="Mint the card with NO home session on purpose (same as --session none). "
                   "Without it a worker, cron or gateway create that resolves no home is "
