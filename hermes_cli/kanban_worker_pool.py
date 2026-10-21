@@ -159,6 +159,17 @@ CARD_NEEDS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
         r"|\blive gate\b|\bpinned (?:relay )?turn\b", re.IGNORECASE)),
     ("sub_ssh", re.compile(r"(?<![\w-])sub-vps-\d+\b", re.IGNORECASE)),
     ("studio_launchd", re.compile(r"\blaunchctl\b|Library/LaunchAgents\b")),
+    # t_40abb42b: the card RUNS something in the Studio's live home tree
+    # (t_50f2fa37 said run `~/.hermes/scripts/dpx-alias-key-leak-lint.py`,
+    # spilled to ci-box, which has no ~/.hermes, and blocked). An executor
+    # word right before a HOME-ABSOLUTE scripts/config/state/var path; a
+    # repo-relative ``scripts/x.py`` or a bare path mention is not a need.
+    # 14 days, 7,124 bodies: a bare mention matched 515 (48 placed
+    # off-Studio, mostly PR work that never touched the path); this matches 87.
+    ("studio_tree", re.compile(
+        r"(?:\brun|\bDO:|\bpython[\d.]*|\bbash|\bz?sh)\s+[`'\"]?"
+        r"(?:~|\$\{?HOME\}?|/Users/[^/\s]+|/home/[^/\s]+)/\.hermes/(?:scripts|config|state|var)/",
+        re.IGNORECASE)),
 )
 STUDIO_NEEDS_RULE = "studio_needs"
 # Card header lines that name where a card CAME FROM, never where it runs.
