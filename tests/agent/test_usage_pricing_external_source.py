@@ -7,7 +7,7 @@ OpenRouter data.
 from decimal import Decimal
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 import agent.model_metadata as model_metadata
 import agent.models_dev as models_dev
