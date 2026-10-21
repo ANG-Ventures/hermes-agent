@@ -176,7 +176,6 @@ _BOARD_SPECS = [
         _arg("--description", help="Optional description"),
         _arg("--icon", help="Optional emoji or single-character icon for the dashboard"),
         _arg("--color", help="Optional hex color (e.g. '#8b5cf6') for the dashboard"),
-        _arg("--switch", action="store_true", help="Switch to the new board after creating it"),
         _arg("--default-workdir", help="Default workspace path for tasks created on this board"),
     ], aliases=["new"], help="Create a new board"),
     _cmd("rm", [
@@ -185,8 +184,7 @@ _BOARD_SPECS = [
              help="Hard-delete the board directory instead of archiving it. "
                   "Default is to move it to boards/_archived/ so it's recoverable."),
     ], aliases=["remove", "delete"], help="Archive (default) or delete a board"),
-    _cmd("switch", [_SLUG], aliases=["use"], help="Set the active board for subsequent CLI calls"),
-    _cmd("show", aliases=["current"], help="Print the currently-active board slug"),
+    _cmd("show", aliases=["current"], help="Print the board this process is pinned to (--board or the DB pin)"),
     _cmd("rename", [_SLUG, _arg("name", help="New display name")],
          help="Change a board's human-readable display name (slug is immutable)"),
     _cmd("set-default-workdir", [
@@ -194,7 +192,7 @@ _BOARD_SPECS = [
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
     _cmd("export", [
-        _arg("slug", nargs="?", help="Board to export (default: the current board)"),
+        _arg("slug", nargs="?", help="Board to export (default: the board the DB pin names)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),
         _arg("--no-attachments", action="store_true", help="Skip attachment files, keeping the archive small"),
         _arg("--include-logs", action="store_true", help="Include per-task worker logs"),
@@ -208,7 +206,6 @@ _BOARD_SPECS = [
     _cmd("import", [
         _arg("archive", help="Path to the .tar.gz archive"),
         _arg("--as", dest="as_slug", help="Slug for the imported board (default: from the archive)"),
-        _arg("--switch", action="store_true", help="Switch to the imported board afterwards"),
         _json_flag(),
     ], help="Import a board archive as a new board", description=(
         "Import a .tar.gz produced by `hermes kanban boards export`. The board always lands as a "
@@ -1119,10 +1116,8 @@ def _intermix_optional_positionals(parser: argparse.ArgumentParser) -> None:
     parser.__class__ = _Intermixed
 
 
-_BOARD_HELP = ("Board slug to operate on. Defaults to the current board (set "
-               "via `hermes kanban boards switch <slug>` or the "
-               "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
-               "list` to see all boards.")
+_BOARD_HELP = ("Board slug. Required unless a card id or the worker's DB pin names it (S7). "
+               "Use `hermes kanban boards list` to see all boards.")
 
 # Verbs that take no verb-position ``--board``: ``clone`` is a git operation with no board state,
 # ``budget`` owns ``--board`` as a report filter. ``boards …`` accepts it for parity and its
@@ -1164,9 +1159,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                     "are executed by a named profile in an isolated workspace. "
                     "See https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban.",
     )
-    # --board scopes every subcommand to one board's DB; when omitted the
-    # resolution is HERMES_KANBAN_BOARD, then the persisted current-board
-    # file, then "default" (kanban_db.get_current_board()).
+    # --board scopes every subcommand to one board's DB; when omitted the board comes from the
+    # DB pin or the verb's card id, else the verb is refused (kanban_board_select.resolve, S7).
     kanban_parser.add_argument("--board", default=None, metavar="<slug>", help=_BOARD_HELP)
     sub = kanban_parser.add_subparsers(dest="kanban_action")
     _add_commands(sub, _SPECS)
