@@ -223,7 +223,6 @@ _NOW = 1_000_000.0 + 60
             {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "x"}}]},
             {"role": "assistant", "content": "a"},
         ]}, _RT, {}, _NOW, "turn_complete"),
-        ({}, _RT, {"boomerang": {"fork_max_prefix_tokens": 1}}, _NOW, "prefix_le_cap"),
         ({"last_served_by": None}, _RT, {}, _NOW, "seat_known"),
         ({}, _RT, {}, 1_000_000.0 + 56 * 60, "warm"),  # 1h parent at 56 min
         ({"_last_cache_creation_split": {"1h": 0, "5m": 10}}, _RT, {}, 1_000_000.0 + 6 * 60, "warm"),  # 5m at 6 min
@@ -237,6 +236,75 @@ def test_each_eligibility_predicate_has_its_own_reason(overrides, rt, cfg, now, 
 
 def test_eligible_parent_is_eligible():
     assert fork.fork_eligible(_eligible_parent(), _RT, {}, now=_NOW) == (True, "")
+
+
+def test_prefix_larger_than_child_window_is_still_eligible():
+    """No prefix ceiling (Ace 2026-10-21, supersedes D-9): a parent prefix far above 0.6x the
+    child's window, and a legacy ``fork_max_prefix_tokens`` knob, do not refuse the fork."""
+    from agent.model_metadata import estimate_messages_tokens_rough, get_model_context_length
+
+    window = get_model_context_length(_RT["model"])
+    big = [{"role": "user", "content": "x" * (window * 4)}, {"role": "assistant", "content": "a"}]
+    assert estimate_messages_tokens_rough(big) > window * 0.6
+    parent = _eligible_parent(_session_messages=big)
+    assert fork.fork_eligible(parent, _RT, {}, now=_NOW) == (True, "")
+    assert fork.fork_eligible(parent, _RT, {"boomerang": {"fork_max_prefix_tokens": 1}}, now=_NOW) == (True, "")
+
+
+def test_fork_child_over_compaction_threshold_compacts_on_first_turn():
+    """A fork child whose inherited prefix + task is over its compaction threshold runs the
+    same turn-loop compaction the parent would (``agent/turn_preflight.py::
+    compress_after_tool_results`` -> ``ContextCompressor.should_compress`` against
+    ``threshold_tokens``), on its first turn, and completes instead of erroring."""
+    parent = _warm_parent()
+    window = parent.context_compressor.context_length
+    parent._session_messages = [
+        {"role": "user", "content": "y" * (window * 3)},
+        {"role": "assistant", "content": "noted"},
+    ]
+    child = _build(parent)
+    assert child._inherit_mode == "fork"
+    threshold = child.context_compressor.threshold_tokens
+    assert 0 < threshold < window
+    user_message, history = fork.fork_run_inputs(child, "verify the canary")
+
+    responses = iter([
+        SimpleNamespace(
+            content=[SimpleNamespace(type="tool_use", id="toolu_1", name="read_file",
+                                     input={"path": "/nonexistent/fork-compaction-probe"})],
+            stop_reason="tool_use", stop_sequence=None, model="claude-fable-5-1",
+            usage=SimpleNamespace(input_tokens=threshold + 50_000, output_tokens=10,
+                                  cache_read_input_tokens=0, cache_creation_input_tokens=0),
+        ),
+        _anthropic_response("canary verified"),
+    ])
+    captured = []
+
+    def _create(kwargs, **_kw):
+        captured.append(json.dumps(kwargs["messages"], default=str))
+        return next(responses)
+
+    def _compress(messages, system_message, **kw):
+        start = max(i for i, m in enumerate(messages) if m.get("role") == "user" and "BOOMERANG FORK" in str(m.get("content")))
+        return messages[start:], child._cached_system_prompt
+
+    with ExitStack() as stack:
+        _patches(stack)
+        stack.enter_context(patch.object(child, "_create_request_anthropic_client", return_value=MagicMock()))
+        stack.enter_context(patch.object(child, "_anthropic_messages_create", side_effect=_create))
+        mock_compress = stack.enter_context(patch.object(child, "_compress_context", side_effect=_compress))
+        stack.enter_context(patch.object(child, "_persist_session"))
+        stack.enter_context(patch.object(child, "_save_trajectory"))
+        stack.enter_context(patch.object(child, "_cleanup_task_resources"))
+        result = child.run_conversation(user_message, conversation_history=history)
+
+    assert mock_compress.called, "fork child over threshold never compacted"
+    assert result.get("failed") is not True
+    assert result["completed"] is True
+    assert result["final_response"] == "canary verified"
+    # First request carried the full inherited prefix (warm read); the one after compaction did not.
+    assert len(captured) == 2
+    assert "y" * 1000 in captured[0] and "y" * 1000 not in captured[1]
 
 
 def test_warm_uses_usage_split_over_cache_ttl():
