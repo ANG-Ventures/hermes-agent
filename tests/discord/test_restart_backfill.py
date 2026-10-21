@@ -679,3 +679,59 @@ def test_anchor_falls_back_to_floor_on_long_outage(_tmp_home):
     assert abs(anchor_epoch - floor) < 1.0, "a long outage must clamp to the now-lookback floor"
 
 
+@pytest.mark.asyncio
+async def test_backfill_skips_message_held_by_gateway_restart_followup(_tmp_home):
+    """Incident 2026-10-20 23:57: a ``/queue`` message accepted just before a
+    planned restart was spooled as a restart follow-up and replayed on boot,
+    AND the reconnect backfill re-injected the same Discord message because it
+    was not yet in the transcript. The queue showed the item twice. A message
+    the gateway already HOLDS is not missed: backfill must skip it."""
+    adapter, store, db = _build_adapter_with_store(_tmp_home)
+    author = _FakeAuthor(11111)
+    channel = _FakeChannel(987010, [])
+    held = _make_msg(70010, author, channel, content="/queue bigger runner pool?")
+    missed = _make_msg(70011, author, channel, content="and this one was really missed")
+    channel._messages = [held, missed]
+    _seed_session_for_channel(adapter, store, db, channel, author)
+
+    adapter.mark_platform_message_held("70010")
+    assert adapter.platform_message_is_held(70010)
+    assert not adapter.platform_message_is_held("70011")
+
+    adapter._restart_recovery.mark_channel_active(str(channel.id))
+    adapter._client = SimpleNamespace(
+        user=_FakeAuthor(99999, "bot", bot=True),
+        get_channel=lambda _id: channel,
+        fetch_channel=AsyncMock(return_value=channel),
+    )
+    await adapter._backfill_missed_messages()
+    assert [m.id for m in adapter._dispatched] == [70011], (
+        "a message replayed from the restart spool must not be re-injected by backfill"
+    )
+
+
+def test_runner_hands_held_followup_ids_to_adapter_wired_later():
+    """The spool replays BEFORE the Discord adapter exists: the runner keeps the
+    held ids per platform and ``_wire_adapter_handlers`` pushes them into the
+    adapter when it is built."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    runner = SimpleNamespace(adapters={})
+    GatewayRunner._note_held_platform_message(runner, SimpleNamespace(platform=Platform.DISCORD), 70010)
+    GatewayRunner._note_held_platform_message(runner, SimpleNamespace(platform=Platform.DISCORD), None)
+    assert runner._held_platform_message_ids == {Platform.DISCORD: {"70010"}}
+
+    from tests.e2e.conftest import _make_discord_adapter_wired
+    adapter, _ = _make_discord_adapter_wired()
+    assert not adapter.platform_message_is_held("70010")
+    for mid in runner._held_platform_message_ids.get(adapter.platform, ()):
+        adapter.mark_platform_message_held(mid)
+    assert adapter.platform_message_is_held("70010")
+
+    # Adapter already wired: the note lands on it directly.
+    runner.adapters[Platform.DISCORD] = adapter
+    GatewayRunner._note_held_platform_message(runner, SimpleNamespace(platform=Platform.DISCORD), "70012")
+    assert adapter.platform_message_is_held("70012")
+
+
