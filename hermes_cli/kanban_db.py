@@ -17498,6 +17498,26 @@ def _safe_cmdline(proc) -> list[str]:
         return []
 
 
+#: ``<task_id>:<run_id>`` on every dispatcher-spawned worker (option C, K6). Unlike
+#: ``HERMES_KANBAN_TASK``/``RUN_ID`` it is not in ``KANBAN_ENV_KEYS``, so
+#: ``scrub_kanban_env`` keeps it on a delegated child's tool processes. It is a REAP
+#: tag only: nothing may read it as ownership or authority
+#: (``scripts/check_kanban_lineage_readers.py`` fails on any other reader).
+KANBAN_LINEAGE_ENV = "HERMES_KANBAN_LINEAGE"
+
+
+def _env_names_run(env: dict, task_id: str, run_id: str) -> Optional[bool]:
+    """True/False when the env carries a run identity (TASK+RUN_ID, else the lineage
+    tag) that is/isn't this run; None when it carries none."""
+    env_task = env.get("HERMES_KANBAN_TASK")
+    if env_task is not None:
+        return env_task == task_id and env.get("HERMES_KANBAN_RUN_ID") == run_id
+    lineage = env.get(KANBAN_LINEAGE_ENV)  # lineage-reader: ok — the escapee reaper
+    if lineage is not None:
+        return lineage == f"{task_id}:{run_id}"
+    return None
+
+
 def _run_env_escapees_detailed(task_id: str, run_id: int) -> list[tuple[int, int, bool]]:
     """``(pid, pgid, by_env)`` of every live process whose ENVIRONMENT carries
     exactly this task+run identity, wherever it sits in the session tree
@@ -17531,11 +17551,11 @@ def _run_env_escapees_detailed(task_id: str, run_id: int) -> list[tuple[int, int
             env = proc.environ()
         except Exception:  # psutil on macOS: SystemError for a process exiting mid-read
             continue
-        env_task = env.get("HERMES_KANBAN_TASK")
-        if env_task is None:
+        by_env = _env_names_run(env, want_task, want_run)
+        if by_env is None:
             if want_task not in _cmdline_profile_cards(_safe_cmdline(proc)):
                 continue
-        elif env_task != want_task or env.get("HERMES_KANBAN_RUN_ID") != want_run:
+        elif not by_env:
             continue
         try:
             if my_sid is not None and os.getsid(pid) == my_sid:
@@ -17545,7 +17565,7 @@ def _run_env_escapees_detailed(task_id: str, run_id: int) -> list[tuple[int, int
             continue
         if pgid <= 1 or pgid == os.getpgid(0):
             continue
-        found.append((pid, pgid, env_task is not None))
+        found.append((pid, pgid, by_env is not None))
     return found
 
 
