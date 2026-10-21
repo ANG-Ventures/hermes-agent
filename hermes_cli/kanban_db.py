@@ -42,6 +42,7 @@ from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as _REVIEW_LE
 from hermes_cli.kanban_review_schema import HEAD_SHA_PATTERN as _HEAD_SHA_PATTERN  # noqa: E402
 from hermes_cli.kanban_review_schema import validate_v2_fields as _validate_review_v2  # noqa: E402
 from hermes_cli import kanban_review_schema as _review_schema  # noqa: E402
+from hermes_cli import kanban_delegations_board as _kdb  # noqa: E402
 _log = logging.getLogger(__name__)
 
 
@@ -6630,7 +6631,9 @@ def create_task(
                 if pr_owner_forced:
                     _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
                 overlap_hits: list[dict] = []
-                if duplicate_guard:
+                # K5: a background delegation unit is not an incident a session
+                # mints; the gate would only comment and hold it for 10 min.
+                if duplicate_guard and not _kdb.conn_is_delegations(conn):
                     # Same-incident gate (t_ba30f0de): another session minted
                     # this incident in the last 30 min. Never refuses; comments
                     # both cards and holds this one in ready for 10 min.
@@ -9810,7 +9813,7 @@ def release_stale_claims(
                 "AND current_run_id IS ? "
                 # A worker that registered its own pid since the SELECT keeps its claim.
                 "AND worker_pid IS ?",
-                (retry_status, row["id"], row["claim_lock"], now,
+                (_kdb.requeue_status(conn, retry_status), row["id"], row["claim_lock"], now,
                  row["current_run_id"], row["worker_pid"]),
             )
             if cur.rowcount != 1:
@@ -9830,6 +9833,9 @@ def release_stale_claims(
                     **({"dead_claimer_release_basis": "operator_claim_no_worker"} if operator_review else {}),
                 },
             )
+            if _kdb.conn_is_delegations(conn):
+                _kdb.park_event(conn, row["id"], outcome="reclaimed",
+                                retry_status=retry_status, run_id=run_id)
             reclaimed += 1
         # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
         # the run ended without a verdict, so it counts toward the breaker and a
@@ -18288,7 +18294,8 @@ def detect_progress_stalls(
         escalate = attempts >= 2
         reason = f"worker progress stalled for {age}s; {evidence['signals']}; heartbeat age {evidence['heartbeat_age_seconds']}s"
         with write_txn(conn):
-            status = "blocked" if escalate else _retry_status_for_run(conn, row["id"])
+            status = "blocked" if escalate else _kdb.requeue_status(
+                conn, _retry_status_for_run(conn, row["id"]))
             cur = conn.execute(
                 "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
                 "worker_pid=NULL, last_heartbeat_at=NULL, block_kind=? "
@@ -18303,6 +18310,9 @@ def detect_progress_stalls(
             )
             _append_event(conn, row["id"], "blocked" if escalate else "stalled_reclaimed",
                           {"reason": reason, **evidence}, run_id=ended)
+            if not escalate and status == _kdb.PARKED_STATUS:
+                _kdb.park_event(conn, row["id"], outcome="stalled",
+                                retry_status=_retry_status_for_run(conn, row["id"], rid), run_id=ended)
         reclaimed.append(row["id"])
     return reclaimed
 ORPHANED_TERMINAL_TASK_OUTCOME = "orphaned_terminal_task"
@@ -19476,6 +19486,8 @@ def count_running_by_placement(boards) -> "dict[str, tuple[int, dict[str, int]]]
     seen: "set[str]" = set()
     for meta in enumerating_each(boards):
         slug = (meta.get("slug") if isinstance(meta, dict) else None) or DEFAULT_BOARD
+        if _kdb.is_delegations_board(slug):
+            continue  # K4: background units never hold kanban capacity
         conn = None
         try:
             with enumerating_boards():
@@ -19557,6 +19569,8 @@ def count_running_tasks_host() -> Optional[int]:
     except Exception:
         current_path = None
     try:
+        if _kdb.is_delegations_board(get_current_board()):
+            raise LookupError("K4: the delegations board holds no kanban capacity")
         conn = connect()
         try:
             total += _count_running_strict(conn)
@@ -19605,6 +19619,8 @@ def _scan_running_tasks(skip_paths: "set[str]") -> "tuple[int, int]":
     # helper is covered too).
     for meta in enumerating_each(boards):
         slug = meta.get("slug") or DEFAULT_BOARD
+        if _kdb.is_delegations_board(slug):
+            continue  # K4: background units never hold kanban capacity
         try:
             # Enumerating every board on disk, not addressing the named one.
             # The extent also covers the ``connect(board=slug)`` below, which

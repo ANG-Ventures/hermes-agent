@@ -1412,7 +1412,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
+                (_kdb.requeue_status(conn, retry_status), tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -1433,6 +1433,9 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 _kb._append_event(
                     conn, tid, "timed_out", payload, run_id=run_id,
                 )
+                if _kdb.conn_is_delegations(conn):
+                    _kdb.park_event(conn, tid, outcome="timed_out",
+                                    retry_status=retry_status, run_id=run_id)
                 timed_out.append(tid)
         # Outside the write_txn above because ``_record_task_failure`` opens its
         # own. If the breaker trips this flips the task to ``blocked`` and emits
@@ -1525,7 +1528,7 @@ def detect_stale_running(
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND current_run_id IS ?",
-                (retry_status, tid, row["claim_lock"], row["current_run_id"]),
+                (_kdb.requeue_status(conn, retry_status), tid, row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -1551,6 +1554,8 @@ def detect_stale_running(
                 metadata=payload,
             )
             _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
+            if _kdb.conn_is_delegations(conn):
+                _kdb.park_event(conn, tid, outcome="stale", retry_status=retry_status, run_id=run_id)
             reclaimed.append(tid)
 
     return reclaimed
@@ -1623,12 +1628,12 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             continue
         with _kbc.write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
+                (_kdb.requeue_status(conn, "ready"), tid, row["claim_lock"], row["claim_expires"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -1652,6 +1657,8 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 now,
             )
             _kb._append_event(conn, tid, "reconciled", payload, run_id=run_id)
+            if _kdb.conn_is_delegations(conn):
+                _kdb.park_event(conn, tid, outcome="reclaimed", retry_status="ready", run_id=run_id)
             reconciled.append(tid)
         _kb._log.info(
             "kanban reconcile: requeued orphaned running task %s "
@@ -2418,7 +2425,7 @@ def detect_crashed_workers(
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                (_kdb.requeue_status(conn, retry_status), row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -2448,6 +2455,9 @@ def detect_crashed_workers(
                     event_payload,
                     run_id=run_id,
                 )
+                if _kdb.conn_is_delegations(conn):
+                    _kdb.park_event(conn, row["id"], outcome=_run_outcome,
+                                    retry_status=retry_status, run_id=run_id)
                 exited_hook_payloads.append({
                     "task_id": row["id"],
                     "assignee": row["assignee"],
@@ -2937,7 +2947,7 @@ def _record_task_failure(
                     "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (retry_status, failures, error[:500], task_id),
+                    (_kdb.requeue_status(conn, retry_status), failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: caller already restored the source phase.
@@ -2969,6 +2979,9 @@ def _record_task_failure(
                     },
                     run_id=run_id,
                 )
+            if release_claim and _kdb.conn_is_delegations(conn):
+                _kdb.park_event(conn, task_id, outcome=outcome, retry_status=retry_status,
+                                run_id=run_id if end_run else None)
             # Timeout/crash path's caller already emitted its own event.
     return blocked
 
@@ -3916,6 +3929,149 @@ def _release_finished_resources(conn: sqlite3.Connection, board: Optional[str]) 
         kanban_resources.release_finished(conn, board=board)
     except Exception as exc:
         _kb._log.warning("kanban resource release failed (%s: %s)", type(exc).__name__, exc)
+
+
+_LAUNCH_OK = "launched"
+_LAUNCH_NOT_OWNED = "not_owned"        # the run lost the card before launch: nothing ran
+_LAUNCH_CLAIM_LOST = "claim_lost"      # launched, then the run lost the card: orphan aborted
+
+
+@dataclass
+class _LaunchState:
+    """``launched`` flips once the worker process exists, so a caller's
+    exception handler can tell a pre-launch failure (refund) from a later one."""
+
+    launched: bool = False
+    pid: Optional[int] = None
+
+
+def _launch_claimed(
+    conn: sqlite3.Connection,
+    claimed: Task,
+    workspace: str,
+    *,
+    board: Optional[str],
+    spawn,
+    spawn_kwargs: dict,
+    host: Optional[str],
+    pool: Optional[str],
+    placement_record: Callable[[], dict],
+    state: _LaunchState,
+    after_launch: Optional[Callable[[Optional[int]], None]] = None,
+) -> str:
+    """Launch one claimed card's worker: fence the run, spawn, stamp the pid
+    with its ``spawned`` + ``placement`` events, fire the spawned hook.
+
+    The per-card spawn step shared by the dispatcher tick and
+    :func:`spawn_now` (option C, K3), so both write the same events.
+    Exceptions propagate; ``state.launched`` says whether a process exists.
+    """
+    from hermes_cli.kanban_continuation import record_placement
+    from hermes_cli import kanban_placement_reasons as _pr
+
+    if not record_placement(conn, claimed.id, claimed.current_run_id, host):
+        return _LAUNCH_NOT_OWNED
+    pid = spawn(claimed, workspace, **spawn_kwargs)
+    state.launched, state.pid = True, pid
+    if after_launch is not None:
+        after_launch(pid)
+    record = placement_record()
+    if pid and not _set_worker_pid(
+        conn, claimed.id, int(pid), run_id=claimed.current_run_id,
+        pool=pool, placement=record,
+    ):
+        _kb._abort_lost_claim_spawn(conn, claimed, int(pid))
+        return _LAUNCH_CLAIM_LOST
+    if not pid:
+        # No pid reported (no ``spawned`` event): still one record.
+        with _kbc.write_txn(conn):
+            _kb._append_event(conn, claimed.id, _pr.PLACEMENT_EVENT, record,
+                              run_id=claimed.current_run_id)
+    # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn returned and
+    # the PID (when reported) is durably persisted, per the RFC timing
+    # contract. Best-effort — can never break the dispatch loop.
+    _kb._fire_worker_spawned_hook(conn, claimed, workspace, pid, board=board)
+    return _LAUNCH_OK
+
+
+class SpawnNowError(RuntimeError):
+    """:func:`spawn_now` did not start a worker; the card's state says why."""
+
+
+_SPAWN_NOW_LOCK_WAIT_SECONDS = 30.0
+
+
+def spawn_now(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: str,
+    spawn_fn=None,
+    lock_wait_seconds: float = _SPAWN_NOW_LOCK_WAIT_SECONDS,
+) -> int:
+    """Claim and launch ONE ``ready`` card now, outside a dispatcher tick (option C, K3).
+
+    For the ``delegations`` board only: a background unit starts at dispatch
+    time instead of waiting for a tick (ready -> claimed p50 83 s). Skips the
+    planner, the load gate and the per-tick budget (the delegation cap is the
+    limit, Ace 2026-10-21 Q2 = a), runs local with no placement, and still
+    holds the board's tick lock so it never races a tick on the same file.
+    Returns the worker pid; raises :class:`SpawnNowError` when nothing runs
+    (a spawn failure is booked on the card first, which K2 parks ``blocked``).
+    """
+    if not _kdb.is_delegations_board(board):
+        raise ValueError(f"spawn_now serves the {_kdb.DELEGATIONS_BOARD!r} board only, not {board!r}")
+    db_path = _kb.kanban_db_path(board=board)
+    deadline = time.monotonic() + max(0.0, float(lock_wait_seconds))
+    while True:
+        with _kbc._dispatch_tick_lock(db_path) as held:
+            if held:
+                return _spawn_now_locked(conn, task_id, board=board, spawn_fn=spawn_fn)
+        if time.monotonic() >= deadline:
+            raise SpawnNowError(f"{task_id}: board tick lock busy for {lock_wait_seconds:.0f}s")
+        time.sleep(0.2)
+
+
+def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spawn_fn) -> int:
+    from hermes_cli import kanban_pause_hold as _kph
+
+    try:
+        claimed = _kb.claim_task(conn, task_id)
+    except _kph.PauseHeld as exc:
+        raise SpawnNowError(f"{task_id}: pause hold: {exc.reason}") from exc
+    if claimed is None:
+        raise SpawnNowError(f"{task_id}: not claimable (not ready, or already claimed)")
+    try:
+        workspace = _kbw.resolve_workspace(claimed, board=board)
+    except Exception as exc:
+        _record_task_failure(conn, claimed.id, f"workspace: {exc}", outcome="spawn_failed",
+                             release_claim=True, end_run=True)
+        raise SpawnNowError(f"{task_id}: workspace: {exc}") from exc
+    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
+    spawn = spawn_fn if spawn_fn is not None else _default_spawn
+    kwargs = {"board": board} if _accepts_kw(spawn, "board") else {}
+    if _accepts_kw(spawn, "placement"):
+        kwargs["placement"] = None
+    state = _LaunchState()
+    try:
+        outcome = _launch_claimed(
+            conn, claimed, str(workspace), board=board, spawn=spawn, spawn_kwargs=kwargs,
+            host=None, pool=None, state=state,
+            placement_record=lambda: _placement_payload(
+                run_id=claimed.current_run_id, route="local", arg=None, rule=None,
+                placed_host=None, plan=None, entry="spawn_now", gate={}, take_refusal=None,
+            ),
+        )
+    except Exception as exc:
+        host_fault = _host_fault(exc)
+        _record_task_failure(
+            conn, claimed.id, str(exc), outcome="spawn_failed", release_claim=True, end_run=True,
+            infrastructure=host_fault is not None, run_metadata_extra=host_fault or None,
+        )
+        raise SpawnNowError(f"{task_id}: spawn failed: {exc}") from exc
+    if outcome != _LAUNCH_OK:
+        raise SpawnNowError(f"{task_id}: run lost the card ({outcome})")
+    return int(state.pid) if state.pid else 0
 
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
@@ -6934,7 +7090,7 @@ def _dispatch_once_locked(
                 spillover.release(placed_host, _rid)  # nothing launched: refund
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-        launched = False
+        _launch = _LaunchState()  # .launched: a worker process exists (refund guard)
         _joined = None  # (join, lease env) once the s7 join took a lease for this claim
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -6976,18 +7132,9 @@ def _dispatch_once_locked(
                     continue
                 spawn_kwargs["browser_env"] = _benv
                 _joined = (_join, _benv)
-            from hermes_cli.kanban_continuation import record_placement
-            if not record_placement(conn, claimed.id, claimed.current_run_id,
-                                    placed_host.name if placed_host else None):
-                # The run no longer owns the card: nothing launched, refund.
-                if _join is not None:
-                    _browser_release_joined(conn, claimed, _join, spawn_kwargs.get("browser_env"), "claim_lost")
-                if placed_host is not None:
-                    spillover.release(placed_host, _rid)
-                continue
-            pid = _spawn(claimed, str(workspace), **spawn_kwargs)
-            launched = True
-            if placed_host is not None:
+            def _after_launch(pid):
+                if placed_host is None:
+                    return
                 band = getattr(spillover, "band", None)
                 spill_reason = getattr(spillover, "spill_reason", None)
                 reason = "pin" if route in ("pin", "origin") else (
@@ -7015,31 +7162,29 @@ def _dispatch_once_locked(
                     claimed.id, claimed.assignee, placed_host.name, pid,
                     band, spill_reason, reason, probe, spawn_paused,
                 )
-            placement_record = _placement_payload(
-                run_id=claimed.current_run_id, route=route, arg=route_arg,
-                rule=row_rules.get(claimed.id), placed_host=placed_host, plan=spillover,
-                entry=entry, gate=tick_gate, take_refusal=_take_refusal,
+
+            outcome = _launch_claimed(
+                conn, claimed, str(workspace), board=board, spawn=_spawn,
+                spawn_kwargs=spawn_kwargs, host=placed_host.name if placed_host else None,
+                pool=admitted_routes.get(claimed.id), state=_launch,
+                after_launch=_after_launch,
+                placement_record=lambda: _placement_payload(
+                    run_id=claimed.current_run_id, route=route, arg=route_arg,
+                    rule=row_rules.get(claimed.id), placed_host=placed_host, plan=spillover,
+                    entry=entry, gate=tick_gate, take_refusal=_take_refusal,
+                ),
             )
-            if pid and not _set_worker_pid(
-                conn, claimed.id, int(pid), run_id=claimed.current_run_id,
-                pool=admitted_routes.get(claimed.id), placement=placement_record,
-            ):
-                _kb._abort_lost_claim_spawn(conn, claimed, int(pid))
+            if outcome == _LAUNCH_NOT_OWNED:
+                # The run no longer owns the card: nothing launched, refund.
+                if _join is not None:
+                    _browser_release_joined(conn, claimed, _join, spawn_kwargs.get("browser_env"), "claim_lost")
+                if placed_host is not None:
+                    spillover.release(placed_host, _rid)
+                continue
+            if outcome == _LAUNCH_CLAIM_LOST:
                 if _joined is not None:
                     _browser_release_joined(conn, claimed, *_joined, "claim_lost_after_spawn")
                 continue
-            if not pid:
-                # No pid reported (no ``spawned`` event): still one record.
-                with _kbc.write_txn(conn):
-                    _kb._append_event(conn, claimed.id, _pr.PLACEMENT_EVENT, placement_record,
-                                      run_id=claimed.current_run_id)
-            # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
-            # returned and the PID (when reported) is durably persisted,
-            # per the RFC timing contract. Best-effort — can never break
-            # the dispatch loop.
-            _kb._fire_worker_spawned_hook(
-                conn, claimed, str(workspace), pid, board=board,
-            )
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -7066,9 +7211,9 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
-            if placed_host is not None and not launched:
+            if placed_host is not None and not _launch.launched:
                 spillover.release(placed_host, _rid)  # pre-launch failure: refund
-            if _joined is not None and not launched:
+            if _joined is not None and not _launch.launched:
                 _browser_release_joined(conn, claimed, *_joined, "spawn_failed")  # Prism d598b2a71104
             # A host that cannot place the worker (no restart-safe scope,
             # eb28bc1bf7; no board mount on a pool host, t_9fb4d477) is not
@@ -8066,6 +8211,13 @@ def _default_spawn(
     # board slug still forces it to the right directory.
     resolved_board = _kb._normalize_board_slug(board) or _kb.get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
+    # K1 (option C): a delegations-board card is a background delegate_task
+    # unit. Keyed on the slug constant, never board.json.
+    delegation_unit = _kdb.is_delegations_board(resolved_board)
+    if delegation_unit:
+        # The runner and the gateway must agree on the kanban root (its lock
+        # directory too), even when the runner's profile home sits outside it.
+        env["HERMES_KANBAN_HOME"] = str(_kb.kanban_home())
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
@@ -8098,9 +8250,10 @@ def _default_spawn(
     # Only a POOL placement's mkdir failure is a (host, board) fault the
     # planner can route around; the local-uid hop below is not (t_9fb4d477).
     pool_board = resolved_board if placement is not None else None
-    if placement is None:
+    if placement is None and not delegation_unit:
         # kanban.local_worker_uid (Q8 (a), t_405acdf0): a local worker's tools
         # run as a dedicated non-sudo uid over ssh to localhost. Unset = 502.
+        # A delegation unit's tools run as the gateway's uid (I5), so no hop.
         from hermes_cli import kanban_local_worker_uid as _klu
         _local_user = _klu.configured_user()
         if _local_user:
@@ -8213,7 +8366,13 @@ def _default_spawn(
     # the lane and makes its receipt's one board call. Same env, same owner
     # grant, same log; only the argv differs. Unset keeps the shim above.
     from hermes_cli.kanban_native_worker import worker_command as _native_worker_command
-    if _native_worker_command(env.get("HERMES_HOME")) is not None:
+    if delegation_unit:
+        # K1: final argv. Replaces the foreign lane, the card's model/provider
+        # and effort, skills and toolsets: the runner reads its unit's route
+        # from the delegation registry, never from this argv.
+        cmd = [*_resolve_hermes_argv(), "-p", profile_arg, "delegation-unit"]
+        env.pop(_kb.SHIM_MODEL_CAPPED_FROM_ENV, None)
+    elif _native_worker_command(env.get("HERMES_HOME")) is not None:
         cmd = _kb._native_worker_argv(task, env.get("HERMES_HOME"))
         # Pin the runner to the tree THIS dispatcher imports, so the code that
         # chose the native path is the code that runs it. The runner drops it
@@ -8423,3 +8582,4 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
+from hermes_cli import kanban_delegations_board as _kdb  # noqa: E402
