@@ -557,3 +557,60 @@ def test_resumed_review_pin_matches_the_registry_case_insensitively(home, monkey
                                                                 "resume": {"new_run_id": None}}]}))
         res, spawned = _tick(conn, _plan())
         assert (tid, "ci-box") in spawned, res.placement_waits.get(tid)
+
+
+# -- t_be5633d4 (Apollo 05:58): the hold gates SPAWNS, not operator review verbs ------------------------------
+
+def _review_held_card(conn, home):
+    """A ci-box card that went through a real implementer run into review, then the host paused."""
+    tid = kb.create_task(conn, title="rv", assignee="alpha", body="do the thing")
+    impl = kb.claim_task(conn, tid)
+    assert kb.request_review(conn, tid, summary="ready", reviewer="human", expected_run_id=impl.current_run_id)
+    _set(conn, tid, origin_host="ci-box")
+    _manifest(home)
+    return tid
+
+
+def _coverage():
+    from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as LENSES
+    return json.dumps({"verdict": "CHANGES_REQUESTED", "head_sha": "1ee13c3d39", "lenses": {k: "done" for k in LENSES},
+                       "findings": 1, "items": ["fix the guard"], "review_minutes": 4, "batch_id": "b1"})
+
+
+def test_operator_review_claim_is_allowed_while_paused(home):
+    """`hermes kanban claim --review` spawns nothing: the pause never refuses it."""
+    with kb.connect_closing() as conn:
+        tid = _review_held_card(conn, home)
+        task = kb.claim_review_task(conn, tid, session_ref="s-op", operator_claim=True)
+        assert task is not None and task.status == "running"
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE kind=?", (kph.REFUSED_EVENT,)).fetchone()[0] == 0
+
+
+def test_dispatched_review_claim_is_still_refused_while_paused(home):
+    with kb.connect_closing() as conn:
+        tid = _review_held_card(conn, home)
+        with pytest.raises(kph.PauseHeld):
+            kb.claim_review_task(conn, tid)
+
+
+def test_request_changes_is_allowed_while_paused_and_the_rework_stays_held(home, monkeypatch):
+    """The operator send-back closes the review and hands the card back; the implementer's NEXT run is the
+    spawn, and that one is still held (dispatcher tick + the ready opener)."""
+    session = "20261018_060000_operator"
+    monkeypatch.setenv("HERMES_SESSION_ID", session)
+    with kb.connect_closing() as conn:
+        tid = _review_held_card(conn, home)
+        runs_before = _runs(conn, tid)
+        ok, detail = kb.request_changes(conn, tid, reason="fix it", claimer="apollo", coverage=_coverage(),
+                                        session_ref=kb.derive_session_ref(session))
+        assert ok, detail
+        assert _runs(conn, tid) == runs_before + 1          # the reviewer run the send-back opened and closed
+        status = kb.get_task(conn, tid).status
+        assert status in ("ready", "todo"), status
+        _set(conn, tid, status="ready")
+        res, spawned = _tick(conn, _plan())
+        assert tid not in {t for t, _ in spawned}
+        assert _routes(res)[tid]["code"] == "pause_hold"
+        with pytest.raises(kph.PauseHeld):
+            kb.claim_task(conn, tid)
+

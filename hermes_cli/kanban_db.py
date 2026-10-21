@@ -9360,6 +9360,7 @@ def _open_review_run(
     now: int,
     session_ref: Optional[str] = None,
     operator_claim: bool = False,
+    spawns: bool = True,
 ) -> Optional[int]:
     """CAS ``review -> running`` and open the review run; caller holds the txn.
 
@@ -9367,10 +9368,15 @@ def _open_review_run(
     reviewer send-back in :func:`request_changes`, so both leave the same
     ``claimed(source_status=review)`` audit shape. Returns the new run id,
     or None when the card is no longer an unclaimed ``review`` card. Raises
-    ``PauseHeld`` (no write) for a paused host's card (t_133d6efd).
+    ``PauseHeld`` (no write) for a paused host's card (t_133d6efd) ONLY when
+    the run spawns a worker: an operator ``claim --review`` (``operator_claim``)
+    and a ``request_changes`` send-back (``spawns=False``) start no process, and
+    the card they hand back is still held at the ready claim and the dispatcher
+    (t_be5633d4: a pause made operator review verbs refuse, 2026-10-18 05:58).
     """
-    from hermes_cli.kanban_pause_hold import refuse_if_held
-    refuse_if_held(conn, task_id)
+    if spawns and not operator_claim:
+        from hermes_cli.kanban_pause_hold import refuse_if_held
+        refuse_if_held(conn, task_id)
     cur = conn.execute(
         """
         UPDATE tasks
@@ -14182,7 +14188,7 @@ def request_changes(
             run_id = _open_review_run(
                 conn, task_id, lock=str(claimer),
                 expires=now + _resolve_claim_ttl_seconds(None), now=now,
-                session_ref=session_ref,
+                session_ref=session_ref, spawns=False,
             )
             if run_id is None:
                 return False, "task left review before the review run opened"
