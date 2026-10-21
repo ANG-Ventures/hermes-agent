@@ -1872,6 +1872,13 @@ def head_label_override(row: Mapping[str, Any]) -> Optional[str]:
         # The response named the quota window (relay or Anthropic headers): the
         # label says which limit, never a windowless "rate limit" (t_94a2b0e4).
         return windowed
+    if (cls in ("quota_model", "quota_seat") and row.get("reason") == "billing"
+            and _cause_phrase(row) != EXTRA_USAGE_EXHAUSTED_CAUSE):
+        # A quota wall with no reset in its text ("monthly usage limit for this
+        # billing cycle") is ``billing`` to the classifier but quota to the
+        # ledger: the head names the quota the rider names, not "credit
+        # exhausted" (t_a3b7bc23).
+        return _relay_quota_head(row)
     if not relay_sourced:
         return None
     if cls in ("quota_model", "quota_seat"):
