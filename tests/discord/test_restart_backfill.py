@@ -735,3 +735,65 @@ def test_runner_hands_held_followup_ids_to_adapter_wired_later():
     assert adapter.platform_message_is_held("70012")
 
 
+@pytest.mark.asyncio
+async def test_refused_restart_followup_releases_hold_so_backfill_recovers_it(_tmp_home):
+    """Prism P1 07a3fb819ffb (#2185): a hold is only a dedup marker while the gateway
+    actually holds the message. A replayed follow-up refused at intake is DROPPED (its
+    spool file is already acked), so its hold must be released on the runner AND the
+    adapter; otherwise every later backfill skips it for the life of the process."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    adapter, store, db = _build_adapter_with_store(_tmp_home)
+    author = _FakeAuthor(11111)
+    channel = _FakeChannel(987011, [])
+    restored = _make_msg(70010, author, channel, content="/queue bigger runner pool?")
+    channel._messages = [restored]
+    _seed_session_for_channel(adapter, store, db, channel, author)
+
+    runner = SimpleNamespace(adapters={Platform.DISCORD: adapter})
+    runner._release_held_platform_message = GatewayRunner._release_held_platform_message.__get__(runner)
+    source = SimpleNamespace(
+        platform=Platform.DISCORD,
+        chat_id=str(channel.id),
+        user_id=str(author.id),
+        _restart_followup_session="agent:main:discord:group:987011",
+        _restart_followup_message_id="70010",
+    )
+    GatewayRunner._note_held_platform_message(runner, source, "70010")
+    assert adapter.platform_message_is_held("70010")
+
+    # The replay is refused at intake (e.g. the user lost authorization during the restart).
+    GatewayRunner._report_refused_restart_followup(runner, source, "unauthorized")
+    assert runner._held_platform_message_ids == {Platform.DISCORD: set()}
+    assert not adapter.platform_message_is_held("70010")
+
+    adapter._restart_recovery.mark_channel_active(str(channel.id))
+    adapter._client = SimpleNamespace(
+        user=_FakeAuthor(99999, "bot", bot=True),
+        get_channel=lambda _id: channel,
+        fetch_channel=AsyncMock(return_value=channel),
+    )
+    await adapter._backfill_missed_messages()
+    assert [m.id for m in adapter._dispatched] == [70010], (
+        "a dropped replay is no longer held: transcript-based recovery must apply to it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_adapter_drop_of_restart_followup_releases_adapter_hold():
+    """The adapter-level unresolved-route drop (runs before the runner's ingress gate)
+    releases the same hold it reports as lost."""
+    from tests.e2e.conftest import _make_discord_adapter_wired
+
+    adapter, _ = _make_discord_adapter_wired()
+    adapter.mark_platform_message_held("70010")
+    source = SimpleNamespace(
+        profile_route_rejected=True,
+        chat_id="987011",
+        _restart_followup_session="agent:main:discord:group:987011",
+        _restart_followup_message_id="70010",
+    )
+    adapter._canonicalize = lambda _src: None
+    assert adapter._drop_unresolved(SimpleNamespace(source=source)) is True
+    assert not adapter.platform_message_is_held("70010")
