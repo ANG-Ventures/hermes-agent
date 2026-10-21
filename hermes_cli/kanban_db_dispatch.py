@@ -3994,6 +3994,27 @@ def _launch_claimed(
     return _LAUNCH_OK
 
 
+def _stop_own_spawn(pid: int, grace: float = 5.0) -> None:
+    """Stop a worker this process just launched, through its own Popen handle.
+
+    For a failure between spawn and ``_set_worker_pid``: no ``spawned`` event
+    (start token) exists yet, so the identity check in
+    ``_abort_lost_claim_spawn`` cannot verify the pid and refuses to signal it.
+    The retained handle is proof (an unreaped child's pid is never reused).
+    No handle (a custom spawn_fn) leaves it to that fail-closed path.
+    """
+    with _kb._worker_processes_lock:
+        proc = _kb._worker_processes.get(int(pid))
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=grace)
+
+
 class SpawnNowError(RuntimeError):
     """:func:`spawn_now` did not start a worker; the card's state says why."""
 
@@ -4070,6 +4091,7 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
         if state.launched and state.pid:
             # Failed after the process started (pid/placement write): stop it before the run
             # is ended, so a reported failure never leaves a unit running (Prism 6a23557fb4be).
+            _stop_own_spawn(int(state.pid))
             _kb._abort_lost_claim_spawn(conn, claimed, int(state.pid))
         host_fault = _host_fault(exc)
         _record_task_failure(

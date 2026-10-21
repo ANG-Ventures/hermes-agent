@@ -301,8 +301,12 @@ def test_k3_post_launch_failure_stops_the_worker(home, monkeypatch):
     procs = []
 
     def spawn(task, workspace, **kw):
-        procs.append(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]))
-        return procs[-1].pid
+        # Retains the handle the way ``_default_spawn`` does.
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        procs.append(proc)
+        with kb._worker_processes_lock:
+            kb._worker_processes[proc.pid] = proc
+        return proc.pid
 
     def pid_write_fails(*a, **k):
         raise sqlite3.OperationalError("database is locked")
@@ -319,6 +323,9 @@ def test_k3_post_launch_failure_stops_the_worker(home, monkeypatch):
             if procs and procs[0].poll() is None:
                 procs[0].kill()
                 procs[0].wait(timeout=10)
+            with kb._worker_processes_lock:
+                for p in procs:
+                    kb._worker_processes.pop(p.pid, None)
 
 
 def test_k3_stale_spawn_failure_leaves_the_successor_run(home, monkeypatch):
