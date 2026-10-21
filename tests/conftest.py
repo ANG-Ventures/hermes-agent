@@ -1074,6 +1074,25 @@ _REAL_KANBAN_ROOT = _capture_real_kanban_root()
 
 
 @pytest.fixture(autouse=True)
+def _kanban_bare_verb_default(request, monkeypatch):
+    """Pre-S7 tests address ONE hermetic board with bare verbs (``create 'x'``, ``list``).
+
+    S7 refuses a bare non-derivable verb unless the root ``kanban.bare_verb: default`` kill
+    switch is set; that switch is exactly the single-board behaviour those tests were written
+    against, so it is applied to them in-process. Tests of the refusal itself opt out with
+    ``@pytest.mark.kanban_bare_verb_refuse``. Subprocess CLI calls read the real (absent ==
+    refuse) root config and must name their board.
+    """
+    if request.node.get_closest_marker("kanban_bare_verb_refuse"):
+        return
+    try:
+        import hermes_cli.kanban_board_select as mod  # stdlib-only at import
+    except Exception:
+        return
+    monkeypatch.setattr(mod, "bare_verb_policy", lambda: mod.BARE_VERB_DEFAULT)
+
+
+@pytest.fixture(autouse=True)
 def _kanban_write_guard(_hermetic_environment, monkeypatch):
     """Fail-closed guard: refuse kanban writes that target the REAL root.
 
@@ -1585,6 +1604,11 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     )
     config.addinivalue_line(
         "markers", "allow_real_home_io: explicitly bypass the test-only home I/O guard."
+    )
+    config.addinivalue_line(
+        "markers",
+        "kanban_bare_verb_refuse: keep S7's real kanban.bare_verb policy (refuse) instead of the "
+        "suite's single-board default.",
     )
     config.addinivalue_line(
         "markers", "real_release_channels: keep the real R2 channel reader (no local source-branch stub)."

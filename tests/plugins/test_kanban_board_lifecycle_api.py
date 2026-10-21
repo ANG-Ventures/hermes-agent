@@ -88,6 +88,7 @@ def test_delete_default_board_is_refused(client):
 
 # --- S7 D5: no current board on the dashboard ------------------------------------------------
 
+@pytest.mark.kanban_bare_verb_refuse
 def test_board_query_omitted_is_400_with_the_next_command(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 400
@@ -96,6 +97,7 @@ def test_board_query_omitted_is_400_with_the_next_command(client):
     assert client.get("/api/plugins/kanban/board?board=default").status_code == 200
 
 
+@pytest.mark.kanban_bare_verb_refuse
 def test_kill_switch_default_serves_the_default_board(client, tmp_path):
     (tmp_path / ".hermes" / "config.yaml").write_text("kanban:\n  bare_verb: default\n", encoding="utf-8")
     assert client.get("/api/plugins/kanban/board").status_code == 200

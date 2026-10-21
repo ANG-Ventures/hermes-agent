@@ -18,10 +18,12 @@ import argparse
 from pathlib import Path
 from typing import Iterable, Optional
 
-from hermes_cli import kanban_db as kb
 
 BARE_VERB_REFUSE = "refuse"
 BARE_VERB_DEFAULT = "default"
+
+# kanban_db is imported inside each function: tests/conftest.py imports this module for every
+# test (the bare-verb fixture) and must not drag the kanban DB layer into unrelated processes.
 
 # Verbs that address no single board: they sweep every board, or touch none.
 BOARD_AGNOSTIC_VERBS = frozenset({
@@ -42,6 +44,8 @@ def bare_verb_policy() -> str:
 
     Absent or unreadable == ``refuse``; only the literal ``default`` relaxes it (S7 D7).
     """
+    from hermes_cli import kanban_db as kb
+
     try:
         import hermes_yaml
 
@@ -68,6 +72,8 @@ def _check_explicit(slug: str) -> str:
     refused: before S7 the CLI silently followed the pin. A pin outside every board's layout has
     no name to disagree with, so only the existing hazard guard applies to it.
     """
+    from hermes_cli import kanban_db as kb
+
     if slug != kb.DEFAULT_BOARD and not kb.board_exists(slug):
         raise BoardNotFound(f"kanban: board {slug!r} does not exist. "
                             f"Create it with `hermes kanban boards create {slug}`.")
@@ -88,6 +94,8 @@ def _check_explicit(slug: str) -> str:
 def resolve_slug(board: Optional[str], *, verb: str, card_ids: Iterable[str] = ()) -> str:
     """The board slug for one verb; raises :class:`BoardRequired` / ``ValueError`` /
     ``KanbanBoardDerivationError`` / ``KanbanPinDivergenceError`` with the next command."""
+    from hermes_cli import kanban_db as kb
+
     if board is not None:
         normed = kb._normalize_board_slug(board)
         if not normed:
@@ -103,11 +111,21 @@ def resolve_slug(board: Optional[str], *, verb: str, card_ids: Iterable[str] = (
                 f"pass --board <the slug that DB belongs to> (boards: hermes kanban boards list)."
             )
         return pinned
+    policy = None
     for card in card_ids:
         card = str(card or "").strip()
         if card:
-            return kb.board_of_task(card)
-    if bare_verb_policy() == BARE_VERB_DEFAULT:
+            try:
+                return kb.board_of_task(card)
+            except kb.KanbanCardNotFound:
+                # Under the kill switch a card on no board falls to step 5 (``default``), as
+                # before S7; the verb then reports the missing card itself. AMBIGUOUS and
+                # UNREADABLE always refuse: guessing there is the bug S7 exists to stop.
+                policy = bare_verb_policy()
+                if policy != BARE_VERB_DEFAULT:
+                    raise
+                break
+    if (policy or bare_verb_policy()) == BARE_VERB_DEFAULT:
         return kb.DEFAULT_BOARD
     raise BoardRequired(refusal_text(verb))
 

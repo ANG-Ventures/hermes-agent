@@ -10,6 +10,7 @@ from hermes_cli.kanban import kanban_command
 from hermes_cli.kanban_parser import build_parser
 
 
+@pytest.mark.kanban_bare_verb_refuse
 @pytest.mark.parametrize(
     "environment,explicit,expected",
     # S7: a HERMES_KANBAN_BOARD in the environment is inert; watch names its board or is refused.

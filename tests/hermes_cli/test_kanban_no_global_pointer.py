@@ -22,6 +22,10 @@ from hermes_cli import kanban_db_connect as kbc
 
 REPO = Path(__file__).resolve().parents[2]
 
+# The suite-wide fixture relaxes bare verbs to the single-board default for pre-S7 tests; this
+# file tests S7's real policy (absent == refuse), so it opts out.
+pytestmark = pytest.mark.kanban_bare_verb_refuse
+
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
