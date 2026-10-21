@@ -397,8 +397,12 @@ def test_gateway_plan_pool_reads_origin_state_in_the_load_probe(tmp_path, monkey
     assert plan is not None, gate.pool
     assert asked == [('ace-media', (ws,))]
     assert plan.continuation_probed and plan.continuation_states == {('ace-media', ws): 'nonempty'}
+    # continuation off: remote-first (#2148) still plans for the ready card, but
+    # no origin workspace rides the probe.
     cfg['placement']['continuation'] = 'off'
-    assert builder.plan_pool([{'slug': 'default'}], {}) is None
+    asked.clear()
+    plan = builder.plan_pool([{'slug': 'default'}], {})
+    assert plan is not None and not plan.continuation_probed and asked == [('ace-media', ())]
     # Overflow admission on and NOTHING ready: a running origin card alone
     # still gets its host probed (HOST_LOST reads this plan).
     cfg['placement']['continuation'] = 'enforce'
