@@ -579,8 +579,9 @@ def archive_gate(names: Iterable[str], root: Optional[Path] = None) -> Dict[str,
     Inside an :func:`archive_batch` the answers are cached for the batch."""
     names = sorted({n for n in names if n})
     root = root or fleet_root()
+    rkey = str(Path(root).resolve())  # Prism 12ed22fe3321: one fleet's verdict never answers another's
     cache = _batch["gate"] if _batch is not None else {}
-    todo = [n for n in names if n not in cache]
+    todo = [n for n in names if (rkey, n) not in cache]
     if todo:
         script = root.joinpath(*ARCHIVE_GATE_SCRIPT)
         res: Dict[str, Tuple[bool, List[str]]] = {}
@@ -603,8 +604,8 @@ def archive_gate(names: Iterable[str], root: Optional[Path] = None) -> Dict[str,
                                                       f"{(p.stderr or p.stdout).strip()[:200]}"]))
             except (OSError, ValueError, subprocess.TimeoutExpired) as e:
                 res = {n: (False, [f"archive gate failed: {type(e).__name__}: {e}"]) for n in todo}
-        cache.update(res)
-    return {n: cache[n] for n in names}
+        cache.update({(rkey, n): v for n, v in res.items()})
+    return {n: cache[(rkey, n)] for n in names}
 
 
 @contextlib.contextmanager
@@ -800,6 +801,7 @@ def archive_shared_skill(
     if parts is None:
         return False, why, []
     group, dname = parts
+    aliases = tuple(aliases)  # Prism d73b5c4c3ad2: read twice below (idle lookup + gate); an iterator would empty
     froot = root.resolve().parent
     try:
         _unsub, archive_days = ladder_days(froot)

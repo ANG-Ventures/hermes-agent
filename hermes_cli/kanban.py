@@ -338,13 +338,34 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "boards":
         return _dispatch_boards(args)
 
+    # `locate` reads every board read-only; it must not initialise (or depend on) any one board.
+    if action == "locate":
+        return _cmd_locate(args)
+
+    from hermes_cli import kanban_board_select as kbsel
+
     # `--board <slug>` pins HERMES_KANBAN_BOARD for the duration of this call so it inherits the
     # exact resolution the dispatcher uses for workers.
     board_override = getattr(args, "board", None)
     board_scope = contextlib.nullcontext()
+    if kbsel.s7_enabled():
+        # S7 D2 (kanban.bare_verb set): the verb names its board, or the DB pin or its card id
+        # does; otherwise it is refused with the next command. The resolved slug is the context
+        # board for the whole verb, so library callers see the board the connection is on.
+        try:
+            resolved = kbsel.resolve(args)
+        except kbsel.BoardRequired as exc:
+            return _err(str(exc), 2)
+        except kbsel.BoardNotFound as exc:
+            return _err(str(exc))
+        except (ValueError, kb.KanbanPinDivergenceError) as exc:
+            msg = str(exc)
+            return _err(msg if msg.startswith("kanban") else f"kanban: {msg}", 2)
+        if resolved and resolved != kb.PINNED_SLUG:
+            board_scope = kb.scoped_current_board(resolved)
     # `is not None`: an explicit empty selector (empty $BOARD in a script) is refused below,
     # never treated as "no selector" and routed to the current board.
-    if board_override is not None:
+    elif board_override is not None:
         try:
             normed = kb._normalize_board_slug(board_override)
         except ValueError as exc:
@@ -1348,6 +1369,22 @@ def _print_section(title: str, lines) -> None:
     print(title)
     for line in lines:
         print(line)
+
+
+def _cmd_locate(args: argparse.Namespace) -> int:
+    """``kanban locate <id>``: the ONE board holding a card (S7 D3, Q2). Output contract (tested,
+    wrapped by hermes-home scripts/kanban_board_resolve.py): stdout ``<slug>\\t<db_path>`` rc 0;
+    otherwise rc 2 and ``<CODE>: <message>`` on stderr (CARD_NOT_FOUND / CARD_AMBIGUOUS /
+    BOARD_UNREADABLE). Under a ``HERMES_KANBAN_DB`` pin: the pin's board and the pin."""
+    from hermes_cli import kanban_db_board_registry as registry
+
+    try:
+        slug, db_path = registry.locate(args.task_id)
+    except kb.KanbanBoardDerivationError as exc:
+        print(f"{exc.code}: {exc}", file=sys.stderr)
+        return 2
+    print(f"{slug}\t{db_path}")
+    return 0
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
@@ -4953,7 +4990,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "budget": _cmd_budget, "swarm": _cmd_swarm,
-    "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
+    "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show, "locate": _cmd_locate,
     "assign": _cmd_assign, "set-model": _cmd_set_model, "priority": _cmd_priority,
     "lane-model": _cmd_lane_model, "pins": _cmd_pins,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
