@@ -16,7 +16,7 @@ HERMES_HOME (real imports, no mocks for the resolution chain):
 - curator-vs-curator: second lock acquisition fails -> skip
 - crash recovery: exact-set match restores self-inflicted dirt; a sibling
   (un-manifested) dirty path -> skip-and-report, never clobbered
-- archive_shared_skill: in-tree <group>/.archive/<name>/ move
+- unsubscribe_shared_skill: idle -> <group>-aux/<name>/ via skill-group.py, never .archive (t_776ae7bc)
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import json
 import subprocess
 import sys
 import textwrap
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -422,68 +423,150 @@ class TestCrashRecovery:
         assert "no shared snapshot" in why
 
 
-class TestSharedArchive:
-    @pytest.mark.live_system_guard_bypass
-    def test_archive_moves_in_tree(self, git_env):
-        cs = git_env["cs"]
-        ok, msg, touched = cs.archive_shared_skill(
-            git_env["small"], shared_root=git_env["shared"],
-        )
-        assert ok, msg
-        dest = git_env["shared"] / "devops" / ".archive" / "cron-alert-discipline"
-        assert dest.is_dir()
-        assert (dest / "SKILL.md").exists()
-        assert not git_env["small"].exists()
+# Fleet-side pieces unsubscribe_shared_skill drives: scripts/lib/skill_tier.py (DEFAULT_IDLE_DAYS +
+# load_last_used) and skills-shared/hermes-harness/skill-finder/scripts/skill-group.py (`move --in-place`).
+# They live in hermes-home; these stubs keep the same contract (t_776ae7bc).
+_TIER_STUB = textwrap.dedent("""\
+    import datetime, json
+    DEFAULT_IDLE_DAYS = 60
+    def _iso(s):
+        try:
+            return datetime.datetime.fromisoformat(str(s)).timestamp() if s else None
+        except ValueError:
+            return None
+    def load_last_used(usage_path, stats_path):
+        last, created = {}, {}
+        try:
+            usage = json.load(open(usage_path))
+        except (OSError, ValueError):
+            usage = {}
+        for n, r in usage.items():
+            if _iso(r.get("last_used_at")):
+                last[n] = _iso(r.get("last_used_at"))
+            if _iso(r.get("created_at")):
+                created[n] = _iso(r.get("created_at"))
+        return last, created
+    """)
+_MOVER_STUB = textwrap.dedent("""\
+    import argparse, json, os, sys
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--home"); ap.add_argument("cmd"); ap.add_argument("skill"); ap.add_argument("to_group")
+    ap.add_argument("--in-place", action="store_true"); ap.add_argument("--create", action="store_true")
+    ap.add_argument("--json", action="store_true"); ap.add_argument("--operator")
+    a = ap.parse_args()
+    sh = os.path.join(a.home, "skills-shared")
+    src = [g for g in os.listdir(sh) if os.path.isfile(os.path.join(sh, g, a.skill, "SKILL.md"))]
+    if not a.in_place or not a.operator or len(src) != 1:
+        print(json.dumps({"ok": False, "error": "refused"})); sys.exit(6)
+    dst = os.path.join(sh, a.to_group)
+    created = not os.path.isdir(dst)
+    if created:
+        os.makedirs(dst); open(os.path.join(dst, "README.md"), "w").write("# aux\\n")
+    os.rename(os.path.join(sh, src[0], a.skill), os.path.join(dst, a.skill))
+    print(json.dumps({"ok": True, "created_group": created, "in_place": True}))
+    """)
 
-    def test_archive_rejects_outside_shared(self, git_env, tmp_path):
+
+def plant_fleet_tier(fleet_root: Path) -> None:
+    lib = fleet_root / "scripts" / "lib"
+    lib.mkdir(parents=True, exist_ok=True)
+    (lib / "skill_tier.py").write_text(_TIER_STUB, encoding="utf-8")
+    mover = fleet_root / "skills-shared" / "hermes-harness" / "skill-finder" / "scripts"
+    mover.mkdir(parents=True, exist_ok=True)
+    (mover / "skill-group.py").write_text(_MOVER_STUB, encoding="utf-8")
+
+
+def _record(days_idle: int) -> dict:
+    ts = (datetime.now(timezone.utc) - timedelta(days=days_idle)).isoformat()
+    return {"created_by": "agent", "created_at": ts, "last_used_at": ts, "use_count": 1}
+
+
+@pytest.fixture
+def tier_env(git_env):
+    plant_fleet_tier(git_env["home"])
+    _git(git_env["home"], "add", "-A")
+    _git(git_env["home"], "commit", "-q", "-m", "fleet tier + mover")
+    return git_env
+
+
+class TestSharedUnsubscribe:
+    """t_776ae7bc: a shared skill is never archived; idle >= skill_tier.DEFAULT_IDLE_DAYS -> <group>-aux."""
+
+    @pytest.mark.live_system_guard_bypass
+    def test_31_day_idle_is_refused_and_stays_put(self, tier_env):
+        cs = tier_env["cs"]
+        ok, msg, _ = cs.unsubscribe_shared_skill(tier_env["small"], shared_root=tier_env["shared"],
+                                                 record=_record(31))
+        assert not ok and "stays subscribed" in msg
+        assert (tier_env["small"] / "SKILL.md").is_file()
+        assert not list(tier_env["shared"].glob("*/.archive"))
+
+    @pytest.mark.live_system_guard_bypass
+    def test_61_day_idle_lands_in_aux_with_curator_commit(self, tier_env):
+        cs = tier_env["cs"]
+        ok, msg, touched = cs.unsubscribe_shared_skill(tier_env["small"], shared_root=tier_env["shared"],
+                                                       record=_record(61))
+        assert ok, msg
+        dest = tier_env["shared"] / "devops-aux" / "cron-alert-discipline"
+        assert (dest / "SKILL.md").is_file() and not tier_env["small"].exists()
+        assert not list(tier_env["shared"].glob("*/.archive"))
+        home = tier_env["home"]
+        assert _git(home, "log", "-1", "--format=%s").stdout.startswith("curator: unsubscribe idle shared skill")
+        status = _git(home, "show", "-M", "--name-status", "--format=", "HEAD").stdout
+        assert ("R100\tskills-shared/devops/cron-alert-discipline/SKILL.md\t"
+                "skills-shared/devops-aux/cron-alert-discipline/SKILL.md") in status
+        assert "A\tskills-shared/devops-aux/README.md" in status
+        left = [ln for ln in _git(home, "status", "--porcelain", "--", "skills-shared").stdout.splitlines()
+                if not ln.endswith(cs.LOCK_NAME)]
+        assert left == []  # the move is fully committed (the lockfile is infra, never content)
+
+    def test_missing_tier_module_refuses(self, git_env):
+        cs = git_env["cs"]
+        ok, msg, _ = cs.unsubscribe_shared_skill(git_env["small"], shared_root=git_env["shared"],
+                                                 record=_record(200))
+        assert not ok and "never archived" in msg
+        assert git_env["small"].is_dir()
+
+    def test_rejects_outside_shared(self, git_env, tmp_path):
         cs = git_env["cs"]
         stray = tmp_path / "stray-skill"
         stray.mkdir()
-        ok, msg, _ = cs.archive_shared_skill(
-            stray, shared_root=git_env["shared"],
-        )
+        ok, msg, _ = cs.unsubscribe_shared_skill(stray, shared_root=git_env["shared"])
         assert not ok
 
     @pytest.mark.live_system_guard_bypass
-    def test_archive_succeeds_despite_sibling_dirt(self, git_env):
-        """THE production scenario (2026-07-21): unrelated dirt elsewhere in
-        the repo must not block archiving an untouched skill — and the
-        sibling dirt must NOT be absorbed into the curator's commit."""
-        cs = git_env["cs"]
-        home = git_env["home"]
-        # sibling skill dirty + an untracked non-skill file (live-home churn)
-        (git_env["big"] / "SKILL.md").write_text("sibling edit", encoding="utf-8")
-        churn = home / "cron-state.json"
-        churn.write_text("{}", encoding="utf-8")
-
-        ok, msg, touched = cs.archive_shared_skill(
-            git_env["small"], shared_root=git_env["shared"],
-        )
+    def test_succeeds_despite_sibling_dirt(self, tier_env):
+        """Unrelated dirt elsewhere must not block the move, nor be absorbed into the curator commit."""
+        cs = tier_env["cs"]
+        home = tier_env["home"]
+        (tier_env["big"] / "SKILL.md").write_text("sibling edit", encoding="utf-8")
+        (home / "cron-state.json").write_text("{}", encoding="utf-8")
+        ok, msg, _ = cs.unsubscribe_shared_skill(tier_env["small"], shared_root=tier_env["shared"],
+                                                 record=_record(90))
         assert ok, msg
-        dest = git_env["shared"] / "devops" / ".archive" / "cron-alert-discipline"
-        assert dest.is_dir()
-        assert not git_env["small"].exists()
-        # sibling dirt untouched and NOT committed
-        assert (git_env["big"] / "SKILL.md").read_text() == "sibling edit"
-        show = _git(home, "show", "--name-only", "--format=", "HEAD")
-        committed = set(show.stdout.split())
-        assert not any("clanker-e2e" in p for p in committed)
-        assert not any("cron-state" in p for p in committed)
+        assert (tier_env["big"] / "SKILL.md").read_text() == "sibling edit"
+        committed = set(_git(home, "show", "--name-only", "--format=", "HEAD").stdout.split())
+        assert not any("clanker-e2e" in p or "cron-state" in p for p in committed)
 
     @pytest.mark.live_system_guard_bypass
-    def test_archive_skill_routes_shared_to_in_tree(self, git_env, monkeypatch):
-        """tools.skill_usage.archive_skill routes an in-scope shared skill to
-        the IN-TREE archive, not the local skills/.archive/."""
+    @pytest.mark.parametrize("days,lands_in_aux", [(31, False), (61, True)])
+    def test_archive_skill_never_archives_shared(self, tier_env, days, lands_in_aux):
+        """tools.skill_usage.archive_skill (the chokepoint the curator's LLM delete and the time-based
+        pass both reach) never writes skills-shared/**/.archive: 31d idle is refused, 61d goes to -aux."""
         import agent.skill_utils as su
         importlib.reload(su)
         import tools.skill_usage as usage
         importlib.reload(usage)
+        data = usage.load_usage()
+        data["cron-alert-discipline"] = {**usage._empty_record(), **_record(days)}
+        usage.save_usage(data)
         ok, msg = usage.archive_skill("cron-alert-discipline")
-        assert ok, msg
-        dest = git_env["shared"] / "devops" / ".archive" / "cron-alert-discipline"
-        assert dest.is_dir()
-        local_archive = git_env["home"] / "skills" / ".archive" / "cron-alert-discipline"
-        assert not local_archive.exists()
+        shared = tier_env["shared"]
+        assert not list(shared.glob("*/.archive")), msg
+        assert not (tier_env["home"] / "skills" / ".archive" / "cron-alert-discipline").exists()
+        assert ok is lands_in_aux, msg
+        assert (shared / "devops-aux" / "cron-alert-discipline").is_dir() is lands_in_aux
+        assert tier_env["small"].is_dir() is not lands_in_aux
 
     def test_archive_skill_still_readonly_flag_off(self, git_env, monkeypatch):
         (git_env["home"] / "config.yaml").write_text(
