@@ -294,38 +294,172 @@ def test_k3_spawn_now_refuses_a_conn_on_another_board(home):
         assert task.status == "ready" and task.current_run_id is None
 
 
-def test_k3_post_launch_failure_stops_the_worker(home, monkeypatch):
-    """The pid write raises after the process exists: it is stopped, the card parks (Prism 6a23557fb4be)."""
-    import sqlite3
+_WORKER_WITH_CHILD = textwrap.dedent("""
+    import subprocess, sys, time
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    open(sys.argv[1] + ".tmp", "w").write(str(child.pid))
+    import os; os.replace(sys.argv[1] + ".tmp", sys.argv[1])
+    time.sleep(120)
+""")
 
-    procs = []
 
-    def spawn(task, workspace, **kw):
-        # Retains the handle the way ``_default_spawn`` does.
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-        procs.append(proc)
+class _OwnSpawn:
+    """A spawn_fn shaped like ``_default_spawn``: own session, handle handed over via
+    ``on_popen``, registered in ``_worker_processes``. ``registry_entry`` replaces what
+    the registry holds under the pid (a stand-in for a reused pid's other Popen)."""
+
+    def __init__(self, tmp_path, *, fork_child=False, registry_entry=None, after=None):
+        self.procs, self.child_pid = [], None
+        self.tmp_path, self.fork_child = tmp_path, fork_child
+        self.registry_entry, self.after = registry_entry, after
+
+    def __call__(self, task, workspace, *, on_popen=None, **kw):
+        if self.fork_child:
+            script = self.tmp_path / "worker_with_child.py"
+            script.write_text(_WORKER_WITH_CHILD, encoding="utf-8")
+            pidfile = self.tmp_path / "child.pid"
+            argv = [sys.executable, str(script), str(pidfile)]
+        else:
+            argv = [sys.executable, "-c", "import time; time.sleep(120)"]
+        proc = subprocess.Popen(argv, start_new_session=True)
+        self.procs.append(proc)
+        if on_popen is not None:
+            on_popen(proc)
         with kb._worker_processes_lock:
-            kb._worker_processes[proc.pid] = proc
+            kb._worker_processes[proc.pid] = self.registry_entry or proc
+        if self.fork_child:
+            deadline = time.monotonic() + 20
+            while not pidfile.exists():
+                assert time.monotonic() < deadline, "worker never forked its child"
+                time.sleep(0.05)
+            self.child_pid = int(pidfile.read_text())
+        if self.after is not None:
+            self.after(task)
         return proc.pid
 
-    def pid_write_fails(*a, **k):
-        raise sqlite3.OperationalError("database is locked")
+    def cleanup(self):
+        for p in self.procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait(timeout=10)
+            with kb._worker_processes_lock:
+                kb._worker_processes.pop(p.pid, None)
+        if self.child_pid and _alive(self.child_pid):
+            # Reparented once its parent died, so it is outside the guarded subtree.
+            subprocess.run(["kill", "-9", str(self.child_pid)], check=False)
 
-    monkeypatch.setattr(kbd, "_set_worker_pid", pid_write_fails)
+
+def _alive(pid: int) -> bool:
+    import psutil
+    try:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+
+
+def _dead_within(pid: int, seconds: float = 15.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while _alive(pid):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def _pid_write_fails(*a, **k):
+    import sqlite3
+    raise sqlite3.OperationalError("database is locked")
+
+
+def test_k3_post_launch_failure_stops_the_worker(home, tmp_path, monkeypatch):
+    """The pid write raises after the process exists: it is stopped, the card parks (Prism 6a23557fb4be)."""
+    spawn = _OwnSpawn(tmp_path)
+    monkeypatch.setattr(kbd, "_set_worker_pid", _pid_write_fails)
     with _conn(BOARD) as conn:
         tid = kb.create_task(conn, title="unit", assignee="worker")
         try:
             with pytest.raises(kbd.SpawnNowError):
                 kbd.spawn_now(conn, tid, board=BOARD, spawn_fn=spawn)
-            assert procs[0].wait(timeout=15) is not None
+            assert spawn.procs[0].poll() is not None
             assert kb.get_task(conn, tid).status == "blocked"
         finally:
-            if procs and procs[0].poll() is None:
-                procs[0].kill()
-                procs[0].wait(timeout=10)
+            spawn.cleanup()
+
+
+def test_k3_claim_lost_after_spawn_stops_the_worker(home, tmp_path, monkeypatch):
+    """The claim is revoked between spawn and the pid write: SpawnNowError, and nothing of
+    this launch keeps running (Prism eebca4e909a0). The worker's create time is unreadable,
+    so the shared identity-checked abort fails closed; spawn_now's own handle must stop it."""
+    monkeypatch.setattr(kb, "_pid_started_in_claim", lambda *a, **k: None)
+
+    def revoke(task):
+        with _conn(BOARD) as other:
+            other.execute("UPDATE tasks SET status = 'ready', claim_lock = NULL, current_run_id = NULL "
+                          "WHERE id = ?", (task.id,))
+            other.commit()
+
+    spawn = _OwnSpawn(tmp_path, fork_child=True, after=revoke)
+    with _conn(BOARD) as conn:
+        tid = kb.create_task(conn, title="unit", assignee="worker")
+        try:
+            with pytest.raises(kbd.SpawnNowError, match="claim_lost"):
+                kbd.spawn_now(conn, tid, board=BOARD, spawn_fn=spawn)
+            assert _dead_within(spawn.procs[0].pid)
+            assert _dead_within(spawn.child_pid)
+        finally:
+            spawn.cleanup()
+
+
+def test_k3_post_launch_failure_kills_the_workers_children(home, tmp_path, monkeypatch):
+    """The worker's own child tools die with it: the group is signalled (Prism 92e06f55de54)."""
+    spawn = _OwnSpawn(tmp_path, fork_child=True)
+    monkeypatch.setattr(kbd, "_set_worker_pid", _pid_write_fails)
+    with _conn(BOARD) as conn:
+        tid = kb.create_task(conn, title="unit", assignee="worker")
+        try:
+            with pytest.raises(kbd.SpawnNowError):
+                kbd.spawn_now(conn, tid, board=BOARD, spawn_fn=spawn)
+            assert spawn.procs[0].poll() is not None
+            assert _dead_within(spawn.child_pid)
+        finally:
+            spawn.cleanup()
+
+
+def test_k3_post_launch_stop_signals_only_this_launchs_process(home, tmp_path, monkeypatch):
+    """The registry holds ANOTHER Popen under the same pid (pid reuse): only the handle this
+    launch created is signalled, never the registry's (Prism 4c387d9a1291)."""
+    class OtherBoardsWorker:
+        pid, returncode, signalled = None, None, []
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.signalled.append("terminate")
+
+        def kill(self):
+            self.signalled.append("kill")
+
+        def wait(self, timeout=None):
+            return None
+
+        def send_signal(self, sig):
+            self.signalled.append(sig)
+
+    other = OtherBoardsWorker()
+    spawn = _OwnSpawn(tmp_path, registry_entry=other)
+    monkeypatch.setattr(kbd, "_set_worker_pid", _pid_write_fails)
+    with _conn(BOARD) as conn:
+        tid = kb.create_task(conn, title="unit", assignee="worker")
+        try:
+            with pytest.raises(kbd.SpawnNowError):
+                kbd.spawn_now(conn, tid, board=BOARD, spawn_fn=spawn)
+            assert spawn.procs[0].poll() is not None
+            assert other.signalled == []
             with kb._worker_processes_lock:
-                for p in procs:
-                    kb._worker_processes.pop(p.pid, None)
+                assert kb._worker_processes.get(spawn.procs[0].pid) is other
+        finally:
+            spawn.cleanup()
 
 
 def test_k3_stale_spawn_failure_leaves_the_successor_run(home, monkeypatch):

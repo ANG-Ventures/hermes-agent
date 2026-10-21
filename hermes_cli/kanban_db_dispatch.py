@@ -3943,6 +3943,9 @@ class _LaunchState:
 
     launched: bool = False
     pid: Optional[int] = None
+    # The Popen this launch created, handed over by the spawner itself
+    # (``on_popen``); never looked up by pid in the shared registry.
+    proc: Optional[subprocess.Popen] = None
 
 
 def _launch_claimed(
@@ -3980,6 +3983,9 @@ def _launch_claimed(
         conn, claimed.id, int(pid), run_id=claimed.current_run_id,
         pool=pool, placement=record,
     ):
+        # A launch holding its own handle (spawn_now) stops its own group first,
+        # while the leader is unreaped; the tick passes none, so it is unchanged.
+        _stop_own_spawn(state.proc)
         _kb._abort_lost_claim_spawn(conn, claimed, int(pid))
         return _LAUNCH_CLAIM_LOST
     if not pid:
@@ -3994,20 +4000,54 @@ def _launch_claimed(
     return _LAUNCH_OK
 
 
-def _stop_own_spawn(pid: int, grace: float = 5.0) -> None:
-    """Stop a worker this process just launched, through its own Popen handle.
+def _stop_own_spawn(proc: Optional[subprocess.Popen], grace: float = 5.0) -> None:
+    """Stop the worker THIS launch created, and its process group, via its own handle.
 
-    For a failure between spawn and ``_set_worker_pid``: no ``spawned`` event
-    (start token) exists yet, so the identity check in
-    ``_abort_lost_claim_spawn`` cannot verify the pid and refuses to signal it.
-    The retained handle is proof (an unreaped child's pid is never reused).
+    For a failure after the spawn: before ``_set_worker_pid`` there is no
+    ``spawned`` event (start token), so ``_abort_lost_claim_spawn`` cannot
+    verify the pid and refuses to signal it. The handle comes from the launch
+    itself, never a pid lookup in ``_worker_processes`` (a reused pid could
+    select another board's worker). The group is signalled while the leader is
+    still unreaped: its pid, and so its pgid, cannot be reused until we reap it,
+    so the group signal is safe and the worker's child tools die with it.
     No handle (a custom spawn_fn) leaves it to that fail-closed path.
     """
-    with _kb._worker_processes_lock:
-        proc = _kb._worker_processes.get(int(pid))
-    if proc is None or proc.poll() is not None:
+    if proc is None:
         return
-    proc.terminate()
+    with _kb._worker_processes_lock:
+        # Out of the registry first, so no reaper polls (reaps) it under us.
+        if _kb._worker_processes.get(proc.pid) is proc:
+            _kb._worker_processes.pop(proc.pid, None)
+    if proc.returncode is not None:
+        return  # already reaped: its pid/pgid may be someone else's now
+    group = None
+    if hasattr(os, "killpg"):
+        try:
+            if os.getpgid(proc.pid) == proc.pid:  # start_new_session: pgid == pid
+                group = proc.pid
+        except OSError:
+            group = None
+
+    def _signal(sig) -> None:
+        try:
+            if group is not None:
+                os.killpg(group, sig)
+            else:
+                os.kill(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    _signal(signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        try:  # leader exited? WNOWAIT keeps it unreaped, so the pgid stays ours
+            if os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                break
+        except (AttributeError, ChildProcessError):
+            break
+        time.sleep(0.05)
+    # Unconditional: group members that outlived or ignored SIGTERM.
+    _signal(getattr(signal, "SIGKILL", signal.SIGTERM))
     try:
         proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
@@ -4078,6 +4118,8 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
     if _accepts_kw(spawn, "placement"):
         kwargs["placement"] = None
     state = _LaunchState()
+    if _accepts_kw(spawn, "on_popen"):
+        kwargs["on_popen"] = lambda proc: setattr(state, "proc", proc)
     try:
         outcome = _launch_claimed(
             conn, claimed, str(workspace), board=board, spawn=spawn, spawn_kwargs=kwargs,
@@ -4091,7 +4133,7 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
         if state.launched and state.pid:
             # Failed after the process started (pid/placement write): stop it before the run
             # is ended, so a reported failure never leaves a unit running (Prism 6a23557fb4be).
-            _stop_own_spawn(int(state.pid))
+            _stop_own_spawn(state.proc)
             _kb._abort_lost_claim_spawn(conn, claimed, int(state.pid))
         host_fault = _host_fault(exc)
         _record_task_failure(
@@ -8039,8 +8081,12 @@ def _default_spawn(
     board: Optional[str] = None,
     placement=None,
     browser_env: Optional[Mapping[str, str]] = None,
+    on_popen: Optional[Callable[[subprocess.Popen], None]] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
+
+    ``on_popen`` receives this call's Popen handle as soon as it exists
+    (:func:`spawn_now` keeps it to stop its own worker on a failure).
 
     Returns the spawned child's PID so the dispatcher can detect crashes
     before the claim TTL expires. The child's completion is still observed
@@ -8485,6 +8531,8 @@ def _default_spawn(
         )
     finally:
         log_f.close()  # the child owns its inherited descriptor
+    if on_popen is not None:
+        on_popen(proc)
     with _kb._worker_processes_lock:
         _kb._recent_worker_exits.pop(proc.pid, None)
         _kb._worker_processes[proc.pid] = proc
