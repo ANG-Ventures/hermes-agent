@@ -617,7 +617,9 @@ handoff. "Tick" = `kanban.dispatch_interval_seconds`, default 60 s.
   1 ack; the same order as today's in-process unit. No steady-state polling
   of the registry (§5.3.5, §5.4).
 
-## 13. Open questions (for Ace)
+## 13. Open questions (RULED by Ace, 2026-10-21 02:45 PDT, msg 1562401396303597598)
+
+Both ruled as recommended: **Q1 = (a) never re-run**; **Q2 = (a) bypass**. Recorded in §14 (RD-6, RD-7).
 
 - **Q1 No automatic re-run after a worker crash (I3).** Today's restart recovery re-runs a killed
   unit from scratch with a continuation note. Under C a restart does not kill the unit, so re-run
@@ -638,7 +640,8 @@ handoff. "Tick" = `kanban.dispatch_interval_seconds`, default 60 s.
 | RD-3 | Delivery truth stays in `async-delegations.json`; the card carries only process lifecycle | one outbox, one claim/ack, same code for owner-up and owner-restarted |
 | RD-4 | Spawn at dispatch (K3), not on the next tick | ready -> claimed p50 83 s on the live board |
 | RD-5 | Board stays visible | debuggable; no new hiding surface |
-| RD-6 | PROPOSED pending Q1: no auto re-run | §13 |
+| RD-6 | No automatic re-run of a kanban-backed unit after a worker crash (I3); deliver the error, the parent re-delegates | Ace 2026-10-21 02:45 (Q1 = a) |
+| RD-7 | Background units bypass the kanban load gate and card budget (K3, K4); `delegation.max_concurrent_children` is the only limit | Ace 2026-10-21 02:45 (Q2 = a) |
 | RD-7 | PROPOSED pending Q2: bypass kanban admission | §13 |
 | RD-8 | Runner tools run as the gateway uid, not `kanban.local_worker_uid` (pass-1 CB-2) | parity with today's in-process child; the knob is unset on the Studio and ace-ai anyway |
 | RD-9 | Board behaviour keys on the slug constant, not `board.json` (pass-1 lens) | a writable file must not switch a board to a different runner |
