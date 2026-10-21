@@ -350,5 +350,5 @@ class TestCandidateScope:
         assert "source=shared" in note
         assert "Bundled" in note and "hub-installed" in note
         assert "read-only" in note
-        assert "NEVER archived" in note and "skills-shared/<group>-aux/<name>/" in note
-        assert ".archive" not in note
+        assert "skills-shared/<group>-aux/<name>/" in note and "120 days" in note
+        assert "no inbound pointer" in note

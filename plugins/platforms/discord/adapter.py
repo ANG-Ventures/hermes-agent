@@ -6692,6 +6692,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
             reinject_attempts = 0
             skipped_in_transcript = 0
+            skipped_held = 0
             reinject_failed = 0
             unanswerable_channels = 0
             scanned_channels = 0
@@ -6731,6 +6732,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                             continue  # our own message (belt-and-suspenders with the filter)
 
                         msg_id = str(getattr(msg, "id", ""))
+                        # Held by the gateway already (a restart follow-up replayed from the
+                        # spool / a restored /queue item): not in the transcript yet, but not
+                        # missed either. Recovering it would deliver it twice.
+                        if self.platform_message_is_held(msg_id):
+                            skipped_held += 1
+                            continue
                         session_id = self._resolve_session_id_for_message(msg)
 
                         # Transcript authority check with the INV-9 answerability
@@ -6797,9 +6804,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             logger.log(
                 level,
                 "[%s] PHASE=restart_backfill channels=%d reinject_attempts=%d "
-                "skipped_in_transcript=%d reinject_failed=%d unanswerable_channels=%d",
+                "skipped_in_transcript=%d skipped_held=%d reinject_failed=%d unanswerable_channels=%d",
                 self.name, scanned_channels, reinject_attempts, skipped_in_transcript,
-                reinject_failed, unanswerable_channels,
+                skipped_held, reinject_failed, unanswerable_channels,
             )
 
     def _history_message_is_conversational(

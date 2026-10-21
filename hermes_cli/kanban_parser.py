@@ -417,6 +417,9 @@ _SPECS = [
     ], aliases=["ls"], help="List tasks"),
     _cmd("show", [_TASK_ID, _json_flag(), *_run_state_args("filter listed runs by task_runs column")],
          help="Show a task with comments + events"),
+    _cmd("locate", [_TASK_ID],
+         help="Print the board holding a card: '<slug>\\t<db_path>' (rc 2 + CARD_NOT_FOUND / "
+              "CARD_AMBIGUOUS / BOARD_UNREADABLE on stderr; never guesses)"),
     _cmd("pins", [
         _json_flag(dest="as_json"),
         _arg("--stale-hours", type=float, dest="stale_hours",

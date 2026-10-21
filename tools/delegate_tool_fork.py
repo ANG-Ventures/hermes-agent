@@ -1,4 +1,4 @@
-"""Boomerang v2 P2: ``inherit_mode="fork"`` (spec 2026-10-18 §5.1/§5.2, D-8/9/10/14/16/17/18).
+"""Boomerang v2 P2: ``inherit_mode="fork"`` (spec 2026-10-18 §5.1/§5.2, D-8/10/14/16/17/18; D-9 superseded).
 
 A fork child's request prefix is byte-identical to the parent's (same system prompt,
 tools[], thinking config, cache ttl, message array through the parent's last complete
@@ -21,7 +21,6 @@ logger = logging.getLogger("tools.delegate_tool")
 _MODE_ALIASES = {"fork": "fork", "branch": "fork", "summary": "summary"}
 INHERIT_MODES = ("fork", "branch", "summary")
 
-_FORK_MAX_PREFIX_TOKENS_DEFAULT = 600_000  # D-9
 _WARM_MARGIN_S = 300
 _TTL_SECONDS = {"1h": 3600, "5m": 300}
 
@@ -110,16 +109,6 @@ def _parent_history(parent: Any) -> Any:
     return getattr(parent, "conversation_history", None) if history is None else history
 
 
-def _estimate_prefix_tokens(parent: Any, messages: List[Dict[str, Any]]) -> int:
-    from agent.model_metadata import estimate_messages_tokens_rough
-
-    system = (getattr(parent, "_cached_system_prompt", None) or "") + (
-        getattr(parent, "ephemeral_system_prompt", None) or ""
-    )
-    tools_chars = len(json.dumps(getattr(parent, "tools", None) or [], default=str))
-    return estimate_messages_tokens_rough(messages) + (len(system) + tools_chars) // 4
-
-
 def fork_eligible(
     parent: Any, rt: Dict[str, Any], delegation_cfg: Any, *, now: Optional[float] = None,
 ) -> Tuple[bool, str]:
@@ -156,17 +145,8 @@ def fork_eligible(
         return False, "turn_complete"
     if not isinstance(getattr(parent, "_cached_system_prompt", None), str):
         return False, "same_request_params"
-    cap = int(_boomerang_cfg(delegation_cfg).get("fork_max_prefix_tokens") or _FORK_MAX_PREFIX_TOKENS_DEFAULT)
-    try:
-        from agent.model_metadata import get_model_context_length
-
-        window = get_model_context_length(rt.get("model"))
-        if window and window > 0:
-            cap = min(cap, int(window * 0.6))
-    except Exception:
-        logger.debug("fork: child window lookup failed; using the configured cap", exc_info=True)
-    if _estimate_prefix_tokens(parent, prefix) > cap:
-        return False, "prefix_le_cap"
+    # No prefix-size ceiling (Ace 2026-10-21, supersedes D-9): a fork child over the
+    # compaction threshold compacts through the same turn-loop path the parent uses.
     return True, ""
 
 
