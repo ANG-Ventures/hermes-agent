@@ -429,6 +429,7 @@ class TestCrashRecovery:
 _TIER_STUB = textwrap.dedent("""\
     import datetime, json
     DEFAULT_IDLE_DAYS = 60
+    DEFAULT_ARCHIVE_DAYS = 120
     def _iso(s):
         try:
             return datetime.datetime.fromisoformat(str(s)).timestamp() if s else None
@@ -467,10 +468,29 @@ _MOVER_STUB = textwrap.dedent("""\
     """)
 
 
+# scripts/skill-archive-gate.py contract: `--home H --json NAME...` -> {"ok", "skills": {name: {archivable,
+# blockers}}}. The stub reads the blockers from <home>/gate-blockers.json (the real gate scans pointers/pins/manifests).
+_GATE_STUB = textwrap.dedent("""\
+    import argparse, json, os
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--home"); ap.add_argument("--json", action="store_true"); ap.add_argument("names", nargs="+")
+    a = ap.parse_args()
+    try:
+        bl = json.load(open(os.path.join(a.home, "gate-blockers.json")))
+    except (OSError, ValueError):
+        bl = {}
+    with open(os.path.join(a.home, "gate-calls.log"), "a") as f:
+        f.write(" ".join(a.names) + "\\n")
+    print(json.dumps({"ok": True, "skills": {n: {"archivable": not bl.get(n), "blockers": bl.get(n, [])}
+                                             for n in a.names}}))
+    """)
+
+
 def plant_fleet_tier(fleet_root: Path) -> None:
     lib = fleet_root / "scripts" / "lib"
     lib.mkdir(parents=True, exist_ok=True)
     (lib / "skill_tier.py").write_text(_TIER_STUB, encoding="utf-8")
+    (fleet_root / "scripts" / "skill-archive-gate.py").write_text(_GATE_STUB, encoding="utf-8")
     mover = fleet_root / "skills-shared" / "hermes-harness" / "skill-finder" / "scripts"
     mover.mkdir(parents=True, exist_ok=True)
     (mover / "skill-group.py").write_text(_MOVER_STUB, encoding="utf-8")
@@ -490,7 +510,7 @@ def tier_env(git_env):
 
 
 class TestSharedUnsubscribe:
-    """t_776ae7bc: a shared skill is never archived; idle >= skill_tier.DEFAULT_IDLE_DAYS -> <group>-aux."""
+    """t_776ae7bc ladder: idle >= DEFAULT_IDLE_DAYS -> <group>-aux; .archive only at DEFAULT_ARCHIVE_DAYS + clean gate."""
 
     @pytest.mark.live_system_guard_bypass
     def test_31_day_idle_is_refused_and_stays_put(self, tier_env):
@@ -524,7 +544,7 @@ class TestSharedUnsubscribe:
         cs = git_env["cs"]
         ok, msg, _ = cs.unsubscribe_shared_skill(git_env["small"], shared_root=git_env["shared"],
                                                  record=_record(200))
-        assert not ok and "never archived" in msg
+        assert not ok and "cannot read the idle threshold" in msg and "skill stays" in msg
         assert git_env["small"].is_dir()
 
     def test_rejects_outside_shared(self, git_env, tmp_path):
@@ -583,3 +603,75 @@ class TestSharedUnsubscribe:
         assert not ok
         assert "read-only" in msg
         assert git_env["small"].exists()
+
+
+class TestArchiveLadder:
+    """Ace 2026-10-21 02:47 (t_776ae7bc): 60 d -> <group>-aux; 120 d + no pointer/pin/manifest -> .archive."""
+
+    @staticmethod
+    def _block(home, name, why):
+        (home / "gate-blockers.json").write_text(json.dumps({name: [why]}), encoding="utf-8")
+
+    @pytest.mark.live_system_guard_bypass
+    def test_121_day_idle_unpointed_unmanifested_goes_to_archive(self, tier_env):
+        cs = tier_env["cs"]
+        ok, msg, _t, action = cs.retire_shared_skill(tier_env["small"], shared_root=tier_env["shared"],
+                                                     record=_record(121))
+        assert ok and action == "archived", msg
+        dest = tier_env["shared"] / "devops" / ".archive" / "cron-alert-discipline"
+        assert (dest / "SKILL.md").is_file() and not tier_env["small"].exists()
+        home = tier_env["home"]
+        assert _git(home, "log", "-1", "--format=%s").stdout.startswith("curator: archive shared skill cron-alert-discipline")
+        assert "R100\tskills-shared/devops/cron-alert-discipline/SKILL.md\tskills-shared/devops/.archive/" \
+            in _git(home, "show", "-M", "--name-status", "--format=", "HEAD").stdout
+
+    @pytest.mark.live_system_guard_bypass
+    def test_121_day_idle_with_inbound_pointer_is_not_archived(self, tier_env):
+        """In <group>: rung 1 only (-aux). Already in -aux: stays put. Never .archive."""
+        cs = tier_env["cs"]
+        self._block(tier_env["home"], "cron-alert-discipline", "pointed to by skills-shared/general/x/SKILL.md")
+        ok, msg, _t, action = cs.retire_shared_skill(tier_env["small"], shared_root=tier_env["shared"],
+                                                     record=_record(121))
+        assert ok and action == "unsubscribed" and "pointed to by" in msg, msg
+        aux = tier_env["shared"] / "devops-aux" / "cron-alert-discipline"
+        assert aux.is_dir() and not list(tier_env["shared"].glob("*/.archive"))
+        ok, msg, _t, action = cs.retire_shared_skill(aux, shared_root=tier_env["shared"], record=_record(200))
+        assert not ok and action == "kept" and "pointed to by" in msg, msg
+        assert (aux / "SKILL.md").is_file() and not list(tier_env["shared"].glob("*/.archive"))
+
+    @pytest.mark.live_system_guard_bypass
+    def test_119_days_never_archives_even_with_clean_gate(self, tier_env):
+        cs = tier_env["cs"]
+        ok, msg, _t, action = cs.retire_shared_skill(tier_env["small"], shared_root=tier_env["shared"],
+                                                     record=_record(119))
+        assert ok and action == "unsubscribed" and "< 120d archive window" in msg, msg
+
+    def test_missing_gate_fails_closed(self, tier_env):
+        cs = tier_env["cs"]
+        (tier_env["home"] / "scripts" / "skill-archive-gate.py").unlink()
+        ok, msg, _ = cs.archive_shared_skill(tier_env["small"], shared_root=tier_env["shared"], record=_record(300))
+        assert not ok and "missing" in msg and tier_env["small"].is_dir()
+
+    @pytest.mark.live_system_guard_bypass
+    def test_archive_batch_posts_one_logs_line(self, tier_env, monkeypatch):
+        cs = tier_env["cs"]
+        posted = []
+        monkeypatch.setattr(cs, "post_archive_logs", lambda moved, root=None: posted.append(list(moved)) or True)
+        with cs.archive_batch(prefetch=["cron-alert-discipline"]):
+            ok, msg, _t, _a = cs.retire_shared_skill(tier_env["small"], shared_root=tier_env["shared"],
+                                                     record=_record(150))
+            assert ok, msg
+        assert posted == [["devops/cron-alert-discipline"]]
+        # one gate scan for the batch: the prefetch answered the archive call
+        assert (tier_env["home"] / "gate-calls.log").read_text().splitlines() == ["cron-alert-discipline"]
+
+    def test_frontmatter_alias_counts_for_idle(self, tier_env):
+        """Prism 21b5138959ff: fleet usage keyed by the skill NAME must count when the dir name differs."""
+        cs = tier_env["cs"]
+        home = tier_env["home"]
+        (home / "skills").mkdir(exist_ok=True)
+        recent = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        (home / "skills" / ".usage.json").write_text(json.dumps({"cad-alias": {"last_used_at": recent}}))
+        idle, _thr, _why = cs.shared_skill_idle_days("cron-alert-discipline", home, record=_record(300),
+                                                     aliases=["cad-alias"])
+        assert idle is not None and idle < 4

@@ -29,7 +29,8 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_HOURS, DEFAULT_MIN_IDLE_HOURS = 24 * 7, 2  # 7 days
-DEFAULT_STALE_AFTER_DAYS, DEFAULT_ARCHIVE_AFTER_DAYS = 14, 30
+# Plain-install defaults; a fleet tree takes both from scripts/lib/skill_tier.py (60/120, Ace 2026-10-21 02:47).
+DEFAULT_STALE_AFTER_DAYS, DEFAULT_ARCHIVE_AFTER_DAYS = 60, 120
 # The LLM consolidation fork is opt-in; the deterministic inactivity prune
 # (apply_automatic_transitions) always runs when the curator is enabled.
 DEFAULT_CONSOLIDATE = False
@@ -135,12 +136,38 @@ def _bounded_count(key: str, default: int) -> int:
     return value
 
 
+def _fleet_ladder() -> Optional[tuple]:
+    """(stale/unsubscribe days, archive days) from the fleet's scripts/lib/skill_tier.py, or None on a plain
+    install without it. On a fleet tree those windows ARE the rule (Ace 2026-10-21 02:47, t_776ae7bc): one
+    source, so a config.yaml copy is ignored (warned once) rather than allowed to drift."""
+    try:
+        from agent.curator_shared import fleet_root, ladder_days, SKILL_TIER_LIB
+        root = fleet_root()
+        if not root.joinpath(*SKILL_TIER_LIB).is_file():
+            return None
+        return ladder_days(root)
+    except Exception as e:
+        logger.debug("Curator could not read the fleet skill_tier windows: %s", e, exc_info=True)
+        return None
+
+
+def _window(key: str, idx: int, default: int) -> int:
+    ladder = _fleet_ladder()
+    if ladder is None:
+        return _bounded_count(key, default)
+    days = int(ladder[idx])
+    if key in _load_config() and (key, "fleet") not in _warned_bad_values:
+        _warned_bad_values.add((key, "fleet"))
+        logger.warning("curator.%s is ignored on a fleet tree: scripts/lib/skill_tier.py sets it (%d)", key, days)
+    return days
+
+
 def get_stale_after_days() -> int:
-    return _bounded_count("stale_after_days", DEFAULT_STALE_AFTER_DAYS)
+    return _window("stale_after_days", 0, DEFAULT_STALE_AFTER_DAYS)
 
 
 def get_archive_after_days() -> int:
-    return _bounded_count("archive_after_days", DEFAULT_ARCHIVE_AFTER_DAYS)
+    return _window("archive_after_days", 1, DEFAULT_ARCHIVE_AFTER_DAYS)
 
 
 def get_consolidate() -> bool:
@@ -320,7 +347,7 @@ def _protected_skills() -> "tuple[Set[str], List[str]]":
     return _cron_referenced_skills() | listed, unreadable
 
 
-def _archive_as_curator(_u, name: str) -> bool:
+def _archive_as_curator(_u, name: str) -> "tuple[bool, str]":
     """Archive via skill_usage with the ledger actor tagged 'curator', so the ledger entry reads as an autonomous transition, not a foreground call."""
     try:
         from tools.skill_ledger import reset_ledger_actor, set_ledger_actor
@@ -328,7 +355,7 @@ def _archive_as_curator(_u, name: str) -> bool:
     except Exception:
         tok = reset_ledger_actor = None  # type: ignore[assignment]
     try:
-        return _u.archive_skill(name)[0]
+        return _u.archive_skill(name)
     finally:
         if tok is not None:
             with contextlib.suppress(Exception):
@@ -359,6 +386,7 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
         _u.set_state(name, state)
         counts[key] += 1
 
+    to_archive: List[tuple] = []
     for row in _u.curated_report():
         counts["checked"] += 1
         name = row["name"]
@@ -387,12 +415,33 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
                 _set(name, _u.STATE_ACTIVE, "reactivated")
             continue
         if anchor <= archive_cutoff and current != _u.STATE_ARCHIVED:
-            if not unreadable_manifests and _archive_as_curator(_u, name):
-                counts["archived"] += 1
+            to_archive.append((name, current, True))
+        elif anchor <= stale_cutoff and row.get("provenance") == "external" and current == _u.STATE_ACTIVE:
+            # a shared skill past the stale window takes rung 1 (<group>-aux) through the same chokepoint
+            to_archive.append((name, current, False))
         elif anchor <= stale_cutoff and current == _u.STATE_ACTIVE:
             _set(name, _u.STATE_STALE, "marked_stale")
         elif anchor > stale_cutoff and current == _u.STATE_STALE:
             _set(name, _u.STATE_ACTIVE, "reactivated")  # used again after going stale
+    # One gate scan and one #logs line for the whole batch (t_776ae7bc). A skill the archive gate keeps
+    # (inbound pointer / pin / manifest) is still past the stale window: mark it stale, never archive it.
+    from agent.curator_shared import archive_batch
+    counts["unsubscribed"] = 0
+    if unreadable_manifests:  # fail closed (t_8dbf7a56): no archive and no move this tick; stale still applies
+        for name, current, _past in to_archive:
+            if current == _u.STATE_ACTIVE:
+                _set(name, _u.STATE_STALE, "marked_stale")
+        to_archive = []
+    with archive_batch(prefetch=[n for n, _c, past in to_archive if past]):
+        for name, current, _past in to_archive:
+            ok, msg = _archive_as_curator(_u, name)
+            if ok and msg.startswith("unsubscribed"):
+                counts["unsubscribed"] += 1
+                _u.set_state(name, _u.STATE_STALE)
+            elif ok:
+                counts["archived"] += 1
+            elif current == _u.STATE_ACTIVE:
+                _set(name, _u.STATE_STALE, "marked_stale")
     return counts
 
 
@@ -1221,10 +1270,11 @@ SHARED_SCOPE_NOTE = (
     "curatable this pass, overriding hard rule #1 for SHARED external-dir "
     "skills ONLY. Bundled and hub-installed skills remain strictly "
     "read-only. Every shared mutation is snapshotted and committed with "
-    "curator provenance. A shared skill is NEVER archived: deleting one "
-    "only unsubscribes it to skills-shared/<group>-aux/<name>/, and only "
-    "when it is idle past the fleet window (scripts/lib/skill_tier.py); a "
-    "recently used one is refused."
+    "curator provenance. Deleting a shared skill walks the idle ladder "
+    "(scripts/lib/skill_tier.py): idle past 60 days it is unsubscribed to "
+    "skills-shared/<group>-aux/<name>/; it reaches skills-shared/<group>/"
+    ".archive/<name>/ only when idle past 120 days with no inbound pointer, "
+    "pin or harness-manifest listing. A recently used one is refused."
 )
 
 def _render_candidate_list() -> str:
@@ -1373,7 +1423,7 @@ def run_curator_review(
                 curator_backup.prune_old_snapshots()
         counts = apply_automatic_transitions(now=start)
     auto_summary = ", ".join(
-        f"{counts[key]} {label}" for key, label in (("marked_stale", "marked stale"), ("archived", "archived"), ("reactivated", "reactivated")) if counts[key]
+        f"{counts[key]} {label}" for key, label in (("marked_stale", "marked stale"), ("unsubscribed", "unsubscribed"), ("archived", "archived"), ("reactivated", "reactivated")) if counts.get(key)
     ) or "no changes"
 
     # Deterministic oversized-skill SPLIT pass (fork, curator.split_over_kb). Placed HERE — before and
