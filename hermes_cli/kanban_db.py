@@ -20290,7 +20290,7 @@ def _native_worker_argv(task: Task, profile_home: Optional[str]) -> list[str]:
     exactly as a shim's argv would), because the lane's model gate reads its
     parent's argv to catch a card re-pinned between spawn and harness start.
     """
-    argv = [sys.executable, "-m", "hermes_cli.kanban_native_worker"]
+    argv = [sys.executable, "-P", "-m", "hermes_cli.kanban_native_worker"]
     model = provider = None
     if task.model_override:
         from hermes_cli.kanban_provider_health import model_override
