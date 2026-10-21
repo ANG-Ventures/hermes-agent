@@ -3552,7 +3552,7 @@ def _board_archived(board_path: Path, slug: str) -> bool:
     if slug == DEFAULT_BOARD:
         return False
     try:
-        return bool(json.loads((board_path / "board.json").read_text(encoding="utf-8")).get("archived"))
+        return bool(json.loads((board_path / "board.json").read_text(encoding="utf-8-sig")).get("archived"))
     except (OSError, ValueError, AttributeError):
         return False
 

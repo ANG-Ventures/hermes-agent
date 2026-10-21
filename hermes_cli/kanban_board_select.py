@@ -52,7 +52,7 @@ def bare_verb_policy() -> str:
         path = kb.kanban_home() / "config.yaml"
         if not path.is_file():
             return BARE_VERB_REFUSE
-        cfg = hermes_yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        cfg = hermes_yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
         value = ((cfg.get("kanban") or {}).get("bare_verb") if isinstance(cfg, dict) else None)
     except Exception:
         return BARE_VERB_REFUSE
