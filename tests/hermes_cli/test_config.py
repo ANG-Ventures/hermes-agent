@@ -1004,7 +1004,6 @@ class TestRetiredMultiplexAllowlist:
 class TestCuratorFasterPrune:
     def test_v44_rewrites_old_curator_defaults_but_keeps_user_values(self, tmp_path, monkeypatch):
         """Old 30/90 defaults move to 14/30; an explicitly customized window is untouched."""
-        from hermes_cli.config import DEFAULT_CONFIG
         from hermes_cli.config_migrations import run_migrations
 
         config_path = tmp_path / "config.yaml"
@@ -1015,7 +1014,8 @@ class TestCuratorFasterPrune:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         run_migrations(43, {"env_added": [], "config_added": [], "warnings": []}, quiet=True)
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        assert raw["curator"]["stale_after_days"] == DEFAULT_CONFIG["curator"]["stale_after_days"]
+        # v44's own target (a literal 14); DEFAULT_CONFIG moved to 60/120 later (t_776ae7bc)
+        assert raw["curator"]["stale_after_days"] == 14
         assert raw["curator"]["archive_after_days"] == 180
 
 

@@ -88,9 +88,9 @@ def test_knob_set_spawns_native_runner_with_worker_env(monkeypatch, tmp_path):
     got = _spawn(monkeypatch, tmp_path,
                  "foreign_lane:\n  harness: claude-code\n  worker_command: [/bin/true]\n")
     cmd = _module_tail(got["cmd"])
-    assert cmd[:3] == [sys.executable, "-m", MODULE]
+    assert cmd[:4] == [sys.executable, "-P", "-m", MODULE]
     # The profile's route, as a shim's argv would state it (the lane's model gate reads it).
-    assert cmd[3:] == ["-m", "claude-bpr/claude-haiku-4-5", "--provider", "claude-bpr"]
+    assert cmd[4:] == ["-m", "claude-bpr/claude-haiku-4-5", "--provider", "claude-bpr"]
     assert "chat" not in cmd
     env = got["env"]
     assert env["PYTHONPATH"] == str(_TREE)
@@ -107,7 +107,7 @@ def test_knob_set_carries_card_override_and_effort(monkeypatch, tmp_path):
                  model_override="claude-sonnet-5", provider_override="claude-bpr",
                  reasoning_effort="high")
     cmd = _module_tail(got["cmd"])
-    assert cmd[3:] == ["-m", "claude-sonnet-5", "--provider", "claude-bpr", "--reasoning", "high"]
+    assert cmd[4:] == ["-m", "claude-sonnet-5", "--provider", "claude-bpr", "--reasoning", "high"]
 
 
 # --------------------------------------------------------------------------
