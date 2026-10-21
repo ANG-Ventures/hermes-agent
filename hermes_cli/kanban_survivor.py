@@ -2778,8 +2778,27 @@ def _landed_claims(explicit):
     )
 
 
+def _uncovered_vanished(bases, workspace, explicit):
+    """Recorded repositories that vanished and that no explicit claim names.
+
+    The nested shortcuts return before the ``missing = set(bases) - keys``
+    coverage check below. Without this, a merged PR qualified for ONE vanished
+    repository vouched for every other vanished one the moment a nested
+    worktree sat under a surviving repository (Prism 2e98d07648a3 on #2175).
+    Returns the uncovered keys; the caller refuses on any. An unqualified
+    claim (key ``None``) covers at most one vanished repository, as the
+    ``missing`` branch rules.
+    """
+    vanished = {key for key in bases if not (workspace / key).is_dir()}
+    if not vanished:
+        return set()
+    if None in explicit:
+        return vanished if len(vanished) > 1 else set()
+    return vanished - set(explicit)
+
+
 def _nested_beside_landed(conn, task_id, metadata, evidence, explicit, previous,
-                          workspace, nested):
+                          workspace, nested, bases):
     """Complete on a landed explicit survivor; leave the nested repo to cleanup.
 
     The nested-repository refusal guards a capture that cannot be expressed as
@@ -2790,6 +2809,13 @@ def _nested_beside_landed(conn, task_id, metadata, evidence, explicit, previous,
     (t_3d376252: t_3ecbb73d, merged hermes-home#5702, refused on
     ``repo/mainwt``, a linked worktree inside its own main checkout).
     """
+    uncovered = _uncovered_vanished(bases, workspace, explicit)
+    if uncovered:
+        raise SurvivorUnavailable(
+            "survivor_unavailable: no operator survivor names the missing "
+            f"repositories ({', '.join(sorted(uncovered))}); qualify each claim "
+            f"as <repository>=<claim>, e.g. {_qualified_hint(uncovered)}"
+        )
     log.warning(
         "kanban survivor: %s completes on a landed explicit survivor; nested repository "
         "%s is left for workspace recovery", task_id, nested.relative_to(workspace),
@@ -2968,7 +2994,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         registered = _drop_pinned_submodules(registered, lambda _path: workspace, pins)
         if registered and not cleanup and _landed_claims(explicit):
             return _nested_beside_landed(conn, task_id, metadata, evidence, explicit,
-                                         previous, workspace, registered[0])
+                                         previous, workspace, registered[0], bases)
         if registered:
             raise SurvivorUnavailable(
                 "survivor_unavailable: nested repository requires separate recovery "
@@ -2995,7 +3021,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
         nested = next((a for a in repos for b in repos if a != b and a.is_relative_to(b)), None)
         if nested is not None and not cleanup and _landed_claims(explicit):
             return _nested_beside_landed(conn, task_id, metadata, evidence, explicit,
-                                         previous, workspace, nested)
+                                         previous, workspace, nested, bases)
         if nested is not None:
             # A patch cannot add a gitlink and files below the same path.
             raise SurvivorUnavailable("survivor_unavailable: nested repository requires separate recovery")
