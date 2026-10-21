@@ -7868,9 +7868,9 @@ def _default_spawn(
     the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
 
     ``board`` pins the child's kanban context to that board: the child's
-    ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
-    vars all resolve to the same board the dispatcher claimed the task
-    from. Workers cannot accidentally see other boards.
+    ``HERMES_KANBAN_DB`` / workspaces_root env vars both resolve to the same
+    board the dispatcher claimed the task from (the worker derives the slug
+    from the DB pin). Workers cannot accidentally see other boards.
     """
     import subprocess
     if not task.assignee:
@@ -8057,11 +8057,7 @@ def _default_spawn(
     env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb.workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
-    # Board slug — the final defense-in-depth pin. If the worker ever
-    # resolves kanban paths without the DB / workspaces env vars, the
-    # board slug still forces it to the right directory.
-    resolved_board = _kb._normalize_board_slug(board) or _kb.get_current_board()
-    env["HERMES_KANBAN_BOARD"] = resolved_board
+    # No board-slug env var (S7): the worker derives its board from the DB pin above.
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are

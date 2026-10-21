@@ -1172,10 +1172,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     return kanban_parser
 
 
+_REMOVED_BOARD_VERBS = frozenset({"switch", "use"})
+_REMOVED_BOARD_VERB_LINE = "boards switch was removed (S7): pass --board <slug> on each verb."
+
+
 def _schema_on_usage_error(sub: argparse._SubParsersAction) -> None:
     """An argparse refusal on a lifecycle verb prints that verb's full schema too (S2, t_cd1bcea4):
-    "the following arguments are required: task_id" alone is the one-field-per-refusal shape."""
+    "the following arguments are required: task_id" alone is the one-field-per-refusal shape.
+    ``boards switch``/``use`` (deleted, S7) add the one line that names the replacement (Q4)."""
     from hermes_cli.kanban_verb_input import VERB_SCHEMAS, schema_text
+
+    boards = sub.choices.get("boards")
+    if boards is not None:
+        boards_base = type(boards)
+
+        class _RemovedBoardVerb(boards_base):  # type: ignore[misc, valid-type]
+            def _check_value(self, action, value):
+                if (isinstance(action, argparse._SubParsersAction) and value in _REMOVED_BOARD_VERBS
+                        and value not in action.choices):
+                    self.exit(2, f"{self.prog}: '{value}' is not a `{self.prog}` command.\n"
+                                 f"{_REMOVED_BOARD_VERB_LINE}\n")
+                super()._check_value(action, value)
+
+        boards.__class__ = _RemovedBoardVerb
 
     for name, p in sub.choices.items():
         if name not in VERB_SCHEMAS:

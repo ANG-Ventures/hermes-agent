@@ -7,6 +7,7 @@ shlex quoting of JSON metadata, structured-JSON failures). Humans use CLI/dashbo
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import logging
@@ -249,7 +250,8 @@ def _loud_refusal(tool_name: str, args: dict, error: str) -> str:
             f"{_redact(message)}")
     try:
         run_id, session_ref = safe_comment_provenance(str(tid))
-        with _board(args.get("board") if isinstance(args.get("board"), str) else None) as (kb, conn):
+        with _board(args.get("board") if isinstance(args.get("board"), str) else None, cards=[str(tid)],
+                    verb=tool_name) as (kb, conn):
             kb.add_comment(conn, str(tid), author=_persisted_identity(), body=body,
                            run_id=run_id, session_ref=session_ref)
     except Exception:
@@ -381,22 +383,40 @@ def _require_orchestrator_tool(tool_name: str) -> None:
             "kanban_heartbeat, or kanban_comment for their assigned task.")
 
 
+def _arg_cards(args: dict) -> list:
+    """Card ids a tool call names, in derivation order (S7 D2 rules 3-4)."""
+    cards = [_default_task_id(args.get("task_id") if isinstance(args.get("task_id"), str) else None)]
+    for key in ("parent_id", "child_id"):
+        if isinstance(args.get(key), str):
+            cards.append(args[key])
+    parents = args.get("parents")
+    if isinstance(parents, list):
+        cards.extend(p for p in parents if isinstance(p, str))
+    return [c for c in cards if c]
+
+
 @contextmanager
-def _board(board: Optional[str], *, quiet_close: bool = False):
+def _board(board: Optional[str], *, cards=(), verb: str = "kanban", quiet_close: bool = False):
     """``with _board(slug) as (kb, conn)``; lazy import so the module loads in non-kanban
-    contexts. ``board=None`` keeps the env/symlink resolution chain; an explicit slug
-    overrides it per call. ``quiet_close`` swallows close() errors (best-effort bridges)."""
+    contexts. The board is resolved once (S7 D2: ``board`` > the DB pin > a card in ``cards`` >
+    refused with the next command) and installed as the context board for the whole block, so
+    every library caller sees the board the connection is on. ``quiet_close`` swallows close()
+    errors (best-effort bridges)."""
+    from hermes_cli import kanban_board_select as kbsel
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
-    conn = kbc.connect(board=board)
-    try:
-        yield kb, conn
-    finally:
+    slug = kbsel.resolve_slug(board if isinstance(board, str) else None, verb=verb, card_ids=cards)
+    scoped = slug if slug != kb.PINNED_SLUG else None
+    with (kb.scoped_current_board(scoped) if scoped else contextlib.nullcontext()):
+        conn = kbc.connect(board=scoped)
         try:
-            conn.close()
-        except Exception:
-            if not quiet_close:
-                raise
+            yield kb, conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                if not quiet_close:
+                    raise
 
 
 def _existing_task(kb, conn, tid: str):
@@ -631,7 +651,7 @@ def register_current_worker_from_env() -> bool:
         return True
     try:
         from hermes_cli import kanban_db_dispatch as kbd
-        with _board(None, quiet_close=True) as (_kb, conn):
+        with _board(None, cards=[tid], quiet_close=True) as (_kb, conn):
             return kbd.adopt_worker_pid(conn, tid, run_id, os.getpid())
     except Exception:
         logger.debug("kanban worker registration for %s failed", tid, exc_info=True)
@@ -654,7 +674,7 @@ def heartbeat_current_worker_from_env(progress_at: Optional[float] = None) -> bo
     _auto_heartbeat_last_attempt = now
     try:
         from hermes_cli import kanban_db_dispatch as kbd
-        with _board(None, quiet_close=True) as (kb, conn):
+        with _board(None, cards=[tid], quiet_close=True) as (kb, conn):
             ops = ((kb.heartbeat_claim, {"claimer": os.environ.get("HERMES_KANBAN_CLAIM_LOCK")}),
                    (kbd.heartbeat_worker, {"note": None, "expected_run_id": _worker_run_id(tid),
                                            "progress_at": progress_at}))
@@ -708,7 +728,7 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     _comment_poll_last_attempt = now
     seen = _comment_watermark.get(tid)
     try:
-        with _board(None, quiet_close=True) as (kb, conn):
+        with _board(None, cards=[tid], quiet_close=True) as (kb, conn):
             rows = kb.list_comments_after(conn, tid, after_id=seen or 0)
     except Exception:
         logger.debug("comment-inject: bridge failed", exc_info=True)
@@ -747,7 +767,7 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 def _handle_show(args: dict, **kw) -> str:
     """Full task state: row, parents, children, comments, runs, last 50 events."""
     tid = _require_task_id(args)
-    with _board(args.get("board")) as (kb, conn):
+    with _board(args.get("board"), cards=_arg_cards(args), verb="kanban_show") as (kb, conn):
         task = _existing_task(kb, conn, tid)
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
@@ -784,7 +804,7 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error("limit must be an integer")
     _check(limit >= 1, "limit must be >= 1")
     _check(limit <= KANBAN_LIST_MAX_LIMIT, f"limit must be <= {KANBAN_LIST_MAX_LIMIT}")
-    with _board(args.get("board")) as (kb, conn):
+    with _board(args.get("board"), cards=_arg_cards(args), verb="kanban_list") as (kb, conn):
         # Match CLI list: dependencies cleared since the last dispatcher tick
         # should be visible to orchestrators immediately.
         promoted = kb.recompute_ready(conn)
@@ -882,7 +902,7 @@ def _handle_complete(args: dict, **kw) -> str:
     metadata = _stamp_worker_session_metadata(tid, metadata)
     survivor_pr = _survivor_claims(args.get("survivor_pr"), "survivor_pr")
     survivor_ref = _survivor_claims(args.get("survivor_ref"), "survivor_ref")
-    with _board(args.get("board")) as (kb, conn):
+    with _board(args.get("board"), cards=_arg_cards(args), verb="kanban_complete") as (kb, conn):
         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
@@ -979,7 +999,7 @@ def _handle_block(args: dict, **kw) -> str:
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
     until_raw = args.get("until")
-    with _board(args.get("board")) as (kb, conn):
+    with _board(args.get("board"), cards=_arg_cards(args), verb="kanban_block") as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
         until = None
@@ -1044,7 +1064,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         _check(profile_exists(reviewer),
                f"reviewer profile {reviewer!r} is not installed. "
                f"Installed profiles: {', '.join(list_profile_names())}")
-    with _board(args.get("board")) as (kb, conn):
+    with _board(args.get("board"), cards=_arg_cards(args), verb="kanban_request_review") as (kb, conn):
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary, conn=conn)
         try:
             ok, fail_reason = kb.request_review(
@@ -1075,7 +1095,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
         coverage = json.dumps(coverage)
     elif coverage is not None:
         coverage = str(coverage)
-    with _board(args.get("board")) as (kb, conn):
+    with _board(args.get("board"), cards=_arg_cards(args), verb="kanban_request_changes") as (kb, conn):
         worker_run = _worker_run_id(tid)
         parked_session = None
         if worker_run is None:
@@ -1111,7 +1131,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     be reclaimed by ``release_stale_claims``."""
     tid = _worker_guard("kanban_heartbeat", args)
     from hermes_cli import kanban_db_dispatch as kbd
-    with _board(args.get("board")) as (kb, conn):
+    with _board(args.get("board"), cards=_arg_cards(args), verb="kanban_heartbeat") as (kb, conn):
         # The dispatcher pins HERMES_KANBAN_CLAIM_LOCK at spawn; the default
         # claimer covers locally-driven workers that bypassed the dispatcher.
         kb.heartbeat_claim(conn, tid, claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
@@ -1142,7 +1162,7 @@ def _handle_comment(args: dict, **kw) -> str:
     # (env + session contextvar), so a model cannot attribute its write to a
     # different run or session; the DB write path re-validates their shape.
     run_id, session_ref = safe_comment_provenance(str(tid))
-    with _board(args.get("board")) as (kb, conn):
+    with _board(args.get("board"), cards=_arg_cards(args), verb="kanban_comment") as (kb, conn):
         cid = kb.add_comment(
             conn, tid, author=author, body=str(body), run_id=run_id, session_ref=session_ref)
         return _ok(task_id=tid, comment_id=cid)
@@ -1151,7 +1171,7 @@ def _handle_comment(args: dict, **kw) -> str:
 def _store_attachment(board, tid, filename, data, content_type, **extra: Any) -> str:
     """Store via ``kanban_db.store_attachment_bytes`` (shared size cap, per-task
     dir, metadata row) so agent, dashboard, and CLI surfaces stay in lockstep."""
-    with _board(board) as (kb, conn):
+    with _board(board, cards=[tid], verb="kanban_attach") as (kb, conn):
         att_id = kb.store_attachment_bytes(
             conn, tid, str(filename), data,
             content_type=content_type, uploaded_by="agent", board=board)
@@ -1305,7 +1325,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
 def _handle_attachments(args: dict, **kw) -> str:
     """List a task's attachments (read-only; no ownership restriction)."""
     tid = _require_task_id(args)
-    with _board(args.get("board")) as (kb, conn):
+    with _board(args.get("board"), cards=_arg_cards(args), verb="kanban_attachments") as (kb, conn):
         _existing_task(kb, conn, tid)
         return json.dumps({
             "ok": True, "task_id": tid,
@@ -1376,7 +1396,7 @@ def _handle_create(args: dict, **kw) -> str:
     force_model = args.get("force_model")
     _check(force_model is None or isinstance(force_model, str), "force_model must be a reason string")
     from hermes_cli import kanban_worker_policy as _worker_policy
-    with _board(args.get("board")) as (kb, conn):
+    with _board(args.get("board"), cards=_arg_cards(args), verb="kanban_create") as (kb, conn):
         until = None
         if until_raw not in (None, ""):
             try:
@@ -1583,7 +1603,7 @@ def _handle_unblock(args: dict, **kw) -> str:
     _check(tid, "task_id is required")
     tid = str(tid)
     _enforce_worker_task_ownership(tid)
-    with _board(args.get("board")) as (kb, conn):
+    with _board(args.get("board"), cards=_arg_cards(args), verb="kanban_unblock") as (kb, conn):
         _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
@@ -1598,7 +1618,7 @@ def _handle_link(args: dict, **kw) -> str:
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
     kind = args.get("kind")
-    with _board(args.get("board")) as (kb, conn):
+    with _board(args.get("board"), cards=_arg_cards(args), verb="kanban_link") as (kb, conn):
         # ValueError also covers an unknown kind.
         gated = kb.link_tasks(
             conn, parent_id=parent_id, child_id=child_id, kind=kind,

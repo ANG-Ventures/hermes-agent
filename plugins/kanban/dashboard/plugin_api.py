@@ -43,7 +43,7 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_BOARD_Q = Query(None, description="Kanban board slug (omit for current)")
+_BOARD_Q = Query(None, description="Kanban board slug (required unless kanban.bare_verb: default)")
 
 
 # --- Connection / board helpers ---------------------------------------------
@@ -64,11 +64,17 @@ def _normalize_slug_or_400(slug: str) -> Optional[str]:
         return kanban_db._normalize_board_slug(slug)
 
 
-def _resolve_board(board: Optional[str]) -> Optional[str]:
-    """Validate/normalise a board slug query param (400 malformed, 404 unknown);
-    ``None`` when omitted so ``kb.connect()`` falls through to the active board."""
+def _resolve_board(board: Optional[str]) -> str:
+    """Validate/normalise a board slug query param (400 malformed, 404 unknown).
+
+    There is no current board (S7 D5): an omitted ``board`` is 400 ``board required`` under
+    ``kanban.bare_verb: refuse`` (the default), ``default`` under the kill switch."""
     if board is None or board == "":
-        return None
+        from hermes_cli import kanban_board_select as kbsel
+
+        if kbsel.bare_verb_policy() == kbsel.BARE_VERB_DEFAULT:
+            return kanban_db.DEFAULT_BOARD
+        raise HTTPException(status_code=400, detail="board required: " + kbsel.refusal_text("request"))
     normed = _normalize_slug_or_400(board)
     if normed and normed != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed):
         raise HTTPException(status_code=404, detail=f"board {normed!r} does not exist")
@@ -95,16 +101,17 @@ def _conn(board: Optional[str] = None):
 
 @contextmanager
 def _board_conn(board: Optional[str]) -> Iterator[tuple[Optional[str], sqlite3.Connection]]:
-    """Resolve the ``board`` query param, open a connection, close it on exit."""
+    """Resolve the ``board`` query param, open a connection with that board as the context board
+    (S7 D2: every library caller sees the board the connection is on), close it on exit."""
     board = _resolve_board(board)
-    with closing(_conn(board=board)) as conn:
+    with kanban_db.scoped_current_board(board), closing(_conn(board=board)) as conn:
         yield board, conn
 
 
 def _with_board_pinned(board: Optional[str], fn: Callable[[], Any]) -> Any:
-    """Run ``fn`` with the board pinned context-locally, not via the process-global
-    ``HERMES_KANBAN_BOARD`` env var (concurrent requests for different boards would cross-write)."""
-    with kanban_db.scoped_current_board(_resolve_board(board) or kanban_db.DEFAULT_BOARD):
+    """Run ``fn`` with the board pinned context-locally (concurrent requests for different
+    boards must not cross-write; there is no process-global board)."""
+    with kanban_db.scoped_current_board(_resolve_board(board)):
         return fn()
 
 
@@ -401,7 +408,7 @@ def get_board(
     current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
     session: Optional[str] = Query(None, description="Viewer session id; flags cards in its kanban home")):
     """Full board grouped by status column; omitting ``board`` uses the active board
-    (``HERMES_KANBAN_BOARD`` env → on-disk ``current`` pointer → ``default``)."""
+    (400 under ``kanban.bare_verb: refuse``; there is no current board, S7)."""
     with _board_conn(board) as (board, conn):
         tasks = kanban_db.list_tasks(
             conn, tenant=tenant, include_archived=include_archived,
@@ -480,7 +487,7 @@ async def get_board_endpoint(
     return await _read_board(
         tenant=tenant,
         include_archived=include_archived,
-        board=board or kanban_db.get_current_board(),
+        board=_resolve_board(board),
         workflow_template_id=workflow_template_id,
         current_step_key=current_step_key,
         session=session,
@@ -1586,7 +1593,6 @@ class CreateBoardBody(BaseModel):
     default_workdir: Optional[str] = None
     # Project (id or slug) scoping the board: default_workdir mirrors its primary repo, tasks inherit it.
     project_id: Optional[str] = None
-    switch: bool = False
 
 
 class RenameBoardBody(BaseModel):
@@ -1611,7 +1617,6 @@ class ExportBoardBody(BaseModel):
 class ImportBoardBody(BaseModel):
     archive: str  # path to a board .tar.gz on the backend's filesystem
     slug: Optional[str] = None  # override the archive's slug; collisions auto-suffix
-    switch: bool = False
 
 
 def _board_display_kwargs(p: BaseModel) -> dict[str, Any]:
@@ -1691,14 +1696,12 @@ def list_kanban_projects():
 
 @router.get("/boards")
 def list_boards(include_archived: bool = Query(False)):
-    """Every board on disk with task counts and the active slug."""
+    """Every board on disk with task counts (there is no current board, S7 D5)."""
     boards = kanban_db.list_boards(include_archived=include_archived)
-    current = kanban_db.get_current_board()
     proj_map = _projects_by_id()
     # Enumeration: this enrich loop asks every board on disk for its counts; the extent spans the
     # body so a per-board call added here later is covered without anyone remembering.
     for b in kanban_db.enumerating_each(boards):
-        b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_counts(b["slug"])
         # Live cards only — archived tasks are hidden from every default board view,
         # so counting them in the switcher badge would visibly disagree.
@@ -1707,7 +1710,7 @@ def list_boards(include_archived: bool = Query(False)):
         pid = b["project_id"] = b.get("project_id") or None
         proj = proj_map.get(pid) if pid else None
         b["project_name"] = proj.name if proj else None
-    return {"boards": boards, "current": current}
+    return {"boards": boards}
 
 
 def _validate_workdir(raw: str) -> str:
@@ -1731,10 +1734,7 @@ def create_board_endpoint(payload: CreateBoardBody):
     with _value_error_400():
         meta = kanban_db.create_board(
             payload.slug, default_workdir=default_workdir, project_id=project_id, **_board_display_kwargs(payload))
-    if payload.switch:
-        with _value_error_400():
-            kanban_db.set_current_board(meta["slug"])
-    return {"board": _annotate_board_meta(meta), "current": kanban_db.get_current_board()}
+    return {"board": _annotate_board_meta(meta)}
 
 
 @router.patch("/boards/{slug}")
@@ -1765,7 +1765,7 @@ def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete
     """Archive (default) or hard-delete a board."""
     with _value_error_400():
         res = kanban_db.remove_board(slug, archive=not delete)
-    return {"result": res, "current": kanban_db.get_current_board()}
+    return {"result": res}
 
 
 async def _run_transfer(fn, log_label: str):
@@ -1809,18 +1809,9 @@ async def import_board_endpoint(body: ImportBoardBody):
     if not archive:
         raise HTTPException(status_code=400, detail="archive path is required")
     result = await _run_transfer(
-        lambda: kanban_transfer.import_board(archive, (body.slug or "").strip() or None, activate=body.switch),
+        lambda: kanban_transfer.import_board(archive, (body.slug or "").strip() or None),
         "POST /boards/import")
-    return {**result, "current": kanban_db.get_current_board()}
-
-
-@router.post("/boards/{slug}/switch")
-def switch_board(slug: str):
-    """Persist ``slug`` as the active board for CLI / slash-command parity
-    (dashboard users pick boards client-side via localStorage)."""
-    normed = _existing_board_slug(slug)
-    kanban_db.set_current_board(normed)
-    return {"current": normed}
+    return result
 
 
 # --- Profile metadata & description editing (kanban orchestrator) ------------

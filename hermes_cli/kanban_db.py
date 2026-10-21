@@ -1573,8 +1573,16 @@ def pinned_board() -> Optional[str]:
     spawn-time env and a new board dir changes the mtime.
     """
     raw = _raw_db_pin()
-    if not raw:
-        return None
+    return board_named_by_pin(raw) if raw else None
+
+
+def board_named_by_pin(raw: str) -> str:
+    """The board whose layout DB path is the file ``raw`` names, else :data:`PINNED_SLUG`.
+
+    The inverse behind :func:`pinned_board`, taking the pin string explicitly so a caller holding
+    a child's env mapping (worker chat identity) derives the same name. Total; see
+    :func:`pinned_board`.
+    """
     try:
         root = boards_root()
         try:
