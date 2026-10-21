@@ -151,7 +151,7 @@ def test_pinned_board_is_total_on_an_unreadable_boards_dir(home, monkeypatch):
     def boom(*a, **k):
         raise PermissionError("boards/ unreadable")
 
-    monkeypatch.setattr(kb, "list_boards", boom)
+    monkeypatch.setattr(kb, "_board_db_layout", boom)
     assert kb.pinned_board() == kb.PINNED_SLUG
     assert kb.get_current_board() == kb.DEFAULT_BOARD
 
@@ -161,8 +161,8 @@ def test_pinned_board_cost_is_paid_once_per_pin(home, monkeypatch):
     kb.create_board("subs-ace")
     _pin(monkeypatch, kb.board_dir("subs-ace") / "kanban.db")
     calls = []
-    real = kb.list_boards
-    monkeypatch.setattr(kb, "list_boards", lambda **kw: calls.append(1) or real(**kw))
+    real = kb._board_db_layout
+    monkeypatch.setattr(kb, "_board_db_layout", lambda: calls.append(1) or real())
     assert kb.pinned_board() == "subs-ace"
     assert kb.pinned_board() == "subs-ace"
     assert len(calls) == 1
@@ -338,6 +338,7 @@ def test_worker_chat_identity_derives_the_board_from_the_pin(home):
 # --- D3 cost (RC-2 / RC-11): measured, not asserted against a CI box ---------------------------
 
 def test_board_of_task_cost_is_recorded(home, capsys):
+    """RC-2: p95 at 21 boards under 250 ms (Studio, 65 boards, measured on the card)."""
     for i in range(20):
         kb.create_board(f"b{i:02d}")
         _card(f"b{i:02d}")

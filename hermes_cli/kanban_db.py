@@ -1596,9 +1596,8 @@ def board_named_by_pin(raw: str) -> str:
         pin = Path(raw).expanduser().resolve(strict=False)
         found = PINNED_SLUG
         with enumerating_boards():
-            for meta in list_boards(include_archived=True):
-                slug = meta["slug"]
-                if _pin_file_agrees(_board_db_path_ignoring_pin(slug).resolve(strict=False), pin):
+            for slug, path in _board_db_layout():
+                if _pin_file_agrees(path.resolve(strict=False), pin):
                     found = slug
                     break
         if len(_PINNED_BOARD_MEMO) > 256:
@@ -3517,6 +3516,40 @@ class KanbanBoardUnreadable(KanbanBoardDerivationError):
     code = "BOARD_UNREADABLE"
 
 
+def _board_db_layout() -> list[tuple[str, Path]]:
+    """``(slug, layout DB path)`` for every board on disk, archived included, ``default`` first.
+
+    The same set :func:`list_boards` enumerates, but resolved from ONE root read: per-board
+    :func:`kanban_home` resolution (via ``board_dir``/``read_board_metadata``) cost ~4 ms a board
+    and pushed :func:`board_of_task` past its 250 ms budget at the live board count (S7 RC-2).
+    A dir named for a slug IS that board's dir; aliases redirect retired names, which have none.
+    """
+    home = kanban_home()
+    out: list[tuple[str, Path]] = [(DEFAULT_BOARD, home / "kanban.db")]
+    root = home / "kanban" / "boards"
+    if not root.is_dir():
+        return out
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        try:
+            slug = _normalize_board_slug(child.name)
+        except ValueError:
+            continue
+        if not slug or slug == DEFAULT_BOARD or not child.is_dir():
+            continue
+        if (child / "kanban.db").exists() or (child / "board.json").exists():
+            out.append((slug, child / "kanban.db"))
+    return out
+
+
+def _board_archived(board_path: Path, slug: str) -> bool:
+    if slug == DEFAULT_BOARD:
+        return False
+    try:
+        return bool(json.loads((board_path / "board.json").read_text(encoding="utf-8")).get("archived"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def board_of_task(task_id: str) -> str:
     """The ONE board holding ``task_id``, probed read-only across every board on disk.
 
@@ -3532,10 +3565,8 @@ def board_of_task(task_id: str) -> str:
         raise KanbanCardNotFound("kanban: a card id is required to derive its board.")
     hits: list[tuple[str, bool]] = []
     with enumerating_boards():
-        boards = list_boards(include_archived=True)
-        for meta in boards:
-            slug = meta["slug"]
-            path = _board_db_path_ignoring_pin(slug)
+        boards = _board_db_layout()
+        for slug, path in boards:
             try:
                 conn = connect_readonly(db_path=path)
             except FileNotFoundError:
@@ -3555,7 +3586,7 @@ def board_of_task(task_id: str) -> str:
             finally:
                 conn.close()
             if row is not None:
-                hits.append((slug, bool(meta.get("archived"))))
+                hits.append((slug, _board_archived(path.parent, slug)))
     if not hits:
         raise KanbanCardNotFound(f"kanban: {tid} is on no board (checked {len(boards)} boards).")
     if len(hits) > 1:
