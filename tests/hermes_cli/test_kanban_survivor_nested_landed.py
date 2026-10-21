@@ -165,3 +165,33 @@ def test_landed_shortcut_completes_when_every_vanished_repo_is_named(board, remo
     assert kb.complete_task(board, tid, summary="approved",
                             survivor_pr=[f"gone1={PR}", f"gone2={PR}"])
     assert kb.get_task(board, tid).status == "done"
+
+
+def test_unqualified_claim_is_bound_to_the_single_vanished_repo(board, remote, tmp_path, shape):
+    """Prism c7eccc58634e: an accepted unqualified claim must be recorded under the vanished
+    repository, not under the workspace root ``.``."""
+    tid, ws = nested_card(board, tmp_path, remote, shape)
+    kept = str(repo_of(ws, shape).relative_to(ws)) or "."
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases",
+            (tid, json.dumps({kept: HEAD, "gone": HEAD})),
+        )
+
+    assert kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
+    saved = kb.latest_run(board, tid).metadata["survivor"]
+    assert [r["repository"] for r in saved["refs"]] == ["gone"]
+
+
+def test_directory_without_git_still_counts_as_vanished(board, remote, tmp_path, shape):
+    """Prism 8e6fc262130b: ``gone2/`` left behind without its ``.git`` is still a vanished
+    repository and still needs its own qualified claim."""
+    tid, ws = nested_card(board, tmp_path, remote, shape)
+    _vanished_bases(board, tid, ws, shape)
+    (ws / "gone2").mkdir()
+    (ws / "gone2" / "leftover.txt").write_text("x\n")
+
+    with pytest.raises(ValueError, match="gone2"):
+        kb.complete_task(board, tid, summary="approved", survivor_pr=[f"gone1={PR}"])
+    assert kb.get_task(board, tid).status != "done"
