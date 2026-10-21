@@ -1,0 +1,200 @@
+"""Which board a card or a DB pin belongs to (S7 D1 + D3), read-only and never guessing.
+
+``pinned_board()`` names the board a ``HERMES_KANBAN_DB`` pin points at; ``board_of_task()``
+finds the ONE board holding a card id. Both probe each board's LAYOUT path
+(``_board_db_path_ignoring_pin``), never ``kanban_db_path``: under a pin that returns the pin for
+every slug and would make every card AMBIGUOUS. ``hermes kanban locate`` is the CLI encoding of
+``board_of_task`` (S7 Q2); ``scripts/kanban_board_resolve.py`` in hermes-home wraps that verb.
+Spec: hermes-home plans/2026-10-21_sdlc-simplification/S7-boards-no-global-pointer-SPEC.md.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+from pathlib import Path
+from typing import Optional
+
+from hermes_cli import kanban_db as _kb  # noqa: E402  (facade imports this module at its tail)
+
+_log = logging.getLogger(__name__)
+
+# A ``HERMES_KANBAN_DB`` pin that agrees with no board's layout path still IS the DB every open
+# uses; only its NAME is unknown. One encoding of that name, shared with hermes-home's
+# scripts/kanban_board_resolve.py ``'override'`` (S7 D1, RC-7).
+PINNED_SLUG = "override"
+
+_PINNED_BOARD_MEMO: dict[tuple, str] = {}
+_PINNED_BOARD_ERROR_LOGGED: set[str] = set()
+# raw pin -> why naming it failed. Not memoised (the next call retries); the surface reads it to
+# refuse the verb with the next command instead of acting under a pin it could not name (RC-11).
+_PINNED_BOARD_ERRORS: dict[str, str] = {}
+
+
+class KanbanBoardDerivationError(ValueError):
+    """A card id could not be mapped to exactly one board (S7 D3). ``code`` is M8's code."""
+
+    code = "BOARD_DERIVATION"
+
+
+class KanbanCardNotFound(KanbanBoardDerivationError):
+    code = "CARD_NOT_FOUND"
+
+
+class KanbanCardAmbiguous(KanbanBoardDerivationError):
+    code = "CARD_AMBIGUOUS"
+
+
+class KanbanBoardUnreadable(KanbanBoardDerivationError):
+    code = "BOARD_UNREADABLE"
+
+
+def raw_db_pin() -> str:
+    """The ``HERMES_KANBAN_DB`` pin as set; ``""`` when absent or sandboxed. Never raises."""
+    return _kb._kanban_path_override("HERMES_KANBAN_DB").strip()
+
+
+def board_db_layout() -> list[tuple[str, Path]]:
+    """``(slug, layout DB path)`` for every board on disk, archived included, ``default`` first.
+
+    The set :func:`kanban_db.list_boards` enumerates, resolved from ONE root read: per-board
+    ``kanban_home()`` resolution costs ~4 ms a board at the live count (S7 RC-2). A dir named for
+    a slug IS that board's dir; aliases redirect retired names, which have no dir.
+    """
+    home = _kb.kanban_home()
+    out: list[tuple[str, Path]] = [(_kb.DEFAULT_BOARD, home / "kanban.db")]
+    root = home / "kanban" / "boards"
+    if not root.is_dir():
+        return out
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        try:
+            slug = _kb._normalize_board_slug(child.name)
+        except ValueError:
+            continue
+        if not slug or slug == _kb.DEFAULT_BOARD or not child.is_dir():
+            continue
+        if (child / "kanban.db").exists() or (child / "board.json").exists():
+            out.append((slug, child / "kanban.db"))
+    return out
+
+
+def _board_archived(board_path: Path, slug: str) -> bool:
+    if slug == _kb.DEFAULT_BOARD:
+        return False
+    try:
+        meta = json.loads((board_path / "board.json").read_text(encoding="utf-8-sig"))
+        return bool(meta.get("archived"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def pinned_board() -> Optional[str]:
+    """Slug of the board ``HERMES_KANBAN_DB`` names; ``None`` only when there is no pin.
+
+    Total (RC-11): an error while naming the pin returns :data:`PINNED_SLUG` and records the
+    reason in ``_PINNED_BOARD_ERRORS``; :func:`pinned_board_error` hands it to the surface, which
+    refuses the verb with the next command.
+    """
+    raw = raw_db_pin()
+    return board_named_by_pin(raw) if raw else None
+
+
+def pinned_board_error() -> Optional[str]:
+    """Why the current pin could not be named, or ``None`` (no pin, or it was named)."""
+    raw = raw_db_pin()
+    return _PINNED_BOARD_ERRORS.get(raw) if raw else None
+
+
+def board_named_by_pin(raw: str) -> str:
+    """The board whose layout DB path is the file ``raw`` names, else :data:`PINNED_SLUG`.
+
+    Spelling-blind inverse of ``_board_db_path_ignoring_pin`` (RC-7): compared through
+    ``_pin_file_agrees``, the contradiction guard's own predicate, so a firmlink / symlinked /
+    case-variant spelling of a board's DB names that board. Memoised on (pin, root, boards/
+    mtime): a new board dir changes the mtime, so a process pays one scan per pin.
+    """
+    try:
+        root = _kb.boards_root()
+        try:
+            stamp = root.stat().st_mtime_ns
+        except FileNotFoundError:
+            stamp = None
+        key = (raw, str(_kb.kanban_home()), stamp)
+        hit = _PINNED_BOARD_MEMO.get(key)
+        if hit is not None:
+            return hit
+        pin = Path(raw).expanduser()
+        found = PINNED_SLUG
+        with _kb.enumerating_boards():
+            for slug, path in board_db_layout():
+                if _kb._pin_file_agrees(path, pin):
+                    found = slug
+                    break
+        if len(_PINNED_BOARD_MEMO) > 256:
+            _PINNED_BOARD_MEMO.clear()
+        _PINNED_BOARD_MEMO[key] = found
+        _PINNED_BOARD_ERRORS.pop(raw, None)
+        return found
+    except Exception as exc:  # RC-11: total; the pin still routes every open.
+        _PINNED_BOARD_ERRORS[raw] = f"{type(exc).__name__}: {exc}"
+        if raw not in _PINNED_BOARD_ERROR_LOGGED:
+            _PINNED_BOARD_ERROR_LOGGED.add(raw)
+            _log.warning("kanban: could not name the board HERMES_KANBAN_DB=%s pins (%s: %s); "
+                         "using %r", raw, type(exc).__name__, exc, PINNED_SLUG)
+        return PINNED_SLUG
+
+
+def _unreadable(slug: str, exc: BaseException) -> KanbanBoardUnreadable:
+    return KanbanBoardUnreadable(
+        f"kanban: board {slug} is unreadable ({type(exc).__name__}: {exc}); fix it or "
+        f"pass --board <slug> to bypass derivation."
+    )
+
+
+def board_of_task(task_id: str) -> str:
+    """The ONE board holding ``task_id``, probed read-only across every board on disk.
+
+    Never guesses (S7 D3, GT6): zero hits -> :class:`KanbanCardNotFound`; two or more ->
+    :class:`KanbanCardAmbiguous` (archived hits marked); any unreadable board ->
+    :class:`KanbanBoardUnreadable` (fail closed: the card might be on it). A board dir with no
+    ``kanban.db`` holds no cards. Each probe is ``connect_readonly`` (``mode=ro``, no init, no
+    migration, no mkdir) on the board's layout path.
+    """
+    tid = str(task_id or "").strip()
+    if not tid:
+        raise KanbanCardNotFound("kanban: a card id is required to derive its board.")
+    hits: list[tuple[str, bool]] = []
+    with _kb.enumerating_boards():
+        boards = board_db_layout()
+        for slug, path in boards:
+            try:
+                conn = _kb.connect_readonly(db_path=path)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                raise _unreadable(slug, exc) from exc
+            try:
+                row = conn.execute("SELECT 1 FROM tasks WHERE id = ? LIMIT 1", (tid,)).fetchone()
+            except sqlite3.Error as exc:
+                raise _unreadable(slug, exc) from exc
+            finally:
+                conn.close()
+            if row is not None:
+                hits.append((slug, _board_archived(path.parent, slug)))
+    if not hits:
+        raise KanbanCardNotFound(f"kanban: {tid} is on no board (checked {len(boards)} boards).")
+    if len(hits) > 1:
+        named = ", ".join(f"{s} (archived)" if arch else s for s, arch in hits)
+        raise KanbanCardAmbiguous(f"kanban: {tid} exists on {named}; pass --board <slug>.")
+    return hits[0][0]
+
+
+def locate(task_id: str) -> tuple[str, str]:
+    """``(slug, db_path)`` for ``hermes kanban locate``. Under a pin: the pin's board and the pin
+    itself (a pinned process addresses that DB whatever the card says; D2 step 2)."""
+    raw = raw_db_pin()
+    if raw:
+        return board_named_by_pin(raw), raw
+    slug = board_of_task(task_id)
+    with _kb.enumerating_boards():
+        return slug, str(_kb._board_db_path_ignoring_pin(slug))
