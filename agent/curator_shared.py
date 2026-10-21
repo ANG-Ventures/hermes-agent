@@ -491,25 +491,42 @@ def attempt_crash_recovery(
     return True, "restored self-inflicted dirt from git/manifest"
 
 
-# Ace's standing rulings (2026-10-18; 2026-10-19 13:45 PT, msg 1561842711190053015): a shared skill is NEVER
-# archived or deleted. One with 0 loads in the idle window may be UNSUBSCRIBED by moving it to
-# skills-shared/<group>-aux/ (still on disk, loadable via skill-finder GROUP mode); one used within it stays.
-UNSUBSCRIBE_OPERATOR = "Ace ruling 2026-10-19 13:45 PT msg 1561842711190053015 (curator idle unsubscribe)"
+# The curator's idle ladder for skills (Ace 2026-10-21 02:47 PT, msg 1562401931165442108; supersedes the
+# 10-19 "never archive" ruling). Both windows live in the fleet's scripts/lib/skill_tier.py, no copy here:
+#   idle >= DEFAULT_IDLE_DAYS (60)     -> a shared skill moves to skills-shared/<group>-aux/ (skill-group.py);
+#   idle >= DEFAULT_ARCHIVE_DAYS (120) -> <group>/.archive/<name>/ ONLY when scripts/skill-archive-gate.py
+#                                         finds no inbound pointer, pin or skills-harness-manifests listing.
+# Nothing is ever deleted. Every archive batch posts one #logs line naming what moved.
+UNSUBSCRIBE_OPERATOR = "Ace ruling 2026-10-21 02:47 PT msg 1562401931165442108 (curator idle unsubscribe)"
 SKILL_GROUP_SCRIPT = ("hermes-harness", "skill-finder", "scripts", "skill-group.py")
 SKILL_TIER_LIB = ("scripts", "lib", "skill_tier.py")
+ARCHIVE_GATE_SCRIPT = ("scripts", "skill-archive-gate.py")
+NOTIFY_SCRIPT = ("scripts", "notify.py")
+LOGS_CHANNEL = "1480525090331561984"  # fleet #logs (== cron/fork_ext/logs_digest_gate.LOGS_CHAT)
 
 
 def _load_skill_tier(fleet_root: Path):
-    """The fleet's ONE tier module (``<root>/scripts/lib/skill_tier.py``): idle threshold + last-used reader."""
+    """The fleet's ONE tier module (``<root>/scripts/lib/skill_tier.py``): both windows + the last-used reader."""
     import importlib.util
 
     path = fleet_root.joinpath(*SKILL_TIER_LIB)
     spec = importlib.util.spec_from_file_location("_fleet_skill_tier", path)
-    if spec is None or spec.loader is None:
+    if spec is None or spec.loader is None or not path.is_file():
         raise ImportError(f"no skill_tier module at {path}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def fleet_root() -> Path:
+    return _shared_root().resolve().parent
+
+
+def ladder_days(root: Optional[Path] = None) -> Tuple[float, float]:
+    """(unsubscribe days, archive days) from the fleet tier module. Raises when it (or the archive constant)
+    is missing: no window, no move."""
+    tier = _load_skill_tier(root or fleet_root())
+    return float(tier.DEFAULT_IDLE_DAYS), float(tier.DEFAULT_ARCHIVE_DAYS)
 
 
 def _iso_ts(value) -> Optional[float]:
@@ -523,20 +540,21 @@ def _iso_ts(value) -> Optional[float]:
 
 
 def shared_skill_idle_days(name: str, fleet_root: Path, record: Optional[Dict[str, Any]] = None,
-                           now: Optional[float] = None) -> Tuple[Optional[float], float, str]:
-    """(idle days or None when unknown, threshold days, why) for a shared skill.
+                           now: Optional[float] = None, aliases: Iterable[str] = ()) -> Tuple[Optional[float], float, str]:
+    """(idle days or None when unknown, unsubscribe threshold days, why) for a shared skill.
 
     Last use = max over the tier module's sources (fleet ``skills/.usage.json`` + ``var/skills-portal/
-    stats-model.json``) and this profile's usage *record* (last use/view/patch, else created_at). The
-    threshold is ``skill_tier.DEFAULT_IDLE_DAYS`` (one source). No timestamp anywhere AND no fleet
-    stats file = unknown (the caller refuses)."""
+    stats-model.json``) for *name* AND every alias (the frontmatter name when it differs from the directory:
+    usage is keyed by the skill name, Prism 21b5138959ff), and this profile's usage *record*. No timestamp
+    anywhere AND no fleet stats file = unknown (the caller refuses)."""
     import time as _time
 
     tier = _load_skill_tier(fleet_root)
     threshold = float(tier.DEFAULT_IDLE_DAYS)
     stats = fleet_root / "var" / "skills-portal" / "stats-model.json"
     last, created = tier.load_last_used(fleet_root / "skills" / ".usage.json", stats)
-    stamps = [t for t in (last.get(name), created.get(name)) if t]
+    keys = [name] + [a for a in aliases if a and a != name]
+    stamps = [t for k in keys for t in (last.get(k), created.get(k)) if t]
     rec = record or {}
     for key in ("last_used_at", "last_viewed_at", "last_patched_at", "last_activity_at", "created_at"):
         ts = _iso_ts(rec.get(key))
@@ -550,48 +568,114 @@ def shared_skill_idle_days(name: str, fleet_root: Path, record: Optional[Dict[st
     return None, threshold, "no usage evidence (no record, no fleet stats-model.json)"
 
 
-def unsubscribe_shared_skill(
-    skill_dir: Path,
-    *,
-    shared_root: Optional[Path] = None,
-    record: Optional[Dict[str, Any]] = None,
-    now: Optional[float] = None,
-) -> Tuple[bool, str, List[Path]]:
-    """The curator's ONLY idle action on a shared skill: move ``<group>/<name>`` to ``<group>-aux/<name>``.
+# --- archive gate + batch reporting -------------------------------------------------------------
 
-    Never ``.archive`` (t_776ae7bc). Refused when the skill was used within ``skill_tier.DEFAULT_IDLE_DAYS``,
-    when its idle time is unknown, or when it already sits in an ``-aux`` group. The move itself is
-    ``skill-group.py move --in-place`` (the fleet's one mover), run under the full safety contract
-    (lock, scoped precheck, snapshot, explicit-pathspec ``curator:`` commit). Returns (ok, message, touched).
-    """
-    root = shared_root or _shared_root()
-    skill_dir = Path(skill_dir)
-    try:
-        rel = skill_dir.resolve().relative_to(root.resolve())
-    except ValueError:
-        return False, f"{skill_dir} is not under the shared tree", []
-    if len(rel.parts) != 2:
-        return False, f"{skill_dir} is not a <group>/<skill> dir", []
-    group, dname = rel.parts
-    if group.endswith("-aux"):
-        return False, f"{dname} is already unsubscribed ({group}); shared skills are never archived", []
-    fleet_root = root.resolve().parent
-    mover = root.joinpath(*SKILL_GROUP_SCRIPT)
-    try:
-        idle, threshold, why = shared_skill_idle_days(dname, fleet_root, record=record, now=now)
-    except Exception as e:  # no tier module = no threshold: refuse, never fall back to a second number
-        return False, f"refused: cannot read the idle threshold ({e}); shared skills are never archived", []
-    if idle is None or idle < threshold:
-        shown = "unknown" if idle is None else f"{idle:.0f}d"
-        return False, (f"refused: {dname} idle {shown} ({why}) < {threshold:g}d: stays subscribed in {group}; "
-                       "shared skills are never archived"), []
-    if not mover.is_file():
-        return False, f"refused: mover {mover} missing; shared skills are never archived", []
-    dest_dir = root / f"{group}-aux"
-    dest = dest_dir / dname
-    readme = dest_dir / "README.md"
-    new_group = not dest_dir.exists()
+_batch: Optional[Dict[str, Any]] = None
 
+
+def archive_gate(names: Iterable[str], root: Optional[Path] = None) -> Dict[str, Tuple[bool, List[str]]]:
+    """{name: (archivable, blockers)} from ``scripts/skill-archive-gate.py`` (inbound pointers, pins,
+    manifests). Fail closed: a missing gate, a non-zero exit or unparseable output blocks every name.
+    Inside an :func:`archive_batch` the answers are cached for the batch."""
+    names = sorted({n for n in names if n})
+    root = root or fleet_root()
+    cache = _batch["gate"] if _batch is not None else {}
+    todo = [n for n in names if n not in cache]
+    if todo:
+        script = root.joinpath(*ARCHIVE_GATE_SCRIPT)
+        res: Dict[str, Tuple[bool, List[str]]] = {}
+        if not script.is_file():
+            res = {n: (False, [f"archive gate {script} missing"]) for n in todo}
+        else:
+            try:
+                p = subprocess.run([sys.executable, str(script), "--home", str(root), "--json", *todo],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                   timeout=300, env={**os.environ, "HERMES_FLEET_HOME": str(root)})
+                doc = json.loads(p.stdout) if p.returncode == 0 else None
+                skills = doc.get("skills") if isinstance(doc, dict) else None
+                for n in todo:
+                    r = (skills or {}).get(n)
+                    if isinstance(r, dict) and r.get("archivable") is True:
+                        res[n] = (True, [])
+                    else:
+                        why = (r or {}).get("blockers") if isinstance(r, dict) else None
+                        res[n] = (False, list(why or [f"archive gate rc={p.returncode}: "
+                                                      f"{(p.stderr or p.stdout).strip()[:200]}"]))
+            except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+                res = {n: (False, [f"archive gate failed: {type(e).__name__}: {e}"]) for n in todo}
+        cache.update(res)
+    return {n: cache[n] for n in names}
+
+
+@contextlib.contextmanager
+def archive_batch(prefetch: Iterable[str] = ()):
+    """One curator pass's archives: caches the gate (one scan for the batch) and posts ONE #logs line
+    naming every skill archived inside it. Nested use joins the outer batch."""
+    global _batch
+    if _batch is not None:
+        yield _batch
+        return
+    _batch = {"gate": {}, "archived": []}
+    try:
+        names = [n for n in prefetch if n]
+        if names:
+            with contextlib.suppress(Exception):
+                archive_gate(names)
+        yield _batch
+    finally:
+        batch, _batch = _batch, None
+        if batch["archived"]:
+            post_archive_logs(batch["archived"])
+
+
+def post_archive_logs(moved: List[str], root: Optional[Path] = None) -> bool:
+    """One #logs line naming what the curator archived (Ace 02:47 rule). Best-effort, never raises; the
+    curator commits/ledger are the durable record."""
+    if not moved:
+        return False
+    root = root or fleet_root()
+    msg = ("curator archived %d skill(s), idle 120d+, unpointed, unpinned, unmanifested (restorable; nothing "
+           "deleted): %s" % (len(moved), ", ".join(moved)))
+    notify = root.joinpath(*NOTIFY_SCRIPT)
+    if not notify.is_file():
+        logger.warning("curator: no %s; #logs line not sent: %s", notify, msg)
+        return False
+    try:
+        p = subprocess.run([sys.executable, str(notify), "--channel", "discord", "--target", LOGS_CHANNEL,
+                            "--sev", "info", "--send", msg], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.warning("curator: #logs line not sent (%s): %s", e, msg)
+        return False
+    if p.returncode != 0:
+        logger.warning("curator: #logs line not sent (notify rc=%s): %s", p.returncode, msg)
+    return p.returncode == 0
+
+
+def note_archived(label: str, root: Optional[Path] = None) -> None:
+    """Record one archive for the batch's #logs line; outside a batch, post it alone."""
+    if _batch is not None:
+        _batch["archived"].append(label)
+    else:
+        post_archive_logs([label], root)
+
+
+def local_archive_refusal(names: Iterable[str]) -> Optional[str]:
+    """Why an OWN-PROFILE skill must not be archived now, else None. On a fleet tree (skill_tier present)
+    the same guards as shared skills apply; on a plain install (no fleet tier module) there is no gate."""
+    root = fleet_root()
+    if not root.joinpath(*SKILL_TIER_LIB).is_file():
+        return None
+    blockers = [b for _ok, bs in archive_gate(names, root).values() for b in bs]
+    return "; ".join(dict.fromkeys(blockers)) or None
+
+
+# --- moves --------------------------------------------------------------------------------------
+
+def _shared_move(skill_dir: Path, dest: Path, root: Path, summary: str, mover) -> Tuple[bool, str, List[Path]]:
+    """Run *mover()* (does the rename, returns (ok, msg, extra_touched)) under the full shared contract:
+    lock, scoped precheck (+crash recovery), pre-mutation snapshot, explicit-pathspec ``curator:`` commit,
+    roll back on a failed commit."""
+    dest_dir = dest.parent
     with shared_pass_lock(root) as acquired:
         if not acquired:
             return False, "lock contention (another curator holds shared lock)", []
@@ -613,16 +697,78 @@ def unsubscribe_shared_skill(
                 for base in (skill_dir, dest):
                     with contextlib.suppress(ValueError):
                         intended_pre.append(str((base / sub).resolve(strict=False).relative_to(repo_resolved)))
-        if new_group:
+        readme = dest_dir / "README.md"
+        if not dest_dir.exists():
             intended_pre.append(str(readme.resolve(strict=False).relative_to(repo_resolved)))
         snap = snapshot_shared([skill_dir.parent], intended_pre, shared_root=root)
         if snap is None:
             return False, "shared snapshot failed (hard gate)", []
+        ok_move, msg_move, extra = mover()
+        if not ok_move:
+            return False, msg_move, []
+        touched = [skill_dir, dest] + list(extra)
+        ok_commit, msg_commit = commit_shared(summary, touched, precheck_dirty=(dirty or []) + intended_pre,
+                                              shared_root=root)
+        if not ok_commit:
+            with contextlib.suppress(OSError):
+                dest.rename(skill_dir)
+                for x in extra:
+                    x.unlink()
+                if extra:
+                    dest_dir.rmdir()
+            return False, f"commit failed: {msg_commit}", []
+        return True, msg_move, touched
+
+
+def _split(skill_dir: Path, root: Path) -> Tuple[Optional[Tuple[str, str]], str]:
+    try:
+        rel = skill_dir.resolve().relative_to(root.resolve())
+    except ValueError:
+        return None, f"{skill_dir} is not under the shared tree"
+    if len(rel.parts) != 2:
+        return None, f"{skill_dir} is not a <group>/<skill> dir"
+    return (rel.parts[0], rel.parts[1]), ""
+
+
+def unsubscribe_shared_skill(
+    skill_dir: Path,
+    *,
+    shared_root: Optional[Path] = None,
+    record: Optional[Dict[str, Any]] = None,
+    now: Optional[float] = None,
+    aliases: Iterable[str] = (),
+) -> Tuple[bool, str, List[Path]]:
+    """Rung 1: move ``<group>/<name>`` to ``<group>-aux/<name>`` via ``skill-group.py move --in-place`` (the
+    fleet's one mover). Refused when used within ``skill_tier.DEFAULT_IDLE_DAYS``, when idle time is unknown,
+    or when it already sits in an ``-aux`` group. Returns (ok, message, touched)."""
+    root = shared_root or _shared_root()
+    skill_dir = Path(skill_dir)
+    parts, why = _split(skill_dir, root)
+    if parts is None:
+        return False, why, []
+    group, dname = parts
+    if group.endswith("-aux"):
+        return False, f"{dname} is already unsubscribed ({group})", []
+    froot = root.resolve().parent
+    mover = root.joinpath(*SKILL_GROUP_SCRIPT)
+    try:
+        idle, threshold, why = shared_skill_idle_days(dname, froot, record=record, now=now, aliases=aliases)
+    except Exception as e:  # no tier module = no threshold: refuse, never fall back to a second number
+        return False, f"refused: cannot read the idle threshold ({e}); skill stays", []
+    if idle is None or idle < threshold:
+        shown = "unknown" if idle is None else f"{idle:.0f}d"
+        return False, f"refused: {dname} idle {shown} ({why}) < {threshold:g}d: stays subscribed in {group}", []
+    if not mover.is_file():
+        return False, f"refused: mover {mover} missing; skill stays", []
+    dest_dir = root / f"{group}-aux"
+    dest = dest_dir / dname
+
+    def _move():
         p = subprocess.run(
-            [sys.executable, str(mover), "--home", str(fleet_root), "move", dname, dest_dir.name,
+            [sys.executable, str(mover), "--home", str(froot), "move", dname, dest_dir.name,
              "--in-place", "--create", "--json", "--operator", UNSUBSCRIBE_OPERATOR],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
-            env={**os.environ, "HERMES_FLEET_HOME": str(fleet_root)},
+            env={**os.environ, "HERMES_FLEET_HOME": str(froot)},
         )
         try:
             out = json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {}
@@ -630,16 +776,78 @@ def unsubscribe_shared_skill(
             out = {}
         if p.returncode != 0 or not out.get("ok") or not dest.is_dir():
             return False, f"skill-group move rc={p.returncode}: {(out.get('error') or p.stderr).strip()[:300]}", []
-        touched = [skill_dir, dest] + ([readme] if out.get("created_group") else [])
-        ok_commit, msg_commit = commit_shared(
-            f"unsubscribe idle shared skill {dname} {group} -> {dest_dir.name}",
-            touched, precheck_dirty=(dirty or []) + intended_pre, shared_root=root,
-        )
-        if not ok_commit:
-            with contextlib.suppress(OSError):
-                dest.rename(skill_dir)
-                if out.get("created_group"):
-                    readme.unlink()
-                    dest_dir.rmdir()
-            return False, f"commit failed: {msg_commit}", []
-        return True, f"unsubscribed to {dest} (idle {idle:.0f}d >= {threshold:g}d)", touched
+        return True, f"unsubscribed to {dest} (idle {idle:.0f}d >= {threshold:g}d)", \
+            ([dest_dir / "README.md"] if out.get("created_group") else [])
+
+    return _shared_move(skill_dir, dest, root, f"unsubscribe idle shared skill {dname} {group} -> {dest_dir.name}",
+                        _move)
+
+
+def archive_shared_skill(
+    skill_dir: Path,
+    *,
+    shared_root: Optional[Path] = None,
+    record: Optional[Dict[str, Any]] = None,
+    now: Optional[float] = None,
+    aliases: Iterable[str] = (),
+) -> Tuple[bool, str, List[Path]]:
+    """Rung 2: ``<group>/<name>`` -> ``<group>/.archive/<name>`` (in-tree, restorable by a revert of the
+    ``curator:`` commit). Refused unless idle >= ``skill_tier.DEFAULT_ARCHIVE_DAYS`` AND
+    ``scripts/skill-archive-gate.py`` reports no inbound pointer, pin or manifest listing."""
+    root = shared_root or _shared_root()
+    skill_dir = Path(skill_dir)
+    parts, why = _split(skill_dir, root)
+    if parts is None:
+        return False, why, []
+    group, dname = parts
+    froot = root.resolve().parent
+    try:
+        _unsub, archive_days = ladder_days(froot)
+        idle, _t, why = shared_skill_idle_days(dname, froot, record=record, now=now, aliases=aliases)
+    except Exception as e:
+        return False, f"refused: cannot read the archive window ({e}); skill stays", []
+    if idle is None or idle < archive_days:
+        shown = "unknown" if idle is None else f"{idle:.0f}d"
+        return False, f"refused: {dname} idle {shown} ({why}) < {archive_days:g}d archive window", []
+    verdict = archive_gate([dname, *aliases], froot)
+    blockers = [b for _ok, bs in verdict.values() for b in bs]
+    if blockers:
+        return False, f"refused: {dname} kept out of .archive: {'; '.join(dict.fromkeys(blockers))}", []
+    archive_dir = root / group / ".archive"
+    dest = archive_dir / dname
+    if dest.exists():
+        dest = archive_dir / f"{dname}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+
+    def _move():
+        try:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            skill_dir.rename(dest)
+        except OSError as e:
+            return False, f"archive rename failed: {e}", []
+        return True, f"archived to {dest} (idle {idle:.0f}d >= {archive_days:g}d; no pointer/pin/manifest)", []
+
+    ok, msg, touched = _shared_move(skill_dir, dest, root, f"archive shared skill {dname} (idle {idle:.0f}d)", _move)
+    if ok:
+        note_archived(f"{group}/{dname}", froot)
+    return ok, msg, touched
+
+
+def retire_shared_skill(
+    skill_dir: Path,
+    *,
+    shared_root: Optional[Path] = None,
+    record: Optional[Dict[str, Any]] = None,
+    now: Optional[float] = None,
+    aliases: Iterable[str] = (),
+) -> Tuple[bool, str, List[Path], str]:
+    """The curator's ONE idle action on a shared skill, picking the rung: archive when every archive guard
+    holds, else unsubscribe to ``<group>-aux`` when past the 60 d window, else refuse.
+    Returns (ok, message, touched, action) with action in {"archived", "unsubscribed", "kept"}."""
+    kw = dict(shared_root=shared_root, record=record, now=now, aliases=tuple(aliases))
+    ok, msg, touched = archive_shared_skill(skill_dir, **kw)
+    if ok:
+        return True, msg, touched, "archived"
+    ok2, msg2, touched2 = unsubscribe_shared_skill(skill_dir, **kw)
+    if ok2:
+        return True, f"{msg2} (not archived: {msg})", touched2, "unsubscribed"
+    return False, f"{msg2}; {msg}", [], "kept"

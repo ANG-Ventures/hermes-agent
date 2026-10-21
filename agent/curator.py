@@ -29,7 +29,8 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_HOURS, DEFAULT_MIN_IDLE_HOURS = 24 * 7, 2  # 7 days
-DEFAULT_STALE_AFTER_DAYS, DEFAULT_ARCHIVE_AFTER_DAYS = 14, 30
+# Plain-install defaults; a fleet tree takes both from scripts/lib/skill_tier.py (60/120, Ace 2026-10-21 02:47).
+DEFAULT_STALE_AFTER_DAYS, DEFAULT_ARCHIVE_AFTER_DAYS = 60, 120
 # The LLM consolidation fork is opt-in; the deterministic inactivity prune
 # (apply_automatic_transitions) always runs when the curator is enabled.
 DEFAULT_CONSOLIDATE = False
@@ -135,12 +136,38 @@ def _bounded_count(key: str, default: int) -> int:
     return value
 
 
+def _fleet_ladder() -> Optional[tuple]:
+    """(stale/unsubscribe days, archive days) from the fleet's scripts/lib/skill_tier.py, or None on a plain
+    install without it. On a fleet tree those windows ARE the rule (Ace 2026-10-21 02:47, t_776ae7bc): one
+    source, so a config.yaml copy is ignored (warned once) rather than allowed to drift."""
+    try:
+        from agent.curator_shared import fleet_root, ladder_days, SKILL_TIER_LIB
+        root = fleet_root()
+        if not root.joinpath(*SKILL_TIER_LIB).is_file():
+            return None
+        return ladder_days(root)
+    except Exception as e:
+        logger.debug("Curator could not read the fleet skill_tier windows: %s", e, exc_info=True)
+        return None
+
+
+def _window(key: str, idx: int, default: int) -> int:
+    ladder = _fleet_ladder()
+    if ladder is None:
+        return _bounded_count(key, default)
+    days = int(ladder[idx])
+    if key in _load_config() and (key, "fleet") not in _warned_bad_values:
+        _warned_bad_values.add((key, "fleet"))
+        logger.warning("curator.%s is ignored on a fleet tree: scripts/lib/skill_tier.py sets it (%d)", key, days)
+    return days
+
+
 def get_stale_after_days() -> int:
-    return _bounded_count("stale_after_days", DEFAULT_STALE_AFTER_DAYS)
+    return _window("stale_after_days", 0, DEFAULT_STALE_AFTER_DAYS)
 
 
 def get_archive_after_days() -> int:
-    return _bounded_count("archive_after_days", DEFAULT_ARCHIVE_AFTER_DAYS)
+    return _window("archive_after_days", 1, DEFAULT_ARCHIVE_AFTER_DAYS)
 
 
 def get_consolidate() -> bool:
@@ -244,7 +271,83 @@ def _cron_referenced_skills() -> Set[str]:
         return set()
 
 
-def _archive_as_curator(_u, name: str) -> bool:
+def _manifest_dir() -> Path:
+    """``<root hermes home>/skills-harness-manifests`` (sibling of the shared skills tree, shared by every profile)."""
+    from agent.skill_utils import get_shared_skills_root
+    return get_shared_skills_root().parent / "skills-harness-manifests"
+
+
+def _harness_manifest_skills() -> Set[str]:
+    """Skill names listed anywhere in ``skills-harness-manifests/*.yaml`` (pins, skills, every group in _groups.yaml,
+    projects). skills-harness-sync REFUSES a listed name that resolves to no directory and exits 1, so archiving one
+    breaks the sync. Over-collects on purpose (unused groups count). A missing dir or bad YAML yields what parsed,
+    never a crash; callers that archive must also check ``_read_harness_manifests()[1]`` and fail closed."""
+    return _read_harness_manifests()[0]
+
+
+def _read_harness_manifests() -> "tuple[Set[str], List[str]]":
+    """``(names, unreadable)``: listed skill names, plus the manifest files that exist but could not be
+    listed/read/parsed (a non-mapping top level counts as unreadable). Never raises."""
+    names: Set[str] = set()
+    unreadable: List[str] = []
+
+    def _add(entries: Any) -> None:  # an entry is a name or {name: ..., soft/variant: ...}
+        for e in entries if isinstance(entries, list) else ():
+            n = e.get("name") if isinstance(e, dict) else e
+            if isinstance(n, str):
+                names.add(n.strip())
+
+    def _values(node: Any) -> list:
+        return list(node.values()) if isinstance(node, dict) else []
+
+    def _collect(data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        _add(data.get("pins"))
+        _add(data.get("skills"))
+        for g in _values(data.get("groups")):  # _groups.yaml
+            _add(g)
+        for p in _values(data.get("projects")):
+            if isinstance(p, dict):
+                _add(p.get("skills"))
+
+    mdir: Any = None
+    try:
+        mdir = _manifest_dir()
+        import yaml
+        # os.listdir, not Path.exists()/glob(): those swallow PermissionError and report an unlistable dir as
+        # empty/absent, which would drop every protection silently. Only a genuinely missing dir is "no manifests".
+        try:
+            entries = os.listdir(mdir)
+        except FileNotFoundError:
+            return names, unreadable
+        files = sorted(mdir / n for n in entries if n.endswith(".yaml"))
+    except Exception as e:
+        logger.debug("Curator could not list harness manifests: %s", e, exc_info=True)
+        return names, [str(mdir or "skills-harness-manifests")]
+    for f in files:
+        try:
+            data = yaml.safe_load(f.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.debug("Curator could not read harness manifest %s: %s", f, e, exc_info=True)
+            unreadable.append(str(f))
+            continue
+        if data is not None and not isinstance(data, dict):
+            unreadable.append(str(f))
+            continue
+        _collect(data)
+    names.discard("")
+    return names, unreadable
+
+
+def _protected_skills() -> "tuple[Set[str], List[str]]":
+    """``(protected, unreadable_manifests)``: skills treated as pinned by every curator pass (cron-referenced +
+    harness-manifest-listed), plus any manifest that failed to parse (its names are unknown, so archive must stop)."""
+    listed, unreadable = _read_harness_manifests()
+    return _cron_referenced_skills() | listed, unreadable
+
+
+def _archive_as_curator(_u, name: str) -> "tuple[bool, str]":
     """Archive via skill_usage with the ledger actor tagged 'curator', so the ledger entry reads as an autonomous transition, not a foreground call."""
     try:
         from tools.skill_ledger import reset_ledger_actor, set_ledger_actor
@@ -252,7 +355,7 @@ def _archive_as_curator(_u, name: str) -> bool:
     except Exception:
         tok = reset_ledger_actor = None  # type: ignore[assignment]
     try:
-        return _u.archive_skill(name)[0]
+        return _u.archive_skill(name)
     finally:
         if tok is not None:
             with contextlib.suppress(Exception):
@@ -269,14 +372,21 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
     stale_cutoff = now - timedelta(days=get_stale_after_days())
     archive_cutoff = now - timedelta(days=get_archive_after_days())
     # Cron-referenced skills are in use by definition (usage only bumps when a
-    # job fires, so paused/rare jobs would age them out). Treat as pinned.
-    protected = _cron_referenced_skills()
+    # job fires, so paused/rare jobs would age them out). Treat as pinned. Same for
+    # skills-harness-manifests entries: archiving one makes skills-harness-sync REFUSE + exit 1.
+    protected, unreadable_manifests = _protected_skills()
+    # Fail closed: an unparseable manifest hides which skills it lists, and archiving is irreversible
+    # (fixing the YAML does not bring the directory back). Skip every archive this tick.
+    if unreadable_manifests:
+        logger.warning("Curator: skipping archive transitions this tick; unreadable harness manifest(s): %s",
+                       ", ".join(unreadable_manifests))
     counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0}
 
     def _set(name: str, state: str, key: str) -> None:
         _u.set_state(name, state)
         counts[key] += 1
 
+    to_archive: List[tuple] = []
     for row in _u.curated_report():
         counts["checked"] += 1
         name = row["name"]
@@ -305,12 +415,33 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
                 _set(name, _u.STATE_ACTIVE, "reactivated")
             continue
         if anchor <= archive_cutoff and current != _u.STATE_ARCHIVED:
-            if _archive_as_curator(_u, name):
-                counts["archived"] += 1
+            to_archive.append((name, current, True))
+        elif anchor <= stale_cutoff and row.get("provenance") == "external" and current == _u.STATE_ACTIVE:
+            # a shared skill past the stale window takes rung 1 (<group>-aux) through the same chokepoint
+            to_archive.append((name, current, False))
         elif anchor <= stale_cutoff and current == _u.STATE_ACTIVE:
             _set(name, _u.STATE_STALE, "marked_stale")
         elif anchor > stale_cutoff and current == _u.STATE_STALE:
             _set(name, _u.STATE_ACTIVE, "reactivated")  # used again after going stale
+    # One gate scan and one #logs line for the whole batch (t_776ae7bc). A skill the archive gate keeps
+    # (inbound pointer / pin / manifest) is still past the stale window: mark it stale, never archive it.
+    from agent.curator_shared import archive_batch
+    counts["unsubscribed"] = 0
+    if unreadable_manifests:  # fail closed (t_8dbf7a56): no archive and no move this tick; stale still applies
+        for name, current, _past in to_archive:
+            if current == _u.STATE_ACTIVE:
+                _set(name, _u.STATE_STALE, "marked_stale")
+        to_archive = []
+    with archive_batch(prefetch=[n for n, _c, past in to_archive if past]):
+        for name, current, _past in to_archive:
+            ok, msg = _archive_as_curator(_u, name)
+            if ok and msg.startswith("unsubscribed"):
+                counts["unsubscribed"] += 1
+                _u.set_state(name, _u.STATE_STALE)
+            elif ok:
+                counts["archived"] += 1
+            elif current == _u.STATE_ACTIVE:
+                _set(name, _u.STATE_STALE, "marked_stale")
     return counts
 
 
@@ -1119,6 +1250,7 @@ def _render_shared_candidate_list() -> str:
     if not dirs:
         return ""
     lines = [f"\nShared (skills-shared/) skills in curator scope ({len(dirs)}):\n"]
+    manifest_listed = _harness_manifest_skills()
     for d in dirs:
         try:
             size = (d / "SKILL.md").stat().st_size
@@ -1126,6 +1258,7 @@ def _render_shared_candidate_list() -> str:
             size = 0
         lines.append(
             f"- {d.name}  source=shared  group={_shared_group_of(d)}  "
+            f"pinned={'yes' if d.name in manifest_listed else 'no'}  "
             f"skill_md_bytes={size}"
         )
     return "\n".join(lines)
@@ -1137,10 +1270,11 @@ SHARED_SCOPE_NOTE = (
     "curatable this pass, overriding hard rule #1 for SHARED external-dir "
     "skills ONLY. Bundled and hub-installed skills remain strictly "
     "read-only. Every shared mutation is snapshotted and committed with "
-    "curator provenance. A shared skill is NEVER archived: deleting one "
-    "only unsubscribes it to skills-shared/<group>-aux/<name>/, and only "
-    "when it is idle past the fleet window (scripts/lib/skill_tier.py); a "
-    "recently used one is refused."
+    "curator provenance. Deleting a shared skill walks the idle ladder "
+    "(scripts/lib/skill_tier.py): idle past 60 days it is unsubscribed to "
+    "skills-shared/<group>-aux/<name>/; it reaches skills-shared/<group>/"
+    ".archive/<name>/ only when idle past 120 days with no inbound pointer, "
+    "pin or harness-manifest listing. A recently used one is refused."
 )
 
 def _render_candidate_list() -> str:
@@ -1166,9 +1300,11 @@ def _render_candidate_list() -> str:
     if not rows:
         return "No agent-created skills to review."
     cron_referenced = _cron_referenced_skills()
+    manifest_listed = _harness_manifest_skills()  # shown as pinned=yes: the LLM pass must not archive/absorb them
     return "\n".join([f"Agent-created skills ({len(rows)}):\n"] + [
         f"- {r['name']}  provenance={r.get('provenance', 'agent')}  state={r['state']}  "
-        f"pinned={'yes' if r.get('pinned') else 'no'}  cron={'yes' if r['name'] in cron_referenced else 'no'}  "
+        f"pinned={'yes' if r.get('pinned') or r['name'] in manifest_listed else 'no'}  "
+        f"cron={'yes' if r['name'] in cron_referenced else 'no'}  "
         f"activity={r.get('activity_count', 0)}  use={r.get('use_count', 0)}  view={r.get('view_count', 0)}  "
         f"patches={r.get('patch_count', 0)}  last_activity={r.get('last_activity_at') or 'never'}"
         for r in rows
@@ -1287,7 +1423,7 @@ def run_curator_review(
                 curator_backup.prune_old_snapshots()
         counts = apply_automatic_transitions(now=start)
     auto_summary = ", ".join(
-        f"{counts[key]} {label}" for key, label in (("marked_stale", "marked stale"), ("archived", "archived"), ("reactivated", "reactivated")) if counts[key]
+        f"{counts[key]} {label}" for key, label in (("marked_stale", "marked stale"), ("unsubscribed", "unsubscribed"), ("archived", "archived"), ("reactivated", "reactivated")) if counts.get(key)
     ) or "no changes"
 
     # Deterministic oversized-skill SPLIT pass (fork, curator.split_over_kb). Placed HERE — before and
