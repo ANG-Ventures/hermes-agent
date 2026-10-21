@@ -8479,6 +8479,21 @@ class GatewayRunner(
             with suppress(Exception):
                 adapter.mark_platform_message_held(mid)
 
+    def _release_held_platform_message(self, source: Any, message_id: Any) -> None:
+        """Undo :meth:`_note_held_platform_message` on the runner AND the adapter: the gateway no
+        longer holds the message (a replay refused at intake), so backfill may recover it."""
+        mid = str(message_id or "").strip()
+        platform = getattr(source, "platform", None)
+        if not mid or platform is None:
+            return
+        held = (getattr(self, "_held_platform_message_ids", None) or {}).get(platform)
+        if held:
+            held.discard(mid)
+        adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
+        if adapter is not None:
+            with suppress(Exception):
+                adapter.release_platform_message_hold(mid)
+
     async def _load_restart_followups(self) -> int:
         """Queue follow-ups spooled by the previous life into startup restore."""
         try:
@@ -8510,19 +8525,24 @@ class GatewayRunner(
                     **kwargs,
                 )
                 event._hermes_restart_followup_path = record["_spool_path"]
+                # In-process only: lets an intake refusal release the hold noted below.
+                source._restart_followup_message_id = getattr(event, "message_id", None)
                 # The replayed follow-up is HELD by the gateway, not yet in the transcript: tell the
                 # platform adapter (once it exists) so its reconnect backfill does not read the same
                 # message as "absent" and re-inject it (one /queue became two, 2026-10-20 23:57).
-                self._note_held_platform_message(source, getattr(event, "message_id", None))
+                # Noted only once the gateway really holds it (held store / startup queue): a record
+                # that fails to load stays recoverable by backfill in this process.
                 if record.get("reason") == "queue_held":
                     # A /queue item held by /stop before the restart: back into the held store,
                     # never replayed as a turn (spec 2026-10-12 D22/I13).
                     from gateway.fork_ext.restart_followups import acknowledge_followup
                     self._session_state(record["session_key"]).conversation.held_queue.append(event)
+                    self._note_held_platform_message(source, source._restart_followup_message_id)
                     await asyncio.to_thread(acknowledge_followup, record["_spool_path"])
                     held_restored += 1
                     continue
                 self._queue_startup_restore_event(event)
+                self._note_held_platform_message(source, source._restart_followup_message_id)
                 queued += 1
             except Exception:
                 logger.warning(
@@ -9825,6 +9845,8 @@ class GatewayRunner(
             return
         from gateway.fork_ext.restart_followups import report_refused_followup
         report_refused_followup(source, reason)
+        # Dropped, not held: release the hold so a later reconnect backfill (live auth) can recover it.
+        self._release_held_platform_message(source, getattr(source, "_restart_followup_message_id", None))
 
     def _save_restart_failure_counts(self, counts: dict[str, dict]) -> None:
         path = self._restart_failure_counts_path()
