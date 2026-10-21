@@ -821,6 +821,9 @@ def _handle_show(args: dict, **kw) -> str:
         runs = kb.list_runs(conn, tid)
         comments = kb.list_comments(conn, tid)
         events = kb.list_events(conn, tid)
+        # Rows of an old terminal card may live in <board>/kanban-archive.db (t_3be5b45f).
+        from hermes_cli import kanban_archive_read as kar
+        comments, runs, events = kar.fill(kb, conn, task, comments, runs, events)
         out: dict[str, Any] = {
             "latest_review": _latest_review(kb, conn, tid, runs),
             "task": _fields(task, _TASK_FIELDS),

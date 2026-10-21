@@ -1412,6 +1412,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = [pid for pid, _kind in parent_links]
         children = [cid for cid, _kind in child_links]
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        # Rows of an old terminal card may live in <board>/kanban-archive.db (t_3be5b45f).
+        from hermes_cli import kanban_archive_read as kar
+        comments, runs, events = kar.fill(kb, conn, task, comments, runs, events, **rsk)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
         refusal = (
