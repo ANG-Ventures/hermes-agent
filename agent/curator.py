@@ -136,25 +136,34 @@ def _bounded_count(key: str, default: int) -> int:
     return value
 
 
-def _fleet_ladder() -> Optional[tuple]:
-    """(stale/unsubscribe days, archive days) from the fleet's scripts/lib/skill_tier.py, or None on a plain
-    install without it. On a fleet tree those windows ARE the rule (Ace 2026-10-21 02:47, t_776ae7bc): one
-    source, so a config.yaml copy is ignored (warned once) rather than allowed to drift."""
+def _fleet_ladder():
+    """(stale/unsubscribe days, archive days) from the fleet's scripts/lib/skill_tier.py; None on a plain
+    install without it; "unreadable" when the fleet library exists but cannot be read (Prism fd080ab7976d:
+    never fall back to config.yaml then; apply_automatic_transitions skips the tick). On a fleet tree those
+    windows ARE the rule (Ace 2026-10-21 02:47, t_776ae7bc): one source, so a config.yaml copy is ignored
+    (warned once) rather than allowed to drift."""
     try:
-        from agent.curator_shared import fleet_root, ladder_days, SKILL_TIER_LIB
+        from agent.curator_shared import fleet_root, SKILL_TIER_LIB
         root = fleet_root()
         if not root.joinpath(*SKILL_TIER_LIB).is_file():
             return None
+    except Exception as e:
+        logger.debug("Curator could not locate the fleet root: %s", e, exc_info=True)
+        return None
+    try:
+        from agent.curator_shared import ladder_days
         return ladder_days(root)
     except Exception as e:
-        logger.debug("Curator could not read the fleet skill_tier windows: %s", e, exc_info=True)
-        return None
+        logger.warning("Curator could not read the fleet skill_tier windows (%s); automatic transitions skip", e)
+        return "unreadable"
 
 
 def _window(key: str, idx: int, default: int) -> int:
     ladder = _fleet_ladder()
     if ladder is None:
         return _bounded_count(key, default)
+    if ladder == "unreadable":
+        return default  # display only: apply_automatic_transitions refuses to act on it
     days = int(ladder[idx])
     if key in _load_config() and (key, "fleet") not in _warned_bad_values:
         _warned_bad_values.add((key, "fleet"))
@@ -362,6 +371,28 @@ def _archive_as_curator(_u, name: str) -> "tuple[bool, str]":
                 reset_ledger_actor(tok)
 
 
+def _transition_rows(_u) -> List[Dict[str, Any]]:
+    """curated_report() plus, with ``include_shared_dirs``, every in-scope shared skill (Prism bcd12aa78312:
+    curated_report lists local skills only, so neither shared rung ran automatically). Shared rows pass the
+    same chokepoints: ``_iter_shared_candidate_dirs`` (is_shared_curatable_path) and is_curation_eligible;
+    a name the local store also holds stays the local row (the local copy wins, as in provenance())."""
+    rows = list(_u.curated_report())
+    if not get_include_shared_dirs():
+        return rows
+    seen = {r["name"] for r in rows}
+    data = _u.load_usage()
+    for d in _iter_shared_candidate_dirs():
+        name = _u._read_skill_name(d / "SKILL.md", fallback=d.name)
+        if name in seen or _u._find_skill_dir(name) is not None or not _u.is_curation_eligible(name, d):
+            continue
+        seen.add(name)
+        row = _u._report_row(name, data.get(name), _persisted=name in data, provenance="external")
+        # Prism dc8ff76a77cc: a cron job may list the DIRECTORY name (skill_view accepts both); protect on either.
+        row["aliases"] = (name, d.name)
+        rows.append(row)
+    return rows
+
+
 def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int]:
     """Move every curator-managed skill between active/stale/archived based on its latest real activity; pinned skills are
     never touched. Built-ins are seeded with a baseline record on first sight so their inactivity clock starts NOW, not at epoch.
@@ -369,6 +400,9 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
     from tools import skill_usage as _u
 
     now = now or datetime.now(timezone.utc)
+    if _fleet_ladder() == "unreadable":  # Prism fd080ab7976d: no authoritative window, no transition
+        return {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0,
+                "unsubscribed": 0, "skipped_unreadable_tier": 1}
     stale_cutoff = now - timedelta(days=get_stale_after_days())
     archive_cutoff = now - timedelta(days=get_archive_after_days())
     # Cron-referenced skills are in use by definition (usage only bumps when a
@@ -387,10 +421,10 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
         counts[key] += 1
 
     to_archive: List[tuple] = []
-    for row in _u.curated_report():
+    for row in _transition_rows(_u):
         counts["checked"] += 1
         name = row["name"]
-        if row.get("pinned") or name in protected:
+        if row.get("pinned") or not protected.isdisjoint(row.get("aliases") or (name,)):
             continue
         # First sight with no persisted record: anchor its clock to now and defer.
         if not row.get("_persisted", True):
