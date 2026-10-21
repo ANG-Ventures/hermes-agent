@@ -1531,6 +1531,20 @@ def get_current_board() -> str:
             return None
         return normed if normed and board_exists(normed) else None
 
+    from hermes_cli import kanban_board_select as _kbsel
+
+    if _kbsel.s7_enabled():
+        # S7 D1 (kanban.bare_verb set): override -> the board the DB pin names -> default.
+        # No file, no env slug. A pin that names no board keeps default's layout paths; every
+        # DB open still takes the pin's path.
+        found = _existing((_CURRENT_BOARD_OVERRIDE.get() or "").strip())
+        if found:
+            return found
+        pinned = pinned_board()
+        if pinned and (pinned != PINNED_SLUG or board_exists(PINNED_SLUG)):
+            return pinned
+        return DEFAULT_BOARD
+
     for candidate in (
         (_CURRENT_BOARD_OVERRIDE.get() or "").strip(),
         os.environ.get("HERMES_KANBAN_BOARD", "").strip(),
@@ -21310,6 +21324,18 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     dispatch_once,
     enforce_max_runtime,
     has_spawnable_ready,
+)
+from hermes_cli.kanban_db_board_registry import (  # noqa: E402
+    PINNED_SLUG,
+    KanbanBoardDerivationError,
+    KanbanBoardUnreadable,
+    KanbanCardAmbiguous,
+    KanbanCardNotFound,
+    board_named_by_pin,
+    board_of_task,
+    pinned_board,
+    pinned_board_error,
+    raw_db_pin,
 )
 from hermes_cli.kanban_db_notify import (  # noqa: E402
     NOTIFY_SUB_OWNER_LIVE_SECONDS,
