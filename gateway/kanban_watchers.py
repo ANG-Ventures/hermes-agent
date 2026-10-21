@@ -1405,6 +1405,37 @@ def auto_decompose_board(_kb, _decomp, slug: str, budget: int) -> tuple[int, int
                 )
     return attempted, successes
 
+
+def auto_decompose_tick(_kb, auto_decompose_per_tick: int) -> int:
+    """Run the auto-decomposer for up to N triage tasks across all boards; returns successes.
+
+    The loop the gateway runs (the dispatcher watcher calls it through ``service``). Each board's
+    body runs in its own context scope (S7 D4); nothing touches os.environ. The launch profile's
+    secret scope is installed for the aux LLM (#107955: the tick runs in a fresh context where
+    ``get_secret`` fails closed under multiplex).
+    """
+    try:
+        from hermes_cli import kanban_decompose as _decomp
+    except Exception as exc:  # pragma: no cover
+        logger.warning("kanban auto-decompose: import failed (%s); skipping", exc)
+        return 0
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+    from gateway.kanban_watchers_dispatcher import _default_profile_secret_scope
+
+    attempted = successes = 0
+    with _default_profile_secret_scope():
+        for b in _kb.enumerating_each(boards):
+            slug = b.get("slug") or _kb.DEFAULT_BOARD
+            if attempted >= auto_decompose_per_tick:
+                break
+            tried, ok = auto_decompose_board(_kb, _decomp, slug, auto_decompose_per_tick - attempted)
+            attempted += tried
+            successes += ok
+    return successes
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -4344,35 +4375,8 @@ class GatewayKanbanWatchersMixin:
             return _resolve_auto_decompose_settings(_load_config)
 
         def _auto_decompose_tick(auto_decompose_per_tick: int) -> int:
-            """Run the auto-decomposer for up to N triage tasks across all
-            boards. Returns the number of triage tasks that were
-            successfully decomposed or specified this tick.
-            """
-            try:
-                from hermes_cli import kanban_decompose as _decomp
-            except Exception as exc:  # pragma: no cover
-                logger.warning(
-                    "kanban auto-decompose: import failed (%s); skipping", exc,
-                )
-                return 0
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            attempted = 0
-            successes = 0
-            # Enumeration: sweeps every board on disk looking for triage cards. Each board's body
-            # runs in its own context scope (S7 D4); nothing touches os.environ.
-            for b in _kb.enumerating_each(boards):
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                if attempted >= auto_decompose_per_tick:
-                    break
-                tried, ok = auto_decompose_board(
-                    _kb, _decomp, slug, auto_decompose_per_tick - attempted,
-                )
-                attempted += tried
-                successes += ok
-            return successes
+            return auto_decompose_tick(_kb, auto_decompose_per_tick)
+
 
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
