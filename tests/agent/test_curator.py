@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -339,6 +340,188 @@ def test_unreferenced_skill_is_still_archived(curator_env, monkeypatch):
     assert usage["orphan"]["state"] == u.STATE_ARCHIVED
 
 
+def _write_harness_manifests(home: Path) -> None:
+    """Real-shaped skills-harness-manifests: a plain name in `skills`, a {name, soft} pin, and a group entry."""
+    mdir = home / "skills-harness-manifests"
+    mdir.mkdir(parents=True, exist_ok=True)
+    (mdir / "claude-code.yaml").write_text(
+        "harness: claude-code\ntarget_dir: ~/.claude/skills\nbudget_chars: 15000\n"
+        "allowed_tiers: [portable]\npins:\n  - {name: pinned-in-manifest, soft: true}\n"
+        "use_groups: [coding-review]\nskills:\n  - listed-in-manifest\n"
+        "projects:\n  topic:\n    target_dir: ~/x\n    skills: [project-listed]\n",
+        encoding="utf-8")
+    (mdir / "_groups.yaml").write_text(
+        "groups:\n  coding-review:\n    - grouped-in-manifest\n    - name: variant-in-manifest\n      variant: portable\n",
+        encoding="utf-8")
+
+
+def test_harness_manifest_skills_parse_every_entry_shape(curator_env):
+    c = curator_env["curator"]
+    _write_harness_manifests(curator_env["home"])
+    assert c._harness_manifest_skills() == {
+        "pinned-in-manifest", "listed-in-manifest", "project-listed",
+        "grouped-in-manifest", "variant-in-manifest"}
+
+
+def test_harness_manifest_skills_missing_dir_is_empty(curator_env):
+    assert curator_env["curator"]._harness_manifest_skills() == set()
+
+
+def test_manifest_listed_skill_survives_inactivity(curator_env, monkeypatch):
+    """t_8dbf7a56: the curator archived github-code-review while 3 harness manifests listed it, so
+    skills-harness-sync REFUSED it ('resolves to 0 directories'), exited 1 and paged #alerts."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    for name in ("listed-in-manifest", "grouped-in-manifest", "orphan"):
+        _write_skill(skills_dir, name)
+        _backdate(u, name, 200)
+    _write_harness_manifests(curator_env["home"])
+    monkeypatch.setattr(c, "_cron_referenced_skills", lambda: set())
+
+    c.apply_automatic_transitions()
+
+    usage = u.load_usage()
+    assert usage["listed-in-manifest"]["state"] == u.STATE_ACTIVE
+    assert usage["grouped-in-manifest"]["state"] == u.STATE_ACTIVE
+    assert (skills_dir / "listed-in-manifest").is_dir()
+    assert usage["orphan"]["state"] == u.STATE_ARCHIVED  # control: protection is not blanket
+
+
+def test_manifest_listed_skill_is_pinned_in_llm_candidate_list(curator_env, monkeypatch):
+    """The LLM consolidation pass must see a manifest-listed skill as pinned=yes (prompt hard rule 3)."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    for name in ("listed-in-manifest", "orphan"):
+        _write_skill(skills_dir, name)
+        u.mark_agent_created(name)
+    _write_harness_manifests(curator_env["home"])
+    monkeypatch.setattr(c, "_cron_referenced_skills", lambda: set())
+
+    rows = {line.split()[1]: line for line in c._render_candidate_list().splitlines() if line.startswith("- ")}
+    assert "pinned=yes" in rows["listed-in-manifest"]
+    assert "pinned=no" in rows["orphan"]
+
+
+def test_background_delete_of_manifest_listed_skill_is_refused(curator_env, monkeypatch):
+    """Even a declared consolidation (absorbed_into=...) may not archive a manifest-listed skill."""
+    from tools import skill_manager_guards as g
+    _write_harness_manifests(curator_env["home"])
+    monkeypatch.setattr(g, "_is_background_review", lambda: True)
+    refused = g._curator_consolidation_delete_guard("grouped-in-manifest", "some-umbrella")
+    assert refused and refused["success"] is False and "skills-harness-manifests" in refused["error"]
+    assert g._curator_consolidation_delete_guard("orphan", "some-umbrella") is None
+
+
+def test_unreadable_manifest_fails_closed_no_archive_this_tick(curator_env, monkeypatch, caplog):
+    """Prism e04f0ee7ddc5: a malformed manifest hides which skills it lists. A 200-day-inactive skill it
+    would list must not be archived; nothing is archived that tick, and one log line names the file."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    for name in ("listed-in-manifest", "orphan"):
+        _write_skill(skills_dir, name)
+        _backdate(u, name, 200)
+    _write_harness_manifests(curator_env["home"])
+    broken = curator_env["home"] / "skills-harness-manifests" / "claude-code.yaml"
+    broken.write_text("skills:\n  - listed-in-manifest\n  bad: [unclosed\n", encoding="utf-8")
+    monkeypatch.setattr(c, "_cron_referenced_skills", lambda: set())
+
+    with caplog.at_level("WARNING", logger=c.logger.name):
+        counts = c.apply_automatic_transitions()
+
+    usage = u.load_usage()
+    assert counts["archived"] == 0
+    assert usage["listed-in-manifest"]["state"] != u.STATE_ARCHIVED
+    assert usage["orphan"]["state"] != u.STATE_ARCHIVED
+    assert (skills_dir / "listed-in-manifest").is_dir() and (skills_dir / "orphan").is_dir()
+    assert any("claude-code.yaml" in r.getMessage() and "skipping archive" in r.getMessage()
+               for r in caplog.records)
+    assert c._read_harness_manifests()[1] == [str(broken)]
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root bypasses dir permissions")
+def test_unlistable_manifest_dir_fails_closed_no_archive(curator_env, monkeypatch):
+    """Prism 9b16c88f5b60: Path.glob() returns [] on a mode-000 dir (no exception), which made protection
+    empty AND unflagged. An unlistable manifest dir must be reported unreadable and archive nothing."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    for name in ("listed-in-manifest", "orphan"):
+        _write_skill(skills_dir, name)
+        _backdate(u, name, 200)
+    _write_harness_manifests(curator_env["home"])
+    mdir = curator_env["home"] / "skills-harness-manifests"
+    monkeypatch.setattr(c, "_cron_referenced_skills", lambda: set())
+    mode = mdir.stat().st_mode
+    os.chmod(mdir, 0o000)
+    try:
+        names, unreadable = c._read_harness_manifests()
+        assert unreadable == [str(mdir)]
+        counts = c.apply_automatic_transitions()
+    finally:
+        os.chmod(mdir, mode)
+
+    usage = u.load_usage()
+    assert counts["archived"] == 0
+    assert usage["listed-in-manifest"]["state"] != u.STATE_ARCHIVED
+    assert usage["orphan"]["state"] != u.STATE_ARCHIVED
+    assert (skills_dir / "listed-in-manifest").is_dir()
+
+
+def test_background_writes_to_manifest_listed_skill_are_refused(curator_env, monkeypatch):
+    """Prism d51f90ce8fe8: pinned=yes in the LLM prompt must match the write guard, or the review fork
+    can empty a manifest-listed skill via patch/write_file/remove_file before any delete check."""
+    import json
+    from tools import skill_manager_tool as smt
+    from tools.skill_manager_guards import _reset_background_review_read_marks, mark_background_review_skill_read
+    from tools.skill_provenance import BACKGROUND_REVIEW, reset_current_write_origin, set_current_write_origin
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    for name in ("listed-in-manifest", "orphan"):
+        d = _write_skill(skills_dir, name)
+        (d / "references").mkdir()
+        (d / "references" / "notes.md").write_text("keep\n", encoding="utf-8")
+        u.mark_agent_created(name)
+    _write_harness_manifests(curator_env["home"])
+    monkeypatch.setattr(smt, "_skills_dir", lambda: skills_dir, raising=False)
+
+    _reset_background_review_read_marks()
+    token = set_current_write_origin(BACKGROUND_REVIEW)
+    try:
+        for name in ("listed-in-manifest", "orphan"):  # satisfy read-before-write so only the pin gate decides
+            mark_background_review_skill_read(skills_dir / name / "SKILL.md")
+            mark_background_review_skill_read(skills_dir / name / "references" / "notes.md")
+        listed = json.loads(smt.skill_manage(action="remove_file", name="listed-in-manifest",
+                                             file_path="references/notes.md"))
+        patched = json.loads(smt.skill_manage(action="patch", name="listed-in-manifest",
+                                              old_string="description: x", new_string="description: y"))
+        orphan = json.loads(smt.skill_manage(action="remove_file", name="orphan",
+                                             file_path="references/notes.md"))
+    finally:
+        reset_current_write_origin(token)
+        _reset_background_review_read_marks()
+
+    for r in (listed, patched):
+        assert r["success"] is False and "skills-harness-manifests" in r["error"], r
+    assert (skills_dir / "listed-in-manifest" / "references" / "notes.md").is_file()
+    assert "description: x" in (skills_dir / "listed-in-manifest" / "SKILL.md").read_text()
+    # control: the gate is not blanket; the same remove_file on an unlisted agent skill goes through
+    assert orphan["success"] is True, orphan
+    assert not (skills_dir / "orphan" / "references" / "notes.md").exists()
+
+
+def test_background_guards_fail_closed_on_unreadable_manifest(curator_env, monkeypatch):
+    from tools import skill_manager_guards as g
+    _write_harness_manifests(curator_env["home"])
+    (curator_env["home"] / "skills-harness-manifests" / "codex.yaml").write_text("- [", encoding="utf-8")
+    monkeypatch.setattr(g, "_is_background_review", lambda: True)
+    for refused in (g._curator_consolidation_delete_guard("orphan", "some-umbrella"),
+                    g._background_review_write_guard("orphan", curator_env["home"] / "skills" / "orphan", "patch")):
+        assert refused and refused["success"] is False and "codex.yaml" in refused["error"]
+
+
 
 
 
@@ -534,8 +717,8 @@ def test_preseeded_never_used_builtin_is_reanchored_not_staled(curator_env, monk
     assert rec["state"] == "active" and rec["first_seen_at"] is not None
     assert datetime.fromisoformat(rec["created_at"]) > datetime.fromisoformat(super_old)
 
-    # One-shot: 15 days of continued non-use (past stale_after_days=14) → stale, not deferred forever.
-    counts = c.apply_automatic_transitions(now=t0 + timedelta(days=15))
+    # One-shot: 61 days of continued non-use (past stale_after_days=60) → stale, not deferred forever.
+    counts = c.apply_automatic_transitions(now=t0 + timedelta(days=61))
     assert counts["marked_stale"] == 1 and u.get_record("bundled-helper")["state"] == "stale"
 
 
@@ -1158,3 +1341,77 @@ def test_threaded_llm_pass_keeps_callers_profile_scope(curator_env, tmp_path, mo
     assert not (root / "skills" / ".curator_state").exists(), "thread wrote the ROOT home's state"
     state = json.loads((profile / "skills" / ".curator_state").read_text(encoding="utf-8-sig"))
     assert state["last_run_summary"].endswith("llm: stub")
+
+
+# --- Own-profile skills on the 60/120 ladder (Ace 2026-10-21 02:47, t_776ae7bc) -----------------------------
+
+_FLEET_TIER = "DEFAULT_IDLE_DAYS = 60\nDEFAULT_ARCHIVE_DAYS = 120\n"
+_FLEET_GATE = (
+    "import argparse, json, os\n"
+    "ap = argparse.ArgumentParser(); ap.add_argument('--home'); ap.add_argument('--json', action='store_true')\n"
+    "ap.add_argument('names', nargs='+'); a = ap.parse_args()\n"
+    "bl = json.load(open(os.path.join(a.home, 'gate-blockers.json'))) if os.path.exists("
+    "os.path.join(a.home, 'gate-blockers.json')) else {}\n"
+    "print(json.dumps({'ok': True, 'skills': {n: {'archivable': not bl.get(n), 'blockers': bl.get(n, [])}"
+    " for n in a.names}}))\n"
+)
+
+
+def _plant_fleet(home: Path, blockers=None):
+    (home / "scripts" / "lib").mkdir(parents=True, exist_ok=True)
+    (home / "scripts" / "lib" / "skill_tier.py").write_text(_FLEET_TIER, encoding="utf-8")
+    (home / "scripts" / "skill-archive-gate.py").write_text(_FLEET_GATE, encoding="utf-8")
+    if blockers:
+        (home / "gate-blockers.json").write_text(json.dumps(blockers), encoding="utf-8")
+
+
+def test_own_profile_skill_at_31_days_is_not_archived(curator_env):
+    """The old 14/30 windows archived a 31 d idle skill; the ladder leaves it active (60 d stale, 120 d archive)."""
+    c, u = curator_env["curator"], curator_env["usage"]
+    _write_skill(curator_env["home"] / "skills", "month-idle")
+    _backdate(u, "month-idle", 31)
+    counts = c.apply_automatic_transitions()
+    assert counts["archived"] == 0 and counts["marked_stale"] == 0
+    assert (curator_env["home"] / "skills" / "month-idle" / "SKILL.md").is_file()
+    assert u.get_record("month-idle")["state"] == "active"
+
+
+def test_own_profile_ladder_windows_plain_install(curator_env):
+    c, u = curator_env["curator"], curator_env["usage"]
+    assert (c.get_stale_after_days(), c.get_archive_after_days()) == (60, 120)
+    for name, days in (("idle-61", 61), ("idle-121", 121)):
+        _write_skill(curator_env["home"] / "skills", name)
+        _backdate(u, name, days)
+    counts = c.apply_automatic_transitions()
+    assert counts["marked_stale"] == 1 and counts["archived"] == 1
+    assert u.get_record("idle-61")["state"] == "stale"
+    assert (curator_env["home"] / "skills" / ".archive" / "idle-121").is_dir()
+
+
+def test_fleet_tree_windows_come_from_skill_tier_not_config(curator_env, monkeypatch):
+    c = curator_env["curator"]
+    _plant_fleet(curator_env["home"])
+    monkeypatch.setattr(c, "_load_config", lambda: {"stale_after_days": 14, "archive_after_days": 30})
+    assert (c.get_stale_after_days(), c.get_archive_after_days()) == (60, 120)
+
+
+def test_own_profile_121_days_with_inbound_pointer_stays(curator_env, monkeypatch):
+    """On a fleet tree an own-profile skill takes the shared archive guards: a pointed-to skill is not archived
+    (it is marked stale instead), an unpointed one is, and the batch posts ONE #logs line naming it."""
+    c, u = curator_env["curator"], curator_env["usage"]
+    home = curator_env["home"]
+    _plant_fleet(home, blockers={"pointed": ["pointed to by skills-shared/general/x/SKILL.md"]})
+    import agent.curator_shared as cs
+    posted = []
+    monkeypatch.setattr(cs, "post_archive_logs", lambda moved, root=None: posted.append(list(moved)) or True)
+    for name in ("pointed", "lonely"):
+        _write_skill(home / "skills", name)
+        _backdate(u, name, 121)
+    counts = c.apply_automatic_transitions()
+    assert counts["archived"] == 1
+    assert (home / "skills" / "pointed" / "SKILL.md").is_file()
+    assert u.get_record("pointed")["state"] == "stale"
+    assert (home / "skills" / ".archive" / "lonely").is_dir()
+    assert posted == [["local/lonely"]]
+    ok, msg = u.archive_skill("pointed")
+    assert not ok and "pointed to by" in msg
