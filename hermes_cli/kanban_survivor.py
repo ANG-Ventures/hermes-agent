@@ -2779,22 +2779,29 @@ def _landed_claims(explicit):
 
 
 def _uncovered_vanished(bases, workspace, explicit):
-    """Recorded repositories that vanished and that no explicit claim names.
+    """(uncovered keys, explicit) for recorded repositories that vanished.
 
     The nested shortcuts return before the ``missing = set(bases) - keys``
     coverage check below. Without this, a merged PR qualified for ONE vanished
     repository vouched for every other vanished one the moment a nested
     worktree sat under a surviving repository (Prism 2e98d07648a3 on #2175).
-    Returns the uncovered keys; the caller refuses on any. An unqualified
-    claim (key ``None``) covers at most one vanished repository, as the
-    ``missing`` branch rules.
+    "Vanished" is repository presence (``_is_repo_on_disk``), never directory
+    presence: a ``gone2/`` left behind without its ``.git`` is still gone
+    (Prism 8e6fc262130b). An unqualified claim (key ``None``) covers at most
+    one vanished repository and is BOUND to it in the returned mapping, so
+    ``_external`` records the claim under that repository instead of ``.``
+    (Prism c7eccc58634e); both rules mirror the ``missing`` branch.
     """
-    vanished = {key for key in bases if not (workspace / key).is_dir()}
+    vanished = {key for key in bases if not _is_repo_on_disk(workspace / key)}
     if not vanished:
-        return set()
+        return set(), explicit
     if None in explicit:
-        return vanished if len(vanished) > 1 else set()
-    return vanished - set(explicit)
+        if len(vanished) > 1:
+            return vanished, explicit
+        bound = dict(explicit)
+        bound[sorted(vanished)[0]] = bound.pop(None)
+        return set(), bound
+    return vanished - set(explicit), explicit
 
 
 def _nested_beside_landed(conn, task_id, metadata, evidence, explicit, previous,
@@ -2809,7 +2816,7 @@ def _nested_beside_landed(conn, task_id, metadata, evidence, explicit, previous,
     (t_3d376252: t_3ecbb73d, merged hermes-home#5702, refused on
     ``repo/mainwt``, a linked worktree inside its own main checkout).
     """
-    uncovered = _uncovered_vanished(bases, workspace, explicit)
+    uncovered, explicit = _uncovered_vanished(bases, workspace, explicit)
     if uncovered:
         raise SurvivorUnavailable(
             "survivor_unavailable: no operator survivor names the missing "
