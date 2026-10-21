@@ -242,6 +242,11 @@ jobs:
       - name: Forbid config.yaml writers that bypass the comment-preserving writer
         run: python scripts/check_config_yaml_writers.py
 
+      # HERMES_KANBAN_LINEAGE survives scrub_kanban_env (option C, K6), so it reaches a
+      # worker's delegated children. It is a reap tag only; any reader but the reaper fails.
+      - name: Forbid readers of the kanban lineage reap tag
+        run: python scripts/check_kanban_lineage_readers.py
+
       # A test that spawns `hermes kanban create|promote|claim` states its caller identity
       # (kanban_identity fixture or --parent/--session/--home/--unhomed); an ambient one made
       # #1825 green in a worker shell and red off-box (t_f4c584e2).
