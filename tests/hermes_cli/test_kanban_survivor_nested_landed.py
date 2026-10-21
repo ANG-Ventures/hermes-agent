@@ -133,3 +133,35 @@ def test_open_survivor_still_refuses(board, remote, tmp_path, shape):
     with pytest.raises(ValueError, match="nested repository"):
         kb.complete_task(board, tid, summary="approved", survivor_pr=PR)
     assert kb.get_task(board, tid).status != "done"
+
+
+def _vanished_bases(board, tid, ws, shape):
+    """Dispatch recorded three repositories; two have since vanished."""
+    kept = str(repo_of(ws, shape).relative_to(ws)) or "."
+    bases = {kept: HEAD, "gone1": HEAD, "gone2": HEAD}
+    with kb.write_txn(board):
+        board.execute(
+            "INSERT INTO task_workspace_survivors(task_id, bases) VALUES (?, ?) "
+            "ON CONFLICT(task_id) DO UPDATE SET bases = excluded.bases",
+            (tid, json.dumps(bases)),
+        )
+
+
+def test_landed_shortcut_still_requires_coverage_of_vanished_repos(board, remote, tmp_path, shape):
+    """Prism 2e98d07648a3: a merged claim for ONE vanished repository must not
+    vouch for a second vanished one just because a nested repo sits beside them."""
+    tid, ws = nested_card(board, tmp_path, remote, shape)
+    _vanished_bases(board, tid, ws, shape)
+
+    with pytest.raises(ValueError, match="gone2"):
+        kb.complete_task(board, tid, summary="approved", survivor_pr=[f"gone1={PR}"])
+    assert kb.get_task(board, tid).status != "done"
+
+
+def test_landed_shortcut_completes_when_every_vanished_repo_is_named(board, remote, tmp_path, shape):
+    tid, ws = nested_card(board, tmp_path, remote, shape)
+    _vanished_bases(board, tid, ws, shape)
+
+    assert kb.complete_task(board, tid, summary="approved",
+                            survivor_pr=[f"gone1={PR}", f"gone2={PR}"])
+    assert kb.get_task(board, tid).status == "done"
