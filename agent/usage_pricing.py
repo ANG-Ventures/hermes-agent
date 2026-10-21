@@ -549,6 +549,11 @@ def _models_dev_scoped_pricing_entry(route: BillingRoute, *, cache_only: bool = 
         output_cost_per_million=_to_decimal(cost.get("output")),
         cache_read_cost_per_million=_to_decimal(cost.get("cache_read")),
         cache_write_cost_per_million=_to_decimal(cost.get("cache_write")),
+        tier_threshold_tokens=int(cost["tier_threshold_tokens"]) if "tier_threshold_tokens" in cost else None,
+        input_cost_per_million_above=_to_decimal(cost.get("input_above")),
+        output_cost_per_million_above=_to_decimal(cost.get("output_above")),
+        cache_read_cost_per_million_above=_to_decimal(cost.get("cache_read_above")),
+        cache_write_cost_per_million_above=_to_decimal(cost.get("cache_write_above")),
         source="provider_models_api", source_url="https://models.dev/api.json",
         pricing_version="models-dev-api", fetched_at=_UTC_NOW(),
     )

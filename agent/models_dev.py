@@ -10,6 +10,7 @@ quarantined, never served as ``{}``. ``models_dev.url`` in config.yaml = mirror.
 import contextlib
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -592,9 +593,32 @@ def _extract_context(entry: Dict[str, Any]) -> Optional[int]:
     return _extract_limit(entry, "context")
 
 
+def _extract_cost_tier(cost: Dict[str, Any], base: Dict[str, float]) -> Optional[Dict[str, float]]:
+    """Flatten the single context tier PricingEntry can represent; never discard other rules."""
+    tiers = cost.get("tiers", [])
+    if not isinstance(tiers, list):
+        return None
+    if not tiers:
+        # This legacy field alone does not reliably identify the threshold (Luna uses 272K).
+        return None if cost.get("context_over_200k") else {}
+    if len(tiers) != 1 or not isinstance(tiers[0], dict):
+        return None
+    tier = tiers[0]
+    descriptor = _dict_or_empty(tier.get("tier"))
+    size = descriptor.get("size")
+    if descriptor.get("type") != "context" or type(size) is not int or size <= 0:
+        return None
+    above = _extract_cost({"cost": {key: tier[key] for key in
+                                   ("input", "output", "cache_read", "cache_write") if key in tier}})
+    # PricingEntry falls back to base rates for absent *_above fields. A missing catalog
+    # rate must remain unknown, not silently inherit the cheaper tier.
+    if above is None or not base.keys() <= above.keys():
+        return None
+    return {"tier_threshold_tokens": size, **{f"{key}_above": value for key, value in above.items()}}
+
+
 def _extract_cost(entry: Dict[str, Any]) -> Optional[Dict[str, float]]:
-    """Flat USD rates from a models.dev entry. models.dev already quotes dollars per MILLION
-    tokens, the unit ``PricingEntry`` uses, so the values are returned unscaled."""
+    """USD/1M rates and a supported context tier, unscaled; incomplete rules remain unknown."""
     cost = entry.get("cost") if isinstance(entry, dict) else None
     if not isinstance(cost, dict):
         return None
@@ -603,12 +627,14 @@ def _extract_cost(entry: Dict[str, Any]) -> Optional[Dict[str, float]]:
         value = cost.get(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
-        return float(value) if value >= 0 else None
+        return float(value) if math.isfinite(value) and value >= 0 else None
 
     if _rate("input") is None and _rate("output") is None:
         return None
     rates = {key: _rate(key) for key in ("input", "output", "cache_read", "cache_write")}
-    return {key: value for key, value in rates.items() if value is not None}
+    base = {key: value for key, value in rates.items() if value is not None}
+    tier = _extract_cost_tier(cost, base)
+    return {**base, **tier} if tier is not None else None
 
 
 def lookup_models_dev_pricing(
