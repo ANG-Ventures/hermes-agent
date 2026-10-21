@@ -179,6 +179,12 @@ _EXCLUDED_ROOT_PATH_GLOBS = (
     ("var", "gh-app", "readcache"),         # gh-shim 30 s read floor, one file per (lane, cwd, argv)
     ("var", "gh-app", "callers"),           # gh-shim per-caller request history, 1 h window
     ("var", "gh-app", "raw"),               # gh-shim read-after-write marks, 330 s window
+    # 2026-10-21 (crons.ace backup-deadman: full tier 6.97 M files killed 8 h 49 m in on 10-18, no full since
+    # 09-27): a names-only walk through this walker still listed 1.59 M files against the 09-20 good full's
+    # 1.11 M. The two largest regenerable trees under var/ were not excluded:
+    ("var", "gh-app", "etag"),              # gh-shim ETag cache, 93 k files, 1 h TTL (S7 markers), rewritten per call
+    ("var", "oneshot", "*"),                # per-card scratch SUBDIRS under oneshot/ (109 k files, the cards are done);
+                                            # the loose operator one-shot scripts directly in var/oneshot/ stay in
     ("var", "lines-portal", "repos"),       # lines.ace's repo clones (its scripts + certs stay in)
     ("var", "graphify"),                    # code-graph builds (rebuilt from the repos)
     ("mirrors",),                           # bare git mirrors of GitHub repos (`kanban clone` objects)
