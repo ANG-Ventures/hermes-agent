@@ -386,7 +386,10 @@ def _transition_rows(_u) -> List[Dict[str, Any]]:
         if name in seen or _u._find_skill_dir(name) is not None or not _u.is_curation_eligible(name, d):
             continue
         seen.add(name)
-        rows.append(_u._report_row(name, data.get(name), _persisted=name in data, provenance="external"))
+        row = _u._report_row(name, data.get(name), _persisted=name in data, provenance="external")
+        # Prism dc8ff76a77cc: a cron job may list the DIRECTORY name (skill_view accepts both); protect on either.
+        row["aliases"] = (name, d.name)
+        rows.append(row)
     return rows
 
 
@@ -421,7 +424,7 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
     for row in _transition_rows(_u):
         counts["checked"] += 1
         name = row["name"]
-        if row.get("pinned") or name in protected:
+        if row.get("pinned") or not protected.isdisjoint(row.get("aliases") or (name,)):
             continue
         # First sight with no persisted record: anchor its clock to now and defer.
         if not row.get("_persisted", True):

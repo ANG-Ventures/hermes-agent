@@ -128,6 +128,29 @@ def test_alias_iterator_reaches_the_gate(env, monkeypatch):
     assert d.is_dir()
 
 
+def test_cron_ref_by_directory_name_protects_a_shared_skill(env, monkeypatch):
+    """Prism dc8ff76a77cc: a shared row is keyed by its frontmatter name; a paused cron job that lists the
+    DIRECTORY name (skill_view accepts both) must still protect it from the 60 d aux move."""
+    c, u = env["c"], env["u"]
+    d = env["shared"] / "devops" / "dir-name"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text("---\nname: public-name\ndescription: t\n---\n\nbody\n", encoding="utf-8")
+    data = u.load_usage()
+    data["public-name"] = _record(61)
+    u.save_usage(data)
+    monkeypatch.setattr(c, "_fleet_ladder", lambda: None)
+    import cron.jobs as cj
+    monkeypatch.setattr(cj, "load_jobs", lambda: [{"id": "j1", "enabled": False, "state": "paused",
+                                                    "skills": ["dir-name"]}])
+    seen = []
+    monkeypatch.setattr(u, "archive_skill", lambda name: (seen.append(name), (True, "unsubscribed to x"))[1])
+    counts = c.apply_automatic_transitions()
+    assert [r["name"] for r in c._transition_rows(u)] == ["public-name"]
+    assert seen == []
+    assert counts["unsubscribed"] == 0 and counts["archived"] == 0
+    assert d.is_dir()
+
+
 def test_effective_default_windows_are_60_120_with_the_real_loader(env):
     """No _load_config stub: DEFAULT_CONFIG merges in. A plain install (no fleet tier lib) reads 60/120."""
     c = env["c"]
