@@ -309,6 +309,48 @@ def test_derived_board_is_the_context_board_for_the_whole_verb(home, monkeypatch
     assert seen == {"ambient": "beta", "workdir": str(tmp_path)}
 
 
+# --- locate (Q2): the registry's one encoding; scripts/kanban_board_resolve.py wraps it -----------
+
+def _locate(tid: str):
+    from hermes_cli import kanban
+
+    return kanban.kanban_command(_ns(kanban_action="locate", board=None, task_id=tid))
+
+
+def test_locate_contract_hit(home, capsys):
+    kb.create_board("beta")
+    tid = _card("beta")
+    assert _locate(tid) == 0
+    out = capsys.readouterr().out.strip()
+    assert out == f"beta\t{home / 'kanban' / 'boards' / 'beta' / 'kanban.db'}"
+
+
+@pytest.mark.parametrize("case,code", [("missing", "CARD_NOT_FOUND"), ("twice", "CARD_AMBIGUOUS"),
+                                       ("broken", "BOARD_UNREADABLE")])
+def test_locate_contract_refusals(home, capsys, case, code):
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    tid = _card("alpha")
+    if case == "twice":
+        _copy_card(tid, "alpha", "beta")
+    if case == "broken":
+        kb.create_board("broken")
+        (kb.board_dir("broken") / "kanban.db").write_bytes(b"junk" * 256)
+    assert _locate("t_00000000" if case == "missing" else tid) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith(f"{code}: kanban: ")
+
+
+def test_locate_under_a_pin_prints_the_pin(home, monkeypatch, capsys, tmp_path):
+    db = tmp_path / "x" / "custom.db"
+    db.parent.mkdir()
+    kbc.connect(db_path=db).close()
+    _pin(monkeypatch, db)
+    assert _locate("t_any") == 0
+    assert capsys.readouterr().out.strip() == f"{kb.PINNED_SLUG}\t{db}"
+
+
 # --- tools surface ----------------------------------------------------------------------------
 
 def test_tool_board_scopes_the_resolved_board(home):

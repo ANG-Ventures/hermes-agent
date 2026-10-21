@@ -1347,6 +1347,25 @@ def _print_section(title: str, lines) -> None:
         print(line)
 
 
+def _cmd_locate(args: argparse.Namespace) -> int:
+    """``kanban locate <id>``: the ONE board holding a card (S7 D3, Q2). The registry's single
+    encoding; ``scripts/kanban_board_resolve.py`` wraps this verb. Output contract (tested):
+    stdout ``<slug>\\t<db_path>``; rc 2 with ``<CODE>: <message>`` on stderr otherwise."""
+    pinned = kb.pinned_board()
+    if pinned:
+        raw = kb._raw_db_pin()
+        print(f"{pinned}\t{raw}")
+        return 0
+    try:
+        slug = kb.board_of_task(args.task_id)
+    except kb.KanbanBoardDerivationError as exc:
+        print(f"{exc.code}: {exc}", file=sys.stderr)
+        return 2
+    with kb.enumerating_boards():
+        print(f"{slug}\t{kb._board_db_path_ignoring_pin(slug)}")
+    return 0
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     rsk, rc = _run_state_kwargs(args, "show")
     if rc:
@@ -4950,7 +4969,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "budget": _cmd_budget, "swarm": _cmd_swarm,
-    "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
+    "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show, "locate": _cmd_locate,
     "assign": _cmd_assign, "set-model": _cmd_set_model, "priority": _cmd_priority,
     "lane-model": _cmd_lane_model, "pins": _cmd_pins,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
