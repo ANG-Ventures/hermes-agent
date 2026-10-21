@@ -120,7 +120,12 @@ def test_finite_chat_joins_parallel_children_before_final_response(tmp_path, mod
     env.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path), HERMES_HOME=str(home),
                HERMES_MANAGED_DIR=str(tmp_path / "managed"), TERMINAL_CWD=str(tmp_path),
                OPENAI_BASE_URL=url, OPENAI_API_KEY="local-test-only", PYTHONPATH=str(REPO_ROOT),
-               PYTHONDONTWRITEBYTECODE="1", LANG="C.UTF-8")
+               PYTHONDONTWRITEBYTECODE="1", LANG="C.UTF-8",
+               # The child inherits the harness's 6 GiB RLIMIT_AS (tests/_fixtures/bounds.py) but
+               # not its mallopt arena cap. On a 128-core host glibc allows 1024 arenas of 64 MiB;
+               # ~100 contended threads reserved 89 of them (5.8 GB) and the child aborted or
+               # wedged in ep_poll on a loaded runner (t_0308509c). Same cap the harness uses.
+               MALLOC_ARENA_MAX="8")
     mode_flags = {"quiet": ["-Q"], "oneshot": ["--oneshot"], "redirected": []}
     command = [
         sys.executable, "-c", "from hermes_cli.main import main; main()", "chat",
