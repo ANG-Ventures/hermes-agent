@@ -42,12 +42,18 @@ def state_path() -> Path:
 
     gw = get_hermes_home() / "gateway"
     path, legacy = gw / STATE_FILENAME, gw / LEGACY_STATE_FILENAME
-    if not path.exists() and legacy.exists():
-        try:
-            os.replace(legacy, path)
-        except OSError as exc:
-            logger.debug("kanban boomerang-wake: legacy state not adopted: %s", exc)
-            return legacy
+    # Check + rename under the state lock so two constructions cannot both adopt; a
+    # failed rename whose canonical file now exists means another caller won (Prism
+    # f07cafce41d5), so the canonical path is the shared state, not the vanished legacy.
+    with _LOCK:
+        if not path.exists() and legacy.exists():
+            try:
+                os.replace(legacy, path)
+            except OSError as exc:
+                if path.exists():
+                    return path
+                logger.debug("kanban boomerang-wake: legacy state not adopted: %s", exc)
+                return legacy
     return path
 
 

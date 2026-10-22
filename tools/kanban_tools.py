@@ -1536,12 +1536,15 @@ def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = Non
     """Subscribe the calling session to completion/block events; True iff a row was
     written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
     ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
-    True). Failures are logged and swallowed: bookkeeping must never fail kanban_create."""
-    try:
-        if not cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True):
-            return False
-    except Exception:
-        pass  # unreadable config keeps the user-friendly default (True)
+    True); an explicit ``wake=True`` (boomerang wake implies it) is a request, not
+    bookkeeping, and bypasses that gate (Prism 2ddacd377db2). Failures are logged and
+    swallowed: bookkeeping must never fail kanban_create."""
+    if wake is not True:
+        try:
+            if not cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True):
+                return False
+        except Exception:
+            pass  # unreadable config keeps the user-friendly default (True)
     return subscribe_calling_session(conn, task_id, wake=wake)
 
 

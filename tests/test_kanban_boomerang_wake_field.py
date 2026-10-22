@@ -157,6 +157,47 @@ def test_explicit_boomerang_create_upgrades_inherited_notify_row(kanban_home, mo
         assert _modes(conn, plain["task_id"]) == ["notify"]   # auto-subscribe stays passive
 
 
+def test_explicit_boomerang_create_bypasses_auto_subscribe_gate(kanban_home, monkeypatch):
+    """Prism 2ddacd377db2 (restated): ``kanban.auto_subscribe_on_create: false`` gates only
+    bookkeeping subscriptions; an explicit boomerang wake still subscribes this chat as waker."""
+    from tools import kanban_tools as kt
+
+    (kanban_home / "config.yaml").write_text("kanban:\n  auto_subscribe_on_create: false\n")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "cG")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "group")
+    on = json.loads(kt._handle_create({"title": "b", "assignee": "peer", "boomerang_wake": True,
+                                       "unhomed": True}))
+    plain = json.loads(kt._handle_create({"title": "p", "assignee": "peer", "unhomed": True}))
+    assert on["ok"] and plain["ok"], (on, plain)
+    assert on["subscribed"] is True and plain["subscribed"] is False
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, on["task_id"]).boomerang_wake is True
+        assert _modes(conn, on["task_id"]) == ["notify+wake"]
+        assert _modes(conn, plain["task_id"]) == []
+
+
+def test_legacy_state_rename_race_resolves_to_canonical_path(kanban_home, monkeypatch):
+    """Prism f07cafce41d5: the caller that loses the legacy-state rename race reads the
+    canonical file the winner produced, never the vanished legacy path."""
+    from gateway import kanban_boomerang_wake as bw
+
+    gw = kanban_home / "gateway"
+    gw.mkdir(parents=True, exist_ok=True)
+    legacy, canonical = gw / bw.LEGACY_STATE_FILENAME, gw / bw.STATE_FILENAME
+    legacy.write_text(json.dumps({"retries": {"t_x": 1}}))
+    real_replace = bw.os.replace
+
+    def winner_then_fail(src, dst):   # another caller adopts the file first
+        real_replace(src, dst)
+        raise FileNotFoundError(src)
+
+    monkeypatch.setattr(bw.os, "replace", winner_then_fail)
+    assert bw.state_path() == canonical
+    monkeypatch.setattr(bw.os, "replace", real_replace)
+    assert not legacy.exists() and bw.BoomerangWakeState().retries("t_x") == 1
+
+
 def test_set_level_lives_on_the_card_only(kanban_home):
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="c", assignee="peer")
