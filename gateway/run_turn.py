@@ -2141,6 +2141,12 @@ class GatewayTurnMixin:
         # The /goal no-progress stop reads this (streamed turns return None, so not from the result).
         with suppress(Exception):
             event._goal_turn_api_calls = int(agent_result.get("api_calls", 0) or 0)
+        # The /goal continuation gate reads this: write | read | none over this turn's tool calls.
+        with suppress(Exception):
+            from hermes_cli.goal_turn_effects import classify_turn_effect, current_turn_messages
+            event._goal_turn_effect = classify_turn_effect(
+                current_turn_messages(agent_messages, agent_result.get("history_offset")),
+            )
         if diagnostic_wake_muted(event):
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).

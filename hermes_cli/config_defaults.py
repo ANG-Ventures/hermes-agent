@@ -1663,6 +1663,10 @@ DEFAULT_CONFIG = {
         # Max continuation turns before auto-pause (/goal resume) — guards against judge false
         # negatives and unbounded spend.
         "max_turns": 20,
+        # Gateway: a turn whose tool calls were all reads (or none: a NO_REPLY, a page answered in
+        # chat) and that the user did not author queues no continuation; the idle check-in is the
+        # next nudge. True restores a continuation after every judged-continue turn.
+        "nudge_on_read_only_turns": False,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially
