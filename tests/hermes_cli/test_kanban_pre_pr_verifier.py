@@ -70,12 +70,12 @@ def test_refused_pr_blocks_the_handoff_with_the_lander_text(kanban_home, tmp_pat
         assert "completion_blocked_pre_pr" in _kinds(conn, tid)
         assert "review_requested" not in _kinds(conn, tid)
     argv = json.loads(calls.read_text().splitlines()[0])
-    assert argv == ["check", "--repo", "o/r", "--pr", "7", "--card", tid, "--worker", "daedalus"]
+    assert argv == ["check", "--repo", "o/r", "--pr", "7", "--card", tid, "--worker", "daedalus", "--draft-ok"]
 
 
-def test_draft_ok_is_passed_to_the_verifier(kanban_home, tmp_path, monkeypatch):
-    """Prism b1fdf6186eca: the audited draft_ok override must reach the verifier, or a draft hand-off can never
-    complete. The stub refuses unless it sees --draft-ok."""
+def test_drafts_stay_with_the_freshness_gate(kanban_home, tmp_path, monkeypatch):
+    """Prism b1fdf6186eca: the verifier never pre-empts the freshness gate's draft handling (DraftPrError and the
+    audited draft_ok override). The stub refuses unless it sees --draft-ok."""
     calls = tmp_path / "calls.jsonl"
     script = tmp_path / "landable_stub.py"
     script.write_text(

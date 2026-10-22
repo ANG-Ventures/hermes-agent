@@ -10360,7 +10360,7 @@ class ExternalCloseError(ValueError):
         )
 
 
-def _pre_pr_refusals(refs, *, task_id: str, worker: str, draft_ok: bool = False) -> list:
+def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
     """Forge L0 section 2.3 (a), card PRE t_7ff229a7: run hermes-home ``scripts/lib/landable.py check`` on each
     of the card's OWN open fleet PRs before the open-PR route, so the worker hears what fleet-merge would refuse at
     land in its own run. -> ``[(repo#n, refusal text)]`` for each PR the verifier refused (rc 1).
@@ -10369,8 +10369,10 @@ def _pre_pr_refusals(refs, *, task_id: str, worker: str, draft_ok: bool = False)
     ``<hermes root>/config/landing-policy.json`` ``"pre_pr": "on"|"off"`` (missing = off): off = no subprocess,
     the handoff proceeds as today. Fail-open on everything else (script absent, timeout, rc 3 unreadable): the
     land-time copy of every gate stays as the backstop. ``KANBAN_PRE_PR_SCRIPT`` overrides the path (tests);
-    inside pytest with no override nothing runs. ``draft_ok`` (the audited t_f38605be override) passes
-    ``--draft-ok``, so the verifier does not refuse an intentionally-open draft; the other checks still run.
+    inside pytest with no override nothing runs. ``--draft-ok`` is always passed: drafts stay with the freshness
+    gate that runs next (``DraftPrError``, ``completion_blocked_draft_pr`` and the audited ``draft_ok`` override,
+    t_f38605be), so this gate never pre-empts them. It has no stale/behind check either, so nothing the freshness
+    update would fix is refused here (Prism b1fdf6186eca).
     """
     script = os.environ.get("KANBAN_PRE_PR_SCRIPT") or ""
     if not script:
@@ -10394,7 +10396,7 @@ def _pre_pr_refusals(refs, *, task_id: str, worker: str, draft_ok: bool = False)
     out = []
     for ref in refs:
         argv = [sys.executable, script, "check", "--repo", ref.repo, "--pr", str(ref.number),
-                "--card", task_id, "--worker", worker or "worker"] + (["--draft-ok"] if draft_ok else [])
+                "--card", task_id, "--worker", worker or "worker", "--draft-ok"]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=180,
                                   stdin=subprocess.DEVNULL, check=False)
@@ -10918,7 +10920,7 @@ def complete_task(
                 metadata=metadata, survivor_pr=survivor_pr))[0]}
             refusals = _pre_pr_refusals(
                 [r for r in still_open if (r.repo.lower(), r.number) in own_keys],
-                task_id=task_id, worker=candidate.assignee or "", draft_ok=draft_ok is not None,
+                task_id=task_id, worker=candidate.assignee or "",
             )
             if refusals:
                 with write_txn(conn):
