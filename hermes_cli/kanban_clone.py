@@ -378,4 +378,85 @@ def clone(url: str, dest: Optional[str] = None, git_opts: Sequence[str] = ()) ->
             )
     cmd += opts
     cmd += ["--", url, dest]
-    return subprocess.run(cmd, check=False, env=_git_env()).returncode
+    rc = subprocess.run(cmd, check=False, env=_git_env()).returncode
+    if rc == 0:
+        try:
+            arm_fleet_prepush(Path(dest), mirror_url)
+        except Exception as exc:  # noqa: BLE001 - the clone itself succeeded
+            print(f"kanban clone: pre-push hook NOT armed ({exc})", file=sys.stderr)
+    return rc
+
+
+# --- fleet pre-push chain (card t_a8f5c76b) ---------------------------------
+#
+# ``git clone`` copies no hooks, and only the fleet root sets core.hooksPath.
+# So a worker's clone of the fleet root's own repo (hermes-home) pushed
+# without the root's pre-push chain. On 10-18/19, 4 PRs pushed that way were
+# refused at land with rc 42 PROSE_IN_PR, a check scripts/prose-in-pr-prepush.py
+# in that chain would have made at push time. The clone now gets a pre-push shim
+# that execs the root's chain, and worktrees of the clone share it.
+
+HOOKS_ROOT_ENV = "HERMES_KANBAN_HOOKS_ROOT"
+ROOT_PREPUSH = Path("scripts") / "git-hooks" / "pre-push"
+SHIM_MARKER = "hermes kanban clone: fleet pre-push chain"
+
+
+def hooks_root() -> Path:
+    override = os.environ.get(HOOKS_ROOT_ENV, "").strip()
+    if override:
+        return Path(override)
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root()
+
+
+def _same_repo(a: Optional[Tuple[str, str]], b: Optional[Tuple[str, str]]) -> bool:
+    if a is None or b is None:
+        return False
+    strip = lambda r: r[:-4] if r.lower().endswith(".git") else r  # noqa: E731
+    return a[0] == b[0] and strip(a[1]).lower() == strip(b[1]).lower()
+
+
+def prepush_shim(target: Path) -> str:
+    t = str(target).replace("'", "'\\''")
+    return (
+        "#!/bin/sh\n"
+        f"# {SHIM_MARKER} (card t_a8f5c76b). Runs the fleet root's pre-push gates\n"
+        "# (prose-in-pr rc 42, merge-resolution, ...) for this clone and its worktrees.\n"
+        f"hook='{t}'\n"
+        'if [ ! -f "$hook" ]; then\n'
+        '  echo "pre-push: $hook missing; refusing the push (fleet pre-push chain cannot run)" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        'exec /bin/bash "$hook" "$@"\n'
+    )
+
+
+def arm_fleet_prepush(dest: Path, url: str) -> Optional[Path]:
+    """Write ``<dest>/.git/hooks/pre-push`` -> the fleet root's chain when *url*
+    is the fleet root's own repo. Returns the hook path, or None when not armed.
+
+    Leaves the clone alone when it is another repo, when the root has no chain,
+    or when the clone already resolves a core.hooksPath or a pre-push hook.
+    """
+    root = hooks_root()
+    target = root / ROOT_PREPUSH
+    origin = _git("-C", str(root), "config", "--get", "remote.origin.url")
+    if origin.returncode != 0 or not _same_repo(parse_fleet_repo(origin.stdout.strip()), parse_fleet_repo(url)):
+        return None
+    if not target.is_file():
+        return None
+    hp = _git("-C", str(dest), "config", "--get", "core.hooksPath")
+    if hp.returncode == 0 and hp.stdout.strip():
+        print(f"kanban clone: core.hooksPath={hp.stdout.strip()} is set; fleet pre-push NOT armed",
+              file=sys.stderr)
+        return None
+    gd = _git("-C", str(dest), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    _must(gd, f"locating the git dir of {dest}")
+    hook = Path(gd.stdout.strip()) / "hooks" / "pre-push"
+    if hook.exists():
+        return None
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(prepush_shim(target), encoding="utf-8")
+    hook.chmod(0o755)
+    return hook
