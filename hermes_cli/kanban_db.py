@@ -42,6 +42,7 @@ from hermes_cli.kanban_review_schema import REQUIRED_REVIEW_LENSES as _REVIEW_LE
 from hermes_cli.kanban_review_schema import HEAD_SHA_PATTERN as _HEAD_SHA_PATTERN  # noqa: E402
 from hermes_cli.kanban_review_schema import validate_v2_fields as _validate_review_v2  # noqa: E402
 from hermes_cli import kanban_review_schema as _review_schema  # noqa: E402
+from hermes_cli import kanban_delegations_board as _kdb  # noqa: E402
 _log = logging.getLogger(__name__)
 
 
@@ -4117,11 +4118,18 @@ def _resolve_birth_session(
     *,
     explicit: bool = False,
     creator_task_id: Optional[str] = None,
+    caller_over_foreign_parent: bool = False,
 ) -> tuple[str, Optional[str]]:
     """THE home a new card is born with, plus the ``origin:`` line it inherits.
 
     0. ``explicit`` (the caller NAMED the session, e.g. ``create --session``):
        that session wins over every parent.
+    0b. ``caller_over_foreign_parent`` (``hermes kanban create`` without
+       ``--home-with-parent``, t_d59f722a): a caller WITH a session, outside a
+       worker run, whose first homed parent belongs to ANOTHER session's home
+       keeps the child in its own session. A child born into someone else's
+       home cannot be driven by the session that made it (the Forge L0 loader,
+       10-21: every block refused ``home session is ...``).
     1. The first homed parent, then the ``creator_task_id`` (durable lineage
        without a dependency edge), then the card the creating kanban worker run
        was dispatched for: fan-out belongs to the HUMAN home of its lineage.
@@ -4139,6 +4147,18 @@ def _resolve_birth_session(
         return (sid or UNHOMED_SESSION), None
     worker_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     creator_tid = (str(creator_task_id).strip() if creator_task_id else "")
+    caller_sid = (str(session_id).strip() if session_id else "")
+    if (caller_over_foreign_parent and caller_sid and not is_unhomed(caller_sid)
+            and not worker_tid and not creator_tid):
+        for tid in (parents or ()):
+            row = conn.execute(
+                "SELECT session_id FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+            home = (row["session_id"] or "").strip() if row is not None else ""
+            if home and not is_unhomed(home):
+                if home not in home_ids(caller_sid):
+                    return caller_sid, None
+                break
     for tid in (
         *(parents or ()),
         *((creator_tid,) if creator_tid else ()),
@@ -5994,6 +6014,7 @@ def create_task(
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
     session_explicit: bool = False,
+    home_with_parent: bool = True,
     duplicate_guard: bool = False,
     force_reason: Optional[str] = None,
     require_home: bool = False,
@@ -6176,6 +6197,7 @@ def create_task(
     birth = _resolve_birth_session(
         conn, session_id, parents, explicit=session_explicit,
         creator_task_id=creator_task_id,
+        caller_over_foreign_parent=not home_with_parent,
     )
     session_id, inherited_origin = birth
     # ``require_home`` (the ``hermes kanban create`` CLI and the
@@ -6318,6 +6340,7 @@ def create_task(
                 rebirth = _resolve_birth_session(
                     conn, requested_session_id, parents, explicit=session_explicit,
                     creator_task_id=creator_task_id,
+                    caller_over_foreign_parent=not home_with_parent,
                 )
                 if rebirth != birth:
                     birth = rebirth
@@ -6630,7 +6653,9 @@ def create_task(
                 if pr_owner_forced:
                     _append_event(conn, task_id, "pr_owner_forced", pr_owner_forced)
                 overlap_hits: list[dict] = []
-                if duplicate_guard:
+                # K5: a background delegation unit is not an incident a session
+                # mints; the gate would only comment and hold it for 10 min.
+                if duplicate_guard and not _kdb.conn_is_delegations(conn):
                     # Same-incident gate (t_ba30f0de): another session minted
                     # this incident in the last 30 min. Never refuses; comments
                     # both cards and holds this one in ready for 10 min.
@@ -9810,7 +9835,7 @@ def release_stale_claims(
                 "AND current_run_id IS ? "
                 # A worker that registered its own pid since the SELECT keeps its claim.
                 "AND worker_pid IS ?",
-                (retry_status, row["id"], row["claim_lock"], now,
+                (_kdb.requeue_status(conn, retry_status), row["id"], row["claim_lock"], now,
                  row["current_run_id"], row["worker_pid"]),
             )
             if cur.rowcount != 1:
@@ -9830,6 +9855,9 @@ def release_stale_claims(
                     **({"dead_claimer_release_basis": "operator_claim_no_worker"} if operator_review else {}),
                 },
             )
+            if _kdb.conn_is_delegations(conn):
+                _kdb.park_event(conn, row["id"], outcome="reclaimed",
+                                retry_status=retry_status, run_id=run_id)
             reclaimed += 1
         # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
         # the run ended without a verdict, so it counts toward the breaker and a
@@ -17512,6 +17540,26 @@ def _safe_cmdline(proc) -> list[str]:
         return []
 
 
+#: ``<task_id>:<run_id>`` on every dispatcher-spawned worker (option C, K6). Unlike
+#: ``HERMES_KANBAN_TASK``/``RUN_ID`` it is not in ``KANBAN_ENV_KEYS``, so
+#: ``scrub_kanban_env`` keeps it on a delegated child's tool processes. It is a REAP
+#: tag only: nothing may read it as ownership or authority
+#: (``scripts/check_kanban_lineage_readers.py`` fails on any other reader).
+KANBAN_LINEAGE_ENV = "HERMES_KANBAN_LINEAGE"
+
+
+def _env_names_run(env: dict, task_id: str, run_id: str) -> Optional[bool]:
+    """True/False when the env carries a run identity (TASK+RUN_ID, else the lineage
+    tag) that is/isn't this run; None when it carries none."""
+    env_task = env.get("HERMES_KANBAN_TASK")
+    if env_task is not None:
+        return env_task == task_id and env.get("HERMES_KANBAN_RUN_ID") == run_id
+    lineage = env.get(KANBAN_LINEAGE_ENV)  # lineage-reader: ok — the escapee reaper
+    if lineage is not None:
+        return lineage == f"{task_id}:{run_id}"
+    return None
+
+
 def _run_env_escapees_detailed(task_id: str, run_id: int) -> list[tuple[int, int, bool]]:
     """``(pid, pgid, by_env)`` of every live process whose ENVIRONMENT carries
     exactly this task+run identity, wherever it sits in the session tree
@@ -17545,11 +17593,11 @@ def _run_env_escapees_detailed(task_id: str, run_id: int) -> list[tuple[int, int
             env = proc.environ()
         except Exception:  # psutil on macOS: SystemError for a process exiting mid-read
             continue
-        env_task = env.get("HERMES_KANBAN_TASK")
-        if env_task is None:
+        by_env = _env_names_run(env, want_task, want_run)
+        if by_env is None:
             if want_task not in _cmdline_profile_cards(_safe_cmdline(proc)):
                 continue
-        elif env_task != want_task or env.get("HERMES_KANBAN_RUN_ID") != want_run:
+        elif not by_env:
             continue
         try:
             if my_sid is not None and os.getsid(pid) == my_sid:
@@ -17559,7 +17607,7 @@ def _run_env_escapees_detailed(task_id: str, run_id: int) -> list[tuple[int, int
             continue
         if pgid <= 1 or pgid == os.getpgid(0):
             continue
-        found.append((pid, pgid, env_task is not None))
+        found.append((pid, pgid, by_env is not None))
     return found
 
 
@@ -18288,7 +18336,8 @@ def detect_progress_stalls(
         escalate = attempts >= 2
         reason = f"worker progress stalled for {age}s; {evidence['signals']}; heartbeat age {evidence['heartbeat_age_seconds']}s"
         with write_txn(conn):
-            status = "blocked" if escalate else _retry_status_for_run(conn, row["id"])
+            status = "blocked" if escalate else _kdb.requeue_status(
+                conn, _retry_status_for_run(conn, row["id"]))
             cur = conn.execute(
                 "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
                 "worker_pid=NULL, last_heartbeat_at=NULL, block_kind=? "
@@ -18303,6 +18352,9 @@ def detect_progress_stalls(
             )
             _append_event(conn, row["id"], "blocked" if escalate else "stalled_reclaimed",
                           {"reason": reason, **evidence}, run_id=ended)
+            if not escalate and status == _kdb.PARKED_STATUS:
+                _kdb.park_event(conn, row["id"], outcome="stalled",
+                                retry_status=_retry_status_for_run(conn, row["id"], rid), run_id=ended)
         reclaimed.append(row["id"])
     return reclaimed
 ORPHANED_TERMINAL_TASK_OUTCOME = "orphaned_terminal_task"
@@ -19476,6 +19528,8 @@ def count_running_by_placement(boards) -> "dict[str, tuple[int, dict[str, int]]]
     seen: "set[str]" = set()
     for meta in enumerating_each(boards):
         slug = (meta.get("slug") if isinstance(meta, dict) else None) or DEFAULT_BOARD
+        if _kdb.is_delegations_board(slug):
+            continue  # K4: background units never hold kanban capacity
         conn = None
         try:
             with enumerating_boards():
@@ -19557,6 +19611,8 @@ def count_running_tasks_host() -> Optional[int]:
     except Exception:
         current_path = None
     try:
+        if _kdb.is_delegations_board(get_current_board()):
+            raise LookupError("K4: the delegations board holds no kanban capacity")
         conn = connect()
         try:
             total += _count_running_strict(conn)
@@ -19605,6 +19661,8 @@ def _scan_running_tasks(skip_paths: "set[str]") -> "tuple[int, int]":
     # helper is covered too).
     for meta in enumerating_each(boards):
         slug = meta.get("slug") or DEFAULT_BOARD
+        if _kdb.is_delegations_board(slug):
+            continue  # K4: background units never hold kanban capacity
         try:
             # Enumerating every board on disk, not addressing the named one.
             # The extent also covers the ``connect(board=slug)`` below, which
