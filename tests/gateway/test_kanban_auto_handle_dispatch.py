@@ -670,3 +670,104 @@ def test_summary_row_and_idle_parent_log_nothing(monkeypatch, caplog):
         assert _resolve(monkeypatch, _Runner(), mode="summary") == ("db-parent", "summary")
         assert _resolve(monkeypatch, _Runner(cache={"k1": (idle, 0)})) == (idle, "fork")
     assert "fork_ineligible" not in caplog.text
+
+
+# --- t_6e9f48cc: an own-repo handback answering every open Prism key forks a child ------------
+
+ANSWERED_HEAD = "d" * 40
+KEY_A, KEY_B = "5ef38967cc14", "f1a50a36ff7f"
+
+
+@pytest.fixture
+def answered_env(env):
+    """Green PR + the home grammar file + a round reader returning ``env["open_keys"]``."""
+    from gateway import kanban_prism_answers as pa
+    from hermes_constants import get_default_hermes_root
+
+    scripts = get_default_hermes_root() / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "prism_soft_gate.py").write_text(
+        "import re\n"
+        "VERDICT_LINE = re.compile(r'prism-verdict:\\s*([A-Za-z0-9_.\\-]+)\\s+(not-a-bug|false|by-design)\\b', re.I)\n"
+        "FIXED_LINE = re.compile(r'prism-verdict:\\s*([A-Za-z0-9_.\\-]+)\\s+fixed\\s+(?:in\\s+)?([0-9a-f]{7,40})\\b', re.I)\n")
+    env["monkeypatch"].setattr(pa, "_GRAMMAR", {})
+    env["open_keys"] = [KEY_A, KEY_B]
+    env["monkeypatch"].setattr(pa, "open_keys_fn", lambda repo, pr, head, card: env["open_keys"])
+    return env
+
+
+def _answered_handback(env, pr, lines):
+    env["health"][(REPO, pr)] = {"state": "open", "mergeable_state": "clean", "failing": [], "head": ANSWERED_HEAD}
+    tid = _card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, \
+            kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+        kb.request_review(conn, tid, force=True, summary=f"PR {REPO}#{pr} ready\n" + "\n".join(lines))
+    return tid
+
+
+def test_all_keys_answered_handback_is_one_fork_dispatch_and_no_turn(answered_env):
+    env = answered_env
+    tid = _answered_handback(env, 3201, [f"prism-verdict: {KEY_A} fixed {ANSWERED_HEAD}",
+                                         f"prism-verdict: {KEY_B} not-a-bug the path is unreachable"])
+    turns = _tick(env)
+    assert [(e["row"], e["mode"]) for e in env["dispatched"]] == [("own_repo_review_all_keys_answered", "fork")]
+    assert env["dispatched"][0]["head"] == ANSWERED_HEAD and env["dispatched"][0]["pr"] == f"{REPO}#3201"
+    assert turns == [], [t.text for t in turns]
+
+
+@pytest.mark.parametrize("lines", [[f"prism-verdict: {KEY_A} fixed {'d' * 40}"], ["all Prism findings fixed"]])
+def test_unanswered_key_on_green_handback_stays_with_the_merge_pass(answered_env, lines):
+    """One key unanswered (or prose only): today's tier-3 NONE row, no child."""
+    env = answered_env
+    _answered_handback(env, 3202, lines)
+    _tick(env)
+    assert env["dispatched"] == [] and _claims() == {}
+
+
+def test_row_knob_off_restores_todays_rows(answered_env):
+    from hermes_constants import get_hermes_home
+
+    env = answered_env
+    (get_hermes_home() / "config.yaml").write_text(
+        "delegation:\n  boomerang:\n    auto_handle_enabled: true\n"
+        "kanban:\n  auto_handle_rows:\n    review_all_answered: false\n")
+    _answered_handback(env, 3203, [f"prism-verdict: {KEY_A} fixed {ANSWERED_HEAD}",
+                                   f"prism-verdict: {KEY_B} by-design advisory"])
+    _tick(env)
+    assert env["dispatched"] == []
+
+
+def test_all_answered_child_brief_carries_the_four_steps_and_the_refusal_rule(answered_env):
+    env = answered_env
+    tid = _answered_handback(env, 3204, [f"prism-verdict: {KEY_A} fixed {ANSWERED_HEAD}",
+                                         f"prism-verdict: {KEY_B} by-design advisory"])
+    _tick(env)
+    goal = ah.build_goal(env["dispatched"][0])
+    for n, needle in enumerate(("handback SUMMARY", "prism-verdict lines", "--coverage-only",
+                                "landing_queue.py enqueue"), start=1):
+        step = next(ln for ln in goal.splitlines() if ln.startswith(f"{n}. "))
+        assert needle in step, (n, step)
+    assert f"--head {ANSWERED_HEAD}" in goal and f"{REPO} --pr 3204" in goal and tid in goal
+    assert "never write an APPROVE on a head that has an unanswered Prism key" in goal
+    assert "never add, drop or widen an fm_arg" in goal
+    assert "post ONE card comment" in goal and "return action `surface`" in goal
+    assert "allowed actions: handled, surface" in goal
+
+
+def test_all_answered_handled_verdict_writes_only_the_receipt(answered_env):
+    env = answered_env
+    tid = _answered_handback(env, 3205, [f"prism-verdict: {KEY_A} fixed {ANSWERED_HEAD}",
+                                         f"prism-verdict: {KEY_B} by-design advisory"])
+    _tick(env)
+    entry = ah.AutoHandleState().get_claim(env["dispatched"][0]["key"])
+    with kb.connect_closing() as conn:   # the child's own step-2/3 comments do not read as "state moved"
+        kb.add_comment(conn, tid, "apollo", f"prism-verdict: {KEY_A} fixed {ANSWERED_HEAD}")
+    res = ah.execute_verdict(entry, _verdict(entry, "handled", summary="verdicts + coverage posted, queued"))
+    assert res["ok"], res
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert task.status == "review" and kinds.count(ah.RECEIPT_KIND) == 1
+    assert "completed" not in kinds and "changes_requested" not in kinds
+    assert not ah.execute_verdict(entry, _verdict(entry, "complete"))["ok"], "complete is not this row's action"

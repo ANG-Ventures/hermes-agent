@@ -23,6 +23,9 @@ its ``trigger``. The payload is the event payload, plus two keys the caller reso
   Missing/false → the upstream row (surface).
 - ``pr_state``: ``"green"`` | ``"pending"`` | ``"red"`` | ``"dirty"``. Missing or anything
   else on an own repo → surface (fail-safe: never guess a PR is green).
+- ``prism_all_answered``: True only when the handback text answers every Prism key open at
+  the handback head (``gateway/kanban_prism_answers.py``) and the row's config knob is on.
+  Anything else (False / None / missing) leaves today's rows deciding (t_6e9f48cc).
 
 Card tags are read from ``task.tags`` (an iterable) when the caller has one, else from the
 card title/body: a ``tags: a, b`` line or a ``[tag]`` marker (the ``[milestone]`` /
@@ -113,6 +116,13 @@ _TABLE: tuple = (
          lambda c: c.kind == "blocked" and str(c.payload.get("kind") or "") == "needs_input", SURFACE),
     _Row(2, "blocked", lambda c: c.kind == "blocked", SURFACE),
     _Row(2, "block_loop_detected", lambda c: c.kind == "block_loop_detected", SURFACE),
+    # Tier 3 — a mechanical own-repo handback: every open Prism key is answered in the
+    # handback text, so posting those lines, the coverage and the enqueue is not a verdict
+    # (t_6e9f48cc). Above the green and red rows: the queue owns CI (a red row's existing
+    # fm_args such as --allow-red-ci ride along unchanged; a dirty PR refuses at step 3 and
+    # the child surfaces). An unanswered key falls through to today's rows.
+    _Row(3, "own_repo_review_all_keys_answered",
+         lambda c: _own_review(c) and c.payload.get("prism_all_answered") is True, AUTO, MODE_FORK),
     # Tier 3 — the merge pass owns a green/pending own-repo handback.
     _Row(3, "own_repo_review_green_or_pending",
          lambda c: _own_review(c) and _pr_state(c) in ("green", "pending"), NONE),
