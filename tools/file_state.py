@@ -1,7 +1,7 @@
 """Cross-agent file state coordination.
 
-Prevents mangled edits when concurrent subagents (same process, same
-filesystem) touch the same file: B writes a file A already read, so A's next
+Prevents mangled edits when concurrent subagents (same filesystem; same
+process, or detached delegation workers in other processes) touch the same file: B writes a file A already read, so A's next
 write would clobber B's changes. Complements the single-agent path-overlap
 check in ``agent.tool_dispatch_helpers._should_parallelize_tool_batch``. A process-wide
 ``FileStateRegistry`` tracks per-agent read stamps, the global last writer and
@@ -9,6 +9,7 @@ a per-path lock; every method is a no-op under ``HERMES_DISABLE_FILE_STATE_GUARD
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -63,6 +64,141 @@ def _evict_oldest(container, cap: int) -> None:
             break
 
 
+def _cross_process_enabled() -> bool:
+    """The cross-process layer (flock + published last writer) exists only for detached delegation
+    workers (``delegation.detached_background``). Off, every process keeps its pre-detached,
+    process-local behaviour: no flock, and another process's write never refuses this one's edit."""
+    try:
+        from tools.delegate_tool_config import _get_detached_background
+
+        return bool(_get_detached_background())
+    except Exception:
+        return False
+
+
+def _lock_file_for(resolved: str) -> Optional[Path]:
+    """Lock file shared by every process of this install (all profiles, like the process-wide
+    registry): ``<hermes root>/state/file-locks/<sha256 of the path>``. None while the
+    cross-process layer is off."""
+    import hashlib
+
+    if not _cross_process_enabled():
+        return None
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = get_default_hermes_root() / "state" / "file-locks"
+        root.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    return root / hashlib.sha256(resolved.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+@contextmanager
+def _cross_process_lock(resolved: str):
+    """Exclusive ``flock`` on the path's lock file; a no-op where it cannot be taken (no fcntl on
+    Windows, where detached units run in-process anyway; unwritable state dir)."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    lock_file = _lock_file_for(resolved)
+    try:
+        fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600) if lock_file else None
+    except OSError:
+        fd = None
+    if fd is None:
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            pass  # flock unsupported on this filesystem (ENOLCK/EOPNOTSUPP): the thread lock still holds
+        yield
+    finally:
+        os.close(fd)  # closing the only descriptor releases the flock
+
+
+# ── cross-process last writer ──────────────────────────────────────────────
+# Detached delegation workers (tools/delegate_detached.py) run sibling subagents in other processes,
+# so the process-local ``_last_writer`` alone would stop refusing a stale sibling overwrite. Every write
+# is also published as ``<lock file>.writer`` = {task_id, ts, pid, create_time}; a record from ANOTHER
+# process counts only while that process still runs (a finished worker is not a concurrent sibling).
+_PROC_START: Optional[float] = None
+
+
+def _own_start_time() -> Optional[float]:
+    global _PROC_START
+    if _PROC_START is None:
+        try:
+            import psutil
+
+            _PROC_START = float(psutil.Process(os.getpid()).create_time())
+        except Exception:
+            return None
+    return _PROC_START
+
+
+def _publish_writer(resolved: str, task_id: str, ts: float) -> None:
+    lock_file = _lock_file_for(resolved)
+    if lock_file is None:
+        return
+    path = lock_file.with_name(lock_file.name + ".writer")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps({"task_id": task_id, "ts": ts, "pid": os.getpid(),
+                                   "create_time": _own_start_time()}), encoding="utf-8")
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _foreign_writer(resolved: str) -> Optional[Tuple[str, float]]:
+    """The last writer of *resolved* recorded by another, still-running process; else None."""
+    lock_file = _lock_file_for(resolved)
+    if lock_file is None:
+        return None
+    try:
+        data = json.loads(lock_file.with_name(lock_file.name + ".writer").read_text(encoding="utf-8"))
+        pid, task_id, ts = int(data["pid"]), str(data["task_id"]), float(data["ts"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if pid == os.getpid():
+        return None  # this process's own writes are tracked (and forgotten) in memory
+    create_time = data.get("create_time")
+    try:
+        import psutil
+
+        alive = create_time is None or abs(psutil.Process(pid).create_time() - float(create_time)) < 0.01
+    except Exception as exc:  # noqa: BLE001
+        alive = type(exc).__name__ not in {"NoSuchProcess", "ZombieProcess"}  # unknown counts as alive
+    return (task_id, ts) if alive else None
+
+
+def _forget_published(resolved: str, task_id: str) -> None:
+    lock_file = _lock_file_for(resolved)
+    if lock_file is None:
+        return
+    path = lock_file.with_name(lock_file.name + ".writer")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("pid") == os.getpid() and data.get("task_id") == task_id:
+            path.unlink()
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _latest(local: Optional[Tuple[str, float]], foreign: Optional[Tuple[str, float]]):
+    if local is None or (foreign is not None and foreign[1] > local[1]):
+        return foreign
+    return local
+
+
 class FileStateRegistry:
     """Process-wide coordinator for cross-agent file edits."""
 
@@ -77,13 +213,17 @@ class FileStateRegistry:
     @contextmanager
     def lock_path(self, resolved: str):
         """Per-path lock: threads on the same path serialize, different paths proceed.
-        The lock entry is dropped once the last holder/waiter exits."""
+        The lock entry is dropped once the last holder/waiter exits. Inside it, an advisory
+        ``flock`` serializes the same path across processes (detached delegation workers,
+        tools/delegate_detached.py): the thread lock is taken first, so one process never
+        holds two descriptors on one lock file."""
         with self._meta_lock:
             lock = self._path_locks.setdefault(resolved, threading.Lock())
             self._path_lock_users[resolved] = self._path_lock_users.get(resolved, 0) + 1
         lock.acquire()
         try:
-            yield
+            with _cross_process_lock(resolved):
+                yield
         finally:
             lock.release()
             with self._meta_lock:
@@ -123,6 +263,7 @@ class FileStateRegistry:
             self._last_writer[resolved] = (task_id, now)
             _evict_oldest(self._last_writer, _MAX_GLOBAL_WRITERS)
             self._stamp(task_id, resolved, mtime, now, False)
+        _publish_writer(resolved, task_id, now)
 
     @staticmethod
     def _sibling_conflict(task_id: str, resolved: str, stamp, last_writer) -> Optional[str]:
@@ -159,6 +300,7 @@ class FileStateRegistry:
         with self._state_lock:
             stamp = self._reads.get(task_id, {}).get(resolved)
             last_writer = self._last_writer.get(resolved)
+        last_writer = _latest(last_writer, _foreign_writer(resolved))
         if last_writer is None or not os.path.exists(resolved):
             return None
         return self._sibling_conflict(task_id, resolved, stamp, last_writer)
@@ -171,6 +313,7 @@ class FileStateRegistry:
         with self._state_lock:
             stamp = self._reads.get(task_id, {}).get(resolved)
             last_writer = self._last_writer.get(resolved)
+        last_writer = _latest(last_writer, _foreign_writer(resolved))
 
         if stamp is None and last_writer is None:  # net-new file / first touch
             return None
@@ -231,8 +374,14 @@ class FileStateRegistry:
         same scratch path as "modified by sibling subagent" hours after the writer exited."""
         with self._state_lock:
             self._reads.pop(task_id, None)
-            for p in [p for p, (writer_tid, _ts) in self._last_writer.items() if writer_tid == task_id]:
+            owned = [p for p, (writer_tid, _ts) in self._last_writer.items() if writer_tid == task_id]
+            for p in owned:
                 del self._last_writer[p]
+        for p in owned if _cross_process_enabled() else ():
+            # Under the path lock writers publish under, so a sibling's record published between the
+            # ownership check and the unlink is never the one removed.
+            with self.lock_path(p):
+                _forget_published(p, task_id)
 
     def clear(self) -> None:
         """Reset all state. Intended for tests only."""
