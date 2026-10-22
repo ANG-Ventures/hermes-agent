@@ -5996,13 +5996,15 @@ class GatewayRunner(
                         delegation_cfg.get("max_concurrent_children") or 3
                     )
 
-                    def _runner_factory(record: dict, continuation: str):
+                    def _runner_factory(record: dict, continuation: str, _delegation_cfg=delegation_cfg):
                         # One reconstruction shared with the detached child process
                         # (tools/delegate_detached.py, docs/dev/delegate-detached-background.md).
+                        # The config is bound per profile: a retry timer calls this after the loop
+                        # has moved on, and the late-bound loop variable would be the LAST profile's.
                         from tools.delegate_detached import build_parent_and_runner
 
                         recovered_runner, interrupt_parent, _parent = build_parent_and_runner(
-                            record, continuation, delegation_cfg,
+                            record, continuation, _delegation_cfg,
                             resolve_default=_resolve_runtime_agent_kwargs,
                             resolve_for_provider=_resolve_runtime_agent_kwargs_for_provider,
                         )

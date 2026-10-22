@@ -3542,8 +3542,13 @@ def _build_durable_background_spec(
     max_iterations: int,
     children: Optional[List[Any]] = None,
     inherit_mode: Optional[str] = None,
+    task_images: Optional[List[Optional[List[str]]]] = None,
+    task_schemas: Optional[List[Optional[Dict[str, Any]]]] = None,
+    skills: Optional[List[str]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Build the non-secret restart intent for a routable gateway session."""
+    """Build the non-secret restart intent for a routable gateway session. Call-level inputs that
+    delegate_task applies outside ``task_list`` (top-level ``images`` / ``output_schema`` / ``skills``)
+    are written into each persisted task: reconstruction rebuilds the children from the tasks alone."""
     if not is_truthy_value(cfg.get("resume_on_restart"), default=True):
         return None, None
     try:
@@ -3582,14 +3587,28 @@ def _build_durable_background_spec(
 
         _mode = _fork.resolve_inherit_mode(
             persisted["inherit_context"], task.get("inherit_mode") if "inherit_mode" in task else inherit_mode)
-        if _mode is not None and children and index < len(children):
-            persisted["materialized_prefill_messages"] = copy.deepcopy(
-                getattr(children[index], "prefill_messages", None)
-            )
+        # Without inheritance the built child still carries the parent's own prefill_messages; the
+        # reconstructed parent has none, so the child's effective prefix is persisted either way.
+        _built_prefill = getattr(children[index], "prefill_messages", None) if (
+            children and index < len(children)) else None
+        if children and index < len(children) and (_mode is not None or _built_prefill is not None):
+            persisted["materialized_prefill_messages"] = copy.deepcopy(_built_prefill)
+        if task_images and index < len(task_images) and task_images[index]:
+            persisted["images"] = list(task_images[index])
+        if task_schemas and index < len(task_schemas) and task_schemas[index] is not None:
+            persisted["output_schema"] = copy.deepcopy(task_schemas[index])
+        if "skills" not in task and skills is not None:
+            persisted["skills"] = list(skills)
         persisted_tasks.append(persisted)
 
     effective_agent = children[0] if children else parent_agent
     effective_provider = creds.get("provider") or getattr(effective_agent, "provider", None)
+    # A named custom endpoint resolves to the generic "custom"; its endpoint-scoped identity
+    # (``custom:<name>``) is ``requested_provider``. Recovery re-resolves by this name, so the
+    # generic one would land the unit on the profile's default endpoint.
+    _requested = getattr(effective_agent, "requested_provider", None)
+    named_provider = (_requested if not creds.get("provider") and effective_provider == _RUNTIME_PROVIDER_CUSTOM
+                      and isinstance(_requested, str) and _requested.startswith("custom:") else effective_provider)
     if cfg.get("base_url"):
         credential_ref = {
             "source": "delegation_config",
@@ -3601,8 +3620,11 @@ def _build_durable_background_spec(
     else:
         credential_ref = {
             "source": "provider",
-            "provider": cfg.get("provider") or effective_provider,
+            "provider": cfg.get("provider") or named_provider,
             "custom_provider": getattr(effective_agent, "custom_provider", None),
+            # The children inherited the parent's route (no delegation.provider/base_url pin): on
+            # reconstruction they must inherit it again, routing filters included, not become a pin.
+            "inherited_route": not creds.get("provider") and not cfg.get("base_url"),
         }
     session_parts = str(session_key or "").split(":")
     chat_type = session_parts[3] if len(session_parts) > 4 else None
@@ -3683,6 +3705,18 @@ def _build_durable_background_spec(
             "profile": profile,
         },
     }, str(boot_id)
+
+
+def _terminal_session_isolated() -> bool:
+    """The terminal backend keys a sandbox per live session (``_SessionScope.session_isolated``).
+    Unreadable counts as isolated: the unit then stays in-process, the pre-detached behaviour."""
+    try:
+        from tools.terminal_tool import _session_scope
+
+        return bool(_session_scope().session_isolated)
+    except Exception:
+        logger.debug("terminal session scope unreadable; keeping the unit in-process", exc_info=True)
+        return True
 
 
 def build_recovered_delegation_runner(
@@ -3957,13 +3991,18 @@ def delegate_task(
             or not _recovered_provider
             or _recovered_provider == _RUNTIME_PROVIDER_CUSTOM
         )
+        # An inherited route stays inherited: the reconstructed parent already carries the recorded
+        # provider and its routing filters (allowlist, data_collection), which a pin would reset.
+        # The model is inherited with it: the parent was rebuilt on the persisted resolved model, and
+        # a model without its provider re-runs alias resolution (gpt-5.5 -> openai-codex).
+        _inherited_route = bool(_credential_ref.get("inherited_route"))
         cfg = dict(cfg)
         cfg.update({
-            "model": _execution.get("model") or "",
-            "provider": _recovered_provider,
-            "base_url": (_execution.get("base_url") or "") if _direct_endpoint else "",
+            "model": "" if _inherited_route else (_execution.get("model") or ""),
+            "provider": "" if _inherited_route else _recovered_provider,
+            "base_url": (_execution.get("base_url") or "") if _direct_endpoint and not _inherited_route else "",
             "api_key": "",
-            "api_mode": (_execution.get("api_mode") or "") if _direct_endpoint else "",
+            "api_mode": (_execution.get("api_mode") or "") if _direct_endpoint and not _inherited_route else "",
             "max_iterations": int(
                 _execution.get("max_iterations") or DEFAULT_MAX_ITERATIONS
             ),
@@ -4660,6 +4699,9 @@ def delegate_task(
                 max_iterations=effective_max_iter,
                 children=_child_agents,
                 inherit_mode=inherit_mode,
+                task_images=task_images,
+                task_schemas=task_schemas,
+                skills=skills,
             )
         except Exception as exc:
             logger.error(
@@ -4680,7 +4722,11 @@ def delegate_task(
         # A fork child carries the parent's live transcript, cache snapshot and served seat, none of
         # which a reconstructed parent in another process has: it stays an in-process unit.
         _has_fork_child = any(getattr(_c, "_inherit_mode", None) == "fork" for _c in _child_agents)
-        if _durable_spec is not None and _get_detached_background() and not _has_fork_child:
+        # So does a session-isolated sandbox (docker + container_persistent: false): children alias the
+        # parent's per-session container by its live task id, and that container is never reused across
+        # processes, so a detached worker would land in a fresh "default" sandbox without the session's files.
+        if _durable_spec is not None and _get_detached_background() and not _has_fork_child \
+                and not _terminal_session_isolated():
             from tools.delegate_detached import spawn_mode
 
             if spawn_mode() != "degraded":
