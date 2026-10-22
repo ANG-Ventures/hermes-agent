@@ -8235,12 +8235,17 @@ def _default_spawn(
     env[_kb.CARD_BRAIN_ENV] = getattr(task, "brain", None) or ""
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+        # K6 (option C): a reap tag that survives scrub_kanban_env, so tool
+        # processes a delegated child starts are still found as this run's
+        # leftovers. Carries no authority (scripts/check_kanban_lineage_readers.py).
+        env[_kb.KANBAN_LINEAGE_ENV] = f"{task.id}:{task.current_run_id}"
         from hermes_cli.kanban_worker_exit import exit_file
         status_path = exit_file(_kb.kanban_db_path(board=board), task.id, task.current_run_id)
         status_path.parent.mkdir(parents=True, exist_ok=True)
         env["HERMES_KANBAN_EXIT_FILE"] = str(status_path)
     else:
         env.pop("HERMES_KANBAN_EXIT_FILE", None)
+        env.pop(_kb.KANBAN_LINEAGE_ENV, None)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # The card pin as CLAIMED (t_a30417c3): the worker's pin snapshot must
