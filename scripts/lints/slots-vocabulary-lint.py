@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import io
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import tokenize
 from pathlib import Path
 
 CONFIG_REL = "scripts/lints/slots-vocabulary.json"
@@ -86,14 +88,28 @@ def tracked(root: Path) -> list:
     return [p for p in out.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
-def counts(root: Path, paths, allow) -> dict:
+def _read_source(path: Path) -> str:
+    """Decode as Python would (PEP 263 coding cookie / BOM, else UTF-8); raise on undecodable bytes."""
+    raw = path.read_bytes()
+    enc, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+    return raw.decode(enc)
+
+
+def counts(root: Path, paths, allow, unreadable=None) -> dict:
+    """Per-file token counts. A tracked file that cannot be decoded is NOT skipped silently: its path and reason
+    go to ``unreadable`` (a list), which ``run`` grades red."""
     got = {}
     for rel in tracked(root):
         if not _match(rel, paths) or _match(rel, allow):
             continue
         try:
-            text = (root / rel).read_text(encoding="utf-8")
-        except (UnicodeDecodeError, FileNotFoundError, IsADirectoryError):
+            text = _read_source(root / rel)
+        except (FileNotFoundError, IsADirectoryError):
+            continue
+        except (UnicodeDecodeError, SyntaxError, LookupError) as exc:
+            if unreadable is not None:
+                unreadable.append(f"{rel}: undecodable ({exc.__class__.__name__}: {exc}); a tracked allocation "
+                                  f"file must decode (UTF-8 or a PEP 263 coding line) so its tokens are graded")
             continue
         n = count_text(text)
         if n:
@@ -121,10 +137,18 @@ def notes(got: dict, baseline: dict) -> list:
             for rel, n in sorted(baseline.items()) if got.get(rel, 0) < n]
 
 
+def _git(root: Path, *args) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, env=_scrub_git_env())
+
+
 def _base_baseline(root: Path, ref: str, rel: str):
-    r = subprocess.run(["git", "-C", str(root), "show", f"{ref}:{rel}"], capture_output=True, env=_scrub_git_env())
+    if _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").returncode != 0:
+        raise ValueError(f"--base-ref {ref!r} does not resolve to a commit (shallow checkout? fetch it first)")
+    if _git(root, "cat-file", "-e", f"{ref}:{rel}").returncode != 0:
+        return None                      # bootstrap: the base commit has no config yet
+    r = _git(root, "show", f"{ref}:{rel}")
     if r.returncode != 0:
-        return None                      # bootstrap: the base has no config yet
+        raise ValueError(f"git show {ref}:{rel} failed: {r.stderr.decode('utf-8', 'replace').strip()}")
     return load_config(json.loads(r.stdout))[2]
 
 
@@ -135,8 +159,9 @@ def run(root: Path, config_rel: str, base_ref=None, out=print) -> int:
     except (OSError, ValueError) as exc:
         out(f"slots-vocabulary-lint: bad config {config_rel}: {exc}")
         return 2
-    got = counts(root, paths, allow)
-    errs = grade(got, baseline, base)
+    unreadable: list = []
+    got = counts(root, paths, allow, unreadable)
+    errs = unreadable + grade(got, baseline, base)
     for n in notes(got, baseline):
         out(n)
     for e in errs:
@@ -159,30 +184,47 @@ def selftest() -> int:
         subprocess.run(["git", "init", "-q", str(root)], check=True, env=_scrub_git_env())
         (root / "scripts/lints").mkdir(parents=True)
         (root / "alloc").mkdir()
-        (root / "alloc/a.py").write_text("max_slots = 1\n")
-        (root / "alloc/pcie.py").write_text("PCIe slot 3\n")
-        (root / "other.py").write_text("slots = 9\n")
+        (root / "alloc/a.py").write_text("max_slots = 1\n", encoding="utf-8")
+        (root / "alloc/pcie.py").write_text("PCIe slot 3\n", encoding="utf-8")
+        (root / "other.py").write_text("slots = 9\n", encoding="utf-8")
         cfg = {"paths": ["alloc/*"], "allow": [{"path": "alloc/pcie.py", "why": "PCIe slot"}],
                "baseline": {"alloc/a.py": 1}}
-        (root / CONFIG_REL).write_text(json.dumps(cfg))
+        (root / CONFIG_REL).write_text(json.dumps(cfg), encoding="utf-8")
         subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, env=_scrub_git_env())
         quiet = lambda *_: None
         cases = [("green at baseline", 0)]
         rc = [run(root, CONFIG_REL, out=quiet)]
-        (root / "alloc/a.py").write_text("max_slots = 1\nlive_slots = 2\n")
+        (root / "alloc/a.py").write_text("max_slots = 1\nlive_slots = 2\n", encoding="utf-8")
         rc.append(run(root, CONFIG_REL, out=quiet)); cases.append(("a new token is red", 1))
-        (root / "alloc/a.py").write_text("ceiling = 1\n")
+        (root / "alloc/a.py").write_text("ceiling = 1\n", encoding="utf-8")
         rc.append(run(root, CONFIG_REL, out=quiet)); cases.append(("below baseline is green", 0))
-        (root / "alloc/b.py").write_text("slot\n")
+        (root / "alloc/b.py").write_text("slot\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, env=_scrub_git_env())
         rc.append(run(root, CONFIG_REL, out=quiet)); cases.append(("a new file is red", 1))
         subprocess.run(["git", "-C", str(root), "rm", "-q", "--cached", "alloc/b.py"], check=True, env=_scrub_git_env())
         subprocess.run(["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm",
                         "base"], check=True, env=_scrub_git_env())
         cfg["baseline"]["alloc/a.py"] = 5
-        (root / CONFIG_REL).write_text(json.dumps(cfg))
+        (root / CONFIG_REL).write_text(json.dumps(cfg), encoding="utf-8")
         rc.append(run(root, CONFIG_REL, base_ref="HEAD", out=quiet)); cases.append(("raising the baseline is red", 1))
-        (root / CONFIG_REL).write_text("{\"paths\": []}")
+        rc.append(run(root, CONFIG_REL, base_ref="no-such-ref", out=quiet))
+        cases.append(("an unresolvable base ref is rc 2, not bootstrap", 2))
+        empty_tree = subprocess.run(["git", "-C", str(root), "hash-object", "-t", "tree", "-w", "--stdin"],
+                                    input=b"", capture_output=True, check=True, env=_scrub_git_env()).stdout
+        no_cfg = subprocess.run(["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree",
+                                 empty_tree.decode().strip(), "-m", "no config"], capture_output=True, check=True,
+                                env=_scrub_git_env()).stdout.decode().strip()
+        rc.append(run(root, CONFIG_REL, base_ref=no_cfg, out=quiet))
+        cases.append(("a base ref without the config is bootstrap", 0))
+        (root / "alloc/c.py").write_bytes(b"# -*- coding: latin-1 -*-\nname = 'caf\xe9'\nmax_slots = 2\n")
+        subprocess.run(["git", "-C", str(root), "add", "alloc/c.py"], check=True, env=_scrub_git_env())
+        rc.append(run(root, CONFIG_REL, out=quiet)); cases.append(("a PEP 263 latin-1 file is graded", 1))
+        cfg["baseline"]["alloc/c.py"] = 1
+        (root / CONFIG_REL).write_text(json.dumps(cfg), encoding="utf-8")
+        rc.append(run(root, CONFIG_REL, out=quiet)); cases.append(("its token counts exactly once", 0))
+        (root / "alloc/c.py").write_bytes(b"name = 'caf\xe9'\n")
+        rc.append(run(root, CONFIG_REL, out=quiet)); cases.append(("an undecodable tracked file is red", 1))
+        (root / CONFIG_REL).write_text("{\"paths\": []}", encoding="utf-8")
         rc.append(run(root, CONFIG_REL, out=quiet)); cases.append(("bad config is rc 2", 2))
     bad = [(c, want, got) for (c, want), got in zip(cases, rc) if want != got]
     if bad:
