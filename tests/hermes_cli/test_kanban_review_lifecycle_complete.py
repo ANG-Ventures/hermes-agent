@@ -164,21 +164,15 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
         reason="Correct the implementation.",
         expected_run_id=review.current_run_id,
     ) == (True, "builder")
+    # Reviewer provenance lives on the newest review_requested event.
     with kb.write_txn(conn):
-        if bad_payload is None:
-            conn.execute(
-                "DELETE FROM task_events "
-                "WHERE task_id = ? AND kind = 'changes_requested'",
-                (task_id,),
-            )
-        else:
-            conn.execute(
-                "UPDATE task_events SET payload = ? "
-                "WHERE id = (SELECT id FROM task_events "
-                "WHERE task_id = ? AND kind = 'changes_requested' "
-                "ORDER BY id DESC LIMIT 1)",
-                (bad_payload, task_id),
-            )
+        conn.execute(
+            "UPDATE task_events SET payload = ? "
+            "WHERE id = (SELECT id FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_requested' "
+            "ORDER BY id DESC LIMIT 1)",
+            (bad_payload, task_id),
+        )
 
     implementation = kb.claim_task(conn, task_id, claimer="builder:retry")
     assert implementation is not None
