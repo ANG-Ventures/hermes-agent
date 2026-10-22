@@ -526,6 +526,60 @@ async def test_discord_thread_channels_threads_replies_with_auto_thread_off(adap
     assert adapter.handle_message.await_args.args[0].source.chat_type == "group"
 
 
+class FakeFetchHistoryChannel(FakeHistoryChannel):
+    async def fetch_message(self, message_id):
+        for message in self._history_messages:
+            if int(message.id) == int(message_id):
+                return message
+        raise LookupError(message_id)
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_channels_reply_keeps_referenced_page(adapter, monkeypatch):
+    """A reply forced into a thread still carries the page it answers (Prism 5227f5a709da).
+
+    Discord delivers an uncached reference as ``resolved=None``; the page must arrive through the
+    parent channel's reply-anchored backfill and the fetched ``reply_to_text``, never be dropped.
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_THREAD_CHANNELS", "777")
+    adapter.config.extra["history_backfill"] = True
+    pager = SimpleNamespace(id=56, display_name="pager", name="pager", bot=False)
+    page = make_history_message(author=pager, content="CRITICAL disk-pressure on ace-ai /tmp 91%", msg_id=42)
+    parent = FakeFetchHistoryChannel([page], channel_id=777)
+    adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=4242, name="t", parent=parent))
+
+    reply = make_message(channel=parent, content="investigate this",
+                         msg_type=discord_platform.discord.MessageType.reply)
+    reply.reference = SimpleNamespace(message_id=42, resolved=None)
+    await adapter._handle_message(reply)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "4242"
+    assert "CRITICAL disk-pressure on ace-ai /tmp 91%" in (event.channel_context or "")
+    assert event.reply_to_text == "CRITICAL disk-pressure on ace-ai /tmp 91%"
+    assert event.reply_to_author_id == "56"
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_channels_fresh_message_skips_backfill(adapter, monkeypatch):
+    """A fresh non-reply message forced into a thread still gets no history backfill."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_THREAD_CHANNELS", "777")
+    adapter.config.extra["history_backfill"] = True
+    adapter._fetch_channel_context = AsyncMock(return_value="[Recent channel messages]\n[Alice] context")
+    adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=4242, name="t"))
+
+    await adapter._handle_message(make_message(channel=FakeTextChannel(channel_id=777), content="new topic"))
+
+    adapter._fetch_channel_context.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "4242"
+    assert event.channel_context is None
+
+
 @pytest.mark.asyncio
 async def test_discord_no_thread_channels_wins_over_thread_channels(adapter, monkeypatch):
     """A channel in both lists replies inline: the explicit inline opt-out wins."""
