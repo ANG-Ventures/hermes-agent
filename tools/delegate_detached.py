@@ -35,6 +35,7 @@ HEARTBEAT_SECONDS = 10.0
 SIGKILL_GRACE_SECONDS = 30.0
 POLL_SECONDS = 1.0
 _RUNTIME_ROOT = Path(__file__).resolve().parent.parent
+WORKER_BOOT_MARKER = "_HERMES_DETACHED_WORKER_BOOT"  # set by spawn_child, consumed by _boot_dependencies
 
 
 # ── job dir ─────────────────────────────────────────────────────────────────
@@ -94,20 +95,31 @@ def process_create_time(pid: int) -> Optional[float]:
         return None
 
 
-def pid_alive(pid: Any, create_time: Any) -> bool:
-    """Same pid AND same kernel start time (pid reuse safe); a zombie counts as dead. An identity
-    with no start time is unverifiable and never matches: a recycled pid must not be signalled."""
+def pid_state(pid: Any, create_time: Any) -> Optional[bool]:
+    """True: same pid AND same kernel start time (pid reuse safe). False: confirmed gone (no such
+    process, a zombie, or a different process on the pid). None: UNKNOWN, either no start time to
+    verify against or process inspection failed. Unknown is never dead and never signallable."""
     if create_time is None:
-        return False
+        return None
     try:
         import psutil
-
+    except Exception:
+        return None
+    try:
         proc = psutil.Process(int(pid))
         if proc.status() == psutil.STATUS_ZOMBIE:
             return False
         return abs(proc.create_time() - float(create_time)) < 0.01
-    except Exception:
+    except (psutil.NoSuchProcess, ValueError, TypeError):  # ZombieProcess subclasses NoSuchProcess
         return False
+    except Exception:
+        return None
+
+
+def pid_alive(pid: Any, create_time: Any) -> bool:
+    """May this identity be signalled? Only when verified alive (``pid_state`` True): a recycled or
+    unverifiable pid must not be signalled. Not a death test: use ``pid_state(...) is False``."""
+    return pid_state(pid, create_time) is True
 
 
 def _argv_has_job(cmdline: list, job_dir: str) -> bool:
@@ -115,46 +127,106 @@ def _argv_has_job(cmdline: list, job_dir: str) -> bool:
                for i, a in enumerate(cmdline))
 
 
+class IdentityUnavailable(Exception):
+    """Process inspection itself failed: the child's identity is UNKNOWN, which never means dead."""
+
+
 def find_job_process(job_dir: Path) -> Optional[Dict[str, Any]]:
     """Process whose argv carries the exact element pair ``--job <job_dir>`` (crash window between
-    ``spawn.json`` and ``pid.json``). Exact element equality on a unique path, never a substring."""
+    ``spawn.json`` and ``pid.json``). Exact element equality on a unique path, never a substring.
+    None only after a completed scan found no such process; a scan that could not run raises
+    ``IdentityUnavailable`` (a live child must not read as gone because inspection failed)."""
     try:
         import psutil
-    except Exception:
-        return None
+    except Exception as exc:
+        raise IdentityUnavailable("psutil is unavailable") from exc
     target = str(job_dir)
-    for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    unreadable: list = []
+    try:
+        for proc in psutil.process_iter(["pid", "cmdline", "create_time", "status", "uids"], ad_value=None):
+            try:
+                cmdline = proc.info.get("cmdline")
+                if cmdline is None:
+                    # An argv we could not read is not "a process that is not this job": a process of
+                    # ours (same effective uid, or uid unreadable) may be the child. Zombies hold no argv.
+                    uids = proc.info.get("uids")
+                    if proc.info.get("status") != psutil.STATUS_ZOMBIE and (
+                            euid is None or uids is None or uids.effective == euid):
+                        unreadable.append(proc)
+                    continue
+                if _argv_has_job(cmdline, target):
+                    return {"pid": proc.info["pid"], "create_time": proc.info["create_time"]}
+            except Exception:
+                unreadable.append(proc)
+    except Exception as exc:
+        raise IdentityUnavailable(f"process scan failed: {exc}") from exc
+    still_unknown = 0
+    for proc in unreadable:  # one direct re-read: a process that exited mid-scan is gone, not unknown
         try:
-            if _argv_has_job(proc.info.get("cmdline") or [], target):
-                return {"pid": proc.info["pid"], "create_time": proc.info["create_time"]}
-        except Exception:
+            if proc.status() == psutil.STATUS_ZOMBIE:
+                continue
+            if _argv_has_job(proc.cmdline(), target):
+                return {"pid": proc.pid, "create_time": proc.create_time()}
+        except psutil.NoSuchProcess:  # ZombieProcess subclasses it
             continue
+        except Exception:
+            still_unknown += 1
+    if still_unknown:
+        raise IdentityUnavailable(f"{still_unknown} process(es) of this user had an unreadable argv")
     return None
 
 
 def job_identity(job_dir: Path, detached_block: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """``{pid, create_time}`` for the job's child: registry block, then pid.json, child.json, argv scan.
-    A recorded pid without a start time is verified by the exact ``--job <dir>`` argv instead."""
+    """``{pid, create_time}`` for the job's child: registry block, then pid.json, then child.json (the
+    child's own record), then the argv scan. The first source with a start time wins, so a start time
+    unknown at spawn is recovered from what the child publishes. A recorded pid with no start time
+    anywhere is verified by the exact ``--job <dir>`` argv. Raises ``IdentityUnavailable`` when that
+    scan cannot run."""
+    recorded_pid = None
     for source in (detached_block, _read_json(job_dir / "pid.json"), _read_json(job_dir / "child.json")):
         if isinstance(source, dict) and source.get("pid"):
             if source.get("create_time") is not None:
                 return {"pid": int(source["pid"]), "create_time": source.get("create_time")}
-            found = find_job_process(job_dir)
-            return found if found and int(found["pid"]) == int(source["pid"]) else None
+            if recorded_pid is None:
+                recorded_pid = int(source["pid"])
+    if recorded_pid is not None:
+        found = find_job_process(job_dir)
+        return found if found and int(found["pid"]) == recorded_pid else None
     if (job_dir / "spawn.json").exists():
         return find_job_process(job_dir)
     return None
 
 
+def current_identity(job_dir: Path, pid: Any, create_time: Any) -> tuple:
+    """``(pid, create_time)`` to act on NOW: the captured identity when it is verified, else re-read
+    from the job dir. A start time that was unknown at spawn therefore never makes the child
+    uncancellable. Stays unverified (``create_time`` None: never signalled) while it cannot be read."""
+    if create_time is not None:
+        return pid, create_time
+    try:
+        ident = job_identity(Path(job_dir), {"pid": pid, "create_time": None} if pid else None)
+    except IdentityUnavailable:
+        ident = None
+    return (ident["pid"], ident["create_time"]) if ident else (pid, None)
+
+
 def probe_job(job_dir: Path, detached_block: Optional[Dict[str, Any]] = None) -> str:
-    """``result`` (result.json present) | ``alive`` | ``dead``. A child that publishes its result and
-    exits between the two checks reads as ``result``, never ``dead`` (that would re-run finished work)."""
+    """``result`` (result.json present) | ``alive`` | ``dead`` | ``unknown`` (process inspection
+    failed: never treated as dead). A child that publishes its result and exits between the two
+    checks reads as ``result``, never ``dead`` (that would re-run finished work)."""
     if (job_dir / "result.json").exists():
         return "result"
-    ident = job_identity(job_dir, detached_block)
-    if ident and pid_alive(ident["pid"], ident["create_time"]):
+    try:
+        ident = job_identity(job_dir, detached_block)
+    except IdentityUnavailable:
+        return "result" if (job_dir / "result.json").exists() else "unknown"
+    state = pid_state(ident["pid"], ident["create_time"]) if ident else False
+    if state is True:
         return "alive"
-    return "result" if (job_dir / "result.json").exists() else "dead"
+    if (job_dir / "result.json").exists():
+        return "result"
+    return "dead" if state is False else "unknown"
 
 
 def _group_members(pid: int) -> list:
@@ -180,7 +252,9 @@ def _group_members(pid: int) -> list:
 
 
 def signal_group(pid: Any, create_time: Any, sig: int) -> bool:
-    """Signal the child's process group (it is its own session leader) iff it is still the same process."""
+    """Signal the child's process group (it is its own session leader) iff it is still the same process.
+    A group whose leader is gone is never signalled by its number (the id may belong to another session
+    by now); its surviving tools are reached one by one through their captured identities."""
     if not pid_alive(pid, create_time):
         return False
     try:
@@ -207,16 +281,133 @@ def _kill_members(pid: Any, create_time: Any, members: list) -> None:
                 pass
 
 
+# Members captured by terminate_group (each a verified ``(pid, create_time)``), keyed by the leader's pid,
+# and persisted to ``<job_dir>/members.json`` so a boot that dies before the escalation leaves them to the
+# next one: an exit is confirmed only once every one of them is gone too.
+MEMBERS_FILE = "members.json"
+_terminated_members: Dict[int, list] = {}
+_terminated_members_lock = threading.Lock()
+
+
+def _recorded_members(pid: Any, job_dir: Optional[Path]) -> list:
+    with _terminated_members_lock:
+        members = {tuple(m) for m in _terminated_members.get(int(pid), [])}
+    if job_dir is not None:
+        data = _read_json(Path(job_dir) / MEMBERS_FILE) or {}
+        if data.get("leader") == int(pid):
+            members |= {(int(m[0]), m[1]) for m in data.get("members") or [] if isinstance(m, list) and len(m) == 2}
+    return sorted(members, key=lambda m: m[0])
+
+
+def group_survivors(job_dir: Path, pid: Any, create_time: Any) -> Optional[list]:
+    """Leader confirmed gone: ``(pid, create_time)`` of every non-zombie process still in its process
+    group (tools it started). Only processes started inside the job's lifetime (after the leader, and no
+    later than shortly after its last heartbeat) count, so a group id reused by an unrelated session after
+    the job's group emptied is never claimed. None: inspection failed (unknown, never "none left")."""
+    if pid is None or create_time is None or not hasattr(os, "getpgid"):
+        return []
+    try:
+        import psutil
+    except Exception:
+        return None
+    beat = _read_json(Path(job_dir) / "heartbeat.json") or {}
+    try:
+        upper = float(beat["ts"]) + 3 * HEARTBEAT_SECONDS
+    except (KeyError, TypeError, ValueError):
+        upper = None
+    out = []
+    try:
+        for proc in psutil.process_iter(["pid", "create_time", "status"]):
+            info = proc.info
+            if info.get("status") == psutil.STATUS_ZOMBIE or info.get("create_time") is None:
+                continue
+            try:
+                if os.getpgid(info["pid"]) != int(pid):
+                    continue
+            except ProcessLookupError:
+                continue
+            ct = float(info["create_time"])
+            if ct + 0.01 < float(create_time) or (upper is not None and ct > upper):
+                continue
+            out.append((int(info["pid"]), ct))
+    except Exception:
+        return None
+    return out
+
+
+def group_state(pid: Any, create_time: Any, job_dir: Optional[Path] = None) -> Optional[bool]:
+    """Is anything of this child still running? True: its leader, or a captured tool (pid + start time).
+    False: all of it confirmed gone. None: unknown (never dead)."""
+    leader = pid_state(pid, create_time)
+    if leader is not False:
+        return leader
+    states = [pid_state(m_pid, m_ct) for m_pid, m_ct in _recorded_members(pid, job_dir)]
+    if any(s is True for s in states):
+        return True
+    return None if any(s is None for s in states) else False
+
+
 def terminate_group(pid: Any, create_time: Any, *, grace: float = SIGKILL_GRACE_SECONDS,
-                    timer_factory: Callable[..., Any] = threading.Timer) -> bool:
-    """SIGTERM now, SIGKILL after ``grace`` on a timer thread; never blocks the caller."""
-    members = _group_members(int(pid)) if pid_alive(pid, create_time) else []
+                    timer_factory: Callable[..., Any] = threading.Timer,
+                    job_dir: Optional[Path] = None) -> bool:
+    """SIGTERM now, SIGKILL after ``grace`` on a timer thread; never blocks the caller. Tools that
+    outlived an earlier SIGTERM'd leader (recorded members) are signalled one by one."""
+    members = _recorded_members(pid, job_dir)
+    if pid_alive(pid, create_time):
+        members = sorted({*members, *((int(m), c) for m, c in _group_members(int(pid)))}, key=lambda m: m[0])
+    elif job_dir is not None and pid_state(pid, create_time) is False:
+        # Leader already gone: tools still in its group that nothing captured are signalled one by one.
+        members = sorted({*members, *(group_survivors(job_dir, pid, create_time) or [])}, key=lambda m: m[0])
+    with _terminated_members_lock:
+        _terminated_members[int(pid)] = members
+    if job_dir is not None and members:
+        try:
+            _write_json(Path(job_dir) / MEMBERS_FILE, {"leader": int(pid), "members": [list(m) for m in members]})
+        except OSError:
+            logger.warning("could not record the tool processes of %s", job_dir, exc_info=True)
     sent = signal_group(pid, create_time, signal.SIGTERM)
+    for member_pid, member_ct in members:
+        if member_pid != int(pid) and pid_alive(member_pid, member_ct):
+            try:
+                os.kill(int(member_pid), signal.SIGTERM)
+                sent = True
+            except OSError:
+                pass
     if sent:
         timer = timer_factory(grace, _kill_members, args=(pid, create_time, members))
         timer.daemon = True
         timer.start()
     return sent
+
+
+def wait_for_exit(pid: Any, create_time: Any, *, popen: Optional[subprocess.Popen] = None,
+                  timeout: Optional[float] = None, poll: float = 0.2, job_dir: Optional[Path] = None) -> bool:
+    """True once the process AND every tool captured from it are confirmed gone within ``timeout``
+    (default: past the SIGKILL escalation of ``terminate_group``). Unknown is never a confirmed exit."""
+    deadline = time.monotonic() + (SIGKILL_GRACE_SECONDS + 5 if timeout is None else timeout)
+    while True:
+        if popen is not None and popen.poll() is None:
+            gone = False
+        elif popen is not None:  # leader reaped: only its captured tools are left to confirm
+            gone = all(pid_state(m_pid, m_ct) is False for m_pid, m_ct in _recorded_members(pid, job_dir))
+        else:
+            gone = group_state(pid, create_time, job_dir) is False
+        if gone and job_dir is not None:
+            gone = group_survivors(job_dir, pid, create_time) == []  # uncaptured tools; unknown is not gone
+        if gone:
+            with _terminated_members_lock:
+                _terminated_members.pop(int(pid), None)
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
+
+
+def terminate_job(job_dir: Path, pid: Any, create_time: Any, **kwargs) -> bool:
+    """``terminate_group`` on the job's identity as known NOW (``current_identity``), so a start time
+    unknown when the caller captured it (spawn-time lookup failed) does not make the child unkillable."""
+    pid, create_time = current_identity(job_dir, pid, create_time)
+    return terminate_group(pid, create_time, job_dir=job_dir, **kwargs)
 
 
 # ── liveness ────────────────────────────────────────────────────────────────
@@ -288,7 +479,7 @@ class _Heartbeat:
 # ── reconstruction (shared with gateway restart recovery) ───────────────────
 def build_parent_and_runner(
     record: Dict[str, Any], continuation: Optional[str], delegation_cfg: Dict[str, Any], *,
-    resolve_default: Callable[[], dict], resolve_for_provider: Callable[[str], dict],
+    resolve_default: Callable[[], dict], resolve_for_provider: Callable[..., dict],
     source: str = "gateway_recovery",
 ):
     """Rebuild the parent AIAgent from a durable record and return ``(runner, interrupt_fn, parent)``.
@@ -334,7 +525,10 @@ def build_parent_and_runner(
         }
     else:
         requested_provider = credential_ref.get("provider") or execution.get("provider")
-        runtime = resolve_for_provider(str(requested_provider)) if requested_provider else resolve_default()
+        # The persisted model picks the transport on model-keyed providers (OpenCode Zen/Go: api_mode +
+        # URL shape); without it the resolver answers for the profile's default model instead.
+        runtime = (resolve_for_provider(str(requested_provider), target_model=execution.get("model") or None)
+                   if requested_provider else resolve_default())
     runtime = {k: v for k, v in runtime.items() if k != "_fallback_notice"}
     agent_kwargs = {
         **runtime,
@@ -471,7 +665,12 @@ def spawn_child(*, record: Dict[str, Any], attempt_id: str, profile_home: Path,
     _write_json(job_dir / "spec.json", spec)
     _write_json(job_dir / "spawn.json", {"attempt_id": attempt_id, "intent_at": time.time()})
     env = served_profile_child_env(target_home=str(profile_home), inherit_credentials=True)
-    env["PYTHONPATH"] = str(_RUNTIME_ROOT)
+    # Same boot as the cron external worker (cron/worker_bootstrap.py): pin this checkout and PM's
+    # committed dependency generation, and mark the child so main() leases + activates it first.
+    from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+
+    env = pin_hermes_tree_on_pythonpath(env, _RUNTIME_ROOT)
+    env[WORKER_BOOT_MARKER] = "1"
     workspace = (record.get("execution") or {}).get("workspace_hint")
     log_f = open(job_dir / "child.log", "ab")
     try:
@@ -509,10 +708,26 @@ def wait_for_result(job_dir: Path, pid: int, create_time: Optional[float],
         if popen is not None:
             if popen.poll() is not None:
                 break
-        elif not pid_alive(pid, create_time):
-            break
+        else:
+            if (job_dir / "result.json").exists():
+                break  # published: the result needs no process inspection (an unverifiable child is done)
+            if create_time is None:  # unverified at adoption: re-read what the child published
+                try:
+                    ident = job_identity(job_dir, {"pid": pid, "create_time": None} if pid else None)
+                except IdentityUnavailable:
+                    time.sleep(poll)
+                    continue  # inspection failed: unknown is not an exit, keep waiting
+                if not ident:
+                    break  # a completed lookup found no such child
+                pid, create_time = ident["pid"], ident["create_time"]
+            if pid_state(pid, create_time) is False:
+                break  # confirmed gone; an inspection error (None) keeps waiting
         time.sleep(poll)
     result = _read_json(job_dir / "result.json")
+    if result is None:
+        # The leader died without a result: tools it started must not run on unowned.
+        for m_pid, m_ct in group_survivors(job_dir, pid, create_time) or []:
+            terminate_group(m_pid, m_ct, job_dir=job_dir)
     if result is not None:
         if result.pop("schema_version", None) != SCHEMA_VERSION:
             return {"status": "error", "summary": None,
@@ -538,6 +753,12 @@ def _isolate_process_checkpoint(job_dir: Path) -> None:
     import tools.process_registry as process_registry_module
 
     process_registry_module.CHECKPOINT_PATH = job_dir / "processes.json"
+    # The gateway cannot adopt a process from this registry, and this worker (with its checkpoint)
+    # is gone once the unit returns: refuse the handoff rather than report a transfer that never lands.
+    process_registry_module.HANDOFF_UNAVAILABLE = (
+        "handoff is unavailable in a detached background subagent: your parent runs in another process "
+        "and cannot take over this one. Wait for the process to finish (process_manage wait/poll) and "
+        "report its result, or kill it.")
 
 
 def _child_main(job_dir: Path) -> int:
@@ -616,10 +837,23 @@ def _child_main(job_dir: Path) -> int:
     return 0
 
 
+def _boot_dependencies() -> None:
+    """PM's dependency boot (``hermes_bootstrap`` never ran here), before the first third-party
+    import: it leases the committed generation for this process's lifetime. Only in a child
+    ``spawn_child`` marked; the marker is consumed so this worker's own children never re-boot.
+    A failed activation propagates: the child exits without a result and the gateway reports it."""
+    if not os.environ.pop(WORKER_BOOT_MARKER, None):
+        return
+    from pm.environments import activate_dependencies
+
+    activate_dependencies(_RUNTIME_ROOT)
+
+
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m tools.delegate_detached")
     parser.add_argument("--job", required=True)
     args = parser.parse_args(argv)
+    _boot_dependencies()
     return _child_main(Path(args.job))
 
 
