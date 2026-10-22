@@ -69,6 +69,9 @@ _IDLE_WAKE_HORIZON_S = 6 * 3600
 # No-progress stop: this many judged-``continue`` turns in a row with no tool call (the agent is only
 # answering the judge) pauses the goal. 0 disables.
 DEFAULT_NO_PROGRESS_TURNS = 4
+# Turn effects (hermes_cli.goal_turn_effects) after which no continuation is queued unless the user
+# spoke: a wake/page/NO_REPLY answered with reads only changed nothing the next turn could act on.
+_NO_NUDGE_TURN_EFFECTS = frozenset({"read", "none"})
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -1664,7 +1667,8 @@ class GoalManager:
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0, real_event: bool = False, made_tool_calls: Optional[bool] = None,
-        no_progress_turns: int = DEFAULT_NO_PROGRESS_TURNS,
+        no_progress_turns: int = DEFAULT_NO_PROGRESS_TURNS, turn_effect: Optional[str] = None,
+        user_spoke: bool = False, nudge_on_read_only_turns: bool = False,
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
@@ -1673,7 +1677,13 @@ class GoalManager:
         ``real_event``: the turn was NOT started by the goal loop (user message, worker/process result);
         it re-arms the idle check-ins. ``made_tool_calls``: whether the turn called any tool (None =
         unknown, not counted); ``no_progress_turns`` judged-continue turns in a row without one pause
-        the goal (0 disables)."""
+        the goal (0 disables).
+
+        ``turn_effect`` (``hermes_cli.goal_turn_effects``: write | read | none; None = unknown): a
+        read/none turn the user did not author (``user_spoke``) still gets the judge's done/blocked/
+        wait/budget verdicts but queues no continuation, and leaves ``turns_used``/``last_turn_at``/
+        ``toolless_turns`` unchanged, so the idle check-in is the next nudge.
+        ``nudge_on_read_only_turns`` (config ``goals.nudge_on_read_only_turns``) disables the gate."""
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
@@ -1685,6 +1695,7 @@ class GoalManager:
         if self.is_waiting():
             return self._waiting_decision(state)
 
+        prior_turns_used, prior_last_turn_at = state.turns_used, state.last_turn_at
         state.turns_used += 1
         state.last_turn_at = time.time()
 
@@ -1748,6 +1759,11 @@ class GoalManager:
 
         if state.turns_used >= state.max_turns:
             return self._budget_pause(state, "continue", reason)
+
+        if not nudge_on_read_only_turns and not user_spoke and turn_effect in _NO_NUDGE_TURN_EFFECTS:
+            state.turns_used, state.last_turn_at = prior_turns_used, prior_last_turn_at
+            self._save()
+            return {**_decision("active", False, None, "continue", reason, ""), "held": turn_effect}
 
         if made_tool_calls is not None:
             state.toolless_turns = 0 if made_tool_calls else state.toolless_turns + 1
