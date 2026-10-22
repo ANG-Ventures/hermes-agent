@@ -283,3 +283,50 @@ def test_rereview_resolves_newest_review_requested_reviewer(
         )
         rr = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"][-1]
         assert rr.payload["reviewer"] == "human:bob"
+
+
+def test_sendback_resume_phase_survives_block_unblock(kanban_home: SimpleNamespace) -> None:
+    """review -> sendback -> block -> unblock resumes ``ready`` (the
+    implementer's phase), never the older review resume phase."""
+    with kbc.connect() as conn:
+        tid = _stopped_in_review(conn, kanban_home, "park after sendback")
+        # A prior park left a review resume phase as the newest lifecycle row.
+        kb._append_event(conn, tid, "unblocked", {"status": "review", "resume_status": "review"})
+        _tick(kanban_home)
+        assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
+        assert kb._resume_status_from_events(conn, tid) == "ready"
+        _tick(kanban_home)
+        assert kb.block_task(conn, tid, reason="wait")
+        _tick(kanban_home)
+        assert kb.unblock_task(conn, tid)
+        t = kb.get_task(conn, tid)
+        assert (t.status, t.assignee) == ("ready", "dev")
+
+
+def test_sendback_to_todo_promotes_to_ready_with_implementer(
+    kanban_home: SimpleNamespace,
+) -> None:
+    """review -> sendback lands ``todo`` behind an open parent -> the parent
+    finishes -> promotion lands ``ready`` with the implementer, not review."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="planner")
+        assert kb.complete_task(conn, parent, result="done")
+        tid = kb.create_task(conn, title="todo sendback", assignee="dev", parents=[parent])
+        claimed = kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="dev", body=f"Opened {PR} for review.")
+        _tick(kanban_home)
+        assert kb.request_review(
+            conn, tid, summary="PR ready", reviewer="human",
+            expected_run_id=claimed.current_run_id,
+        )
+        kb._append_event(conn, tid, "status", {"status": "review", "resume_status": "review"})
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
+        _tick(kanban_home)
+        assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
+        assert kb.get_task(conn, tid).status == "todo"
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+        kb.recompute_ready(conn)
+        t = kb.get_task(conn, tid)
+        assert (t.status, t.assignee) == ("ready", "dev")

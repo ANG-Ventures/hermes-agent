@@ -8691,7 +8691,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
-        "'unblocked', 'changes_requested', 'status', 'reclaimed', "
+        "'unblocked', 'changes_requested', 'sendback', 'status', 'reclaimed', "
         # 'review_reopened' is historical (verb retired); legacy rows still count.
         "'review_reopened', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', "
@@ -14411,6 +14411,11 @@ def request_sendback(
       is restored and the card re-gated to ``ready``/``todo``, as a
       ``changes_requested`` send-back does. ``"requeued"``.
 
+    ``sendback`` is a lifecycle kind for :func:`_resume_status_from_events`:
+    its ``resume_status`` (the implementer phase it set) supersedes an older
+    review resume phase, so a later park/unblock or parent promotion lands
+    ``ready``, not ``review``.
+
     Refused (nothing written): an active REVIEW run (the reviewer is not the
     implementer), and every other status (blocked, done, archived, triage,
     scheduled) -- the producer keeps its current path for those.
@@ -14421,7 +14426,7 @@ def request_sendback(
     record = dict(redact_review_value(payload))
     record.setdefault("retry", "after_change")
     # Handoff provenance is the kernel's to record, never the producer's.
-    for key in ("implementer", "reviewer"):
+    for key in ("implementer", "reviewer", "resume_status"):
         record.pop(key, None)
 
     with write_txn(conn):
@@ -14432,18 +14437,21 @@ def request_sendback(
             return False, "task not found"
         status = row["status"]
         if status == "running":
-            if _retry_status_for_run(conn, task_id, row["current_run_id"]) == "review":
+            retry_status = _retry_status_for_run(conn, task_id, row["current_run_id"])
+            if retry_status == "review":
                 return False, "a review run is active; the reviewer is not the implementer"
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
-                {**record, "delivery": "in_flight", "status": status},
+                {**record, "delivery": "in_flight", "status": status,
+                 "resume_status": retry_status},
                 run_id=row["current_run_id"],
             )
             return True, "in_flight"
         if status in ("ready", "todo"):
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
-                {**record, "delivery": "requeued", "status": status},
+                {**record, "delivery": "requeued", "status": status,
+                 "resume_status": status},
             )
             return True, "requeued"
         if status == "review":
@@ -14464,7 +14472,7 @@ def request_sendback(
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": new_status,
-                 "implementer": implementer},
+                 "resume_status": new_status, "implementer": implementer},
             )
             return True, "requeued"
         return False, f"task is {status!r}; a sendback needs running/ready/todo/review"
