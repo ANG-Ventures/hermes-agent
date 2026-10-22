@@ -953,7 +953,7 @@
       "gateway/kanban_notify_suppress.py",
       "gateway/kanban_home_route.py",
       "gateway/kanban_wake_disposition.py",
-      "gateway/kanban_auto_handle.py",
+      "gateway/kanban_boomerang_wake.py",
       "gateway/kanban_prism_answers.py",
       "gateway/run_turn.py"
     ],
@@ -1236,5 +1236,26 @@
       "telegram"
     ],
     "proposed_canary": "tests/fork_canaries/test_fork_canary_short_aliases.py (RED-proof: see card t_92c49fb6)"
+  },
+  {
+    "feature": "/goal continuation re-fires only after a turn that changed state (write-class tool call) or a human message; read-only/no-tool wakes leave the next nudge to the idle check-in (t_c4ac59ae)",
+    "tests": [
+      "tests/gateway/test_goal_continuation_turn_effect.py"
+    ],
+    "paths": [
+      "hermes_cli/goal_turn_effects.py",
+      "hermes_cli/goals.py",
+      "gateway/run_goals.py",
+      "gateway/run_turn.py",
+      "gateway/run_turn_*.py",
+      "hermes_cli/config_defaults.py"
+    ],
+    "why": "Ace 2026-10-22 13:43/14:06 PT (#github-alternatives, ruling option b): a goal armed with --checkin-minutes 30 got '[Continuing toward your standing goal]' every 2-6 min on a busy board (session 20261018_220948_05ec4d95, 12:12..13:48) because every kanban wake / review-deadman page / NO_REPLY answer was followed by a continuation turn that re-read unchanged state. Not a spacing timer: the continuation edge is gated on the turn's tool-call effect class; judge done/blocked/wait/budget verdicts still run every turn. Kill switch goals.nudge_on_read_only_turns: true.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
   }
 ]

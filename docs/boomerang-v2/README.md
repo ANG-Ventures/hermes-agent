@@ -1,8 +1,8 @@
 # Boomerang v2 — operator guide
 
 Read this when you dispatch a boomerang, read a `boomerang.fork_ineligible` log line, see an
-`[auto-handled]` or `⚠️ auto-handle` line in a chat, or decide whether to turn on `auto_handle`
-for a kanban card. You do not need the spec to act on anything here.
+`[boomerang-wake]` or `⚠️ boomerang-wake` line in a chat, or decide whether to put a kanban card
+at the `boomerang wake` level. You do not need the spec to act on anything here.
 
 Source of truth: `~/.hermes/plans/2026-10-18_boomerang-fork-autowake-spec.md` (v1.0, APPROVED).
 Phase 0 measurements: `docs/boomerang-v2/phase0-probes.md`. Where this file and the spec disagree,
@@ -33,7 +33,7 @@ A forked child never ships a near-fork that silently writes cold.
 | skill `boomerang` or `/boomerang <task>` | `true` | `fork` requested (D-1). |
 | `/boomerang --summary <task>` | `true` | `summary`. |
 | `/boomerang --fork <task>` ≡ `/boomerang --branch <task>` | `true` | `fork` requested (explicit; same as the default). |
-| kanban auto-handle dispatch (§4 below) | `true` | `fork` requested; the disposition row's `mode` may say `summary` (D-6); falls back to `summary` on any failed check. |
+| kanban boomerang-wake dispatch (§4 below) | `true` | `fork` requested; the disposition row's `mode` may say `summary` (D-6); falls back to `summary` on any failed check. |
 
 Rules that follow from the table:
 
@@ -84,7 +84,7 @@ fails. Forks are for human-paced (1h) sessions; machine-paced 5m sessions use th
 
 `wake_disposition(kind, payload, task)` returns exactly one of three values. It is consulted by
 both wake paths (the kanban notifier and the owner-wake), after the self-echo suppressor, and
-only for cards where auto-handle resolves to on (§4).
+only for cards at the `boomerang wake` level (§4).
 
 **Precedence: evaluate tiers in this order and stop at the first that matches.** It is not
 first-match over the row list.
@@ -108,7 +108,7 @@ What each return value does downstream:
 
 | Value | Effect |
 |---|---|
-| `auto` | The passive line posts as today, tagged `[auto-handling…]`. The gateway takes a single-owner claim on `(board, task_id, event_id)` (if the other wake path already holds it, stop). It snapshots the home session, dispatches a boomerang child (fork requested) whose goal is a fixed instruction with the wake text quoted as DATA, writes a ledger entry, and advances the cursor only after dispatch is accepted. The parent's live turn is never interrupted. |
+| `auto` | The passive line posts as today, tagged `[boomerang-waking…]`. The gateway takes a single-owner claim on `(board, task_id, event_id)` (if the other wake path already holds it, stop). It snapshots the home session, dispatches a boomerang child (fork requested) whose goal is a fixed instruction with the wake text quoted as DATA, writes a ledger entry, and advances the cursor only after dispatch is accepted. The parent's live turn is never interrupted. |
 | `surface` | Existing path, unchanged: passive line + wake turn in the live session. Ace sees it exactly as today (INV-5). |
 | `none` | Existing path, unchanged. No child, no claim. The merge pass owns the event. |
 
@@ -120,59 +120,65 @@ Each `auto` row may carry `mode: fork|summary` (default `fork`, subject to §2 e
 (D-6, AC-4b).
 
 Retries (D-13): a crash-class event gets one automatic retry. The count is persisted per card in
-`kanban_auto_handle.json` (`retries[task_id]`), survives restarts, and resets when the card
+`kanban_boomerang_wake.json` (`retries[task_id]`), survives restarts, and resets when the card
 reaches `completed`/`archived` or when Ace surfaces-and-acts on it. The second occurrence
 surfaces.
 
-## 4. Turning auto-handle on and off
+## 4. The boomerang wake level
 
-**Default: OFF everywhere (D-15).** Apollo enables it by judgment, per card or per session. This
-is an experiment; default-on is revisited only on measured data.
+A card has one subscription level, and it is the only setting. There is no config knob, no
+session `/autohandle` toggle and no board default (Ace 2026-10-22, t_7be18632).
 
-**Resolution order at wake time** (tri-state resolved to a bool before any truthiness check):
-
-1. `card.auto_handle`, if set (`true` or `false`). Set with `kanban_create` / `kanban_update`
-   `auto_handle: bool`.
-2. else the home session's setting: `/autohandle on|off|status` in that session (stored in
-   session metadata, read on every wake, so cards already owned by the session follow a change).
-3. else the board default.
-4. else `false`.
-
-Example: card `auto_handle` unset + home session `/autohandle on` → auto-handle applies.
-
-**Kill switches** (config, read every notifier tick, no restart; INV-7):
-
-| Key | Default | Effect when `false` |
+| Level a person sees | Delivery mode on the waker row | What a wake does |
 |---|---|---|
-| `delegation.boomerang.auto_handle_enabled` | `false` | Disables auto-handle (P3) fleet-wide. Every wake surfaces as today, whatever the card/session/board say. Both this AND the resolved card value must be true for auto-handle to run. |
-| `delegation.boomerang.fork_enabled` | on (unset = forks allowed) | Disables fork mode (P2). Every boomerang, including auto-handle children, runs `summary`; logs `reason=fork_enabled`. |
+| `notify` | `notify` | Passive line only. |
+| `wake` | `notify+wake` / `wake` | Passive line + a turn in the subscribed session. |
+| `boomerang wake` | `notify+wake` / `wake` (+ `tasks.boomerang_wake = 1`) | Mechanical events go to a background boomerang child (§3 `auto`); everything else wakes as `wake`. |
 
-Scope: auto-handle is armed for the `default` (Apollo) profile only (spec §2).
+`tasks.boomerang_wake` holds the level (`kanban show` prints `level: boomerang wake`). Set it with
+`hermes kanban create --boomerang-wake`, `kanban edit <id> --boomerang-wake` /
+`--no-boomerang-wake`, `kanban notify-subscribe <id> --boomerang-wake` (= `--delivery-mode
+notify+boomerang`), or the `kanban_create` tool's `boomerang_wake: true`. The level lives only
+on the card: subscription rows stay `notify+wake` / `wake` (the request values `notify+boomerang` /
+`boomerang` are stored as those), so a gateway that predates the level still wakes on them. A
+boomerang request sets the card level only once the requesting chat holds the wake.
+
+Until the gateway restarts onto this code, cards at level `boomerang wake` are handled by the OLD
+path: every wake surfaces to the home session as a plain `wake`.
+
+**Emergency stop** (read every notifier tick, no restart; INV-7):
+
+| Switch | Default | Effect |
+|---|---|---|
+| file `<HERMES_HOME>/state/boomerang-wake.disabled` | absent (on) | Present: no card is boomerang-woken; every wake surfaces as `wake`. One #logs line on each on/off transition. `touch` to stop, `rm` to resume. |
+| `delegation.boomerang.fork_enabled` | on (unset = forks allowed) | Disables fork mode (P2). Every boomerang, including boomerang-wake children, runs `summary`; logs `reason=fork_enabled`. |
+
+Scope: boomerang wake is armed for the `default` (Apollo) profile only (spec §2).
 
 ## 5. Lines you will see in the origin chat
 
-**`[auto-handled] <card> — <Outcome>`**
-One line per auto-handled wake, rendered from the child's structured handoff (Outcome / Changed
+**`[boomerang-wake] <card> — <Outcome>`**
+One line per boomerang-wake child, rendered from the child's structured handoff (Outcome / Changed
 / Commands-validation / Blockers), with expandable detail (D-7, INV-6). What to do: read it; act
 only if the Outcome is wrong. If the child did something that needed you, revert it and treat it
-as a mis-disposition (it counts against the D-15 default-on threshold).
+as a mis-disposition (it counts as a mis-disposition).
 
-**`[auto-handling…]`**
-The passive event line for a wake that went to a child. A matching `[auto-handled]` or `⚠️` line
+**`[boomerang-waking…]`**
+The passive event line for a wake that went to a child. A matching `[boomerang-wake]` or `⚠️` line
 follows. What to do: nothing yet.
 
-**`⚠️ auto-handle failed for <card>: <reason>`**
+**`⚠️ boomerang-wake failed <card>: <reason>`**
 Child dispatch raised, or the child crashed or timed out. The original wake is re-delivered to
 the home session as a normal surfaced wake (INV-6). What to do: handle the surfaced wake as you
-would any wake. If the same card keeps producing this, set `auto_handle: false` on it.
+would any wake. If the same card keeps producing this, `kanban edit <card> --no-boomerang-wake`.
 
-**`⚠️ auto-handle lost <card> (reason: gateway restart|timeout)`**
+**`⚠️ boomerang-wake lost <card> (reason: gateway restart|timeout)`**
 The reconciler (§5.7) found a claimed entry whose child died (gateway restart) or ran past its
 `max_minutes` (default 45); in the timeout case it cancelled the child first (bounded 60 s wait).
 The original wake is re-surfaced through the normal path, once. What to do: handle the surfaced
 wake. Re-surfacing happens at most once per entry; after that it is an ordinary wake.
 
-**`[auto-handle cancelled; ignored]`**
+**`[boomerang-wake cancelled; ignored]`**
 A handoff that arrived from a child after the reconciler cancelled it. It is tagged and not
 rendered in the origin chat. What to do: nothing; the re-surfaced wake is the live one.
 
@@ -181,7 +187,7 @@ rendered in the origin chat. What to do: nothing; the re-surfaced wake is the li
 A boomerang child, fork or summary, runs inside the delegated-child kanban fence
 (`hermes_cli/kanban_db.py::_assert_not_delegated_child_mutation`). It opens board DBs read-only,
 and its only write is a comment tagged ` (subagent)`, which the review machinery treats as
-machine-written. So an auto-handle child cannot complete, send back, re-dispatch or approve
+machine-written. So a boomerang-wake child cannot complete, send back, re-dispatch or approve
 anything itself.
 
 Instead, the child ends its final message with ONE verdict block:
@@ -193,7 +199,7 @@ Instead, the child ends its final message with ONE verdict block:
 <<<END-VERDICT>>>
 ```
 
-The gateway's executor (`gateway/kanban_auto_handle.py::execute_verdict`) does at most ONE
+The gateway's executor (`gateway/kanban_boomerang_wake.py::execute_verdict`) does at most ONE
 board write for it:
 
 - **Accept only a real verdict.** The block must be the only one in the child's final message,
@@ -209,15 +215,15 @@ board write for it:
   the claim, nothing is written and the wake is re-surfaced (`reason: state moved`). Moved means a
   newer event other than the child's own comment, a status change, or a new PR head. Redispatch
   goes to the card's current assignee only.
-- **Signed as a machine.** Every write carries `operator_kind: machine`, `via: auto-handle` and the
-  `delegation_id`, and every comment starts with `[auto-handle]`. The review machinery
+- **Signed as a machine.** Every write carries `operator_kind: machine`, `via: boomerang-wake` and the
+  `delegation_id`, and every comment starts with `[boomerang-wake]`. The review machinery
   (hermes-home `scripts/lib/operator_identity.py` / `our_authors.py`) therefore never reads an
   executor write as a human hold.
 - **Crash-safe.** The state goes `executing` → write → `terminal`. After a restart, the reconciler
-  counts only the executor's own `auto_handle_executed` receipt as proof the write happened.
+  counts only the executor's own `boomerang_wake_executed` receipt (or a pre-rename `auto_handle_executed` one) as proof the write happened.
   Quoted text never counts.
 
-Anything rejected writes nothing. You see the `⚠️ auto-handle failed <card>: <reason>` line, and
+Anything rejected writes nothing. You see the `⚠️ boomerang-wake failed <card>: <reason>` line, and
 the original wake is re-surfaced.
 
 **Residual (accepted):** the fence is cooperative scoping, not confinement. A full-toolset fork
@@ -226,7 +232,7 @@ before v2; D-19 does not claim a hard boundary.
 
 Log lines (`logs/agent.log`, from `tools.delegate_tool`): `boomerang.fork_ineligible reason=…`,
 `boomerang.fork served_by=… read_share=…`. In `logs/gateway.log`:
-`kanban notifier: auto-handled <card> disposition=…`.
+`kanban notifier: boomerang-wake <card> disposition=…`.
 
 ## Decisions cited
 

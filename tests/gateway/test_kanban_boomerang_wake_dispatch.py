@@ -3,7 +3,7 @@
 Spec ``plans/2026-10-18_boomerang-fork-autowake-spec.md`` §5.5 / §5.7 / §5.8, INV-5/6/7,
 AC-12 / AC-13 / AC-14 / AC-15. Every dispatch test drives ONE real notifier tick (its tail
 runs the owner-wake tick and the reconciler) against a temp board and a real
-``SessionStore``; the child itself is a seam (``kanban_auto_handle.run_entry`` /
+``SessionStore``; the child itself is a seam (``kanban_boomerang_wake.run_entry`` /
 ``run_child`` / ``parent_resolver``), PR health is a dict (no GitHub).
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ import time
 import pytest
 from types import SimpleNamespace
 
-from gateway import kanban_auto_handle as ah
+from gateway import kanban_boomerang_wake as ah
 from gateway import kanban_home_route as hr
 from gateway import kanban_owner_wake as ow
 from gateway.config import GatewayConfig, Platform
@@ -48,10 +48,13 @@ class Adapter:
 
 
 def _config(on: bool) -> None:
-    from hermes_constants import get_hermes_home
-
-    (get_hermes_home() / "config.yaml").write_text(
-        f"delegation:\n  boomerang:\n    auto_handle_enabled: {'true' if on else 'false'}\n")
+    """The emergency stop file (no config knob): absent = on."""
+    stop = ah.stop_file_path()
+    if on:
+        stop.unlink(missing_ok=True)
+    else:
+        stop.parent.mkdir(parents=True, exist_ok=True)
+        stop.write_text("")
 
 
 @pytest.fixture
@@ -90,6 +93,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(ah, "run_entry", fake_run_entry)
     monkeypatch.setattr(ah, "_INFLIGHT", {})
     monkeypatch.setattr(ah, "_alive", lambda key: key in alive)
+    monkeypatch.setattr(ah, "_LAST_ENABLED", {})
+    monkeypatch.setattr(ah, "post_logs", lambda text: None)
     _config(True)
     return {"group": group, "adapter": adapter, "runner": runner, "health": health,
             "monkeypatch": monkeypatch, "dispatched": dispatched, "alive": alive}
@@ -122,7 +127,7 @@ def _tick(env) -> list:
 def _card(env, *, auto=True, title="card", **kw) -> str:
     with kb.connect_closing() as conn:
         return kb.create_task(conn, title=title, assignee="worker", session_id=env["group"].session_id,
-                              auto_handle=auto, **kw)
+                              boomerang_wake=auto, **kw)
 
 
 def _sub(tid):
@@ -148,7 +153,7 @@ def _red(env, pr, head="a" * 40):
 
 
 def _claims() -> dict:
-    return ah.AutoHandleState().claims()
+    return ah.BoomerangWakeState().claims()
 
 
 def _writes(tid) -> tuple:
@@ -236,7 +241,7 @@ def test_dispatch_raising_posts_warning_and_surfaces_the_wake(env):
     _worker_close(tid)
     turns = _tick(env)
     assert len(turns) == 1 and tid in turns[0].text
-    assert any(s.startswith(f"⚠️ auto-handle failed {tid}") for s in env["adapter"].sent), env["adapter"].sent
+    assert any(s.startswith(f"⚠️ boomerang-wake failed {tid}") for s in env["adapter"].sent), env["adapter"].sent
     assert [c["state"] for c in _claims().values()] == [ah.STATE_TERMINAL]
     with kb.connect_closing() as conn:
         sub = kbn.list_notify_subs(conn, notifier_profiles={"default"}, include_unowned=True)
@@ -259,8 +264,8 @@ def test_kill_switch_flipped_between_ticks_next_tick_surfaces(env):
 
 @pytest.mark.slow_test(180, reason="two full notifier+owner-wake ticks on real boards")
 def test_switch_off_both_paths_byte_identical_to_an_unflagged_card(env):
-    """With auto_handle_enabled=false an opted-in card produces exactly the lines and turns of
-    a card that never opted in (snapshot of both wake paths)."""
+    """With the stop file present a boomerang-wake card produces exactly the lines and turns of
+    a card that never set the level (snapshot of both wake paths)."""
     _config(False)
     out = {}
     for flag in (True, None):
@@ -300,7 +305,7 @@ def _claimed_entry(env, tid, row="completed", kind="completed", **extra) -> dict
     assert asyncio.run(go())
     entry = env["dispatched"][-1]
     if extra:
-        entry = ah.AutoHandleState().update_claim(entry["key"], **extra)
+        entry = ah.BoomerangWakeState().update_claim(entry["key"], **extra)
     return entry
 
 
@@ -321,16 +326,16 @@ def _run(env, entry, status, final):
     """The real dispatched task with a fake child (parent + child are the seams)."""
     env["monkeypatch"].setattr(ah, "parent_resolver", lambda *_a, **_k: _resolved())
     env["monkeypatch"].setattr(ah, "run_child", lambda parent, goal, mode: (status, final))
-    asyncio.run(_REAL_RUN_ENTRY(env["runner"], entry, ah.AutoHandleState()))
+    asyncio.run(_REAL_RUN_ENTRY(env["runner"], entry, ah.BoomerangWakeState()))
 
 
-def test_child_handoff_renders_one_auto_handled_line(env):
+def test_child_handoff_renders_one_boomerang_wake_line(env):
     tid = _card(env)
     _worker_close(tid)
     entry = _claimed_entry(env, tid)
     _run(env, entry, "completed", _verdict(entry, "complete", summary="verified: PR merged, tests green"))
-    lines = [s for s in env["adapter"].sent if s.startswith("[auto-handled]")]
-    assert lines and lines[0].splitlines()[0] == f"[auto-handled] {tid} — verified: PR merged, tests green"
+    lines = [s for s in env["adapter"].sent if s.startswith("[boomerang-wake]")]
+    assert lines and lines[0].splitlines()[0] == f"[boomerang-wake] {tid} — verified: PR merged, tests green"
     assert env["adapter"].handled == []
 
 
@@ -339,9 +344,9 @@ def test_child_crash_posts_warning_and_resurfaces_the_wake(env):
     _worker_close(tid)
     entry = _claimed_entry(env, tid)
     _run(env, entry, "failed", "rate_limit")
-    assert any(s.startswith(f"⚠️ auto-handle failed {tid}: child failed") for s in env["adapter"].sent)
+    assert any(s.startswith(f"⚠️ boomerang-wake failed {tid}: child failed") for s in env["adapter"].sent)
     assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
-    assert ah.AutoHandleState().get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
+    assert ah.BoomerangWakeState().get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
 
 
 def test_goal_quotes_the_wake_as_data_with_the_nonce(env):
@@ -384,11 +389,11 @@ def test_ac15b_valid_verdict_writes_once_signed_as_machine(env):
     cr = [e for e in evs if e.kind == "changes_requested"]
     assert len(cr) == 1 and cr[0].payload["operator_kind"] == "machine"
     rec = [e for e in evs if e.kind == ah.RECEIPT_KIND]
-    assert len(rec) == 1 and rec[0].payload["via"] == "auto-handle" \
+    assert len(rec) == 1 and rec[0].payload["via"] == "boomerang-wake" \
         and rec[0].payload["delegation_id"] == entry["delegation_id"] and rec[0].payload["operator_kind"] == "machine"
     ours = [c for c in comments if c.author == ah.AUTHOR]
-    assert ours and all(c.body.startswith("[auto-handle]") for c in ours)
-    assert ah.AutoHandleState().get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
+    assert ours and all(c.body.startswith("[boomerang-wake]") for c in ours)
+    assert ah.BoomerangWakeState().get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
 
 
 @pytest.mark.parametrize("case", [
@@ -414,7 +419,7 @@ def test_ac15c_zero_writes(env, case):
         "moved_head": good,
     }[case]
     if case == "block_only_in_wake":
-        entry = ah.AutoHandleState().update_claim(entry["key"], wake_text=good)
+        entry = ah.BoomerangWakeState().update_claim(entry["key"], wake_text=good)
     if case == "aba":   # sent back and re-handed-back since the claim: same status, newer events
         with kb.connect_closing() as conn, kb.write_txn(conn), \
                 kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
@@ -436,7 +441,7 @@ def test_ac15d_crash_after_write_reconciler_marks_terminal_without_resurface(env
     _kill(env, entry)
     n = asyncio.run(ah.reconcile(env["runner"]))
     assert n == 0 and env["adapter"].handled == []
-    assert ah.AutoHandleState().get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
+    assert ah.BoomerangWakeState().get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
 
 
 def test_ac15d_crash_before_write_subagent_quote_does_not_count(env):
@@ -445,7 +450,7 @@ def test_ac15d_crash_before_write_subagent_quote_does_not_count(env):
                            state=ah.STATE_EXECUTING)
     with kb.connect_closing() as conn:
         kb.add_comment(conn, tid, "worker (subagent)",
-                       f'via: "auto-handle" operator_kind: "machine" delegation_id {entry["delegation_id"]}')
+                       f'via: "boomerang-wake" operator_kind: "machine" delegation_id {entry["delegation_id"]}')
     _kill(env, entry)
     assert asyncio.run(ah.reconcile(env["runner"])) == 1
     assert len(env["adapter"].handled) == 1
@@ -472,7 +477,7 @@ def test_ac15d3_matrix_keys_on_the_claim_time_row(env):
         kb._append_event(conn, tid, "crashed", {"error": "boom"})  # noqa: SLF001
     entry = _claimed_entry(env, tid, row="crash_first_occurrence", kind="crashed")
     for _ in range(3):   # the counter moved past MAX_AUTO_RETRIES since the claim
-        ah.AutoHandleState().bump_retry(tid)
+        ah.BoomerangWakeState().bump_retry(tid)
     assert not ah.execute_verdict(entry, _verdict(entry, "complete"))["ok"]
     res = ah.execute_verdict(entry, _verdict(entry, "retry"))
     assert res["ok"], res
@@ -496,23 +501,23 @@ def test_reconciler_dead_child_resurfaced_once(env, caplog):
     _worker_close(tid)
     entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
     _kill(env, entry)
-    with caplog.at_level("INFO", logger="gateway.kanban_auto_handle"):
+    with caplog.at_level("INFO", logger="gateway.kanban_boomerang_wake"):
         assert asyncio.run(ah.reconcile(env["runner"])) == 1
         assert asyncio.run(ah.reconcile(env["runner"])) == 0
     assert [r.getMessage() for r in caplog.records if " lost reason=" in r.getMessage()] == [
-        f"kanban auto-handle: {tid} lost reason=gateway restart resurfaced delivered=True "
+        f"kanban boomerang-wake: {tid} lost reason=gateway restart resurfaced delivered=True "
         f"delegation={entry['delegation_id']}"]
     assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
-    assert [s for s in env["adapter"].sent if "auto-handle lost" in s] == [
-        f"⚠️ auto-handle lost {tid} (reason: gateway restart)"]
-    assert ah.AutoHandleState().get_claim(entry["key"])["resurfaced"] is True
+    assert [s for s in env["adapter"].sent if "boomerang-wake lost" in s] == [
+        f"⚠️ boomerang-wake lost {tid} (reason: gateway restart)"]
+    assert ah.BoomerangWakeState().get_claim(entry["key"])["resurfaced"] is True
 
 
 def test_ac14_live_child_past_max_cancelled_first_late_handoff_dropped(env):
     tid = _card(env)
     _worker_close(tid)
     entry = _claimed_entry(env, tid)
-    ah.AutoHandleState().update_claim(entry["key"], claimed_at=time.time() - 46 * 60)
+    ah.BoomerangWakeState().update_claim(entry["key"], claimed_at=time.time() - 46 * 60)
     order: list = []
     release = threading.Event()
 
@@ -540,7 +545,7 @@ def test_ac14_live_child_past_max_cancelled_first_late_handoff_dropped(env):
     mp.setattr(ah, "resurface", resurface)
 
     async def scenario():
-        state = ah.AutoHandleState()
+        state = ah.BoomerangWakeState()
         ah._INFLIGHT[entry["key"]] = asyncio.ensure_future(_REAL_RUN_ENTRY(env["runner"], entry, state))
         await asyncio.sleep(0.2)
         assert await ah.reconcile(env["runner"], cancel_wait_s=5) == 1
@@ -549,14 +554,14 @@ def test_ac14_live_child_past_max_cancelled_first_late_handoff_dropped(env):
 
     asyncio.run(scenario())
     assert order[0] == "cancel" and order.index("child-exit") < order.index("resurface"), order
-    assert not any(s.startswith("[auto-handled]") for s in env["adapter"].sent), env["adapter"].sent
-    assert [s for s in env["adapter"].sent if "auto-handle lost" in s] == [
-        f"⚠️ auto-handle lost {tid} (reason: timeout)"]
+    assert not any(s.startswith("[boomerang-wake]") for s in env["adapter"].sent), env["adapter"].sent
+    assert [s for s in env["adapter"].sent if "boomerang-wake lost" in s] == [
+        f"⚠️ boomerang-wake lost {tid} (reason: timeout)"]
     with kb.connect_closing() as conn:
         assert not any(e.kind == ah.RECEIPT_KIND for e in kb.list_events(conn, tid))
 
 
-# --- wake load gate (smoke 2026-10-19: a box idling above the band never auto-handled) ---------
+# --- wake load gate (smoke 2026-10-19: a box idling above the band never boomerang-woken) ---------
 
 
 def _gate(env, tmp_path, *, load: float, lane=None, axis="load1", cpu=None):
@@ -570,7 +575,7 @@ def _gate(env, tmp_path, *, load: float, lane=None, axis="load1", cpu=None):
         state_file=tmp_path / "wake_gate.json", **kw)
 
 
-def test_cpu_axis_contention_alone_does_not_stop_the_auto_handle_child(env, tmp_path):
+def test_cpu_axis_contention_alone_does_not_stop_the_boomerang_wake_child(env, tmp_path):
     """The DEFAULT host axis is measured cpu busy (t_0e52c7ab): its reason is `host cpu N% busy`,
     and it must exempt an auto child exactly like the load1 band does."""
     _gate(env, tmp_path, load=71.0, axis="cpu", cpu=0.99)
@@ -582,7 +587,7 @@ def test_cpu_axis_contention_alone_does_not_stop_the_auto_handle_child(env, tmp_
     assert [e["task_id"] for e in env["dispatched"]] == [tid] and turns == []
 
 
-def test_host_load_alone_does_not_stop_the_auto_handle_child(env, tmp_path):
+def test_host_load_alone_does_not_stop_the_boomerang_wake_child(env, tmp_path):
     """Above the host band the session's wake is a notify, but the child still dispatches: it
     replaces that wake turn, so downgrading it saves nothing."""
     _gate(env, tmp_path, load=71.0)
@@ -595,7 +600,7 @@ def test_host_load_alone_does_not_stop_the_auto_handle_child(env, tmp_path):
     assert any("(notify: host load 71)" in s for s in env["adapter"].sent), env["adapter"].sent
 
 
-def test_capped_lane_still_stops_the_auto_handle_child(env, tmp_path):
+def test_capped_lane_still_stops_the_boomerang_wake_child(env, tmp_path):
     """A capped lane is a real cost for the child too: no dispatch, the line posts as a notify."""
     _gate(env, tmp_path, load=10.0, lane="lane prov-x capped")
     tid = _card(env)
@@ -608,7 +613,7 @@ def test_capped_lane_still_stops_the_auto_handle_child(env, tmp_path):
 
 def test_failed_dispatch_under_host_load_stays_a_notify(env, tmp_path):
     """INV-6 at load: a raised dispatch posts the warning; the wake it falls back to is still
-    downgraded (a notify, no session turn), exactly as without auto-handle."""
+    downgraded (a notify, no session turn), exactly as without boomerang wake."""
     def boom(*_a, **_k):
         raise OSError("ledger disk full")
 
@@ -619,7 +624,7 @@ def test_failed_dispatch_under_host_load_stays_a_notify(env, tmp_path):
     _worker_close(tid)
     turns = _tick(env)
     assert turns == []
-    assert any(s.startswith(f"⚠️ auto-handle failed {tid}") for s in env["adapter"].sent), env["adapter"].sent
+    assert any(s.startswith(f"⚠️ boomerang-wake failed {tid}") for s in env["adapter"].sent), env["adapter"].sent
 
 
 def test_unflagged_card_under_host_load_is_unchanged(env, tmp_path):
@@ -730,8 +735,7 @@ def test_row_knob_off_restores_todays_rows(answered_env):
 
     env = answered_env
     (get_hermes_home() / "config.yaml").write_text(
-        "delegation:\n  boomerang:\n    auto_handle_enabled: true\n"
-        "kanban:\n  auto_handle_rows:\n    review_all_answered: false\n")
+        "kanban:\n  boomerang_wake_rows:\n    review_all_answered: false\n")
     _answered_handback(env, 3203, [f"prism-verdict: {KEY_A} fixed {ANSWERED_HEAD}",
                                    f"prism-verdict: {KEY_B} by-design advisory"])
     _tick(env)
@@ -760,7 +764,7 @@ def test_all_answered_handled_verdict_writes_only_the_receipt(answered_env):
     tid = _answered_handback(env, 3205, [f"prism-verdict: {KEY_A} fixed {ANSWERED_HEAD}",
                                          f"prism-verdict: {KEY_B} by-design advisory"])
     _tick(env)
-    entry = ah.AutoHandleState().get_claim(env["dispatched"][0]["key"])
+    entry = ah.BoomerangWakeState().get_claim(env["dispatched"][0]["key"])
     with kb.connect_closing() as conn:   # the child's own step-2/3 comments do not read as "state moved"
         kb.add_comment(conn, tid, "apollo", f"prism-verdict: {KEY_A} fixed {ANSWERED_HEAD}")
     res = ah.execute_verdict(entry, _verdict(entry, "handled", summary="verdicts + coverage posted, queued"))

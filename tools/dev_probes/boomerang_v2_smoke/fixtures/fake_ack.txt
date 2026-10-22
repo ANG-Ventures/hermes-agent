@@ -1,4 +1,4 @@
 fork_enabled=false
-auto_handle_enabled=false
+boomerang_wake=disabled
 restart
 restore

@@ -638,12 +638,6 @@ gateway:
     channel_not_joined: "Bir ses kanalında değilim."
     channel_left: "Ses kanalından ayrıldım."
     transcript_echo: "**[Ses]** <@{user}>: {text}"
-  autohandle:
-    status: "🪃 Auto-handle for this session: **{value}** ({source}). Cards homed here with no card-level flag follow it."
-    set: "🪃 Auto-handle **{value}** for this session: mechanical kanban wakes on cards homed here go to a background boomerang child; judgment events still surface. A card's own auto_handle flag wins."
-    usage: "Usage: `/autohandle on|off|status`"
-    unavailable: "No session to store the auto-handle setting on yet; send a message first."
-    save_failed: "Couldn't save the auto-handle setting for this session."
   yolo:
     disabled: "⚠️ Bu oturumda YOLO modu **KAPALI** — tehlikeli komutlar onay gerektirecek."
     enabled: "⚡ Bu oturumda YOLO modu **AÇIK** — tüm komutlar otomatik onaylanır. Dikkatli kullanın."
@@ -1723,8 +1717,6 @@ slash:
     description: "Odak görünümünü aç/kapat — yalnızca isteminizi ve son yanıtı göster"
   footer:
     description: "Son yanıtlarda gateway çalışma zamanı meta veri altbilgisini aç/kapat"
-  autohandle:
-    description: "Auto-handle mechanical kanban wakes for cards homed in this session (on/off/status)"
   yolo:
     description: "YOLO modunu aç/kapat (tüm tehlikeli komut onaylarını atla)"
   approvals:

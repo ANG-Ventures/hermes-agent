@@ -1663,6 +1663,10 @@ DEFAULT_CONFIG = {
         # Max continuation turns before auto-pause (/goal resume) — guards against judge false
         # negatives and unbounded spend.
         "max_turns": 20,
+        # Gateway: a turn whose tool calls were all reads (or none: a NO_REPLY, a page answered in
+        # chat) and that the user did not author queues no continuation; the idle check-in is the
+        # next nudge. True restores a continuation after every judged-continue turn.
+        "nudge_on_read_only_turns": False,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially
@@ -2477,11 +2481,11 @@ DEFAULT_CONFIG = {
         "needs_input_pager": True,
         # Also page a card parked as `dependency` on a parent that is blocked.
         "needs_input_pager_dependency": False,
-        # Per-row kill switches for Boomerang auto-handle disposition rows, on top
-        # of delegation.boomerang.auto_handle_enabled (t_6e9f48cc).
+        # Per-row kill switches for boomerang wake disposition rows, on top of the
+        # state/boomerang-wake.disabled stop file (t_6e9f48cc, t_7be18632).
         # review_all_answered: an own-repo review handback whose text answers every
         # open Prism key forks a child to post the lines, coverage and enqueue.
-        "auto_handle_rows": {"review_all_answered": True},
+        "boomerang_wake_rows": {"review_all_answered": True},
         # "platform:chat_id" (e.g. "discord:1480525090331561984"). When set,
         # the notifier posts done / ready-for-review / blocked lines there
         # instead of the subscriber's chat; the wake still goes to the

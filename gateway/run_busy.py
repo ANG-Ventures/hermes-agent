@@ -931,7 +931,6 @@ class GatewayBusySessionMixin:
         "kanban", "subgoal", "heartbeat", "busy", "yolo", "verbose", "footer", "help",
         "commands", "profile", "login", "update", "version",
         "overview",   # fork-only (t_66ffcd4f): handler in gateway/slash_commands.py
-        "autohandle",  # fork-only (Boomerang v2 D-15): gateway/slash_commands_autohandle.py
     )
     # Dispatched only on the idle path (busy dispatch has its own allowlist).
     _IDLE_COMMANDS = (

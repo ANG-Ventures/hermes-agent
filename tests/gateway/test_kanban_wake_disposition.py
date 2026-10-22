@@ -1,8 +1,8 @@
-"""Boomerang v2 P3a judgment gate (spec §5.4, INV-5, AC-6, AC-13, D-13, D-15).
+"""Boomerang v2 P3a judgment gate (spec §5.4, INV-5, AC-6, AC-13, D-13).
 
-``wake_disposition`` must never auto-handle a judgment event, must let card tags beat every
+``wake_disposition`` must never boomerang-wake a judgment event, must let card tags beat every
 kind row, and must leave a green/pending own-repo handback to the merge pass. Retries persist
-in ``kanban_auto_handle.json`` across a restart.
+in ``kanban_boomerang_wake.json`` across a restart.
 """
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ import json
 import pytest
 
 from gateway import kanban_owner_wake as ow
-from gateway.kanban_auto_handle import AutoHandleState, state_path
+from gateway.kanban_boomerang_wake import BoomerangWakeState, state_path
 from gateway.kanban_wake_disposition import (
-    AUTO, NONE, SURFACE, classify, resolve_auto_handle, wake_disposition,
+    AUTO, NONE, SURFACE, classify, resolve_boomerang_wake, wake_disposition,
 )
 
 # ``kanban_watchers`` defines ``_WAKE_KINDS`` inside the notifier tick, so it is not importable
@@ -91,7 +91,7 @@ def test_every_owner_wake_reason_is_dispositioned(trigger):
 
 @pytest.mark.parametrize("payload_extra", [{}, {"reason": "x"}, {"own_repo": True, "pr_state": "red"}])
 @pytest.mark.parametrize("retries", [0, 1, 5])
-@pytest.mark.parametrize("card", [PLAIN, {"title": "t", "body": "auto_handle: on"}, None])
+@pytest.mark.parametrize("card", [PLAIN, {"title": "t", "body": "boomerang_wake: on"}, None])
 def test_needs_input_surfaces_always(payload_extra, retries, card):
     payload = {"kind": "needs_input", **payload_extra}
     assert wake_disposition("blocked", payload, card, retries=retries) == SURFACE
@@ -180,53 +180,47 @@ def test_auto_rows_default_to_fork_mode():
         assert classify(kind, {}, PLAIN).mode == "fork"
 
 
-# --- D-15 tri-state ------------------------------------------------------------------
+# --- D-A: the card is the only setting ------------------------------------------------
 
 
-@pytest.mark.parametrize("card,session,board,expected", [
-    (None, True, None, True),       # card null + session on -> True
-    (False, True, None, False),     # card false + session on -> False
-    (None, None, None, False),      # all null -> False
-    (True, False, False, True),
-    (None, False, True, False),     # session beats board
-    (None, None, True, True),       # board default when session unset
-    ({"auto_handle": None}, "on", None, True),
-    ({"auto_handle": False}, "on", True, False),
-    (None, "garbage", None, False),
+@pytest.mark.parametrize("card,expected", [
+    (None, False), (False, False), (True, True), (1, True), (0, False),
+    ({"boomerang_wake": None}, False), ({"boomerang_wake": True}, True),
+    ({"boomerang_wake": False}, False), ("true", True), ("garbage", False),
 ])
-def test_resolve_auto_handle_tri_state(card, session, board, expected):
-    assert resolve_auto_handle(card, session, board) is expected
+def test_resolve_boomerang_wake_reads_only_the_card(card, expected):
+    assert resolve_boomerang_wake(card) is expected
 
 
 # --- retry state ---------------------------------------------------------------------
 
 
 def test_retries_persist_across_restart_and_reset_on_completed(tmp_path):
-    path = tmp_path / "gateway" / "kanban_auto_handle.json"
-    first = AutoHandleState(path)
+    path = tmp_path / "gateway" / "kanban_boomerang_wake.json"
+    first = BoomerangWakeState(path)
     assert first.retries("t_a") == 0
     assert first.bump_retry("t_a") == 1
     first.bump_retry("t_b")
 
-    restarted = AutoHandleState(path)          # simulated gateway restart: fresh object, same file
+    restarted = BoomerangWakeState(path)          # simulated gateway restart: fresh object, same file
     assert restarted.retries("t_a") == 1
     assert wake_disposition("crashed", {}, PLAIN, retries=restarted.retries("t_a")) == SURFACE
 
     assert restarted.observe_event("t_a", "review_requested") is False
     assert restarted.observe_event("t_a", "completed") is True
-    assert AutoHandleState(path).retries("t_a") == 0
-    assert AutoHandleState(path).retries("t_b") == 1
+    assert BoomerangWakeState(path).retries("t_a") == 0
+    assert BoomerangWakeState(path).retries("t_b") == 1
     assert restarted.observe_event("t_b", "archived") is True
     assert json.loads(path.read_text())["retries"] == {}
-    assert not list(path.parent.glob(".auto-handle-*")), "temp file left behind"
+    assert not list(path.parent.glob(".boomerang-wake-*")), "temp file left behind"
 
 
 def test_retry_state_preserves_unknown_keys_and_lives_under_hermes_home(tmp_path):
     path = state_path()
-    assert path.name == "kanban_auto_handle.json" and path.parent.name == "gateway"
+    assert path.name == "kanban_boomerang_wake.json" and path.parent.name == "gateway"
     p = tmp_path / "s.json"
     p.write_text(json.dumps({"claims": {"k": 1}, "retries": {"t_x": "2"}}))
-    st = AutoHandleState(p)
+    st = BoomerangWakeState(p)
     assert st.retries("t_x") == 2
     st.bump_retry("t_x")
     data = json.loads(p.read_text())

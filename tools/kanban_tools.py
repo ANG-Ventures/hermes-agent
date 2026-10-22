@@ -492,7 +492,7 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override reasoning_effort completion_contract last_failure_error auto_handle".split())
+    "provider_override reasoning_effort completion_contract last_failure_error boomerang_wake".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override "
@@ -1421,9 +1421,9 @@ def _handle_create(args: dict, **kw) -> str:
             reasoning_effort=reasoning_effort,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
-            # Boomerang v2 D-15: absent = NULL (inherit), never coerced to False.
-            auto_handle=(None if args.get("auto_handle") is None
-                         else _parse_bool_arg(args, "auto_handle")),
+            # Subscription level "boomerang wake": absent = NULL (not boomerang).
+            boomerang_wake=(None if args.get("boomerang_wake") is None
+                            else _parse_bool_arg(args, "boomerang_wake")),
             initial_status=str(args.get("initial_status") or "running"),
             # Fan-out brake: worker-created cards park per kanban.worker_created_status.
             forced_status=_worker_policy.resolve_park_status(
@@ -1446,7 +1446,9 @@ def _handle_create(args: dict, **kw) -> str:
         return _ok(task_id=new_tid, **landed, **gate,
                    subscribed=_maybe_auto_subscribe(
                        conn, new_tid,
-                       wake=args.get("wake") if isinstance(args.get("wake"), bool) else None),
+                       # boomerang wake is a wake level: it always subscribes as a waker.
+                       wake=(True if _parse_bool_arg(args, "boomerang_wake")
+                             else args.get("wake") if isinstance(args.get("wake"), bool) else None)),
                    **({"assignee_remapped": assignee_remap} if assignee_remap else {}),
                    **({"near_duplicates": dup_warning.get("duplicates", [])} if dup_warning else {}),
                    **({"scope_warning": scope_warning} if scope_warning else {}))
@@ -1534,12 +1536,15 @@ def _maybe_auto_subscribe(conn: Any, task_id: str, *, wake: Optional[bool] = Non
     """Subscribe the calling session to completion/block events; True iff a row was
     written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
     ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
-    True). Failures are logged and swallowed: bookkeeping must never fail kanban_create."""
-    try:
-        if not cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True):
-            return False
-    except Exception:
-        pass  # unreadable config keeps the user-friendly default (True)
+    True); an explicit ``wake=True`` (boomerang wake implies it) is a request, not
+    bookkeeping, and bypasses that gate (Prism 2ddacd377db2). Failures are logged and
+    swallowed: bookkeeping must never fail kanban_create."""
+    if wake is not True:
+        try:
+            if not cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True):
+                return False
+        except Exception:
+            pass  # unreadable config keeps the user-friendly default (True)
     return subscribe_calling_session(conn, task_id, wake=wake)
 
 
@@ -1560,10 +1565,14 @@ def subscribe_calling_session(
             return False  # CLI / cron / test — no persistent channel
         from hermes_cli import kanban_db_notify as _kbn
         # Inheritance and explicit subscriptions already encode the delivery policy.
-        # Auto-subscribe must not turn a passive destination into an agent wake.
-        if any(sub["platform"] == target["platform"] and sub["chat_id"] == target["chat_id"]
-               and (sub["thread_id"] or "") == (target["thread_id"] or "")
-               for sub in _kbn.list_notify_subs(conn, task_id)):
+        # Auto-subscribe must not turn a passive destination into an agent wake; an
+        # explicit ``wake=True`` (boomerang wake implies it) does, through the same
+        # one-waker claim (Prism 2ddacd377db2).
+        mine = [sub for sub in _kbn.list_notify_subs(conn, task_id)
+                if sub["platform"] == target["platform"] and sub["chat_id"] == target["chat_id"]
+                and (sub["thread_id"] or "") == (target["thread_id"] or "")]
+        if mine and not (wake is True and target["delivery_mode"] in _kbn.NOTIFY_WAKE_MODES
+                         and all(s["delivery_mode"] not in _kbn.NOTIFY_WAKE_MODES for s in mine)):
             return True
         _kbn.add_notify_sub(conn, task_id=task_id, takeover=takeover, **target)
         return True

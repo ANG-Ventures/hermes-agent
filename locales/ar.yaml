@@ -638,12 +638,6 @@ gateway:
     channel_not_joined: "لست في قناة صوتية."
     channel_left: "خرجت من القناة الصوتية."
     transcript_echo: "**[صوت]** <@{user}>: {text}"
-  autohandle:
-    status: "🪃 Auto-handle for this session: **{value}** ({source}). Cards homed here with no card-level flag follow it."
-    set: "🪃 Auto-handle **{value}** for this session: mechanical kanban wakes on cards homed here go to a background boomerang child; judgment events still surface. A card's own auto_handle flag wins."
-    usage: "Usage: `/autohandle on|off|status`"
-    unavailable: "No session to store the auto-handle setting on yet; send a message first."
-    save_failed: "Couldn't save the auto-handle setting for this session."
   yolo:
     disabled: "⚠️ وضع YOLO **مُعطّل** لهذه الجلسة — ستتطلّب الأوامر الخطيرة موافقة."
     enabled: "⚡ وضع YOLO **مُفعّل** لهذه الجلسة — كل الأوامر مُوافق عليها تلقائيًا. استخدمه بحذر."
@@ -1723,8 +1717,6 @@ slash:
     description: "تبديل عرض التركيز — إظهار مطالبتك والرد النهائي فقط"
   footer:
     description: "تبديل تذييل بيانات وقت التشغيل للبوّابة في الردود النهائية"
-  autohandle:
-    description: "Auto-handle mechanical kanban wakes for cards homed in this session (on/off/status)"
   yolo:
     description: "تبديل وضع YOLO (تخطّي كل موافقات الأوامر الخطيرة)"
   approvals:

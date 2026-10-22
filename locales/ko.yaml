@@ -638,12 +638,6 @@ gateway:
     channel_not_joined: "음성 채널에 참여하고 있지 않아요."
     channel_left: "음성 채널에서 나갔어요."
     transcript_echo: "**[음성]** <@{user}>: {text}"
-  autohandle:
-    status: "🪃 Auto-handle for this session: **{value}** ({source}). Cards homed here with no card-level flag follow it."
-    set: "🪃 Auto-handle **{value}** for this session: mechanical kanban wakes on cards homed here go to a background boomerang child; judgment events still surface. A card's own auto_handle flag wins."
-    usage: "Usage: `/autohandle on|off|status`"
-    unavailable: "No session to store the auto-handle setting on yet; send a message first."
-    save_failed: "Couldn't save the auto-handle setting for this session."
   yolo:
     disabled: "⚠️ 이 세션에서 YOLO 모드 **꺼짐** — 위험한 명령은 승인이 필요합니다."
     enabled: "⚡ 이 세션에서 YOLO 모드 **켜짐** — 모든 명령이 자동 승인됩니다. 주의해서 사용하세요."
@@ -1723,8 +1717,6 @@ slash:
     description: "포커스 보기 전환 — 내 프롬프트와 최종 응답만 표시"
   footer:
     description: "최종 답변의 게이트웨이 런타임 메타데이터 푸터 전환"
-  autohandle:
-    description: "Auto-handle mechanical kanban wakes for cards homed in this session (on/off/status)"
   yolo:
     description: "YOLO 모드 전환 (모든 위험 명령 승인 건너뛰기)"
   approvals:

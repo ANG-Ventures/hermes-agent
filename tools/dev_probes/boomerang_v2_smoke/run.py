@@ -15,6 +15,7 @@ override so the test path runs on fakes:
   BV2_GATEWAY_LOG    gateway log                          (default: <root>/logs/gateway.log)
   BV2_GATEWAY_ENV    .env holding DISCORD_BOT_TOKEN       (default: <root>/.env)
   BV2_CONFIG         config.yaml, or a dir of stage<N>.yaml snapshots (fake)
+  BV2_STOP_FILE      boomerang-wake stop file, or a dir of stage<N>.disabled markers (fake)
   BV2_WIRELOG_DIR    relay wire capture root              (default: ~/.claude-wirelog)
   BV2_ACK_FILE       ack file Apollo appends to           (default: <scratch>/bv2-smoke.ack)
   BV2_ACK_CMD        scripted acker argv prefix: run as `<cmd> <token>`, does the action, exit 0
@@ -66,20 +67,20 @@ _DASH = r"\s*[-\u2013\u2014]\s*"
 _WARN = r"(?:\u26a0\ufe0f?|warning)\s*"
 
 
-def re_auto_handled_line(card: str) -> re.Pattern:
-    return re.compile(r"\[auto-handled\]\s*" + re.escape(card) + _DASH + r"(?P<outcome>\S.*)")
+def re_boomerang_wake_line(card: str) -> re.Pattern:
+    return re.compile(r"\[boomerang-wake\]\s*" + re.escape(card) + _DASH + r"(?P<outcome>\S.*)")
 
 
 def re_failed_line(card: str) -> re.Pattern:
-    return re.compile(_WARN + r"auto-handle failed\s+(?:for\s+)?" + re.escape(card) + r":\s*(?P<reason>\S.*)")
+    return re.compile(_WARN + r"boomerang-wake failed\s+(?:for\s+)?" + re.escape(card) + r":\s*(?P<reason>\S.*)")
 
 
 def re_lost_line(card: str) -> re.Pattern:
-    return re.compile(_WARN + r"auto-handle lost\s+(?:for\s+)?" + re.escape(card) + r"\b(?P<rest>.*)")
+    return re.compile(_WARN + r"boomerang-wake lost\s+(?:for\s+)?" + re.escape(card) + r"\b(?P<rest>.*)")
 
 
 def re_notifier_line(card: str) -> re.Pattern:
-    return re.compile(r"kanban notifier: auto-handled " + re.escape(card) + r" disposition=(?P<disp>[a-z_]+)")
+    return re.compile(r"kanban notifier: boomerang-wake " + re.escape(card) + r" disposition=(?P<disp>[a-z_]+)")
 
 
 RE_FORK_INELIGIBLE = re.compile(r"boomerang\.fork_ineligible reason=(?P<reason>[A-Za-z0-9_]+)")
@@ -393,9 +394,9 @@ class Ctx:
             rep.notes.append(f"board_create exit {rc} (an existing board is fine)")
         self.board_ready = True
 
-    def make_card(self, rep: StepReport, role: str, title: str, auto_handle: bool = True) -> str:
+    def make_card(self, rep: StepReport, role: str, title: str, boomerang_wake: bool = True) -> str:
         """Create one scratch card (unassigned, so the dispatcher never spawns it), subscribe the
-        origin chat with a wake delivery mode, and set auto_handle. Returns the card id."""
+        origin chat with a wake delivery mode, and set its level to boomerang wake. Returns the card id."""
         self.ensure_board(rep)
         rc, out = self.kanban_cmd(rep, "create", title=title)
         if self.live:
@@ -407,10 +408,10 @@ class Ctx:
         rc, _ = self.kanban_cmd(rep, "notify_subscribe", card=card)
         if self.live and rc != 0:   # no subscription = no wake: every negative check would pass vacuously
             raise StepAbort(f"notify_subscribe failed for {card} (exit {rc})")
-        if auto_handle:
-            rc, _ = self.kanban_cmd(rep, "set_auto_handle", card=card)
+        if boomerang_wake:
+            rc, _ = self.kanban_cmd(rep, "set_boomerang_wake", card=card)
             if self.live and rc != 0:
-                raise StepAbort(f"set_auto_handle failed for {card} (exit {rc}); check the flag "
+                raise StepAbort(f"set_boomerang_wake failed for {card} (exit {rc}); check the flag "
                                 f"name in {self.plan['_path']} against P4's kanban CLI")
         rep.notes.append(f"card `{role}` = `{card}`")
         return card
@@ -418,7 +419,7 @@ class Ctx:
     def force(self, rep: StepReport, key: str, **vals: str) -> None:
         """Run a FORCING kanban transition; abort the step if it fails (Prism 7d1bf9b6fa33).
 
-        A negative check ("no auto-handle within one tick") trivially passes when the event it
+        A negative check ("no boomerang wake within one tick") trivially passes when the event it
         waits on was never generated, so a failed transition is an abort, never a PASS.
         """
         rc, _ = self.kanban_cmd(rep, key, **vals)
@@ -527,13 +528,13 @@ def find_log(log: GatewayLog, pattern: re.Pattern, after_ts: float | None = None
 # --- step 1: AC-7 / INV-6 ------------------------------------------------------------------------
 
 def step1(ctx: Ctx) -> StepReport:
-    rep = StepReport(1, "auto-handle origin-chat lines (AC-7, INV-5, INV-6)", ctx.mode)
+    rep = StepReport(1, "boomerang-wake origin-chat lines (AC-7, INV-5, INV-6)", ctx.mode)
     t0 = now()
     log = GatewayLog(gateway_log_path(ctx.live), ctx.live)
     chat = make_chat(ctx.live, t0)
     rep.notes.append(f"board `{ctx.board}`; gateway log `{log.path}`; origin chat `{chat.label}`")
 
-    done_card = ctx.make_card(rep, "s1_completed", "bv2 smoke s1: completed -> auto-handled")
+    done_card = ctx.make_card(rep, "s1_completed", "bv2 smoke s1: completed -> boomerang-wake")
     ni_card = ctx.make_card(rep, "s1_needs_input", "bv2 smoke s1: needs_input -> surface")
     # Dry-run evaluates the failure-line assertion against the fake chat even with no fault hook
     # configured (it exercises the matcher); live without a hook reports SKIP, never a fake PASS.
@@ -551,45 +552,45 @@ def step1(ctx: Ctx) -> StepReport:
     if inject:
         # AC-7 live fault (t_480d08ce): the home stays live and the DISPATCHED child's verdict is
         # refused. A board write by another session after the claim (inject_failure = a kanban
-        # comment) makes the executor's freshness check (kanban_auto_handle._moved) return
+        # comment) makes the executor's freshness check (kanban_boomerang_wake._moved) return
         # "state moved", so run_entry -> _fail posts the warning AND re-surfaces the wake into the
         # live home. Rehoming the card (the old fault) only proved the warning half.
         ctx.force(rep, "complete", card=fail_card)
         fail_dispatch = ctx.poll(lambda: _auto_disp(find_log(log, re_notifier_line(fail_card)), fail_card), win)
-        rep.check(f"failure card {fail_card}: auto-handle child dispatched before the fault",
+        rep.check(f"failure card {fail_card}: boomerang-wake child dispatched before the fault",
                   PASS if fail_dispatch else FAIL, fail_dispatch or f"absent after {win:.0f}s")
         if fail_dispatch:
             ctx.force(rep, "inject_failure", card=fail_card)
 
-    hit = ctx.poll(lambda: find_chat(chat, re_auto_handled_line(done_card)), win)
-    rep.check(f"origin chat: `[auto-handled] {done_card} - <Outcome>`", PASS if hit else FAIL,
+    hit = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(done_card)), win)
+    rep.check(f"origin chat: `[boomerang-wake] {done_card} - <Outcome>`", PASS if hit else FAIL,
               hit.content if hit else f"absent after {win:.0f}s")
     if hit:
         rep.raw.append(f"--- chat match\n{hit.content}")
     line = ctx.poll(lambda: find_log(log, re_notifier_line(done_card)), ctx.tick_window)
     disp = re_notifier_line(done_card).search(line).group("disp") if line else None
-    rep.check(f"gateway log: `kanban notifier: auto-handled {done_card} disposition=auto`",
+    rep.check(f"gateway log: `kanban notifier: boomerang-wake {done_card} disposition=auto`",
               PASS if disp == "auto" else FAIL, line or "absent")
     if line:
         rep.raw.append(f"--- log match\n{line}")
 
-    # needs_input is a judgment event: it must surface, never auto-handle (INV-5).
+    # needs_input is a judgment event: it must surface, never boomerang-wake (INV-5).
     def ni_auto():
-        return find_chat(chat, re_auto_handled_line(ni_card))
+        return find_chat(chat, re_boomerang_wake_line(ni_card))
     neg = ctx.poll(ni_auto, ctx.tick_window)  # live: waits the whole window for a line that must not come
-    rep.check(f"needs_input card {ni_card}: no `[auto-handled]` line", FAIL if neg else PASS,
+    rep.check(f"needs_input card {ni_card}: no `[boomerang-wake]` line", FAIL if neg else PASS,
               neg.content if neg else f"none ({ctx.window_label()})")
     ni_log = find_log(log, re_notifier_line(ni_card))
     ni_disp = re_notifier_line(ni_card).search(ni_log).group("disp") if ni_log else None
     rep.check(f"needs_input card {ni_card}: notifier disposition is not auto",
-              FAIL if ni_disp == "auto" else PASS, ni_log or "no auto-handled log line (surfaced as today)")
+              FAIL if ni_disp == "auto" else PASS, ni_log or "no boomerang-wake log line (surfaced as today)")
 
     if not arm_failure:
-        rep.check(f"failure card {fail_card}: `warning auto-handle failed {fail_card}: <reason>`", SKIP,
+        rep.check(f"failure card {fail_card}: `warning boomerang-wake failed {fail_card}: <reason>`", SKIP,
                   "plan.commands.inject_failure is null: no fault-injection hook configured (README)")
     else:
         warn = ctx.poll(lambda: find_chat(chat, re_failed_line(fail_card)), win)
-        rep.check(f"origin chat: `warning auto-handle failed {fail_card}: <reason>`", PASS if warn else FAIL,
+        rep.check(f"origin chat: `warning boomerang-wake failed {fail_card}: <reason>`", PASS if warn else FAIL,
                   warn.content if warn else f"absent after {win:.0f}s")
         if warn:
             rep.raw.append(f"--- chat match\n{warn.content}")
@@ -607,7 +608,7 @@ def _check_live_resurface(ctx: Ctx, rep: StepReport, log: GatewayLog, chat, card
     reason = re_failed_line(card).search(warn.content).group("reason") if warn else None
     rep.check(f"failure card {card}: warning reason is the injected fault (/{reason_re.pattern}/)",
               PASS if reason and reason_re.search(reason) else FAIL, reason or "no warning line")
-    early = find_chat(chat, re_auto_handled_line(card))
+    early = find_chat(chat, re_boomerang_wake_line(card))
     if early:
         rep.check(f"failure card {card}: fault landed before the verdict", INCOMPLETE,
                   f"`{early.content}` posted: the child finished before inject_failure; re-run "
@@ -694,26 +695,43 @@ def _effective(raw, default: bool) -> bool:
     return default if raw is None else bool(raw)
 
 
-SWITCH_AUTO = "delegation.boomerang.auto_handle_enabled"
 SWITCH_FORK = "delegation.boomerang.fork_enabled"
-# INV-7: auto_handle_enabled defaults false; fork_enabled is the opt-out (unset = forks allowed).
-SWITCH_DEFAULTS = {SWITCH_AUTO: False, SWITCH_FORK: True}
+# INV-7: fork_enabled is the opt-out (unset = forks allowed). Boomerang wake has no config knob:
+# its emergency stop is the file <root>/state/boomerang-wake.disabled (absent = on).
+SWITCH_DEFAULTS = {SWITCH_FORK: True}
+STOP_FILE = "boomerang-wake.disabled"
+
+
+def _stop_present(ctx: Ctx, stage: int) -> bool:
+    """Is the boomerang-wake stop file present at ``stage``? Fake: a dir of
+    ``stage<N>.disabled`` markers (present = that stage has the stop file)."""
+    spec = os.environ.get("BV2_STOP_FILE", "").strip()
+    if spec:
+        path = Path(spec).expanduser()
+    else:
+        path = hermes_root() / "state" / STOP_FILE if ctx.live else FIXTURES / "fake_stop"
+    if path.is_dir():
+        return (path / f"stage{stage}.disabled").exists()
+    return path.exists()
 
 
 def step2(ctx: Ctx) -> StepReport:
     rep = StepReport(2, "kill switches take effect on the next tick (AC-8, INV-7)", ctx.mode)
     log = GatewayLog(gateway_log_path(ctx.live), ctx.live)
     chat = make_chat(ctx.live, rep.started)
-    rep.notes.append("the harness never edits config: it prints each one-line diff for Apollo and "
-                     "waits on the ack file")
+    rep.notes.append("the harness never edits config or the stop file: it prints each one-line "
+                     "change for Apollo and waits on the ack file")
 
     stage = 0
     cfg = _read_config(ctx, stage)
-    pre = {k: _effective(_get(cfg, k), d) for k, d in SWITCH_DEFAULTS.items()}
-    rep.raw.append(f"--- config stage {stage}\n{SWITCH_AUTO}={pre[SWITCH_AUTO]} {SWITCH_FORK}={pre[SWITCH_FORK]}")
-    ok_pre = pre[SWITCH_AUTO] and pre[SWITCH_FORK]
-    rep.check("precondition: auto_handle_enabled=true and fork_enabled=true", PASS if ok_pre else FAIL,
-              f"auto_handle_enabled={pre[SWITCH_AUTO]} fork_enabled={pre[SWITCH_FORK]}")
+    fork_on = _effective(_get(cfg, SWITCH_FORK), SWITCH_DEFAULTS[SWITCH_FORK])
+    bw_on = not _stop_present(ctx, stage)
+    rep.raw.append(f"--- config stage {stage}\nboomerang_wake={'enabled' if bw_on else 'disabled'} "
+                   f"{SWITCH_FORK}={fork_on}")
+    ok_pre = bw_on and fork_on
+    rep.check("precondition: boomerang_wake=enabled (no stop file) and fork_enabled=true",
+              PASS if ok_pre else FAIL,
+              f"boomerang_wake={'enabled' if bw_on else 'disabled'} fork_enabled={fork_on}")
     if not ok_pre:
         return rep
 
@@ -729,7 +747,19 @@ def step2(ctx: Ctx) -> StepReport:
                   f"read {str(got).lower()} (stage {stage})")
         return got == value
 
-    # (a) fork_enabled=false with auto-handle on: the next fork request must downgrade (INV-7 P2 kill).
+    def stop(token: str) -> bool:
+        nonlocal stage
+        action = f"touch <root>/state/{STOP_FILE}"
+        rep.commands.append(f"# APOLLO (manual): {action}   ack: {token}")
+        if not ctx.wait_ack(rep, token, action):
+            return False
+        stage += 1
+        present = _stop_present(ctx, stage)
+        rep.check(f"stop file {STOP_FILE} present after ack", PASS if present else FAIL,
+                  f"present={present} (stage {stage})")
+        return present
+
+    # (a) fork_enabled=false with boomerang wake on: the next fork request must downgrade (INV-7 P2 kill).
     if flip(SWITCH_FORK, False, "fork_enabled=false"):
         t = now()
         card = ctx.make_card(rep, "s2_fork_off", "bv2 smoke s2: fork_enabled=false -> summary")
@@ -744,28 +774,30 @@ def step2(ctx: Ctx) -> StepReport:
             if ctx.live and ts is not None:
                 rep.notes.append(f"fork_enabled: event forced {iso(t)}, downgrade logged {iso(ts)} "
                                  f"({ts - t:.1f}s; tick {ctx.tick:.0f}s)")
-        hit = ctx.poll(lambda: find_chat(chat, re_auto_handled_line(card)), ctx.timeout)
-        rep.check(f"origin chat: `[auto-handled] {card}` still posts (summary-mode child)",
+        hit = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card)), ctx.timeout)
+        rep.check(f"origin chat: `[boomerang-wake] {card}` still posts (summary-mode child)",
                   PASS if hit else FAIL, hit.content if hit else "absent")
 
-    # (b) auto_handle_enabled=false: the next wake on an auto_handle card is NOT auto-handled.
-    if flip(SWITCH_AUTO, False, "auto_handle_enabled=false"):
-        card = ctx.make_card(rep, "s2_auto_off", "bv2 smoke s2: auto_handle_enabled=false -> surface")
+    # (b) the stop file: the next wake on a boomerang-wake card is NOT handled by a child.
+    if stop("boomerang_wake=disabled"):
+        card = ctx.make_card(rep, "s2_auto_off", "bv2 smoke s2: boomerang_wake=disabled -> surface")
         ctx.force(rep, "complete", card=card)
-        neg = ctx.poll(lambda: find_chat(chat, re_auto_handled_line(card)) or
+        neg = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card)) or
                        _auto_disp(find_log(log, re_notifier_line(card)), card), ctx.tick_window)
-        detail = getattr(neg, "content", neg) if neg else f"no auto-handle ({ctx.window_label()})"
-        rep.check(f"card {card}: not auto-handled within one tick of the flip", FAIL if neg else PASS,
+        detail = getattr(neg, "content", neg) if neg else f"no boomerang wake ({ctx.window_label()})"
+        rep.check(f"card {card}: not boomerang-woken within one tick of the stop file", FAIL if neg else PASS,
                   str(detail))
 
-    # restore both (Apollo), verify the config reads the pre-run values again
-    rep.commands.append(f"# APOLLO (manual): restore {SWITCH_FORK}: true and {SWITCH_AUTO}: true   ack: restore")
+    # restore both (Apollo), verify config + stop file read the pre-run values again
+    rep.commands.append(f"# APOLLO (manual): restore {SWITCH_FORK}: true and rm <root>/state/{STOP_FILE}"
+                        "   ack: restore")
     if ctx.wait_ack(rep, "restore", f"config.yaml: restore {SWITCH_FORK}: false -> true and "
-                    f"{SWITCH_AUTO}: false -> true"):
+                    f"rm <root>/state/{STOP_FILE}"):
         stage += 1
         cfg = _read_config(ctx, stage)
-        back = all(_effective(_get(cfg, k), d) for k, d in SWITCH_DEFAULTS.items())
-        rep.check("config restored: both switches true", PASS if back else FAIL, f"stage {stage}")
+        back = (_effective(_get(cfg, SWITCH_FORK), SWITCH_DEFAULTS[SWITCH_FORK])
+                and not _stop_present(ctx, stage))
+        rep.check("restored: fork_enabled=true and no stop file", PASS if back else FAIL, f"stage {stage}")
     return rep
 
 
@@ -1067,19 +1099,19 @@ def step4(ctx: Ctx) -> StepReport:
         ctx.force(rep, "s4_hold", card=card)
     ctx.force(rep, "complete", card=card)
     dispatched = ctx.poll(lambda: _auto_disp(find_log(log, re_notifier_line(card)), card), ctx.timeout)
-    rep.check(f"auto-handle child dispatched for {card} (disposition=auto)", PASS if dispatched else FAIL,
+    rep.check(f"boomerang-wake child dispatched for {card} (disposition=auto)", PASS if dispatched else FAIL,
               dispatched or f"absent after {ctx.timeout:.0f}s")
     if not dispatched:
         return rep
     rep.raw.append(f"--- log match\n{dispatched}")
 
     instr = ("restart the gateway NOW via safe-gateway-restart (single-use approval), while the "
-             f"auto-handle child for {card} is still running")
+             f"boomerang-wake child for {card} is still running")
     rep.commands.append(f"# APOLLO (manual): {instr}   ack: restart")
     if not ctx.wait_ack(rep, "restart", instr):
         return rep
 
-    early = find_chat(chat, re_auto_handled_line(card))
+    early = find_chat(chat, re_boomerang_wake_line(card))
     dispatch_ts = log_line_ts(dispatched)  # a boot line BEFORE the dispatch is not this restart
     restart_line = ctx.poll(lambda: find_log(log, re_restart, after_ts=dispatch_ts), ctx.timeout)
     rep.check("gateway restart observed in the log", PASS if restart_line else FAIL,
@@ -1094,7 +1126,7 @@ def step4(ctx: Ctx) -> StepReport:
     restart_ts = log_line_ts(restart_line)
     if early and (early.ts is None or restart_ts is None or early.ts < restart_ts):
         rep.check("child was still in flight at restart", INCOMPLETE,
-                  f"`[auto-handled] {card}` posted before the restart; the drill did not cut a live child, re-run")
+                  f"`[boomerang-wake] {card}` posted before the restart; the drill did not cut a live child, re-run")
         return rep
 
     re_resurface = re.compile(ctx.plan["expect"]["resurface_log_regex"].format(card=re.escape(card)))
@@ -1117,12 +1149,12 @@ def step4(ctx: Ctx) -> StepReport:
                       f"{lag:.1f}s after `{restart_line[:19]}` (limit {limit:.0f}s = wiring + 5 s initial delay "
                       f"+ one full notifier tick, --first-tick-seconds)")
     lost = ctx.poll(lambda: find_chat(chat, re_lost_line(card)), ctx.tick_window + ctx.tick)
-    rep.check(f"origin chat: `warning auto-handle lost {card} (reason: gateway restart)`",
+    rep.check(f"origin chat: `warning boomerang-wake lost {card} (reason: gateway restart)`",
               PASS if lost else FAIL, lost.content if lost else "absent")
     # Prism b2a4a7e824f7: watch for a stale child's late completion for a FULL tick window after the
     # lost-warning, not a single read; a post one second after the last read must still fail the drill.
-    late = ctx.poll(lambda: find_chat(chat, re_auto_handled_line(card)), ctx.tick_window)
-    rep.check(f"no late `[auto-handled] {card}` within {ctx.window_label()} after the re-surface",
+    late = ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card)), ctx.tick_window)
+    rep.check(f"no late `[boomerang-wake] {card}` within {ctx.window_label()} after the re-surface",
               FAIL if late else PASS, late.content if late else "none")
     return rep
 

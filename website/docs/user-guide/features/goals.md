@@ -183,6 +183,10 @@ Process exits and returned subagent results deliver their own turns, which resum
 
 A goal can carry its own interval (`GoalManager.set_checkin_minutes(n)`; `0` = off for that goal), which overrides `goals.checkin_minutes`. Goals idle for more than 6 hours are never woken. Set `goals.checkin_minutes: 0` to turn idle wakes off. The classic CLI has its own idle hook for parked goals.
 
+### Continuations follow changes, not turns (gateway)
+
+After a turn the user did not author (a kanban wake, a page, a worker result), the gateway queues the next continuation only if that turn had a side effect: at least one write-class tool call (a kanban create/comment/complete/block, a file write, a `git commit`/`push`, a `gh` mutation, a cron change, an unknown tool or shell command). A turn whose tool calls were all reads (`kanban_show`, `read_file`, `git status`, `gh pr view`, a `gh api` GET) or that made none (a NO_REPLY) still gets the judge's done/blocked/wait/budget verdicts, but no continuation; the idle check-in above is the next nudge, and the turn does not count against `max_turns`. A message from you always continues. The table lives in `hermes_cli/goal_turn_effects.py::TOOL_EFFECTS`; `goals.nudge_on_read_only_turns: true` restores a continuation after every judged-continue turn.
+
 ### No-progress stop
 
 If `goals.no_progress_turns` (4) judged-continue turns in a row make no tool call (the agent is only answering the judge), the goal pauses with a `⏸ Goal paused — … without doing anything` notice. `/goal resume` continues it; `0` disables the check.
@@ -252,6 +256,8 @@ goals:
   max_idle_checkins: 3
   # Pause after this many judged-continue turns in a row with no tool call (0 = off).
   no_progress_turns: 4
+  # true = queue a continuation even after a read-only / no-tool turn nobody asked for.
+  nudge_on_read_only_turns: false
 ```
 
 ### Choosing the judge model

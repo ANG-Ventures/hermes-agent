@@ -642,12 +642,6 @@ gateway:
     channel_not_joined: "Not in a voice channel."
     channel_left: "Left voice channel."
     transcript_echo: "**[Voice]** <@{user}>: {text}"
-  autohandle:
-    status: "🪃 Auto-handle for this session: **{value}** ({source}). Cards homed here with no card-level flag follow it."
-    set: "🪃 Auto-handle **{value}** for this session: mechanical kanban wakes on cards homed here go to a background boomerang child; judgment events still surface. A card's own auto_handle flag wins."
-    usage: "Usage: `/autohandle on|off|status`"
-    unavailable: "No session to store the auto-handle setting on yet; send a message first."
-    save_failed: "Couldn't save the auto-handle setting for this session."
   yolo:
     disabled: "⚠️ YOLO mode **OFF** for this session — dangerous commands will require approval."
     enabled: "⚡ YOLO mode **ON** for this session — all commands auto-approved. Use with caution."
@@ -1794,8 +1788,6 @@ slash:
     description: "Toggle focus view — show only your prompt and the final response"
   footer:
     description: "Toggle gateway runtime-metadata footer on final replies"
-  autohandle:
-    description: "Auto-handle mechanical kanban wakes for cards homed in this session (on/off/status)"
   yolo:
     description: "Toggle YOLO mode (skip all dangerous command approvals)"
   approvals:

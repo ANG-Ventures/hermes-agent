@@ -37,7 +37,7 @@ run = _load()
 
 _BV2_VARS = ("BV2_KANBAN_CMD", "BV2_SCRATCH_BOARD", "BV2_HOME_SESSION", "BV2_ORIGIN_CHAT",
              "BV2_GATEWAY_LOG", "BV2_GATEWAY_ENV", "BV2_CONFIG", "BV2_WIRELOG_DIR", "BV2_ACK_FILE",
-             "BV2_EVIDENCE", "BV2_PLAN", "BV2_GATEWAY_PID")
+             "BV2_EVIDENCE", "BV2_PLAN", "BV2_GATEWAY_PID", "BV2_STOP_FILE")
 
 
 @pytest.fixture
@@ -90,20 +90,20 @@ def _copy_fixtures(tmp_path: Path) -> Path:
     return dst
 
 
-def test_step1_fails_when_needs_input_is_auto_handled(env, monkeypatch):
+def test_step1_fails_when_needs_input_is_boomerang_woken(env, monkeypatch):
     fx = _copy_fixtures(env["tmp"])
     with open(fx / "fake_origin_chat.jsonl", "a") as fh:
-        fh.write(json.dumps({"ts": 1792378999.0, "content": "[auto-handled] t_5m0ce002 - closed it"}) + "\n")
+        fh.write(json.dumps({"ts": 1792378999.0, "content": "[boomerang-wake] t_5m0ce002 - closed it"}) + "\n")
     monkeypatch.setenv("BV2_ORIGIN_CHAT", str(fx / "fake_origin_chat.jsonl"))
     assert run.main(["--step", "1", "--dry-run"]) == 1
-    assert "needs_input card t_5m0ce002: no `[auto-handled]` line | FAIL" in env["evidence"].read_text()
+    assert "needs_input card t_5m0ce002: no `[boomerang-wake]` line | FAIL" in env["evidence"].read_text()
 
 
-def test_step1_fails_without_the_auto_handled_line(env, monkeypatch):
+def test_step1_fails_without_the_boomerang_wake_line(env, monkeypatch):
     fx = _copy_fixtures(env["tmp"])
     chat = fx / "fake_origin_chat.jsonl"
     lines = chat.read_text().splitlines()
-    kept = [ln for ln in lines if not json.loads(ln)["content"].startswith("[auto-handled] t_5m0ce001")]
+    kept = [ln for ln in lines if not json.loads(ln)["content"].startswith("[boomerang-wake] t_5m0ce001")]
     assert len(kept) == len(lines) - 1
     chat.write_text("".join(ln + "\n" for ln in kept))
     monkeypatch.setenv("BV2_ORIGIN_CHAT", str(chat))
@@ -116,6 +116,15 @@ def test_step2_fails_when_switch_flip_is_not_visible(env, monkeypatch):
     (fx / "fake_config" / "stage1.yaml").write_text((fx / "fake_config" / "stage0.yaml").read_text())
     monkeypatch.setenv("BV2_CONFIG", str(fx / "fake_config"))
     assert run.main(["--step", "2", "--dry-run"]) == 1
+
+
+def test_step2_fails_when_the_stop_file_is_not_visible(env, monkeypatch):
+    fx = _copy_fixtures(env["tmp"])
+    # Apollo acked `boomerang_wake=disabled` but the stop file never appeared
+    (fx / "fake_stop" / "stage2.disabled").unlink()
+    monkeypatch.setenv("BV2_STOP_FILE", str(fx / "fake_stop"))
+    assert run.main(["--step", "2", "--dry-run"]) == 1
+    assert "stop file boomerang-wake.disabled present after ack | FAIL" in env["evidence"].read_text()
 
 
 def test_step2_fails_without_ack(env, monkeypatch):
@@ -178,12 +187,12 @@ def test_live_requires_home_session_and_origin_chat(env, monkeypatch):
 
 def test_contract_line_matchers_accept_both_spellings():
     card = "t_abc12345"
-    assert run.re_auto_handled_line(card).search(f"[auto-handled] {card} \u2014 Landed #12")
-    assert run.re_auto_handled_line(card).search(f"[auto-handled] {card} - Landed #12")
-    assert not run.re_auto_handled_line(card).search(f"[auto-handled] {card}9 - x")
-    assert run.re_failed_line(card).search(f"\u26a0\ufe0f auto-handle failed for {card}: boom")
-    assert run.re_failed_line(card).search(f"warning auto-handle failed {card}: boom")
-    m = run.re_notifier_line(card).search(f"x kanban notifier: auto-handled {card} disposition=surface")
+    assert run.re_boomerang_wake_line(card).search(f"[boomerang-wake] {card} \u2014 Landed #12")
+    assert run.re_boomerang_wake_line(card).search(f"[boomerang-wake] {card} - Landed #12")
+    assert not run.re_boomerang_wake_line(card).search(f"[boomerang-wake] {card}9 - x")
+    assert run.re_failed_line(card).search(f"\u26a0\ufe0f boomerang-wake failed for {card}: boom")
+    assert run.re_failed_line(card).search(f"warning boomerang-wake failed {card}: boom")
+    m = run.re_notifier_line(card).search(f"x kanban notifier: boomerang-wake {card} disposition=surface")
     assert m and m.group("disp") == "surface"
 
 
@@ -207,9 +216,9 @@ if verb == "create":
 elif verb == "complete":
     card = argv[argv.index("complete") + 1]
     with open(os.environ["BV2_GATEWAY_LOG"], "a") as fh:
-        fh.write(f"{stamp} INFO gateway.kanban_watchers: kanban notifier: auto-handled {card} disposition=auto\n")
+        fh.write(f"{stamp} INFO gateway.kanban_watchers: kanban notifier: boomerang-wake {card} disposition=auto\n")
     with open(os.environ["BV2_ORIGIN_CHAT"], "a") as fh:
-        fh.write(json.dumps({"ts": time.time(), "content": f"[auto-handled] {card} \u2014 verified"}) + "\n")
+        fh.write(json.dumps({"ts": time.time(), "content": f"[boomerang-wake] {card} \u2014 verified"}) + "\n")
 elif verb == "block":
     card = argv[argv.index("block") + 1]
     with open(os.environ["BV2_GATEWAY_LOG"], "a") as fh:
@@ -224,7 +233,7 @@ def test_step1_live_against_fake_gateway_kanban(env, monkeypatch):
     fake = tmp / "fake_kanban.py"
     fake.write_text(FAKE_GATEWAY_KANBAN)
     log = tmp / "gateway.log"
-    log.write_text("2026-10-18 19:00:00,000 INFO kanban notifier: auto-handled t_fa4e0001 disposition=auto\n")
+    log.write_text("2026-10-18 19:00:00,000 INFO kanban notifier: boomerang-wake t_fa4e0001 disposition=auto\n")
     chat = tmp / "chat.jsonl"
     chat.write_text("")
     plan = json.loads((FIXTURES / "plan.json").read_text())
@@ -249,7 +258,7 @@ def test_step1_live_against_fake_gateway_kanban(env, monkeypatch):
     block = next(c for c in calls if "block" in c)
     assert block[block.index("--kind") + 1] == "needs_input"
     # the stale pre-run log line for t_fa4e0001 was not counted: live reads only new log bytes
-    assert "kanban notifier: auto-handled t_fa4e0000 disposition=auto" in text
+    assert "kanban notifier: boomerang-wake t_fa4e0000 disposition=auto" in text
 
 
 # --- Prism round 1 regressions (#2102 @7e312ccc) -------------------------------------------------
@@ -293,8 +302,8 @@ def test_step4_late_completion_is_watched_for_a_full_window(env, monkeypatch):
             seen.append(window)
             return fn()
     src = (HARNESS_DIR / "run.py").read_text()
-    i = src.index("no late `[auto-handled]")
-    assert "ctx.poll(lambda: find_chat(chat, re_auto_handled_line(card)), ctx.tick_window)" in src[i - 400:i]
+    i = src.index("no late `[boomerang-wake]")
+    assert "ctx.poll(lambda: find_chat(chat, re_boomerang_wake_line(card)), ctx.tick_window)" in src[i - 400:i]
 
 
 # --- t_480d08ce: AC-9 positive control (canary) + AC-7 live re-surface fault -----------------------
@@ -374,7 +383,7 @@ def test_step1_fault_without_resurfaced_wake_fails(env, monkeypatch):
     fx = _copy_fixtures(env["tmp"])
     log = fx / "fake_gateway.log"
     keep = [ln for ln in log.read_text().splitlines() if "[kanban] Task t_5m0ce003" not in ln]
-    keep.append("2026-10-18 20:01:31,000 WARNING gateway.kanban_auto_handle: kanban auto-handle: "
+    keep.append("2026-10-18 20:01:31,000 WARNING gateway.kanban_boomerang_wake: kanban boomerang-wake: "
                 "no live home for t_5m0ce003; wake not re-surfaced")
     log.write_text("\n".join(keep) + "\n")
     monkeypatch.setenv("BV2_GATEWAY_LOG", str(log))
@@ -423,12 +432,12 @@ if verb == "create":
 elif verb == "complete":
     card = argv[argv.index("complete") + 1]
     title = open(os.path.join(state, "cards", card)).read()
-    logline(f"gateway.kanban_auto_handle: kanban notifier: auto-handled {card} disposition=auto")
+    logline(f"gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake {card} disposition=auto")
     if "forced child failure" not in title:
-        say(f"[auto-handled] {card} \u2014 verified")
+        say(f"[boomerang-wake] {card} \u2014 verified")
 elif verb == "comment":
     card = argv[argv.index("comment") + 1]
-    say(f"\u26a0\ufe0f auto-handle failed {card}: write refused: state moved")
+    say(f"\u26a0\ufe0f boomerang-wake failed {card}: write refused: state moved")
     logline(f"gateway.run: inbound message: platform=discord user=u chat=c msg='[kanban] Task {card} completed. "
             f"Title: x' reply_to_id=None reply_to_text=''")
 """
@@ -572,7 +581,7 @@ def test_step3_failed_fork_seat_sync_is_not_pass(env, monkeypatch, body, why):
 
 def test_failed_notify_subscribe_aborts_not_passes():
     """Same class, make_card: a subscription that exits non-zero means no wake is ever delivered,
-    so step 1's negative checks would pass vacuously; abort like set_auto_handle does."""
+    so step 1's negative checks would pass vacuously; abort like set_boomerang_wake does."""
     ctx = run.Ctx.__new__(run.Ctx)
     ctx.live = True
     ctx.board_ready = True
