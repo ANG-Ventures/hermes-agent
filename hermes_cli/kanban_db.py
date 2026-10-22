@@ -8684,6 +8684,11 @@ def find_stranded_by_triage(
     return [(r["child"], r["parent"]) for r in rows]
 
 
+# Payload keys whose ``review`` value steers the resume phase; read by
+# :func:`_resume_status_from_events`, stripped from producer sendback payloads.
+RESUME_PHASE_KEYS: tuple[str, ...] = ("resume_status", "retry_status", "source_status")
+
+
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     """``review`` when the newest lifecycle event carries a review
     ``resume_status``/``retry_status``/``source_status``, else ``ready`` (legacy)."""
@@ -8691,7 +8696,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
-        "'unblocked', 'changes_requested', 'status', 'reclaimed', "
+        "'unblocked', 'changes_requested', 'sendback', 'status', 'reclaimed', "
         # 'review_reopened' is historical (verb retired); legacy rows still count.
         "'review_reopened', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', "
@@ -8700,7 +8705,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         (task_id,),
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))
-    for key in ("resume_status", "retry_status", "source_status"):
+    for key in RESUME_PHASE_KEYS:
         if payload.get(key) == "review":
             return "review"
     return "ready"
@@ -13673,42 +13678,15 @@ def _request_review_txn(
             implementer = trow["assignee"]
         reviewer_from_provenance = False
         if reviewer is None:
-            changes_run = conn.execute(
-                "SELECT id FROM task_runs "
-                "WHERE task_id = ? AND outcome = 'changes_requested' "
-                "ORDER BY id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            changes_event = None
-            if changes_run is not None:
-                changes_event = conn.execute(
-                    "SELECT payload FROM task_events "
-                    "WHERE task_id = ? AND run_id = ? "
-                    "AND kind = 'changes_requested' "
-                    "ORDER BY id DESC LIMIT 1",
-                    (task_id, int(changes_run["id"])),
-                ).fetchone()
-            try:
-                changes_payload = (
-                    json.loads(changes_event["payload"])
-                    if changes_event and changes_event["payload"]
-                    else {}
+            prior_reviewer = _latest_review_provenance(conn, task_id)
+            if prior_reviewer is False:
+                return _ret(
+                    False,
+                    "re-review has no durable reviewer provenance (the "
+                    "latest review_requested event's reviewer is missing or "
+                    "malformed); pass reviewer= explicitly",
                 )
-            except (json.JSONDecodeError, TypeError):
-                changes_payload = {}
-            prior_reviewer = (
-                changes_payload.get("reviewer")
-                if isinstance(changes_payload, dict)
-                else None
-            )
-            if changes_run is not None:
-                if not isinstance(prior_reviewer, str) or not prior_reviewer.strip():
-                    return _ret(
-                        False,
-                        "re-review has no durable reviewer provenance (the "
-                        "latest changes_requested event is missing or "
-                        "malformed); pass reviewer= explicitly",
-                    )
+            if prior_reviewer is not None:
                 reviewer = prior_reviewer
                 reviewer_from_provenance = True
         # Validate/resolve at the gate: a review assignee must be spawnable
@@ -13793,19 +13771,21 @@ def _request_review_txn(
     return _ret(True)
 
 
-def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
-    """Reviewer recorded by the latest ``changes_requested`` run's event.
-    ``None`` = first review (no such run); ``False`` = a run exists but its
-    provenance is missing/malformed."""
-    changes_run = conn.execute(
-        "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'changes_requested' "
-        "ORDER BY id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    if changes_run is None:
+def _latest_review_provenance(conn: sqlite3.Connection, task_id: str):
+    """Reviewer of the newest ``review_requested`` event: the ONE source of
+    "who reviews this card" (every review cycle records the resolved reviewer,
+    explicit or inherited). ``None`` = never reviewed, or that cycle resolved
+    no reviewer (unconfigured board); ``False`` = the event exists but its
+    reviewer is missing/blank/malformed."""
+    event = _latest_event(conn, task_id, "review_requested")
+    if event is None:
         return None
-    changes_event = _latest_event(conn, task_id, "changes_requested", changes_run["id"])
-    reviewer = _json_dict(_row_get(changes_event, "payload")).get("reviewer")
+    payload = _json_dict(_row_get(event, "payload"))
+    if "reviewer" not in payload:
+        return False
+    reviewer = payload["reviewer"]
+    if reviewer is None:
+        return None
     return reviewer if isinstance(reviewer, str) and reviewer.strip() else False
 
 
@@ -14376,6 +14356,184 @@ def request_changes(
         except Exception:  # pragma: no cover - never fail the transition
             pass
     return ok, detail
+
+
+# Forge L0 §2.4 ``sendback`` (SB-K). The kernel half only: the producer library
+# (hermes-home ``scripts/lib/sendback.py``) owns dedupe, round counting, the
+# cap and the status line; the kernel records the event and returns the card to
+# its implementer exactly as ``changes_requested`` does.
+SENDBACK_EVENT_KIND = "sendback"
+SENDBACK_SOURCES: tuple[str, ...] = (
+    "ci-red", "prism", "lander", "pre-pr", "conflict", "revert", "prism-postland",
+)
+_SENDBACK_MAX_PAYLOAD_BYTES = 16 * 1024
+_CTX_MAX_SENDBACKS = 5
+
+
+def _sendback_payload_error(payload: Any) -> Optional[str]:
+    """Why ``payload`` is not a §2.4 sendback row, or ``None``."""
+    if not isinstance(payload, dict):
+        return "sendback payload must be a JSON object"
+    for key in ("source", "reason", "summary"):
+        if not _nonblank_str(payload.get(key)):
+            return f"sendback payload needs a non-empty {key!r}"
+    if payload["source"] not in SENDBACK_SOURCES:
+        return f"sendback source must be one of {', '.join(SENDBACK_SOURCES)}"
+    # Only ``retry=after_change`` becomes a sendback (§2.4 retry routing).
+    if payload.get("retry", "after_change") != "after_change":
+        return "only retry=after_change becomes a sendback"
+    try:
+        size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return "sendback payload must be JSON-serialisable"
+    if size > _SENDBACK_MAX_PAYLOAD_BYTES:
+        return f"sendback payload is {size} bytes (max {_SENDBACK_MAX_PAYLOAD_BYTES})"
+    return None
+
+
+def _review_handoff_implementer(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The implementer recorded by the latest ``review_requested``, or ``None``."""
+    requested = _latest_event(conn, task_id, "review_requested")
+    return _nonblank_str(_json_dict(_row_get(requested, "payload")).get("implementer"))
+
+
+@_home_session_guarded("request-changes")
+def request_sendback(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    payload: dict,
+) -> tuple[bool, Optional[str]]:
+    """Send a PR defect straight back to the card's implementer (Forge L0 §2.4).
+
+    Appends ONE ``sendback`` event carrying ``payload`` (the §2.4 row: source,
+    reason, summary, evidence, ...). ``sendback`` is a handoff kind, so the
+    respawn guard and the dispatcher treat it exactly like
+    ``changes_requested``: it lifts ``active_pr`` for one spawn and
+    :func:`build_worker_context` renders the payload into the next prompt.
+
+    Delivery by card state:
+
+    * ``running`` (implementation run) -> the event only; the live worker
+      receives it in flight (the producer steers the session). Second item
+      ``"in_flight"``.
+    * ``ready`` / ``todo`` -> the event is the requeue intent. ``"requeued"``.
+    * ``review`` -> the implementer recorded by the latest ``review_requested``
+      is restored and the card re-gated to ``ready``/``todo``, as a
+      ``changes_requested`` send-back does. ``"requeued"``.
+
+    ``sendback`` is a lifecycle kind for :func:`_resume_status_from_events`:
+    its ``resume_status`` (the implementer phase it set) supersedes an older
+    review resume phase, so a later park/unblock or parent promotion lands
+    ``ready``, not ``review``.
+
+    Refused (nothing written): an active REVIEW run (the reviewer is not the
+    implementer), and every other status (blocked, done, archived, triage,
+    scheduled) -- the producer keeps its current path for those.
+    """
+    err = _sendback_payload_error(payload)
+    if err:
+        return False, err
+    record = dict(redact_review_value(payload))
+    record.setdefault("retry", "after_change")
+    # Handoff provenance and resume phase are the kernel's to record, never
+    # the producer's: strip every alias the resume-phase reader honours.
+    for key in ("implementer", "reviewer", *RESUME_PHASE_KEYS):
+        record.pop(key, None)
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task not found"
+        status = row["status"]
+        if status == "running":
+            retry_status = _retry_status_for_run(conn, task_id, row["current_run_id"])
+            if retry_status == "review":
+                return False, "a review run is active; the reviewer is not the implementer"
+            _append_event(
+                conn, task_id, SENDBACK_EVENT_KIND,
+                {**record, "delivery": "in_flight", "status": status,
+                 "resume_status": retry_status},
+                run_id=row["current_run_id"],
+            )
+            return True, "in_flight"
+        if status in ("ready", "todo"):
+            # A card demoted from review (reopened parent) still names the
+            # reviewer: restore the implementer as the review branch does.
+            implementer = _review_handoff_implementer(conn, task_id)
+            extra: dict = {}
+            if implementer is not None:
+                extra["implementer"] = implementer
+                if row["assignee"] != implementer:
+                    cur = conn.execute(
+                        "UPDATE tasks SET assignee = ? WHERE id = ? AND status = ?",
+                        (implementer, task_id, status),
+                    )
+                    if cur.rowcount != 1:
+                        return False, "task changed during sendback"
+            _append_event(
+                conn, task_id, SENDBACK_EVENT_KIND,
+                {**record, "delivery": "requeued", "status": status,
+                 "resume_status": status, **extra},
+            )
+            return True, "requeued"
+        if status == "review":
+            implementer = _review_handoff_implementer(conn, task_id)
+            if implementer is None:
+                return False, "review handoff has no valid implementer provenance"
+            new_status = _landing_status_after_parents(conn, task_id)
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, assignee = ?, claim_lock = NULL, "
+                "claim_expires = NULL WHERE id = ? AND status = 'review'",
+                (new_status, implementer, task_id),
+            )
+            if cur.rowcount != 1:
+                return False, "task changed during sendback"
+            _append_event(
+                conn, task_id, SENDBACK_EVENT_KIND,
+                {**record, "delivery": "requeued", "status": new_status,
+                 "resume_status": new_status, "implementer": implementer},
+            )
+            return True, "requeued"
+        return False, f"task is {status!r}; a sendback needs running/ready/todo/review"
+
+
+def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+    """Render the newest ``sendback`` events into the worker prompt (§2.4).
+    A sendback older than the latest ``review_requested`` was already answered
+    by that handback and is not replayed."""
+    rows = conn.execute(
+        "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested'), 0) ORDER BY id DESC LIMIT ?",
+        (task_id, SENDBACK_EVENT_KIND, task_id, _CTX_MAX_SENDBACKS),
+    ).fetchall()
+    if not rows:
+        return
+    lines.append("## Send-backs on your PR (newest last)")
+    lines.append(
+        "A producer sent a defect on your PR straight back to you. Fix it and "
+        "push (a new head clears it), or reply `prism-verdict: <id> not-a-bug "
+        "<why>` / `sendback-reply: not-mine <evidence>`."
+    )
+    lines.append("")
+    for r in reversed(rows):
+        p = _json_dict(r["payload"])
+        where = f"{p.get('repo')}#{p.get('pr')}" if p.get("repo") else "(no PR)"
+        head = str(p.get("head") or "")[:12]
+        rnd = f" r{p['round']}" if p.get("round") is not None else ""
+        lines.append(
+            f"### {p.get('source')}: {p.get('reason')}{rnd} on {where}"
+            + (f" @ {head}" if head else "") + f" ({_ctx_stamp(r['created_at'], now)})"
+        )
+        lines.append(_ctx_cap(p.get("summary")))
+        if p.get("evidence"):
+            lines.append("```json")
+            lines.append(_ctx_cap(json.dumps(p["evidence"], ensure_ascii=False, indent=1)))
+            lines.append("```")
+        lines.append("")
 
 
 @_home_session_guarded("requeue")
@@ -16708,6 +16866,9 @@ def _notify_rate_limit_circuit(
 # behind its own checkpoint draft PR (respawn_guarded:active_pr every tick).
 _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
     "changes_requested",
+    # Forge L0 §2.4: a PR producer's send-back to the card's own implementer
+    # (``request_sendback``). Same requeue semantics as ``changes_requested``.
+    "sendback",
     "unblocked",
     # Historical: the reopen-review verb is retired and no longer emits it,
     # but legacy rows still mark an operator requeue.
@@ -20498,6 +20659,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_header(lines, task)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
+    _ctx_sendbacks(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)

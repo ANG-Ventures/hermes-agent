@@ -3448,14 +3448,15 @@ def check_respawn_guard(
         if _kb._unused_operator_intent_after_pr(conn, task_id):
             return None
         # A handoff AFTER the assignee's newest PR comment (operator reassign
-        # to a different profile, reviewer changes_requested, review reopen)
-        # names the profile that must now work on THAT PR — a closer or the
-        # implementer finishing it, not a duplicate implementation (#111910).
+        # to a different profile, reviewer changes_requested, a ``sendback``
+        # from a PR producer (Forge L0 §2.4), review reopen) names the profile
+        # that must now work on THAT PR — a closer or the implementer finishing
+        # it, not a duplicate implementation (#111910).
         # Strictly after: a same-second tie stays guarded (fail closed).
         handoff_events = conn.execute(
             "SELECT kind, payload FROM task_events "
             "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
+            "AND kind IN ('assigned', 'changes_requested', 'sendback', 'review_reopened')",
             (task_id, newest_pr_comment_at),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in handoff_events):

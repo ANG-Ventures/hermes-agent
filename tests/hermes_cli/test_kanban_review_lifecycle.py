@@ -250,12 +250,12 @@ def test_request_review_malformed_provenance_gets_distinct_reason(
         assert covered_request_changes(
             conn, tid, reason="fix", expected_run_id=review.current_run_id,
         ) == (True, "builder")
-        # Corrupt the changes_requested payload so re-review cannot recover
+        # Corrupt the review_requested payload so re-review cannot recover
         # the prior reviewer.
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE task_events SET payload = '{\"reviewer\": 42}' "
-                "WHERE task_id = ? AND kind = 'changes_requested'",
+                "WHERE task_id = ? AND kind = 'review_requested'",
                 (tid,),
             )
         retry = kb.claim_task(conn, tid, claimer="builder:retry")
