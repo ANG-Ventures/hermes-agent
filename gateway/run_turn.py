@@ -4324,7 +4324,6 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
@@ -4348,7 +4347,13 @@ class GatewayTurnMixin:
             )
             adapter = self._delivery_adapter_for(source)
             if adapter and pending_event:
-                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                # The drain already promoted the overflow head into the slot; merging would REPLACE it
+                # (two internal TEXT wakes never merge), losing an accepted wake (t_f36d21e8). Put the
+                # dequeued event back at the head and the slot's occupant back on the overflow front.
+                occupant = adapter._pending_messages.get(session_key)
+                if occupant is not None and occupant is not pending_event:
+                    self._session_state(session_key).conversation.queued_events.insert(0, occupant)
+                adapter._pending_messages[session_key] = pending_event
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
