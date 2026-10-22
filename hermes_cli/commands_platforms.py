@@ -406,8 +406,6 @@ _SLACK_VIA_HERMES_ONLY = frozenset({
     "refine", "review", "pause", "whoami", "platform", "insights", "login",
     # Fork-only commands demoted so the cap never drops help/restart/usage (fork parity set).
     "boomerang", "merge", "resume-handoff",
-    # autohandle: Boomerang v2 D-15 session toggle, set once per session by the operator.
-    "autohandle",
     # overview: the fleet operator's session card overview, used from Discord (t_66ffcd4f).
     "overview"})
 

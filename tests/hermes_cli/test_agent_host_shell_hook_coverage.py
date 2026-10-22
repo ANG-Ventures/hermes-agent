@@ -46,7 +46,7 @@ AGENT_CONSTRUCTION_HOSTS: dict[str, str] = {
     "batch_runner.py": EXEMPT + ": standalone trajectory-generation runner, not a profile agent host",
     "cron/scheduler.py": CRON,
     "docs/boomerang-v2/evidence/qa-output/inv1_probe.py": EXEMPT + ": archived QA probe (#2156) against a scratch home, never imported",
-    "gateway/kanban_auto_handle.py": GATEWAY + "; the auto-handle summary parent runs on the gateway's kanban ticker",
+    "gateway/kanban_boomerang_wake.py": GATEWAY + "; the boomerang-wake summary parent runs on the gateway's kanban ticker",
     "gateway/platforms/api_server.py": GATEWAY,
     "gateway/run_turn.py": GATEWAY,
     "gateway/run_turn_runner.py": GATEWAY,

@@ -20,18 +20,32 @@ if TYPE_CHECKING:
 
 # Notifier reaction to a terminal event: "notify" = passive adapter.send only
 # (default); "notify+wake" = send AND wake the destination agent; "wake" = wake only.
+# These three are the only STORED modes.
 _NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake")
 # Modes that start an agent turn in the subscriber's session.
 NOTIFY_WAKE_MODES = ("notify+wake", "wake")
+# Boomerang wake level (t_7be18632): accepted on a REQUEST only. The level lives on
+# ``tasks.boomerang_wake``; the row is stored as the plain wake mode, so a gateway that
+# predates the level still wakes on it (Apollo F-1: no stored mode an old notifier
+# cannot read).
+BOOMERANG_REQUEST_MODES = {"notify+boomerang": "notify+wake", "boomerang": "wake"}
+
+
+def card_level(boomerang_wake: Any, subs: list) -> str:
+    """The level a person sees on a card: ``boomerang wake`` | ``wake`` | ``notify`` |
+    ``none`` (no subscription)."""
+    if boomerang_wake:
+        return "boomerang wake"
+    if any((s.get("delivery_mode") or "notify") in NOTIFY_WAKE_MODES for s in subs):
+        return "wake"
+    return "notify" if subs else "none"
 # One waker per card (Ace 2026-10-03 13:28, t_74bf5296): a partial UNIQUE
 # index over the wake rows, so a second wake row on a card cannot be written
 # by ANY writer, not only by add_notify_sub's own bookkeeping. api_server is
 # exempt: it has no push channel, its wake self-post IS the delivery (one per
 # origin), so demoting it would deliver nothing.
 ONE_WAKER_INDEX = "idx_notify_one_waker"
-_WAKER_PREDICATE = (
-    "delivery_mode IN ('notify+wake', 'wake') AND platform != 'api_server'"
-)
+_WAKER_PREDICATE = "delivery_mode IN ('notify+wake', 'wake') AND platform != 'api_server'"
 _SCALAR_TYPES = (str, int, float, bool)
 
 # Subscription primary key predicate; every per-row statement below binds
@@ -252,6 +266,25 @@ def _notify_sub_admission(
     ):
         return "keep", others
     return "replace", others
+
+
+def _card_boomerang_wake(conn: sqlite3.Connection, task_id: str) -> bool:
+    row = conn.execute("SELECT boomerang_wake FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return bool(row is not None and row[0])
+
+
+def _set_card_boomerang_wake(conn: sqlite3.Connection, task_id: str, value: bool) -> bool:
+    """Write ``tasks.boomerang_wake`` (caller holds the write txn); True when it changed.
+    Records ``boomerang_wake_set``."""
+    stored = 1 if value else 0
+    row = conn.execute("SELECT boomerang_wake FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return False
+    _kbc.write_card_boomerang_wake(conn, task_id, stored)   # also re-syncs a stale legacy mirror
+    if row[0] == stored:
+        return False
+    _kb._append_event(conn, task_id, "boomerang_wake_set", {"boomerang_wake": bool(value)})  # noqa: SLF001
+    return True
 
 
 def card_waker(
@@ -520,6 +553,8 @@ def add_notify_sub(
                     platform, chat_id,
                 )
                 outcome = "rehomed"
+        wants_boomerang = delivery_mode in BOOMERANG_REQUEST_MODES
+        delivery_mode = BOOMERANG_REQUEST_MODES.get(delivery_mode, delivery_mode)
         requested_mode = (
             delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else None
         )
@@ -542,6 +577,11 @@ def add_notify_sub(
                 thread_id=thread_id or "", notifier_profile=notifier_profile,
                 mode=target_mode, takeover=takeover,
             )
+        # Boomerang wake level: the card column is the one setting. A boomerang request
+        # sets it only once this chat actually holds the wake (Prism 9fe9442a9d4c): a
+        # request downgraded to notify must not change how another chat's wakes run.
+        if wants_boomerang and target_mode in NOTIFY_WAKE_MODES:
+            _set_card_boomerang_wake(conn, task_id, True)
         insert_mode = target_mode
         if requested_mode is not None or (
             existing_mode_row is not None and existing_mode_row["delivery_mode"] != target_mode

@@ -2598,9 +2598,9 @@ class Task:
     origin_host: Optional[str] = None
     # Task whose workspace this card works in (``--workspace-of``, t_6d5bc652).
     workspace_of: Optional[str] = None
-    # Boomerang v2 D-15 tri-state: True/False = the card decides; None = inherit
-    # (home session /autohandle -> board default -> off).
-    auto_handle: Optional[bool] = None
+    # Boomerang wake level (Ace 2026-10-22): True/False = the card's subscription level is
+    # / is not ``boomerang wake``; None = never set (not boomerang). The only setting.
+    boomerang_wake: Optional[bool] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2626,7 +2626,7 @@ class Task:
             pin_sub_fallback=bool(g("pin_sub_fallback")),
             next_eligible_at=g("next_eligible_at"),
             no_worker=bool(g("no_worker")),
-            auto_handle=None if g("auto_handle") is None else bool(g("auto_handle")),
+            boomerang_wake=None if g("boomerang_wake") is None else bool(g("boomerang_wake")),
         )
 
 # Columns every schema version has (KeyError if the SELECT omitted them).
@@ -2895,10 +2895,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- A placement constraint (co-locate via bind_host) and a retention key;
     -- never an owner of the directory. NULL = its own workspace.
     workspace_of         TEXT,
-    -- Boomerang v2 P3 (D-15): may a mechanical wake on this card be handled by an
-    -- auto boomerang child? 1/0 = the card decides; NULL (default) = inherit the
-    -- home session's /autohandle, then the board default, then off.
-    auto_handle          INTEGER
+    -- Boomerang wake level: 1 = mechanical wakes on this card are handled by a
+    -- background boomerang child; 0/NULL = they surface. The card is the only setting.
+    boomerang_wake       INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -6023,7 +6022,7 @@ def create_task(
     i_mean_blocks: bool = False,
     continues: Optional[str] = None,
     workspace_of: Optional[str] = None,
-    auto_handle: Optional[bool] = None,
+    boomerang_wake: Optional[bool] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -6524,7 +6523,7 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort, pin_sub_reason, pin_sub_fallback,
                         goal_mode, goal_max_turns, session_id, completion_contract, brain,
-                        workspace_of, auto_handle
+                        workspace_of, boomerang_wake
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
@@ -6556,7 +6555,7 @@ def create_task(
                         completion_contract,
                         brain,
                         workspace_of,
-                        None if auto_handle is None else (1 if auto_handle else 0),
+                        None if boomerang_wake is None else (1 if boomerang_wake else 0),
                     ),
                 )
                 for pid in parents:
@@ -6565,6 +6564,8 @@ def create_task(
                         "(parent_id, child_id, kind) VALUES (?, ?, ?)",
                         (pid, task_id, parents_kind),
                     )
+                if boomerang_wake is not None:   # mirror into the legacy column (Prism 921e843952a6)
+                    write_card_boomerang_wake(conn, task_id, 1 if boomerang_wake else 0)
                 from hermes_cli import kanban_continuation as _kcont_create
                 if continues:
                     _kcont_create.transfer_workspace(conn, continues, task_id)
@@ -6597,7 +6598,7 @@ def create_task(
                         "provider_override": provider_override,
                         "minted_by": _minted_by(create_origin),
                         **({"brain": brain} if brain else {}),
-                        **({"auto_handle": bool(auto_handle)} if auto_handle is not None else {}),
+                        **({"boomerang_wake": bool(boomerang_wake)} if boomerang_wake is not None else {}),
                         **({"pin_sub_reason": pin_sub_reason,
                             "pin_sub_fallback": bool(pin_sub_fallback)}
                            if pin_sub_reason else {}),
@@ -7030,29 +7031,29 @@ def _set_no_worker_locked(
     return True
 
 
-def set_task_auto_handle(
+def set_task_boomerang_wake(
     conn: sqlite3.Connection,
     task_id: str,
-    value: Optional[bool],
+    value: bool,
     *,
     operator: Optional[str] = None,
 ) -> bool:
-    """Set a card's ``auto_handle`` tri-state (Boomerang v2 D-15): True/False, or None
-    to clear it back to inherit. False for an unknown id. A change records
-    ``auto_handle_set``; writing the current value is a silent no-op."""
-    stored = None if value is None else (1 if value else 0)
+    """Set a card's boomerang wake level on/off. False for an unknown id. A change records
+    ``boomerang_wake_set``; writing the current value is a silent no-op. Subscription rows
+    are untouched: the level lives only on the card (Apollo F-1)."""
+    stored = 1 if value else 0
     with write_txn(conn):
-        row = conn.execute("SELECT auto_handle FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        row = conn.execute("SELECT boomerang_wake FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
             return False
-        if row["auto_handle"] == stored:
+        write_card_boomerang_wake(conn, task_id, stored)   # also re-syncs a stale legacy mirror
+        if row["boomerang_wake"] == stored:
             return True
-        conn.execute("UPDATE tasks SET auto_handle = ? WHERE id = ?", (stored, task_id))
-        payload: dict = {"auto_handle": None if value is None else bool(value)}
+        payload: dict = {"boomerang_wake": bool(value)}
         if operator:
             payload["operator"] = operator
-        _append_event(conn, task_id, "auto_handle_set", payload)
-    notify_task_updated(conn, task_id, ("auto_handle",))
+        _append_event(conn, task_id, "boomerang_wake_set", payload)
+    notify_task_updated(conn, task_id, ("boomerang_wake",))
     return True
 
 
@@ -21503,6 +21504,7 @@ from hermes_cli.kanban_db_connect import (  # noqa: E402
     connect,
     connect_closing,
     init_db,
+    write_card_boomerang_wake,
     write_txn,
 )
 from hermes_cli.kanban_db_workspace import (  # noqa: E402

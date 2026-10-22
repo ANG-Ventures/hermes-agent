@@ -953,7 +953,7 @@
       "gateway/kanban_notify_suppress.py",
       "gateway/kanban_home_route.py",
       "gateway/kanban_wake_disposition.py",
-      "gateway/kanban_auto_handle.py",
+      "gateway/kanban_boomerang_wake.py",
       "gateway/kanban_prism_answers.py",
       "gateway/run_turn.py"
     ],

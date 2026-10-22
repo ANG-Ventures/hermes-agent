@@ -638,12 +638,6 @@ gateway:
     channel_not_joined: "Níl mé i gcainéal gutha."
     channel_left: "D'fhág mé an cainéal gutha."
     transcript_echo: "**[Guth]** <@{user}>: {text}"
-  autohandle:
-    status: "🪃 Auto-handle for this session: **{value}** ({source}). Cards homed here with no card-level flag follow it."
-    set: "🪃 Auto-handle **{value}** for this session: mechanical kanban wakes on cards homed here go to a background boomerang child; judgment events still surface. A card's own auto_handle flag wins."
-    usage: "Usage: `/autohandle on|off|status`"
-    unavailable: "No session to store the auto-handle setting on yet; send a message first."
-    save_failed: "Couldn't save the auto-handle setting for this session."
   yolo:
     disabled: "⚠️ Mód YOLO **AS** don seisiún seo — beidh cead de dhíth d'orduithe contúirteacha."
     enabled: "⚡ Mód YOLO **AR** don seisiún seo — gach ordú ceadaithe go huathoibríoch. Úsáid go cúramach."
@@ -1723,8 +1717,6 @@ slash:
     description: "Scoránaigh amharc fócais — taispeáin do leid agus an freagra deiridh amháin"
   footer:
     description: "Scoránaigh buntásc meiteashonraí am rite an gateway ar fhreagraí deiridh"
-  autohandle:
-    description: "Auto-handle mechanical kanban wakes for cards homed in this session (on/off/status)"
   yolo:
     description: "Scoránaigh mód YOLO (scipeáil gach ceadú ordaithe chontúirtigh)"
   approvals:
