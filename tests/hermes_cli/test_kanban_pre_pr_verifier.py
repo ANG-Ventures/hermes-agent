@@ -73,6 +73,25 @@ def test_refused_pr_blocks_the_handoff_with_the_lander_text(kanban_home, tmp_pat
     assert argv == ["check", "--repo", "o/r", "--pr", "7", "--card", tid, "--worker", "daedalus"]
 
 
+def test_draft_ok_is_passed_to_the_verifier(kanban_home, tmp_path, monkeypatch):
+    """Prism b1fdf6186eca: the audited draft_ok override must reach the verifier, or a draft hand-off can never
+    complete. The stub refuses unless it sees --draft-ok."""
+    calls = tmp_path / "calls.jsonl"
+    script = tmp_path / "landable_stub.py"
+    script.write_text(
+        "import json, sys\n"
+        "open(%r, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "sys.exit(0 if '--draft-ok' in sys.argv else 1)\n" % str(calls))
+    monkeypatch.setenv("KANBAN_PRE_PR_SCRIPT", str(script))
+    monkeypatch.setattr("hermes_cli.kanban_pr_freshness.check", lambda *a, **k: {"prs": [], "draft_override": [PR]})
+    monkeypatch.setattr("hermes_cli.kanban_survivor.preserve", lambda *a, **k: None)
+    with kb.connect() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, summary="ci vehicle", survivor_pr=PR, draft_ok="CI vehicle, left draft")
+        assert "completion_blocked_pre_pr" not in _kinds(conn, tid)
+    assert json.loads(calls.read_text().splitlines()[0])[-1] == "--draft-ok"
+
+
 @pytest.mark.parametrize("rc", [0, 3])
 def test_landable_or_unreadable_proceeds_to_the_open_pr_route(kanban_home, tmp_path, monkeypatch, rc):
     _stub(tmp_path, monkeypatch, rc)
