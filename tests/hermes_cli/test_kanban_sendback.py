@@ -192,8 +192,8 @@ def test_sendback_refusals_write_nothing(kanban_home: SimpleNamespace) -> None:
 def test_rereview_after_sendback_keeps_reviewer_provenance(
     kanban_home: SimpleNamespace, prior_round: bool,
 ) -> None:
-    """Reviewer provenance is read from the newest handoff event of either
-    kind: review -> sendback -> request_review(reviewer=None) re-routes to the
+    """Reviewer provenance is read from the newest review_requested event:
+    review -> sendback -> request_review(reviewer=None) re-routes to the
     original reviewer, with or without an earlier changes_requested round."""
     from tests.kanban_review_helpers import covered_request_changes
 
@@ -217,11 +217,12 @@ def test_rereview_after_sendback_keeps_reviewer_provenance(
                 conn, tid, summary="fixed", expected_run_id=again.current_run_id,
             )
         _tick(kanban_home)
-        # A producer cannot forge handoff provenance.
+        # A producer cannot forge handoff provenance; the kernel records only
+        # the implementer (the reviewer lives on review_requested).
         spoof = _payload(reviewer="mallory", implementer="mallory")
         assert kb.request_sendback(conn, tid, payload=spoof) == (True, "requeued")
         sb = [e for e in kb.list_events(conn, tid) if e.kind == "sendback"][-1]
-        assert (sb.payload["reviewer"], sb.payload["implementer"]) == ("human:apollo", "dev")
+        assert sb.payload["implementer"] == "dev" and "reviewer" not in sb.payload
         fix = kb.claim_task(conn, tid)
         assert "## Send-backs on your PR" in kb.build_worker_context(conn, tid)
         _tick(kanban_home)
@@ -232,3 +233,53 @@ def test_rereview_after_sendback_keeps_reviewer_provenance(
         assert rr.payload["reviewer"] == "human:apollo"
         # Answered by that handback: not replayed into the next prompt.
         assert "## Send-backs on your PR" not in kb.build_worker_context(conn, tid)
+
+
+def test_rereview_resolves_newest_review_requested_reviewer(
+    kanban_home: SimpleNamespace,
+) -> None:
+    """changes_requested(reviewer=A) -> request_review(reviewer=B) -> the card
+    leaves review with no handoff (a reopened parent demotes it) -> sendback
+    -> request_review(None) resolves B, the reviewer of the newest review
+    cycle, never A from the older changes_requested event."""
+    from tests.kanban_review_helpers import covered_request_changes
+
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="planner")
+        assert kb.complete_task(conn, parent, result="done")
+        tid = kb.create_task(conn, title="a-then-b", assignee="dev", parents=[parent])
+        claimed = kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="dev", body=f"Opened {PR} for review.")
+        _tick(kanban_home)
+        assert kb.request_review(
+            conn, tid, summary="v1", reviewer="human:alice",
+            expected_run_id=claimed.current_run_id,
+        )
+        rclaim = kb.claim_review_task(conn, tid)
+        assert covered_request_changes(
+            conn, tid, reason="round 1", expected_run_id=rclaim.current_run_id,
+        )[0]
+        again = kb.claim_task(conn, tid)
+        _tick(kanban_home)
+        assert kb.request_review(
+            conn, tid, summary="v2", reviewer="human:bob",
+            expected_run_id=again.current_run_id,
+        )
+        # Parent reopens: the review claim demotes the card to todo, no handoff.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
+        assert kb.claim_review_task(conn, tid) is None
+        assert kb.get_task(conn, tid).status == "todo"
+        _tick(kanban_home)
+        assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        fix = kb.claim_task(conn, tid)
+        assert fix is not None
+        _tick(kanban_home)
+        assert kb.request_review(
+            conn, tid, summary="v3", expected_run_id=fix.current_run_id,
+        )
+        rr = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"][-1]
+        assert rr.payload["reviewer"] == "human:bob"

@@ -13673,12 +13673,12 @@ def _request_review_txn(
             implementer = trow["assignee"]
         reviewer_from_provenance = False
         if reviewer is None:
-            prior_reviewer = _latest_handoff_provenance(conn, task_id)
+            prior_reviewer = _latest_review_provenance(conn, task_id)
             if prior_reviewer is False:
                 return _ret(
                     False,
                     "re-review has no durable reviewer provenance (the "
-                    "latest changes_requested/sendback event is missing or "
+                    "latest review_requested event's reviewer is missing or "
                     "malformed); pass reviewer= explicitly",
                 )
             if prior_reviewer is not None:
@@ -13766,27 +13766,21 @@ def _request_review_txn(
     return _ret(True)
 
 
-def _latest_handoff_provenance(conn: sqlite3.Connection, task_id: str):
-    """Reviewer recorded by the newest review HANDOFF event of either kind:
-    a ``changes_requested`` event of a ``changes_requested`` run, or a
-    ``sendback`` that left ``review`` (only those carry ``reviewer``).
-    ``None`` = first review (no handoff); ``False`` = a handoff exists but
-    its provenance is missing/malformed."""
-    event = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND ("
-        "(kind = 'changes_requested' AND run_id IN (SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'changes_requested')) OR "
-        "(kind = ? AND json_extract(payload, '$.reviewer') IS NOT NULL)"
-        ") ORDER BY id DESC LIMIT 1",
-        (task_id, task_id, SENDBACK_EVENT_KIND),
-    ).fetchone()
+def _latest_review_provenance(conn: sqlite3.Connection, task_id: str):
+    """Reviewer of the newest ``review_requested`` event: the ONE source of
+    "who reviews this card" (every review cycle records the resolved reviewer,
+    explicit or inherited). ``None`` = never reviewed, or that cycle resolved
+    no reviewer (unconfigured board); ``False`` = the event exists but its
+    reviewer is missing/blank/malformed."""
+    event = _latest_event(conn, task_id, "review_requested")
     if event is None:
-        changes_run = conn.execute(
-            "SELECT 1 FROM task_runs WHERE task_id = ? "
-            "AND outcome = 'changes_requested' LIMIT 1", (task_id,),
-        ).fetchone()
-        return False if changes_run is not None else None
-    reviewer = _json_dict(_row_get(event, "payload")).get("reviewer")
+        return None
+    payload = _json_dict(_row_get(event, "payload"))
+    if "reviewer" not in payload:
+        return False
+    reviewer = payload["reviewer"]
+    if reviewer is None:
+        return None
     return reviewer if isinstance(reviewer, str) and reviewer.strip() else False
 
 
@@ -14453,13 +14447,12 @@ def request_sendback(
             )
             return True, "requeued"
         if status == "review":
-            requested = _json_dict(
-                _row_get(_latest_event(conn, task_id, "review_requested"), "payload")
+            requested = _latest_event(conn, task_id, "review_requested")
+            implementer = _nonblank_str(
+                _json_dict(_row_get(requested, "payload")).get("implementer")
             )
-            implementer = _nonblank_str(requested.get("implementer"))
-            reviewer = _nonblank_str(requested.get("reviewer"))
-            if implementer is None or reviewer is None:
-                return False, "review handoff has no valid implementer/reviewer provenance"
+            if implementer is None:
+                return False, "review handoff has no valid implementer provenance"
             new_status = _landing_status_after_parents(conn, task_id)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, assignee = ?, claim_lock = NULL, "
@@ -14471,7 +14464,7 @@ def request_sendback(
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": new_status,
-                 "implementer": implementer, "reviewer": reviewer},
+                 "implementer": implementer},
             )
             return True, "requeued"
         return False, f"task is {status!r}; a sendback needs running/ready/todo/review"
