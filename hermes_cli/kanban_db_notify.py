@@ -280,7 +280,7 @@ def _set_card_boomerang_wake(conn: sqlite3.Connection, task_id: str, value: bool
     row = conn.execute("SELECT boomerang_wake FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None or row[0] == stored:
         return False
-    conn.execute("UPDATE tasks SET boomerang_wake = ? WHERE id = ?", (stored, task_id))
+    _kbc.write_card_boomerang_wake(conn, task_id, stored)
     _kb._append_event(conn, task_id, "boomerang_wake_set", {"boomerang_wake": bool(value)})  # noqa: SLF001
     return True
 

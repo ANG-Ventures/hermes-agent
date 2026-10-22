@@ -1562,10 +1562,14 @@ def subscribe_calling_session(
             return False  # CLI / cron / test — no persistent channel
         from hermes_cli import kanban_db_notify as _kbn
         # Inheritance and explicit subscriptions already encode the delivery policy.
-        # Auto-subscribe must not turn a passive destination into an agent wake.
-        if any(sub["platform"] == target["platform"] and sub["chat_id"] == target["chat_id"]
-               and (sub["thread_id"] or "") == (target["thread_id"] or "")
-               for sub in _kbn.list_notify_subs(conn, task_id)):
+        # Auto-subscribe must not turn a passive destination into an agent wake; an
+        # explicit ``wake=True`` (boomerang wake implies it) does, through the same
+        # one-waker claim (Prism 2ddacd377db2).
+        mine = [sub for sub in _kbn.list_notify_subs(conn, task_id)
+                if sub["platform"] == target["platform"] and sub["chat_id"] == target["chat_id"]
+                and (sub["thread_id"] or "") == (target["thread_id"] or "")]
+        if mine and not (wake is True and target["delivery_mode"] in _kbn.NOTIFY_WAKE_MODES
+                         and all(s["delivery_mode"] not in _kbn.NOTIFY_WAKE_MODES for s in mine)):
             return True
         _kbn.add_notify_sub(conn, task_id=task_id, takeover=takeover, **target)
         return True

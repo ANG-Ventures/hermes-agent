@@ -7046,7 +7046,7 @@ def set_task_boomerang_wake(
             return False
         if row["boomerang_wake"] == stored:
             return True
-        conn.execute("UPDATE tasks SET boomerang_wake = ? WHERE id = ?", (stored, task_id))
+        write_card_boomerang_wake(conn, task_id, stored)
         payload: dict = {"boomerang_wake": bool(value)}
         if operator:
             payload["operator"] = operator
@@ -21502,6 +21502,7 @@ from hermes_cli.kanban_db_connect import (  # noqa: E402
     connect,
     connect_closing,
     init_db,
+    write_card_boomerang_wake,
     write_txn,
 )
 from hermes_cli.kanban_db_workspace import (  # noqa: E402

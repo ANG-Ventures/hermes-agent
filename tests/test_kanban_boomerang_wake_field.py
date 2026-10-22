@@ -99,6 +99,64 @@ def test_migration_copies_legacy_column_and_keeps_rows_old_gateway_readable(kanb
     assert lines == ["kanban migration: boomerang_wake copied from auto_handle on 2 card(s)"], lines
 
 
+def _rewind_to_legacy(values: dict) -> None:
+    raw = sqlite3.connect(kb.kanban_db_path())
+    raw.execute("ALTER TABLE tasks DROP COLUMN boomerang_wake")
+    raw.execute("ALTER TABLE tasks ADD COLUMN auto_handle INTEGER")
+    raw.executemany("UPDATE tasks SET auto_handle = ? WHERE id = ?", [(v, k) for k, v in values.items()])
+    raw.commit()
+    raw.close()
+
+
+def _reopen() -> None:
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+
+def test_late_legacy_write_after_migration_is_copied_on_next_open(kanban_home):
+    """Prism 4158abbc3b1b: pre-update code writing ``auto_handle`` after the first copy is
+    picked up on the next open; a level set by new code survives later opens."""
+    with kbc.connect_closing() as conn:
+        on = kb.create_task(conn, title="on", assignee="peer")
+        other = kb.create_task(conn, title="other", assignee="peer")
+    _rewind_to_legacy({on: 1, other: 1})
+    _reopen()
+    raw = sqlite3.connect(kb.kanban_db_path())
+    raw.execute("UPDATE tasks SET auto_handle = 0 WHERE id = ?", (on,))   # old CLI disable
+    raw.commit()
+    raw.close()
+    _reopen()
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, on).boomerang_wake is False
+        assert kb.set_task_boomerang_wake(conn, other, False)   # new code disable
+    _reopen()
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, other).boomerang_wake is False
+        assert conn.execute("SELECT auto_handle FROM tasks WHERE id = ?", (other,)).fetchone()[0] == 0
+
+
+def test_explicit_boomerang_create_upgrades_inherited_notify_row(kanban_home, monkeypatch):
+    """Prism 2ddacd377db2: a child created with boomerang_wake from a chat the parent only
+    notifies gets that chat's inherited ``notify`` row upgraded to a waker."""
+    from tools import kanban_tools as kt
+
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="p", assignee="peer")
+        _sub(conn, parent, "cA", "notify")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "cA")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "group")
+    child = json.loads(kt._handle_create({"title": "c", "assignee": "peer", "parents": [parent],
+                                          "boomerang_wake": True, "unhomed": True}))
+    plain = json.loads(kt._handle_create({"title": "d", "assignee": "peer", "parents": [parent],
+                                          "unhomed": True}))
+    assert child["ok"] and plain["ok"], (child, plain)
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, child["task_id"]).boomerang_wake is True
+        assert _modes(conn, child["task_id"]) == ["notify+wake"]
+        assert _modes(conn, plain["task_id"]) == ["notify"]   # auto-subscribe stays passive
+
+
 def test_set_level_lives_on_the_card_only(kanban_home):
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="c", assignee="peer")
