@@ -10391,7 +10391,18 @@ def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
         if not isinstance(cfg, dict) or cfg.get("pre_pr") != "on":
             return []
         script = str(root / "scripts" / "lib" / "landable.py")
-    if not os.path.isfile(script):
+    if not os.path.isfile(script) or not refs:
+        return []
+    # The verifier reads GitHub as the card's profile, never as whichever process runs complete_task (a
+    # multiplexed gateway's launch env carries ANOTHER profile's HERMES_HOME and gh login; Prism 3728a4da34a1).
+    # Same seam as the acceptance gate: the assignee's home, its own credentials overlaid. Unresolvable = did
+    # not run (fail-open), never the ambient login.
+    try:
+        from hermes_cli.kanban_pr_acceptance import _assignee_profile_home, _gh_env
+        env = _gh_env(_assignee_profile_home(worker))
+    except Exception as exc:  # noqa: BLE001 -- fail-open
+        _log.warning("pre-PR verifier did not run for %s: profile env for %r unresolvable: %s",
+                     task_id, worker, exc)
         return []
     out = []
     for ref in refs:
@@ -10399,17 +10410,23 @@ def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
                 "--card", task_id, "--worker", worker or "worker", "--draft-ok"]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=180,
-                                  stdin=subprocess.DEVNULL, check=False)
+                                  stdin=subprocess.DEVNULL, check=False, env=env)
         except (OSError, subprocess.SubprocessError) as exc:
             _log.warning("pre-PR verifier %s#%s did not run: %s", ref.repo, ref.number, exc)
             continue
         if proc.returncode != 1:
             continue
-        text = ""
+        # rc 1 is a refusal ONLY when the last stdout line is the verdict JSON ({"landable": false, ...}).
+        # CPython also exits 1 on an uncaught exception; a crashing verifier must fail OPEN (Prism 0b37fb2ab9a0).
         try:
-            text = str(json.loads((proc.stdout or "").strip().splitlines()[-1]).get("text") or "")
-        except (ValueError, IndexError, AttributeError):
-            pass
+            verdict = json.loads((proc.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            verdict = None
+        if not isinstance(verdict, dict) or verdict.get("landable") is not False:
+            _log.warning("pre-PR verifier %s#%s did not run (rc 1, no verdict line): %s", ref.repo, ref.number,
+                         (proc.stderr or proc.stdout or "").strip()[-400:])
+            continue
+        text = str(verdict.get("text") or "")
         out.append((f"{ref.repo}#{ref.number}", text or (proc.stdout or "").strip()[-2000:]))
     return out
 
