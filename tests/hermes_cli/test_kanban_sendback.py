@@ -330,3 +330,55 @@ def test_sendback_to_todo_promotes_to_ready_with_implementer(
         kb.recompute_ready(conn)
         t = kb.get_task(conn, tid)
         assert (t.status, t.assignee) == ("ready", "dev")
+
+
+@pytest.mark.parametrize("alias", ["resume_status", "retry_status", "source_status"])
+def test_sendback_strips_every_resume_phase_alias(
+    kanban_home: SimpleNamespace, alias: str,
+) -> None:
+    """A producer cannot steer the resume phase through any alias the reader
+    honours: todo sendback with ``<alias>=review`` -> parent done -> ready."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="open parent", assignee="planner")
+        tid = kb.create_task(conn, title="forge", assignee="dev", parents=[parent])
+        assert kb.get_task(conn, tid).status == "todo"
+        ok = kb.request_sendback(conn, tid, payload=_payload(**{alias: "review"}))
+        assert ok == (True, "requeued")
+        sb = [e for e in kb.list_events(conn, tid) if e.kind == "sendback"][-1]
+        assert kb.complete_task(conn, parent, result="done")
+        kb.recompute_ready(conn)
+        t = kb.get_task(conn, tid)
+        assert (t.status, t.assignee) == ("ready", "dev")
+        assert all(sb.payload.get(k) != "review" for k in kb.RESUME_PHASE_KEYS)
+
+
+def test_sendback_on_review_demoted_todo_restores_implementer(
+    kanban_home: SimpleNamespace,
+) -> None:
+    """review -> reopened parent demotes to todo (assignee still the reviewer)
+    -> sendback -> parent done -> ready with the implementer as assignee."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="planner")
+        assert kb.complete_task(conn, parent, result="done")
+        tid = kb.create_task(conn, title="demoted", assignee="dev", parents=[parent])
+        claimed = kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="dev", body=f"Opened {PR} for review.")
+        _tick(kanban_home)
+        assert kb.request_review(
+            conn, tid, summary="PR ready", reviewer="argus",
+            expected_run_id=claimed.current_run_id,
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent,))
+        assert kb.claim_review_task(conn, tid) is None
+        t = kb.get_task(conn, tid)
+        assert (t.status, t.assignee) == ("todo", "argus")
+        _tick(kanban_home)
+        assert kb.request_sendback(conn, tid, payload=_payload()) == (True, "requeued")
+        sb = [e for e in kb.list_events(conn, tid) if e.kind == "sendback"][-1]
+        assert sb.payload["implementer"] == "dev"
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+        kb.recompute_ready(conn)
+        t = kb.get_task(conn, tid)
+        assert (t.status, t.assignee) == ("ready", "dev")

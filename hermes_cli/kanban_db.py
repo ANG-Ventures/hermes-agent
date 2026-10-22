@@ -8684,6 +8684,11 @@ def find_stranded_by_triage(
     return [(r["child"], r["parent"]) for r in rows]
 
 
+# Payload keys whose ``review`` value steers the resume phase; read by
+# :func:`_resume_status_from_events`, stripped from producer sendback payloads.
+RESUME_PHASE_KEYS: tuple[str, ...] = ("resume_status", "retry_status", "source_status")
+
+
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     """``review`` when the newest lifecycle event carries a review
     ``resume_status``/``retry_status``/``source_status``, else ``ready`` (legacy)."""
@@ -8700,7 +8705,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         (task_id,),
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))
-    for key in ("resume_status", "retry_status", "source_status"):
+    for key in RESUME_PHASE_KEYS:
         if payload.get(key) == "review":
             return "review"
     return "ready"
@@ -14386,6 +14391,12 @@ def _sendback_payload_error(payload: Any) -> Optional[str]:
     return None
 
 
+def _review_handoff_implementer(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The implementer recorded by the latest ``review_requested``, or ``None``."""
+    requested = _latest_event(conn, task_id, "review_requested")
+    return _nonblank_str(_json_dict(_row_get(requested, "payload")).get("implementer"))
+
+
 @_home_session_guarded("request-changes")
 def request_sendback(
     conn: sqlite3.Connection,
@@ -14425,13 +14436,14 @@ def request_sendback(
         return False, err
     record = dict(redact_review_value(payload))
     record.setdefault("retry", "after_change")
-    # Handoff provenance is the kernel's to record, never the producer's.
-    for key in ("implementer", "reviewer", "resume_status"):
+    # Handoff provenance and resume phase are the kernel's to record, never
+    # the producer's: strip every alias the resume-phase reader honours.
+    for key in ("implementer", "reviewer", *RESUME_PHASE_KEYS):
         record.pop(key, None)
 
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False, "task not found"
@@ -14448,17 +14460,27 @@ def request_sendback(
             )
             return True, "in_flight"
         if status in ("ready", "todo"):
+            # A card demoted from review (reopened parent) still names the
+            # reviewer: restore the implementer as the review branch does.
+            implementer = _review_handoff_implementer(conn, task_id)
+            extra: dict = {}
+            if implementer is not None:
+                extra["implementer"] = implementer
+                if row["assignee"] != implementer:
+                    cur = conn.execute(
+                        "UPDATE tasks SET assignee = ? WHERE id = ? AND status = ?",
+                        (implementer, task_id, status),
+                    )
+                    if cur.rowcount != 1:
+                        return False, "task changed during sendback"
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": status,
-                 "resume_status": status},
+                 "resume_status": status, **extra},
             )
             return True, "requeued"
         if status == "review":
-            requested = _latest_event(conn, task_id, "review_requested")
-            implementer = _nonblank_str(
-                _json_dict(_row_get(requested, "payload")).get("implementer")
-            )
+            implementer = _review_handoff_implementer(conn, task_id)
             if implementer is None:
                 return False, "review handoff has no valid implementer provenance"
             new_status = _landing_status_after_parents(conn, task_id)
