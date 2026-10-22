@@ -509,13 +509,26 @@ def _mutate_and_emit(skill_name: str, action: str, mutator: Callable[[Dict[str, 
         _emit_skill_lifecycle(skill_name, action, record=facts, **hook_kwargs)
 
 
+def _is_curator_read() -> bool:
+    """The curator's own review reads are not use: counting them resets the idle clock the
+    archive ladder reads, so a skill under weekly review never goes idle (t_d91e1d60)."""
+    with suppress(Exception):
+        from tools.skill_ledger import derive_actor
+        return derive_actor() == "curator"
+    return False
+
+
 # --- Counter bumps — telemetry for ALL skills regardless of provenance (observability only) ---
 def bump_view(skill_name: str) -> None:
+    if _is_curator_read():
+        return
     _mutate(skill_name, lambda rec: _bump(rec, "view_count", "last_viewed_at"))
 
 
 def bump_use(skill_name: str, *, task_id: Optional[str] = None, session_id: Optional[str] = None) -> None:
     """Skill actively used (loaded into the prompt path / referenced from an assistant turn)."""
+    if _is_curator_read():
+        return
     def _apply(rec: Dict[str, Any]) -> Dict[str, Any]:
         uses = _non_negative_int(rec.get("use_count"))
         gen = _non_negative_int(rec.get("patch_generation"))

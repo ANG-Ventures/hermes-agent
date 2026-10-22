@@ -613,3 +613,39 @@ def test_skill_file_lock_is_reentrant_in_thread_and_exclusive_across_threads(tmp
         assert not other_done.wait(timeout=0.2), "second thread acquired a held lock"
     t.join(timeout=2)
     assert entered.is_set() and other_done.is_set()
+
+
+@pytest.mark.parametrize("binding", ["review_fork", "curator_actor"])
+def test_curator_review_read_is_not_use_but_agent_view_is(skills_home, monkeypatch, binding):
+    """Regression for t_d91e1d60: a curator pass that views skill X must not move X's
+    last_used_at (the 60/120-day ladder clock); a normal agent skill_view still bumps it."""
+    import tools.skill_usage as usage
+    import tools.skills_tool as skills_tool
+    from tools.skill_ledger import reset_ledger_actor, set_ledger_actor
+    from tools.skill_provenance import (BACKGROUND_REVIEW, reset_current_write_origin,
+                                        set_current_write_origin)
+
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "x-skill")
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_dir)
+    stale = "2026-01-01T00:00:00+00:00"
+    usage.save_usage({"x-skill": {**usage._empty_record(), "use_count": 3, "view_count": 3,
+                                  "last_used_at": stale, "last_viewed_at": stale}})
+
+    # The curator fork runs with write-origin background_review (turn_context binds it from
+    # _memory_write_origin); the curator's own walk binds ledger actor "curator".
+    token = (set_current_write_origin(BACKGROUND_REVIEW) if binding == "review_fork"
+             else set_ledger_actor("curator"))
+    try:
+        assert json.loads(skills_tool._skill_view_with_bump({"name": "x-skill"}))["success"] is True
+    finally:
+        (reset_current_write_origin if binding == "review_fork" else reset_ledger_actor)(token)
+    rec = usage.get_record("x-skill")
+    assert (rec["last_used_at"], rec["use_count"]) == (stale, 3)
+    assert (rec["last_viewed_at"], rec["view_count"]) == (stale, 3)
+    assert usage.latest_activity_at(rec) == stale
+
+    assert json.loads(skills_tool._skill_view_with_bump({"name": "x-skill"}))["success"] is True
+    rec = usage.get_record("x-skill")
+    assert rec["use_count"] == 4 and rec["last_used_at"] != stale
+    assert rec["view_count"] == 4 and rec["last_viewed_at"] != stale
