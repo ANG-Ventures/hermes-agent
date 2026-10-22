@@ -7799,6 +7799,24 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 return _Snowflake(int(_ref_mid))
         return None
 
+    async def _fetch_unresolved_reference(self, message: Any) -> Optional[Any]:
+        """Fetch the replied-to message when Discord sent ``reference.resolved=None`` (uncached).
+        Same-channel references only; any failure (deleted, no access) returns None."""
+        reference = getattr(message, "reference", None)
+        ref_mid = getattr(reference, "message_id", None)
+        channel = getattr(message, "channel", None)
+        fetch = getattr(channel, "fetch_message", None)
+        ref_channel_id = getattr(reference, "channel_id", None)
+        if ref_mid is None or fetch is None or (
+            ref_channel_id is not None and str(ref_channel_id) != str(getattr(channel, "id", ""))
+        ):
+            return None
+        try:
+            return await fetch(int(ref_mid))
+        except Exception:
+            logger.debug("[%s] fetch of replied-to message %s failed", self.name, ref_mid, exc_info=True)
+            return None
+
     async def _handle_message(
         self, message: DiscordMessage, role_authorized: bool = False, *, recovered: bool = False,
     ) -> bool:
@@ -8002,9 +8020,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not _is_dm and self._discord_history_backfill():
             # Backfill on a gap: mention-gated channels, any thread (processing/restart gaps), any
             # reply (hydrate context around the referenced message). DMs/fresh auto-threads: nothing.
+            # A reply forced into a new thread (thread_channels) still backfills from the PARENT
+            # message.channel, where the referenced page lives (Prism 5227f5a709da).
             _has_mention_gap = require_mention and not is_free_channel and not in_bot_thread
             _is_reply = message.reference is not None
-            if (_has_mention_gap or is_thread or _is_reply) and auto_threaded_channel is None:
+            if (_has_mention_gap or is_thread or _is_reply) and (auto_threaded_channel is None or _is_reply):
                 _backfill_text = await self._fetch_channel_context(
                     message.channel, before=message,
                     reply_target=self._reply_target(message.reference) if _is_reply else None,
@@ -8033,11 +8053,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         reply_to_is_own = False
         if message.reference:
             reply_to_id = str(message.reference.message_id)
-            if message.reference.resolved:
-                reply_to_text = getattr(message.reference.resolved, "content", None) or None
+            _ref_msg = message.reference.resolved or await self._fetch_unresolved_reference(message)
+            if _ref_msg:
+                reply_to_text = getattr(_ref_msg, "content", None) or None
                 # Platform-verified authorship of the replied-to message: text is
                 # user-forgeable, the author id is not (t_3ad14889 untrusted menus).
-                _ref_author_id = getattr(getattr(message.reference.resolved, "author", None), "id", None)
+                _ref_author_id = getattr(getattr(_ref_msg, "author", None), "id", None)
                 _own_id = getattr(getattr(self._client, "user", None), "id", None)
                 if _ref_author_id is not None:
                     reply_to_author_id = str(_ref_author_id)
