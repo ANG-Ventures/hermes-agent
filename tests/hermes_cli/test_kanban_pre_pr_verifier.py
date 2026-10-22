@@ -110,6 +110,22 @@ def test_prose_mention_is_not_verified(kanban_home, tmp_path, monkeypatch):
     assert not calls.exists()
 
 
+def test_branch_owned_pr_is_verified(kanban_home, tmp_path, monkeypatch):
+    """Operator send-back on b1fdf6186eca: a PR the card owns by head branch is verified even when the handoff
+    metadata names nothing."""
+    calls = _stub(tmp_path, monkeypatch, 1)
+    with kb.connect() as conn:
+        tid = _card(conn)
+        q = lambda repo, number: {"state": "OPEN", "head_ref": f"daedalus/{tid}-fix"}  # noqa: E731
+        monkeypatch.setattr(op, "_default_query", lambda: q)
+        with pytest.raises(kb.NotLandableError) as err:
+            kb.complete_task(conn, tid, summary="shipped in https://github.com/o/r/pull/7")
+        assert err.value.prs == [PR]
+        assert "completion_blocked_pre_pr" in _kinds(conn, tid)
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "running"
+    assert calls.exists()
+
+
 def test_pre_pr_off_runs_nothing(kanban_home, tmp_path, monkeypatch):
     """No override + pre_pr missing/off in <root>/config/landing-policy.json: no subprocess at all."""
     monkeypatch.delenv("KANBAN_PRE_PR_SCRIPT", raising=False)

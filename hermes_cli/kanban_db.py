@@ -10916,8 +10916,10 @@ def complete_task(
                 _append_event(conn, task_id, "completion_unowned_pr_mentions", {"prs": mentioned})
         if still_open and not review_claimed:
             # Pre-PR verifier (Forge L0 section 2.3 (a), card PRE): the card's OWN fleet PRs only, never a mention.
+            # Own = declared in the handoff OR owned by head-branch provenance (b1fdf6186eca).
             own_keys = {(r.repo.lower(), r.number) for r in _open_pr.split_fleet(_open_pr.extract_pr_refs(
                 metadata=metadata, survivor_pr=survivor_pr))[0]}
+            own_keys |= {(r.repo.lower(), r.number) for r in branch_owned_prs}
             refusals = _pre_pr_refusals(
                 [r for r in still_open if (r.repo.lower(), r.number) in own_keys],
                 task_id=task_id, worker=candidate.assignee or "",
