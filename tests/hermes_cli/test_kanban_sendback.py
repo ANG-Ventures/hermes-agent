@@ -186,3 +186,49 @@ def test_sendback_refusals_write_nothing(kanban_home: SimpleNamespace) -> None:
         assert kb.request_sendback(conn, "t_nope", payload=_payload()) == (False, "task not found")
         for t in (tid, r):
             assert not [e for e in kb.list_events(conn, t) if e.kind == "sendback"]
+
+
+@pytest.mark.parametrize("prior_round", [False, True])
+def test_rereview_after_sendback_keeps_reviewer_provenance(
+    kanban_home: SimpleNamespace, prior_round: bool,
+) -> None:
+    """Reviewer provenance is read from the newest handoff event of either
+    kind: review -> sendback -> request_review(reviewer=None) re-routes to the
+    original reviewer, with or without an earlier changes_requested round."""
+    from tests.kanban_review_helpers import covered_request_changes
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rereview", assignee="dev")
+        claimed = kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="dev", body=f"Opened {PR} for review.")
+        _tick(kanban_home)
+        assert kb.request_review(
+            conn, tid, summary="PR ready", reviewer="human:apollo",
+            expected_run_id=claimed.current_run_id,
+        )
+        if prior_round:
+            rclaim = kb.claim_review_task(conn, tid)
+            assert covered_request_changes(
+                conn, tid, reason="round 1", expected_run_id=rclaim.current_run_id,
+            )[0]
+            again = kb.claim_task(conn, tid)
+            _tick(kanban_home)
+            assert kb.request_review(
+                conn, tid, summary="fixed", expected_run_id=again.current_run_id,
+            )
+        _tick(kanban_home)
+        # A producer cannot forge handoff provenance.
+        spoof = _payload(reviewer="mallory", implementer="mallory")
+        assert kb.request_sendback(conn, tid, payload=spoof) == (True, "requeued")
+        sb = [e for e in kb.list_events(conn, tid) if e.kind == "sendback"][-1]
+        assert (sb.payload["reviewer"], sb.payload["implementer"]) == ("human:apollo", "dev")
+        fix = kb.claim_task(conn, tid)
+        assert "## Send-backs on your PR" in kb.build_worker_context(conn, tid)
+        _tick(kanban_home)
+        assert kb.request_review(
+            conn, tid, summary="fixed sendback", expected_run_id=fix.current_run_id,
+        )
+        rr = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"][-1]
+        assert rr.payload["reviewer"] == "human:apollo"
+        # Answered by that handback: not replayed into the next prompt.
+        assert "## Send-backs on your PR" not in kb.build_worker_context(conn, tid)

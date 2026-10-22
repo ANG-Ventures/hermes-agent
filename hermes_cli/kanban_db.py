@@ -13673,42 +13673,15 @@ def _request_review_txn(
             implementer = trow["assignee"]
         reviewer_from_provenance = False
         if reviewer is None:
-            changes_run = conn.execute(
-                "SELECT id FROM task_runs "
-                "WHERE task_id = ? AND outcome = 'changes_requested' "
-                "ORDER BY id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            changes_event = None
-            if changes_run is not None:
-                changes_event = conn.execute(
-                    "SELECT payload FROM task_events "
-                    "WHERE task_id = ? AND run_id = ? "
-                    "AND kind = 'changes_requested' "
-                    "ORDER BY id DESC LIMIT 1",
-                    (task_id, int(changes_run["id"])),
-                ).fetchone()
-            try:
-                changes_payload = (
-                    json.loads(changes_event["payload"])
-                    if changes_event and changes_event["payload"]
-                    else {}
+            prior_reviewer = _latest_handoff_provenance(conn, task_id)
+            if prior_reviewer is False:
+                return _ret(
+                    False,
+                    "re-review has no durable reviewer provenance (the "
+                    "latest changes_requested/sendback event is missing or "
+                    "malformed); pass reviewer= explicitly",
                 )
-            except (json.JSONDecodeError, TypeError):
-                changes_payload = {}
-            prior_reviewer = (
-                changes_payload.get("reviewer")
-                if isinstance(changes_payload, dict)
-                else None
-            )
-            if changes_run is not None:
-                if not isinstance(prior_reviewer, str) or not prior_reviewer.strip():
-                    return _ret(
-                        False,
-                        "re-review has no durable reviewer provenance (the "
-                        "latest changes_requested event is missing or "
-                        "malformed); pass reviewer= explicitly",
-                    )
+            if prior_reviewer is not None:
                 reviewer = prior_reviewer
                 reviewer_from_provenance = True
         # Validate/resolve at the gate: a review assignee must be spawnable
@@ -13793,19 +13766,27 @@ def _request_review_txn(
     return _ret(True)
 
 
-def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
-    """Reviewer recorded by the latest ``changes_requested`` run's event.
-    ``None`` = first review (no such run); ``False`` = a run exists but its
-    provenance is missing/malformed."""
-    changes_run = conn.execute(
-        "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'changes_requested' "
-        "ORDER BY id DESC LIMIT 1", (task_id,),
+def _latest_handoff_provenance(conn: sqlite3.Connection, task_id: str):
+    """Reviewer recorded by the newest review HANDOFF event of either kind:
+    a ``changes_requested`` event of a ``changes_requested`` run, or a
+    ``sendback`` that left ``review`` (only those carry ``reviewer``).
+    ``None`` = first review (no handoff); ``False`` = a handoff exists but
+    its provenance is missing/malformed."""
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND ("
+        "(kind = 'changes_requested' AND run_id IN (SELECT id FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'changes_requested')) OR "
+        "(kind = ? AND json_extract(payload, '$.reviewer') IS NOT NULL)"
+        ") ORDER BY id DESC LIMIT 1",
+        (task_id, task_id, SENDBACK_EVENT_KIND),
     ).fetchone()
-    if changes_run is None:
-        return None
-    changes_event = _latest_event(conn, task_id, "changes_requested", changes_run["id"])
-    reviewer = _json_dict(_row_get(changes_event, "payload")).get("reviewer")
+    if event is None:
+        changes_run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? "
+            "AND outcome = 'changes_requested' LIMIT 1", (task_id,),
+        ).fetchone()
+        return False if changes_run is not None else None
+    reviewer = _json_dict(_row_get(event, "payload")).get("reviewer")
     return reviewer if isinstance(reviewer, str) and reviewer.strip() else False
 
 
@@ -14445,6 +14426,9 @@ def request_sendback(
         return False, err
     record = dict(redact_review_value(payload))
     record.setdefault("retry", "after_change")
+    # Handoff provenance is the kernel's to record, never the producer's.
+    for key in ("implementer", "reviewer"):
+        record.pop(key, None)
 
     with write_txn(conn):
         row = conn.execute(
@@ -14469,12 +14453,13 @@ def request_sendback(
             )
             return True, "requeued"
         if status == "review":
-            requested = _latest_event(conn, task_id, "review_requested")
-            implementer = _nonblank_str(
-                _json_dict(_row_get(requested, "payload")).get("implementer")
+            requested = _json_dict(
+                _row_get(_latest_event(conn, task_id, "review_requested"), "payload")
             )
-            if implementer is None:
-                return False, "review handoff has no valid implementer provenance"
+            implementer = _nonblank_str(requested.get("implementer"))
+            reviewer = _nonblank_str(requested.get("reviewer"))
+            if implementer is None or reviewer is None:
+                return False, "review handoff has no valid implementer/reviewer provenance"
             new_status = _landing_status_after_parents(conn, task_id)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, assignee = ?, claim_lock = NULL, "
@@ -14486,18 +14471,21 @@ def request_sendback(
             _append_event(
                 conn, task_id, SENDBACK_EVENT_KIND,
                 {**record, "delivery": "requeued", "status": new_status,
-                 "implementer": implementer},
+                 "implementer": implementer, "reviewer": reviewer},
             )
             return True, "requeued"
         return False, f"task is {status!r}; a sendback needs running/ready/todo/review"
 
 
 def _ctx_sendbacks(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
-    """Render the newest ``sendback`` events into the worker prompt (§2.4)."""
+    """Render the newest ``sendback`` events into the worker prompt (§2.4).
+    A sendback older than the latest ``review_requested`` was already answered
+    by that handback and is not replayed."""
     rows = conn.execute(
         "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
-        "ORDER BY id DESC LIMIT ?",
-        (task_id, SENDBACK_EVENT_KIND, _CTX_MAX_SENDBACKS),
+        "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested'), 0) ORDER BY id DESC LIMIT ?",
+        (task_id, SENDBACK_EVENT_KIND, task_id, _CTX_MAX_SENDBACKS),
     ).fetchall()
     if not rows:
         return
