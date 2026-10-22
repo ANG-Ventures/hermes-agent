@@ -7,6 +7,7 @@ rc 1 + a JSON line with `text` = refused, anything else = landable / fail-open.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +32,9 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     q = lambda repo, number: {"state": "OPEN"}  # noqa: E731
     monkeypatch.setattr(op, "_default_query", lambda: q)
+    # the card's assignee is a real profile: the verifier runs with ITS env (Prism 3728a4da34a1)
+    (home / "profiles" / "daedalus").mkdir(parents=True)
+    (home / "profiles" / "daedalus" / ".env").write_text("GH_TOKEN=daedalus-token\n", encoding="utf-8")
     kb.init_db()
     return home
 
@@ -135,15 +139,53 @@ def test_pre_pr_off_runs_nothing(kanban_home, tmp_path, monkeypatch):
     (root / "scripts" / "lib").mkdir(parents=True)
     marker = tmp_path / "ran"
     (root / "scripts" / "lib" / "landable.py").write_text(
-        "open(%r, 'w').write('x')\nimport sys\nsys.exit(1)\n" % str(marker))
+        "open(%r, 'w').write('x')\nimport json, sys\nprint(json.dumps({'landable': False}))\nsys.exit(1)\n" % str(marker))
     monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda **k: root)
     ref = op.extract_pr_refs(PR)
     for doc in (None, {"pre_pr": "off"}):
         if doc is not None:
             (root / "config" / "landing-policy.json").write_text(json.dumps(doc))
-        assert kb._pre_pr_refusals(ref, task_id="t_x", worker="w") == []
+        assert kb._pre_pr_refusals(ref, task_id="t_x", worker="daedalus") == []
         assert not marker.exists()
     (root / "config" / "landing-policy.json").write_text(json.dumps({"pre_pr": "on"}))
-    assert [pr for pr, _ in kb._pre_pr_refusals(ref, task_id="t_x", worker="w")] == ["o/r#7"]
+    assert [pr for pr, _ in kb._pre_pr_refusals(ref, task_id="t_x", worker="daedalus")] == ["o/r#7"]
     assert marker.exists()
     assert sys.executable
+
+
+def test_verifier_crash_fails_open(kanban_home, tmp_path, monkeypatch):
+    """Prism 0b37fb2ab9a0: CPython exits 1 on an uncaught exception. rc 1 is a refusal ONLY when the last stdout
+    line is the verdict JSON; a raising verifier is 'did not run' and the handoff proceeds."""
+    script = tmp_path / "landable_raises.py"
+    script.write_text("print('gathering')\nraise KeyError('boom')\n")
+    monkeypatch.setenv("KANBAN_PRE_PR_SCRIPT", str(script))
+    with kb.connect() as conn:
+        tid = _card(conn)
+        assert kb.complete_task(conn, tid, summary="shipped", survivor_pr=PR) is True
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "review"
+        assert "completion_blocked_pre_pr" not in _kinds(conn, tid)
+    # a JSON last line that is NOT a refusal verdict (landable true / no key) is not a refusal either
+    for line in ("{\"landable\": true}", "{\"pre_pr\": \"on\", \"error\": \"x\"}", "[1]"):
+        script.write_text("import sys\nprint(%r)\nsys.exit(1)\n" % line)
+        assert kb._pre_pr_refusals(op.extract_pr_refs(PR), task_id="t_x", worker="daedalus") == []
+
+
+@pytest.mark.platforms("posix")
+def test_verifier_runs_with_the_assignee_profile_env(kanban_home, tmp_path, monkeypatch):
+    """Prism 3728a4da34a1: the subprocess gets the card's profile home + its own GH credentials, never the launch
+    process's (a multiplexed gateway's os.environ is another profile's)."""
+    monkeypatch.setenv("GH_TOKEN", "launch-token")
+    dump = tmp_path / "env.json"
+    script = tmp_path / "landable_env.py"
+    script.write_text("import json, os, sys\njson.dump(dict(os.environ), open(%r, 'w'))\n"
+                      "print(json.dumps({'landable': False, 'text': 'refused'}))\nsys.exit(1)\n" % str(dump))
+    monkeypatch.setenv("KANBAN_PRE_PR_SCRIPT", str(script))
+    got = kb._pre_pr_refusals(op.extract_pr_refs(PR), task_id="t_x", worker="daedalus")
+    assert got == [(PR, "refused")]
+    env = json.loads(dump.read_text())
+    assert env["GH_TOKEN"] == "daedalus-token"
+    assert os.path.realpath(env["HERMES_HOME"]) == os.path.realpath(kanban_home / "profiles" / "daedalus")
+    # an assignee whose profile cannot be resolved: did not run (fail-open), never the ambient login
+    dump.unlink()
+    assert kb._pre_pr_refusals(op.extract_pr_refs(PR), task_id="t_x", worker="ghost") == []
+    assert not dump.exists()
