@@ -296,13 +296,13 @@ ROW_REVIEW_ALL_ANSWERED = "review_all_answered"
 
 
 def row_enabled(name: str) -> bool:
-    """Per-row kill switch ``kanban.auto_handle_rows.<name>`` (default True), read every tick.
-    Only an explicit ``false`` turns a row off; an unreadable config leaves it on, because the
-    process-wide ``auto_handle_enabled`` already failed closed on the same read."""
+    """Per-row kill switch ``kanban.boomerang_wake_rows.<name>`` (default True), read every tick.
+    Only an explicit ``false`` turns a row off; an unreadable config leaves it on (the
+    process-wide stop is the ``state/boomerang-wake.disabled`` file, see ``enabled()``)."""
     try:
         from hermes_cli.config import load_config_readonly
 
-        rows = ((load_config_readonly() or {}).get("kanban") or {}).get("auto_handle_rows") or {}
+        rows = ((load_config_readonly() or {}).get("kanban") or {}).get("boomerang_wake_rows") or {}
         return not (isinstance(rows, dict) and rows.get(name) is False)
     except Exception:
         return True

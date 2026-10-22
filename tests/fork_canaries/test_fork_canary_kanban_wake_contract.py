@@ -592,7 +592,7 @@ def _answered_handback(env, pr, lines, open_keys):
 
 def test_w21_all_keys_answered_handback_is_one_fork_dispatch_zero_turns(auto_env):
     """RED-PROVABLE: drop the own_repo_review_all_keys_answered row from kanban_wake_disposition._TABLE
-    (or stop setting prism_all_answered in kanban_auto_handle.review_payload) -> 0 dispatches."""
+    (or stop setting prism_all_answered in kanban_boomerang_wake.review_payload) -> 0 dispatches."""
     env = auto_env
     _answered_handback(env, 2131, ["prism-verdict: 5ef38967cc14 fixed " + "e" * 40,
                                    "prism-verdict: f1a50a36ff7f not-a-bug unreachable"],

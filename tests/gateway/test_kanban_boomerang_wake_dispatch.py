@@ -735,8 +735,7 @@ def test_row_knob_off_restores_todays_rows(answered_env):
 
     env = answered_env
     (get_hermes_home() / "config.yaml").write_text(
-        "delegation:\n  boomerang:\n    auto_handle_enabled: true\n"
-        "kanban:\n  auto_handle_rows:\n    review_all_answered: false\n")
+        "kanban:\n  boomerang_wake_rows:\n    review_all_answered: false\n")
     _answered_handback(env, 3203, [f"prism-verdict: {KEY_A} fixed {ANSWERED_HEAD}",
                                    f"prism-verdict: {KEY_B} by-design advisory"])
     _tick(env)
@@ -765,7 +764,7 @@ def test_all_answered_handled_verdict_writes_only_the_receipt(answered_env):
     tid = _answered_handback(env, 3205, [f"prism-verdict: {KEY_A} fixed {ANSWERED_HEAD}",
                                          f"prism-verdict: {KEY_B} by-design advisory"])
     _tick(env)
-    entry = ah.AutoHandleState().get_claim(env["dispatched"][0]["key"])
+    entry = ah.BoomerangWakeState().get_claim(env["dispatched"][0]["key"])
     with kb.connect_closing() as conn:   # the child's own step-2/3 comments do not read as "state moved"
         kb.add_comment(conn, tid, "apollo", f"prism-verdict: {KEY_A} fixed {ANSWERED_HEAD}")
     res = ah.execute_verdict(entry, _verdict(entry, "handled", summary="verdicts + coverage posted, queued"))
