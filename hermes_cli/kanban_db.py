@@ -6564,6 +6564,8 @@ def create_task(
                         "(parent_id, child_id, kind) VALUES (?, ?, ?)",
                         (pid, task_id, parents_kind),
                     )
+                if boomerang_wake is not None:   # mirror into the legacy column (Prism 921e843952a6)
+                    write_card_boomerang_wake(conn, task_id, 1 if boomerang_wake else 0)
                 from hermes_cli import kanban_continuation as _kcont_create
                 if continues:
                     _kcont_create.transfer_workspace(conn, continues, task_id)
@@ -7044,9 +7046,9 @@ def set_task_boomerang_wake(
         row = conn.execute("SELECT boomerang_wake FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
             return False
+        write_card_boomerang_wake(conn, task_id, stored)   # also re-syncs a stale legacy mirror
         if row["boomerang_wake"] == stored:
             return True
-        write_card_boomerang_wake(conn, task_id, stored)
         payload: dict = {"boomerang_wake": bool(value)}
         if operator:
             payload["operator"] = operator

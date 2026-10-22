@@ -135,6 +135,47 @@ def test_late_legacy_write_after_migration_is_copied_on_next_open(kanban_home):
         assert conn.execute("SELECT auto_handle FROM tasks WHERE id = ?", (other,)).fetchone()[0] == 0
 
 
+def _add_legacy_column() -> None:
+    raw = sqlite3.connect(kb.kanban_db_path())
+    raw.execute("ALTER TABLE tasks ADD COLUMN auto_handle INTEGER")
+    raw.commit()
+    raw.close()
+
+
+def _legacy(conn, tid):
+    return conn.execute("SELECT auto_handle FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+
+
+def test_create_mirrors_level_into_legacy_column(kanban_home):
+    """Prism 921e843952a6: a card created by new code before the gateway restart carries the
+    level in ``auto_handle`` too, so the pre-restart gateway reads the same value."""
+    _add_legacy_column()
+    with kbc.connect_closing() as conn:
+        on = kb.create_task(conn, title="on", assignee="peer", boomerang_wake=True)
+        off = kb.create_task(conn, title="off", assignee="peer", boomerang_wake=False)
+        unset = kb.create_task(conn, title="unset", assignee="peer")
+        assert (_legacy(conn, on), _legacy(conn, off), _legacy(conn, unset)) == (1, 0, None)
+
+
+def test_same_level_write_resyncs_a_stale_legacy_mirror(kanban_home):
+    """Prism 63c954aa8cce: canonical 1 / legacy 0, set level 1 -> legacy becomes 1 (no
+    early return), and the next open cannot copy the stale 0 back."""
+    _add_legacy_column()
+    with kbc.connect_closing() as conn:
+        a = kb.create_task(conn, title="a", assignee="peer", boomerang_wake=True)
+        b = kb.create_task(conn, title="b", assignee="peer", boomerang_wake=True)
+        conn.execute("UPDATE tasks SET auto_handle = 0 WHERE id IN (?, ?)", (a, b))
+        conn.commit()
+        assert kb.set_task_boomerang_wake(conn, a, True)
+        with kb.write_txn(conn):
+            assert kbn._set_card_boomerang_wake(conn, b, True) is False
+        assert _legacy(conn, a) == 1 and _legacy(conn, b) == 1
+        assert [e.kind for e in kb.list_events(conn, a)].count("boomerang_wake_set") == 0
+    _reopen()
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, a).boomerang_wake is True and kb.get_task(conn, b).boomerang_wake is True
+
+
 def test_explicit_boomerang_create_upgrades_inherited_notify_row(kanban_home, monkeypatch):
     """Prism 2ddacd377db2: a child created with boomerang_wake from a chat the parent only
     notifies gets that chat's inherited ``notify`` row upgraded to a waker."""

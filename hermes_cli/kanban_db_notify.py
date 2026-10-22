@@ -278,9 +278,11 @@ def _set_card_boomerang_wake(conn: sqlite3.Connection, task_id: str, value: bool
     Records ``boomerang_wake_set``."""
     stored = 1 if value else 0
     row = conn.execute("SELECT boomerang_wake FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if row is None or row[0] == stored:
+    if row is None:
         return False
-    _kbc.write_card_boomerang_wake(conn, task_id, stored)
+    _kbc.write_card_boomerang_wake(conn, task_id, stored)   # also re-syncs a stale legacy mirror
+    if row[0] == stored:
+        return False
     _kb._append_event(conn, task_id, "boomerang_wake_set", {"boomerang_wake": bool(value)})  # noqa: SLF001
     return True
 
