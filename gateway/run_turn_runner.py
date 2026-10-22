@@ -1444,6 +1444,26 @@ class TurnRunner:
         render_notification(present, platform=self._ctx.source.platform,
                             user_config=self._ctx.user_config, diagnostic=diagnostic)
 
+    def _bg_review_chat_muted(self) -> bool:
+        """True when this turn's chat is an act-now page channel: the review receipt ("💾
+        Self-improvement review: ...") is not a page, so it is not posted there (t_a823c573: 20/day
+        in fleet #alerts). ``display.memory_notifications_muted_chats`` lists chat ids; unset means
+        the fleet #alerts channel on Discord. The review itself still runs and logs."""
+        ctx = self._ctx
+        source = getattr(ctx, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if not chat_id:
+            return False
+        configured = ((ctx.user_config or {}).get("display") or {}).get("memory_notifications_muted_chats")
+        if configured is None:
+            if getattr(source, "platform", None) != Platform.DISCORD:
+                return False
+            from gateway.kanban_watchers import _needs_input_channels
+            configured = [_needs_input_channels()[0]]
+        if not isinstance(configured, (list, tuple, set)):
+            configured = [configured]
+        return chat_id in {str(c) for c in configured if c}
+
     def _make_bg_review_callbacks(self):
         """(send, release): background-review messages ("💾 Memory updated") are held until the
         adapter's post-delivery hook releases them after the main response lands."""
@@ -1469,8 +1489,10 @@ class TurnRunner:
             for message in queued:
                 deliver(message)
 
+        muted = self._bg_review_chat_muted()
+
         def send(message: str) -> None:
-            if not self._status_live():
+            if muted or not self._status_live():
                 return
             if not release_evt.is_set():
                 with pending_lock:
