@@ -604,3 +604,105 @@ def test_w22_one_unanswered_key_keeps_todays_merge_pass_row(auto_env):
     turns = _tick(env)
     assert env["dispatched"] == [], _msg("W22", "an unanswered key was auto-handled", turns)
     assert _paths(turns) == ["notifier"], _msg("W22", "the green handback must wake as today", turns)
+
+
+# --- W23: a wake ACCEPTED behind a busy session survives the drain's depth cap (t_f36d21e8) ---
+
+
+@pytest.mark.asyncio
+async def test_w23_two_wakes_queued_behind_a_depth_capped_turn_both_survive(monkeypatch, tmp_path):
+    """2026-10-22 05:43-07:12 (session 20261018_220948_05ec4d95): the notifier logged ``woke agent
+    for t_69c88a73`` at 05:43:23, the adapter accepted it behind a busy turn, and no turn for it ever
+    ran (next G-LINT turn 07:12, from a later handback). At ``_MAX_INTERRUPT_DEPTH`` the drain
+    re-seated the dequeued follow-up with ``merge_pending_message_event`` into the head slot that
+    ``_promote_queued_event`` had just refilled from the overflow, so the overflow head was
+    REPLACED (two internal TEXT events never merge). One accepted wake per handback must reach a turn.
+
+    RED-PROVABLE: restore the plain ``merge_pending_message_event`` re-seat in
+    ``GatewayRunner._run_agent_queued_followup`` -> wake B is gone."""
+    import importlib
+    import sys
+    import types
+
+    from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+    from gateway.config import PlatformConfig
+
+    key = "agent:main:telegram:group:-1001:17585"
+    src = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group", thread_id="17585")
+
+    class _Ad(BasePlatformAdapter):
+        def __init__(self):
+            super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
+
+        async def connect(self, *, is_reconnect: bool = False) -> bool:
+            return True
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+            return SendResult(success=True, message_id="m1")
+
+        async def edit_message(self, chat_id, message_id, content) -> SendResult:
+            return SendResult(success=True, message_id=message_id)
+
+        async def send_typing(self, chat_id, metadata=None) -> None:
+            return None
+
+        async def stop_typing(self, chat_id) -> None:
+            return None
+
+        async def get_chat_info(self, chat_id: str):
+            return {"id": chat_id}
+
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    gateway_run = importlib.import_module("gateway.run")
+    adapter = _Ad()
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.adapters = {adapter.platform: adapter}
+    for name, value in (("_voice_mode", {}), ("_prefill_messages", []), ("_ephemeral_system_prompt", ""),
+                        ("_reasoning_config", None), ("_provider_routing", {}), ("_fallback_model", None),
+                        ("_session_db", None), ("_running_agents", {}), ("_session_run_generation", {})):
+        setattr(runner, name, value)
+    runner.hooks = types.SimpleNamespace(loaded_hooks=False)
+    runner.config = types.SimpleNamespace(thread_sessions_per_user=False, group_sessions_per_user=False,
+                                          stt_enabled=False)
+    runner._MAX_INTERRUPT_DEPTH = 0  # this drain IS the capped one
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+
+    def wake(tid):
+        return MessageEvent(text=f"[kanban] Task {tid} handed off for review", message_type=MessageType.TEXT,
+                            source=src, internal=True, allow_gateway_control=False,
+                            metadata={"kanban_owner_wake": True})
+
+    class StubAgent:
+        def __init__(self, **kwargs):
+            self.tools = []
+            self._interrupt_requested = False
+
+        @property
+        def is_interrupted(self):
+            return self._interrupt_requested
+
+        def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+            # Both notifier wakes arrive while this turn runs; the runner FIFO accepts both.
+            runner._enqueue_fifo(key, wake("t_A"), adapter)
+            runner._enqueue_fifo(key, wake("t_B"), adapter)
+            return {"final_response": "done", "messages": [], "api_calls": 1}
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = StubAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    await runner._run_agent(message="busy turn", context_prompt="", history=[], source=src,
+                            session_id="sess-w23", session_key=key)
+
+    head = adapter._pending_messages.get(key)
+    overflow = list(runner._session_state(key).conversation.queued_events)
+    texts = ([head.text] if head else []) + [e.text for e in overflow]
+    assert texts == ["[kanban] Task t_A handed off for review", "[kanban] Task t_B handed off for review"], (
+        f"FORK CANARY {FEATURE} W23: an accepted wake was dropped at the interrupt-depth cap; queue={texts}")
