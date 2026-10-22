@@ -1177,24 +1177,17 @@ _LEGACY_BOOMERANG_COLUMN = "auto_handle"
 
 
 def _migrate_legacy_boomerang_column(conn: sqlite3.Connection, cols) -> None:
-    """Copy the legacy column into ``boomerang_wake`` (1/0/NULL as stored) and upgrade the
-    subscriptions of every card that was on: ``notify+wake`` -> ``notify+boomerang``,
-    ``wake`` -> ``boomerang``. Runs once, right after the column is added; logs the counts."""
+    """Copy the legacy column into ``boomerang_wake`` (1/0/NULL as stored). Runs once, right
+    after the column is added; logs the count. Subscription rows are NOT rewritten: this runs
+    on the first CLI connect after the tree updates, hours before the gateway restarts, and the
+    old gateway wakes only on ``notify+wake``/``wake`` (Apollo F-1). The level lives on the card."""
     if _LEGACY_BOOMERANG_COLUMN not in cols:
         return
     copied = conn.execute(
         f"UPDATE tasks SET boomerang_wake = {_LEGACY_BOOMERANG_COLUMN}"
         f" WHERE {_LEGACY_BOOMERANG_COLUMN} IS NOT NULL").rowcount
-    upgraded = 0
-    if _table_exists(conn, "kanban_notify_subs"):
-        for old, new in (("notify+wake", "notify+boomerang"), ("wake", "boomerang")):
-            upgraded += conn.execute(
-                "UPDATE kanban_notify_subs SET delivery_mode = ? WHERE delivery_mode = ?"
-                " AND task_id IN (SELECT id FROM tasks WHERE boomerang_wake = 1)",
-                (new, old)).rowcount
-    _kb._log.info("kanban migration: boomerang_wake copied from %s on %d card(s); "
-                  "%d subscription(s) upgraded to the boomerang level",
-                  _LEGACY_BOOMERANG_COLUMN, copied, upgraded)
+    _kb._log.info("kanban migration: boomerang_wake copied from %s on %d card(s)",
+                  _LEGACY_BOOMERANG_COLUMN, copied)
 
 
 def backfill_workspace_of(conn: sqlite3.Connection) -> int:

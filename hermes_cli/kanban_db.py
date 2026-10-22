@@ -6823,9 +6823,6 @@ def _inherit_notify_subs(
             exclude=(prow["platform"], prow["chat_id"], prow["thread_id"] or ""),
         ) is not None:
             inherited_mode = "notify"
-        # The child's own level decides boomerang vs plain wake (the card is the setting).
-        child_bw = conn.execute("SELECT boomerang_wake FROM tasks WHERE id = ?", (child_id,)).fetchone()
-        inherited_mode = level_mode(inherited_mode, bool(child_bw is not None and child_bw[0]))
         conn.execute(
             f"""
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -7040,9 +7037,8 @@ def set_task_boomerang_wake(
     operator: Optional[str] = None,
 ) -> bool:
     """Set a card's boomerang wake level on/off. False for an unknown id. A change records
-    ``boomerang_wake_set`` and moves the card's waker row to the matching delivery mode
-    (``notify+wake`` <-> ``notify+boomerang``, ``wake`` <-> ``boomerang``); writing the
-    current value is a silent no-op."""
+    ``boomerang_wake_set``; writing the current value is a silent no-op. Subscription rows
+    are untouched: the level lives only on the card (Apollo F-1)."""
     stored = 1 if value else 0
     with write_txn(conn):
         row = conn.execute("SELECT boomerang_wake FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -7051,15 +7047,6 @@ def set_task_boomerang_wake(
         if row["boomerang_wake"] == stored:
             return True
         conn.execute("UPDATE tasks SET boomerang_wake = ? WHERE id = ?", (stored, task_id))
-        for sub in conn.execute(
-                "SELECT platform, chat_id, thread_id, delivery_mode FROM kanban_notify_subs WHERE task_id = ?",
-                (task_id,)).fetchall():
-            mode = level_mode(sub["delivery_mode"] or "notify", bool(value))
-            if mode != (sub["delivery_mode"] or "notify"):
-                conn.execute(
-                    "UPDATE kanban_notify_subs SET delivery_mode = ? WHERE task_id = ? AND platform = ?"
-                    " AND chat_id = ? AND thread_id = ?",
-                    (mode, task_id, sub["platform"], sub["chat_id"], sub["thread_id"] or ""))
         payload: dict = {"boomerang_wake": bool(value)}
         if operator:
             payload["operator"] = operator
@@ -21572,7 +21559,6 @@ from hermes_cli.kanban_db_board_registry import (  # noqa: E402
 from hermes_cli.kanban_db_notify import (  # noqa: E402
     NOTIFY_SUB_OWNER_LIVE_SECONDS,
     NOTIFY_WAKE_MODES,
-    level_mode,
     ONE_WAKER_INDEX,
     _ensure_single_waker_index,
     card_waker,

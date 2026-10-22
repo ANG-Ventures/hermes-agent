@@ -846,7 +846,8 @@ def _maybe_cli_auto_subscribe(conn, task_id: str, *, boomerang_wake: bool = Fals
     cron / script creates stay silent regardless of the knob.
 
     ``--boomerang-wake`` IS a subscription level, so it subscribes the calling
-    gateway chat whatever the knob says (stored ``notify+boomerang``).
+    gateway chat as its waker whatever the knob says (row ``notify+wake``; the level is
+    ``tasks.boomerang_wake``).
 
     Returns True when a subscription row was written. Never raises — a
     notification bookkeeping failure must not fail the create.
@@ -4444,7 +4445,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         )
         waker = kbn.card_waker(conn, args.task_id)
         wants_wake = (
-            getattr(args, "delivery_mode", None) in kbn.NOTIFY_WAKE_MODES
+            getattr(args, "delivery_mode", None) in (*kbn.NOTIFY_WAKE_MODES, *kbn.BOOMERANG_REQUEST_MODES)
             or getattr(args, "wake", False) or getattr(args, "boomerang_wake", False)
         )
         thread = args.thread_id or ""

@@ -507,7 +507,7 @@ KANBAN_CREATE_SCHEMA = _schema(
             "Subscription level 'boomerang wake': mechanical wakes on this card "
             "(completed, changes requested, a red own-repo handback, a first crash) are "
             "handled by a background boomerang child instead of a turn in the home "
-            "session; the calling chat subscribes notify+boomerang. Judgment events and "
+            "session; the calling chat subscribes as the card's waker. Judgment events and "
             "cards tagged irreversible/spend/outbound always surface. Default false."
         )),
         "unhomed": _prop("boolean", (

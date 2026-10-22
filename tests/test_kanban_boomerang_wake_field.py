@@ -1,7 +1,7 @@
 """Boomerang wake level: ``tasks.boomerang_wake`` is the ONLY setting (Ace 2026-10-22, t_7be18632).
 
-Covers the additive migration from the pre-rename ``auto_handle`` column (copy + one-shot
-delivery-mode upgrade), the kernel create/edit path, the ``kanban_create`` tool, the
+Covers the additive migration from the pre-rename ``auto_handle`` column (copy only; the
+subscription rows stay readable by a pre-restart gateway), the kernel create/edit path, the ``kanban_create`` tool, the
 ``hermes kanban create/edit --boomerang-wake`` CLI and ``kanban show``'s level line, the
 emergency stop file behind ``enabled()``, and the removal of ``/autohandle``.
 """
@@ -56,9 +56,15 @@ def test_fresh_board_has_nullable_boomerang_wake(kanban_home):
         assert kb.get_task(conn, tid).boomerang_wake is None
 
 
-def test_migration_copies_legacy_column_and_upgrades_only_the_on_card(kanban_home, caplog):
-    """AC-5: auto_handle true/false/null -> boomerang_wake 1/0/null; only the true card's
-    wake subscription moves to the boomerang level, once."""
+# The wake predicate of the gateway that is still RUNNING when the CLI first migrates a
+# board (kanban_watchers_notifier / kanban_watchers before this change).
+_OLD_GATEWAY_WAKE_SQL = ("SELECT task_id FROM kanban_notify_subs"
+                         " WHERE delivery_mode IN ('notify+wake', 'wake')")
+
+
+def test_migration_copies_legacy_column_and_keeps_rows_old_gateway_readable(kanban_home, caplog):
+    """AC-5 + Apollo F-1: auto_handle true/false/null -> boomerang_wake 1/0/null, and every
+    on-card's waker row still matches the OLD gateway's wake predicate after the CLI migrates."""
     with kbc.connect_closing() as conn:
         on = kb.create_task(conn, title="on", assignee="peer")
         off = kb.create_task(conn, title="off", assignee="peer")
@@ -84,23 +90,21 @@ def test_migration_copies_legacy_column_and_upgrades_only_the_on_card(kanban_hom
     with kbc.connect_closing() as conn:
         got = {r["id"]: r["boomerang_wake"] for r in conn.execute("SELECT id, boomerang_wake FROM tasks")}
         assert got == {on: 1, off: 0, unset: None}
-        assert _modes(conn, on) == ["notify", "notify+boomerang"]
+        assert _modes(conn, on) == ["notify", "notify+wake"]
         assert _modes(conn, off) == ["notify+wake"] and _modes(conn, unset) == ["notify+wake"]
         assert kb.get_task(conn, on).boomerang_wake is True
-        # the one-waker index now covers the boomerang modes too
-        idx = conn.execute("SELECT sql FROM sqlite_master WHERE name = ?", (kbn.ONE_WAKER_INDEX,)).fetchone()[0]
-        assert "boomerang" in idx
+        old_wakers = {r[0] for r in conn.execute(_OLD_GATEWAY_WAKE_SQL)}
+        assert old_wakers == {on, off, unset}
     lines = [r.getMessage() for r in caplog.records if "boomerang_wake copied" in r.getMessage()]
-    assert lines == ["kanban migration: boomerang_wake copied from auto_handle on 2 card(s); "
-                     "1 subscription(s) upgraded to the boomerang level"], lines
+    assert lines == ["kanban migration: boomerang_wake copied from auto_handle on 2 card(s)"], lines
 
 
-def test_set_level_moves_the_waker_mode_both_ways(kanban_home):
+def test_set_level_lives_on_the_card_only(kanban_home):
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="c", assignee="peer")
         _sub(conn, tid, "c1", "notify+wake")
         assert kb.set_task_boomerang_wake(conn, tid, True)
-        assert kb.get_task(conn, tid).boomerang_wake is True and _modes(conn, tid) == ["notify+boomerang"]
+        assert kb.get_task(conn, tid).boomerang_wake is True and _modes(conn, tid) == ["notify+wake"]
         assert kbn.card_level(True, kbn.list_notify_subs(conn, tid)) == "boomerang wake"
         assert kb.set_task_boomerang_wake(conn, tid, False)
         assert _modes(conn, tid) == ["notify+wake"]
@@ -114,7 +118,20 @@ def test_subscribing_a_boomerang_mode_sets_the_card_level(kanban_home):
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="c", assignee="peer")
         _sub(conn, tid, "c1", "boomerang")
-        assert kb.get_task(conn, tid).boomerang_wake is True and _modes(conn, tid) == ["boomerang"]
+        assert kb.get_task(conn, tid).boomerang_wake is True and _modes(conn, tid) == ["wake"]
+
+
+def test_boomerang_request_held_by_another_waker_leaves_the_card_level(kanban_home, monkeypatch):
+    """Prism 9fe9442a9d4c: a boomerang request downgraded to notify (another live chat holds
+    the wake) must not switch the card to boomerang wake."""
+    monkeypatch.setattr(kbn, "notify_chat_is_live", lambda *a, **k: True)
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="c", assignee="peer")
+        _sub(conn, tid, "cA", "notify+wake")
+        kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id="cB", chat_type="group",
+                           delivery_mode="notify+boomerang", also=True)
+        assert not kb.get_task(conn, tid).boomerang_wake
+        assert _modes(conn, tid) == ["notify", "notify+wake"]
 
 
 def test_kanban_create_tool_accepts_boomerang_wake(kanban_home):
@@ -147,7 +164,7 @@ def _cli():
 
 
 def test_cli_create_with_boomerang_wake_subscribes_and_shows_level(kanban_home, monkeypatch, capsys):
-    """AC-2: --boomerang-wake -> boomerang_wake=1, a notify+boomerang subscription, and
+    """AC-2: --boomerang-wake -> boomerang_wake=1, a waker subscription (stored notify+wake), and
     ``kanban show`` prints the level."""
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "c1")
@@ -157,7 +174,7 @@ def test_cli_create_with_boomerang_wake_subscribes_and_shows_level(kanban_home, 
     with kbc.connect_closing() as conn:
         tid = conn.execute("SELECT id FROM tasks WHERE title='cli card'").fetchone()["id"]
         assert kb.get_task(conn, tid).boomerang_wake is True
-        assert _modes(conn, tid) == ["notify+boomerang"]
+        assert _modes(conn, tid) == ["notify+wake"]
     capsys.readouterr()
     assert run("show", tid) == 0
     assert "level:     boomerang wake" in capsys.readouterr().out
@@ -175,7 +192,7 @@ def test_notify_subscribe_boomerang_wake_shorthand(kanban_home):
     assert run("notify-subscribe", tid, "--platform", "discord", "--chat-id", "c9",
                "--boomerang-wake") == 0
     with kbc.connect_closing() as conn:
-        assert _modes(conn, tid) == ["notify+boomerang"] and kb.get_task(conn, tid).boomerang_wake is True
+        assert _modes(conn, tid) == ["notify+wake"] and kb.get_task(conn, tid).boomerang_wake is True
 
 
 def test_enabled_is_the_stop_file_with_one_logs_line_per_transition(kanban_home, monkeypatch):

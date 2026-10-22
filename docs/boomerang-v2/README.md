@@ -133,14 +133,18 @@ session `/autohandle` toggle and no board default (Ace 2026-10-22, t_7be18632).
 |---|---|---|
 | `notify` | `notify` | Passive line only. |
 | `wake` | `notify+wake` / `wake` | Passive line + a turn in the subscribed session. |
-| `boomerang wake` | `notify+boomerang` / `boomerang` | Mechanical events go to a background boomerang child (§3 `auto`); everything else wakes as `wake`. |
+| `boomerang wake` | `notify+wake` / `wake` (+ `tasks.boomerang_wake = 1`) | Mechanical events go to a background boomerang child (§3 `auto`); everything else wakes as `wake`. |
 
 `tasks.boomerang_wake` holds the level (`kanban show` prints `level: boomerang wake`). Set it with
 `hermes kanban create --boomerang-wake`, `kanban edit <id> --boomerang-wake` /
 `--no-boomerang-wake`, `kanban notify-subscribe <id> --boomerang-wake` (= `--delivery-mode
-notify+boomerang`), or the `kanban_create` tool's `boomerang_wake: true`. Setting or clearing the
-level moves the card's waker row between `notify+wake` and `notify+boomerang` (and `wake` and
-`boomerang`).
+notify+boomerang`), or the `kanban_create` tool's `boomerang_wake: true`. The level lives only
+on the card: subscription rows stay `notify+wake` / `wake` (the request values `notify+boomerang` /
+`boomerang` are stored as those), so a gateway that predates the level still wakes on them. A
+boomerang request sets the card level only once the requesting chat holds the wake.
+
+Until the gateway restarts onto this code, cards at level `boomerang wake` are handled by the OLD
+path: every wake surfaces to the home session as a plain `wake`.
 
 **Emergency stop** (read every notifier tick, no restart; INV-7):
 

@@ -1,8 +1,7 @@
 """Boomerang wake: persisted state, auto-dispatch, verdict executor, reconciler (Boomerang v2).
 
-A card at subscription level ``boomerang wake`` (``tasks.boomerang_wake``; delivery mode
-``boomerang`` / ``notify+boomerang``) lets a background boomerang child take its mechanical
-wakes. The card is the ONLY setting: there is no config knob, session toggle or board default.
+A card at subscription level ``boomerang wake`` (``tasks.boomerang_wake``; its waker row stays
+``notify+wake`` / ``wake``) lets a background boomerang child take its mechanical wakes. The card is the ONLY setting: there is no config knob, session toggle or board default.
 The emergency stop is the file ``<HERMES_HOME>/state/boomerang-wake.disabled`` (:func:`enabled`).
 
 ``<HERMES_HOME>/gateway/kanban_boomerang_wake.json`` holds ``retries[task_id]``: how many

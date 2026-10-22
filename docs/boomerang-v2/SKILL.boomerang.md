@@ -156,8 +156,8 @@ unless the wake needs human judgment.
 
 - **The card is the only setting.** No config knob, no session toggle, no board default. Set it
   with `kanban create --boomerang-wake`, `kanban edit <id> --boomerang-wake|--no-boomerang-wake`,
-  `notify-subscribe --boomerang-wake` (delivery mode `notify+boomerang`), or `kanban_create`
-  `boomerang_wake: true`.
+  `notify-subscribe --boomerang-wake`, or `kanban_create` `boomerang_wake: true`. The
+  subscription row stays `notify+wake`; the level is `tasks.boomerang_wake` only.
 - **Emergency stop:** the file `<HERMES_HOME>/state/boomerang-wake.disabled` (present = every
   wake surfaces; one #logs line per transition), plus `delegation.boomerang.fork_enabled` for
   fork mode. Both read every tick, no restart.

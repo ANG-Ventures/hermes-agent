@@ -364,7 +364,7 @@ _SPECS = [
         _arg("--boomerang-wake", action="store_true", dest="boomerang_wake",
              help="Subscription level 'boomerang wake': mechanical wakes on this card are "
                   "handled by a background boomerang child (the calling chat subscribes "
-                  "notify+boomerang). Omit for notify / wake."),
+                  "--boomerang-wake). Omit for notify / wake."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
@@ -676,10 +676,10 @@ _SPECS = [
         _group(
             _arg("--boomerang-wake", action="store_const", const=True, dest="boomerang_wake",
                  default=None,
-                 help="Set the card's level to 'boomerang wake' (its waker row becomes "
-                      "notify+boomerang / boomerang)"),
+                 help="Set the card's level to 'boomerang wake' (the card column; "
+                      "subscription rows are unchanged)"),
             _arg("--no-boomerang-wake", action="store_const", const=False, dest="boomerang_wake",
-                 help="Drop the card back to plain wake (notify+wake / wake)"),
+                 help="Drop the card back to plain wake"),
         ),
         # fork #1614: per-card skill list; fork #1612: needs-input pager opt-out.
         _arg("--skill", action="append", default=[], dest="skills", metavar="NAME",
@@ -891,14 +891,14 @@ _SPECS = [
         _arg("--notifier-profile",
              help="Profile gateway that owns/delivers this subscription (default: active profile)"),
         # choices: single source of truth shared with the DB/watcher enum.
-        _arg("--delivery-mode", choices=kbn._NOTIFY_DELIVERY_MODES,
+        _arg("--delivery-mode", choices=(*kbn._NOTIFY_DELIVERY_MODES, *kbn.BOOMERANG_REQUEST_MODES),
              help="How the kanban-notifier reacts to terminal events for this "
                   "subscription: 'notify' (passive message only; default), "
                   "'notify+wake' (message AND wake the destination gateway agent so "
                   "it reads the full board context and replies in its own voice), "
                   "'wake' (wake the agent only, no passive message), or the boomerang "
-                  "wake level 'notify+boomerang' / 'boomerang' (mechanical wakes go to a "
-                  "background boomerang child). Omit to leave an existing subscription's "
+                  "wake level 'notify+boomerang' / 'boomerang' (stored as notify+wake / wake "
+                  "and sets the card's boomerang_wake once this chat holds the wake). Omit to leave an existing subscription's "
                   "mode unchanged (new subs default to 'notify')."),
         _arg("--wake", action="store_true",
              help="Shorthand for --delivery-mode notify+wake. One waker per card: "

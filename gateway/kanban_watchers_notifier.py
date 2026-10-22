@@ -532,8 +532,8 @@ class _KanbanNotification:
         # The wake self-post path needs the key even when every event was skipped.
         self.sub_key = (sub["task_id"], sub["platform"], sub["chat_id"], sub.get("thread_id") or "")
         mode = sub.get("delivery_mode") or "notify"
-        self.wake_agent = mode in _kbn().NOTIFY_WAKE_MODES
-        self.send_passive = mode not in _kbn().WAKE_ONLY_MODES
+        self.wake_agent = mode in ("notify+wake", "wake")
+        self.send_passive = mode != "wake"
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""

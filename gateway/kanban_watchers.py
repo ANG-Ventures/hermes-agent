@@ -325,10 +325,6 @@ def self_caused_event_ids(sub: dict, events, origin_of=None) -> set[int]:
 # LoadGate moved to hermes_cli.kanban_load_gate (shared with the standalone
 # `hermes kanban daemon` loop); re-exported here for existing importers.
 from hermes_cli.kanban_load_gate import LoadGate, _denom  # noqa: E402,F401
-from hermes_cli.kanban_db_notify import (  # noqa: E402
-    NOTIFY_WAKE_MODES as _BOOMERANG_AWARE_WAKE_MODES,
-    WAKE_ONLY_MODES as _WAKE_ONLY_MODES,
-)
 
 
 def _format_spawn_routes(routes, sources=None) -> str:
@@ -2152,7 +2148,7 @@ class GatewayKanbanWatchersMixin:
                                     _suppress_cfg = _suppress_cfg_for(owner_profile)
                                     if _suppress_cfg.enabled and (
                                         sub.get("delivery_mode") or "notify"
-                                    ) not in _WAKE_ONLY_MODES and platform != "api_server" and any(
+                                    ) != "wake" and platform != "api_server" and any(
                                         ev.kind in _suppress_cfg.kinds for ev in events
                                     ):
                                         # Home-side evidence (home session, its operator,
@@ -2195,10 +2191,10 @@ class GatewayKanbanWatchersMixin:
                                     # lands on the card (kanban show lists it).
                                     wake_noise: dict = {}
                                     red_keys: dict = {}
-                                    _wake_mode = (sub.get("delivery_mode") or "notify") in _BOOMERANG_AWARE_WAKE_MODES
+                                    _wake_mode = (sub.get("delivery_mode") or "notify") in ("notify+wake", "wake")
                                     # notify+wake only: the line still posts, so the owner is
                                     # told; a wake-only sub's wake IS the delivery (d9c37a52d911).
-                                    _s5 = ((sub.get("delivery_mode") or "notify") in ("notify+wake", "notify+boomerang")
+                                    _s5 = ((sub.get("delivery_mode") or "notify") == "notify+wake"
                                            and platform != "api_server"
                                            and _suppress_cfg.enabled and _suppress_cfg.actionable_only)
                                     _s5_home = _s5 and _hr.same_chat(
@@ -2248,7 +2244,7 @@ class GatewayKanbanWatchersMixin:
                                     # unblocked ride THIS wake too (owner-wake's
                                     # last_blocker_done), one turn not two.
                                     ready_state: dict = {}
-                                    if (sub.get("delivery_mode") or "notify") in _BOOMERANG_AWARE_WAKE_MODES:
+                                    if (sub.get("delivery_mode") or "notify") in ("notify+wake", "wake"):
                                         for _ev in events:
                                             if _ev.kind != "completed":
                                                 continue
@@ -2411,7 +2407,7 @@ class GatewayKanbanWatchersMixin:
                     _defer_pending = False
                     # api_server has no push channel: its wake self-post IS
                     # the delivery, so it is never downgraded.
-                    if mode in _BOOMERANG_AWARE_WAKE_MODES and sub["platform"] != "api_server":
+                    if mode in ("notify+wake", "wake") and sub["platform"] != "api_server":
                         wake_downgrade = await _to_thread_process_service(
                             _wake_downgrade_reason, self,
                             self._wake_gate_profile(plat, sub, sub_profile or None),
@@ -2428,7 +2424,7 @@ class GatewayKanbanWatchersMixin:
                                 f"; deferred for {_defer_owner}" if _defer_pending else "",
                             )
                             mode = "notify"
-                    wake_agent = mode in _BOOMERANG_AWARE_WAKE_MODES
+                    wake_agent = mode in ("notify+wake", "wake")
                     # Host load1 alone never stops a boomerang-wake child: the child REPLACES the
                     # session's wake turn, so downgrading it saves nothing, and on a box idling
                     # above the band boomerang wake never ran (smoke 2026-10-19: load 55-75 for
@@ -2440,7 +2436,7 @@ class GatewayKanbanWatchersMixin:
                         d.get("auto") and wake_downgrade
                         and str(wake_downgrade).startswith(("host load", "host cpu"))
                     )
-                    send_passive = mode not in _WAKE_ONLY_MODES
+                    send_passive = mode != "wake"
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
