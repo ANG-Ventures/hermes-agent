@@ -95,7 +95,7 @@ def test_gateway_recovery_runs_once_and_reresolves_current_credentials(tmp_path,
     assert second == {"claimed": 0, "queued": 0}
     recover.assert_called_once()
     replay.assert_called_once()
-    resolve.assert_called_once_with("named-provider")
+    resolve.assert_called_once_with("named-provider", target_model="persisted-model")
     assert agent_cls.call_args.kwargs["api_key"] == "CURRENT-KEY"
     assert agent_cls.call_args.kwargs["model"] == "persisted-model"
     built_parent.interrupt.assert_called_once()

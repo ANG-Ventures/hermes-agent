@@ -2,7 +2,7 @@
 
 Status: rev 4, built (t_eaabba56). Momus: pass-1 BLOCK, pass-2 BLOCK, pass-3 APPROVE-WITH-CHANGES; the pass-3
 RCs (RC-E hand-off fencing, RC-F fallback reclassification, RC-G protocol version) are folded below.
-Knob: `delegation.detached_background` (default `true`; `false` = today's threads, byte-identical path).
+Knob: `delegation.detached_background` (default `false` = threads, byte-identical path; t_414b4d92 replaces this mechanism).
 
 ## Problem
 
@@ -28,17 +28,31 @@ the kanban precedent on launchd) or `scoped` (systemd user scope). On `degraded`
 user bus) the unit runs as a thread exactly as today (CB-2). Native Windows is always `degraded`: there is no
 process-group cancel (`os.killpg`), so `/stop` could not reach the child. A unit with a `fork`/`branch` child
 also stays a thread: the fork's live transcript, cache snapshot and served seat cannot cross the process
-boundary. An explicit `inherit_mode="summary"` persists the built child's fold (`materialized_prefill_messages`).
+boundary. So does a unit under a session-isolated terminal sandbox (`terminal.env: docker` +
+`container_persistent: false`): children alias the parent's per-session container by its live task id, and
+that container is never reused across processes. An explicit `inherit_mode="summary"` persists the built
+child's fold (`materialized_prefill_messages`).
 
 Process identity is `(pid, kernel start time)`; a pid without a start time is never signalled (only adopted
-when its argv carries the exact `--job <dir>` pair). SIGKILL escalation also reaches group members captured at
+when its argv carries the exact `--job <dir>` pair). A start time unknown at spawn is re-read from the job dir
+(`child.json`) when the cancel hook fires (`terminate_job`), so it never makes the child uncancellable.
+An identity lookup that FAILS (process inspection error) is unknown, never dead: `probe_job` returns
+`unknown`, `wait_for_exit` does not confirm an exit, and the adoption pass keeps the record's block, the
+fence, or an unfenced orphan's dir + marker untouched for the next pass (no adopt, no re-dispatch, no
+removal). SIGKILL escalation also reaches group members captured at
 SIGTERM time that outlived the leader. A dispatcher standing an un-advertised child down first fences the
 attempt in the registry (`stand_down_detached`); if an overlapping boot already adopted it, the child is left
-running for that boot. A fence whose outcome stays unknown (the registry raises on every retry) never kills:
+running for that boot. The fence keeps the child's identity on the record (`detached_fenced`) until its death
+is confirmed: `claim_recoveries` will not re-dispatch the unit while it is there, and any boot's adoption pass
+re-sends the kill (the dispatcher may die between fence and kill). A fence whose outcome stays unknown (the registry raises on every retry) never kills:
 the child and its job dir are left running, marked `stand-down-unknown.json`, and the next boot's adoption pass
 decides. A live owned record adopts it (marker cleared); a dir no live record owns is an orphan, killed and
 removed. The detached worker writes its process checkpoint into its job dir, never the
-gateway's `<home>/processes.json`.
+gateway's `<home>/processes.json`, and refuses `process_manage(action="handoff")`: its in-process parent is a
+reconstruction that exits with the worker, so a handed-off process would have no owner and no completion.
+File edits (`write_file` / `patch`) hold the per-path lock across processes too (`file_state.lock_path` takes an
+advisory `flock` on `<hermes root>/state/file-locks/<sha256(path)>` inside the thread lock), so two detached
+units patching one file serialize exactly as two in-process children do.
 
 Out of scope: synchronous delegation (thread), depth>0 (always synchronous already), TUI/CLI
 sessions (no durable spec, unchanged), kanban, cross-host.
@@ -51,7 +65,10 @@ sessions (no durable spec, unchanged), kanban, cross-host.
 - `Popen(start_new_session=True, stdin=DEVNULL, stdout/stderr -> <job_dir>/child.log, cwd=<workspace_hint
   if it is a dir, else None>)`.
 - Env: `environments/local.py::served_profile_child_env(target_home=<owning profile home>,
-  inherit_credentials=True)` + `PYTHONPATH=<this runtime tree>` (the child imports the gateway's code).
+  inherit_credentials=True)`, then `cron/scheduler_worker_env.py::pin_hermes_tree_on_pythonpath` (this
+  runtime tree + PM's committed dependency generation) and the `_HERMES_DETACHED_WORKER_BOOT` marker: the
+  child's `main()` consumes it and runs `pm.environments.activate_dependencies` (lease + activate) before its
+  first third-party import, the same boot as the cron external worker (`cron/worker_bootstrap.py`).
 - Job dir, keyed by ATTEMPT (RC-3): `<profile_home>/state/detached-delegations/<attempt_id-safe>/` (0700):
   `spec.json` (input), `child.json` (child writes `{pid, create_time}` as its FIRST act), `heartbeat.json`
   (child, every 10 s), `result.json` (child, atomic rename), `child.log`.
@@ -79,7 +96,8 @@ reasoning, fallback chain, provider routing, depth, workspace) and calls
 `build_recovered_delegation_runner(record, continuation, parent, source=...)`, which runs
 `delegate_task(tasks=..., background=False, _recovery_spec=record)`. Per-task skills, role,
 inherit_context + materialized prefill, output_schema, images stay in `source.tasks` and go through the
-normal child builder. Children are always built with `skip_memory/skip_context_files` (`_build_child_agent`),
+normal child builder. Call-level inputs delegate_task applies outside the task dicts (top-level `images`,
+`output_schema` and `skills`) are written into each persisted task, so the reconstruction sees them. Children are always built with `skip_memory/skip_context_files` (`_build_child_agent`),
 so the recovery parent's skip flags change nothing the child sees.
 
 RC-1 fixes in the shared runner: a `None` continuation appends nothing; the session source is a
@@ -140,7 +158,8 @@ Missing/invalid `result.json` after exit, while this gateway owns the unit -> `s
   - pid dead and no `result.json` -> drop the `detached` block (lifecycle `detached_lost`) and leave the
     record to `claim_recoveries` in the SAME boot: normal re-dispatch with continuation, retry budget spent
     as today (CB-2). The re-dispatch spawns a new detached child for the new attempt.
-  - record already `cancelled`/terminal with a live pid -> SIGTERM the group (orphan rule).
+  - record already `cancelled`/terminal with a live pid -> SIGTERM the group (orphan rule). The `detached` block
+    stays until the pid is confirmed dead, so every later boot re-sends the kill.
   - age cap: a detached record older than `ACTIVE_STALE_SECONDS` -> SIGTERM the group if alive, fail the
     record `stale_record` (same cap `claim_recoveries` applies today).
   Adoption runs regardless of `resume_on_restart` AND of `detached_background` (RC-B: the child is already
