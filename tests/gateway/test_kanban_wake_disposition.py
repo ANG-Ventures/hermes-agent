@@ -135,6 +135,32 @@ def test_own_repo_red_is_auto(state):
     assert d.verdict == AUTO and d.mode == "fork"
 
 
+# --- t_6e9f48cc: every open Prism key answered in the handback -> a mechanical fork ----------
+
+
+@pytest.mark.parametrize("state", ["green", "pending", "red", "dirty", None])
+def test_own_repo_review_all_keys_answered_is_auto_fork(state):
+    payload = {"own_repo": True, "prism_all_answered": True, **({"pr_state": state} if state else {})}
+    d = classify("review_requested", payload, PLAIN)
+    assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "own_repo_review_all_keys_answered")
+
+
+@pytest.mark.parametrize("answered", [False, None, "true", 1])
+@pytest.mark.parametrize("state,row", [("green", "own_repo_review_green_or_pending"),
+                                       ("pending", "own_repo_review_green_or_pending"),
+                                       ("red", "own_repo_review_red"), (None, "default")])
+def test_unanswered_or_unreadable_keys_keep_todays_rows(answered, state, row):
+    """One key missing (False), unreadable prism state (None) or a non-bool: today's row."""
+    payload = {"own_repo": True, "prism_all_answered": answered, **({"pr_state": state} if state else {})}
+    assert classify("review_requested", payload, PLAIN).row == row
+
+
+def test_all_answered_upstream_or_spend_card_surfaces():
+    assert wake_disposition("review_requested", {"own_repo": False, "prism_all_answered": True}, PLAIN) == SURFACE
+    card = {"title": "buy", "body": "tags: spend"}
+    assert wake_disposition("review_requested", {"own_repo": True, "prism_all_answered": True}, card) == SURFACE
+
+
 @pytest.mark.parametrize("payload", [
     {"own_repo": False, "pr_state": "red"}, {"own_repo": False, "pr_state": "green"},
     {"own_repo": True, "pr_state": "unknown"}, {"own_repo": True}, {"own_repo": "yes", "pr_state": "red"},

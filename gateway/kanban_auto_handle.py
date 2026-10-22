@@ -233,11 +233,14 @@ STATE_CLAIMED, STATE_RUNNING, STATE_EXECUTING = "claimed", "running", "executing
 STATE_TERMINAL, STATE_CANCELLED = "terminal", "cancelled"
 OPEN_STATES = frozenset({STATE_CLAIMED, STATE_RUNNING, STATE_EXECUTING, STATE_CANCELLED})
 
-ACTIONS = frozenset({"complete", "request_changes", "redispatch", "retry", "surface"})
+ACTIONS = frozenset({"complete", "request_changes", "redispatch", "retry", "surface", "handled"})
 # RC-2: kind × action, keyed on the row stored at claim time (pass-5 RC-A).
 ALLOWED = {
     "completed": frozenset({"complete", "request_changes", "surface"}),
     "own_repo_review_red": frozenset({"request_changes", "redispatch", "surface"}),
+    # t_6e9f48cc: the child itself posts the verdict lines, the coverage and the enqueue (all
+    # outside the card's state machine); ``handled`` writes only the receipt, the card stays in review.
+    "own_repo_review_all_keys_answered": frozenset({"handled", "surface"}),
     "changes_requested": frozenset({"redispatch", "surface"}),
     "crash_first_occurrence": frozenset({"retry", "surface"}),
 }
@@ -265,6 +268,22 @@ def enabled() -> bool:
         return isinstance(boom, dict) and boom.get("auto_handle_enabled") is True
     except Exception:
         return False
+
+
+ROW_REVIEW_ALL_ANSWERED = "review_all_answered"
+
+
+def row_enabled(name: str) -> bool:
+    """Per-row kill switch ``kanban.auto_handle_rows.<name>`` (default True), read every tick.
+    Only an explicit ``false`` turns a row off; an unreadable config leaves it on, because the
+    process-wide ``auto_handle_enabled`` already failed closed on the same read."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        rows = ((load_config_readonly() or {}).get("kanban") or {}).get("auto_handle_rows") or {}
+        return not (isinstance(rows, dict) and rows.get(name) is False)
+    except Exception:
+        return True
 
 
 def claim_key(board: Optional[str], task_id: str, event_id: Any) -> str:
@@ -323,7 +342,8 @@ def review_payload(kb: Any, conn: Any, task_id: str, task_result: Any, payload: 
     from gateway import kanban_owner_wake as _ow
 
     out = dict(payload or {})
-    refs = _handback_refs(kb, conn, task_result, payload, run_id)
+    run = _handback_run(kb, conn, run_id)
+    refs = _handback_refs(kb, conn, task_result, payload, run_id, run=run)
     out["own_repo"] = bool(refs)
     if not refs or pr_health is None:
         return out
@@ -333,19 +353,51 @@ def review_payload(kb: Any, conn: Any, task_id: str, task_result: Any, payload: 
     except Exception:
         return out
     out["pr_state"] = "red" if verdict["state"] else "green"
+    if len(refs) == 1 and row_enabled(ROW_REVIEW_ALL_ANSWERED):
+        out["prism_all_answered"] = _all_keys_answered(task_id, refs[0], task_result, payload, run, memo)
     return out
 
 
-def _handback_refs(kb: Any, conn: Any, task_result: Any, payload: Optional[dict], run_id: Any) -> list:
+def _handback_run(kb: Any, conn: Any, run_id: Any) -> Any:
+    if run_id is None:
+        return None
+    try:
+        return kb.get_run(conn, int(run_id))
+    except Exception:
+        return None
+
+
+def _handback_texts(task_result: Any, payload: Optional[dict], run: Any) -> list:
+    """The handback's own words: the run summary (the event payload is a clip), the event
+    summary, the card result and ``metadata.prism_verdicts``."""
+    meta = getattr(run, "metadata", None) if run else None
+    lines = (meta or {}).get("prism_verdicts") if isinstance(meta, dict) else None
+    return [getattr(run, "summary", None) if run else None, (payload or {}).get("summary"), task_result,
+            "\n".join(str(x) for x in lines) if isinstance(lines, list) else None]
+
+
+def _all_keys_answered(task_id: str, ref: Any, task_result: Any, payload: Optional[dict], run: Any,
+                       memo: dict) -> Optional[bool]:
+    """t_6e9f48cc: every Prism key open at the PR's live head is answered in the handback text.
+    The head is the one handback_pr_verdict just read (memo); unknown -> None (surface)."""
+    from gateway import kanban_prism_answers as _pa
+
+    health = memo.get((ref.repo.lower(), int(ref.number))) or {}
+    head = str(health.get("head") or "")
+    try:
+        return _pa.all_answered(ref.repo, int(ref.number), head, task_id,
+                                _handback_texts(task_result, payload, run))
+    except Exception as exc:
+        logger.warning("kanban auto-handle: prism answers for %s unread (%s); surfacing", task_id, exc)
+        return None
+
+
+def _handback_refs(kb: Any, conn: Any, task_result: Any, payload: Optional[dict], run_id: Any,
+                   *, run: Any = None) -> list:
     from hermes_cli import kanban_open_pr as _op
 
-    meta = None
-    if run_id is not None:
-        try:
-            run = kb.get_run(conn, int(run_id))
-            meta = getattr(run, "metadata", None) if run else None
-        except Exception:
-            meta = None
+    run = run if run is not None else _handback_run(kb, conn, run_id)
+    meta = getattr(run, "metadata", None) if run else None
     return [r for r in _op.extract_pr_refs((payload or {}).get("summary"), task_result,
                                            metadata=meta if isinstance(meta, dict) else None)
             if _op.is_fleet_ref(r)]
@@ -467,14 +519,55 @@ def ledger_append(event: dict) -> None:
 
 # --- child goal (pass-1 R7: the wake text is DATA, never the instruction) -----------------
 
+REVIEW_ALL_ANSWERED_STEPS = (
+    "1. Read the handback SUMMARY (`hermes kanban --board {board} show {task_id}`: the newest review run's "
+    "summary and metadata.prism_verdicts).",
+    "2. Post the prism-verdict lines it already contains onto the card, exactly as written, in one "
+    "`hermes kanban --board {board} comment {task_id}`; then `python3 {home}/scripts/prism_soft_gate.py round "
+    "--repo {repo} --pr {number} --head {head} --card {task_id}` must print `unanswered=0` and no "
+    "`unanswered:` / `pending-carry:` / `open-at-head:` line.",
+    "3. `python3 {home}/skills-shared/kanban/kanban-review-handback-operator/scripts/land-handback.py {repo} "
+    "{number} {task_id} \"<reason: every open Prism key answered in the handback>\" --coverage-only`; its "
+    "COVERAGE_AT= must equal {head}.",
+    "4. `python3 {home}/scripts/lib/landing_queue.py enqueue --repo {repo} --pr {number} --card {task_id} "
+    "--head {head} --by apollo/operator --reason \"<same reason>\" -- <fm_args>`, carrying the fm_args of the "
+    "PR's existing landing-queue row ({home}/state/landing-queue/{row} or landing-queue.done/{row}; e.g. "
+    "--allow-red-ci) unchanged; no row -> no extra args.",
+)
+REVIEW_ALL_ANSWERED_RULE = (
+    "HARD RULE: never write an APPROVE on a head that has an unanswered Prism key (step 2's round check "
+    "comes first, and the head must still be {head}); never add, drop or widen an fm_arg. If any step "
+    "refuses or reads anything else, post ONE card comment naming the step and its output, run nothing "
+    "after it, and return action `surface`. Return `handled` only when all four steps succeeded."
+)
+
+
+def _review_all_answered_brief(entry: dict) -> str:
+    from hermes_constants import display_hermes_home, get_default_hermes_root
+
+    repo, _, number = str(entry.get("pr") or "?#?").partition("#")
+    fields = {"board": entry.get("board") or "default", "task_id": entry["task_id"], "repo": repo,
+              "number": number, "head": entry.get("head") or "<unknown head: surface>",
+              "home": display_hermes_home(get_default_hermes_root()),
+              "row": f"{repo.replace('/', '__')}__{number}.json"}
+    steps = "\n".join(s.format(**fields) for s in REVIEW_ALL_ANSWERED_STEPS)
+    return f"Do these four steps, in order:\n{steps}\n{REVIEW_ALL_ANSWERED_RULE.format(**fields)}\n"
+
+
+#: Row-specific instructions appended to the generic goal (keyed on the claim-time row).
+ROW_BRIEFS = {"own_repo_review_all_keys_answered": _review_all_answered_brief}
+
+
 def build_goal(entry: dict) -> str:
     quoted = "\n".join("> " + ln for ln in str(entry.get("wake_text") or "").splitlines()) or "> (empty)"
     allowed = ", ".join(sorted(ALLOWED.get(entry.get("row") or "", ())))
+    brief = ROW_BRIEFS.get(entry.get("row") or "")
     return (
         f"{GOAL}\n\nDelegation ID `{entry['delegation_id']}`: include it verbatim in your final summary.\n"
         f"verdict_nonce: {entry['verdict_nonce']}\n"
         f"Card {entry['task_id']} (board {entry.get('board') or 'default'}), wake row `{entry.get('row')}`; "
         f"allowed actions: {allowed}.\n"
+        f"{brief(entry) if brief else ''}"
         "End your final message with exactly ONE block, last:\n"
         f"<<<BOOMERANG-VERDICT nonce={entry['verdict_nonce']}>>>\n"
         '{"action": "<one allowed action>", "evidence": ["<command + result>"], '
@@ -549,8 +642,12 @@ def _moved(entry: dict, kb: Any, conn: Any) -> Optional[str]:
     """RC-3 freshness: an event newer than the claim's cursor (rows by this claim's own
     child_session excepted, pass-5 RC-B), a status change, or a moved own-PR head."""
     child = str(entry.get("child_session") or "")
-    rows = conn.execute("SELECT actor_session_id FROM task_events WHERE task_id = ? AND id > ?",
+    rows = conn.execute("SELECT actor_session_id, kind FROM task_events WHERE task_id = ? AND id > ?",
                         (entry["task_id"], int(entry.get("cursor_event_id") or entry["event_id"]))).fetchall()
+    if entry.get("row") == "own_repo_review_all_keys_answered":
+        # t_6e9f48cc: that child's own work IS comments (verdict lines + coverage), posted from a
+        # terminal whose event actor is not reliably the child session; a comment moves no state.
+        rows = [r for r in rows if r[1] != "commented"]
     if any(not child or (r[0] or "") != child for r in rows):
         return "state moved"
     task = kb.get_task(conn, entry["task_id"])
@@ -590,6 +687,9 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
                     raise RuntimeError("complete refused")
             elif status != "done":   # a done card: the verification receipt IS the write
                 raise RuntimeError(f"complete on a {status} card")
+        elif action == "handled":    # the child's own writes are done; the receipt IS the write
+            if status != "review":
+                raise RuntimeError(f"handled on a {status} card")
         elif action == "request_changes":
             if status != "review":
                 raise RuntimeError(f"request_changes on a {status} card")
@@ -960,21 +1060,45 @@ def _owner_candidates(board: str, task_id: str, items: list, home_sid: str, sess
     conn = _readonly(kb, board)
     try:
         task = kb.get_task(conn, task_id)
+        if task is None or not opted_in(task, home_sid, board, session_store):
+            return {"task": task}
+        retries = AutoHandleState().retries(task_id)
+        out: dict = {"task": task}
+        memo: dict = {}
+        for i in items:
+            payload = dict(i.get("payload") or {})
+            if i.get("kind") == "review_requested":
+                # the owner-wake queues a review handback only when its fleet PR is red/dirty
+                payload.update(own_repo=True, pr_state="red" if i.get("pr_state") else "")
+                if row_enabled(ROW_REVIEW_ALL_ANSWERED):
+                    payload["prism_all_answered"] = _owner_all_answered(kb, conn, task, i, memo)
+            disp = classify_event(str(i.get("kind") or ""), payload, task, retries)
+            if disp.verdict == "auto":
+                out[int(i["event_id"])] = disp
+        return out
     finally:
         conn.close()
-    if task is None or not opted_in(task, home_sid, board, session_store):
-        return {"task": task}
-    retries = AutoHandleState().retries(task_id)
-    out: dict = {"task": task}
-    for i in items:
-        payload = dict(i.get("payload") or {})
-        if i.get("kind") == "review_requested":
-            # the owner-wake queues a review handback only when its fleet PR is red/dirty
-            payload.update(own_repo=True, pr_state="red" if i.get("pr_state") else "")
-        disp = classify_event(str(i.get("kind") or ""), payload, task, retries)
-        if disp.verdict == "auto":
-            out[int(i["event_id"])] = disp
-    return out
+
+
+def _owner_all_answered(kb: Any, conn: Any, task: Any, item: dict, memo: dict) -> Optional[bool]:
+    """Owner-wake twin of review_payload's ``prism_all_answered`` (same refs, health, texts)."""
+    fn = _health_fn()
+    if fn is None:
+        return None
+    try:
+        row = conn.execute("SELECT run_id FROM task_events WHERE id = ?", (int(item["event_id"]),)).fetchone()
+        run_id = row[0] if row else None
+        run = _handback_run(kb, conn, run_id)
+        refs = _handback_refs(kb, conn, _field(task, "result"), item.get("payload"), run_id, run=run)
+        if len(refs) != 1:
+            return None
+        key = (refs[0].repo.lower(), int(refs[0].number))
+        if key not in memo:
+            memo[key] = fn(refs[0].repo, int(refs[0].number))
+    except Exception as exc:
+        logger.debug("kanban auto-handle: owner-wake prism read for %s failed (%s)", _field(task, "id"), exc)
+        return None
+    return _all_keys_answered(_field(task, "id"), refs[0], _field(task, "result"), item.get("payload"), run, memo)
 
 
 async def owner_wake_filter(runner: Any, card: dict, items: list, entry: Any, *, dispatch_on: bool) -> list:

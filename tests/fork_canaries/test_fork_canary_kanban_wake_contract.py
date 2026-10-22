@@ -556,3 +556,51 @@ def test_w20_kill_switch_off_auto_card_wakes_as_today(auto_env):
     _close(tid, sid=WORKER_SID, profile="worker", summary="worker finished")
     turns = _tick(env)
     assert _paths(turns) == ["notifier"] and env["dispatched"] == [], _msg("W20", "switch off still dispatched", turns)
+
+
+# --- W21-W22: a mechanical own-repo handback (every open Prism key answered) -> a fork child (t_6e9f48cc) ---
+
+
+def _answered_handback(env, pr, lines, open_keys):
+    """A green own-repo PR whose handback SUMMARY carries ``lines``; ``round`` reads ``open_keys``."""
+    from gateway import kanban_prism_answers as pa
+    from hermes_constants import get_default_hermes_root
+
+    scripts = get_default_hermes_root() / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "prism_soft_gate.py").write_text(
+        "import re\n"
+        "VERDICT_LINE = re.compile(r'prism-verdict:\\s*([A-Za-z0-9_.\\-]+)\\s+(not-a-bug|false|by-design)\\b', re.I)\n"
+        "FIXED_LINE = re.compile(r'prism-verdict:\\s*([A-Za-z0-9_.\\-]+)\\s+fixed\\s+(?:in\\s+)?([0-9a-f]{7,40})\\b', re.I)\n")
+    env["monkeypatch"].setattr(pa, "_GRAMMAR", {})
+    env["monkeypatch"].setattr(pa, "open_keys_fn", lambda repo, n, head, card: list(open_keys))
+    env["health"][(REPO, pr)] = {"state": "open", "mergeable_state": "clean", "failing": [], "head": "e" * 40}
+    tid = _auto_card(env)
+    _sub(tid)
+    with kb.connect_closing() as conn, \
+            kb.mutation_actor(session_ids=[WORKER_SID], profile="worker", surface="worker"):
+        kb.request_review(conn, tid, force=True, summary=f"PR {REPO}#{pr} ready\n" + "\n".join(lines))
+    return tid
+
+
+def test_w21_all_keys_answered_handback_is_one_fork_dispatch_zero_turns(auto_env):
+    """RED-PROVABLE: drop the own_repo_review_all_keys_answered row from kanban_wake_disposition._TABLE
+    (or stop setting prism_all_answered in kanban_auto_handle.review_payload) -> 0 dispatches."""
+    env = auto_env
+    _answered_handback(env, 2131, ["prism-verdict: 5ef38967cc14 fixed " + "e" * 40,
+                                   "prism-verdict: f1a50a36ff7f not-a-bug unreachable"],
+                       ["5ef38967cc14", "f1a50a36ff7f"])
+    turns = _tick(env)
+    rows = [(e["row"], e["mode"]) for e in env["dispatched"]]
+    assert rows == [("own_repo_review_all_keys_answered", "fork")] and turns == [], \
+        _msg("W21", f"an all-answered handback did not fork exactly once: {rows}", turns)
+
+
+def test_w22_one_unanswered_key_keeps_todays_merge_pass_row(auto_env):
+    """RED-PROVABLE: make kanban_prism_answers.all_answered ignore keys -> a dispatch appears."""
+    env = auto_env
+    _answered_handback(env, 2132, ["prism-verdict: 5ef38967cc14 fixed " + "e" * 40],
+                       ["5ef38967cc14", "f1a50a36ff7f"])
+    turns = _tick(env)
+    assert env["dispatched"] == [], _msg("W22", "an unanswered key was auto-handled", turns)
+    assert _paths(turns) == ["notifier"], _msg("W22", "the green handback must wake as today", turns)

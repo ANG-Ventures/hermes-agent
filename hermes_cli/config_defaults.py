@@ -2477,6 +2477,11 @@ DEFAULT_CONFIG = {
         "needs_input_pager": True,
         # Also page a card parked as `dependency` on a parent that is blocked.
         "needs_input_pager_dependency": False,
+        # Per-row kill switches for Boomerang auto-handle disposition rows, on top
+        # of delegation.boomerang.auto_handle_enabled (t_6e9f48cc).
+        # review_all_answered: an own-repo review handback whose text answers every
+        # open Prism key forks a child to post the lines, coverage and enqueue.
+        "auto_handle_rows": {"review_all_answered": True},
         # "platform:chat_id" (e.g. "discord:1480525090331561984"). When set,
         # the notifier posts done / ready-for-review / blocked lines there
         # instead of the subscriber's chat; the wake still goes to the
