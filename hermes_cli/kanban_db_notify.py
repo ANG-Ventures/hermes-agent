@@ -20,9 +20,33 @@ if TYPE_CHECKING:
 
 # Notifier reaction to a terminal event: "notify" = passive adapter.send only
 # (default); "notify+wake" = send AND wake the destination agent; "wake" = wake only.
-_NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake")
+# "boomerang" / "notify+boomerang" = the boomerang wake level: a wake whose mechanical
+# events a background boomerang child handles (``tasks.boomerang_wake``, the one setting).
+_NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake", "boomerang", "notify+boomerang")
 # Modes that start an agent turn in the subscriber's session.
-NOTIFY_WAKE_MODES = ("notify+wake", "wake")
+NOTIFY_WAKE_MODES = ("notify+wake", "wake", "notify+boomerang", "boomerang")
+# The boomerang wake level, and the wake modes with no passive line.
+BOOMERANG_MODES = ("notify+boomerang", "boomerang")
+WAKE_ONLY_MODES = ("wake", "boomerang")
+# plain wake mode <-> its boomerang counterpart (same passive-line half).
+_TO_BOOMERANG = {"notify+wake": "notify+boomerang", "wake": "boomerang"}
+_TO_PLAIN = {v: k for k, v in _TO_BOOMERANG.items()}
+
+
+def level_mode(mode: str, boomerang: bool) -> str:
+    """``mode`` at the card's level: a wake mode becomes its boomerang counterpart on a
+    boomerang-wake card and its plain counterpart otherwise; ``notify`` is unchanged."""
+    return (_TO_BOOMERANG if boomerang else _TO_PLAIN).get(mode, mode)
+
+
+def card_level(boomerang_wake: Any, subs: list) -> str:
+    """The level a person sees on a card: ``boomerang wake`` | ``wake`` | ``notify`` |
+    ``none`` (no subscription)."""
+    if boomerang_wake:
+        return "boomerang wake"
+    if any((s.get("delivery_mode") or "notify") in NOTIFY_WAKE_MODES for s in subs):
+        return "wake"
+    return "notify" if subs else "none"
 # One waker per card (Ace 2026-10-03 13:28, t_74bf5296): a partial UNIQUE
 # index over the wake rows, so a second wake row on a card cannot be written
 # by ANY writer, not only by add_notify_sub's own bookkeeping. api_server is
@@ -30,7 +54,8 @@ NOTIFY_WAKE_MODES = ("notify+wake", "wake")
 # origin), so demoting it would deliver nothing.
 ONE_WAKER_INDEX = "idx_notify_one_waker"
 _WAKER_PREDICATE = (
-    "delivery_mode IN ('notify+wake', 'wake') AND platform != 'api_server'"
+    "delivery_mode IN ('notify+wake', 'wake', 'notify+boomerang', 'boomerang')"
+    " AND platform != 'api_server'"
 )
 _SCALAR_TYPES = (str, int, float, bool)
 
@@ -254,13 +279,30 @@ def _notify_sub_admission(
     return "replace", others
 
 
+def _card_boomerang_wake(conn: sqlite3.Connection, task_id: str) -> bool:
+    row = conn.execute("SELECT boomerang_wake FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return bool(row is not None and row[0])
+
+
+def _set_card_boomerang_wake(conn: sqlite3.Connection, task_id: str, value: bool) -> bool:
+    """Write ``tasks.boomerang_wake`` (caller holds the write txn); True when it changed.
+    Records ``boomerang_wake_set``."""
+    stored = 1 if value else 0
+    row = conn.execute("SELECT boomerang_wake FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row[0] == stored:
+        return False
+    conn.execute("UPDATE tasks SET boomerang_wake = ? WHERE id = ?", (stored, task_id))
+    _kb._append_event(conn, task_id, "boomerang_wake_set", {"boomerang_wake": bool(value)})  # noqa: SLF001
+    return True
+
+
 def card_waker(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     exclude: Optional[tuple[str, str, str]] = None,
 ) -> Optional[dict]:
-    """The card's single wake subscription (``notify+wake``/``wake``), or None.
+    """The card's single wake subscription (any ``NOTIFY_WAKE_MODES`` row), or None.
 
     ``exclude`` = ``(platform, chat_id, thread_id)`` of a row to ignore (the
     row being written). The ``idx_notify_one_waker`` index guarantees at most
@@ -335,11 +377,15 @@ def _ensure_single_waker_index(conn: sqlite3.Connection) -> None:
     one wake row it keeps the home chat's row, else the oldest; the rest drop
     to ``notify``. Their subscription (the human's line) is kept.
     """
-    if conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+    existing = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
         (ONE_WAKER_INDEX,),
-    ).fetchone():
-        return
+    ).fetchone()
+    if existing is not None:
+        if "boomerang" in str(existing[0] or ""):
+            return
+        # Pre-boomerang predicate: rebuild so the boomerang modes are one waker too.
+        conn.execute(f"DROP INDEX IF EXISTS {ONE_WAKER_INDEX}")
     if not conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kanban_notify_subs'"
     ).fetchone():
@@ -536,6 +582,13 @@ def add_notify_sub(
             # ``wake held`` hint both say so); an explicit mode still wins.
             # Prism #1679 P1 6d9abd90336a.
             target_mode = "notify+wake"
+        # Boomerang wake level: the card column is the one setting. Asking for a
+        # boomerang mode sets it; any wake row on a boomerang-wake card is stored at
+        # the boomerang level.
+        if target_mode in BOOMERANG_MODES:
+            _set_card_boomerang_wake(conn, task_id, True)
+        elif target_mode in NOTIFY_WAKE_MODES and _card_boomerang_wake(conn, task_id):
+            target_mode = level_mode(target_mode, True)
         if target_mode in NOTIFY_WAKE_MODES:
             target_mode = _claim_wake(
                 conn, task_id=task_id, platform=platform, chat_id=chat_id,

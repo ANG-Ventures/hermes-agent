@@ -638,12 +638,6 @@ gateway:
     channel_not_joined: "Не в голосовом канале."
     channel_left: "Покинул голосовой канал."
     transcript_echo: "**[Голос]** <@{user}>: {text}"
-  autohandle:
-    status: "🪃 Auto-handle for this session: **{value}** ({source}). Cards homed here with no card-level flag follow it."
-    set: "🪃 Auto-handle **{value}** for this session: mechanical kanban wakes on cards homed here go to a background boomerang child; judgment events still surface. A card's own auto_handle flag wins."
-    usage: "Usage: `/autohandle on|off|status`"
-    unavailable: "No session to store the auto-handle setting on yet; send a message first."
-    save_failed: "Couldn't save the auto-handle setting for this session."
   yolo:
     disabled: "⚠️ Режим YOLO для этого сеанса **ОТКЛЮЧЁН** — опасные команды потребуют одобрения."
     enabled: "⚡ Режим YOLO для этого сеанса **ВКЛЮЧЁН** — все команды одобряются автоматически. Используйте с осторожностью."
@@ -1723,8 +1717,6 @@ slash:
     description: "Переключить режим фокуса — показывать только ваш промпт и финальный ответ"
   footer:
     description: "Переключить нижний колонтитул с метаданными шлюза в финальных ответах"
-  autohandle:
-    description: "Auto-handle mechanical kanban wakes for cards homed in this session (on/off/status)"
   yolo:
     description: "Переключить режим YOLO (пропускать все одобрения опасных команд)"
   approvals:

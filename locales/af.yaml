@@ -638,12 +638,6 @@ gateway:
     channel_not_joined: "Nie in 'n stemkanaal nie."
     channel_left: "Stemkanaal verlaat."
     transcript_echo: "**[Stem]** <@{user}>: {text}"
-  autohandle:
-    status: "🪃 Auto-handle for this session: **{value}** ({source}). Cards homed here with no card-level flag follow it."
-    set: "🪃 Auto-handle **{value}** for this session: mechanical kanban wakes on cards homed here go to a background boomerang child; judgment events still surface. A card's own auto_handle flag wins."
-    usage: "Usage: `/autohandle on|off|status`"
-    unavailable: "No session to store the auto-handle setting on yet; send a message first."
-    save_failed: "Couldn't save the auto-handle setting for this session."
   yolo:
     disabled: "⚠️ YOLO-modus **AF** vir hierdie sessie — gevaarlike opdragte sal goedkeuring vereis."
     enabled: "⚡ YOLO-modus **AAN** vir hierdie sessie — alle opdragte word outomaties goedgekeur. Gebruik versigtig."
@@ -1723,8 +1717,6 @@ slash:
     description: "Wissel fokusaansig — wys net jou prompt en die finale antwoord"
   footer:
     description: "Wissel die gateway se looptyd-metadata-voetstuk op finale antwoorde"
-  autohandle:
-    description: "Auto-handle mechanical kanban wakes for cards homed in this session (on/off/status)"
   yolo:
     description: "Wissel YOLO-modus (slaan alle goedkeurings vir gevaarlike opdragte oor)"
   approvals:

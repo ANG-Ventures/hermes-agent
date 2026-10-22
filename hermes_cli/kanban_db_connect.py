@@ -1158,10 +1158,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if _add_column_if_missing(conn, "tasks", "workspace_of", "workspace_of TEXT"):
             _kb._log.info("kanban migration: workspace_of backfill set %d decompose child(ren)",
                           backfill_workspace_of(conn))
-    if "auto_handle" not in cols:
-        # After workspace_of (fresh column order). Nullable tri-state, no backfill:
-        # NULL = inherit (Boomerang v2 D-15), which is what every existing card means.
-        _add_column_if_missing(conn, "tasks", "auto_handle", "auto_handle INTEGER")
+    if "boomerang_wake" not in cols:
+        # After workspace_of (fresh column order). Ace 2026-10-22 (t_7be18632): the
+        # pre-rename ``auto_handle`` column is copied once and left in place, unread.
+        if _add_column_if_missing(conn, "tasks", "boomerang_wake", "boomerang_wake INTEGER"):
+            _migrate_legacy_boomerang_column(conn, cols)
     # Retention reads ``workspace_of = ?`` per GC decision (Momus pass 3 answer 4).
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_workspace_of ON tasks(workspace_of) "
                  "WHERE workspace_of IS NOT NULL")
@@ -1169,6 +1170,31 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     _rebuild_drifted_tables(conn)
     # After the rebuild: a rebuilt kanban_notify_subs drops extra indexes.
     _kb._ensure_single_waker_index(conn)
+
+
+# The pre-rename card column (Boomerang v2 D-15). Read ONLY by the one-shot copy below.
+_LEGACY_BOOMERANG_COLUMN = "auto_handle"
+
+
+def _migrate_legacy_boomerang_column(conn: sqlite3.Connection, cols) -> None:
+    """Copy the legacy column into ``boomerang_wake`` (1/0/NULL as stored) and upgrade the
+    subscriptions of every card that was on: ``notify+wake`` -> ``notify+boomerang``,
+    ``wake`` -> ``boomerang``. Runs once, right after the column is added; logs the counts."""
+    if _LEGACY_BOOMERANG_COLUMN not in cols:
+        return
+    copied = conn.execute(
+        f"UPDATE tasks SET boomerang_wake = {_LEGACY_BOOMERANG_COLUMN}"
+        f" WHERE {_LEGACY_BOOMERANG_COLUMN} IS NOT NULL").rowcount
+    upgraded = 0
+    if _table_exists(conn, "kanban_notify_subs"):
+        for old, new in (("notify+wake", "notify+boomerang"), ("wake", "boomerang")):
+            upgraded += conn.execute(
+                "UPDATE kanban_notify_subs SET delivery_mode = ? WHERE delivery_mode = ?"
+                " AND task_id IN (SELECT id FROM tasks WHERE boomerang_wake = 1)",
+                (new, old)).rowcount
+    _kb._log.info("kanban migration: boomerang_wake copied from %s on %d card(s); "
+                  "%d subscription(s) upgraded to the boomerang level",
+                  _LEGACY_BOOMERANG_COLUMN, copied, upgraded)
 
 
 def backfill_workspace_of(conn: sqlite3.Connection) -> int:
