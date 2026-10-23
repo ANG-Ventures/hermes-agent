@@ -43,3 +43,28 @@ def test_writes_pops_and_the_definition_pass():
         'x = env.get(KANBAN_LINEAGE_ENV)  # lineage-reader: ok — reaper\n'
     )
     assert lint.scan_source(ok, "x.py") == []
+
+
+# The raw-text prefilter in front of the AST check must never skip a file the AST would flag:
+# each spelling below decodes to a reader of the tag (t_44dcc531, Prism 55a085104aea).
+_BS = chr(92)
+_SPLIT_READERS = {
+    "backslash-newline-in-literal": 'import os\nx = os.environ.get("HERMES_KANBAN_' + _BS + '\nLINEAGE")\n',
+    "backslash-crlf-in-literal": 'import os\r\nx = os.environ.get("HERMES_KANBAN_' + _BS + '\r\nLINEAGE")\r\n',
+    "backslash-cr-in-literal": 'import os\rx = os.environ.get("HERMES_KANBAN_' + _BS + '\rLINEAGE")\r',
+    "implicit-join": 'import os\nx = os.environ.get("HERMES_KANBAN_" "LINEAGE")\n',
+    "implicit-join-empty-literal": 'import os\nx = os.environ.get("HERMES_KAN" "" "BAN_LINEAGE")\n',
+    "continuation-between-literals": 'import os\nx = os.environ.get("HERMES_KANBAN_" ' + _BS + '\n "LINEAGE")\n',
+    "crlf-continuation-between-literals": 'import os\r\nx = os.environ.get("HERMES_" ' + _BS + '\r\n "KANBAN_LINEAGE")\r\n',
+    "comment-between-literals": 'import os\nx = os.environ.get(("HERMES_KANBAN_"  # c\n "LINEAGE"))\n',
+    "hex-escape": 'import os\nx = os.environ.get("HERMES_\\x4bANBAN_LINEAGE")\n',
+    "nfkc-identifier": 'from hermes_cli.kanban_db import KANBAN_LINEAGE_\uff25\uff2e\uff36\ny = env[KANBAN_LINEAGE_\uff25\uff2e\uff36]\n',
+}
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("src", list(_SPLIT_READERS.values()), ids=list(_SPLIT_READERS))
+def test_a_split_spelling_of_the_tag_is_still_scanned(src):
+    assert _lint().scan_source(src, "x.py"), "the prefilter skipped a file the AST flags"

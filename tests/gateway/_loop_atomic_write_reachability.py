@@ -56,6 +56,8 @@ baseline being updated, so it cannot silently rot).
 from __future__ import annotations
 
 import ast
+import bisect
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -149,6 +151,14 @@ def derive_scanned_modules(repo: Path, roots=None) -> frozenset[str]:
     Returns repo-relative posix paths (``"gateway/session.py"``), so the caller
     never has to translate module names back to files.
     """
+    roots = tuple(roots) if roots else None  # once: an iterator would be consumed by the key
+    key = _memo_key(repo, "modules", roots)
+    if key is not None and key not in _INDEX_MEMO:
+        _INDEX_MEMO[key] = _derive_scanned_modules(repo, roots)
+    return _INDEX_MEMO[key] if key is not None else _derive_scanned_modules(repo, roots)
+
+
+def _derive_scanned_modules(repo: Path, roots) -> frozenset[str]:
     seen_modules: set[str] = set()
     kept: set[str] = set()
     stack = [GRAPH_ENTRY_MODULE]
@@ -230,7 +240,7 @@ def _file_import_map(repo: Path, tree: ast.AST, modules) -> dict[str, str]:
     the scanned module set are kept.
     """
     out: dict[str, str] = {}
-    scanned = set(modules)
+    scanned = modules if isinstance(modules, (set, frozenset)) else set(modules)
     for node in _scope_nodes(tree):
         if not isinstance(node, ast.ImportFrom) or node.level or not node.module:
             continue
@@ -260,12 +270,42 @@ def _scope_nodes(tree: ast.AST):
 _IMPORT_MAPS: dict[str, dict] = {}
 
 
+# The checkout this file lives in. Index builds of THIS tree are memoized per process
+# (``_INDEX_MEMO``): no test edits the checkout, and the gates call ``build_index`` /
+# ``derive_scanned_modules`` 2-4 times per file with the same arguments, each one 20-120 s
+# on a 4-CPU CI slice (t_44dcc531). ``tmp_path`` trees are rebuilt on every call: tests
+# rewrite them in place between calls.
+_THIS_REPO = Path(__file__).resolve().parents[2]
+_INDEX_MEMO: dict = {}
+_AST_LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+def _memo_key(repo: Path, *parts):
+    return (parts if Path(repo).resolve() == _THIS_REPO else None)
+
+
 def build_index(repo: Path, modules, *, noqa_token: str | None = None) -> dict:
     """``(rel_path, fn_name) -> {"async", "calls", "line", "noqa"}``."""
     token = noqa_token or _NOQA_TOKEN
+    modules = frozenset(modules)  # once: an iterator argument is consumed by the first pass
+    key = _memo_key(repo, "index", modules, token)
+    if key is not None and key in _INDEX_MEMO:
+        index, import_maps = _INDEX_MEMO[key]
+        _IMPORT_MAPS.clear()
+        _IMPORT_MAPS.update(import_maps)
+        _FAMILY_CACHE.clear()
+        return index
+    index = _build_index(repo, modules, token)
+    if key is not None:
+        _INDEX_MEMO[key] = (index, dict(_IMPORT_MAPS))
+    return index
+
+
+def _build_index(repo: Path, modules, token: str) -> dict:
     index: dict = {}
     _IMPORT_MAPS.clear()
     _FAMILY_CACHE.clear()
+    modules = frozenset(modules)
     for rel in sorted(modules):
         path = repo / rel
         try:
@@ -275,15 +315,22 @@ def build_index(repo: Path, modules, *, noqa_token: str | None = None) -> dict:
             continue
         _IMPORT_MAPS[rel] = _file_import_map(repo, tree, modules)
         lines = src.splitlines()
+        # A function-local ``from X import y`` spells "import" on a line of the def's span; a
+        # def with none has an empty local map, so its scope is not walked a second time.
+        # Numbered as the AST numbers lines (\n, \r\n, \r only): ``splitlines`` also breaks on
+        # \f and U+2028 and would shift an import past ``end_lineno`` (Prism 22358872b569).
+        import_lines = [i for i, ln in enumerate(_AST_LINE_BREAK.split(src), 1) if "import" in ln]
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             decl = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
+            at = bisect.bisect_left(import_lines, node.lineno)
+            local_imports = at < len(import_lines) and import_lines[at] <= (node.end_lineno or node.lineno)
             index[(rel, node.name)] = {
                 "async": isinstance(node, ast.AsyncFunctionDef),
                 "calls": _called_names(node),
                 "line": node.lineno,
-                "imports": _file_import_map(repo, node, modules),
+                "imports": _file_import_map(repo, node, modules) if local_imports else {},
                 "noqa": token in decl and bool(
                     decl.split(token, 1)[1].strip()
                 ),

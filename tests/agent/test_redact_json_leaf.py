@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import os
 import json
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -165,6 +166,14 @@ def _violations(tree):
     return sorted(set(out))
 
 
+def _source_violations(src):
+    """``_violations`` of ``src``, skipping the parse when it cannot name the call. Both shapes
+    call ``redact_sensitive_text`` by name; NFKC because the tokenizer normalises identifiers."""
+    if "redact_sensitive_text" not in (src if src.isascii() else unicodedata.normalize("NFKC", src)):
+        return []
+    return _violations(ast.parse(src))
+
+
 def test_guard_detects_the_shapes():
     src = (
         "import json\n"
@@ -209,10 +218,10 @@ def test_no_serialize_then_redact_text_call_sites():
                 continue
             path = Path(root) / name
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
+                lines = _source_violations(path.read_text(encoding="utf-8"))
             except (SyntaxError, UnicodeDecodeError, OSError):
                 continue
-            offenders += [f"{path.relative_to(REPO)}:{ln}" for ln in _violations(tree)]
+            offenders += [f"{path.relative_to(REPO)}:{ln}" for ln in lines]
     assert not offenders, (
         "redact serialized JSON per leaf with agent.redact.redact_sensitive_json, "
         f"not redact_sensitive_text(json.dumps(...)): {offenders}"
@@ -224,3 +233,9 @@ def test_masked_key_collision_keeps_every_value():
     out = redact_sensitive_json({"PASS=abcdef12": 1, "PASS=ghijkl34": 2}, force=True)
     assert sorted(out.values()) == [1, 2]
     assert "abcdef12" not in repr(out) and "ghijkl34" not in repr(out)
+
+
+def test_prefilter_scans_an_nfkc_spelling_of_the_call():
+    # The tokenizer NFKC-normalises identifiers; the raw-text prefilter must too (t_44dcc531).
+    src = "import json\ndef a(m):\n    return redact_sensitive_\uff54ext(json.dumps(m))\n"
+    assert _source_violations(src) == [3]

@@ -42,6 +42,7 @@ Usage: ``python scripts/check_liveness_patches.py [--all|--print-baseline|--stri
 from __future__ import annotations
 
 import ast
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -109,6 +110,31 @@ def _target_of(call: ast.Call) -> str | None:
 _CALLABLE, _SIDE_EFFECT, _RETURN_VALUE = "callable", "side_effect", "return_value"
 _MOCKS = frozenset({"MagicMock", "Mock", "AsyncMock", "NonCallableMock", "create_autospec"})
 _PRIM_TAILS = frozenset({"kill", "waitpid", "connect", "pid_exists"})
+
+
+# Raw-text prefilter for a STRING CONSTANT the AST check looks for. The decoded constant need
+# not appear contiguously in the source: Python joins adjacent literals (``"kan" "" "ban"``),
+# drops a backslash-newline inside a literal and decodes escapes (``"\x6bill"``). ``_spelled``
+# builds a pattern for every such spelling: each character may be itself or an escape that can
+# decode to it, and between characters any run of literal joints (quote, gap, optional prefix,
+# quote) or continuations. A superset: a match only means "parse it" (Prism 675e33503531,
+# 10b55641b9b8, 3c7e1b72c0b1; t_44dcc531).
+_JOINT = r"""(?:['"]{1,3}(?:[ \t\f\r\n()]|\\(?:\r\n?|\n)|#[^\r\n]*)*[rRbBuUfF]{0,2}['"]{1,3}|\\(?:\r\n?|\n))*"""
+
+
+def _spelled(word: str) -> str:
+    parts = []
+    for ch in word:
+        o = ord(ch)
+        escapes = r"\\(?:x(?i:%02x)|u(?i:%04x)|U(?i:%08x)|0{0,2}%o|N\{[^}]*\})" % (o, o, o, o)
+        parts.append("(?:%s|%s)" % (re.escape(ch), escapes))
+    return _JOINT.join(parts)
+
+
+# ``_target_of`` only matches a str constant that IS a tail (``setattr(os, "kill", ...)``) or
+# ends in ``.<tail>`` (``patch("os.kill")``): a tail that ENDS a literal. A file without one has
+# no patch site. The bare-substring test it replaces parsed every file that says "connect".
+_PRIM_LITERAL = re.compile("(?:%s)%s['\"]" % ("|".join(_spelled(t) for t in sorted(_PRIM_TAILS)), _JOINT))
 
 
 def _replacement(call: ast.Call, fname: str) -> tuple[ast.expr | None, str]:
@@ -338,8 +364,8 @@ class _File:
 
 
 def check_source(src: str, filename: str = "<src>") -> list[str]:
-    if not any(t in src for t in _PRIM_TAILS):
-        return []  # cannot name a primitive: skip the parse (most of tests/)
+    if not _PRIM_LITERAL.search(src):
+        return []  # no quoted primitive name for _target_of to match: skip the parse (~98% of tests/)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         tree = ast.parse(src, filename=filename)

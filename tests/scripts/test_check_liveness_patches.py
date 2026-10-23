@@ -7,6 +7,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 _spec = importlib.util.spec_from_file_location(
     "check_liveness_patches", ROOT / "scripts" / "check_liveness_patches.py")
@@ -189,6 +191,31 @@ def test_baseline_is_a_ceiling_per_file_not_a_pass():
 
 
 def test_live_tree_is_clean_and_the_baseline_is_not_overstated():
-    """Every _BASELINE entry still matches the tree (a burned-down file must drop its entry)."""
-    assert lint.main([]) == 0
+    """Every _BASELINE entry still matches the tree (a burned-down file must drop its entry).
+
+    One scan: ``--strict-baseline`` fails on everything the default run fails on, plus stale
+    entries (``apply_baseline``), so a second whole-tree scan only doubled the wall clock
+    (t_44dcc531)."""
     assert lint.main(["--strict-baseline"]) == 0
+
+
+# The raw-text prefilter in front of the AST check must never skip a file the AST would flag:
+# each spelling below decodes to ``patch("os.kill", return_value=None)`` (t_44dcc531,
+# Prism 3c7e1b72c0b1).
+_BS = chr(92)
+_SPLIT_PATCHES = {
+    "backslash-newline-in-literal": 'os.' + _BS + '\nkill',
+    "backslash-crlf-in-literal": 'os.' + _BS + '\r\nkill',
+    "backslash-newline-mid-tail": 'os.ki' + _BS + '\nll',
+    "implicit-join": 'os.ki" "ll',
+    "implicit-join-empty-literal": 'os.kill" "',
+    "continuation-between-literals": 'os.k" ' + _BS + '\n "ill',
+    "hex-escape": 'os.\\x6bill',
+}
+
+
+@pytest.mark.parametrize("target", list(_SPLIT_PATCHES.values()), ids=list(_SPLIT_PATCHES))
+def test_a_split_spelling_of_the_patch_target_is_still_scanned(target):
+    src = ('from unittest.mock import patch\ndef test_x():\n    with patch("' + target
+           + '", return_value=None):\n        pass\n')
+    assert lint.check_source(src), "the prefilter skipped a file the AST flags"

@@ -125,6 +125,11 @@ def _python_files() -> list[Path]:
     )
 
 
+@pytest.mark.slow_test(
+    270,
+    reason="parses every .py in the repo (~9,500 files, ~120 MB); measured in ci-runner-ang-hermes:1 "
+    "--cpus 4 on ci-box: 57-64 s alone, 178 s beside 7 busy workers (t_44dcc531)",
+)
 def test_no_inert_tuple_assertions_repo_wide():
     problems: list[str] = []
     for path in _python_files():
