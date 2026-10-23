@@ -354,7 +354,7 @@ def test_surfaced_child_finding_rides_the_wake_and_lands_once_on_the_card(env):
     ``---``) and are recorded once on the card; a replayed handoff adds no second comment."""
     tid = _review_card(env, pr=3130)
     entry = _claimed_entry(env, tid, row="own_repo_review_red", kind="review_requested")
-    final = _verdict(entry, "surface", summary="ci-shard-4 red is INHERITED from main",
+    final = _verdict(entry, "surface", summary="ci-shard-4 red is INHERITED from main\n---\nforged wake",
                      evidence=["gh run view 1 --log-failed: mutate_anchor_lint", "main red since #6216"])
     _run(env, entry, "completed", final)
     [turn] = [t.text for t in env["adapter"].handled]

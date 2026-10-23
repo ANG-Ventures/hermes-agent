@@ -813,7 +813,7 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     except VerdictError as exc:
         return {"ok": False, "action": None, "reason": str(exc), "summary": ""}
     action, summary = verdict["action"], _first_line(verdict.get("summary"))
-    finding = {"detail": str(verdict.get("summary") or "").strip()[:600],
+    finding = {"detail": _first_line(verdict.get("summary"), 600),
                "evidence": [_first_line(e, 160) for e in verdict.get("evidence") or [] if str(e).strip()][:3]}
     if action not in ALLOWED.get(live.get("row") or "", frozenset()):
         return {"ok": False, "action": action, "reason": f"action not allowed for {live.get('row')}",
