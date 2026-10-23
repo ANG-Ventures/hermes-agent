@@ -392,6 +392,30 @@ def test_a_browser_child_does_not_inherit_the_address_space_cap(tmp_path):
 
 
 @pytest.mark.platforms("linux")
+def test_a_driven_program_and_its_descendants_run_without_the_address_space_cap(tmp_path):
+    """t_b56f9e1e: the e2e upgrade sandbox runs install.sh -> node; a node build with one V8
+    isolate per worker needs more than 6 GiB of address space. ``uncapped_argv`` lifts the cap
+    for that program and everything it execs; the test process and its other children keep it."""
+    import resource
+
+    saved = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (saved[1], saved[1]))
+    try:
+        out = _run_child(tmp_path, '''
+            import resource, subprocess
+            from tests._fixtures.bounds import uncapped_argv
+            def test_driven():
+                grandchild = ["/bin/sh", "-c", "/bin/sh -c 'ulimit -v'"]
+                assert subprocess.run(uncapped_argv(grandchild), capture_output=True, text=True).stdout.strip() == "unlimited"
+                assert subprocess.run(grandchild, capture_output=True, text=True).stdout.strip() == str(1024 ** 2)
+                assert resource.getrlimit(resource.RLIMIT_AS)[0] == 1024 ** 3
+        ''', env={bounds._RLIMIT_ENV: "1"})
+    finally:
+        resource.setrlimit(resource.RLIMIT_AS, saved)
+    assert out.returncode == 0, out.stdout + out.stderr
+
+
+@pytest.mark.platforms("linux")
 def test_the_browser_exemption_resolves_through_the_child_env_and_keeps_shell_semantics(tmp_path):
     """Prism f368ed80a38b: a browser pinned through ``env['PATH']`` (or a relative ``cwd``) must be
     THAT browser, not the parent PATH's. Prism acd9932c0af8: ``shell=True`` must still run the

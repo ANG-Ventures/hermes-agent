@@ -507,6 +507,20 @@ _EXEC_UNCAPPED = (
 _SHELL_ARG = 10  # ``Popen._execute_child(self, args, executable, preexec_fn, ..., shell, ...)``: index of ``shell``
 
 
+def uncapped_argv(argv) -> list[str]:
+    """``argv`` started with the pre-harness soft RLIMIT_AS, for a child that is a whole other
+    program the test drives, not code under the test's own budget. The cap is inherited through
+    every exec, so it reaches grandchildren the browser match above never sees: the e2e upgrade
+    sandbox runs install.sh / ``hermes update``, whose ``node`` builds start one V8 isolate per
+    worker (~1 GiB of address space each, measured on ACE-AI: 16 workers peak at 16 GiB VmPeak)
+    and died with \"JavaScript heap out of memory\" at a 75 MB heap under 6 GiB (t_b56f9e1e).
+    Unchanged when the harness did not lower the cap."""
+    argv = [os.fsdecode(a) for a in argv]
+    if _RLIMIT_AS_SAVED is None or not argv:
+        return argv
+    return [sys.executable, "-I", "-S", "-c", _EXEC_UNCAPPED, str(_RLIMIT_AS_SAVED[0]), argv[0], *argv]
+
+
 def _exempt_browser_children() -> None:
     """Spawn browser children (and the Playwright node driver) with the pre-harness soft
     RLIMIT_AS. Covers ``subprocess.Popen`` and asyncio subprocesses (both reach
