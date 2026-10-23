@@ -116,6 +116,35 @@ _PRIM_TAILS = frozenset({"kill", "waitpid", "connect", "pid_exists"})
 _PRIM_LITERAL = re.compile(r"""['"](?:[\w.]*\.)?(?:%s)['"]""" % "|".join(sorted(_PRIM_TAILS)))
 
 
+# Raw-text prefilter for a STRING CONSTANT the AST check looks for. Python joins adjacent
+# literals (``"kanban cre" "ate"``) and decodes escapes (``"\\x6bill"``), so the decoded
+# constant need not appear in the source. ``_gate_texts`` returns the texts to search: the
+# source, a copy with every adjacent-literal boundary removed, and (when the source has a
+# backslash) that copy with character escapes decoded (Prism 675e33503531, t_44dcc531).
+_LITERAL_JOIN = re.compile(r"""['"]{1,3}(?:\s|\\\n|[()]|#[^\n]*\n)*[rRbBuUfF]{0,2}['"]{1,3}""")
+_CHAR_ESCAPE = re.compile(r"\\(?:x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|([0-7]{1,3})|N\{([^}]*)\})")
+
+
+def _decode_escape(m: re.Match) -> str:
+    hexa = m.group(1) or m.group(2) or m.group(3)
+    try:
+        if hexa:
+            return chr(int(hexa, 16))
+        if m.group(4):
+            return chr(int(m.group(4), 8))
+        import unicodedata
+        return unicodedata.lookup(m.group(5))
+    except (KeyError, ValueError, OverflowError):
+        return m.group(0)
+
+
+def _gate_texts(src: str):
+    joined = _LITERAL_JOIN.sub("", src)
+    if "\\" not in src:
+        return (src, joined)
+    return (src, joined, _CHAR_ESCAPE.sub(_decode_escape, joined))
+
+
 def _replacement(call: ast.Call, fname: str) -> tuple[ast.expr | None, str]:
     """(expression installed, mode). ``(None, _CALLABLE)`` = a bare MagicMock."""
     kw = {k.arg: k.value for k in call.keywords}
@@ -343,7 +372,8 @@ class _File:
 
 
 def check_source(src: str, filename: str = "<src>") -> list[str]:
-    if not _PRIM_LITERAL.search(src):
+    texts = _gate_texts(src)
+    if not any(_PRIM_LITERAL.search(t) for t in texts):
         return []  # no quoted primitive name for _target_of to match: skip the parse (~98% of tests/)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

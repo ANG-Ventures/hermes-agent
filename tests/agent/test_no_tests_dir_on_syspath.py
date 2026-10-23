@@ -33,9 +33,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TESTS_DIR = REPO_ROOT / "tests"
-# ``sys`` . ``path`` as the tokenizer may spell it: whitespace, parens, line continuations
-# and comments between the tokens. A file without it cannot hold the AST shape below.
-_SYS_PATH_TEXT = re.compile(r"\bsys(?:\s|[()\\]|#[^\n]*\n)*\.(?:\s|\\)*path\b")
+# ``sys`` . ``path`` as the tokenizer may spell it: whitespace, line continuations and
+# comments on either side of the dot, parens before it. A file without it cannot hold the
+# AST shape below.
+_SYS_PATH_TEXT = re.compile(r"\bsys(?:\s|[()\\]|#[^\n]*\n)*\.(?:\s|\\|#[^\n]*\n)*path\b")
 
 
 def _syspath_insert_targets(path: Path) -> list[tuple[int, str]]:

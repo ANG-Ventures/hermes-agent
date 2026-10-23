@@ -45,6 +45,35 @@ SUPPRESS = "# kanban-identity: ok"
 _QUOTED_VERB = re.compile(r"""['"]\s*(?:create|promote|claim)\b|\b(?:create|promote|claim)\s*['"]""")
 
 
+# Raw-text prefilter for a STRING CONSTANT the AST check looks for. Python joins adjacent
+# literals (``"kanban cre" "ate"``) and decodes escapes (``"\\x6bill"``), so the decoded
+# constant need not appear in the source. ``_gate_texts`` returns the texts to search: the
+# source, a copy with every adjacent-literal boundary removed, and (when the source has a
+# backslash) that copy with character escapes decoded (Prism 675e33503531, t_44dcc531).
+_LITERAL_JOIN = re.compile(r"""['"]{1,3}(?:\s|\\\n|[()]|#[^\n]*\n)*[rRbBuUfF]{0,2}['"]{1,3}""")
+_CHAR_ESCAPE = re.compile(r"\\(?:x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|([0-7]{1,3})|N\{([^}]*)\})")
+
+
+def _decode_escape(m: re.Match) -> str:
+    hexa = m.group(1) or m.group(2) or m.group(3)
+    try:
+        if hexa:
+            return chr(int(hexa, 16))
+        if m.group(4):
+            return chr(int(m.group(4), 8))
+        import unicodedata
+        return unicodedata.lookup(m.group(5))
+    except (KeyError, ValueError, OverflowError):
+        return m.group(0)
+
+
+def _gate_texts(src: str):
+    joined = _LITERAL_JOIN.sub("", src)
+    if "\\" not in src:
+        return (src, joined)
+    return (src, joined, _CHAR_ESCAPE.sub(_decode_escape, joined))
+
+
 def _func_name(node: ast.AST) -> str | None:
     if isinstance(node, ast.Attribute):
         return node.attr
@@ -132,7 +161,10 @@ def _requests_fixture(fn: ast.AST) -> bool:
 
 
 def check_source(src: str, filename: str = "<src>") -> list[str]:
-    if "kanban" not in src or not (SHELL_RE.search(src) or _QUOTED_VERB.search(src)):
+    texts = _gate_texts(src)
+    if not any(
+        "kanban" in t and (SHELL_RE.search(t) or _QUOTED_VERB.search(t)) for t in texts
+    ):
         # Every spawn shape needs "kanban" plus a verb literal: the argv token / helper
         # argument (a quoted "create") or a shell string (SHELL_RE). Skips the parse of
         # ~99% of tests/ (t_44dcc531).

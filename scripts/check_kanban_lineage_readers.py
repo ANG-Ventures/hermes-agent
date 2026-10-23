@@ -23,6 +23,7 @@ Usage: python3 scripts/check_kanban_lineage_readers.py [paths...]
 from __future__ import annotations
 
 import ast
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,35 @@ NAME = "HERMES_KANBAN_LINEAGE"
 CONST = "KANBAN_LINEAGE_ENV"
 SUPPRESS = "# lineage-reader: ok"
 SELF = "scripts/check_kanban_lineage_readers.py"  # names the tag to look for it
+
+
+# Raw-text prefilter for a STRING CONSTANT the AST check looks for. Python joins adjacent
+# literals (``"kanban cre" "ate"``) and decodes escapes (``"\\x6bill"``), so the decoded
+# constant need not appear in the source. ``_gate_texts`` returns the texts to search: the
+# source, a copy with every adjacent-literal boundary removed, and (when the source has a
+# backslash) that copy with character escapes decoded (Prism 675e33503531, t_44dcc531).
+_LITERAL_JOIN = re.compile(r"""['"]{1,3}(?:\s|\\\n|[()]|#[^\n]*\n)*[rRbBuUfF]{0,2}['"]{1,3}""")
+_CHAR_ESCAPE = re.compile(r"\\(?:x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|([0-7]{1,3})|N\{([^}]*)\})")
+
+
+def _decode_escape(m: re.Match) -> str:
+    hexa = m.group(1) or m.group(2) or m.group(3)
+    try:
+        if hexa:
+            return chr(int(hexa, 16))
+        if m.group(4):
+            return chr(int(m.group(4), 8))
+        import unicodedata
+        return unicodedata.lookup(m.group(5))
+    except (KeyError, ValueError, OverflowError):
+        return m.group(0)
+
+
+def _gate_texts(src: str):
+    joined = _LITERAL_JOIN.sub("", src)
+    if "\\" not in src:
+        return (src, joined)
+    return (src, joined, _CHAR_ESCAPE.sub(_decode_escape, joined))
 
 
 def _mentions(node: ast.AST) -> bool:
@@ -55,7 +85,8 @@ def _allowed(node: ast.AST, parent: ast.AST) -> bool:
 
 
 def scan_source(src: str, rel: str) -> list[str]:
-    if NAME not in src and CONST not in src:
+    texts = _gate_texts(src)
+    if CONST not in src and not any(NAME in t for t in texts):
         return []  # every _mentions node spells one of them: skip the parse (all but a few files)
     try:
         tree = ast.parse(src)

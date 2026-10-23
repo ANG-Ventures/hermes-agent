@@ -150,7 +150,8 @@ def derive_scanned_modules(repo: Path, roots=None) -> frozenset[str]:
     Returns repo-relative posix paths (``"gateway/session.py"``), so the caller
     never has to translate module names back to files.
     """
-    key = _memo_key(repo, "modules", tuple(roots) if roots else None)
+    roots = tuple(roots) if roots else None  # once: an iterator would be consumed by the key
+    key = _memo_key(repo, "modules", roots)
     if key is not None and key not in _INDEX_MEMO:
         _INDEX_MEMO[key] = _derive_scanned_modules(repo, roots)
     return _INDEX_MEMO[key] if key is not None else _derive_scanned_modules(repo, roots)
@@ -284,7 +285,8 @@ def _memo_key(repo: Path, *parts):
 def build_index(repo: Path, modules, *, noqa_token: str | None = None) -> dict:
     """``(rel_path, fn_name) -> {"async", "calls", "line", "noqa"}``."""
     token = noqa_token or _NOQA_TOKEN
-    key = _memo_key(repo, "index", frozenset(modules), token)
+    modules = frozenset(modules)  # once: an iterator argument is consumed by the first pass
+    key = _memo_key(repo, "index", modules, token)
     if key is not None and key in _INDEX_MEMO:
         index, import_maps = _INDEX_MEMO[key]
         _IMPORT_MAPS.clear()
