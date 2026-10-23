@@ -133,7 +133,7 @@ def _parse_bash() -> Tuple[Optional[str], str]:
         try:
             return subprocess.run(
                 [exe, "-c", 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"'], stdin=subprocess.DEVNULL,
-                capture_output=True, text=True, timeout=5, env={"LC_ALL": "C"}).stdout.strip() or "?"
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, env={"LC_ALL": "C"}).stdout.strip() or "?"
         except (OSError, subprocess.SubprocessError):
             return None
 

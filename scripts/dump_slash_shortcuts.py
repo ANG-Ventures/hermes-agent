@@ -36,7 +36,7 @@ def render() -> str:
 
 
 def check(out: Path = OUT) -> int:
-    committed = out.read_text(encoding="utf-8") if out.exists() else ""
+    committed = out.read_text(encoding="utf-8-sig") if out.exists() else ""
     if committed == render():
         return 0
     print(f"{out.relative_to(ROOT)} is stale — run scripts/dump_slash_shortcuts.py", file=sys.stderr)

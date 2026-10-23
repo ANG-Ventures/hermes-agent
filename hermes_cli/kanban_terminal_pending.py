@@ -106,7 +106,7 @@ def approve_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
 
 def _read(path: Path) -> Optional[dict]:
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
         return None

@@ -102,7 +102,7 @@ def _run_child(script, args, in_fd, out_fd, err_fd):
         os.dup2(err_fd, 2)
         _close_inherited_fds()
         signal.signal(signal.SIGINT, signal.default_int_handler)
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)  # windows-footgun: ok — POSIX fork child; on Windows os.fork fails first and shell_hooks_batch runs hooks one by one
         orig_in, orig_out, orig_err = sys.__stdin__, sys.__stdout__, sys.__stderr__
         sys.stdin = open(0, "r", encoding=orig_in.encoding, errors=orig_in.errors, closefd=False)
         sys.stdout = open(1, "w", encoding=orig_out.encoding, errors=orig_out.errors, closefd=False)
@@ -184,7 +184,7 @@ def _start(i, hook, payload):
     err_r, err_w = os.pipe()
     sys.stdout.flush()
     sys.stderr.flush()
-    pid = os.fork()
+    pid = os.fork()  # windows-footgun: ok — POSIX fork model; on Windows this raises and shell_hooks_batch runs hooks one by one
     if pid == 0:
         _run_child(script, args, in_r, out_w, err_w)
     for fd in (in_r, out_w, err_w):
@@ -281,7 +281,7 @@ def main():
                 live.remove(h)
             elif now >= h.deadline:
                 try:
-                    os.killpg(h.pid, signal.SIGKILL)
+                    os.killpg(h.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX fork model; never reached on Windows (os.fork fails first)
                 except OSError:
                     pass
                 if h.status is None:

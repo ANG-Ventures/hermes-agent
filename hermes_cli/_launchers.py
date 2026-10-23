@@ -383,7 +383,7 @@ def _shell_launcher_python(target: Path) -> Path | None:
     try:
         if target.is_symlink():
             return None
-        lines = target.read_text(encoding="utf-8").split("\n", 1)
+        lines = target.read_text(encoding="utf-8-sig").split("\n", 1)
         if lines[0] != "#!/bin/sh" or len(lines) < 2:
             return None
         tokens = shlex.split(lines[1])

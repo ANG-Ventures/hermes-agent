@@ -54,6 +54,14 @@ LOCK_NAME = ".curator.lock"
 SHARED_MANIFEST_NAME = "shared-manifest.json"
 
 
+def _fleet_child_env(root: Path) -> Dict[str, str]:
+    """Exact-inherit env for the fleet gate/mover scripts, pointed at *root*."""
+    from tools.environments.local import build_subprocess_env
+
+    return build_subprocess_env(scrub_secrets=False, inherit_profile_home=False,
+                                extra={"HERMES_FLEET_HOME": str(root)})
+
+
 def _shared_root() -> Path:
     from agent.skill_utils import get_shared_skills_root
 
@@ -591,7 +599,7 @@ def archive_gate(names: Iterable[str], root: Optional[Path] = None) -> Dict[str,
             try:
                 p = subprocess.run([sys.executable, str(script), "--home", str(root), "--json", *todo],
                                    capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                   timeout=300, env={**os.environ, "HERMES_FLEET_HOME": str(root)})
+                                   timeout=300, env=_fleet_child_env(root))
                 doc = json.loads(p.stdout) if p.returncode == 0 else None
                 skills = doc.get("skills") if isinstance(doc, dict) else None
                 for n in todo:
@@ -643,7 +651,8 @@ def post_archive_logs(moved: List[str], root: Optional[Path] = None) -> bool:
         return False
     try:
         p = subprocess.run([sys.executable, str(notify), "--channel", "discord", "--target", LOGS_CHANNEL,
-                            "--sev", "info", "--send", msg], capture_output=True, text=True, timeout=60)
+                            "--sev", "info", "--send", msg], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=60)
     except (OSError, subprocess.TimeoutExpired) as e:
         logger.warning("curator: #logs line not sent (%s): %s", e, msg)
         return False
@@ -769,7 +778,7 @@ def unsubscribe_shared_skill(
             [sys.executable, str(mover), "--home", str(froot), "move", dname, dest_dir.name,
              "--in-place", "--create", "--json", "--operator", UNSUBSCRIBE_OPERATOR],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
-            env={**os.environ, "HERMES_FLEET_HOME": str(froot)},
+            env=_fleet_child_env(froot),
         )
         try:
             out = json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {}

@@ -202,7 +202,7 @@ _GB = float(1 << 30)
 def _cg_bytes(path: Path) -> Optional[float]:
     """A cgroup v2 memory file: a byte count, or None for "max" / absent / unreadable."""
     try:
-        raw = path.read_text(encoding="utf-8").strip()
+        raw = path.read_text(encoding="utf-8-sig").strip()
     except OSError:
         return None
     if not raw or raw == "max":
@@ -264,7 +264,7 @@ def read_history(path, *, since: Optional[float] = None) -> List[dict]:
     """Rows of the history ledger; a torn last line or a foreign row is skipped (append-only, never fatal)."""
     out: List[dict] = []
     try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
     except FileNotFoundError:
         return out
     for ln in lines:

@@ -83,14 +83,14 @@ def _run_file(python: str, repo: Path, nodeids: Sequence[str], timeout_s: int) -
                "-p", "no:randomly", "-p", "scripts.hermes_parity.canary_plugin",
                "--canary-report", str(report), *nodeids]
         try:
-            proc = subprocess.run(cmd, cwd=repo, env=env, stdin=subprocess.DEVNULL, text=True,
-                                  encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
+            proc = subprocess.run(cmd, cwd=repo, env=env, stdin=subprocess.DEVNULL,
+                                  text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT, check=False, timeout=timeout_s)
         except subprocess.TimeoutExpired:
             return {"crash": f"timed out after {timeout_s}s", "rc": -1}
         if not report.exists():
             return {"crash": proc.stdout[-2000:], "rc": proc.returncode}
-        data = json.loads(report.read_text(encoding="utf-8"))
+        data = json.loads(report.read_text(encoding="utf-8-sig"))
         data["rc"] = proc.returncode
         return data
 
@@ -240,7 +240,7 @@ def main(args) -> int:
     repo = Path(args.worktree).resolve() if args.worktree else gitops.repo_root(Path.cwd())
     changed = None
     if args.changed_file_list:
-        changed = [ln.strip() for ln in Path(args.changed_file_list).read_text(encoding="utf-8").splitlines() if ln.strip()]
+        changed = [ln.strip() for ln in Path(args.changed_file_list).read_text(encoding="utf-8-sig").splitlines() if ln.strip()]
     elif args.changed_from:
         changed = changed_from(repo, args.changed_from)
     absolute = lambda p: str(Path(p).absolute()) if p and os.sep in p else p   # noqa: E731 - pytest runs with cwd=repo

@@ -424,7 +424,7 @@ def main(argv: list[str]) -> int:
     unparsable: list[str] = []
     for f in files:
         try:
-            src = f.read_text(encoding="utf-8")
+            src = f.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
             continue
         try:

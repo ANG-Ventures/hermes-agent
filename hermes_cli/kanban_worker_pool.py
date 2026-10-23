@@ -691,7 +691,7 @@ def _ssh_config_files(path: Path, depth: int = 0,
     if depth > 4:
         return files
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return files
     for line in text.splitlines():
@@ -724,7 +724,7 @@ def ssh_config_hosts(path: Optional[Path] = None) -> Optional[frozenset]:
     names: List[str] = []
     try:
         for f in files:
-            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            for line in f.read_text(encoding="utf-8-sig", errors="replace").splitlines():
                 key, val = _ssh_config_kv(line)
                 if key == "host":
                     names += [n.lower() for n in val.split()

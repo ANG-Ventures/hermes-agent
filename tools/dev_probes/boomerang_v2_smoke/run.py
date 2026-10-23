@@ -120,7 +120,7 @@ def log_line_ts(line: str) -> float | None:
 
 def load_plan() -> dict:
     path = Path(os.environ.get("BV2_PLAN") or FIXTURES / "plan.json")
-    with open(path, encoding="utf-8") as fh:
+    with open(path, encoding="utf-8-sig") as fh:
         plan = json.load(fh)
     plan["_path"] = str(path)
     return plan
@@ -193,7 +193,7 @@ def render_section(rep: StepReport) -> str:
 def write_evidence(rep: StepReport) -> Path:
     path = Path(os.environ.get("BV2_EVIDENCE") or DEFAULT_EVIDENCE)
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = path.read_text(encoding="utf-8") if path.exists() else (
+    text = path.read_text(encoding="utf-8-sig") if path.exists() else (
         "# Boomerang v2 smoke evidence\n\n"
         "Written by `tools/dev_probes/boomerang_v2_smoke/run.py`; one section per step, "
         "replaced on every run of that step.\n\n")
@@ -265,7 +265,7 @@ class FileChat:
         if not self.path.exists():
             return []
         out = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
+        for line in self.path.read_text(encoding="utf-8-sig").splitlines():
             if not line.strip():
                 continue
             try:
@@ -290,7 +290,7 @@ class DiscordChat:
         self.after = str(max(0, (int(since * 1000) - 1420070400000)) << 22)
 
     def _token(self) -> str:
-        for raw in self.env_path.read_text(encoding="utf-8").splitlines():
+        for raw in self.env_path.read_text(encoding="utf-8-sig").splitlines():
             line = raw.strip()
             if line.startswith("export "):
                 line = line[7:].lstrip()
@@ -380,7 +380,7 @@ class Ctx:
             rep.commands.append(shown + "   # dry-run: not executed")
             return 0, ""
         print(shown, flush=True)
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, stdin=subprocess.DEVNULL)
         out = (proc.stdout or "") + (proc.stderr or "")
         rep.commands.append(shown + f"   # exit {proc.returncode}")
         rep.raw.append(f"--- {key} (exit {proc.returncode})\n{out.strip()[:4000]}")
@@ -457,7 +457,7 @@ class Ctx:
             shown = "$ " + shlex.join(argv)
             print(shown, flush=True)
             try:
-                proc = subprocess.run(argv, capture_output=True, text=True, timeout=self.args.ack_timeout)
+                proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=self.args.ack_timeout)
                 rc, out = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
             except (OSError, subprocess.TimeoutExpired) as exc:
                 rc, out = 127, f"{type(exc).__name__}: {exc}"
@@ -474,7 +474,7 @@ class Ctx:
         def seen() -> float | None:
             if not self.ack.exists():
                 return None
-            if token in {ln.strip() for ln in self.ack.read_text(encoding="utf-8").splitlines()}:
+            if token in {ln.strip() for ln in self.ack.read_text(encoding="utf-8-sig").splitlines()}:
                 return now()
             return None
 
@@ -652,7 +652,7 @@ def _read_config(ctx: Ctx, stage: int) -> dict:
 
 
 def _parse_snapshot(path: Path) -> dict:
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8-sig")
     try:
         import yaml  # noqa: PLC0415 - optional, the venv carries it
         return yaml.safe_load(text) or {}
@@ -977,7 +977,7 @@ def _sync_seat(ctx: Ctx, rep: StepReport, seat: str | None, what: str) -> str | 
         # hard 600 s. A timeout is recorded as a non-zero exit, never swallowed.
         budget = float(os.environ.get("BV2_SYNC_TIMEOUT") or 600)
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=budget)
+            proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=budget)
             rc, out = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
         except subprocess.TimeoutExpired as exc:
             rc, out = 124, f"wirelog_sync timed out after {budget:.0f}s (BV2_SYNC_TIMEOUT): {exc}"
@@ -1075,7 +1075,7 @@ def step3(ctx: Ctx) -> StepReport:
 
 def _boot_id(path: Path) -> str | None:
     try:
-        return str(json.loads(path.read_text(encoding="utf-8")).get("boot_id"))
+        return str(json.loads(path.read_text(encoding="utf-8-sig")).get("boot_id"))
     except (OSError, ValueError, AttributeError):
         return None
 
