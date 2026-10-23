@@ -23,6 +23,7 @@ makes the corresponding assertion fail.
 """
 
 import copy
+import shutil
 import sqlite3
 from types import SimpleNamespace
 from pathlib import Path
@@ -36,6 +37,17 @@ from agent.agent_runtime_helpers import sanitize_api_messages
 from agent.tool_executor import execute_tool_calls_segmented
 from hermes_state import SessionDB
 from run_agent import AIAgent
+
+
+_AGENT_HOMES: list[Path] = []
+
+
+@pytest.fixture(autouse=True)
+def _remove_agent_homes():
+    # _make_agent() takes no fixture, so its mkdtemp homes are removed here on pass and failure.
+    yield
+    while _AGENT_HOMES:
+        shutil.rmtree(_AGENT_HOMES.pop(), ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +72,7 @@ def _make_tool_defs(*names: str) -> list:
 
 def _make_agent():
     hermes_home = Path(tempfile.mkdtemp(prefix="hermes-test-home-"))
+    _AGENT_HOMES.append(hermes_home)
     (hermes_home / "logs").mkdir(parents=True, exist_ok=True)
     with (
         patch(

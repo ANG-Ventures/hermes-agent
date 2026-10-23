@@ -1,4 +1,5 @@
 import os, sys, json, asyncio, threading, tempfile, sqlite3, socket, subprocess, tracemalloc
+import atexit, shutil, signal, time
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from types import SimpleNamespace
@@ -6,6 +7,32 @@ from types import SimpleNamespace
 ROOT = Path(sys.argv[1]).resolve()
 RECEIPT = Path(sys.argv[2]).resolve()
 HOME = Path(tempfile.mkdtemp(prefix="hermes-104653-state-"))
+# tests/gateway/test_failure_writer_ownership.py waits 90 s; past that nobody reads the receipt.
+DEADLINE_S = 85
+
+
+def _remove_home():
+    shutil.rmtree(HOME, ignore_errors=True)
+
+
+def _expire():
+    # A wedged turn leaves non-daemon gateway threads, so a normal exit would block in
+    # threading._shutdown forever (orphaned probes lived for days on ci-box). Leave hard.
+    print(f"probe exceeded {DEADLINE_S}s deadline; exiting", file=sys.stderr, flush=True)
+    # Other threads may still be writing into HOME; remove until it stays gone.
+    for _ in range(40):
+        _remove_home()
+        time.sleep(0.05)
+        if not HOME.exists():
+            break
+    os._exit(124)
+
+
+atexit.register(_remove_home)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+_deadline = threading.Timer(DEADLINE_S, _expire)
+_deadline.daemon = True
+_deadline.start()
 # Discard inherited credentials/config, preserve only interpreter essentials.
 keep = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "TZ")}
 os.environ.clear()

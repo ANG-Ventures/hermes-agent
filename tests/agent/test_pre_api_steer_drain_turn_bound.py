@@ -21,10 +21,13 @@ Contract pinned here, through the real ``AIAgent.run_conversation`` loop:
 """
 
 import copy
+import shutil
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from agent.prompt_builder import STEER_MARKER_OPEN
 from agent.tool_dispatch_helpers import make_tool_result_message
@@ -33,8 +36,20 @@ from run_agent import AIAgent
 STEER = "slim the CLI harness please"
 
 
+_AGENT_HOMES: list[Path] = []
+
+
+@pytest.fixture(autouse=True)
+def _remove_agent_homes():
+    # _make_agent() takes no fixture, so its mkdtemp homes are removed here on pass and failure.
+    yield
+    while _AGENT_HOMES:
+        shutil.rmtree(_AGENT_HOMES.pop(), ignore_errors=True)
+
+
 def _make_agent():
     home = Path(tempfile.mkdtemp(prefix="hermes-test-home-"))
+    _AGENT_HOMES.append(home)
     (home / "logs").mkdir(parents=True, exist_ok=True)
     tool_defs = [
         {
