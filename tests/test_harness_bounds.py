@@ -313,7 +313,17 @@ def test_an_ancestor_cgroup_limit_binds(monkeypatch):
     """Prism e023de0647d5: the leaf is unlimited, the parent slice holds memory.max."""
     gib = 1024 ** 3
     _fake_cgroups(monkeypatch, [("/cg/slice/leaf", None, int(0.1 * gib)), ("/cg/slice", 2 * gib, int(1.2 * gib))])
-    assert bounds._clamp_to_cgroup(gib, int(0.1 * gib)) == 2 * gib - int(1.2 * gib) - int(2 * gib * 0.35)
+    assert bounds._clamp_to_cgroup(gib, int(0.1 * gib)) == 2 * gib - int(1.2 * gib) - bounds._headroom(2 * gib)
+
+
+def test_a_large_cgroup_does_not_reserve_a_share_of_itself_as_headroom(monkeypatch):
+    """t_b56f9e1e: ci-runner containers are 4 GiB with 8 workers and ~630 MiB of /_work tmpfs.
+    A 35 % headroom reserved 1.4 GiB there, and with 1 GiB still free every test got the 16 MiB
+    floor. The stop overshoot is allocator speed x latency, so 1 GiB free leaves a real budget."""
+    gib = 1024 ** 3
+    _fake_cgroups(monkeypatch, [("/cg/a", 4 * gib, 3 * gib)])
+    assert bounds._headroom(4 * gib) <= bounds._headroom(gib) + 256 * 1024 ** 2
+    assert bounds._clamp_to_cgroup(gib, int(0.1 * gib)) >= gib // 2
 
 
 def test_a_namespaced_container_root_cgroup_is_a_level(monkeypatch):
