@@ -42,6 +42,7 @@ Usage: ``python scripts/check_liveness_patches.py [--all|--print-baseline|--stri
 from __future__ import annotations
 
 import ast
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -109,6 +110,10 @@ def _target_of(call: ast.Call) -> str | None:
 _CALLABLE, _SIDE_EFFECT, _RETURN_VALUE = "callable", "side_effect", "return_value"
 _MOCKS = frozenset({"MagicMock", "Mock", "AsyncMock", "NonCallableMock", "create_autospec"})
 _PRIM_TAILS = frozenset({"kill", "waitpid", "connect", "pid_exists"})
+# ``_target_of`` only matches a str constant that IS a tail (``setattr(os, "kill", ...)``) or
+# ends in ``.<tail>`` (``patch("os.kill")``); a file without such a literal has no patch site.
+# The bare-substring test it replaces parsed every file that says "connect" (t_44dcc531).
+_PRIM_LITERAL = re.compile(r"""['"](?:[\w.]*\.)?(?:%s)['"]""" % "|".join(sorted(_PRIM_TAILS)))
 
 
 def _replacement(call: ast.Call, fname: str) -> tuple[ast.expr | None, str]:
@@ -338,8 +343,8 @@ class _File:
 
 
 def check_source(src: str, filename: str = "<src>") -> list[str]:
-    if not any(t in src for t in _PRIM_TAILS):
-        return []  # cannot name a primitive: skip the parse (most of tests/)
+    if not _PRIM_LITERAL.search(src):
+        return []  # no quoted primitive name for _target_of to match: skip the parse (~98% of tests/)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         tree = ast.parse(src, filename=filename)

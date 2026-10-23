@@ -131,6 +131,8 @@ def _requests_fixture(fn: ast.AST) -> bool:
 
 
 def check_source(src: str, filename: str = "<src>") -> list[str]:
+    if "kanban" not in src:
+        return []  # every spawn shape (argv token, shell string, same-module helper) spells it
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # other files' invalid-escape Syntax/DeprecationWarnings
         tree = ast.parse(src, filename=filename)
