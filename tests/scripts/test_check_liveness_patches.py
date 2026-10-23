@@ -191,8 +191,11 @@ def test_baseline_is_a_ceiling_per_file_not_a_pass():
 
 
 def test_live_tree_is_clean_and_the_baseline_is_not_overstated():
-    """Every _BASELINE entry still matches the tree (a burned-down file must drop its entry)."""
-    assert lint.main([]) == 0
+    """Every _BASELINE entry still matches the tree (a burned-down file must drop its entry).
+
+    One scan: ``--strict-baseline`` fails on everything the default run fails on, plus stale
+    entries (``apply_baseline``), so a second whole-tree scan only doubled the wall clock
+    (t_44dcc531)."""
     assert lint.main(["--strict-baseline"]) == 0
 
 
