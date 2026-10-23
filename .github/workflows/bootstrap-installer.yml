@@ -21,7 +21,9 @@ concurrency:
 jobs:
   posix:
     name: install.sh protocol + small fresh-install E2E
-    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-24.04' }}
+    # CI_BIG_PLUMBING_RUNNER (set only on the private mirror) wins over the plumbing pool: this job
+    # writes 5.6 GiB to /_work (7.2 GiB cgroup peak with /_work in RAM), so the ci-box pool's 3g /_work tmpfs ENOSPCs (t_08dc2e4e).
+    runs-on: ${{ vars.CI_BIG_PLUMBING_RUNNER && fromJSON(vars.CI_BIG_PLUMBING_RUNNER) || vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-24.04' }}
     timeout-minutes: 15
     # NOTE: `runner.temp` is only available in step-level env, not job-level
     # env — a job-env `${{ runner.temp }}` makes GitHub reject the workflow
