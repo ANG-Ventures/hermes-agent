@@ -474,6 +474,11 @@ def _iter_python_files():
         yield path, rel
 
 
+@pytest.mark.slow_test(
+    180,
+    reason="parses the ~1,000 tree files that spell a clock; measured in ci-runner-ang-hermes:1 --cpus 4 "
+    "on ci-box: 46 s alone, 123 s beside 7 busy workers (t_44dcc531)",
+)
 def test_no_zero_seeded_monotonic_limiters_in_tree():
     hits: list[str] = []
     for path, rel in _iter_python_files():
