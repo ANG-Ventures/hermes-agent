@@ -4028,6 +4028,7 @@ def _stop_own_spawn(proc: Optional[subprocess.Popen], grace: float = 5.0) -> Non
                 group = proc.pid
         except OSError:
             group = None
+    born = _kb._member_birth(proc.pid) if group is not None else None
 
     def _signal(sig) -> None:
         try:
@@ -4049,6 +4050,11 @@ def _stop_own_spawn(proc: Optional[subprocess.Popen], grace: float = 5.0) -> Non
         time.sleep(0.05)
     # Unconditional: group members that outlived or ignored SIGTERM.
     _signal(getattr(signal, "SIGKILL", signal.SIGTERM))
+    if group is not None and born is not None:
+        # A tool that setpgid()s out of the group is still in the worker's session (Prism
+        # ffe521cbbb21). Swept while the leader is unreaped (its pid, so the sid, is not
+        # reusable), bounded by the leader's own birth: there is no spawned event yet.
+        _kb._reap_worker_session(proc.pid, born_after=born, born_before=time.time())
     try:
         proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
@@ -4131,11 +4137,14 @@ def _spawn_now_locked(conn: sqlite3.Connection, task_id: str, *, board: str, spa
             ),
         )
     except Exception as exc:
-        if state.launched and state.pid:
-            # Failed after the process started (pid/placement write): stop it before the run
-            # is ended, so a reported failure never leaves a unit running (Prism 6a23557fb4be).
-            _stop_own_spawn(state.proc)
-            _kb._abort_lost_claim_spawn(conn, claimed, int(state.pid))
+        # Failed after the process started (pid/placement write, or the spawner raising after
+        # it handed over its Popen): stop it before the run is ended, so a reported failure
+        # never leaves a unit running (Prism 6a23557fb4be). The handle alone proves a process
+        # exists, whether or not the spawner got as far as returning a pid (Prism a80612555536).
+        _stop_own_spawn(state.proc)
+        pid = state.pid if state.launched else None
+        if pid:
+            _kb._abort_lost_claim_spawn(conn, claimed, int(pid))
         host_fault = _host_fault(exc)
         _record_task_failure(
             conn, claimed.id, str(exc), outcome="spawn_failed", release_claim=True, end_run=True,

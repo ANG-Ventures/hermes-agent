@@ -295,8 +295,10 @@ def test_k3_spawn_now_refuses_a_conn_on_another_board(home):
 
 
 _WORKER_WITH_CHILD = textwrap.dedent("""
-    import subprocess, sys, time
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    import os, subprocess, sys, time
+    # argv[2] == "escape": the child leaves the worker's process group (setpgid), still in its session.
+    escape = os.setpgrp if sys.argv[2:] == ["escape"] else None
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], preexec_fn=escape)
     open(sys.argv[1] + ".tmp", "w").write(str(child.pid))
     import os; os.replace(sys.argv[1] + ".tmp", sys.argv[1])
     time.sleep(120)
@@ -308,17 +310,18 @@ class _OwnSpawn:
     ``on_popen``, registered in ``_worker_processes``. ``registry_entry`` replaces what
     the registry holds under the pid (a stand-in for a reused pid's other Popen)."""
 
-    def __init__(self, tmp_path, *, fork_child=False, registry_entry=None, after=None):
-        self.procs, self.child_pid = [], None
-        self.tmp_path, self.fork_child = tmp_path, fork_child
-        self.registry_entry, self.after = registry_entry, after
+    def __init__(self, tmp_path, *, fork_child=False, registry_entry=None, after=None,
+                 escape_group=False):
+        self.procs, self.child_pid, self.child_birth = [], None, None
+        self.tmp_path, self.fork_child = tmp_path, fork_child or escape_group
+        self.registry_entry, self.after, self.escape_group = registry_entry, after, escape_group
 
     def __call__(self, task, workspace, *, on_popen=None, **kw):
         if self.fork_child:
             script = self.tmp_path / "worker_with_child.py"
             script.write_text(_WORKER_WITH_CHILD, encoding="utf-8")
             pidfile = self.tmp_path / "child.pid"
-            argv = [sys.executable, str(script), str(pidfile)]
+            argv = [sys.executable, str(script), str(pidfile)] + (["escape"] if self.escape_group else [])
         else:
             argv = [sys.executable, "-c", "import time; time.sleep(120)"]
         proc = subprocess.Popen(argv, start_new_session=True)
@@ -333,6 +336,10 @@ class _OwnSpawn:
                 assert time.monotonic() < deadline, "worker never forked its child"
                 time.sleep(0.05)
             self.child_pid = int(pidfile.read_text())
+            self.child_birth = _birth(self.child_pid)
+            if self.escape_group:
+                assert os.getpgid(self.child_pid) == self.child_pid != proc.pid
+                assert os.getsid(self.child_pid) == proc.pid
         if self.after is not None:
             self.after(task)
         return proc.pid
@@ -344,9 +351,19 @@ class _OwnSpawn:
                 p.wait(timeout=10)
             with kb._worker_processes_lock:
                 kb._worker_processes.pop(p.pid, None)
-        if self.child_pid and _alive(self.child_pid):
-            # Reparented once its parent died, so it is outside the guarded subtree.
+        if self.child_pid and self.child_birth is not None and _birth(self.child_pid) == self.child_birth:
+            # Reparented once its parent died, so it is outside the guarded subtree (hence
+            # kill(1), not os.kill). Killed only while the pid is still the child we saw:
+            # same pid AND create time, never by number alone (Prism 979ec636a7bb).
             subprocess.run(["kill", "-9", str(self.child_pid)], check=False)
+
+
+def _birth(pid: int):
+    import psutil
+    try:
+        return psutil.Process(pid).create_time()
+    except psutil.NoSuchProcess:
+        return None
 
 
 def _alive(pid: int) -> bool:
@@ -413,6 +430,43 @@ def test_k3_claim_lost_after_spawn_stops_the_worker(home, tmp_path, monkeypatch)
 def test_k3_post_launch_failure_kills_the_workers_children(home, tmp_path, monkeypatch):
     """The worker's own child tools die with it: the group is signalled (Prism 92e06f55de54)."""
     spawn = _OwnSpawn(tmp_path, fork_child=True)
+    monkeypatch.setattr(kbd, "_set_worker_pid", _pid_write_fails)
+    with _conn(BOARD) as conn:
+        tid = kb.create_task(conn, title="unit", assignee="worker")
+        try:
+            with pytest.raises(kbd.SpawnNowError):
+                kbd.spawn_now(conn, tid, board=BOARD, spawn_fn=spawn)
+            assert spawn.procs[0].poll() is not None
+            assert _dead_within(spawn.child_pid)
+        finally:
+            spawn.cleanup()
+
+
+def test_k3_spawner_raising_after_on_popen_stops_the_worker(home, tmp_path):
+    """The spawner hands over its Popen, then raises before returning a pid (e.g.
+    ``_register_worker_identity`` failing in ``_default_spawn``): the worker it started
+    and its children are still stopped, and the card parks (Prism a80612555536 / ea1ee2e6a294)."""
+    def raise_after_popen(task):
+        raise RuntimeError("identity write failed")
+
+    spawn = _OwnSpawn(tmp_path, fork_child=True, after=raise_after_popen)
+    with _conn(BOARD) as conn:
+        tid = kb.create_task(conn, title="unit", assignee="worker")
+        try:
+            with pytest.raises(kbd.SpawnNowError):
+                kbd.spawn_now(conn, tid, board=BOARD, spawn_fn=spawn)
+            assert spawn.procs[0].poll() is not None
+            assert _dead_within(spawn.child_pid)
+            assert kb.get_task(conn, tid).status == "blocked"
+        finally:
+            spawn.cleanup()
+
+
+@pytest.mark.live_system_guard_bypass  # the escaped group is reparented once its leader dies
+def test_k3_post_launch_stop_reaches_a_tool_that_left_the_group(home, tmp_path, monkeypatch):
+    """A tool that setpgid()s out of the worker's group is still in its session: the stop
+    sweeps the session, not only the leader's group (Prism ffe521cbbb21)."""
+    spawn = _OwnSpawn(tmp_path, escape_group=True)
     monkeypatch.setattr(kbd, "_set_worker_pid", _pid_write_fails)
     with _conn(BOARD) as conn:
         tid = kb.create_task(conn, title="unit", assignee="worker")
