@@ -2485,7 +2485,10 @@ DEFAULT_CONFIG = {
         # state/boomerang-wake.disabled stop file (t_6e9f48cc, t_7be18632).
         # review_all_answered: an own-repo review handback whose text answers every
         # open Prism key forks a child to post the lines, coverage and enqueue.
-        "boomerang_wake_rows": {"review_all_answered": True},
+        # review_deadman: a review-deadman tier-1 event on a boomerang-wake card
+        # forks a child for the attended read (why-waits comment or surface);
+        # false = the owner-wake delivers it as a plain turn (t_1e0ffee4).
+        "boomerang_wake_rows": {"review_all_answered": True, "review_deadman": True},
         # "platform:chat_id" (e.g. "discord:1480525090331561984"). When set,
         # the notifier posts done / ready-for-review / blocked lines there
         # instead of the subscriber's chat; the wake still goes to the

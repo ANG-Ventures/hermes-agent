@@ -76,7 +76,7 @@ STATE_FILENAME = "kanban_owner_wake.json"
 
 SCAN_KINDS = (
     "blocked", "stalled", "crashed", "gave_up", "timed_out", "reclaimed",
-    "completed", "review_requested", "skipped_nonspawnable",
+    "completed", "review_requested", "skipped_nonspawnable", "review_deadman",
 )
 STUCK_KINDS = frozenset({"stalled", "crashed", "gave_up", "timed_out"})
 # Kinds the per-subscription notify+wake path turns into a wake. The owner-wake
@@ -96,6 +96,7 @@ TRIGGER_STUCK = "stuck"
 TRIGGER_LAST_BLOCKER = "last_blocker_done"
 TRIGGER_RED_HANDBACK = "red_handback"
 TRIGGER_WOKE_NONSPAWNABLE = "woke_nonspawnable"
+TRIGGER_REVIEW_DEADMAN = "review_deadman"
 
 _WAKE_OFF_RE = re.compile(r"^\s*wake\s*:\s*off\s*$", re.I | re.M)
 # A block reason that names WHEN or ON WHAT the card can move again.
@@ -294,6 +295,9 @@ def describe(item: dict) -> str:
                 "auto-spawn — decide: reassign to a worker or do it")
     elif trig == TRIGGER_RED_HANDBACK:
         out = f"handed back for review but the PR cannot land ({item.get('pr_state')})"
+    elif trig == TRIGGER_REVIEW_DEADMAN:
+        out = (f"waiting {item.get('waiting_min') or '?'}m in review on you with no owner comment (review deadman "
+               "tier 1): land it, request changes, or comment why it waits")
     else:
         out = str(item.get("kind"))
     if reason:
@@ -871,6 +875,9 @@ def _classify_row(kb: Any, conn: Any, r: Any, pr_health: Optional[PrHealthFn],
             return None
         item.update(trigger=TRIGGER_RED_HANDBACK, pr_state=verdict["state"],
                     red_keys=verdict["keys"], inherited_only=verdict["inherited_only"])
+    elif kind == "review_deadman":
+        # t_1e0ffee4: the review deadman's tier-1 page as an event (hermes-home kanban-review-deadman.py)
+        item.update(trigger=TRIGGER_REVIEW_DEADMAN, waiting_min=(payload or {}).get("waiting_min"))
     else:
         return None
     return item

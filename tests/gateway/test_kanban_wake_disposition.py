@@ -32,6 +32,7 @@ OWNER_WAKE_TRIGGER_EVENTS = {
     ow.TRIGGER_LAST_BLOCKER: [("completed", {"summary": "done"})],
     ow.TRIGGER_RED_HANDBACK: [("review_requested", {"own_repo": True, "pr_state": "red"})],
     ow.TRIGGER_WOKE_NONSPAWNABLE: [("skipped_nonspawnable", {"assignee": "apollo"})],
+    ow.TRIGGER_REVIEW_DEADMAN: [("review_deadman", {"waiting_min": 25})],
 }
 
 PLAIN = {"id": "t_1", "title": "plain card", "body": "do the thing"}
@@ -49,6 +50,7 @@ EXPECTED = {
     "blocked": SURFACE, "block_loop_detected": SURFACE,
     "review_requested": SURFACE,   # no own_repo/pr_state -> upstream row -> surface
     "reclaimed": SURFACE, "skipped_nonspawnable": SURFACE,
+    "review_deadman": AUTO,   # t_1e0ffee4: the deadman's tier-1 event -> the attended-read child
 }
 
 
@@ -225,3 +227,11 @@ def test_retry_state_preserves_unknown_keys_and_lives_under_hermes_home(tmp_path
     st.bump_retry("t_x")
     data = json.loads(p.read_text())
     assert data["claims"] == {"k": 1} and data["retries"] == {"t_x": 3}
+
+
+
+def test_review_deadman_event_is_an_auto_fork_row_and_a_tag_surfaces_it():
+    """t_1e0ffee4: the deadman's tier-1 event is mechanical; a spend/egress tag still surfaces it."""
+    d = classify("review_deadman", {"waiting_min": 25}, PLAIN)
+    assert (d.verdict, d.mode, d.row) == (AUTO, "fork", "review_deadman")
+    assert classify("review_deadman", {}, dict(PLAIN, title="[spend] card")).verdict == SURFACE

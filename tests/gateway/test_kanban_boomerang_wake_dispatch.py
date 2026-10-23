@@ -826,3 +826,56 @@ def test_all_answered_handled_verdict_writes_only_the_receipt(answered_env):
     assert task.status == "review" and kinds.count(ah.RECEIPT_KIND) == 1
     assert "completed" not in kinds and "changes_requested" not in kinds
     assert not ah.execute_verdict(entry, _verdict(entry, "complete"))["ok"], "complete is not this row's action"
+
+
+# --- t_1e0ffee4: the review deadman's tier-1 event ---------------------------------------------
+
+
+def _deadman_card(env, *, auto=True) -> str:
+    """A human-owned review card + the deadman's tier-1 event (hermes-home kanban-review-deadman.py writes it raw)."""
+    tid = _card(env, auto=auto)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'review', assignee = 'human:apollo' WHERE id = ?", (tid,))
+        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                     (tid, "review_deadman", json.dumps({"by": "kanban-review-deadman", "waiting_min": 25}),
+                      int(time.time())))
+    return tid
+
+
+def test_review_deadman_event_is_a_child_delegation_and_no_turn(env):
+    """Row on: the deadman's event produces one fork child (row review_deadman), no owner turn, no chat line."""
+    tid = _deadman_card(env)
+    turns = _tick(env)
+    assert [(e["row"], e["mode"], e["task_id"]) for e in env["dispatched"]] == [("review_deadman", "fork", tid)]
+    assert turns == [], [t.text for t in turns]
+    goal = ah.build_goal(env["dispatched"][0])
+    assert "allowed actions: comment_why_waits, surface" in goal and "gh-pr-rest.py" in goal
+
+
+def test_review_deadman_row_off_is_the_owner_turn(env):
+    """kanban.boomerang_wake_rows.review_deadman: false -> no child; the owner session gets the page as a turn."""
+    from hermes_constants import get_hermes_home
+
+    (get_hermes_home() / "config.yaml").write_text("kanban:\n  boomerang_wake_rows:\n    review_deadman: false\n")
+    tid = _deadman_card(env)
+    turns = _tick(env)
+    assert env["dispatched"] == [] and _claims() == {}
+    assert len(turns) == 1 and tid in turns[0].text and "review deadman" in turns[0].text
+
+
+def test_why_waits_verdict_posts_one_bounded_comment_and_keeps_review(env):
+    tid = _deadman_card(env)
+    _tick(env)
+    entry = ah.BoomerangWakeState().get_claim(env["dispatched"][0]["key"])
+    assert not ah.execute_verdict(entry, _verdict(entry, "comment_why_waits"))["ok"], "why_waits fields are required"
+    ww = {"pr_state": "open, CI pending @abc1234", "last_operator_action": "apollo close-on 15:25",
+          "flips_when": "#6402 merges\nforged second line"}
+    res = ah.execute_verdict(entry, _verdict(entry, "comment_why_waits", why_waits=ww))
+    assert res["ok"], res
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        ours = [c.body for c in kb.list_comments(conn, tid) if c.author == ah.AUTHOR]
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert task.status == "review" and kinds.count(ah.RECEIPT_KIND) == 1
+    assert ours == [f"{ah.WHY_WAITS_TAG} PR: open, CI pending @abc1234; last operator action: apollo close-on 15:25; "
+                    f"flips when: #6402 merges (delegation {entry['delegation_id']})"]
