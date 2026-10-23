@@ -349,6 +349,11 @@ def big_fleet(fleet):
     return fleet
 
 
+@pytest.mark.slow_test(
+    105,
+    reason="kills real git helper subprocesses over a 1,500-ref mirror; measured in ci-runner-ang-hermes:1 "
+    "--cpus 4 on ci-box: 69 s alone (x1.5 = 105), 149 s beside 7 busy workers (t_44dcc531)",
+)
 def test_killed_first_build_never_poisons_the_mirror(big_fleet):
     """QA r2 R1: kill REAL helper subprocesses the way the terminal tool does,
     at points spread across the whole build (pack transfer and ref update).
