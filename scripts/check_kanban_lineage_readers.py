@@ -55,6 +55,8 @@ def _allowed(node: ast.AST, parent: ast.AST) -> bool:
 
 
 def scan_source(src: str, rel: str) -> list[str]:
+    if NAME not in src and CONST not in src:
+        return []  # every _mentions node spells one of them: skip the parse (all but a few files)
     try:
         tree = ast.parse(src)
     except SyntaxError:

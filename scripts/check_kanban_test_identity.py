@@ -42,6 +42,7 @@ IN_PROCESS = frozenset({"parse_args", "run_slash", "parse_known_args"})
 # ``/kanban create`` is a slash command run in-process (gateway/CLI), not a spawn.
 SHELL_RE = re.compile(r"(?<![/\w])kanban\s+(?:--board\s+\S+\s+)?(create|promote|claim)\b")
 SUPPRESS = "# kanban-identity: ok"
+_QUOTED_VERB = re.compile(r"""['"]\s*(?:create|promote|claim)\b|\b(?:create|promote|claim)\s*['"]""")
 
 
 def _func_name(node: ast.AST) -> str | None:
@@ -131,6 +132,11 @@ def _requests_fixture(fn: ast.AST) -> bool:
 
 
 def check_source(src: str, filename: str = "<src>") -> list[str]:
+    if "kanban" not in src or not (SHELL_RE.search(src) or _QUOTED_VERB.search(src)):
+        # Every spawn shape needs "kanban" plus a verb literal: the argv token / helper
+        # argument (a quoted "create") or a shell string (SHELL_RE). Skips the parse of
+        # ~99% of tests/ (t_44dcc531).
+        return []
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # other files' invalid-escape Syntax/DeprecationWarnings
         tree = ast.parse(src, filename=filename)

@@ -209,7 +209,10 @@ def test_no_serialize_then_redact_text_call_sites():
                 continue
             path = Path(root) / name
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
+                src = path.read_text(encoding="utf-8")
+                if "redact_sensitive_text" not in src:
+                    continue  # both shapes call it by name: skip the parse
+                tree = ast.parse(src)
             except (SyntaxError, UnicodeDecodeError, OSError):
                 continue
             offenders += [f"{path.relative_to(REPO)}:{ln}" for ln in _violations(tree)]

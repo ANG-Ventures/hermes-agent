@@ -30,6 +30,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tests.gateway._loop_atomic_write_reachability import (
+    build_index,
     derive_scanned_modules,
     find_onloop_sink_sites,
 )
@@ -61,7 +62,11 @@ def _repo_root() -> Path:
 @pytest.fixture(scope="module")
 def modules():
     repo = _repo_root()
-    return repo, derive_scanned_modules(repo, SCAN_ROOTS)
+    mods = derive_scanned_modules(repo, SCAN_ROOTS)
+    # Built here, in SETUP, so the tests read the memoized index: 20-60 s on a 4-CPU CI
+    # slice, outside the per-test wall clock (t_44dcc531).
+    build_index(repo, mods)
+    return repo, mods
 
 
 def test_no_coroutine_reaches_an_agent_release_body(modules):

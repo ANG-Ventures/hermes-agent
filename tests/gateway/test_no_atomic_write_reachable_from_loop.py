@@ -46,6 +46,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from tests.gateway._loop_atomic_write_reachability import (
     GRAPH_ENTRY_MODULE,
     PACKAGE_ROOTS,
@@ -54,6 +56,14 @@ from tests.gateway._loop_atomic_write_reachability import (
     find_onloop_atomic_write_sites,
     ratchet_key,
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _live_index_built_in_setup():
+    """Build the live tree's index once, in SETUP: the tests below read the memoized copy.
+    20-60 s on a 4-CPU CI slice, outside the per-test wall clock (t_44dcc531)."""
+    repo = Path(__file__).resolve().parents[2]
+    build_index(repo, derive_scanned_modules(repo))
 
 # Vacuity floors.  A broken derivation or a broken walk must fail LOUDLY, not
 # report a clean tree.  Measured on the commit that introduced this gate:

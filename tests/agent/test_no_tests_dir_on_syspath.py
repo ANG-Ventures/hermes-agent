@@ -28,16 +28,23 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TESTS_DIR = REPO_ROOT / "tests"
+# ``sys`` . ``path`` as the tokenizer may spell it: whitespace, parens, line continuations
+# and comments between the tokens. A file without it cannot hold the AST shape below.
+_SYS_PATH_TEXT = re.compile(r"\bsys(?:\s|[()\\]|#[^\n]*\n)*\.(?:\s|\\)*path\b")
 
 
 def _syspath_insert_targets(path: Path) -> list[tuple[int, str]]:
     """Return (lineno, resolved_dir) for every literal sys.path insert/append."""
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        src = path.read_text(encoding="utf-8")
+        if not _SYS_PATH_TEXT.search(src):
+            return []  # no ``sys.path`` spelled anywhere: skip the parse (~96% of tests/)
+        tree = ast.parse(src, filename=str(path))
     except (SyntaxError, UnicodeDecodeError):
         return []
 
