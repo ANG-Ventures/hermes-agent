@@ -245,7 +245,7 @@ def _read_main_red_state() -> Optional[dict]:
     from hermes_constants import get_default_hermes_root
 
     try:
-        return json.loads((get_default_hermes_root() / "state" / MAIN_RED_STATE).read_text(encoding="utf-8"))
+        return json.loads((get_default_hermes_root() / "state" / MAIN_RED_STATE).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
 

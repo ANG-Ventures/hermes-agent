@@ -182,7 +182,9 @@ jobs:
     name: Windows footguns (blocking)
     # Hosted by design — short, no LAN dependency. See `lint-diff` above.
     runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
-    timeout-minutes: 5
+    # 16 serial lint steps: 5m0s ran out at step 13 on a loaded ci-box once step 1 stopped failing
+    # (mirror run 39900711727, t_3475d957).
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1

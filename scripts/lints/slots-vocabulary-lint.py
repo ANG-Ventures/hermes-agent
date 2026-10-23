@@ -154,7 +154,7 @@ def _base_baseline(root: Path, ref: str, rel: str):
 
 def run(root: Path, config_rel: str, base_ref=None, out=print) -> int:
     try:
-        paths, allow, baseline = load_config(json.loads((root / config_rel).read_text(encoding="utf-8")))
+        paths, allow, baseline = load_config(json.loads((root / config_rel).read_text(encoding="utf-8-sig")))
         base = _base_baseline(root, base_ref, config_rel) if base_ref else None
     except (OSError, ValueError) as exc:
         out(f"slots-vocabulary-lint: bad config {config_rel}: {exc}")
@@ -244,10 +244,10 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
-    root = Path(a.root or subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+    root = Path(a.root or subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, encoding="utf-8", errors="replace",
                                          check=True).stdout.strip())   # the caller's repo: env kept on purpose
     if a.print_counts:
-        paths, allow, _ = load_config(json.loads((root / a.config).read_text(encoding="utf-8")))
+        paths, allow, _ = load_config(json.loads((root / a.config).read_text(encoding="utf-8-sig")))
         print(json.dumps(dict(sorted(counts(root, paths, allow).items())), indent=2))
         return 0
     return run(root, a.config, a.base_ref)

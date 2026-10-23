@@ -280,7 +280,7 @@ def check_sandbox_disarm(src: str, filename: str = "<src>") -> list[str]:
 def check_conftest_sandbox(conftest: Path) -> list[str]:
     """tests/conftest.py must set the sandbox flag inside an autouse fixture."""
     try:
-        tree = ast.parse(conftest.read_text(encoding="utf-8"))
+        tree = ast.parse(conftest.read_text(encoding="utf-8-sig"))
     except (OSError, SyntaxError) as exc:
         return [f"{conftest}: unreadable: {exc}"]
     for fn in ast.walk(tree):
@@ -311,7 +311,7 @@ def main(argv: list[str]) -> int:
         problems.extend(check_conftest_sandbox(ROOT / "tests" / "conftest.py"))
     for f in files:
         try:
-            src = f.read_text(encoding="utf-8")
+            src = f.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
             continue
         try:

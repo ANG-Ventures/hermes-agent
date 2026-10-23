@@ -45,7 +45,7 @@ PROBE_USER_TURN = (
 
 
 def _load_body(path: str) -> dict:
-    with open(path, encoding="utf-8") as fh:
+    with open(path, encoding="utf-8-sig") as fh:
         doc = json.load(fh)
     if isinstance(doc, dict) and isinstance(doc.get("request"), dict) and "body" in doc["request"]:
         return doc["request"]["body"]
@@ -167,7 +167,7 @@ def _ack_from_reply(reply) -> list:
 
 
 def cmd_replay(a) -> int:
-    with open(a.state, encoding="utf-8") as fh:
+    with open(a.state, encoding="utf-8-sig") as fh:
         st = json.load(fh)
     body = json.loads(st["body"])  # the exact bytes the parent sent, re-parsed (no transform)
     body["messages"] = body["messages"] + [

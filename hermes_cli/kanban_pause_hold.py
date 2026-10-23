@@ -87,7 +87,7 @@ def _load(host: str, cache: dict):
         return cache[host]
     path = root() / host / "manifest.json"
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         cache[host] = None
         return None

@@ -161,7 +161,7 @@ def merge_gate_profile(repo: str, path: Optional[str] = None) -> str:
             except Exception:  # noqa: BLE001 -- fail-safe: v1
                 return "v1"
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             d = json.load(fh)
     except (OSError, ValueError):
         return "v1"

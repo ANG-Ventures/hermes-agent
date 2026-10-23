@@ -254,7 +254,7 @@ def cmd_run(a) -> int:
 
 
 def cmd_report(a) -> int:
-    rows = [json.loads(line) for line in open(a.results, encoding="utf-8") if line.strip()]
+    rows = [json.loads(line) for line in open(a.results, encoding="utf-8-sig") if line.strip()]
     if a.framing:
         rows = [r for r in rows if r.get("framing") == a.framing]
     by = {}

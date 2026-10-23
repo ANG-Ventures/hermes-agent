@@ -154,7 +154,7 @@ def load_registry_file(path: Path) -> LaneRegistry:
         return LaneRegistry()
     # An EXISTING file that cannot be read or parsed raises (Prism da4f556e96bb): the dispatcher's browser gate
     # holds every browser card on that fault instead of treating the registry as "mode off".
-    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(doc, dict):
         raise ValueError(f"{path}: top level is not an object")
     raw_sect = doc.get("browsers")

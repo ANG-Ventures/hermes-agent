@@ -1049,7 +1049,11 @@ def test_android_create_time_is_not_stable(monkeypatch):
     """Prism 1865f7896adc: Android runs the Linux kernel; its create_time is btime-derived, not kernel-stored."""
     monkeypatch.setattr(ca.sys, "platform", "android")
     assert ca._create_time_is_stable() is False
-    monkeypatch.setattr(ca.sys, "platform", "darwin")
+
+
+@pytest.mark.platforms("macos")
+def test_macos_create_time_is_stable():
+    """The control arm of the Android case, on a real macOS host (kernel-stored create_time)."""
     assert ca._create_time_is_stable() is True
 
 

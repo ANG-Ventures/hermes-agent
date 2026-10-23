@@ -336,7 +336,7 @@ def _read_harness_manifests() -> "tuple[Set[str], List[str]]":
         return names, [str(mdir or "skills-harness-manifests")]
     for f in files:
         try:
-            data = yaml.safe_load(f.read_text(encoding="utf-8"))
+            data = yaml.safe_load(f.read_text(encoding="utf-8-sig"))
         except Exception as e:
             logger.debug("Curator could not read harness manifest %s: %s", f, e, exc_info=True)
             unreadable.append(str(f))

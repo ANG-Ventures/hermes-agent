@@ -201,7 +201,7 @@ def _session_skill_group_dirs(external_dirs: list) -> list:
         scratch = get_session_scratch_dir(session_id, create=False) if session_id else None
         if scratch is None:
             return []
-        lines = (scratch / SESSION_SKILL_GROUPS_FILE).read_text(encoding="utf-8").splitlines()
+        lines = (scratch / SESSION_SKILL_GROUPS_FILE).read_text(encoding="utf-8-sig").splitlines()
     except (OSError, ImportError, UnicodeDecodeError):
         return []
     parents = {d.resolve().parent for d in external_dirs}

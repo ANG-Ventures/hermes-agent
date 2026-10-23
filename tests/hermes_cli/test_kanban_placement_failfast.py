@@ -1319,5 +1319,11 @@ def test_host_classification_does_not_need_the_posix_uid_module(monkeypatch):
     assert kwh.is_pool_host(None) is False
     assert kwh.is_pool_host(kwh.LOCAL_HOST_NAME) is False
     assert kwh.is_pool_host("ace-ai") is True
-    with pytest.raises(ModuleNotFoundError):                         # control: the seam is real
-        importlib.import_module("hermes_cli.kanban_local_worker_uid")
+    # Without pwd (native Windows) an unset knob still spawns plain local workers; a set knob,
+    # a privilege boundary the host cannot honour, fails closed (Prism f591bbc9b1f8).
+    klu = importlib.import_module("hermes_cli.kanban_local_worker_uid")
+    assert klu.pwd is None                                           # control: the seam is real
+    assert klu.resolve_user({}) is None
+    assert klu.resolve_user({"local_worker_uid": None}) is None
+    with pytest.raises(klu.LocalWorkerUidError):
+        klu.resolve_user({"local_worker_uid": "_kanbanw"})

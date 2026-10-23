@@ -1194,8 +1194,8 @@ def differential(roots, base_ref: str) -> tuple[str, list]:
 
 
 # ---------------------------------------------------------------- selftest
-UNGATED_DOCKER = "#!/bin/bash\nstart() {\n  ssh ci-box 'docker run -d --rm runner:latest'\n}\n"
-GATED_DOCKER = ("#!/bin/bash\nstart() {\n  ALLOC_RESERVATION=$(alloc-admit --consumer ci --job \"$1\")\n"
+UNGATED_DOCKER = "#!/usr/bin/env bash\nstart() {\n  ssh ci-box 'docker run -d --rm runner:latest'\n}\n"
+GATED_DOCKER = ("#!/usr/bin/env bash\nstart() {\n  ALLOC_RESERVATION=$(alloc-admit --consumer ci --job \"$1\")\n"
                 "  ssh ci-box \"ALLOC_RESERVATION=$ALLOC_RESERVATION docker run -d --rm runner:latest\"\n}\n")
 UNGATED_PY_SSH = "import subprocess\n\ndef go(h):\n    subprocess.run(['ssh', '-o', 'BatchMode=yes', h, 'make test'])\n"
 # Prism 10dea09c29d3: a bare MENTION of the reservation (here: removing it) is not proof of gating
@@ -1205,8 +1205,8 @@ PR2_DICT_ENV = ("import subprocess\nimport alloc_client\n\ndef go(job):\n    d, 
 # Prism r3 208bec3a985c: a string VALUE naming the reservation does not make the dict a reservation env
 PR3_NOTE_DICT = "import subprocess\n\ndef go(h):\n    env = {'NOTE': 'ALLOC_RESERVATION'}\n    subprocess.run(['ssh', h, 'job'], env=env)\n"
 # Prism r3 d65c1a6e74e9: an admit AFTER the spawn on the same line does not gate it
-PR3_LATE_ADMIT_SH = "#!/bin/bash\nssh fleet-box job; ALLOC_RESERVATION=$(alloc-admit --consumer ci --job x)\n"
-PR3_PREFIX_ADMIT_SH = "#!/bin/bash\nALLOC_RESERVATION=$(alloc-admit --consumer ci --job x) ssh fleet-box job\n"
+PR3_LATE_ADMIT_SH = "#!/usr/bin/env bash\nssh fleet-box job; ALLOC_RESERVATION=$(alloc-admit --consumer ci --job x)\n"
+PR3_PREFIX_ADMIT_SH = "#!/usr/bin/env bash\nALLOC_RESERVATION=$(alloc-admit --consumer ci --job x) ssh fleet-box job\n"
 GATED_PY = ("import os, subprocess\nimport alloc_client\n\ndef go(job):\n"
             "    d, rid = alloc_client.admit('test-gate', job_id=job)\n"
             "    env = dict(os.environ, ALLOC_RESERVATION=rid)\n"
@@ -1218,7 +1218,7 @@ POOL_SHAPE = ("import subprocess\n\ndef ssh(alias, script):\n    return run_it(a
               "        script = f\"docker run -d --rm --name {name} img\"\n        ssh(host, script)\n")
 HELPER_SSH = ("import subprocess\nSSH_OPTS=['-o','BatchMode=yes']\n\ndef _ssh_cmd():\n    return ['ssh'] + SSH_OPTS\n\n"
               "def go(h, r):\n    subprocess.Popen(_ssh_cmd() + [h, r])\n")
-NOT_SPAWNS = ("#!/bin/bash\n# ssh ci-box 'docker run x'\necho \"run: ssh ci-box uptime\"\n"
+NOT_SPAWNS = ("#!/usr/bin/env bash\n# ssh ci-box 'docker run x'\necho \"run: ssh ci-box uptime\"\n"
               "git push git@github.com:o/r.git\nssh -T git@github.com\nssh-keygen -t ed25519\n")
 RUNNER_MINT = ("class Gh:\n    def jit(self, name):\n"
                "        args = ['-X', 'POST', f'orgs/{self.org}/actions/runners/generate-jitconfig', '-f', name]\n"
@@ -1232,7 +1232,7 @@ PR1_TWO_MINTS = ("class Gh:\n    def jit(self, a, b):\n"
                  "        self._gh(['-X', 'POST', 'orgs/o/actions/runners/generate-jitconfig', b])\n")
 PR1_CLASS_BODY = "import subprocess\n\nclass Worker:\n    process = subprocess.Popen(['ssh', 'ci-box', 'job'])\n"
 PR1_LAMBDA = "import subprocess\n\ndef mk(h):\n    return lambda: subprocess.run(['ssh', h, 'job'])\n"
-PR1_TWO_ON_LINE = "#!/bin/bash\nstart() {\n  docker run image; docker run another-image\n}\n"
+PR1_TWO_ON_LINE = "#!/usr/bin/env bash\nstart() {\n  docker run image; docker run another-image\n}\n"
 PR1_LOCAL_ARGV = ("import subprocess\n\ndef go(box):\n    cmd = ['ssh', '-o', 'BatchMode=yes', box, 'uptime']\n"
                   "    subprocess.run(cmd, capture_output=True)\n")
 PR1_BARE_RUN = "from subprocess import run\n\ndef go(h):\n    run(['ssh', h, 'job'])\n"
@@ -1243,8 +1243,8 @@ PR1_STARRED = "import subprocess\nBASE = ['ssh', 'ci-box']\n\ndef go():\n    sub
 PR2_LATE_ENV = ("import os, subprocess\n\ndef go(h, rid):\n    env = dict(os.environ)\n"
                 "    subprocess.run(['ssh', h, 'start'], env=env)\n    env['ALLOC_RESERVATION'] = rid\n")
 PR2_ASYNC = "import asyncio\n\nasync def go():\n    await asyncio.create_subprocess_exec('docker', 'run', 'img')\n"
-PR2_PRINTF_PIPE = "#!/bin/bash\nmint() {\n  printf '%s' \"$JIT\" | ssh ci-box 'docker run --rm runner:latest'\n}\n"
-PR2_ECHO_SUBST = "#!/bin/bash\necho \"up: $(ssh ci-box uptime)\"\n"
+PR2_PRINTF_PIPE = "#!/usr/bin/env bash\nmint() {\n  printf '%s' \"$JIT\" | ssh ci-box 'docker run --rm runner:latest'\n}\n"
+PR2_ECHO_SUBST = "#!/usr/bin/env bash\necho \"up: $(ssh ci-box uptime)\"\n"
 # t_ed9b147b: #4308 Prism r3/r4 residue, one fixture each (RED on the #4308 lint, GREEN-as-RED after)
 PR3_LATE_ARGV = ("import subprocess\n\ndef go():\n    cmd = ['ssh', 'ci-box', 'job']\n    subprocess.run(cmd)\n"
                  "    cmd = ['echo', 'done']\n")
@@ -1256,13 +1256,13 @@ PR3_ENV_COPY_GATED = ("import os, subprocess\nimport alloc_client\n\ndef go(job)
                       "    d, rid = alloc_client.admit('test-gate', job_id=job)\n"
                       "    env = dict(os.environ, ALLOC_RESERVATION=rid)\n    env = dict(env, TERM='dumb')\n"
                       "    subprocess.run(['ssh', d.host, 'make test'], env=env)\n")
-PR3_CONTINUATION = "#!/bin/bash\nstart() {\n  docker \\\n    run --rm runner:latest\n}\n"
-PR3_GATE_AFTER = "#!/bin/bash\nstart() {\n  ssh ci-box job; ALLOC_RESERVATION=$(alloc-admit --consumer ci)\n}\n"
-PR3_GATE_BEFORE = ("#!/bin/bash\nstart() {\n  ALLOC_RESERVATION=$(alloc-admit --consumer ci); "
+PR3_CONTINUATION = "#!/usr/bin/env bash\nstart() {\n  docker \\\n    run --rm runner:latest\n}\n"
+PR3_GATE_AFTER = "#!/usr/bin/env bash\nstart() {\n  ssh ci-box job; ALLOC_RESERVATION=$(alloc-admit --consumer ci)\n}\n"
+PR3_GATE_BEFORE = ("#!/usr/bin/env bash\nstart() {\n  ALLOC_RESERVATION=$(alloc-admit --consumer ci); "
                    "ssh ci-box \"ALLOC_RESERVATION=$ALLOC_RESERVATION job\"\n}\n")
 PR3_DOCKER_GLOBAL_PY = ("import subprocess\n\ndef go():\n"
                         "    subprocess.run(['docker', '--host', 'unix:///var/run/docker.sock', 'run', 'image'])\n")
-PR3_DOCKER_GLOBAL_SH = "#!/bin/bash\nstart() {\n  docker --host ssh://ci-box run image\n}\n"
+PR3_DOCKER_GLOBAL_SH = "#!/usr/bin/env bash\nstart() {\n  docker --host ssh://ci-box run image\n}\n"
 # #4330 Prism r1
 PR5_SELECTIVE_COPY = ("import os, subprocess\n\ndef go(h, rid):\n    env = dict(os.environ, ALLOC_RESERVATION=rid)\n"
                       "    child_env = {'PATH': env['PATH']}\n    subprocess.run(['ssh', h, 'job'], env=child_env)\n")
@@ -1270,18 +1270,18 @@ PR5_SPREAD_COPY_GATED = ("import os, subprocess\n\ndef go(h, rid):\n    env = di
                          "    child_env = {**env, 'TERM': 'dumb'}\n    subprocess.run(['ssh', h, 'job'], env=child_env)\n")
 PR5_SELF_CONCAT = ("def go(client):\n    script = 'docker run'\n    script = script + ' --rm image'\n"
                    "    client.ssh(script)\n")
-PR5_HEREDOC_TAIL = "#!/bin/bash\ncat <<'EOF'\nliteral \\\nEOF\nssh ci-box job\n"
-PR5_HEREDOC_UNQUOTED = "#!/bin/bash\nssh ci-box bash <<EOF\ndocker \\\n  run --rm img\nEOF\n"
+PR5_HEREDOC_TAIL = "#!/usr/bin/env bash\ncat <<'EOF'\nliteral \\\nEOF\nssh ci-box job\n"
+PR5_HEREDOC_UNQUOTED = "#!/usr/bin/env bash\nssh ci-box bash <<EOF\ndocker \\\n  run --rm img\nEOF\n"
 # #4330 Prism r2
 PR6_POP = ("import os, subprocess\n\ndef go(h, rid):\n    env = dict(os.environ, ALLOC_RESERVATION=rid)\n"
            "    child_env = env.copy()\n    child_env.pop('ALLOC_RESERVATION', None)\n"
            "    subprocess.run(['ssh', h, 'job'], env=child_env)\n")
-PR6_BS_SPACE = "#!/bin/bash\necho ready \\ \nssh ci-box job\n"
+PR6_BS_SPACE = "#!/usr/bin/env bash\necho ready \\ \nssh ci-box job\n"
 PR6_LOOP_DOCKER = ("def go(client):\n    script = 'echo ready'\n    for _ in range(2):\n        client.ssh(script)\n"
                    "        script = 'docker run img'\n")
 PR6_LOOP_ARGV = ("import subprocess\n\ndef go():\n    cmd = ['echo', 'ready']\n    for _ in range(2):\n"
                  "        subprocess.run(cmd)\n        cmd = ['ssh', 'ci-box', 'job']\n")
-PR6_SUBST_ONCE = "#!/bin/bash\nOUT=$(ssh -o BatchMode=yes \\\n  ci-box uptime)\n"
+PR6_SUBST_ONCE = "#!/usr/bin/env bash\nOUT=$(ssh -o BatchMode=yes \\\n  ci-box uptime)\n"
 PR6_COND_REBIND = ("def go(client, dry_run):\n    script = 'docker run image'\n    if dry_run:\n"
                    "        script = 'echo skipped'\n    client.ssh(script)\n")
 PR6_COND_GATE = ("import os, subprocess\nimport alloc_client\n\ndef go(h, fast):\n    env = dict(os.environ)\n"
@@ -1301,10 +1301,10 @@ PR7_UPDATE_GATED = ("import os, subprocess\n\ndef go(h, rid):\n    env = dict(os
                     "    env.update({'ALLOC_RESERVATION': rid})\n    subprocess.run(['ssh', h, 'job'], env=env)\n")
 PR7_INLINE_SELECT = ("import os, subprocess\n\ndef go(rid):\n    env = dict(os.environ, ALLOC_RESERVATION=rid)\n"
                      "    subprocess.run(['docker', 'run', 'img'], env={'PATH': env['PATH']})\n")
-PR7_COMMENT_BS = "#!/bin/bash\nls  # see foo \\\nssh ci-box job\n"
-PR7_QUOTED_HASH_BS = "#!/bin/bash\ndocker --config \"/tmp/#c\" \\\nrun img\n"
-PR7_REPEAT_CMD = "#!/bin/bash\nssh ci-box job;ALLOC_RESERVATION=$(alloc-admit --consumer ci);ssh ci-box job\n"
-PR7_TOKEN_JOIN = "#!/bin/bash\ndocker ru\\\nn --rm image\n"
+PR7_COMMENT_BS = "#!/usr/bin/env bash\nls  # see foo \\\nssh ci-box job\n"
+PR7_QUOTED_HASH_BS = "#!/usr/bin/env bash\ndocker --config \"/tmp/#c\" \\\nrun img\n"
+PR7_REPEAT_CMD = "#!/usr/bin/env bash\nssh ci-box job;ALLOC_RESERVATION=$(alloc-admit --consumer ci);ssh ci-box job\n"
+PR7_TOKEN_JOIN = "#!/usr/bin/env bash\ndocker ru\\\nn --rm image\n"
 # #4330 Apollo r5: discovery must be a superset of main's (every ast.Call is a candidate); MAY facts never gate
 PR8_TARGET_CALL = "import subprocess\n\ndef go(outputs):\n    outputs[subprocess.check_output(['ssh', 'ci-box', 'job'])] = True\n"
 PR8_MATCH_GUARD = ("import subprocess\n\ndef go(a):\n    match a:\n        case 1 if subprocess.run(['ssh', 'ci-box', 'job']):\n"
@@ -1322,11 +1322,11 @@ PR8_DEFAULT_ARG = "import subprocess\n\ndef launch(proc=subprocess.Popen(['ssh',
 PR8_DECORATOR = "import subprocess\n\n@register(subprocess.run(['docker', 'run', 'img']))\ndef go():\n    pass\n"
 PR8_EXTEND = "import subprocess\n\ndef go():\n    cmd = []\n    cmd.extend(['ssh', 'ci-box', 'job'])\n    subprocess.run(cmd)\n"
 PR8_STAR_ECHO = "import asyncio\n\nasync def go():\n    await asyncio.create_subprocess_exec('echo', *['ssh', 'ci-box', 'job'])\n"
-PR9_SUBST_BEFORE_ADMIT = ("#!/bin/bash\nX=$(ssh fleet-box pre) ALLOC_RESERVATION=$(alloc-admit --consumer ci --job x) "
+PR9_SUBST_BEFORE_ADMIT = ("#!/usr/bin/env bash\nX=$(ssh fleet-box pre) ALLOC_RESERVATION=$(alloc-admit --consumer ci --job x) "
                           "ssh fleet-box work\n")
-PR9_SUBST_IN_ADMIT = ("#!/bin/bash\nALLOC_RESERVATION=$(alloc-admit --consumer ci --job $(ssh fleet-box getjob)) "
+PR9_SUBST_IN_ADMIT = ("#!/usr/bin/env bash\nALLOC_RESERVATION=$(alloc-admit --consumer ci --job $(ssh fleet-box getjob)) "
                       "ssh fleet-box work\n")
-PR9_SUBST_AFTER_ADMIT = ("#!/bin/bash\nALLOC_RESERVATION=$(alloc-admit --consumer ci --job x) Y=$(ssh fleet-box post) "
+PR9_SUBST_AFTER_ADMIT = ("#!/usr/bin/env bash\nALLOC_RESERVATION=$(alloc-admit --consumer ci --job x) Y=$(ssh fleet-box post) "
                          "ssh fleet-box work\n")
 PR9_ALIAS_DEL = ("import os, subprocess\n\ndef go(rid):\n    env = dict(os.environ, ALLOC_RESERVATION=rid)\n    alias = env\n"
                  "    del env['ALLOC_RESERVATION']\n    subprocess.run(['ssh', 'ci-box', 'job'], env=alias)\n")
@@ -1347,7 +1347,7 @@ PR10_FINALLY_MIDRAISE = ("import os, subprocess\n\ndef go(rid):\n    env = dict(
                          "    try:\n        env.pop('ALLOC_RESERVATION')\n        prepare()\n"
                          "        env['ALLOC_RESERVATION'] = rid\n    finally:\n"
                          "        subprocess.run(['ssh', 'ci-box', 'job'], env=env)\n")
-PR8_SH_CONT_LINE = ("#!/bin/bash\ntick \\\n  --feed-cmd \"ssh ci-box 'cat log'\" \\\n"
+PR8_SH_CONT_LINE = ("#!/usr/bin/env bash\ntick \\\n  --feed-cmd \"ssh ci-box 'cat log'\" \\\n"
                     "  --alerts-cmd \"ssh ci-box 'cscli alerts'\"\n")
 PY_NOT = "import subprocess\nsubprocess.run(['ssh-keygen', '-t', 'ed25519'])\nsubprocess.run(['git', 'push'])\n"
 

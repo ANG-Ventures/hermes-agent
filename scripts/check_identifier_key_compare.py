@@ -167,7 +167,7 @@ def scan(root: Path = ROOT) -> list[dict]:
     sites = []
     for path in files:
         rel = path.relative_to(root).as_posix()
-        sites += scan_source(rel, path.read_text(encoding="utf-8"))
+        sites += scan_source(rel, path.read_text(encoding="utf-8-sig"))
     return sites
 
 
@@ -178,7 +178,7 @@ def fingerprint(site: dict) -> str:
 
 
 def load_ledger(path: Path = LEDGER) -> dict:
-    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    data = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
     return data.get("sites", {})
 
 
