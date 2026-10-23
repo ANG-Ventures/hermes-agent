@@ -30,6 +30,7 @@ def _refuse_git_transport(inst: X.Install) -> str:
     return dead
 
 
+@pytest.mark.slow_test(480, reason="the head cell runs install.sh inside the call: 96 s of a 105 s run on 8 ACE-AI cores")
 @pytest.mark.parametrize("column", ["n1", "head"])
 def test_refused_fetch_leaves_the_running_gateway_alone(root, column):
     if column == "n1" and not X.refs().base:

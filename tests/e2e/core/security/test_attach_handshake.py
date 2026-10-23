@@ -48,7 +48,9 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from tests.e2e.core._pending_fixes import known_gate
+from tests.e2e.core._pm_dependencies import select_test_dependencies
 from tests.e2e.core.security._helpers import (
+    REPO_ROOT,
     BoundaryBreach,
     canary,
     hermetic_env,
@@ -238,6 +240,8 @@ def home(tmp_path: Path) -> Path:
     home = tmp_path / "home"
     # The model is never called: the launcher hands off to the TUI stand-in before any turn.
     write_home(home / ".hermes", "http://127.0.0.1:9/v1", api_key=canary("unused-key"))
+    # The launcher resolves node through PM; point the sandbox at the runner's provisioned store.
+    select_test_dependencies(home / ".hermes", REPO_ROOT)
     probe = tmp_path / "tui-probe" / "dist"
     probe.mkdir(parents=True)
     (probe / "entry.js").write_text(PROBE_ENTRY, encoding="utf-8")

@@ -484,6 +484,7 @@ def test_optional_import_table_only_names_optional_or_platform_deps():
     assert all(reason.strip() for reason in _PLATFORM_ALLOWLIST.values()), "every allowlist entry needs a reason"
 
 
+@pytest.mark.slow_test(180, reason="2,229 fresh-process imports, ~126 s of child time; the CI guest runs ~3x ACE-AI")
 def test_every_shipped_module_imports_from_a_clean_first_party_graph(tmp_path):
     _sandbox_or_skip()
     entries, first_party = _shipped_modules()
@@ -499,7 +500,9 @@ def test_every_shipped_module_imports_from_a_clean_first_party_graph(tmp_path):
     out = tmp_path / "results.json"
     spec = {
         "tree": str(WORKTREE), "first_party": sorted(first_party), "modules": entries,
-        "workers": max(2, min(8, (os.cpu_count() or 4) // 2)), "timeout": 180,
+        # Each child is one fork + import, mostly CPU: use every CPU (an 8-vCPU CI guest ran 4 wide
+        # and crossed the 60 s wall; 8 wide measured 17 s vs 29 s on 8 ACE-AI cores, t_0271e437).
+        "workers": max(2, min(8, os.cpu_count() or 4)), "timeout": 180,
         "out": str(out), "preload": list(_PRELOAD),
     }
     spec_path = tmp_path / "spec.json"

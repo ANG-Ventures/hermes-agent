@@ -30,6 +30,11 @@ _INTERPRETER_PREFIXES = tuple({
 # resolve once at import, as before: they are fixed for the process lifetime.
 _normcase = os.path.normcase
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
+# pm.environments.payload_venv stats ``<checkout>/../manifest.json`` (a sealed payload ships its
+# venv beside the tree) at every gateway import. For a worktree under the home
+# (``<home>/hermes-agent/.worktrees/<card>``) that sibling is in the home but is the checkout's
+# own layout probe, not Hermes state (t_b56f9e1e).
+_PAYLOAD_MANIFEST_STR = _normcase(os.fspath(Path(__file__).resolve().parent.parent.parent / "manifest.json"))
 
 
 def _within(path: str, prefix: str) -> bool:
@@ -97,7 +102,7 @@ class HomeIOGuard:
             roots = tuple(_normcase(os.fspath(r)) for r in self.roots())
             # Resolving the root itself (get_default_hermes_root's relative_to
             # probe) reads no state; only its contents are guarded.
-            if metadata and absolute in roots:
+            if metadata and (absolute in roots or absolute == _PAYLOAD_MANIFEST_STR):
                 return
             # ``shutil.which`` stats/accesses ``<PATH entry>/<name>``. A developer shell puts
             # PM's tool store (~/.hermes/tools/...) on PATH; probing an executable there is
