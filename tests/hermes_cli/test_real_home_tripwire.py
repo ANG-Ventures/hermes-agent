@@ -241,3 +241,19 @@ def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed" in result.stdout
+
+
+def test_a_checkout_inside_the_home_may_probe_for_a_payload_manifest(monkeypatch):
+    """t_b56f9e1e: a worktree at ``<home>/hermes-agent/.worktrees/<card>`` imports the gateway,
+    whose bootstrap asks ``pm.environments.payload_venv`` for ``<checkout>/../manifest.json``. That
+    stat is the checkout probing its own layout; anything else beside the checkout stays guarded."""
+    from pm.environments import payload_venv
+    from tests.home_io_guard import HomeIOGuard
+
+    if (PROJECT_ROOT.parent / "manifest.json").exists():
+        pytest.skip("this checkout is a sealed payload")
+    guard = HomeIOGuard(lambda: [PROJECT_ROOT.parent])
+    guard.install(monkeypatch)
+    assert payload_venv(PROJECT_ROOT) is None
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(PROJECT_ROOT.parent / "state.db", metadata=True)

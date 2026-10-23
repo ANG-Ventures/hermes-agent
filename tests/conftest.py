@@ -401,6 +401,11 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     monkeypatch.setattr(
         hermes_constants, "_get_platform_default_hermes_home", isolated_platform_default
     )
+    # The CI runners are Docker containers (/.dockerenv), so the canonical container signal
+    # made every owner-only chmod a no-op there and the 0600/0700 tests red on ci-box/ace-ai only.
+    # Like HERMES_CONTAINER (blanked in step 2), the runner's own container-ness is not a test
+    # input; tests of the container policy set it explicitly (t_b56f9e1e).
+    monkeypatch.setattr(hermes_constants, "_detect_container", lambda: False)
     fake_hermes_home = tmp_path / "hermes_test"
     fake_hermes_home.mkdir()
     (fake_hermes_home / "sessions").mkdir()
