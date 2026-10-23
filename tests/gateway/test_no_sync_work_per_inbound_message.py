@@ -75,32 +75,70 @@ MAX_OVER_BUDGET_INTERVALS = 3
 # ---------------------------------------------------------------------------
 
 
+def _process_run_queue_ms() -> float | None:
+    """Time every thread of this process has spent RUNNABLE BUT NOT RUNNING (ms), or None
+    where the kernel does not report it (``/proc/<pid>/task/*/schedstat`` field 2: Linux).
+
+    That is CPU starvation, not work: a CFS-throttled ``--cpus`` container, a host run
+    queue, or a GIL holder that is itself waiting for a CPU. Measured in
+    ci-runner-ang-hermes:1 ``--cpus 4`` on ci-box (t_44dcc531), the fixed per-message
+    path, 5-6 runs per arm:
+        alone            raw over-budget gaps 1-3   net of this  1-2
+        beside 7 busy    raw 2-14                   net         1-2
+        beside 15 busy   raw 25-46                  net         1-2
+    and the defect (config read under ``_CONFIG_LOCK``, the pre-#773 shape): raw 31-67,
+    net 31-67 in every arm.  Lock contention leaves the loop thread SLEEPING, not runnable,
+    so subtracting run-queue time never hides it.
+    """
+    try:
+        tids = os.listdir("/proc/self/task")
+    except OSError:
+        return None
+    total = 0
+    for tid in tids:
+        try:
+            with open(f"/proc/self/task/{tid}/schedstat", encoding="ascii") as fh:
+                total += int(fh.read().split()[1])
+        except (OSError, IndexError, ValueError):
+            continue  # the thread exited between listdir and open
+    return total / 1e6
+
+
 class LoopLagMonitor:
     """Records the longest interval the event loop failed to make progress.
 
     A coroutine that re-schedules itself every ``interval`` and records the
     delta between successive wakeups.  Any synchronous call blocking the loop
     shows up directly as an oversized delta -- this measures the LOOP, not the
-    wall clock of the work under test.
+    wall clock of the work under test.  Where the kernel reports it, the time the
+    process's threads sat in a CPU run queue during the interval is subtracted
+    (``_process_run_queue_ms``): a starved CI slice is not on-loop work.
     """
 
     def __init__(self, interval: float = 0.002) -> None:
         self.interval = interval
         self.max_gap_ms = 0.0
         self.samples: list[float] = []
+        self.raw_samples: list[float] = []
         self._stop = False
         self._task: asyncio.Task | None = None
 
     async def _run(self) -> None:
         last = time.perf_counter()
+        queued = _process_run_queue_ms()
         while not self._stop:
             await asyncio.sleep(self.interval)
             now = time.perf_counter()
-            gap_ms = (now - last - self.interval) * 1000.0
+            queued_now = _process_run_queue_ms()
+            raw_ms = (now - last - self.interval) * 1000.0
+            starved_ms = (queued_now - queued) if queued is not None and queued_now is not None else 0.0
+            gap_ms = raw_ms - max(starved_ms, 0.0)
+            if raw_ms > 0:
+                self.raw_samples.append(raw_ms)
             if gap_ms > 0:
                 self.samples.append(gap_ms)
                 self.max_gap_ms = max(self.max_gap_ms, gap_ms)
-            last = now
+            last, queued = now, queued_now
 
     def start(self) -> None:
         self._task = asyncio.ensure_future(self._run())
@@ -244,8 +282,9 @@ def test_loop_lag_stays_bounded_while_handling_messages_under_a_config_writer(
         f"{len(over_budget)} occasions (worst {monitor.max_gap_ms:.1f}ms) while "
         "handling 200 synthetic inbound messages with a background thread "
         "writing config. The per-message path must not contend on the config "
-        f"lock nor do filesystem/psutil work on the loop. Samples: "
-        f"{[round(g, 1) for g in sorted(over_budget, reverse=True)[:10]]}"
+        f"lock nor do filesystem/psutil work on the loop. Samples (net of CPU run-queue "
+        f"wait): {[round(g, 1) for g in sorted(over_budget, reverse=True)[:10]]}; raw: "
+        f"{[round(g, 1) for g in sorted(monitor.raw_samples, reverse=True)[:10]]}"
     )
 
 
@@ -270,6 +309,46 @@ def test_loop_lag_monitor_actually_detects_a_blocked_loop(sandbox_home):
     assert monitor.max_gap_ms > MAX_LOOP_BLOCK_MS, (
         f"monitor only saw {monitor.max_gap_ms:.1f}ms of lag across a deliberate "
         "400ms block -- the instrument does not work"
+    )
+
+
+@pytest.mark.timeout(60)
+def test_loop_lag_monitor_counts_a_lock_wait_on_the_loop(sandbox_home):
+    """Control arm for the run-queue correction: the loop WAITING on a lock a thread holds
+    (the defect's shape) is counted in full, because a lock wait is not run-queue time.
+
+    A busy thread holds the lock (and the GIL most of the time) for 1 s while the loop
+    blocks on it: the net gap must still be over budget.
+    """
+    lock = threading.Lock()
+    held = threading.Event()
+
+    def _holder() -> None:
+        with lock:
+            held.set()
+            end = time.perf_counter() + 1.0
+            while time.perf_counter() < end:
+                pass  # CPU work under the lock, like a YAML parse in save_config
+
+    async def main() -> LoopLagMonitor:
+        monitor = LoopLagMonitor()
+        monitor.start()
+        await asyncio.sleep(0.05)
+        thread = threading.Thread(target=_holder, daemon=True)
+        thread.start()
+        await asyncio.to_thread(held.wait, 5)
+        with lock:  # noqa: sync-on-loop control arm: the loop blocks on a held lock
+            pass
+        await asyncio.sleep(0.05)
+        await monitor.stop()
+        await asyncio.to_thread(thread.join, 5)
+        return monitor
+
+    monitor = asyncio.run(main())
+    assert monitor.max_gap_ms > MAX_LOOP_BLOCK_MS, (
+        f"monitor saw only {monitor.max_gap_ms:.1f}ms net of run-queue wait across a 1s "
+        f"lock wait on the loop (raw {max(monitor.raw_samples, default=0):.1f}ms) -- the "
+        "starvation correction is hiding the defect class"
     )
 
 
