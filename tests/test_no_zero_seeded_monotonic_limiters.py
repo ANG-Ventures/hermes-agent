@@ -169,6 +169,8 @@ class _Scope:
         self.attrs: dict[str, list[ast.expr | None]] = {}  # ClassDef only
         self.item_stores: list[tuple[str, object, ast.expr]] = []
         self.own: list[ast.AST] = []  # _own_nodes(node), collected once by _build_scopes
+        self.assigns: list[ast.AST] = []  # the Assign/AnnAssign nodes of ``own``
+        self.children: list[_Scope] = []
 
     def class_attrs(self) -> dict[str, list[ast.expr | None]]:
         """Attribute seeds of the nearest enclosing class ({} if none)."""
@@ -287,15 +289,15 @@ def _assign_pairs(child: ast.AST):
         yield child.target, child.value
 
 
-def _class_nodes(cls: ast.ClassDef):
-    """Nodes of ``cls`` incl. its methods, but not nested classes (whose
-    ``self`` is a different object)."""
-    stack = list(ast.iter_child_nodes(cls))
+def _class_assigns(cls: _Scope):
+    """Assignments of class ``cls`` incl. its methods, but not nested classes (whose
+    ``self`` is a different object). Read from the scopes' collected nodes: the scopes
+    partition the tree, so this is the class subtree without walking it again."""
+    stack = [cls]
     while stack:
-        node = stack.pop()
-        yield node
-        if not isinstance(node, ast.ClassDef):
-            stack.extend(ast.iter_child_nodes(node))
+        scope = stack.pop()
+        yield from scope.assigns
+        stack.extend(c for c in scope.children if not isinstance(c.node, ast.ClassDef))
 
 
 def _build_scopes(tree: ast.Module) -> list[_Scope]:
@@ -319,13 +321,16 @@ def _build_scopes(tree: ast.Module) -> list[_Scope]:
                 + [a for a in (args.vararg, args.kwarg) if a is not None]
             ):
                 scope.bindings.setdefault(arg.arg, []).append(None)
+        if parent is not None:
+            parent.children.append(scope)
         scope.own = list(_own_nodes(node))
         for child in scope.own:
             if isinstance(child, ast.Global):
                 scope.globals.update(child.names)
             elif isinstance(child, ast.Nonlocal):
                 scope.nonlocals.update(child.names)
-            else:
+            elif isinstance(child, (ast.Assign, ast.AnnAssign)):
+                scope.assigns.append(child)
                 for target, value in _assign_pairs(child):
                     if isinstance(target, ast.Name):
                         scope.bindings.setdefault(target.id, []).append(value)
@@ -349,7 +354,7 @@ def _build_scopes(tree: ast.Module) -> list[_Scope]:
             attrs: dict[str, list[ast.expr | None]] = {
                 k: list(v) for k, v in scope.bindings.items()
             }
-            for sub in _class_nodes(scope.node):
+            for sub in _class_assigns(scope):
                 for target, value in _assign_pairs(sub):
                     attr = _self_attr(target)
                     if attr is not None:
