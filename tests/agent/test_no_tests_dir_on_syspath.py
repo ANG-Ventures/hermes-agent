@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import unicodedata
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -43,7 +44,8 @@ def _syspath_insert_targets(path: Path) -> list[tuple[int, str]]:
     """Return (lineno, resolved_dir) for every literal sys.path insert/append."""
     try:
         src = path.read_text(encoding="utf-8")
-        if not _SYS_PATH_TEXT.search(src):
+        # NFKC: the tokenizer normalises identifiers (``ｓys.path`` is ``sys.path``).
+        if not _SYS_PATH_TEXT.search(src if src.isascii() else unicodedata.normalize("NFKC", src)):
             return []  # no ``sys.path`` spelled anywhere: skip the parse (~96% of tests/)
         tree = ast.parse(src, filename=str(path))
     except (SyntaxError, UnicodeDecodeError):

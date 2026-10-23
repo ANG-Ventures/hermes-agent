@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import ast
 import re
+import unicodedata
 import warnings
 from pathlib import Path
 
@@ -67,9 +68,26 @@ _LOOP_GETTERS = {"get_running_loop", "get_event_loop"}
 # fits the per-test wall clock on a 4-CPU CI slice (t_44dcc531). Between tokens: whitespace,
 # line continuations, parentheses and comments, as the tokenizer allows.
 _TOK_GAP = r"(?:\s|[()\\]|#[^\n]*\n)*"
-_CLOCK_TEXT = re.compile(
-    r"monotonic|perf_counter|(?i:loop)\b(?:(?:\s|\\)*\([^()]*\))?" + _TOK_GAP + r"\." + _TOK_GAP + r"time\b"
-)
+_CLOCK_TEXT = re.compile(r"monotonic|perf_counter")
+# ``<...loop>(<any args>).time``: the getter's arguments may nest parentheses, so the owner and
+# the ``.time`` are tested separately (a superset; a match only means "parse it").
+_LOOP_TEXT = re.compile(r"(?i:loop)\b")
+_DOT_TIME_TEXT = re.compile(r"\." + _TOK_GAP + r"time\b")
+
+
+def _gate_texts(source: str):
+    """The source, and its NFKC form when it can differ: the tokenizer NFKC-normalises
+    identifiers, so ``time.ｍｏｎｏｔｏｎｉｃ()`` is ``time.monotonic()`` to the AST."""
+    yield source
+    if not source.isascii():
+        yield unicodedata.normalize("NFKC", source)
+
+
+def _may_spell_a_clock(source: str) -> bool:
+    return any(
+        _CLOCK_TEXT.search(t) or (_LOOP_TEXT.search(t) and _DOT_TIME_TEXT.search(t))
+        for t in _gate_texts(source)
+    )
 
 
 def _call_name(func: ast.expr) -> str | None:
@@ -389,7 +407,7 @@ def _build_scopes(tree: ast.Module) -> list[_Scope]:
 
 def find_zero_seeded_monotonic_diffs(source: str, filename: str = "<src>") -> list[str]:
     """Return ``file:line: name`` for each ``<monotonic> - <0-seeded name>``."""
-    if not _CLOCK_TEXT.search(source):
+    if not _may_spell_a_clock(source):
         return []  # no clock spelled: no left side can be monotonic, skip the parse
     with warnings.catch_warnings():
         # Scanning the whole tree compiles files with invalid escape sequences.

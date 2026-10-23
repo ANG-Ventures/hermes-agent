@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import re
 import subprocess
+import unicodedata
 import sys
 from pathlib import Path
 
@@ -42,7 +43,7 @@ SELF = "scripts/check_kanban_lineage_readers.py"  # names the tag to look for it
 # decode to it, and between characters any run of literal joints (quote, gap, optional prefix,
 # quote) or continuations. A superset: a match only means "parse it" (Prism 675e33503531,
 # 10b55641b9b8, 3c7e1b72c0b1; t_44dcc531).
-_JOINT = r"""(?:['"]{1,3}(?:[ \t\f\r\n()]|\\\r?\n|#[^\n]*\n)*[rRbBuUfF]{0,2}['"]{1,3}|\\\r?\n)*"""
+_JOINT = r"""(?:['"]{1,3}(?:[ \t\f\r\n()]|\\(?:\r\n?|\n)|#[^\r\n]*)*[rRbBuUfF]{0,2}['"]{1,3}|\\(?:\r\n?|\n))*"""
 
 
 def _spelled(word: str) -> str:
@@ -78,7 +79,9 @@ def _allowed(node: ast.AST, parent: ast.AST) -> bool:
 
 
 def scan_source(src: str, rel: str) -> list[str]:
-    if CONST not in src and not _NAME_TEXT.search(src):
+    # CONST is an identifier, and the tokenizer NFKC-normalises identifiers (``ＥＮＶ``).
+    ident = src if src.isascii() else unicodedata.normalize("NFKC", src)
+    if CONST not in ident and not _NAME_TEXT.search(src):
         return []  # every _mentions node spells one of them: skip the parse (all but a few files)
     try:
         tree = ast.parse(src)

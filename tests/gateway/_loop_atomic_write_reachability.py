@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import ast
 import bisect
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -276,6 +277,7 @@ _IMPORT_MAPS: dict[str, dict] = {}
 # rewrite them in place between calls.
 _THIS_REPO = Path(__file__).resolve().parents[2]
 _INDEX_MEMO: dict = {}
+_AST_LINE_BREAK = re.compile(r"\r\n|\r|\n")
 
 
 def _memo_key(repo: Path, *parts):
@@ -315,7 +317,9 @@ def _build_index(repo: Path, modules, token: str) -> dict:
         lines = src.splitlines()
         # A function-local ``from X import y`` spells "import" on a line of the def's span; a
         # def with none has an empty local map, so its scope is not walked a second time.
-        import_lines = [i for i, ln in enumerate(lines, 1) if "import" in ln]
+        # Numbered as the AST numbers lines (\n, \r\n, \r only): ``splitlines`` also breaks on
+        # \f and U+2028 and would shift an import past ``end_lineno`` (Prism 22358872b569).
+        import_lines = [i for i, ln in enumerate(_AST_LINE_BREAK.split(src), 1) if "import" in ln]
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue

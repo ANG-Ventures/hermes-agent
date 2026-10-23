@@ -51,7 +51,7 @@ SUPPRESS = "# kanban-identity: ok"
 # decode to it, and between characters any run of literal joints (quote, gap, optional prefix,
 # quote) or continuations. A superset: a match only means "parse it" (Prism 675e33503531,
 # 10b55641b9b8, 3c7e1b72c0b1; t_44dcc531).
-_JOINT = r"""(?:['"]{1,3}(?:[ \t\f\r\n()]|\\\r?\n|#[^\n]*\n)*[rRbBuUfF]{0,2}['"]{1,3}|\\\r?\n)*"""
+_JOINT = r"""(?:['"]{1,3}(?:[ \t\f\r\n()]|\\(?:\r\n?|\n)|#[^\r\n]*)*[rRbBuUfF]{0,2}['"]{1,3}|\\(?:\r\n?|\n))*"""
 
 
 def _spelled(word: str) -> str:
