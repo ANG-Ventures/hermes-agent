@@ -349,6 +349,40 @@ def test_child_crash_posts_warning_and_resurfaces_the_wake(env):
     assert ah.BoomerangWakeState().get_claim(entry["key"])["state"] == ah.STATE_TERMINAL
 
 
+def test_surfaced_child_finding_rides_the_wake_and_lands_once_on_the_card(env):
+    """D-14: a surfaced child's summary + evidence lead the re-delivered wake (original after
+    ``---``) and are recorded once on the card; a replayed handoff adds no second comment."""
+    tid = _review_card(env, pr=3130)
+    entry = _claimed_entry(env, tid, row="own_repo_review_red", kind="review_requested")
+    final = _verdict(entry, "surface", summary="ci-shard-4 red is INHERITED from main",
+                     evidence=["gh run view 1 --log-failed: mutate_anchor_lint", "main red since #6216"])
+    _run(env, entry, "completed", final)
+    [turn] = [t.text for t in env["adapter"].handled]
+    assert turn.startswith(f"[boomerang-wake] child surfaced {tid} (own_repo_review_red, fork, "), turn
+    head, _, tail = turn.partition("\n---\n")
+    assert "ci-shard-4 red is INHERITED from main" in head
+    assert "gh run view 1 --log-failed: mutate_anchor_lint" in head
+    assert tail == f"Task {tid} wake"
+    _run(env, ah.BoomerangWakeState().get_claim(entry["key"]), "completed", final)   # replay
+    assert ah.record_surface(entry, "again") is False
+    with kb.connect_closing() as conn:
+        ours = [c.body for c in kb.list_comments(conn, tid) if c.body.startswith("[boomerang-wake] surfaced:")]
+    assert len(ours) == 1 and "ci-shard-4 red is INHERITED from main" in ours[0], ours
+    assert len(env["adapter"].handled) == 1
+
+
+def test_lost_child_without_verdict_keeps_the_plain_warning_and_wake(env):
+    """INV-6 unchanged: no verdict → the ⚠️ reason line + the original wake text verbatim."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid)
+    _run(env, entry, "completed", "Outcome: done, no verdict.")
+    assert any(s.startswith(f"⚠️ boomerang-wake failed {tid}: unparseable verdict") for s in env["adapter"].sent)
+    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+    with kb.connect_closing() as conn:
+        assert not [c for c in kb.list_comments(conn, tid) if "surfaced:" in c.body]
+
+
 def test_goal_quotes_the_wake_as_data_with_the_nonce(env):
     tid = _card(env)
     _worker_close(tid)
