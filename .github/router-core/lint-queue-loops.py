@@ -292,7 +292,7 @@ DISPATCH_RETURN = DISPATCH_OK.replace("        spawn(row)\n", "        if refuse
                                                                 "        spawn(row)\n")
 DISPATCH_FILTER = DISPATCH_OK.replace("for r in ready_rows}", "for r in ready_rows if r['ok']}")
 DISPATCH_NO_ROUTE = DISPATCH_OK.replace('    row_route = {r["id"]: _route_row(conn, r) for r in ready_rows}\n', "")
-POOL_OK = '''#!/bin/bash
+POOL_OK = '''#!/usr/bin/env bash
 while true; do
   i=1
   while [ "$effective_pool" -ge 1 ] && [ "$i" -le "$effective_pool" ]; do
@@ -366,7 +366,7 @@ def selftest() -> int:
         ("pool: continue-on-refuse + nested-loop break + echo text is GREEN", {P: POOL_OK}, ["pool"], 0),
         ("pool: planted break on refuse is RED", {P: POOL_409_BREAK}, ["pool"], 1),
         ("pool: exit inside the slot loop is RED", {P: POOL_EXIT}, ["pool"], 1),
-        ("pool: a file with no slot loop is RED", {P: "#!/bin/bash\nfor i in 1 2; do :; done\n"}, ["pool"], 1),
+        ("pool: a file with no slot loop is RED", {P: "#!/usr/bin/env bash\nfor i in 1 2; do :; done\n"}, ["pool"], 1),
     ]
     bad = 0
     for name, files, checks, want in cases:
