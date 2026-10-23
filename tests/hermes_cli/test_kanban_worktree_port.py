@@ -145,6 +145,8 @@ def test_clone_script_against_a_real_local_origin(tmp_path):
     out = subprocess.run(["git", "-C", str(ws), "branch", "--show-current"],
                          capture_output=True, text=True).stdout.strip()
     assert out == "wt/t_x" and (ws / "f").read_text() == "x"
+    # t_69e47673: the pool workspace is never world-searchable (git clone into the empty dir keeps its mode)
+    assert (ws.stat().st_mode & 0o7777) == 0o770, oct(ws.stat().st_mode)
     # --dissociate: nothing borrowed from the mirror survives the clone
     assert not (ws / ".git" / "objects" / "info" / "alternates").exists()
     assert subprocess.run(["sh", "-c", script]).returncode == 0  # idempotent
