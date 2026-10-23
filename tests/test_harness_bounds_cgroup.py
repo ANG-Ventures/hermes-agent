@@ -62,7 +62,13 @@ def test_mlocked_clean_file_pages_stay_counted(tmp_path):
     base = _cgroup(tmp_path, current=3172 * MiB, anon=100 * MiB, file=3072 * MiB, shmem=0,
                    active_file=0, inactive_file=0, unevictable=3072 * MiB, file_dirty=0, file_writeback=0)
     assert pytest_bounds._level_used(base) == 3172 * MiB
-    assert _budget(base) == pytest_bounds._MIN_GROWTH  # 4 GiB - 3.1 GiB leaves less than the headroom
+    # Mlocked, they shrink the budget to what 4 GiB - 3.1 GiB leaves above the headroom; the same
+    # pages reclaimable leave the 1 GiB default.
+    assert _budget(base) == 4 * GiB - 3172 * MiB - pytest_bounds._headroom(4 * GiB)
+    (tmp_path / "reclaimable").mkdir()
+    reclaimable = _cgroup(tmp_path / "reclaimable", current=3172 * MiB, anon=100 * MiB, file=3072 * MiB,
+                          shmem=0, active_file=0, inactive_file=0, unevictable=0, file_dirty=0, file_writeback=0)
+    assert _budget(reclaimable) == GiB
 
 
 def test_unevictable_never_drives_clean_negative(tmp_path):
