@@ -28,7 +28,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from tests.gateway._loop_atomic_write_reachability import (
+    build_index,
     derive_scanned_modules,
     find_onloop_atomic_write_sites,
     ratchet_key,
@@ -40,6 +43,14 @@ MIN_PLUGIN_MODULES = 20
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _live_index_built_in_setup():
+    """Build the live tree's index once, in SETUP: the tests below read the memoized copy.
+    20-60 s on a 4-CPU CI slice, outside the per-test wall clock (t_44dcc531)."""
+    repo = _repo_root()
+    build_index(repo, set(derive_scanned_modules(repo)) | set(plugin_modules(repo)))
 
 
 def plugin_modules(repo: Path) -> frozenset[str]:
