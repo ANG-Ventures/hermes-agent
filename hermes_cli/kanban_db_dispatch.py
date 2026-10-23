@@ -8333,11 +8333,10 @@ def _default_spawn(
     # Only a POOL placement's mkdir failure is a (host, board) fault the
     # planner can route around; the local-uid hop below is not (t_9fb4d477).
     pool_board = resolved_board if placement is not None else None
-    if placement is None and not delegation_unit and os.name == "posix":
+    if placement is None and not delegation_unit:
         # kanban.local_worker_uid (Q8 (a), t_405acdf0): a local worker's tools
         # run as a dedicated non-sudo uid over ssh to localhost. Unset = 502.
         # A delegation unit's tools run as the gateway's uid (I5), so no hop.
-        # POSIX only: the knob names a passwd login (the module imports ``pwd``).
         from hermes_cli import kanban_local_worker_uid as _klu
         _local_user = _klu.configured_user()
         if _local_user:

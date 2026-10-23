@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
-import pwd  # windows-footgun: ok — POSIX-only module; its one importer (kanban_db_dispatch) gates on os.name == "posix"
+import pwd  # windows-footgun: ok — POSIX-only privilege boundary: without pwd the import fails, so a spawn fails closed, never skips the uid hop
 import re
 from typing import Any, Mapping, Optional
 
@@ -40,7 +40,7 @@ class LocalWorkerUidError(RuntimeError):
 
 def _my_login() -> str:
     # The process uid, never LOGNAME/USER (a launcher can set those to anything).
-    return pwd.getpwuid(os.getuid()).pw_name  # windows-footgun: ok — POSIX-only module; its one importer (kanban_db_dispatch) gates on os.name == "posix"
+    return pwd.getpwuid(os.getuid()).pw_name  # windows-footgun: ok — POSIX-only privilege boundary: without pwd the import fails, so a spawn fails closed, never skips the uid hop
 
 
 def resolve_user(kanban_cfg: Optional[Mapping[str, Any]], *, me: Optional[str] = None) -> Optional[str]:
@@ -61,7 +61,7 @@ def resolve_user(kanban_cfg: Optional[Mapping[str, Any]], *, me: Optional[str] =
     if me is None:
         me = _my_login()
     if value.isdigit():
-        if int(value) == os.getuid():  # windows-footgun: ok — POSIX-only module; its one importer (kanban_db_dispatch) gates on os.name == "posix"
+        if int(value) == os.getuid():  # windows-footgun: ok — POSIX-only privilege boundary: without pwd the import fails, so a spawn fails closed, never skips the uid hop
             return None
         try:
             value = pwd.getpwuid(int(value)).pw_name
