@@ -67,7 +67,7 @@ class BoomerangWakeState:
 
     def _read(self) -> dict:
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             return {}
         return raw if isinstance(raw, dict) else {}

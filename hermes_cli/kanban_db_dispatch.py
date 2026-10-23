@@ -4032,7 +4032,7 @@ def _stop_own_spawn(proc: Optional[subprocess.Popen], grace: float = 5.0) -> Non
     def _signal(sig) -> None:
         try:
             if group is not None:
-                os.killpg(group, sig)
+                os.killpg(group, sig)  # windows-footgun: ok — group is set only under hasattr(os, "killpg") above
             else:
                 os.kill(proc.pid, sig)
         except (ProcessLookupError, PermissionError):

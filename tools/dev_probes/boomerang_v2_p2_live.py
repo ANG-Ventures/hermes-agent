@@ -89,7 +89,7 @@ def _build_history(target_tokens: int) -> list:
     for p in files:
         if chars // 4 >= target_tokens:
             break
-        text = p.read_text(encoding="utf-8", errors="replace")[:120_000]
+        text = p.read_text(encoding="utf-8-sig", errors="replace")[:120_000]
         history.append({"role": "user", "content": f"Read this file for later reference: {p.relative_to(REPO)}\n\n{text}"})
         history.append({"role": "assistant", "content": f"Read {p.relative_to(REPO)} ({len(text)} chars). Ready."})
         chars += len(text) + 80

@@ -479,7 +479,7 @@ def read_inventory(path) -> Dict[str, dict]:
     if path is None:
         return {}
     try:
-        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+        doc = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return {}
     hosts = doc.get("hosts") if isinstance(doc, dict) else None
@@ -524,7 +524,7 @@ def read_host_speed(path=None) -> Dict[str, dict]:
     capacity seed is the ruled default, so a bad speed file must not close the fleet."""
     p = Path(path) if path is not None else fleet_root() / SPEED_REL
     try:
-        doc = json.loads(p.read_text(encoding="utf-8"))
+        doc = json.loads(p.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:
@@ -566,7 +566,7 @@ def load_hosts(path=None, inventory=None, *, speed_path=None, scorer: Optional[s
     compares both)."""
     p = Path(path) if path is not None else fleet_root() / TABLE_REL
     try:
-        doc = json.loads(p.read_text(encoding="utf-8"))
+        doc = json.loads(p.read_text(encoding="utf-8-sig"))
     except FileNotFoundError as exc:
         raise PlacementError(f"{p}: missing") from exc
     except (OSError, ValueError) as exc:
@@ -634,7 +634,7 @@ def read_exclusions(path=None, *, now: float) -> Dict[str, str]:
     now = _now(now)
     p = Path(path) if path is not None else fleet_root() / EXCLUSIONS_REL
     try:
-        text = p.read_text(encoding="utf-8")
+        text = p.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return {}
     except OSError as exc:
@@ -1421,7 +1421,7 @@ def admission_mode(path=None) -> str:
     if hit and hit[0] == sig:
         return hit[1]
     try:
-        mode = _parse_admission(p.read_text(encoding="utf-8"))
+        mode = _parse_admission(p.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         mode = "legacy"
     _MODE_CACHE[key] = (sig, mode)
@@ -1481,7 +1481,7 @@ def _locked(path: Path, timeout_s: Optional[float] = None):
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path) + ".lock", "a+", encoding="utf-8") as fh:
+    with open(str(path) + ".lock", "a+", encoding="utf-8") as fh:  # windows-footgun: ok — append-mode lock file, not a read
         if timeout_s is None:
             fcntl.flock(fh, fcntl.LOCK_EX)
         else:
@@ -1504,7 +1504,7 @@ def _read_ledger(path: Path) -> dict:
     """The ledger document. A MISSING file is an empty ledger; anything else that fails is LedgerError (a
     reserve()/release() must never replace a ledger it could not read: that drops live reservations)."""
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return {"schema": SCHEMA, "rows": []}
     except OSError as exc:
@@ -1552,7 +1552,7 @@ def _write_ledger(path: Path, doc: dict) -> None:
     loss right after a remote job launched cannot forget the reservation it was launched on (Prism 9da46cee)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
-    with os.fdopen(fd, "w") as fh:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, sort_keys=True)
         fh.flush()
         os.fsync(fh.fileno())

@@ -114,7 +114,7 @@ jobs:
     name: Placement
     needs: generate
     if: vars.CI_OVERFLOW_PLACEMENT_ENABLED == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 5
     continue-on-error: true
     permissions:

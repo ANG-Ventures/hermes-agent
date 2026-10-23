@@ -169,7 +169,7 @@ def _skill_binding(name: str, dirs: Tuple[Path, ...],
             return None, None
         from agent.skill_utils import parse_frontmatter
     except Exception:
-        _log.debug("kanban host affinity: %s failed open (not cached)", name, exc_info=True)
+        _log.debug("kanban host affinity: %s failed open (not cached)", name, exc_info=True)  # windows-footgun: ok — log text ("failed open" = fail-open), not an open() call
         return None, None
     reason: Optional[str] = None
     target: Optional[str] = None
@@ -204,7 +204,7 @@ def _profile_dirs(assignee: str, now: float) -> Optional[Tuple[Path, ...]]:
         home = Path(get_profile_dir(assignee))
         dirs: Tuple[Path, ...] = tuple(profile_skill_dirs(home)) if home.is_dir() else ()
     except Exception:
-        _log.debug("kanban host affinity: dirs for %s failed open (not cached)", assignee,
+        _log.debug("kanban host affinity: dirs for %s failed open (not cached)", assignee,  # windows-footgun: ok — log text ("failed open" = fail-open), not an open() call
                    exc_info=True)
         return None
     _dirs_cache[assignee] = (now, dirs)

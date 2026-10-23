@@ -111,7 +111,7 @@ def flag_state(path: Path, *, now: Optional[float] = None) -> Tuple[str, Optiona
     """Return (state, data): state in {"absent", "active", "expired", "invalid"}."""
     now = time.time() if now is None else now
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return "absent", None
     except OSError:
@@ -255,7 +255,7 @@ def replay(add_fn: AddFn, *, path: Optional[Path] = None) -> Tuple[int, int]:
                 os.rename(path, replaying)
             except FileNotFoundError:
                 return 0, 0
-    lines = [ln for ln in replaying.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    lines = [ln for ln in replaying.read_text(encoding="utf-8-sig").splitlines() if ln.strip()]
     failed: List[str] = []
     replayed = 0
     for ln in lines:
@@ -323,7 +323,7 @@ def status(*, queue_path: str = DEFAULT_QUEUE_PATH, now: Optional[float] = None)
         out[f"{name}_expires_at"] = (data or {}).get("expires_at")
     jp = journal_path()
     out["journal"] = sum(
-        sum(1 for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip())
+        sum(1 for ln in f.read_text(encoding="utf-8-sig").splitlines() if ln.strip())
         for f in (jp, jp.with_name(jp.name + REPLAYING_SUFFIX)) if f.exists())
     try:
         out["pending"], age = _pending_stats(queue_path, now)

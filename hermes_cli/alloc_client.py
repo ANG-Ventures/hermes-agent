@@ -109,7 +109,7 @@ def read_samples(path=None, *, now: float):
     """The scorer's samples from var/fleet-pressure.json. A missing / unreadable document = no samples = every host
     closed (fail-CLOSED), never an exception that a caller could mistake for a liveness fault."""
     try:
-        doc = json.loads(pressure_path(path).read_text(encoding="utf-8"))
+        doc = json.loads(pressure_path(path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return {}
     if not isinstance(doc, dict):
@@ -183,7 +183,7 @@ def _token(consumer: str) -> Optional[str]:
         raise Refused(f"consumer name required (got {consumer!r})")
     p = placement.fleet_root() / TOKENS_REL / consumer
     try:
-        tok = p.read_text(encoding="utf-8").strip()
+        tok = p.read_text(encoding="utf-8-sig").strip()
     except FileNotFoundError:
         if _protected(consumer):
             raise TokenUnreadable(f"{p}: missing for a protected consumer") from None
@@ -210,7 +210,7 @@ class Unreachable(Exception):
 
 def _router_host() -> str:
     try:
-        doc = json.loads((placement.fleet_root() / placement.TABLE_REL).read_text(encoding="utf-8"))
+        doc = json.loads((placement.fleet_root() / placement.TABLE_REL).read_text(encoding="utf-8-sig"))
         r = doc.get("router") if isinstance(doc, dict) else None
         h = r.get("host") if isinstance(r, dict) else None
         return h if isinstance(h, str) and h else DEFAULT_ROUTER_HOST

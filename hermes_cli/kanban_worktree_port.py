@@ -57,7 +57,7 @@ _log = logging.getLogger(__name__)
 def read_mirrors(fleet_dir: Path) -> Dict[str, Tuple[str, Tuple[str, ...]]]:
     """``{owner/repo (lower): (mirror path, hosts)}``; {} on any doubt."""
     try:
-        doc = json.loads((Path(fleet_dir) / MIRRORS_FILE).read_text(encoding="utf-8"))
+        doc = json.loads((Path(fleet_dir) / MIRRORS_FILE).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return {}
     repos = doc.get("repos") if isinstance(doc, dict) and doc.get("schema") == 1 else None

@@ -164,7 +164,7 @@ def _foreign_writer(resolved: str) -> Optional[Tuple[str, float]]:
     if lock_file is None:
         return None
     try:
-        data = json.loads(lock_file.with_name(lock_file.name + ".writer").read_text(encoding="utf-8"))
+        data = json.loads(lock_file.with_name(lock_file.name + ".writer").read_text(encoding="utf-8-sig"))
         pid, task_id, ts = int(data["pid"]), str(data["task_id"]), float(data["ts"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -186,7 +186,7 @@ def _forget_published(resolved: str, task_id: str) -> None:
         return
     path = lock_file.with_name(lock_file.name + ".writer")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         if data.get("pid") == os.getpid() and data.get("task_id") == task_id:
             path.unlink()
     except (OSError, ValueError, AttributeError):

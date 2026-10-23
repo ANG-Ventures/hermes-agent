@@ -12,6 +12,7 @@ Command (scratch `HERMES_HOME`, live `plugins/model-providers` linked read-only,
 
 ```
 HERMES_HOME=<scratch> python tools/dev_probes/boomerang_v2_p2_live.py cache --prefix-tokens 205000 --trials 16 --out p2-cache-trials-realpath.jsonl
+<!-- no-tmp: ok — verbatim record of the command the evidence run used -->
 HERMES_HOME=<scratch> TERMINAL_CWD=/tmp python tools/dev_probes/boomerang_v2_p2_live.py cost --prefix-tokens 205000 --max-iterations 6 --out p2-cost-pairs-realpath.jsonl
 ```
 

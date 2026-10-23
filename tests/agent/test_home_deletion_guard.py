@@ -78,7 +78,7 @@ def test_literal_assignment_in_the_same_command_is_tracked(home):
 
 def test_script_invoked_by_path_is_read(home, tmp_path):
     script = tmp_path / "rd-1956.sh"
-    script.write_text('#!/bin/bash\nset -e\necho hi\nrm -rf "$HERMES_HOME"\n')
+    script.write_text('#!/usr/bin/env bash\nset -e\necho hi\nrm -rf "$HERMES_HOME"\n')
     for cmd in (f"bash {script}", f"sh {script}", f"bash -x {script}"):
         assert check(home, cmd) is not None, cmd
 

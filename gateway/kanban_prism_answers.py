@@ -89,7 +89,7 @@ def _default_open_keys(repo: str, pr: int, head: str, card: str) -> Optional[lis
         proc = subprocess.run(
             [sys.executable, str(script), "round", "--repo", repo, "--pr", str(int(pr)), "--head", head,
              "--card", card],
-            capture_output=True, text=True, timeout=ROUND_TIMEOUT_S, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=ROUND_TIMEOUT_S, stdin=subprocess.DEVNULL,
             cwd=str(script.parent.parent))
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         logger.debug("kanban prism answers: round failed (%s)", exc)

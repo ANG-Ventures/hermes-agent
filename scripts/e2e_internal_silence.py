@@ -150,7 +150,7 @@ def _bot_messages(dc, channel: str, target_id: str, after_id: str, since_ts: flo
 
 def _log_has(home: str, needle: str) -> bool:
     try:
-        with open(os.path.join(home, "logs", "gateway.log"), encoding="utf-8", errors="replace") as fh:
+        with open(os.path.join(home, "logs", "gateway.log"), encoding="utf-8-sig", errors="replace") as fh:
             return any(needle in line for line in fh)
     except FileNotFoundError:
         return False
@@ -196,7 +196,7 @@ def run_arm(arm: str, env: dict, puppet, dc, target_id: str) -> bool:
 def enable_agent_notify(home: str) -> None:
     """Scratch-only: production keeps it off; the E2E needs bg completions to wake the agent.
     Read at spawn time (tools/process_registry.py::resolve_agent_notify_mode), so no restart."""
-    with open(os.path.join(home, "config.yaml"), "a", encoding="utf-8") as fh:
+    with open(os.path.join(home, "config.yaml"), "a", encoding="utf-8") as fh:  # windows-footgun: ok — append-mode write, not a read
         fh.write("display:\n  background_process_agent_notify: 'on'\n")
 
 

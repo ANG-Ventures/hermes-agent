@@ -132,7 +132,7 @@ def check(root: Path) -> List[str]:
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", SyntaxWarning)
-                tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
+                tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=rel)
         except (SyntaxError, UnicodeDecodeError) as exc:
             findings.append(f"{rel}: unparseable ({exc})")
             continue
@@ -192,8 +192,8 @@ def _selftest() -> int:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / SCAN).mkdir()
-            (root / SCAN / "kanban_db_dispatch.py").write_text(dispatch)
-            (root / SCAN / "kanban_continuation.py").write_text(_FIX_CONT)
+            (root / SCAN / "kanban_db_dispatch.py").write_text(dispatch, encoding="utf-8")
+            (root / SCAN / "kanban_continuation.py").write_text(_FIX_CONT, encoding="utf-8")
             return check(root)
 
     cases = {

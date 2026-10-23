@@ -78,7 +78,7 @@ def scan_source(src: str, rel: str) -> list[str]:
 def _tracked_py() -> list[Path]:
     try:
         out = subprocess.run(["git", "-C", str(ROOT), "ls-files", "*.py"], check=True,
-                             capture_output=True, text=True).stdout
+                             capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
     except (OSError, subprocess.CalledProcessError):
         return [p for p in ROOT.rglob("*.py") if ".git" not in p.parts]
     return [ROOT / line for line in out.splitlines() if line]
