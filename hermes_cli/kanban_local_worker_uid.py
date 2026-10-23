@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import logging
 import os
-import pwd  # windows-footgun: ok — POSIX-only privilege boundary: without pwd the import fails, so a spawn fails closed, never skips the uid hop
+try:
+    import pwd
+except ImportError:  # native Windows: no passwd database
+    pwd = None
 import re
 from typing import Any, Mapping, Optional
 
@@ -40,7 +43,7 @@ class LocalWorkerUidError(RuntimeError):
 
 def _my_login() -> str:
     # The process uid, never LOGNAME/USER (a launcher can set those to anything).
-    return pwd.getpwuid(os.getuid()).pw_name  # windows-footgun: ok — POSIX-only privilege boundary: without pwd the import fails, so a spawn fails closed, never skips the uid hop
+    return pwd.getpwuid(os.getuid()).pw_name  # windows-footgun: ok — only reached with pwd present (resolve_user fails closed without it)
 
 
 def resolve_user(kanban_cfg: Optional[Mapping[str, Any]], *, me: Optional[str] = None) -> Optional[str]:
@@ -58,10 +61,14 @@ def resolve_user(kanban_cfg: Optional[Mapping[str, Any]], *, me: Optional[str] =
     if isinstance(raw, bool):
         raise LocalWorkerUidError(f"kanban.{KNOB}: {raw!r} is not a login or uid")
     value = str(raw).strip()
+    if pwd is None:
+        # A set knob is a privilege boundary this host cannot honour: fail closed, never run as the
+        # dispatcher. An unset knob returned above, so plain local workers still spawn here.
+        raise LocalWorkerUidError(f"kanban.{KNOB}: {value!r} needs a POSIX passwd database; none on this host")
     if me is None:
         me = _my_login()
     if value.isdigit():
-        if int(value) == os.getuid():  # windows-footgun: ok — POSIX-only privilege boundary: without pwd the import fails, so a spawn fails closed, never skips the uid hop
+        if int(value) == os.getuid():  # windows-footgun: ok — only reached with pwd present (resolve_user fails closed without it)
             return None
         try:
             value = pwd.getpwuid(int(value)).pw_name
