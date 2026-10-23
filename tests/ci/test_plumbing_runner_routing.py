@@ -83,6 +83,29 @@ def test_plumbing_routed_job_is_hosted_unless_the_var_is_set(workflow, job_id, r
     assert "CI_RUNNER_LABELS" not in runs_on
 
 
+# Plumbing jobs too big for the ci-box pool (4g memory, 3g /_work tmpfs). The mirror sets
+# CI_BIG_PLUMBING_RUNNER to the 8g, disk-/_work ace-ai/ace-media pool (label `overflow`).
+# Measured in the runner image on ci-box (t_08dc2e4e): docs build 5.7 GiB peak / 2.2 GiB /_work,
+# install.sh E2E 5.6 GiB /_work.
+BIG_PLUMBING = "CI_BIG_PLUMBING_RUNNER"
+BIG_JOBS = {("docs-site-checks.yml", "docs-site-checks"), ("bootstrap-installer.yml", "posix")}
+
+
+@pytest.mark.parametrize("workflow,job_id", sorted(BIG_JOBS))
+def test_big_plumbing_job_prefers_the_big_runner_var(workflow, job_id):
+    runs_on = {(w, j): job["runs-on"] for w, j, job in _ci_graph_jobs()}[(workflow, job_id)]
+    big = '["self-hosted","hermes-ci","overflow"]'
+    assert _resolve(runs_on, {BIG_PLUMBING: big, PLUMBING: MIRROR_LABELS}) == ["self-hosted", "hermes-ci", "overflow"]
+    # Unset or empty big var: the plain plumbing routing, unchanged.
+    assert _resolve(runs_on, {BIG_PLUMBING: "", PLUMBING: MIRROR_LABELS}) == ["self-hosted", "hermes-ci"]
+    assert HOSTED_LINUX.match(_resolve(runs_on, {}))
+
+
+def test_only_the_big_jobs_read_the_big_runner_var():
+    readers = {(w, j) for w, j, job in _ci_graph_jobs() if BIG_PLUMBING in str(job["runs-on"])}
+    assert readers == BIG_JOBS
+
+
 @pytest.mark.parametrize(
     "workflow,job_id",
     [

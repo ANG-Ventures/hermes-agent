@@ -46,7 +46,7 @@ test, not a dead host:
    would have been failed at ~1 GiB, three seconds in, on every host. The sample costs
    ~2 us. Inside a cgroup with a numeric ``memory.max`` (test-gate's ``MemoryMax``, a CI
    container) the budget is clamped to what the cgroup leaves above the test's starting
-   RSS minus a headroom (35 % of the cgroup, min 96 MiB: the poll interval plus the
+   RSS minus a headroom (35 % of the cgroup, min 96 MiB, max 512 MiB: the poll interval plus the
    stop latency of a ~2 GB/s allocator), so the harness names the test BEFORE the kernel's OOM killer SIGKILLs the
    process (measured: a 1 GiB cgroup + the 1 GiB default budget = exit 137 with no
    verdict; clamped = the named failure in under a second).
@@ -103,6 +103,11 @@ _CGROUP_HEADROOM_MIN = 96 * 1024 ** 2
 # lands one poll late and the test thread allocates another ~150 MB before the async
 # exception stops it, so a 1 GiB cgroup needs ~0.35 GiB above the budget.
 _CGROUP_HEADROOM_FRACTION = 0.35
+# The overshoot is allocator speed x stop latency, not a share of the cgroup, so the fraction
+# stops growing here. Uncapped, a 4 GiB ci-runner container (8 workers, ~630 MiB of /_work tmpfs)
+# reserved 1.4 GiB and every test on a busy slice got the 16 MiB floor ("grew 0.02 GiB of RSS
+# (limit 0.02 GiB)" on hundreds of unrelated tests, measured on ci-box, t_b56f9e1e).
+_CGROUP_HEADROOM_MAX = 512 * 1024 ** 2
 _CGROUP_RECHECK_SECONDS = 0.5  # re-read the cgroup tree's room this often while a test runs
 _MIN_GROWTH = 16 * 1024 ** 2
 _ESCALATE_EXIT_CODE = 70
@@ -262,7 +267,7 @@ def _cgroup_room(own_rss: int) -> tuple[int, int] | None:
 
 
 def _headroom(limit: int) -> int:
-    return max(_CGROUP_HEADROOM_MIN, int(limit * _CGROUP_HEADROOM_FRACTION))
+    return min(max(_CGROUP_HEADROOM_MIN, int(limit * _CGROUP_HEADROOM_FRACTION)), _CGROUP_HEADROOM_MAX)
 
 
 def _cgroup_memory_max() -> int | None:

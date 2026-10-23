@@ -10,7 +10,10 @@ jobs:
   docs-site-checks:
     # Hosted by design: npm/node docs build, no LAN dependency.
     # Keeps a 17-slot pool slot free for a test slice.
-    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
+    # CI_BIG_PLUMBING_RUNNER (set only on the private mirror) wins over the plumbing pool: the
+    # Docusaurus build peaks at 5.7 GiB with 2.2 GiB of /_work, and the ci-box pool's 4g/3g-tmpfs
+    # runners kill it with exit 137 (t_08dc2e4e).
+    runs-on: ${{ vars.CI_BIG_PLUMBING_RUNNER && fromJSON(vars.CI_BIG_PLUMBING_RUNNER) || vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1

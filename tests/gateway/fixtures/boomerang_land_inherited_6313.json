@@ -1,0 +1,49 @@
+{
+ "_doc": "t_47d1968c: real bytes behind the hermes-home#6313 inherited-red wake (child 20261023_010403_4d2d02, 01:04-01:06 PT 10-23). Excerpts of the files at the PR head and at main b8b00e0a94 (the main the child read); suites.json trimmed to the family row + globsets.",
+ "repo": "ANG-Ventures/hermes-home",
+ "pr": 6313,
+ "head": "223618c18ffab2f4b155a5c61f379676f8a10cdd",
+ "main_sha": "b8b00e0a94b789ed8ed06a6cfce42fe16791c1f7",
+ "base": "main",
+ "pr_files": [
+  "scripts/lib/approve_carry.py",
+  "scripts/lib/landing_queue.py",
+  "scripts/tests/test_landing_queue.py"
+ ],
+ "files": {
+  "scripts/kanban-review-merge-pass.py@head": "    aef = _aef()\n    recs = psg.pr_records(ctx[\"shadow\"], repo, n, aef._read_json)\n    route = psg.read_route_rows(FINDINGS_ROUTE_LEDGER, repo, n)\n    scoped = [card] + [c for cs in route.values() for c in cs]\n    return psg.Resolver(repo, n, head, prior=psg.prior_index(recs, head),\n                        compare=lambda b, h: gate_compare(b, h, repo),\n                        route_cards=route, card_verdict=gate_card_verdict, verdict_lines=gate_verdict_lines(scoped),\n                        operator_verdict_lines=gate_verdict_lines(scoped, operator_only=True),\n                        operator_card_verdict=lambda c: gate_card_verdict(c, operator_only=True),\n                        fixed_lines=gate_verdict_lines(scoped, fixed=True),\n                        operator_fixed_lines=gate_verdict_lines(scoped, operator_only=True, fixed=True),\n                        ancestor=lambda sha, h: contains(repo, sha, h),\n                        prior_rows=psg.prior_findings(recs, head),\n                        same_change=lambda b, h: gate_same_change(repo, n, b, h),\n                        verdict_heads=gate_verdict_heads(scoped, repo, n),\n",
+  "scripts/kanban-review-merge-pass.py@main": "    on_pr = (repo, n, card) if card else None   # t_5da88027: the card's worker / operator App lines on the PR\n    return psg.Resolver(repo, n, head, prior=psg.prior_index(recs, head),\n                        compare=lambda b, h: gate_compare(b, h, repo),\n                        route_cards=route, card_verdict=gate_card_verdict,\n                        verdict_lines=gate_verdict_lines(scoped, pr=on_pr),\n                        operator_verdict_lines=gate_verdict_lines(scoped, operator_only=True),\n                        operator_card_verdict=lambda c: gate_card_verdict(c, operator_only=True),\n                        fixed_lines=gate_verdict_lines(scoped, fixed=True, pr=on_pr),\n                        operator_fixed_lines=gate_verdict_lines(scoped, operator_only=True, fixed=True),\n                        ancestor=lambda sha, h: contains(repo, sha, h),\n                        prior_rows=psg.prior_findings(recs, head),\n                        same_change=lambda b, h: gate_same_change(repo, n, b, h),\n                        verdict_heads=gate_verdict_heads(scoped, repo, n, card=card),\n",
+  "scripts/tests/mutate_auto_enqueue_pass.sh@main": "  $'operator_verdict_lines=gate_verdict_lines(scoped),'\nmut \"p0-resolver-gets-worker-card-reader\" \\\n  $'operator_card_verdict=lambda c: gate_card_verdict(c, operator_only=True),' \\\n  $'operator_card_verdict=gate_card_verdict,'\n# t_25436b65: `fixed <sha>` wiring + the HOLD-time PR re-read\nmut \"p0-resolver-gets-worker-fixed-lines\" \\\n  $'operator_fixed_lines=gate_verdict_lines(scoped, operator_only=True, fixed=True),' \\\n  $'operator_fixed_lines=gate_verdict_lines(scoped, fixed=True),'\nmut \"fixed-lines-not-wired\" \\\n  $'fixed_lines=gate_verdict_lines(scoped, fixed=True),\\n' \\\n  $'fixed_lines=None,\\n'\nmut \"hold-reread-ignored\" \\\n  $'        if moot:\\n            notify(' \\\n",
+  ".github/ci/suites.json@main": "{\"suites\": {\"mutate_anchor_lint\": {\"paths\": [\"scripts/tests/mutate_*.sh\", \"scripts/lib/gh_accounting.py\", \"scripts/mutate-anchor-lint.py\", \"tests/test_mutate_anchor_lint.py\", \"fleet/git-safe\", \"scripts/auto_enqueue_fr.py\", \"scripts/changes_hold.py\", \"scripts/config_reload.py\", \"scripts/daemon-stale-code-watch.py\", \"scripts/deploy-map.json\", \"scripts/ci_review_label.py\", \"scripts/fleet-merge-horizon-watch.py\", \"scripts/fleet-merge.sh\", \"scripts/gh-app-token.py\", \"scripts/gh-shim.py\", \"scripts/gh-webhook-consumer.py\", \"scripts/gh-webhook-front.py\", \"scripts/gh-webhook-sweep.py\", \"scripts/gh_token_cache.py\", \"scripts/gh_webhook_state.py\", \"scripts/git-safe\", \"scripts/github-apps-lint.py\", \"scripts/kanban-review-merge-pass.py\", \"scripts/kanban_board_resolve.py\", \"scripts/land.py\", \"scripts/land_request.py\", \"scripts/lander-audit.py\", \"scripts/lander_actuators.py\", \"scripts/lens_fanout.py\", \"scripts/lib/approve_carry.py\", \"scripts/lib/operator_identity.py\", \"scripts/lib/red_class.py\", \"scripts/live_evidence_recheck.py\", \"scripts/pr-lost-work-sweep.py\", \"scripts/pr_lost_work.py\", \"scripts/pr_monitor/alerts.py\", \"scripts/pr_monitor/classify.py\", \"scripts/pr_monitor/inventory.py\", \"scripts/prism_soft_gate.py\", \"scripts/prs-monitor.py\", \"scripts/repo-merge-settings-lint.py\", \"scripts/review_of_record.py\", \"scripts/stacked_replay.py\", \"scripts/themis_packet.py\", \"scripts/git-materialize-ref.sh\", \"scripts/level-import-smoke.py\", \"scripts/lib/level_order.py\", \"scripts/lib/level_pause.py\"]}}, \"globsets\": {}}"
+ },
+ "child_verdict": {
+  "action": "land_inherited",
+  "evidence": [
+   "gh pr view 6313 --json files -> scripts/lib/approve_carry.py, scripts/lib/landing_queue.py, scripts/tests/test_landing_queue.py (no merge-pass, no mutate script)",
+   "job 120301984639 log: FAIL test_live_tree_is_clean -- mutate_auto_enqueue_pass.sh:192 mutant fixed-lines-not-wired: anchor 'fixed_lines=gate_verdict_lines(scoped, fixed=True),\\n' not found; mutate_anchor_lint rc=1",
+   "git show gh/main:scripts/kanban-review-merge-pass.py | grep -c 'fixed_lines=gate_verdict_lines(scoped, fixed=True)' -> 0 (line 4113 is now fixed=True, pr=on_pr; changed by 3c3e4966 #6216)"
+  ],
+  "findings": [],
+  "summary": "ci-shard-4 red on #6313 is INHERITED (mutate_anchor_lint anchor broken on main by #6216, not by this PR): land with --allow-red-ci inherited.",
+  "inherited": {
+   "family": "mutate_anchor_lint",
+   "job": "ci-shard-4",
+   "anchor_or_test": {
+    "file": "scripts/kanban-review-merge-pass.py",
+    "anchor": "fixed_lines=gate_verdict_lines(scoped, fixed=True),\\n",
+    "harness": "scripts/tests/mutate_auto_enqueue_pass.sh"
+   },
+   "main_sha": "b8b00e0a94b789ed8ed06a6cfce42fe16791c1f7",
+   "pr_files": [
+    "scripts/lib/approve_carry.py",
+    "scripts/lib/landing_queue.py",
+    "scripts/tests/test_landing_queue.py"
+   ],
+   "proof": [
+    "mutate_anchor_lint rc=1 at the PR head (job 120301984639)",
+    "anchor count at gh/main: 0; at the PR head: 1"
+   ]
+  }
+ },
+ "coverage_comment": "apollo manual: APPROVE @ 223618c\nreview_coverage: {\"verdict\": \"APPROVE\", \"head_sha\": \"223618c18ffab2f4b155a5c61f379676f8a10cdd\", \"pr\": \"ANG-Ventures/hermes-home#6313\", \"reviewer\": \"apollo\", \"by\": \"apollo/operator\", \"findings\": 0}"
+}
