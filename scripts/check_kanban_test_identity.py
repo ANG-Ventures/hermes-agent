@@ -42,36 +42,29 @@ IN_PROCESS = frozenset({"parse_args", "run_slash", "parse_known_args"})
 # ``/kanban create`` is a slash command run in-process (gateway/CLI), not a spawn.
 SHELL_RE = re.compile(r"(?<![/\w])kanban\s+(?:--board\s+\S+\s+)?(create|promote|claim)\b")
 SUPPRESS = "# kanban-identity: ok"
-_QUOTED_VERB = re.compile(r"""['"]\s*(?:create|promote|claim)\b|\b(?:create|promote|claim)\s*['"]""")
 
 
-# Raw-text prefilter for a STRING CONSTANT the AST check looks for. Python joins adjacent
-# literals (``"kanban cre" "ate"``) and decodes escapes (``"\\x6bill"``), so the decoded
-# constant need not appear in the source. ``_gate_texts`` returns the texts to search: the
-# source, a copy with every adjacent-literal boundary removed, and (when the source has a
-# backslash) that copy with character escapes decoded (Prism 675e33503531, t_44dcc531).
-_LITERAL_JOIN = re.compile(r"""['"]{1,3}(?:\s|\\\n|[()]|#[^\n]*\n)*[rRbBuUfF]{0,2}['"]{1,3}""")
-_CHAR_ESCAPE = re.compile(r"\\(?:x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|([0-7]{1,3})|N\{([^}]*)\})")
+# Raw-text prefilter for a STRING CONSTANT the AST check looks for. The decoded constant need
+# not appear contiguously in the source: Python joins adjacent literals (``"kan" "" "ban"``),
+# drops a backslash-newline inside a literal and decodes escapes (``"\x6bill"``). ``_spelled``
+# builds a pattern for every such spelling: each character may be itself or an escape that can
+# decode to it, and between characters any run of literal joints (quote, gap, optional prefix,
+# quote) or continuations. A superset: a match only means "parse it" (Prism 675e33503531,
+# 10b55641b9b8, 3c7e1b72c0b1; t_44dcc531).
+_JOINT = r"""(?:['"]{1,3}(?:[ \t\f\r\n()]|\\\r?\n|#[^\n]*\n)*[rRbBuUfF]{0,2}['"]{1,3}|\\\r?\n)*"""
 
 
-def _decode_escape(m: re.Match) -> str:
-    hexa = m.group(1) or m.group(2) or m.group(3)
-    try:
-        if hexa:
-            return chr(int(hexa, 16))
-        if m.group(4):
-            return chr(int(m.group(4), 8))
-        import unicodedata
-        return unicodedata.lookup(m.group(5))
-    except (KeyError, ValueError, OverflowError):
-        return m.group(0)
+def _spelled(word: str) -> str:
+    parts = []
+    for ch in word:
+        o = ord(ch)
+        escapes = r"\\(?:x(?i:%02x)|u(?i:%04x)|U(?i:%08x)|0{0,2}%o|N\{[^}]*\})" % (o, o, o, o)
+        parts.append("(?:%s|%s)" % (re.escape(ch), escapes))
+    return _JOINT.join(parts)
 
 
-def _gate_texts(src: str):
-    joined = _LITERAL_JOIN.sub("", src)
-    if "\\" not in src:
-        return (src, joined)
-    return (src, joined, _CHAR_ESCAPE.sub(_decode_escape, joined))
+_KANBAN_TEXT = re.compile(_spelled("kanban"))
+_VERB_TEXT = re.compile("|".join(_spelled(v) for v in sorted(VERBS)))
 
 
 def _func_name(node: ast.AST) -> str | None:
@@ -161,13 +154,9 @@ def _requests_fixture(fn: ast.AST) -> bool:
 
 
 def check_source(src: str, filename: str = "<src>") -> list[str]:
-    texts = _gate_texts(src)
-    if not any(
-        "kanban" in t and (SHELL_RE.search(t) or _QUOTED_VERB.search(t)) for t in texts
-    ):
-        # Every spawn shape needs "kanban" plus a verb literal: the argv token / helper
-        # argument (a quoted "create") or a shell string (SHELL_RE). Skips the parse of
-        # ~99% of tests/ (t_44dcc531).
+    if not (_KANBAN_TEXT.search(src) and _VERB_TEXT.search(src)):
+        # Every spawn shape spells "kanban" and a verb in a string constant (argv token,
+        # helper argument or shell string). Skips the parse of most of tests/ (t_44dcc531).
         return []
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # other files' invalid-escape Syntax/DeprecationWarnings
