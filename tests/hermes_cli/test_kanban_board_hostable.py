@@ -190,6 +190,41 @@ def test_a_card_path_fault_under_a_writable_root_is_the_cards(tmp_path):
     assert (board / "t_y").is_dir()
 
 
+def test_pool_workspace_is_created_0770_and_an_existing_dir_keeps_its_mode(tmp_path):
+    """t_69e47673: a pool workspace is kanbanw-only (0770, umask-independent), so the ci-box prism lane reset
+    walk prunes it at depth 1; `mkdir -m` sets the LAST component only (the board root keeps 2775)."""
+    board = tmp_path / "subs-ace"
+    board.mkdir()
+    board.chmod(0o2775)
+    old = os.umask(0o002)
+    try:
+        kwh.prepare_remote_workspace(_host("ci-box"), str(board / "t_new"), runner=_local_mkdir, board="subs-ace")
+        (board / "t_old").mkdir()
+        (board / "t_old").chmod(0o775)
+        kwh.prepare_remote_workspace(_host("ci-box"), str(board / "t_old"), runner=_local_mkdir, board="subs-ace")
+    finally:
+        os.umask(old)
+    assert ((board / "t_new").stat().st_mode & 0o777) == 0o770
+    assert ((board / "t_old").stat().st_mode & 0o7777) == 0o775
+    assert (board.stat().st_mode & 0o7777) == 0o2775
+
+
+def test_local_uid_hop_keeps_the_umask_mode():
+    """The Studio local-uid hop reaches its workspace through the scratch-root ACL, never a mode: no `-m`."""
+    seen = []
+
+    def runner(argv, **kw):
+        seen.append(argv[-1])
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    local = kwp.PoolHost(name=kwh.LOCAL_HOST_NAME, ssh_host="localhost", ssh_user="_kanbanw", slots=0,
+                         capacity_pct=1.0, absence="required", profiles=(), state="active", enabled=True,
+                         priority=0)
+    kwh.prepare_remote_workspace(local, "/w/default/t_x", runner=runner)
+    kwh.prepare_remote_workspace(_host("ci-box"), "/w/default/t_x", runner=runner)
+    assert seen[0].startswith("mkdir -p -- ") and seen[1].startswith("mkdir -p -m 0770 -- ")
+
+
 def test_ssh_transport_failure_is_not_a_board_fact():
     with pytest.raises(RuntimeError) as ei:
         kwh.prepare_remote_workspace(_host("ci-box"), "/w/subs-ace/t_x",
