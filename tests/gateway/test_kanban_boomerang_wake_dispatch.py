@@ -371,6 +371,23 @@ def test_surfaced_child_finding_rides_the_wake_and_lands_once_on_the_card(env):
     assert len(env["adapter"].handled) == 1
 
 
+def test_surface_with_malformed_evidence_still_resurfaces(env):
+    """Optional diagnostics never abort the surface handoff (Prism 466d1245315e)."""
+    tid = _review_card(env, pr=3131)
+    entry = _claimed_entry(env, tid, row="own_repo_review_red", kind="review_requested")
+    _run(env, entry, "completed", _verdict(entry, "surface", summary="needs operator review", evidence=True))
+    [turn] = [t.text for t in env["adapter"].handled]
+    assert turn.startswith(f"[boomerang-wake] child surfaced {tid}") and "needs operator review" in turn
+
+
+def test_surfaced_dedup_ignores_a_tag_quoted_inside_another_summary(env):
+    """Dedup keys on the executor-appended suffix, not on text the child wrote (Prism 91467028a76a)."""
+    tid = _card(env)
+    assert ah.record_surface({"task_id": tid, "delegation_id": "a"}, "see (delegation b)") is True
+    assert ah.record_surface({"task_id": tid, "delegation_id": "b"}, "finding B") is True
+    assert ah.record_surface({"task_id": tid, "delegation_id": "b"}, "finding B") is False
+
+
 def test_lost_child_without_verdict_keeps_the_plain_warning_and_wake(env):
     """INV-6 unchanged: no verdict → the ⚠️ reason line + the original wake text verbatim."""
     tid = _card(env)

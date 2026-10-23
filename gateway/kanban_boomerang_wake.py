@@ -813,8 +813,10 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     except VerdictError as exc:
         return {"ok": False, "action": None, "reason": str(exc), "summary": ""}
     action, summary = verdict["action"], _first_line(verdict.get("summary"))
+    raw_evidence = verdict.get("evidence")
+    raw_evidence = raw_evidence if isinstance(raw_evidence, list) else []
     finding = {"detail": _first_line(verdict.get("summary"), 600),
-               "evidence": [_first_line(e, 160) for e in verdict.get("evidence") or [] if str(e).strip()][:3]}
+               "evidence": [_first_line(e, 160) for e in raw_evidence if str(e).strip()][:3]}
     if action not in ALLOWED.get(live.get("row") or "", frozenset()):
         return {"ok": False, "action": action, "reason": f"action not allowed for {live.get('row')}",
                 "summary": summary, "refused": True, **finding}
@@ -845,8 +847,7 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     finally:
         conn.close()
     state.update_claim(key, state=STATE_TERMINAL, outcome=action, finished_at=_time.time())  # RC-5 (3)
-    evidence = [_first_line(e, 160) for e in verdict.get("evidence") or [] if str(e).strip()][:3]
-    return {"ok": True, "action": action, "reason": "", "summary": summary or action, "evidence": evidence}
+    return {"ok": True, "action": action, "reason": "", "summary": summary or action, "evidence": finding["evidence"]}
 
 
 # --- delivery (event loop) ----------------------------------------------------------------
@@ -884,7 +885,7 @@ def record_surface(entry: dict, summary: str) -> bool:
     tag = f"(delegation {entry['delegation_id']})"
     conn = kb.connect(board=entry.get("board"))
     try:
-        if any(c.author == AUTHOR and c.body.startswith(f"{MARKER} surfaced:") and tag in c.body
+        if any(c.author == AUTHOR and c.body.startswith(f"{MARKER} surfaced:") and c.body.endswith(tag)
                for c in kb.list_comments(conn, entry["task_id"])):
             return False
         with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
