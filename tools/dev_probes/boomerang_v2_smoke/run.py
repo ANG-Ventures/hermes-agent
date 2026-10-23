@@ -44,6 +44,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -353,7 +354,7 @@ class Ctx:
         self.kanban = shlex.split(os.environ.get("BV2_KANBAN_CMD") or "hermes kanban")
         self.chat_id = os.environ.get("BV2_ORIGIN_CHAT", "").strip()
         self.ack = Path(os.environ.get("BV2_ACK_FILE") or (
-            Path(os.environ.get("TMPDIR") or "/tmp") / "bv2-smoke.ack" if self.live
+            Path(tempfile.gettempdir()) / "bv2-smoke.ack" if self.live
             else FIXTURES / "fake_ack.txt"))
         self.tick = float(args.tick_seconds)
         self.slack = float(args.slack_seconds)

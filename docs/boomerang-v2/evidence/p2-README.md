@@ -23,6 +23,7 @@ writes to its ledger. Scratch `HERMES_HOME` (profile scratch dir) with the live
 
 ```
 HERMES_HOME=<scratch> python tools/dev_probes/boomerang_v2_p2_live.py cache --prefix-tokens 205000 --trials 16 --out p2-cache-trials.jsonl
+<!-- no-tmp: ok — verbatim record of the command the evidence run used -->
 HERMES_HOME=<scratch> TERMINAL_CWD=/tmp python tools/dev_probes/boomerang_v2_p2_live.py cost --prefix-tokens 205000 --max-iterations 6 --out p2-cost-pairs.jsonl
 ```
 
@@ -59,6 +60,7 @@ more even though its prefix is a quarter of the size. The margin narrows as iter
 
 Caveats, reported as found:
 - `red_review`: the task text names the test file without its directory and the scratch terminal cwd
+  <!-- no-tmp: ok — describes the scratch cwd the run actually had -->
   is `/tmp`, so BOTH arms answered "couldn't find test_delegate_tool_fork_mode.py". The pair compares
   two equal failures; it is still a matched pair, but not a useful answer.
 - The cost run's parent turn READ the cache the AC-4 run had written 3 minutes earlier
