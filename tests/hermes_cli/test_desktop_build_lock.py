@@ -178,6 +178,11 @@ def test_gui_releases_lock_before_packaged_electron_handoff(tmp_path, monkeypatc
     assert exc.value.code == 0
 
 
+@pytest.mark.slow_test(
+    90,
+    reason="runs the real failing desktop build under the lock; measured in ci-runner-ang-hermes:1 "
+    "--cpus 4 on ci-box: 58 s alone (x1.5 = 87), 110 s beside 7 busy workers (t_44dcc531)",
+)
 def test_gui_releases_lock_after_build_failure(tmp_path, monkeypatch, capsys):
     """A failed build must not deadlock the next `hermes desktop`."""
     root = _checkout(tmp_path)
