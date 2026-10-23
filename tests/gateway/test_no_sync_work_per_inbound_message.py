@@ -268,6 +268,17 @@ def test_loop_lag_stays_bounded_while_handling_messages_under_a_config_writer(
             writer_error.append(exc)
 
     async def main() -> LoopLagMonitor:
+        # One message before measuring: its first-call costs (lazy imports, the status
+        # lane's executor thread start) run once per PROCESS, not per message, and each
+        # cost 400-1000 ms on a 4-CPU CI slice (2-5 gaps over budget with no other load,
+        # stacks in importlib and ThreadPoolExecutor._adjust_thread_count; t_44dcc531).
+        # The defect is per message, so warming does not hide it.
+        from gateway import status as gwstatus
+
+        _resolve_hook_callback_timeout()
+        runner._persist_active_agents()
+        await asyncio.to_thread(gwstatus._fence_runtime_status_lane)
+
         monitor = LoopLagMonitor()
         monitor.start()
         await asyncio.sleep(0.05)  # let the monitor establish a baseline
