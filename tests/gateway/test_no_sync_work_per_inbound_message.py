@@ -76,61 +76,50 @@ MAX_OVER_BUDGET_INTERVALS = 3
 
 
 class _RunQueueClock:
-    """CPU run-queue time (ms) of this process's Python threads: time each spent RUNNABLE
-    BUT NOT RUNNING (``/proc/self/task/<tid>/schedstat`` field 2; Linux only, else None).
+    """CPU run-queue time (ms) of the CALLING thread: time it spent RUNNABLE BUT NOT RUNNING
+    (``/proc/self/task/<tid>/schedstat`` field 2; Linux only, else None).
 
-    That is CPU starvation, not work: a CFS-throttled ``--cpus`` container, a host run
-    queue, or a GIL holder that is itself waiting for a CPU.  Lock contention leaves the
-    waiting thread SLEEPING, not runnable, so subtracting it never hides the defect
-    (``test_loop_lag_monitor_counts_a_lock_wait_on_the_loop``).
+    Only the loop thread's own wait is subtracted from a loop gap: that time is starvation
+    of the loop itself by construction.  Other threads' run-queue time is never subtracted,
+    because it need not have delayed the loop (the loop blocked in sync I/O while a starved
+    worker queued would be hidden; Prism 77dc6042a683).  A lock or I/O wait leaves the loop
+    thread SLEEPING, not runnable, so it is never subtracted either
+    (``test_loop_lag_monitor_counts_a_lock_wait_on_the_loop``,
+    ``test_loop_lag_monitor_counts_sync_work_beside_starved_threads``).
 
     Read ON the loop, so the read must not release the GIL: every release hands the GIL to
-    the CPU-bound config writer for a switch interval, and ``open``/``read`` of each task
-    file per 2 ms tick made the instrument itself block the loop (29-31 gaps over budget,
-    alone, measured).  So the files stay open and are ``pread`` through ``ctypes.PyDLL``,
-    which holds the GIL.  Only Python threads are read: no other thread can hold the GIL.
+    the CPU-bound config writer for a switch interval, and an ``open``/``read`` per 2 ms
+    tick made the instrument itself block the loop (29-31 gaps over budget, alone,
+    measured).  So the file stays open and is ``pread`` through ``ctypes.PyDLL``, which
+    holds the GIL.
     """
 
     def __init__(self) -> None:
-        self._fds: dict[int, int] = {}
+        self._fd = -1
         self._buf = None
         self._libc = None
-        if os.path.isdir("/proc/self/task"):
-            import ctypes
+        if not os.path.isdir("/proc/self/task"):
+            return
+        import ctypes
 
-            self._libc = ctypes.PyDLL(None)  # PyDLL: calls keep the GIL
-            self._libc.pread.restype = ctypes.c_ssize_t
-            self._libc.pread.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_long]
-            self._libc.open.argtypes = [ctypes.c_char_p, ctypes.c_int]
-            self._buf = ctypes.create_string_buffer(128)
+        self._libc = ctypes.PyDLL(None)  # PyDLL: calls keep the GIL
+        self._libc.pread.restype = ctypes.c_ssize_t
+        self._libc.pread.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_long]
+        self._buf = ctypes.create_string_buffer(128)
+        self._fd = os.open(f"/proc/self/task/{threading.get_native_id()}/schedstat", os.O_RDONLY)
 
     def read(self) -> float | None:
-        if self._libc is None:
+        if self._fd < 0:
             return None
-        total = 0
-        for thread in threading.enumerate():
-            tid = thread.native_id
-            if tid is None:
-                continue
-            fd = self._fds.get(tid)
-            if fd is None:
-                fd = self._libc.open(f"/proc/self/task/{tid}/schedstat".encode(), os.O_RDONLY)
-                if fd < 0:
-                    continue
-                self._fds[tid] = fd
-            n = self._libc.pread(fd, self._buf, 127, 0)
-            if n <= 0:
-                continue  # the thread exited; its last value is gone with it
-            try:
-                total += int(self._buf.raw[:n].split()[1])
-            except (IndexError, ValueError):
-                continue
-        return total / 1e6
+        n = self._libc.pread(self._fd, self._buf, 127, 0)
+        if n <= 0:
+            return None
+        return int(self._buf.raw[:n].split()[1]) / 1e6
 
     def close(self) -> None:
-        for fd in self._fds.values():
-            os.close(fd)
-        self._fds.clear()
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
 
 
 class LoopLagMonitor:
@@ -139,9 +128,9 @@ class LoopLagMonitor:
     A coroutine that re-schedules itself every ``interval`` and records the
     delta between successive wakeups.  Any synchronous call blocking the loop
     shows up directly as an oversized delta -- this measures the LOOP, not the
-    wall clock of the work under test.  Where the kernel reports it, the CPU
-    run-queue time of the process's Python threads inside each interval is
-    subtracted (``_RunQueueClock``): a starved CI slice is not on-loop work.
+    wall clock of the work under test.  Where the kernel reports it, the loop
+    thread's own CPU run-queue time inside each interval is subtracted
+    (``_RunQueueClock``): a loop waiting for a CPU is not on-loop work.
     """
 
     def __init__(self, interval: float = 0.002) -> None:
@@ -351,6 +340,50 @@ def test_loop_lag_monitor_actually_detects_a_blocked_loop(sandbox_home):
     assert monitor.max_gap_ms > MAX_LOOP_BLOCK_MS, (
         f"monitor only saw {monitor.max_gap_ms:.1f}ms of lag across a deliberate "
         "400ms block -- the instrument does not work"
+    )
+
+
+@pytest.mark.timeout(60)
+def test_loop_lag_monitor_counts_sync_work_beside_starved_threads(sandbox_home):
+    """Control arm (Prism 77dc6042a683): other threads starving for a CPU while the loop
+    blocks in synchronous work must not be subtracted from the loop's gap.
+
+    16 threads hash a 4 MiB buffer in a loop (``hashlib`` drops the GIL for large inputs,
+    so they really run in parallel and, on a CPU-quota'd CI slice, queue for a CPU) while
+    the loop sleeps synchronously for 1 s (sleeping, not runnable, like a blocking I/O
+    call).  Their run-queue time sums to seconds; none of it may come off the loop's gap.
+    """
+    import hashlib
+
+    stop = threading.Event()
+    payload = b"x" * (4 << 20)
+
+    def _spin() -> None:
+        while not stop.is_set():
+            hashlib.sha256(payload).digest()
+
+    spinners = [threading.Thread(target=_spin, daemon=True) for _ in range(16)]
+
+    async def main() -> LoopLagMonitor:
+        monitor = LoopLagMonitor()
+        monitor.start()
+        await asyncio.sleep(0.05)
+        for t in spinners:
+            t.start()
+        time.sleep(1.0)  # noqa: sync-on-loop control arm: sync work while other threads queue
+        await asyncio.sleep(0.05)
+        await monitor.stop()
+        stop.set()
+        for t in spinners:
+            await asyncio.to_thread(t.join, 5)
+        return monitor
+
+    monitor = asyncio.run(main())
+    assert monitor.max_gap_ms > MAX_LOOP_BLOCK_MS, (
+        f"monitor saw only {monitor.max_gap_ms:.1f}ms net of run-queue wait across a 1s "
+        f"synchronous block beside {len(spinners)} CPU-bound threads (raw "
+        f"{max(monitor.raw_samples, default=0):.1f}ms) -- other threads' starvation is being "
+        "charged to the loop"
     )
 
 
