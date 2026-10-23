@@ -719,3 +719,29 @@ def heartbeat_current_worker_from_env(progress_at=None):
 def test_detector_shapes(source, expected):
     hits = find_zero_seeded_monotonic_diffs(source)
     assert sorted(h.split(": ", 1)[1] for h in hits) == sorted(expected)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "import asyncio\ndef f(p):\n    last = 0\n"
+            "    if asyncio.get_event_loop(p()).time() - last > 5:\n        last = 1\n",
+            id="loop-getter-with-nested-parens",
+        ),
+        pytest.param(
+            "import time\ndef f():\n    last = 0\n"
+            "    if time.\uff4d\uff4f\uff4e\uff4f\uff54\uff4f\uff4e\uff49\uff43() - last > 5:\n"
+            "        last = 1\n",
+            id="nfkc-identifier",
+        ),
+        pytest.param(
+            "import time\ndef f():\n    last = 0\n"
+            "    if time.\\\nmonotonic() - last > 5:\n        last = 1\n",
+            id="continuation-after-dot",
+        ),
+    ],
+)
+def test_prefilter_scans_every_spelling_the_ast_flags(source):
+    """The raw-text prefilter must never skip a file the AST would flag (t_44dcc531)."""
+    assert find_zero_seeded_monotonic_diffs(source) == ["<src>:4: last"]

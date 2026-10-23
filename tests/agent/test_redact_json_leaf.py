@@ -233,3 +233,9 @@ def test_masked_key_collision_keeps_every_value():
     out = redact_sensitive_json({"PASS=abcdef12": 1, "PASS=ghijkl34": 2}, force=True)
     assert sorted(out.values()) == [1, 2]
     assert "abcdef12" not in repr(out) and "ghijkl34" not in repr(out)
+
+
+def test_prefilter_scans_an_nfkc_spelling_of_the_call():
+    # The tokenizer NFKC-normalises identifiers; the raw-text prefilter must too (t_44dcc531).
+    src = "import json\ndef a(m):\n    return redact_sensitive_\uff54ext(json.dumps(m))\n"
+    assert _source_violations(src) == [3]

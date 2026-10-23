@@ -158,3 +158,22 @@ def test_tests_dir_really_does_shadow_real_packages() -> None:
         "tests/hermes_cli no longer shadows the real package — re-check whether "
         f"this lint is still needed. Currently shadowed: {sorted(shadowed)}"
     )
+
+
+def test_prefilter_scans_every_spelling_of_sys_path(tmp_path) -> None:
+    """The raw-text prefilter must never skip a file the AST would flag (t_44dcc531, Prism
+    56999f4a0cd2, 01b08f7daae4): comments and continuations around the dot, NFKC identifiers."""
+    bs = chr(92)
+    spellings = [
+        "sys.path",
+        "(sys. # c\n path)",
+        "(sys # c\n .path)",
+        "sys." + bs + "\npath",
+        "sys" + bs + "\r\n.path",
+        "\uff53ys.path",
+        "sys.\uff50\uff41\uff54\uff48",
+    ]
+    for i, spelled in enumerate(spellings):
+        probe = tmp_path / f"probe_{i}.py"
+        probe.write_text(f"import sys\n{spelled}.insert(0, {str(TESTS_DIR)!r})\n", encoding="utf-8")
+        assert _syspath_insert_targets(probe), f"prefilter skipped {spelled!r}"
