@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from dataclasses import dataclass
 
 from pydantic import ValidationError
@@ -49,27 +50,38 @@ SERVER_REQUESTS: dict[str, ServerRequestContract] = {}
 EVENTS: dict[str, EventContract] = {}
 
 
-def _declare(table: dict, entry) -> None:
-    if entry.name in table:
+# (table id, name) -> globals of the module execution that declared it.
+_DECLARED_BY: dict[tuple[int, str], dict] = {}
+
+
+def _declare(table: dict, entry, declarer: dict) -> None:
+    """A second declaration is an error unless it comes from a NEW execution of the same module.
+    An exception that lands mid-import (the test harness's async stop, a KeyboardInterrupt) leaves
+    this module's tables filled while Python drops the half-run topic module from ``sys.modules``;
+    the next import runs it again with a fresh namespace, and its entries replace the stale ones."""
+    key = (id(table), entry.name)
+    prior = _DECLARED_BY.get(key)
+    if prior is not None and (prior is declarer or prior.get("__name__") != declarer.get("__name__")):
         raise RuntimeError(f"contract declared twice: {entry.name}")
     table[entry.name] = entry
+    _DECLARED_BY[key] = declarer
 
 
 def method(name: str, *, params: type[Params], result: type[Result], doc: str = "") -> MethodContract:
     entry = MethodContract(name, params, result, doc)
-    _declare(METHODS, entry)
+    _declare(METHODS, entry, sys._getframe(1).f_globals)
     return entry
 
 
 def server_request(name: str, *, params: type[Params], result: type[Result], doc: str = "") -> ServerRequestContract:
     entry = ServerRequestContract(name, params, result, doc)
-    _declare(SERVER_REQUESTS, entry)
+    _declare(SERVER_REQUESTS, entry, sys._getframe(1).f_globals)
     return entry
 
 
 def event(name: str, payload: type[Payload] | None = None, *, doc: str = "") -> EventContract:
     entry = EventContract(name, payload, doc)
-    _declare(EVENTS, entry)
+    _declare(EVENTS, entry, sys._getframe(1).f_globals)
     return entry
 
 
