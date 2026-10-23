@@ -66,8 +66,9 @@ _LOOP_GETTERS = {"get_running_loop", "get_event_loop"}
 # the alias's import/assignment) or ``<...loop>[()] . time``. A file without it has no
 # monotonic left side, so the tree scan skips its parse: 1 in 9 files is parsed and the scan
 # fits the per-test wall clock on a 4-CPU CI slice (t_44dcc531). Between tokens: whitespace,
-# line continuations, parentheses and comments, as the tokenizer allows.
-_TOK_GAP = r"(?:\s|[()\\]|#[^\n]*\n)*"
+# line continuations, parentheses and comments, as the tokenizer allows. A comment ends at
+# LF, CRLF or a bare CR (the tokenizer accepts all three).
+_TOK_GAP = r"(?:\s|[()\\]|#[^\r\n]*(?:\r\n?|\n))*"
 _CLOCK_TEXT = re.compile(r"monotonic|perf_counter")
 # ``<...loop>(<any args>).time``: the getter's arguments may nest parentheses, so the owner and
 # the ``.time`` are tested separately (a superset; a match only means "parse it").
@@ -739,6 +740,11 @@ def test_detector_shapes(source, expected):
             "import time\ndef f():\n    last = 0\n"
             "    if time.\\\nmonotonic() - last > 5:\n        last = 1\n",
             id="continuation-after-dot",
+        ),
+        pytest.param(
+            "import asyncio\rdef f(loop):\r    last = 0\r"
+            "    if (loop. # c\r time)() - last > 5:\r        last = 1\r",
+            id="comment-after-dot-bare-cr",
         ),
     ],
 )
