@@ -96,6 +96,18 @@ def test_agent_build_and_evict_cycles_keep_lcm_db_handles_bounded(lcm_home):
     assert len(_lcm_post_llm_hooks()) <= 1, "register() must replace, not stack, its post_llm_call hook"
 
 
+def test_post_llm_call_hook_still_falls_back_to_the_live_registered_engine(lcm_home):
+    """Hosts that pass no context_compressor and no bound session id still ingest
+    through the engine register() built, for as long as that engine is alive."""
+    engine = _load_lcm_engine()
+    seen = []
+    engine.ingest = lambda history: seen.append(list(history))
+    (hook,) = _lcm_post_llm_hooks()
+    history = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+    hook(conversation_history=history, session_id="", platform="")
+    assert seen == [history]
+
+
 def test_every_connection_opened_by_an_engine_is_closed_by_its_owner(lcm_home, monkeypatch):
     """Each sqlite3.connect made for an engine is closed explicitly by the
     helper that owns it, not left to Connection deallocation: the test holds a
