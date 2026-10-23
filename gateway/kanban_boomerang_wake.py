@@ -813,11 +813,16 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     except VerdictError as exc:
         return {"ok": False, "action": None, "reason": str(exc), "summary": ""}
     action, summary = verdict["action"], _first_line(verdict.get("summary"))
+    raw_evidence = verdict.get("evidence")
+    raw_evidence = raw_evidence if isinstance(raw_evidence, list) else []
+    finding = {"detail": _first_line(verdict.get("summary"), 600),
+               "evidence": [_first_line(e, 160) for e in raw_evidence if str(e).strip()][:3]}
     if action not in ALLOWED.get(live.get("row") or "", frozenset()):
         return {"ok": False, "action": action, "reason": f"action not allowed for {live.get('row')}",
-                "summary": summary}
+                "summary": summary, "refused": True, **finding}
     if action == "surface":
-        return {"ok": False, "action": action, "reason": "child surfaced it", "summary": summary, "surface": True}
+        return {"ok": False, "action": action, "reason": "child surfaced it", "summary": summary, "surface": True,
+                **finding}
     conn = kb.connect(board=live.get("board"))
     try:
         if _receipt_exists(conn, live["task_id"], live["delegation_id"]):
@@ -832,7 +837,7 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
                 logger.info("kanban boomerang-wake: %s land_inherited degraded to surface: %s",
                             live["task_id"], degraded)
                 return {"ok": False, "action": "surface", "reason": f"land_inherited degraded: {degraded}",
-                        "summary": summary, "surface": True, "degraded": degraded}
+                        "summary": summary, "surface": True, "degraded": degraded, **finding}
         state.update_claim(key, state=STATE_EXECUTING, action=action)               # RC-5 (1)
         try:
             _write_action(kb, conn, live, verdict)                                  # RC-5 (2)
@@ -842,8 +847,7 @@ def execute_verdict(entry: dict, child_final_message: Any, *, state: Optional[Bo
     finally:
         conn.close()
     state.update_claim(key, state=STATE_TERMINAL, outcome=action, finished_at=_time.time())  # RC-5 (3)
-    evidence = [_first_line(e, 160) for e in verdict.get("evidence") or [] if str(e).strip()][:3]
-    return {"ok": True, "action": action, "reason": "", "summary": summary or action, "evidence": evidence}
+    return {"ok": True, "action": action, "reason": "", "summary": summary or action, "evidence": finding["evidence"]}
 
 
 # --- delivery (event loop) ----------------------------------------------------------------
@@ -863,8 +867,36 @@ async def post_line(runner: Any, entry: dict, text: str) -> bool:
         return False
 
 
-async def resurface(runner: Any, entry: dict) -> bool:
-    """Re-deliver the original wake text to the card's home session as a normal wake."""
+def finding_text(entry: dict, result: dict, header: str) -> str:
+    """What the child learned, ahead of the original wake (D-14: wake WITH the reason)."""
+    secs = int(max(0.0, _time.time() - float(entry.get("claimed_at") or _time.time())))
+    mode = entry.get("inherit_mode") or entry.get("mode") or "fork"
+    lines = [f"{MARKER} {header} {entry['task_id']} ({entry.get('row')}, {mode}, {secs}s): "
+             f"{result.get('detail') or result.get('summary') or ''}"]
+    if result.get("evidence"):
+        lines.append("evidence:" + "".join(f"\n- {e}" for e in result["evidence"]))
+    return "\n".join(lines) + "\n---\n" + str(entry.get("wake_text") or "")
+
+
+def record_surface(entry: dict, summary: str) -> bool:
+    """One executor-authored ``surfaced:`` comment per claim (keyed by delegation id)."""
+    from hermes_cli import kanban_db as kb
+
+    tag = f"(delegation {entry['delegation_id']})"
+    conn = kb.connect(board=entry.get("board"))
+    try:
+        if any(c.author == AUTHOR and c.body.startswith(f"{MARKER} surfaced:") and c.body.endswith(tag)
+               for c in kb.list_comments(conn, entry["task_id"])):
+            return False
+        with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
+            kb.add_comment(conn, entry["task_id"], AUTHOR, f"{MARKER} surfaced: {summary or 'no summary'} {tag}")
+        return True
+    finally:
+        conn.close()
+
+
+async def resurface(runner: Any, entry: dict, text: Optional[str] = None) -> bool:
+    """Re-deliver the original wake text (or ``text``) to the card's home session as a normal wake."""
     from gateway import kanban_home_route as _hr
     from gateway import kanban_owner_wake as _ow
 
@@ -877,17 +909,18 @@ async def resurface(runner: Any, entry: dict) -> bool:
         card = {"board": entry.get("board"), "task_id": entry["task_id"], "title": entry.get("title"),
                 "items": [{"kind": entry.get("kind"), "trigger": "boomerang_wake_resurface",
                            "event_ts": entry.get("event_ts")}]}
-        await _ow.deliver_turn(runner, home, str(entry.get("wake_text") or ""), [card])
+        await _ow.deliver_turn(runner, home, text if text is not None else str(entry.get("wake_text") or ""), [card])
         return True
     except Exception as exc:
         logger.warning("kanban boomerang-wake: re-surface of %s failed: %s", entry.get("task_id"), exc)
         return False
 
 
-async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState) -> None:
+async def _fail(runner: Any, entry: dict, reason: str, state: BoomerangWakeState,
+                text: Optional[str] = None) -> None:
     """INV-6: one warning line + the original wake re-delivered, then terminal."""
     await post_line(runner, entry, f"⚠️ boomerang-wake failed {entry['task_id']}: {reason}")
-    ok = await resurface(runner, entry)
+    ok = await resurface(runner, entry, text)
     await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="failed",
                             reason=reason, resurfaced=True, resurface_delivered=ok)
 
@@ -1053,11 +1086,16 @@ async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None
     if result.get("surface"):
         if result.get("degraded"):
             await post_line(runner, live, f"⚠️ boomerang-wake {live['task_id']}: {result['reason']}")
-        ok = await resurface(runner, live)
+        try:
+            await asyncio.to_thread(record_surface, live, result.get("summary") or "")
+        except Exception as exc:
+            logger.warning("kanban boomerang-wake: surfaced comment on %s not written: %s", live["task_id"], exc)
+        ok = await resurface(runner, live, finding_text(live, result, "child surfaced"))
         await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="surfaced",
                                 resurfaced=True, resurface_delivered=ok)
         return
-    await _fail(runner, live, result["reason"], state)
+    text = finding_text(live, result, "child verdict refused") if result.get("refused") else None
+    await _fail(runner, live, result["reason"], state, text)
 
 
 async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: int, kind: str, event_ts: Any,
