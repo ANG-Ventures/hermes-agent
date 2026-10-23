@@ -167,16 +167,21 @@ unless the wake needs human judgment.
   `review_requested`, `completed`, `changes_requested`, first crash-class event → `auto`;
   everything else (incl. upstream-repo reviews, a second crash) → `surface`. Only an explicit
   `auto` dispatches a child.
+- **`land_inherited`** (own-repo red row only): the child proves the red is main's (`inherited` proof).
+  Before enqueueing with `--allow-red-ci inherited:<family>`, the executor re-checks: (a) the PR touches none
+  of the red's owning files (the anchor source + harness, or the family's suites.json paths); (b) the anchor
+  is absent at main, or the family is red in main's newest grade. It also needs the operator coverage at the
+  head and zero open P0/P1. Any miss surfaces it.
 - **Chat lines:** `[boomerang-wake] <card> — <Outcome>` (one per handled wake; read it, act only if
   wrong); `⚠️ boomerang-wake failed <card>: <reason>` or `⚠️ boomerang-wake lost <card> (reason:
   …)` → the original wake was re-surfaced; handle it like any wake.
 
 - **The child cannot write the board (D-19).** It runs inside the delegated-child kanban fence:
   board reads only, plus ` (subagent)` comments. It verifies and ends its final message with one
-  `<<<BOOMERANG-VERDICT nonce=…>>>` block (`complete|request_changes|redispatch|retry|surface`
+  `<<<BOOMERANG-VERDICT nonce=…>>>` block (`complete|request_changes|redispatch|retry|land_inherited|surface`
   + evidence). The gateway executor checks the nonce, the allowed-action list and that the card
-  has not moved, then does the ONE write, signed `[boomerang-wake]` as a machine. It never lands,
-  merges or approves. If you are the child: no verdict block, or a malformed one, means nothing
+  has not moved, then does the ONE write, signed `[boomerang-wake]` as a machine. It never merges,
+  approves or stamps coverage (`land_inherited` only enqueues the operator's own approved head). If you are the child: no verdict block, or a malformed one, means nothing
   is written and the wake goes back to the session.
 
 Full tables and downstream effects: `docs/boomerang-v2/README.md`.
