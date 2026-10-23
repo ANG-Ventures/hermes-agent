@@ -47,7 +47,6 @@ config -- never a wall-clock sleep as an assertion.
 from __future__ import annotations
 
 import asyncio
-import bisect
 import os
 import sys
 import threading
@@ -76,27 +75,62 @@ MAX_OVER_BUDGET_INTERVALS = 3
 # ---------------------------------------------------------------------------
 
 
-def _process_run_queue_ms() -> float | None:
-    """Time every thread of this process has spent RUNNABLE BUT NOT RUNNING (ms), or None
-    where the kernel does not report it (``/proc/<pid>/task/*/schedstat`` field 2: Linux).
+class _RunQueueClock:
+    """CPU run-queue time (ms) of this process's Python threads: time each spent RUNNABLE
+    BUT NOT RUNNING (``/proc/self/task/<tid>/schedstat`` field 2; Linux only, else None).
 
     That is CPU starvation, not work: a CFS-throttled ``--cpus`` container, a host run
     queue, or a GIL holder that is itself waiting for a CPU.  Lock contention leaves the
     waiting thread SLEEPING, not runnable, so subtracting it never hides the defect
     (``test_loop_lag_monitor_counts_a_lock_wait_on_the_loop``).
+
+    Read ON the loop, so the read must not release the GIL: every release hands the GIL to
+    the CPU-bound config writer for a switch interval, and ``open``/``read`` of each task
+    file per 2 ms tick made the instrument itself block the loop (29-31 gaps over budget,
+    alone, measured).  So the files stay open and are ``pread`` through ``ctypes.PyDLL``,
+    which holds the GIL.  Only Python threads are read: no other thread can hold the GIL.
     """
-    try:
-        tids = os.listdir("/proc/self/task")
-    except OSError:
-        return None
-    total = 0
-    for tid in tids:
-        try:
-            with open(f"/proc/self/task/{tid}/schedstat", encoding="ascii") as fh:
-                total += int(fh.read().split()[1])
-        except (OSError, IndexError, ValueError):
-            continue  # the thread exited between listdir and open
-    return total / 1e6
+
+    def __init__(self) -> None:
+        self._fds: dict[int, int] = {}
+        self._buf = None
+        self._libc = None
+        if os.path.isdir("/proc/self/task"):
+            import ctypes
+
+            self._libc = ctypes.PyDLL(None)  # PyDLL: calls keep the GIL
+            self._libc.pread.restype = ctypes.c_ssize_t
+            self._libc.pread.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_long]
+            self._libc.open.argtypes = [ctypes.c_char_p, ctypes.c_int]
+            self._buf = ctypes.create_string_buffer(128)
+
+    def read(self) -> float | None:
+        if self._libc is None:
+            return None
+        total = 0
+        for thread in threading.enumerate():
+            tid = thread.native_id
+            if tid is None:
+                continue
+            fd = self._fds.get(tid)
+            if fd is None:
+                fd = self._libc.open(f"/proc/self/task/{tid}/schedstat".encode(), os.O_RDONLY)
+                if fd < 0:
+                    continue
+                self._fds[tid] = fd
+            n = self._libc.pread(fd, self._buf, 127, 0)
+            if n <= 0:
+                continue  # the thread exited; its last value is gone with it
+            try:
+                total += int(self._buf.raw[:n].split()[1])
+            except (IndexError, ValueError):
+                continue
+        return total / 1e6
+
+    def close(self) -> None:
+        for fd in self._fds.values():
+            os.close(fd)
+        self._fds.clear()
 
 
 class LoopLagMonitor:
@@ -105,21 +139,9 @@ class LoopLagMonitor:
     A coroutine that re-schedules itself every ``interval`` and records the
     delta between successive wakeups.  Any synchronous call blocking the loop
     shows up directly as an oversized delta -- this measures the LOOP, not the
-    wall clock of the work under test.
-
-    Where the kernel reports it, the CPU run-queue time of the process's threads
-    inside each interval is subtracted (``_process_run_queue_ms``): a starved CI
-    slice is not on-loop work.  A sampler THREAD reads it and the windows are
-    charged after the run.  Reading ``/proc`` on the loop itself is ~20 GIL releases
-    per tick, each waiting out the switch interval behind the CPU-bound config writer:
-    that made the instrument block the loop it measures (29-31 gaps over budget,
-    alone, measured, t_44dcc531).
-
-    Measured in ci-runner-ang-hermes:1 ``--cpus 4`` on ci-box (t_44dcc531), fixed
-    per-message path vs the defect (config read under ``_CONFIG_LOCK``, pre-#773):
-    the per-gap run-queue share left 1-2 fixed-path gaps over budget alone, beside 7
-    and beside 15 busy pytest workers (raw: 1-3 / 2-14 / 25-46), and 31-67 defect gaps
-    in every arm.
+    wall clock of the work under test.  Where the kernel reports it, the CPU
+    run-queue time of the process's Python threads inside each interval is
+    subtracted (``_RunQueueClock``): a starved CI slice is not on-loop work.
     """
 
     def __init__(self, interval: float = 0.002) -> None:
@@ -127,44 +149,29 @@ class LoopLagMonitor:
         self.max_gap_ms = 0.0
         self.samples: list[float] = []
         self.raw_samples: list[float] = []
-        self._windows: list[tuple[float, float, float]] = []
-        self._queue_trace: list[tuple[float, float]] = []
         self._stop = False
-        self._sampler_stop = threading.Event()
-        self._sampler: threading.Thread | None = None
         self._task: asyncio.Task | None = None
 
     async def _run(self) -> None:
-        last = time.perf_counter()
-        while not self._stop:
-            await asyncio.sleep(self.interval)
-            now = time.perf_counter()
-            raw_ms = (now - last - self.interval) * 1000.0
-            if raw_ms > 0:
-                self._windows.append((last, now, raw_ms))
-            last = now
-
-    def _sample(self) -> None:
-        while not self._sampler_stop.is_set():
-            queued = _process_run_queue_ms()
-            if queued is None:
-                return
-            self._queue_trace.append((time.perf_counter(), queued))
-            self._sampler_stop.wait(self.interval)
-
-    def _starved_ms(self, start: float, end: float) -> float:
-        """Run-queue ms between the first sample after ``start`` and the last before ``end``:
-        only time inside the window, so it never overstates the starvation."""
-        times = [t for t, _ in self._queue_trace]
-        i = bisect.bisect_left(times, start)
-        j = bisect.bisect_right(times, end) - 1
-        if j <= i:
-            return 0.0
-        return max(self._queue_trace[j][1] - self._queue_trace[i][1], 0.0)
+        clock = _RunQueueClock()
+        try:
+            last, queued = time.perf_counter(), clock.read()
+            while not self._stop:
+                await asyncio.sleep(self.interval)
+                now, queued_now = time.perf_counter(), clock.read()
+                raw_ms = (now - last - self.interval) * 1000.0
+                starved_ms = queued_now - queued if queued is not None and queued_now is not None else 0.0
+                gap_ms = raw_ms - max(starved_ms, 0.0)
+                if raw_ms > 0:
+                    self.raw_samples.append(raw_ms)
+                if gap_ms > 0:
+                    self.samples.append(gap_ms)
+                    self.max_gap_ms = max(self.max_gap_ms, gap_ms)
+                last, queued = now, queued_now
+        finally:
+            clock.close()
 
     def start(self) -> None:
-        self._sampler = threading.Thread(target=self._sample, daemon=True)
-        self._sampler.start()
         self._task = asyncio.ensure_future(self._run())
 
     async def stop(self) -> None:
@@ -174,15 +181,6 @@ class LoopLagMonitor:
                 await asyncio.wait_for(self._task, timeout=2.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
-        self._sampler_stop.set()
-        if self._sampler is not None:
-            await asyncio.to_thread(self._sampler.join, 5)
-        for start, end, raw_ms in self._windows:
-            self.raw_samples.append(raw_ms)
-            gap_ms = raw_ms - self._starved_ms(start, end)
-            if gap_ms > 0:
-                self.samples.append(gap_ms)
-                self.max_gap_ms = max(self.max_gap_ms, gap_ms)
 
 
 @pytest.fixture()
