@@ -1154,17 +1154,19 @@ async def run_entry(runner: Any, entry: dict, state: BoomerangWakeState) -> None
 
 async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: int, kind: str, event_ts: Any,
                    disposition: Any, wake_text: str, home_sid: Optional[str], route: dict, path: str,
-                   state: Optional[BoomerangWakeState] = None) -> bool:
+                   state: Optional[BoomerangWakeState] = None, key: Optional[str] = None) -> bool:
     """Claim ``(board, task, event)`` and start its child.
 
     True: accepted, the caller withholds the wake and may advance its cursor. False: another
     path already owns the event, the caller does nothing. Raises when the dispatch itself
-    fails; the caller then posts the warning line and surfaces the wake (INV-6)."""
+    fails; the caller then posts the warning line and surfaces the wake (INV-6).
+    ``key`` overrides the claim key (the restart redispatch, which already spent the retry)."""
     if disposition.verdict != "auto":   # explicit equality ONLY (pass-3 RC-B)
         raise ValueError(f"not an auto disposition: {disposition.verdict!r}")
     state = state or BoomerangWakeState()
     task_id = _field(task, "id")
-    key = claim_key(board, task_id, event_id)
+    redispatch = key is not None
+    key = key or claim_key(board, task_id, event_id)
     if await asyncio.to_thread(state.has_claim, key):
         return False
     snap = await asyncio.to_thread(card_snapshot, board, task_id)
@@ -1187,7 +1189,7 @@ async def dispatch(runner: Any, *, board: Optional[str], task: Any, event_id: in
             "event": "dispatch", "delegation_id": entry["delegation_id"],
             "task_summary": f"boomerang-wake {task_id} {kind}"[:120], "dispatched_at": _now_iso(),
             "expected_artifacts": [], "max_minutes": MAX_MINUTES, "pgrep_pattern": None})
-        if disposition.row == "crash_first_occurrence":
+        if disposition.row == "crash_first_occurrence" and not redispatch:
             await asyncio.to_thread(state.bump_retry, task_id)   # D-13: one automatic retry
         _INFLIGHT[key] = asyncio.ensure_future(run_entry(runner, entry, state))
         logger.info("kanban notifier: boomerang-wake %s disposition=auto row=%s path=%s delegation=%s",
@@ -1377,6 +1379,54 @@ async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional
                 board_has_receipt, entry.get("board"), entry["task_id"], entry["delegation_id"]):
             await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome=entry.get("action"))
             continue
-        await _lost(runner, entry, "gateway restart", state)
+        await _restart_redispatch_or_lost(runner, entry, state, now)
         handled += 1
     return handled
+
+
+def _restart_refusal(entry: dict, state: BoomerangWakeState, now: float) -> Optional[str]:
+    """Why a claim whose child a restart killed may NOT be redispatched (None = it may):
+    the D-13 retry is spent, the card left the claim-time status, or the claim's budget ran out."""
+    from gateway.kanban_wake_disposition import MAX_AUTO_RETRIES
+
+    budget = float(entry.get("max_minutes") or MAX_MINUTES) * 60
+    if entry.get("state") == STATE_CANCELLED or now - float(entry.get("claimed_at") or 0) > budget:
+        return "budget expired"
+    if state.retries(entry["task_id"]) >= MAX_AUTO_RETRIES:
+        return "retry spent"
+    if not entry.get("status") or card_snapshot(entry.get("board"), entry["task_id"])["status"] != entry["status"]:
+        return "card moved"
+    return None
+
+
+async def _restart_redispatch_or_lost(runner: Any, entry: dict, state: BoomerangWakeState, now: float) -> None:
+    """A restart killed this claim's child: spend the card's D-13 retry on a fresh child for the
+    same card and wake (quiet: one INFO line), else today's ``_lost`` with the reason why not."""
+    from gateway.kanban_wake_disposition import AUTO, MAX_AUTO_RETRIES, Disposition
+
+    try:
+        why = await asyncio.to_thread(_restart_refusal, entry, state, now)
+    except Exception as exc:
+        why = f"card unread ({type(exc).__name__})"
+    if why:
+        await _lost(runner, entry, f"gateway restart, {why}", state)
+        return
+    spent = await asyncio.to_thread(state.bump_retry, entry["task_id"])
+    new_key = f"{entry['key']}#restart{spent}"
+    try:
+        await dispatch(runner, board=entry.get("board"), key=new_key,
+                       task={"id": entry["task_id"], "title": entry.get("title")},
+                       event_id=entry["event_id"], kind=str(entry.get("kind") or ""), event_ts=entry.get("event_ts"),
+                       disposition=Disposition(AUTO, entry.get("mode") or "fork", 0, str(entry.get("row") or "")),
+                       wake_text=str(entry.get("wake_text") or ""), home_sid=entry.get("home_sid"),
+                       route=entry.get("route") or {}, path=f"{entry.get('path') or 'reconcile'}+restart",
+                       state=state)
+    except Exception as exc:
+        logger.warning("kanban boomerang-wake: %s redispatch after restart failed: %s", entry["task_id"], exc)
+        await _lost(runner, entry, "gateway restart, redispatch failed", state)
+        return
+    await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
+                            outcome="redispatched_after_restart", redispatched_as=new_key, finished_at=_time.time())
+    new = await asyncio.to_thread(state.get_claim, new_key) or {}
+    logger.info("kanban boomerang-wake: %s redispatched after gateway restart (retry %d/%d) delegation=%s",
+                entry["task_id"], spent, MAX_AUTO_RETRIES, new.get("delegation_id"))

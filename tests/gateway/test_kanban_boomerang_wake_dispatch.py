@@ -502,6 +502,7 @@ def test_ac15d_crash_before_write_subagent_quote_does_not_count(env):
     with kb.connect_closing() as conn:
         kb.add_comment(conn, tid, "worker (subagent)",
                        f'via: "boomerang-wake" operator_kind: "machine" delegation_id {entry["delegation_id"]}')
+    ah.BoomerangWakeState().bump_retry(tid)   # retry spent: the restart path resurfaces, never redispatches
     _kill(env, entry)
     assert asyncio.run(ah.reconcile(env["runner"])) == 1
     assert len(env["adapter"].handled) == 1
@@ -548,20 +549,98 @@ def test_ac15e_replayed_handoff_on_terminal_entry_writes_nothing(env):
 
 
 def test_reconciler_dead_child_resurfaced_once(env, caplog):
+    """The fallback: the card's D-13 retry is already spent, so a restart-killed child is lost."""
     tid = _card(env)
     _worker_close(tid)
     entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    ah.BoomerangWakeState().bump_retry(tid)
     _kill(env, entry)
     with caplog.at_level("INFO", logger="gateway.kanban_boomerang_wake"):
         assert asyncio.run(ah.reconcile(env["runner"])) == 1
         assert asyncio.run(ah.reconcile(env["runner"])) == 0
     assert [r.getMessage() for r in caplog.records if " lost reason=" in r.getMessage()] == [
-        f"kanban boomerang-wake: {tid} lost reason=gateway restart resurfaced delivered=True "
+        f"kanban boomerang-wake: {tid} lost reason=gateway restart, retry spent resurfaced delivered=True "
         f"delegation={entry['delegation_id']}"]
     assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
     assert [s for s in env["adapter"].sent if "boomerang-wake lost" in s] == [
-        f"⚠️ boomerang-wake lost {tid} (reason: gateway restart)"]
+        f"⚠️ boomerang-wake lost {tid} (reason: gateway restart, retry spent)"]
     assert ah.BoomerangWakeState().get_claim(entry["key"])["resurfaced"] is True
+    assert len(env["dispatched"]) == 1, "a spent retry was redispatched"
+
+
+def test_restart_killed_child_is_redispatched_once_quietly(env, caplog):
+    """AC-1: a restart-killed child on an unmoved card with its retry unspent gets a fresh child for
+    the same card and wake; the retry is spent, the old claim is terminal, nothing reaches chat."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid, state=ah.STATE_EXECUTING)
+    _kill(env, entry)
+    with caplog.at_level("INFO", logger="gateway.kanban_boomerang_wake"):
+        assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    state = ah.BoomerangWakeState()
+    assert state.retries(tid) == 1
+    old = state.get_claim(entry["key"])
+    assert old["state"] == ah.STATE_TERMINAL and old["outcome"] == "redispatched_after_restart"
+    assert not old["resurfaced"]
+    [new] = env["dispatched"][1:]
+    assert new["key"] == old["redispatched_as"] and new["key"] != entry["key"]
+    assert new["delegation_id"] != entry["delegation_id"] and new["verdict_nonce"] != entry["verdict_nonce"]
+    assert (new["task_id"], new["row"], new["wake_text"], new["status"]) == (
+        tid, entry["row"], entry["wake_text"], entry["status"])
+    assert state.get_claim(new["key"])["state"] == ah.STATE_CLAIMED
+    assert env["adapter"].handled == [] and env["adapter"].sent == []
+    assert [r.getMessage() for r in caplog.records if "redispatched after" in r.getMessage()] == [
+        f"kanban boomerang-wake: {tid} redispatched after gateway restart (retry 1/1) "
+        f"delegation={new['delegation_id']}"]
+    assert asyncio.run(ah.reconcile(env["runner"])) == 0, "the live redispatched child was touched"
+
+
+def test_restart_with_moved_card_or_expired_budget_is_lost(env):
+    """AC-2: a card that left its claim-time status, or a claim past max_minutes, falls back to _lost."""
+    moved = _card(env, title="moved")
+    _worker_close(moved)
+    a = _claimed_entry(env, moved, state=ah.STATE_RUNNING)
+    with kb.connect_closing() as conn:
+        kb.archive_task(conn, moved)
+    old = _card(env, title="old")
+    _worker_close(old)
+    b = _claimed_entry(env, old, state=ah.STATE_RUNNING, claimed_at=time.time() - 46 * 60)
+    _kill(env, a)
+    _kill(env, b)
+    assert asyncio.run(ah.reconcile(env["runner"])) == 2
+    assert sorted(s for s in env["adapter"].sent if "boomerang-wake lost" in s) == sorted([
+        f"⚠️ boomerang-wake lost {moved} (reason: gateway restart, card moved)",
+        f"⚠️ boomerang-wake lost {old} (reason: gateway restart, budget expired)"])
+    assert len(env["dispatched"]) == 2, "a moved/expired claim was redispatched"
+
+
+def test_redispatched_child_that_fails_is_not_retried_again(env):
+    """AC-3: the restart spent the D-13 budget, so the redispatched child's crash surfaces (once) and a
+    second restart under it is lost, never a third child."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    _kill(env, entry)
+    asyncio.run(ah.reconcile(env["runner"]))
+    new = env["dispatched"][-1]
+    _run(env, ah.BoomerangWakeState().get_claim(new["key"]), "failed", "rate_limit")
+    assert any(s.startswith(f"⚠️ boomerang-wake failed {tid}: child failed") for s in env["adapter"].sent)
+    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+    # a second restart while the redispatched child was open: retry spent
+    again = _card(env, title="again")
+    _worker_close(again)
+    first = _claimed_entry(env, again, state=ah.STATE_RUNNING)
+    _kill(env, first)
+    asyncio.run(ah.reconcile(env["runner"]))
+    second = env["dispatched"][-1]
+    _kill(env, second)
+    asyncio.run(ah.reconcile(env["runner"]))
+    assert env["dispatched"][-1] is second, "a redispatched child was redispatched again"
+    assert ah.BoomerangWakeState().get_claim(second["key"])["reason"] == "gateway restart, retry spent"
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, again)
+    disp = ah.classify_event("crashed", {}, task, ah.BoomerangWakeState().retries(again))
+    assert disp.verdict != "auto", "a worker crash after the restart retry got a second automatic retry"
 
 
 def test_ac14_live_child_past_max_cancelled_first_late_handoff_dropped(env):

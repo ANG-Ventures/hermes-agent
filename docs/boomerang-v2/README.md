@@ -172,11 +172,23 @@ Child dispatch raised, or the child crashed or timed out. The original wake is r
 the home session as a normal surfaced wake (INV-6). What to do: handle the surfaced wake as you
 would any wake. If the same card keeps producing this, `kanban edit <card> --no-boomerang-wake`.
 
-**`⚠️ boomerang-wake lost <card> (reason: gateway restart|timeout)`**
+**`⚠️ boomerang-wake lost <card> (reason: gateway restart, retry spent|card moved|budget expired|timeout)`**
 The reconciler (§5.7) found a claimed entry whose child died (gateway restart) or ran past its
 `max_minutes` (default 45); in the timeout case it cancelled the child first (bounded 60 s wait).
 The original wake is re-surfaced through the normal path, once. What to do: handle the surfaced
 wake. Re-surfacing happens at most once per entry; after that it is an ordinary wake.
+
+**Restart behaviour (t_870c1fba).** A gateway restart kills every in-flight child. On the new
+boot the reconciler spends the card's D-13 retry on it instead of surfacing: when the card's
+status still equals the status recorded at claim time, `retries[task_id] < MAX_AUTO_RETRIES` and
+the claim is within `max_minutes` of `claimed_at`, it bumps the retry, marks the old claim
+`terminal` with `outcome: redispatched_after_restart` (`redispatched_as` names the new claim key,
+`<old key>#restart<n>`), and dispatches a fresh child for the same card and wake (new delegation
+id and nonce, the same row and fork/summary decision). It posts nothing to chat; the gateway log
+gets one INFO line `kanban boomerang-wake: <card> redispatched after gateway restart (retry 1/1)
+delegation=<new>`. Otherwise the entry is lost as above, with the reason saying which condition
+failed. The restart spent the budget, so the redispatched child's own failure, a second restart,
+or a later crash-class event on the card surfaces (no second automatic retry).
 
 **`[boomerang-wake cancelled; ignored]`**
 A handoff that arrived from a child after the reconciler cancelled it. It is tagged and not
