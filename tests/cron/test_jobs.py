@@ -1799,6 +1799,9 @@ class TestJobsJsonIdKeyedMap:
         on_disk = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
         assert [j["id"] for j in on_disk["jobs"]] == [job["id"]]
 
+        # The job leaves through the store (journalled) before the raw junk rewrites below;
+        # an un-journalled drop would be restored from the store shadow (t_811e92d7).
+        assert remove_job(job["id"])
         for bad, detail in (([None, "***", 42], "Skipping 3 non-object"),
                             (None, "Replacing invalid"), ("not-a-list", "Replacing invalid")):
             JOBS_FILE.write_text(json.dumps({"jobs": bad}), encoding="utf-8")

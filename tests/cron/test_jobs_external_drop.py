@@ -1,0 +1,223 @@
+"""t_811e92d7: a job dropped from jobs.json by a NON-store writer is put back by the store.
+
+2026-10-23 16:18..16:20 PT a process outside cron.jobs copied an older committed blob of
+cron/jobs.json over the live store (a git checkout/restore of the scheduler-owned file; same
+class as the 10-14 and 10-22 rewinds, t_1a2ccffd). Every job created since that blob vanished
+with NO `removed` lifecycle event, and the scheduler's next tick then journalled 25 retention
+`removed` events for the stale completed one-shots the blob brought back. Seven enabled jobs,
+three with 10-25/10-27/11-02 deadlines, were gone.
+
+The store's own removal paths all thread ``removed_ids`` and journal it. The bad path is a
+writer that bypasses the store. The store cannot stop that write, so it refuses the removal
+on its next locked read: rows it last wrote, that are now absent and were never journalled
+removed, are restored. These tests drop a job through that bad path.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+
+import pytest
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    (home / "cron").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import importlib
+    import hermes_constants
+    import cron.jobs
+
+    importlib.reload(hermes_constants)
+    importlib.reload(cron.jobs)
+    return home
+
+
+def _external_rewrite(home, keep_ids):
+    """What `git checkout <ref> -- cron/jobs.json` does: whole-file replace, no lock, no journal."""
+    path = home / "cron" / "jobs.json"
+    doc = json.loads(path.read_text())
+    doc["jobs"] = [j for j in doc["jobs"] if j["id"] in keep_ids]
+    tmp = path.with_name("jobs.json.git-tmp")
+    tmp.write_text(json.dumps(doc, indent=2))
+    tmp.replace(path)
+
+
+def _ids(jobs):
+    return sorted(j["id"] for j in jobs)
+
+
+def test_external_drop_is_restored_on_next_locked_read(store, caplog):
+    from cron.jobs import create_job, get_due_jobs, load_jobs
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    b = create_job(prompt="b", schedule="2099-01-01T09:00:00", name="deadline-oneshot", deliver="local")
+    _external_rewrite(store, keep_ids={a["id"]})
+    assert _ids(load_jobs()) == [a["id"]]  # the bad path really dropped it
+
+    with caplog.at_level(logging.WARNING, logger="cron.jobs"):
+        get_due_jobs()  # any locked read; the gateway ticker does this every tick
+
+    after = load_jobs()
+    assert _ids(after) == sorted([a["id"], b["id"]])
+    restored = next(j for j in after if j["id"] == b["id"])
+    assert restored["name"] == "deadline-oneshot" and restored["next_run_at"] == b["next_run_at"]
+    assert "cron.store_external_drop" in caplog.text and b["id"] in caplog.text
+
+
+def test_journalled_remove_is_not_restored(store):
+    from cron.jobs import create_job, get_due_jobs, load_jobs, remove_job
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    b = create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+    assert remove_job(b["id"])
+    get_due_jobs()
+    assert _ids(load_jobs()) == [a["id"]]
+
+
+def test_external_drop_of_a_journalled_remove_is_not_resurrected(store):
+    """A row the journal says was removed stays removed even if the shadow still lists it
+    (degraded-lock race between two store writers)."""
+    from cron import lifecycle_journal
+    from cron.jobs import create_job, get_due_jobs, load_jobs
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    b = create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+    lifecycle_journal.record_removed(b["id"], reason="sibling writer")
+    _external_rewrite(store, keep_ids={a["id"]})
+    get_due_jobs()
+    assert _ids(load_jobs()) == [a["id"]]
+
+
+def test_external_add_is_kept_and_nothing_resurrected_without_a_drop(store):
+    """home-reconcile carry_added_jobs/apply_pending write the file outside the store and only
+    ADD rows: the store keeps them and restores nothing."""
+    from cron.jobs import create_job, get_due_jobs, load_jobs
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    path = store / "cron" / "jobs.json"
+    doc = json.loads(path.read_text())
+    carried = dict(doc["jobs"][0], id="0123456789ab", name="carried")
+    doc["jobs"].append(carried)
+    path.write_text(json.dumps(doc))
+    get_due_jobs()
+    assert _ids(load_jobs()) == sorted([a["id"], "0123456789ab"])
+
+
+def test_no_shadow_is_a_no_op(store):
+    """A store last written by an older build (no shadow) is read as-is."""
+    from cron.jobs import get_due_jobs, load_jobs
+
+    (store / "cron" / "jobs.json").write_text(json.dumps({"jobs": []}))
+    get_due_jobs()
+    assert load_jobs() == []
+
+
+def test_failed_shadow_refresh_never_publishes_a_stale_trusted_shadow(store, monkeypatch):
+    """Prism 16b999b0035d / 9b425d2b5b82: a pause whose shadow refresh fails must not leave the
+    OLD enabled copy trusted, or a later external drop resurrects the job enabled."""
+    import cron.jobs as cj
+    from cron.jobs import create_job, get_due_jobs, load_jobs, pause_job
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    b = create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+
+    def _boom(*_a, **_k):
+        raise PermissionError("shadow unwritable")
+
+    with monkeypatch.context() as m:
+        m.setattr(cj.shutil, "copyfile", _boom)
+        assert pause_job(b["id"])["enabled"] is False
+    _external_rewrite(store, keep_ids={a["id"]})
+    get_due_jobs()
+    assert _ids(load_jobs()) == [a["id"]]  # nothing trusted to restore from; never b enabled
+
+
+def test_observe_only_repair_keeps_the_recovery_shadow(store):
+    """Prism ebd95708a55e: check_vanished_jobs (no_heal) persisting a normalization repair must
+    not overwrite the shadow with the incomplete list; the next locked read still recovers B."""
+    from cron.jobs import create_job, get_due_jobs, load_jobs
+    from cron.lifecycle_journal import check_vanished_jobs
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    b = create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+    path = store / "cron" / "jobs.json"
+    doc = json.loads(path.read_text())
+    doc["jobs"] = [dict(j, repeat={"times": None, "completed": "bad"}) for j in doc["jobs"]
+                   if j["id"] == a["id"]]
+    path.write_text(json.dumps(doc))
+    check_vanished_jobs()
+    get_due_jobs()
+    assert _ids(load_jobs()) == sorted([a["id"], b["id"]])
+
+
+def test_root_write_hands_shadow_and_stamp_back_to_the_store_owner(store, monkeypatch):
+    """Prism 1ddf5a524dcf: a root CLI save chowns the sidecars back like jobs.json, or the
+    unprivileged gateway cannot read the shadow and silently loses its recovery copy."""
+    import cron.jobs as cj
+    from cron.jobs import create_job
+
+    create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    chowned = []
+    monkeypatch.setattr(cj.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(cj.os, "getegid", lambda: 0)
+    monkeypatch.setattr(cj.os, "chown", lambda p, u, g: chowned.append(str(p)))
+    create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+    names = {p.rsplit("/", 1)[-1] for p in chowned}
+    assert {"jobs.json", ".jobs.shadow.json", ".jobs.shadow.stamp"} <= names
+
+
+def test_writer_racing_the_save_leaves_the_shadow_untrusted(store, monkeypatch):
+    """Prism ab98ebb1f131: a replace between our rename and the stamp must not certify the
+    external payload; the stamp is withheld, so nothing stale is trusted later either."""
+    import cron.jobs as cj
+    from cron.jobs import create_job
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    real = cj.atomic_replace
+
+    def racing(src, dst):
+        out = real(src, dst)
+        _external_rewrite(store, keep_ids={a["id"]})
+        return out
+
+    monkeypatch.setattr(cj, "atomic_replace", racing)
+    create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+    assert not (store / "cron" / ".jobs.shadow.stamp").exists()
+
+
+def test_shadow_from_another_save_is_not_trusted(store):
+    """Prism 26cea77eab5d: the stamp names the payload digest; a shadow holding a different
+    save's bytes (degraded-lock sibling) restores nothing."""
+    from cron.jobs import create_job, get_due_jobs, load_jobs
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    b = create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+    shadow = store / "cron" / ".jobs.shadow.json"
+    doc = json.loads(shadow.read_text())
+    doc["jobs"].append(dict(doc["jobs"][0], id="feedfacefeed", name="sibling"))
+    shadow.write_text(json.dumps(doc))
+    _external_rewrite(store, keep_ids={a["id"]})
+    get_due_jobs()
+    assert _ids(load_jobs()) == [a["id"]]
+    assert b["id"]  # b is gone: only a TRUSTED shadow restores
+
+
+def test_snapshot_restore_is_a_rollback_not_a_silent_drop(store):
+    """Prism b63d3ad8f76a: /snapshot restore replaces jobs.json on purpose; jobs created after
+    the snapshot must stay gone."""
+    from cron.jobs import create_job, get_due_jobs, load_jobs
+    from hermes_cli.backup import _quick_snapshot_root, restore_quick_snapshot
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    snap = _quick_snapshot_root(store) / "snap1"
+    (snap / "cron").mkdir(parents=True)
+    (snap / "cron" / "jobs.json").write_text((store / "cron" / "jobs.json").read_text())
+    (snap / "manifest.json").write_text(json.dumps({"files": {"cron/jobs.json": 1}}))
+    create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+    assert restore_quick_snapshot("snap1", hermes_home=store)
+    get_due_jobs()
+    assert _ids(load_jobs()) == [a["id"]]
