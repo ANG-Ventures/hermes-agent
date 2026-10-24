@@ -22,7 +22,7 @@
     "hermes_cli/kanban_placement_diag.py": 7,
     "hermes_cli/kanban_placement_reasons.py": 1,
     "hermes_cli/kanban_placement_view.py": 10,
-    "hermes_cli/kanban_worker_pool.py": 65,
+    "hermes_cli/kanban_worker_pool.py": 64,
     "hermes_cli/placement.py": 55,
     "hermes_cli/placement_ledger.py": 3,
     "hermes_cli/placement_policy.py": 9
