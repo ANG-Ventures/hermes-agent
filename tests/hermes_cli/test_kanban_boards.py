@@ -9,7 +9,7 @@ Covers the pieces added when boards became a first-class concept:
   ``HERMES_KANBAN_BOARD`` env var.
 * ``connect(board=)`` isolation — writes on one board don't leak.
 * ``create_board`` / ``list_boards`` / ``remove_board`` round trip.
-* CLI surface: ``hermes kanban boards list/create/switch/rm``.
+* CLI surface: ``hermes kanban boards list/create/rm``.
 * ``_default_spawn`` injects ``HERMES_KANBAN_BOARD`` into worker env.
 """
 
@@ -128,12 +128,13 @@ class TestCurrentBoard:
 
 
 
-    def test_kanban_db_path_reads_current(self, fresh_home):
-        """kanban_db_path() with no args respects the on-disk pointer."""
+    def test_kanban_db_path_reads_the_scoped_board(self, fresh_home):
+        """kanban_db_path() with no args follows the context board, never a file (S7)."""
         kb.create_board("my-proj")
-        kb.set_current_board("my-proj")
         expected = fresh_home / "kanban" / "boards" / "my-proj" / "kanban.db"
-        assert kb.kanban_db_path() == expected
+        with kb.scoped_current_board("my-proj"):
+            assert kb.kanban_db_path() == expected
+        assert kb.kanban_db_path() == fresh_home / "kanban.db"
 
 
 # ---------------------------------------------------------------------------
@@ -210,26 +211,24 @@ class TestConnectionIsolation:
         assert {t.title for t in b} == {"beta-only"}
         assert d == []
 
-    def test_connect_without_args_uses_current(self, fresh_home):
+    def test_connect_without_args_uses_the_scoped_board(self, fresh_home):
         kb.create_board("curr")
-        kb.set_current_board("curr")
-        with kbc.connect() as conn:
+        with kb.scoped_current_board("curr"), kbc.connect() as conn:
             kb.create_task(conn, title="implicit", assignee="x")
         with kbc.connect(board="curr") as conn:
             tasks = kb.list_tasks(conn)
         assert [t.title for t in tasks] == ["implicit"]
 
-    def test_connect_env_var_overrides_current(self, fresh_home, monkeypatch):
-        kb.create_board("persist")
+    def test_board_env_var_is_inert(self, fresh_home, monkeypatch):
+        """S7: an exported HERMES_KANBAN_BOARD changes nothing; a bare connect is default."""
         kb.create_board("envwin")
-        kb.set_current_board("persist")
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "envwin")
         with kbc.connect() as conn:
-            kb.create_task(conn, title="via-env", assignee="x")
+            kb.create_task(conn, title="bare", assignee="x")
         with kbc.connect(board="envwin") as conn:
-            assert [t.title for t in kb.list_tasks(conn)] == ["via-env"]
-        with kbc.connect(board="persist") as conn:
             assert kb.list_tasks(conn) == []
+        with kbc.connect(board="default") as conn:
+            assert [t.title for t in kb.list_tasks(conn)] == ["bare"]
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +236,7 @@ class TestConnectionIsolation:
 # ---------------------------------------------------------------------------
 
 class TestWorkerSpawnEnv:
-    """Ensure the dispatcher pins ``HERMES_KANBAN_BOARD`` / DB / workspaces on spawn.
+    """Ensure the dispatcher pins the DB / workspaces on spawn, and no board slug env (S7).
 
     We monkey-patch ``subprocess.Popen`` to capture the child env without
     actually spawning anything.
@@ -278,7 +277,7 @@ class TestWorkerSpawnEnv:
         kbd._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
 
         env = captured["env"]
-        assert env["HERMES_KANBAN_BOARD"] == "spawntest"
+        assert "HERMES_KANBAN_BOARD" not in env
         assert env["HERMES_KANBAN_TASK"] == "t_abc"
         # Workers never write the host's gateway service definitions (t_8749a807).
         assert env["HERMES_GATEWAY_INSTALL_DISABLED"] == "1"
@@ -311,6 +310,23 @@ def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.Completed
 
 class TestCLI:
 
+    def test_boards_switch_is_removed_and_names_the_replacement(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        assert _cli(["boards", "create", "projA"], env_extra=env).returncode == 0
+        r = _cli(["boards", "switch", "projA"], env_extra=env)
+        assert r.returncode == 2
+        assert "boards switch was removed (S7): pass --board <slug> on each verb." in r.stderr
+        assert not (tmp_path / "kanban" / "current").exists()
+
+    def test_bare_create_is_refused_with_the_next_command(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path), "HERMES_KANBAN_BOARD": "projA"}
+        assert _cli(["boards", "create", "projA"], env_extra=env).returncode == 0
+        r = _cli(["create", "bare", "--assignee", "dev"], env_extra=env)
+        assert r.returncode == 2, r.stdout
+        assert ("kanban: create needs a board: pass --board <slug> (boards: hermes kanban boards "
+                "list) or a card id this verb can derive it from or --parent <card>.") in r.stderr
+        listA = _cli(["--board", "projA", "list", "--json"], env_extra=env)
+        assert json.loads(listA.stdout) == []
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
@@ -326,7 +342,7 @@ class TestCLI:
         # list on each board only shows its own.
         listA = _cli(["--board", "projA", "list", "--json"], env_extra=env)
         listB = _cli(["--board", "projB", "list", "--json"], env_extra=env)
-        listD = _cli(["list", "--json"], env_extra=env)
+        listD = _cli(["--board", "default", "list", "--json"], env_extra=env)
 
         titlesA = [t["title"] for t in json.loads(listA.stdout)]
         titlesB = [t["title"] for t in json.loads(listB.stdout)]

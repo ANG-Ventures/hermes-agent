@@ -1217,18 +1217,16 @@ REMOVED_BOARDS_VERBS = {
 
 
 def _removed_boards_verbs_hint(sub: argparse._SubParsersAction) -> None:
-    """``boards switch``/``use`` get argparse's ``invalid choice`` plus the line naming what replaced them."""
+    """``boards switch``/``use`` exit 2 with the one line naming what replaced them."""
     boards = sub.choices.get("boards")
     if boards is None:
         return
     base = type(boards)
 
     class _RemovedVerbHint(base):  # type: ignore[misc, valid-type]
-        def error(self, message):
-            for verb, line in REMOVED_BOARDS_VERBS.items():
-                if f"invalid choice: '{verb}'" in message:
-                    message = f"{message}\n{line}"
-                    break
-            super().error(message)
+        def _check_value(self, action, value):
+            if isinstance(action, argparse._SubParsersAction) and value in REMOVED_BOARDS_VERBS:
+                self.exit(2, f"{self.prog}: {REMOVED_BOARDS_VERBS[value]}\n")
+            super()._check_value(action, value)
 
     boards.__class__ = _RemovedVerbHint
