@@ -6,20 +6,13 @@
 name: router-core-lints
 
 # path-filter-exempt: the spawn-site lint scans every tracked .py/.sh, so any code change can add an ungated spawn.
+# Called unconditionally from ci.yaml (t_6b4d3881): the CI mirror (hermes-agent-ci) runs only ci.yaml's call graph
+# and keeps every standalone workflow disabled, so its own pull_request/push triggers never ran (0 runs).
 on:
-  pull_request:
-  push:
-    branches: [main]
-    paths-ignore: ['**.md']
-  merge_group:
-  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
-
-concurrency:
-  group: router-core-lints-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   router-core-lints:
