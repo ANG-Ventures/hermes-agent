@@ -497,3 +497,31 @@ def test_archive_with_a_content_carrying_sha_still_archives(board, monkeypatch):
         conn.execute("UPDATE task_runs SET summary=? WHERE id=?", (f"SUPERSEDED-BY {SHA}", run))
         conn.commit()
         assert kb.archive_task(conn, tid) is True
+
+
+# --- residual Prism P1s from #2058 (t_194cdb7e) ------------------------------
+
+
+def test_insertion_in_another_scope_is_not_carried():
+    """Prism 86fbd795f101: `run()` the PR added to `a()` is not carried by a `run()` in `b()`. The
+    inserted block must sit right after its unchanged predecessor on the candidate."""
+    mb = ["def a():", "    pass", "def b():", "    pass"]
+    head = ["def a():", "    run()", "    pass", "def b():", "    pass"]
+    wrong = ["def a():", "    pass", "def b():", "    run()", "    pass"]
+    assert not sc.lines_carry(mb, head, wrong)
+    assert sc.lines_carry(mb, head, head)
+    # a newer edit elsewhere, or a line added later after the block, still carries it
+    assert sc.lines_carry(mb, head, ["# newer", "def a():", "    run()", "    log()", "    pass",
+                                     "def b():", "    pass"])
+
+
+def test_frontmatter_deleted_key_replaced_by_a_mapping_is_not_carried():
+    """Prism d3b02265e3bf: a scalar key the PR deleted is still present when the candidate holds a
+    mapping under it; flattening to leaf paths hid it."""
+    assert not sc.frontmatter_carries({"x": 1, "keep": 0}, {"keep": 0}, {"x": {"nested": 2}, "keep": 0})
+    assert sc.frontmatter_carries({"x": 1, "keep": 0}, {"keep": 0}, {"keep": 0})
+    # a deleted nested key the candidate still holds as a container is likewise not gone
+    assert not sc.frontmatter_carries({"m": {"x": 1, "k": 0}}, {"m": {"k": 0}}, {"m": {"x": {"y": 1}, "k": 0}})
+    assert not sc.frontmatter_carries({"m": {"x": 1, "k": 0}}, {"m": {"k": 0}}, {"m": {"x": [1], "k": 0}})
+    # a scalar the PR turned into a mapping is carried by that mapping
+    assert sc.frontmatter_carries({"x": 1}, {"x": {"n": 2}}, {"x": {"n": 2}})
