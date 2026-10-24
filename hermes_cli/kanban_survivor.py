@@ -1900,8 +1900,57 @@ def _capture(repo, key, workspace, recorded=None):
         if ref:
             return ref, None, None
     base = _recorded_base(repo, recorded, published, _base(repo, published))
+    if base is None:
+        _require_live_boundary(repo, published)
     prefix = "" if key == "." else key + "/"
     return None, base, _snapshot(repo, base, prefix)
+
+
+def _require_live_boundary(repo, published):
+    """Refuse a shallow bundle whose boundary no durable remote still holds.
+
+    A bundle cut in a shallow clone declares the boundary commits as
+    prerequisites and omits their trees and every unchanged blob, so it
+    restores only into a repository that already has them. Local presence
+    proves nothing about that: if the upstream was deleted or force-pushed
+    away, the bundle is unrestorable and deleting the workspace loses the
+    work (Prism d722f02857e3). Each boundary commit must be an ancestor of a
+    durable remote's LIVE branch tip (`_reachable_from_live`), nominated by a
+    local tracking ref that contains it, as `_live_ancestor_survivor` does.
+    """
+    shallow = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "shallow",
+                   check=False)
+    path = Path(shallow.stdout.decode().strip()) if shallow.returncode == 0 else None
+    if path is None or not path.is_file():
+        return
+    # Same filter as `_snapshot`: a stale line naming an absent object is no boundary.
+    boundary = _present_commits(repo, sorted(set(path.read_text().split())))
+    advertised = {f"refs/remotes/{ref['remote']}/{ref['branch']}": ref for ref in published}
+    deadline = time.monotonic() + _LIVE_BASE_TIMEOUT
+    for sha in boundary:
+        listed = _git(repo, "for-each-ref", "--contains", sha, "--format=%(refname)",
+                      "refs/remotes", check=False)
+        matched = (set(advertised).intersection(listed.stdout.decode("utf-8", "replace").splitlines())
+                   if listed.returncode == 0 else set())
+        proven = False
+        for name in sorted(matched):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ref = advertised[name]
+            if _reachable_from_live(repo, ref["remote"], ref["branch"], sha, timeout=remaining):
+                proven = True
+                break
+        if not proven:
+            raise _BoundaryUnproven(
+                f"shallow boundary {sha} is not reachable from any durable remote, so a bundle "
+                f"(which omits the boundary tree) could never restore; push the work to a "
+                f"durable remote, or add a remote whose live branch still contains {sha}, and retry"
+            )
+
+
+class _BoundaryUnproven(SurvivorUnavailable):
+    """`_require_live_boundary` refused; its message already names the remedy."""
 
 
 _QUALIFIER = re.compile(r"[^:?#=]+=")
@@ -3296,7 +3345,9 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # Anything else re-raises unchanged.
                 _explain_dead_worktree_stub(repo, key, bases)
                 _explain_broken_object_store(repo, key, workspace, bases)
-                _explain_shallow(repo, key, str(exc))
+                if not isinstance(exc, _BoundaryUnproven):
+                    # `fetch --unshallow` cannot restore a boundary the remote lost.
+                    _explain_shallow(repo, key, str(exc))
                 raise
             if ref:
                 refs.append(dict(ref, repository=key))

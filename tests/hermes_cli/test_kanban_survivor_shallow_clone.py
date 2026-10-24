@@ -193,6 +193,9 @@ def test_a_shallow_capture_that_still_fails_names_the_remedy(board, tmp_path, mo
     # Simulate any future shallow-traversal failure: without the grafts the
     # bundle walks past the boundary exactly as it did before the fix.
     monkeypatch.setattr(survivor, "_borrow_shallow", lambda *a, **k: None)
+    # Without grafts the live-boundary probe also fails; skip it so this pins
+    # the bundle-traversal failure, not the boundary refusal.
+    monkeypatch.setattr(survivor, "_require_live_boundary", lambda *a, **k: None)
     tid, ws, remote, clone = shallow_workspace(board, tmp_path)
     (clone / "work.txt").write_text("unpublished\n")
     git(clone, "add", ".")
@@ -202,4 +205,73 @@ def test_a_shallow_capture_that_still_fails_names_the_remedy(board, tmp_path, mo
     message = str(raised.value)
     assert "shallow clone ./repo" in message
     assert "fetch --unshallow" in message
+    assert ws.exists()
+
+
+def _one_commit_shallow_workspace(conn, tmp_path):
+    """Depth-1 clone of a one-commit upstream (Prism d722f02857e3 repro)."""
+    tid = kb.create_task(conn, title="shallow, upstream gone")
+    ws = kbw.resolve_workspace(kb.get_task(conn, tid))
+    ws.mkdir(parents=True, exist_ok=True)
+    kbw.set_workspace_path(conn, tid, ws)
+    upstream = tmp_path / "upstream"
+    git(tmp_path, "init", "-q", "-b", "main", str(upstream))
+    _identity(upstream)
+    (upstream / "base.txt").write_text("base\n")
+    git(upstream, "add", ".")
+    git(upstream, "commit", "-q", "-m", "only")
+    remote = tmp_path / "remote.git"
+    git(tmp_path, "clone", "-q", "--bare", str(upstream), str(remote))
+    clone = ws / "repo"
+    git(ws, "clone", "-q", "--depth", "1", f"file://{remote}", str(clone))
+    _identity(clone)
+    assert git(clone, "rev-parse", "--is-shallow-repository") == "true"
+    return tid, ws, remote, upstream, clone
+
+
+def _commit_work(clone):
+    (clone / "work.txt").write_text("unpublished\n")
+    git(clone, "add", ".")
+    git(clone, "commit", "-q", "-m", "local work")
+
+
+def test_shallow_boundary_on_no_durable_remote_keeps_the_workspace(board, tmp_path):
+    """Prism d722f02857e3: the upstream holding the boundary is gone.
+
+    The bundle omits the boundary tree and its unchanged blobs, so nothing can
+    restore it; complete_task must refuse and keep the workspace.
+    """
+    import shutil
+
+    import hermes_cli.kanban_survivor as survivor
+    tid, ws, remote, upstream, clone = _one_commit_shallow_workspace(board, tmp_path)
+    shutil.rmtree(remote)
+    shutil.rmtree(upstream)
+    git(clone, "remote", "remove", "origin")
+    _commit_work(clone)
+    with pytest.raises(survivor.SurvivorUnavailable) as raised:
+        kb.complete_task(board, tid)
+    message = str(raised.value)
+    assert "not reachable from any durable remote" in message, message
+    # The boundary is gone upstream: `fetch --unshallow` cannot help, so it is not offered.
+    assert "push the work to a durable remote" in message, message
+    assert "fetch --unshallow" not in message, message
+    assert ws.exists()
+    assert (clone / "work.txt").read_text() == "unpublished\n"
+
+
+def test_shallow_boundary_force_pushed_away_keeps_the_workspace(board, tmp_path):
+    """The remote still exists, but its branch no longer contains the boundary."""
+    import hermes_cli.kanban_survivor as survivor
+    tid, ws, remote, upstream, clone = _one_commit_shallow_workspace(board, tmp_path)
+    git(upstream, "checkout", "-q", "--orphan", "rewrite")
+    (upstream / "other.txt").write_text("other\n")
+    git(upstream, "add", ".")
+    git(upstream, "commit", "-q", "-m", "unrelated")
+    git(upstream, "push", "-q", "--force", str(remote), "rewrite:main")
+    git(remote, "gc", "-q", "--prune=now")
+    _commit_work(clone)
+    with pytest.raises(survivor.SurvivorUnavailable) as raised:
+        kb.complete_task(board, tid)
+    assert "not reachable from any durable remote" in str(raised.value)
     assert ws.exists()
