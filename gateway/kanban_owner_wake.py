@@ -758,6 +758,7 @@ def scan(state: WakeState, now: float, pr_health: Optional[PrHealthFn],
          boards: Optional[Iterable[dict]] = None) -> int:
     """Read new events on every board into ``state.pending``. Returns events queued."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_delegations_board as _kdb
 
     if boards is None:
         try:
@@ -769,6 +770,8 @@ def scan(state: WakeState, now: float, pr_health: Optional[PrHealthFn],
     memo: dict = {}
     for meta in boards:
         slug = str(meta.get("slug") or kb.DEFAULT_BOARD)
+        if _kdb.is_delegations_board(slug):
+            continue  # a background unit reports through its own outbox; its card never wakes the session
         try:
             path = Path(meta["db_path"]).expanduser() if meta.get("db_path") else kb.kanban_db_path(slug)
             resolved = str(path.resolve())

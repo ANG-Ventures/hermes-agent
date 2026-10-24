@@ -1651,6 +1651,10 @@ DEFAULT_CONFIG = {
         # Durable background units run in their own process and survive a gateway restart
         # (docs/dev/delegate-detached-background.md). false = in-gateway threads (kill switch).
         "detached_background": False,  # default OFF (Ace ruling option B, t_7ccdc21b); the replacement is t_414b4d92
+        # Where a restart-durable gateway background unit runs: "in_process" (gateway threads) or
+        # "kanban" (one card on the internal `delegations` board, its own process; survives a gateway
+        # restart, docs/dev/delegate-background-on-kanban-runtime.md). "in_process" is the kill switch.
+        "background_runtime": "in_process",
         "surface_child_process_notifications": False,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of

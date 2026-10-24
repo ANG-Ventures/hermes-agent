@@ -2062,6 +2062,34 @@ class GatewayNotificationsMixin:
             if count:
                 logger.info("%s %d undelivered async completion(s) for profile %r", verb, count, profile_name)
 
+    _KANBAN_DRAIN_INTERVAL_S = 5.0
+
+    def _kanban_drain_homes(self):
+        """``(name, home)`` of every profile this gateway serves (the launch profile in its own scope)."""
+        homes = dict(getattr(self, "_served_profile_homes", None) or {})
+        if not homes:
+            from hermes_constants import get_hermes_home
+            homes = {getattr(self, "_primary_profile_name", None) or "default": get_hermes_home()}
+        return homes.items()
+
+    def _drain_kanban_delegation_cards(self) -> None:
+        """Card-end watcher (§5.4): drain each served profile's ended kanban units under its scope."""
+        from gateway.run import _profile_runtime_scope
+        from tools.async_delegation_kanban import drain_profile
+        boot_id = self._current_boot_id()
+        for profile_name, profile_home in self._kanban_drain_homes():
+            try:
+                with _profile_runtime_scope(Path(profile_home), {}):
+                    counts = drain_profile(Path(profile_home), boot_id)
+            except Exception:
+                logger.warning("Kanban delegation drain failed for profile %r", profile_name, exc_info=True)
+                continue
+            if any(counts.values()):
+                from tools.async_delegation import active_count, kanban_active_count
+                logger.info("async_delegation_kanban_drain profile=%s %s active_count=%d kanban_active=%d",
+                            profile_name, " ".join(f"{k}={v}" for k, v in counts.items()),
+                            active_count(), kanban_active_count())
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async completions and pattern notifications even while sessions are idle.
 
@@ -2073,6 +2101,7 @@ class GatewayNotificationsMixin:
         from tools.async_delegation import ORPHAN_SWEEP_INTERVAL_S
         from tools.process_registry import process_registry as _pr
         last_orphan_sweep = last_admitted_sweep = None
+        last_kanban_drain = None
         while self._running:
             with _log_suppressed(logging.DEBUG, "Async delegation watcher error: %s"):
                 # Completions whose owner process died while this gateway runs (#97202).
@@ -2083,6 +2112,11 @@ class GatewayNotificationsMixin:
                 if last_admitted_sweep is None or time.monotonic() - last_admitted_sweep >= SWEEP_INTERVAL_S:
                     last_admitted_sweep = time.monotonic()
                     await sweep_admitted_completions(self)
+                # Kanban-runtime units (docs/dev/delegate-background-on-kanban-runtime.md §5.4): a card
+                # that ended is the signal to drain its record; one SQLite read per tick in steady state.
+                if last_kanban_drain is None or time.monotonic() - last_kanban_drain >= self._KANBAN_DRAIN_INTERVAL_S:
+                    last_kanban_drain = time.monotonic()
+                    await asyncio.to_thread(self._drain_kanban_delegation_cards)
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
                 # Process completions remain owned by their per-process watchers.

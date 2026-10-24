@@ -4716,6 +4716,29 @@ def delegate_task(
                     "the subagent(s) ran SYNCHRONOUSLY and the result is included above."
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
+        # Kanban runtime (docs/dev/delegate-background-on-kanban-runtime.md §5.1-5.2): an eligible durable
+        # unit runs as one card on the internal ``delegations`` board, in its own process. The allowlist
+        # fails closed: any condition not positively true keeps today's in-process unit (I6).
+        _kanban = None
+        if _durable_spec is not None:
+            from tools import async_delegation_kanban as _akb
+
+            _unit_cwd = (_durable_spec.get("execution") or {}).get("workspace_hint")
+            _why_not = _akb.ineligible_reason(durable_spec=_durable_spec, children=_child_agents, cwd=_unit_cwd)
+            if _why_not is None:
+                _durable_spec["execution"]["runtime"] = "kanban"
+                _durable_spec["execution"]["route"] = _akb.parent_route(parent_agent, cfg)
+
+                def _on_kanban_spawned():
+                    # The gateway-built children never run: close them through the one teardown door.
+                    for _c in _child_agents:
+                        with _quiet("kanban: gateway child close failed", exc_info=True):
+                            _teardown(_c, "kanban_spawned")
+
+                _kanban = {"profile": _durable_spec.get("profile") or "default", "cwd": _unit_cwd,
+                           "session_id": _parent_session_id, "on_spawned": _on_kanban_spawned}
+            else:
+                logger.debug("delegate_task: kanban runtime not used (%s)", _why_not)
         # Detached mode (docs/dev/delegate-detached-background.md): a durable unit runs its children in
         # its own process so a gateway restart neither kills nor re-runs it. Only on a restart-safe spawn.
         _detached = None
@@ -4725,7 +4748,7 @@ def delegate_task(
         # So does a session-isolated sandbox (docker + container_persistent: false): children alias the
         # parent's per-session container by its live task id, and that container is never reused across
         # processes, so a detached worker would land in a fresh "default" sandbox without the session's files.
-        if _durable_spec is not None and _get_detached_background() and not _has_fork_child \
+        if _kanban is None and _durable_spec is not None and _get_detached_background() and not _has_fork_child \
                 and not _terminal_session_isolated():
             from tools.delegate_detached import spawn_mode
 
@@ -4757,6 +4780,7 @@ def delegate_task(
             durable_spec=_durable_spec,
             current_boot_id=_gateway_boot_id,
             detached=_detached,
+            kanban=_kanban,
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
@@ -4807,7 +4831,12 @@ def delegate_task(
             _sids = [
                 getattr(_c, "_subagent_id", None) for _c in _child_agents
             ]
-            if _detached is not None:
+            if _kanban is not None:
+                payload["runtime"] = "kanban"
+                payload["control_hint"] = (
+                    "This background unit runs in its own process and survives a gateway restart. "
+                    "steer/list are not available for it; /stop still cancels it.")
+            elif _detached is not None:
                 payload["detached"] = True
                 payload["control_hint"] = (
                     "This background unit runs in its own process and survives a gateway restart. "
