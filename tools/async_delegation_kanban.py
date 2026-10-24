@@ -167,7 +167,7 @@ def parse_card_body(body: Optional[str]) -> Dict[str, Any]:
 
 def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, profile: str,
                 goal: str, cwd: str, session_id: Optional[str],
-                spawn_fn: Optional[Callable] = None) -> Dict[str, Any]:
+                spawn_fn: Optional[Callable] = None, slot_key: Optional[str] = None) -> Dict[str, Any]:
     """Create the unit's card and spawn its runner now (§5.2 steps 2-3).
 
     Returns ``{"ok": True, "task_id", "pid"}``, or ``{"ok": False, "error"}`` after archiving any
@@ -187,9 +187,11 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
                 max_runtime_seconds=None, session_id=session_id or None,
                 idempotency_key=attempt_id, board=board, created_by=profile,
             )
-            if not _store.set_kanban_block(delegation_id, attempt_id,
-                                           {"board": board, "task_id": task_id},
-                                           profile_home=profile_home):
+            # ``slot_key``: the call's shared pool slot, so a boot observer of a multi-unit call
+            # holds ONE slot as the dispatching gateway did (not one per unit).
+            block = {"board": board, "task_id": task_id,
+                     **({"slot_key": slot_key} if slot_key and slot_key != delegation_id else {})}
+            if not _store.set_kanban_block(delegation_id, attempt_id, block, profile_home=profile_home):
                 raise RuntimeError("attempt no longer current before spawn")
             pid = kbd.spawn_now(conn, task_id, board=board, spawn_fn=spawn_fn)
         return {"ok": True, "task_id": task_id, "pid": pid}
@@ -215,7 +217,12 @@ def _archive_quietly(task_id: str) -> bool:
 
 def cancel_unit(delegation_id: str, profile_home: Optional[Path]) -> None:
     """Archive the unit's card (the dispatcher's identity-checked kill); off-thread, never blocks
-    the caller (a ``/stop`` on the gateway loop). The runner's own 5 s card read stops it too."""
+    the caller (a ``/stop`` on the gateway loop). The runner's own 5 s card read stops it too.
+
+    The thread is only the fast path: the live record is marked ``kanban_cancel`` first, and every
+    drain re-archives a marked unit's card until it has ended (a lost thread or a failed archive is
+    retried); after a restart, boot re-marks a cancelled record whose card is still live."""
+    _mark_cancel(delegation_id)
     try:
         with _store.locked_registry(profile_home, write=False) as registry:
             record = registry["records"].get(delegation_id)
@@ -229,6 +236,35 @@ def cancel_unit(delegation_id: str, profile_home: Optional[Path]) -> None:
     thread = threading.Thread(target=_archive_quietly, args=(task_id,), daemon=True,
                               name=f"deleg-cancel-{delegation_id}")
     thread.start()
+
+
+def _mark_cancel(delegation_id: str) -> None:
+    from tools import async_delegation as ad
+
+    with ad._records_lock:
+        rec = ad._records.get(delegation_id)
+        if rec is not None and rec.get("kanban_unit"):
+            rec["kanban_cancel"] = True
+
+
+def _replay_cancels(conn, live: Dict[str, str]) -> None:
+    """Archive the card of every cancel-marked live unit whose card has not ended (durable cancel
+    replay). Steady state (no marked unit) reads nothing."""
+    from tools import async_delegation as ad
+
+    with ad._records_lock:
+        marked = [d for d in live if (ad._records.get(d) or {}).get("kanban_cancel")]
+    kb = _kb()
+    for delegation_id in marked:
+        task_id = live.get(delegation_id)
+        if not task_id:
+            continue
+        try:
+            row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is not None and row["status"] not in ENDED_STATUSES:
+                kb.archive_task(conn, task_id)
+        except Exception:
+            logger.warning("async_delegation_kanban_cancel_replay_failed task_id=%s", task_id, exc_info=True)
 
 
 def cancelled_during_launch(delegation_id: str, attempt_id: str, profile_home: Path) -> bool:
@@ -279,15 +315,22 @@ def _terminal_settled(record: Dict[str, Any]) -> bool:
                    for e in record.get("outbox") or [])
 
 
-def _mark_drained(conn, task_id: str, delegation_id: str, status: str) -> None:
+def _mark_drained(conn, task_id: str, delegation_id: str, status: str) -> int:
+    """Archive the card, THEN record the drained marker (1). An archive error leaves the card unmarked
+    (0), so the next drain (or boot cleanup) retries it; the marker only ever names an archived card."""
     kb = _kb()
-    with kb.write_txn(conn):
-        kb._append_event(conn, task_id, DRAINED_EVENT, {"delegation_id": delegation_id})
     if status != "archived":
         try:
-            kb.archive_task(conn, task_id)
+            if not kb.archive_task(conn, task_id):
+                row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if row is None or row["status"] != "archived":
+                    return 0
         except Exception:
             logger.warning("async_delegation_kanban_archive_failed task_id=%s", task_id, exc_info=True)
+            return 0
+    with kb.write_txn(conn):
+        kb._append_event(conn, task_id, DRAINED_EVENT, {"delegation_id": delegation_id})
+    return 1
 
 
 def _records_of(profile_home: Path) -> Dict[str, Dict[str, Any]]:
@@ -342,6 +385,7 @@ def drain_profile(profile_home: Path, boot_id: str, *,
         return out
     kb = _kb()
     with kb.connect_closing(board=_board()) as conn:
+        _replay_cancels(conn, live)
         ended = []
         for row in _ended_cards(conn):
             body = parse_card_body(row["body"])
@@ -369,36 +413,46 @@ def drain_profile(profile_home: Path, boot_id: str, *,
             delegation_id, attempt_id = body["delegation_id"], body.get("attempt_id")
             record = records.get(delegation_id)
             if record is None:
-                _mark_drained(conn, row["id"], delegation_id, row["status"])
-                out["drained"] += 1
+                out["drained"] += _mark_drained(conn, row["id"], delegation_id, row["status"])
                 continue
             if (record.get("attempt") or {}).get("attempt_id") != attempt_id:
                 # Superseded (spawn failure, §5.2.4): the record belongs to its in-process attempt now.
                 if record.get("state") != "running":
-                    _mark_drained(conn, row["id"], delegation_id, row["status"])
-                    out["drained"] += 1
+                    out["drained"] += _mark_drained(conn, row["id"], delegation_id, row["status"])
                 continue
             if record.get("state") == "running":
                 # The runner died without a result: what its children left (setsid'd tools carry the
                 # K6 lineage tag) goes now, create-time checked; never a live runner process.
-                procs = lineage_processes(row["id"])
-                if procs:
-                    _kill_leftovers([p for p in procs if not _is_runner(p, row["id"])])
+                procs = (scan or lineage_processes)(row["id"])
+                if procs is None:
+                    continue  # scan unknown: a tool may still be writing; never finalize, retry next tick
+                _kill_leftovers([p for p in procs if not _is_runner(p, row["id"])])
                 tail = _log_tail(row["id"])
                 if _store.fail_attempt(delegation_id, str(attempt_id),
                                        f"unit worker ended without a result: {tail}",
                                        profile_home=profile_home, queued_boot_id=None):
                     out["failed"] += 1
+            elif not _needs_enqueue(record, boot_id):
+                # Its completion is already queued this boot (waiting on its ack): no registry write.
+                settle(delegation_id, record.get("state"))
+                if _terminal_settled(record):
+                    out["drained"] += _mark_drained(conn, row["id"], delegation_id, row["status"])
+                continue
             queued = _store.enqueue_record_outbox(delegation_id, boot_id, profile_home=profile_home)
             _put(queued, profile_home)
             out["queued"] += len(queued)
             fresh = _records_of(profile_home).get(delegation_id) or {}
             settle(delegation_id, fresh.get("state"))
             if _terminal_settled(fresh):
-                _mark_drained(conn, row["id"], delegation_id, row["status"])
-                out["drained"] += 1
+                out["drained"] += _mark_drained(conn, row["id"], delegation_id, row["status"])
         _drain_lost(profile_home, boot_id, lost, out, scan=scan, records=records)
     return out
+
+
+def _needs_enqueue(record: Dict[str, Any], boot_id: str) -> bool:
+    """The record has a pending outbox event not yet queued by this boot."""
+    return any(isinstance(e, dict) and e.get("state") == "pending" and e.get("queued_boot_id") != boot_id
+               for e in record.get("outbox") or [])
 
 
 def _drain_lost(profile_home: Path, boot_id: str, lost: List[Any], out: Dict[str, int], *,
@@ -604,10 +658,13 @@ def observe_running(profile_home: Path, boot_id: str) -> int:
     except Exception:
         return 0
     added = 0
+    cancelled = _cancelled_with_live_card(records, profile_home)
     for delegation_id, durable in records.items():
-        if durable.get("state") != "running" or not _store.is_kanban_record(durable):
+        if not _store.is_kanban_record(durable):
             continue
-        if _fail_never_started(delegation_id, durable, profile_home, boot_id):
+        if durable.get("state") != "running" and delegation_id not in cancelled:
+            continue
+        if durable.get("state") == "running" and _fail_never_started(delegation_id, durable, profile_home, boot_id):
             continue
         source = durable.get("source") or {}
         route = durable.get("route") or {}
@@ -627,13 +684,36 @@ def observe_running(profile_home: Path, boot_id: str) -> int:
                 "is_batch": source.get("kind") == "batch" or len(goals) > 1,
                 "attempt_id": (durable.get("attempt") or {}).get("attempt_id"),
                 "owner_boot_id": (durable.get("attempt") or {}).get("owner_boot_id"),
-                "registry_profile_home": str(profile_home), "slot_key": delegation_id,
+                "registry_profile_home": str(profile_home),
+                "slot_key": (durable.get("kanban") or {}).get("slot_key") or delegation_id,
                 "interrupt_fn": cancel_fn(delegation_id, profile_home), "progress_fn": None,
                 "kanban_unit": True, "kanban_task_id": (durable.get("kanban") or {}).get("task_id"),
+                **({"kanban_cancel": True} if delegation_id in cancelled else {}),
                 "_context": contextvars.copy_context()}
         added += 1
     _archive_stale_cards(records, profile_home)
     return added
+
+
+def _cancelled_with_live_card(records: Dict[str, Dict[str, Any]], profile_home: Path) -> set:
+    """Cancelled kanban records whose card has not ended: the cancel's archive never landed (the
+    gateway exited before its thread ran). Boot observes them so the drain replays the archive."""
+    candidates = {d: str((r.get("kanban") or {}).get("task_id") or "") for d, r in records.items()
+                  if r.get("state") == "cancelled" and _store.is_kanban_record(r)
+                  and (r.get("kanban") or {}).get("task_id")}
+    if not candidates or not _board_exists():
+        return set()
+    kb = _kb()
+    out = set()
+    try:
+        with kb.connect_closing(board=_board()) as conn:
+            for delegation_id, task_id in candidates.items():
+                row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if row is not None and row["status"] not in ENDED_STATUSES:
+                    out.add(delegation_id)
+    except Exception:
+        logger.warning("async_delegation_kanban_cancel_scan_failed home=%s", profile_home, exc_info=True)
+    return out
 
 
 def _archive_stale_cards(records: Dict[str, Dict[str, Any]], profile_home: Path) -> None:

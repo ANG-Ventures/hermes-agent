@@ -368,3 +368,38 @@ def test_the_unit_runner_arms_the_profiles_shell_hooks_before_building_the_paren
         shell_hooks.reset_for_tests()
 
     assert seen["block"] == "unit-policy", "the unit's tool calls would run with no shell-hook policy"
+
+
+def test_direct_endpoint_without_a_delegation_key_inherits_the_parent_own_key(unit, monkeypatch):
+    """36ceed09ccf5: delegation.base_url set, delegation.api_key unset -> the parent's own key (as
+    in-process), resolved on the parent's route, never against the delegation endpoint."""
+    import sys
+    import hermes_cli.config as config_mod
+    import hermes_cli.runtime_provider as rp
+
+    calls = []
+
+    def fake_resolve(**kw):
+        calls.append(kw)
+        key = "endpoint-resolved-key" if kw.get("explicit_base_url") else "parent-own-key"
+        return {"api_key": key, "base_url": kw.get("explicit_base_url") or "https://openrouter.ai/api/v1",
+                "provider": "custom", "requested_provider": kw.get("requested"), "api_mode": "chat_completions"}
+
+    monkeypatch.setattr(rp, "resolve_runtime_provider", fake_resolve)
+    monkeypatch.setattr(config_mod, "load_config", lambda: {"delegation": {"base_url": "https://delegate.example/v1"}})
+    built = {}
+
+    class FakeAgent:
+        def __init__(self, **kw):
+            built.update(kw)
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    record = _record(unit.did)
+    record["execution"].update({
+        "credential_ref": {"source": "delegation_config", "parent_provider": "openrouter"},
+        "route": {"requested_provider": "openrouter", "model": "m",
+                  "explicit_base_url": "https://delegate.example/v1"}})
+    duw.build_parent(record)
+    assert built["api_key"] == "parent-own-key"
+    assert built["base_url"] == "https://delegate.example/v1", "the endpoint stays the delegation's"
+    assert any(not c.get("explicit_base_url") and c.get("requested") == "openrouter" for c in calls)

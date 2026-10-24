@@ -1548,7 +1548,7 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
         delegation_id=delegation_id, attempt_id=old_attempt, profile_home=Path(profile_home),
         profile=str(kanban.get("profile") or "default"), goal=str(record.get("goal") or ""),
         cwd=str(kanban.get("cwd") or ""), session_id=kanban.get("session_id"),
-        spawn_fn=kanban.get("spawn_fn"))
+        spawn_fn=kanban.get("spawn_fn"), slot_key=record.get("slot_key"))
     if launched.get("ok"):
         with _records_lock:
             rec = _records.get(delegation_id)

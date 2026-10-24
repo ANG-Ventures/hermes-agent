@@ -159,6 +159,20 @@ def _delegation_api_key(execution: Dict[str, Any], cfg: Dict[str, Any]) -> Optio
     return str(((cfg.get("delegation") or {}).get("api_key")) or "").strip() or None
 
 
+def _parent_own_key(execution: Dict[str, Any], route: Dict[str, Any], runtime: Dict[str, Any]) -> Any:
+    """The key the in-process child inherits on a direct endpoint with no ``delegation.api_key``: the
+    parent's OWN key, resolved on its own route. The route's ``explicit_base_url`` (the delegation
+    endpoint) must not take part, or the resolver answers for that endpoint, not the parent."""
+    if ((execution.get("credential_ref") or {}).get("source") != "delegation_config"
+            or not route.get("explicit_base_url")):
+        return runtime.get("api_key")
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    own = resolve_runtime_provider(requested=route.get("requested_provider") or None,
+                                   target_model=route.get("model") or execution.get("model") or None)
+    return own.get("api_key")
+
+
 def build_parent(record: Dict[str, Any]):
     """Step 3: the parent ``AIAgent`` from the CLI's resolver, keyed on the recorded route; the
     parent never runs a turn. Children get the profile's own ``delegation:`` config (read by the
@@ -177,7 +191,8 @@ def build_parent(record: Dict[str, Any]):
     cfg = load_config() or {}
     pr = cfg.get("provider_routing") or {}
     kwargs: Dict[str, Any] = {
-        "api_key": _delegation_api_key(execution, cfg) or runtime.get("api_key"), "base_url": runtime.get("base_url"),
+        "api_key": _delegation_api_key(execution, cfg) or _parent_own_key(execution, route, runtime),
+        "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"), "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"), "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
