@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -119,8 +120,9 @@ def board_named_by_pin(raw: str) -> str:
 
     Spelling-blind inverse of ``_board_db_path_ignoring_pin`` (RC-7): compared through
     ``_pin_file_agrees``, the contradiction guard's own predicate, so a firmlink / symlinked /
-    case-variant spelling of a board's DB names that board. Memoised on (pin, root, boards/
-    mtime): a new board dir changes the mtime, so a process pays one scan per pin.
+    case-variant spelling of a board's DB names that board. Memoised on (pin, its resolved
+    identity, root, boards/ mtime): a new board dir changes the mtime, and a retargeted symlink
+    pin changes the identity (Prism 69c969208e42), so a process pays one scan per pin target.
     """
     _kb = _facade()
     try:
@@ -129,7 +131,7 @@ def board_named_by_pin(raw: str) -> str:
             stamp = root.stat().st_mtime_ns
         except FileNotFoundError:
             stamp = None
-        key = (raw, str(_kb.kanban_home()), stamp)
+        key = (raw, _pin_identity(raw), str(_kb.kanban_home()), stamp)
         hit = _PINNED_BOARD_MEMO.get(key)
         if hit is not None:
             return hit
@@ -152,6 +154,17 @@ def board_named_by_pin(raw: str) -> str:
             _log.warning("kanban: could not name the board HERMES_KANBAN_DB=%s pins (%s: %s); "
                          "using %r", raw, type(exc).__name__, exc, PINNED_SLUG)
         return PINNED_SLUG
+
+
+def _pin_identity(raw: str) -> tuple:
+    """The file a pin names right now: realpath + (st_dev, st_ino) of the target, or
+    ``(realpath, None)`` when it does not exist yet."""
+    real = os.path.realpath(os.path.expanduser(raw))
+    try:
+        st = os.stat(real)
+    except OSError:
+        return (real, None)
+    return (real, (st.st_dev, st.st_ino))
 
 
 def _unreadable(slug: str, exc: BaseException) -> KanbanBoardUnreadable:
