@@ -9,6 +9,7 @@ records and arguments is the order argparse renders in ``--help``.
 from __future__ import annotations
 
 import argparse
+import sys
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
@@ -121,7 +122,30 @@ _WHY = _arg("--why", action="store_true",
 _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
-_PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
+# Tiers sit on the fleet's live scale (store ORDER BY priority DESC): 0 is the default/normal
+# pile, ~80 is the ready pile, 100-300 is operator-urgent (measured 2026-10-24 on kanban.db).
+# A p0 must sort ABOVE every existing card, so it is 300, not a small ordinal (Prism P1 f02195f23922).
+_P_TIERS = {"p0": 300, "p1": 200, "p2": 100, "p3": 0}
+
+
+def priority_value(text: str) -> int:
+    """``--priority`` accepts the signed int the store keeps (higher = first) OR a
+    ``p0``..``p3`` tier (p0=300, p1=200, p2=100, p3=0: the fleet's live scale, p0 = highest). An operator who
+    types ``--priority p2`` against an int-only flag gets a refusal whose last line is
+    the create schema, which never mentions ``--priority`` -- the real cause scrolls off
+    (2026-10-24, three refused creates in a row on the vegas-theft board)."""
+    t = text.strip().lower()
+    if t in _P_TIERS:
+        return _P_TIERS[t]
+    try:
+        return int(t)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: want an int (higher = first) or a tier p0..p3 (p0 = highest)")
+
+
+_PRIORITY = _arg("--priority", type=priority_value, default=0,
+                 help="Priority tiebreaker: int (higher = first) or p0..p3 (p0 = highest)")
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
@@ -1207,6 +1231,10 @@ def _schema_on_usage_error(sub: argparse._SubParsersAction) -> None:
             _verb = name
 
             def error(self, message):
-                super().error(f"{message}\n{schema_text(self._verb)}")
+                # Schema FIRST, the actual refusal LAST: a tool/terminal that tails the
+                # output shows the cause, not the example line (2026-10-24: three
+                # `--priority p2` refusals read as "the wrapper wants a different shape").
+                self.print_usage(sys.stderr)
+                self.exit(2, f"{schema_text(self._verb)}\n{self.prog}: error: {message}\n")
 
         p.__class__ = _SchemaOnError
