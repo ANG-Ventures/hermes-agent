@@ -134,6 +134,10 @@ _TABLE: tuple = (
     _Row(4, "changes_requested", lambda c: c.kind == "changes_requested", AUTO, MODE_FORK),
     _Row(4, "crash_first_occurrence",
          lambda c: c.kind in CRASH_KINDS and c.retries < MAX_AUTO_RETRIES, AUTO, MODE_FORK),
+    # t_1e0ffee4: the review deadman's tier-1 page, emitted as a ``review_deadman`` card event
+    # (hermes-home scripts/kanban-review-deadman.py) instead of a direct wake. The child does the
+    # attended read: a bounded why-waits comment, or surface.
+    _Row(4, "review_deadman", lambda c: c.kind == "review_deadman", AUTO, MODE_FORK),
     # Tier 5 — default: upstream handbacks, repeat crashes, reclaimed, skipped_nonspawnable,
     # status/heartbeat plumbing and any kind nobody listed.
     _Row(5, "default", lambda c: True, SURFACE),

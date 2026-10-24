@@ -223,7 +223,8 @@ STATE_CLAIMED, STATE_RUNNING, STATE_EXECUTING = "claimed", "running", "executing
 STATE_TERMINAL, STATE_CANCELLED = "terminal", "cancelled"
 OPEN_STATES = frozenset({STATE_CLAIMED, STATE_RUNNING, STATE_EXECUTING, STATE_CANCELLED})
 
-ACTIONS = frozenset({"complete", "request_changes", "redispatch", "retry", "surface", "handled", "land_inherited"})
+ACTIONS = frozenset({"complete", "request_changes", "redispatch", "retry", "surface", "handled", "land_inherited",
+                     "comment_why_waits"})
 # RC-2: kind × action, keyed on the row stored at claim time (pass-5 RC-A).
 ALLOWED = {
     "completed": frozenset({"complete", "request_changes", "surface"}),
@@ -235,7 +236,16 @@ ALLOWED = {
     "own_repo_review_all_keys_answered": frozenset({"handled", "surface"}),
     "changes_requested": frozenset({"redispatch", "surface"}),
     "crash_first_occurrence": frozenset({"retry", "surface"}),
+    # t_1e0ffee4: a review-deadman tier-1 page. comment_why_waits = the executor posts ONE bounded
+    # why-waits comment (WHY_WAITS_FIELDS); the card stays in review.
+    "review_deadman": frozenset({"comment_why_waits", "surface"}),
 }
+
+#: comment_why_waits: the verdict's ``why_waits`` object; each field a non-empty line, clipped.
+WHY_WAITS_FIELDS = ("pr_state", "last_operator_action", "flips_when")
+WHY_WAITS_MAX = 200
+#: Prefix of the why-waits comment; the review deadman reads it as the owner's answer (hermes-home).
+WHY_WAITS_TAG = f"{MARKER} why-waits:"
 
 GOAL = ("Handle this kanban card event per the disposition table: verify, then return ONE "
         "<<<BOOMERANG-VERDICT>>> block per spec §5.8; you cannot write the board (D-19). "
@@ -301,6 +311,7 @@ def enabled() -> bool:
 
 
 ROW_REVIEW_ALL_ANSWERED = "review_all_answered"
+ROW_REVIEW_DEADMAN = "review_deadman"
 
 
 def row_enabled(name: str) -> bool:
@@ -592,8 +603,29 @@ LAND_INHERITED_HINT = (
     "The executor re-checks it from GitHub and surfaces on any miss.\n"
 )
 
+REVIEW_DEADMAN_STEPS = (
+    "1. Read the card: `hermes kanban --board {board} show {task_id}` (status, the newest review run's summary, "
+    "the comment thread: the last operator comment, any `close-on:` line).",
+    "2. Read its PR state over REST, never GraphQL: `python3 {home}/scripts/gh-pr-rest.py <owner/repo> <n> --checks` "
+    "for the PR the card names.",
+    "3. If the card waits on something outside the operator (CI, the merge queue, a parent card, a deploy, a "
+    "`close-on:` gate), return `comment_why_waits` with `\"why_waits\": {{\"pr_state\": \"<state + head>\", "
+    "\"last_operator_action\": \"<who, when, what>\", \"flips_when\": \"<the one event that moves it>\"}}`. "
+    "If the operator owes a decision (land it, request changes, answer a question), return `surface`.",
+)
+
+
+def _review_deadman_brief(entry: dict) -> str:
+    from hermes_constants import display_hermes_home, get_default_hermes_root
+
+    fields = {"board": entry.get("board") or "default", "task_id": entry["task_id"],
+              "home": display_hermes_home(get_default_hermes_root())}
+    return "Do this attended read:\n" + "\n".join(s.format(**fields) for s in REVIEW_DEADMAN_STEPS) + "\n"
+
+
 #: Row-specific instructions appended to the generic goal (keyed on the claim-time row).
-ROW_BRIEFS = {"own_repo_review_all_keys_answered": _review_all_answered_brief}
+ROW_BRIEFS = {"own_repo_review_all_keys_answered": _review_all_answered_brief,
+              "review_deadman": _review_deadman_brief}
 
 
 def build_goal(entry: dict) -> str:
@@ -648,7 +680,19 @@ def parse_verdict(entry: dict, final_message: Any) -> dict:
     if verdict["action"] == "request_changes" and not [
             f for f in verdict.get("findings") or [] if str(f).strip()]:
         raise VerdictError("unparseable verdict")
+    if verdict["action"] == "comment_why_waits":
+        ww = verdict.get("why_waits")
+        if not isinstance(ww, dict) or not all(_first_line(ww.get(k)) for k in WHY_WAITS_FIELDS):
+            raise VerdictError("unparseable verdict")
     return verdict
+
+
+def why_waits_text(entry: dict, verdict: dict) -> str:
+    """The ONE bounded why-waits comment: PR state, last operator action, what flips it."""
+    ww = verdict["why_waits"]
+    pr, last, flips = (_first_line(ww.get(k), WHY_WAITS_MAX) for k in WHY_WAITS_FIELDS)
+    return (f"{WHY_WAITS_TAG} PR: {pr}; last operator action: {last}; flips when: {flips} "
+            f"(delegation {entry['delegation_id']})")
 
 
 # --- the executor (§5.8) ------------------------------------------------------------------
@@ -727,9 +771,9 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
                     raise RuntimeError("complete refused")
             elif status != "done":   # a done card: the verification receipt IS the write
                 raise RuntimeError(f"complete on a {status} card")
-        elif action == "handled":    # the child's own writes are done; the receipt IS the write
+        elif action in ("handled", "comment_why_waits"):   # receipt (+ the why-waits comment); card stays in review
             if status != "review":
-                raise RuntimeError(f"handled on a {status} card")
+                raise RuntimeError(f"{action} on a {status} card")
         elif action == "land_inherited":   # the ONE write is the landing-queue enqueue (plan re-verified)
             if status != "review":
                 raise RuntimeError(f"land_inherited on a {status} card")
@@ -758,10 +802,20 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
                    "child_session": entry.get("child_session") or None, "action": action,
                    "claim_event_id": int(entry["event_id"])}
         with kb.write_txn(conn):
+            if action == "comment_why_waits":
+                # Prism 19efbd980406: the comment IS this action, so it commits with its receipt (both or
+                # neither). A refused comment rolls back its own savepoint; the receipt records why, and the
+                # deadman reads a receipt from this episode as the answer either way.
+                try:
+                    payload["comment_id"] = kb.add_comment(conn, tid, AUTHOR, why_waits_text(entry, verdict))
+                except Exception as exc:
+                    payload["comment_failed"] = f"{type(exc).__name__}: {exc}"[:300]
+                    logger.warning("kanban boomerang-wake: %s why-waits comment refused: %s",
+                                   tid, payload["comment_failed"])
             kb._append_event(conn, tid, RECEIPT_KIND, payload)  # noqa: SLF001 -- the one event writer
         if action == "land_inherited":
             _land_inherited_records(entry, verdict["_plan"], conn, kb)
-        else:
+        elif action != "comment_why_waits":
             kb.add_comment(conn, tid, AUTHOR, f"{MARKER} {action}: {summary} (delegation {entry['delegation_id']})")
 
 
@@ -1199,6 +1253,8 @@ def _owner_candidates(board: str, task_id: str, items: list) -> dict:
                 if row_enabled(ROW_REVIEW_ALL_ANSWERED):
                     payload["prism_all_answered"] = _owner_all_answered(kb, conn, task, i, memo)
             disp = classify_event(str(i.get("kind") or ""), payload, task, retries)
+            if disp.row == ROW_REVIEW_DEADMAN and not row_enabled(ROW_REVIEW_DEADMAN):
+                continue   # row off: the owner-wake delivers the deadman page as today's turn
             if disp.verdict == "auto":
                 out[int(i["event_id"])] = disp
         return out
