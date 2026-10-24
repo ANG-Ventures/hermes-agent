@@ -23,6 +23,9 @@ from typing import Iterable, Optional
 BARE_VERB_REFUSE = "refuse"
 BARE_VERB_DEFAULT = "default"
 _POLICIES = frozenset({BARE_VERB_REFUSE, BARE_VERB_DEFAULT})
+# What an absent / unreadable / unknown ``kanban.bare_verb`` means. ``refuse`` is the shipped
+# answer (S7 D7); the test suite's legacy tests run under ``default`` until C1c rewrites them.
+ABSENT_POLICY = BARE_VERB_REFUSE
 
 # Verbs that address no single board: they sweep every board, or touch none.
 BOARD_AGNOSTIC_VERBS = frozenset({
@@ -53,7 +56,7 @@ def bare_verb_policy() -> str:
         st = path.stat()
         stamp: Optional[tuple[int, int]] = (st.st_mtime_ns, st.st_size)
     except OSError:
-        return BARE_VERB_REFUSE
+        return ABSENT_POLICY
     cached = _POLICY_CACHE.get(str(path))
     if cached is not None and cached[0] == stamp:
         return cached[1]
@@ -65,7 +68,7 @@ def bare_verb_policy() -> str:
         value = str((kanban or {}).get("bare_verb") or "").strip().lower() if isinstance(kanban, dict) else ""
     except Exception:
         value = ""
-    policy = value if value in _POLICIES else BARE_VERB_REFUSE
+    policy = value if value in _POLICIES else ABSENT_POLICY
     _POLICY_CACHE[str(path)] = (stamp, policy)
     return policy
 

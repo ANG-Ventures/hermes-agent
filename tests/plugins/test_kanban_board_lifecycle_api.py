@@ -88,6 +88,7 @@ def test_delete_default_board_is_refused(client):
 
 # --- S7 D5: no server-side current board ------------------------------------------------------
 
+@pytest.mark.kanban_bare_verb_refuse
 def test_board_query_omitted_is_400_under_refuse_and_default_under_the_switch(client, tmp_path):
     """Mutation: let ``_resolve_board(None)`` fall through to an ambient board -> the 400 is 200."""
     r = client.get("/api/plugins/kanban/board")
