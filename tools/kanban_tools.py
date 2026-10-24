@@ -749,6 +749,10 @@ def _handle_show(args: dict, **kw) -> str:
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
+        # Rows of an old terminal card may live in <board>/kanban-archive.db (t_3be5b45f).
+        from hermes_cli import kanban_archive_read as kar
+        comments, runs, events = kar.fill(
+            kb, conn, task, kb.list_comments(conn, tid), kb.list_runs(conn, tid), kb.list_events(conn, tid))
         return json.dumps({
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
@@ -763,10 +767,10 @@ def _handle_show(args: dict, **kw) -> str:
                 {**_fields(c, _COMMENT_FIELDS),
                  "author_display": kb.format_comment_author(
                      c.author, run_id=c.run_id, session_ref=c.session_ref)}
-                for c in kb.list_comments(conn, tid)],
+                for c in comments],
             # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
-            "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
+            "events": [_fields(e, _EVENT_FIELDS) for e in events[-50:]],
+            "runs": [_fields(r, _RUN_FIELDS) for r in runs],
             # Same string build_worker_context hands the dispatcher at spawn time.
             "worker_context": kb.build_worker_context(conn, tid)})
 
