@@ -7398,6 +7398,7 @@ def _dispatch_once_locked(
         if spawn_budget is not None and spawned >= spawn_budget:
             break
         _review_origin_host = None
+        _review_rid = None
         if row['id'] in _review_pause_pins:
             # A resumed paused card's first review run goes back to its origin (fleet pause resume fence).
             _pin_host = _review_pause_pins[row['id']]
@@ -7469,6 +7470,7 @@ def _dispatch_once_locked(
             continue
         if _review_origin_host is not None:
             _review_origin_host = spillover.take(row['assignee'], pin=_review_origin_host.name)
+            _review_rid = getattr(spillover, "last_reservation", None)
             if _review_origin_host is None:
                 result.placement_waits[row['id']] = spillover.refusal
                 continue
@@ -7487,9 +7489,11 @@ def _dispatch_once_locked(
         except _kph.PauseHeld as exc:
             _pause_held_at_claim(conn, result, exc)
             if _review_origin_host is not None:
-                spillover.release(_review_origin_host, getattr(spillover, "last_reservation", None))
+                spillover.release(_review_origin_host, _review_rid)
             continue
         if claimed is None:
+            if _review_origin_host is not None:
+                spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
             continue
         # Review spawns are workers too: a capacity window that re-routes the
         # ready lane but silently leaves reviewers on a capped provider would
@@ -7527,8 +7531,12 @@ def _dispatch_once_locked(
             _kb._release_claim_for_workspace_refusal(
                 conn, claimed.id, result, str(exc),
             )
+            if _review_origin_host is not None:
+                spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
             continue
         except Exception as exc:
+            if _review_origin_host is not None:
+                spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
             # A workspace anchor that can never resolve (bare repo, non-repo
             # path, missing default_workdir) is a capability wall: retrying it
             # re-runs the identical git probe against the identical path. Block
@@ -7564,12 +7572,16 @@ def _dispatch_once_locked(
         )
         if not _kb._claim_still_held(conn, claimed):
             _kb._abort_lost_claim_spawn(conn, claimed, None)
+            if _review_origin_host is not None:
+                spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
             continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             from hermes_cli.kanban_continuation import record_placement
             if not record_placement(conn, claimed.id, claimed.current_run_id,
                                     _review_origin_host.name if _review_origin_host else None):
+                if _review_origin_host is not None:
+                    spillover.release(_review_origin_host, _review_rid)  # nothing launched: refund
                 continue
             if _review_origin_host:
                 _kb._kwh.prepare_remote_workspace(_review_origin_host, str(workspace))

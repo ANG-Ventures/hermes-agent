@@ -14569,11 +14569,7 @@ def requeue_task(
         ).fetchone()
         if row is None:
             return False, f"task {task_id} not found"
-        if drop_origin and row['status'] == 'blocked':
-            # Dropping state does not waive incomplete blocking parents.
-            target_status = 'todo' if unsatisfied_parents(conn, task_id) else 'ready'
-            conn.execute("UPDATE tasks SET status=? WHERE id=?", (target_status, task_id))
-        elif row["status"] != "ready":
+        if row["status"] != "ready" and not (drop_origin and row['status'] == 'blocked'):
             return False, (
                 f"task {task_id} is {row['status']!r}; requeue only applies to "
                 f"'ready' tasks (use unblock/reopen/triage-resolve/promote "
@@ -14581,7 +14577,17 @@ def requeue_task(
             )
         if drop_origin:
             from hermes_cli import kanban_continuation as kc
-            kc.drop_origin(conn, task_id, actor=actor, files=_origin_files)
+            # Drop first: a blocked card is promoted only when an origin was
+            # actually dropped (Prism 954a3633bcc2, t_8a8aad55).
+            if not kc.drop_origin(conn, task_id, actor=actor, files=_origin_files):
+                if row['status'] == 'blocked':
+                    return False, (f"task {task_id} stays blocked: it has no origin to drop, so "
+                                   f"--drop-origin cannot clear the block (use unblock)")
+                return False, f"task {task_id} has no origin to drop"
+        if drop_origin and row['status'] == 'blocked':
+            # Dropping state does not waive incomplete blocking parents.
+            target_status = 'todo' if unsatisfied_parents(conn, task_id) else 'ready'
+            conn.execute("UPDATE tasks SET status=? WHERE id=?", (target_status, task_id))
         _append_event(
             conn, task_id, "requeued", {"actor": actor, "reason": reason},
         )
