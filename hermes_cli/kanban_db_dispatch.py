@@ -4577,9 +4577,12 @@ def _wait_history(conn, tids: list, since_ts: int) -> "tuple[dict, dict]":
 
 
 def _record_placement_waits(conn, result, row_route: dict, dry_run: bool,
-                            reached=()) -> None:
+                            reached=(), local_binding: Optional[dict] = None) -> None:
     """One ``placement_wait`` task_event per held ready card
-    ``{code, detail, reason, route, host, since}`` (spec §4.2).
+    ``{code, detail, reason, route, host, since}`` (spec §4.2). A
+    ``local_full`` row also carries ``local_binding`` (``{binding,
+    binding_detail}``, ``_pr.local_full_binding``): gate vs board quota. It is
+    not part of the dedup key.
 
     Written only when the card's dedup key ``(code, route, host)`` differs
     from its latest one in the current episode, or that one is older than
@@ -4649,10 +4652,13 @@ def _record_placement_waits(conn, result, row_route: dict, dry_run: bool,
                         seen = list(dict.fromkeys(k[0] for k in recent if k[0] != _pr.FLAPPING))
                         code, detail, host = _pr.FLAPPING, "|".join(seen), None
                         reason = f"{code} ({detail})"
-            writes.append((tid, {
+            payload = {
                 "code": code, "detail": detail, "reason": reason, "route": route,
                 "host": host, "since": since,
-            }))
+            }
+            if code == _pr.LOCAL_FULL and local_binding:
+                payload.update(local_binding)
+            writes.append((tid, payload))
         if not writes:
             return
         with _kb.write_txn(conn):
@@ -7342,7 +7348,9 @@ def _dispatch_once_locked(
         _drop_foreign(conn, _held_own, default_assignee)
         _khc.notify_held(conn, board, list(_held_own.items()))
     _park_access_contradictions(conn, result, dry_run, default_assignee)
-    _record_placement_waits(conn, result, row_route, dry_run, _wait_reached)
+    _record_placement_waits(
+        conn, result, row_route, dry_run, _wait_reached,
+        local_binding=_pr.local_full_binding(spawn_paused, local_budget, ready_local, local_spawned))
     result.rows_routed = len(ready_rows)
     result.portable_waiting = sum(
         1 for tid in result.placement_waits
