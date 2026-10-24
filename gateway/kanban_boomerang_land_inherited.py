@@ -129,7 +129,7 @@ class GhIo:
 
     def streak(self) -> Optional[dict]:
         try:
-            return json.loads((_root() / "state" / "main-green-streak.json").read_text(encoding="utf-8"))
+            return json.loads((_root() / "state" / "main-green-streak.json").read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             return None
 
@@ -137,7 +137,7 @@ class GhIo:
         name = f"{repo.replace('/', '__')}__{int(number)}.json"
         for sub in ("landing-queue", "landing-queue.done"):
             try:
-                row = json.loads((_root() / "state" / sub / name).read_text(encoding="utf-8"))
+                row = json.loads((_root() / "state" / sub / name).read_text(encoding="utf-8-sig"))
             except (OSError, ValueError):
                 continue
             if isinstance(row, dict):
@@ -149,8 +149,8 @@ class GhIo:
         script = _root() / "scripts" / "lib" / "landing_queue.py"
         env = dict(os.environ, HERMES_SESSION_ID=actor or "boomerang-wake")
         try:
-            p = subprocess.run([sys.executable, str(script), *argv], capture_output=True, text=True, env=env,
-                               encoding="utf-8", errors="replace", timeout=300, check=False)
+            p = subprocess.run([sys.executable, str(script), *argv], capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", env=env, timeout=300, check=False)
         except (OSError, subprocess.SubprocessError) as exc:
             return 1, str(exc)
         return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
