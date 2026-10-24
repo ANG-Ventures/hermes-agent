@@ -10,6 +10,15 @@ name: Bootstrap installer
 
 on:
   workflow_call:
+    inputs:
+      hosted_os:
+        description: >-
+          Run the hosted windows-latest install.ps1 job. The caller passes
+          detect.outputs.hosted_os (off when vars.CI_HOSTED_OS_JOBS=off, the
+          private mirror with no hosted billing). A caller that passes nothing gets it.
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -130,6 +139,7 @@ jobs:
 
   windows:
     name: install.ps1 protocol surface
+    if: inputs.hosted_os
     runs-on: windows-latest
     timeout-minutes: 10
     steps:

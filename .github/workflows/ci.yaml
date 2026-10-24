@@ -176,6 +176,7 @@ jobs:
       e2e_desktop_core: ${{ steps.gate-lanes.outputs.e2e_desktop_core }}
       e2e_desktop_update: ${{ steps.gate-lanes.outputs.e2e_desktop_update }}
       desktop: ${{ steps.gate-lanes.outputs.desktop }}
+      hosted_os: ${{ steps.gate-lanes.outputs.hosted_os }}
       # Not lane booleans: raw classifier values, never release-forced.
       test_scope: ${{ steps.classify.outputs.test_scope }}
       changed_files: ${{ steps.classify.outputs.changed_files }}
@@ -219,6 +220,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           DESKTOP_JOBS: ${{ vars.CI_DESKTOP_JOBS }}
           PR_OS_TESTS: ${{ vars.CI_PR_OS_TESTS }}
+          HOSTED_OS_JOBS: ${{ vars.CI_HOSTED_OS_JOBS }}
           CLASSIFIED: ${{ toJSON(steps.classify.outputs) }}
         run: |
           python3 - <<'PY'
@@ -234,6 +236,12 @@ jobs:
           # vars.CI_PR_OS_TESTS=on runs them on every PR again.
           if os.environ['EVENT_NAME'] != 'pull_request' or os.environ['PR_OS_TESTS'] == 'on':
               values['os_tests'] = 'true'
+          # Hosted macOS/Windows jobs (tests-os, install.ps1 protocol surface).
+          # CI_HOSTED_OS_JOBS=off on the private mirror, which has no hosted
+          # billing and no self-hosted macOS/Windows class: those jobs otherwise
+          # fail with runner=none and 0 steps (t_70d527c7). A release run forces
+          # it back on below, so a strict release gate still sees them.
+          values['hosted_os'] = 'false' if os.environ.get('HOSTED_OS_JOBS') == 'off' else 'true'
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               for lane, value in values.items():
                   if release and value in ('true', 'false'):
@@ -301,7 +309,8 @@ jobs:
   tests-os:
     name: OS-specific tests
     needs: detect
-    if: needs.detect.outputs.python == 'true'
+    # Every job in tests-os.yml is hosted macOS/Windows; hosted_os gates it (CI_HOSTED_OS_JOBS).
+    if: needs.detect.outputs.python == 'true' && needs.detect.outputs.hosted_os == 'true'
     uses: ./.github/workflows/tests-os.yml
     with:
       # The Windows lane spawns the real desktop-update hand-off script
@@ -349,6 +358,8 @@ jobs:
     # are platforms("windows") pytest files and run in tests-os.
     if: needs.detect.outputs.bootstrap == 'true'
     uses: ./.github/workflows/bootstrap-installer.yml
+    with:
+      hosted_os: ${{ needs.detect.outputs.hosted_os == 'true' }}
 
   e2e-desktop:
     name: Desktop E2E
