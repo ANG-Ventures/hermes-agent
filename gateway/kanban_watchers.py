@@ -35,6 +35,7 @@ from gateway.kanban_watchers_common import (
     _wake_downgrade_reason,
     logger,
 )
+from gateway.kanban_watchers_dispatcher import _default_profile_secret_scope
 from gateway.kanban_watchers_notifier import (
     _adapter_for_subscription,
     _safe_review_reason,
@@ -4308,7 +4309,14 @@ class GatewayKanbanWatchersMixin:
             """Run the auto-decomposer for up to N triage tasks across all
             boards. Returns the number of triage tasks that were
             successfully decomposed or specified this tick.
+
+            The tick runs in a fresh context (``_to_thread_process_service``), so it
+            installs the launch profile's secret scope itself (#107955 / #57837).
             """
+            with _default_profile_secret_scope():
+                return _auto_decompose_boards(auto_decompose_per_tick)
+
+        def _auto_decompose_boards(auto_decompose_per_tick: int) -> int:
             try:
                 from hermes_cli import kanban_decompose as _decomp
             except Exception as exc:  # pragma: no cover

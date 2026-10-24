@@ -25,6 +25,7 @@ from unittest.mock import Mock
 import pytest
 
 import hermes_cli
+from agent import secret_scope as ss
 from gateway import kanban_watchers as watchers
 from hermes_cli import config, kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
@@ -69,6 +70,10 @@ def loop(tmp_path, monkeypatch):
 
     def decompose_task(task_id, **kwargs):
         seen["decompose_kwargs"] = dict(kwargs)
+        try:
+            seen["secret"] = ss.get_secret("ANTHROPIC_API_KEY")
+        except Exception as exc:  # fail-closed read: record it, the secret-scope test asserts
+            seen["secret"] = exc
         return SimpleNamespace(ok=False, fanout=False, child_ids=None, reason="test")
 
     fake = SimpleNamespace(list_triage_ids=list_triage_ids, decompose_task=decompose_task)
@@ -80,7 +85,7 @@ def loop(tmp_path, monkeypatch):
         sleep=clock.sleep, to_thread=asyncio.to_thread, CancelledError=asyncio.CancelledError,
         create_task=asyncio.create_task, shield=asyncio.shield,
     ))
-    return SimpleNamespace(seen=seen, clock=clock)
+    return SimpleNamespace(seen=seen, clock=clock, home=home)
 
 
 async def _one_decompose_iteration(loop) -> None:
