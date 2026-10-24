@@ -117,6 +117,13 @@ def _get_detached_background() -> bool:
     process and survives a gateway restart (docs/dev/delegate-detached-background.md). False = gateway threads."""
     return is_truthy_value(_cfg().get("detached_background", False))
 
+def _get_background_runtime() -> str:
+    """delegation.background_runtime: ``"kanban"`` runs an eligible restart-durable background unit as a
+    card on the internal ``delegations`` board (docs/dev/delegate-background-on-kanban-runtime.md);
+    anything else (default ``"in_process"``) keeps it a gateway thread."""
+    value = str(_cfg().get("background_runtime") or "in_process").strip().lower()
+    return "kanban" if value == "kanban" else "in_process"
+
 def _get_worktree_isolation() -> bool:
     """delegation.worktree_isolation (bool, default False): each child gets its own
     git worktree off the parent's HEAD so parallel children never contend for one

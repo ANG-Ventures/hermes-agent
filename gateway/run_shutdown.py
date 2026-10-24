@@ -374,8 +374,10 @@ class GatewayShutdownMixin:
         ):
             return True
         def _delegations_active() -> bool:
-            from tools.async_delegation import active_count
-            return active_count() > 0
+            # A kanban-runtime unit's process is not the gateway's and the next boot observes it:
+            # it must not keep the gateway awake (spec §5.4 Boot, scale-to-zero).
+            from tools.async_delegation import active_count, kanban_active_count
+            return active_count() - kanban_active_count() > 0
 
         def _processes_active() -> bool:
             from tools.process_registry import process_registry
