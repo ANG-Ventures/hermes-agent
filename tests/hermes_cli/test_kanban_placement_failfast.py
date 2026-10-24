@@ -260,6 +260,11 @@ def test_undeclared_browser_navigate_on_ci_box_returns_the_token_and_records_it(
     assert out["error"].startswith("BROWSER_RAIL_ABSENT cap=browser-session host=ci-box")
     assert rp.take_rail_absent() == out["error"]
     assert pff.parse_absent(out["error"])[:2] == ("BROWSER_RAIL_ABSENT", "browser-session")
+    # A background-review fork shares the worker's task env but is never the card's work.
+    import tools.skill_provenance as sp
+    monkeypatch.setattr(sp, "is_background_review", lambda: True)
+    assert rp.browser_capability_error() is None
+    assert rp.take_rail_absent() is None
 
 
 def test_capability_gate_is_inert_on_a_capable_host_unplaced_or_warn(board, monkeypatch):

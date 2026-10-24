@@ -187,6 +187,8 @@ def browser_capability_error() -> Optional[str]:
     lacks an ENFORCED ``browser-session`` gets the placement ABSENT line at once, recorded like
     the mid-run skill_view gate, whether or not the card declared the need. Without it the call
     passes every declared-need gate and fails slowly inside CDP on the pool host."""
+    if not _owned_task():   # background-review fork / delegate child / interactive: never gated
+        return None
     from hermes_cli.kanban_placement_failfast import capability_gate
     absent = capability_gate("browser-session")
     if absent is not None:
