@@ -136,7 +136,8 @@ class Board:
 
     def cli(self, *args: str, timeout: float = 90.0, check: bool = True) -> subprocess.CompletedProcess:
         proc = subprocess.run(
-            [PY, "-m", "hermes_cli.main", "kanban", *args], cwd=str(self.root), env=self.env(),
+            # S7: a non-derivable verb names its board; every card in this harness is on default.
+            [PY, "-m", "hermes_cli.main", "kanban", "--board", "default", *args], cwd=str(self.root), env=self.env(),
             capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
         )
         if check and proc.returncode != 0:
