@@ -35,7 +35,7 @@ def _load():
 
 run = _load()
 
-_BV2_VARS = ("BV2_KANBAN_CMD", "BV2_SCRATCH_BOARD", "BV2_HOME_SESSION", "BV2_ORIGIN_CHAT",
+_BV2_VARS = ("BV2_WAKE_STATE", "BV2_KANBAN_CMD", "BV2_SCRATCH_BOARD", "BV2_HOME_SESSION", "BV2_ORIGIN_CHAT",
              "BV2_GATEWAY_LOG", "BV2_GATEWAY_ENV", "BV2_CONFIG", "BV2_WIRELOG_DIR", "BV2_ACK_FILE",
              "BV2_EVIDENCE", "BV2_PLAN", "BV2_GATEWAY_PID", "BV2_STOP_FILE")
 
@@ -205,27 +205,25 @@ def test_step4_fallback_arm_needs_the_retry_spent_reason(env, monkeypatch):
     assert "(reason: gateway restart, retry spent)` | FAIL" in env["evidence"].read_text()
 
 
-def test_step4_fallback_prespend_writes_only_the_cards_retry(env, tmp_path):
+def test_step4_fallback_prespend_writes_only_the_cards_retry(env, tmp_path, monkeypatch):
     """Live fallback arm: retries[card]=1 lands in BV2_WAKE_STATE, every other key is kept."""
     state = tmp_path / "kanban_boomerang_wake.json"
     state.write_text(json.dumps({"claims": {"b|t_s4|9": {"task_id": "t_s4", "state": "running",
-                                                         "delegation_id": "d1"}},
+                                                         "delegation_id": "d1", "child_session": "c1"}},
                                  "retries": {"t_other": 1}, "future_key": [1]}))
     ctx = run.Ctx.__new__(run.Ctx)
     ctx.live, ctx.timeout, ctx.tick = True, 1.0, 0.05
     rep = run.StepReport(4, "t", "live")
-    os.environ["BV2_WAKE_STATE"] = str(state)
-    try:
-        assert run._prespend_retry(ctx, rep, "t_s4")
-    finally:
-        del os.environ["BV2_WAKE_STATE"]
+    monkeypatch.setenv("BV2_WAKE_STATE", str(state))
+    assert run._prespend_retry(ctx, rep, "t_s4")
     doc = json.loads(state.read_text())
     assert doc["retries"] == {"t_other": 1, "t_s4": 1}
     assert doc["future_key"] == [1] and doc["claims"]["b|t_s4|9"]["state"] == "running"
 
 
-def test_step4_live_prespend_refuses_without_an_explicit_state_file(env):
+def test_step4_live_prespend_refuses_without_an_explicit_state_file(env, monkeypatch):
     """Never default the write to the fleet gateway's own state file."""
+    monkeypatch.delenv("BV2_WAKE_STATE", raising=False)
     ctx = run.Ctx.__new__(run.Ctx)
     ctx.live = True
     rep = run.StepReport(4, "t", "live")
@@ -679,3 +677,26 @@ def test_step3_remote_fork_seat_without_sync_command_is_not_pass(env, monkeypatc
     rc, text = _step3_live_remote_seat(env, monkeypatch, None)
     assert rc == 3, text
     assert "no plan.commands.wirelog_sync for remote seat `sub-9`" in text
+
+
+def test_step4_prespend_retries_when_the_gateway_writes_in_between(env, tmp_path, monkeypatch):
+    """Prism 1c04b69ce0b6: a gateway write between the snapshot and the replace is never discarded."""
+    state = tmp_path / "kanban_boomerang_wake.json"
+    claim = {"task_id": "t_s4", "state": "running", "delegation_id": "d1", "child_session": "c1"}
+    state.write_text(json.dumps({"claims": {"a": claim}, "retries": {}}))
+    monkeypatch.setenv("BV2_WAKE_STATE", str(state))
+    real_mkstemp, fired = run.tempfile.mkstemp, []
+
+    def racing_mkstemp(*a, **k):   # the gateway saves claim B right after the harness took its snapshot
+        if not fired:
+            fired.append(1)
+            state.write_text(json.dumps({"claims": {"a": claim, "b": {"task_id": "t_b"}}, "retries": {}}))
+        return real_mkstemp(*a, **k)
+
+    monkeypatch.setattr(run.tempfile, "mkstemp", racing_mkstemp)
+    ctx = run.Ctx.__new__(run.Ctx)
+    ctx.live, ctx.timeout, ctx.tick = True, 1.0, 0.05
+    assert run._prespend_retry(ctx, run.StepReport(4, "t", "live"), "t_s4")
+    doc = json.loads(state.read_text())
+    assert set(doc["claims"]) == {"a", "b"} and doc["retries"] == {"t_s4": 1}
+

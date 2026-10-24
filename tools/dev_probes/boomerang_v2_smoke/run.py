@@ -1107,7 +1107,10 @@ def _claim_running(path: Path, card: str) -> dict | None:
     except (OSError, ValueError):
         return None
     for entry in (doc.get("claims") or {}).values() if isinstance(doc, dict) else ():
-        if isinstance(entry, dict) and entry.get("task_id") == card and entry.get("state") == "running":
+        # child_session is the gateway's LAST claim write before the child finishes
+        # (kanban_boomerang_wake._note_child_session): after it the state file is quiet.
+        if (isinstance(entry, dict) and entry.get("task_id") == card and entry.get("state") == "running"
+                and entry.get("child_session")):
             return entry
     return None
 
@@ -1126,19 +1129,35 @@ def _prespend_retry(ctx: Ctx, rep: StepReport, card: str) -> bool:
         rep.commands.append(shown + "   # dry-run: not written")
         return True
     running = ctx.poll(lambda: _claim_running(path, card), ctx.timeout)
-    rep.check(f"claim for {card} is `running` before the retry is pre-spent", PASS if running else FAIL,
+    rep.check(f"claim for {card} is `running` with its child session recorded before the retry is pre-spent", PASS if running else FAIL,
               f"delegation {running.get('delegation_id')}" if running else f"no running claim in {path}")
     if not running:
         return False
-    doc = json.loads(path.read_text(encoding="utf-8-sig"))
-    retries = doc.get("retries") if isinstance(doc.get("retries"), dict) else {}
-    retries[card] = 1
-    doc["retries"] = retries
-    fd, tmp = tempfile.mkstemp(prefix=".bv2-prespend-", dir=str(path.parent))
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, sort_keys=True)
-    os.replace(tmp, path)
-    readback = json.loads(path.read_text(encoding="utf-8-sig")).get("retries", {}).get(card)
+    # The gateway's writer lock is in-process (threading.Lock), so this cannot share it. Compare-and-swap
+    # instead: build from one snapshot, re-read the bytes just before os.replace and start over if the
+    # gateway wrote in between (Prism 1c04b69ce0b6). The claim being quiet (above) keeps the window empty.
+    for _attempt in range(20):
+        before = path.read_bytes()
+        doc = json.loads(before.decode("utf-8-sig"))
+        retries = doc.get("retries") if isinstance(doc.get("retries"), dict) else {}
+        retries[card] = 1
+        doc["retries"] = retries
+        fd, tmp = tempfile.mkstemp(prefix=".bv2-prespend-", dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, sort_keys=True)
+        if path.read_bytes() != before:
+            os.unlink(tmp)
+            time.sleep(0.2)
+            continue
+        os.replace(tmp, path)
+        break
+    else:
+        rep.check(f"retries[{card}] pre-spent", FAIL, f"{path} kept changing under the compare-and-swap")
+        return False
+    after = json.loads(path.read_text(encoding="utf-8-sig"))
+    readback = after.get("retries", {}).get(card)
+    if set(after.get("claims") or {}) != set(doc.get("claims") or {}):
+        readback = f"claims changed across the write: {sorted(set(after.get('claims') or {}) ^ set(doc.get('claims') or {}))}"
     rep.commands.append(shown + f"   # readback retries[{card}]={readback}")
     rep.check(f"retries[{card}] pre-spent", PASS if readback == 1 else FAIL, f"readback {readback!r}")
     return readback == 1
