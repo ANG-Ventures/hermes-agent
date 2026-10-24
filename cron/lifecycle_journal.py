@@ -429,13 +429,17 @@ def check_vanished_jobs(
         with _jobs_lock():
             _state = jobs_module._jobs_lock_state
             _saved = (getattr(_state, "load_stamp", None),
-                      getattr(_state, "load_baseline", None))
+                      getattr(_state, "load_baseline", None),
+                      getattr(_state, "no_heal", False))
+            # Observe, never repair: the guard must SEE a dropped row, so the store's own
+            # external-drop heal (t_811e92d7) is off for this read.
+            _state.no_heal = True
             try:
                 entries, malformed = read_entries_with_health(
                     window_hours=window_hours)
                 jobs = load_jobs()
             finally:
-                _state.load_stamp, _state.load_baseline = _saved
+                _state.load_stamp, _state.load_baseline, _state.no_heal = _saved
     except Exception as e:
         return VanishedJobReport(status=STATUS_UNAVAILABLE,
                                  window_hours=window_hours,

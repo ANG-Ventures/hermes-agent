@@ -4,8 +4,8 @@
 cron/jobs.json over the live store (a git checkout/restore of the scheduler-owned file; same
 class as the 10-14 and 10-22 rewinds, t_1a2ccffd). Every job created since that blob vanished
 with NO `removed` lifecycle event, and the scheduler's next tick then journalled 25 retention
-`removed` events for the stale completed one-shots the blob brought back. Seven live jobs, three
-with 10-25/10-27/11-02 deadlines, and the integrity watch that would have paged it, were gone.
+`removed` events for the stale completed one-shots the blob brought back. Seven enabled jobs,
+three with 10-25/10-27/11-02 deadlines, were gone.
 
 The store's own removal paths all thread ``removed_ids`` and journal it. The bad path is a
 writer that bypasses the store. The store cannot stop that write, so it refuses the removal

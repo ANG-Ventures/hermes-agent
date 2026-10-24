@@ -1696,7 +1696,7 @@ def load_jobs() -> List[Dict[str, Any]]:
             repair = repair or "invalid repeat.completed normalized"
     # A non-store writer replaced the file and dropped rows the store last wrote (t_811e92d7):
     # refuse that removal by putting them back. Only under the lock, where the save follows.
-    if getattr(_jobs_lock_state, "depth", 0):
+    if getattr(_jobs_lock_state, "depth", 0) and not getattr(_jobs_lock_state, "no_heal", False):
         restored = _external_drops(jobs, pre_read_stamp)
         if restored:
             jobs = jobs + restored
