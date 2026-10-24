@@ -256,3 +256,38 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+
+
+def test_decompose_explicit_board_reads_that_board(kanban_home):
+    """Prism a12a6d915a8b: ``decompose_task(tid, board="beta")`` loads the triage task from beta,
+    not from the ambient board, even when the same id exists on both with different bodies."""
+    kb.create_board("beta")
+    with kbc.connect_closing(board="beta") as conn:
+        tid = kb.create_task(conn, title="beta title", body="BETA-BODY", triage=True)
+    with kbc.connect_closing() as conn:
+        other = kb.create_task(conn, title="default title", body="DEFAULT-BODY", triage=True)
+        conn.execute("UPDATE tasks SET id = ? WHERE id = ?", (tid, other))
+        conn.commit()
+        assert "DEFAULT-BODY" in kb.get_task(conn, tid).body
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test split",
+        "tasks": [{"title": "only", "body": "x", "assignee": "engineer", "parents": []}],
+    })
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload) as call_llm, _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me", board="beta")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    prompt = jsonlib.dumps(call_llm.call_args.kwargs.get("messages") or call_llm.call_args)
+    assert "BETA-BODY" in prompt
+    assert "DEFAULT-BODY" not in prompt
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "triage"  # default's copy untouched

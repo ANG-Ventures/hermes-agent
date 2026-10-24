@@ -62,15 +62,17 @@ def raw_db_pin() -> str:
     return _kb._kanban_path_override("HERMES_KANBAN_DB").strip()
 
 
-def board_db_layout() -> list[tuple[str, Path]]:
+def board_db_layout(home: Optional[Path] = None) -> list[tuple[str, Path]]:
     """``(slug, layout DB path)`` for every board on disk, archived included, ``default`` first.
 
     The set :func:`kanban_db.list_boards` enumerates, resolved from ONE root read: per-board
     ``kanban_home()`` resolution costs ~4 ms a board at the live count (S7 RC-2). A dir named for
-    a slug IS that board's dir; aliases redirect retired names, which have no dir.
+    a slug IS that board's dir; aliases redirect retired names, which have no dir. ``home`` names
+    another Hermes root's registry (an env snapshot of a worker under that root); default: ours.
     """
     _kb = _facade()
-    home = _kb.kanban_home()
+    if home is None:
+        home = _kb.kanban_home()
     out: list[tuple[str, Path]] = [(_kb.DEFAULT_BOARD, home / "kanban.db")]
     root = home / "kanban" / "boards"
     if not root.is_dir():
@@ -115,7 +117,7 @@ def pinned_board_error() -> Optional[str]:
     return _PINNED_BOARD_ERRORS.get(raw) if raw else None
 
 
-def board_named_by_pin(raw: str) -> str:
+def board_named_by_pin(raw: str, *, home: Optional[Path] = None) -> str:
     """The board whose layout DB path is the file ``raw`` names, else :data:`PINNED_SLUG`.
 
     Spelling-blind inverse of ``_board_db_path_ignoring_pin`` (RC-7): compared through
@@ -123,22 +125,26 @@ def board_named_by_pin(raw: str) -> str:
     case-variant spelling of a board's DB names that board. Memoised on (pin, its resolved
     identity, root, boards/ mtime): a new board dir changes the mtime, and a retargeted symlink
     pin changes the identity (Prism 69c969208e42), so a process pays one scan per pin target.
+    ``home`` is the Hermes root whose registry names the pin (Prism f984ec16d458); default: ours.
     """
     _kb = _facade()
     try:
-        root = _kb.boards_root()
+        foreign = home is not None
+        if not foreign:
+            home = _kb.kanban_home()
+        root = home / "kanban" / "boards"
         try:
             stamp = root.stat().st_mtime_ns
         except FileNotFoundError:
             stamp = None
-        key = (raw, _pin_identity(raw), str(_kb.kanban_home()), stamp)
+        key = (raw, _pin_identity(raw), str(home), stamp)
         hit = _PINNED_BOARD_MEMO.get(key)
         if hit is not None:
             return hit
         pin = Path(raw).expanduser()
         found = PINNED_SLUG
         with _kb.enumerating_boards():
-            for slug, path in board_db_layout():
+            for slug, path in (board_db_layout(home) if foreign else board_db_layout()):
                 if _kb._pin_file_agrees(path, pin):
                     found = slug
                     break

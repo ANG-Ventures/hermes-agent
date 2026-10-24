@@ -318,7 +318,7 @@ def decompose_task(
     # the decompose upgrade's default_workdir lookup) can't disagree if a
     # concurrent `boards switch` moves the ambient board mid-call.
     board = board or kb.get_current_board()
-    task, reason = _load_triage_task(task_id)
+    task, reason = _load_triage_task(task_id, board=board)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 

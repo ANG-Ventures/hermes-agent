@@ -33,13 +33,33 @@ def resolve_kanban_worker_chat_identity(
         if pin:
             from hermes_cli.kanban_db_board_registry import board_named_by_pin
 
-            board = board_named_by_pin(pin)
+            board = board_named_by_pin(pin, home=None if env is None else _env_kanban_root(source))
     chat_name = (
         " / ".join(part for part in ("kanban", board, task_id) if part)
         if task_id
         else ""
     )
     return task_id, chat_name
+
+
+def _env_kanban_root(env: Mapping[str, str]):
+    """The Hermes root a described env's board registry lives under (Prism f984ec16d458).
+
+    Same order as ``kanban_db.kanban_home``, read from ``env`` instead of the process: an explicit
+    ``HERMES_KANBAN_HOME``, else the root of its ``HERMES_HOME``. ``None`` (use the process root)
+    only when the env names neither, i.e. it describes this process's own root.
+    """
+    from pathlib import Path
+
+    explicit = (env.get("HERMES_KANBAN_HOME") or "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    home = (env.get("HERMES_HOME") or "").strip()
+    if not home:
+        return None
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root(home=home)
 
 
 def _resolve_current_session_id() -> Optional[str]:

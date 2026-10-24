@@ -168,3 +168,32 @@ def test_dispatcher_env_reaches_chat_q_agent_identity(monkeypatch, tmp_path):
     assert _fake_cli()._init_agent() is True
     assert captured["chat_id"] == "t_identity"
     assert captured["chat_name"] == "kanban / identity-board / t_identity"
+
+
+def test_foreign_root_env_names_its_own_board(monkeypatch, tmp_path):
+    """Prism f984ec16d458: an ``env`` describing a worker under ANOTHER Hermes root resolves its
+    pin against THAT root's board registry, never the process root's."""
+    from hermes_cli.kanban_identity import resolve_kanban_worker_chat_identity
+
+    a_root = tmp_path / "a" / ".hermes"
+    b_root = tmp_path / "b" / ".hermes"
+    for root in (a_root, b_root):
+        root.mkdir(parents=True)
+        root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(b_root))
+    kb.create_board("beta")  # board beta exists ONLY under root b
+    beta_db = b_root / "kanban" / "boards" / "beta" / "kanban.db"
+    assert beta_db.parent.is_dir()
+    monkeypatch.setenv("HERMES_HOME", str(a_root))  # the process root is a
+
+    env = {
+        "HOME": str(tmp_path / "b"),
+        "HERMES_HOME": str(b_root),
+        "HERMES_KANBAN_TASK": "t_12345678",
+        "HERMES_KANBAN_DB": str(beta_db),
+    }
+    chat_id, chat_name = resolve_kanban_worker_chat_identity(env=env)
+    assert chat_id == "t_12345678"
+    assert chat_name == "kanban / beta / t_12345678"
