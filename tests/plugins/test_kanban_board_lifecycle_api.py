@@ -52,16 +52,15 @@ def test_rename_board_keeps_slug(client):
     assert listed["name"] == "Gadget"
 
 
-def test_delete_board_archives_and_reverts_current(client):
+def test_delete_board_archives(client):
     client.post("/api/plugins/kanban/boards", json={"slug": "widget", "name": "Widget"})
     client.post("/api/plugins/kanban/tasks?board=widget", json={"title": "do the thing"})
-    kb.set_current_board("widget")
 
     r = client.delete("/api/plugins/kanban/boards/widget")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["result"]["action"] == "archived"
-    assert body["current"] == "default"
+    assert "current" not in body  # S7 D5: the server keeps no current board
 
     # The switcher shows this path, so it must point at real recoverable data.
     archived = Path(body["result"]["new_path"])
@@ -85,3 +84,26 @@ def test_delete_default_board_is_refused(client):
     r = client.delete("/api/plugins/kanban/boards/default")
     assert r.status_code == 400
     assert "default" in r.json()["detail"]
+
+
+# --- S7 D5: no server-side current board ------------------------------------------------------
+
+def test_board_query_omitted_is_400_under_refuse_and_default_under_the_switch(client, tmp_path):
+    """Mutation: let ``_resolve_board(None)`` fall through to an ambient board -> the 400 is 200."""
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 400, r.text
+    assert "board required" in r.json()["detail"]
+    (tmp_path / ".hermes" / "config.yaml").write_text("kanban:\n  bare_verb: default\n", encoding="utf-8")
+    assert client.get("/api/plugins/kanban/board").status_code == 200
+    assert client.get("/api/plugins/kanban/board?board=default").status_code == 200
+
+
+def test_set_current_endpoint_and_field_are_gone(client):
+    created = client.post("/api/plugins/kanban/boards", json={"slug": "widget", "switch": True})
+    assert created.status_code == 200, created.text
+    assert "current" not in created.json()
+    assert client.post("/api/plugins/kanban/boards/widget/switch").status_code in (404, 405)
+    listed = client.get("/api/plugins/kanban/boards").json()
+    assert "current" not in listed
+    assert all("is_current" not in b for b in listed["boards"])
+    assert kb.get_current_board() == kb.DEFAULT_BOARD
