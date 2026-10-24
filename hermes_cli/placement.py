@@ -68,6 +68,8 @@ holder ended the lease) or ``expired`` (the TTL lapsed without renew/release: th
 task_runs.claim_expires). ``band`` is the chosen host's band at decision time WITH live reservations (ok = room
 for one more, warm = room for this one only); each ``hosts.<h>`` row carries its own. A job waiting on the same
 refusal writes one ``deferred`` line, then again only when the reason changes or every DEFERRED_REEMIT_S.
+``admitted`` and ``deferred`` lines carry ``admission_mode`` (legacy | utilization: the mode that decided them;
+None for a pin booked without a decision), so a readback reads the mode off the ledger (t_f73c65a8).
 
 Footprint axes: ram_gb and threads gate every pick; scratch_gb gates when the sample measures
 ``scratch_free_gb`` (host-pressure.json does; a direct probe does not) and is otherwise only reserved; gpu_mb is
@@ -1176,6 +1178,7 @@ class Decision:
     kept_previous: bool = False
     rule: str = ""                           # which layer picked: affinity | continuity | priority | core_class:<c> | default_first | headroom
     scorer: str = DEFAULT_SCORER             # which scorer produced it (v2 adds denominators to as_row)
+    mode: str = ""                           # admission mode that decided it (legacy | utilization; t_f73c65a8)
 
     def lines(self, table: HostTable) -> List[str]:
         return [r.line(table.hosts[r.host]) for r in self.rows]
@@ -1296,7 +1299,7 @@ def choose(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sampl
     v2 = table.scorer == "v2" and not util     # utilization replaces the scorer's cpu axis (admission.score ranks)
 
     def done(d: Decision) -> Decision:
-        d.scorer = table.scorer
+        d.scorer, d.mode = table.scorer, mode
         return d
     if not rows:
         return done(Decision(None, "no_candidates", rows, consumer, fp))
@@ -1704,7 +1707,10 @@ def _reserve_unlocked(p: Path, host: str, consumer: str, fp: Footprint, *, ttl_s
     rows.append(row)
     _write_ledger(p, {"schema": SCHEMA, "rows": rows})
     chosen = next((r for r in decision.rows if r.host == host), None) if decision else None
+    # admission_mode on every decision line, so a readback reads the mode off the ledger (t_f73c65a8); a pin booked
+    # without a decision carries None (no mode decided it)
     extra = {"rule": decision.rule, "hosts": decision.as_row()["hosts"]} if decision else {}
+    extra["admission_mode"] = (decision.mode or None) if decision else None
     _append_admissions(admissions_path_for(p, admissions_path), expired + [_ledger_line(
         at=now, host=host, consumer=consumer, job_id=job_id, fp=fp, decision="admitted", reservation=rid,
         band=band_of(chosen, fp) if chosen else None, ttl_s=float(ttl_s),
@@ -1732,7 +1738,7 @@ def _deferred_line(ap: Path, d: Decision, *, job_id, now: float) -> List[dict]:
         _DEFERRED_SEEN.clear()
     _DEFERRED_SEEN[key] = (sig, now)
     return [_ledger_line(at=now, host=None, consumer=d.consumer, job_id=job_id, fp=d.footprint, decision="deferred",
-                         reason=reason, hosts=d.as_row()["hosts"])]
+                         reason=reason, hosts=d.as_row()["hosts"], admission_mode=d.mode or None)]
 
 
 def admit(table: HostTable, consumer: str, samples: Mapping[str, Optional[Sample]], *, ttl_s: float,

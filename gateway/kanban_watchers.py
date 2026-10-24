@@ -3895,6 +3895,7 @@ class GatewayKanbanWatchersMixin:
         # wall-clock start of each board's current zero-spawn streak while
         # the gate had allowance (published to `hermes kanban diagnostics`).
         from hermes_cli import kanban_load_gate as _klg
+        from hermes_cli import kanban_placement_reasons as _kpr
         _board_rr = {"tick": 0}
         _board_starved_since: dict[str, float] = {}
 
@@ -4155,7 +4156,7 @@ class GatewayKanbanWatchersMixin:
                 _paused = _spawn_paused
                 if _paused is None and _limit is not None and _limit <= 0:
                     _paused = (
-                        f"load gate: this tick's allowance of {_allowance} "
+                        f"{_kpr.QUOTA_SPENT_PREFIX}{_allowance} "
                         f"spawn(s) is used by other boards"
                     )
                 # spawn_limit is an int whenever the gate is enabled (0 when

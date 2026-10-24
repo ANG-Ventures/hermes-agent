@@ -114,6 +114,16 @@ PROVENANCE_LINK_KINDS = frozenset({"derived-from"})
 
 # Phase 2a (t_7133e03d): hold codes written by the dispatcher itself.
 LOCAL_FULL = "local_full"
+# What bound a ``local_full`` hold (t_f73c65a8), so "local_full while a host has
+# headroom" is checkable from the event alone: ``gate`` = the host load gate
+# paused or allowed no new local worker this tick; ``quota`` = the gate had
+# room but this board's share of it was spent (by other boards, by this
+# board's own spawns this tick, or held back for a review row).
+LOCAL_BINDING_GATE = "gate"
+LOCAL_BINDING_QUOTA = "quota"
+# The board-split pause the gateway writes when other boards spent the shared
+# allowance; classified as ``quota``, every other pause as ``gate``.
+QUOTA_SPENT_PREFIX = "load gate: this tick's allowance of "
 POOL_UNAVAILABLE = "pool_unavailable"
 POOL_FULL = "pool_full"
 BOARD_UNHOSTABLE = "board_unhostable"
@@ -211,6 +221,26 @@ def route_first(kanban_cfg: Any) -> bool:
     if isinstance(val, bool):
         return val
     return str(val).strip().lower() not in ("false", "off", "no", "0")
+
+
+def local_full_binding(spawn_paused, local_budget, ready_local, local_spawned) -> "dict | None":
+    """``{binding, binding_detail}`` for this tick's ``local_full`` holds, or
+    None when no local budget bound them (gate disabled: local is never full).
+    Read at the end of the tick: ``local_spawned`` only grows, and a row is
+    held local_full only once it reached ``ready_local``."""
+    if spawn_paused:
+        text = str(spawn_paused)
+        cause = LOCAL_BINDING_QUOTA if text.startswith(QUOTA_SPENT_PREFIX) else LOCAL_BINDING_GATE
+        return {"binding": cause, "binding_detail": text}
+    if local_budget is None:
+        return None
+    if local_budget <= 0:
+        return {"binding": LOCAL_BINDING_GATE, "binding_detail": "gate allowance 0 this tick"}
+    held = local_budget - (ready_local if ready_local is not None else local_budget)
+    detail = f"{local_spawned}/{local_budget} local spawns this tick"
+    if held > 0:
+        detail += f" ({held} held for review)"
+    return {"binding": LOCAL_BINDING_QUOTA, "binding_detail": detail}
 
 
 def take_refusal_code(refusal) -> "str | None":
