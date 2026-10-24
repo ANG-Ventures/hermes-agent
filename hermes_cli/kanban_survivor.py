@@ -5,7 +5,10 @@ against a published ancestor, or a self-contained bundle when none survives.
 """
 from __future__ import annotations
 
+import concurrent.futures
+import contextvars
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -1141,8 +1144,13 @@ def _published_refs(repo, workspace, storage_cache=None):
     for remote in remotes:
         if not _durable_remote(repo, remote, workspace, storage_cache):
             continue
+        timeout = _probe_timeout(30)
+        if timeout <= 0:
+            # The `preserve()` probe budget is spent: an unlisted remote only
+            # loses the cheaper survivor forms, never the captured bytes.
+            continue
         try:
-            advertised = _git(repo, "ls-remote", "--heads", remote, check=False)
+            advertised = _git(repo, "ls-remote", "--heads", remote, check=False, timeout=timeout)
         except subprocess.TimeoutExpired:
             continue
         if advertised.returncode:
@@ -1439,12 +1447,15 @@ def _content_advisory(repo, head, published, *, budget=_CONTENT_SCAN_BUDGET):
                 return None
             url = _git(repo, "remote", "get-url", ref["remote"]).stdout.decode().strip()
             fetch_env = dict(env, KANBAN_FETCH_URL=url)
+            timeout = _probe_timeout(120)
+            if timeout <= 0:
+                return None
             try:
                 fetched = _git(
                     probe, "--config-env=remote.candidate.url=KANBAN_FETCH_URL",
                     "fetch", "--no-tags", "--depth", str(_CONTENT_SCAN_DEPTH + 1),
                     "candidate", f"+refs/heads/{ref['branch']}:refs/heads/candidate",
-                    env=fetch_env, check=False, timeout=120,
+                    env=fetch_env, check=False, timeout=timeout,
                 )
             except subprocess.TimeoutExpired:
                 continue
@@ -1683,15 +1694,10 @@ def _recorded_base(repo, recorded, published, base):
     # branch can reach it. Prove reachability from the live tip instead.
     # Network only here, after every cheap local check passed; one fetch per
     # matched branch (normally one), never per published head, and ONE
-    # overall budget: a hung remote must not cost 120 s per matched branch.
-    deadline = time.monotonic() + _LIVE_BASE_TIMEOUT
-    for ref in sorted(matched):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        remote, branch = advertised[ref]
-        if _reachable_from_live(repo, remote, branch, recorded, timeout=remaining):
-            return recorded
+    # overall budget: a hung remote must not cost 120 s per matched branch,
+    # nor starve a healthy branch behind it (`_first_live`).
+    if _first_live(repo, [advertised[ref] for ref in matched], recorded):
+        return recorded
     return base
 
 
@@ -1741,20 +1747,84 @@ def _live_ancestor_survivor(repo, head, published):
     if listed.returncode:
         return None
     matched = set(advertised).intersection(listed.stdout.decode("utf-8", "replace").splitlines())
-    deadline = time.monotonic() + _LIVE_BASE_TIMEOUT
-    for name in sorted(matched):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        ref = advertised[name]
-        if _reachable_from_live(repo, ref["remote"], ref["branch"], head, timeout=remaining):
-            return dict(ref, head=head, matched_by="live-ancestor")
-    return None
+    names = {(advertised[name]["remote"], advertised[name]["branch"]): name for name in matched}
+    found = _first_live(repo, names, head)
+    return dict(advertised[names[found]], head=head, matched_by="live-ancestor") if found else None
 
 
-#: TOTAL budget for proving the recorded base against live branches. A timeout just
-#: keeps the older published base: a larger patch, never a lost one.
+#: TOTAL budget for one site's live-tip probes (`_recorded_base`,
+#: `_live_ancestor_survivor`, `_require_live_boundary`). A timeout just keeps
+#: the older published base: a larger patch, never a lost one.
 _LIVE_BASE_TIMEOUT = 120
+#: Live-tip probes run concurrently, at most this many at once, so a hung
+#: first candidate cannot starve a healthy one behind it (Prism dbe35c381e8f):
+#: each probe starts with the whole remaining site budget as its floor.
+_LIVE_PROBE_WORKERS = 4
+#: ONE network budget per `preserve()` call, threaded through every live probe
+#: (`ls-remote`, live-tip fetch, content-advisory fetch) of every repository.
+#: Without it one repo could spend 3 x 120 s of probes + 30 s ls-remote per
+#: remote + 300 s `_snapshot`, past the 420 s `kanban_complete` tool ceiling.
+#: 90 s + `_SNAPSHOT_TIMEOUT` keeps the network share of a call under it.
+_PROBE_BUDGET = 90
+_probe_deadline = contextvars.ContextVar("kanban_survivor_probe_deadline", default=None)
+
+
+def _probe_end(budget):
+    """Monotonic end of a ``budget``-second probe, clamped to the `preserve()` deadline."""
+    end = time.monotonic() + budget
+    overall = _probe_deadline.get()
+    return end if overall is None else min(end, overall)
+
+
+def _probe_timeout(default):
+    """``default`` seconds clamped to the `preserve()` probe deadline; <= 0 means skip."""
+    return _probe_end(default) - time.monotonic()
+
+
+def _first_live(repo, candidates, sha):
+    """The first ``(remote, branch)`` whose LIVE tip contains ``sha``, else None.
+
+    One wall-clock site budget (`_LIVE_BASE_TIMEOUT`, clamped to the
+    `preserve()` deadline) covers every candidate. Up to `_LIVE_PROBE_WORKERS`
+    probes run at once and each starts with all of the time still left, so a
+    hung candidate costs its own slot, never a healthy sibling's chance.
+    Remotes are interleaved, so one hung remote's many branches cannot fill
+    every slot ahead of another remote. The first proof wins; probes still in
+    flight are abandoned (each is bounded by its own timeout and writes only
+    its throwaway probe repository).
+    """
+    by_remote = {}
+    for remote, branch in sorted(candidates):
+        by_remote.setdefault(remote, []).append((remote, branch))
+    order = [pair for rank in itertools.zip_longest(*by_remote.values()) for pair in rank if pair]
+    if not order:
+        return None
+    end = _probe_end(_LIVE_BASE_TIMEOUT)
+
+    def probe(pair):
+        # The deadline is read when the probe STARTS, not when it was queued.
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return False
+        return _reachable_from_live(repo, pair[0], pair[1], sha, timeout=remaining)
+
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(_LIVE_PROBE_WORKERS, len(order)), thread_name_prefix="kanban-live-probe")
+    try:
+        futures = {pool.submit(probe, pair): pair for pair in order}
+        pending = set(futures)
+        while pending:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            done, pending = concurrent.futures.wait(
+                pending, timeout=left, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                if not future.exception() and future.result():
+                    return futures[future]
+        return None
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _reachable_from_live(repo, remote, branch, sha, *, timeout=_LIVE_BASE_TIMEOUT):
@@ -1925,25 +1995,20 @@ def _require_live_boundary(repo, published):
         return
     # Same filter as `_snapshot`: a stale line naming an absent object is no boundary.
     boundary = _present_commits(repo, sorted(set(path.read_text().split())))
-    advertised = {f"refs/remotes/{ref['remote']}/{ref['branch']}": ref for ref in published}
-    deadline = time.monotonic() + _LIVE_BASE_TIMEOUT
+    advertised = {f"refs/remotes/{ref['remote']}/{ref['branch']}": (ref["remote"], ref["branch"])
+                  for ref in published}
     for sha in boundary:
         listed = _git(repo, "for-each-ref", "--contains", sha, "--format=%(refname)",
                       "refs/remotes", check=False)
         matched = (set(advertised).intersection(listed.stdout.decode("utf-8", "replace").splitlines())
                    if listed.returncode == 0 else set())
-        proven = False
-        for name in sorted(matched):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            ref = advertised[name]
-            if _reachable_from_live(repo, ref["remote"], ref["branch"], sha, timeout=remaining):
-                proven = True
-                break
-        if not proven:
+        # `_first_live`: a hung first candidate must not starve a healthy one
+        # into a false refusal (Prism dbe35c381e8f).
+        if not _first_live(repo, [advertised[name] for name in matched], sha):
+            spent = (" (the live-probe budget of this complete ran out, so a slow remote may be why)"
+                     if _probe_timeout(_LIVE_BASE_TIMEOUT) <= 0 else "")
             raise _BoundaryUnproven(
-                f"shallow boundary {sha} is not reachable from any durable remote, so a bundle "
+                f"shallow boundary {sha} is not reachable from any durable remote{spent}, so a bundle "
                 f"(which omits the boundary tree) could never restore; push the work to a "
                 f"durable remote, or add a remote whose live branch still contains {sha}, and retry"
             )
@@ -2984,7 +3049,28 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
     ``content_survivor`` is a ref :func:`kanban_supersede_content.verify` already
     proved: the card's own PR content is on the default branch (t_8035c8af). It
     stands in for an operator ``--survivor-ref`` when none is given.
+
+    Every live network probe of the call shares ONE deadline (`_PROBE_BUDGET`),
+    so a complete stays under the 420 s tool ceiling however many repositories
+    and remotes the workspace holds. A nested call keeps the outer deadline.
     """
+    end = time.monotonic() + _PROBE_BUDGET
+    outer = _probe_deadline.get()
+    token = _probe_deadline.set(end if outer is None else min(end, outer))
+    try:
+        return _preserve(conn, task_id, metadata, cleanup=cleanup, workspace=workspace,
+                         survivor_ref=survivor_ref, survivor_pr=survivor_pr,
+                         survivor_unbound=survivor_unbound, evidence=evidence,
+                         survivor_none=survivor_none, survivor_reason=survivor_reason,
+                         content_survivor=content_survivor)
+    finally:
+        _probe_deadline.reset(token)
+
+
+def _preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
+              survivor_ref=None, survivor_pr=None, survivor_unbound=False, evidence=(),
+              survivor_none=False, survivor_reason=None, content_survivor=None):
+    """`preserve`'s body, run inside its probe deadline."""
     try:
         bases, held, previous = _state(conn, task_id)
         if not isinstance(bases, dict) or not (previous is None or isinstance(previous, dict)):
