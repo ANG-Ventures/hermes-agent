@@ -56,6 +56,9 @@ ROLE = "kanban-worker"
 SSH_USER = "kanbanw"
 ROLES_FILE = "fleet-roles.json"
 SIDECAR_FILE = "kanban-pool.json"
+# Roles that are membership only (t_940fc400): ``{}``, or a legacy ``{"slots": N}``
+# until hermes-home drops the count (t_1acfaa85). Every other role keeps its count.
+COUNT_FREE_ROLES = frozenset({"ci-runner"})
 # Per-worker-host SSH reach matrix (card t_1e9ea7e9): written daily by the
 # hermes-home no_agent cron ``kanban-reach-matrix`` (``ssh -o BatchMode=yes
 # <alias> true`` from EVERY worker host, rc recorded), read here fail-closed.
@@ -246,8 +249,9 @@ def _pct(value) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and 0 < value <= 1
 
 
-def parse_roles(doc) -> Dict[str, Tuple[Dict[str, int], str]]:
-    """``fleet-roles.json`` with the router's validators; raises PoolError."""
+def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
+    """``fleet-roles.json`` with the router's validators; raises PoolError.
+    A ``COUNT_FREE_ROLES`` role may be ``{}`` (parsed as None) or a legacy count."""
     if not isinstance(doc, dict) or set(doc) - _ROLES_TOP:
         raise PoolError("fleet-roles.json: bad top level")
     if isinstance(doc.get("schema"), bool) or doc.get("schema") != 1:
@@ -264,12 +268,17 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, int], str]]:
         roles = row["roles"]
         if not isinstance(roles, dict) or not roles:
             raise PoolError(f"fleet-roles.json: host {hid}: roles must be a non-empty object")
-        parsed: Dict[str, int] = {}
+        parsed: Dict[str, Optional[int]] = {}
         for role, spec in roles.items():
             if not isinstance(role, str) or not _ROLE_RE.fullmatch(role):
                 raise PoolError(f"fleet-roles.json: host {hid}: bad role {role!r}")
+            if role in COUNT_FREE_ROLES and spec == {}:
+                # Membership only (t_940fc400): the per-box allocator owns CI capacity.
+                parsed[role] = None
+                continue
             if not isinstance(spec, dict) or set(spec) != {"slots"}:
-                raise PoolError(f"fleet-roles.json: host {hid}: role {role} must be {{\"slots\": N}}")
+                shape = "{} or {\"slots\": N}" if role in COUNT_FREE_ROLES else "{\"slots\": N}"
+                raise PoolError(f"fleet-roles.json: host {hid}: role {role} must be {shape}")
             slots = spec["slots"]
             if isinstance(slots, bool) or not isinstance(slots, int) or not 1 <= slots <= 64:
                 raise PoolError(f"fleet-roles.json: host {hid}: role {role} slots must be 1..64")
