@@ -275,3 +275,124 @@ def test_shallow_boundary_force_pushed_away_keeps_the_workspace(board, tmp_path)
         kb.complete_task(board, tid)
     assert "not reachable from any durable remote" in str(raised.value)
     assert ws.exists()
+
+
+def _hang_on(branch_name, real, seen):
+    """A `_reachable_from_live` that hangs PAST its timeout on one branch.
+
+    A fetch that ignores its budget is the worst case for a shared budget: it
+    eats the whole site budget and every candidate sorted after it (Prism
+    dbe35c381e8f). Every other branch goes through ``real``.
+    """
+    import time
+
+    def probe(repo, remote, branch, sha, *, timeout):
+        seen.append(branch)
+        if branch == branch_name:
+            time.sleep(timeout + 0.5)
+            return False
+        return real(repo, remote, branch, sha, timeout=timeout)
+    return probe
+
+
+def test_boundary_probe_hung_first_candidate_does_not_starve_a_healthy_one(board, tmp_path,
+                                                                          monkeypatch):
+    """Prism dbe35c381e8f (`_require_live_boundary`): `origin/aaa` sorts before
+    `origin/main` and hangs; the boundary is still proven through main."""
+    import hermes_cli.kanban_survivor as survivor
+    tid, ws, remote, clone = shallow_workspace(board, tmp_path)
+    boundary = git(clone, "rev-parse", "HEAD")
+    # aaa's live tip is remote main's advanced tip (absent locally, so no base is found).
+    git(remote, "update-ref", "refs/heads/aaa", git(remote, "rev-parse", "refs/heads/main"))
+    git(clone, "update-ref", "refs/remotes/origin/aaa", boundary)
+    _commit_work(clone)
+    seen = []
+    monkeypatch.setattr(survivor, "_LIVE_BASE_TIMEOUT", 1)
+    monkeypatch.setattr(survivor, "_reachable_from_live",
+                        _hang_on("aaa", survivor._reachable_from_live, seen))
+    assert kb.complete_task(board, tid)
+    assert kb.latest_run(board, tid).metadata["survivor"]["kind"] == "bundle"
+    assert "main" in seen, seen
+
+
+def test_live_ancestor_hung_first_candidate_does_not_starve_a_healthy_one(board, tmp_path,
+                                                                         monkeypatch):
+    """Prism dbe35c381e8f (`_live_ancestor_survivor`): a clean shallow HEAD is
+    still published through `main` when `aaa`, sorted first, hangs."""
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_canonical_survivor", lambda *a, **k: None)
+    tid, ws, remote, clone = shallow_workspace(board, tmp_path)
+    head = git(clone, "rev-parse", "HEAD")
+    git(remote, "update-ref", "refs/heads/aaa", git(remote, "rev-parse", "refs/heads/main"))
+    git(clone, "update-ref", "refs/remotes/origin/aaa", head)
+    seen = []
+    monkeypatch.setattr(survivor, "_LIVE_BASE_TIMEOUT", 1)
+    monkeypatch.setattr(survivor, "_reachable_from_live",
+                        _hang_on("aaa", survivor._reachable_from_live, seen))
+    assert kb.complete_task(board, tid)
+    ref = kb.latest_run(board, tid).metadata["survivor"]["refs"][0]
+    assert (ref["branch"], ref["matched_by"], ref["head"]) == ("main", "live-ancestor", head)
+
+
+def test_every_live_probe_of_a_complete_shares_one_deadline(board, tmp_path, monkeypatch):
+    """No probe outlives the per-`preserve()` budget (420 s tool ceiling).
+
+    With every live fetch hung and a 120 s site budget, the complete still
+    returns inside `_PROBE_BUDGET` and refuses (fail-closed, workspace kept),
+    naming the spent budget.
+    """
+    import threading
+    import time
+
+    import hermes_cli.kanban_survivor as survivor
+    tid, ws, remote, clone = shallow_workspace(board, tmp_path)
+    _commit_work(clone)
+    monkeypatch.setattr(survivor, "_PROBE_BUDGET", 1.0)
+    budgets, release = [], threading.Event()
+
+    def hung(repo, remote, branch, sha, *, timeout):
+        budgets.append(timeout)
+        release.wait(timeout)
+        return False
+    monkeypatch.setattr(survivor, "_reachable_from_live", hung)
+    started = time.monotonic()
+    try:
+        with pytest.raises(survivor.SurvivorUnavailable) as raised:
+            kb.complete_task(board, tid)
+    finally:
+        release.set()
+    assert time.monotonic() - started < 10
+    assert budgets and max(budgets) <= 1.0, budgets
+    assert "live-probe budget of this complete ran out" in str(raised.value)
+    assert ws.exists()
+
+
+def test_a_spent_complete_budget_skips_ls_remote(tmp_path, monkeypatch):
+    """`_published_refs` must not start a 30 s ls-remote past the deadline."""
+    import time
+
+    import hermes_cli.kanban_survivor as survivor
+    calls = []
+    real = survivor._git
+
+    def spy(repo, *args, **kwargs):
+        if args and args[0] == "ls-remote":
+            calls.append(kwargs.get("timeout"))
+        return real(repo, *args, **kwargs)
+    monkeypatch.setattr(survivor, "_git", spy)
+    monkeypatch.setattr(survivor, "_durable_remote", lambda *a, **k: True)
+    repo = tmp_path / "repo"
+    git(tmp_path, "init", "-q", "-b", "main", str(repo))
+    git(repo, "remote", "add", "origin", str(tmp_path / "nowhere.git"))
+    token = survivor._probe_deadline.set(time.monotonic() - 1)
+    try:
+        assert list(survivor._published_refs(repo, tmp_path)) == []
+    finally:
+        survivor._probe_deadline.reset(token)
+    assert calls == []
+    token = survivor._probe_deadline.set(time.monotonic() + 5)
+    try:
+        list(survivor._published_refs(repo, tmp_path))
+    finally:
+        survivor._probe_deadline.reset(token)
+    assert calls and 0 < calls[0] <= 5
