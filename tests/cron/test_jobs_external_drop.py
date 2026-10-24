@@ -114,3 +114,57 @@ def test_no_shadow_is_a_no_op(store):
     (store / "cron" / "jobs.json").write_text(json.dumps({"jobs": []}))
     get_due_jobs()
     assert load_jobs() == []
+
+
+def test_failed_shadow_refresh_never_publishes_a_stale_trusted_shadow(store, monkeypatch):
+    """Prism 16b999b0035d / 9b425d2b5b82: a pause whose shadow refresh fails must not leave the
+    OLD enabled copy trusted, or a later external drop resurrects the job enabled."""
+    import cron.jobs as cj
+    from cron.jobs import create_job, get_due_jobs, load_jobs, pause_job
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    b = create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+
+    def _boom(*_a, **_k):
+        raise PermissionError("shadow unwritable")
+
+    with monkeypatch.context() as m:
+        m.setattr(cj.shutil, "copyfile", _boom)
+        assert pause_job(b["id"])["enabled"] is False
+    _external_rewrite(store, keep_ids={a["id"]})
+    get_due_jobs()
+    assert _ids(load_jobs()) == [a["id"]]  # nothing trusted to restore from; never b enabled
+
+
+def test_observe_only_repair_keeps_the_recovery_shadow(store):
+    """Prism ebd95708a55e: check_vanished_jobs (no_heal) persisting a normalization repair must
+    not overwrite the shadow with the incomplete list; the next locked read still recovers B."""
+    from cron.jobs import create_job, get_due_jobs, load_jobs
+    from cron.lifecycle_journal import check_vanished_jobs
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    b = create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+    path = store / "cron" / "jobs.json"
+    doc = json.loads(path.read_text())
+    doc["jobs"] = [dict(j, repeat={"times": None, "completed": "bad"}) for j in doc["jobs"]
+                   if j["id"] == a["id"]]
+    path.write_text(json.dumps(doc))
+    check_vanished_jobs()
+    get_due_jobs()
+    assert _ids(load_jobs()) == sorted([a["id"], b["id"]])
+
+
+def test_root_write_hands_shadow_and_stamp_back_to_the_store_owner(store, monkeypatch):
+    """Prism 1ddf5a524dcf: a root CLI save chowns the sidecars back like jobs.json, or the
+    unprivileged gateway cannot read the shadow and silently loses its recovery copy."""
+    import cron.jobs as cj
+    from cron.jobs import create_job
+
+    create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    chowned = []
+    monkeypatch.setattr(cj.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(cj.os, "getegid", lambda: 0)
+    monkeypatch.setattr(cj.os, "chown", lambda p, u, g: chowned.append(str(p)))
+    create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+    names = {p.rsplit("/", 1)[-1] for p in chowned}
+    assert {"jobs.json", ".jobs.shadow.json", ".jobs.shadow.stamp"} <= names

@@ -2056,9 +2056,10 @@ def _invalidate_store_shadow(jobs_file: Path) -> None:
     _unlink_quiet(str(_shadow_paths(jobs_file)[1]))
 
 
-def _write_store_shadow(jobs_file: Path, staged: str) -> None:
-    """Copy the staged payload to the shadow. A copy, never a hardlink: an in-place writer
-    (``git show ref:p > p``) truncates the inode, and a shared inode would rewrite the shadow."""
+def _write_store_shadow(jobs_file: Path, staged: str, owner: Optional[os.stat_result]) -> bool:
+    """Copy the staged payload to the shadow; True only when the shadow now holds it. A copy,
+    never a hardlink: an in-place writer (``git show ref:p > p``) truncates the inode, and a
+    shared inode would rewrite the shadow. *owner*: hand it back like jobs.json (root writer)."""
     shadow, _ = _shadow_paths(jobs_file)
     tmp = None
     try:
@@ -2068,19 +2069,25 @@ def _write_store_shadow(jobs_file: Path, staged: str) -> None:
         os.replace(tmp, shadow)
         tmp = None
         _secure_file(shadow)
+        _preserve_file_ownership(shadow, owner)
+        return True
     except OSError:
         logger.debug("cron store shadow write failed", exc_info=True)
+        return False
     finally:
         _unlink_quiet(tmp)
 
 
-def _write_store_shadow_stamp(jobs_file: Path) -> None:
-    shadow, stamp_path = _shadow_paths(jobs_file)
+def _write_store_shadow_stamp(jobs_file: Path, owner: Optional[os.stat_result]) -> None:
+    """Publish the stamp that makes the shadow trusted. Called only after a successful shadow
+    refresh: a stamp over a stale shadow would resurrect an older copy of a row (16b999b0035d)."""
+    _, stamp_path = _shadow_paths(jobs_file)
     stamp = _jobs_file_stamp(jobs_file)
-    if stamp is None or not shadow.exists():
+    if stamp is None:
         return
     with contextlib.suppress(OSError):
         atomic_write_text(stamp_path, json.dumps(list(stamp)))
+        _preserve_file_ownership(stamp_path, owner)
 
 
 def _journal_removed_ids(ids: Set[str]) -> Set[str]:
@@ -2169,17 +2176,23 @@ def _save_jobs_unlocked(
                 _unlink_quiet(tmp_path)
                 tmp_path = None
                 continue
-            # Shadow (t_811e92d7): drop the stamp FIRST, so a crash anywhere below leaves an
-            # untrusted shadow (load ignores it) rather than a stale trusted one.
-            _invalidate_store_shadow(jobs_file)
-            _write_store_shadow(jobs_file, tmp_path)
+            # Shadow (t_811e92d7): drop the stamp FIRST, so a crash or failed refresh below leaves
+            # an untrusted shadow (load ignores it) rather than a stale trusted one. An observe-only
+            # read (no_heal) that persists a repair leaves shadow AND stamp alone: its payload may
+            # lack the very rows the shadow exists to recover (ebd95708a55e).
+            keep_shadow = getattr(_jobs_lock_state, "no_heal", False)
+            shadow_ok = False
+            if not keep_shadow:
+                _invalidate_store_shadow(jobs_file)
+                shadow_ok = _write_store_shadow(jobs_file, tmp_path, _stat_before)
             # fsync the directory the rename actually landed in (atomic_replace resolves symlinks).
             replaced = Path(atomic_replace(tmp_path, jobs_file))
             tmp_path = None
             fsync_directory(replaced.parent)
             _secure_file(jobs_file)
             _preserve_file_ownership(jobs_file, _stat_before)
-            _write_store_shadow_stamp(jobs_file)
+            if shadow_ok:
+                _write_store_shadow_stamp(jobs_file, _stat_before)
             # Invalidate (never refresh) the stamp: a refresh would let a nested save certify disk
             # against an OUTER caller's stale payload. Later saves take the full merge (fail-safe).
             _record_load_stamp(None)
