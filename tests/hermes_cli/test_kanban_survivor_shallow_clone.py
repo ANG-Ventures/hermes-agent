@@ -193,6 +193,9 @@ def test_a_shallow_capture_that_still_fails_names_the_remedy(board, tmp_path, mo
     # Simulate any future shallow-traversal failure: without the grafts the
     # bundle walks past the boundary exactly as it did before the fix.
     monkeypatch.setattr(survivor, "_borrow_shallow", lambda *a, **k: None)
+    # Without grafts the live-boundary probe also fails; skip it so this pins
+    # the bundle-traversal failure, not the boundary refusal.
+    monkeypatch.setattr(survivor, "_require_live_boundary", lambda *a, **k: None)
     tid, ws, remote, clone = shallow_workspace(board, tmp_path)
     (clone / "work.txt").write_text("unpublished\n")
     git(clone, "add", ".")
@@ -250,7 +253,9 @@ def test_shallow_boundary_on_no_durable_remote_keeps_the_workspace(board, tmp_pa
         kb.complete_task(board, tid)
     message = str(raised.value)
     assert "not reachable from any durable remote" in message, message
-    assert "fetch --unshallow" in message, message
+    # The boundary is gone upstream: `fetch --unshallow` cannot help, so it is not offered.
+    assert "push the work to a durable remote" in message, message
+    assert "fetch --unshallow" not in message, message
     assert ws.exists()
     assert (clone / "work.txt").read_text() == "unpublished\n"
 

@@ -1942,10 +1942,15 @@ def _require_live_boundary(repo, published):
                 proven = True
                 break
         if not proven:
-            raise SurvivorUnavailable(
+            raise _BoundaryUnproven(
                 f"shallow boundary {sha} is not reachable from any durable remote, so a bundle "
-                f"(which omits the boundary tree) could never restore"
+                f"(which omits the boundary tree) could never restore; push the work to a "
+                f"durable remote, or add a remote whose live branch still contains {sha}, and retry"
             )
+
+
+class _BoundaryUnproven(SurvivorUnavailable):
+    """`_require_live_boundary` refused; its message already names the remedy."""
 
 
 _QUALIFIER = re.compile(r"[^:?#=]+=")
@@ -3340,7 +3345,9 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # Anything else re-raises unchanged.
                 _explain_dead_worktree_stub(repo, key, bases)
                 _explain_broken_object_store(repo, key, workspace, bases)
-                _explain_shallow(repo, key, str(exc))
+                if not isinstance(exc, _BoundaryUnproven):
+                    # `fetch --unshallow` cannot restore a boundary the remote lost.
+                    _explain_shallow(repo, key, str(exc))
                 raise
             if ref:
                 refs.append(dict(ref, repository=key))
