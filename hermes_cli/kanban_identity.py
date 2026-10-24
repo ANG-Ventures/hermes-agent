@@ -26,7 +26,14 @@ def resolve_kanban_worker_chat_identity(
     """Return ``(chat_id, chat_name)`` from the worker's pinned environment."""
     source = os.environ if env is None else env
     task_id = (source.get("HERMES_KANBAN_TASK") or "").strip()
-    board = (source.get("HERMES_KANBAN_BOARD") or "").strip()
+    board = ""
+    if task_id:
+        # S7: the board is derived from the DB pin, never read from a slug env var.
+        pin = (source.get("HERMES_KANBAN_DB") or "").strip()
+        if pin:
+            from hermes_cli.kanban_db_board_registry import board_named_by_pin
+
+            board = board_named_by_pin(pin)
     chat_name = (
         " / ".join(part for part in ("kanban", board, task_id) if part)
         if task_id

@@ -8114,8 +8114,7 @@ def _default_spawn(
     the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
 
     ``board`` pins the child's kanban context to that board: the child's
-    ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
-    vars all resolve to the same board the dispatcher claimed the task
+    ``HERMES_KANBAN_DB`` / workspaces_root env vars both resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
     """
     import subprocess
@@ -8308,11 +8307,8 @@ def _default_spawn(
     env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb.workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
-    # Board slug — the final defense-in-depth pin. If the worker ever
-    # resolves kanban paths without the DB / workspaces env vars, the
-    # board slug still forces it to the right directory.
+    # No board slug env (S7): the worker derives its board from the DB pin.
     resolved_board = _kb._normalize_board_slug(board) or _kb.get_current_board()
-    env["HERMES_KANBAN_BOARD"] = resolved_board
     # K1 (option C): a delegations-board card is a background delegate_task
     # unit. Keyed on the slug constant, never board.json.
     delegation_unit = _kdb.is_delegations_board(resolved_board)

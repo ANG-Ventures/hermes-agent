@@ -3371,7 +3371,7 @@ def _assert_live_board_tree_write_allowed(path: Path) -> None:
     ``connect()``'s guard only sees ``kanban.db``. ``create_board()`` writes
     ``board.json`` (and mkdirs the board dir) BEFORE it reaches ``connect()``,
     so a refused create still left a board that ``list_boards()`` surfaces;
-    ``set_current_board()`` / ``remove_board()`` never touch the DB at all.
+    ``remove_board()`` never touches the DB at all.
     That is how ten fixture boards (alpha, curr, spawntest, slug-immutable, …)
     landed in the live ``kanban/boards/`` on 2026-09-22 (card t_216b74e0).
     Same production-root list and R1/R2 predicate as the DB guard, and the same
