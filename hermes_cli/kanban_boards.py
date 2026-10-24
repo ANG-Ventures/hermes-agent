@@ -1,4 +1,4 @@
-"""``hermes kanban boards …`` — board directories, the ``current`` pointer and ``board.json``.
+"""``hermes kanban boards …`` — board directories and ``board.json``. There is no current board (S7).
 Filesystem-only, so every action works before ``kanban init`` and must ignore the shared
 ``--board`` task-routing override.
 """
@@ -53,7 +53,7 @@ def _board_slug_arg(args: argparse.Namespace, cmd: str, *, must_exist: bool) -> 
 
 def _cmd_boards_list(args: argparse.Namespace) -> int:
     boards = kb.list_boards(include_archived=bool(getattr(args, "all", False)))
-    current = kb.get_current_board()
+    current = _scoped_board(args)
     # Enumeration: the enrich loop asks every board on disk for its counts; scoping
     # the loop body keeps any future per-board call added here covered by construction.
     for b in kb.enumerating_each(boards):
@@ -70,9 +70,10 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
         marker = "●" if b["is_current"] else " "
         name = (b.get("name") or "") + (" [archived]" if b.get("archived") else "")
         print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {_fmt_counts(b['counts'] or {}, '(empty)')}")
-    print(f"\nCurrent board: {current}")
+    if current:
+        print(f"\nThis call is scoped to: {current}")
     if len(boards) > 1:
-        print("Switch boards with `hermes kanban boards switch <slug>`.")
+        print("Address a board with `hermes kanban --board <slug> <verb>`.")
     return 0
 
 
@@ -88,11 +89,7 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
     print(f"Board {meta['slug']!r} {'already exists' if already else 'created'}.\n"
           f"  Display name: {meta.get('name', '')}\n"
           f"  DB path:      {meta['db_path']}")
-    if getattr(args, "switch", False):
-        kb.set_current_board(meta["slug"])
-        print(f"  Switched to {meta['slug']!r}.")
-    else:
-        print(f"  Use `hermes kanban boards switch {meta['slug']}` to make it current.")
+    print(f"  Address it with `hermes kanban --board {meta['slug']} <verb>`.")
     return 0
 
 
@@ -113,25 +110,26 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_boards_switch(args: argparse.Namespace) -> int:
-    normed, rc = _board_slug_arg(args, "switch", must_exist=False)
-    if rc:
-        return rc
-    if not kb.board_exists(normed):
-        return _err(
-            f"kanban boards switch: board {normed!r} does not exist. "
-            f"Create it with `hermes kanban boards create {normed}`."
-        )
-    kb.set_current_board(normed)
-    print(f"Active board is now {normed!r}.")
-    return 0
+def _scoped_board(args: argparse.Namespace) -> Optional[str]:
+    """The board ``boards show``/``list`` report: ``--board`` or the DB pin (S7 D2 steps 1-2), never
+    a pointer. ``None`` when neither names one."""
+    explicit = getattr(args, "board", None)
+    if explicit is not None:
+        return kb._normalize_board_slug(explicit) or None
+    return kb.pinned_board()
 
 
 def _cmd_boards_show(args: argparse.Namespace) -> int:
-    current = kb.get_current_board()
+    try:
+        current = _scoped_board(args)
+    except ValueError as exc:
+        return _err(f"kanban boards show: {exc}", 2)
+    if not current:
+        print("no board pinned; pass --board <slug> (boards: hermes kanban boards list)")
+        return 0
     meta = kb.read_board_metadata(current)
     counts = _board_task_counts(current)
-    print(f"Current board: {current}\n  Display name: {meta.get('name', '')}")
+    print(f"Board: {current}\n  Display name: {meta.get('name', '')}")
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
     print(f"  DB path:      {meta['db_path']}\n"
@@ -164,7 +162,7 @@ def _cmd_boards_export(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_transfer
     from hermes_cli.sizefmt import format_bytes
 
-    slug = args.slug or kb.get_current_board()
+    slug = args.slug
     output = args.output or f"{slug}.tar.gz"
     try:
         res = kanban_transfer.export_board(
@@ -188,7 +186,7 @@ def _cmd_boards_import(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_transfer
 
     try:
-        res = kanban_transfer.import_board(args.archive, args.as_slug, activate=args.switch)
+        res = kanban_transfer.import_board(args.archive, args.as_slug)
     except (OSError, ValueError) as exc:
         return _err(f"kanban boards import: {exc}")
     if _json_out(args, res):
@@ -199,10 +197,7 @@ def _cmd_boards_import(args: argparse.Namespace) -> int:
     print(f"  Path:  {res['path']}\n  Tasks: {res['counts']['tasks']}")
     for warning in res["warnings"]:
         print(f"  Note:  {warning}")
-    if res["activated"]:
-        print(f"  Active board is now {res['board']!r}.")
-    else:
-        print(f"  Switch to it with `hermes kanban boards switch {res['board']}`.")
+    print(f"  Address it with `hermes kanban --board {res['board']} <verb>`.")
     return 0
 
 
@@ -210,7 +205,6 @@ _BOARD_HANDLERS = {
     "list": _cmd_boards_list, "ls": _cmd_boards_list,
     "create": _cmd_boards_create, "new": _cmd_boards_create,
     "rm": _cmd_boards_rm, "remove": _cmd_boards_rm, "delete": _cmd_boards_rm,
-    "switch": _cmd_boards_switch, "use": _cmd_boards_switch,
     "show": _cmd_boards_show, "current": _cmd_boards_show,
     "rename": _cmd_boards_rename,
     "set-default-workdir": _cmd_boards_set_default_workdir,
