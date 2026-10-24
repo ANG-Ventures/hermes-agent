@@ -222,10 +222,17 @@ def test_flat_form_head_reads_legacy_routed_pr(board, monkeypatch):
 
 # --- --priority accepts p0..p3; the argparse refusal ends on the cause (2026-10-24) -------------
 
-@pytest.mark.parametrize("text,expected", [("p0", 3), ("P1", 2), ("p2", 1), ("p3", 0), ("7", 7), ("-2", -2)])
+@pytest.mark.parametrize("text,expected", [("p0", 300), ("P1", 200), ("p2", 100), ("p3", 0), ("7", 7), ("-2", -2)])
 def test_priority_value_accepts_tiers_and_ints(text, expected):
     from hermes_cli.kanban_parser import priority_value
     assert priority_value(text) == expected
+
+
+def test_p0_sorts_above_every_live_priority_shape():
+    """A p0 card must be dispatched first; the fleet's measured scale tops out at 300 (2026-10-24)."""
+    from hermes_cli.kanban_parser import _P_TIERS, priority_value
+    assert priority_value("p0") >= 300 and priority_value("p0") > priority_value("80")
+    assert list(_P_TIERS.values()) == sorted(_P_TIERS.values(), reverse=True)
 
 
 def test_priority_value_refuses_garbage_with_both_shapes_named():
@@ -242,7 +249,7 @@ def test_create_with_tier_priority_is_accepted(board, monkeypatch):
     assert "usage error" not in out, out
     with kb.connect_closing() as conn:
         row = conn.execute("SELECT priority FROM tasks WHERE title = ?", ("tier prio card",)).fetchone()
-    assert row is not None and row[0] == 1
+    assert row is not None and row[0] == 100
 
 
 def test_argparse_refusal_puts_the_cause_on_the_last_line(board, monkeypatch):

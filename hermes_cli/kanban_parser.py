@@ -122,12 +122,15 @@ _WHY = _arg("--why", action="store_true",
 _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
-_P_TIERS = {"p0": 3, "p1": 2, "p2": 1, "p3": 0}
+# Tiers sit on the fleet's live scale (store ORDER BY priority DESC): 0 is the default/normal
+# pile, ~80 is the ready pile, 100-300 is operator-urgent (measured 2026-10-24 on kanban.db).
+# A p0 must sort ABOVE every existing card, so it is 300, not a small ordinal (Prism P1 f02195f23922).
+_P_TIERS = {"p0": 300, "p1": 200, "p2": 100, "p3": 0}
 
 
 def priority_value(text: str) -> int:
     """``--priority`` accepts the signed int the store keeps (higher = first) OR a
-    ``p0``..``p3`` tier (the orchestrator vocabulary; p0 = highest). An operator who
+    ``p0``..``p3`` tier (p0=300, p1=200, p2=100, p3=0: the fleet's live scale, p0 = highest). An operator who
     types ``--priority p2`` against an int-only flag gets a refusal whose last line is
     the create schema, which never mentions ``--priority`` -- the real cause scrolls off
     (2026-10-24, three refused creates in a row on the vegas-theft board)."""
