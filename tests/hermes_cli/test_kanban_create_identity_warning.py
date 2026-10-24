@@ -35,7 +35,7 @@ def child_env(tmp_path):
 
 def _create(env: dict, title: str) -> subprocess.CompletedProcess:
     proc = subprocess.run(
-        [sys.executable, "-m", "hermes_cli.main", "kanban", "create", title,
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "--board", "default", "create", title,
          "--assignee", "worker1", "--home", "operator"],
         env=env, capture_output=True, text=True, timeout=180, cwd=str(REPO))
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
