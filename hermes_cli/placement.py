@@ -4,7 +4,8 @@ VENDORED from hermes-home ``scripts/lib/placement.py`` (re-vendored whole @ d74c
 work estimator, t_9e395789 / t_82e15796; sha256 54c757ebc03bc739cf4872af5ae6bf1376b89fa49950e26ac6b2ac085bd933b8; earlier
 re-vendors t_da6f84f7, t_39a267cb; first vendored @ 2fe117cbcb, hermes-home#4462) for the kanban dispatcher (t_d6ce856e)
 and its alloc_client route (t_4187c8f1): the fork may not import hermes-home code. The ONLY local changes are
-``fleet_root()`` plus ``encoding="utf-8"`` on two ``open()`` calls (the fork's PLW1514 lint);
+``fleet_root()`` plus ``encoding="utf-8"`` on two ``open()`` calls (the fork's PLW1514 lint), and, until hermes-home
+mirrors it, t_bc197d33's record_usage gpu-axis check + loud admission_mode parse failure;
 ``tests/hermes_cli/test_kanban_headroom_placement.py`` checks the rest against the canonical file.
 ``hermes_cli/admission.py`` and ``hermes_cli/work_estimate.py`` are the same bytes as hermes-home
 ``scripts/lib/admission.py`` / ``scripts/lib/work_estimate.py`` @ d74c191170.
@@ -1370,10 +1371,11 @@ _FLOW_KANBAN = re.compile(r"^kanban:[ \t]*\{(.*)\}[ \t]*(?:#.*)?$")
 _FLOW_ADMISSION = re.compile(r"(?:^|,)[ \t]*admission:[ \t]*['\"]?([A-Za-z_-]*)['\"]?[ \t]*(?:,|$)")
 
 
-def _parse_admission(text: str) -> str:
+def _parse_admission(text: str, source: str = "config.yaml") -> str:
     """``kanban.admission`` from config.yaml text. PyYAML when importable (the same parse the other config readers
     do); else a stdlib reader of the top-level ``kanban:`` mapping's DIRECT child at whatever indent the mapping uses,
-    and of the flow form ``kanban: {admission: x}`` (Prism 7ca95688be5a / 39c7eb0a3015)."""
+    and of the flow form ``kanban: {admission: x}`` (Prism 7ca95688be5a / 39c7eb0a3015). A file that does not parse
+    reads legacy and says so on stderr (once per file version: admission_mode caches the verdict)."""
     try:
         import yaml  # noqa: PLC0415  (optional: launchd hooks run /usr/bin/python3 without it)
     except ImportError:
@@ -1381,7 +1383,9 @@ def _parse_admission(text: str) -> str:
     if yaml is not None:
         try:
             doc = yaml.safe_load(text)
-        except yaml.YAMLError:
+        except yaml.YAMLError as exc:
+            first = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            sys.stderr.write(f"placement: kanban.admission reads legacy: {source} does not parse ({first})\n")
             return "legacy"
         kb = doc.get("kanban") if isinstance(doc, dict) else None
         v = kb.get("admission") if isinstance(kb, dict) else None
@@ -1421,8 +1425,11 @@ def admission_mode(path=None) -> str:
     if hit and hit[0] == sig:
         return hit[1]
     try:
-        mode = _parse_admission(p.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
+        mode = _parse_admission(p.read_text(encoding="utf-8-sig"), str(p))
+    except ValueError as exc:   # undecodable bytes: a parse failure, as loud as a YAMLError (t_bc197d33)
+        sys.stderr.write(f"placement: kanban.admission reads legacy: {p} does not parse ({exc})\n")
+        mode = "legacy"
+    except OSError:
         mode = "legacy"
     _MODE_CACHE[key] = (sig, mode)
     return mode
@@ -1860,8 +1867,10 @@ def record_usage(row: Mapping, actual: Mapping, *, now: float, path=None) -> Opt
     try:
         est = admission.Estimate(cpus=float(row.get("threads") or 0), ram_gb=float(row.get("ram_gb") or 0),
                                  gpu_mib=float(row.get("gpu_mb") or 0), source="lease")
-        missing = [k for k in ("cpus", "ram_gb") if actual.get(k) is None]
-        if missing:     # an unmeasured axis is never recorded as 0 (Prism dd0cbea04139); gpu_mib absent = no GPU
+        # every axis the lease estimates must be measured: an unmeasured axis is never recorded as 0 (Prism
+        # dd0cbea04139); gpu_mib absent = no GPU only when the lease estimated none (t_bc197d33)
+        missing = [k for k in ("cpus", "ram_gb") + (("gpu_mib",) if est.gpu_mib > 0 else ()) if actual.get(k) is None]
+        if missing:
             raise ValueError(f"actual is missing {','.join(missing)}: {dict(actual)!r}")
         vals = {k: float(actual[k]) for k in ("cpus", "ram_gb")}
         vals["gpu_mib"] = float(actual.get("gpu_mib") or 0.0)
