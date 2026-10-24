@@ -802,12 +802,20 @@ def _write_action(kb: Any, conn: Any, entry: dict, verdict: dict) -> None:
                    "child_session": entry.get("child_session") or None, "action": action,
                    "claim_event_id": int(entry["event_id"])}
         with kb.write_txn(conn):
+            if action == "comment_why_waits":
+                # Prism 19efbd980406: the comment IS this action, so it commits with its receipt (both or
+                # neither). A refused comment rolls back its own savepoint; the receipt records why, and the
+                # deadman reads a receipt from this episode as the answer either way.
+                try:
+                    payload["comment_id"] = kb.add_comment(conn, tid, AUTHOR, why_waits_text(entry, verdict))
+                except Exception as exc:
+                    payload["comment_failed"] = f"{type(exc).__name__}: {exc}"[:300]
+                    logger.warning("kanban boomerang-wake: %s why-waits comment refused: %s",
+                                   tid, payload["comment_failed"])
             kb._append_event(conn, tid, RECEIPT_KIND, payload)  # noqa: SLF001 -- the one event writer
         if action == "land_inherited":
             _land_inherited_records(entry, verdict["_plan"], conn, kb)
-        elif action == "comment_why_waits":
-            kb.add_comment(conn, tid, AUTHOR, why_waits_text(entry, verdict))
-        else:
+        elif action != "comment_why_waits":
             kb.add_comment(conn, tid, AUTHOR, f"{MARKER} {action}: {summary} (delegation {entry['delegation_id']})")
 
 

@@ -879,3 +879,43 @@ def test_why_waits_verdict_posts_one_bounded_comment_and_keeps_review(env):
     assert task.status == "review" and kinds.count(ah.RECEIPT_KIND) == 1
     assert ours == [f"{ah.WHY_WAITS_TAG} PR: open, CI pending @abc1234; last operator action: apollo close-on 15:25; "
                     f"flips when: #6402 merges (delegation {entry['delegation_id']})"]
+
+
+def test_why_waits_comment_and_receipt_commit_together(env, monkeypatch):
+    """Prism 19efbd980406: a death between the two writes leaves neither, so the retry posts exactly one
+    why-waits; a refused comment still leaves the receipt, marked comment_failed (the episode's answer)."""
+    tid = _deadman_card(env)
+    _tick(env)
+    entry = ah.BoomerangWakeState().get_claim(env["dispatched"][0]["key"])
+    ww = {"pr_state": "open", "last_operator_action": "none", "flips_when": "CI green"}
+    real = kb._append_event
+
+    def dies_on_receipt(conn, task_id, kind, payload=None, **kw):
+        if kind == ah.RECEIPT_KIND:
+            raise RuntimeError("killed between the comment and the receipt")
+        return real(conn, task_id, kind, payload, **kw)
+
+    monkeypatch.setattr(kb, "_append_event", dies_on_receipt)
+    assert not ah.execute_verdict(entry, _verdict(entry, "comment_why_waits", why_waits=ww))["ok"]
+    monkeypatch.setattr(kb, "_append_event", real)
+    with kb.connect_closing() as conn:
+        assert [c for c in kb.list_comments(conn, tid) if c.author == ah.AUTHOR] == []
+        assert not ah._receipt_exists(conn, tid, entry["delegation_id"])
+    assert ah.execute_verdict(entry, _verdict(entry, "comment_why_waits", why_waits=ww))["ok"]
+    assert ah.execute_verdict(entry, _verdict(entry, "comment_why_waits", why_waits=ww)).get("noop")
+    with kb.connect_closing() as conn:
+        assert len([c for c in kb.list_comments(conn, tid) if c.author == ah.AUTHOR]) == 1
+
+    tid2 = _deadman_card(env)
+    _tick(env)
+    entry2 = ah.BoomerangWakeState().get_claim(next(e["key"] for e in env["dispatched"] if e["task_id"] == tid2))
+
+    def refuse(*a, **kw):
+        raise ValueError("comment refused")
+
+    monkeypatch.setattr(kb, "add_comment", refuse)
+    assert ah.execute_verdict(entry2, _verdict(entry2, "comment_why_waits", why_waits=ww))["ok"]
+    with kb.connect_closing() as conn:
+        receipts = [json.loads(r[0]) for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?", (tid2, ah.RECEIPT_KIND))]
+    assert len(receipts) == 1 and "comment refused" in receipts[0]["comment_failed"]
