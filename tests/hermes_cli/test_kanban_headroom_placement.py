@@ -673,3 +673,58 @@ def test_dispatch_books_the_assignees_profile_class(home):
     booked = {r["job_id"]: r["ram_gb"] for r in rows}
     assert booked.get(a) == 7.5
     assert b not in booked or booked[b] == TABLE["footprints"]["kanban"]["ram_gb"]
+
+
+# -- Prism post-merge on #2101 (t_bc197d33) ---------------------------------
+
+@pytest.mark.parametrize("text", [
+    "kanban:\n  admission: utilization\n",
+    "kanban:\n    admission: utilization\n",                       # 4-space indent (Prism 7ca95688be5a)
+    "kanban: {admission: utilization}\n",                        # flow style
+    "kanban: {dispatch_load_gate: {enabled: true}, admission: 'utilization'}  # c\n",
+])
+def test_admission_mode_reads_any_yaml_layout(tmp_path, text):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(text, encoding="utf-8")
+    assert placement.admission_mode(cfg) == "utilization"
+
+
+def test_admission_mode_unknown_value_is_legacy_quietly(tmp_path, capsys):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("kanban:\n  admission: turbo\n", encoding="utf-8")
+    assert placement.admission_mode(cfg) == "legacy"
+    assert capsys.readouterr().err == ""
+
+
+def test_admission_mode_parse_failure_is_legacy_and_loud(tmp_path, capsys):
+    """Prism 7ca95688be5a: a config.yaml that does not parse reads legacy, and says so on stderr."""
+    pytest.importorskip("yaml")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("kanban:\n  admission: utilization\n bad: [\n", encoding="utf-8")
+    assert placement.admission_mode(cfg) == "legacy"
+    err = capsys.readouterr().err
+    assert "kanban.admission" in err and "does not parse" in err and str(cfg) in err
+
+
+_USAGE_ROW = {"id": "r1", "host": "ace-ai", "consumer": "kanban", "threads": 2, "ram_gb": 4, "gpu_mb": 0,
+              "job_id": "t_1"}
+
+
+@pytest.mark.parametrize("row, actual", [
+    (_USAGE_ROW, {"ram_gb": 12}),                                  # Prism dd0cbea04139: cpus unmeasured
+    (_USAGE_ROW, {"cpus": 1.5}),                                   # ram unmeasured
+    (dict(_USAGE_ROW, gpu_mb=8000), {"cpus": 1.5, "ram_gb": 12}),  # the lease estimates gpu; gpu unmeasured
+])
+def test_partial_actual_leaves_class_history_unchanged(tmp_path, capsys, row, actual):
+    usage = tmp_path / "class-usage.jsonl"
+    assert placement.record_usage(row, actual, now=T0, path=usage) is None
+    assert not usage.exists()
+    assert "class usage not recorded for r1" in capsys.readouterr().err
+
+
+def test_full_actual_is_recorded(tmp_path):
+    usage = tmp_path / "class-usage.jsonl"
+    row = dict(_USAGE_ROW, gpu_mb=8000)
+    got = placement.record_usage(row, {"cpus": 1.5, "ram_gb": 12, "gpu_mib": 6000}, now=T0, path=usage)
+    assert got is not None and (got["cpus"], got["ram_gb"], got["gpu_mib"]) == (1.5, 12.0, 6000.0)
+    assert len(usage.read_text(encoding="utf-8").splitlines()) == 1
