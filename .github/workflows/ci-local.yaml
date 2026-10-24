@@ -127,9 +127,14 @@ permissions:
 # github.run_id, so even a parent rerun cannot kill this child mid-flight.
 # Release (workflow_call with inputs.release) never cancels and never gets
 # cancelled: its group is github.run_id. PRs collapse per-PR; pushes use the
-# ref as before.
+# ref as before, except push:main under vars.CI_MAIN_GROUP_PER_SHA == 'true':
+# one group per sha (hermes-home#5880/#5942 shape). One shared `main` group
+# keeps ONE pending run, so a third push replaced the second (mirror run
+# 40124835454 @83bf634c, cancelled with 0 jobs) and main shas went ungraded.
+# The nested workflows key push:main by run_id, so concurrent main runs do not
+# cancel each other's children. Rollback: delete the repo variable.
 concurrency:
-  group: ci-${{ inputs.release == true && github.run_id || (github.event_name == 'pull_request' && github.event.pull_request.number || github.ref) }}
+  group: ci-${{ inputs.release == true && github.run_id || (github.event_name == 'pull_request' && github.event.pull_request.number || (github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.CI_MAIN_GROUP_PER_SHA == 'true' && github.sha || github.ref)) }}
   # Cancel superseded runs on BOTH pull_request and merge_group.
   #
   # merge_group was previously excluded, which stranded a full 44-job run every

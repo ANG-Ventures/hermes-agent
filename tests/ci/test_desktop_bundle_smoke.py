@@ -168,8 +168,9 @@ def test_signature_cache_saves_only_in_the_writable_build():
     tools = next(step for step in action['runs']['steps'] if step.get('id') == 'tools-cache')
     # The assembly's save-tools-cache: false must turn the tool cache save off.
     enabled = {'cache': 'true', 'save-tools-cache': 'true'}
-    assert gate(tools['if'], enabled, {}, job_if=False)
-    assert not gate(tools['if'], {**enabled, 'save-tools-cache': 'false'}, {}, job_if=False)
+    hosted = {'environment': 'github-hosted'}
+    assert gate(tools['if'], enabled, {}, job_if=False, runner=hosted)
+    assert not gate(tools['if'], {**enabled, 'save-tools-cache': 'false'}, {}, job_if=False, runner=hosted)
     assert all(not step.get('uses', '').startswith('actions/cache@') for step in assembly['steps'])
 
 
