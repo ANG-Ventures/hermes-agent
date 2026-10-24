@@ -343,6 +343,13 @@ def _format_spawn_routes(routes, sources=None) -> str:
     )
 
 
+def _held_by_requires(res) -> int:
+    """Ready cards a ``requires:`` pin holds at host=none this tick (t_640a4ea0)."""
+    waits = getattr(res, "placement_waits", None) or {}
+    return sum(1 for tid, a in (getattr(res, "placement_affinity", None) or {}).items()
+               if a.get("host") == "none" and str(waits.get(tid, "")).startswith("requires_unsatisfied"))
+
+
 def _format_lane_expiry(lane, route, successor="profile default") -> str:
     return f"lane-model expired -> {successor} ({lane}: {route})"
 
@@ -4180,9 +4187,10 @@ class GatewayKanbanWatchersMixin:
                 elif _ready > 0:
                     logger.info(
                         "kanban dispatcher [%s]: ready=%d quota=%d spawned=%d "
-                        "starved=%d allowance=%s",
+                        "starved=%d allowance=%s held_by_requires=%d",
                         slug, _ready, _quota, _n,
                         _ready if _n == 0 else 0, _allowance,
+                        _held_by_requires(res),
                     )
                     _prev = _board_starved_since.get(slug)
                     if _n > 0:
