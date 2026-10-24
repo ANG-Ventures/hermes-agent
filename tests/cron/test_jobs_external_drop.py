@@ -168,3 +168,56 @@ def test_root_write_hands_shadow_and_stamp_back_to_the_store_owner(store, monkey
     create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
     names = {p.rsplit("/", 1)[-1] for p in chowned}
     assert {"jobs.json", ".jobs.shadow.json", ".jobs.shadow.stamp"} <= names
+
+
+def test_writer_racing_the_save_leaves_the_shadow_untrusted(store, monkeypatch):
+    """Prism ab98ebb1f131: a replace between our rename and the stamp must not certify the
+    external payload; the stamp is withheld, so nothing stale is trusted later either."""
+    import cron.jobs as cj
+    from cron.jobs import create_job
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    real = cj.atomic_replace
+
+    def racing(src, dst):
+        out = real(src, dst)
+        _external_rewrite(store, keep_ids={a["id"]})
+        return out
+
+    monkeypatch.setattr(cj, "atomic_replace", racing)
+    create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+    assert not (store / "cron" / ".jobs.shadow.stamp").exists()
+
+
+def test_shadow_from_another_save_is_not_trusted(store):
+    """Prism 26cea77eab5d: the stamp names the payload digest; a shadow holding a different
+    save's bytes (degraded-lock sibling) restores nothing."""
+    from cron.jobs import create_job, get_due_jobs, load_jobs
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    b = create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+    shadow = store / "cron" / ".jobs.shadow.json"
+    doc = json.loads(shadow.read_text())
+    doc["jobs"].append(dict(doc["jobs"][0], id="feedfacefeed", name="sibling"))
+    shadow.write_text(json.dumps(doc))
+    _external_rewrite(store, keep_ids={a["id"]})
+    get_due_jobs()
+    assert _ids(load_jobs()) == [a["id"]]
+    assert b["id"]  # b is gone: only a TRUSTED shadow restores
+
+
+def test_snapshot_restore_is_a_rollback_not_a_silent_drop(store):
+    """Prism b63d3ad8f76a: /snapshot restore replaces jobs.json on purpose; jobs created after
+    the snapshot must stay gone."""
+    from cron.jobs import create_job, get_due_jobs, load_jobs
+    from hermes_cli.backup import _quick_snapshot_root, restore_quick_snapshot
+
+    a = create_job(prompt="a", schedule="every 1h", name="a", deliver="local")
+    snap = _quick_snapshot_root(store) / "snap1"
+    (snap / "cron").mkdir(parents=True)
+    (snap / "cron" / "jobs.json").write_text((store / "cron" / "jobs.json").read_text())
+    (snap / "manifest.json").write_text(json.dumps({"files": {"cron/jobs.json": 1}}))
+    create_job(prompt="b", schedule="every 1h", name="b", deliver="local")
+    assert restore_quick_snapshot("snap1", hermes_home=store)
+    get_due_jobs()
+    assert _ids(load_jobs()) == [a["id"]]

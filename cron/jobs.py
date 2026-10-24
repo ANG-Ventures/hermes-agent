@@ -5,6 +5,7 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+import hashlib
 import json
 import logging
 import shutil
@@ -2078,16 +2079,42 @@ def _write_store_shadow(jobs_file: Path, staged: str, owner: Optional[os.stat_re
         _unlink_quiet(tmp)
 
 
-def _write_store_shadow_stamp(jobs_file: Path, owner: Optional[os.stat_result]) -> None:
-    """Publish the stamp that makes the shadow trusted. Called only after a successful shadow
-    refresh: a stamp over a stale shadow would resurrect an older copy of a row (16b999b0035d)."""
+def _payload_digest(path) -> Optional[str]:
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _write_store_shadow_stamp(jobs_file: Path, owner: Optional[os.stat_result], digest: str) -> None:
+    """Publish the stamp that makes the shadow trusted: ``[mtime_ns, size, ino, sha256]``.
+
+    Called only after a successful shadow refresh (16b999b0035d). The stat and the digest come
+    from ONE open of jobs.json, and the stamp is published only when that file still holds the
+    bytes this save staged: a writer that replaced the path after our rename leaves the shadow
+    untrusted instead of certifying ITS payload (ab98ebb1f131). The digest also binds the shadow
+    to this save: a load trusts the shadow only when its own bytes hash to it (26cea77eab5d)."""
     _, stamp_path = _shadow_paths(jobs_file)
-    stamp = _jobs_file_stamp(jobs_file)
-    if stamp is None:
+    try:
+        with open(jobs_file, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if hashlib.sha256(fh.read()).hexdigest() != digest:
+                logger.warning("cron store shadow not trusted: jobs.json changed right after the "
+                               "store wrote it (a non-store writer raced the save)")
+                return
+    except OSError:
         return
     with contextlib.suppress(OSError):
-        atomic_write_text(stamp_path, json.dumps(list(stamp)))
+        atomic_write_text(stamp_path, json.dumps([st.st_mtime_ns, st.st_size, st.st_ino, digest]))
         _preserve_file_ownership(stamp_path, owner)
+
+
+def disown_store_shadow(jobs_file: Optional[Path] = None) -> None:
+    """For an INTENTIONAL whole-file replace outside the store (``/snapshot restore``): the rows
+    the replacement drops are a rollback, not a silent drop, so the shadow must not restore them
+    (b63d3ad8f76a). Removes the stamp; the next store save re-arms the shadow."""
+    _invalidate_store_shadow(jobs_file or _current_cron_store().jobs_file)
 
 
 def _journal_removed_ids(ids: Set[str]) -> Set[str]:
@@ -2111,11 +2138,14 @@ def _external_drops(
         jobs_file = _current_cron_store().jobs_file
         shadow, stamp_path = _shadow_paths(jobs_file)
         try:
-            stored = tuple(json.loads(stamp_path.read_text()))
-        except (OSError, ValueError, TypeError):
+            stored = json.loads(stamp_path.read_text())
+            stored_stat, digest = tuple(stored[:3]), stored[3]
+        except (OSError, ValueError, TypeError, IndexError, KeyError):
             return []
-        if pre_read_stamp is None or stored == tuple(pre_read_stamp):
+        if pre_read_stamp is None or stored_stat == tuple(pre_read_stamp):
             return []
+        if not isinstance(digest, str) or _payload_digest(shadow) != digest:
+            return []  # the shadow is not the payload this stamp certified (another save's copy)
         data, _ = _parse_jobs_file(shadow)
         shadow_jobs = data.get("jobs") if isinstance(data, dict) else None
         if not isinstance(shadow_jobs, list):
@@ -2185,14 +2215,15 @@ def _save_jobs_unlocked(
             if not keep_shadow:
                 _invalidate_store_shadow(jobs_file)
                 shadow_ok = _write_store_shadow(jobs_file, tmp_path, _stat_before)
+                staged_digest = _payload_digest(tmp_path) if shadow_ok else None
             # fsync the directory the rename actually landed in (atomic_replace resolves symlinks).
             replaced = Path(atomic_replace(tmp_path, jobs_file))
             tmp_path = None
             fsync_directory(replaced.parent)
             _secure_file(jobs_file)
             _preserve_file_ownership(jobs_file, _stat_before)
-            if shadow_ok:
-                _write_store_shadow_stamp(jobs_file, _stat_before)
+            if shadow_ok and staged_digest:
+                _write_store_shadow_stamp(jobs_file, _stat_before, staged_digest)
             # Invalidate (never refresh) the stamp: a refresh would let a nested save certify disk
             # against an OUTER caller's stale payload. Later saves take the full merge (fail-safe).
             _record_load_stamp(None)

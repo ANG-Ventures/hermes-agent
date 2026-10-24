@@ -2022,6 +2022,11 @@ def restore_quick_snapshot(
                     continue
             else:
                 shutil.copy2(src, dst)
+                if rel == _CRON_JOBS_REL:
+                    # An intentional rollback: the cron store shadow must not re-add the jobs
+                    # this snapshot predates (t_811e92d7, b63d3ad8f76a).
+                    from cron.jobs import disown_store_shadow
+                    disown_store_shadow(dst)
             restored += 1
         except (OSError, PermissionError) as exc:
             logger.error("Failed to restore %s: %s", rel, exc)
