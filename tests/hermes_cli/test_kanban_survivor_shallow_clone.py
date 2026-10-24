@@ -124,6 +124,70 @@ def test_unpublished_work_on_a_shallow_clone_is_bundled(board, tmp_path):
     assert (restored / "work.txt").read_text() == "unpublished\n"
 
 
+def test_a_shallow_bundle_declares_its_boundary_as_prerequisites(board, tmp_path):
+    """A shallow bundle omits everything behind the boundary; it must say so.
+
+    Without declared prerequisites `bundle verify` calls it complete in an
+    EMPTY repo, yet `clone`/`fetch` there die "Failed to traverse parents".
+    Declared, an empty repo refuses it up front, and the remote's history
+    plus the bundle restore the work.
+    """
+    tid, ws, remote, clone = shallow_workspace(board, tmp_path)
+    (clone / "work.txt").write_text("unpublished\n")
+    git(clone, "add", ".")
+    git(clone, "commit", "-m", "local work")
+    work = git(clone, "rev-parse", "HEAD")
+    boundary = set((clone / ".git" / "shallow").read_text().split())
+    assert kb.complete_task(board, tid)
+    stored = [Path(a.stored_path) for a in kb.list_attachments(board, tid)
+              if a.stored_path.endswith(".bundle")]
+    assert stored, kb.list_attachments(board, tid)
+    artifact = stored[0]
+    listed = subprocess.run(["git", "bundle", "list-heads", str(artifact)],
+                            capture_output=True, check=True).stdout.decode()
+    assert "refs/heads/implementation" in listed
+    header = artifact.read_bytes().split(b"\n\n", 1)[0].decode()
+    prereqs = {line[1:].split()[0] for line in header.splitlines() if line.startswith("-")}
+    assert prereqs == boundary, header
+    # An empty repo cannot satisfy the boundary: verify says so instead of "okay".
+    empty = tmp_path / "empty"
+    git(tmp_path, "init", "-q", str(empty))
+    verify = subprocess.run(["git", "-C", str(empty), "bundle", "verify", str(artifact)],
+                            capture_output=True)
+    assert verify.returncode != 0
+    assert b"lacks these prerequisite commits" in verify.stderr, verify.stderr
+    # Fetch the remote's history into that same empty repo, then the bundle restores.
+    git(empty, "fetch", "-q", f"file://{remote}", "+refs/heads/*:refs/remotes/origin/*")
+    git(empty, "bundle", "verify", str(artifact))
+    git(empty, "fetch", "-q", str(artifact), "refs/heads/implementation:refs/heads/recovered")
+    git(empty, "checkout", "-q", "recovered")
+    assert git(empty, "rev-parse", "HEAD^") == work
+    assert (empty / "work.txt").read_text() == "unpublished\n"
+
+
+def test_a_stale_shallow_entry_whose_object_is_absent_still_bundles(board, tmp_path):
+    """A `shallow` line naming an object the store lacks is not a boundary.
+
+    Passed through as `^<sha>`, `bundle create` dies rc=128 "bad object"; it is
+    dropped, and the real boundary is still declared.
+    """
+    tid, ws, remote, clone = shallow_workspace(board, tmp_path)
+    (clone / "work.txt").write_text("unpublished\n")
+    git(clone, "add", ".")
+    git(clone, "commit", "-m", "local work")
+    shallow = clone / ".git" / "shallow"
+    boundary = set(shallow.read_text().split())
+    with shallow.open("a") as fh:
+        fh.write("1" * 40 + "\n")
+    assert kb.complete_task(board, tid)
+    stored = [Path(a.stored_path) for a in kb.list_attachments(board, tid)
+              if a.stored_path.endswith(".bundle")]
+    assert stored, kb.list_attachments(board, tid)
+    header = stored[0].read_bytes().split(b"\n\n", 1)[0].decode()
+    prereqs = {line[1:].split()[0] for line in header.splitlines() if line.startswith("-")}
+    assert prereqs == boundary, header
+
+
 def test_a_shallow_capture_that_still_fails_names_the_remedy(board, tmp_path, monkeypatch):
     import hermes_cli.kanban_survivor as survivor
     # Simulate any future shallow-traversal failure: without the grafts the
