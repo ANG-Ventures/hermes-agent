@@ -1,21 +1,26 @@
 {
- "_doc": "Byte-identical copies of ANG-Ventures/hermes-home lints (Router Core spec v5 \u00a74.1/\u00a77.1, card t_8b05b16b). hermes-home is private, so CI here cannot fetch them: change the lint THERE, re-copy, re-pin. check_pin.py enforces the bytes. Re-pinned to hermes-home main cafd2a9b6714 on 2026-10-16 (t_8b05b16b): #4308, #4319 and #4330 (spawn-site precision, 8 review rounds) merged.",
+ "_doc": "Byte-identical copies of ANG-Ventures/hermes-home lints (Router Core spec v5 \u00a74.1/\u00a77.1, card t_8b05b16b). hermes-home is private, so CI here cannot fetch them: change the lint THERE, re-copy, re-pin. check_pin.py enforces the bytes. lib/scan_scope.py is lint-spawn-site.py's sibling import (scripts/lib/ at the source). Re-pinned to hermes-home #6501 on 2026-10-24 (t_6b4d3881): fixture shebangs #!/usr/bin/env bash at the source.",
  "source_repo": "ANG-Ventures/hermes-home",
  "files": {
   "lint-spawn-site.py": {
-   "source_sha": "cafd2a9b671476b83e45f3954d0c8b59434ff642",
+   "source_sha": "052e9dec59adcf9b37f45231fd8fba81b66d05fe",
    "source_path": "scripts/lint-spawn-site.py",
-   "sha256": "14c0d09c884a7ce588f551de6666513a3c213ea3766f78e49ac7c834f095dfd8"
+   "sha256": "79281fec5ecd9ef6c4a7d553168ff21b10e6ecb07d68be010b8967f533608248"
   },
   "p0-label-lint.py": {
-   "source_sha": "d638cc56f62f62c548629b1b46a71c486796fb3d",
+   "source_sha": "052e9dec59adcf9b37f45231fd8fba81b66d05fe",
    "source_path": "scripts/p0-label-lint.py",
-   "sha256": "6b9df1cbdea7faff2b12882d6a55f74467bebfeac4928dad5b0ec670323a56eb"
+   "sha256": "7dbcbab775a0ca99d47881168c9e94c0f4ebcab66825b25a2d86c12f17579a7b"
   },
   "lint-queue-loops.py": {
-   "source_sha": "d638cc56f62f62c548629b1b46a71c486796fb3d",
+   "source_sha": "052e9dec59adcf9b37f45231fd8fba81b66d05fe",
    "source_path": "scripts/lint-queue-loops.py",
-   "sha256": "c7207721e1a6ab3b832bec033324d07ba989823e99a01517c6bcfcf3c9d16976"
+   "sha256": "b73386b7de502cbb48575206897f18a54ca47845051caad5f4042ed1e8cd543b"
+  },
+  "lib/scan_scope.py": {
+   "source_sha": "052e9dec59adcf9b37f45231fd8fba81b66d05fe",
+   "source_path": "scripts/lib/scan_scope.py",
+   "sha256": "10bc6c0faae3eaa7977626775e0c3efd218bf2f0030e672b956fffa1aa427505"
   }
  }
 }
