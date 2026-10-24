@@ -80,3 +80,58 @@ def test_dead_interpreter_is_still_healed_from_another_store(install, tmp_path, 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "elsewhere"))
     _launchers.ensure_install_launchers(repo, local)
     assert str(other).encode() in (local / "hermes").read_bytes()
+
+
+@pytest.fixture
+def ephemeral(tmp_path, monkeypatch):
+    """The whole fixture lives in pytest's tmp; only ``<tmp_path>/tmp`` counts as a temp root."""
+    root = (tmp_path / "tmp").resolve()
+    monkeypatch.setattr(_launchers, "_is_ephemeral_path",
+                        lambda p: Path(p).resolve().is_relative_to(root))
+    return root
+
+
+def test_real_install_rebinds_a_launcher_bound_to_a_live_tmp_store(
+        install, ephemeral, tmp_path, monkeypatch):
+    """Prism 57e9a766ab86: the 10-19 shape, while the tmp interpreter still exists."""
+    repo, local, real_python = install
+    test_python = _store(ephemeral / "pytest-of-ace" / "home")
+    for name in _launchers.ENTRY_POINTS:
+        _launchers.mint_launcher(name, repo, local, test_python, None)
+    assert _launchers._shell_launcher_python(local / "hermes") == test_python
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _launchers.ensure_install_launchers(repo, local)
+    for name in _launchers.ENTRY_POINTS:
+        assert _launchers._shell_launcher_python(local / name) == real_python
+
+
+def test_tmp_home_leaves_the_shared_launcher_byte_identical(install, ephemeral, monkeypatch):
+    """Even with the bound interpreter gone, a test home never writes the shared file."""
+    repo, local, real_python = install
+    before = _bytes(local)
+    real_python.unlink()
+    test_home = ephemeral / "pytest-of-ace" / "home"
+    _store(test_home)
+    monkeypatch.setenv("HERMES_HOME", str(test_home))
+    _launchers.ensure_install_launchers(repo, local)
+    assert _bytes(local) == before
+
+
+def test_launcher_bound_to_another_real_home_is_kept(install, ephemeral, tmp_path, monkeypatch):
+    repo, local, _ = install
+    before = _bytes(local)
+    other_home = tmp_path / "home-of-bob" / ".hermes"
+    _store(other_home)
+    monkeypatch.setenv("HERMES_HOME", str(other_home))
+    _launchers.ensure_install_launchers(repo, local)
+    assert _bytes(local) == before
+
+
+@pytest.mark.parametrize("path, expected", [
+    ("/tmp/pytest-of-ace/x/home/tools", True),
+    ("/var/tmp/hermes-pytest/b-1/home/tools", True),
+    ("/Users/ace/.hermes/profiles/coder/cache/scratch/h/tools", True),
+    ("/home/bob/.hermes/tools", False),
+])
+def test_ephemeral_classifier(path, expected):
+    assert _launchers._is_ephemeral_path(Path(path)) is expected
