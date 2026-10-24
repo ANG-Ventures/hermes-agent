@@ -460,6 +460,11 @@ jobs:
     needs: detect
     uses: ./.github/workflows/lazy-deps-guard.yml
 
+  router-core-lints:
+    name: Router Core lints (spawn-site, p0 label, queue loops)
+    needs: detect
+    uses: ./.github/workflows/router-core-lints.yml
+
   lockfile-diff:
     name: package-lock.json diff
     needs: detect
@@ -529,6 +534,7 @@ jobs:
       - infographic-check
       - case-collision-check
       - lazy-deps-guard
+      - router-core-lints
       - lockfile-diff
       - docker-lint
       - profile-artifact-check

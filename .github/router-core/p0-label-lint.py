@@ -360,6 +360,25 @@ def _job_runs_on(job: dict):
     return None
 
 
+def _never_runs(job: dict, known: dict) -> bool:
+    """True only when the job-level `if` is false for every outcome under this event (opaque -> it may run)."""
+    cond = job.get("if")
+    if cond is None:
+        return False
+    if isinstance(cond, bool):
+        return not cond
+    if not isinstance(cond, str):
+        return False
+    s = cond.strip()
+    m = EXPR.fullmatch(s)
+    if m:
+        s = m.group(1).strip()
+    elif EXPR.search(s):
+        return False   # text around an embedded expression: a non-empty string, truthy
+    vals = _eval(s, known, {})
+    return all(not isinstance(v, tuple) and not _gh_truthy(v) for v in vals)
+
+
 def scan(root: Path) -> tuple[int, list, list]:
     """-> (workflow files read, rows [(path, job, event, venue, outcomes)], findings for R1/R3/R4)."""
     wf_dir = root / ".github" / "workflows"
@@ -391,6 +410,8 @@ def scan(root: Path) -> tuple[int, list, list]:
                     continue   # remote reusable workflow with no runner input: the callee's default (hosted)
                 mv = _matrix_vals(tjob)
                 for ev in evs:
+                    if _never_runs(job, EVENTS[ev]) or (tjob is not job and _never_runs(tjob, EVENTS[ev])):
+                        continue   # the job-level `if` excludes this event (caller's or callee job's own)
                     outs = outcomes(ro, EVENTS[ev], mv)
                     venue = _venue(outs)
                     rows.append((rel, tname, ev, venue, outs))
@@ -641,6 +662,12 @@ CALLEE_WITH_OK = CALLEE_WITH.replace("    runs-on: p0\n", "    runs-on: ${{ inpu
 EMPTY_ARRAY = PR_P0.replace("runs-on: p0", "runs-on: ${{ fromJSON('[]') && 'p0' || 'hermes-ci' }}")
 SELFHOSTED_P0 = POOL_MAIN.replace("${{ vars.CI_RUNNER || vars.CI_FALLBACK_RUNNER || 'hermes-ci' }}",
                                   "[self-hosted, p0]")
+PUSH_ONLY_IF = WF_HEAD + "  t:\n    if: github.event_name == 'push'\n    runs-on: p0\n    steps: []\n"
+PUSH_ONLY_IF_WRAPPED = PUSH_ONLY_IF.replace("if: github.event_name == 'push'",
+                                            "if: \"${{ github.event_name != 'pull_request' }}\"")
+OPAQUE_IF = PUSH_ONLY_IF.replace("if: github.event_name == 'push'", "if: always() && vars.X == 'y'")
+PR_ONLY_IF_POOL = POOL_MAIN.replace("  t:\n", "  t:\n    if: github.event_name == 'pull_request'\n")
+CALLER_IF = CALLER.replace("    uses:", "    if: github.event_name == 'pull_request'\n    uses:")
 REG_RESET = ("[Service]\nEnvironment=NO_DEFAULT_LABELS=1\nEnvironment=\nEnvironment=LABELS=p0\n"
              "Environment=POOL_SIZE=2\n")
 REG_GOOD = ("[Service]\nEnvironment=LABELS=p0\nEnvironment=NO_DEFAULT_LABELS=1\nEnvironment=POOL_SIZE=2\n")
@@ -706,6 +733,12 @@ def selftest() -> int:
          {"ci-runners/host-config/ci-box/override-p0.conf": REG_RESET}, 1),
         ("p0 pool conf with default labels / wrong size is RED (R5)", {"w.yml": GOOD_SPLIT}, None,
          {"ci-runners/host-config/ace-ai/override-p0.conf": REG_BAD}, 1),
+        ("push-only job `if` with runs-on p0 is GREEN (no PR outcome)", {"w.yml": PUSH_ONLY_IF}, None, None, 0),
+        ("${{ }}-wrapped event `if` excluding PR is GREEN", {"w.yml": PUSH_ONLY_IF_WRAPPED}, None, None, 0),
+        ("opaque job `if` may run on a PR: p0 is RED (R1)", {"w.yml": OPAQUE_IF}, None, None, 1),
+        ("PR-only job `if` on the pool is GREEN (no main outcome)", {"w.yml": PR_ONLY_IF_POOL}, None, None, 0),
+        ("caller job `if` (PR only) skips the callee's main pool job (GREEN)",
+         {"w.yml": CALLER_IF, "c.yml": LOCAL_CALLEE}, None, None, 0),
     ]
     bad = 0
     for name, wfs, rows, extra, want in cases:
