@@ -56,6 +56,15 @@ def _bwrap_usable() -> bool:
 BWRAP_OK = _bwrap_usable()
 
 
+def host_uv() -> str | None:
+    """The host's ``uv`` from PATH, else None (callers skip "uv required").
+
+    Never a fallback into the real ``~/.hermes/bin``: the home-I/O guard refuses that probe
+    mid-test, so a runner without uv on PATH went red instead of skipping (t_04dd8b69).
+    """
+    return shutil.which("uv")
+
+
 def sandbox_required_reason() -> str | None:
     """Why a test that runs the real updater must skip here, or None when it is safe.
 
@@ -131,7 +140,7 @@ def isolated_env(
     if real_uv_cache.is_dir():
         env["UV_CACHE_DIR"] = str(real_uv_cache)
     base_path = os.environ.get("PATH", "/usr/bin:/bin")
-    uv = shutil.which("uv") or (str(REAL_HOME / ".hermes" / "bin" / "uv") if (REAL_HOME / ".hermes" / "bin" / "uv").exists() else None)
+    uv = host_uv()
     path_parts = [str(shim_dir), *[str(p) for p in extra_path]]
     if uv:
         path_parts.append(str(Path(uv).parent))
