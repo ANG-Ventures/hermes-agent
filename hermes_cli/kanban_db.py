@@ -10361,6 +10361,91 @@ class ExternalCloseError(ValueError):
         )
 
 
+def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
+    """Forge L0 section 2.3 (a), card PRE t_7ff229a7: run hermes-home ``scripts/lib/landable.py check`` on each
+    of the card's OWN open fleet PRs before the open-PR route, so the worker hears what fleet-merge would refuse at
+    land in its own run. -> ``[(repo#n, refusal text)]`` for each PR the verifier refused (rc 1).
+
+    The policy lives in hermes-home (one copy, the lander's own predicates); this only calls it. Kill switch:
+    ``<hermes root>/config/landing-policy.json`` ``"pre_pr": "on"|"off"`` (missing = off): off = no subprocess,
+    the handoff proceeds as today. Fail-open on everything else (script absent, timeout, rc 3 unreadable): the
+    land-time copy of every gate stays as the backstop. ``KANBAN_PRE_PR_SCRIPT`` overrides the path (tests);
+    inside pytest with no override nothing runs. ``--draft-ok`` is always passed: drafts stay with the freshness
+    gate that runs next (``DraftPrError``, ``completion_blocked_draft_pr`` and the audited ``draft_ok`` override,
+    t_f38605be), so this gate never pre-empts them. It has no stale/behind check either, so nothing the freshness
+    update would fix is refused here (Prism b1fdf6186eca).
+    """
+    script = os.environ.get("KANBAN_PRE_PR_SCRIPT") or ""
+    if not script:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return []
+        try:
+            from hermes_constants import get_default_hermes_root
+            root = get_default_hermes_root()
+        except Exception:  # noqa: BLE001 -- fail-open
+            return []
+        try:
+            with open(root / "config" / "landing-policy.json", encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError):
+            return []
+        if not isinstance(cfg, dict) or cfg.get("pre_pr") != "on":
+            return []
+        script = str(root / "scripts" / "lib" / "landable.py")
+    if not os.path.isfile(script) or not refs:
+        return []
+    # The verifier reads GitHub as the card's profile, never as whichever process runs complete_task (a
+    # multiplexed gateway's launch env carries ANOTHER profile's HERMES_HOME and gh login; Prism 3728a4da34a1).
+    # Same seam as the acceptance gate: the assignee's home, its own credentials overlaid. Unresolvable = did
+    # not run (fail-open), never the ambient login.
+    try:
+        from hermes_cli.kanban_pr_acceptance import _assignee_profile_home, _gh_env
+        env = _gh_env(_assignee_profile_home(worker))
+    except Exception as exc:  # noqa: BLE001 -- fail-open
+        _log.warning("pre-PR verifier did not run for %s: profile env for %r unresolvable: %s",
+                     task_id, worker, exc)
+        return []
+    out = []
+    for ref in refs:
+        argv = [sys.executable, script, "check", "--repo", ref.repo, "--pr", str(ref.number),
+                "--card", task_id, "--worker", worker or "worker", "--draft-ok"]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=180,
+                                  stdin=subprocess.DEVNULL, check=False, env=env)
+        except (OSError, subprocess.SubprocessError) as exc:
+            _log.warning("pre-PR verifier %s#%s did not run: %s", ref.repo, ref.number, exc)
+            continue
+        if proc.returncode != 1:
+            continue
+        # rc 1 is a refusal ONLY when the last stdout line is the verdict JSON ({"landable": false, ...}).
+        # CPython also exits 1 on an uncaught exception; a crashing verifier must fail OPEN (Prism 0b37fb2ab9a0).
+        try:
+            verdict = json.loads((proc.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            verdict = None
+        if not isinstance(verdict, dict) or verdict.get("landable") is not False:
+            _log.warning("pre-PR verifier %s#%s did not run (rc 1, no verdict line): %s", ref.repo, ref.number,
+                         (proc.stderr or proc.stdout or "").strip()[-400:])
+            continue
+        text = str(verdict.get("text") or "")
+        out.append((f"{ref.repo}#{ref.number}", text or (proc.stdout or "").strip()[-2000:]))
+    return out
+
+
+class NotLandableError(ValueError):
+    """Raised by ``complete_task`` when the pre-PR verifier refuses one of the card's own open PRs
+    (Forge L0 section 2.3, card PRE). Nothing is mutated beyond the ``completion_blocked_pre_pr`` event."""
+
+    def __init__(self, task_id: str, refusals: list):
+        self.task_id = task_id
+        self.prs = [pr for pr, _ in refusals]
+        super().__init__(
+            "handoff refused by the pre-PR verifier (fleet-merge would refuse it at land):\n"
+            + "\n".join(text for _, text in refusals)
+            + f"\n{task_id} is still in-flight (no state change)."
+        )
+
+
 class EmptyDraftOverrideError(ValueError):
     """Raised by ``complete_task`` when ``draft_ok`` is given but blank.
 
@@ -10847,6 +10932,21 @@ def complete_task(
                          task_id, ", ".join(mentioned))
             with write_txn(conn):
                 _append_event(conn, task_id, "completion_unowned_pr_mentions", {"prs": mentioned})
+        if still_open and not review_claimed:
+            # Pre-PR verifier (Forge L0 section 2.3 (a), card PRE): the card's OWN fleet PRs only, never a mention.
+            # Own = declared in the handoff OR owned by head-branch provenance (b1fdf6186eca).
+            own_keys = {(r.repo.lower(), r.number) for r in _open_pr.split_fleet(_open_pr.extract_pr_refs(
+                metadata=metadata, survivor_pr=survivor_pr))[0]}
+            own_keys |= {(r.repo.lower(), r.number) for r in branch_owned_prs}
+            refusals = _pre_pr_refusals(
+                [r for r in still_open if (r.repo.lower(), r.number) in own_keys],
+                task_id=task_id, worker=candidate.assignee or "",
+            )
+            if refusals:
+                with write_txn(conn):
+                    _append_event(conn, task_id, "completion_blocked_pre_pr",
+                                  {"prs": [pr for pr, _ in refusals]})
+                raise NotLandableError(task_id, refusals)
         if still_open:
             # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
             # DraftPrError, nothing mutated), update a stale head, arm a green
