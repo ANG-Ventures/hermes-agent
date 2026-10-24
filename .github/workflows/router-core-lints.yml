@@ -17,7 +17,8 @@ permissions:
 jobs:
   router-core-lints:
     name: router-core-lints
-    runs-on: ubuntu-latest
+    # The mirror is private: hosted ubuntu-latest never starts there (billing), so run where ci.yaml's plumbing runs.
+    runs-on: ${{ vars.CI_PLUMBING_RUNNER && fromJSON(vars.CI_PLUMBING_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
