@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -79,7 +80,15 @@ def _cross_process_enabled() -> bool:
     try:
         from tools.delegate_tool_config import _get_background_runtime, _get_detached_background
 
-        return bool(_get_detached_background()) or _get_background_runtime() == "kanban"
+        if bool(_get_detached_background()) or _get_background_runtime() == "kanban":
+            return True
+    except Exception:
+        pass
+    # Kanban units that outlived a knob flip (a gateway restarted with ``in_process``) still edit
+    # files in their own processes: this process keeps coordinating while any of them is live.
+    ad = sys.modules.get("tools.async_delegation")
+    try:
+        return bool(ad is not None and ad.kanban_active_count())
     except Exception:
         return False
 

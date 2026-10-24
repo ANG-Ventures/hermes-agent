@@ -274,3 +274,63 @@ def test_runner_registry_read_is_one_locked_read(unit, monkeypatch):
     assert reads == [False], "one read-only registry read before the terminal write, no polling"
     gate.set()
     t.join(30)
+
+
+
+def _build_with(unit, monkeypatch, execution_extra, cfg):
+    seen, built = {}, {}
+
+    def fake_resolve(**kw):
+        seen.update(kw)
+        return {"api_key": "parent-provider-key", "base_url": "http://fake/v1", "provider": "custom",
+                "requested_provider": kw.get("requested"), "api_mode": "chat_completions",
+                "credential_pool": object()}
+
+    import sys
+    import hermes_cli.config as config_mod
+    import hermes_cli.runtime_provider as rp
+
+    monkeypatch.setattr(rp, "resolve_runtime_provider", fake_resolve)
+    monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
+
+    class FakeAgent:
+        def __init__(self, **kw):
+            built.update(kw)
+
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    record = _record(unit.did)
+    record["execution"].update(execution_extra)
+    duw.build_parent(record)
+    return built
+
+
+def test_model_only_delegation_override_reaches_the_children(unit, monkeypatch):
+    """Prism 235939999e6d: inherited route + delegation.model -> the parent carries the child model."""
+    built = _build_with(unit, monkeypatch, {
+        "model": "child-model", "credential_ref": {"source": "provider", "inherited_route": True},
+        "route": {"requested_provider": "custom:x", "model": "parent-model", "explicit_base_url": None}}, {})
+    assert built["model"] == "child-model"
+
+
+def test_pinned_route_keeps_the_recorded_parent_model(unit, monkeypatch):
+    built = _build_with(unit, monkeypatch, {
+        "model": "child-model", "credential_ref": {"source": "provider", "provider": "openrouter"},
+        "route": {"requested_provider": "custom:x", "model": "parent-model", "explicit_base_url": None}}, {})
+    assert built["model"] == "parent-model"
+
+
+def test_direct_endpoint_uses_the_current_delegation_api_key(unit, monkeypatch):
+    """Prism 467e6bac5ed5: delegation.base_url + delegation.api_key -> that key, not the parent's."""
+    built = _build_with(unit, monkeypatch, {
+        "credential_ref": {"source": "delegation_config", "parent_provider": "openrouter"},
+        "route": {"requested_provider": "openrouter", "model": "m",
+                  "explicit_base_url": "https://delegate.example/v1"}},
+        {"delegation": {"api_key": "delegation-key-B"}})
+    assert built["api_key"] == "delegation-key-B" and built["credential_pool"] is None
+    assert "delegation-key-B" not in json.dumps(_record(unit.did)), "never persisted (I4)"
+
+
+def test_provider_route_keeps_the_resolved_key(unit, monkeypatch):
+    built = _build_with(unit, monkeypatch, {"credential_ref": {"source": "provider"}},
+                        {"delegation": {"api_key": "unused"}})
+    assert built["api_key"] == "parent-provider-key"

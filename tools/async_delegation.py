@@ -1469,6 +1469,11 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
             if rec is not None:
                 rec.update(interrupt_fn=_akb.cancel_fn(delegation_id, Path(profile_home)),
                            progress_fn=None, kanban_unit=True, kanban_task_id=launched.get("task_id"))
+        # A stop accepted while the card was being spawned signalled the old in-process callback: the
+        # runner past its record read would never see it. Re-read the durable record now that the
+        # card's cancel is installed, and archive the card if it was cancelled meanwhile.
+        if _akb.cancelled_during_launch(delegation_id, old_attempt, Path(profile_home)):
+            _akb.cancel_unit(delegation_id, Path(profile_home))
         on_spawned = kanban.get("on_spawned")
         if on_spawned is not None:
             try:

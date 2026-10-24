@@ -139,6 +139,26 @@ def _prefill_messages() -> Optional[list]:
     return messages or None
 
 
+def _parent_model(execution: Dict[str, Any], route: Dict[str, Any]) -> str:
+    """An inherited route makes the recovered children take the parent's model (delegate_task's
+    recovery branch clears ``delegation.model``), so a model-only ``delegation.model`` override is
+    carried on the parent: the effective child model ``execution.model``. A pinned route keeps the
+    recorded parent model; the recovery branch pins the child model itself."""
+    inherited = bool((execution.get("credential_ref") or {}).get("inherited_route"))
+    if inherited and execution.get("model"):
+        return str(execution["model"])
+    return route.get("model") or execution.get("model") or ""
+
+
+def _delegation_api_key(execution: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[str]:
+    """A direct-endpoint delegation (``delegation.base_url``) authenticates with the profile's current
+    ``delegation.api_key``: the recovered children inherit the parent's key on that endpoint. Read
+    from config at run time, never from the record (I4). None: the parent provider's key, as in-process."""
+    if (execution.get("credential_ref") or {}).get("source") != "delegation_config":
+        return None
+    return str(((cfg.get("delegation") or {}).get("api_key")) or "").strip() or None
+
+
 def build_parent(record: Dict[str, Any]):
     """Step 3: the parent ``AIAgent`` from the CLI's resolver, keyed on the recorded route; the
     parent never runs a turn. Children get the profile's own ``delegation:`` config (read by the
@@ -157,12 +177,13 @@ def build_parent(record: Dict[str, Any]):
     cfg = load_config() or {}
     pr = cfg.get("provider_routing") or {}
     kwargs: Dict[str, Any] = {
-        "api_key": runtime.get("api_key"), "base_url": runtime.get("base_url"),
+        "api_key": _delegation_api_key(execution, cfg) or runtime.get("api_key"), "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"), "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"), "command": runtime.get("command"),
-        "args": list(runtime.get("args") or []), "credential_pool": runtime.get("credential_pool"),
+        "args": list(runtime.get("args") or []),
+        "credential_pool": None if _delegation_api_key(execution, cfg) else runtime.get("credential_pool"),
         "request_overrides": runtime.get("request_overrides"),
-        "model": route.get("model") or execution.get("model") or "",
+        "model": _parent_model(execution, route),
         "max_iterations": int(execution.get("max_iterations") or 45),
         "quiet_mode": True, "skip_memory": True, "skip_context_files": True,
         "prefill_messages": _prefill_messages(),
