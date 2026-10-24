@@ -259,6 +259,48 @@ def test_spawn_failure_runs_once_in_process_under_the_new_attempt(monkeypatch, t
     assert statuses == ["archived"]
 
 
+def test_spawn_failure_with_an_unfenced_card_fails_instead_of_running_in_process(monkeypatch, tmp_path):
+    """Prism f55794792ec0: a spawn that raised after its worker may have started, on a card that
+    could not be archived, must not also run the unit in-process (two writers on one tree)."""
+    monkeypatch.setattr(akb, "_archive_quietly", lambda task_id: False)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=Spawner(fail=True))
+    rec = _record(handle["delegation_id"])
+    assert calls == [], "no in-process fallback while the card is not fenced"
+    assert rec["attempt"]["generation"] == 0, "the attempt was not superseded"
+    assert rec["state"] == "failed"
+    terminal = [e for e in rec["outbox"] if e.get("type") == "async_delegation"]
+    assert len(terminal) == 1 and "not fenced" in json.dumps(terminal[0])
+
+
+def test_scale_to_zero_counts_in_process_units_in_one_snapshot(monkeypatch, tmp_path):
+    """Prism 0ef3aa091277: a kanban unit admitted between two separate counts must not hide a
+    live in-process delegation from the idle probe."""
+    from gateway.run import GatewayRunner
+    from tools.process_registry import process_registry as pr
+
+    ad._records["inproc"] = {"status": "running"}
+    real = ad._records_lock
+
+    class _Racing:
+        acquires = 0
+
+        def __enter__(self):
+            real.acquire()
+
+        def __exit__(self, *exc):
+            _Racing.acquires += 1
+            if _Racing.acquires == 1:  # a kanban unit lands between two separate reads
+                ad._records["kanban"] = {"status": "running", "kanban_unit": True}
+            real.release()
+
+    monkeypatch.setattr(ad, "_records_lock", _Racing())
+    monkeypatch.setattr(pr, "has_any_active", lambda: False)
+    monkeypatch.setattr(pr, "pending_watchers", [], raising=False)
+    r = GatewayRunner.__new__(GatewayRunner)
+    r._background_tasks = set()
+    assert r._scale_to_zero_has_live_background_work() is True
+
+
 def test_supersede_attempt_bumps_generation_only():
     did = "deleg_sup"
     rec, _ = store.persist_dispatch(delegation_id=did, durable_spec=_spec("/tmp"), boot_id=BOOT,

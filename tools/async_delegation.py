@@ -1099,6 +1099,13 @@ def kanban_active_count() -> int:
         return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES and r.get("kanban_unit"))
 
 
+def in_process_active_count() -> int:
+    """The live units of ``active_count`` this process runs, from ONE snapshot: the difference of
+    two separately locked counts can hide one when a kanban unit lands between them."""
+    with _records_lock:
+        return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES and not r.get("kanban_unit"))
+
+
 def active_task_count() -> int:
     """Number of running child subagents (a batch of N contributes N; a batch with
     no goal list counts 1) — the truthful observability figure, unlike slots."""
@@ -1553,6 +1560,11 @@ def _launch_kanban_unit(delegation_id: str, record: Dict[str, Any], kanban: Dict
         return True
     logger.warning("async_delegation_kanban_spawn_failed delegation_id=%s attempt_id=%s error=%s",
                    delegation_id, old_attempt, launched.get("error"))
+    if not launched.get("fenced"):
+        # The card could not be archived and its runner may have started: running the unit here too
+        # would put two writers on one tree. Deliver the error instead (Q1: no automatic re-run).
+        raise RuntimeError(f"background unit card {launched.get('task_id')} not fenced after a failed "
+                           f"spawn ({launched.get('error')}); not run in-process")
     new_attempt = _store.supersede_attempt(delegation_id, old_attempt, profile_home=profile_home)
     if new_attempt is None:
         raise RuntimeError("background unit stopped before it started (attempt no longer current)")

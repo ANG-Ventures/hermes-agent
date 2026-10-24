@@ -194,9 +194,10 @@ def launch_unit(*, delegation_id: str, attempt_id: str, profile_home: Path, prof
             pid = kbd.spawn_now(conn, task_id, board=board, spawn_fn=spawn_fn)
         return {"ok": True, "task_id": task_id, "pid": pid}
     except Exception as exc:
-        if task_id:
-            _archive_quietly(task_id)
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "task_id": task_id}
+        # Fenced = no card exists, or it is archived (a started runner's card read stops it). An
+        # unfenced card may still have a runner: the caller must not run the unit a second time.
+        fenced = not task_id or _archive_quietly(task_id)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "task_id": task_id, "fenced": fenced}
 
 
 def _archive_quietly(task_id: str) -> bool:
