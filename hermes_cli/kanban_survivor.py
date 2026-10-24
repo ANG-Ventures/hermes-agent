@@ -1695,6 +1695,63 @@ def _recorded_base(repo, recorded, published, base):
     return base
 
 
+def _borrow_shallow(repo, bare):
+    """Give ``bare`` the shallow grafts of ``repo`` when ``repo`` is shallow.
+
+    GIT_ALTERNATE_OBJECT_DIRECTORIES lends objects, not the `shallow` file, so a
+    walk in ``bare`` from a shallow clone's HEAD goes past the boundary into
+    parents that were never fetched and dies rc=128 ("Failed to traverse
+    parents of commit ...", t_b15005c7).
+    """
+    shallow = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "shallow",
+                   check=False)
+    if shallow.returncode:
+        return
+    source = Path(shallow.stdout.decode().strip())
+    if source.is_file():
+        shutil.copyfile(source, Path(bare) / "shallow")
+
+
+def _explain_shallow(repo, key, reason):
+    """Re-raise a failed capture in a shallow clone with the remedy named."""
+    probe = _git(repo, "rev-parse", "--is-shallow-repository", check=False)
+    if probe.returncode or probe.stdout.strip() != b"true":
+        return
+    where = "." if key == "." else f"./{key}"
+    raise SurvivorUnavailable(
+        f"{reason} in shallow clone {where} -- the history behind its shallow boundary was "
+        f"never fetched; run `git -C {where} fetch --unshallow` (or push the work) and retry"
+    )
+
+
+def _live_ancestor_survivor(repo, head, published):
+    """A published ref whose LIVE tip contains ``head``, or None.
+
+    `_remote_survivor` only sees advertised tips present locally. When the
+    remote has moved past this checkout (always, for a stale `--depth 1`
+    clone) the new tip is absent, yet HEAD is still on the branch. A local
+    tracking ref containing HEAD nominates the branch; `_reachable_from_live`
+    proves it against the live tip, as `_recorded_base` does.
+    """
+    advertised = {f"refs/remotes/{ref['remote']}/{ref['branch']}": ref for ref in published}
+    if not advertised:
+        return None
+    listed = _git(repo, "for-each-ref", "--contains", head, "--format=%(refname)",
+                  "refs/remotes", check=False)
+    if listed.returncode:
+        return None
+    matched = set(advertised).intersection(listed.stdout.decode("utf-8", "replace").splitlines())
+    deadline = time.monotonic() + _LIVE_BASE_TIMEOUT
+    for name in sorted(matched):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ref = advertised[name]
+        if _reachable_from_live(repo, ref["remote"], ref["branch"], head, timeout=remaining):
+            return dict(ref, head=head, matched_by="live-ancestor")
+    return None
+
+
 #: TOTAL budget for proving the recorded base against live branches. A timeout just
 #: keeps the older published base: a larger patch, never a lost one.
 _LIVE_BASE_TIMEOUT = 120
@@ -1723,6 +1780,7 @@ def _reachable_from_live(repo, remote, branch, sha, *, timeout=_LIVE_BASE_TIMEOU
         try:
             _git(repo, "init", "-q", "--bare",
                  f"--object-format={fmt.stdout.decode().strip()}", str(probe))
+            _borrow_shallow(repo, probe)
             if _git(probe, "update-ref", "refs/heads/recorded", sha, env=env,
                     check=False).returncode:
                 return False
@@ -1777,6 +1835,7 @@ def _snapshot(repo, base, prefix, *, irreversible_delete=False):
             commit = _git(repo, "commit-tree", tree, *parents, "-m", "Kanban workspace recovery", env=identity).stdout.decode().strip()
             recovery = Path(tmp) / "recovery.git"
             _git(repo, "init", "--bare", str(recovery))
+            _borrow_shallow(repo, recovery)
             objects = _git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects").stdout.decode().strip()
             bundle_env = dict(os.environ, GIT_ALTERNATE_OBJECT_DIRECTORIES=objects)
             _git(recovery, "update-ref", "refs/heads/implementation", commit, env=bundle_env)
@@ -1815,7 +1874,8 @@ def _capture(repo, key, workspace, recorded=None):
         # LIVE CANONICAL TREE the workspace was cloned from — never a patch-id
         # hit, which is diff identity only.
         ref = (_remote_survivor(repo, sha, published)
-               or _canonical_survivor(repo, sha, workspace, storage_cache))
+               or _canonical_survivor(repo, sha, workspace, storage_cache)
+               or _live_ancestor_survivor(repo, sha, published))
         if ref and ref.get("matched_by") == "canonical":
             hint = _content_advisory(repo, sha, published)
             if hint:
@@ -3214,7 +3274,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                     data = _snapshot(repo, base, "" if key == "." else key + "/",
                                      irreversible_delete=True)
                     irreversible = True
-            except SurvivorUnavailable:
+            except SurvivorUnavailable as exc:
                 # Every object-reading step above (`status`, `diff`, and
                 # `_snapshot`'s `git bundle` inside pack-objects) raises the
                 # bare constant. Classify it before it escapes: if this repo's
@@ -3222,6 +3282,7 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                 # Anything else re-raises unchanged.
                 _explain_dead_worktree_stub(repo, key, bases)
                 _explain_broken_object_store(repo, key, workspace, bases)
+                _explain_shallow(repo, key, str(exc))
                 raise
             if ref:
                 refs.append(dict(ref, repository=key))
