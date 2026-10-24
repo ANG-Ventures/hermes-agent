@@ -932,18 +932,23 @@ def finding_text(entry: dict, result: dict, header: str) -> str:
     return "\n".join(lines) + "\n---\n" + str(entry.get("wake_text") or "")
 
 
+def _surfaced_comment_exists(kb: Any, conn: Any, task_id: str, delegation_id: str) -> bool:
+    tag = f"(delegation {delegation_id})"
+    return any(c.author == AUTHOR and c.body.startswith(f"{MARKER} surfaced:") and c.body.endswith(tag)
+               for c in kb.list_comments(conn, task_id))
+
+
 def record_surface(entry: dict, summary: str) -> bool:
     """One executor-authored ``surfaced:`` comment per claim (keyed by delegation id)."""
     from hermes_cli import kanban_db as kb
 
-    tag = f"(delegation {entry['delegation_id']})"
     conn = kb.connect(board=entry.get("board"))
     try:
-        if any(c.author == AUTHOR and c.body.startswith(f"{MARKER} surfaced:") and c.body.endswith(tag)
-               for c in kb.list_comments(conn, entry["task_id"])):
+        if _surfaced_comment_exists(kb, conn, entry["task_id"], entry["delegation_id"]):
             return False
         with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
-            kb.add_comment(conn, entry["task_id"], AUTHOR, f"{MARKER} surfaced: {summary or 'no summary'} {tag}")
+            kb.add_comment(conn, entry["task_id"], AUTHOR,
+                           f"{MARKER} surfaced: {summary or 'no summary'} (delegation {entry['delegation_id']})")
         return True
     finally:
         conn.close()
@@ -1379,9 +1384,55 @@ async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional
                 board_has_receipt, entry.get("board"), entry["task_id"], entry["delegation_id"]):
             await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome=entry.get("action"))
             continue
-        await _restart_redispatch_or_lost(runner, entry, state, now)
+        if not await _superseded_by_terminal(entry, "gateway restart", state):
+            await _restart_redispatch_or_lost(runner, entry, state, now)
         handled += 1
     return handled
+
+
+# A completion verification whose verdict already reached the board (executor receipt or the
+# ``surfaced:`` comment) on a card that is still closed lost nothing when a restart killed its claim:
+# a ⚠️ line + re-surface replays a stale notice as new (5 false lines on the 2026-10-24 restart).
+# No verdict yet = the verification did not finish; that claim takes the redispatch path below.
+_CLOSED_STATUSES = frozenset({"done", "archived"})
+_CLOSED_NOTICE_KINDS = frozenset({"completed", "archived"})
+
+
+def _closed_with_verdict(entry: dict) -> Optional[str]:
+    """The card's status when it is closed AND this delegation's verdict is on the board, else None."""
+    from hermes_cli import kanban_db as kb
+
+    conn = _readonly(kb, entry.get("board"))
+    try:
+        status = getattr(kb.get_task(conn, entry["task_id"]), "status", None)
+        if status not in _CLOSED_STATUSES:
+            return None
+        if _receipt_exists(conn, entry["task_id"], entry["delegation_id"]) or _surfaced_comment_exists(
+                kb, conn, entry["task_id"], entry["delegation_id"]):
+            return status
+        return None
+    finally:
+        conn.close()
+
+
+async def _superseded_by_terminal(entry: dict, reason: str, state: BoomerangWakeState) -> bool:
+    """True = the claim was closed silently (``superseded-by-terminal``); False = real lost work."""
+    if entry.get("kind") not in _CLOSED_NOTICE_KINDS or not entry.get("delegation_id"):
+        return False
+    try:
+        status = await asyncio.to_thread(_closed_with_verdict, entry)
+    except Exception as exc:   # unreadable board: keep today's visible path
+        logger.debug("kanban boomerang-wake: verdict read for %s failed (%s)", entry["task_id"], exc)
+        return False
+    if status is None:
+        return False
+    logger.info("kanban boomerang-wake: %s lost reason=%s superseded-by-terminal status=%s kind=%s "
+                "delegation=%s (verdict on board; no line, no re-surface)", entry["task_id"], reason, status,
+                entry.get("kind"), entry.get("delegation_id"))
+    await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
+                            outcome="superseded-by-terminal", reason=reason, card_status=status,
+                            finished_at=_time.time())
+    return True
 
 
 def _restart_refusal(entry: dict, state: BoomerangWakeState, now: float) -> Optional[str]:

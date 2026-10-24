@@ -643,6 +643,85 @@ def test_redispatched_child_that_fails_is_not_retried_again(env):
     assert disp.verdict != "auto", "a worker crash after the restart retry got a second automatic retry"
 
 
+def _verdict_on_board(entry, how: str) -> None:
+    """The child's verdict reached the board before the restart killed the claim."""
+    if how == "surfaced":
+        assert ah.record_surface(entry, "child surfaced it")
+        return
+    with kb.connect_closing() as conn:
+        kb._append_event(conn, entry["task_id"], ah.RECEIPT_KIND, {  # noqa: SLF001
+            "operator_kind": "machine", "via": ah.VIA, "delegation_id": entry["delegation_id"],
+            "action": "complete", "claim_event_id": int(entry["event_id"])})
+
+
+@pytest.mark.parametrize("how", ["surfaced", "receipt"])
+def test_restart_completed_wake_with_verdict_on_done_card_is_silent(env, caplog, how):
+    """2026-10-24 (5 false lines): the verification's verdict is already on the board and the card is
+    still done, so a restart lost nothing: no ⚠️ line, no replayed notice, no redispatch."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    _verdict_on_board(entry, how)
+    _kill(env, entry)
+    with caplog.at_level("INFO", logger="gateway.kanban_boomerang_wake"):
+        assert asyncio.run(ah.reconcile(env["runner"])) == 1
+        assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    assert env["adapter"].handled == [] and env["adapter"].sent == []
+    assert len(env["dispatched"]) == 1, "a finished verification was redispatched"
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "superseded-by-terminal"
+    assert any(f"{tid} lost reason=gateway restart superseded-by-terminal status=done" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_restart_completed_wake_without_verdict_redispatches_verification(env):
+    """Prism d1cebc43e013: a completed wake ALWAYS finds its card done; with no verdict on the board the
+    verification did not finish, so the restart redispatches it (never a silent terminal)."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    _kill(env, entry)
+    assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    old = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert old["outcome"] == "redispatched_after_restart", old["outcome"]
+    [new] = env["dispatched"][1:]
+    assert (new["task_id"], new["wake_text"]) == (tid, entry["wake_text"])
+    assert env["adapter"].handled == [] and env["adapter"].sent == []
+
+
+def test_redispatched_verification_killed_again_is_lost_once(env):
+    """The redispatch is bounded: a second restart under the redispatched verification (no verdict yet)
+    posts today's warning + re-surface once, and never starts a third child."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    _kill(env, entry)
+    asyncio.run(ah.reconcile(env["runner"]))
+    new = env["dispatched"][-1]
+    _kill(env, new)
+    assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    assert env["dispatched"][-1] is new and len(env["dispatched"]) == 2
+    assert [s for s in env["adapter"].sent if "boomerang-wake lost" in s] == [
+        f"⚠️ boomerang-wake lost {tid} (reason: gateway restart, retry spent)"]
+    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+
+
+def test_restart_review_wake_with_verdict_on_board_still_warns(env):
+    """Only completion notices are silenced: a review wake on a card still in review is real lost work."""
+    tid = _review_card(env)
+    entry = _claimed_entry(env, tid, row="own_repo_review_red", kind="review_requested",
+                           state=ah.STATE_RUNNING)
+    ah.BoomerangWakeState().bump_retry(tid)
+    assert ah.record_surface(entry, "child surfaced it")
+    _kill(env, entry)
+    assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    assert [s for s in env["adapter"].sent if "boomerang-wake lost" in s] == [
+        f"⚠️ boomerang-wake lost {tid} (reason: gateway restart, retry spent)"]
+    assert [t.text for t in env["adapter"].handled] == [f"Task {tid} wake"]
+    assert ah.BoomerangWakeState().get_claim(entry["key"])["outcome"] == "lost"
+
+
 def test_ac14_live_child_past_max_cancelled_first_late_handoff_dropped(env):
     tid = _card(env)
     _worker_close(tid)
