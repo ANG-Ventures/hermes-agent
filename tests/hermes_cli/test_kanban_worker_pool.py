@@ -148,6 +148,31 @@ def test_reader_accepts_the_last_change_audit_field_and_still_refuses_unknown_ro
         kwp.parse_roles(roles)
 
 
+def test_ci_runner_role_is_count_free_and_other_roles_keep_their_count(tmp_path):
+    """t_1acfaa85: hermes-home#6459 writes ``"ci-runner": {}``; the pool must still load."""
+    def doc(roles):
+        return {"schema": 1, "hosts": {"a": {"roles": roles, "state": "active"}}}
+
+    assert kwp.parse_roles(doc({"ci-runner": {}})) == {"a": ({"ci-runner": None}, "active")}
+    assert kwp.parse_roles(doc({"ci-runner": {"slots": 3}})) == {"a": ({"ci-runner": 3}, "active")}
+    for role in ("kanban-worker", "review-worker"):
+        with pytest.raises(kwp.PoolError, match=r'must be \{"slots": N\}'):
+            kwp.parse_roles(doc({role: {}}))
+    with pytest.raises(kwp.PoolError, match="ci-runner must be"):
+        kwp.parse_roles(doc({"ci-runner": {"slots": 3, "x": 1}}))
+    with pytest.raises(kwp.PoolError, match="slots must be 1..64"):
+        kwp.parse_roles(doc({"ci-runner": {"slots": 0}}))
+    roles = {"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {"slots": 4}, "ci-runner": {}}, "state": "active"},
+        "ace-media": {"roles": {"kanban-worker": {"slots": 4}, "ci-runner": {}}, "state": "active"},
+    }}
+    _write_pool(tmp_path, roles=roles)
+    cfg = kwp.read_pool(tmp_path, kanban_cfg={})
+    assert cfg.refused is None
+    assert sorted(h.name for h in cfg.pool_hosts) == ["ace-ai", "ace-media"]
+    assert {h.slots for h in cfg.pool_hosts} == {4}
+
+
 def _studio_registered(fleet: Path, policy_hosts=None):
     """The QA t_1302fe6c repro: mac-studio carries the kanban-worker role and
     sits FIRST in the sidecar priority, while the placement policy says
