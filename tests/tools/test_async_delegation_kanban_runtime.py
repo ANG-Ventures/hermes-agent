@@ -650,6 +650,38 @@ def test_lineage_scan_finds_a_tagged_process():
         proc.wait(timeout=10)
 
 
+def test_lineage_scan_skips_same_uid_processes_whose_environ_is_denied(monkeypatch):
+    """Linux hides a non-dumpable same-uid process's environ (systemd --user, ssh-agent): that is not a
+    unit's process, so the scan stays known; any other read error still makes it unknown (None)."""
+    import os
+    from types import SimpleNamespace
+
+    import psutil
+
+    uid = os.getuid()
+
+    class _P:
+        def __init__(self, pid, env=None, exc=None):
+            self.pid, self._env, self._exc = pid, env, exc
+            self.info = {"pid": pid, "uids": SimpleNamespace(real=uid, effective=uid)}
+
+        def cmdline(self):
+            return ["python"]
+
+        def environ(self):
+            if self._exc is not None:
+                raise self._exc
+            return self._env
+
+    tagged = _P(4242, env={"HERMES_KANBAN_LINEAGE": "t_scan0002:1"})
+    denied = _P(4243, exc=psutil.AccessDenied(4243))
+    monkeypatch.setattr(psutil, "process_iter", lambda *a, **k: iter([denied, tagged]))
+    assert [p.pid for p in akb.lineage_processes("t_scan0002")] == [4242]
+    broken = _P(4244, exc=OSError("environ unreadable"))
+    monkeypatch.setattr(psutil, "process_iter", lambda *a, **k: iter([broken, tagged]))
+    assert akb.lineage_processes("t_scan0002") is None
+
+
 # ── file_state across processes (spec §8 rows 10/29) ────────────────────────
 
 

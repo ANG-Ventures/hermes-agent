@@ -531,6 +531,11 @@ def lineage_processes(task_id: str) -> Optional[List[Any]]:
             env = proc.environ()
         except psutil.NoSuchProcess:
             continue
+        except psutil.AccessDenied:
+            # Same uid but non-dumpable (Linux: systemd --user, sd-pam, ssh-agent, sshd-session): the
+            # kernel hides its environ. Like the setuid skip above, it is not ours; counting it unknown
+            # made every scan on a Linux host with a user session unknown, forever.
+            continue
         except Exception:
             return None
         tag = env.get(KANBAN_LINEAGE_ENV) or ""  # lineage-reader: ok — the lost-card reaper (spec §5.4)
