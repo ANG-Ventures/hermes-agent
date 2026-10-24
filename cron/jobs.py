@@ -3719,7 +3719,8 @@ def claim_job_for_fire(
         now = _hermes_now()
         if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
             return False  # someone holds a fresh claim
-        from cron.occurrences import completed_occurrence, rewound_watermark, scheduled_instant
+        from cron.occurrences import (
+            LedgerUnavailable, completed_occurrence, rewound_watermark, scheduled_instant)
 
         # ``manual`` (an off-tick run-now) must NOT stamp an occurrence identity: outside a
         # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
@@ -3741,15 +3742,21 @@ def claim_job_for_fire(
         if (instant is not None
                 and datetime.fromisoformat(instant) - now >= timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS)):
             instant = None
-        if instant and completed_occurrence(job, instant):
-            if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
+        recurring = job.get("schedule", {}).get("kind") in {"cron", "interval"}
+        try:
+            completed = bool(instant) and completed_occurrence(job, instant)
+            watermark = rewound_watermark(job, instant) if instant and not completed else None
+        except LedgerUnavailable:
+            if not recurring:
+                return False  # a one-shot never fires on a ledger that cannot rule out a prior run
+            completed, watermark = False, None  # recurring: a duplicate beats a silent skip
+        if completed:
+            if recurring:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
                     job["next_run_at"] = nxt
                     save_jobs(jobs)
             return False
-        recurring = job.get("schedule", {}).get("kind") in {"cron", "interval"}
-        watermark = rewound_watermark(job, instant) if instant else None
         if watermark:
             # Rewound store: refuse this claim. A recurring job re-arms after the completed
             # occurrence (a slot genuinely missed after it stays past-due for the due scan's
@@ -4285,6 +4292,38 @@ def _restore_unclaimed_slot(job: Dict[str, Any], scan: _DueScan) -> Optional[str
     return slot
 
 
+# Last-warned monotonic time per one-shot id for _warn_oneshot_ledger_unavailable.
+_ledger_unavailable_warned: Dict[str, float] = {}
+
+
+def _warn_oneshot_ledger_unavailable(job: Dict[str, Any]) -> None:
+    """One WARNING per one-shot per 10 min while the ledger cannot be read (t_9b3b6e4b)."""
+    jid = str(job.get("id") or "")
+    mono = time.monotonic()
+    last = _ledger_unavailable_warned.get(jid)
+    if last is not None and mono - last < _OVERDUE_ONESHOT_WARN_INTERVAL_SECONDS:
+        return
+    _ledger_unavailable_warned[jid] = mono
+    logger.warning(
+        "cron.oneshot.ledger_unavailable job=%s id=%s next_run_at=%s: executions ledger "
+        "unreadable, cannot tell whether this one-shot already ran; not firing and not "
+        "retiring it this tick", job.get("name"), jid, job.get("next_run_at"))
+
+
+def _settle_completed_oneshot(job: Dict[str, Any], scan: _DueScan, completed_at: str) -> None:
+    """Persist terminal completion for a one-shot the ledger proves ran, so the record stops
+    re-evaluating every tick and the retention sweep can prune it. Idempotent: a finite budget
+    is set to ``times``, never incremented past it."""
+    repeat = dict(job.get("repeat") or {})
+    times = repeat.get("times")
+    if isinstance(times, int) and times > 0 and repeat.get("completed", 0) < times:
+        repeat["completed"] = times
+    fields: Dict[str, Any] = {"repeat": repeat, "last_run_at": job.get("last_run_at") or completed_at}
+    _complete_job_record(fields)
+    job.update(fields)
+    scan.persist(job["id"], **fields)
+
+
 def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float) -> bool:
     """Decide whether one enabled, non-terminal job fires this tick, persisting any repairs.
     Ordering matters: recover missing next_run_at, repair timezone shifts, re-arm stale-error
@@ -4311,14 +4350,26 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     # into both fields, and any rewrite of next_run_at (edit, re-anchor, fire-claim advance) must
     # invalidate the marker. Do not "fix" this with _ensure_aware normalization.
     manual_run = job.get("manual_run_at") == next_run
-    from cron.occurrences import completed_occurrence, rewound_watermark, scheduled_instant
+    from cron.occurrences import (
+        LedgerUnavailable, completed_occurrence_at, rewound_watermark, scheduled_instant)
 
-    if not manual_run and completed_occurrence(job, next_run):
-        new_next = d.recompute_next() if recurring else None
+    try:
+        completed_at = None if manual_run else completed_occurrence_at(job, next_run)
+        watermark = None if manual_run or completed_at else rewound_watermark(job, next_run)
+    except LedgerUnavailable:
+        if not recurring:
+            # An unreadable ledger proves nothing: never fire, retire or page a one-shot on it.
+            _warn_oneshot_ledger_unavailable(job)
+            return False
+        completed_at = watermark = None  # recurring: a duplicate beats a silent skip
+    if completed_at:
+        if not recurring:
+            _settle_completed_oneshot(job, scan, completed_at)
+            return False
+        new_next = d.recompute_next()
         if new_next:
             scan.persist(job["id"], next_run_at=new_next)
         return False
-    watermark = rewound_watermark(job, next_run) if not manual_run else None
     if watermark:
         scan.rewound.append(str(job["id"]))
     if watermark and not recurring:
