@@ -955,6 +955,10 @@ def _state(conn, task_id):
 
 def record_baseline(conn, task_id, workspace):
     """Record once, before dispatch; retries must not reset the task's base."""
+    from hermes_cli.kanban_delegations_board import conn_is_delegations
+
+    if conn_is_delegations(conn):
+        return  # a background unit's dir is the session's cwd: not its output, never captured
     if conn.execute("SELECT 1 FROM task_workspace_survivors WHERE task_id = ?", (task_id,)).fetchone():
         return
     bases, held, survivor = _state(conn, task_id)
@@ -2862,6 +2866,12 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
     proved: the card's own PR content is on the default branch (t_8035c8af). It
     stands in for an operator ``--survivor-ref`` when none is given.
     """
+    from hermes_cli.kanban_delegations_board import conn_is_delegations
+
+    if conn_is_delegations(conn) and not cleanup:
+        # A background unit's card works IN the session's cwd (a user's tree, often a home dir);
+        # its output is the delegation registry record, never the directory's bytes.
+        return None
     try:
         bases, held, previous = _state(conn, task_id)
         if not isinstance(bases, dict) or not (previous is None or isinstance(previous, dict)):
