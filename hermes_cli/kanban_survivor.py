@@ -1994,7 +1994,7 @@ def _require_live_boundary(repo, published):
     if path is None or not path.is_file():
         return
     # Same filter as `_snapshot`: a stale line naming an absent object is no boundary.
-    boundary = _present_commits(repo, sorted(set(path.read_text().split())))
+    boundary = _present_commits(repo, sorted(set(path.read_text(encoding="ascii").split())))
     advertised = {f"refs/remotes/{ref['remote']}/{ref['branch']}": (ref["remote"], ref["branch"])
                   for ref in published}
     for sha in boundary:
