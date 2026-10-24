@@ -474,39 +474,50 @@ note: no session identity — home-session guard skipped
 <!-- bv2-smoke:step3:end -->
 
 <!-- bv2-smoke:step4:begin -->
-## Step 4: restart drill observer: reconciler re-surfaces within one tick (AC-11, 5.7)
+## Step 4: restart drill: a cut child is redispatched once; a spent retry re-surfaces (AC-11, 5.7)
 
-- mode: `live`  started: 2026-10-20T05:51:30-07:00  finished: 2026-10-20T05:59:32-07:00
+- mode: `live`  started: 2026-10-24T16:15:28-07:00  finished: 2026-10-24T16:21:21-07:00
 - verdict: **PASS**
-- the harness never restarts anything; gateway pid file `/Volumes/fleet-scratch/tmp/pl-1020044514/home/gateway.pid` boot_id before: `6910:1792496722.396544`
-- card `s4_restart` = `t_db9c6f92`
+- the harness never restarts anything; gateway pid file `/Volumes/fleet-scratch/tmp/pl-1024161447/home/gateway.pid` boot_id at start: `47216:1792883688.502225`; wake state `/Volumes/fleet-scratch/tmp/pl-1024161447/home/gateway/kanban_boomerang_wake.json`
+- arm 1 (redispatch): retry unspent -> quiet redispatch, second child finishes the card
+- arm 2 (fallback): retries[card]=1 written before the restart -> lost (retry spent) + re-surface
+- card `s4_restart` = `t_9053192c`
+- card `s4_fallback` = `t_fff7c556`
 
 ### Commands
 
 ```text
-$ /Users/alexgierczyk/.hermes/.worktrees/t_b901c171/skills-shared/hermes-harness/puppet-lane/scripts/bv2-kanban.sh boards create bv2-smoke-pl --name 'BV2 smoke (scratch)' --description 'Boomerang v2 smoke harness scratch board (t_989cde1b); safe to archive'   # exit 0
-$ /Users/alexgierczyk/.hermes/.worktrees/t_b901c171/skills-shared/hermes-harness/puppet-lane/scripts/bv2-kanban.sh --board bv2-smoke-pl create 'bv2 smoke s4: child in flight across a gateway restart' --session 20261020_044727_01aab3eb --assignee human:apollo --json   # exit 0
-$ /Users/alexgierczyk/.hermes/.worktrees/t_b901c171/skills-shared/hermes-harness/puppet-lane/scripts/bv2-kanban.sh --board bv2-smoke-pl notify-subscribe t_db9c6f92 --platform discord --chat-id 1562069703856496752 --chat-type channel --delivery-mode notify+wake   # exit 0
-$ /Users/alexgierczyk/.hermes/.worktrees/t_b901c171/skills-shared/hermes-harness/puppet-lane/scripts/bv2-kanban.sh --board bv2-smoke-pl edit t_db9c6f92 --auto-handle true   # exit 0
-$ /Users/alexgierczyk/.hermes/.worktrees/t_b901c171/skills-shared/hermes-harness/puppet-lane/scripts/bv2-kanban.sh --board bv2-smoke-pl edit t_db9c6f92 --body 'bv2 smoke s4 restart-drill fixture (board bv2-smoke-pl, puppet lane). Accepting this forced completion requires these checks, each run with the terminal tool and quoted in your evidence: (1) `cat "$HERMES_HOME/config.yaml"` and list every top-level key; (2) `ls -la "$HERMES_HOME/logs"`; (3) `tail -n 5 "$HERMES_HOME/logs/gateway.log"`; (4) `shasum -a 256 "$HERMES_HOME/logs/gateway.log"`; (5) `python3 -c '"'"'import json,sys; print(len(json.load(open(sys.argv[1]))))'"'"' "$HERMES_HOME/sessions/sessions.json"`; (6) wait 60 seconds (`sleep 60`) and re-run (4): report whether the digest changed. If all six ran, accept the completion.'   # exit 0
-$ /Users/alexgierczyk/.hermes/.worktrees/t_b901c171/skills-shared/hermes-harness/puppet-lane/scripts/bv2-kanban.sh --board bv2-smoke-pl complete t_db9c6f92 --summary 'bv2 smoke: forced completed event'   # exit 0
-# APOLLO (manual): restart the gateway NOW via safe-gateway-restart (single-use approval), while the auto-handle child for t_db9c6f92 is still running   ack: restart
-$ /Users/alexgierczyk/.hermes/.worktrees/t_b901c171/skills-shared/hermes-harness/puppet-lane/scripts/bv2-ack.sh restart   # scripted ack, exit 0
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-kanban.sh boards create bv2-smoke-pl --name 'BV2 smoke (scratch)' --description 'Boomerang v2 smoke harness scratch board (t_989cde1b); safe to archive'   # exit 0
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-kanban.sh --board bv2-smoke-pl create 'bv2 smoke s4: child in flight across a gateway restart (redispatch)' --session 20261024_161516_fcf7f5c3 --assignee human:apollo --json   # exit 0
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-kanban.sh --board bv2-smoke-pl notify-subscribe t_9053192c --platform discord --chat-id 1563692373173731358 --chat-type channel --delivery-mode notify+wake   # exit 0
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-kanban.sh --board bv2-smoke-pl edit t_9053192c --boomerang-wake   # exit 0
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-kanban.sh --board bv2-smoke-pl edit t_9053192c --body 'bv2 smoke s4 restart-drill fixture (board bv2-smoke-pl, puppet lane). Accepting this forced completion requires these checks, each run with the terminal tool and quoted in your evidence: (1) `cat "$HERMES_HOME/config.yaml"` and list every top-level key; (2) `ls -la "$HERMES_HOME/logs"`; (3) `tail -n 5 "$HERMES_HOME/logs/gateway.log"`; (4) `shasum -a 256 "$HERMES_HOME/logs/gateway.log"`; (5) `python3 -c '"'"'import json,sys; print(len(json.load(open(sys.argv[1]))))'"'"' "$HERMES_HOME/sessions/sessions.json"`; (6) wait 60 seconds (`sleep 60`) and re-run (4): report whether the digest changed. If all six ran, accept the completion.'   # exit 0
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-kanban.sh --board bv2-smoke-pl complete t_9053192c --summary 'bv2 smoke: forced completed event'   # exit 0
+# APOLLO (manual): restart the gateway NOW via safe-gateway-restart (single-use approval), while the boomerang-wake child for t_9053192c is still running   ack: restart
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-ack.sh restart   # scripted ack, exit 0
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-kanban.sh --board bv2-smoke-pl create 'bv2 smoke s4: child in flight across a gateway restart (retry spent)' --session 20261024_161516_fcf7f5c3 --assignee human:apollo --json   # exit 0
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-kanban.sh --board bv2-smoke-pl notify-subscribe t_fff7c556 --platform discord --chat-id 1563692373173731358 --chat-type channel --delivery-mode notify+wake   # exit 0
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-kanban.sh --board bv2-smoke-pl edit t_fff7c556 --boomerang-wake   # exit 0
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-kanban.sh --board bv2-smoke-pl edit t_fff7c556 --body 'bv2 smoke s4 restart-drill fixture (board bv2-smoke-pl, puppet lane). Accepting this forced completion requires these checks, each run with the terminal tool and quoted in your evidence: (1) `cat "$HERMES_HOME/config.yaml"` and list every top-level key; (2) `ls -la "$HERMES_HOME/logs"`; (3) `tail -n 5 "$HERMES_HOME/logs/gateway.log"`; (4) `shasum -a 256 "$HERMES_HOME/logs/gateway.log"`; (5) `python3 -c '"'"'import json,sys; print(len(json.load(open(sys.argv[1]))))'"'"' "$HERMES_HOME/sessions/sessions.json"`; (6) wait 60 seconds (`sleep 60`) and re-run (4): report whether the digest changed. If all six ran, accept the completion.'   # exit 0
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-kanban.sh --board bv2-smoke-pl complete t_fff7c556 --summary 'bv2 smoke: forced completed event'   # exit 0
+# write retries[t_fff7c556]=1 into /Volumes/fleet-scratch/tmp/pl-1024161447/home/gateway/kanban_boomerang_wake.json   # readback retries[t_fff7c556]=1
+# APOLLO (manual): restart the gateway NOW via safe-gateway-restart (single-use approval), while the boomerang-wake child for t_fff7c556 is still running   ack: restart
+$ /Volumes/fleet-scratch/tmp/bv2-lane.VnGQJO/scripts/bv2-ack.sh restart   # scripted ack, exit 0
 ```
 
 ### Raw output
 
 ```text
 --- board_create (exit 0)
-Board 'bv2-smoke-pl' already exists.
+Board 'bv2-smoke-pl' created.
   Display name: BV2 smoke (scratch)
-  DB path:      /Volumes/fleet-scratch/tmp/pl-1020044514/home/kanban/boards/bv2-smoke-pl/kanban.db
+  DB path:      /Volumes/fleet-scratch/tmp/pl-1024161447/home/kanban/boards/bv2-smoke-pl/kanban.db
   Use `hermes kanban boards switch bv2-smoke-pl` to make it current.
 --- create (exit 0)
 {
-  "id": "t_db9c6f92",
-  "title": "bv2 smoke s4: child in flight across a gateway restart",
-  "body": "origin: cli · session 20261020_044727_01aab3eb · 2026-10-20",
+  "id": "t_9053192c",
+  "title": "bv2 smoke s4: child in flight across a gateway restart (redispatch)",
+  "body": "origin: cli · session 20261024_161516_fcf7f5c3 · 2026-10-24",
   "assignee": "human:apollo",
   "status": "ready",
   "priority": 0,
@@ -516,7 +527,7 @@ Board 'bv2-smoke-pl' already exists.
   "branch_name": null,
   "project_id": null,
   "created_by": "user",
-  "created_at": 1792500778,
+  "created_at": 1792883738,
   "started_at": null,
   "completed_at": null,
   "result": null,
@@ -525,7 +536,7 @@ Board 'bv2-smoke-pl' already exists.
   "max_retries": null,
   "model_override": null,
   "provider_override": null,
-  "session_id": "20261020_044727_01aab3eb",
+  "session_id": "20261024_161516_fcf7f5c3",
   "workflow_template_id": null,
   "current_step_key": null,
   "completion_contract": "local-only",
@@ -535,46 +546,153 @@ Board 'bv2-smoke-pl' already exists.
   "pin_sub_reason": null,
   "pin_sub_fallback": false,
   "unhomed": false,
-  "no_worker": false
+  "no_worker": false,
+  "home": "20261024_161516_fcf7f5c3"
 }
 --- notify_subscribe (exit 0)
-Subscribed discord:1562069703856496752 to t_db9c6f92
---- set_auto_handle (exit 0)
-t_db9c6f92: auto-handle: true
+Subscribed discord:1563692373173731358 to t_9053192c
+--- set_boomerang_wake (exit 0)
+t_9053192c: level: boomerang wake
 note: no session identity — home-session guard skipped
 --- s4_hold (exit 0)
-Edited t_db9c6f92
+Edited t_9053192c
 note: no session identity — home-session guard skipped
 --- complete (exit 0)
-Completed t_db9c6f92
+Completed t_9053192c
 note: no session identity — home-session guard skipped
---- log match
-2026-10-20 05:55:41,754 INFO gateway.kanban_auto_handle: kanban notifier: auto-handled t_db9c6f92 disposition=auto row=completed path=notifier delegation=del-20261020-055541-0ffc
+--- log match (redispatch arm)
+2026-10-24 16:15:47,962 INFO gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake t_9053192c disposition=auto row=completed path=notifier delegation=del-20261024-161547-08cd
 --- ack request
-restart the gateway NOW via safe-gateway-restart (single-use approval), while the auto-handle child for t_db9c6f92 is still running
-ack: echo restart >> /Volumes/fleet-scratch/tmp/pl-1020044514/bv2.ack
+restart the gateway NOW via safe-gateway-restart (single-use approval), while the boomerang-wake child for t_9053192c is still running
+ack: echo restart >> /Volumes/fleet-scratch/tmp/pl-1024161447/bv2.ack
 --- ack cmd restart (exit 0)
-bv2-ack: restart: scratch gateway boot_id before=6910:1792496722.396544 pid=6910
-gw-restart: pid 6910 SIGKILL after 45s
-gw-restart: pid 7895 connected boot_id=7895:1792501007.955348
---- log match
-2026-10-20 05:59:00,612 INFO gateway.run: Gateway running with 1 platform(s)
---- log match
-2026-10-20 05:59:08,327 INFO gateway.kanban_auto_handle: kanban auto-handle: t_db9c6f92 lost reason=gateway restart resurfaced delivered=True delegation=del-20261020-055541-0ffc
+bv2-ack: restart: scratch gateway boot_id before=47216:1792883688.502225 pid=47216
+gw-restart: pid 47216 SIGKILL after 45s
+gw-restart: pid 69420 connected boot_id=69420:1792883794.829501
+--- log match (redispatch arm)
+2026-10-24 16:16:52,152 INFO gateway.run: Gateway running with 1 platform(s)
+--- log match (redispatch arm)
+2026-10-24 16:16:58,269 INFO gateway.kanban_boomerang_wake: kanban boomerang-wake: t_9053192c redispatched after gateway restart (retry 1/1) delegation=del-20261024-161658-5f2a
+--- log match (redispatch arm)
+2026-10-24 16:19:15,828 INFO gateway.kanban_boomerang_wake: kanban boomerang-wake: t_9053192c handled action=complete delegation=del-20261024-161658-5f2a
+--- chat match (redispatch arm)
+[boomerang-wake] t_9053192c — All six fixture checks ran and passed; forced completion of restart-drill card t_9053192c accepted, gateway.log digest stable across 60s.
+--- create (exit 0)
+{
+  "id": "t_fff7c556",
+  "title": "bv2 smoke s4: child in flight across a gateway restart (retry spent)",
+  "body": "origin: cli · session 20261024_161516_fcf7f5c3 · 2026-10-24",
+  "assignee": "human:apollo",
+  "status": "ready",
+  "priority": 0,
+  "tenant": null,
+  "workspace_kind": "scratch",
+  "workspace_path": null,
+  "branch_name": null,
+  "project_id": null,
+  "created_by": "user",
+  "created_at": 1792883979,
+  "started_at": null,
+  "completed_at": null,
+  "result": null,
+  "skills": [],
+  "max_runtime_seconds": null,
+  "max_retries": null,
+  "model_override": null,
+  "provider_override": null,
+  "session_id": "20261024_161516_fcf7f5c3",
+  "workflow_template_id": null,
+  "current_step_key": null,
+  "completion_contract": "local-only",
+  "last_failure_error": null,
+  "reasoning_effort": null,
+  "brain": null,
+  "pin_sub_reason": null,
+  "pin_sub_fallback": false,
+  "unhomed": false,
+  "no_worker": false,
+  "home": "20261024_161516_fcf7f5c3"
+}
+--- notify_subscribe (exit 0)
+Subscribed discord:1563692373173731358 to t_fff7c556
+--- set_boomerang_wake (exit 0)
+t_fff7c556: level: boomerang wake
+note: no session identity — home-session guard skipped
+--- s4_hold (exit 0)
+Edited t_fff7c556
+note: no session identity — home-session guard skipped
+--- complete (exit 0)
+Completed t_fff7c556
+note: no session identity — home-session guard skipped
+--- log match (fallback arm)
+2026-10-24 16:19:46,975 INFO gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake t_fff7c556 disposition=auto row=completed path=notifier delegation=del-20261024-161946-7b62
+--- ack request
+restart the gateway NOW via safe-gateway-restart (single-use approval), while the boomerang-wake child for t_fff7c556 is still running
+ack: echo restart >> /Volumes/fleet-scratch/tmp/pl-1024161447/bv2.ack
+--- ack cmd restart (exit 0)
+bv2-ack: restart: scratch gateway boot_id before=69420:1792883794.829501 pid=69420
+gw-restart: pid 69420 SIGKILL after 45s
+gw-restart: pid 38081 connected boot_id=38081:1792884032.82546
+--- log match (fallback arm)
+2026-10-24 16:20:53,604 INFO gateway.run: Gateway running with 1 platform(s)
+--- log match (fallback arm)
+2026-10-24 16:20:59,734 INFO gateway.kanban_boomerang_wake: kanban boomerang-wake: t_fff7c556 lost reason=gateway restart, retry spent resurfaced delivered=True delegation=del-20261024-161946-7b62
 ```
 
 ### Checks
 
 | # | check | result | detail |
 |---|---|---|---|
-| 1 | auto-handle child dispatched for t_db9c6f92 (disposition=auto) | PASS | 2026-10-20 05:55:41,754 INFO gateway.kanban_auto_handle: kanban notifier: auto-handled t_db9c6f92 disposition=auto row=completed path=notifier delegation=del-20261020-055541-0ffc |
-| 2 | ack `restart` received | PASS | /Volumes/fleet-scratch/tmp/pl-1020044514/bv2.ack |
-| 3 | gateway restart observed in the log | PASS | 2026-10-20 05:59:00,612 INFO gateway.run: Gateway running with 1 platform(s) |
-| 4 | gateway boot_id changed | PASS | 6910:1792496722.396544 -> 7895:1792501007.955348 |
-| 5 | reconciler re-surfaced the wake for t_db9c6f92 | PASS | 2026-10-20 05:59:08,327 INFO gateway.kanban_auto_handle: kanban auto-handle: t_db9c6f92 lost reason=gateway restart resurfaced delivered=True delegation=del-20261020-055541-0ffc |
-| 6 | re-surface on the first notifier tick after the restart | PASS | 7.7s after `2026-10-20 05:59:00` (limit 180s = wiring + 5 s initial delay + one full notifier tick, --first-tick-seconds) |
-| 7 | origin chat: `warning auto-handle lost t_db9c6f92 (reason: gateway restart)` | PASS | ⚠️ auto-handle lost t_db9c6f92 (reason: gateway restart) |
-| 8 | no late `[auto-handled] t_db9c6f92` within waited 20s after the re-surface | PASS | none |
+| 1 | redispatch arm: boomerang-wake child dispatched for t_9053192c (disposition=auto) | PASS | 2026-10-24 16:15:47,962 INFO gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake t_9053192c disposition=auto row=completed path=notifier delegation=del-20261024-161547-08cd |
+| 2 | ack `restart` received | PASS | /Volumes/fleet-scratch/tmp/pl-1024161447/bv2.ack |
+| 3 | redispatch arm: gateway restart observed in the log | PASS | 2026-10-24 16:16:52,152 INFO gateway.run: Gateway running with 1 platform(s) |
+| 4 | redispatch arm: gateway boot_id changed | PASS | 47216:1792883688.502225 -> 69420:1792883794.829501 |
+| 5 | redispatch arm: gateway.log INFO `kanban boomerang-wake: t_9053192c redispatched after gateway restart` | PASS | 2026-10-24 16:16:58,269 INFO gateway.kanban_boomerang_wake: kanban boomerang-wake: t_9053192c redispatched after gateway restart (retry 1/1) delegation=del-20261024-161658-5f2a |
+| 6 | redispatch arm: redispatch on the first notifier tick after the restart | PASS | 6.1s after the boot line (limit 180s = wiring + 5 s initial delay + one full notifier tick, --first-tick-seconds) |
+| 7 | redispatch arm: the redispatch is a NEW child | PASS | first delegation del-20261024-161547-08cd -> redispatched del-20261024-161658-5f2a |
+| 8 | redispatch arm: the second child handled the card (delegation del-20261024-161658-5f2a) | PASS | 2026-10-24 16:19:15,828 INFO gateway.kanban_boomerang_wake: kanban boomerang-wake: t_9053192c handled action=complete delegation=del-20261024-161658-5f2a |
+| 9 | redispatch arm: origin chat `[boomerang-wake] t_9053192c - <Outcome>` after the restart | PASS | [boomerang-wake] t_9053192c — All six fixture checks ran and passed; forced completion of restart-drill card t_9053192c accepted, gateway.log digest stable across 60s. |
+| 10 | redispatch arm: ZERO `warning boomerang-wake lost t_9053192c` lines in the origin chat | PASS | none (waited 20s) |
+| 11 | fallback arm: boomerang-wake child dispatched for t_fff7c556 (disposition=auto) | PASS | 2026-10-24 16:19:46,975 INFO gateway.kanban_boomerang_wake: kanban notifier: boomerang-wake t_fff7c556 disposition=auto row=completed path=notifier delegation=del-20261024-161946-7b62 |
+| 12 | claim for t_fff7c556 is `running` before the retry is pre-spent | PASS | delegation del-20261024-161946-7b62 |
+| 13 | retries[t_fff7c556] pre-spent | PASS | readback 1 |
+| 14 | ack `restart` received | PASS | /Volumes/fleet-scratch/tmp/pl-1024161447/bv2.ack |
+| 15 | fallback arm: gateway restart observed in the log | PASS | 2026-10-24 16:20:53,604 INFO gateway.run: Gateway running with 1 platform(s) |
+| 16 | fallback arm: gateway boot_id changed | PASS | 69420:1792883794.829501 -> 38081:1792884032.82546 |
+| 17 | fallback arm: reconciler re-surfaced the wake for t_fff7c556 (retry spent) | PASS | 2026-10-24 16:20:59,734 INFO gateway.kanban_boomerang_wake: kanban boomerang-wake: t_fff7c556 lost reason=gateway restart, retry spent resurfaced delivered=True delegation=del-20261024-161946-7b62 |
+| 18 | fallback arm: re-surface on the first notifier tick after the restart | PASS | 6.1s after the boot line (limit 180s = wiring + 5 s initial delay + one full notifier tick, --first-tick-seconds) |
+| 19 | fallback arm: resurfaced delivered=True | PASS | delivered=True |
+| 20 | fallback arm: origin chat `warning boomerang-wake lost t_fff7c556 (reason: gateway restart, retry spent)` | PASS | ⚠️ boomerang-wake lost t_fff7c556 (reason: gateway restart, retry spent) |
+| 21 | fallback arm: no redispatch for t_fff7c556 | PASS | none |
+| 22 | fallback arm: no late `[boomerang-wake] t_fff7c556` within waited 20s after the re-surface | PASS | none |
 
 <!-- bv2-smoke:step4:end -->
 
+
+## t_facf0dba step 4 runs (2026-10-24)
+
+The step-4 section above is run 2. Two lane runs against the #2271 head, steps 4 only (`bv2-smoke-lane.sh <wt> --steps 4`):
+
+- **run 1, scratch code `4217925545` (#2271 head + harness), lane exit 1.** Redispatch arm: the INFO line
+  `kanban boomerang-wake: t_9b9b8b56 redispatched after gateway restart (retry 1/1) delegation=del-20261024-154551-3f1e`
+  landed 6.2 s after the boot line, and no `lost` line was posted. But the second child never finished the card:
+  after a boot there is no live parent, so `resolve_parent` falls back to `_db_parent` (`fork_ineligible reason=no_live_parent`),
+  which built the AIAgent with `model=""`. Its first call got HTTP 400 `the request carries no usable model value`
+  (scratch agent.log 15:45:51.702). Checks: `the second child handled the card | FAIL`, `[boomerang-wake] ... after the restart | FAIL`.
+  The fallback arm PASSed on that run (t_36777497).
+### Run 1 lane facts
+
+- scratch gateway code: `421792554567925bd01f1ae07451aff05426ceb0` from `/Users/alexgierczyk/.hermes/hermes-agent/.worktrees/t_facf0dba`; scratch home `/Volumes/fleet-scratch/tmp/pl-1024154312/home`
+- origin thread `1563684599572201542` in #daedalus, home session `20261024_154423_03ce097a` (owned by the scratch gateway)
+- launchd gateway boot_ids before: .hermes 34786:1792874306.006716;aegis 92061:1792778715.678917;argus 93629:1792778722.792216;athena 94130:1792778724.722454;cadmus 95056:1792778728.530041;chiron 96430:1792778734.539368;daedalus-opus 97046:1792778737.505067;daedalus 97990:1792778740.431808;momus 98937:1792778744.600903;
+- launchd gateway boot_ids after:  .hermes 34786:1792874306.006716;aegis 92061:1792778715.678917;argus 93629:1792778722.792216;athena 94130:1792778724.722454;cadmus 95056:1792778728.530041;chiron 96430:1792778734.539368;daedalus-opus 97046:1792778737.505067;daedalus 97990:1792778740.431808;momus 98937:1792778744.600903;  -> UNCHANGED
+
+- **fix `f8939c5c90`:** `_db_parent` passes the fallback route's model or `_resolve_gateway_model()`.
+- **run 2, scratch code `f8939c5c90`, lane exit 0:** both arms PASS (the section above). launchd boot_ids unchanged, zero-spill PASS.
+
+## Lane facts
+
+- scratch gateway code: `f8939c5c902ced56cb861313d92c371c604c09e8` from `/Users/alexgierczyk/.hermes/hermes-agent/.worktrees/t_facf0dba`; scratch home `/Volumes/fleet-scratch/tmp/pl-1024161447/home`
+- origin thread `1563692373173731358` in #daedalus, home session `20261024_161516_fcf7f5c3` (owned by the scratch gateway)
+- launchd gateway boot_ids before: .hermes 34786:1792874306.006716;aegis 92061:1792778715.678917;argus 93629:1792778722.792216;athena 94130:1792778724.722454;cadmus 95056:1792778728.530041;chiron 96430:1792778734.539368;daedalus-opus 97046:1792778737.505067;daedalus 97990:1792778740.431808;momus 98937:1792778744.600903;
+- launchd gateway boot_ids after:  .hermes 34786:1792874306.006716;aegis 92061:1792778715.678917;argus 93629:1792778722.792216;athena 94130:1792778724.722454;cadmus 95056:1792778728.530041;chiron 96430:1792778734.539368;daedalus-opus 97046:1792778737.505067;daedalus 97990:1792778740.431808;momus 98937:1792778744.600903;  -> UNCHANGED
