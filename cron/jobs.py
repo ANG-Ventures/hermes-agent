@@ -3946,6 +3946,7 @@ class _DueScan:
     now: datetime
     needs_save: bool = False
     removed: Set[str] = field(default_factory=set)
+    rewound: List[str] = field(default_factory=list)  # ids behind a completed occurrence this tick
 
     def find(self, job_id: Any) -> Optional[Dict[str, Any]]:
         return next((rj for rj in self.raw_jobs if rj["id"] == job_id), None)
@@ -4318,6 +4319,8 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
             scan.persist(job["id"], next_run_at=new_next)
         return False
     watermark = rewound_watermark(job, next_run) if not manual_run else None
+    if watermark:
+        scan.rewound.append(str(job["id"]))
     if watermark and not recurring:
         return False  # a one-shot already completed at a later (rescheduled) instant: never replay
     if watermark:
@@ -4421,6 +4424,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 job.get("name") or job.get("id") or "?")
 
     _warn_overdue_oneshots_not_due(jobs, due, scan.removed, scan.now)
+    from cron.occurrences import REWOUND_BURST_MARKER, rewound_burst_payload
+
+    burst = rewound_burst_payload(scan.rewound, scan.now.isoformat())
+    if burst:
+        _write_marker(REWOUND_BURST_MARKER, json.dumps(burst) + "\n", ".rewound_burst_")
 
     if scan.needs_save:
         save_jobs(raw_jobs, removed_ids=scan.removed or None)

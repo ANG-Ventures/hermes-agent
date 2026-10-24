@@ -101,6 +101,32 @@ def rewound_watermark(job, instant):
     return None
 
 
+# --- Rewound-store burst: one tick saw many cron.registry_rewound jobs ---
+#
+# 2026-10-23 16:20:05 one tick logged 422 cron.registry_rewound WARNINGs after a whole-tree
+# `git checkout -- .` put an older jobs.json over the live store. The scheduler handled each job
+# correctly (resume after the watermark), but the log was the only record and nobody saw it.
+# max(job.updated_at) did not move (old blob and live store shared the same newest row), so the
+# per-tick count is the signal. The tick writes this marker; hermes-home
+# scripts/cron-jobs-integrity-watch.py pages #alerts once per marker (t_3d311bd1).
+REWOUND_BURST_THRESHOLD = 20
+REWOUND_BURST_MARKER = "registry_rewound_burst.json"
+REWOUND_BURST_SAMPLE = 10
+
+
+def rewound_burst_payload(job_ids, tick_at):
+    """Marker body when *job_ids* (rewound in ONE tick) reach the threshold, else None."""
+    ids = [str(i) for i in job_ids]
+    if len(ids) < REWOUND_BURST_THRESHOLD:
+        return None
+    logger.error(
+        "cron.registry_rewound_burst: %d jobs in one tick at %s were behind a completed occurrence "
+        "(jobs.json replaced by an older snapshot?); marker %s, sample %s",
+        len(ids), tick_at, REWOUND_BURST_MARKER, ",".join(ids[:REWOUND_BURST_SAMPLE]))
+    return {"count": len(ids), "tick_at": tick_at, "threshold": REWOUND_BURST_THRESHOLD,
+            "sample_ids": ids[:REWOUND_BURST_SAMPLE]}
+
+
 # --- Pending slot: the occurrence a tick took off the schedule but has not yet claimed ---
 #
 # The tick advances a recurring job's ``next_run_at`` BEFORE dispatch (at-most-once: a crash
