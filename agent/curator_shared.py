@@ -599,7 +599,7 @@ def archive_gate(names: Iterable[str], root: Optional[Path] = None) -> Dict[str,
             try:
                 p = subprocess.run([sys.executable, str(script), "--home", str(root), "--json", *todo],
                                    capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                   timeout=300, env=_fleet_child_env(root))
+                                   timeout=300, env=_fleet_child_env(root), stdin=subprocess.DEVNULL)
                 doc = json.loads(p.stdout) if p.returncode == 0 else None
                 skills = doc.get("skills") if isinstance(doc, dict) else None
                 for n in todo:
@@ -652,7 +652,7 @@ def post_archive_logs(moved: List[str], root: Optional[Path] = None) -> bool:
     try:
         p = subprocess.run([sys.executable, str(notify), "--channel", "discord", "--target", LOGS_CHANNEL,
                             "--sev", "info", "--send", msg], capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=60)
+                           errors="replace", timeout=60, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
         logger.warning("curator: #logs line not sent (%s): %s", e, msg)
         return False

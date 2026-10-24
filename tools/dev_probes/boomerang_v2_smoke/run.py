@@ -458,7 +458,7 @@ class Ctx:
             shown = "$ " + shlex.join(argv)
             print(shown, flush=True)
             try:
-                proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=self.args.ack_timeout)
+                proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=self.args.ack_timeout, stdin=subprocess.DEVNULL)
                 rc, out = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
             except (OSError, subprocess.TimeoutExpired) as exc:
                 rc, out = 127, f"{type(exc).__name__}: {exc}"
@@ -978,7 +978,7 @@ def _sync_seat(ctx: Ctx, rep: StepReport, seat: str | None, what: str) -> str | 
         # hard 600 s. A timeout is recorded as a non-zero exit, never swallowed.
         budget = float(os.environ.get("BV2_SYNC_TIMEOUT") or 600)
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=budget)
+            proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=budget, stdin=subprocess.DEVNULL)
             rc, out = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
         except subprocess.TimeoutExpired as exc:
             rc, out = 124, f"wirelog_sync timed out after {budget:.0f}s (BV2_SYNC_TIMEOUT): {exc}"
