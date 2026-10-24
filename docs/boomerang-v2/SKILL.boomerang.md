@@ -175,6 +175,11 @@ unless the wake needs human judgment.
 - **Chat lines:** `[boomerang-wake] <card> — <Outcome>` (one per handled wake; read it, act only if
   wrong); `⚠️ boomerang-wake failed <card>: <reason>` or `⚠️ boomerang-wake lost <card> (reason:
   …)` → the original wake was re-surfaced; handle it like any wake.
+- **Gateway restart:** a child killed by a restart is re-run once on the new boot, silently (one
+  INFO line `redispatched after gateway restart` in the gateway log), when the card has not moved,
+  its D-13 retry is unspent and the claim is inside `max_minutes`. That spends the retry: a failure
+  of the re-run child, or a second restart, surfaces as `⚠️ boomerang-wake lost <card> (reason:
+  gateway restart, retry spent|card moved|budget expired)`.
 
 - **The child cannot write the board (D-19).** It runs inside the delegated-child kanban fence:
   board reads only, plus ` (subagent)` comments. It verifies and ends its final message with one
