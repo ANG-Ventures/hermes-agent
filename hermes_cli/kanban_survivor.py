@@ -1841,7 +1841,21 @@ def _snapshot(repo, base, prefix, *, irreversible_delete=False):
             _git(recovery, "update-ref", "refs/heads/implementation", commit, env=bundle_env)
             _git(recovery, "symbolic-ref", "HEAD", "refs/heads/implementation", env=bundle_env)
             bundle = Path(tmp) / "implementation.bundle"
-            _git(recovery, "bundle", "create", str(bundle), "--all", env=bundle_env, lazy_fetch=True)
+            # A shallow bundle omits everything behind the boundary. Excluding the
+            # boundary commits makes the header declare them as prerequisites, so
+            # an empty repo refuses it at `verify` instead of calling it complete
+            # and then dying "Failed to traverse parents" on clone/fetch.
+            # A stale line naming an absent object is no boundary, and as `^<sha>`
+            # it would kill `bundle create` with "bad object"; drop it.
+            grafts = recovery / "shallow"
+            boundary = grafts.read_bytes().split() if grafts.is_file() else []
+            if boundary:
+                present = _git(recovery, "cat-file", "--batch-check=%(objectname)",
+                               env=bundle_env, input=b"\n".join(boundary) + b"\n")
+                boundary = [line for line in present.stdout.split(b"\n")
+                            if line and not line.endswith(b" missing")]
+            _git(recovery, "bundle", "create", str(bundle), "--all", "--stdin", env=bundle_env,
+                 input=b"".join(b"^" + sha + b"\n" for sha in boundary), lazy_fetch=True)
             return bundle.read_bytes()
         return _git(
             repo, "diff", "--cached", "--relative", "--binary", "--full-index", "--no-ext-diff",
