@@ -628,7 +628,8 @@
   function KanbanPage() {
     const { t } = useI18n();
     const kanbanDialogs = useKanbanDialogs(t);
-    const [board, setBoard] = useState(() => readSelectedBoard() || null);
+    // S7 D5: there is no server-side current board; the tab always names one.
+    const [board, setBoard] = useState(() => readSelectedBoard() || "default");
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
     const [showBoardSettings, setShowBoardSettings] = useState(false);
@@ -712,12 +713,7 @@
       return SDK.fetchJSON(withBoard(`${API}/boards`, board))
         .then(function (data) {
           const boards = (data && data.boards) || [];
-          const storedBoard = readSelectedBoard();
           setBoardList(boards);
-          if (!storedBoard && !board && data && data.current) {
-            setBoard(data.current);
-            return;
-          }
           // If the stored slug isn't in the list any longer (board was
           // deleted in the CLI while dashboard was open), fall back to
           // default so the UI doesn't hang on a 404.
@@ -1197,7 +1193,8 @@
       return SDK.fetchJSON(`${API}/boards`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        // `switch` is client-side only (S7 D5: the server keeps no current board).
+        body: JSON.stringify(Object.assign({}, payload, { switch: undefined })),
       }).then(function (res) {
         loadBoardList();
         const slug = res && res.board && res.board.slug;
@@ -1239,7 +1236,7 @@
        destructive: true,
      }).then(function (r) {
        if (!r.confirmed) return null;
-       return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
+       return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board), {
          method: "DELETE",
        }).then(function () {
          loadBoard();
@@ -1265,7 +1262,7 @@
         const ids = Array.from(selectedIds);
         setSelectedIds(new Set());
         return Promise.all(ids.map(function (id) {
-          return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
+          return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(id)}`, board), { method: "DELETE" });
         })).then(function () {
           loadBoard();
         }).catch(function (e) { setError(String(e.message || e)); });

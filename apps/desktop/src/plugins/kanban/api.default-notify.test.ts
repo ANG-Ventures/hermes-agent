@@ -40,7 +40,7 @@ describe('default board event notifications', () => {
     const { taskKey } = await import('./api')
     let frame!: (data: unknown) => void
     dispose = bindApi(
-      (async (path: string) => (path === '/boards' ? { current: 'drawer-board' } : { latest_event_id: 100 })) as never,
+      (async () => ({ latest_event_id: 100 })) as never,
       { get: (_key, fallback) => fallback, set: vi.fn(), remove: vi.fn() },
       (_path, callback) => {
         frame = callback
@@ -69,48 +69,14 @@ describe('default board event notifications', () => {
     }
   })
 
-  it.each(['empty', 'rejected'])('preserves the live alias socket when board resolution is %s', async mode => {
-    const rest = vi.fn(async (path: string) => {
-      if (path === '/boards') {
-        if (mode === 'rejected') {
-          throw new Error('offline')
-        }
-
-        return { current: '' }
-      }
-
-      return { latest_event_id: 20 }
-    })
-
+  it('an unselected tab pins the socket to default without asking the server (S7 D5)', async () => {
+    const rest = vi.fn(async () => ({ latest_event_id: 20 }))
     const socket = vi.fn(() => vi.fn())
     dispose = bindApi(rest as never, { get: (_key, fallback) => fallback, set: vi.fn(), remove: vi.fn() }, socket)
-    await vi.waitFor(() => expect(socket).toHaveBeenCalledWith('/events?since=20', expect.any(Function)))
+    await vi.waitFor(() => expect(socket).toHaveBeenCalledWith('/events?board=default&since=20', expect.any(Function)))
+    expect(rest).not.toHaveBeenCalledWith('/boards')
+    expect(rest).toHaveBeenCalledWith('/board?board=default')
     expect(doors.notify).not.toHaveBeenCalled()
-  })
-
-  it.each(['selection', 'dispose'])('ignores alias resolution after %s', async change => {
-    let resolveBoards!: (value: unknown) => void
-
-    const boards = new Promise(resolve => {
-      resolveBoards = resolve
-    })
-
-    const rest = vi.fn(async (path: string) => (path === '/boards' ? boards : { latest_event_id: 30 }))
-    const socket = vi.fn(() => vi.fn())
-    dispose = bindApi(rest as never, { get: (_key, fallback) => fallback, set: vi.fn(), remove: vi.fn() }, socket)
-
-    if (change === 'selection') {
-      $boardSlug.set('chosen')
-      await vi.waitFor(() => expect(socket).toHaveBeenCalledWith('/events?board=chosen&since=30', expect.any(Function)))
-    } else {
-      dispose()
-      dispose = undefined
-    }
-
-    resolveBoards({ current: 'late' })
-    await new Promise(resolve => setTimeout(resolve, 0))
-    expect(socket).toHaveBeenCalledTimes(change === 'selection' ? 1 : 0)
-    expect(rest).not.toHaveBeenCalledWith('/board?board=late')
   })
 
   it('does not resolve or override a caller-selected board', async () => {
@@ -141,11 +107,7 @@ describe('default board event notifications', () => {
     let latest = 100
 
     const rest = vi.fn(async (path: string) => {
-      if (path === '/boards') {
-        return { current: 'default', boards: [{ slug: 'default' }] }
-      }
-
-      if (path === '/board?board=default' || path === '/board') {
+      if (path === '/board?board=default') {
         return { latest_event_id: latest }
       }
 

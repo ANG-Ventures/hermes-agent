@@ -747,8 +747,8 @@ def connect(
     * ``db_path`` explicit → used as-is (legacy callers, tests).
     * ``board`` explicit → resolves to that board's DB.
     * Neither → :func:`kanban_db_path` resolves via
-      ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
-      ``<root>/kanban/current`` → ``default``.
+      ``HERMES_KANBAN_DB`` env → the context board → ``default`` (S7: no
+      current-board file, no board env var).
     """
     if db_path is not None:
         path = db_path

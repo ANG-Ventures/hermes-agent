@@ -35,6 +35,7 @@ from gateway.kanban_watchers_common import (
     _wake_downgrade_reason,
     logger,
 )
+from gateway.kanban_watchers_dispatcher import _default_profile_secret_scope
 from gateway.kanban_watchers_notifier import (
     _adapter_for_subscription,
     _safe_review_reason,
@@ -4308,7 +4309,14 @@ class GatewayKanbanWatchersMixin:
             """Run the auto-decomposer for up to N triage tasks across all
             boards. Returns the number of triage tasks that were
             successfully decomposed or specified this tick.
+
+            The tick runs in a fresh context (``_to_thread_process_service``), so it
+            installs the launch profile's secret scope itself (#107955 / #57837).
             """
+            with _default_profile_secret_scope():
+                return _auto_decompose_boards(auto_decompose_per_tick)
+
+        def _auto_decompose_boards(auto_decompose_per_tick: int) -> int:
             try:
                 from hermes_cli import kanban_decompose as _decomp
             except Exception as exc:  # pragma: no cover
@@ -4323,22 +4331,15 @@ class GatewayKanbanWatchersMixin:
             attempted = 0
             successes = 0
             # Enumeration: sweeps every board on disk looking for triage cards.
-            # The body pins HERMES_KANBAN_BOARD and lets the decomposer connect
-            # with no board kwarg, so the resolves happen deep inside the call —
-            # only a body-spanning extent reaches them.
+            # S7 D4: the board is named explicitly and scoped with a ContextVar for
+            # this thread only; never an os.environ flip (process-global, M6).
             for b in _kb.enumerating_each(boards):
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break
-                # Pin this board for the duration of the call — same
-                # pattern as the dashboard specify endpoint. The
-                # decomposer module connects with no board kwarg and
-                # relies on the env var.
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
-                try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
+                with _kb.scoped_current_board(slug):
                     try:
-                        triage_ids = _decomp.list_triage_ids()
+                        triage_ids = _decomp.list_triage_ids(board=slug)
                     except Exception as exc:
                         logger.debug(
                             "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
@@ -4351,7 +4352,7 @@ class GatewayKanbanWatchersMixin:
                         attempted += 1
                         try:
                             outcome = _decomp.decompose_task(
-                                tid, author="auto-decomposer",
+                                tid, author="auto-decomposer", board=slug,
                             )
                         except Exception:
                             logger.exception(
@@ -4378,11 +4379,6 @@ class GatewayKanbanWatchersMixin:
                                 "kanban auto-decompose [%s]: %s skipped: %s",
                                 slug, tid, outcome.reason,
                             )
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
             return successes
 
         logger.info(
