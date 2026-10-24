@@ -84,7 +84,7 @@ outputs:
     value: ${{ steps.install.outputs.uv-cache-path }}
   node-cache-hit:
     description: Exact npm dependency cache hit.
-    value: ${{ steps.node-cache.outputs.cache-hit || steps.node-cache-restore.outputs.cache-hit }}
+    value: ${{ steps.node-cache.outputs.cache-hit || steps.node-cache-self-hosted.outputs.cache-hit || steps.node-cache-restore.outputs.cache-hit }}
   node-cache-key:
     description: Rolling snapshot key when save-node-cache is false.
     value: ${{ steps.node-cache-restore.outputs.cache-primary-key }}
@@ -213,9 +213,21 @@ runs:
         restore-keys: |
           node-cache-${{ runner.os }}-${{ steps.prepare.outputs.arch }}-npm-
 
+    # Self-hosted restore of the namespace node-cache writes (hosted saves it;
+    # the mirror holds node-cache-<os>-<arch>-npm-* and no setup-pm-npm-v1-*).
+    - name: Restore npm dependencies without saving on self-hosted
+      id: node-cache-self-hosted
+      if: inputs.toolchain != 'python' && inputs.cache-node == 'true' && inputs.save-node-cache == 'true' && runner.environment == 'self-hosted'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.install.outputs.npm-cache-path }}
+        key: node-cache-${{ runner.os }}-${{ steps.prepare.outputs.arch }}-npm-${{ hashFiles(inputs.node-cache-dependency-path) }}${{ inputs.cache-suffix != '' && format('-{0}', inputs.cache-suffix) || '' }}
+        restore-keys: |
+          node-cache-${{ runner.os }}-${{ steps.prepare.outputs.arch }}-npm-
+
     - name: Restore npm dependencies for an explicit save
       id: node-cache-restore
-      if: inputs.toolchain != 'python' && inputs.cache-node == 'true' && (inputs.save-node-cache == 'false' || runner.environment == 'self-hosted')
+      if: inputs.toolchain != 'python' && inputs.cache-node == 'true' && inputs.save-node-cache == 'false'
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.install.outputs.npm-cache-path }}

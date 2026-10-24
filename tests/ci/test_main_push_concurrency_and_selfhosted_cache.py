@@ -136,8 +136,20 @@ def test_setup_pm_self_hosted_restores_and_never_saves(save):
     ctx = {"inputs": inputs, "runner": {"environment": "self-hosted"}, "steps": {}}
     saving = [i for i, s in steps.items() if str(s.get("uses", "")).startswith("actions/cache@") and _cond(s["if"], ctx)]
     assert saving == []
-    for restore in ("tools-cache-restore", "python-cache-restore", "node-cache-restore"):
+    npm_restore = "node-cache-self-hosted" if save == "true" else "node-cache-restore"
+    for restore in ("tools-cache-restore", "python-cache-restore", npm_restore):
         assert _cond(steps[restore]["if"], ctx), restore
+
+
+def test_setup_pm_self_hosted_npm_restore_reads_the_namespace_hosted_saves():
+    """Prism 956a8deebe07: a self-hosted npm restore must look up keys a save writes."""
+    steps = _setup_steps()
+    saved, restored = steps["node-cache"]["with"], steps["node-cache-self-hosted"]["with"]
+    save_prefixes = [k.strip() for k in saved["restore-keys"].splitlines() if k.strip()]
+    restore_prefixes = [k.strip() for k in restored["restore-keys"].splitlines() if k.strip()]
+    assert restore_prefixes and set(restore_prefixes) <= set(save_prefixes)
+    assert restored["key"] == saved["key"]
+    assert all(saved["key"].startswith(prefix) for prefix in restore_prefixes)
 
 
 def test_setup_pm_hosted_still_saves_by_default():
@@ -145,5 +157,5 @@ def test_setup_pm_hosted_still_saves_by_default():
     ctx = {"inputs": _CACHE_ON, "runner": {"environment": "github-hosted"}, "steps": {}}
     for save in ("tools-cache", "python-cache", "node-cache"):
         assert _cond(steps[save]["if"], ctx), save
-    for restore in ("tools-cache-restore", "python-cache-restore", "node-cache-restore"):
+    for restore in ("tools-cache-restore", "python-cache-restore", "node-cache-restore", "node-cache-self-hosted"):
         assert not _cond(steps[restore]["if"], ctx), restore
