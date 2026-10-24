@@ -22,6 +22,8 @@ _JOBS = (
     "detect",
     "tests",
     "lint",
+    "tests-os",
+    "bootstrap-installer",
     "js-tests",
     "e2e-desktop",
     "docs-site",
@@ -44,6 +46,8 @@ _FALSE_DETECT_OUTPUTS = {
     "docker_meta": "false",
     "mcp_catalog": "false",
     "ci_review": "false",
+    "hosted_os": "false",
+    "bootstrap": "false",
     "event_name": "pull_request",
 }
 
@@ -117,6 +121,20 @@ def test_tests_skipped_while_python_unchanged_passes():
             {},
             "detect.outputs.python == 'true'",
             id="lint-python",
+        ),
+        pytest.param(
+            "tests-os",
+            {"python": "true", "hosted_os": "true"},
+            {},
+            "detect.outputs.python == 'true' and detect.outputs.hosted_os == 'true'",
+            id="tests-os-python-hosted-os",
+        ),
+        pytest.param(
+            "bootstrap-installer",
+            {"bootstrap": "true"},
+            {},
+            "detect.outputs.bootstrap == 'true'",
+            id="bootstrap-installer",
         ),
         pytest.param(
             "js-tests",
@@ -215,6 +233,18 @@ def test_classifier_required_job_cannot_be_skipped(
     assert reason in violations[job]
 
 
+@pytest.mark.parametrize(
+    "detect_outputs",
+    [
+        pytest.param({"python": "true", "hosted_os": "false"}, id="hosted-os-off"),
+        pytest.param({"python": "false", "hosted_os": "true"}, id="python-unchanged"),
+    ],
+)
+def test_tests_os_may_skip_unless_python_and_hosted_os(detect_outputs):
+    """CI_HOSTED_OS_JOBS=off (the private mirror) or no python change: the skip is chosen."""
+    assert evaluate_needs(_needs(results={"tests-os": "skipped"}, detect_outputs=detect_outputs)) == {}
+
+
 def test_js_tests_skipped_while_frontend_unchanged_passes():
     assert evaluate_needs(_needs(results={"js-tests": "skipped"})) == {}
 
@@ -223,6 +253,8 @@ def test_classifier_jobs_may_skip_when_no_condition_requires_them():
     classifier_jobs = {
         "tests",
         "lint",
+        "tests-os",
+        "bootstrap-installer",
         "js-tests",
         "e2e-desktop",
         "docs-site",
