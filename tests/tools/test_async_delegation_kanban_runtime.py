@@ -664,3 +664,148 @@ def test_a_sibling_write_from_another_process_refuses_a_stale_edit_under_the_kan
     finally:
         proc.stdin.close()
         proc.wait(timeout=30)
+
+
+
+# ── Prism round 1 on #2252 (one regression per finding) ───────────────────
+
+
+def test_lost_card_after_the_runner_wrote_its_result_still_delivers():
+    """a66f5b9cdaf5: terminal written, card row gone before the drain -> the result is queued once."""
+    _kanban_record()
+    profile_home = _observe("deleg_b1")
+    _runner_writes("deleg_b1")
+    counts = akb.drain_profile(profile_home, BOOT, scan=lambda t: [])
+    queued = _queued()
+    assert counts["queued"] == 1 and [q["delegation_id"] for q in queued] == ["deleg_b1"]
+    assert ad.active_count() == 0
+    assert akb.drain_profile(profile_home, BOOT, scan=lambda t: []) == {"drained": 0, "queued": 0,
+                                                                        "failed": 0, "lost": 0}
+
+
+def test_missing_board_still_fails_a_unit_whose_runner_died(monkeypatch):
+    """6ad353d2c1ab: board removed + worker dead -> the unit fails and its error is delivered."""
+    _kanban_record()
+    profile_home = _observe("deleg_b1")
+    monkeypatch.setattr(akb, "_board_state", lambda: False)
+    counts = akb.drain_profile(profile_home, BOOT, scan=lambda t: [])
+    assert counts["lost"] == 1 and _record("deleg_b1")["state"] == "failed"
+    assert [q["error"] for q in _queued()] == ["unit card lost"] and ad.active_count() == 0
+
+
+def test_board_check_error_is_not_board_absence(monkeypatch):
+    _kanban_record()
+    profile_home = _observe("deleg_b1")
+    monkeypatch.setattr(akb, "_board_state", lambda: None)
+    assert akb.drain_profile(profile_home, BOOT, scan=lambda t: [])["lost"] == 0
+    assert _record("deleg_b1")["state"] == "running"
+
+
+def test_cardless_observer_is_failed_once_its_launching_owner_dies(monkeypatch):
+    """ee62b1f9e8d6: observed while the launcher lived; the launcher then dies -> a drain fails it."""
+    rec, _ = store.persist_dispatch(delegation_id="deleg_nc2", durable_spec=_spec("/tmp"), boot_id="launcher:1",
+                                    dispatched_at=time.time())
+    alive = {"launcher:1": True}
+    monkeypatch.setattr(akb, "_boot_alive", lambda b: alive.get(b, False))
+    profile_home = _observe("deleg_nc2")
+    assert ad._records["deleg_nc2"]["kanban_task_id"] in (None, "")
+    akb.drain_profile(profile_home, BOOT, scan=lambda t: [])
+    assert _record("deleg_nc2")["state"] == "running", "launcher alive: not failed"
+    alive["launcher:1"] = False
+    akb.drain_profile(profile_home, BOOT, scan=lambda t: [])
+    assert _record("deleg_nc2")["state"] == "failed" and ad.active_count() == 0
+    assert [q["delegation_id"] for q in _queued()] == ["deleg_nc2"]
+
+
+def test_cardless_observer_adopts_the_card_once_recorded(monkeypatch):
+    rec, _ = store.persist_dispatch(delegation_id="deleg_nc3", durable_spec=_spec("/tmp"), boot_id="launcher:1",
+                                    dispatched_at=time.time())
+    monkeypatch.setattr(akb, "_boot_alive", lambda b: True)
+    profile_home = _observe("deleg_nc3")
+    store.set_kanban_block("deleg_nc3", rec["attempt"]["attempt_id"], {"board": "delegations", "task_id": "t_nc3"})
+    akb.drain_profile(profile_home, BOOT, scan=lambda t: [SimpleNamespace(cmdline=lambda: ["delegation-unit"])])
+    assert ad._records["deleg_nc3"]["kanban_task_id"] == "t_nc3"
+
+
+def test_stale_card_cleanup_leaves_a_pending_completion_to_the_drain(monkeypatch, tmp_path, spawner):
+    """de44f712febf: a 49 h card whose record turned done with a pending result is NOT marked drained."""
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _runner_writes(did)
+    monkeypatch.setattr(akb, "STALE_CARD_SECONDS", -10)
+    profile_home = Path(ad._registry_path().parent.parent)
+    akb._archive_stale_cards(akb._records_of(profile_home), profile_home)
+    assert akb.DRAINED_EVENT not in _card(task_id)[1]
+    _end_card(task_id, "done")
+    assert _drain()["queued"] == 1
+
+
+def test_titled_worker_is_recognised_as_the_runner():
+    """af4825de587f: setproctitle rewrote argv to the canonical worker title."""
+    titled = SimpleNamespace(cmdline=lambda: ["hermes kanban-worker t_lost00001"])
+    assert akb._is_runner(titled, "t_lost00001")
+    assert not akb._is_runner(titled, "t_other0001")
+    _kanban_record()
+    profile_home = _observe("deleg_b1")
+    assert akb.drain_profile(profile_home, BOOT, scan=lambda t: [titled])["lost"] == 0
+    assert _record("deleg_b1")["state"] == "running"
+
+
+def test_cancel_during_card_spawn_archives_the_card(monkeypatch, tmp_path):
+    """9cc97d328cfa: a stop accepted while spawn_fn runs still reaches the unit's card."""
+    started, release = threading.Event(), threading.Event()
+    procs = []
+
+    def slow_spawn(task, workspace, *, on_popen=None, **kw):
+        started.set()
+        release.wait(30)
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True)
+        procs.append(proc)
+        if on_popen is not None:
+            on_popen(proc)
+        return proc.pid
+
+    threads = _sync_executor(monkeypatch)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir(exist_ok=True)
+    handle = ad.dispatch_async_delegation_batch(
+        goals=["write the report"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="agent:main:telegram:dm:1", parent_session_id="parent-1",
+        runner=lambda: {"status": "completed"}, max_async_children=3, durable_spec=_spec(cwd),
+        current_boot_id=BOOT, kanban={"profile": "default", "cwd": str(cwd), "session_id": "parent-1",
+                                       "spawn_fn": slow_spawn})
+    try:
+        assert started.wait(30)
+        ad.interrupt_all("/stop", include_kanban=True)
+        release.set()
+        for t in threads:
+            t.join(timeout=30)
+        did = handle["delegation_id"]
+        assert _record(did)["state"] == "cancelled"
+        task_id = _record(did)["kanban"]["task_id"]
+        deadline = time.time() + 10
+        while time.time() < deadline and _card(task_id)[0].status != "archived":
+            time.sleep(0.1)
+        assert _card(task_id)[0].status == "archived"
+    finally:
+        release.set()
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+
+def test_file_state_keeps_coordinating_while_a_kanban_unit_survives_a_knob_flip(monkeypatch):
+    """f5c4cfd763de: the gateway restarted with in_process still uses the shared lock while a unit lives."""
+    from tools import delegate_tool_config as cfgmod
+    from tools import file_state
+
+    monkeypatch.setattr(cfgmod, "_get_background_runtime", lambda: "in_process")
+    monkeypatch.setattr(cfgmod, "_get_detached_background", lambda: False)
+    monkeypatch.setattr(file_state, "FORCE_CROSS_PROCESS", False)
+    assert not file_state._cross_process_enabled()
+    _kanban_record()
+    _observe("deleg_b1")
+    assert ad.kanban_active_count() == 1
+    assert file_state._cross_process_enabled()

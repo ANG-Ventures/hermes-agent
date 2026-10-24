@@ -132,10 +132,15 @@ def _board() -> str:
 
 
 def _board_exists() -> bool:
+    return bool(_board_state())
+
+
+def _board_state() -> Optional[bool]:
+    """True/False: the delegations board positively exists/does not; None: the check itself failed."""
     try:
         return bool(_kb().board_exists(_board()))
     except Exception:
-        return False
+        return None
 
 
 def card_body(delegation_id: str, attempt_id: str, profile_home: Path) -> str:
@@ -225,6 +230,16 @@ def cancel_unit(delegation_id: str, profile_home: Optional[Path]) -> None:
     thread.start()
 
 
+def cancelled_during_launch(delegation_id: str, attempt_id: str, profile_home: Path) -> bool:
+    """The record left ``running`` on *attempt_id* (cancelled) while the card was being spawned."""
+    try:
+        record = _records_of(profile_home).get(delegation_id) or {}
+    except Exception:
+        return False
+    return (record.get("state") == "cancelled"
+            and (record.get("attempt") or {}).get("attempt_id") == attempt_id)
+
+
 def cancel_fn(delegation_id: str, profile_home: Optional[Path]) -> Callable[[], None]:
     return lambda: cancel_unit(delegation_id, profile_home)
 
@@ -312,12 +327,19 @@ def drain_profile(profile_home: Path, boot_id: str, *,
     drained and archive it. Then the lost-card check for live units whose card did not show.
     Steady state (nothing ended, every live card present) is SQLite reads only: no registry lock."""
     out = {"drained": 0, "queued": 0, "failed": 0, "lost": 0}
-    if not _board_exists():
-        return out
-    kb = _kb()
     profile_home = Path(profile_home)
     home = profile_home.resolve()
     live = _live_kanban_units(profile_home)
+    if any(not task_id for task_id in live.values()):
+        _refresh_cardless(profile_home, boot_id, live)
+    board = _board_state()
+    if board is None:
+        return out  # unknown is never absent: retried next tick
+    if board is False:
+        # No board, so no card of any live unit exists: each one is a lost card (the process table decides).
+        _drain_lost(profile_home, boot_id, [(d, t) for d, t in live.items() if t], out, scan=scan)
+        return out
+    kb = _kb()
     with kb.connect_closing(board=_board()) as conn:
         ended = []
         for row in _ended_cards(conn):
@@ -360,7 +382,7 @@ def drain_profile(profile_home: Path, boot_id: str, *,
                 # K6 lineage tag) goes now, create-time checked; never a live runner process.
                 procs = lineage_processes(row["id"])
                 if procs:
-                    _kill_leftovers([p for p in procs if not _is_runner(p)])
+                    _kill_leftovers([p for p in procs if not _is_runner(p, row["id"])])
                 tail = _log_tail(row["id"])
                 if _store.fail_attempt(delegation_id, str(attempt_id),
                                        f"unit worker ended without a result: {tail}",
@@ -374,14 +396,76 @@ def drain_profile(profile_home: Path, boot_id: str, *,
             if _terminal_settled(fresh):
                 _mark_drained(conn, row["id"], delegation_id, row["status"])
                 out["drained"] += 1
-        for delegation_id, task_id in lost:
-            record = records.get(delegation_id)
-            if record is None or record.get("state") != "running":
-                settle(delegation_id, (record or {}).get("state") or "failed")
-                continue
-            if _lost_card(delegation_id, record, task_id, profile_home, boot_id, scan=scan):
-                out["lost"] += 1
+        _drain_lost(profile_home, boot_id, lost, out, scan=scan, records=records)
     return out
+
+
+def _drain_lost(profile_home: Path, boot_id: str, lost: List[Any], out: Dict[str, int], *,
+                scan=None, records: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+    """Live units whose card is positively absent. A record the runner already finished is delivered
+    (its pending events queued) before it is settled: no other path would find it again."""
+    if not lost:
+        return
+    if records is None:
+        try:
+            records = _records_of(profile_home)
+        except Exception:
+            logger.debug("async_delegation_kanban_registry_unreadable home=%s", profile_home, exc_info=True)
+            return
+    for delegation_id, task_id in lost:
+        record = records.get(delegation_id)
+        if record is None or record.get("state") != "running":
+            if record is not None:
+                queued = _store.enqueue_record_outbox(delegation_id, boot_id, profile_home=profile_home)
+                _put(queued, profile_home)
+                out["queued"] += len(queued)
+            settle(delegation_id, (record or {}).get("state") or "failed")
+            continue
+        if _lost_card(delegation_id, record, task_id, profile_home, boot_id, scan=scan):
+            out["lost"] += 1
+
+
+def _refresh_cardless(profile_home: Path, boot_id: str, live: Dict[str, str]) -> None:
+    """A live unit observed before its card was recorded: adopt the card id once the record has one;
+    fail the unit when its launching gateway died without recording one (the boot rule, every tick)."""
+    from tools import async_delegation as ad
+
+    try:
+        records = _records_of(profile_home)
+    except Exception:
+        return
+    for delegation_id, task_id in list(live.items()):
+        if task_id:
+            continue
+        durable = records.get(delegation_id) or {}
+        recorded = str((durable.get("kanban") or {}).get("task_id") or "")
+        if recorded:
+            with ad._records_lock:
+                rec = ad._records.get(delegation_id)
+                if rec is not None:
+                    rec["kanban_task_id"] = recorded
+            live[delegation_id] = recorded
+            continue
+        if durable.get("state") != "running":
+            _put(_store.enqueue_record_outbox(delegation_id, boot_id, profile_home=profile_home), profile_home)
+            settle(delegation_id, durable.get("state") or "failed")
+            continue
+        if _fail_never_started(delegation_id, durable, profile_home, boot_id):
+            settle(delegation_id, "failed")
+
+
+def _fail_never_started(delegation_id: str, durable: Dict[str, Any], profile_home: Path, boot_id: str) -> bool:
+    """A running kanban record with no card whose dispatching gateway is gone: no card and no runner
+    exist, and none ever will. Deliver the error; never re-run (I3). False while the owner may live."""
+    attempt = durable.get("attempt") or {}
+    owner = str(attempt.get("owner_boot_id") or "")
+    if (durable.get("kanban") or {}).get("task_id") or owner == boot_id or _boot_alive(owner):
+        return False
+    if _store.fail_attempt(delegation_id, str(attempt.get("attempt_id") or ""),
+                           "background unit never started (gateway stopped while launching it)",
+                           profile_home=profile_home, queued_boot_id=None):
+        _put(_store.enqueue_record_outbox(delegation_id, boot_id, profile_home=profile_home), profile_home)
+    return True
 
 
 def _lost_card(delegation_id: str, record: Dict[str, Any], task_id: str, profile_home: Path,
@@ -391,7 +475,7 @@ def _lost_card(delegation_id: str, record: Dict[str, Any], task_id: str, profile
     procs = (scan or lineage_processes)(task_id)
     if procs is None:
         return False  # scan unknown: retry next tick
-    if any(_is_runner(p) for p in procs):
+    if any(_is_runner(p, task_id) for p in procs):
         return False
     _kill_leftovers(procs)
     attempt_id = str((record.get("attempt") or {}).get("attempt_id") or "")
@@ -403,11 +487,19 @@ def _lost_card(delegation_id: str, record: Dict[str, Any], task_id: str, profile
     return True
 
 
-def _is_runner(proc) -> bool:
+def _is_runner(proc, task_id: Optional[str] = None) -> bool:
+    """The unit's runner: its argv, or (``setproctitle`` rewrote argv) the canonical worker title."""
     try:
-        return RUNNER_ARG in (proc.cmdline() or [])
+        cmdline = proc.cmdline() or []
     except Exception:
         return True  # unreadable: assume a live runner (unknown is never dead)
+    if RUNNER_ARG in cmdline:
+        return True
+    if task_id:
+        from hermes_cli.kanban_db import _proc_is_titled_worker
+
+        return _proc_is_titled_worker(cmdline, task_id)
+    return False
 
 
 def lineage_processes(task_id: str) -> Optional[List[Any]]:
@@ -432,6 +524,9 @@ def lineage_processes(task_id: str) -> Optional[List[Any]]:
             # read nor signal is not ours, so its unreadable env does not make the scan unknown.
             if uid is not None and uids is not None and (uids.real != uid or uids.effective != uid):
                 continue
+            if _titled_worker(proc, task_id):
+                found.append(proc)  # setproctitle overwrote argv and env: the title names the card
+                continue
             env = proc.environ()
         except psutil.NoSuchProcess:
             continue
@@ -441,6 +536,15 @@ def lineage_processes(task_id: str) -> Optional[List[Any]]:
         if tag.startswith(prefix):
             found.append(proc)
     return found
+
+
+def _titled_worker(proc, task_id: str) -> bool:
+    from hermes_cli.kanban_db import _proc_is_titled_worker
+
+    try:
+        return _proc_is_titled_worker(proc.cmdline() or [], task_id)
+    except Exception:
+        return False
 
 
 def _kill_leftovers(procs: List[Any], grace: float = 5.0) -> None:
@@ -497,16 +601,7 @@ def observe_running(profile_home: Path, boot_id: str) -> int:
     for delegation_id, durable in records.items():
         if durable.get("state") != "running" or not _store.is_kanban_record(durable):
             continue
-        attempt = durable.get("attempt") or {}
-        owner = str(attempt.get("owner_boot_id") or "")
-        if not (durable.get("kanban") or {}).get("task_id") and owner != boot_id and not _boot_alive(owner):
-            # The dispatching gateway died between persisting the unit and recording its card: no
-            # card and no runner exist, and none ever will. Deliver the error; never re-run (I3).
-            if _store.fail_attempt(delegation_id, str(attempt.get("attempt_id") or ""),
-                                   "background unit never started (gateway stopped while launching it)",
-                                   profile_home=profile_home, queued_boot_id=None):
-                _put(_store.enqueue_record_outbox(delegation_id, boot_id, profile_home=profile_home),
-                     profile_home)
+        if _fail_never_started(delegation_id, durable, profile_home, boot_id):
             continue
         source = durable.get("source") or {}
         route = durable.get("route") or {}
@@ -551,7 +646,8 @@ def _archive_stale_cards(records: Dict[str, Dict[str, Any]], profile_home: Path)
                 if Path(str(body.get("profile_home") or "")).resolve() != profile_home.resolve():
                     continue
                 record = records.get(body.get("delegation_id") or "")
-                if record is None or record.get("state") in SETTLE_STATUS:
+                # A terminal record whose completion is still pending is left to drain_profile.
+                if record is None or _terminal_settled(record):
                     _mark_drained(conn, row["id"], str(body.get("delegation_id")), row["status"])
     except Exception:
         logger.warning("async_delegation_kanban_stale_archive_failed home=%s", profile_home, exc_info=True)
