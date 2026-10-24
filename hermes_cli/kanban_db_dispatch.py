@@ -4907,6 +4907,9 @@ def _route_row(conn, row, plan, default_assignee: Optional[str] = None,
             row["body"], skills, caps,
             pin_host=pin if pin not in (None, _kwp.PIN_ANY, _kwp.PIN_STUDIO) else None,
             any_pin=pin == _kwp.PIN_ANY)
+        if verdict.body_ignored and caps_out is not None:
+            # Advisory body pin no host may serve (t_640a4ea0): placed without it, recorded.
+            caps_out.setdefault("body_ignored", {})[row["id"]] = verdict.body_ignored[0]
     ok, rule, route_class = _kwp.portable(
         workspace_kind=row["workspace_kind"], has_links=linked, workspace_bind=bind,
         workspace_has_content=(_kb._kwh.local_workspace_has_content(row["workspace_path"])
@@ -5416,6 +5419,8 @@ def _caps_into_result(result, caps, caps_out: dict) -> None:
         result.placement_caps.setdefault(tid, {})["reasons"] = reasons
     for tid, hosts in (caps_out.get("only") or {}).items():
         result.placement_caps.setdefault(tid, {})["only"] = list(hosts)
+    for tid, req in (caps_out.get("body_ignored") or {}).items():
+        result.placement_caps.setdefault(tid, {})["body_ignored"] = f"requires_body_ignored:{req.cap}"
 
 
 def _identity_only_unplanned(rows) -> dict:
@@ -7326,11 +7331,16 @@ def _dispatch_once_locked(
         from hermes_cli.kanban_host_affinity import record_affinity_events
         from hermes_cli import kanban_host_capabilities as _khc
         _cap_comments = _khc.pending_comments(conn, result, _caps, _caps_out)
+        # Held at host=none on the previous tick too: read before this tick's waits land.
+        _held = _khc.held_pending(conn, result)
         record_affinity_events(conn, result, _affinity_evaluated, _affinity_reached)
         # The pin-lacks park blocks the card: ownership first, as for access contradictions.
         _drop_foreign(conn, _caps_out.get("pin_lacks") or {}, default_assignee)
         _khc.record_capability_events(conn, result, _caps, _caps_out, _affinity_evaluated,
                                       _cap_comments)
+        _held_own = dict(_held)
+        _drop_foreign(conn, _held_own, default_assignee)
+        _khc.notify_held(conn, board, list(_held_own.items()))
     _park_access_contradictions(conn, result, dry_run, default_assignee)
     _record_placement_waits(conn, result, row_route, dry_run, _wait_reached)
     result.rows_routed = len(ready_rows)

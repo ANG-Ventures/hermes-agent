@@ -2407,6 +2407,11 @@ DEFAULT_CONFIG = {
         # of `fleet-host capabilities --sync` (generated_by + source_hash);
         # a hand-written index runs warn. Absent host-capabilities.json = off.
         # See hermes_cli/kanban_host_capabilities.py.
+        # kanban.placement.body_requires_mode (t_640a4ea0, read per tick from
+        # the ROOT config): advisory (absent) = a body-sniffed capability no
+        # host may serve never holds the card (event requires_body_ignored);
+        # enforce = it holds at host=none as before. A `requires:` line always
+        # enforces; a host=none hold past one tick gets ONE card comment.
         # route_first (t_7133e03d, read per tick): every ready row is routed
         # and every held row gets a placement_wait, including rows a total
         # gate or an exhausted budget holds; false restores the silent early

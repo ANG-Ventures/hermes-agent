@@ -58,6 +58,16 @@ DEFAULT_MODE = WARN
 # from every SKILL.md and compares it against ``source_hash``.
 INDEX_GENERATOR = "fleet-host capabilities --sync"
 DEFAULT_ENFORCE = ("browser-session", "screen")
+# kanban.placement.body_requires_mode (t_640a4ea0): ``advisory`` (default) = a
+# body-sniffed pin that no host may serve never holds the card; ``enforce`` =
+# the pre-t_640a4ea0 hold. An explicit ``requires:`` line is always enforced.
+ADVISORY = "advisory"
+BODY_MODES = (ADVISORY, ENFORCE)
+BODY_IGNORED = "requires_body_ignored"
+BODY_IGNORED_EVENT = "placement_body_ignored"
+# ONE comment + ONE #logs line per card held at host=none past one tick.
+HELD_EVENT = "placement_requires_held"
+HELD_PREFIX = "held by requires:"
 NONE_WORD = "none"   # reserved: ``requires: none`` overrides every SOFT requirement (F4/F12)
 
 HARD, SOFT = "hard", "soft"
@@ -144,6 +154,9 @@ class Verdict:
     # Pool hosts that advertise every enforced requirement (capability-aware
     # take, t_90887924): the card is portable to these hosts only.
     only: Tuple[str, ...] = ()
+    # Body-sniffed requirements dropped under ``body_requires_mode: advisory``
+    # because no host may serve them (t_640a4ea0): recorded, never held.
+    body_ignored: Tuple["Requirement", ...] = ()
     # ``requires_unsatisfied:<cap>``: an identity-only capability no pool host
     # advertises. The card waits; it never spawns locally unpinned (AC-5).
     wait: Optional[str] = None
@@ -163,6 +176,7 @@ class CapabilityTick:
     mode: str
     enforce: Tuple[str, ...]
     pool_hosts: Tuple[str, ...]
+    body_mode: str = ADVISORY
 
     def mode_of(self, cap: str) -> str:
         if self.mode == OFF:
@@ -211,6 +225,15 @@ def read_modes(kanban_cfg: Any) -> Tuple[str, Tuple[str, ...]]:
     if not isinstance(enforce, (list, tuple)):
         enforce = DEFAULT_ENFORCE
     return mode, tuple(str(c).strip().lower() for c in enforce if isinstance(c, str) and c.strip())
+
+
+def read_body_mode(kanban_cfg: Any) -> str:
+    """``kanban.placement.body_requires_mode`` from the ROOT config: ``advisory``
+    (default; anything unrecognised) or ``enforce``."""
+    pl = kanban_cfg.get("placement") if isinstance(kanban_cfg, Mapping) else None
+    raw = pl.get("body_requires_mode", ADVISORY) if isinstance(pl, Mapping) else ADVISORY
+    mode = str(raw).strip().lower()
+    return mode if mode in BODY_MODES else ADVISORY
 
 
 def env_value(mode: str, enforce: Iterable[str]) -> str:
@@ -394,7 +417,8 @@ def tick(fleet_dir: Path, kanban_cfg: Any, pool_hosts: Iterable[str]) -> Optiona
         import time as _time
         _note_demoted(cmap, _time.monotonic())
     return CapabilityTick(cmap=cmap, mode=eff, enforce=enforce,
-                          pool_hosts=tuple(h.lower() for h in pool_hosts or ()))
+                          pool_hosts=tuple(h.lower() for h in pool_hosts or ()),
+                          body_mode=read_body_mode(kanban_cfg))
 
 
 # -- derivation (s2.2) ------------------------------------------------------
@@ -524,6 +548,14 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
         not _satisfied(r.cap, ctx, pin_host)
         or (pin_host is None and r.cap in ctx.cmap.identity_only))]
     enforced = [r for r in live if ctx.mode_of(r.cap) == ENFORCE]
+    ignored: Tuple[Requirement, ...] = ()
+    if ctx.body_mode == ADVISORY and pin_host is None:
+        # A body-sniffed word whose capability no host may serve (identity-only,
+        # no pool host advertises it) would hold the card at host=none forever
+        # (t_640a4ea0: "docker run" held 3 cards 9.5 h). It is advice, not a pin.
+        ignored = tuple(r for r in enforced if r.matched_by == BODY and r.cap in ctx.cmap.identity_only
+                        and not any(r.cap in ctx.cmap.hosts.get(h, frozenset()) for h in ctx.pool_hosts))
+        enforced = [r for r in enforced if r not in ignored]
     warned = [r for r in live if ctx.mode_of(r.cap) == WARN]
     hard = _first([r for r in enforced if r.strength == HARD])
     soft = _first([r for r in enforced if r.strength == SOFT])
@@ -538,19 +570,20 @@ def evaluate(body: Optional[str], skills: Iterable[str], ctx: Optional[Capabilit
             # Some pool host advertises everything the card needs: portable,
             # placed on those hosts only (t_90887924, AC-5 "host X").
             return Verdict(pin=hard or soft, enforced=tuple(enforced),
-                           observed=_first(warned), only=servers)
+                           observed=_first(warned), only=servers, body_ignored=ignored)
         idle = sorted(needed & ctx.cmap.identity_only)
         if idle:
             return Verdict(hard_rule=hard.rule if hard else None,
                            soft_rule=soft.rule if soft else None, pin=hard or soft,
                            enforced=tuple(enforced), observed=_first(warned),
-                           wait=f"{UNSATISFIED}:{idle[0]}")
+                           wait=f"{UNSATISFIED}:{idle[0]}", body_ignored=ignored)
     return Verdict(
         hard_rule=hard.rule if hard else None,
         soft_rule=soft.rule if soft else None,
         pin=hard or soft,
         enforced=tuple(enforced),
         observed=_first(warned),
+        body_ignored=ignored,
     )
 
 
@@ -671,20 +704,21 @@ def pending_comments(conn, result, caps: Optional[CapabilityTick], caps_out: Map
     return out
 
 
-def _reconcile_warn_events(conn, task_ids: Iterable[str], observed: Mapping[str, Any]) -> None:
+def _reconcile_warn_events(conn, task_ids: Iterable[str], observed: Mapping[str, Any],
+                           kind: str = WARN_EVENT) -> None:
     """Inside the caller's txn: write each card's warn observation on change,
     and ``{"cleared": true}`` once for a card whose last one no longer holds."""
     from hermes_cli import kanban_db as _kb
     from hermes_cli.kanban_host_affinity import _last_payloads
     ids = list(dict.fromkeys(task_ids))
-    last_by = _last_payloads(conn, ids, WARN_EVENT)
+    last_by = _last_payloads(conn, ids, kind)
     for tid in ids:
         last = last_by.get(tid)
         want = observed.get(tid)
         if want is not None and last != want:
-            _kb._append_event(conn, tid, WARN_EVENT, dict(want))
+            _kb._append_event(conn, tid, kind, dict(want))
         elif want is None and last is not None and not last.get("cleared"):
-            _kb._append_event(conn, tid, WARN_EVENT, {"cleared": True})
+            _kb._append_event(conn, tid, kind, {"cleared": True})
 
 
 def _clear_warn_events(conn, evaluated_ids: Iterable[str]) -> None:
@@ -725,6 +759,9 @@ def record_capability_events(conn, result, caps: Optional[CapabilityTick], caps_
                     _kb.add_comment(conn, tid, "dispatcher", body)
             observed = caps_out.get("observed") or {}
             _reconcile_warn_events(conn, [*evaluated_ids, *observed], observed)
+            ignored = {tid: body_ignored_payload(req)
+                       for tid, req in (caps_out.get("body_ignored") or {}).items()}
+            _reconcile_warn_events(conn, [*evaluated_ids, *ignored], ignored, BODY_IGNORED_EVENT)
             error = caps.error
             if error:
                 # On the cards the bad file demoted (a warn-mode requirement,
@@ -756,3 +793,110 @@ def record_capability_events(conn, result, caps: Optional[CapabilityTick], caps_
         except Exception:
             log.warning("kanban dispatch: could not park %s needs_input (pin lacks %s)",
                         tid, req.cap, exc_info=True)
+
+
+# -- body-sniffed pins: advisory, and a held enforce pin is never silent (t_640a4ea0) --
+
+def body_ignored_payload(req: Requirement) -> Dict[str, Any]:
+    """The ``placement_body_ignored`` event: the card was placed without it."""
+    return {"reason": f"{BODY_IGNORED}:{req.cap}", "cap": req.cap, "term": req.term,
+            "matched_by": req.matched_by}
+
+
+def matched_line(body: Optional[str], affinity: Mapping[str, Any]) -> Optional[str]:
+    """The body line a pin came from: the ``requires:`` line naming the word,
+    or the first line holding the sniffed term. None for a skill pin."""
+    term = str(affinity.get("term") or "")
+    by = affinity.get("matched_by")
+    if not term or by == SKILL:
+        return None
+    for line in (body or "").splitlines():
+        if by == DECLARED:
+            if REQUIRES_RE.match(line) and term.lower() in _line_words(line.split(":", 1)[1]):
+                return line.strip()
+        elif term.lower() in line.lower():
+            return line.strip()
+    return None
+
+
+def held_comment(affinity: Mapping[str, Any], line: Optional[str]) -> str:
+    cap = str(affinity.get("rule", ""))[len(RULE_PREFIX):]
+    req = Requirement(cap, affinity.get("strength") or HARD, affinity.get("matched_by") or BODY,
+                      affinity.get("term") or "")
+    where = f" (line: `{line}`)" if line else ""
+    if req.matched_by == DECLARED:
+        undo = "or replace that line with `requires: none`"
+    elif req.matched_by == SKILL:
+        undo = f"or remove the skill {req.term} from the card"
+    else:
+        undo = "or add a line `requires: none`"
+    return (f"{HELD_PREFIX} {cap} from {_source_text(req)}{where}. No host that may run this card "
+            f"has {cap} (host=none), so it waits and will not clear on its own. Override: add a line "
+            f"`host: studio` (the Mac Studio serves {cap} to an explicit pin) {undo}.")
+
+
+def _open_none_wait(conn, tid: str) -> bool:
+    """Whether the card's latest ``placement_wait`` (written by an EARLIER tick)
+    is an open host=none hold."""
+    from hermes_cli import kanban_placement_reasons as _pr
+    row = conn.execute("SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'placement_wait' "
+                       "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+    if row is None:
+        return False
+    try:
+        last = json.loads(row[1] or "{}")
+    except (TypeError, ValueError):
+        return False
+    if last.get("host") != "none" or not str(last.get("reason", "")).startswith(UNSATISFIED):
+        return False
+    kinds = sorted(_pr.PLACEMENT_WAIT_EPISODE_END_KINDS)
+    return conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN (%s) LIMIT 1"
+                        % ",".join("?" * len(kinds)), (tid, row[0], *kinds)).fetchone() is None
+
+
+def held_pending(conn, result) -> List[Tuple[str, Dict[str, Any]]]:
+    """``[(task_id, affinity)]`` held at host=none this tick AND on the previous
+    one, with no notice yet. Read BEFORE this tick's wait events are written."""
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    waits = result.placement_waits or {}
+    for tid, aff in (result.placement_affinity or {}).items():
+        if aff.get("host") != "none" or aff.get("mode") != ENFORCE \
+                or not str(waits.get(tid, "")).startswith(UNSATISFIED):
+            continue
+        if conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+                        (tid, HELD_EVENT)).fetchone() is not None:
+            continue   # once per card
+        if _open_none_wait(conn, tid):
+            out.append((tid, dict(aff)))
+    return out
+
+
+def notify_held(conn, board: Optional[str], pending: List[Tuple[str, Dict[str, Any]]]) -> List[str]:
+    """Post the one comment per held card (the event is its latch) and one
+    #logs line, never #alerts. Best-effort: never breaks a tick."""
+    import logging
+    from hermes_cli import kanban_budget as _kbudget
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_connect as _kbc
+    log = logging.getLogger(__name__)
+    posted: List[str] = []
+    for tid, aff in pending:
+        try:
+            row = conn.execute("SELECT body FROM tasks WHERE id = ?", (tid,)).fetchone()
+            line = matched_line(row[0] if row else None, aff)
+            text = held_comment(aff, line)
+            with _kbc.write_txn(conn):
+                _kb._append_event(conn, tid, HELD_EVENT, {"rule": aff.get("rule"), "term": aff.get("term"),
+                                                         "matched_by": aff.get("matched_by"), "line": line})
+                _kb.add_comment(conn, tid, "dispatcher", text)
+            posted.append(tid)
+        except Exception:
+            log.warning("kanban dispatch: could not post the requires-held notice on %s", tid, exc_info=True)
+            continue
+        script = _kbudget._notify_script_path()
+        if script is not None:
+            import sys
+            _kbudget._run_notify([sys.executable, script, "--channel", "discord", "--target",
+                                  _kbudget.RECOVERY_TARGET, "--send",
+                                  f"📌 Kanban '{board or 'default'}': {tid} {text}"])
+    return posted
