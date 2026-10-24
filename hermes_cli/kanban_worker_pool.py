@@ -56,7 +56,7 @@ ROLE = "kanban-worker"
 SSH_USER = "kanbanw"
 ROLES_FILE = "fleet-roles.json"
 SIDECAR_FILE = "kanban-pool.json"
-# Roles that are membership only (t_940fc400): ``{}``, or a legacy ``{"slots": N}``
+# Roles that are membership only (t_940fc400): ``{}``, or the legacy count object
 # until hermes-home drops the count (t_1acfaa85). Every other role keeps its count.
 COUNT_FREE_ROLES = frozenset({"ci-runner"})
 # Per-worker-host SSH reach matrix (card t_1e9ea7e9): written daily by the
@@ -277,7 +277,7 @@ def parse_roles(doc) -> Dict[str, Tuple[Dict[str, Optional[int]], str]]:
                 parsed[role] = None
                 continue
             if not isinstance(spec, dict) or set(spec) != {"slots"}:
-                shape = "{} or {\"slots\": N}" if role in COUNT_FREE_ROLES else "{\"slots\": N}"
+                shape = "{} or {\"slots\": N}" if role in COUNT_FREE_ROLES else "{\"slots\": N}"  # slots-vocab: allow legacy fleet-roles.json schema key
                 raise PoolError(f"fleet-roles.json: host {hid}: role {role} must be {shape}")
             slots = spec["slots"]
             if isinstance(slots, bool) or not isinstance(slots, int) or not 1 <= slots <= 64:
