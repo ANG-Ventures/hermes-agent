@@ -549,6 +549,13 @@ class GoalState:
 
 # ── Persistence (SessionDB state_meta) ────────────────────────────────
 
+# GoalState fields an idle wake mutates (accounting + the wait barrier it consumes).
+_IDLE_WAKE_FIELDS = (
+    "idle_wakes", "last_idle_wake_at", "waiting_on_pid", "waiting_on_session", "waiting_until",
+    "waiting_on_delegations", "waiting_reason", "waiting_since",
+)
+
+
 def _meta_key(session_id: str) -> str:
     return f"goal:{session_id}"
 
@@ -737,6 +744,37 @@ def save_goal(session_id: str, state: GoalState) -> None:
         db.set_meta(_meta_key(session_id), state.to_json())
     except Exception as exc:
         logger.debug("GoalManager: set_meta failed: %s", exc)
+
+
+def undo_idle_wake(session_id: str, before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+    """Give back a recorded idle wake that was never dispatched (the session turned busy or was
+    /stop-ped meanwhile), so it does not consume a check-in. Read, compare and write run in ONE
+    write transaction, so a pause/clear from any surface either lands first (and the goal is left
+    alone) or after (and sees the restored fields). A field is restored only while it still holds
+    the value the wake wrote; anything saved since then wins. Returns True when anything changed."""
+    db = _get_session_db() if session_id and before else None
+    execute_write = getattr(db, "_execute_write", None)
+    if execute_write is None:
+        return False
+    key = _meta_key(session_id)
+
+    def _txn(conn) -> bool:
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        state = GoalState.from_json(row[0]) if row and row[0] else None
+        if state is None or state.status != "active":
+            return False
+        changed = [f for f in _IDLE_WAKE_FIELDS if f in before and getattr(state, f) == after.get(f) != before[f]]
+        for field in changed:
+            setattr(state, field, before[field])
+        if changed:
+            conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
+        return bool(changed)
+
+    try:
+        return bool(execute_write(_txn))
+    except Exception as exc:
+        logger.debug("GoalManager: idle-wake undo failed for %s: %s", session_id, exc)
+        return False
 
 
 def clear_goal(session_id: str) -> None:
@@ -1280,6 +1318,11 @@ class GoalManager:
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
         self._state: Optional[GoalState] = load_goal(session_id)
+
+    def reload(self) -> Optional[GoalState]:
+        """Re-read the persisted goal, dropping this manager's snapshot (another writer may have saved)."""
+        self._state = load_goal(self.session_id)
+        return self._state
 
     # --- introspection ------------------------------------------------
 
@@ -1842,6 +1885,11 @@ class GoalManager:
         s.last_idle_wake_at = now
         self._save()
         return prompt
+
+    def idle_wake_snapshot(self) -> Dict[str, Any]:
+        """The fields ``idle_wake_prompt`` may change, for ``undo_idle_wake``."""
+        s = self._state
+        return {} if s is None else {f: getattr(s, f) for f in _IDLE_WAKE_FIELDS}
 
     def set_checkin_minutes(self, minutes: int) -> GoalState:
         """Per-goal check-in interval (minutes; 0 = off for this goal; -1 = config default)."""

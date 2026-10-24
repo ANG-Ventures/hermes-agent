@@ -86,15 +86,11 @@ async def test_timer_parked_goal_is_woken_when_the_deadline_passes(rig):
 @pytest.mark.asyncio
 async def test_busy_session_is_never_woken(rig):
     runner, adapter, received, key = rig
-    mgr = goals.GoalManager("goal-sess")
-    mgr.set("g")
-    mgr.wait_for_seconds(1, reason="x")
-    mgr.state.waiting_until = time.time() - 1
-    mgr._save()
+    await asyncio.to_thread(_due)                         # off-loop: no SessionDB bootstrap window
     runner._running_agents[key] = object()
     await runner._goal_idle_wake_scan()
     assert received == []
-    assert goals.load_goal("goal-sess").waiting_until > 0     # barrier untouched for the live turn
+    assert (await asyncio.to_thread(goals.load_goal, "goal-sess")).waiting_until > 0  # barrier untouched
 
 
 @pytest.mark.asyncio
@@ -148,3 +144,155 @@ async def test_ended_goals_are_never_woken(rig, end):
     await runner._goal_idle_wake_scan()
     await _drain(adapter)
     assert received == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ["clear", "pause"])
+async def test_goal_command_racing_the_idle_wake_is_not_overwritten(rig, end):
+    """A /goal pause|clear that lands while the idle wake is hopping to the executor wins: the wake
+    must not save its stale active snapshot over it, and must not start a turn."""
+    runner, adapter, received, key = rig
+    await asyncio.to_thread(_due)                         # off-loop: no SessionDB bootstrap window
+    real_hop = runner._run_in_executor_with_context
+
+    async def hop_after_user_command(fn, *args):
+        getattr(goals.GoalManager("goal-sess"), end)()     # the user's /goal command commits first
+        runner._run_in_executor_with_context = real_hop
+        return await real_hop(fn, *args)
+
+    runner._run_in_executor_with_context = hop_after_user_command
+    entry = runner.session_store.list_sessions()[0]
+    await runner._goal_idle_wake_one(entry, 30, 3)
+    await _drain(adapter)
+    assert received == []
+    assert (await asyncio.to_thread(goals.load_goal, "goal-sess")).status == ("cleared" if end == "clear" else "paused")
+
+
+@pytest.mark.asyncio
+async def test_goal_paused_after_the_wake_is_recorded_does_not_dispatch(rig):
+    """Eligibility is re-checked after the executor hop: a pause committed after the wake was
+    recorded (but before dispatch) still prevents the automatic turn."""
+    runner, adapter, received, key = rig
+    await asyncio.to_thread(_due)                         # off-loop: no SessionDB bootstrap window
+    real_hop = runner._run_in_executor_with_context
+
+    async def hop_then_user_pause(fn, *args):
+        result = await real_hop(fn, *args)
+        await asyncio.to_thread(lambda: goals.GoalManager("goal-sess").pause())
+        return result
+
+    runner._run_in_executor_with_context = hop_then_user_pause
+    entry = runner.session_store.list_sessions()[0]
+    await runner._goal_idle_wake_one(entry, 30, 3)
+    await _drain(adapter)
+    assert received == []
+    assert (await asyncio.to_thread(goals.load_goal, "goal-sess")).status == "paused"
+
+
+@pytest.mark.asyncio
+async def test_user_message_arriving_during_the_hop_is_not_raced(rig):
+    """A real message that made the session busy during the executor hop owns the next turn."""
+    runner, adapter, received, key = rig
+    await asyncio.to_thread(_due)                         # off-loop: no SessionDB bootstrap window
+    real_hop = runner._run_in_executor_with_context
+
+    async def hop_then_busy(fn, *args):
+        result = await real_hop(fn, *args)
+        runner._running_agents[key] = object()
+        return result
+
+    runner._run_in_executor_with_context = hop_then_busy
+    entry = runner.session_store.list_sessions()[0]
+    await runner._goal_idle_wake_one(entry, 30, 3)
+    await _drain(adapter)
+    assert received == []
+
+
+@pytest.mark.asyncio
+async def test_goal_command_waits_for_an_in_flight_idle_wake_and_reads_its_save(rig):
+    """/goal pause issued while the idle wake holds the session's goal lock runs after it, on the
+    wake's saved state (no lost update in either direction)."""
+    runner, adapter, received, key = rig
+    await asyncio.to_thread(_due)                         # off-loop: no SessionDB bootstrap window
+    real_hop = runner._run_in_executor_with_context
+    in_hop, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_hop(fn, *args):
+        in_hop.set()
+        await release.wait()
+        runner._run_in_executor_with_context = real_hop
+        return await real_hop(fn, *args)
+
+    async def _manager(event):
+        return await asyncio.to_thread(goals.GoalManager, "goal-sess"), SimpleNamespace(session_id="goal-sess")
+
+    runner._run_in_executor_with_context = slow_hop
+    runner._get_goal_manager_for_event = _manager
+    runner._clear_goal_continuations = lambda *a: None
+    entry = runner.session_store.list_sessions()[0]
+    wake = asyncio.create_task(runner._goal_idle_wake_one(entry, 30, 3))
+    await in_hop.wait()
+    cmd_event = SimpleNamespace(source=entry.origin, get_command_args=lambda: "pause")
+    command = asyncio.create_task(runner._handle_goal_command(cmd_event))
+    await asyncio.sleep(0.05)
+    assert not command.done()                                # serialized behind the wake
+    release.set()
+    await asyncio.wait_for(asyncio.gather(wake, command), 10)
+    state = await asyncio.to_thread(goals.load_goal, "goal-sess")
+    assert state.status == "paused"
+    assert state.last_idle_wake_at > 0                       # the wake's save was not clobbered
+
+
+@pytest.mark.asyncio
+async def test_wake_abandoned_for_a_busy_session_does_not_consume_the_checkin(rig):
+    """The session turned busy during the hop: no dispatch, and the recorded wake is given back so
+    the last allowed check-in is still available once the session is idle again."""
+    runner, adapter, received, key = rig
+
+    def _quiet_due():
+        mgr = goals.GoalManager("goal-sess")
+        mgr.set("g")
+        mgr.state.created_at = mgr.state.last_turn_at = time.time() - 31 * 60
+        mgr._save()
+
+    await asyncio.to_thread(_quiet_due)
+    real_hop = runner._run_in_executor_with_context
+
+    async def hop_then_busy(fn, *args):
+        runner._run_in_executor_with_context = real_hop
+        result = await real_hop(fn, *args)
+        runner._running_agents[key] = object()
+        return result
+
+    runner._run_in_executor_with_context = hop_then_busy
+    entry = runner.session_store.list_sessions()[0]
+    await runner._goal_idle_wake_one(entry, 30, 1)
+    await _drain(adapter)
+    assert received == []
+    state = await asyncio.to_thread(goals.load_goal, "goal-sess")
+    assert (state.idle_wakes, state.last_idle_wake_at) == (0, 0.0)
+    runner._running_agents.pop(key)
+    await runner._goal_idle_wake_one(entry, 30, 1)          # idle again: the sole check-in fires
+    await _drain(adapter)
+    assert len(received) == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_wake_undo_never_reactivates_a_goal_paused_from_another_surface(rig):
+    """The give-back is one transaction against the stored row: a pause from a surface outside the
+    gateway lock that landed after the wake was recorded is kept (no stale active state saved)."""
+    def _scenario():
+        mgr = goals.GoalManager("goal-sess")
+        mgr.set("g")
+        mgr.state.created_at = mgr.state.last_turn_at = time.time() - 31 * 60
+        mgr._save()
+        before = mgr.idle_wake_snapshot()
+        assert mgr.idle_wake_prompt(checkin_minutes=30, max_checkins=1)
+        after = mgr.idle_wake_snapshot()
+        goals.GoalManager("goal-sess").pause()                # CLI / other surface
+        undone = goals.undo_idle_wake("goal-sess", before, after)
+        return undone, goals.load_goal("goal-sess")
+
+    undone, state = await asyncio.to_thread(_scenario)
+    assert undone is False
+    assert state.status == "paused"

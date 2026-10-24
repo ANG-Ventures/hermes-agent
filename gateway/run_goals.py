@@ -627,15 +627,38 @@ class GatewayGoalsMixin:
             return  # busy: the running turn's own post-turn judge owns the next step
         if getattr(entry, "user_stopped_at", None) is not None or self._stop_latched(quick_key):
             return  # /stop latched: only a human turn resumes automatic work
-        with self._profile_scope_for_source(source):
+        max_turns = self._goal_max_turns_from_config()
+
+        def _wake():
             from hermes_cli.goals import GoalManager
 
-            mgr = GoalManager(session_id=session_id, default_max_turns=self._goal_max_turns_from_config())
-            prompt = await self._run_in_executor_with_context(
-                lambda: mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins),
-            )
-        if not prompt:
-            return
+            # Load inside the hop and under the session's goal lock: a /goal pause|clear that
+            # committed before this point is what we read, so the save below cannot undo it.
+            mgr = GoalManager(session_id=session_id, default_max_turns=max_turns)
+            before = mgr.idle_wake_snapshot()
+            return mgr, mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins), before
+
+        from hermes_cli.goals import undo_idle_wake
+
+        with self._profile_scope_for_source(source):
+            async with self._goal_session_lock(session_id):
+                mgr, prompt, before = await self._run_in_executor_with_context(_wake)
+                if not prompt:
+                    return
+                # Re-check eligibility after the hop: a real message or /stop that landed meanwhile
+                # owns the next step, and the wake recorded in the hop is given back (it never ran).
+                if (
+                    quick_key in getattr(self, "_running_agents", {})
+                    or quick_key in adapter._active_sessions
+                    or self._queue_depth(quick_key, adapter=adapter) > 0
+                    or self._stop_latched(quick_key)
+                ):
+                    after = mgr.idle_wake_snapshot()
+                    await self._run_in_executor_with_context(lambda: undo_idle_wake(session_id, before, after))
+                    return
+                # Writers outside this lock (another surface on the same session) may have ended it.
+                if not await self._run_in_executor_with_context(lambda: mgr.reload() is not None and mgr.is_active()):
+                    return
         logger.info(
             "goal idle wake #%s for %s (session %s): %s", mgr.state.idle_wakes if mgr.state else "?",
             quick_key, session_id, prompt.splitlines()[0][:80],
