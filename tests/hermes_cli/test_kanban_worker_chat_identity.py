@@ -61,6 +61,7 @@ def _capture_spawn_env(monkeypatch, tmp_path) -> dict[str, str]:
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    kb.create_board("identity-board")
 
     assert kbd._default_spawn(_task(), str(workspace), board="identity-board") == 4242
     return captured["env"]  # type: ignore[return-value]
@@ -141,9 +142,9 @@ def test_dispatcher_env_reaches_chat_q_agent_identity(monkeypatch, tmp_path):
     """The real dispatcher env must identify the agent built by ``chat -q``."""
     env = _capture_spawn_env(monkeypatch, tmp_path)
     assert env["HERMES_KANBAN_TASK"] == "t_identity"
-    assert env["HERMES_KANBAN_BOARD"] == "identity-board"
+    assert "HERMES_KANBAN_BOARD" not in env  # S7: the board is derived from the DB pin
     monkeypatch.setenv("HERMES_KANBAN_TASK", env["HERMES_KANBAN_TASK"])
-    monkeypatch.setenv("HERMES_KANBAN_BOARD", env["HERMES_KANBAN_BOARD"])
+    monkeypatch.setenv("HERMES_KANBAN_DB", env["HERMES_KANBAN_DB"])
 
     import cli as cli_mod
     from agent import credits_tracker

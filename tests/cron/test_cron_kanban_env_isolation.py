@@ -51,7 +51,6 @@ def worker_env(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/tmp/ws")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "lock-abc")
-    monkeypatch.setenv("HERMES_KANBAN_BOARD", "team-alpha")
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +315,7 @@ class TestRunJobKanbanIsolation:
         assert success is False
         assert is_dispatcher_owned_worker_context() is True
         # And the env survived the failure too.
-        assert os.environ.get("HERMES_KANBAN_BOARD") == "team-alpha"
+        assert os.environ.get("HERMES_KANBAN_WORKSPACE") == "/tmp/ws"
 
     def test_concurrent_jobs_do_not_corrupt_worker_identity(
         self, monkeypatch, worker_env

@@ -253,7 +253,6 @@ def test_claim_check_fails_closed_without_a_board(clear_kanban_env, tmp_path):
     clear_kanban_env.setenv("HERMES_KANBAN_DB", str(tmp_path / "missing.db"))
     assert worker_claim_is_live() is False
     clear_kanban_env.delenv("HERMES_KANBAN_DB", raising=False)
-    clear_kanban_env.setenv("HERMES_KANBAN_BOARD", "no-such-board-xyz")
     assert worker_claim_is_live() is False  # and no ambient fallback rescues it
 
 
