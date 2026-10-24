@@ -5127,10 +5127,12 @@ def _run_slash(rest: str) -> str:
     except argparse.ArgumentError as exc:
         # py>=3.12 raises here (exit_on_error=False) without calling error(), so the
         # schema-on-miss hook in kanban_parser never runs on this path (t_cd1bcea4).
+        # Schema is context, the ArgumentError is the answer -- it goes LAST so a reader
+        # (or a tail) sees the cause, not the example line (2026-10-24).
         schema = ""
         if tokens and tokens[0] in kvi.VERB_SCHEMAS and "input: required" not in str(exc):
-            schema = "\n" + kvi.schema_text(tokens[0])
-        return f"⚠ /kanban usage error\n{_usage_for_error()}\n{exc}{schema}"
+            schema = kvi.schema_text(tokens[0]) + "\n"
+        return f"⚠ /kanban usage error\n{_usage_for_error()}\n{schema}error: {exc}"
 
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
         try:

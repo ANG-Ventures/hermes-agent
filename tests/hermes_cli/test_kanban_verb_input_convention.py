@@ -218,3 +218,38 @@ def test_flat_form_head_reads_legacy_routed_pr(board, monkeypatch):
         conn.commit()
         assert kvi._routed_pr_head(conn, board) == (HEAD, "ANG-Ventures/hermes-agent#41")
     assert seen == [("ANG-Ventures/hermes-agent", 41)]
+
+
+# --- --priority accepts p0..p3; the argparse refusal ends on the cause (2026-10-24) -------------
+
+@pytest.mark.parametrize("text,expected", [("p0", 3), ("P1", 2), ("p2", 1), ("p3", 0), ("7", 7), ("-2", -2)])
+def test_priority_value_accepts_tiers_and_ints(text, expected):
+    from hermes_cli.kanban_parser import priority_value
+    assert priority_value(text) == expected
+
+
+def test_priority_value_refuses_garbage_with_both_shapes_named():
+    import argparse
+    from hermes_cli.kanban_parser import priority_value
+    with pytest.raises(argparse.ArgumentTypeError) as exc:
+        priority_value("high")
+    assert "p0..p3" in str(exc.value) and "int" in str(exc.value)
+
+
+def test_create_with_tier_priority_is_accepted(board, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_ID", SESSION)
+    out = cli.run_slash('create "tier prio card" --priority p2 --body x')
+    assert "usage error" not in out, out
+    with kb.connect_closing() as conn:
+        row = conn.execute("SELECT priority FROM tasks WHERE title = ?", ("tier prio card",)).fetchone()
+    assert row is not None and row[0] == 1
+
+
+def test_argparse_refusal_puts_the_cause_on_the_last_line(board, monkeypatch):
+    """The schema is context; the refusal is the answer. A reader (or a `tail`) that sees only
+    the last line must see WHY the call was refused, not the example invocation."""
+    monkeypatch.setenv("HERMES_SESSION_ID", SESSION)
+    out = cli.run_slash('create "x" --priority high')
+    last = out.rstrip().splitlines()[-1]
+    assert "error:" in last and "--priority" in last, out
+    assert "example:" in out.lower(), out
