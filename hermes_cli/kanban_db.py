@@ -18020,10 +18020,12 @@ def sweep_terminal_workspace_orphans(
     for proc in psutil.process_iter(["pid", "ppid", "uids"]):
         info = proc.info
         pid = info.get("pid") or 0
-        if pid <= 1 or pid == me or not _init_parented(proc, info.get("ppid")):
-            continue
         uids = info.get("uids")
-        if uids is None or uids.real != uid:
+        # uid before _init_parented: on Linux that reads the PARENT's name per process
+        # (a 12.8k-process shared host spent seconds per tick on other users' parents).
+        if pid <= 1 or pid == me or uids is None or uids.real != uid:
+            continue
+        if not _init_parented(proc, info.get("ppid")):
             continue
         try:
             cwd = proc.cwd()
