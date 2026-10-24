@@ -165,6 +165,29 @@ def test_a_shallow_bundle_declares_its_boundary_as_prerequisites(board, tmp_path
     assert (empty / "work.txt").read_text() == "unpublished\n"
 
 
+def test_a_stale_shallow_entry_whose_object_is_absent_still_bundles(board, tmp_path):
+    """A `shallow` line naming an object the store lacks is not a boundary.
+
+    Passed through as `^<sha>`, `bundle create` dies rc=128 "bad object"; it is
+    dropped, and the real boundary is still declared.
+    """
+    tid, ws, remote, clone = shallow_workspace(board, tmp_path)
+    (clone / "work.txt").write_text("unpublished\n")
+    git(clone, "add", ".")
+    git(clone, "commit", "-m", "local work")
+    shallow = clone / ".git" / "shallow"
+    boundary = set(shallow.read_text().split())
+    with shallow.open("a") as fh:
+        fh.write("1" * 40 + "\n")
+    assert kb.complete_task(board, tid)
+    stored = [Path(a.stored_path) for a in kb.list_attachments(board, tid)
+              if a.stored_path.endswith(".bundle")]
+    assert stored, kb.list_attachments(board, tid)
+    header = stored[0].read_bytes().split(b"\n\n", 1)[0].decode()
+    prereqs = {line[1:].split()[0] for line in header.splitlines() if line.startswith("-")}
+    assert prereqs == boundary, header
+
+
 def test_a_shallow_capture_that_still_fails_names_the_remedy(board, tmp_path, monkeypatch):
     import hermes_cli.kanban_survivor as survivor
     # Simulate any future shallow-traversal failure: without the grafts the
