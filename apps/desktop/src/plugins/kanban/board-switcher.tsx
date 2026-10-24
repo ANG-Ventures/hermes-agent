@@ -38,6 +38,7 @@ import { type ReactNode, useEffect, useState } from 'react'
 
 import {
   $boardSlug,
+  DEFAULT_BOARD,
   boardsKey,
   createBoard,
   deleteBoard,
@@ -296,8 +297,8 @@ export function BoardSwitcher() {
   const [renameFor, setRenameFor] = useState<BoardMeta | null>(null)
   const [deleteFor, setDeleteFor] = useState<BoardMeta | null>(null)
 
-  // Archive rather than erase, so a mis-click stays recoverable. The backend
-  // reverts the active board to default; drop our override to follow it.
+  // Archive rather than erase, so a mis-click stays recoverable. The archived
+  // board is gone; fall back to the default board.
   const confirmDelete = async (target: BoardMeta) => {
     const { result } = await deleteBoard(target.slug)
 
@@ -335,7 +336,7 @@ export function BoardSwitcher() {
     return null
   }
 
-  const currentSlug = slug || boards.current
+  const currentSlug = slug || DEFAULT_BOARD
   const current = boards.boards.find(meta => meta.slug === currentSlug)
   const label = current?.name || current?.slug || k.board
 
@@ -364,7 +365,7 @@ export function BoardSwitcher() {
           {boards.boards.map(meta => (
             <DropdownMenuItem
               key={meta.slug}
-              onSelect={() => $boardSlug.set(meta.slug === boards.current ? '' : meta.slug)}
+              onSelect={() => $boardSlug.set(meta.slug === DEFAULT_BOARD ? '' : meta.slug)}
             >
               {meta.name || meta.slug}
               {typeof meta.total === 'number' && (
