@@ -5,6 +5,7 @@ import subprocess
 
 import pytest
 import hermes_yaml as yaml
+from tests._fixtures.bounds import uncapped_argv
 
 
 @pytest.mark.platforms("posix")
@@ -26,7 +27,10 @@ def test_external_validator_checkout_uses_requested_ref_and_preserves_caller(tmp
            "GITHUB_OUTPUT": str(output), "GITHUB_ENV": str(env_file), "_HERMES_REF": ref,
            "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"url.{repo.as_uri()}.insteadOf",
            "GIT_CONFIG_VALUE_0": "https://github.com/NousResearch/hermes-agent.git"}
-    subprocess.run(["bash", "-c", source_step["run"]], cwd=caller, env=env, check=True,
+    # The step is a CI runner's shell, not code under the test's budget: under the harness's
+    # 6 GiB RLIMIT_AS the local `git upload-pack` cannot start pack-objects' threads on a
+    # 128-core box ("unable to create thread", ci-box, t_e9a7a83f).
+    subprocess.run(uncapped_argv(["bash", "-c", source_step["run"]]), cwd=caller, env=env, check=True,
                    capture_output=True, text=True, timeout=60)
     outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
     source = Path(outputs["source"])
