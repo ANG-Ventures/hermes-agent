@@ -37,7 +37,7 @@ TOKEN_RE = re.compile(r"close-on", re.I)
 MACHINE_AUTHORS = frozenset({
     "dispatcher", "kanban-dispatcher", "kanban", "kanban-pr-gate", "kanban-overlap-gate",
     "kanban-orphan-menu", "review-merge-pass", "kanban-review-merge-pass", "fleetreview-route",
-    "prism-holds", "review-failsafe", "close-on-convert",
+    "prism-holds", "review-failsafe", "close-on-convert", "boomerang-wake",
 })
 REFUSAL_HINT = "post the bare line on its own; say release line in prose"
 
