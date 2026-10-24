@@ -1007,12 +1007,15 @@ def _live_agent(runner: Any, session_key: str) -> tuple:
 def _db_parent(runner: Any, home: Any) -> Any:
     """Summary-mode parent when no idle live agent exists: an AIAgent on the gateway's runtime
     whose transcript is the session DB's (the v1 fold reads ``_session_messages``)."""
-    from gateway.run import _resolve_runtime_agent_kwargs
+    from gateway.run import _resolve_gateway_model, _resolve_runtime_agent_kwargs
     from run_agent import AIAgent
 
     kw = dict(_resolve_runtime_agent_kwargs())
     kw.pop("_fallback_notice", None)
     kw.pop("capabilities", None)
+    # The runtime kwargs carry no model unless a fallback route chose one; without it the child's
+    # every turn sent model="" (400, puppet lane 2026-10-24). Same precedence as a gateway turn.
+    kw["model"] = kw.get("model") or _resolve_gateway_model()
     agent = AIAgent(**kw, session_id=getattr(home, "session_id", None), quiet_mode=True,
                     skip_memory=True, skip_context_files=True)
     agent._session_messages = runner.session_store.load_transcript(home.session_id)
