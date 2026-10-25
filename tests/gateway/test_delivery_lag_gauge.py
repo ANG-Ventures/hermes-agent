@@ -104,3 +104,73 @@ def test_threshold_compares_the_unrounded_p99(tmp_path, capsys):
         "2026-10-24 14:00:05,040 INFO x: [discord] Sending response (10 chars) to 111\n", encoding="utf-8")
     assert mod.main(["--log", str(log), "--since", "0", "--window", "2000000000", "--max-p99-s", "5.01"]) == 1
     assert mod.main(["--log", str(log), "--since", "0", "--window", "2000000000", "--max-p99-s", "5.05"]) == 0
+
+
+def _run(mod, tmp_path, text, *extra):
+    import json
+    log = tmp_path / "gateway.log"
+    log.write_text(text, encoding="utf-8")
+    rc = mod.main(["--log", str(log), "--since", "0", "--window", "4000000000", *extra])
+    return rc, json.loads(_LAST[0].readouterr().out.splitlines()[-1])
+
+
+_LAST = []
+
+
+def test_superseded_ready_is_dropped_not_paired_with_the_next_send(tmp_path, capsys):
+    """Prism b0dbbe468ced: a cancelled reply's ``response ready`` must not pair with the NEXT turn's
+    send in that chat (that reported 100 s here instead of 1 s). Same-chat pairing takes only the
+    last ready; the superseded one is counted unpaired."""
+    _LAST[:] = [capsys]
+    mod = _script()
+    rc, out = _run(mod, tmp_path,
+        "2026-10-24 14:00:00,000 INFO x: response ready: platform=discord chat=111 session=a time=1.0s\n"
+        "2026-10-24 14:01:39,000 INFO x: response ready: platform=discord chat=111 session=a time=1.0s\n"
+        "2026-10-24 14:01:40,000 INFO x: [discord] Sending response (10 chars) to 111\n"
+        "2026-10-24 14:05:00,000 INFO x: [discord] Sending response (10 chars) to 111\n")
+    assert rc == 0
+    assert (out["n"], out["max_s"], out["unpaired"]) == (1, 1.0, 2), out  # stale ready + orphan send
+
+
+def test_pairs_by_turn_id_when_present(tmp_path, capsys):
+    _LAST[:] = [capsys]
+    mod = _script()
+    rc, out = _run(mod, tmp_path,
+        "2026-10-24 14:00:00,000 INFO x: response ready: platform=discord chat=111 turn=t1 time=1.0s\n"
+        "2026-10-24 14:00:10,000 INFO x: response ready: platform=discord chat=111 turn=t2 time=1.0s\n"
+        "2026-10-24 14:00:11,000 INFO x: [discord] Sending response (10 chars) to 111 turn=t2\n"
+        "2026-10-24 14:00:30,000 INFO x: [discord] Sending response (10 chars) to 111 turn=t1\n")
+    assert rc == 0
+    assert (out["n"], out["p50_s"], out["max_s"], out["unpaired"]) == (2, 1.0, 30.0, 0), out
+
+
+@pytest.mark.parametrize("ready_ts,send_ts", [
+    ("2026-10-24T21:00:00Z", "2026-10-24T21:00:03Z"),
+    ("2026-10-24T14:00:00-07:00", "2026-10-24T21:00:03+00:00"),
+    ("2026-10-25T06:00:00.500+09:00", "2026-10-24T21:00:03.500Z"),
+])
+def test_utc_and_offset_timestamps_are_honoured(tmp_path, capsys, monkeypatch, ready_ts, send_ts):
+    """Prism d756c5c3a7d8: ``Z`` and ``+HH:MM`` suffixes were dropped and the time read as local, so
+    a run outside the log's timezone picked the wrong window and mixed-offset pairs got wrong lags.
+    The host zone is forced off UTC (conftest pins TZ=UTC, where a dropped ``Z`` is invisible)."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("no time.tzset")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    _LAST[:] = [capsys]
+    mod = _script()
+    assert mod._epoch(f"{send_ts} INFO x") == 1792875603.0 + (0.5 if "." in send_ts else 0.0)
+    log = (f"{ready_ts} INFO x: response ready: platform=discord chat=1 session=a\n"
+           f"{send_ts} INFO x: [discord] Sending response (10 chars) to 1\n")
+    rc, out = _run(mod, tmp_path, log)
+    assert rc == 0 and (out["n"], out["max_s"]) == (1, 3.0), out
+    # window is absolute: 1 s around the UTC send instant catches it in any host timezone
+    log_path = tmp_path / "gateway.log"
+    assert mod.main(["--log", str(log_path), "--since", "1792875602.5", "--window", "2"]) == 0
+
+
+@pytest.fixture(autouse=True)
+def _restore_tzset():
+    yield
+    if hasattr(time, "tzset"):
+        time.tzset()  # after monkeypatch restored TZ (fixture teardown order: this runs last)

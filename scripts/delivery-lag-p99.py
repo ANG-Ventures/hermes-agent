@@ -7,9 +7,17 @@ because the reply-path transcript persist queued behind a SessionDB._lock held f
 (t_aeae3fe7). This reads a gateway log and reports the lag that users see.
 
 Two sources, per line:
-  * ``Sending response (N chars) to <chat> delivery_lag_s=X.X`` -- the gauge (preferred, exact).
-  * otherwise a ``response ready: platform=<p> chat=<c> ...`` line paired with the next
-    ``[<p>] Sending response (...) to <c>`` line (no gauge), lag = timestamp difference.
+  * ``Sending response (N chars) to <chat> delivery_lag_s=X.X`` -- the gauge (preferred, exact: it is
+    measured on the turn's own event).
+  * otherwise a ``response ready: platform=<p> chat=<c> ...`` line paired with a later
+    ``[<p>] Sending response (...) to <c>`` line, lag = timestamp difference. When both lines carry a
+    ``turn=<id>`` token they pair by turn id. Otherwise a send pairs only with the LAST ready in the
+    same chat, and only if no other ready for that chat came in between: a ready superseded by a
+    newer one (a cancelled or interrupted reply) is dropped, never paired with the next turn's send
+    (Prism b0dbbe468ced). Dropped readies and sends with nothing to pair are counted as ``unpaired``.
+
+Timestamps: ``YYYY-MM-DD HH:MM:SS[,.frac]`` in the host's local time, or with a ``Z`` / ``+HH:MM`` /
+``-HHMM`` suffix honoured (Prism d756c5c3a7d8).
 
     python3 scripts/delivery-lag-p99.py --log ~/.hermes/logs/gateway.log
     python3 scripts/delivery-lag-p99.py --log gw.log --since 1792890000 --window 3600 --max-p99-s 5
@@ -24,46 +32,83 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
-_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})(?:[,.](\d{1,6}))?")
+_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})(?:[,.](\d{1,6}))?(Z|[+-]\d{2}:?\d{2})?")
 _READY = re.compile(r"response ready: platform=(\S+) chat=(\S+)")
-_SEND = re.compile(r"\[([^\]]+)\] Sending response \(\d+ chars\) to (\S+)(?: delivery_lag_s=([0-9.]+))?")
+_SEND = re.compile(r"\[([^\]]+)\] Sending response \(\d+ chars\) to (\S+)")
+_LAG = re.compile(r"\bdelivery_lag_s=([0-9.]+)")
+_TURN = re.compile(r"\bturn=(\S+)")
 
 
 def _epoch(line: str):
     m = _TS.match(line)
     if not m:
         return None
-    base = datetime.strptime(m.group(1).replace("T", " "), "%Y-%m-%d %H:%M:%S").timestamp()
+    dt = datetime.strptime(m.group(1).replace("T", " "), "%Y-%m-%d %H:%M:%S")
+    tz = m.group(3)
+    if tz == "Z":
+        dt = dt.replace(tzinfo=timezone.utc)
+    elif tz:
+        sign = -1 if tz[0] == "-" else 1
+        hh, mm = int(tz[1:3]), int(tz[-2:])
+        dt = dt.replace(tzinfo=timezone(sign * timedelta(hours=hh, minutes=mm)))
     frac = m.group(2)
-    return base + (int(frac) / 10 ** len(frac) if frac else 0.0)
+    return dt.timestamp() + (int(frac) / 10 ** len(frac) if frac else 0.0)  # naive = host local time
 
 
-def samples(lines, platform: str):
-    """Yield ``(send_epoch, lag_s)`` for *platform* (``all`` = every platform)."""
-    pending = {}  # (platform, chat) -> ready epoch, oldest first
+def samples(lines, platform: str, unpaired=None):
+    """Yield ``(send_epoch, lag_s)`` for *platform* (``all`` = every platform). Epochs of readies and
+    sends that could not be paired are appended to *unpaired* when given."""
+    unpaired = [] if unpaired is None else unpaired
+    pending = {}  # (platform, chat) -> (ready epoch, turn id or None): the LAST ready only
+    by_turn = {}  # turn id -> ((platform, chat), ready epoch)
+
+    def wanted(key):
+        return platform == "all" or key[0] == platform
+
     for line in lines:
         ts = _epoch(line)
         if ts is None:
             continue
+        turn = _TURN.search(line)
+        turn = turn.group(1) if turn else None
         m = _READY.search(line)
         if m:
             key = (m.group(1).lower(), m.group(2))
-            pending.setdefault(key, []).append(ts)
+            if turn is not None:
+                by_turn[turn] = (key, ts)
+            prev = pending.get(key)
+            if prev is not None and prev[1] is None and wanted(key):
+                unpaired.append(prev[0])  # superseded with no turn id: never paired with a later send
+            pending[key] = (ts, turn)  # a superseded ready WITH a turn id can still pair by turn
             continue
         m = _SEND.search(line)
         if not m:
             continue
         key = (m.group(1).lower(), m.group(2))
-        queue = pending.get(key) or []
-        ready = queue.pop(0) if queue else None
-        if platform != "all" and key[0] != platform:
+        ready = None
+        if turn is not None and turn in by_turn:
+            rkey, ready = by_turn.pop(turn)
+            if pending.get(rkey, (None, None))[1] == turn:
+                pending.pop(rkey)
+        else:
+            entry = pending.pop(key, None)
+            if entry is not None:
+                ready = entry[0]
+                if entry[1] is not None:
+                    by_turn.pop(entry[1], None)
+        if not wanted(key):
             continue
-        if m.group(3) is not None:
-            yield ts, float(m.group(3))
+        lag = _LAG.search(line)
+        if lag is not None:
+            yield ts, float(lag.group(1))
         elif ready is not None:
             yield ts, max(0.0, ts - ready)
+        else:
+            unpaired.append(ts)
+    unpaired.extend(ts for key, (ts, t) in pending.items() if t is None and wanted(key))
+    unpaired.extend(ts for key, ts in by_turn.values() if wanted(key))
 
 
 def pct(sorted_vals, q: float) -> float:
@@ -88,13 +133,16 @@ def main(argv=None) -> int:
     lo = a.since if a.since is not None else time.time() - a.window
     hi = lo + a.window
     try:
+        unpaired = []
         with open(a.log, encoding="utf-8", errors="replace") as fh:
-            rows = [(ts, lag) for ts, lag in samples(fh, a.platform.lower()) if lo <= ts < hi]
+            rows = [(ts, lag) for ts, lag in samples(fh, a.platform.lower(), unpaired) if lo <= ts < hi]
+        n_unpaired = sum(1 for ts in unpaired if lo <= ts < hi)
     except OSError as exc:
         print(json.dumps({"verdict": "BLIND", "error": str(exc), "log": a.log}))
         return 2
     if not rows:
-        print(json.dumps({"verdict": "BLIND", "n": 0, "log": a.log, "from": int(lo), "to": int(hi)}))
+        print(json.dumps({"verdict": "BLIND", "n": 0, "unpaired": n_unpaired, "log": a.log,
+                          "from": int(lo), "to": int(hi)}))
         return 2
     hours = {}
     for ts, lag in rows:
@@ -102,7 +150,7 @@ def main(argv=None) -> int:
     for hour in sorted(hours):
         print(json.dumps({"hour": hour, **summarize(hours[hour])}, sort_keys=True))
     lags = sorted(lag for _, lag in rows)
-    out = {"from": int(lo), "to": int(hi), "platform": a.platform, **summarize(lags)}
+    out = {"from": int(lo), "to": int(hi), "platform": a.platform, "unpaired": n_unpaired, **summarize(lags)}
     ok = a.max_p99_s is None or pct(lags, 99) <= a.max_p99_s  # at the limit passes (Prism 71fb90530d15); unrounded: rounding is display only
     out["verdict"] = "PASS" if ok else "FAIL"
     print(json.dumps(out, sort_keys=True))
