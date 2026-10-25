@@ -188,3 +188,36 @@ def _restore_tzset():
     yield
     if hasattr(time, "tzset"):
         time.tzset()  # after monkeypatch restored TZ (fixture teardown order: this runs last)
+
+
+def test_nanosecond_offset_timestamps_parse_the_timezone(tmp_path, monkeypatch):
+    """Prism 5175c734a604: a 9-digit fraction left the offset unmatched, so the line read as host-local
+    time and a 3 s lag across mixed offsets clamped to 0 and PASSed."""
+    monkeypatch.setenv("TZ", "UTC")
+    if hasattr(time, "tzset"):
+        time.tzset()
+    mod = _script()
+    log = tmp_path / "gateway.log"
+    log.write_text(
+        "2026-10-25T06:00:00.123456789+09:00 INFO x: response ready: platform=discord chat=1\n"
+        "2026-10-24T21:00:03.123456789Z INFO x: [discord] Sending response (10 chars) to 1\n", encoding="utf-8")
+    assert mod.main(["--log", str(log), "--since", "0", "--window", "4000000000", "--max-p99-s", "1"]) == 1
+    assert mod.main(["--log", str(log), "--since", "0", "--window", "4000000000", "--max-p99-s", "3.01"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_gauge_keeps_precision_for_the_threshold(tmp_path, caplog, monkeypatch):
+    """Prism 46a62b2e0ef8: the gauge printed %.1f, so 5.04 s became 5.0 and PASSed a 5.01 s limit on
+    the preferred (gauge) path. The field now carries the raw measurement."""
+    import gateway.platforms.base as base
+    monkeypatch.setattr(base, "stop_reply_clock", lambda *a, **k: None)
+    monkeypatch.setattr(base, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: 105.04}))
+    event = _event(_response_ready_at=100.0)
+    with caplog.at_level(logging.INFO, logger=base.logger.name):
+        await _adapter().send_final_ledgered(event, "sk", "hello", {}, reply_to=None)
+    line = next(r.getMessage() for r in caplog.records if "Sending response" in r.getMessage())
+    mod = _script()
+    log = tmp_path / "gateway.log"
+    log.write_text(f"2026-10-24 14:00:05,040 INFO gateway.platforms.base: {line}\n", encoding="utf-8")
+    assert mod.main(["--log", str(log), "--since", "0", "--window", "4000000000", "--max-p99-s", "5.01"]) == 1
+    assert mod.main(["--log", str(log), "--since", "0", "--window", "4000000000", "--max-p99-s", "5.05"]) == 0

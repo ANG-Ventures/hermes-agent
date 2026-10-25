@@ -34,7 +34,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})(?:[,.](\d{1,6}))?(Z|[+-]\d{2}:?\d{2})?")
+_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})(?:[,.](\d+))?(Z|[+-]\d{2}:?\d{2})?")  # every fractional digit (Prism 5175c734a604)
 _READY = re.compile(r"response ready: platform=(\S+) chat=(\S+)")
 _SEND = re.compile(r"\[([^\]]+)\] Sending response \(\d+ chars\) to (\S+)")
 _LAG = re.compile(r"\bdelivery_lag_s=([0-9.]+)")
@@ -54,7 +54,7 @@ def _epoch(line: str):
         hh, mm = int(tz[1:3]), int(tz[-2:])
         dt = dt.replace(tzinfo=timezone(sign * timedelta(hours=hh, minutes=mm)))
     frac = m.group(2)
-    return dt.timestamp() + (int(frac) / 10 ** len(frac) if frac else 0.0)  # naive = host local time
+    return dt.timestamp() + (float("0." + frac) if frac else 0.0)  # naive = host local time
 
 
 def samples(lines, platform: str, unpaired=None):

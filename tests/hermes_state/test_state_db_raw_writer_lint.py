@@ -90,6 +90,7 @@ UNREGISTERED_OK: dict[tuple[str, str], str] = {
     ("hermes_cli/data_cleanup_holders.py", "_refuse_cron_writers"): "reads cron/executions.db, not state.db",
     ("hermes_cli/browser_connect.py", "_copy_auth_file"): "copies a browser profile's auth sqlite, not state.db",
     ("hermes_cli/backup_restore.py", "_safe_restore_db"): "reads the snapshot copy being restored, never the live state.db",
+    ("evals/postmortem/forensics/common.py", "open"): _NO_SESSIONDB + " (offline forensics on a COPY of state.db)",
     ("tools/read_extract.py", "_extract_sqlite"):
         "immutable=1 user-file extraction: no -shm, no locks to lose (a state.db path reads the main file only)",
 }
@@ -263,7 +264,9 @@ def _scan_all(path: Path, rel: str):
                for a in n.names if a.name == "connect"}
     hits = []
     state_mod = bool(_STATE_DB_PATH_MODULES.match(rel))
-    imports_state = _imports_hermes_state(tree)
+    # A module that names state.db anywhere (``SOURCE_NAME = "state.db"``, Prism c349a9fa2a66) may read
+    # it through a generic variable (``source``), so its read-only connects count as readers too.
+    imports_state = _imports_hermes_state(tree) or any("state.db" in v for v in _strings(tree))
 
     def visit(scope: ast.AST, fn_name: str, assigns, registered: bool):
         if isinstance(scope, (ast.With, ast.AsyncWith)):
@@ -416,6 +419,19 @@ def test_lint_flags_read_only_connects_by_shape_not_only_by_name(tmp_path):
     )
     assert [(fn, reg) for _r, fn, _l, _ro, reg in _scan_all(importer, "importer.py")] == [
         ("other", False), ("wrapped", True)]
+
+
+def test_lint_flags_a_generic_reader_in_a_module_that_names_state_db(tmp_path):
+    """Prism c349a9fa2a66: ``gateway/hosted_rooms_legacy_import.py`` opens ``f"file:{source}?mode=ro"``
+    where ``source = db_path.with_name(SOURCE_NAME)`` and ``SOURCE_NAME = "state.db"``."""
+    src = tmp_path / "legacy.py"
+    src.write_text(
+        "import sqlite3\n"
+        "SOURCE_NAME = 'state.db'\n"
+        "def copy(source):\n"
+        "    return sqlite3.connect(f'file:{source}?mode=ro', uri=True)\n"
+    )
+    assert [(fn, ro, reg) for _r, fn, _l, ro, reg in _scan_all(src, "legacy.py")] == [("copy", True, False)]
 
 
 def test_every_read_only_state_db_connect_is_a_registered_reader():

@@ -80,7 +80,12 @@ def _copy_rows(target: sqlite3.Connection, source: Path) -> int:
 
     copied_rooms: list[str] = []
     existing = {str(row[0]) for row in target.execute("SELECT room_id FROM hosted_rooms")}
-    with closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=10)) as legacy:
+    from hermes_state_lockguard import registered_reader
+
+    # *source* is the live state.db: a registered reader of the WAL lock guard for the whole copy, so
+    # a same-process SessionDB close cannot cancel this read-mark (t_aeae3fe7, Prism c349a9fa2a66).
+    with registered_reader(source), \
+            closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=10)) as legacy:
         names = [str(row[0]) for row in legacy.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'hosted_room*'")]
         # Parents first: hosted_room_events carries a foreign key into hosted_rooms.

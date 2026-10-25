@@ -1295,3 +1295,30 @@ def test_writer_whose_journal_probe_returns_none_stays_counted(tmp_path, monkeyp
     finally:
         blind.close()
     assert shm not in lg._FDS
+
+
+def test_legacy_room_import_reads_state_db_as_a_registered_reader(tmp_path, monkeypatch):
+    """Prism c349a9fa2a66: gateway/hosted_rooms_legacy_import._copy_rows streams rows from the live
+    state.db; its connection must be a registered reader for the whole copy, so a same-process
+    SessionDB close cannot close the private -shm fd (and cancel the read-mark) under it."""
+    import sqlite3 as _sq
+    from gateway import hosted_rooms_legacy_import as legacy
+
+    source = tmp_path / "state.db"
+    with contextlib.closing(_sq.connect(source)) as c:
+        c.execute("CREATE TABLE hosted_rooms (room_id TEXT PRIMARY KEY)")
+        c.commit()
+    target = _sq.connect(":memory:")
+    target.execute("CREATE TABLE hosted_rooms (room_id TEXT PRIMARY KEY)")
+    key = ("path", lg._canonical(source))
+    seen = []
+    real = legacy._select_expressions
+
+    def _spy(*a, **k):
+        seen.append(lg._READERS.get(key, 0))
+        return real(*a, **k)
+
+    monkeypatch.setattr(legacy, "_select_expressions", _spy)
+    legacy._copy_rows(target, source)
+    assert seen and all(n >= 1 for n in seen), f"legacy import read state.db unregistered: {seen}"
+    assert key not in lg._READERS

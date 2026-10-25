@@ -16,6 +16,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from contextlib import closing, contextmanager
 from typing import Iterable, Iterator, Optional
 
 
@@ -91,8 +92,13 @@ def default_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
 
-def _connect_readonly(db_path: Path) -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+@contextmanager
+def _connect_readonly(db_path: Path) -> Iterator[sqlite3.Connection]:
+    """A read-only connection on *db_path* (a live state.db), registered with the WAL lock guard for
+    its whole life and closed inside the registration (t_aeae3fe7)."""
+    from hermes_state_lockguard import registered_reader
+    with registered_reader(db_path), closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as con:
+        yield con
 
 
 def _fetch_rows(cur) -> Iterator[tuple]:
@@ -156,8 +162,7 @@ def scan_approval_history(db_path: Optional[Path] = None, days: int = 90) -> lis
     since_ts = 0.0 if days <= 0 else time.time() - days * 86400
 
     records: list[tuple[str, str]] = []
-    con = _connect_readonly(path)
-    try:
+    with _connect_readonly(path) as con:
         blocked = _blocked_tool_call_ids(con, since_ts)
         for tool_call_id, command in _iter_terminal_calls(con, since_ts):
             if tool_call_id in blocked:
@@ -169,8 +174,6 @@ def scan_approval_history(db_path: Optional[Path] = None, days: int = 90) -> lis
             is_dangerous, _key, description = detect_dangerous_command(command)
             if is_dangerous:
                 records.append((command, description))
-    finally:
-        con.close()
     return records
 
 
