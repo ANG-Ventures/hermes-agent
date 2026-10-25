@@ -4352,6 +4352,11 @@ class GatewayTurnMixin:
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
             )
             adapter = self._delivery_adapter_for(source)
+            if adapter and pending_event is None and pending:
+                # An event-less follow-up (leftover /steer, interrupt text) has no slot entry to put
+                # back. No adapter defines ``queue_message``, so it used to vanish here; a completion
+                # steered into the capped turn after its last tool batch was lost (t_97a879af).
+                pending_event = MessageEvent(text=pending, message_type=MessageType.TEXT, source=source)
             if adapter and pending_event:
                 # The drain already promoted the overflow head into the slot; merging would REPLACE it
                 # (two internal TEXT wakes never merge), losing an accepted wake (t_f36d21e8). Put the
@@ -4360,8 +4365,6 @@ class GatewayTurnMixin:
                 if occupant is not None and occupant is not pending_event:
                     self._session_state(session_key).conversation.queued_events.insert(0, occupant)
                 adapter._pending_messages[session_key] = pending_event
-            elif adapter and hasattr(adapter, 'queue_message'):
-                adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
 
         # Interrupted: discard the response ("Operation interrupted." is noise).

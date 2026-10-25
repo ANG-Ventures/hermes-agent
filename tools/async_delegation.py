@@ -876,10 +876,78 @@ def acknowledge_event_outbox(
 
 
 @_producer_scoped
+def admit_event_outbox(evt: Dict[str, Any], *, session_key: str, session_id: str = "",
+                       admitted_at: Optional[float] = None) -> bool:
+    """Gateway wake admitted (queued/steered), not yet consumed: the JSON outbox goes ``admitted``
+    so the consumption sweeper can confirm or re-inject it (t_97a879af). False = no JSON receipt."""
+    if evt.get("type") not in {"async_delegation", "async_delegation_restarted"} or is_interim_delegation_event(evt):
+        return False
+    event_id = str(evt.get("event_id") or "")
+    if not event_id:
+        return False
+    profile_home = evt.get("_registry_profile_home")
+    return acknowledge_outbox_event(
+        event_id, outcome="admitted", profile_home=Path(profile_home) if profile_home else None,
+        admission={"boot_id": current_boot_id(), "session_key": session_key, "session_id": session_id,
+                   "admitted_at": admitted_at})
+
+
+def admitted_outbox_events(profile_home: Path) -> List[Dict[str, Any]]:
+    return _store.admitted_events(profile_home)
+
+
+def confirm_admitted_event(event_id: str, profile_home: Path) -> bool:
+    """The parent transcript carries the wake: ``admitted`` -> ``delivered``."""
+    return _store.acknowledge(event_id, outcome="delivered", profile_home=profile_home)
+
+
+def drop_admitted_event(event_id: str, reason: str, profile_home: Path) -> bool:
+    return _store.acknowledge(event_id, outcome="dropped", reason=reason, profile_home=profile_home)
+
+
+def reopen_admitted_event(event_id: str, profile_home: Path, *, reason: str) -> Optional[Dict[str, Any]]:
+    """Re-open a lost admitted wake for ONE re-injection: JSON back to ``pending`` and the legacy
+    SQLite row back to claimable, so the normal delivery path claims and admits it again. Returns
+    the payload stamped with its producer home, or None when it settled meanwhile."""
+    payload = _store.reopen_admitted(event_id, reason=reason, profile_home=profile_home)
+    if payload is None:
+        return None
+    payload["_registry_profile_home"] = str(profile_home)
+    delegation_id = str(payload.get("delegation_id") or "")
+    if delegation_id and payload.get("type") == "async_delegation":
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        token = set_hermes_home_override(profile_home)
+        try:
+            # Only this attempt's mirror row: a newer generation's receipt must not be reopened.
+            _update_delivery("""UPDATE async_delegations SET delivery_state='pending', delivered_at=NULL,
+                          delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                   WHERE delegation_id=? AND delivery_state='delivered'
+                     AND json_extract(event_json, '$.event_id') = ?""",
+                             (time.time(), delegation_id, event_id))
+        finally:
+            reset_hermes_home_override(token)
+    return payload
+
+
+def admission_receipt_needle(evt: Dict[str, Any]) -> str:
+    """The text a consuming turn's persisted user row must contain: the rendered ``Event: <event_id>``
+    line, which names the attempt generation (``<deleg>:terminal:g<N>``)."""
+    event_id = str(evt.get("event_id") or "")
+    return f"Event: {event_id}" if event_id else ""
+
+
+@_producer_scoped
 def complete_event_delivery(evt: Dict[str, Any], claim_id: Optional[str]) -> None:
-    """Record consumer acceptance, not completion of the resulting model turn."""
+    """Record consumer acceptance, not completion of the resulting model turn. A gateway push wake
+    (``_gateway_admission``, set at adapter admission) is only queued: its JSON outbox goes
+    ``admitted`` until the consumption sweep confirms the transcript (t_97a879af)."""
     try:
-        acknowledge_event_outbox(evt, outcome="delivered")
+        admission = evt.get("_gateway_admission")
+        if not (isinstance(admission, dict) and admit_event_outbox(
+                evt, session_key=str(admission.get("session_key") or ""),
+                session_id=str(admission.get("session_id") or ""),
+                admitted_at=admission.get("admitted_at"))):
+            acknowledge_event_outbox(evt, outcome="delivered")
     finally:
         # A JSON storage failure must not skip the independent legacy receipt.
         if claim_id and evt.get("type") == "async_delegation":
@@ -2282,12 +2350,14 @@ def acknowledge_outbox_event(
     outcome: str,
     reason: Optional[str] = None,
     profile_home=None,
+    admission: Optional[Dict[str, Any]] = None,
 ) -> bool:
     return _store.acknowledge(
         event_id,
         outcome=outcome,
         reason=reason,
         profile_home=profile_home,
+        admission=admission,
     )
 
 
