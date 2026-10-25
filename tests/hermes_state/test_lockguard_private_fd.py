@@ -39,6 +39,13 @@ def _foreign_exclusive(path: str, start: int, length: int) -> str:
     return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
 
 
+def _sqlite_close(*paths) -> None:
+    """Stand-in for SQLite's own close after release(): closing its descriptor drops this process's
+    POSIX locks on the inode, including the one release() swapped in for the OFD lock."""
+    for path in paths:
+        os.close(os.open(path, os.O_RDONLY))
+
+
 def test_private_hold_refuses_foreign_exclusive_until_released(tmp_path):
     if not lg.supported():
         pytest.skip("no OFD locks")
@@ -59,10 +66,15 @@ def test_private_hold_refuses_foreign_exclusive_until_released(tmp_path):
         assert _foreign_exclusive(str(shm), *_DMS) == "REFUSED"
     finally:
         lg.release(held)
+    _sqlite_close(db, shm)
     lg.retire()
     assert _foreign_exclusive(str(db), *_SHARED) == "ACQUIRED"
     assert _foreign_exclusive(str(shm), *_DMS) == "ACQUIRED"
-    assert not set(held_idents) & set(lg._FDS), "retire() must close the private descriptors"
+    # Both paths still name their inodes: the descriptors stay parked (Prism 7072ffc85b72).
+    assert set(held_idents) <= set(lg._FDS)
+    shm.unlink()  # a true last close unlinks -shm: retire() then closes its parked fd
+    lg.retire()
+    assert held_idents[1] not in lg._FDS and held_idents[0] in lg._FDS
 
 
 def test_missing_shm_is_tolerated(tmp_path):
@@ -120,8 +132,7 @@ def test_late_shm_is_armed_by_checkpoint_with_one_stat_and_no_listdir(tmp_path, 
 
 
 def test_write_path_never_reaches_the_fd_table_scan(tmp_path, monkeypatch):
-    """I2: open, write, checkpoint and reopen never call _own_fds_for in private mode. The one scan
-    left is retire() on the close path, after SQLite's close and outside SessionDB._lock."""
+    """I2: open, write, checkpoint, reopen and close never call _own_fds_for in private mode."""
     pin_wal(monkeypatch)
     real_scan = lg._own_fds_for
     holders = []
@@ -149,13 +160,10 @@ def test_write_path_never_reaches_the_fd_table_scan(tmp_path, monkeypatch):
     shm = (os.stat(f"{sdb.db_path}-shm").st_dev, os.stat(f"{sdb.db_path}-shm").st_ino)
     main = (os.stat(sdb.db_path).st_dev, os.stat(sdb.db_path).st_ino)
     sdb.close()
-    assert holders, "close() never retired the private descriptors"
-    assert all(not frames and not any(locked) for frames, locked in holders), holders
+    assert holders == [], holders
     assert not lg._HANDLES
     assert shm not in lg._FDS, "the -shm descriptor outlived the last close (pins a deleted generation)"
-    # state.db (``main``) may keep its private fd: hermes_state_dbfile's process-lifetime header-probe
-    # fd references the inode and retire() never closes while another descriptor is open (one fd/db).
-    del main
+    assert main in lg._FDS, "state.db's private fd is parked for the next hold(), never closed"
 
 
 class _SlowWrite:
@@ -220,34 +228,16 @@ def test_mode_kill_switch_is_read_at_import(monkeypatch, tmp_path, value, mode, 
         finally:
             os.close(fd)
         guard.retire()
-        assert not guard._FDS
+        assert set(guard._FDS) <= {(os.stat(db).st_dev, os.stat(db).st_ino)}  # private: parked, reused
+        guard._close_pool_at_exit()
     finally:
         monkeypatch.delitem(sys.modules, "hermes_state_lockguard", raising=False)
         sys.modules["hermes_state_lockguard"] = lg
 
 
-def test_retire_keeps_the_fd_while_an_unguarded_reader_is_open(tmp_path):
-    """Prism 44919d3eb909: closing the private fd would cancel an in-process reader's POSIX locks.
-    retire() keeps it while any other descriptor references the inode, closes it once none does."""
-    if not lg.supported():
-        pytest.skip("no OFD locks")
-    db = tmp_path / "state.db"
-    db.write_bytes(b"\0" * 4096)
-    ident = (os.stat(db).st_dev, os.stat(db).st_ino)
-    reader = os.open(db, os.O_RDONLY)  # stands in for an unguarded read-only connection
-    try:
-        lg.release(lg.hold(db))
-        lg.retire()
-        assert ident in lg._FDS, "retired a descriptor while another one still referenced the inode"
-    finally:
-        os.close(reader)
-    lg.retire()
-    assert ident not in lg._FDS
-
-
-def test_refused_lock_descriptor_is_still_retired(tmp_path, monkeypatch):
-    """Prism 78f32301dabd: a private fd opened by a hold() whose lock was refused is not in any
-    handle's record, so retire() must sweep it rather than leak it (and pin a deleted -shm)."""
+def test_refused_lock_descriptor_is_parked_and_reused(tmp_path, monkeypatch):
+    """Prism 78f32301dabd: a private fd opened by a hold() whose lock was refused is in no handle's
+    record. It is parked like any other and the next hold() reuses it: one fd per inode, no leak."""
     if not lg.supported():
         pytest.skip("no OFD locks")
     db = tmp_path / "state.db"
@@ -255,10 +245,14 @@ def test_refused_lock_descriptor_is_still_retired(tmp_path, monkeypatch):
     ident = (os.stat(db).st_dev, os.stat(db).st_ino)
     monkeypatch.setattr(lg, "_ofd_lock", lambda *a, **k: False)
     assert lg.hold(db) == {}
-    assert ident in lg._FDS, "the refused hold() did not open its private descriptor"
+    fd = lg._FDS[ident]
     monkeypatch.undo()
     lg.retire()
-    assert ident not in lg._FDS and ident not in lg._HANDLES
+    held = lg.hold(db)
+    try:
+        assert ident in held and lg._FDS[ident] == fd
+    finally:
+        lg.release(held)
 
 
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
@@ -299,3 +293,130 @@ def test_fork_child_closes_inherited_private_fds_and_parent_stays_guarded(tmp_pa
     finally:
         lg.release(held)
         lg.retire()
+
+
+def _foreign_posix_exclusive(path: str, start: int, length: int) -> str:
+    """A CHILD process tries a process-owned POSIX F_SETLK F_WRLCK: 'ACQUIRED' or 'REFUSED'."""
+    code = (
+        "import fcntl, os, struct\n"
+        f"fd = os.open({path!r}, os.O_RDWR)\n"
+        f"lk = struct.pack('@hhqqi', fcntl.F_WRLCK, 0, {start}, {length}, 0)\n"
+        "try:\n    fcntl.fcntl(fd, fcntl.F_SETLK, lk); print('ACQUIRED')\n"
+        "except (BlockingIOError, PermissionError):\n    print('REFUSED')\n"
+    )
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def test_retire_never_strips_a_reader_that_opened_after_the_snapshot(tmp_path, monkeypatch):
+    """Prism 7072ffc85b72: a raw in-process sqlite3 reader opens on the inode between hold/release
+    and retire(). Any close() of a descriptor on that inode cancels the reader's POSIX SHARED lock,
+    so retire() must not close it. The fd-table snapshot is made blind to the reader (it opened
+    after the scan): private mode must not depend on that scan at all."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    import sqlite3
+    db = tmp_path / "state.db"
+    setup = sqlite3.connect(db)
+    setup.execute("PRAGMA journal_mode=WAL")
+    setup.execute("CREATE TABLE t(x)")
+    setup.execute("INSERT INTO t VALUES (1)")
+    setup.commit()
+    setup.close()
+    lg.release(lg.hold(db))
+    reader = sqlite3.connect(db)
+    try:
+        reader.execute("BEGIN")
+        assert reader.execute("SELECT x FROM t").fetchall() == [(1,)]
+        assert _foreign_posix_exclusive(str(db), *_SHARED) == "REFUSED", "reader holds no SHARED lock?"
+        real_scan = lg._own_fds_for
+        mine = set(lg._FDS.values())
+
+        def _stale_snapshot(identities):  # the scan ran before the reader opened
+            return ((fd, ident) for fd, ident in real_scan(identities) if fd in mine)
+
+        monkeypatch.setattr(lg, "_own_fds_for", _stale_snapshot)
+        lg.retire()
+        assert _foreign_posix_exclusive(str(db), *_SHARED) == "REFUSED", "retire() stripped the reader's lock"
+    finally:
+        reader.rollback()
+        reader.close()
+
+
+def test_hold_retire_hold_reuses_one_parked_fd(tmp_path, monkeypatch):
+    """hold -> release/retire -> hold on the same inode opens exactly one private descriptor."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    opens = []
+    real_open = os.open
+
+    def _open(path, *a, **k):
+        opens.append(os.fspath(path))
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(lg.os, "open", _open)
+    held = lg.hold(db)
+    lg.release(held)
+    lg.retire()
+    held = lg.hold(db)
+    try:
+        assert opens == [str(db)], opens
+        assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED"
+    finally:
+        lg.release(held)
+        _sqlite_close(db)
+        lg.retire()
+    assert _foreign_exclusive(str(db), *_SHARED) == "ACQUIRED", "a parked fd must carry no OFD lock"
+
+
+def test_fd_table_scan_never_runs_in_private_mode(tmp_path, monkeypatch):
+    """I2 with no exceptions: open, write, checkpoint, close, reopen, retire, close -> 0 scans."""
+    pin_wal(monkeypatch)
+    calls = []
+    monkeypatch.setattr(lg, "_own_fds_for", lambda identities: calls.append(identities) or iter(()))
+    sdb = make_db(tmp_path / "state.db", "s", "seed")
+    require_wal(sdb)
+    sdb._try_wal_checkpoint()
+    sdb.close()
+    sdb.append_message("s", role="user", content="after close")  # reopen path
+    assert sdb._wal_lock_guard
+    sdb.close()
+    lg.retire()
+    assert calls == []
+    assert not lg._HANDLES
+
+
+def test_pool_gauge_warns_once_past_the_bound(tmp_path, monkeypatch, caplog):
+    """More parked fds than _POOL_WARN_FDS logs one WARNING, not one per hold()."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    monkeypatch.setattr(lg, "_POOL_WARN_FDS", len(lg._FDS) + 1)
+    monkeypatch.setattr(lg, "_POOL_WARNED", False)
+    with caplog.at_level(logging.WARNING, logger="hermes_state"):
+        for i in range(4):
+            db = tmp_path / f"s{i}.db"
+            db.write_bytes(b"\0" * 4096)
+            lg.release(lg.hold(db))
+    assert len([r for r in caplog.records if "private descriptors parked" in r.getMessage()]) == 1
+
+
+def test_sessiondb_close_leaves_no_lock_on_parked_fds(tmp_path, monkeypatch):
+    """After a guarded SessionDB's close, the parked state.db fd carries no lock of any kind (SQLite's
+    close dropped the swapped-in POSIX lock), so a sibling's true last close is not refused forever;
+    the unlinked -shm generation's fd is closed by retire()."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    pin_wal(monkeypatch)
+    sdb = make_db(tmp_path / "state.db", "s", "seed")
+    require_wal(sdb)
+    shm = f"{sdb.db_path}-shm"
+    shm_ident = (os.stat(shm).st_dev, os.stat(shm).st_ino)
+    assert _foreign_exclusive(str(sdb.db_path), *_SHARED) == "REFUSED"
+    sdb.close()
+    assert _foreign_exclusive(str(sdb.db_path), *_SHARED) == "ACQUIRED"
+    assert _foreign_posix_exclusive(str(sdb.db_path), *_SHARED) == "ACQUIRED"
+    if os.path.exists(shm):
+        assert _foreign_exclusive(shm, *_DMS) == "ACQUIRED"
+    else:
+        assert shm_ident not in lg._FDS

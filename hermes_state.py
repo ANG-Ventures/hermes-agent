@@ -1887,7 +1887,7 @@ class SessionDB(
                     # Only a clean close ends the generation; retain the recorded
                     # identity when retiring an unsafe handle.
                     self._db_sidecar_identity = {}
-        # After SQLite's close and outside self._lock: may scan the fd table (hermes_state_lockguard).
+        # After SQLite's close and outside self._lock: closes a parked -shm fd the close unlinked.
         _lockguard.retire()
         self._read_budget.unregister(self)  # idempotent: a never-registered (failed-init) handle is a no-op
         # t_69e10010 (sibling t_aeae3fe7 owns the lockguard release above): idempotent; a handle
