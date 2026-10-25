@@ -144,6 +144,20 @@ def test_pairs_by_turn_id_when_present(tmp_path, capsys):
     assert (out["n"], out["p50_s"], out["max_s"], out["unpaired"]) == (2, 1.0, 30.0, 0), out
 
 
+def test_send_with_an_unknown_turn_never_takes_another_turns_ready(tmp_path, capsys):
+    """Prism 35b6a882d9fe: readies for t1 and t2, then a send for t3: no valid sample (BLIND, exit 2),
+    not a fabricated 1 s sample that PASSes a 5 s gate."""
+    _LAST[:] = [capsys]
+    mod = _script()
+    rc, out = _run(mod, tmp_path,
+        "2026-10-24 14:00:00,000 INFO x: response ready: platform=discord chat=1 turn=t1 time=1.0s\n"
+        "2026-10-24 14:00:10,000 INFO x: response ready: platform=discord chat=1 turn=t2 time=1.0s\n"
+        "2026-10-24 14:00:11,000 INFO x: [discord] Sending response (10 chars) to 1 turn=t3\n",
+        "--max-p99-s", "5")
+    assert rc == 2 and out["verdict"] == "BLIND" and out["n"] == 0, out
+    assert out["unpaired"] == 3, out
+
+
 @pytest.mark.parametrize("ready_ts,send_ts", [
     ("2026-10-24T21:00:00Z", "2026-10-24T21:00:03Z"),
     ("2026-10-24T14:00:00-07:00", "2026-10-24T21:00:03+00:00"),

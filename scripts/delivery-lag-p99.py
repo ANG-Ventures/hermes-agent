@@ -11,8 +11,8 @@ Two sources, per line:
     measured on the turn's own event).
   * otherwise a ``response ready: platform=<p> chat=<c> ...`` line paired with a later
     ``[<p>] Sending response (...) to <c>`` line, lag = timestamp difference. When both lines carry a
-    ``turn=<id>`` token they pair by turn id. Otherwise a send pairs only with the LAST ready in the
-    same chat, and only if no other ready for that chat came in between: a ready superseded by a
+    ``turn=<id>`` token they pair by turn id. Otherwise (at least one side has no turn id; a ready
+    with a different turn id is never taken) a send pairs only with the LAST ready in the same chat, and only if no other ready for that chat came in between: a ready superseded by a
     newer one (a cancelled or interrupted reply) is dropped, never paired with the next turn's send
     (Prism b0dbbe468ced). Dropped readies and sends with nothing to pair are counted as ``unpaired``.
 
@@ -93,8 +93,11 @@ def samples(lines, platform: str, unpaired=None):
             if pending.get(rkey, (None, None))[1] == turn:
                 pending.pop(rkey)
         else:
-            entry = pending.pop(key, None)
-            if entry is not None:
+            entry = pending.get(key)
+            # Chat fallback only when at least one side has no turn id: a ready carrying a DIFFERENT
+            # turn id is another turn's, never this send's (Prism 35b6a882d9fe); it stays pending.
+            if entry is not None and (turn is None or entry[1] is None):
+                pending.pop(key)
                 ready = entry[0]
                 if entry[1] is not None:
                     by_turn.pop(entry[1], None)
