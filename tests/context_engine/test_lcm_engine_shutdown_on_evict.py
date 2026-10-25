@@ -204,3 +204,56 @@ def test_del_never_raises_on_half_built_engine():
 
     engine = LCMEngine.__new__(LCMEngine)  # no stores bound, no _closed flag
     engine.__del__()
+
+
+def test_shallow_copy_finalizer_never_closes_the_live_engines_shared_stores(lcm_home):
+    """Prism ada69b1dc05e: lcm_grep's full-text path takes ``copy.copy(engine)`` and swaps in private
+    _store/_dag only; _lifecycle (and assertions/query views) stay shared. Collecting that copy must
+    not close them under the live engine."""
+    import copy
+    import sqlite3
+
+    engine = _lcm_engine(lcm_home, "copy-1")
+    try:
+        read_engine = copy.copy(engine)
+        read_store = copy.copy(engine._store)
+        read_dag = copy.copy(engine._dag)
+        read_store._conn = sqlite3.connect(lcm_home / "lcm.db")
+        read_dag._conn = sqlite3.connect(lcm_home / "lcm.db")
+        read_engine._store, read_engine._dag = read_store, read_dag
+        assert read_engine._lifecycle is engine._lifecycle, "premise: the copy shares the lifecycle store"
+        read_store._conn.close()
+        read_dag._conn.close()
+        del read_engine, read_store, read_dag
+        gc.collect()
+
+        assert engine._lifecycle._conn is not None, "copy's __del__ closed the live engine's lifecycle store"
+        engine._lifecycle._conn.execute("SELECT 1")
+        assert engine._store._conn is not None and engine._dag._conn is not None
+    finally:
+        engine.shutdown()
+    assert _fds_on(lcm_home / "lcm.db") == 0
+
+
+def test_failed_close_is_retried_by_the_next_shutdown(lcm_home, monkeypatch):
+    """Prism 755c5639a743: a store close that raises must not mark the engine closed."""
+    engine = _lcm_engine(lcm_home, "retry-1")
+    dag = engine._dag
+    real_close = dag.close
+    calls = {"n": 0}
+
+    def flaky_close():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("sqlite busy")
+        return real_close()
+
+    monkeypatch.setattr(dag, "close", flaky_close)
+    engine.shutdown()
+    assert not getattr(engine, "_closed", False)
+    assert _fds_on(lcm_home / "lcm.db") > 0, "premise: the DAG connection is still open after the failed close"
+
+    engine.shutdown()
+    assert engine._closed is True
+    assert calls["n"] == 2
+    assert _fds_on(lcm_home / "lcm.db") == 0

@@ -864,6 +864,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
+        # Owner token for the __del__ backstop: a shallow copy (tools.py lcm_grep's read_engine)
+        # inherits this value but has a different id(), so its finalizer never closes stores it
+        # shares with the live engine.
+        self._storage_owner_id = id(self)
         self._assertions = None
         self._query_views = None
         self._adaptive_retrieval = None
@@ -912,8 +916,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._close_storage()
             raise
 
-    def _close_storage(self) -> None:
-        """Best-effort close of currently bound SQLite helpers."""
+    def _close_storage(self) -> bool:
+        """Best-effort close of currently bound SQLite helpers; ``True`` when every close succeeded."""
+        ok = True
         for attr in (
             "_adaptive_retrieval",
             "_store",
@@ -928,7 +933,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 try:
                     close()
                 except Exception:
+                    ok = False
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+        return ok
 
     def _assertion_extraction_model(self) -> str:
         return str(
@@ -8127,15 +8134,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _finalize_storage(self, *, unregister: bool) -> None:
         if getattr(self, "_closed", False):
             return
-        self._closed = True
         if unregister:
-            self._unregister_active_engine_binding()
-        self._close_storage()
+            try:
+                self._unregister_active_engine_binding()
+            except Exception:
+                logger.debug("LCM failed unregistering engine binding at shutdown", exc_info=True)
+        # Marked closed only once every store closed, so a failed close is retried by the next
+        # shutdown() or by __del__ instead of leaking its connection.
+        if self._close_storage():
+            self._closed = True
 
     def __del__(self) -> None:  # backstop for an engine nobody shut down (t_0d987578)
         # Skip the registry unregister: its WeakValueDictionary entries are already dead once
         # __del__ runs, and taking its lock from a GC callback on an arbitrary thread is avoidable.
+        # Only the engine that bound the storage closes it: a shallow copy shares the live stores.
         try:
-            self._finalize_storage(unregister=False)
+            if getattr(self, "_storage_owner_id", None) == id(self):
+                self._finalize_storage(unregister=False)
         except BaseException:  # never raise from a finalizer, incl. during interpreter teardown
             pass
