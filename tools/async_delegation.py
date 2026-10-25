@@ -920,10 +920,13 @@ def reopen_admitted_event(event_id: str, profile_home: Path, *, reason: str) -> 
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         token = set_hermes_home_override(profile_home)
         try:
-            # Only this attempt's mirror row: a newer generation's receipt must not be reopened.
+            # Only this attempt's mirror row: a newer generation's receipt must not be reopened. A row
+            # still ``pending`` under the admitting consumer's claim (crash between the JSON admission and
+            # the SQLite receipt) loses that claim too, or the re-injected wake fails its own claim inside
+            # the lease and is discarded as owned elsewhere (Prism 9057f657dd27).
             _update_delivery("""UPDATE async_delegations SET delivery_state='pending', delivered_at=NULL,
                           delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
-                   WHERE delegation_id=? AND delivery_state='delivered'
+                   WHERE delegation_id=? AND delivery_state IN ('delivered', 'pending')
                      AND json_extract(event_json, '$.event_id') = ?""",
                              (time.time(), delegation_id, event_id))
         finally:
