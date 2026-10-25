@@ -264,6 +264,10 @@ _DARWIN_FD_RECORD_SIZE = 1200  # PROC_PIDFDVNODEPATHINFO_SIZE
 _DARWIN_FD_DEV_OFFSET = 24
 _DARWIN_FD_INO_OFFSET = 32
 _DARWIN_FD_PATH_OFFSET = 176
+# ``struct proc_fileinfo`` opens the record: ``uint32 fi_openflags`` at 0 holds the kernel's FREAD
+# (0x1) / FWRITE (0x2) bits, i.e. ``O_ACCMODE + 1`` (sys/fcntl.h FFLAGS). Read-only = FWRITE clear.
+_DARWIN_FD_OPENFLAGS_OFFSET = 0
+_DARWIN_FWRITE = 0x2
 _DARWIN_LIBPROC = None
 
 
@@ -306,6 +310,14 @@ def _darwin_all_pids(lib) -> List[int]:
 
 def _iter_darwin_fd_targets():
     """Yield ``(pid, fd, last pathname, (st_dev, st_ino))`` for every vnode fd libproc reports.
+    :func:`_iter_darwin_fd_targets_with_flags` adds the descriptor's open flags.
+"""
+    for pid, fd, target, identity, _flags in _iter_darwin_fd_targets_with_flags():
+        yield pid, fd, target, identity
+
+
+def _iter_darwin_fd_targets_with_flags():
+    """Yield ``(pid, fd, last pathname, (st_dev, st_ino), fi_openflags)`` for every vnode fd.
 
     The pathname and the identity both stay readable after the path is unlinked, which is what
     makes an orphaned WAL generation visible at all on macOS.  Processes that cannot be inspected
@@ -335,7 +347,7 @@ def _iter_darwin_fd_targets():
             identity = (struct.unpack_from("<I", raw, _DARWIN_FD_DEV_OFFSET)[0],
                         struct.unpack_from("<Q", raw, _DARWIN_FD_INO_OFFSET)[0])
             target = raw[_DARWIN_FD_PATH_OFFSET:].split(b"\x00", 1)[0].decode("utf-8", "replace")
-            yield pid, fd, target, identity
+            yield pid, fd, target, identity, struct.unpack_from("<I", raw, _DARWIN_FD_OPENFLAGS_OFFSET)[0]
 
 
 def _iter_darwin_sidecar_holders(db_path) -> List[Tuple[int, str]]:
@@ -349,11 +361,36 @@ def _iter_darwin_sidecar_holders(db_path) -> List[Tuple[int, str]]:
     # APFS/HFS+ are case-insensitive by default and libproc reports the pathname as the opener
     # spelled it; ``os.path.normcase`` is the identity on darwin, so fold case here.
     watched = {path.casefold(): path for path in (base + "-wal", base + "-shm")}
-    holders: List[Tuple[int, str]] = []
-    for pid, _fd, target, identity in _iter_darwin_fd_targets():
+    unlinked: List[Tuple[int, str, bool]] = []  # (pid, target, read-only) of every retired sidecar fd
+    for pid, _fd, target, identity, flags in _iter_darwin_fd_targets_with_flags():
         literal = watched.get(target.casefold())
         if literal is not None and _identity_is_truly_unlinked(identity, literal):
-            holders.append((pid, target))
+            unlinked.append((pid, target, not flags & _DARWIN_FWRITE))
+    return _drop_guard_only_shm(unlinked)
+
+
+def _drop_guard_only_shm(unlinked: List[Tuple[int, str, bool]]) -> List[Tuple[int, str]]:
+    """Holders among *unlinked* ``(pid, target, read_only)`` retired-sidecar descriptors, minus a
+    WAL lock guard's private ``-shm`` descriptor between a completed generation's last close and the
+    guard's retire() (t_aeae3fe7, Prism ba6fa9c4a5a7 / 87071f0f59e3 / 17cb68d1ff79).
+
+    A connection still LIVE on a retired generation holds that generation's ``-wal`` too, and that
+    ``-wal`` is retired with it (SQLite unlinks ``-wal`` before ``-shm``; a replacement names a new
+    inode), so it is itself in *unlinked*; SQLite also opens ``-shm`` read-write. The guard opens
+    ``-shm`` read-only and never opens ``-wal``. So a retired ``-shm`` is skipped only when every retired
+    ``-shm`` descriptor of that pid is read-only AND the pid holds no RETIRED ``-wal``. A ``-wal`` of
+    the CURRENT generation (a new opener in the same process) proves nothing about the old one and is
+    deliberately not counted: process-wide WAL presence made a completed guard look live."""
+    def kind(target: str) -> str:  # "-wal" / "-shm"; Linux targets carry a " (deleted)" marker
+        return target.removesuffix(" (deleted)")[-4:]
+
+    retired_wal_pids = {pid for pid, target, _ro in unlinked if kind(target) == "-wal"}
+    holders: List[Tuple[int, str]] = []
+    for pid, target, _ro in unlinked:
+        if kind(target) == "-shm" and pid not in retired_wal_pids and all(
+                ro for p, t, ro in unlinked if p == pid and kind(t) == "-shm"):
+            continue
+        holders.append((pid, target))
     return holders
 
 
@@ -377,30 +414,17 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
             holders = _iter_darwin_sidecar_holders(db_path)
         elif sys.platform.startswith("linux"):
             watched = _watched_sqlite_sidecar_paths(db_path)
-            wal_pids: set = set()  # pids with ANY descriptor on a watched -wal (live or deleted)
-            shm: List[Tuple[int, str, str]] = []
+            unlinked: List[Tuple[int, str, bool]] = []
             for pid, target, fd_path in _iter_proc_fd_targets():
                 canonical = canonical_sqlite_path(target)
                 if canonical not in watched:
                     continue
-                if canonical.endswith("-wal"):
-                    wal_pids.add(pid)
                 if " (deleted)" in target and _fd_is_truly_unlinked(fd_path, watched[canonical]):
-                    if canonical.endswith("-shm"):
-                        shm.append((pid, target, fd_path))
-                    else:
-                        holders.append((pid, target))
-            # t_aeae3fe7 (Prism ba6fa9c4a5a7; this scan is t_69e10010's): a clean last close unlinks
-            # -shm a moment before that process's WAL lock guard closes its PRIVATE -shm descriptor.
-            # That descriptor is no live generation: SQLite opens -shm O_RDWR and always holds the
-            # -wal open while it uses -shm, the guard opens -shm O_RDONLY and never opens -wal. So a
-            # deleted -shm whose holder has only O_RDONLY descriptors on it and no -wal descriptor is
-            # skipped; anything else (or an unreadable fdinfo) still counts.
-            guard_only = {pid for pid, _t, _f in shm if pid not in wal_pids}
-            for pid, target, fd_path in shm:
-                if pid in guard_only and all(_fd_is_read_only(f) for p, _t, f in shm if p == pid):
-                    continue
-                holders.append((pid, target))
+                    # fdinfo read only for a -shm (fail closed: unreadable = read-write = a holder)
+                    unlinked.append((pid, target, canonical.endswith("-shm") and _fd_is_read_only(fd_path)))
+            # t_aeae3fe7 (this scan is t_69e10010's): a WAL lock guard's private -shm descriptor of a
+            # completed generation is not a live one; see _drop_guard_only_shm (shared with darwin).
+            holders = _drop_guard_only_shm(unlinked)
     except Exception as exc:
         logger.debug("deleted-WAL holder scan failed for %s: %s", db_path, exc)
     return holders

@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -1488,3 +1489,67 @@ def test_generation_ended_during_an_open_is_retired_once_the_opener_is_counted(t
         assert not any(str(h).endswith("-shm") for h in dbf.iter_deleted_sqlite_sidecar_holders(db))
     finally:
         b.close()
+
+
+
+_GEN_CHILD = (
+    "import os, sys\n"
+    "shm = os.open(sys.argv[1] + '-shm', os.O_RDONLY)\n"  # the guard's private fd on the OLD -shm
+    "wal = os.open(sys.argv[1] + '-wal', os.O_RDWR)\n"
+    "print('open', flush=True)\n"
+    "sys.stdin.readline()\n"  # parent retires the old generation
+    "if sys.argv[2] == 'new':\n"
+    "    os.close(wal)\n"
+    "    wal = os.open(sys.argv[1] + '-wal', os.O_RDWR | os.O_CREAT)\n"  # a NEW generation's -wal
+    "print('ready', flush=True)\n"
+    "sys.stdin.readline()\n"
+)
+
+
+@pytest.mark.parametrize("wal_generation,expect_holder", [("new", False), ("old", True)])
+def test_guard_only_shm_beside_a_current_generation_wal(tmp_path, wal_generation, expect_holder):
+    """Prism 17cb68d1ff79: the Linux scan counted ANY -wal descriptor of the pid, so a process that had
+    opened the NEW generation (live -wal) made its completed old guard -shm read as a live deleted
+    generation, and a foreign opener was refused. Only a RETIRED -wal keeps a read-only -shm a holder:
+    that is a writer stranded on the old generation."""
+    import hermes_state_dbfile as dbf
+    if not sys.platform.startswith("linux"):
+        pytest.skip("/proc scan")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    Path(f"{db}-shm").write_bytes(b"\0" * 32768)
+    Path(f"{db}-wal").write_bytes(b"\0" * 32)
+    child = subprocess.Popen([sys.executable, "-c", _GEN_CHILD, str(db), wal_generation],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "open"
+        os.unlink(f"{db}-wal")  # the old generation ends: SQLite unlinks -wal, then -shm
+        os.unlink(f"{db}-shm")
+        child.stdin.write("\n")
+        child.stdin.flush()
+        assert child.stdout.readline().strip() == "ready"
+        holders = [pid for pid, _t in dbf.iter_deleted_sqlite_sidecar_holders(db)]
+        assert (child.pid in holders) is expect_holder, (wal_generation, holders)
+    finally:
+        child.communicate("\n", timeout=10)
+
+
+@pytest.mark.parametrize("shm_flags,with_retired_wal,expect", [
+    (0x1, False, []),             # guard: FREAD only, no retired -wal -> skipped
+    (0x3, False, ["-shm"]),       # SQLite's read-write -shm -> holder
+    (0x1, True, ["-shm", "-wal"]),  # stranded writer: retired -wal keeps the -shm a holder
+])
+def test_darwin_scan_skips_a_completed_guard_only_shm(tmp_path, monkeypatch, shm_flags, with_retired_wal, expect):
+    """Prism 87071f0f59e3: the macOS leg reported every retired sidecar descriptor, so the guard's
+    private O_RDONLY -shm between a clean last close and retire() refused a concurrent opener. The
+    darwin leg now applies the same guard-only rule as Linux, from libproc's fi_openflags."""
+    import hermes_state_dbfile as dbf
+    db = tmp_path / "state.db"
+    base = os.path.realpath(str(db))
+    fds = [(4242, 7, base + "-shm", (1, 100), shm_flags)]
+    if with_retired_wal:
+        fds.append((4242, 8, base + "-wal", (1, 101), 0x3))
+    monkeypatch.setattr(dbf, "_iter_darwin_fd_targets_with_flags", lambda: iter(fds))
+    monkeypatch.setattr(dbf, "_identity_is_truly_unlinked", lambda ident, path: True)
+    got = sorted(t[-4:] for _p, t in dbf._iter_darwin_sidecar_holders(db))
+    assert got == expect, got
