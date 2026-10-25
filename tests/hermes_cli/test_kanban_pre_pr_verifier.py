@@ -191,6 +191,32 @@ def test_verifier_runs_with_the_assignee_profile_env(kanban_home, tmp_path, monk
     assert not dump.exists()
 
 
+def test_candidate_query_keeps_an_indeterminate_ambient_read(kanban_home, tmp_path, monkeypatch):
+    """Prism 3a5427313c61: the assignee's read says NOT_FOUND (its profile cannot see the private repo) and the
+    ambient read is indeterminate (None: timeout / rate limit). Before, that collapsed to NOT_FOUND and the PR
+    dropped out of still_open, so its verifier never ran. None must survive: open_pr_refs keeps an unreadable PR
+    as a candidate (fail-closed, t_1bd02e0b) and the verifier runs on it."""
+    seen = []
+
+    def fake_query(repo, number, env=None):
+        seen.append(env is not None)
+        return {"state": op.NOT_FOUND} if env is not None else None
+
+    monkeypatch.setattr(op, "query_pr_state", fake_query)
+    monkeypatch.setattr(op, "_default_query", lambda: op.query_pr_state)
+    monkeypatch.setattr(kb, "_assignee_gh_env", lambda who: (True, {"GH_TOKEN": "daedalus-token"}))
+    monkeypatch.setattr("hermes_cli.kanban_survivor.preserve", lambda *a, **k: None)
+    calls = _stub(tmp_path, monkeypatch, 1)                 # the verifier refuses whatever it is handed
+    with kb.connect() as conn:
+        tid = _card(conn)
+        with pytest.raises(kb.NotLandableError) as err:
+            kb.complete_task(conn, tid, summary="shipped", survivor_pr=PR)
+        assert err.value.prs == [PR]                         # the PR stayed a candidate and was verified
+        assert "completion_blocked_pre_pr" in _kinds(conn, tid)
+    assert seen[:2] == [True, False], seen                   # assignee first, then the ambient fallback
+    assert calls.exists()
+
+
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("answers_for", ["daedalus-token", "launch-token"])
 def test_candidate_query_runs_as_the_assignee(kanban_home, tmp_path, monkeypatch, answers_for):
