@@ -1072,12 +1072,14 @@ def test_definition_fast_path_save_reconciles_against_original_baseline(temp_hom
     assert rec["enabled"] is False and rec["state"] == "paused" and rec["paused_reason"] == "by B"
 
 
-def test_json_mode_save_with_live_db_logs_error_once(temp_home, monkeypatch, caplog):
-    """7ffd35b7bd2a (accepted by-design): json mode with runtime_state.db still present logs ONE
-    ERROR naming runtime-export."""
+def test_json_mode_save_with_live_db_saves_rows_not_json_only(temp_home, monkeypatch, caplog):
+    """Ruling R3 (supersedes the 7ffd35b7bd2a log-only answer): json mode with runtime_state.db
+    still present saves as sqlite mode, so the save reaches the rows and the next read (merged)
+    returns it. No "rows are not in jobs.json" error: they no longer diverge."""
     import logging
 
     from cron import jobs as cj
+    from cron import runtime_state as rs
 
     created = cj.create_job(prompt="x", schedule="every 5m", name="ks-warn")
     assert _db(temp_home).exists()
@@ -1086,12 +1088,11 @@ def test_json_mode_save_with_live_db_logs_error_once(temp_home, monkeypatch, cap
     with caplog.at_level(logging.ERROR, logger=cj.logger.name):
         with cj._jobs_lock():
             jobs = json.loads(_jobs_file(temp_home).read_text())["jobs"]
+            jobs[0]["last_status"] = "saved"
             cj.save_jobs(jobs)
             cj.save_jobs(jobs)
-    hits = [r for r in caplog.records if "runtime-export" in r.getMessage()
-            and r.levelno == logging.ERROR]
-    assert len(hits) == 1
-    assert created["id"]
+    assert rs.read_all(temp_home / "cron")[created["id"]]["last_status"] == "saved"
+    assert not [r for r in caplog.records if "runtime-export" in r.getMessage()]
 
 
 # --- Prism round 4 @ 35479f90 (Apollo send-back, run 38922) ---------------------------------
@@ -2337,13 +2338,17 @@ def test_json_mode_save_on_degraded_lock_is_not_overlaid_by_the_old_row(temp_hom
     with monkeypatch.context() as mp:
         mp.setattr(cj, "_acquire_flock", lambda fd, timeout: False)
         mp.setenv("HERMES_CRON_RUNTIME_STATE", "json")
-        assert cj.get_job(jid)["last_status"] == "from-row"  # merged view, db kept (R1)
-        assert cj.mark_job_run(jid, False, error="boom") is True
-        rec = cj.get_job(jid)
-        assert rec["last_status"] == "error" and rec["last_error"] == "boom"
-        jobs = cj.load_jobs()
-        assert next(j for j in jobs if j["id"] == jid)["last_status"] == "error"
+        with cj._jobs_lock():
+            jobs = cj.load_jobs()  # merged view, db kept (R1)
+            job = next(j for j in jobs if j["id"] == jid)
+            assert job["last_status"] == "from-row"
+            job["last_status"] = "saved"
+            cj.save_jobs(jobs)
+        assert cj.get_job(jid)["last_status"] == "saved"
         assert _db(temp_home).exists()
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+    assert cj.get_job(jid)["last_status"] == "saved"  # locked load: the fold keeps it
+    assert not _db(temp_home).exists()
 
 
 def test_json_mode_degraded_write_survives_the_later_fold(temp_home, monkeypatch):
@@ -2360,6 +2365,26 @@ def test_json_mode_degraded_write_survives_the_later_fold(temp_home, monkeypatch
     assert cj.get_job(jid)["last_status"] == "degraded-write"  # locked load: fold happens
     assert not _db(temp_home).exists()
     assert _raw(temp_home, jid)["last_status"] == "degraded-write"
+
+
+def test_json_mode_degraded_runtime_save_leaves_jobs_json_untouched(temp_home, monkeypatch):
+    """Ruling R3, READ half: with the db present a json-mode load on a degraded lock is the
+    sqlite-mode load (load stamp + baseline recorded), so a runtime-only save writes the row and
+    leaves jobs.json alone, exactly as in sqlite mode."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    jid = _r3_store(temp_home)
+    before = _snapshot(_jobs_file(temp_home))
+    with monkeypatch.context() as mp:
+        mp.setattr(cj, "_acquire_flock", lambda fd, timeout: False)
+        mp.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+        with cj._jobs_lock():
+            jobs = cj.load_jobs()
+            next(j for j in jobs if j["id"] == jid)["last_status"] = "row-only"
+            cj.save_jobs(jobs)
+    assert rs.read_all(temp_home / "cron")[jid]["last_status"] == "row-only"
+    assert _snapshot(_jobs_file(temp_home)) == before
 
 
 def test_export_on_degraded_lock_reads_but_never_publishes(temp_home, monkeypatch, capsys):

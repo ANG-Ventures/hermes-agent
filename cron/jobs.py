@@ -1840,6 +1840,13 @@ def _split_store() -> bool:
     return _runtime_db_path().exists() and not _kill_switch_orphans_only()
 
 
+def _fast_split() -> bool:
+    """Single-job fast paths (caller holds ``_jobs_lock``): sqlite mode, or json mode while the db
+    stays because the fold cannot run now (degraded lock, R1 + R3). With the cross-process lock in
+    json mode the full ``load_jobs()`` path runs instead, and it folds first."""
+    return _rs.enabled() or (not _destructive_ok() and _split_store())
+
+
 def _normalize_repeat_completed(job: Dict[str, Any]) -> bool:
     """Same rule load_jobs applies to the file's value, for a value merged from a runtime row:
     a non-negative int, else 0. Returns True when it changed the record."""
@@ -2497,7 +2504,7 @@ _MISSING_FAST = object()
 def _locked_job_view(job_id: Any) -> Optional[Dict[str, Any]]:
     """One merged record (caller holds ``_jobs_lock``): the cached definition + its row in sqlite
     mode (same view the ``_with_job`` writers use), else a full ``load_jobs()`` scan."""
-    if _split_store():
+    if _fast_split():
         usable, definition, file_runtime = _cached_definition(job_id)
         if usable:
             if definition is None:
@@ -3239,7 +3246,7 @@ def _with_job(
     """Run ``fn(jobs, i, job)`` on the first match under ``_jobs_lock()``; ``fn`` saves. *missing*
     if none."""
     with _jobs_lock():
-        if _split_store():
+        if _fast_split():
             result = _with_job_runtime(job_id, fn, missing)
             if result is not _MISSING_FAST:
                 return result
@@ -4745,7 +4752,8 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
 
     if _split_store():
         with _jobs_lock():
-            fast = _refresh_claim_row(job_id, "run_claim", expected_owner, once_only=True)
+            fast = (_refresh_claim_row(job_id, "run_claim", expected_owner, once_only=True)
+                    if _fast_split() else None)
             if fast is not None:
                 return fast
     return _with_job(job_id, apply, False)
@@ -4921,7 +4929,8 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
 
     if _split_store():
         with _jobs_lock():
-            fast = _refresh_claim_row(job_id, "fire_claim", expected_owner, once_only=False)
+            fast = (_refresh_claim_row(job_id, "fire_claim", expected_owner, once_only=False)
+                    if _fast_split() else None)
             if fast is not None:
                 return fast
     return _with_job(job_id, apply, False)
