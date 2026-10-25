@@ -2154,3 +2154,168 @@ def test_runtime_db_honours_configured_journal_mode_delete(temp_home):
     with rs.connect(temp_home / "cron") as conn:
         assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+# --- round 10 (Apollo send-back at d781e8f6) ------------------------------------------------
+
+def test_run_claim_heartbeat_adopts_file_only_claim(temp_home):
+    """726efdd6b234: a one-shot whose run_claim lives only in jobs.json (no row yet, while the db
+    already exists for other jobs) is refreshed via adoption, never reported lost; a foreign owner
+    still loses."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    job = _fixture_job(1, with_runtime=False)
+    job.update(schedule={"kind": "once", "run_at": "2030-01-01T00:00:00+00:00"},
+               repeat={"times": 1},
+               run_claim={"by": "owner-a", "at": "2026-10-25T00:00:00+00:00"})
+    _write_store(temp_home, [job])
+    rs.write_rows(temp_home / "cron", {"other": {"last_status": "ok"}})
+    assert cj.heartbeat_run_claim(job["id"], expected_owner="owner-b") is False
+    assert cj.heartbeat_run_claim(job["id"], expected_owner="owner-a") is True
+    with rs.connect(temp_home / "cron") as conn:
+        row = rs.read_row(conn, job["id"])
+    assert row["run_claim"]["by"] == "owner-a"
+    assert row["run_claim"]["at"] != "2026-10-25T00:00:00+00:00"
+
+
+def test_fire_claim_heartbeat_adopts_file_only_claim(temp_home):
+    """726efdd6b234 (Prism repro): a valid fire_claim only in jobs.json, no row for the job while
+    the db exists: the heartbeat adopts it and returns True, never False."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    job = _fixture_job(2, with_runtime=False)
+    job["fire_claim"] = {"by": "owner", "at": "2026-10-25T00:00:00+00:00"}
+    _write_store(temp_home, [job])
+    rs.write_rows(temp_home / "cron", {"other": {"last_status": "ok"}})
+    assert cj.heartbeat_fire_claim(job["id"], expected_owner="owner") is True
+    with rs.connect(temp_home / "cron") as conn:
+        assert rs.read_row(conn, job["id"])["fire_claim"]["by"] == "owner"
+
+
+def test_retire_keeps_db_when_a_row_changed_after_the_export_snapshot(temp_home, monkeypatch):
+    """c10b8ca4d934 + fb81a100b27c: retire is compare-and-delete. A degraded-lock sibling writes
+    a row between the export snapshot and the retire: that row survives (jobs.json carries the
+    older value), the db is kept and the export refuses the drop. The kill-switch fold
+    (keep_orphans) keeps the db the same way without raising."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="cas")
+    cj.mark_job_run(created["id"], True)
+    real_write = cj._write_definitions_file
+    calls = []
+
+    def write_then_sibling(defs):
+        real_write(defs)
+        calls.append(1)
+        rs.write_rows(temp_home / "cron",
+                      {created["id"]: {"last_status": f"sibling{len(calls)}"}})
+
+    monkeypatch.setattr(cj, "_write_definitions_file", write_then_sibling)
+    with pytest.raises(cj.RuntimeRetireRefused, match="changed while exporting"):
+        cj.export_runtime_to_json(retire=True)
+    assert _db(temp_home).exists()
+    with rs.connect(temp_home / "cron") as conn:
+        assert rs.read_row(conn, created["id"]) == {"last_status": "sibling1"}
+    assert cj.export_runtime_to_json(retire=True, keep_orphans=True) == 1
+    assert _db(temp_home).exists()
+    with rs.connect(temp_home / "cron") as conn:
+        assert rs.read_row(conn, created["id"]) == {"last_status": "sibling2"}
+    monkeypatch.setattr(cj, "_write_definitions_file", real_write)
+    cj.export_runtime_to_json(retire=True)  # nothing changed this time: retires and drops
+    assert not _db(temp_home).exists()
+    assert _raw(temp_home, created["id"])["last_status"] == "sibling2"
+
+
+def test_profile_export_drops_staged_rollback_journal(temp_home, tmp_path, monkeypatch):
+    """15391e1b7adf: a runtime_state.db-journal (journal_mode=delete hot journal, holds row
+    pre-images) is removed from the STAGED copy like -wal/-shm, with or without a main db; a
+    symlink at that name is refused."""
+    from cron import runtime_state as rs
+
+    profiles, profile_dir, cron = _export_profile_fixture(tmp_path, monkeypatch)
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "n"}]}),
+                                    encoding="utf-8")
+    (cron / "runtime_state.db-journal").write_bytes(b"ghp_" + b"a" * 36)
+    names = _archive_names(profiles.export_profile("p", str(tmp_path / "a.tar.gz")))
+    assert not any("runtime_state.db" in n for n in names), names
+    journal = (cron / "runtime_state.db-journal").read_bytes()
+    rs.write_rows(cron, {"j1": {"last_status": "ok"}})
+    (cron / "runtime_state.db-journal").write_bytes(journal)
+    names = _archive_names(profiles.export_profile("p", str(tmp_path / "b.tar.gz")))
+    assert not any("runtime_state.db" in n for n in names), names
+    assert (cron / "runtime_state.db-journal").exists()  # the live dir is never touched
+    (cron / "runtime_state.db-journal").unlink()
+    outside = tmp_path / "outside"
+    outside.write_text("x")
+    (cron / "runtime_state.db-journal").symlink_to(outside)
+    with pytest.raises(ValueError, match="symlink"):
+        profiles.export_profile("p", str(tmp_path / "c.tar.gz"))
+    assert outside.read_text() == "x"
+
+
+def test_repeat_limit_edit_keeps_concurrent_completion(temp_home, monkeypatch):
+    """60d10bb9ae09: repeat merges per sub-key. Editing repeat.times while a degraded-lock
+    sibling records a completion (row repeat.completed=1) keeps completed=1."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="rep", repeat=5)
+    real_norm = cj._normalize_job_updates
+
+    def norm_then_sibling(job, updates):
+        real_norm(job, updates)
+        with rs.transaction(temp_home / "cron") as conn:
+            row = rs.read_row(conn, created["id"]) or {}
+            row[rs.REPEAT_COMPLETED] = 1
+            rs.upsert_rows(conn, {created["id"]: row})
+
+    monkeypatch.setattr(cj, "_normalize_job_updates", norm_then_sibling)
+    cj.update_job(created["id"], {"repeat": 10})
+    monkeypatch.setattr(cj, "_normalize_job_updates", real_norm)
+    assert cj.get_job(created["id"])["repeat"] == {"times": 10, "completed": 1}
+
+
+def test_cached_definition_rechecks_published_generation(temp_home):
+    """f92e5396970e: a generation published (R2 marker) by a save that crashed before its rename
+    leaves jobs.json untouched. The single-job fast path must not keep serving the cached
+    definition + the old row: the heartbeat recovers the published generation first, so the
+    owner it reassigned the claim to wins and the old owner sees the loss."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="pub")
+    assert cj.claim_job_for_fire(created["id"]) is True
+    owner_a = cj.get_job(created["id"])["fire_claim"]["by"]
+    assert cj.heartbeat_fire_claim(created["id"], expected_owner=owner_a) is True  # cache primed
+    with rs.transaction(temp_home / "cron") as conn:
+        base = rs.read_row(conn, created["id"])
+        staged = dict(base, fire_claim={**base["fire_claim"], "by": "owner-b"})
+        rs.stage_pending(conn, "gcrash", {created["id"]: staged}, bases={created["id"]: base})
+        rs.mark_published(conn, "gcrash")
+    assert cj.heartbeat_fire_claim(created["id"], expected_owner=owner_a) is False
+    assert cj.get_job(created["id"])["fire_claim"]["by"] == "owner-b"
+
+
+def test_mirror_detects_same_size_in_place_rewrite(temp_home, monkeypatch):
+    """a131d31922ac: mirror identity includes mtime_ns. An equal-length in-place rewrite of
+    jobs.json (same inode, same size) is detected and the mirror restored from the rows."""
+    from cron import jobs as cj
+
+    monkeypatch.setenv("HERMES_CRON_MIRROR_INTERVAL_S", "0")
+    created = cj.create_job(prompt="x", schedule="every 5m", name="inplace")
+    cj.mark_job_run(created["id"], True)
+    cj.maybe_flush_runtime_mirror(force=True)
+    assert _raw(temp_home, created["id"])["last_status"] == "ok"
+    path = _jobs_file(temp_home)
+    text = path.read_text(encoding="utf-8")
+    assert text.count('"last_status": "ok"') == 1
+    ino, size = path.stat().st_ino, path.stat().st_size
+    time.sleep(0.01)
+    with open(path, "r+", encoding="utf-8") as fh:  # in place: same inode, same length
+        fh.write(text.replace('"last_status": "ok"', '"last_status": "no"'))
+    assert (path.stat().st_ino, path.stat().st_size) == (ino, size)
+    assert cj.maybe_flush_runtime_mirror(force=True) is True
+    assert _raw(temp_home, created["id"])["last_status"] == "ok"

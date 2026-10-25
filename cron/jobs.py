@@ -4687,11 +4687,15 @@ def _refresh_claim_row(job_id: str, claim_key: str, expected_owner: str,
     """sqlite-mode compare-and-refresh (caller holds ``_jobs_lock``): one owner-guarded UPDATE on
     the job's row, no jobs.json read or write. ``None`` = fast path unusable (file needs a
     repair/migration first); the caller then takes the ``_with_job`` path."""
-    usable, definition, _file_runtime = _cached_definition(job_id)
+    usable, definition, file_runtime = _cached_definition(job_id)
     if not usable:
         return None
     if definition is None:
         return False
+    if file_runtime and _read_one_row(job_id) is None:
+        # Prism 726efdd6b234: the claim lives only in jobs.json (not adopted yet); the caller's
+        # _with_job path adopts it into a row first. Never report that as a lost claim.
+        return None
     if once_only and (definition.get("schedule") or {}).get("kind") != "once":
         return False
     # Same test-context live-store guard, and the same 0600/ownership pass on a new db or sidecar
