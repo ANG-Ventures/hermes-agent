@@ -52,7 +52,7 @@ _FIXES = (
      "`requires:` line, or pin the host that serves it."),
     ("not_portable:linked",
      "a link to a live card (named in the detail) holds it off the pool, so its `host:` pin "
-     "can never be honoured while that edge is live. Fix: drop the pin, or relink the edge "
+     "is not honoured while that edge is live. Fix: drop the pin, or relink the edge "
      "`--kind derived-from` if it is lineage only."),
     ("not_portable:",
      "a placement rule keeps it off every host that has room. Fix: read `kanban placement <id>` "
