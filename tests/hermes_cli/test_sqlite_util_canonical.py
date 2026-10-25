@@ -169,3 +169,24 @@ def test_plugin_db_wal_goes_through_the_shared_fallback(monkeypatch, tmp_path):
     finally:
         conn.close()
     assert seen == ["plugin-data/board/data.db"]
+
+
+
+def test_open_db_connection_is_counted_by_the_wal_lock_guard(tmp_path):
+    """Prism 33735f457c2b: the delivery ledger / async delegation write state.db through open_db; an
+    uncounted connection there lost its WAL locks when the last guarded SessionDB's close retired the
+    private -shm fd. open_db counts the connection until its successful close."""
+    import hermes_state_lockguard as lg
+    from hermes_cli.sqlite_util import open_db
+
+    db = tmp_path / "state.db"
+    key = ("path", lg._canonical(db))
+    conn = open_db(db, db_label="state.db (test)", row_factory=None)
+    try:
+        assert lg._READERS.get(key, 0) == 1
+        conn.execute("CREATE TABLE IF NOT EXISTS t (x)")
+    finally:
+        conn.close()
+    assert lg._READERS.get(key, 0) == 0
+    conn.close()  # idempotent: a second close never drops another registration
+    assert lg._READERS.get(key, 0) == 0

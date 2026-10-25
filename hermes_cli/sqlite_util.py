@@ -15,6 +15,39 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 
+class _GuardCountedConnection(sqlite3.Connection):
+    """A connection the state.db WAL lock guard counts as an in-process user of its file from before
+    the connect until its close SUCCEEDS (t_aeae3fe7, Prism 33735f457c2b): the delivery ledger and
+    async delegation write state.db through :func:`open_db`, and an uncounted transaction there loses
+    its POSIX WAL locks when the last guarded SessionDB's close retires the private -shm descriptor.
+    Counted for every path (a non-state.db file holds no private descriptor, so it is a no-op there).
+    A close that raises keeps the count: the connection may still be open."""
+
+    _guard_token = None
+
+    def close(self) -> None:
+        super().close()
+        token, self._guard_token = self._guard_token, None
+        if token:
+            _unregister_guard(token)
+
+
+def _register_guard(path):
+    try:
+        from hermes_state_lockguard import register_reader
+    except Exception:  # standalone use with broken app imports: no SessionDB, nothing to count with
+        return None
+    return register_reader(path)
+
+
+def _unregister_guard(token) -> None:
+    try:
+        from hermes_state_lockguard import unregister_reader
+    except Exception:
+        return
+    unregister_reader(token)
+
+
 def open_db(
     path: Path | str,
     *,
@@ -44,7 +77,22 @@ def open_db(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Resolved at call time: fd-leak tests patch ``sqlite3.connect`` through the caller's module.
-    conn = sqlite3.connect(path, timeout=busy_timeout_ms / 1000, check_same_thread=check_same_thread)
+    token = _register_guard(path)  # before the connect: see _GuardCountedConnection
+    try:
+        conn = sqlite3.connect(path, timeout=busy_timeout_ms / 1000, check_same_thread=check_same_thread,
+                               factory=_GuardCountedConnection)
+    except TypeError:
+        # A test double for sqlite3.connect without factory= (they patch it through the caller's module):
+        # the connection stays uncounted, which is the pre-guard behaviour.
+        conn = sqlite3.connect(path, timeout=busy_timeout_ms / 1000, check_same_thread=check_same_thread)
+    except BaseException:
+        if token:
+            _unregister_guard(token)
+        raise
+    if isinstance(conn, _GuardCountedConnection):
+        conn._guard_token = token
+    elif token:
+        _unregister_guard(token)
     try:
         conn.row_factory = row_factory
         conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")

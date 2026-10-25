@@ -46,6 +46,10 @@ ALLOWLIST: dict[tuple[str, str], str] = {
     ("evals/gateway_failure_ownership/probe.py", "main"): _EVAL,
     ("evals/desktop_bug_campaign/persistence_live.py", "main"): _EVAL,
     ("evals/desktop_bug_campaign/leases_live.py", "main"): _EVAL,
+    # Writers through hermes_cli.sqlite_util.open_db (Prism 33735f457c2b): open_db counts every
+    # connection with the WAL lock guard from before the connect until its successful close.
+    ("gateway/delivery_ledger.py", "_connect"): "delivery ledger table writer; counted by open_db",
+    ("tools/async_delegation.py", "_connect"): "async delegation table writer; counted by open_db",
 }
 
 # (repo-relative path, enclosing function name) -> why a state.db connect outside registered_reader()
@@ -110,7 +114,7 @@ def _py_files():
 
 # Helpers that open a sqlite3 connection on the path they are given (hermes_state_dbfile /
 # hermes_cli.sqlite_safe_read): a state.db connect through them is a connect like any other.
-_TRACKED_CONNECTS = {"_connect_tracked_db", "connect_tracked"}
+_TRACKED_CONNECTS = {"_connect_tracked_db", "connect_tracked", "open_db"}  # open_db: Prism 33735f457c2b
 
 
 def _is_sqlite_connect(call: ast.Call, connect_aliases: set[str]) -> bool:
@@ -120,6 +124,16 @@ def _is_sqlite_connect(call: ast.Call, connect_aliases: set[str]) -> bool:
     if isinstance(f, ast.Attribute) and f.attr in _TRACKED_CONNECTS:
         return True
     return isinstance(f, ast.Name) and (f.id in connect_aliases or f.id in _TRACKED_CONNECTS)
+
+
+def _labels_state_db(call: ast.Call) -> bool:
+    """``open_db(path, db_label="state.db (...)")``: the label names the file even when the path
+    argument is a generic ``_db_path()`` / ``path`` (Prism 33735f457c2b)."""
+    f = call.func
+    name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
+    return name == "open_db" and any(
+        kw.arg == "db_label" and any(re.match(r"state\.db(\s|$)", v) for v in _strings(kw.value))
+        for kw in call.keywords)  # "state.db (...)", never "shared-state.db"
 
 
 def _strings(node: ast.AST):
@@ -213,6 +227,8 @@ _REGISTERED_IN_CODE: dict[tuple[str, str], str] = {
     ("hermes_state_repair.py", "_connect_repair_durable"): "token bound to the tracked close()",
     ("tui_gateway/change_watcher.py", "_session_db_content_sig"): "register before the try, unregister after close in finally",
     ("hermes_state_dbfile.py", "collect_state_db_stats"): "register before the connect, unregister after close in finally",
+    ("gateway/delivery_ledger.py", "_connect"): "open_db registers before the connect, unregisters after a successful close",
+    ("tools/async_delegation.py", "_connect"): "open_db registers before the connect, unregisters after a successful close",
     ("hermes_cli/backup_sqlite.py", "_safe_copy_db"): "_register_reader before the source connect, _unregister_reader after its close in finally",
 }
 
@@ -290,7 +306,7 @@ def _scan_all(path: Path, rel: str):
                 (kw.value for kw in child.keywords if kw.arg == "database"), None)
             if target is None:
                 pass
-            elif _names_state_db(target, assigns, db_path_names=state_mod):
+            elif _names_state_db(target, assigns, db_path_names=state_mod) or _labels_state_db(child):
                 hits.append((rel, fn_name, child.lineno, _read_only(child, assigns), registered))
             elif _read_only(child, assigns) and (imports_state or _builds_as_uri(target, assigns)):
                 # Shape, not name (Prism ad2e7f0783a5): a ``?mode=ro`` connect on ``path.as_uri()``,
@@ -331,6 +347,22 @@ def _unregistered_readers():
     """Read-only or allowlisted state.db connects outside a ``registered_reader`` block."""
     return [(rel, fn, line) for rel, fn, line, ro, reg in _all_state_db_connects()
             if not reg and (ro or (rel, fn) in ALLOWLIST) and (rel, fn) not in UNREGISTERED_OK]
+
+
+def test_lint_sees_open_db_on_state_db_by_its_label(tmp_path):
+    """Prism 33735f457c2b: open_db(_db_path(), db_label="state.db (...)") is a state.db writer even
+    though the path expression names no state.db."""
+    src = tmp_path / "probe.py"
+    src.write_text(
+        "from hermes_cli.sqlite_util import open_db\n"
+        "def _connect():\n"
+        "    return open_db(_db_path(), db_label='state.db (ledger)')\n"
+        "def other():\n"
+        "    return open_db(_db_path(), db_label='cron/executions.db')\n"
+        "def shared():\n"
+        "    return open_db(_db_path(), db_label='shared-state.db (rooms)')\n"
+    )
+    assert [(fn, line) for _rel, fn, line in _scan(src, "probe.py")] == [("_connect", 3)]
 
 
 def test_lint_flags_a_raw_writer_and_passes_read_only(tmp_path):
