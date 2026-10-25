@@ -1425,8 +1425,8 @@ def test_save_rolls_forward_sibling_generation_published_before_our_rename(temp_
     gen_b = "b" * 32
     fired = []
 
-    def stage_then_sibling(jobs_file, jobs, runtime_gen=None, overlay=None):
-        out = real(jobs_file, jobs, runtime_gen, overlay)
+    def stage_then_sibling(jobs_file, jobs, runtime_gen=None, overlay=None, mirror_mark=None):
+        out = real(jobs_file, jobs, runtime_gen, overlay, mirror_mark)
         if not fired:
             fired.append(1)
             with rs.transaction(temp_home / "cron") as conn:
@@ -1567,8 +1567,8 @@ def test_mirror_flush_rolls_forward_sibling_generation_published_before_its_rena
     gen_b = "c" * 32
     fired = []
 
-    def stage_then_sibling(jobs_file, jobs, runtime_gen=None, overlay=None):
-        out = real(jobs_file, jobs, runtime_gen, overlay)
+    def stage_then_sibling(jobs_file, jobs, runtime_gen=None, overlay=None, mirror_mark=None):
+        out = real(jobs_file, jobs, runtime_gen, overlay, mirror_mark)
         if not fired:
             fired.append(1)
             with rs.transaction(temp_home / "cron") as conn:
@@ -1742,3 +1742,149 @@ def test_kill_switch_refolds_orphan_once_its_definition_returns(temp_home, monke
     jobs = {j["id"]: j for j in cj.load_jobs()}
     assert jobs[b["id"]]["last_status"] == "kept-b"
     assert not _db(temp_home).exists()
+
+
+
+# --- round 7 (Apollo 2026-10-25 05:2x send-back) -------------------------------------------
+
+def test_retire_refuses_when_jobs_lock_is_degraded(temp_home, monkeypatch):
+    """21c210e015e8: retire deletes the database; under a degraded (in-process only) jobs lock a
+    sibling's committed row write between our read and the delete would be lost. Refuse (CLI rc 2),
+    write nothing, keep the db."""
+    from cron import jobs as cj
+    from hermes_cli.cron import cron_runtime_export
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="degraded")
+    cj.mark_job_run(created["id"], True)
+    before = _snapshot(_jobs_file(temp_home))
+    monkeypatch.setattr(cj, "_acquire_flock", lambda fd, timeout: False)
+    with pytest.raises(cj.RuntimeRetireRefused, match="degraded"):
+        cj.export_runtime_to_json(retire=True)
+
+    class A:
+        retire, drop_orphans = True, True
+    assert cron_runtime_export(A()) == 2
+    assert _db(temp_home).exists() and _snapshot(_jobs_file(temp_home)) == before
+
+
+def test_mirror_flush_never_replaces_a_newer_mirror(temp_home, monkeypatch):
+    """e5b0da3eb246: a mirror flush that read seq N must not replace a jobs.json that a concurrent
+    flush already published at a NEWER seq of the same database; it skips and leaves the mirror
+    dirty. A file from another database (different epoch) never blocks the flush."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    monkeypatch.setenv("HERMES_CRON_MIRROR_INTERVAL_S", "0")
+    created = cj.create_job(prompt="x", schedule="every 5m", name="seq")
+    cj.mark_job_run(created["id"], True)
+    data = json.loads(_jobs_file(temp_home).read_text())
+    assert "_mirror_seq" in data and "_mirror_epoch" in data
+    data["_mirror_seq"] = data["_mirror_seq"] + 1000  # flush B published after A read its seq
+    _jobs_file(temp_home).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    with rs.transaction(temp_home / "cron") as conn:
+        conn.execute("UPDATE job_runtime SET fields=? WHERE job_id=?",
+                     (json.dumps({"last_status": "older"}), created["id"]))
+        rs.mark_dirty(conn)
+    before = _snapshot(_jobs_file(temp_home))
+    assert cj.maybe_flush_runtime_mirror(force=True) is False
+    assert _snapshot(_jobs_file(temp_home)) == before
+    with rs.connect(temp_home / "cron") as conn:
+        assert rs.dirty_since(conn) is not None
+    data["_mirror_epoch"] = -1.0
+    _jobs_file(temp_home).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    assert cj.maybe_flush_runtime_mirror(force=True) is True
+    assert _raw(temp_home, created["id"])["last_status"] == "older"
+
+
+def test_adoption_records_mirror_identity(temp_home):
+    """79bacc90b295: after the first adoption, an out-of-band replacement of jobs.json with an
+    older copy is detected and the mirror restored from the rows."""
+    from cron import jobs as cj
+
+    job = _fixture_job(1, with_runtime=False)
+    job["last_status"] = "success"
+    _write_store(temp_home, [job])
+    cj.load_jobs()  # adoption
+    older = dict(job, last_status="failed")
+    tmp = _jobs_file(temp_home).with_name("older.json")
+    tmp.write_text(json.dumps({"jobs": [older]}, indent=2), encoding="utf-8")
+    os.replace(tmp, _jobs_file(temp_home))
+    assert cj.maybe_flush_runtime_mirror(force=True) is True
+    assert _raw(temp_home, job["id"])["last_status"] == "success"
+
+
+def test_profile_export_extra_files_override_wins_over_captured_pair(tmp_path, monkeypatch):
+    """13e40ddef8fa: an explicit cron/jobs.json override in extra_files is applied AFTER the pair
+    capture, so the archive carries the override (folded with the row), not the live file."""
+    import tarfile
+
+    from cron import runtime_state as rs
+
+    profiles, profile_dir, cron = _export_profile_fixture(tmp_path, monkeypatch)
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "live"}]}),
+                                    encoding="utf-8")
+    rs.write_rows(cron, {"j1": {"last_status": "ok"}})
+    out = profiles.export_profile("p", str(tmp_path / "export.tar.gz"), extra_files={
+        "cron/jobs.json": json.dumps({"jobs": [{"id": "j1", "name": "export-only"}]})})
+    with tarfile.open(out) as tf:
+        member = next(m for m in tf.getmembers() if m.name.endswith("cron/jobs.json"))
+        job = json.loads(tf.extractfile(member).read())["jobs"][0]
+    assert job["name"] == "export-only" and job["last_status"] == "ok"
+
+
+def test_fold_tmp_symlink_is_refused_and_target_untouched(tmp_path, monkeypatch):
+    """5a6d55ddbf83: a preserved cron/jobs.json.fold-tmp symlink is never written through: the
+    export refuses on it, and the fold itself never follows it."""
+    from cron import runtime_state as rs
+
+    target = tmp_path / "outside.txt"
+    target.write_text("keep me", encoding="utf-8")
+    profiles, profile_dir, cron = _export_profile_fixture(tmp_path, monkeypatch)
+    job = _fixture_job(1, with_runtime=False)
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [job]}), encoding="utf-8")
+    rs.write_rows(cron, {job["id"]: {"last_status": "ok"}})
+    (cron / "jobs.json.fold-tmp").symlink_to(target)
+    with pytest.raises(ValueError, match="symlink"):
+        profiles.export_profile("p", str(tmp_path / "export.tar.gz"))
+    assert target.read_text(encoding="utf-8") == "keep me"
+
+    staged = tmp_path / "staged" / "cron"
+    staged.mkdir(parents=True)
+    (staged / "jobs.json").write_text(json.dumps({"jobs": [job]}), encoding="utf-8")
+    rs.write_rows(staged, {job["id"]: {"last_status": "ok"}})
+    (staged / "jobs.json.fold-tmp").symlink_to(target)
+    assert rs.fold_staged_copy(staged) is True
+    assert target.read_text(encoding="utf-8") == "keep me"
+    assert json.loads((staged / "jobs.json").read_text())["jobs"][0]["last_status"] == "ok"
+
+
+def test_kill_switch_orphan_row_folds_before_returned_definition_runs(temp_home, monkeypatch):
+    """7b30cbcd48c4 (not-a-bug proof): the orphans-only cache is keyed on (db, jobs.json)
+    identity, so restoring the definition in json mode re-folds the retained row on the next load,
+    BEFORE the job runs, and retires the db; neither a later process start (cache cleared) nor a
+    flip back to sqlite can revert the json-mode counter."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    x = cj.create_job(prompt="x", schedule="every 5m", name="x", repeat=5)
+    keep = cj.create_job(prompt="x", schedule="every 5m", name="keep")
+    data = json.loads(_jobs_file(temp_home).read_text())
+    x_def = next(j for j in data["jobs"] if j["id"] == x["id"])
+    data["jobs"] = [j for j in data["jobs"] if j["id"] != x["id"]]
+    _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+    rs.write_rows(temp_home / "cron", {keep["id"]: {"last_status": "ok"},
+                                       x["id"]: {"repeat.completed": 1}})
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+    cj.load_jobs()
+    assert set(rs.read_all(temp_home / "cron")) == {x["id"]}  # orphan kept
+    data = json.loads(_jobs_file(temp_home).read_text())
+    data["jobs"].append(x_def)  # the definition comes back (git revert / restore)
+    _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+    for _ in range(3):
+        cj.mark_job_run(x["id"], True)
+    assert not _db(temp_home).exists()
+    assert _raw(temp_home, x["id"])["repeat"]["completed"] == 4
+    cj._KILL_SWITCH_ORPHANS_ONLY.clear()  # next process start
+    assert cj.get_job(x["id"])["repeat"]["completed"] == 4
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "sqlite")
+    assert cj.get_job(x["id"])["repeat"]["completed"] == 4

@@ -2173,14 +2173,14 @@ def _scrub_export_secrets(staged: Path) -> None:
 
 
 def _staged_cron_dir(staged: Path) -> Path:
-    """``staged/cron``, refused (ValueError) when it or a file the fold rewrites/removes is a
-    symlink or resolves outside the staging root: copytree keeps symlinks, so a symlinked ``cron``
+    """``staged/cron``, refused (ValueError) when it or a file the fold rewrites/removes (the fold
+    temp name included, Prism 5a6d55ddbf83) is a symlink or resolves outside the staging root: copytree keeps symlinks, so a symlinked ``cron``
     would point the fold and the db removals below at the LIVE store (Prism d8715e0ffdf8)."""
-    from cron.runtime_state import DB_NAME
+    from cron.runtime_state import DB_NAME, FOLD_TMP_NAME
 
     staged_cron = staged / "cron"
     root = os.path.realpath(staged)
-    for name in ("", "jobs.json", DB_NAME, DB_NAME + "-wal", DB_NAME + "-shm"):
+    for name in ("", "jobs.json", FOLD_TMP_NAME, DB_NAME, DB_NAME + "-wal", DB_NAME + "-shm"):
         path = staged_cron / name if name else staged_cron
         if not (path.exists() or path.is_symlink()):
             continue
@@ -2255,17 +2255,19 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
         shutil.copytree(profile_dir, staged, symlinks=True, ignore=ignore)
-        for rel, content in (extra_files or {}).items():
-            target = staged.joinpath(*normalize_archive_parts(rel))
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
         # Cron runtime fields (prompts, errors) live in cron/runtime_state.db since t_94e91559: fold
         # them back into the staged jobs.json so the text scrubber below sees them, and drop the
         # binary db + sidecars from the archive (the scrubber skips binaries). A db the fold
         # refused (no definitions to fold into) would ship unscrubbed: refuse the export instead.
+        # The live pair is captured BEFORE extra_files, so an explicit cron/jobs.json override
+        # wins over the captured copy (Prism 13e40ddef8fa).
         from cron.runtime_state import db_path, fold_staged_copy
+        _capture_cron_pair(profile_dir, _staged_cron_dir(staged))
+        for rel, content in (extra_files or {}).items():
+            target = staged.joinpath(*normalize_archive_parts(rel))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
         staged_cron = _staged_cron_dir(staged)
-        _capture_cron_pair(profile_dir, staged_cron)
         if db_path(staged_cron).exists() and not fold_staged_copy(staged_cron):
             raise ValueError(
                 f"refusing export: {profile_dir / 'cron'} has a runtime_state.db that cannot be "

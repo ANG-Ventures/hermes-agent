@@ -107,6 +107,14 @@ CREATE TABLE IF NOT EXISTS mirror_state (
 )
 """
 
+# Top-level jobs.json keys a mirror write embeds (first, so a 256-byte peek reads them): the seq
+# of the row snapshot it reflects, and the database epoch that seq belongs to.
+MIRROR_EPOCH_KEY = "_mirror_epoch"
+MIRROR_SEQ_KEY = "_mirror_seq"
+# Fixed temp name ``fold_staged_copy`` writes next to a staged jobs.json (profile export refuses a
+# symlink at it).
+FOLD_TMP_NAME = "jobs.json.fold-tmp"
+
 # Statement counter for tests/bench (done-when 1): one per row INSERT/UPDATE that changed a row.
 UPSERT_COUNT = 0
 # jobs.json mirror rewrites performed by this process (tests/bench).
@@ -151,8 +159,20 @@ def _state(conn: sqlite3.Connection, key: str) -> Optional[float]:
     return float(row[0]) if row is not None else None
 
 
+def _ensure_epoch(conn: sqlite3.Connection) -> None:
+    conn.execute("INSERT OR IGNORE INTO mirror_state(k, v) VALUES ('epoch', ?)",
+                 (float(int.from_bytes(os.urandom(6), "big")),))
+
+
+def mirror_epoch(conn: sqlite3.Connection) -> Optional[float]:
+    """Random id of THIS database's seq counter (a recreated db restarts seq at 0): a ``seq``
+    embedded in jobs.json is only comparable when its epoch matches."""
+    return _state(conn, "epoch")
+
+
 def mark_dirty(conn: sqlite3.Connection) -> None:
     """The jobs.json mirror lags the rows from now on (caller owns the transaction)."""
+    _ensure_epoch(conn)
     conn.execute("INSERT INTO mirror_state(k, v) VALUES ('seq', 1) "
                  "ON CONFLICT(k) DO UPDATE SET v = v + 1")
     conn.execute("INSERT OR IGNORE INTO mirror_state(k, v) VALUES ('dirty_since', ?)", (_now(),))
@@ -172,6 +192,7 @@ def dirty_since(conn: sqlite3.Connection) -> Optional[float]:
 def mark_flushed(conn: sqlite3.Connection, seq: float) -> None:
     """A jobs.json write reflected every row write up to *seq* (read in the same snapshot as the
     rows it wrote). A row write that landed after that snapshot keeps the mirror dirty."""
+    _ensure_epoch(conn)
     conn.execute("INSERT INTO mirror_state(k, v) VALUES ('flushed', ?) "
                  "ON CONFLICT(k) DO UPDATE SET v = max(v, excluded.v)", (seq,))
     if mirror_seq(conn) <= seq:
@@ -635,11 +656,19 @@ def fold_staged_copy(cron_dir: Path) -> bool:
     except (OSError, ValueError, sqlite3.Error):
         return False
     payload = dict(data) if isinstance(data, dict) else {}
-    payload.pop("runtime_gen", None)
+    for key in ("runtime_gen", MIRROR_SEQ_KEY, MIRROR_EPOCH_KEY):  # they describe the dropped db
+        payload.pop(key, None)
     payload["jobs"] = merged
-    tmp = jobs_file.with_name(jobs_file.name + ".fold-tmp")
+    tmp = jobs_file.with_name(FOLD_TMP_NAME)
     try:
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Never through a preserved entry at that name (a symlink would truncate its target
+        # outside the staging dir, Prism 5a6d55ddbf83): unlink it, then create exclusively.
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, indent=2, ensure_ascii=False))
         os.replace(tmp, jobs_file)
     except OSError:
         with contextlib.suppress(OSError):
