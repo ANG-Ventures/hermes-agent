@@ -1528,12 +1528,14 @@ class SessionMessagesMixin:
     def user_message_contains(self, session_ids: List[str], needle: str, *, since: float = 0.0,
                               session_key: str = "") -> bool:
         """True when any user row (any active state) at or after ``since`` contains ``needle``, in
-        ``session_ids`` or in a session of ``session_key`` started since: the consumption receipt for
-        an admitted gateway wake (t_97a879af)."""
+        ``session_ids`` or in any session of ``session_key`` still open or ended since (a wake retargeted
+        from an idle-ended parent runs in the key's current session): the consumption receipt for an
+        admitted gateway wake (t_97a879af)."""
         ids = [sid for sid in session_ids if sid]
         if session_key:
             ids += [row[0] for row in self._read_all(
-                "SELECT id FROM sessions WHERE session_key = ? AND started_at >= ?", (session_key, since))]
+                "SELECT id FROM sessions WHERE session_key = ? AND (ended_at IS NULL OR ended_at >= ?)",
+                (session_key, since))]
         if not ids or not needle:
             return False
         row = self._read_one(

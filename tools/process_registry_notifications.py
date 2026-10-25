@@ -153,6 +153,9 @@ def _preamble(evt: dict, title: str, intro: str, completed_at: float, *, with_go
     if evt.get("toolsets"):
         lines.append(f"Toolsets: {', '.join(evt['toolsets'])}")
     lines.append(f"Role: {evt.get('role') or 'leaf'}   Model: {evt.get('model') or '?'}")
+    if evt.get("event_id") and not evt.get("task_failure_notice"):
+        # Consumption receipt marker (t_97a879af): generation-specific, read back from the transcript.
+        lines.append(f"Event: {evt['event_id']}")
     return lines
 
 
@@ -436,6 +439,7 @@ def format_process_notification(evt: dict) -> "str | None":
             f"recovery launch {evt.get('redispatch_count', '?')}/2).\n"
             f"Original task: {task_text}\n"
             "No action is required; the terminal result will re-enter as a fresh turn."
+            + (f"\nEvent: {evt['event_id']}" if evt.get("event_id") else "")
         )
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)

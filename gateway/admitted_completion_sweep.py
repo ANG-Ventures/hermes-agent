@@ -5,9 +5,11 @@ event sits ``admitted`` until a turn consumes it. On 2026-10-24 deleg_3b87f5fe's
 acked ``delivered`` at admission and then lost in memory at the interrupt-depth cap; nothing could
 tell. This sweep, run at boot and every ``SWEEP_INTERVAL_S`` by the async-delegation watcher:
 
-* confirms ``delivered`` once the parent transcript carries the wake (its banner tag in a user row
-  of the parent session's compression chain, or of any session of its routing key, since admission);
-* leaves it alone while the wake is still parked in memory or the session is running a turn;
+* confirms ``delivered`` once the transcript carries the wake (its generation-specific ``Event:
+  <event_id>`` line in a user row since admission, in the parent's compression chain or in any
+  session of its routing key open or ended since);
+* leaves it alone while the wake is still parked in memory or the session is running a turn, and
+  skips (never re-injects) a candidate whose transcript cannot be read;
 * otherwise, after two consecutive misses and ``MIN_AGE_S``, re-opens it ``pending`` and re-queues
   it ONCE through the normal delivery path (``REINJECT_CAP`` per event, then ``dropped``).
 
@@ -96,44 +98,54 @@ async def sweep_admitted_completions(runner: Any, *, now: float | None = None) -
     started = float(getattr(runner, "_gateway_started_at", 0.0) or 0.0)
     homes = _profile_homes(runner)
     candidates = await asyncio.to_thread(_load_admitted, homes)
-    live_ids = {event.get("event_id") for _home, event in candidates}
-    suspects.intersection_update(live_ids)
+    # Event ids are only unique per profile registry: every suspect is keyed by (home, event_id).
+    suspects.intersection_update({(str(home), event.get("event_id")) for home, event in candidates})
     requeued = 0
     for home, event in candidates:
-        event_id = str(event.get("event_id") or "")
-        payload = event.get("payload") or {}
-        if await asyncio.to_thread(_in_transcript, home, event):
-            await asyncio.to_thread(ad.confirm_admitted_event, event_id, home)
-            suspects.discard(event_id)
-            continue
-        admitted_at = float(event.get("admitted_at") or 0.0)
-        if now - max(admitted_at, started) < MIN_AGE_S:
-            continue
-        key = str(event.get("admitted_session_key") or payload.get("session_key") or "")
-        if _parked_in_memory(runner, key, ad.admission_receipt_needle(payload)):
-            suspects.discard(event_id)
-            continue
-        if event_id not in suspects:
-            suspects.add(event_id)  # one more look before acting: a drain may be mid-flight
-            continue
-        suspects.discard(event_id)
-        if int(event.get("reinjects") or 0) >= REINJECT_CAP:
-            await asyncio.to_thread(ad.drop_admitted_event, event_id, "reinject_cap", home)
-            logger.warning("async_delegation_wake_lost event_id=%s session_key=%s reinjects=%s: giving up",
-                           event_id, key, event.get("reinjects"))
-            continue
-        reopened = await asyncio.to_thread(
-            ad.reopen_admitted_event, event_id, home, reason="admitted_not_in_transcript")
-        if reopened is None:
-            continue
-        identity = runner._completion_delivery_identity(reopened)
-        if identity is not None:
-            with runner._completion_delivery_lock:
-                runner._completion_deliveries_delivered.pop(identity, None)
-                runner._completion_deliveries_inflight.discard(identity)
-        logger.warning(
-            "async_delegation_wake_reinjected event_id=%s session_key=%s admitted_at=%.0f: admitted but never "
-            "reached the transcript", event_id, key, admitted_at)
-        process_registry.completion_queue.put(reopened)
-        requeued += 1
+        try:
+            requeued += await _sweep_one(runner, ad, process_registry, suspects, started, now, home, event)
+        except Exception:
+            # One unreadable profile/transcript must not starve the rest; unknown is not "lost".
+            logger.warning("admitted-completion sweep: skipped %s in %s", event.get("event_id"), home,
+                           exc_info=True)
     return requeued
+
+
+async def _sweep_one(runner, ad, process_registry, suspects, started, now, home, event) -> int:
+    event_id = str(event.get("event_id") or "")
+    suspect = (str(home), event_id)
+    payload = event.get("payload") or {}
+    if await asyncio.to_thread(_in_transcript, home, event):
+        await asyncio.to_thread(ad.confirm_admitted_event, event_id, home)
+        suspects.discard(suspect)
+        return 0
+    admitted_at = float(event.get("admitted_at") or 0.0)
+    if now - max(admitted_at, started) < MIN_AGE_S:
+        return 0
+    key = str(event.get("admitted_session_key") or payload.get("session_key") or "")
+    if _parked_in_memory(runner, key, ad.admission_receipt_needle(payload)):
+        suspects.discard(suspect)
+        return 0
+    if suspect not in suspects:
+        suspects.add(suspect)  # one more look before acting: a drain may be mid-flight
+        return 0
+    suspects.discard(suspect)
+    if int(event.get("reinjects") or 0) >= REINJECT_CAP:
+        await asyncio.to_thread(ad.drop_admitted_event, event_id, "reinject_cap", home)
+        logger.warning("async_delegation_wake_lost event_id=%s session_key=%s reinjects=%s: giving up",
+                       event_id, key, event.get("reinjects"))
+        return 0
+    reopened = await asyncio.to_thread(
+        ad.reopen_admitted_event, event_id, home, reason="admitted_not_in_transcript")
+    if reopened is None:
+        return 0
+    identity = runner._completion_delivery_identity(reopened)
+    if identity is not None:
+        with runner._completion_delivery_lock:
+            runner._completion_deliveries_delivered.pop(identity, None)
+            runner._completion_deliveries_inflight.discard(identity)
+    logger.warning(
+        "async_delegation_wake_reinjected event_id=%s session_key=%s admitted_at=%.0f: admitted but never "
+        "reached the transcript", event_id, key, admitted_at)
+    process_registry.completion_queue.put(reopened)
+    return 1

@@ -916,21 +916,22 @@ def reopen_admitted_event(event_id: str, profile_home: Path, *, reason: str) -> 
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         token = set_hermes_home_override(profile_home)
         try:
+            # Only this attempt's mirror row: a newer generation's receipt must not be reopened.
             _update_delivery("""UPDATE async_delegations SET delivery_state='pending', delivered_at=NULL,
                           delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
-                   WHERE delegation_id=? AND delivery_state='delivered'""", (time.time(), delegation_id))
+                   WHERE delegation_id=? AND delivery_state='delivered'
+                     AND json_extract(event_json, '$.event_id') = ?""",
+                             (time.time(), delegation_id, event_id))
         finally:
             reset_hermes_home_override(token)
     return payload
 
 
 def admission_receipt_needle(evt: Dict[str, Any]) -> str:
-    """The text a consuming turn's persisted user row must contain (the rendered banner tag)."""
-    delegation_id = str(evt.get("delegation_id") or "")
-    if not delegation_id:
-        return ""
-    kind = "RESTARTED" if evt.get("type") == "async_delegation_restarted" else "COMPLETE"
-    return f"{kind} — {delegation_id}]"
+    """The text a consuming turn's persisted user row must contain: the rendered ``Event: <event_id>``
+    line, which names the attempt generation (``<deleg>:terminal:g<N>``)."""
+    event_id = str(evt.get("event_id") or "")
+    return f"Event: {event_id}" if event_id else ""
 
 
 @_producer_scoped
