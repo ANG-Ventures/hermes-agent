@@ -282,6 +282,12 @@ class TestShouldExclude:
             "var/oneshot/f5854.tgz",
             "state/gitconfig-watch/events.ndjson",
             "state/gitconfig-watch/backstop-poller.ndjson",
+            ".sqlite-snapshots/fleet-sqlite-snapshot-1-x/state.db",
+            "var/ledger/.sqlite-snapshots/fleet-sqlite-snapshot-2-y/ledger.db",
+            "lcm.db.pre-replay-dedup-20260925",
+            "state.db.broken-20260919-171433",
+            "state.db.broken-20260919-171433-wal",
+            "recovery/agora-session-continuity-20261013/aegis-repair/preapply-state.db",
         ):
             assert _should_exclude(Path(p)), p
         for d in ("state/backup/offsite2", "profiles/aegis/incidents", "var/lcm-prune-20260924", "blackbox/pre-x"):
@@ -300,6 +306,8 @@ class TestShouldExclude:
             "skills/x/var/oneshot/a.tgz",                   # root-anchored
             "skills/x/profiles/p/state.db",
             "profiles/aegis/skills/x/state.db",             # only the profile's top-level store
+            "recovery/agora-session-continuity-20261013/REPORT.md",
+            "recovery/agora-session-continuity-20261013/aegis-repair/chronological/a.json",
         ):
             assert not _should_exclude(Path(p)), p
 
@@ -430,9 +438,9 @@ class TestIterBackupFiles:
         return subprocess.run(["git", "-C", str(cwd), *argv], check=True, capture_output=True, text=True).stdout
 
     def test_root_worktrees_carry_only_dirty_and_untracked(self, tmp_path, monkeypatch):
-        """t_7da95544: root wt/ + worktrees/ were 549 k of the 1.43 M files the full tier listed. A LINKED
-        worktree's clean tracked files live in its parent repo; only the work that exists nowhere else rides
-        (t_e95deca8). A plain clone (objects in the pruned .git/) and a worktree git cannot read walk whole."""
+        """t_7da95544: root wt/ + worktrees/ were 549 k of the 1.43 M files the full tier listed. A checkout's
+        clean tracked files live in its repository; only the work that exists nowhere else rides (t_e95deca8).
+        A clone whose HEAD is on no remote, and a checkout git cannot read, walk whole."""
         import shutil as _sh
         if _sh.which("git") is None:
             pytest.skip("git not installed")
@@ -455,8 +463,14 @@ class TestIterBackupFiles:
         (wt / "new" ).mkdir()
         (wt / "new" / "evidence.md").write_text("unique\n")    # untracked
         (wt / "ignored.log").write_text("x\n")                 # untracked + ignored: still unique, still carried
-        clone = root / "worktrees" / "full-clone"              # .git is a DIR: walked whole
+        clone = root / "worktrees" / "full-clone"              # HEAD == origin/main: dirty-only
         self._git(tmp_path, "clone", "-q", str(parent), str(clone))
+        (clone / "sub" / "clean2.py").write_text("edited\n")
+        ahead = root / "projects" / "ahead"                    # nested anywhere, HEAD on no remote: walked whole
+        self._git(tmp_path, "clone", "-q", str(parent), str(ahead))
+        (ahead / "local.py").write_text("x\n")
+        self._git(ahead, "add", "local.py")
+        self._git(ahead, "commit", "-q", "-m", "local only")
         broken = root / "worktrees" / "broken"                 # pointer to a missing gitdir: walked whole
         broken.mkdir(parents=True)
         (broken / ".git").write_text("gitdir: /nonexistent/x\n")
@@ -465,7 +479,8 @@ class TestIterBackupFiles:
         got = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip")}
         assert {"wt/op/mod.py", "wt/op/staged.py", "wt/op/new/evidence.md", "wt/op/ignored.log"} <= got
         assert not {"wt/op/clean.py", "wt/op/sub/clean2.py", "wt/op/.gitignore"} & got, got
-        assert {"worktrees/full-clone/clean.py", "worktrees/full-clone/sub/clean2.py"} <= got
+        assert "worktrees/full-clone/sub/clean2.py" in got and "worktrees/full-clone/clean.py" not in got
+        assert {"projects/ahead/clean.py", "projects/ahead/local.py"} <= got
         assert "worktrees/broken/a.py" in got
 
         # git failing for a worktree (timeout) falls back to the whole tree, never to dropping it

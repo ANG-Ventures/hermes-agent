@@ -93,6 +93,9 @@ _EXCLUDED_DIRS = {
     ".venv", "venv", "site-packages",
     # Tool / build caches — all regeneratable.
     ".cache", ".tox", ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    # Private per-reader SQLite snapshots (fleet scripts/live_sqlite_snapshot.py) next to their source DB, removed
+    # on close: a copy of a DB that is itself archived. The 10-25 tree held a 9.6 GiB one at the root (t_7da95544).
+    ".sqlite-snapshots",
 }
 
 # Path-anchored excludes: a dir name that is only Apple-IP (or otherwise droppable)
@@ -218,6 +221,8 @@ _EXCLUDED_ROOT_FILE_PATH_GLOBS = (
     ("state", "gitconfig-watch", "*.ndjson"),  # gcw_es / backstop_poller append-only event logs (22 GiB); the
                                             # restic machine lane excludes them for the same reason
     ("var", "ledger", "*.db.bak*"),         # ledger.db rollback copies left by repair cards (3.3 GiB)
+    ("recovery", "*", "*-repair", "*.db"),  # incident repair workdirs' pre-apply/dry-run state.db copies (7.6 GiB);
+                                            # the incident's reports and evidence next to them stay in
     # Per-profile hot SQLite stores (daedalus 23 GiB, daedalus-opus 14 GiB). The quick tier snapshots the
     # ROOT's state.db (and aegis's); a worker profile's own session/LCM history is transcript state, and the
     # nightly restic machine lane carries profiles/*/ off-box.
@@ -226,19 +231,23 @@ _EXCLUDED_ROOT_FILE_PATH_GLOBS = (
     ("profiles", "*", "lcm-archive.db"),
 )
 
-# Root operator worktrees (``wt/<name>``, ``worktrees/<name>``) are git checkouts: their tracked, unmodified
-# files exist in the parent repository and on its remotes. 2026-10-25 (t_7da95544): 549 k of the 1.43 M files
-# the full tier listed. For a LINKED worktree (``.git`` is a pointer file) the walk carries only what exists
-# nowhere else: tracked files that differ from HEAD plus every untracked file (t_e95deca8's unique
-# work). Unpushed commits ride as a bundle (_WORKTREE_BUNDLE_ROOTS). If git cannot answer for a worktree,
-# that worktree is walked whole as before, so a git failure never drops work.
+# Git checkouts below the root (any dir holding a ``.git`` file or dir, the root's own checkout excluded) carry
+# only what exists nowhere else: tracked files that differ from HEAD plus every untracked file (t_e95deca8's
+# unique work). Their tracked, unmodified files are in the repository and on its remotes. 2026-10-25
+# (t_7da95544): root wt/ + worktrees/ alone were 549 k of the 1.43 M files the full tier listed. A checkout
+# qualifies when its HEAD is reachable from a remote-tracking ref, or when it is a linked worktree directly
+# under _DIRTY_ONLY_WORKTREE_ROOTS (its unpushed commits ride as a bundle, _WORKTREE_BUNDLE_ROOTS). Any other
+# checkout, and any checkout git cannot answer for, is walked whole as before, so a git failure never drops work.
 _DIRTY_ONLY_WORKTREE_ROOTS = ("wt", "worktrees")
 
 # Root-level rollback copies of a DB (`kanban.db.bak-notify-sweep-<ts>`, `state.db.bak-<tag>`, ...). Pre-change
 # rollback points written by sweeps and repair recipes, not state: the DB itself is in the archive (sqlite backup)
 # and kanban.db has its own hourly tier. 2026-10-18: 68 of them at the root, 4.7 GB. Root-only, so a profile's own
 # files are untouched; fnmatch on the basename.
-_EXCLUDED_ROOT_FILE_GLOBS = ("*.db.bak*", "*.db.*.bak", "*.sqlite.bak*")
+_EXCLUDED_ROOT_FILE_GLOBS = ("*.db.bak*", "*.db.*.bak", "*.sqlite.bak*",
+                             # t_7da95544: same class, other spellings (lcm.db.pre-replay-dedup-20260925 6.2 GB,
+                             # state.db.broken-20260919-171433 3.7 GB + its -wal)
+                             "*.db.pre-*", "*.db.broken-*")
 
 # Root-anchored ``cache/`` rules. ``$HERMES_HOME/cache/`` is the fleet's REGENERABLE
 # scratch root (tool caches, telemetry cuts, per-incident capture dirs) — not agent
@@ -602,16 +611,16 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
     excluded tree, the root-only ``hermes-agent`` carve-out, root runtime trees, per-file rules),
     shared by ``hermes backup`` and the pre-update path so they can never drift.
     """
-    clean_by_worktree: Dict[tuple, Optional[frozenset]] = {}  # (root, name) -> clean tracked paths
+    # Innermost enclosing git checkout of the current dir: (its rel parts, clean tracked paths or None).
+    checkouts: List[tuple] = []
     for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
         rel_dir = Path(dirpath).relative_to(hermes_root)
         is_root = rel_dir == Path(".")
-        clean: Optional[frozenset] = None
-        wt_key = rel_dir.parts[:2]
-        if len(wt_key) == 2 and wt_key[0] in _DIRTY_ONLY_WORKTREE_ROOTS:
-            if wt_key not in clean_by_worktree:
-                clean_by_worktree[wt_key] = _worktree_clean_tracked(hermes_root.joinpath(*wt_key))
-            clean = clean_by_worktree[wt_key]
+        while checkouts and rel_dir.parts[:len(checkouts[-1][0])] != checkouts[-1][0]:
+            checkouts.pop()
+        if not is_root and (".git" in dirnames or ".git" in filenames):
+            checkouts.append((rel_dir.parts, _checkout_clean_tracked(Path(dirpath), rel_dir.parts)))
+        co_parts, clean = checkouts[-1] if checkouts else ((), None)
         kept = [
             d for d in dirnames
             if (d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root))
@@ -632,8 +641,8 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
             # published nor as its open staging file (a re-scan runs while that file is growing).
             if _should_exclude(rel):
                 continue
-            if clean and Path(*rel.parts[2:]).as_posix() in clean:
-                continue  # tracked + unmodified in a root operator worktree: the parent repo has it
+            if clean and Path(*rel.parts[len(co_parts):]).as_posix() in clean:
+                continue  # tracked + unmodified in a git checkout: the repository and its remotes have it
             if _is_non_regular_path(fpath):
                 continue
             with suppress(OSError, ValueError):
@@ -642,17 +651,22 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
             yield fpath, rel
 
 
-def _worktree_clean_tracked(worktree: Path) -> Optional[frozenset]:
-    """Tracked paths of a LINKED worktree that match HEAD (posix, worktree-relative); None = walk it whole.
+def _checkout_clean_tracked(checkout: Path, rel_parts: tuple) -> Optional[frozenset]:
+    """Tracked paths of a git checkout that match HEAD (posix, checkout-relative); None = walk it whole.
 
-    None when ``.git`` is not a pointer file (a full clone keeps its objects in the excluded ``.git/``, so
-    its tracked files are not recoverable from elsewhere) or when git fails or times out.
+    Qualifies (see _DIRTY_ONLY_WORKTREE_ROOTS): HEAD reachable from a remote-tracking ref, or a linked worktree
+    directly under a dirty-only root (its unpushed commits are bundled). None otherwise, and on any git failure.
     """
     try:
-        if not (worktree / ".git").is_file():
-            return None
-        tracked = _worktree_git(worktree, "ls-files", "-z")
-        changed = _worktree_git(worktree, "diff", "-z", "--name-only", "--no-renames", "HEAD")
+        bundled = (len(rel_parts) == 2 and rel_parts[0] in _DIRTY_ONLY_WORKTREE_ROOTS
+                   and (checkout / ".git").is_file())
+        if not bundled:
+            ahead = _worktree_git(checkout, "rev-list", "--count", "HEAD", "--not", "--remotes")
+            if ahead.returncode != 0 or ahead.stdout.strip() != "0":
+                return None
+            # `--not --remotes` with no remote-tracking refs at all counts every commit, so "0" means HEAD is on one
+        tracked = _worktree_git(checkout, "ls-files", "-z")
+        changed = _worktree_git(checkout, "diff", "-z", "--name-only", "--no-renames", "HEAD")
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
     if tracked.returncode != 0 or changed.returncode != 0:
