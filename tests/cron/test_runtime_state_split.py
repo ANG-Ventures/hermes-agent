@@ -2312,3 +2312,84 @@ def test_mirror_detects_same_size_in_place_rewrite(temp_home, monkeypatch):
     assert (path.stat().st_ino, path.stat().st_size) == (ino, size)
     assert cj.maybe_flush_runtime_mirror(force=True) is True
     assert _raw(temp_home, created["id"])["last_status"] == "ok"
+
+
+# --- round 11: ruling R3 (json mode is in effect only once the fold has happened) -----------
+
+def _r3_store(temp_home):
+    """A job with a row (last_status from-row); then json mode on a degraded lock: the fold is
+    refused (R1), so the db stays."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="r3")
+    cj.mark_job_run(created["id"], True)
+    rs.write_rows(temp_home / "cron", {created["id"]: {"last_status": "from-row"}})
+    return created["id"]
+
+
+def test_json_mode_save_on_degraded_lock_is_not_overlaid_by_the_old_row(temp_home, monkeypatch):
+    """b696f63bccc1, ruling R3: while runtime_state.db exists, a json-mode save writes the row
+    (sqlite-mode save), so the next merged read returns the value just saved, not the old row."""
+    from cron import jobs as cj
+
+    jid = _r3_store(temp_home)
+    with monkeypatch.context() as mp:
+        mp.setattr(cj, "_acquire_flock", lambda fd, timeout: False)
+        mp.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+        assert cj.get_job(jid)["last_status"] == "from-row"  # merged view, db kept (R1)
+        assert cj.mark_job_run(jid, False, error="boom") is True
+        rec = cj.get_job(jid)
+        assert rec["last_status"] == "error" and rec["last_error"] == "boom"
+        jobs = cj.load_jobs()
+        assert next(j for j in jobs if j["id"] == jid)["last_status"] == "error"
+        assert _db(temp_home).exists()
+
+
+def test_json_mode_degraded_write_survives_the_later_fold(temp_home, monkeypatch):
+    """ef86e5d00d84, ruling R3: a runtime write made in json mode on a degraded lock is not
+    hidden by the row and is not overwritten by the fold once a load holds the lock."""
+    from cron import jobs as cj
+
+    jid = _r3_store(temp_home)
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+    with monkeypatch.context() as mp:
+        mp.setattr(cj, "_acquire_flock", lambda fd, timeout: False)
+        cj.update_job(jid, {"last_status": "degraded-write"})
+        assert cj.get_job(jid)["last_status"] == "degraded-write"
+    assert cj.get_job(jid)["last_status"] == "degraded-write"  # locked load: fold happens
+    assert not _db(temp_home).exists()
+    assert _raw(temp_home, jid)["last_status"] == "degraded-write"
+
+
+def test_export_on_degraded_lock_reads_but_never_publishes(temp_home, monkeypatch, capsys):
+    """0e7b265dc160, ruling R1: a non-retiring export on a degraded lock may READ but not
+    PUBLISH. A sibling adds job b after the export read jobs.json: the file is left untouched
+    (b survives), the merged payload is returned, the CLI prints it and says not written."""
+    from cron import jobs as cj
+    from hermes_cli.cron import cron_runtime_export
+
+    jid = _r3_store(temp_home)
+    real_recover = cj._recover_pending_now
+
+    def recover_then_sibling_adds_b():
+        real_recover()
+        data = json.loads(_jobs_file(temp_home).read_text())
+        if not any(j["id"] == "sibling0000b" for j in data["jobs"]):
+            data["jobs"].append({"id": "sibling0000b", "name": "b"})
+            _jobs_file(temp_home).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(cj, "_acquire_flock", lambda fd, timeout: False)
+        mp.setattr(cj, "_recover_pending_now", recover_then_sibling_adds_b)
+        with pytest.raises(cj.RuntimeExportNotWritten) as exc:
+            cj.export_runtime_to_json(retire=False)
+        assert [j["last_status"] for j in exc.value.jobs if j["id"] == jid] == ["from-row"]
+        before = _snapshot(_jobs_file(temp_home))
+        assert cron_runtime_export(None) == 2
+        assert _snapshot(_jobs_file(temp_home)) == before
+    out = capsys.readouterr().out
+    assert "lock degraded: not written" in out
+    assert json.loads(out[out.index("{"):out.rindex("}") + 1])["jobs"]
+    assert any(j["id"] == "sibling0000b" for j in json.loads(_jobs_file(temp_home).read_text())["jobs"])
+    assert _db(temp_home).exists()

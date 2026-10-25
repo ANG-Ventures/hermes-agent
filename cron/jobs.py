@@ -1726,21 +1726,19 @@ def load_jobs() -> List[Dict[str, Any]]:
         if not locked:
             with _jobs_lock():
                 return load_jobs()
-        if not _destructive_ok():
-            # R1: the fold retires rows, which a degraded lock forbids. Leave the database and
-            # read the merged view (rows overlaid read-only), as out-of-process readers do.
-            _warn_degraded_fold_once()
-            merged = [j for j in _rs.merged_jobs(jobs_file) if isinstance(j, dict)]
-            _record_load_stamp(None)
-            _record_load_baseline(merged)
-            return merged
-        export_runtime_to_json(keep_orphans=True)
-        if _runtime_db_path().exists():
-            # Only rows with no definition are left (kept, never dropped silently): remember the
-            # db's identity so later loads do not re-fold it, and say so once.
-            _note_kill_switch_orphans_only()
-            _warn_json_mode_with_runtime_db()
-        return load_jobs()  # re-read the folded file
+        if _destructive_ok():
+            export_runtime_to_json(keep_orphans=True)
+            if _runtime_db_path().exists():
+                # Only rows with no definition are left (kept, never dropped silently): remember
+                # the db's identity so later loads do not re-fold it, and say so once.
+                _note_kill_switch_orphans_only()
+                _warn_json_mode_with_runtime_db()
+            return load_jobs()  # re-read the folded file
+        # R1: the fold retires rows, which a degraded lock forbids, so the database stays. R3:
+        # json mode is in effect only once the fold has happened; until then this store is read
+        # (and written, see _split_store) exactly as in sqlite mode.
+        _warn_degraded_fold_once()
+        split = True
     if split:
         # jobs.json is a read-only MIRROR of the merged view (see cron/runtime_state.py): a job
         # with a row takes its runtime ONLY from the row (file runtime keys dropped first). A job
@@ -1828,6 +1826,18 @@ def _note_kill_switch_orphans_only() -> None:
 
 def _runtime_db_path() -> Path:
     return _rs.db_path(_current_cron_store().cron_dir)
+
+
+def _split_store() -> bool:
+    """Apollo ruling R3 (t_94e91559): json mode is in effect only once the fold has happened.
+    While runtime_state.db exists (and is not the orphans-only remainder of a fold), every read
+    and write behaves as in sqlite mode whatever ``HERMES_CRON_RUNTIME_STATE`` says: the kill
+    switch changes what the next successful fold does (load_jobs, R1-gated), not what the store
+    is now. A json-only write next to the rows would be overlaid by an older row on the next
+    read and overwritten by the fold (Prism b696f63bccc1, ef86e5d00d84)."""
+    if _rs.enabled():
+        return True
+    return _runtime_db_path().exists() and not _kill_switch_orphans_only()
 
 
 def _normalize_repeat_completed(job: Dict[str, Any]) -> bool:
@@ -2209,6 +2219,18 @@ class RuntimeRetireRefused(RuntimeError):
     """``runtime-export --retire`` refused (operator rollback step, nothing written)."""
 
 
+class RuntimeExportNotWritten(RuntimeError):
+    """``runtime-export`` on a degraded jobs lock (ruling R1, Prism 0e7b265dc160): the export may
+    READ but not PUBLISH, since the definitions it read may already be stale. ``jobs`` is the
+    merged payload it would have written; nothing is on disk."""
+
+    def __init__(self, jobs: List[Any]):
+        self.jobs = jobs
+        super().__init__(
+            f"lock degraded: not written (no cross-process lock on {_jobs_lock_file()}); jobs.json "
+            f"and {_rs.DB_NAME} are unchanged")
+
+
 class RuntimeOrphansRefused(RuntimeRetireRefused):
     """``runtime-export --retire`` refused: rows with no definition in jobs.json would be lost."""
 
@@ -2303,6 +2325,10 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
                 job = _rs.overlay_row(job, row)
                 applied += 1
             merged.append(job)
+        if not _destructive_ok():
+            # Only reachable without retire (retire refused above). The jobs list may predate a
+            # sibling's write (the read is outside any cross-process lock): never publish it.
+            raise RuntimeExportNotWritten(merged)
         if applied or not kept:
             _write_definitions_file(merged)
         changed: List[str] = []
@@ -2471,7 +2497,7 @@ _MISSING_FAST = object()
 def _locked_job_view(job_id: Any) -> Optional[Dict[str, Any]]:
     """One merged record (caller holds ``_jobs_lock``): the cached definition + its row in sqlite
     mode (same view the ``_with_job`` writers use), else a full ``load_jobs()`` scan."""
-    if _rs.enabled():
+    if _split_store():
         usable, definition, file_runtime = _cached_definition(job_id)
         if usable:
             if definition is None:
@@ -3067,7 +3093,7 @@ def _publish_jobs_json(tmp_path: str, jobs_file: Path, *, own_gen: Optional[str]
             logger.info("cron runtime-state: skipped a stale jobs.json mirror (seq %s < %s on "
                         "disk)", newer_than[1], on_disk[1])
             return None
-    if _rs.enabled() and _runtime_db_path().exists():
+    if _split_store() and _runtime_db_path().exists():
         _roll_forward_published_sibling(own_gen)
     if own_gen:
         # R2: the commit marker lives in the database, set in its own transaction BEFORE the
@@ -3171,7 +3197,7 @@ def save_jobs(
             scope.removed = set(scope.removed or ()) | {str(i) for i in removed_ids}
         return
     with _jobs_lock():
-        if _rs.enabled():
+        if _split_store():  # R3: json mode with the db present saves as sqlite mode
             _save_split_unlocked(jobs, removed_ids=removed_ids, replace=replace,
                                  prune_runtime=prune_runtime)
         else:
@@ -3213,7 +3239,7 @@ def _with_job(
     """Run ``fn(jobs, i, job)`` on the first match under ``_jobs_lock()``; ``fn`` saves. *missing*
     if none."""
     with _jobs_lock():
-        if _rs.enabled():
+        if _split_store():
             result = _with_job_runtime(job_id, fn, missing)
             if result is not _MISSING_FAST:
                 return result
@@ -4717,7 +4743,7 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
             return False
         return _refresh_claim(jobs, job.get("run_claim"), expected_owner)
 
-    if _rs.enabled():
+    if _split_store():
         with _jobs_lock():
             fast = _refresh_claim_row(job_id, "run_claim", expected_owner, once_only=True)
             if fast is not None:
@@ -4893,7 +4919,7 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     def apply(jobs, _i, job):
         return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
 
-    if _rs.enabled():
+    if _split_store():
         with _jobs_lock():
             fast = _refresh_claim_row(job_id, "fire_claim", expected_owner, once_only=False)
             if fast is not None:
