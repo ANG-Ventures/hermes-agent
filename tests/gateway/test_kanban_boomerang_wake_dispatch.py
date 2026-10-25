@@ -595,6 +595,31 @@ def test_restart_killed_child_is_redispatched_once_quietly(env, caplog):
     assert asyncio.run(ah.reconcile(env["runner"])) == 0, "the live redispatched child was touched"
 
 
+def test_restart_gap_between_successor_and_close_is_healed_quietly(env, caplog):
+    """Prism P1 4623a20b225a: the gateway stopped after the #restart1 successor claim was persisted but
+    before the original was marked terminal. The next reconcile closes the original quietly (no lost
+    line, no resurface, no second redispatch) and leaves the successor alone."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid, state=ah.STATE_EXECUTING)
+    _kill(env, entry)
+    assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    state = ah.BoomerangWakeState()
+    succ = state.get_claim(entry["key"])["redispatched_as"]
+    # Re-open the original as if the close never happened (the crash window).
+    state.update_claim(entry["key"], state=ah.STATE_EXECUTING, outcome=None, redispatched_as=None)
+    sent_before, dispatched_before = list(env["adapter"].sent), len(env["dispatched"])
+    with caplog.at_level("INFO", logger="gateway.kanban_boomerang_wake"):
+        asyncio.run(ah.reconcile(env["runner"]))
+    old = state.get_claim(entry["key"])
+    assert old["state"] == ah.STATE_TERMINAL and old["outcome"] == "redispatched_after_restart"
+    assert old["redispatched_as"] == succ and not old.get("resurfaced")
+    assert len(env["dispatched"]) == dispatched_before, "a second redispatch was made"
+    assert env["adapter"].sent == sent_before, "a chat line was posted"
+    assert state.retries(tid) == 1
+    assert "superseded by restart redispatch" in caplog.text
+
+
 def test_restart_with_moved_card_or_expired_budget_is_lost(env):
     """AC-2: a card that left its claim-time status, or a claim past max_minutes, falls back to _lost."""
     moved = _card(env, title="moved")
