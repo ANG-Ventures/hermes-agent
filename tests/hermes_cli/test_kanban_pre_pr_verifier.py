@@ -191,6 +191,34 @@ def test_verifier_runs_with_the_assignee_profile_env(kanban_home, tmp_path, monk
     assert not dump.exists()
 
 
+def test_pr_lookup_is_pinned_to_github_com(monkeypatch):
+    """Prism 7cf1422cf1d2: the assignee env may carry GH_HOST; every extracted ref is a github.com ref."""
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        class R:  # noqa: D401
+            returncode, stdout, stderr = 0, '{"state": "open", "head": {"ref": "x"}}', ""
+        return R()
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op.query_pr_state("o/r", 7, env={"GH_HOST": "ghe.example.com", "GH_TOKEN": "t"})
+    assert "--hostname" in seen["argv"] and seen["argv"][seen["argv"].index("--hostname") + 1] == "github.com"
+
+
+@pytest.mark.platforms("posix")
+def test_launch_profile_assignee_keeps_the_process_injected_token(kanban_home, monkeypatch):
+    """Prism d637c235ac85: the assignee IS the launch profile and the only GitHub login is a token injected into
+    the process (shell / service unit). The scrub dropped it and the verifier ran unauthenticated."""
+    from hermes_cli import kanban_pr_acceptance as pa
+    monkeypatch.setenv("GH_TOKEN", "injected-token")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    home = pa._assignee_profile_home("default") or str(kanban_home)
+    monkeypatch.setattr("tools.environments.local._is_routed_home", lambda h: False)
+    env = pa._gh_env(home)
+    assert env is not None and env.get("GH_TOKEN") == "injected-token"
+
+
 def test_candidate_query_keeps_an_indeterminate_ambient_read(kanban_home, tmp_path, monkeypatch):
     """Prism 3a5427313c61: the assignee's read says NOT_FOUND (its profile cannot see the private repo) and the
     ambient read is indeterminate (None: timeout / rate limit). Before, that collapsed to NOT_FOUND and the PR

@@ -97,7 +97,9 @@ def query_pr_state(repo: str, number: int, env: Optional[dict] = None) -> Option
     """
     try:
         proc = subprocess.run(
-            ["gh", "api", f"repos/{repo}/pulls/{number}"],
+            # every extracted ref is a github.com ref; a profile env may carry GH_HOST (Enterprise), which would
+            # resolve an unrelated owner/repo/number there and let a MERGED answer close the card (Prism 7cf1422cf1d2)
+            ["gh", "api", "--hostname", "github.com", f"repos/{repo}/pulls/{number}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=QUERY_TIMEOUT_SECONDS, check=False, env=env,
         )

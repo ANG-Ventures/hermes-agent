@@ -10,6 +10,7 @@ org's private repos (#122689).
 """
 from __future__ import annotations
 
+import os
 import json
 import re
 import subprocess
@@ -89,6 +90,15 @@ def _gh_env(profile_home: str | None) -> dict[str, str] | None:
         # credential, so no scrub list sees it; the target's own value is overlaid from its .env.
         base.pop("GH_CONFIG_DIR", None)
     env = served_profile_child_env(base=base, target_home=profile_home, inherit_credentials=True)
+    if not routed and not (env.keys() & {"GH_TOKEN", "GITHUB_TOKEN"}):
+        # The target IS the launch profile: hermes_subprocess_env scrubs GH_TOKEN/GITHUB_TOKEN unconditionally and
+        # the overlay restores only .env / external-source values, so a token injected by the shell or the service
+        # unit (how the gateway itself is logged in) was dropped and the verifier ran unauthenticated: a private
+        # repo read "unreadable" and the refusal was silently skipped (Prism d637c235ac85). Our own process's
+        # credentials are this profile's credentials; keep them.
+        for key in ("GH_TOKEN", "GITHUB_TOKEN"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
     if routed and not (env.keys() & {"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"}):
         # HOME/XDG_CONFIG_HOME are still the launch process's: without a login of its own the
         # child would fall through to ~/.config/gh/hosts.yml — the ambient login. Pin gh's config
