@@ -1406,11 +1406,13 @@ def test_foreign_scan_skips_a_guard_only_deleted_shm(tmp_path):
     shm.write_bytes(b"\0" * 32768)
     code = (
         "import os, sys, time\n"
-        f"fd = os.open({str(shm)!r}, os.O_RDONLY if sys.argv[1] == 'ro' else os.O_RDWR)\n"
+        f"fd = os.open({str(shm)!r}, {{'guard': os.O_RDONLY | os.O_NONBLOCK, 'ro': os.O_RDONLY, 'rw': os.O_RDWR}}[sys.argv[1]])\n"
         "print('open', flush=True)\n"
         "sys.stdin.readline()\n"
     )
-    for mode, expect_holder in (("ro", False), ("rw", True)):
+    # Prism fd548cf605f5: a plain O_RDONLY -shm is a real read-only SQLite reader and still counts;
+    # only the guard's marked descriptor (O_RDONLY|O_NONBLOCK) is skipped.
+    for mode, expect_holder in (("guard", False), ("ro", True), ("rw", True)):
         if not shm.exists():
             shm.write_bytes(b"\0" * 32768)
         child = subprocess.Popen([sys.executable, "-c", code, mode], stdin=subprocess.PIPE,
@@ -1494,7 +1496,7 @@ def test_generation_ended_during_an_open_is_retired_once_the_opener_is_counted(t
 
 _GEN_CHILD = (
     "import os, sys\n"
-    "shm = os.open(sys.argv[1] + '-shm', os.O_RDONLY)\n"  # the guard's private fd on the OLD -shm
+    "shm = os.open(sys.argv[1] + '-shm', os.O_RDONLY | os.O_NONBLOCK)\n"  # the guard's private fd on the OLD -shm
     "wal = os.open(sys.argv[1] + '-wal', os.O_RDWR)\n"
     "print('open', flush=True)\n"
     "sys.stdin.readline()\n"  # parent retires the old generation
@@ -1535,9 +1537,10 @@ def test_guard_only_shm_beside_a_current_generation_wal(tmp_path, wal_generation
 
 
 @pytest.mark.parametrize("shm_flags,with_retired_wal,expect", [
-    (0x1, False, []),             # guard: FREAD only, no retired -wal -> skipped
-    (0x3, False, ["-shm"]),       # SQLite's read-write -shm -> holder
-    (0x1, True, ["-shm", "-wal"]),  # stranded writer: retired -wal keeps the -shm a holder
+    (0x5, False, []),               # guard: FREAD|FNONBLOCK -> skipped
+    (0x1, False, ["-shm"]),         # read-only SQLite reader (no mark) -> holder (Prism fd548cf605f5)
+    (0x3, False, ["-shm"]),         # SQLite's read-write -shm -> holder
+    (0x5, True, ["-wal"]),          # the -wal of a stranded writer always counts
 ])
 def test_darwin_scan_skips_a_completed_guard_only_shm(tmp_path, monkeypatch, shm_flags, with_retired_wal, expect):
     """Prism 87071f0f59e3: the macOS leg reported every retired sidecar descriptor, so the guard's
@@ -1553,3 +1556,20 @@ def test_darwin_scan_skips_a_completed_guard_only_shm(tmp_path, monkeypatch, shm
     monkeypatch.setattr(dbf, "_identity_is_truly_unlinked", lambda ident, path: True)
     got = sorted(t[-4:] for _p, t in dbf._iter_darwin_sidecar_holders(db))
     assert got == expect, got
+
+
+def test_private_descriptor_carries_the_guard_mark(tmp_path):
+    """The scan's positive evidence (Prism fd548cf605f5): every private descriptor is O_RDONLY with
+    GUARD_FD_MARK, which SQLite never sets on a sidecar."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    import fcntl
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    held = lg.hold(db)
+    try:
+        ident = (os.stat(db).st_dev, os.stat(db).st_ino)
+        flags = fcntl.fcntl(lg._FDS[ident], fcntl.F_GETFL)
+        assert flags & os.O_ACCMODE == os.O_RDONLY and flags & lg.GUARD_FD_MARK
+    finally:
+        lg.release(held)

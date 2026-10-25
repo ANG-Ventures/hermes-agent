@@ -108,9 +108,11 @@ def samples(lines, platform: str, unpaired=None):
         lag = _LAG.search(line)
         if lag is not None:
             yield ts, float(lag.group(1))
-        elif ready is not None:
-            yield ts, max(0.0, ts - ready)
+        elif ready is not None and ts >= ready:
+            yield ts, ts - ready
         else:
+            # No pair, or a pair that runs BACKWARDS (a naive-local log across a DST fall-back): never a
+            # fabricated 0 s sample that passes the gate (Prism a6da10393688); counted unpaired.
             unpaired.append(ts)
     unpaired.extend(ts for key, (ts, t) in pending.items() if t is None and wanted(key))
     unpaired.extend(ts for tkey, ts in by_turn.items() if wanted(tkey[:2]))

@@ -72,6 +72,7 @@ logger = logging.getLogger("hermes_state")
 # SQLite's unix VFS lock geometry (os_unix.c): the SHARED range on the main file and the
 # deadman-switch byte of the -shm file.
 _PENDING_BYTE = 0x40000000
+GUARD_FD_MARK = getattr(os, "O_NONBLOCK", 0)  # see _private_fd
 _SHARED_FIRST = _PENDING_BYTE + 2
 _SHARED_SIZE = 510
 _SHM_DMS_BYTE = 128
@@ -297,7 +298,10 @@ def _private_fd(path: str, ident: Identity, db_ident: Optional[Identity] = None)
     fd = _FDS.get(ident)
     if fd is not None:
         return fd
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    # O_NONBLOCK is the guard's MARK (no effect on a regular file or on OFD locks): SQLite never opens a
+    # sidecar with it, so another process's deleted-generation scan can tell this descriptor from a
+    # real read-only SQLite reader (hermes_state_dbfile.GUARD_FD_MARK, Prism fd548cf605f5).
+    fd = os.open(path, os.O_RDONLY | GUARD_FD_MARK | getattr(os, "O_CLOEXEC", 0))
     try:
         st = os.fstat(fd)
     except OSError:

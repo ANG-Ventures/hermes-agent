@@ -279,6 +279,23 @@ def test_same_turn_id_in_two_chats_keeps_both_readies(tmp_path, capsys):
     assert rc == 1 and (out["n"], out["p99_s"], out["unpaired"]) == (2, 30.0, 0), out
 
 
+
+def test_backwards_pair_across_dst_fall_back_is_unpaired_not_zero(tmp_path, monkeypatch, capsys):
+    """Prism a6da10393688: naive-local timestamps across the New York fall-back (01:59:59 EDT ready,
+    01:00:01 EST send) differ by -3598 s; clamping to 0 s fabricated an instant delivery that PASSed
+    a 5 s gate. A backwards pair is counted unpaired: no sample, BLIND, exit 2."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("no time.tzset")
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    _LAST[:] = [capsys]
+    mod = _script()
+    rc, out = _run(mod, tmp_path,
+        "2026-11-01 01:59:59 INFO x: response ready: platform=discord chat=c session=a\n"
+        "2026-11-01 01:00:01 INFO x: [discord] Sending response (1 chars) to c\n",
+        "--max-p99-s", "5")
+    assert rc == 2 and out["n"] == 0 and out["unpaired"] == 1, out
+
 def test_dst_fall_back_hours_stay_separate(tmp_path, monkeypatch, capsys):
     """Prism fdd03dbb8e37: 08:30Z and 09:30Z on 2026-11-01 are both 01:30 in Los Angeles; a local-time
     hour key merged them into one summary."""

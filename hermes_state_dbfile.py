@@ -212,14 +212,24 @@ def _fd_is_truly_unlinked(fd_path: str, watched_path: str) -> bool:
     return _identity_is_truly_unlinked((fd_stat.st_dev, fd_stat.st_ino), watched_path)
 
 
-def _fd_is_read_only(fd_path: str) -> bool:
-    """True when ``/proc/<pid>/fdinfo/<fd>`` says O_RDONLY; False when it says otherwise or cannot be
-    read (fail closed: the caller then keeps counting the descriptor as a holder)."""
+# The WAL lock guard opens its private descriptors O_RDONLY | O_NONBLOCK (hermes_state_lockguard
+# GUARD_FD_MARK). SQLite never sets O_NONBLOCK on a sidecar, so the pair is positive evidence that a
+# descriptor is a guard's, not a read-only SQLite reader's (Prism fd548cf605f5). Darwin reports the
+# same bit in fi_openflags (FNONBLOCK == O_NONBLOCK == 0x4).
+GUARD_FD_MARK = getattr(os, "O_NONBLOCK", 0)
+
+
+def _fd_is_guard_marked(fd_path: str) -> bool:
+    """True when ``/proc/<pid>/fdinfo/<fd>`` says O_RDONLY with the guard mark; False when it says
+    otherwise or cannot be read (fail closed: the caller then keeps counting the descriptor)."""
+    if not GUARD_FD_MARK:
+        return False
     try:
         with open(fd_path.replace("/fd/", "/fdinfo/", 1), encoding="ascii") as fh:
             for line in fh:
                 if line.startswith("flags:"):
-                    return (int(line.split()[1], 8) & os.O_ACCMODE) == os.O_RDONLY
+                    flags = int(line.split()[1], 8)
+                    return (flags & os.O_ACCMODE) == os.O_RDONLY and bool(flags & GUARD_FD_MARK)
     except (OSError, ValueError, IndexError):
         return False
     return False
@@ -268,6 +278,7 @@ _DARWIN_FD_PATH_OFFSET = 176
 # (0x1) / FWRITE (0x2) bits, i.e. ``O_ACCMODE + 1`` (sys/fcntl.h FFLAGS). Read-only = FWRITE clear.
 _DARWIN_FD_OPENFLAGS_OFFSET = 0
 _DARWIN_FWRITE = 0x2
+_DARWIN_FNONBLOCK = 0x4
 _DARWIN_LIBPROC = None
 
 
@@ -361,37 +372,24 @@ def _iter_darwin_sidecar_holders(db_path) -> List[Tuple[int, str]]:
     # APFS/HFS+ are case-insensitive by default and libproc reports the pathname as the opener
     # spelled it; ``os.path.normcase`` is the identity on darwin, so fold case here.
     watched = {path.casefold(): path for path in (base + "-wal", base + "-shm")}
-    unlinked: List[Tuple[int, str, bool]] = []  # (pid, target, read-only) of every retired sidecar fd
+    unlinked: List[Tuple[int, str, bool]] = []  # (pid, target, guard-marked) of every retired sidecar fd
     for pid, _fd, target, identity, flags in _iter_darwin_fd_targets_with_flags():
         literal = watched.get(target.casefold())
         if literal is not None and _identity_is_truly_unlinked(identity, literal):
-            unlinked.append((pid, target, not flags & _DARWIN_FWRITE))
+            unlinked.append((pid, target, literal.endswith("-shm") and not flags & _DARWIN_FWRITE
+                             and bool(flags & _DARWIN_FNONBLOCK)))
     return _drop_guard_only_shm(unlinked)
 
 
 def _drop_guard_only_shm(unlinked: List[Tuple[int, str, bool]]) -> List[Tuple[int, str]]:
-    """Holders among *unlinked* ``(pid, target, read_only)`` retired-sidecar descriptors, minus a
-    WAL lock guard's private ``-shm`` descriptor between a completed generation's last close and the
-    guard's retire() (t_aeae3fe7, Prism ba6fa9c4a5a7 / 87071f0f59e3 / 17cb68d1ff79).
-
-    A connection still LIVE on a retired generation holds that generation's ``-wal`` too, and that
-    ``-wal`` is retired with it (SQLite unlinks ``-wal`` before ``-shm``; a replacement names a new
-    inode), so it is itself in *unlinked*; SQLite also opens ``-shm`` read-write. The guard opens
-    ``-shm`` read-only and never opens ``-wal``. So a retired ``-shm`` is skipped only when every retired
-    ``-shm`` descriptor of that pid is read-only AND the pid holds no RETIRED ``-wal``. A ``-wal`` of
-    the CURRENT generation (a new opener in the same process) proves nothing about the old one and is
-    deliberately not counted: process-wide WAL presence made a completed guard look live."""
-    def kind(target: str) -> str:  # "-wal" / "-shm"; Linux targets carry a " (deleted)" marker
-        return target.removesuffix(" (deleted)")[-4:]
-
-    retired_wal_pids = {pid for pid, target, _ro in unlinked if kind(target) == "-wal"}
-    holders: List[Tuple[int, str]] = []
-    for pid, target, _ro in unlinked:
-        if kind(target) == "-shm" and pid not in retired_wal_pids and all(
-                ro for p, t, ro in unlinked if p == pid and kind(t) == "-shm"):
-            continue
-        holders.append((pid, target))
-    return holders
+    """Holders among *unlinked* ``(pid, target, guard_marked)`` retired-sidecar descriptors, minus each
+    WAL lock guard private ``-shm`` descriptor (t_aeae3fe7; Prism ba6fa9c4a5a7 / 87071f0f59e3 /
+    17cb68d1ff79 / fd548cf605f5). Between a completed generation's last close and the guard's retire()
+    that descriptor still names the unlinked ``-shm``, yet it is no live generation: the guard takes no
+    SQLite lock and never opens ``-wal``. Skipped per DESCRIPTOR, on positive evidence only (the guard
+    mark, see GUARD_FD_MARK): a read-only SQLite reader, a read-write connection, every ``-wal`` and an
+    unreadable flag set all still count, and so does any process that holds one beside a guard fd."""
+    return [(pid, target) for pid, target, guard_marked in unlinked if not guard_marked]
 
 
 def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
@@ -420,8 +418,8 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
                 if canonical not in watched:
                     continue
                 if " (deleted)" in target and _fd_is_truly_unlinked(fd_path, watched[canonical]):
-                    # fdinfo read only for a -shm (fail closed: unreadable = read-write = a holder)
-                    unlinked.append((pid, target, canonical.endswith("-shm") and _fd_is_read_only(fd_path)))
+                    # fdinfo read only for a -shm (fail closed: unreadable = unmarked = a holder)
+                    unlinked.append((pid, target, canonical.endswith("-shm") and _fd_is_guard_marked(fd_path)))
             # t_aeae3fe7 (this scan is t_69e10010's): a WAL lock guard's private -shm descriptor of a
             # completed generation is not a live one; see _drop_guard_only_shm (shared with darwin).
             holders = _drop_guard_only_shm(unlinked)
