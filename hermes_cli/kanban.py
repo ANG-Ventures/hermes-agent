@@ -39,6 +39,7 @@ from hermes_cli.kanban_ops import (
 )
 from hermes_cli import kanban_verb_input as kvi
 from hermes_cli.kanban_close_on_guard import check_comment as check_close_on_comment
+from hermes_cli.kanban_close_on_guard import ReleaseSuperseded
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
 from hermes_cli.kanban_pr_freshness import DraftPrError
 from hermes_cli.kanban_branch_base import StaleBaseError
@@ -2946,10 +2947,14 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             # Human review lane: the session holding ``claim --review`` on this
             # card attests to that review run (the claim is the provenance).
             run_id = _operator_review_run_id(conn, args.task_id)
-        kb.add_comment(
-            conn, args.task_id, author, body,
-            run_id=run_id, session_ref=session_ref, claimed_author=claimed,
-        )
+        try:
+            kb.add_comment(
+                conn, args.task_id, author, body,
+                run_id=run_id, session_ref=session_ref, claimed_author=claimed,
+                if_latest_release=getattr(args, "if_latest_release", None),
+            )
+        except ReleaseSuperseded as exc:
+            return _err(f"kanban: comment not posted (--if-latest-release): {exc}", 3)
     print(f"Comment added to {args.task_id}")
     return 0
 

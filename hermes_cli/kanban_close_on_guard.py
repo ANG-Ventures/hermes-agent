@@ -124,6 +124,44 @@ def check_comment(author: str, body: str) -> None:
         )
 
 
+# Fallback when the fleet grammar cannot be loaded: the same shape as close_on.LINE_RE. The
+# conditional append fails CLOSED, so it needs a line matcher even when the guard above fails open.
+_LINE_RE_FALLBACK = re.compile(
+    r"^[ \t]*(?:[-*][ \t]+)?[*_`]*close-on[*_`]*[ \t]*:[*_`]*[ \t]*(?P<gate>[^\n]*)$", re.I | re.M)
+
+
+class ReleaseSuperseded(ValueError):
+    """``--if-latest-release <id>``: a newer release-bearing comment exists (or ``<id>`` is unknown)."""
+
+
+def newer_release_comment(conn, task_id: str, comment_id: int) -> Optional[str]:
+    """Why ``comment_id`` is NOT the card's latest release-bearing comment, or None when it is.
+
+    Release-bearing = a ``close-on:`` line (``close_on.LINE_RE``) in a comment that is not
+    automation (:data:`MACHINE_AUTHORS`, ``our_authors.is_machine``). Order is the closer's:
+    ``(created_at, id)``. Fails closed: an unknown id, or one on another card, is a refusal.
+    Called inside the comment insert's write transaction (Prism 3406ba8bbfd9 / f3498875f176)."""
+    row = conn.execute("SELECT task_id, created_at FROM task_comments WHERE id = ?",
+                       (int(comment_id),)).fetchone()
+    if row is None or row[0] != task_id:
+        return f"comment {comment_id} is not a comment on {task_id}"
+    lib, authors = _load("close_on"), _load("our_authors")
+    line_re = getattr(lib, "LINE_RE", None) or _LINE_RE_FALLBACK
+    at = int(row[1] or 0)
+    for cid, author, body in conn.execute(
+            "SELECT id, author, body FROM task_comments WHERE task_id = ? AND id != ? "
+            "AND (created_at > ? OR (created_at = ? AND id > ?)) ORDER BY created_at, id",
+            (task_id, int(comment_id), at, at, int(comment_id))):
+        a = str(author or "").strip().lower()
+        if a.startswith("unverified:"):
+            a = a.split(":", 1)[1].strip()
+        if a in MACHINE_AUTHORS or (authors is not None and authors.is_machine(body)):
+            continue
+        if line_re.search(str(body or "")):
+            return f"comment {cid} ({author}) is a newer release-bearing comment than {comment_id}"
+    return None
+
+
 def refusal(author: str, body: str) -> Optional[str]:
     """:func:`check_comment` for writers that return ``(ok, reason)``: the message, or None."""
     try:

@@ -232,3 +232,83 @@ def test_block_reason_is_refused_before_the_transition(fleet, capsys):
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).status != "blocked"
     assert _comments(tid) == []
+
+
+# --- kanban comment --if-latest-release (Prism 3406ba8bbfd9 / f3498875f176, t_fc712261) ------------------------
+HOLD = "close-on: manual: land-pr holds this card until the release posts"
+
+
+def _cli_args(tid, body, capsys, *extra):
+    top = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(top.add_subparsers(dest="command"))
+    rc = kc.kanban_command(top.parse_args(["kanban", "comment", tid, "--body", body, *extra]))
+    return rc, capsys.readouterr().err
+
+
+def _post(tid, author, body):
+    with kb.connect_closing() as conn:
+        return kb.add_comment(conn, tid, author, body)
+
+
+def test_if_latest_release_refuses_when_an_operator_line_landed_after_the_read(fleet, capsys):
+    """The Prism repro: the merge pass read hold c10, an operator posted c11, the staged append is refused, no c12."""
+    _, tid = fleet
+    c10 = _post(tid, "apollo", HOLD)
+    c11 = _post(tid, "apollo", "close-on: manual: Ace holds this until the acceptance run")
+    rc, err = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c10))
+    assert rc == 3 and f"comment {c11}" in err, err
+    assert _comments(tid) == [HOLD, "close-on: manual: Ace holds this until the acceptance run"]
+
+
+def test_if_latest_release_appends_while_the_read_comment_is_still_current(fleet, capsys):
+    _, tid = fleet
+    c10 = _post(tid, "apollo", HOLD)
+    _post(tid, "apollo", "plain prose, no release line")
+    _post(tid, "default", "[review-merge-pass] LANDED o/r#1: close-on: merged quoted by automation")
+    assert _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c10))[0] == 0
+    assert _comments(tid)[-1] == "close-on: merged"
+
+
+def test_if_latest_release_fails_closed_on_an_id_from_another_card(fleet, capsys):
+    _, tid = fleet
+    with kb.connect_closing() as conn:
+        other = kb.create_task(conn, title="other", assignee="daedalus")
+    foreign = _post(other, "apollo", HOLD)
+    rc, err = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(foreign))
+    assert rc == 3 and "not a comment on" in err
+    rc, _ = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", "999999")
+    assert rc == 3 and _comments(tid) == []
+
+
+def test_if_latest_release_check_shares_the_insert_transaction(fleet, monkeypatch):
+    """The check runs inside the insert's write_txn: a newer line committed by the time the
+    check reads is seen, and a refusal leaves no row and no ``commented`` event."""
+    _, tid = fleet
+    c10 = _post(tid, "apollo", HOLD)
+    _post(tid, "apollo", "close-on: merged")
+    seen = []
+    real = guard.newer_release_comment
+
+    def spy(conn, task_id, cid):
+        seen.append(conn.in_transaction)
+        return real(conn, task_id, cid)
+
+    monkeypatch.setattr(guard, "newer_release_comment", spy)
+    with kb.connect_closing() as conn:
+        events = len(kb.list_events(conn, tid))
+        with pytest.raises(guard.ReleaseSuperseded):
+            kb.add_comment(conn, tid, "apollo", "close-on: merged", if_latest_release=c10)
+        assert len(kb.list_events(conn, tid)) == events
+    assert seen == [True]
+    assert len(_comments(tid)) == 2
+
+
+def test_if_latest_release_fails_closed_without_the_fleet_grammar(fleet):
+    home, tid = fleet
+    c10 = _post(tid, "apollo", HOLD)
+    _post(tid, "apollo", "close-on: merged")
+    (home / "scripts" / "lib" / "close_on.py").unlink()
+    guard._LIB_CACHE.clear()
+    with pytest.raises(guard.ReleaseSuperseded):
+        with kb.connect_closing() as conn:
+            kb.add_comment(conn, tid, "apollo", "close-on: merged", if_latest_release=c10)
