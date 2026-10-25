@@ -2363,14 +2363,18 @@ def _emit_cron_fallback_alert(job: dict, agent, *, adapters=None, loop=None) -> 
 
         job_name = job.get("name", job.get("id", "?"))
         declared = _fallback_was_declared(job, new_provider, new_model)
-        # A declared fallback posts ONCE per job per day per primary->fallback pair (t_2efae1cd):
-        # a walled primary re-walks the same chain on every run/retry, and each line repeated
-        # the first. Undeclared switches stay loud on every run.
+        # Every fallback notice posts ONCE per job per day per primary->fallback pair
+        # (t_2efae1cd declared; t_f238d060 undeclared): a walled primary re-walks the same
+        # chain on every run/retry, and each line repeated the first. An undeclared switch
+        # still pages #alerts loudly the first time; a retrying job re-paged every ~10 min
+        # (12 identical #alerts lines on 2026-10-25). A new pair or a new day pages again.
         notice_pair = f"{old_label} -> {new_label}"
+        if not declared:
+            notice_pair = f"undeclared: {notice_pair}"
         notice_home = _get_hermes_home()
-        if declared and fallback_notice_gate.already_noticed(
+        if fallback_notice_gate.already_noticed(
                 notice_home, job.get("id", "?"), notice_pair):
-            logger.info("Job '%s': declared fallback %s already noticed today; not reposting",
+            logger.info("Job '%s': fallback %s already noticed today; not reposting",
                         job.get("id", "?"), notice_pair)
             return
         # WHY the primary failed — surfaced from the recorded fallback event so
@@ -2429,8 +2433,7 @@ def _emit_cron_fallback_alert(job: dict, agent, *, adapters=None, loop=None) -> 
                 job.get("id", "?"), err,
             )
         else:
-            if declared:
-                fallback_notice_gate.mark_noticed(notice_home, job.get("id", "?"), notice_pair)
+            fallback_notice_gate.mark_noticed(notice_home, job.get("id", "?"), notice_pair)
             logger.warning(
                 "Job '%s': FALLBACK FIRED %s -> %s — loud alert sent to %s",
                 job.get("id", "?"), old_label, new_label, alert_deliver,
