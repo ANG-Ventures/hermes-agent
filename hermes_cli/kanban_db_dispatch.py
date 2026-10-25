@@ -4452,6 +4452,9 @@ def _linked_ids(conn, ids, mode: Optional[str] = None) -> dict:
             for me, other, other_status in ((r[0], r[1], r[4]), (r[1], r[0], r[3])):
                 if mode != _pr.LINEAGE_PINS_LEGACY and other_status in _TERMINAL_STATUSES:
                     continue  # a terminal far end pins nothing (t_6d9e7d90)
+                if (mode != _pr.LINEAGE_PINS_LEGACY and kind in _pr.CHILD_ONLY_LINK_KINDS
+                        and me == r[0]):
+                    continue  # the parent's own outgoing after-merge edge (t_250a7fc5)
                 if me not in best or edge < best[me]:
                     best[me] = edge
                     out[me] = (kind, other)
