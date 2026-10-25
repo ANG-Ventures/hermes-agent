@@ -30,53 +30,60 @@ def _coverage(head: str) -> str:
     })
 
 
-def _f(path, *lines, at=1, fn="def f():"):
-    """A files[] entry: one hunk at offset ``at`` (function context ``fn``) carrying ``lines``."""
-    return {"filename": path, "status": "modified",
-            "patch": f"@@ -{at},3 +{at},4 @@ {fn}\n ctx\n" + "\n".join(lines)}
+def _f(path, sha, status="modified", **kw):
+    """A compare files[] entry: the file's blob sha at the tip of that side."""
+    return dict({"filename": path, "status": status, "sha": sha}, **kw)
 
 
-PR_FILES = [_f("app.py", "-old = 1", "+new = 2"), _f("tests/test_app.py", "+def test_new(): ...")]
-MODES = {"app.py": ["100644", "100644"], "tests/test_app.py": ["100644", "100644"]}
+APP_A, APP_C, APP_M = "1" * 40, "2" * 40, "3" * 40   # app.py blob at A; after an implementer edit; after a main edit
+TEST_A = "4" * 40
+PR_FILES = [_f("app.py", APP_A), _f("tests/test_app.py", TEST_A, status="added")]
+MODES = {"app.py": ["100644", "100644"], "tests/test_app.py": [None, "100644"]}
+MAIN_OTHER = [_f("docs/unrelated.md", "5" * 40)]     # main moved, touching no PR path
 
 
-def _view(head, head_files, status="ahead", head_modes=MODES, seen_modes=MODES):
+def _view(head, head_files, status="ahead", head_modes=MODES, seen_modes=MODES,
+          main_status="ahead", main_files=MAIN_OTHER):
     return {"head": head, "status": status, "seen_files": PR_FILES, "head_files": head_files,
-            "seen_modes": seen_modes, "head_modes": head_modes}
+            "seen_modes": seen_modes, "head_modes": head_modes,
+            "main_status": main_status, "main_files": main_files}
 
 # The PR's GitHub state after the send-back, keyed by scenario. ``status`` is compare/<A>...<head>;
-# ``seen_files`` is compare/<base>...<A>, ``head_files`` is pulls/N/files.
+# ``seen_files``/``head_files`` are compare/<base>...<A|head>; ``main_*`` is compare/<mb_seen>...<mb_head>.
 VIEWS = {
     "unchanged": {"head": A},
-    # fold bot merged main; the PR's own lines are the same (fixture 1).
+    # fold bot merged main; main touched no PR path and every PR blob is byte-identical (fixture 2).
     "fold_merge": _view(B, PR_FILES),
-    # main changed app.py outside the PR's hunk: offsets shift, lines unchanged (fixture 3).
-    "fold_offset_shift": _view(B, [_f("app.py", "-old = 1", "+new = 2", at=40), PR_FILES[1]]),
-    # main chmod'ed app.py on both ends: the PR's mode CHANGE is still none.
-    "fold_main_chmod": _view(B, PR_FILES, head_modes=dict(MODES, **{"app.py": ["100755", "100755"]})),
-    # a merge that resolves a conflict inside a PR-touched file (live: t_c9887522 44e346d675; fixture 2).
-    "fold_conflict_resolution": _view(B, [_f("app.py", "-old = 1", "+new = 2", "+resolved = 3"), PR_FILES[1]]),
-    # the live shape (t_c9887522 44e346d675): the resolution keeps main's adjacent insert next to the PR's
-    # line, so the +/- lines are equal and only the context around the PR's hunk changed.
-    "fold_adjacent_insert": _view(B, [{"filename": "app.py", "status": "modified",
-                                       "patch": "@@ -1,3 +1,5 @@ def f():\n ctx\n main_insert = 1\n"
-                                                "-old = 1\n+new = 2"}, PR_FILES[1]]),
-    # the same edit moved to an identical-context block in another function (Prism 8b66a52674df).
-    "moved_region": _view(B, [_f("app.py", "-old = 1", "+new = 2", at=90, fn="def g():"), PR_FILES[1]]),
-    # app.py's text delta is unchanged but the PR now also makes it executable (Prism e8f58301f565).
+    # fold onto an unchanged merge base (a re-merge): nothing on main moved.
+    "fold_same_base": _view(B, PR_FILES, main_status="identical", main_files=[]),
+    # Prism cdd568482ca1: H2 reverts the edit in block 1 and applies it in identical block 2 of the same
+    # function. The normalised patch text was equal; the blob is not (fixture 1).
+    "relocated_edit": _view(B, [_f("app.py", APP_C), PR_FILES[1]]),
+    # a merge resolving a conflict inside a PR file (live: t_c9887522 44e346d675).
+    "fold_conflict_resolution": _view(B, [_f("app.py", APP_M), PR_FILES[1]],
+                                      main_files=[_f("app.py", APP_M)]),
+    # fixture 3, the accepted conservative cost: main touched a PR path and the fold auto-merged cleanly.
+    # Even with byte-equal PR blobs a hand resolution cannot be excluded, so it routes.
+    "fold_main_touched_pr_path": _view(B, PR_FILES, main_files=[_f("app.py", APP_M)]),
+    # main renamed something away from a PR path: previous_filename counts as touching it.
+    "fold_main_renamed_pr_path": _view(B, PR_FILES, main_files=[
+        _f("lib/app.py", APP_M, status="renamed", previous_filename="app.py")]),
+    "main_unreadable": _view(B, PR_FILES, main_status=None, main_files=None),
+    "main_over_cap": _view(B, PR_FILES, main_files=[_f(f"m{i}.py", "6" * 40) for i in range(300)]),
+    # app.py's blob is unchanged but the PR now also makes it executable (Prism e8f58301f565).
     "chmod_only": _view(B, PR_FILES, head_modes=dict(MODES, **{"app.py": ["100644", "100755"]})),
-    # same patch text, but the file is now a rename rather than a modify.
+    # same blob, but the file is now a rename rather than a modify.
     "status_change": _view(B, [dict(PR_FILES[0], status="renamed", previous_filename="old_app.py"),
                                PR_FILES[1]]),
     # modes unreadable (tree truncated / REST fault): cannot be proved.
     "modes_unknown": _view(B, PR_FILES, head_modes=None),
-    # file list at the REST cap: cannot be proved (fixture 4).
-    "over_cap": _view(B, [_f(f"f{i}.py", "+x") for i in range(300)]),
-    # a file with no patch (binary / too large): cannot be proved.
-    "patchless": _view(B, [{"filename": "app.py", "status": "modified"}, PR_FILES[1]]),
+    # file list at the REST cap: cannot be proved.
+    "over_cap": _view(B, [_f(f"f{i}.py", "7" * 40) for i in range(300)]),
+    # a file with no blob sha: cannot be proved.
+    "shaless": _view(B, [{"filename": "app.py", "status": "modified"}, PR_FILES[1]]),
     # worker reset the PR to A^: head does not descend from A (Prism cc70026dd515).
     "rewound": _view(C, PR_FILES, status="behind"),
-    "new_commit": _view(C, [_f("app.py", "-old = 1", "+new = 3"), PR_FILES[1]]),
+    "new_commit": _view(C, [_f("app.py", APP_C), PR_FILES[1]]),
 }
 
 
@@ -115,7 +122,7 @@ def _complete_as_worker(tid, monkeypatch, scenario):
         return kb.get_task(conn, tid).status, kinds, comments
 
 
-@pytest.mark.parametrize("scenario", ["unchanged", "fold_merge", "fold_offset_shift", "fold_main_chmod"])
+@pytest.mark.parametrize("scenario", ["unchanged", "fold_merge", "fold_same_base"])
 def test_no_new_head_is_not_a_handback(sent_back, monkeypatch, scenario):
     status, kinds, comments = _complete_as_worker(sent_back, monkeypatch, scenario)
     assert status == "ready"
@@ -138,8 +145,9 @@ def test_bounced_run_keeps_the_workers_handoff(sent_back, monkeypatch):
 
 
 @pytest.mark.parametrize("scenario", [
-    "new_commit", "fold_conflict_resolution", "fold_adjacent_insert", "moved_region", "chmod_only",
-    "status_change", "modes_unknown", "over_cap", "patchless", "rewound"])
+    "new_commit", "relocated_edit", "fold_conflict_resolution", "fold_main_touched_pr_path",
+    "fold_main_renamed_pr_path", "main_unreadable", "main_over_cap", "chmod_only", "status_change",
+    "modes_unknown", "over_cap", "shaless", "rewound"])
 def test_content_the_reviewer_has_not_seen_routes_to_review(sent_back, monkeypatch, scenario):
     status, kinds, _ = _complete_as_worker(sent_back, monkeypatch, scenario)
     assert status == "review"

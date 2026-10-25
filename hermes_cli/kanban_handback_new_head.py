@@ -14,14 +14,17 @@ t_c9887522 fold-2): a merge commit can carry a hand conflict resolution, so comm
 * The head must DESCEND from ``seen`` (``compare/<seen>...<head>`` status ``ahead``/``identical``); a rewound or
   rewritten head is a change the reviewer has not seen.
 * The PR's content at ``seen`` (``compare/<base>...<seen>``) and at the head (``compare/<base>...<head>``) are
-  compared per path: ``status``, ``previous_filename``, the ordered patch lines with only the line NUMBERS of each
-  ``@@`` header dropped (hunk offsets move when main moves; the trailing function context stays), and the PR's
-  mode change for the path, merge base -> tip, from the git trees (``patch`` text carries no mode). Equal means a pure fold. The
-  equivalence is lossless or it routes (Apollo r2, t_f716021d).
+  compared per path: ``status``, ``previous_filename``, the BLOB sha (``files[].sha``) and the PR's mode change for
+  the path, merge base -> tip, from the git trees (a blob sha carries no mode). Equal blobs are byte-identical
+  content, which patch text cannot prove (Apollo r3, Prism cdd568482ca1: an edit moved between identical blocks in
+  one function compares equal as text).
+* Main must not have touched any PR path between the two merge bases (``compare/<mb_seen>...<mb_head>``). If it
+  did, a hand resolution cannot be excluded, so it routes. That is the accepted conservative cost: a clean
+  auto-merge of a main change to a PR file reaches the reviewer.
 
 :func:`verdict` answers ``"unchanged"`` (head == seen), ``"merge_only"`` (content unchanged) or None (route as
 today). None is also the answer for every case it cannot prove: no seen head, a ``n/a`` head, an unreadable PR, a
-file list at the REST cap, a file with no ``patch``, an unreadable mode. Inside pytest there is no default reader; tests pass a stub.
+file list at the REST cap, a file with no blob sha, an unreadable mode or main compare. Inside pytest there is no default reader; tests pass a stub.
 """
 from __future__ import annotations
 
@@ -41,12 +44,11 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 # GitHub returns at most 300 files for a compare and for pulls/N/files (3 pages of 100 here).
 _FILES_CAP = 300
 _DESCENDS = frozenset({"ahead", "identical"})
-# Line numbers of a hunk header; the trailing function context after the second ``@@`` is kept.
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 
 # (repo, number, seen) -> {"head": sha, "status": compare(seen...head).status,
-#                          "seen_files": [{"filename", "status", "patch", ...}], "head_files": [...],
-#                          "seen_modes": {path: [mode at merge base, mode at tip]}, "head_modes": {...}}
+#                          "seen_files": [{"filename", "status", "sha", ...}], "head_files": [...],
+#                          "seen_modes": {path: [mode at merge base, mode at tip]}, "head_modes": {...},
+#                          "main_status": compare(mb_seen...mb_head).status, "main_files": [...]}
 Reader = Callable[[str, int, str], Optional[dict]]
 
 
@@ -73,28 +75,38 @@ def seen_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
 def content(files, modes) -> Optional[dict]:
     """The PR's content per path, or None when it cannot be proved.
 
-    Per path: ``status``, ``previous_filename``, the mode change (merge base -> tip) and the ordered hunk lines
-    (context, ``+``, ``-``, and each ``@@`` header with its line numbers dropped). Context lines stay in: a
-    conflict resolution that keeps main's adjacent insert beside the PR's own lines leaves the ``+``/``-``
-    multiset equal and changes only the context (t_c9887522 fold-2, 44e346d675). The header's function context
-    stays so an edit moved to another region does not compare equal (Prism 8b66a52674df), and the modes are
-    compared because ``patch`` omits them (Prism e8f58301f565).
+    Per path: ``status``, ``previous_filename``, the mode change (merge base -> tip) and the blob sha at the tip.
+    A blob sha is the file's exact bytes, so equality cannot alias a moved or relocated edit the way patch text
+    does (Prism 8b66a52674df, cdd568482ca1). Modes are compared because a blob sha omits them (Prism e8f58301f565).
     """
     if not isinstance(files, list) or len(files) >= _FILES_CAP or not isinstance(modes, dict):
         return None
     out: dict = {}
     for f in files:
-        if not isinstance(f, dict) or not f.get("filename") or not isinstance(f.get("patch"), str):
+        if not isinstance(f, dict) or not f.get("filename"):
             return None
+        sha = str(f.get("sha") or "").lower()
         path = str(f["filename"])
         mode = modes.get(path)
-        if path in out or not isinstance(mode, (list, tuple)) or len(mode) != 2:
+        if not _SHA_RE.match(sha) or path in out or not isinstance(mode, (list, tuple)) or len(mode) != 2:
             return None
         # The PR's mode CHANGE, not the absolute modes: a chmod on main moves both ends and is not PR content.
         delta = tuple(mode) if mode[0] != mode[1] else ("same",)
-        out[path] = (str(f.get("status") or ""), str(f.get("previous_filename") or ""), delta,
-                     tuple(_HUNK_RE.sub("@@ @@", ln) for ln in f["patch"].splitlines()))
+        out[path] = (str(f.get("status") or ""), str(f.get("previous_filename") or ""), delta, sha)
     return out
+
+
+def main_touched(view: dict, paths: set) -> bool:
+    """True unless main provably touched none of ``paths`` between the two merge bases (unknown counts as touched)."""
+    files = view.get("main_files")
+    if view.get("main_status") not in _DESCENDS or not isinstance(files, list) or len(files) >= _FILES_CAP:
+        return True
+    for f in files:
+        if not isinstance(f, dict) or not f.get("filename"):
+            return True
+        if {str(f["filename"]), str(f.get("previous_filename") or "")} & paths:
+            return True
+    return False
 
 
 def classify(view: Optional[dict], seen: str) -> Optional[str]:
@@ -111,6 +123,9 @@ def classify(view: Optional[dict], seen: str) -> Optional[str]:
     at_seen = content(view.get("seen_files"), view.get("seen_modes"))
     at_head = content(view.get("head_files"), view.get("head_modes"))
     if at_seen is None or at_head is None or at_seen != at_head:
+        return None
+    paths = set(at_head) | {v[1] for v in at_head.values() if v[1]}
+    if main_touched(view, paths):
         return None
     return "merge_only"
 
@@ -156,7 +171,8 @@ def _modes(repo: str, files, merge_base: str, tip: str) -> Optional[dict]:
 
 
 def read_view(repo: str, number: int, seen: str) -> Optional[dict]:
-    """REST: PR head, whether it descends from ``seen``, and the PR's files and modes at ``seen`` and at the head."""
+    """REST: PR head, whether it descends from ``seen``, the PR's files and modes at ``seen`` and at the head, and
+    the files main changed between the two merge bases."""
     pr = _gh_json([f"repos/{repo}/pulls/{number}"])
     if not isinstance(pr, dict):
         return None
@@ -175,9 +191,17 @@ def read_view(repo: str, number: int, seen: str) -> Optional[dict]:
             "seen_files": at_seen.get("files"), "head_files": at_head.get("files")}
     if ahead.get("status") not in _DESCENDS:
         return view
+    bases = {}
     for side, cmp_, tip in (("seen", at_seen, seen), ("head", at_head, head)):
-        view[f"{side}_modes"] = _modes(repo, cmp_.get("files"),
-                                       str((cmp_.get("merge_base_commit") or {}).get("sha") or ""), tip)
+        bases[side] = str((cmp_.get("merge_base_commit") or {}).get("sha") or "")
+        view[f"{side}_modes"] = _modes(repo, cmp_.get("files"), bases[side], tip)
+    if bases["seen"] and bases["head"]:
+        if bases["seen"] == bases["head"]:
+            view["main_status"], view["main_files"] = "identical", []
+        else:
+            main = _gh_json([f"repos/{repo}/compare/{bases['seen']}...{bases['head']}"])
+            if isinstance(main, dict):
+                view["main_status"], view["main_files"] = main.get("status"), main.get("files")
     return view
 
 
