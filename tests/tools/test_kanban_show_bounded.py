@@ -84,6 +84,24 @@ def test_newest_review_in_full_within_first_20k(long_card):
     assert d["runs"][0]["outcome"] == "changes_requested"  # newest first
 
 
+def test_non_ascii_review_is_not_escape_inflated(long_card, monkeypatch):
+    """Prism ff401a3f1d26: default JSON escaping turned a 16K-char CJK review into ~96K chars."""
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    from tools.budget_config import DEFAULT_RESULT_SIZE_CHARS
+    review = "界" * 16_000
+    conn = kbc.connect()
+    try:
+        with conn:
+            conn.execute("UPDATE task_runs SET summary = ? WHERE task_id = ? AND outcome = 'changes_requested'",
+                         (review, long_card))
+    finally:
+        conn.close()
+    out = kt._handle_show({})
+    assert len(out) < DEFAULT_RESULT_SIZE_CHARS
+    assert json.loads(out)["latest_review"]["summary"] == review
+
+
 def test_card_read_stays_under_the_spill_threshold(long_card):
     from tools import kanban_tools as kt
     from tools.budget_config import DEFAULT_RESULT_SIZE_CHARS

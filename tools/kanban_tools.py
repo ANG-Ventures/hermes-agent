@@ -794,7 +794,7 @@ def _latest_review(kb, conn, tid: str, runs: list) -> Optional[dict[str, Any]]:
 def _bounded_show(out: dict[str, Any]) -> dict[str, Any]:
     """Shrink the history lists, oldest entries first, until the response fits the budget."""
     def size() -> int:
-        return len(json.dumps(out, default=str))
+        return len(json.dumps(out, ensure_ascii=False, default=str))
     omitted = out.setdefault("omitted", {})
     for key, floor in (("events", 5), ("runs", 2), ("comments", 5)):
         while size() > _SHOW_BUDGET_CHARS and len(out[key]) > floor:
@@ -853,7 +853,7 @@ def _handle_show(args: dict, **kw) -> str:
                                      ("runs", len(runs) - _SHOW_MAX_RUNS)) if n > 0}
         if omitted:
             out["omitted"] = omitted
-        return json.dumps(_bounded_show(out), default=str)
+        return json.dumps(_bounded_show(out), ensure_ascii=False, default=str)
 
 
 @_kanban_handler("kanban_list")
