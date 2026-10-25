@@ -288,6 +288,7 @@ class TestShouldExclude:
             "state.db.broken-20260919-171433",
             "state.db.broken-20260919-171433-wal",
             "recovery/agora-session-continuity-20261013/aegis-repair/preapply-state.db",
+            "var/detached/land-5480-x/log",
         ):
             assert _should_exclude(Path(p)), p
         for d in ("state/backup/offsite2", "profiles/aegis/incidents", "var/lcm-prune-20260924", "blackbox/pre-x"):

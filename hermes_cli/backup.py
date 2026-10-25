@@ -211,6 +211,7 @@ _EXCLUDED_ROOT_PATH_GLOBS = (
     ("var", "ledger-snap"),                 # restic lane's integrity-checked COPY of var/ledger/ledger.db (4 GiB)
     ("blackbox", "pre-*"),                  # blackbox pre-repair/pre-backfill rollback copies (4.4 GiB)
     ("profiles", "*", "blackbox"),          # per-profile turn telemetry (daedalus 5.5 GiB); restic excludes it too
+    ("var", "detached"),                    # detached-run.py run dirs + logs, self-pruned at 7 days (54 k files)
 )
 
 # ROOT-anchored FILE globs: one fnmatch pattern per path component and the same length as the path, so
