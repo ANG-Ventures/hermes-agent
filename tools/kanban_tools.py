@@ -1047,10 +1047,12 @@ def _handle_complete(args: dict, **kw) -> str:
                 note=("auto-routed to review: the handoff names a PR that is still OPEN; "
                       "the card is NOT done and dependants stay gated"))
         from hermes_cli import kanban_handback_new_head as _nh
-        bounced = _nh.bounced_note(conn, tid, run.id if run else None)
+        # By THIS run's id: a successor can be claimed right after a bounce (Prism bec5d5358114).
+        bounced_run = _worker_run_id(tid)
+        bounced = _nh.bounced_note(conn, tid, bounced_run)
         if bounced is not None:
             # t_f716021d: nothing on the PR the reviewer has not seen; NOT a handback.
-            return _ok(task_id=tid, run_id=run.id, status=getattr(task, "status", None), note=bounced)
+            return _ok(task_id=tid, run_id=bounced_run, status=getattr(task, "status", None), note=bounced)
         # Artifact staging is atomic with the completion write, so a worker that
         # read `kanban_attachments` before completing saw an empty list and has
         # no way to observe what its completion just registered (#117360).

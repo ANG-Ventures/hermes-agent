@@ -10849,6 +10849,14 @@ def complete_task(
                          task_id, ", ".join(mentioned))
             with write_txn(conn):
                 _append_event(conn, task_id, "completion_unowned_pr_mentions", {"prs": mentioned})
+        # No-op handback (t_f716021d), decided BEFORE the freshness gate so a completion
+        # that will bounce never arms fleet-merge on the head the reviewer sent back
+        # (Prism 6dc02dcaa12e, r2).
+        no_new = None
+        if (still_open and expected_run_id is not None and candidate.status == 'running'
+                and not review_claimed and not negative_trigger):
+            from hermes_cli import kanban_handback_new_head as _nh
+            no_new = _nh.verdict(conn, task_id, still_open)
         if still_open:
             # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
             # DraftPrError, nothing mutated), update a stale head, arm a green
@@ -10859,7 +10867,7 @@ def complete_task(
                 # merely mentions (FleetReview #1234 finding).
                 freshness = _fresh.check(
                     still_open, task_id=task_id,
-                    allow_arm=not is_milestone_card(conn, task_id),
+                    allow_arm=no_new is None and not is_milestone_card(conn, task_id),
                     armable={
                         f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
                             metadata=metadata, survivor_pr=survivor_pr,
@@ -10886,26 +10894,23 @@ def complete_task(
                 still_open = [
                     r for r in still_open if f"{r.repo}#{r.number}" not in overridden
                 ]
-        if (still_open and expected_run_id is not None and candidate.status == 'running'
-                and not review_claimed and not negative_trigger):
+        if still_open and no_new is not None:
             # No-op handback (t_f716021d): nothing on the PR the reviewer has not
             # seen, so the send-back stands and the card goes back to its worker.
             from hermes_cli import kanban_handback_new_head as _nh
-            no_new = _nh.verdict(conn, task_id, still_open)
-            if no_new is not None:
-                # The run's own handoff and artifacts survive the bounce (Prism 9c7fd6708b92).
-                from hermes_cli import kanban_negative_handoff as _neg
-                bounce_meta, staged = _stage_routed_scratch_artifacts(
-                    conn, task_id, dict(metadata or {}, no_new_head=no_new),
-                    summary=summary, result=result,
-                )
-                ok = _nh.bounce(
-                    conn, task_id, no_new, expected_run_id=expected_run_id,
-                    summary=_neg.routed_summary(_nh.comment(no_new["seen"]), summary, result),
-                    metadata=bounce_meta,
-                )
-                _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
-                return ok
+            # The run's own handoff and artifacts survive the bounce (Prism 9c7fd6708b92).
+            from hermes_cli import kanban_negative_handoff as _neg
+            bounce_meta, staged = _stage_routed_scratch_artifacts(
+                conn, task_id, dict(metadata or {}, no_new_head=no_new),
+                summary=summary, result=result,
+            )
+            ok = _nh.bounce(
+                conn, task_id, no_new, expected_run_id=expected_run_id,
+                summary=_neg.routed_summary(_nh.comment(no_new["seen"]), summary, result),
+                metadata=bounce_meta,
+            )
+            _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
+            return ok
         if still_open:
             note = _open_pr.route_note(still_open)
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[

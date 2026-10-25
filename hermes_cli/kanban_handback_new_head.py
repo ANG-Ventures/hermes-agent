@@ -13,13 +13,15 @@ t_c9887522 fold-2): a merge commit can carry a hand conflict resolution, so comm
 
 * The head must DESCEND from ``seen`` (``compare/<seen>...<head>`` status ``ahead``/``identical``); a rewound or
   rewritten head is a change the reviewer has not seen.
-* The PR's content at ``seen`` (``compare/<base>...<seen>`` files) and at the head (``pulls/N/files``) are compared
-  per path as the ordered patch lines with ``@@`` hunk headers dropped, because hunk offsets move when main moves.
-  Context lines are kept (see :func:`content`). Equal means a pure fold.
+* The PR's content at ``seen`` (``compare/<base>...<seen>``) and at the head (``compare/<base>...<head>``) are
+  compared per path: ``status``, ``previous_filename``, the ordered patch lines with only the line NUMBERS of each
+  ``@@`` header dropped (hunk offsets move when main moves; the trailing function context stays), and the PR's
+  mode change for the path, merge base -> tip, from the git trees (``patch`` text carries no mode). Equal means a pure fold. The
+  equivalence is lossless or it routes (Apollo r2, t_f716021d).
 
 :func:`verdict` answers ``"unchanged"`` (head == seen), ``"merge_only"`` (content unchanged) or None (route as
 today). None is also the answer for every case it cannot prove: no seen head, a ``n/a`` head, an unreadable PR, a
-file list at the REST cap, a file with no ``patch``. Inside pytest there is no default reader; tests pass a stub.
+file list at the REST cap, a file with no ``patch``, an unreadable mode. Inside pytest there is no default reader; tests pass a stub.
 """
 from __future__ import annotations
 
@@ -39,9 +41,12 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 # GitHub returns at most 300 files for a compare and for pulls/N/files (3 pages of 100 here).
 _FILES_CAP = 300
 _DESCENDS = frozenset({"ahead", "identical"})
+# Line numbers of a hunk header; the trailing function context after the second ``@@`` is kept.
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 
 # (repo, number, seen) -> {"head": sha, "status": compare(seen...head).status,
-#                          "seen_files": [{"filename", "patch"}], "head_files": [...]}
+#                          "seen_files": [{"filename", "status", "patch", ...}], "head_files": [...],
+#                          "seen_modes": {path: [mode at merge base, mode at tip]}, "head_modes": {...}}
 Reader = Callable[[str, int, str], Optional[dict]]
 
 
@@ -65,21 +70,30 @@ def seen_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     return head if _SHA_RE.match(head) else None
 
 
-def content(files) -> Optional[dict]:
-    """Per path, the ordered hunk lines (context, ``+`` and ``-``) with ``@@`` headers dropped; None when unprovable.
+def content(files, modes) -> Optional[dict]:
+    """The PR's content per path, or None when it cannot be proved.
 
-    Context lines stay in: a conflict resolution that keeps main's adjacent insert beside the PR's own lines leaves
-    the ``+``/``-`` multiset equal and changes only the context (t_c9887522 fold-2, 44e346d675). A main change far
-    from the PR's hunks only moves the ``@@`` offsets, which are dropped.
+    Per path: ``status``, ``previous_filename``, the mode change (merge base -> tip) and the ordered hunk lines
+    (context, ``+``, ``-``, and each ``@@`` header with its line numbers dropped). Context lines stay in: a
+    conflict resolution that keeps main's adjacent insert beside the PR's own lines leaves the ``+``/``-``
+    multiset equal and changes only the context (t_c9887522 fold-2, 44e346d675). The header's function context
+    stays so an edit moved to another region does not compare equal (Prism 8b66a52674df), and the modes are
+    compared because ``patch`` omits them (Prism e8f58301f565).
     """
-    if not isinstance(files, list) or len(files) >= _FILES_CAP:
+    if not isinstance(files, list) or len(files) >= _FILES_CAP or not isinstance(modes, dict):
         return None
     out: dict = {}
     for f in files:
         if not isinstance(f, dict) or not f.get("filename") or not isinstance(f.get("patch"), str):
             return None
-        out.setdefault(str(f["filename"]), []).extend(
-            ln for ln in f["patch"].splitlines() if not ln.startswith("@@"))
+        path = str(f["filename"])
+        mode = modes.get(path)
+        if path in out or not isinstance(mode, (list, tuple)) or len(mode) != 2:
+            return None
+        # The PR's mode CHANGE, not the absolute modes: a chmod on main moves both ends and is not PR content.
+        delta = tuple(mode) if mode[0] != mode[1] else ("same",)
+        out[path] = (str(f.get("status") or ""), str(f.get("previous_filename") or ""), delta,
+                     tuple(_HUNK_RE.sub("@@ @@", ln) for ln in f["patch"].splitlines()))
     return out
 
 
@@ -94,7 +108,8 @@ def classify(view: Optional[dict], seen: str) -> Optional[str]:
         return "unchanged"
     if view.get("status") not in _DESCENDS:
         return None
-    at_seen, at_head = content(view.get("seen_files")), content(view.get("head_files"))
+    at_seen = content(view.get("seen_files"), view.get("seen_modes"))
+    at_head = content(view.get("head_files"), view.get("head_modes"))
     if at_seen is None or at_head is None or at_seen != at_head:
         return None
     return "merge_only"
@@ -116,8 +131,32 @@ def _gh_json(args: list):
         return None
 
 
+def _tree_modes(repo: str, commit: str) -> Optional[dict]:
+    """``{path: mode}`` for every blob at ``commit`` (one recursive tree read), or None if unreadable/truncated."""
+    tree = _gh_json([f"repos/{repo}/git/trees/{commit}?recursive=1"])
+    if not isinstance(tree, dict) or not isinstance(tree.get("tree"), list) or tree.get("truncated"):
+        return None
+    return {e.get("path"): e.get("mode") for e in tree["tree"] if isinstance(e, dict)}
+
+
+def _modes(repo: str, files, merge_base: str, tip: str) -> Optional[dict]:
+    """``{path: [mode at merge_base, mode at tip]}`` (None = absent there), or None when unreadable."""
+    if not isinstance(files, list) or not merge_base or not tip:
+        return None
+    at_base, at_tip = _tree_modes(repo, merge_base), _tree_modes(repo, tip)
+    if at_base is None or at_tip is None:
+        return None
+    out = {}
+    for f in files:
+        if not isinstance(f, dict) or not f.get("filename"):
+            return None
+        path = str(f["filename"])
+        out[path] = [at_base.get(str(f.get("previous_filename") or path)), at_tip.get(path)]
+    return out
+
+
 def read_view(repo: str, number: int, seen: str) -> Optional[dict]:
-    """REST: PR head, whether it descends from ``seen``, and the PR's files at ``seen`` and at the head."""
+    """REST: PR head, whether it descends from ``seen``, and the PR's files and modes at ``seen`` and at the head."""
     pr = _gh_json([f"repos/{repo}/pulls/{number}"])
     if not isinstance(pr, dict):
         return None
@@ -129,19 +168,17 @@ def read_view(repo: str, number: int, seen: str) -> Optional[dict]:
         return {"head": head}
     ahead = _gh_json([f"repos/{repo}/compare/{seen}...{head}"])
     at_seen = _gh_json([f"repos/{repo}/compare/{base}...{seen}"])
-    head_files: Optional[list] = []
-    for page in range(1, _FILES_CAP // 100 + 1):
-        chunk = _gh_json([f"repos/{repo}/pulls/{number}/files?per_page=100&page={page}"])
-        if not isinstance(chunk, list):
-            head_files = None
-            break
-        head_files.extend(chunk)
-        if len(chunk) < 100:
-            break
-    if not isinstance(ahead, dict) or not isinstance(at_seen, dict) or head_files is None:
+    at_head = _gh_json([f"repos/{repo}/compare/{base}...{head}"])
+    if not all(isinstance(x, dict) for x in (ahead, at_seen, at_head)):
         return None
-    return {"head": head, "status": ahead.get("status"),
-            "seen_files": at_seen.get("files"), "head_files": head_files}
+    view = {"head": head, "status": ahead.get("status"),
+            "seen_files": at_seen.get("files"), "head_files": at_head.get("files")}
+    if ahead.get("status") not in _DESCENDS:
+        return view
+    for side, cmp_, tip in (("seen", at_seen, seen), ("head", at_head, head)):
+        view[f"{side}_modes"] = _modes(repo, cmp_.get("files"),
+                                       str((cmp_.get("merge_base_commit") or {}).get("sha") or ""), tip)
+    return view
 
 
 def _default_reader() -> Optional[Reader]:
@@ -239,13 +276,20 @@ def bounce(conn: sqlite3.Connection, task_id: str, no_new: dict, *,
 
 
 def bounced_note(conn: sqlite3.Connection, task_id: str, expected_run_id: Optional[int]) -> Optional[str]:
-    """The NOT-handed-back note when ``expected_run_id`` (or the newest run) just ended in a bounce, else None."""
+    """The NOT-handed-back note when ``expected_run_id`` (or, with none, the newest run) ended in a bounce, else None.
+
+    Read by the supplied run id: a bounce returns the card to ready, so a successor run can be claimed before the
+    caller gets here, and the newest run would hide the bounce (Prism bec5d5358114).
+    """
     from hermes_cli import kanban_db as kb
 
-    run = kb.latest_run(conn, task_id)
+    if expected_run_id is not None:
+        run = kb.get_run(conn, int(expected_run_id))
+        if run is not None and run.task_id != task_id:
+            return None
+    else:
+        run = kb.latest_run(conn, task_id)
     if run is None or run.outcome != OUTCOME:
-        return None
-    if expected_run_id is not None and int(run.id) != int(expected_run_id):
         return None
     first = (run.summary or "").splitlines()[0] if run.summary else "no new head"
     return f"NOT handed back: {first}. Push the requested changes, then complete again."
