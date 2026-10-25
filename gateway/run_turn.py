@@ -4959,10 +4959,11 @@ class GatewayTurnMixin:
                 pending_event, pending = None, None
             else:
                 if isinstance(result, dict) and result.get("pending_steer"):
-                    # Provenance of the leftover steer: internal only when every text steered into
-                    # this turn came from an internal event (t_506536db).
-                    _steered = turn_ctx.steered_internal
-                    result["_pending_steer_internal"] = bool(_steered) and all(_steered)
+                    # Provenance of the leftover steer: internal only when the leftover text is made
+                    # up entirely of internal steers recorded on the agent that drained it (t_506536db).
+                    from gateway.run_busy import leftover_steer_is_internal
+                    result["_pending_steer_internal"] = leftover_steer_is_internal(
+                        turn_ctx.agent_holder[0] if turn_ctx.agent_holder else None, result["pending_steer"])
                 pending_event, pending = await self._run_agent_drain_pending(
                     result, adapter, source, session_key, turn_ctx.session_id,
                 )

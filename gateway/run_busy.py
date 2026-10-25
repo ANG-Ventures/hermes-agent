@@ -47,6 +47,47 @@ def approval_input_words(input_key: str) -> Tuple[str, ...]:
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Agent attribute holding the stripped texts of accepted INTERNAL steers not yet classified. It lives
+# on the agent because the steer buffer does: a recursive follow-up reuses the cached agent while the
+# session slot may still hold the previous turn's context (Prism e08366573530, t_506536db).
+_INTERNAL_STEERS_ATTR = "_gateway_internal_steers"
+_INTERNAL_STEERS_MAX = 64
+
+
+def record_internal_steer(agent: Any, text: str) -> None:
+    """Remember that *text* (as queued by ``agent.steer``, i.e. stripped) came from an internal event."""
+    cleaned = (text or "").strip()
+    if not cleaned or agent is None:
+        return
+    try:
+        ledger = agent.__dict__.setdefault(_INTERNAL_STEERS_ATTR, [])
+    except AttributeError:
+        return
+    ledger.append(cleaned)
+    del ledger[:-_INTERNAL_STEERS_MAX]
+
+
+def leftover_steer_is_internal(agent: Any, leftover: Optional[str]) -> bool:
+    """True only when *leftover* consists entirely of internal steers recorded on *agent*.
+
+    Each matched record is consumed. Any text not accounted for (a human steer, a steer recorded on
+    another agent, an unknown origin) makes the leftover human: the failure direction is a visible
+    turn, never a silenced one."""
+    remainder = (leftover or "").strip()
+    ledger = getattr(agent, "__dict__", {}).get(_INTERNAL_STEERS_ATTR) if agent is not None else None
+    if not remainder or not ledger:
+        return False
+    matched = []
+    for idx, text in enumerate(ledger):
+        if text in remainder:
+            remainder = remainder.replace(text, "", 1)
+            matched.append(idx)
+    if remainder.strip():
+        return False
+    for idx in reversed(matched):
+        del ledger[idx]
+    return True
+
 
 def _strip_slot(text: str, slot: str) -> Optional[str]:
     """Remainder after ``slot`` when ``text`` starts with it as a WHOLE slot, else None.
@@ -308,10 +349,17 @@ class GatewayBusySessionMixin:
                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
         return accepted
 
-    def _steer_running_agent(self, running_agent: Any, text: str) -> bool:
+    def _steer_running_agent(self, running_agent: Any, text: str, *, internal: bool = False) -> bool:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
-        :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
+        :meth:`_steer_active_subagents`); True when the parent or any child queued it.
+
+        An accepted *internal* steer is recorded ON THE AGENT, next to the buffer the text went into,
+        so provenance follows the text to whichever turn drains it (see
+        :func:`leftover_steer_is_internal`), never to the context the slot held at steer time
+        (Prism e08366573530, t_506536db)."""
         accepted = bool(running_agent.steer(text))
+        if accepted and internal:
+            record_internal_steer(running_agent, text)
         return bool(self._steer_active_subagents(running_agent, text)) or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
@@ -657,8 +705,12 @@ class GatewayBusySessionMixin:
         try:
             call_text = self._steer_text_with_origin(text, event) if event else text
             if verb == "steer":
-                return self._steer_running_agent(running_agent, call_text)
-            return bool(getattr(running_agent, verb)(call_text))
+                return self._steer_running_agent(running_agent, call_text,
+                                                 internal=bool(getattr(event, "internal", False)))
+            accepted = bool(getattr(running_agent, verb)(call_text))
+            if accepted and getattr(event, "internal", False):
+                record_internal_steer(running_agent, call_text)  # a redirect may land in the steer buffer
+            return accepted
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
@@ -693,8 +745,6 @@ class GatewayBusySessionMixin:
         turn = self._session_state(session_key).turn
         if turn.agent is not running_agent:
             return None
-        if turn.ctx is not None:
-            turn.ctx.steered_internal.append(bool(getattr(event, "internal", False)))
         if turn.event is not None and turn.event is not event:
             turn.event.absorb_reply_expected(event)
             if turn.ctx is not None:
