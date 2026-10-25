@@ -315,3 +315,15 @@ def test_the_bounce_redacts_the_handoff_like_request_review(sent_back, monkeypat
     assert token not in ended.summary and token not in json.dumps(ended.metadata)
     assert "hunter2" not in json.dumps(ended.metadata)
     assert token not in context and "hunter2" not in context
+
+
+def test_a_worker_posted_coverage_does_not_redefine_the_seen_head(sent_back, monkeypatch):
+    """Prism e76f9616eb30: the worker pushes C and posts a coverage-shaped comment naming C from its own run."""
+    monkeypatch.setattr(nh, "_default_reader", lambda: lambda repo, n, seen: (
+        {"head": C} if seen == C else VIEWS["new_commit"]))
+    with kb.connect() as conn:
+        run = kb.claim_task(conn, sent_back).current_run_id
+        kb.add_comment(conn, sent_back, "builder", _coverage(C), run_id=run)
+        assert nh.seen_head(conn, sent_back, nh._pending_send_back(conn, sent_back)) == A
+        assert kb.complete_task(conn, sent_back, summary=f"r2 {PR}", expected_run_id=run)
+        assert kb.get_task(conn, sent_back).status == "review"

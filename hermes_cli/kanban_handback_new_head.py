@@ -60,14 +60,25 @@ def comment(seen: str) -> str:
     return f"no new head since {seen[:10]}; the send-back stands"
 
 
-def seen_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """``head_sha`` of the card's newest parseable ``review_coverage`` record, lowercased, or None."""
+def seen_head(conn: sqlite3.Connection, task_id: str, send_back: Optional[int] = None) -> Optional[str]:
+    """``head_sha`` of the newest parseable ``review_coverage`` record the reviewer posted, lowercased, or None.
+
+    With ``send_back`` (the pending ``changes_requested`` event id) only a record posted no later than that
+    send-back, and not from an implementer run, counts: a coverage-shaped comment the worker posts during rework
+    must not redefine what the reviewer has seen (Prism e76f9616eb30).
+    """
     from hermes_cli import kanban_db as kb
 
     rows = conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND body LIKE '%review_coverage:%' "
+        "SELECT body, run_id, created_at FROM task_comments WHERE task_id = ? AND body LIKE '%review_coverage:%' "
         "ORDER BY id DESC LIMIT 20", (task_id,),
     ).fetchall()
+    if send_back is not None:
+        at = conn.execute("SELECT created_at FROM task_events WHERE id = ?", (send_back,)).fetchone()
+        if at is None:
+            return None
+        rows = [r for r in rows if int(r[2] or 0) <= int(at[0])
+                and (r[1] is None or kb._retry_status_for_run(conn, task_id, int(r[1])) == "review")]  # noqa: SLF001
     record, _err = kb._latest_review_coverage([{"body": r[0] or ""} for r in rows])  # noqa: SLF001 -- the one parser
     if not isinstance(record, dict):
         return None
@@ -265,7 +276,7 @@ def verdict(conn: sqlite3.Connection, task_id: str, refs: Iterable, *,
     send_back = _pending_send_back(conn, task_id)
     if send_back is None or bounces_since(conn, task_id, send_back) >= MAX_BOUNCES:
         return None
-    seen = seen_head(conn, task_id)
+    seen = seen_head(conn, task_id, send_back)
     if seen is None:
         return None
     if reader is None:
