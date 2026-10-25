@@ -318,6 +318,23 @@ def hold_ended(token: Optional[int]) -> None:
             _write_record(hold, state="released", held_s=round(held, 1), released_at=time.time())
 
 
+def note_lock_hold(db_path, op: str, held_s: float) -> None:
+    """Record a finished in-process lock hold (``SessionDB._lock``, op ``_lock:<fn>``) as a
+    "released" row, as hold_ended() does for a write transaction. Never raises (t_aeae3fe7)."""
+    global _hold_seq
+    try:
+        with _holds_lock:
+            _hold_seq += 1
+            seq = _hold_seq
+        now = time.time()
+        hold = {"db_path": db_path, "op": op, "t0": time.monotonic() - held_s, "since": now - held_s,
+                "marked": True, "ended": True, "pid": os.getpid(), "who": None, "ledger": None, "seq": seq}
+        with _publish_lock:
+            _write_record(hold, state="released", held_s=round(held_s, 1), released_at=now)
+    except Exception:
+        logger.debug("state.db lock-holder ledger: lock-hold note failed", exc_info=True)
+
+
 def _pid_alive(pid: int) -> bool:
     # Never os.kill(pid, 0): on Windows signal 0 is CTRL_C_EVENT (Prism 765905ac86f6).
     from hermes_cli._subprocess_compat import pid_exists_stdlib

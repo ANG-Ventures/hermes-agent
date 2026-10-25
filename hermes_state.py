@@ -78,6 +78,7 @@ from hermes_state_profile_repair import SessionProfileRepairMixin
 from hermes_state_schema import SessionSchemaMixin, _FTS_TRIGRAM_TRIGGERS
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
+import hermes_state_lockowners as _lockowners
 from hermes_state_lockowners import describe_write_lock_holders, hold_ended, hold_started, log_write_lock_holders
 from hermes_state_dbfile import (
     _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
@@ -524,6 +525,24 @@ _NETWORK_DRIVE_ACTION = (
 _WRITE_PLUMBING_FRAMES = frozenset({
     "_execute_write", "_execute_transcript_write", "_write_sql", "_write_rowcount", "_attempt", "_do", "wrapped",
 })
+
+
+# SessionDB._lock hold gauge (t_aeae3fe7): a hold longer than this is logged and written to the
+# lock-holder ledger. The holder ledger proper only sees BEGIN IMMEDIATE..commit, so time spent
+# under the Python lock outside the transaction (the 2026-10-24 checkpoint-time fd scan) was blind.
+_LOCK_HOLD_WARN_S = 1.0
+
+
+def _note_lock_hold(db_path, fn_name: str, t0: float) -> None:
+    """Log + ledger a ``SessionDB._lock`` hold over _LOCK_HOLD_WARN_S. Never raises."""
+    held = time.monotonic() - t0
+    if held <= _LOCK_HOLD_WARN_S:
+        return
+    try:
+        logger.warning("SessionDB._lock held %.1fs in %s", held, fn_name)
+        _lockowners.note_lock_hold(db_path, f"_lock:{fn_name}", held)
+    except Exception:
+        pass
 
 
 def _write_caller_name() -> str:
@@ -1274,8 +1293,11 @@ class SessionDB(
             # later writes (#105567). Inside the lock the probe only ever sees the
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
+            lock_t0 = None
+            caller = None
             try:
                 with self._lock:
+                    lock_t0 = time.monotonic()
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
@@ -1284,7 +1306,8 @@ class SessionDB(
                     try:
                         # Inside the rollback try: nothing between BEGIN and fn may leave the
                         # transaction open (hold_started never raises; this is the backstop).
-                        hold = hold_started(self.db_path, _write_caller_name())  # holder-side lock ledger
+                        caller = _write_caller_name()
+                        hold = hold_started(self.db_path, caller)  # holder-side lock ledger
                         fn_started = True
                         result = fn(self._conn)
                         self._conn.commit()
@@ -1296,6 +1319,7 @@ class SessionDB(
                         raise
                     finally:
                         hold_ended(hold)
+                        _note_lock_hold(self.db_path, caller or "write", lock_t0)
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -1767,13 +1791,19 @@ class SessionDB(
             return
         try:
             with self._lock:
-                if self._conn is None:
-                    return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
-                if self._wal_lock_guard:
-                    _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
-                result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
-                if result and result[1] > 0:
-                    logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
+                lock_t0 = time.monotonic()
+                try:
+                    if self._conn is None:
+                        return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
+                    if self._wal_lock_guard:
+                        # A -shm minted after open: one os.stat when already guarded, never an fd-table
+                        # scan under this lock (t_aeae3fe7: 16-28 s holds under GIL load).
+                        _lockguard.refresh_shm(self.db_path, self._wal_lock_guard)
+                    result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                    if result and result[1] > 0:
+                        logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
+                finally:
+                    _note_lock_hold(self.db_path, "_try_wal_checkpoint", lock_t0)
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
@@ -1847,13 +1877,14 @@ class SessionDB(
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:
                         logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
-                _lockguard.release(self._wal_lock_guard)  # before the close: see release()
+                released = _lockguard.release(self._wal_lock_guard)  # before the close: see release()
                 if retire_without_close:
                     self._pin_connection(self._conn)
                     self._conn = None
                 else:
                     conn, self._conn = self._conn, None
                     self._close_connection_quietly(conn)
+                    _lockguard.retire(released)  # after SQLite's close, never before: see hermes_state_lockguard
                     # Only a clean close ends the generation; retain the recorded
                     # identity when retiring an unsafe handle.
                     self._db_sidecar_identity = {}

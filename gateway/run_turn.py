@@ -2598,6 +2598,10 @@ class GatewayTurnMixin:
                 )
                 return None
 
+            # Delivery-lag gauge (t_aeae3fe7): stamped as the shaper logs "response ready" (its pre-log
+            # work is sentinel/silence handling, no I/O); the Sending-response line in
+            # send_final_ledgered reports delivery_lag_s from it. Ordering untouched (I4).
+            event._response_ready_at = time.monotonic()
             response, _intentional_silence, agent_messages = await self._hmwa_shape_agent_response(
                 agent_result, source, history, session_entry, session_key,
                 _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,

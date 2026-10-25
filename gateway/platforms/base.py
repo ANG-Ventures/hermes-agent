@@ -5338,8 +5338,13 @@ class BasePlatformAdapter(ABC):
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
         delivery_adapter = self._final_delivery_adapter(event.source)
-        logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
-                    len(text_content), event.source.chat_id)
+        ready_at = getattr(event, "_response_ready_at", None)
+        if isinstance(ready_at, (int, float)):  # stamped at "response ready" (gateway/run_turn.py)
+            logger.info("[%s] Sending response (%d chars) to %s delivery_lag_s=%.1f", delivery_adapter.name,
+                        len(text_content), event.source.chat_id, time.monotonic() - ready_at)
+        else:
+            logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
+                        len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
         if obligation_id is not None:
