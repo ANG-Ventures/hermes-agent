@@ -228,6 +228,43 @@ async def test_gauge_keeps_precision_for_the_threshold(tmp_path, caplog, monkeyp
     assert mod.main(["--log", str(log), "--since", "0", "--window", "4000000000", "--max-p99-s", "5.05"]) == 0
 
 
+@pytest.mark.asyncio
+async def test_gauge_logs_the_full_float_not_three_decimals(tmp_path, caplog, monkeypatch):
+    """Prism 17b1ec3cef71: ``%.3f`` turned 5.0104 s into 5.010, which PASSed a 5.01 s limit. The log
+    carries the full float; only the script's summary rounds, for display."""
+    import gateway.platforms.base as base
+    monkeypatch.setattr(base, "stop_reply_clock", lambda *a, **k: None)
+    monkeypatch.setattr(base, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: 105.0104}))
+    event = _event(_response_ready_at=100.0)
+    with caplog.at_level(logging.INFO, logger=base.logger.name):
+        await _adapter().send_final_ledgered(event, "sk", "hello", {}, reply_to=None)
+    line = next(r.getMessage() for r in caplog.records if "Sending response" in r.getMessage())
+    mod = _script()
+    assert float(mod._LAG.search(line).group(1)) == 105.0104 - 100.0, line
+    log = tmp_path / "gateway.log"
+    log.write_text(f"2026-10-24 14:00:05,010 INFO gateway.platforms.base: {line}\n", encoding="utf-8")
+    assert mod.main(["--log", str(log), "--since", "0", "--window", "4000000000", "--max-p99-s", "5.01"]) == 1
+    assert mod.main(["--log", str(log), "--since", "0", "--window", "4000000000", "--max-p99-s", "5.011"]) == 0
+
+
+def test_turn_id_pairs_only_within_the_same_chat(tmp_path, capsys):
+    """Prism 5d7636b702b4: a send in chat 2 carrying turn t1 paired with chat 1's ready for t1 and
+    reported a fabricated 1 s sample. Turn pairing now requires the same (platform, chat)."""
+    _LAST[:] = [capsys]
+    mod = _script()
+    rc, out = _run(mod, tmp_path,
+        "2026-10-24 14:00:00,000 INFO x: response ready: platform=discord chat=1 turn=t1 time=1.0s\n"
+        "2026-10-24 14:00:01,000 INFO x: [discord] Sending response (10 chars) to 2 turn=t1\n",
+        "--max-p99-s", "5")
+    assert rc == 2 and out["verdict"] == "BLIND" and out["n"] == 0, out
+    assert out["unpaired"] == 2, out  # chat 2's orphan send + chat 1's unmatched ready
+    rc, out = _run(mod, tmp_path,
+        "2026-10-24 14:00:00,000 INFO x: response ready: platform=discord chat=1 turn=t1 time=1.0s\n"
+        "2026-10-24 14:00:01,000 INFO x: [discord] Sending response (10 chars) to 2 turn=t1\n"
+        "2026-10-24 14:00:30,000 INFO x: [discord] Sending response (10 chars) to 1 turn=t1\n")
+    assert rc == 0 and (out["n"], out["max_s"], out["unpaired"]) == (1, 30.0, 1), out
+
+
 def test_dst_fall_back_hours_stay_separate(tmp_path, monkeypatch, capsys):
     """Prism fdd03dbb8e37: 08:30Z and 09:30Z on 2026-11-01 are both 01:30 in Los Angeles; a local-time
     hour key merged them into one summary."""

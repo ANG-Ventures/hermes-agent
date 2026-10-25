@@ -5340,8 +5340,9 @@ class BasePlatformAdapter(ABC):
         delivery_adapter = self._final_delivery_adapter(event.source)
         ready_at = getattr(event, "_response_ready_at", None)
         if isinstance(ready_at, (int, float)):  # stamped at "response ready" (gateway/run_turn.py)
-            logger.info("[%s] Sending response (%d chars) to %s delivery_lag_s=%.3f", delivery_adapter.name,
-                        len(text_content), event.source.chat_id, time.monotonic() - ready_at)
+            # %r: the full float, so a threshold read of the log never sees a rounded-down lag (Prism 17b1ec3cef71)
+            logger.info("[%s] Sending response (%d chars) to %s delivery_lag_s=%r", delivery_adapter.name,
+                        len(text_content), event.source.chat_id, float(time.monotonic() - ready_at))
         else:
             logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                         len(text_content), event.source.chat_id)

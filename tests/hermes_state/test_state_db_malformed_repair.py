@@ -507,14 +507,20 @@ print(json.dumps(repair_state_db_schema({db!r})), flush=True)
 
 
 def _release_header_probe_fds() -> None:
-    """Close this process's cached header-probe fds (no SQLite connection is live, so no lock is at risk)."""
+    """Close this process's cached header-probe fds and the WAL lock guard's parked private state.db
+    fds (no SQLite connection is live, so no lock is at risk). Both are process-lifetime O_RDONLY
+    descriptors on state.db that the foreign-holder scan of a child repairer counts (t_aeae3fe7)."""
     import os
 
     import hermes_state_dbfile
+    import hermes_state_lockguard as lockguard
     with hermes_state_dbfile._HEADER_PROBE_LOCK:
         for fd, _dev, _ino in hermes_state_dbfile._HEADER_PROBE_FDS.values():
             os.close(fd)
         hermes_state_dbfile._HEADER_PROBE_FDS.clear()
+    with lockguard._LOCK:
+        for ident in [i for i in lockguard._FDS if not lockguard._in_use(i)]:
+            lockguard._close_private(ident)
 
 
 @pytest.mark.platforms("posix")  # POSIX flock test

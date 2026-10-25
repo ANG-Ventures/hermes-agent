@@ -37,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 _TS = re.compile(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})(?:[,.](\d+))?(Z|[+-]\d{2}:?\d{2})?")  # every fractional digit (Prism 5175c734a604)
 _READY = re.compile(r"response ready: platform=(\S+) chat=(\S+)")
 _SEND = re.compile(r"\[([^\]]+)\] Sending response \(\d+ chars\) to (\S+)")
-_LAG = re.compile(r"\bdelivery_lag_s=([0-9.]+)")
+_LAG = re.compile(r"\bdelivery_lag_s=([0-9.]+(?:[eE][-+]?\d+)?)")  # full repr float (Prism 17b1ec3cef71)
 _TURN = re.compile(r"\bturn=(\S+)")
 
 
@@ -89,9 +89,12 @@ def samples(lines, platform: str, unpaired=None):
         key = (m.group(1).lower(), m.group(2))
         ready = None
         if turn is not None and turn in by_turn:
-            rkey, ready = by_turn.pop(turn)
-            if pending.get(rkey, (None, None))[1] == turn:
-                pending.pop(rkey)
+            # Same chat only (Prism 5d7636b702b4): a turn id seen on another chat's ready is not this
+            # send's; it stays pending for its own send and this send counts unpaired.
+            if by_turn[turn][0] == key:
+                rkey, ready = by_turn.pop(turn)
+                if pending.get(rkey, (None, None))[1] == turn:
+                    pending.pop(rkey)
         else:
             entry = pending.get(key)
             # Chat fallback only when at least one side has no turn id: a ready carrying a DIFFERENT
