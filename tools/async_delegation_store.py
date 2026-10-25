@@ -16,7 +16,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -1905,8 +1905,14 @@ def admitted_events(profile_home: Path | None = None) -> list[dict[str, Any]]:
     return out
 
 
-def reopen_admitted(event_id: str, *, reason: str, profile_home: Path | None = None) -> dict[str, Any] | None:
-    """``admitted`` -> ``pending`` for one re-injection; returns the payload, else None (settled)."""
+def reopen_admitted(event_id: str, *, reason: str, profile_home: Path | None = None,
+                    before_publish: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any] | None:
+    """``admitted`` -> ``pending`` for one re-injection; returns the payload, else None (settled).
+
+    ``before_publish(payload)`` runs under the registry lock before ``pending`` is written (the legacy
+    SQLite mirror reset). If it raises, the event stays ``admitted`` and uncounted, so a crash or failure
+    between the two writes can never leave JSON ``pending`` beside a ``delivered`` mirror (Prism
+    9057f657dd27)."""
     with locked_registry(profile_home) as registry:
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
         for delegation_id, record in registry["records"].items():
@@ -1916,33 +1922,17 @@ def reopen_admitted(event_id: str, *, reason: str, profile_home: Path | None = N
                 if isinstance(event, dict) and event.get("event_id") == event_id:
                     if event.get("state") != "admitted":
                         return None
+                    payload = copy.deepcopy(event.get("payload") or {})
+                    if before_publish is not None:
+                        before_publish(payload)
                     event["state"] = "pending"
                     event["reinjects"] = int(event.get("reinjects") or 0) + 1
                     logger.warning(
                         "async_delegation_outbox_reopened event_id=%s reason=%s reinjects=%d",
                         event_id, reason, event["reinjects"],
                     )
-                    return copy.deepcopy(event.get("payload") or {})
+                    return payload
     return None
-
-
-def restore_admitted(event_id: str, *, profile_home: Path | None = None) -> bool:
-    """Undo ``reopen_admitted`` when the re-injection could not proceed: ``pending`` -> ``admitted``,
-    the attempt uncounted. Admission fields were never cleared, so the age ceiling still holds."""
-    with locked_registry(profile_home) as registry:
-        invalid_record_ids = set(registry.get("_invalid_record_ids", []))
-        for delegation_id, record in registry["records"].items():
-            if str(delegation_id) in invalid_record_ids or not isinstance(record, dict):
-                continue
-            for event in record.get("outbox", []):
-                if isinstance(event, dict) and event.get("event_id") == event_id:
-                    if event.get("state") != "pending":
-                        return False
-                    event["state"] = "admitted"
-                    event["reinjects"] = max(0, int(event.get("reinjects") or 0) - 1)
-                    logger.warning("async_delegation_outbox_reopen_undone event_id=%s", event_id)
-                    return True
-    return False
 
 
 def acknowledge(

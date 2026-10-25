@@ -92,11 +92,16 @@ async def _drive_chain(monkeypatch, tmp_path, delivery, *, steer_on="h3", sent=N
         def __init__(self, **kwargs):
             self.tools = []
             self._interrupt_requested = False
-            self._steered = None
+            self._pending_steer = None
 
         def steer(self, text):
-            self._steered = f"{self._steered}\n{text}" if self._steered else text
+            self._pending_steer = f"{self._pending_steer}\n{text}" if self._pending_steer else text
             return True
+
+        def _drain_pending_steer(self):
+            # The finalizer's leftover drain (agent/turn_finalizer.py), through the agent's own method.
+            text, self._pending_steer = self._pending_steer, None
+            return text
 
         @property
         def is_interrupted(self):
@@ -124,9 +129,10 @@ async def _drive_chain(monkeypatch, tmp_path, delivery, *, steer_on="h3", sent=N
             elif nxt is not None:
                 _admit_from_thread(lambda: admit_internal_event(adapter, _wake(nxt)))
             result = {"final_response": f"answer {message}", "messages": [], "api_calls": 1}
-            if self._steered:
+            leftover = self._drain_pending_steer()
+            if leftover:
                 # Final answer already produced: the finalizer hands the unapplied steer back.
-                result["pending_steer"], self._steered = self._steered, None
+                result["pending_steer"] = leftover
             return result
 
         def _promotion_race(self, message, adapter):
@@ -145,9 +151,9 @@ async def _drive_chain(monkeypatch, tmp_path, delivery, *, steer_on="h3", sent=N
                 assert holder["promoted"].wait(5)
                 _admit_from_thread(lambda: holder["runner"]._hm_handle_running_session_message(
                     _wake(), _source(), holder["key"]))
-                assert self._steered == f"{HUMAN_STEER}\n{WAKE}" or (
-                    HUMAN_STEER in self._steered and WAKE in self._steered), self._steered
-                result["pending_steer"], self._steered = self._steered, None
+                assert self._pending_steer == f"{HUMAN_STEER}\n{WAKE}" or (
+                    HUMAN_STEER in self._pending_steer and WAKE in self._pending_steer), self._pending_steer
+                result["pending_steer"] = self._drain_pending_steer()
             else:
                 result["final_response"] = "NO_REPLY"
             return result
@@ -345,3 +351,27 @@ def test_turn_end_without_leftover_retires_entries_before_a_non_gateway_steer():
     assert leftover_steer_is_internal(agent, None) is False  # turn end, no leftover
     agent.steer("continue")  # producer with no gateway entry
     assert leftover_steer_is_internal(agent, agent._drain_pending_steer()) is False
+
+
+def test_provenance_is_snapshotted_at_drain_not_read_from_the_live_buffer():
+    """Prism 83626dd6bc5a / 96e62751d3d9 (t_506536db r5): the finalizer drains a human leftover, then an
+    internal steer with the same text lands before the gateway classifies. The drained leftover is human."""
+    from gateway.run_busy import leftover_steer_is_internal
+    agent = _BufferAgent()
+    _steer(agent, "continue", internal=False)
+    left = agent._drain_pending_steer()
+    _steer(agent, "continue", internal=True)  # accepted between the drain and the classification
+    assert leftover_steer_is_internal(agent, left) is False
+
+
+def test_classifying_a_drained_leftover_leaves_the_buffered_steer_entries_alone():
+    """t_506536db r5: a human steer drained, an internal steer buffered, then classification: False, and
+    the buffered internal entry still classifies its own leftover as internal afterwards."""
+    from gateway.run_busy import leftover_steer_is_internal
+    agent = _BufferAgent()
+    _steer(agent, "please explain", internal=False)
+    left = agent._drain_pending_steer()
+    _steer(agent, "wake ready", internal=True)
+    assert leftover_steer_is_internal(agent, left) is False
+    assert agent._pending_steer == "wake ready"
+    assert leftover_steer_is_internal(agent, agent._drain_pending_steer()) is True

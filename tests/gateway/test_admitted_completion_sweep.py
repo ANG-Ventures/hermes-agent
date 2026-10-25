@@ -303,6 +303,80 @@ def test_failed_legacy_reset_leaves_the_wake_retryable_as_admitted(tmp_path, iso
     assert _json_outbox_states(tmp_path) == ["pending"]
 
 
+class _Crash(BaseException):
+    """Process death between two writes: no ``except Exception`` handler runs."""
+
+
+def test_crash_between_mirror_reset_and_json_reopen_still_delivers_exactly_once(tmp_path, isolated_registry,
+                                                                                monkeypatch):
+    """Prism 9057f657dd27 (t_506536db r5): the re-injection writes the JSON outbox and the legacy SQLite
+    mirror. A crash after the first of the two, then a restart and its boot replay, must still put the wake
+    in front of the parent exactly once. Red when JSON ``pending`` is committed first: the replay's claim
+    fails on the still-``delivered`` mirror, reconciliation marks JSON ``delivered`` and the wake is gone."""
+    import queue
+    from tests.gateway.test_completion_delivery import _persist_pending_completion
+    from tools import async_delegation_store as store
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("parent-sess", source="telegram", session_key=KEY)
+    db.close()
+    event = dict(_async_event("deleg_lost"), parent_session_id="parent-sess")
+    event["dispatched_at"], event["completed_at"] = time.time() - 12, time.time()
+    _seed_json_outbox([event], tmp_path)  # stamps event_id/generation before the mirror copies the event
+    _persist_pending_completion(event)
+    adapter = SimpleNamespace(handle_message=AdmittingHandler(), _pending_messages={}, _active_sessions={})
+    runner = _runner(adapter)
+    runner._session_db = None
+    runner._classify_completion_target = AsyncMock(return_value="deliver")
+    runner._gateway_started_at = 0.0
+    runner._is_session_running = lambda key: False
+    runner._peek_session_state = lambda key: None
+    text = f"[ASYNC DELEGATION BATCH COMPLETE — deleg_lost] verdict\nEvent: {event['event_id']}"
+    assert asyncio.run(runner._deliver_completion_notification(text, event)) is True
+    assert _json_outbox_states(tmp_path) == ["admitted"]
+    assert ad.get_durable_delegation("deleg_lost")["delivery_state"] == "delivered"
+    assert adapter.handle_message.await_count == 1  # admitted, then lost in memory: never persisted
+
+    # Crash after whichever of the two writes comes first, before the second one runs.
+    writes = []
+    real_write, real_update = store._write, ad._update_delivery
+
+    def crash_on_second(kind, real):
+        def wrapped(*a, **k):
+            if writes:
+                raise _Crash(kind)
+            result = real(*a, **k)
+            writes.append(kind)
+            return result
+        return wrapped
+
+    monkeypatch.setattr(store, "_write", crash_on_second("json", real_write))
+    monkeypatch.setattr(ad, "_update_delivery", crash_on_second("mirror", real_update))
+    with pytest.raises(_Crash):
+        ad.reopen_admitted_event(event["event_id"], tmp_path, reason="admitted_not_in_transcript")
+    assert len(writes) == 1
+    monkeypatch.setattr(store, "_write", real_write)
+    monkeypatch.setattr(ad, "_update_delivery", real_update)
+
+    # Restart: fresh in-memory dedupe, then both boot replays.
+    runner._completion_deliveries_delivered.clear()
+    runner._completion_deliveries_inflight.clear()
+    replay = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", replay)
+    ad.enqueue_pending_outbox(current_boot_id="next-boot", profile_home=tmp_path)
+    ad.restore_undelivered_completions(replay)
+    while not replay.empty():
+        asyncio.run(runner._deliver_completion_notification(text, replay.get_nowait()))
+    assert adapter.handle_message.await_count == 2, "the lost wake never reached the parent again"
+
+    # The parent turn persists it; the sweep confirms without another re-injection.
+    _persist_user_row(tmp_path, "parent-sess", text)
+    later = time.time() + 600
+    assert _run(runner, later) == 0 and _run(runner, later + 60) == 0
+    assert _json_outbox_states(tmp_path) == ["delivered"]
+    assert replay.empty() and adapter.handle_message.await_count == 2
+
+
 # Prism 515bc357c1a8 (t_506536db r2): the batch formatter glues "   Total duration: Ns" onto the
 # ``Event: <id>`` line, so the needle must also end at a space, not only at a newline.
 
