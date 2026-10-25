@@ -90,6 +90,46 @@ def _is_host_side_env(env) -> bool:
         return False
 
 
+def _host_spill_unreachable_reason() -> str | None:
+    """Why a host-side spill path would be unreadable by an agent that has NO active env yet, else None.
+
+    A dispatcher-placed pool worker runs its tools over ``TERMINAL_ENV=ssh`` on another host while
+    this process (the writer) stays on the Studio. Its first tool call (typically ``kanban_show``)
+    happens before any terminal env exists, so ``env`` is None and a host path like
+    ``/Users/.../cache/spillover/x.txt`` is not on the host where read_file runs (t_ad44f109).
+    The backend's own translation says whether host cache paths are valid as-is: it returns the
+    host path unchanged only for backends that read the host filesystem (local, singularity,
+    plugin backends without a ``cache_path_base``)."""
+    try:
+        from tools.credential_files import _terminal_backend, to_agent_visible_cache_path
+        backend = _terminal_backend()
+        if backend in ("", "local"):
+            return None
+        probe = str(get_spillover_dir() / "probe.txt")
+        if to_agent_visible_cache_path(probe) == probe:
+            return None
+        return f"terminal backend {backend!r} has no active environment yet"
+    except Exception as exc:
+        logger.debug("Spillover reachability check failed: %s", exc)
+        return None
+
+
+def _inline_head_tail(content: str, preview_size: int, note: str) -> str:
+    """Bounded head+tail inline preview, used when no readable spill location exists. The tail is
+    kept because the newest entries of a chronological dump (a card's latest review) sit there."""
+    if len(content) <= 2 * preview_size:
+        return content
+    head, _ = generate_preview(content, max_chars=preview_size)
+    tail = content[-preview_size:]
+    nl = tail.find("\n")
+    if 0 <= nl < preview_size // 2:
+        tail = tail[nl + 1:]
+    omitted = len(content) - len(head) - len(tail)
+    return (f"{head}\n\n[... {omitted:,} chars omitted ...]\n\n{tail}\n\n"
+            f"[Truncated: tool response was {len(content):,} chars. {note} "
+            f"Showing the first {len(head):,} and last {len(tail):,} chars.]")
+
+
 def _write_to_spillover(content: str, filename: str):
     """Write host-side to $HERMES_HOME/cache/spillover; returns path str or None.
 
@@ -311,9 +351,17 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
                     tool_name, tool_use_id, len(persisted_content), path, host_suffix)
         return _build_persisted_message(preview, has_more, len(persisted_content), path)
 
+    host_side = _is_host_side_env(env)
+    if env is None and (unreachable := _host_spill_unreachable_reason()):
+        # No env to write into or probe, and the host path is not where the reader's tools run:
+        # never hand out a stub the reader cannot open (t_ad44f109).
+        logger.info("Inline-truncating large tool result: %s (%d chars, %s)",
+                    tool_name, len(content), unreachable)
+        return _inline_head_tail(
+            persisted_content, config.preview_size,
+            f"Full output not saved: no location readable from this agent's tools ({unreachable}).")
     # Always persist host-side first: cache/spillover is the single canonical home.
     host_path = _write_to_spillover(persisted_content, filename)
-    host_side = _is_host_side_env(env)
     if host_side and host_path is not None:
         return _persisted(host_path)
     if not host_side:
