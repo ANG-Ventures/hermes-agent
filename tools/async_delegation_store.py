@@ -1828,8 +1828,8 @@ def enqueue_pending_outbox(
 def admit(
     event_id: str,
     *,
-    boot_id: str,
-    session_key: str,
+    boot_id: str = "",
+    session_key: str = "",
     session_id: str = "",
     profile_home: Path | None = None,
 ) -> bool:
@@ -1838,7 +1838,8 @@ def admit(
     ``admitted`` is not ``delivered``: an admitted wake can still be lost in memory (depth cap,
     eviction, /stop, crash before the drain). The consumption sweeper confirms it ``delivered`` once
     the parent transcript carries it, or re-opens it ``pending`` for re-injection. Only a pending
-    event moves here, so a late admission never downgrades a settled receipt.
+    event moves here, so a late admission never downgrades a settled receipt; an already admitted
+    one answers True (idempotent for a retried receipt).
     """
     with locked_registry(profile_home) as registry:
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
@@ -1847,6 +1848,8 @@ def admit(
                 continue
             for event in record.get("outbox", []):
                 if isinstance(event, dict) and event.get("event_id") == event_id:
+                    if event.get("state") == "admitted":
+                        return True  # a retried receipt: already held
                     if event.get("state") != "pending":
                         return False
                     event.update(state="admitted", admitted_at=time.time(), admitted_boot_id=boot_id,
@@ -1900,9 +1903,12 @@ def acknowledge(
     outcome: str,
     reason: str | None = None,
     profile_home: Path | None = None,
+    admission: dict[str, Any] | None = None,
 ) -> bool:
+    if outcome == "admitted":
+        return admit(event_id, profile_home=profile_home, **(admission or {}))
     if outcome not in {"delivered", "dropped"}:
-        raise ValueError("outcome must be delivered or dropped")
+        raise ValueError("outcome must be delivered, dropped or admitted")
     with locked_registry(profile_home) as registry:
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
         for delegation_id, record in registry["records"].items():

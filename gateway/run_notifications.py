@@ -1405,6 +1405,8 @@ class GatewayNotificationsMixin:
             if callable(_prime):
                 _prime(synth_event)
             await admit_internal_event(adapter, synth_event)
+            # Queued or steered, not consumed: the durable receipt records admission (t_97a879af).
+            evt["_gateway_admission"] = {"session_key": session_key, "session_id": parent_session_id}
             return True
         except WakeNotAccepted:
             # Durable callers refund the claim; ordinary watch callers just requeue.
@@ -1700,18 +1702,14 @@ class GatewayNotificationsMixin:
 
         One off-thread operation per batch: a receipt failure is independent per event, and
         cancellation of the awaiter must not skip later receipts for content already accepted.
-        A push-adapter wake is only QUEUED (or steered) at acceptance, so its JSON outbox goes
-        ``admitted``; ``_sweep_admitted_completions`` marks it ``delivered`` once the parent
-        transcript carries it, or re-injects it (t_97a879af). API-server deliveries
-        (``origin_session_id``) keep the direct receipt.
+        A push-adapter wake is only QUEUED (or steered) at acceptance: ``_inject_watch_notification``
+        stamps it ``_gateway_admission`` and the receipt then records ``admitted``;
+        ``gateway.admitted_completion_sweep`` marks it ``delivered`` once the parent transcript
+        carries it, or re-injects it (t_97a879af).
         """
-        from tools.async_delegation import admit_event_delivery, complete_event_delivery_with_retry
+        from tools.async_delegation import complete_event_delivery_with_retry
         for event, claim_id in pairs:
             try:
-                if not str(event.get("origin_session_id") or "").strip() and admit_event_delivery(
-                        event, claim_id or None, session_key=str(event.get("session_key") or ""),
-                        session_id=str(event.get("parent_session_id") or "")):
-                    continue
                 complete_event_delivery_with_retry(event, claim_id or None)
             except Exception:
                 logger.warning(
@@ -1745,6 +1743,9 @@ class GatewayNotificationsMixin:
                     self._mark_completions_delivered_locked((identity,))
             if sibling_claims:
                 self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
+                if evt.get("_gateway_admission"):
+                    for sibling, _claim_id in sibling_claims:  # same consolidated wake, same receipt
+                        sibling["_gateway_admission"] = evt["_gateway_admission"]
             # Acknowledge BOTH producer formats after adapter acceptance: JSON restart notices need a
             # receipt even without a SQLite claim (``complete_event_delivery_with_retry`` covers both),
             # primary and siblings together, off the loop. Receipts are the only awaited step after
