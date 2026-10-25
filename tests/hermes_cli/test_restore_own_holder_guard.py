@@ -131,3 +131,31 @@ def test_update_autorestore_still_works_without_holder(tmp_path):
     assert update_cmd._restore_state_db_from_snapshot(dst, src) is True
     assert _read_marker(dst) == "snapshot-good"
     assert not dst.with_name(dst.name + "-wal").exists()
+
+
+def test_safe_restore_counts_its_live_destination_with_the_lock_guard(tmp_path, monkeypatch):
+    """Prism 08ee131061e6: the backup-API restore writes into the LIVE destination through its own
+    connection. Uncounted, a sibling SessionDB's close retires the private -shm descriptor under that
+    connection's WAL locks mid-backup. The destination is registered from before its connect until
+    after its close, and the registration is dropped afterwards."""
+    import hermes_state_lockguard as lockguard
+
+    dst = tmp_path / "state.db"
+    src = tmp_path / "snap.db"
+    _make_db(src, "snapshot-good")
+    _make_db(dst, "live-old")
+    key = ("path", lockguard._canonical(dst))
+    seen = []
+    real_connect = backup_restore_mod.sqlite3.connect
+
+    def spy(database, *a, **k):
+        if str(database) == str(dst):
+            seen.append(lockguard._READERS.get(key, 0))
+        return real_connect(database, *a, **k)
+
+    monkeypatch.setattr(backup_restore_mod.sqlite3, "connect", spy)
+    assert backup_restore_mod._safe_restore_db(src, dst) is True
+    assert seen and all(n >= 1 for n in seen), seen
+    assert lockguard._READERS.get(key, 0) == 0
+    monkeypatch.setattr(backup_restore_mod.sqlite3, "connect", real_connect)
+    assert _read_marker(dst) == "snapshot-good"

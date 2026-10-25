@@ -990,21 +990,30 @@ class SessionDB(
             if self._close_connection_quietly(conn) and not self._opening_close_failed:
                 _lockguard.unregister_reader(opening)
             raise
-        self._settle_opening_registration(opening)
+        self._settle_opening_registration(opening, self._conn)
+        # Prism 201b553b8a1e: while this opener was registered, a sibling handle's last close may have
+        # ended a -shm generation whose private descriptor our registration pinned; now that hold()
+        # counts this writer on the db inode, nothing else would ever retire it, and a foreign
+        # opener's deleted-generation probe would read it as a live deleted -shm. Retire only a
+        # PROVEN-completed generation (path gone or replaced, no other fd on the inode). Outside
+        # self._lock (__init__ path; the reopen path under the lock does not do this, I2).
+        with _lockguard.RETIRE_GATE:
+            _lockguard.retire_completed_shm()
 
-    def _settle_opening_registration(self, opening) -> None:
+    def _settle_opening_registration(self, opening, conn) -> None:
         """Drop the opener's reader token once the writer is counted by hold(), never earlier
         (Prism ca0b4382bc99: a journal_mode probe that returns None leaves ``_wal_active`` False and
         hold() uncalled, yet the file may be WAL and the connection hold -shm locks). Uncounted, the
         token is bound to the connection and dropped after its successful close. A connection whose
         close failed during the open keeps it forever. Under ``self._lock`` on the reopen path:
-        settles only, never retires."""
+        settles only, never retires. *conn* is the caller's ``self._conn`` (read by the caller: this
+        helper never touches the shared writer connection itself)."""
         if self._opening_close_failed:
             return
-        if self._wal_lock_guard or self._conn is None:
+        if self._wal_lock_guard or conn is None:
             _lockguard.unregister_reader(opening, retire_now=False)
         else:
-            self.__dict__.setdefault("_reader_tokens", {})[id(self._conn)] = opening
+            self.__dict__.setdefault("_reader_tokens", {})[id(conn)] = opening
 
     def _open_writer_counted(self) -> None:
         """:meth:`_open_writer`'s body, run while the lock guard counts this opener."""
@@ -1345,7 +1354,7 @@ class SessionDB(
             ) from exc
         if self._wal_active:  # a reopened writer is a live generation holder like the first open
             self._wal_lock_guard = _lockguard.hold(self.db_path)
-        self._settle_opening_registration(opening)
+        self._settle_opening_registration(opening, self._conn)
 
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,

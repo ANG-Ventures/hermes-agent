@@ -89,7 +89,7 @@ UNREGISTERED_OK: dict[tuple[str, str], str] = {
     )},
     ("hermes_cli/data_cleanup_holders.py", "_refuse_cron_writers"): "reads cron/executions.db, not state.db",
     ("hermes_cli/browser_connect.py", "_copy_auth_file"): "copies a browser profile's auth sqlite, not state.db",
-    ("hermes_cli/backup_restore.py", "_safe_restore_db"): "reads the snapshot copy being restored, never the live state.db",
+    ("hermes_cli/backup_restore.py", "_safe_restore_db_unregistered"): "reads the snapshot copy being restored, never the live state.db (the live destination is registered by _safe_restore_db, Prism 08ee131061e6)",
     ("evals/postmortem/forensics/common.py", "open"): _NO_SESSIONDB + " (offline forensics on a COPY of state.db)",
     ("tools/read_extract.py", "_extract_sqlite"):
         "immutable=1 user-file extraction: no -shm, no locks to lose (a state.db path reads the main file only)",

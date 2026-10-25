@@ -1421,3 +1421,70 @@ def test_foreign_scan_skips_a_guard_only_deleted_shm(tmp_path):
             assert (child.pid in holders) is expect_holder, (mode, holders)
         finally:
             child.communicate("\n", timeout=10)
+
+
+def test_failed_fstat_after_private_open_never_closes_the_descriptor(tmp_path, monkeypatch):
+    """Prism 7e0266f152b2: an fstat failure right after the private open closed that descriptor,
+    which cancels every POSIX lock this process holds on the inode (SQLite's own SHARED lock of a live
+    connection included), so a foreign EXCLUSIVE then succeeded. The descriptor is quarantined."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    sqlite_fd = os.open(str(db), os.O_RDONLY)  # stands in for SQLite's descriptor + POSIX SHARED lock
+    assert lg._ofd_lock(sqlite_fd, lg._F_RDLCK, *_SHARED, cmd=lg._F_SETLK)
+    ident = (os.stat(db).st_dev, os.stat(db).st_ino)
+    real_fstat, calls = os.fstat, []
+
+    def failing_fstat(fd):
+        calls.append(fd)
+        raise OSError(5, "Input/output error")
+
+    held = None
+    try:
+        monkeypatch.setattr(lg.os, "fstat", failing_fstat)
+        held = lg.hold(db)
+        monkeypatch.setattr(lg.os, "fstat", real_fstat)
+        assert calls, "the private open's fstat was not reached"
+        assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED", "our POSIX lock was cancelled"
+        assert lg._SURPLUS.get(ident), "the descriptor is quarantined, not closed"
+    finally:
+        monkeypatch.setattr(lg.os, "fstat", real_fstat)
+        if held is not None:
+            lg.release(held)
+        with lg._LOCK:
+            lg._close_private(ident)
+        os.close(sqlite_fd)
+
+
+def test_generation_ended_during_an_open_is_retired_once_the_opener_is_counted(tmp_path, monkeypatch):
+    """Prism 201b553b8a1e: opener B passes the gated preflight, then sibling A's last close unlinks the
+    -shm while B's opening registration pins A's private -shm fd. B connects to a NEW generation and
+    drops its token, but nothing retired the completed old generation, so a foreign opener's
+    deleted-generation scan saw this process holding a deleted -shm. B's open now retires it."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    pin_wal(monkeypatch)
+    import hermes_state_dbfile as dbf
+    db = tmp_path / "state.db"
+    a = make_db(db, "s", "a")
+    require_wal(a)
+    old_shm = (os.stat(f"{db}-shm").st_dev, os.stat(f"{db}-shm").st_ino)
+    real_conn = hermes_state.SessionDB._open_writer_conn
+    fired = []
+
+    def open_after_sibling_close(self):
+        if not fired:
+            fired.append(1)
+            a.close()  # A's last close lands between B's preflight and B's connect
+            assert old_shm in lg._FDS, "B's opening registration pins A's -shm fd (the race window)"
+        return real_conn(self)
+
+    monkeypatch.setattr(hermes_state.SessionDB, "_open_writer_conn", open_after_sibling_close)
+    b = hermes_state.SessionDB(db_path=db)
+    try:
+        assert fired
+        assert old_shm not in lg._FDS, "the completed generation's private -shm fd stays pinned"
+        assert not any(str(h).endswith("-shm") for h in dbf.iter_deleted_sqlite_sidecar_holders(db))
+    finally:
+        b.close()

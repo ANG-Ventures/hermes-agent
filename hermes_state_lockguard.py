@@ -301,7 +301,10 @@ def _private_fd(path: str, ident: Identity, db_ident: Optional[Identity] = None)
     try:
         st = os.fstat(fd)
     except OSError:
-        os.close(fd)
+        # Never close it (Prism 7e0266f152b2): this process's SQLite connection may already hold POSIX
+        # locks on the inode, and any close would cancel them. Quarantined as a surplus of the inode the
+        # path named: closed only together with that inode's private fd, or by a fork child / exit.
+        _SURPLUS.setdefault(ident, []).append(fd)
         raise
     real = (st.st_dev, st.st_ino)
     if real != ident:

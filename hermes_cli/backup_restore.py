@@ -73,6 +73,21 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
 
 
 def _safe_restore_db(src: Path, dst: Path) -> bool:
+    """See :func:`_safe_restore_db_unregistered`. *dst* may be the LIVE state.db (the backup-API path
+    is the live-safe route), so its connection is counted with the WAL lock guard from before the
+    connect until its close succeeds: a sibling SessionDB's close must not retire the private -shm
+    descriptor under the restore's WAL locks (Prism 08ee131061e6). A failed close keeps the count."""
+    from hermes_cli.backup_sqlite import _register_reader, _unregister_reader
+    token = _register_reader(dst)
+    closed = [True]
+    try:
+        return _safe_restore_db_unregistered(src, dst, closed)
+    finally:
+        if token is not None and closed[0]:
+            _unregister_reader(token)
+
+
+def _safe_restore_db_unregistered(src: Path, dst: Path, closed: list) -> bool:
     """Restore a SQLite database from snapshot *src* into live *dst*.
 
     Uses SQLite's backup() API to write snapshot pages into the live
@@ -126,6 +141,7 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
         finally:
             src_conn.close()
         dst_conn.close()
+        dst_conn = None
         # Restore original file permissions from the snapshot
         try:
             mode = src.stat().st_mode
@@ -142,7 +158,7 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
             try:
                 dst_conn.close()
             except Exception:
-                pass
+                closed[0] = False  # may still be open: keep its lock-guard count (Prism 08ee131061e6)
         # Fallback: unlink+move (the old approach).  This still works for
         # the common case where no other process holds the DB open.
         from hermes_cli.sqlite_safe_read import (
