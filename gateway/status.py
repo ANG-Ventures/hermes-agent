@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -126,6 +127,7 @@ class _RuntimeStatusWriter:
                 self._writing_generation = generation
             error: Optional[BaseException] = None
             try:
+                _LCM_FD_GAUGE.annotate(payload)
                 (self._write_fn or _write_json_file)(path, _merge_over_on_disk(path, payload))
             except BaseException as exc:
                 error = exc
@@ -149,6 +151,112 @@ class _RuntimeStatusWriter:
             else:
                 logger.debug("Failed to persist gateway runtime status: %s", error)
 
+
+_cached_agents_source: Optional["weakref.WeakMethod"] = None
+
+
+def set_cached_agents_source(method: Callable[[], int]) -> None:
+    """Register the gateway runner's cached-agent counter (bound method, held weakly) for the
+    ``lcm_db_fds`` gauge. A later registration replaces an earlier one."""
+    global _cached_agents_source
+    _cached_agents_source = weakref.WeakMethod(method)  # type: ignore[arg-type]
+
+
+def _cached_agents_now() -> Optional[int]:
+    ref = _cached_agents_source
+    fn = ref() if ref is not None else None
+    if fn is None:
+        return None
+    try:
+        return int(fn())
+    except Exception:
+        return None
+
+
+def _lcm_db_identities() -> set[tuple[int, int]]:
+    """``(st_dev, st_ino)`` of this process's lcm.db (the process home's, plus an explicit
+    ``LCM_DATABASE_PATH`` override); missing files are skipped."""
+    paths = [get_process_hermes_home() / "lcm.db"]
+    override = os.environ.get("LCM_DATABASE_PATH")
+    if override:
+        paths.append(Path(override))
+    ids: set[tuple[int, int]] = set()
+    for p in paths:
+        with contextlib.suppress(OSError):
+            st = os.stat(p)
+            ids.add((st.st_dev, st.st_ino))
+    return ids
+
+
+def count_fds_on(identities: set[tuple[int, int]]) -> Optional[int]:
+    """Count this process's open descriptors whose ``(st_dev, st_ino)`` is in ``identities``:
+    one ``/dev/fd`` listing + one fstat per fd. ``None`` where /dev/fd is unavailable."""
+    try:
+        names = os.listdir("/dev/fd")
+    except OSError:
+        return None
+    count = 0
+    for name in names:
+        try:
+            st = os.fstat(int(name))
+        except (OSError, ValueError):
+            continue  # closed between listdir and fstat, or the listing's own dir fd
+        if (st.st_dev, st.st_ino) in identities:
+            count += 1
+    return count
+
+
+class _LcmFdGauge:
+    """``lcm_db_fds`` / ``cached_agents`` in the runtime-status payload (t_0d987578).
+
+    Runs ONLY on the ``gateway-runtime-status-writer`` thread, never on a write/open hot path.
+    The fd scan is rate-limited to once per ``scan_interval_s`` (status writes also happen on
+    every turn boundary); between scans the last sample is republished. Warns at most once per
+    ``warn_interval_s`` when ``lcm_db_fds > 3 * max(cached_agents, 1)``: evicted engines are
+    leaking their sqlite connections again.
+    """
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic,
+                 scan_interval_s: float = 60.0, warn_interval_s: float = 600.0,
+                 identities: Callable[[], set[tuple[int, int]]] = _lcm_db_identities,
+                 cached_agents: Callable[[], Optional[int]] = _cached_agents_now,
+                 count_fds: Callable[[set[tuple[int, int]]], Optional[int]] = count_fds_on):
+        self._clock = clock
+        self._scan_interval_s = scan_interval_s
+        self._warn_interval_s = warn_interval_s
+        self._identities = identities
+        self._cached_agents = cached_agents
+        self._count_fds = count_fds
+        self._last_scan: Optional[float] = None
+        self._last_warn: Optional[float] = None
+        self._sample: Optional[tuple[Optional[int], Optional[int]]] = None
+
+    def annotate(self, payload: dict[str, Any]) -> None:
+        try:
+            now = self._clock()
+            if self._sample is None or self._last_scan is None or now - self._last_scan >= self._scan_interval_s:
+                self._last_scan = now
+                ids = self._identities()
+                fds = self._count_fds(ids) if ids else 0
+                cached = self._cached_agents()
+                self._sample = (fds, cached)
+                self._maybe_warn(now, fds, cached)
+            payload["lcm_db_fds"], payload["cached_agents"] = self._sample
+        except Exception:
+            logger.debug("lcm_db_fds gauge failed", exc_info=True)
+
+    def _maybe_warn(self, now: float, fds: Optional[int], cached: Optional[int]) -> None:
+        if fds is None or fds <= 3 * max(cached or 0, 1):
+            return
+        if self._last_warn is not None and now - self._last_warn < self._warn_interval_s:
+            return
+        self._last_warn = now
+        logger.warning(
+            "lcm.db descriptor leak suspected: %d open fds on lcm.db vs %s cached agent(s) "
+            "(threshold 3x); evicted LCM engines may not be shutting down", fds, cached)
+
+
+_LCM_FD_GAUGE = _LcmFdGauge()
 
 _runtime_status_state_lock = threading.RLock()
 _runtime_status_state_path: Optional[Path] = None
