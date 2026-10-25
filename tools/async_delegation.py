@@ -879,7 +879,7 @@ def acknowledge_event_outbox(
 def admit_event_outbox(evt: Dict[str, Any], *, session_key: str, session_id: str = "") -> bool:
     """Gateway wake admitted (queued/steered), not yet consumed: the JSON outbox goes ``admitted``
     so the consumption sweeper can confirm or re-inject it (t_97a879af). False = no JSON receipt."""
-    if evt.get("type") not in {"async_delegation", "async_delegation_restarted"}:
+    if evt.get("type") not in {"async_delegation", "async_delegation_restarted"} or is_interim_delegation_event(evt):
         return False
     event_id = str(evt.get("event_id") or "")
     if not event_id:
@@ -889,10 +889,59 @@ def admit_event_outbox(evt: Dict[str, Any], *, session_key: str, session_id: str
                         session_id=session_id, profile_home=Path(profile_home) if profile_home else None)
 
 
+@_producer_scoped
+def admit_event_delivery(evt: Dict[str, Any], claim_id: Optional[str], *, session_key: str,
+                         session_id: str = "") -> bool:
+    """Admission receipt for a gateway wake (t_97a879af): the JSON outbox goes ``admitted`` and the
+    legacy SQLite claim settles. False when there is no JSON receipt to hold (caller acks directly)."""
+    if not admit_event_outbox(evt, session_key=session_key, session_id=session_id):
+        return False
+    if claim_id and evt.get("type") == "async_delegation":
+        complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+    return True
+
+
+def admitted_outbox_events(profile_home: Path) -> List[Dict[str, Any]]:
+    return _store.admitted_events(profile_home)
+
+
+def confirm_admitted_event(event_id: str, profile_home: Path) -> bool:
+    """The parent transcript carries the wake: ``admitted`` -> ``delivered``."""
+    return _store.acknowledge(event_id, outcome="delivered", profile_home=profile_home)
+
+
+def drop_admitted_event(event_id: str, reason: str, profile_home: Path) -> bool:
+    return _store.acknowledge(event_id, outcome="dropped", reason=reason, profile_home=profile_home)
+
+
+def reopen_admitted_event(event_id: str, profile_home: Path, *, reason: str) -> Optional[Dict[str, Any]]:
+    """Re-open a lost admitted wake for ONE re-injection: JSON back to ``pending`` and the legacy
+    SQLite row back to claimable, so the normal delivery path claims and admits it again. Returns
+    the payload stamped with its producer home, or None when it settled meanwhile."""
+    payload = _store.reopen_admitted(event_id, reason=reason, profile_home=profile_home)
+    if payload is None:
+        return None
+    payload["_registry_profile_home"] = str(profile_home)
+    delegation_id = str(payload.get("delegation_id") or "")
+    if delegation_id and payload.get("type") == "async_delegation":
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        token = set_hermes_home_override(profile_home)
+        try:
+            _update_delivery("""UPDATE async_delegations SET delivery_state='pending', delivered_at=NULL,
+                          delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                   WHERE delegation_id=? AND delivery_state='delivered'""", (time.time(), delegation_id))
+        finally:
+            reset_hermes_home_override(token)
+    return payload
+
+
 def admission_receipt_needle(evt: Dict[str, Any]) -> str:
     """The text a consuming turn's persisted user row must contain (the rendered banner tag)."""
     delegation_id = str(evt.get("delegation_id") or "")
-    return f"— {delegation_id}]" if delegation_id else ""
+    if not delegation_id:
+        return ""
+    kind = "RESTARTED" if evt.get("type") == "async_delegation_restarted" else "COMPLETE"
+    return f"{kind} — {delegation_id}]"
 
 
 @_producer_scoped

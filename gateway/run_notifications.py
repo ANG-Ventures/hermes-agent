@@ -1700,10 +1700,18 @@ class GatewayNotificationsMixin:
 
         One off-thread operation per batch: a receipt failure is independent per event, and
         cancellation of the awaiter must not skip later receipts for content already accepted.
+        A push-adapter wake is only QUEUED (or steered) at acceptance, so its JSON outbox goes
+        ``admitted``; ``_sweep_admitted_completions`` marks it ``delivered`` once the parent
+        transcript carries it, or re-injects it (t_97a879af). API-server deliveries
+        (``origin_session_id``) keep the direct receipt.
         """
-        from tools.async_delegation import complete_event_delivery_with_retry
+        from tools.async_delegation import admit_event_delivery, complete_event_delivery_with_retry
         for event, claim_id in pairs:
             try:
+                if not str(event.get("origin_session_id") or "").strip() and admit_event_delivery(
+                        event, claim_id or None, session_key=str(event.get("session_key") or ""),
+                        session_id=str(event.get("parent_session_id") or "")):
+                    continue
                 complete_event_delivery_with_retry(event, claim_id or None)
             except Exception:
                 logger.warning(
@@ -2058,15 +2066,20 @@ class GatewayNotificationsMixin:
         consumer; both must progress without a later foreground turn.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
+        from gateway.admitted_completion_sweep import SWEEP_INTERVAL_S, sweep_admitted_completions
         from tools.async_delegation import ORPHAN_SWEEP_INTERVAL_S
         from tools.process_registry import process_registry as _pr
-        last_orphan_sweep = None
+        last_orphan_sweep = last_admitted_sweep = None
         while self._running:
             with _log_suppressed(logging.DEBUG, "Async delegation watcher error: %s"):
                 # Completions whose owner process died while this gateway runs (#97202).
                 if last_orphan_sweep is None or time.monotonic() - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_S:
                     last_orphan_sweep = time.monotonic()
                     await asyncio.to_thread(self._sweep_orphaned_completion_ledgers)
+                # Admitted wakes that never reached the transcript (boot + every minute, t_97a879af).
+                if last_admitted_sweep is None or time.monotonic() - last_admitted_sweep >= SWEEP_INTERVAL_S:
+                    last_admitted_sweep = time.monotonic()
+                    await sweep_admitted_completions(self)
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
                 # Process completions remain owned by their per-process watchers.
