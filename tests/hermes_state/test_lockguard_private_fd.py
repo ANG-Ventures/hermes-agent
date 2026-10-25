@@ -232,19 +232,35 @@ def test_mode_kill_switch_is_read_at_import(monkeypatch, tmp_path, value, mode, 
         sys.modules["hermes_state_lockguard"] = lg
 
 
-def test_refused_lock_descriptor_is_parked_and_reused(tmp_path, monkeypatch):
-    """Prism 78f32301dabd: a private fd opened by a hold() whose lock was refused is in no handle's
-    record. It is parked like any other and the next hold() reuses it: one fd per inode, no leak."""
+@pytest.mark.parametrize("failure", ["refused", "oserror"])
+def test_refused_lock_descriptor_is_counted_parked_and_reused(tmp_path, monkeypatch, failure):
+    """Prism 78f32301dabd + e63d481511da: a hold() whose OFD lock is refused (or fails) still COUNTS
+    its private fds, so no retire() closes them under the live connection; once released, the
+    state.db fd is parked and the next hold() reuses it: one fd per inode, no leak."""
     if not lg.supported():
         pytest.skip("no OFD locks")
     db = tmp_path / "state.db"
     db.write_bytes(b"\0" * 4096)
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
     ident = (os.stat(db).st_dev, os.stat(db).st_ino)
-    monkeypatch.setattr(lg, "_ofd_lock", lambda *a, **k: False)
-    assert lg.hold(db) == {}
-    fd = lg._FDS[ident]
+    shm_ident = _ident(shm)
+
+    def _fail(*a, **k):
+        if failure == "oserror":
+            raise OSError(22, "EINVAL")
+        return False
+
+    monkeypatch.setattr(lg, "_ofd_lock", _fail)
+    first = lg.hold(db)
     monkeypatch.undo()
+    assert set(first) == {ident, shm_ident}
+    with lg.registered_reader(db):  # a reader's exit runs retire(): must not close A's -shm fd
+        pass
     lg.retire()
+    assert shm_ident in lg._FDS, "an uncounted -shm fd was closed under a live writer"
+    lg.retire(lg.release(first))
+    fd = lg._FDS[ident]
     held = lg.hold(db)
     try:
         assert ident in held and lg._FDS[ident] == fd
@@ -816,3 +832,72 @@ def test_clean_close_never_reads_its_own_unretired_shm_fd_as_a_lost_generation(t
     finally:
         go.set()
         t.join(30)
+
+
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_inherited_reader_token_never_settles_a_child_registration(tmp_path):
+    """Prism 1e8ea9086d86: a read-only handle opened before fork() and closed in the child must not
+    decrement a reader the CHILD registered on the same db, or the child's next writer close retires
+    the private -shm fd under that live reader."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    inherited = lg.register_reader(db)
+    try:
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                assert not lg._READERS  # the child starts with no counts
+                mine = lg.register_reader(db)
+                lg.unregister_reader(inherited)  # the inherited handle closes in the child
+                ok = lg._READERS.get(("path", str(db)), 0) == 1
+                lg.unregister_reader(mine)
+                ok = ok and not lg._READERS
+                os.write(w, b"ok" if ok else repr(dict(lg._READERS)).encode()[:200])
+            finally:
+                os._exit(0)
+        os.close(w)
+        out = os.read(r, 256).decode()
+        os.close(r)
+        os.waitpid(pid, 0)
+        assert out == "ok", f"inherited token settled the child's reader count: {out}"
+    finally:
+        lg.unregister_reader(inherited)
+    assert ("path", str(db)) not in lg._READERS
+
+
+@pytest.mark.parametrize("helper", ["stats", "structural", "repair_conn", "change_watcher"])
+def test_state_module_readers_connect_while_registered(tmp_path, monkeypatch, helper):
+    """Prism 230be3dd449d: collect_state_db_stats, state_db_has_structural_damage, the repair
+    connections and the desktop change watcher open state.db beside live SessionDB handles. Each must
+    be a registered reader for the connection's whole life (registered at connect, dropped after close)."""
+    import sqlite3
+    db = tmp_path / "state.db"
+    sqlite3.connect(db).close()
+    key = ("path", str(db))
+    seen = []
+    real_connect = sqlite3.connect
+
+    def _connect(target, *a, **k):
+        if "state.db" in str(target):
+            seen.append(lg._READERS.get(key, 0))
+        return real_connect(target, *a, **k)
+
+    monkeypatch.setattr(sqlite3, "connect", _connect)
+    if helper == "stats":
+        import hermes_state_dbfile as dbf
+        dbf.collect_state_db_stats(db)
+    elif helper == "structural":
+        import hermes_state_repair as rep
+        rep.state_db_has_structural_damage(db)
+    elif helper == "repair_conn":
+        import hermes_state_repair as rep
+        with rep._repair_conn(db):
+            assert lg._READERS.get(key, 0) == 1
+    else:
+        from tui_gateway import change_watcher as cw
+        cw._session_db_content_sig(db)
+    assert seen and all(n >= 1 for n in seen), seen
+    assert key not in lg._READERS, "registration outlived the connection"

@@ -32,6 +32,9 @@ _RO_HELPERS = {"read_only_db_uri"}  # hermes_state_holders: file: URI + ?mode=ro
 # guarded gateway writer in the same process.
 _EVAL = "offline eval harness on a throwaway HERMES_HOME; never runs in a process beside the live gateway's guarded writer"
 ALLOWLIST: dict[tuple[str, str], str] = {
+    ("hermes_state.py", "_open_writer_conn"): "SessionDB's own writer connection: guarded by hold() and counted",
+    ("hermes_state_repair.py", "_connect_repair_durable"):
+        "repair surgery under the cross-process repair lock, refused while a live writer holds state.db",
     ("gateway/lifecycle_ledger.py", "check_state_db_integrity"):
         "PRAGMA quick_check only, writes nothing; opened read-write because a WAL store needs its -shm to open",
     ("hermes_cli/doctor_state.py", "_write_health_reason"):
@@ -68,17 +71,26 @@ def _py_files():
     for root, dirs, files in os.walk(REPO):
         dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith(".")]
         for name in files:
-            if not name.endswith(".py") or name.startswith(("hermes_state", "test_")) or name.endswith("_test.py"):
+            # hermes_state*.py is scanned too (Prism 230be3dd449d: its helpers open state.db beside live
+            # SessionDB handles); SessionDB's own connects are registered in code, see _OWN_CONNECTS.
+            if not name.endswith(".py") or name.startswith("test_") or name.endswith("_test.py"):
                 continue
             path = Path(root, name)
             yield path, path.relative_to(REPO).as_posix()
+
+
+# Helpers that open a sqlite3 connection on the path they are given (hermes_state_dbfile /
+# hermes_cli.sqlite_safe_read): a state.db connect through them is a connect like any other.
+_TRACKED_CONNECTS = {"_connect_tracked_db", "connect_tracked"}
 
 
 def _is_sqlite_connect(call: ast.Call, connect_aliases: set[str]) -> bool:
     f = call.func
     if isinstance(f, ast.Attribute) and f.attr == "connect" and isinstance(f.value, ast.Name):
         return f.value.id in {"sqlite3", "_sqlite3", "sqlite"}
-    return isinstance(f, ast.Name) and f.id in connect_aliases
+    if isinstance(f, ast.Attribute) and f.attr in _TRACKED_CONNECTS:
+        return True
+    return isinstance(f, ast.Name) and (f.id in connect_aliases or f.id in _TRACKED_CONNECTS)
 
 
 def _strings(node: ast.AST):
@@ -107,16 +119,23 @@ def _assignments(scope: ast.AST) -> dict[str, list[ast.AST]]:
     return out
 
 
-def _names_state_db(expr: ast.AST, assigns: dict[str, list[ast.AST]], seen: set | None = None) -> bool:
+# Modules whose functions receive the state.db path as a plain ``db_path`` (Prism 230be3dd449d): there,
+# a ``db_path`` argument names state.db too. Elsewhere ``db_path`` is any database (kanban.db, ...).
+_STATE_DB_PATH_MODULES = re.compile(r"^(hermes_state[a-z_]*\.py|tui_gateway/change_watcher\.py)$")
+_DB_PATH_NAME = re.compile(r"^(db_path|tracking_path)$")
+
+
+def _names_state_db(expr: ast.AST, assigns: dict[str, list[ast.AST]], seen: set | None = None,
+                    db_path_names: bool = False) -> bool:
     seen = set() if seen is None else seen  # shared across the walk: linear, not per-path exponential
     if any("state.db" in s for s in _strings(expr)):
         return True
     for name in _names(expr):
-        if _STATE_DB_NAME.search(name):
+        if _STATE_DB_NAME.search(name) or (db_path_names and _DB_PATH_NAME.search(name)):
             return True
         if name in assigns and name not in seen:
             seen.add(name)
-            if any(_names_state_db(v, assigns, seen) for v in assigns[name]):
+            if any(_names_state_db(v, assigns, seen, db_path_names) for v in assigns[name]):
                 return True
     return False
 
@@ -130,6 +149,18 @@ def _read_only(call: ast.Call, assigns: dict[str, list[ast.AST]]) -> bool:
     if any(name in _RO_HELPERS for e in exprs for name in _names(e)):
         return True
     return any("mode=ro" in s for e in exprs for s in _strings(e))
+
+
+# Connects registered in code rather than by a ``with registered_reader`` block: each function calls
+# ``register_reader`` before the connect and drops the token only after the connection's close.
+# Verified behaviourally by tests/hermes_state/test_lockguard_private_fd.py.
+_REGISTERED_IN_CODE: dict[tuple[str, str], str] = {
+    ("hermes_state.py", "_connect_read_only"): "token kept per connection, dropped by _unregister_reader after close",
+    ("hermes_state.py", "_open_writer_conn"): "the writer: register_reader in _open_writer / reopen until hold() counts it",
+    ("hermes_state_repair.py", "_connect_repair_durable"): "token bound to the tracked close()",
+    ("tui_gateway/change_watcher.py", "_session_db_content_sig"): "register before the try, unregister after close in finally",
+    ("hermes_state_dbfile.py", "collect_state_db_stats"): "register before the connect, unregister after close in finally",
+}
 
 
 def _is_registered_reader(expr: ast.AST) -> bool:
@@ -147,7 +178,7 @@ def _scan_all(path: Path, rel: str):
     later item of the same ``with`` statement."""
     try:
         text = path.read_text(encoding="utf-8")
-        if "connect" not in text or "sqlite" not in text:
+        if "connect" not in text or ("sqlite" not in text and "_connect_tracked_db" not in text):
             return []  # cheap pre-filter: most files never open sqlite
         tree = ast.parse(text, filename=rel)
     except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
@@ -155,6 +186,7 @@ def _scan_all(path: Path, rel: str):
     aliases = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "sqlite3"
                for a in n.names if a.name == "connect"}
     hits = []
+    state_mod = bool(_STATE_DB_PATH_MODULES.match(rel))
 
     def visit(scope: ast.AST, fn_name: str, assigns, registered: bool):
         if isinstance(scope, (ast.With, ast.AsyncWith)):
@@ -176,12 +208,17 @@ def _scan_all(path: Path, rel: str):
         if isinstance(child, ast.Call) and _is_sqlite_connect(child, aliases):
             target = child.args[0] if child.args else next(
                 (kw.value for kw in child.keywords if kw.arg == "database"), None)
-            if target is not None and _names_state_db(target, assigns):
+            if target is not None and _names_state_db(target, assigns, db_path_names=state_mod):
                 hits.append((rel, fn_name, child.lineno, _read_only(child, assigns), registered))
         visit(child, fn_name, assigns, registered)
 
     visit(tree, "<module>", _assignments(tree), False)
     return hits
+
+
+def _scan_registered(path: Path, rel: str):
+    """:func:`_scan_all` with the :data:`_REGISTERED_IN_CODE` sites marked registered."""
+    return [(r, fn, line, ro, reg or (r, fn) in _REGISTERED_IN_CODE) for r, fn, line, ro, reg in _scan_all(path, rel)]
 
 
 def _scan(path: Path, rel: str):
@@ -195,7 +232,7 @@ _ALL_SITES = None
 def _all_state_db_connects():
     global _ALL_SITES
     if _ALL_SITES is None:  # one repo walk (~14 s) shared by the tests below
-        _ALL_SITES = [hit for path, rel in _py_files() for hit in _scan_all(path, rel)]
+        _ALL_SITES = [hit for path, rel in _py_files() for hit in _scan_registered(path, rel)]
     return _ALL_SITES
 
 
@@ -288,3 +325,6 @@ def test_allowlist_has_no_stale_entries():
     unreg = {(rel, fn) for rel, fn, _l, _ro, reg in _all_state_db_connects() if not reg}
     stale = sorted(set(UNREGISTERED_OK) - unreg)
     assert not stale, f"UNREGISTERED_OK entries that no longer match an unregistered connect: {stale}"
+    sites = {(rel, fn) for rel, fn, *_ in _all_state_db_connects()}
+    stale = sorted(set(_REGISTERED_IN_CODE) - sites)
+    assert not stale, f"_REGISTERED_IN_CODE entries that no longer match a connect: {stale}"
