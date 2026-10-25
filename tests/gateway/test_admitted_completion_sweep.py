@@ -282,3 +282,52 @@ def test_failed_legacy_reset_leaves_the_wake_retryable_as_admitted(tmp_path, iso
     _run(runner, later + 120)
     assert _run(runner, later + 180) == 1
     assert _json_outbox_states(tmp_path) == ["pending"]
+
+
+# Prism 515bc357c1a8 (t_506536db r2): the batch formatter glues "   Total duration: Ns" onto the
+# ``Event: <id>`` line, so the needle must also end at a space, not only at a newline.
+
+def _batch_wake_event(event_id):
+    return {"type": "async_delegation", "delegation_id": event_id.split(":")[0], "event_id": event_id,
+            "is_batch": True, "goals": ["g"], "results": [{"task_index": 0, "status": "completed", "summary": "ok"}],
+            "total_duration_seconds": 42, "role": "leaf", "model": "m", "completed_at": time.time()}
+
+
+def test_rendered_BATCH_wake_is_confirmed(tmp_path):
+    from tools.process_registry_notifications import _format_async_delegation
+    from hermes_state import SessionDB
+    evt = _batch_wake_event("deleg_x:terminal:g1")
+    text = _format_async_delegation(evt)
+    assert f"{ad.admission_receipt_needle(evt)}\n" not in text  # the glued shape this test pins
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("s1", source="telegram", session_key="k1")
+    db.append_message("s1", "user", text)
+    assert db.user_message_contains(["s1"], ad.admission_receipt_needle(evt), session_key="k1")
+    assert not db.user_message_contains(["s1"], "Event: deleg_x:terminal:g", session_key="k1")
+
+
+def test_parked_batch_wake_is_seen():
+    from tools.process_registry_notifications import _format_async_delegation
+    evt = _batch_wake_event("deleg_x:terminal:g1")
+    ev = SimpleNamespace(text=_format_async_delegation(evt))
+    runner = SimpleNamespace(
+        _is_session_running=lambda k: False,
+        _peek_session_state=lambda k: SimpleNamespace(conversation=SimpleNamespace(queued_events=[ev], held_queue=[])),
+        adapters={}, _profile_adapters={})
+    assert sweep._parked_in_memory(runner, "k1", ad.admission_receipt_needle(evt))
+    assert not sweep._parked_in_memory(runner, "k1", "Event: deleg_x:terminal:g")
+
+
+def test_consumed_batch_wake_is_delivered_with_zero_reinjects(tmp_path, isolated_registry):
+    """Sweep level: an admitted batch wake whose rendered text is in the transcript is confirmed, never
+    re-injected, across two sweeps (the second sweep is where a miss would re-queue it)."""
+    from tools.process_registry_notifications import _format_async_delegation
+    runner, _adapter, event = _admitted(tmp_path, isolated_registry)
+    rendered = _format_async_delegation(dict(_batch_wake_event(event["event_id"]),
+                                             delegation_id=event["delegation_id"]))
+    assert f"Event: {event['event_id']}   Total duration:" in rendered
+    _persist_user_row(tmp_path, "parent-sess", rendered)
+    later = time.time() + 600
+    assert _run(runner, later) == 0 and _run(runner, later + 60) == 0
+    assert _json_outbox_states(tmp_path) == ["delivered"]
+    assert isolated_registry.completion_queue.empty()

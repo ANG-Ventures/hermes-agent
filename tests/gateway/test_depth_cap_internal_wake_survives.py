@@ -70,9 +70,13 @@ def _wake(text=WAKE):
                         metadata={"notification_origin": "process_registry_synthetic"})
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("delivery", ["queued", "steered"])
-async def test_internal_wake_admitted_at_depth_cap_runs_as_a_later_turn(monkeypatch, tmp_path, delivery):
+HUMAN_STEER = "human steer mid-turn"
+
+
+async def _drive_chain(monkeypatch, tmp_path, delivery, *, steer_on="h3"):
+    """Run t0 (-> h1 -> h2 -> h3 when ``steer_on`` is the depth-cap turn); on ``steer_on`` deliver the
+    completion (``queued``/``steered``), or a human steer then the completion (``mixed``). Returns
+    ``(calls, kinds)``: each turn's message and ``display_kind_for_event`` of the event it ran from."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *a, **k: None
@@ -91,7 +95,7 @@ async def test_internal_wake_admitted_at_depth_cap_runs_as_a_later_turn(monkeypa
             self._steered = None
 
         def steer(self, text):
-            self._steered = text
+            self._steered = f"{self._steered}\n{text}" if self._steered else text
             return True
 
         @property
@@ -104,16 +108,19 @@ async def test_internal_wake_admitted_at_depth_cap_runs_as_a_later_turn(monkeypa
             # Each turn of the chain gets the next queued wake (10-24: kanban/deadman wakes); the
             # depth-3 turn gets the delegation completion, exactly as on 10-24.
             nxt = {"t0": "h1", "h1": "h2", "h2": "h3"}.get(message)
-            if nxt is not None:
-                _admit_from_thread(lambda: admit_internal_event(adapter, _wake(nxt)))
-            elif message == "h3" and delivery == "queued":
+            if message == steer_on and delivery == "queued":
                 _admit_from_thread(lambda: admit_internal_event(adapter, _wake()))
-            elif message == "h3":
+            elif message == steer_on:
                 # The real busy fast path steers the completion into this running agent. Let the
                 # tracker promote THIS agent into the slot first (a real turn runs for minutes).
                 time.sleep(0.3)
+                if delivery == "mixed":
+                    _admit_from_thread(lambda: holder["runner"]._hm_handle_running_session_message(
+                        _msg(HUMAN_STEER), _source(), holder["key"]))
                 _admit_from_thread(lambda: holder["runner"]._hm_handle_running_session_message(
                     _wake(), _source(), holder["key"]))
+            elif nxt is not None:
+                _admit_from_thread(lambda: admit_internal_event(adapter, _wake(nxt)))
             result = {"final_response": f"answer {message}", "messages": [], "api_calls": 1}
             if self._steered:
                 # Final answer already produced: the finalizer hands the unapplied steer back.
@@ -144,14 +151,23 @@ async def test_internal_wake_admitted_at_depth_cap_runs_as_a_later_turn(monkeypa
     runner._effective_busy_input_mode = lambda source: "steer"
     monkeypatch.setattr(type(runner), "_MAX_INTERRUPT_DEPTH", 3)
 
+    # Every turn's persisted display kind: the handler's fresh turns and the drain's recursive
+    # follow-ups both enter ``_run_agent`` with it.
     kinds = []
+    real_run_agent = runner._run_agent
+
+    async def recording_run_agent(*args, **kwargs):
+        kinds.append(kwargs.get("persist_user_display_kind"))
+        return await real_run_agent(*args, **kwargs)
+
+    runner._run_agent = recording_run_agent
 
     async def handler(event):
         from gateway.response_filters import display_kind_for_event
-        kinds.append(display_kind_for_event(event))
         generation = runner._begin_session_run_generation(key)
         await runner._run_agent(message=event.text or "", context_prompt="", history=[], source=_source(),
-                                session_id="sess-depth", session_key=key, run_generation=generation)
+                                session_id="sess-depth", session_key=key, run_generation=generation,
+                                persist_user_display_kind=display_kind_for_event(event))
         return None
 
     adapter.set_message_handler(handler)
@@ -161,8 +177,30 @@ async def test_internal_wake_admitted_at_depth_cap_runs_as_a_later_turn(monkeypa
         if any(WAKE in c for c in calls) and not any(not t.done() for t in list(adapter._session_tasks.values())):
             break
         await asyncio.sleep(0.01)
+    return calls, kinds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["queued", "steered"])
+async def test_internal_wake_admitted_at_depth_cap_runs_as_a_later_turn(monkeypatch, tmp_path, delivery):
+    calls, kinds = await _drive_chain(monkeypatch, tmp_path, delivery)
     assert calls[:4] == ["t0", "h1", "h2", "h3"], calls
     assert len(calls) == 5 and WAKE in calls[4], calls
     # The 5th turn runs as the internal wake it was, never as a human turn (t_506536db): before, the
     # re-seated pending_steer was a bare internal=False event (visible fallback, auth path).
-    assert kinds[-1] == "internal_notification", kinds
+    assert len(kinds) == 5 and kinds[-1] == "internal_notification", kinds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("steer_on", ["t0", "h3"], ids=["depth0", "depth_cap"])
+@pytest.mark.parametrize("delivery,expected_kind", [("steered", "internal_notification"), ("mixed", None)])
+async def test_leftover_steer_provenance_follows_every_steered_text(monkeypatch, tmp_path, steer_on, delivery,
+                                                                     expected_kind):
+    """t_506536db: a re-seated leftover steer runs internal only when EVERY text steered into the turn was
+    internal. One human steer beside the completion makes the next turn a human turn, at depth 0 and at
+    the depth cap; a completion steered alone stays internal at depth 0 too."""
+    calls, kinds = await _drive_chain(monkeypatch, tmp_path, delivery, steer_on=steer_on)
+    chain = ["t0"] if steer_on == "t0" else ["t0", "h1", "h2", "h3"]
+    assert calls[:-1] == chain and WAKE in calls[-1], calls
+    assert (HUMAN_STEER in calls[-1]) == (delivery == "mixed"), calls
+    assert len(kinds) == len(calls) and kinds[-1] == expected_kind, kinds
