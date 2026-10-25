@@ -2225,7 +2225,10 @@ class GatewayInboundMixin:
             )
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
-        if "@" in message_text:
+        # An internal event (async-delegation wake, steered leftover) carries already-rendered text:
+        # an ``@file:`` in a child's result is data, never a fresh injection request, and an
+        # over-budget expansion would return None and strand the wake (Prism 5723164466ce).
+        if "@" in message_text and not getattr(event, "internal", False):
             message_text = await self._expand_inbound_context_references(source, session_key, message_text)
             if message_text is None:
                 return None

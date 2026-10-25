@@ -61,6 +61,8 @@ _STEER_DRAINED_ATTR = "_gateway_steer_drained"
 _STEER_LOCK_ATTR = "_gateway_steer_lock"
 _STEER_ENTRIES_MAX = 64
 _STEER_INSTALL_LOCK = threading.Lock()
+# Set while steer_with_provenance runs its verb: the wrapped ``steer`` then records nothing itself.
+_RECORDING = threading.local()
 
 
 def _steer_buffer_empty(agent: Any) -> bool:
@@ -97,7 +99,47 @@ def _provenance_lock(agent: Any) -> Optional[threading.Lock]:
                     del drained[:-_STEER_ENTRIES_MAX]
             return text
 
+        orig_steer = getattr(agent, "steer", None)
+
+        def _steer_recorded(text, _orig=orig_steer, _attrs=attrs, _lock=lock):
+            """Any producer that bypasses :func:`steer_with_provenance` (kanban comment-inject, the
+            redirect re-steer, ``api_server``) is recorded as a HUMAN entry, so a stale internal
+            entry can never cover its text (t_3572d4df (c))."""
+            if getattr(_RECORDING, "active", False):
+                return _orig(text)  # steer_with_provenance holds the lock and records the entry itself
+            with _lock:
+                fresh = _steer_buffer_empty(agent)
+                accepted = _orig(text)
+                if accepted:
+                    _record_steer_entry(agent, text, internal=False, fresh=fresh)
+            return accepted
+
+        prev_requeue = attrs.get("_steer_requeue_sink")
+
+        def _requeue_with_snapshot(text, put_back, _prev=prev_requeue, _attrs=attrs, _lock=lock):
+            """A drained batch put back into the buffer carries its snapshot entries back with it, so
+            the next drain classifies it like the first one would have (Prism 96e62751d3d9)."""
+            with _lock:
+                fresh = _steer_buffer_empty(agent)
+                _prev(text, put_back) if callable(_prev) else put_back()
+                drained = _attrs.get(_STEER_DRAINED_ATTR) or []
+                restored = drained.pop()[1] if drained and drained[-1][0] == text else []
+                if fresh or not isinstance(_attrs.get(_STEER_ENTRIES_ATTR), list):
+                    _attrs[_STEER_ENTRIES_ATTR] = []
+                _attrs[_STEER_ENTRIES_ATTR].extend(restored)
+
+        def _wipe_with_entries(wipe, _attrs=attrs, _lock=lock):
+            """A hard cancel wipes the buffer without a drain: drop the entries that described it
+            (Prism 7c35492cc023)."""
+            with _lock:
+                wipe()
+                _attrs.pop(_STEER_ENTRIES_ATTR, None)
+
         attrs["_drain_pending_steer"] = _drain_with_snapshot
+        if callable(orig_steer):
+            attrs["steer"] = _steer_recorded
+        attrs["_steer_requeue_sink"] = _requeue_with_snapshot
+        attrs["_steer_wipe_sink"] = _wipe_with_entries
         attrs[_STEER_LOCK_ATTR] = lock
         return lock
 
@@ -107,7 +149,11 @@ def steer_with_provenance(agent: Any, verb: Any, text: str, *, internal: bool) -
     lock = _provenance_lock(agent) if agent is not None else None
     with lock if lock is not None else contextlib.nullcontext():
         fresh = _steer_buffer_empty(agent)
-        accepted = bool(verb(text))
+        _RECORDING.active = True
+        try:
+            accepted = bool(verb(text))
+        finally:
+            _RECORDING.active = False
         if accepted and lock is not None:
             _record_steer_entry(agent, text, internal=internal, fresh=fresh)
     return accepted
@@ -129,9 +175,9 @@ def leftover_steer_is_internal(agent: Any, leftover: Optional[str]) -> bool:
     """True only when *leftover* is exactly the last text drained from *agent*'s steer buffer AND that
     drain's snapshot is built entirely from internal steer entries.
 
-    Retires every drain snapshot of the turn whatever the verdict, and never touches the live buffer's
-    entries (steers still buffered for the next turn). False when no snapshot matches the leftover, when
-    any entry is human, when an entry is missing from the leftover, or when the leftover holds text no
+    Retires every drain snapshot of the turn whatever the verdict. Live entries are kept while the buffer
+    holds text (steers still buffered for the next turn) and retired once it is empty. False when no
+    snapshot matches the leftover, when any entry is human, when an entry is missing from the leftover, or when the leftover holds text no
     entry accounts for (a steer that bypassed the gateway): the failure direction is a visible turn, never
     a silenced one."""
     lock = getattr(agent, "__dict__", {}).get(_STEER_LOCK_ATTR) if agent is not None else None
@@ -139,6 +185,10 @@ def leftover_steer_is_internal(agent: Any, leftover: Optional[str]) -> bool:
         return False
     with lock:
         drained = agent.__dict__.pop(_STEER_DRAINED_ATTR, None)
+        if _steer_buffer_empty(agent):
+            # Nothing is buffered, so no live entry describes anything: a buffer emptied without a
+            # drain (direct wipe) must not hand its entries to the next steer (Prism 43b1ce3c30ef).
+            agent.__dict__.pop(_STEER_ENTRIES_ATTR, None)
     remainder = (leftover or "").strip()
     if not remainder or not drained:
         return False

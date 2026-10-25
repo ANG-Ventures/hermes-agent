@@ -53,6 +53,13 @@ def _persist_user_row(tmp_path, session_id, text):
     db.close()
 
 
+def _stamp_updated_at(home, when):
+    from tools import async_delegation_store as store
+    with store.locked_registry(home) as registry:
+        for record in registry["records"].values():
+            record["updated_at"] = when
+
+
 def _run(runner, now):
     return asyncio.run(sweep.sweep_admitted_completions(runner, now=now))
 
@@ -258,20 +265,25 @@ def test_admitted_row_with_missing_store_is_dropped_at_the_age_ceiling(tmp_path,
     with caplog.at_level("WARNING"):
         assert _run(runner, past) == 0
     assert _json_outbox_states(tmp_path) == ["dropped"]
-    assert "async_delegation_wake_lost" in caplog.text
+    assert "async_delegation_wake_unverified" in caplog.text  # nothing read the transcript: not "lost"
     assert isolated_registry.completion_queue.empty()
 
 
 def test_admitted_row_on_an_unserved_profile_is_dropped_by_the_registry_scan(tmp_path, isolated_registry, monkeypatch, caplog):
-    """No sweeper serves this home any more; the next registry write/scan expires it at the ceiling."""
+    """No sweeper serves this home any more (no fresh sweep marker); the next registry write (a CLI
+    dispatch in that profile) expires it at the ceiling, labelled unverified, not lost."""
     from tools import async_delegation_store as store
     _admitted(tmp_path, isolated_registry)
     real_time = time.time
     monkeypatch.setattr(store.time, "time", lambda: real_time() + store.ADMITTED_MAX_AGE_SECONDS + 60)
+    _stamp_updated_at(tmp_path, store.time.time())  # seeded rows carry no updated_at: keep _prune's retention off
     with caplog.at_level("WARNING"):
-        assert ad.enqueue_pending_outbox(current_boot_id="next-boot", profile_home=tmp_path) == 0
-    assert _json_outbox_states(tmp_path) == ["dropped"]
-    assert "async_delegation_wake_lost" in caplog.text
+        record, _ = store.persist_dispatch(delegation_id="deleg_other", durable_spec={}, boot_id="b",
+                                           dispatched_at=store.time.time(), profile_home=tmp_path)
+    assert record is not None
+    events = [e for r in store.read_registry(profile_home=tmp_path)["records"].values() for e in r["outbox"]]
+    assert [(e["state"], e["drop_reason"]) for e in events] == [("dropped", "admitted_age_ceiling_unverified")]
+    assert "async_delegation_wake_unverified" in caplog.text
 
 
 def test_admitted_row_under_the_ceiling_is_kept(tmp_path, isolated_registry):

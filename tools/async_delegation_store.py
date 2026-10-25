@@ -227,6 +227,10 @@ def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
                 # for every healthy delegation in the profile.
                 or (isinstance(event, dict)
                     and not _is_optional_number(event.get("created_at")))
+                # The admitted-age ceiling computes `now - admitted_at` across the whole
+                # registry; an unconvertible value would abort it for every sibling (7aaf4b17dca7).
+                or (isinstance(event, dict)
+                    and not _is_optional_number(event.get("admitted_at")))
                 or (isinstance(event, dict)
                     and isinstance(event.get("payload"), dict)
                     and not _is_optional_number(event["payload"].get("attempt_generation")))
@@ -399,23 +403,52 @@ def admitted_past_ceiling(event: dict[str, Any], now: float) -> bool:
             and now - admitted_at > ADMITTED_MAX_AGE_SECONDS)
 
 
-def _expire_admitted(registry: dict[str, Any], now: float) -> None:
+def sweep_marker_path(profile_home: Path | None = None) -> Path:
+    """Touched by the admitted-completion sweeper for every home it serves (and by the gateway's boot
+    replay, before its first sweep). Its mtime is how the store tells a served home from an unserved one."""
+    return registry_path(profile_home).with_suffix(".sweep")
+
+
+def note_sweeper_serves(profile_home: Path | None = None) -> None:
+    path = sweep_marker_path(profile_home)
+    try:
+        _prepare_directory(path)
+        path.touch()
+        stamp = time.time()  # the store's clock, not the filesystem's: expiry compares against it
+        os.utime(path, (stamp, stamp))
+    except OSError:
+        logger.debug("could not touch the admitted-sweep marker %s", path, exc_info=True)
+
+
+def _sweeper_serves(path: Path, now: float) -> bool:
+    try:
+        return now - path.with_suffix(".sweep").stat().st_mtime <= ADMITTED_MAX_AGE_SECONDS
+    except OSError:
+        return False
+
+
+def _expire_admitted_unserved(registry: dict[str, Any], path: Path, now: float) -> None:
+    """Housekeeping for a home NO sweeper serves: an ``admitted`` row past the ceiling is dropped as
+    ``unverified``, not lost, since nothing checked its transcript. A served home is left to the sweep,
+    which confirms against the transcript first and only then expires (Prism 2fcb0b3d9b47)."""
+    if _sweeper_serves(path, now):
+        return
     invalid_record_ids = set(registry.get("_invalid_record_ids", []))
     for delegation_id, record in registry["records"].items():
         if str(delegation_id) in invalid_record_ids or not isinstance(record, dict):
             continue
         for event in record.get("outbox", []):
             if isinstance(event, dict) and admitted_past_ceiling(event, now):
-                event.update(state="dropped", drop_reason="admitted_age_ceiling", delivered_at=now)
+                event.update(state="dropped", drop_reason="admitted_age_ceiling_unverified", delivered_at=now)
                 logger.warning(
-                    "async_delegation_wake_lost event_id=%s session_key=%s age_hours=%.1f: admitted, "
-                    "never confirmed; dropped at the age ceiling", event.get("event_id"),
+                    "async_delegation_wake_unverified event_id=%s session_key=%s age_hours=%.1f: admitted, "
+                    "no sweeper serves this profile; expired unverified at the age ceiling", event.get("event_id"),
                     event.get("admitted_session_key") or "-", (now - event["admitted_at"]) / 3600.0,
                 )
 
 
-def _prune(registry: dict[str, Any], now: float) -> None:
-    _expire_admitted(registry, now)
+def _prune(registry: dict[str, Any], now: float, path: Path) -> None:
+    _expire_admitted_unserved(registry, path, now)
     records = registry["records"]
     invalid_record_ids = set(registry.get("_invalid_record_ids", []))
     removable: list[tuple[float, str]] = []
@@ -523,7 +556,7 @@ def persist_dispatch(
     try:
         _assert_nonsecret_settings(durable_spec)
         with locked_registry(profile_home) as registry:
-            _prune(registry, now)
+            _prune(registry, now, path)
             if len(registry["records"]) >= record_limit:
                 logger.error(
                     "async_delegation_sync_fallback reason=registry_cap cap=%d path=%s",
@@ -1801,8 +1834,11 @@ def enqueue_pending_outbox(
 ) -> list[dict[str, Any]]:
     queued: list[dict[str, Any]] = []
     now = time.time()
+    # The gateway replaying this home's outbox also runs its admitted sweep, which owns expiry of
+    # ``admitted`` rows (transcript first, then the age ceiling). Mark it served BEFORE any write can
+    # prune, so a restart after a long outage never drops a consumed wake unchecked (2fcb0b3d9b47).
+    note_sweeper_serves(profile_home)
     with locked_registry(profile_home) as registry:
-        _expire_admitted(registry, now)
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
         for delegation_id, record in registry["records"].items():
             if str(delegation_id) in invalid_record_ids:
