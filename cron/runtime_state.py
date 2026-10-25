@@ -52,6 +52,9 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 # by path to merge runtime rows onto a raw jobs.json read (see ``merged_jobs``).
 
 DB_NAME = "runtime_state.db"
+# The database file and every side file SQLite may leave next to it (WAL mode: -wal/-shm; a
+# configured ``journal_mode: delete``: -journal).
+SIDECAR_SUFFIXES = ("", "-wal", "-shm", "-journal")
 ENV_MODE = "HERMES_CRON_RUNTIME_STATE"
 ENV_MIRROR_INTERVAL = "HERMES_CRON_MIRROR_INTERVAL_S"
 DEFAULT_MIRROR_INTERVAL_S = 30.0
@@ -326,6 +329,38 @@ def _rows_and_unreadable(conn: sqlite3.Connection) -> tuple:
         else:
             bad.append(str(job_id))
     return out, sorted(bad)
+
+
+def row_texts(conn: sqlite3.Connection) -> Dict[str, str]:
+    """``{job_id: stored fields text}``: the compare token for ``delete_rows_if_unchanged``."""
+    return {str(jid): text for jid, text in
+            conn.execute("SELECT job_id, fields FROM job_runtime").fetchall()}
+
+
+def delete_rows_if_unchanged(conn: sqlite3.Connection, expected: Dict[str, str]) -> List[str]:
+    """Compare-and-delete (caller owns the transaction, Prism c10b8ca4d934/fb81a100b27c): delete
+    each row only while its stored text still equals *expected[job_id]* (the text an export folded
+    into jobs.json). Returns the ids that were NOT deleted because a writer changed (or removed)
+    the row since: their newer value is not in the file, so the caller must keep the database."""
+    changed: List[str] = []
+    for job_id, text in expected.items():
+        if not conn.execute("DELETE FROM job_runtime WHERE job_id=? AND fields=?",
+                            (str(job_id), text)).rowcount:
+            changed.append(str(job_id))
+    return sorted(changed)
+
+
+def published_token(conn: sqlite3.Connection) -> Optional[int]:
+    """``max(rowid)`` of the published pending generations (None = none): one indexed read the
+    single-job definition cache keys on, so a generation published without the rename that
+    names it (crash between mark and rename, ruling R2) invalidates the cache (Prism
+    f92e5396970e). Tolerates a database without the column."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_runtime)")}
+    if "published_at" not in cols:
+        return None
+    row = conn.execute(
+        "SELECT max(rowid) FROM pending_runtime WHERE published_at IS NOT NULL").fetchone()
+    return row[0] if row else None
 
 
 def read_row(conn: sqlite3.Connection, job_id: str) -> Optional[Dict[str, Any]]:
@@ -714,8 +749,10 @@ def fold_staged_copy(cron_dir: Path) -> bool:
 
 
 def drop_database(cron_dir: Path) -> None:
-    """Remove the database and its WAL/SHM side files (after a fold back into jobs.json)."""
+    """Remove the database and its side files (WAL/SHM, and the rollback journal a
+    ``journal_mode: delete`` database leaves after a crash, Prism 15391e1b7adf) after a fold back
+    into jobs.json."""
     base = db_path(cron_dir)
-    for suffix in ("", "-wal", "-shm"):
+    for suffix in SIDECAR_SUFFIXES:
         with contextlib.suppress(FileNotFoundError):
             Path(str(base) + suffix).unlink()

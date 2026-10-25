@@ -2066,12 +2066,29 @@ def _recover_pending_now() -> None:
         _recover_pending_runtime(_file_runtime_gen())
 
 
-def _mirror_stamp(jobs_file: Path) -> Optional[Tuple[float, float]]:
+def _mirror_stamp(jobs_file: Path) -> Optional[Tuple[float, float, float]]:
+    """``(inode, size, mtime_ns)`` of jobs.json: an equal-length in-place rewrite keeps inode and
+    size, only the mtime moves (Prism a131d31922ac)."""
     try:
         st = jobs_file.stat()
     except OSError:
         return None
-    return float(st.st_ino), float(st.st_size)
+    return float(st.st_ino), float(st.st_size), float(st.st_mtime_ns)
+
+
+_MIRROR_STAMP_KEYS = ("file_ino", "file_size", "file_mtime_ns")
+
+
+def _store_mirror_stamp(conn, stamp: Tuple[float, float, float]) -> None:
+    conn.executemany("INSERT OR REPLACE INTO mirror_state(k, v) VALUES (?, ?)",
+                     list(zip(_MIRROR_STAMP_KEYS, stamp)))
+
+
+def _known_mirror_stamp(conn) -> Optional[Tuple[Optional[float], ...]]:
+    """The recorded identity, or None when none was recorded. A database from an earlier PR head
+    recorded no mtime: that reads as a mismatch once, and the next flush records all three."""
+    known = tuple(_rs._state(conn, k) for k in _MIRROR_STAMP_KEYS)
+    return None if known[0] is None and known[1] is None else known
 
 
 def _record_mirror_written(conn, seq: float) -> None:
@@ -2081,8 +2098,7 @@ def _record_mirror_written(conn, seq: float) -> None:
     _rs.mark_flushed(conn, seq)
     stamp = _mirror_stamp(_current_cron_store().jobs_file)
     if stamp is not None:
-        conn.execute("INSERT OR REPLACE INTO mirror_state(k, v) VALUES ('file_ino', ?), "
-                     "('file_size', ?)", stamp)
+        _store_mirror_stamp(conn, stamp)
 
 
 def _record_mirror_stamp_if_unknown(conn) -> None:
@@ -2090,12 +2106,11 @@ def _record_mirror_stamp_if_unknown(conn) -> None:
     its identity and an out-of-band replacement is detected from the first tick. Only when no
     identity is known yet: a known one that no longer matches is a replacement the next flush
     must repair, and the seq is untouched (other rows may still be ahead of the file)."""
-    if _rs._state(conn, "file_ino") is not None:
+    if _known_mirror_stamp(conn) is not None:
         return
     stamp = _mirror_stamp(_current_cron_store().jobs_file)
     if stamp is not None:
-        conn.execute("INSERT OR REPLACE INTO mirror_state(k, v) VALUES ('file_ino', ?), "
-                     "('file_size', ?)", stamp)
+        _store_mirror_stamp(conn, stamp)
 
 
 def maybe_flush_runtime_mirror(*, force: bool = False) -> bool:
@@ -2113,8 +2128,8 @@ def maybe_flush_runtime_mirror(*, force: bool = False) -> bool:
         if conn is None:
             return False
         since = _rs.dirty_since(conn)
-        known = (_rs._state(conn, "file_ino"), _rs._state(conn, "file_size"))
-    replaced = known != (None, None) and _mirror_stamp(store.jobs_file) != known
+        known = _known_mirror_stamp(conn)
+    replaced = known is not None and _mirror_stamp(store.jobs_file) != known
     if since is None and not replaced:
         return False
     interval = _rs.mirror_interval()
@@ -2205,9 +2220,12 @@ class RuntimeOrphansRefused(RuntimeRetireRefused):
             "--drop-orphans to discard them")
 
 
-def _retire_runtime_rows(conn, ids: List[str]) -> None:
-    """Delete rows already folded into jobs.json (caller checked ``_destructive_ok()``, R1)."""
-    _rs.upsert_rows(conn, {}, delete_ids=ids, dirty=False)
+def _retire_runtime_rows(conn, folded: Dict[str, str]) -> List[str]:
+    """Compare-and-delete the rows folded into jobs.json (caller checked ``_destructive_ok()``,
+    R1): ``folded`` maps each job id to the row text the export snapshot read. A row a
+    degraded-lock sibling rewrote since is kept (its newer value is not in the file); returns
+    those ids (Prism c10b8ca4d934 / fb81a100b27c)."""
+    return _rs.delete_rows_if_unchanged(conn, folded)
 
 
 def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retire: bool = True,
@@ -2255,7 +2273,10 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
         # Count what we could NOT read (Prism 61ba1c33f294): a row that is not a JSON object has
         # no record to fold into, and dropping the database would delete it unread.
         with _rs.connect(cron_dir) as conn:
+            conn.execute("BEGIN")  # one snapshot: the parsed rows AND the texts retire compares
             rows, unreadable = _rs._rows_and_unreadable(conn)
+            texts = _rs.row_texts(conn)
+            conn.execute("COMMIT")
         if unreadable and retire and not keep_orphans:
             raise RuntimeError(
                 f"{len(unreadable)} runtime row(s) in {_rs.DB_NAME} are not readable JSON objects "
@@ -2284,9 +2305,22 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
             merged.append(job)
         if applied or not kept:
             _write_definitions_file(merged)
-        if retire and kept and _destructive_ok():  # retire the folded rows only
+        changed: List[str] = []
+        if retire and _destructive_ok():  # compare-and-delete the folded rows only
             with _runtime_txn() as conn:
-                _retire_runtime_rows(conn, [j for j in rows if j not in kept])
+                changed = _retire_runtime_rows(
+                    conn, {j: texts[j] for j in rows if j not in kept and j in texts})
+        if retire and changed:
+            # A sibling wrote these rows after our snapshot: jobs.json carries the older value,
+            # so the database (still the source of truth for them) is kept.
+            msg = (f"{len(changed)} runtime row(s) changed while exporting "
+                   f"({', '.join(changed)}); {_rs.DB_NAME} kept (those rows are newer than "
+                   "jobs.json). Re-run the export")
+            if keep_orphans:
+                logger.warning("cron runtime-state: %s", msg)
+                return applied
+            raise RuntimeRetireRefused(msg)
+        if retire and kept:
             logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
                            "jobs.json; %s kept for %d row(s)", applied, _rs.DB_NAME,
                            len(kept))
@@ -2301,7 +2335,7 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
 # Parsed definitions keyed by jobs.json stamp, for the single-job fast path: a runtime touch then
 # costs one stat() instead of a 1.4 MB parse + whole-store deepcopy. Never handed out: callers get
 # a deepcopy of ONE record.
-_defs_cache: Dict[str, Tuple[Tuple[int, int, int], Dict[str, Dict[str, Any]], bool]] = {}
+_defs_cache: Dict[str, Tuple[Tuple[Any, Optional[int]], Dict[str, Dict[str, Any]], bool]] = {}
 _defs_cache_lock = threading.Lock()
 
 
@@ -2314,6 +2348,12 @@ def _cached_definition(job_id: Any) -> Tuple[bool, Optional[Dict[str, Any]], boo
     stamp = _jobs_file_stamp(jobs_file)
     if stamp is None:
         return False, None, False
+    # Prism f92e5396970e: a generation published (R2 marker) by a save that crashed before its
+    # rename leaves jobs.json's stamp unchanged; key the cache on the newest published pending
+    # rowid too, so the reparse below sees the pending generation and the full path recovers it.
+    with _rs.connect(_current_cron_store().cron_dir, create=False) as conn:
+        token = _rs.published_token(conn) if conn is not None else None
+    stamp = (stamp, token)
     key = str(jobs_file)
     with _defs_cache_lock:
         cached = _defs_cache.get(key)
@@ -2611,6 +2651,13 @@ def _reconcile_job_fields(
     for key in set(disk_job) | set(baseline_job):
         in_payload = key in payload_job
         base_val = baseline_job.get(key)
+        if key == "repeat" and all(isinstance(v, dict) for v in (
+                payload_job.get(key), disk_job.get(key), base_val)):
+            # Prism 60d10bb9ae09: ``repeat`` mixes a definition key (``times``) with a runtime
+            # counter (``completed``, a row field). Merge per sub-key, so editing the limit keeps
+            # a sibling's concurrent completion instead of reverting it with our stale copy.
+            merged[key] = _reconcile_job_fields(payload_job[key], disk_job[key], base_val)
+            continue
         ours_changed = (
             (key in baseline_job) != in_payload
             or (in_payload and payload_job[key] != base_val)

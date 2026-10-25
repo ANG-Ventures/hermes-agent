@@ -2176,11 +2176,11 @@ def _staged_cron_dir(staged: Path) -> Path:
     """``staged/cron``, refused (ValueError) when it or a file the fold rewrites/removes (the fold
     temp name included, Prism 5a6d55ddbf83) is a symlink or resolves outside the staging root: copytree keeps symlinks, so a symlinked ``cron``
     would point the fold and the db removals below at the LIVE store (Prism d8715e0ffdf8)."""
-    from cron.runtime_state import DB_NAME, FOLD_TMP_NAME
+    from cron.runtime_state import DB_NAME, FOLD_TMP_NAME, SIDECAR_SUFFIXES
 
     staged_cron = staged / "cron"
     root = os.path.realpath(staged)
-    for name in ("", "jobs.json", FOLD_TMP_NAME, DB_NAME, DB_NAME + "-wal", DB_NAME + "-shm"):
+    for name in ("", "jobs.json", FOLD_TMP_NAME, *(DB_NAME + s for s in SIDECAR_SUFFIXES)):
         path = staged_cron / name if name else staged_cron
         if not (path.exists() or path.is_symlink()):
             continue
@@ -2202,7 +2202,7 @@ def _capture_cron_pair(profile_dir: Path, staged_cron: Path) -> None:
     that retired the db after copytree must not leave copytree's two-moment db/jobs.json pair for
     the fold. Staged db files are always removed first, so a stray -wal/-shm with no main db
     (Prism 789c2932efbe) never reaches the archive. Only the STAGED copy is touched."""
-    from cron.runtime_state import DB_NAME
+    from cron.runtime_state import DB_NAME, SIDECAR_SUFFIXES
     from hermes_cli.backup import _cron_store_lock
     from hermes_cli.backup_sqlite import _safe_copy_db
 
@@ -2213,13 +2213,16 @@ def _capture_cron_pair(profile_dir: Path, staged_cron: Path) -> None:
         staged_had_db = (staged_cron / DB_NAME).exists()
         live_has_db = (src_cron / DB_NAME).exists()
         if not staged_had_db:
-            stray = [n for n in (DB_NAME + "-wal", DB_NAME + "-shm") if (staged_cron / n).exists()]
+            stray = [DB_NAME + sfx for sfx in SIDECAR_SUFFIXES[1:]
+                     if (staged_cron / (DB_NAME + sfx)).exists()]
             if stray:
                 logger.warning("profile export: dropped stray %s (no %s) from the staged copy",
                                ", ".join(stray), DB_NAME)
-        for name in (DB_NAME, DB_NAME + "-wal", DB_NAME + "-shm"):
+        # -journal too (Prism 15391e1b7adf): a journal_mode=delete db's hot rollback journal holds
+        # pre-images of runtime rows and would reach the archive unscrubbed.
+        for sfx in SIDECAR_SUFFIXES:
             with contextlib.suppress(FileNotFoundError):
-                (staged_cron / name).unlink()
+                (staged_cron / (DB_NAME + sfx)).unlink()
         if not (staged_had_db or live_has_db):
             return  # the store never had a db: copytree's jobs.json is one consistent file
         # A db was involved: the live jobs.json is re-read under the lock (a retire that ran after
