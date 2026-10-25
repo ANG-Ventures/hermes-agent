@@ -1725,3 +1725,32 @@ def test_load_conversation_skips_non_dict_lines(monkeypatch, tmp_path):
         f.write("42\n")
     convo = protocol.load_conversation("ctx-mixed")
     assert len(convo) == 1 and convo[0]["text"] == "hello"
+
+
+@pytest.mark.platforms("linux")
+def test_a2a_title_write_reads_the_target_profiles_config(monkeypatch, tmp_path):
+    """Prism 6abd24f065ba: the a2a title UPDATE opens a SessionDB on ANOTHER profile's state.db. It must
+    resolve that profile's config (database.journal_mode), not the launch profile's: a target profile
+    on a WAL-unsafe filesystem (journal_mode: delete) must never be flipped to WAL by a peer."""
+    import hermes_state_wal
+    from hermes_constants import get_hermes_home
+    from hermes_state import SessionDB
+    from plugins.platforms.a2a import adapter as a2a
+
+    launch, target = tmp_path / "launch", tmp_path / "target"
+    launch.mkdir()
+    target.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    SessionDB(db_path=target / "state.db").close()
+    seen = []
+    real = hermes_state_wal.resolve_journal_mode
+
+    def _resolve():
+        seen.append(str(get_hermes_home()))
+        return real()
+
+    monkeypatch.setattr(hermes_state_wal, "resolve_journal_mode", _resolve)
+    monkeypatch.setattr(a2a, "_profile_home", lambda profile: str(target))
+    a2a._state_db("target", "UPDATE sessions SET title = ? WHERE id = ?", ("t", "none"), "x", commit=True)
+    assert seen and set(seen) == {str(target)}, seen
+    assert str(get_hermes_home()) == str(launch), "the profile scope leaked past the write"

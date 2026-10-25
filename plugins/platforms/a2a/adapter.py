@@ -144,12 +144,19 @@ def _state_db(profile: str, sql: str, params: tuple, log_msg: str, *, commit: bo
         if commit:
             # Writes go through SessionDB, never a raw connection: the WAL lock guard counts only
             # SessionDB writers (tests/hermes_state/test_state_db_raw_writer_lint.py, t_aeae3fe7).
+            # Bound to the TARGET profile's home for this one write, so SessionDB reads that profile's
+            # config (database.journal_mode, ...), not the launch profile's (Prism 6abd24f065ba).
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
             from hermes_state import SessionDB
-            sdb = SessionDB(db_path=Path(db))
+            token = set_hermes_home_override(home)
             try:
-                sdb._execute_write(lambda con: con.execute(sql, params))
+                sdb = SessionDB(db_path=Path(db))
+                try:
+                    sdb._execute_write(lambda con: con.execute(sql, params))
+                finally:
+                    sdb.close()
             finally:
-                sdb.close()
+                reset_hermes_home_override(token)
             return ""
         from hermes_state_holders import read_only_db_uri
         from hermes_state_lockguard import registered_reader
