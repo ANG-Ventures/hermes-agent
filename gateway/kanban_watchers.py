@@ -16,6 +16,7 @@ refusal paging) as the loop bodies ``GatewayRunner`` runs.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import math
 import os
 import sqlite3
@@ -232,22 +233,104 @@ def _resolve_home_line(session_id: Optional[str]) -> str:
     return format_home_line(sid, row)
 
 
+class _SessionOriginReader:
+    """One reused SessionDB per state.db path for the notifier's origin lookups (t_69e10010).
+
+    Constructing a SessionDB runs the full writable open path (fd-table scans under the startup
+    lock); the notifier used to do that once per actor per subscription per tick. The handle comes
+    from ``hermes_state_registry.acquire``, the process-wide registry the gateway's session store
+    also opens through, so in a gateway it is the runner's own writer and nothing new is opened.
+    The path is resolved per call (``_default_db_path`` follows the context-local HERMES_HOME),
+    the handle is dropped when the file at the path was replaced or a read fails, and ``close()``
+    returns every reference when the watcher stops.
+    """
+
+    def __init__(self) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self._dbs: dict[str, Any] = {}
+
+    def _handle(self, key: str):
+        from hermes_state_common import stat_db_file_identity
+
+        with self._lock:
+            db = self._dbs.get(key)
+        if db is not None and getattr(db, "_db_file_identity", None) == stat_db_file_identity(Path(key)):
+            return db
+        if db is not None:
+            self._drop(key, db)
+        from hermes_state_registry import acquire
+
+        db = acquire(Path(key))
+        with self._lock:
+            other = self._dbs.setdefault(key, db)
+        if other is not db:
+            self._release(db)
+        return other
+
+    def _drop(self, key: str, db) -> None:
+        with self._lock:
+            if self._dbs.get(key) is db:
+                del self._dbs[key]
+            else:
+                return
+        self._release(db)
+
+    @staticmethod
+    def _release(db) -> None:
+        try:
+            from hermes_state_registry import release_or_close
+
+            release_or_close(db)
+        except Exception:
+            logger.debug("kanban notifier: origin reader release failed", exc_info=True)
+
+    def get_session(self, session_id: str):
+        from hermes_state import _default_db_path
+
+        key = str(_default_db_path())
+        db = self._handle(key)
+        try:
+            return db.get_session(session_id)
+        except Exception:
+            self._drop(key, db)
+            raise
+
+    def close(self) -> None:
+        with self._lock:
+            dbs, self._dbs = list(self._dbs.values()), {}
+        for db in dbs:
+            self._release(db)
+
+
+# Set by the notifier watcher for its lifetime; ``asyncio.to_thread`` copies it into ``_collect``.
+_ORIGIN_READER: "contextvars.ContextVar[Optional[_SessionOriginReader]]" = contextvars.ContextVar(
+    "kanban_notifier_origin_reader", default=None,
+)
+
+
 def _session_origin(session_id: str) -> Optional[dict]:
     """The ``origin_json`` dict a session was opened from, or None.
 
-    Blocking state.db lookup; call from a worker thread only.
+    Blocking state.db lookup; call from a worker thread only. Inside the notifier watcher the
+    lookup reuses its ``_SessionOriginReader``; elsewhere it opens (and closes) one SessionDB.
     """
     row = None
     try:
-        from hermes_state import SessionDB
+        reader = _ORIGIN_READER.get()
+        if reader is not None:
+            row = reader.get_session(session_id)
+        else:
+            from hermes_state import SessionDB
 
-        db = SessionDB()
-        try:
-            row = db.get_session(session_id)
-        finally:
-            close = getattr(db, "close", None)
-            if callable(close):
-                close()
+            db = SessionDB()
+            try:
+                row = db.get_session(session_id)
+            finally:
+                close = getattr(db, "close", None)
+                if callable(close):
+                    close()
     except Exception:
         return None
     raw = (row or {}).get("origin_json")
@@ -1786,6 +1869,19 @@ class GatewayKanbanWatchersMixin:
             slept += 1.0
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+        """Run the notifier loop with ONE reused state.db reader for origin lookups (t_69e10010):
+        ``_session_origin`` used to construct a SessionDB per actor per tick; the reader is set
+        for this task's context (``asyncio.to_thread`` carries it into ``_collect``) and every
+        reference it took is returned when the watcher stops."""
+        reader = _SessionOriginReader()
+        token = _ORIGIN_READER.set(reader)
+        try:
+            await self._kanban_notifier_watcher_loop(interval)
+        finally:
+            _ORIGIN_READER.reset(token)
+            reader.close()
+
+    async def _kanban_notifier_watcher_loop(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
