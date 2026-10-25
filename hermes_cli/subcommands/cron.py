@@ -213,6 +213,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_subparsers.add_parser("doctor", help="Check scheduled jobs for common health issues")
 
+    cron_rt_export = cron_subparsers.add_parser(
+        "runtime-export",
+        help="Fold cron/runtime_state.db back into jobs.json and remove it (kill switch: run "
+             "before setting HERMES_CRON_RUNTIME_STATE=json)")
+    cron_rt_export.add_argument(
+        "--to-json", action="store_true", required=True,
+        help="Write runtime fields back into jobs.json (the only supported target)")
+
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)
     add_accept_hooks_flag(cron_parser)

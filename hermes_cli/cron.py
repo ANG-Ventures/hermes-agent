@@ -1033,11 +1033,26 @@ def cron_notepad(args) -> int:
         return 1
 
 
+def cron_runtime_export(args) -> int:
+    """``hermes cron runtime-export --to-json`` (t_94e91559): fold runtime_state.db back into
+    jobs.json and remove the database. Prints the job count; idempotent (no db = 0 jobs)."""
+    from cron.jobs import export_runtime_to_json
+
+    try:
+        count = export_runtime_to_json()
+    except Exception as exc:
+        print(color(f"runtime-export failed: {exc}", Colors.RED))
+        return 1
+    print(f"runtime-export: wrote runtime fields of {count} job(s) back into jobs.json")
+    return 0
+
+
 # Late-bound lambdas keep module-level monkeypatching working; list/status/runs return None -> 0.
 _CRON_SUBCOMMANDS = {
     "list": lambda a: cron_list(getattr(a, "all", False), as_json=getattr(a, "json", False)) or 0,
     "status": lambda a: cron_status() or 0,
     "doctor": lambda a: cron_doctor(),
+    "runtime-export": lambda a: cron_runtime_export(a),
     "tick": lambda a: cron_tick(),
     "runs": lambda a: cron_runs(getattr(a, "job_id", None), getattr(a, "limit", 20)) or 0,
     "incidents": lambda a: cron_incidents(a),
