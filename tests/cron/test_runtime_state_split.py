@@ -1888,3 +1888,269 @@ def test_kill_switch_orphan_row_folds_before_returned_definition_runs(temp_home,
     assert cj.get_job(x["id"])["repeat"]["completed"] == 4
     monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "sqlite")
     assert cj.get_job(x["id"])["repeat"]["completed"] == 4
+
+
+# --- round 8 (Apollo 2026-10-25 07:1x: rulings R1 + R2, fixes 8f9783e7 + 173ea387) ----------
+
+def _pending(home):
+    from cron import runtime_state as rs
+
+    with rs.connect(home / "cron") as conn:
+        return rs.pending_gens(conn)
+
+
+def test_degraded_lock_never_discards_a_pending_generation(temp_home, clock, monkeypatch):
+    """ce568117e609 / 67f77d97cb14, ruling R1: under a degraded jobs lock recovery discards no
+    generation, neither one of unknown owner past the age bound nor one whose lock file is free.
+    Once a section holds the cross-process lock, the provably dead one goes."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="r1")
+    cron = temp_home / "cron"
+    unknown, dead = "u" * 32, "d" * 32
+    with rs.transaction(cron) as conn:
+        rs.stage_pending(conn, unknown, {created["id"]: {"last_status": "u"}})
+        rs.stage_pending(conn, dead, {created["id"]: {"last_status": "d"}})
+    cj._gen_lock_path(dead).write_text("")  # lock file free: its owner died
+    clock[0] += rs.pending_discard_after() * 10
+    with monkeypatch.context() as mp:
+        mp.setattr(cj, "_acquire_flock", lambda fd, timeout: False)  # degraded
+        with cj._jobs_lock():
+            assert cj._jobs_lock_degraded()
+            cj._recover_pending_runtime(None)
+        cj.load_jobs()
+    assert sorted(_pending(temp_home)) == sorted([unknown, dead])
+    with cj._jobs_lock():
+        cj._recover_pending_runtime(None)
+    assert _pending(temp_home) == []
+
+
+def test_degraded_lock_refuses_retire_on_every_path(temp_home, monkeypatch):
+    """Ruling R1: export_runtime_to_json(retire=True) refuses on a degraded lock with keep_orphans
+    too; the json kill-switch fold then leaves the db and serves the merged view, and folds once
+    a load holds the cross-process lock."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="r1-retire")
+    cj.mark_job_run(created["id"], True)
+    rs.write_rows(temp_home / "cron", {created["id"]: {"last_status": "from-row"}})
+    before = _snapshot(_jobs_file(temp_home))
+    with monkeypatch.context() as mp:
+        mp.setattr(cj, "_acquire_flock", lambda fd, timeout: False)
+        for kwargs in ({}, {"keep_orphans": True}, {"drop_orphans": True}):
+            with pytest.raises(cj.RuntimeRetireRefused, match="degraded"):
+                cj.export_runtime_to_json(retire=True, **kwargs)
+        mp.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+        jobs = cj.load_jobs()
+        assert [j["last_status"] for j in jobs if j["id"] == created["id"]] == ["from-row"]
+        assert _db(temp_home).exists() and _snapshot(_jobs_file(temp_home)) == before
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+    assert cj.get_job(created["id"])["last_status"] == "from-row"
+    assert not _db(temp_home).exists()
+    assert _raw(temp_home, created["id"])["last_status"] == "from-row"
+
+
+def _destructive_call_sites():
+    """``(module, function, call name, guarded)`` for every call to a destructive runtime-store
+    primitive in cron/: guarded = it sits in the body of an ``if``/``elif`` whose test calls
+    ``_destructive_ok()`` (not negated)."""
+    import ast
+    import pathlib
+
+    import cron
+
+    destructive = {"drop_database", "_discard_pending", "_retire_runtime_rows"}
+    out = []
+    for path in sorted(pathlib.Path(cron.__file__).parent.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+
+        def name_of(call):
+            f = call.func
+            return f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
+
+        def guard_ok(test):
+            if isinstance(test, ast.UnaryOp):
+                return False
+            if isinstance(test, ast.Call):
+                return name_of(test) == "_destructive_ok"
+            if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+                return any(guard_ok(v) for v in test.values)
+            return False
+
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and name_of(node) in destructive):
+                continue
+            guarded, func, child, cur = False, None, node, parents.get(node)
+            while cur is not None:
+                if isinstance(cur, ast.If) and child in cur.body and guard_ok(cur.test):
+                    guarded = True
+                if func is None and isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    func = cur.name
+                child, cur = cur, parents.get(cur)
+            out.append((path.name, func, name_of(node), guarded))
+    return out
+
+
+def test_every_destructive_runtime_call_sits_under_destructive_ok():
+    """Ruling R1 (operator-required AST check): every call that discards a pending generation,
+    retires rows or drops the database is under ``_destructive_ok()``. The one exemption is
+    ``fold_staged_copy``, which only ever runs on a STAGED copy (profile export), never the live
+    store."""
+    sites = _destructive_call_sites()
+    names = {name for _, _, name, _ in sites}
+    assert names == {"drop_database", "_discard_pending", "_retire_runtime_rows"}, sites
+    unguarded = [s for s in sites if not s[3]
+                 and (s[0], s[1]) != ("runtime_state.py", "fold_staged_copy")]
+    assert unguarded == [], unguarded
+
+
+def test_sibling_generation_published_in_the_rename_window_survives(temp_home):
+    """2f90285ab230, ruling R2: A's save has rolled siblings forward; in the window before A's
+    rename a degraded-lock sibling B stages gB, marks it published, renames jobs.json naming gB
+    and dies. A's rename erases the name, not the DB marker: gB is applied, never discarded."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    a = cj.create_job(prompt="x", schedule="every 5m", name="a")
+    b = cj.create_job(prompt="x", schedule="every 5m", name="b")
+    cj.mark_job_run(a["id"], True)
+    gen_b = "b" * 32
+    real_replace = cj.atomic_replace
+    fired = []
+
+    def sibling_then_replace(tmp, target):
+        if not fired:
+            fired.append(1)
+            with rs.transaction(temp_home / "cron") as conn:
+                row = rs.read_row(conn, a["id"]) or {}
+                rs.stage_pending(conn, gen_b, {a["id"]: dict(row, last_status="sibling")},
+                                 bases={a["id"]: row})
+                rs.mark_published(conn, gen_b)
+            data = json.loads(_jobs_file(temp_home).read_text())
+            data["runtime_gen"] = gen_b
+            _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+            cj._gen_lock_path(gen_b).write_text("")  # B died: lock file free
+        return real_replace(tmp, target)
+
+    cj.atomic_replace = sibling_then_replace
+    try:
+        cj.update_job(b["id"], {"name": "b2"})
+    finally:
+        cj.atomic_replace = real_replace
+    assert fired
+    assert "runtime_gen" not in json.loads(_jobs_file(temp_home).read_text()) or \
+        json.loads(_jobs_file(temp_home).read_text())["runtime_gen"] != gen_b
+    assert cj.get_job(b["id"])["name"] == "b2"
+    assert cj.get_job(a["id"])["last_status"] == "sibling"
+    assert _pending(temp_home) == []
+
+
+def test_stale_file_gen_never_deletes_a_published_generation(temp_home, clock):
+    """01add2c86d6d, ruling R2: recovery runs with a stale file_gen (None here) while a dead
+    sibling's generation is published; the marker makes it committed, so it is rolled forward
+    however old and however dead its owner, never discarded."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="stale")
+    gen = "p" * 32
+    with rs.transaction(temp_home / "cron") as conn:
+        rs.stage_pending(conn, gen, {created["id"]: {"last_status": "published"}},
+                         bases={created["id"]: rs.read_row(conn, created["id"])})
+        rs.mark_published(conn, gen)
+    cj._gen_lock_path(gen).write_text("")
+    clock[0] += rs.pending_discard_after() * 10
+    with cj._jobs_lock():
+        cj._recover_pending_runtime(None)
+    assert _pending(temp_home) == []
+    assert cj.get_job(created["id"])["last_status"] == "published"
+    # The out-of-process merged view resolves a published generation the same way.
+    with rs.transaction(temp_home / "cron") as conn:
+        rs.stage_pending(conn, gen, {created["id"]: {"last_status": "again"}},
+                         bases={created["id"]: rs.read_row(conn, created["id"])})
+        rs.mark_published(conn, gen)
+    view = rs.merged_jobs(_jobs_file(temp_home))
+    assert [j["last_status"] for j in view if j["id"] == created["id"]] == ["again"]
+
+
+def test_two_phase_save_sets_commit_marker_before_rename(temp_home):
+    """Ruling R2: by the time jobs.json is renamed naming generation g, g's published_at is set."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="mark")
+    seen = []
+    real_replace = cj.atomic_replace
+
+    def spy(tmp, target):
+        with rs.connect(temp_home / "cron") as conn:
+            seen.append((set(rs.pending_gens(conn)), set(rs.published_gens(conn))))
+        return real_replace(tmp, target)
+
+    cj.atomic_replace = spy
+    try:
+        with cj._jobs_lock():
+            jobs = cj.load_jobs()
+            jobs[0]["name"] = "mark2"
+            jobs[0]["last_status"] = "both-halves"
+            cj.save_jobs(jobs)
+    finally:
+        cj.atomic_replace = real_replace
+    staged = [s for s in seen if s[0]]
+    assert staged and all(pend == pub for pend, pub in staged), seen
+    assert cj.get_job(created["id"])["last_status"] == "both-halves"
+
+
+def test_profile_export_fails_closed_when_live_jobs_json_vanishes(temp_home, tmp_path,
+                                                                 monkeypatch):
+    """8f9783e7bc58: copytree stages jobs.json + db; the live jobs.json is then removed before the
+    pair capture. The staged jobs.json (another moment) must not be folded with the captured db:
+    it is removed, the fold refuses and the export raises."""
+    import shutil
+
+    from cron import runtime_state as rs
+
+    profiles, profile_dir, cron = _export_profile_fixture(tmp_path, monkeypatch)
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "old"}]}),
+                                    encoding="utf-8")
+    rs.write_rows(cron, {"j1": {"last_status": "ok"}})
+    real_copytree = shutil.copytree
+
+    def copytree_then_remove(src, dst, *a, **kw):
+        out = real_copytree(src, dst, *a, **kw)
+        if str(src) == str(profile_dir):
+            (cron / "jobs.json").unlink()
+        return out
+
+    monkeypatch.setattr(shutil, "copytree", copytree_then_remove)
+    with pytest.raises(ValueError, match="refusing export"):
+        profiles.export_profile("p", str(tmp_path / "export.tar.gz"))
+    assert not (tmp_path / "export.tar.gz").exists()
+    assert rs.db_path(cron).exists()
+
+
+def test_runtime_db_honours_configured_journal_mode_delete(temp_home):
+    """173ea387a852: the runtime db opens through the shared sqlite policy, so a configured
+    database.journal_mode: delete is honoured on a new database; synchronous stays FULL."""
+    from cron import jobs as cj
+
+    (temp_home / "config.yaml").write_text("database:\n  journal_mode: delete\n",
+                                           encoding="utf-8")
+    cj.create_job(prompt="x", schedule="every 5m", name="jm")
+    assert _db(temp_home).exists()
+    con = sqlite3.connect(_db(temp_home))
+    try:
+        assert con.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    finally:
+        con.close()
+    from cron import runtime_state as rs
+
+    with rs.connect(temp_home / "cron") as conn:
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"

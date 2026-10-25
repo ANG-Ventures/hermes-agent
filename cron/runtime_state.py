@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS pending_runtime (
     fields TEXT,
     staged_at REAL,
     base TEXT,
+    published_at REAL,
     PRIMARY KEY (gen, job_id)
 );
 CREATE TABLE IF NOT EXISTS mirror_state (
@@ -258,7 +259,14 @@ def connect(cron_dir: Path, *, create: bool = True) -> Iterator[Optional[sqlite3
     would otherwise create it with the process umask (0644 under umask 022), and it holds the same
     private prompt/error text as the 0600 jobs.json. SQLite creates its -wal/-shm sidecars with the
     main file's mode, so they inherit 0600. ``synchronous=FULL``: a committed row is what callers
-    treat as persisted (claims, completion counters, a migration that already stripped jobs.json)."""
+    treat as persisted (claims, completion counters, a migration that already stripped jobs.json).
+
+    Opened through ``hermes_cli.sqlite_util.open_db`` (Prism 173ea387a852), the policy every other
+    Hermes database takes: the configured ``database.journal_mode`` (``delete`` is honoured on a
+    new database), the WAL-reset-bug gate, the cross-VM filesystem guard, never a live downgrade.
+    Late import: this module stays stdlib-only at import time for out-of-process readers."""
+    from hermes_cli.sqlite_util import open_db
+
     path = db_path(cron_dir)
     if not path.exists():
         if not create:
@@ -267,14 +275,14 @@ def connect(cron_dir: Path, *, create: bool = True) -> Iterator[Optional[sqlite3
         Path(cron_dir).mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(FileExistsError):
             os.close(os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-    conn = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
+    conn = open_db(path, db_label=f"cron/{DB_NAME}", busy_timeout_ms=30000,
+                   synchronous_full=True, row_factory=None)
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
+        conn.isolation_level = None  # explicit BEGIN/COMMIT only (see ``transaction``)
         conn.executescript(_SCHEMA)
-        # A database created before pending_runtime.staged_at/base existed (earlier PR heads).
+        # A database created before pending_runtime.staged_at/base/published_at existed.
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_runtime)")}
-        for col, decl in (("staged_at", "REAL"), ("base", "TEXT")):
+        for col, decl in (("staged_at", "REAL"), ("base", "TEXT"), ("published_at", "REAL")):
             if col not in cols:
                 with contextlib.suppress(sqlite3.OperationalError):  # a sibling added it first
                     conn.execute(f"ALTER TABLE pending_runtime ADD COLUMN {col} {decl}")
@@ -428,11 +436,16 @@ def refresh_claim_conn(conn: sqlite3.Connection, job_id: str, claim_key: str,
 # --- two-phase commit for saves that change BOTH halves ---------------------------------------
 # 1. stage_pending: the new rows go into pending_runtime under a fresh generation id, each with
 #    the row it was computed from (``base``); COMMIT.
-# 2. jobs.json is renamed into place carrying the same id as top-level "runtime_gen".
-# 3. apply_pending: pending rows move into job_runtime, three-way merged against ``base`` so a
+# 2. mark_published (own transaction, right BEFORE the rename): pending_runtime.published_at is
+#    the generation's commit marker (Apollo ruling R2). The file name is no longer the only one:
+#    a sibling's rename can erase "runtime_gen" from the file, never the row in the database.
+# 3. jobs.json is renamed into place carrying the same id as top-level "runtime_gen".
+# 4. apply_pending: pending rows move into job_runtime, three-way merged against ``base`` so a
 #    row write that landed between 1 and 3 (a degraded-lock sibling) survives; COMMIT.
-# recover_pending (every load): pending rows whose gen matches the file's "runtime_gen" are rolled
-# forward (crash after 2); any other gen is discarded once provably dead (crash before 2).
+# recover_pending (every load): a gen that is published OR named by the file's "runtime_gen" is
+# rolled forward (merge3 makes a replay harmless; a crash between 2 and 3 applies rows the file
+# never named, accepted as the lesser evil versus losing a committed update). An unpublished gen
+# is discarded only when its owner is provably dead, and never under a degraded jobs lock (R1).
 
 def merge3(ours: Dict[str, Any], current: Dict[str, Any],
            base: Dict[str, Any]) -> Dict[str, Any]:
@@ -506,6 +519,23 @@ def pending_gen_ages(conn: sqlite3.Connection) -> Dict[str, Optional[float]]:
     """``{gen: newest staged_at}`` (``None`` = a row staged before the column existed)."""
     return {gen: (float(at) if at is not None else None) for gen, at in conn.execute(
         "SELECT gen, max(staged_at) FROM pending_runtime GROUP BY gen").fetchall()}
+
+
+def mark_published(conn: sqlite3.Connection, gen: str) -> None:
+    """Commit marker of generation *gen* (caller owns the transaction; call right BEFORE the rename
+    that publishes it, ruling R2): from here on recovery rolls it forward whatever the file names."""
+    conn.execute("UPDATE pending_runtime SET published_at=? WHERE gen=?", (_now(), gen))
+
+
+def published_gens(conn: sqlite3.Connection) -> List[str]:
+    """Pending generations whose commit marker is set, oldest publication first. Tolerates a
+    database from an earlier PR head without the column (read-only callers cannot add it)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_runtime)")}
+    if "published_at" not in cols:
+        return []
+    return [r[0] for r in conn.execute(
+        "SELECT gen, max(published_at) AS p FROM pending_runtime WHERE published_at IS NOT NULL"
+        " GROUP BY gen ORDER BY p, gen").fetchall()]
 
 
 def _pending_entries(conn: sqlite3.Connection, gen: str) -> List[tuple]:
@@ -595,11 +625,14 @@ def merged_jobs(jobs_file: Path, *, strict: bool = False,
                     rows[str(job_id)] = value
                 elif complete:
                     raise ValueError(f"runtime row {job_id!r} is not a JSON object")
-            if isinstance(file_gen, str) and file_gen:
-                # A save that crashed after its rename left generation *file_gen* staged: the
-                # file already names it, so it is committed. Resolve it the way load_jobs'
-                # recovery (apply_pending) will, without writing.
-                _apply_entries(rows, _pending_entries(conn, file_gen))
+            # A save that crashed after publishing left its generation staged: published (R2) or
+            # named by the file, it is committed. Resolve it the way load_jobs' recovery
+            # (apply_pending, same order) will, without writing.
+            committed = published_gens(conn)
+            if isinstance(file_gen, str) and file_gen and file_gen not in committed:
+                committed.append(file_gen)
+            for gen in committed:
+                _apply_entries(rows, _pending_entries(conn, gen))
             conn.execute("COMMIT")
         finally:
             conn.close()
@@ -663,6 +696,8 @@ def fold_staged_copy(cron_dir: Path) -> bool:
     try:
         # Never through a preserved entry at that name (a symlink would truncate its target
         # outside the staging dir, Prism 5a6d55ddbf83): unlink it, then create exclusively.
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL

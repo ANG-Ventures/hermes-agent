@@ -300,6 +300,14 @@ def _jobs_lock_degraded() -> bool:
     return bool(getattr(_jobs_lock_state, "degraded", False))
 
 
+def _destructive_ok() -> bool:
+    """Apollo ruling R1 (t_94e91559): a DEGRADED jobs lock permits no destructive action on the
+    runtime store. True only inside a ``_jobs_lock`` section that holds the cross-process lock.
+    Every site that discards a pending generation, retires rows or drops the database is guarded
+    by this one predicate (``tests/cron/test_runtime_state_split.py`` checks each call site)."""
+    return bool(getattr(_jobs_lock_state, "depth", 0)) and not _jobs_lock_degraded()
+
+
 def _jobs_lock_file() -> Path:
     """Return the advisory lock path for the current cron directory."""
     return _current_cron_store().cron_dir / ".jobs.lock"
@@ -1718,6 +1726,14 @@ def load_jobs() -> List[Dict[str, Any]]:
         if not locked:
             with _jobs_lock():
                 return load_jobs()
+        if not _destructive_ok():
+            # R1: the fold retires rows, which a degraded lock forbids. Leave the database and
+            # read the merged view (rows overlaid read-only), as out-of-process readers do.
+            _warn_degraded_fold_once()
+            merged = [j for j in _rs.merged_jobs(jobs_file) if isinstance(j, dict)]
+            _record_load_stamp(None)
+            _record_load_baseline(merged)
+            return merged
         export_runtime_to_json(keep_orphans=True)
         if _runtime_db_path().exists():
             # Only rows with no definition are left (kept, never dropped silently): remember the
@@ -1868,6 +1884,25 @@ def _runtime_pending() -> bool:
         return bool(_rs.pending_gens(conn))
 
 
+_DEGRADED_FOLD_WARNED: Set[str] = set()
+
+
+def _warn_degraded_fold_once() -> None:
+    path = _runtime_db_path()
+    if str(path) in _DEGRADED_FOLD_WARNED:
+        return
+    _DEGRADED_FOLD_WARNED.add(str(path))
+    logger.error("cron runtime-state: %s=json but the cron jobs lock is degraded; not folding %s "
+                 "back into jobs.json (that retires rows). Reading the merged view until a load "
+                 "holds the cross-process lock", _rs.ENV_MODE, path)
+
+
+def _discard_pending(conn, gen: str) -> None:
+    """Drop pending generation *gen* (caller owns the transaction and has checked
+    ``_destructive_ok()``, ruling R1)."""
+    conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
+
+
 def _gen_lock_path(gen: str) -> Path:
     return _current_cron_store().cron_dir / f".runtime-gen-{gen}.lock"
 
@@ -1918,27 +1953,34 @@ def _gen_owner_alive(gen: str) -> Optional[bool]:
 
 
 def _recover_pending_runtime(file_gen: Optional[str]) -> None:
-    """Roll forward the generation the file names. Discard another generation ONLY when it is
-    provably dead: its owner's lock file is free (the owner died before its rename), or, when no
-    lock file exists, it is older than ``_rs.pending_discard_after()`` by its staged_at. A
-    generation whose owner still holds its lock is a degraded-lock sibling between its stage and
-    its rename, whatever its age: it is left alone (that sibling applies or deletes it itself)."""
+    """Roll forward every COMMITTED generation: one whose commit marker is set in the database
+    (``published_at``, ruling R2) or that the file names, oldest publication first; merge3 makes
+    a replay of rows already applied harmless. An unpublished generation is discarded ONLY when
+    the jobs lock is not degraded (R1) and its owner is provably dead: its owner's lock file is
+    free (the owner died before publishing), or, when no lock file exists, it is older than
+    ``_rs.pending_discard_after()`` by its staged_at. A generation whose owner still holds its
+    lock is a sibling between its stage and its publish, whatever its age: it is left alone."""
     with _defs_cache_lock:
         _defs_cache.clear()  # entries parsed while a generation was pending are marked unusable
     with _runtime_txn() as conn:
         ages = _rs.pending_gen_ages(conn)
+        committed = _rs.published_gens(conn)
+        if file_gen and file_gen in ages and file_gen not in committed:
+            committed.append(file_gen)
         bound = _rs.pending_discard_after()
         now = _rs._now()
+        for gen in committed:
+            n = _rs.apply_pending(conn, gen)
+            logger.warning("cron runtime-state: rolled interrupted save %s forward "
+                           "(%d row(s))", gen, n)
         for gen, staged_at in ages.items():
-            if file_gen and gen == file_gen:
-                n = _rs.apply_pending(conn, gen)
-                logger.warning("cron runtime-state: rolled interrupted save %s forward "
-                               "(%d row(s))", gen, n)
+            if gen in committed:
                 continue
             alive = _gen_owner_alive(gen)
-            if alive is False or (alive is None and (
-                    staged_at is None or now - staged_at >= bound)):
-                conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
+            dead = alive is False or (alive is None and (
+                staged_at is None or now - staged_at >= bound))
+            if dead and _destructive_ok():
+                _discard_pending(conn, gen)
                 _unlink_quiet(str(_gen_lock_path(gen)))
                 logger.warning("cron runtime-state: discarded interrupted save %s (its "
                                "definitions never reached jobs.json)", gen)
@@ -2163,6 +2205,11 @@ class RuntimeOrphansRefused(RuntimeRetireRefused):
             "--drop-orphans to discard them")
 
 
+def _retire_runtime_rows(conn, ids: List[str]) -> None:
+    """Delete rows already folded into jobs.json (caller checked ``_destructive_ok()``, R1)."""
+    _rs.upsert_rows(conn, {}, delete_ids=ids, dirty=False)
+
+
 def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retire: bool = True,
                            drop_orphans: bool = False, keep_orphans: bool = False) -> int:
     """Reverse of the migration (kill switch ``HERMES_CRON_RUNTIME_STATE=json`` and
@@ -2178,15 +2225,17 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
     (``RuntimeOrphansRefused``, nothing written) unless *drop_orphans* (Prism 747baaf507d1), or,
     with *keep_orphans* (the json kill switch's automatic fold in load_jobs, which must not raise),
     retires every row that HAS a definition and keeps only the orphan rows in the database.
-    Returns the number of jobs that had a row."""
+    *retire* on a degraded jobs lock refuses on EVERY path, *keep_orphans* included (ruling R1;
+    load_jobs checks ``_destructive_ok()`` before it calls here). Returns the number of jobs that
+    had a row."""
     with _jobs_lock():
         jobs_file = _current_cron_store().jobs_file
         cron_dir = _current_cron_store().cron_dir
         if not _rs.db_path(cron_dir).exists():
             return 0
-        if retire and not keep_orphans and _jobs_lock_degraded():
-            # Prism 21c210e015e8: without the cross-process lock a sibling's committed row write
-            # between our read and the delete below would be lost with the database.
+        if retire and not _destructive_ok():
+            # Prism 21c210e015e8, ruling R1: without the cross-process lock a sibling's committed
+            # row write between our read and the delete below would be lost with the database.
             raise RuntimeRetireRefused(
                 f"the cron jobs lock is degraded (no cross-process lock on {_jobs_lock_file()}); "
                 f"refusing to retire {_rs.DB_NAME} (nothing written, rows kept). Retry when no "
@@ -2235,15 +2284,14 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
             merged.append(job)
         if applied or not kept:
             _write_definitions_file(merged)
-        if retire and kept:  # retire the folded rows only
+        if retire and kept and _destructive_ok():  # retire the folded rows only
             with _runtime_txn() as conn:
-                _rs.upsert_rows(conn, {}, delete_ids=[j for j in rows if j not in kept],
-                                dirty=False)
+                _retire_runtime_rows(conn, [j for j in rows if j not in kept])
             logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
                            "jobs.json; %s kept for %d row(s)", applied, _rs.DB_NAME,
                            len(kept))
             return applied
-        if retire:
+        if retire and _destructive_ok():
             _rs.drop_database(cron_dir)
         logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
                        "jobs.json%s", applied, f" and removed {_rs.DB_NAME}" if retire else "")
@@ -2912,12 +2960,17 @@ def _save_split_two_phase(gen, defs, merged_changes, *, removed_ids, replace, ba
     except BaseException:
         if gen is not None:
             with contextlib.suppress(Exception), _runtime_txn() as conn:
-                if _file_runtime_gen() == gen:
-                    # The rename landed before the failure (fsync/chmod/chown, or a signal):
-                    # the live file names this generation, so it is committed. Roll forward.
+                named = _file_runtime_gen() == gen
+                if named or (gen in _rs.published_gens(conn) and not _destructive_ok()):
+                    # The rename landed before the failure (fsync/chmod/chown, or a signal), or,
+                    # on a degraded lock, a sibling's rename may since have erased the file's
+                    # name for it: the marker (R2) says committed. Roll forward.
                     _rs.apply_pending(conn, gen)
-                else:
-                    conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
+                elif _destructive_ok():
+                    # With the cross-process lock no sibling renamed over us, so a file that does
+                    # not name gen means our rename never landed: the marker set just before it
+                    # is withdrawn with the generation.
+                    _discard_pending(conn, gen)
         raise
     finally:
         _jobs_lock_state.load_baseline = saved_baseline
@@ -2969,6 +3022,11 @@ def _publish_jobs_json(tmp_path: str, jobs_file: Path, *, own_gen: Optional[str]
             return None
     if _rs.enabled() and _runtime_db_path().exists():
         _roll_forward_published_sibling(own_gen)
+    if own_gen:
+        # R2: the commit marker lives in the database, set in its own transaction BEFORE the
+        # rename; a sibling's later rename can erase the file's "runtime_gen", never this.
+        with _runtime_txn() as conn:
+            _rs.mark_published(conn, own_gen)
     return Path(atomic_replace(tmp_path, jobs_file))
 
 

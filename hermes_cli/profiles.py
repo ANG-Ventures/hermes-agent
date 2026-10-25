@@ -2226,6 +2226,12 @@ def _capture_cron_pair(profile_dir: Path, staged_cron: Path) -> None:
         # copytree folded the runtime into it), and paired with the db captured below if any.
         if (src_cron / "jobs.json").exists():
             shutil.copy2(src_cron / "jobs.json", staged_cron / "jobs.json")
+        else:
+            # Prism 8f9783e7bc58: the live definitions are gone, so copytree's staged jobs.json
+            # is from another moment than the db captured below. Remove it: the fold then has
+            # no definitions, refuses, and the export fails closed instead of pairing the two.
+            with contextlib.suppress(FileNotFoundError):
+                (staged_cron / "jobs.json").unlink()
         if not live_has_db:
             return
         if not _safe_copy_db(src_cron / DB_NAME, staged_cron / DB_NAME):
