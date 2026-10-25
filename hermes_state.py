@@ -85,6 +85,7 @@ from hermes_state_dbfile import (
     _watched_sqlite_sidecar_paths, has_invalid_sqlite_header_preopen, is_zeroed_state_db, quarantine_cross_process_lock,
     quarantine_invalid_state_db,
     RetiredGenerationCaptureError, capture_retired_wal_generation, refuse_deleted_wal_generation,
+    register_live_writer, unregister_live_writer,
 )
 from hermes_state_messages import SessionMessagesMixin
 from hermes_state_rewind import SessionRewindMixin
@@ -914,6 +915,10 @@ class SessionDB(
                 # Only a successfully opened handle owns a writer connection. Failed
                 # construction must not leave a diagnostic member behind.
                 self._read_budget.register(self)
+                if not self.read_only:
+                    # t_69e10010: the open-path deleted-WAL refusal reads live writers' recorded
+                    # sidecar generations from this registry instead of scanning the fd table.
+                    register_live_writer(self)
                 # Test-isolation runs only (gated inside the helper): register
                 # for the suite-level leak sweep in tests/conftest.py.
                 _register_test_instance(self)
@@ -1853,6 +1858,9 @@ class SessionDB(
                     # identity when retiring an unsafe handle.
                     self._db_sidecar_identity = {}
         self._read_budget.unregister(self)  # idempotent: a never-registered (failed-init) handle is a no-op
+        # t_69e10010 (sibling t_aeae3fe7 owns the lockguard release above): idempotent; a handle
+        # retired unclosed keeps its recorded generation in the deleted-WAL registry.
+        unregister_live_writer(self)
 
     def __del__(self) -> None:
         """Safety net: close() if the caller forgot. Attribute access stays
