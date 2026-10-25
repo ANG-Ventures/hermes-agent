@@ -93,3 +93,14 @@ def test_script_percentiles_and_exit_codes(tmp_path, capsys):
     capsys.readouterr()
     assert mod.main(["--log", str(log), "--since", "0", "--window", "10"]) == 2
     assert mod.main(["--log", str(tmp_path / "missing.log")]) == 2
+
+
+def test_threshold_compares_the_unrounded_p99(tmp_path, capsys):
+    """Prism a23d23dcf728: 5.04 s rounds to 5.0 for display but must still FAIL a 5.01 s limit."""
+    mod = _script()
+    log = tmp_path / "gateway.log"
+    log.write_text(
+        "2026-10-24 14:00:00,000 INFO x: response ready: platform=discord chat=111 session=a time=1.0s api_calls=1 response=1 chars\n"
+        "2026-10-24 14:00:05,040 INFO x: [discord] Sending response (10 chars) to 111\n", encoding="utf-8")
+    assert mod.main(["--log", str(log), "--since", "0", "--window", "2000000000", "--max-p99-s", "5.01"]) == 1
+    assert mod.main(["--log", str(log), "--since", "0", "--window", "2000000000", "--max-p99-s", "5.05"]) == 0

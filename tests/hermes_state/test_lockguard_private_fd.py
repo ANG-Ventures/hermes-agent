@@ -47,6 +47,7 @@ def test_private_hold_refuses_foreign_exclusive_until_released(tmp_path):
     shm = tmp_path / "state.db-shm"
     shm.write_bytes(b"\0" * 32768)
     held = lg.hold(db)
+    held_idents = list(held)
     try:
         assert set(held) == {(os.stat(db).st_dev, os.stat(db).st_ino), (os.stat(shm).st_dev, os.stat(shm).st_ino)}
         assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED"
@@ -57,11 +58,11 @@ def test_private_hold_refuses_foreign_exclusive_until_released(tmp_path):
         assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED"
         assert _foreign_exclusive(str(shm), *_DMS) == "REFUSED"
     finally:
-        released = lg.release(held)
-    lg.retire(released)
+        lg.release(held)
+    lg.retire()
     assert _foreign_exclusive(str(db), *_SHARED) == "ACQUIRED"
     assert _foreign_exclusive(str(shm), *_DMS) == "ACQUIRED"
-    assert not lg._HANDLES and not lg._FDS, "retire() must close the private descriptors"
+    assert not set(held_idents) & set(lg._FDS), "retire() must close the private descriptors"
 
 
 def test_missing_shm_is_tolerated(tmp_path):
@@ -71,7 +72,8 @@ def test_missing_shm_is_tolerated(tmp_path):
     db.write_bytes(b"\0" * 4096)
     held = lg.hold(db)  # never raises; arms the main file only
     assert list(held) == [(os.stat(db).st_dev, os.stat(db).st_ino)]
-    lg.retire(lg.release(held))
+    lg.release(held)
+    lg.retire()
     assert lg.hold(tmp_path / "absent.db") == {}
 
 
@@ -118,21 +120,42 @@ def test_late_shm_is_armed_by_checkpoint_with_one_stat_and_no_listdir(tmp_path, 
 
 
 def test_write_path_never_reaches_the_fd_table_scan(tmp_path, monkeypatch):
-    """I2: open, write, checkpoint, reopen and close never call _own_fds_for in private mode."""
+    """I2: open, write, checkpoint and reopen never call _own_fds_for in private mode. The one scan
+    left is retire() on the close path, after SQLite's close and outside SessionDB._lock."""
     pin_wal(monkeypatch)
+    real_scan = lg._own_fds_for
+    holders = []
+    forbidden = {"_execute_write", "_try_wal_checkpoint", "_open_writer", "_reopen_after_close_locked", "hold",
+                 "refresh_shm"}
 
-    def _boom(*_a, **_k):
-        raise AssertionError("fd-table scan on the write path")
+    def _recording_scan(identities):
+        frames, f = set(), sys._getframe(1)
+        while f is not None:
+            frames.add(f.f_code.co_name)
+            f = f.f_back
+        holders.append((frames & forbidden, [db._lock.locked() for db in dbs]))
+        return real_scan(identities)
 
-    monkeypatch.setattr(lg, "_own_fds_for", _boom)
+    dbs = []
+    monkeypatch.setattr(lg, "_own_fds_for", _recording_scan)
     sdb = make_db(tmp_path / "state.db", "s", "seed")
+    dbs.append(sdb)
     require_wal(sdb)
     sdb._try_wal_checkpoint()
+    assert holders == [], "fd-table scan on the open/write/checkpoint path"
     sdb.close()
     sdb.append_message("s", role="user", content="after close")  # reopen path
     assert sdb._wal_lock_guard
+    shm = (os.stat(f"{sdb.db_path}-shm").st_dev, os.stat(f"{sdb.db_path}-shm").st_ino)
+    main = (os.stat(sdb.db_path).st_dev, os.stat(sdb.db_path).st_ino)
     sdb.close()
-    assert not lg._HANDLES and not lg._FDS
+    assert holders, "close() never retired the private descriptors"
+    assert all(not frames and not any(locked) for frames, locked in holders), holders
+    assert not lg._HANDLES
+    assert shm not in lg._FDS, "the -shm descriptor outlived the last close (pins a deleted generation)"
+    # state.db (``main``) may keep its private fd: hermes_state_dbfile's process-lifetime header-probe
+    # fd references the inode and retire() never closes while another descriptor is open (one fd/db).
+    del main
 
 
 class _SlowWrite:
@@ -193,9 +216,46 @@ def test_mode_kill_switch_is_read_at_import(monkeypatch, tmp_path, value, mode, 
             assert bool(held) is armed
             if armed:
                 assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED"
-            guard.retire(guard.release(held))
+            guard.release(held)
         finally:
             os.close(fd)
+        guard.retire()
+        assert not guard._FDS
     finally:
         monkeypatch.delitem(sys.modules, "hermes_state_lockguard", raising=False)
         sys.modules["hermes_state_lockguard"] = lg
+
+
+def test_retire_keeps_the_fd_while_an_unguarded_reader_is_open(tmp_path):
+    """Prism 44919d3eb909: closing the private fd would cancel an in-process reader's POSIX locks.
+    retire() keeps it while any other descriptor references the inode, closes it once none does."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    ident = (os.stat(db).st_dev, os.stat(db).st_ino)
+    reader = os.open(db, os.O_RDONLY)  # stands in for an unguarded read-only connection
+    try:
+        lg.release(lg.hold(db))
+        lg.retire()
+        assert ident in lg._FDS, "retired a descriptor while another one still referenced the inode"
+    finally:
+        os.close(reader)
+    lg.retire()
+    assert ident not in lg._FDS
+
+
+def test_refused_lock_descriptor_is_still_retired(tmp_path, monkeypatch):
+    """Prism 78f32301dabd: a private fd opened by a hold() whose lock was refused is not in any
+    handle's record, so retire() must sweep it rather than leak it (and pin a deleted -shm)."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    ident = (os.stat(db).st_dev, os.stat(db).st_ino)
+    monkeypatch.setattr(lg, "_ofd_lock", lambda *a, **k: False)
+    assert lg.hold(db) == {}
+    assert ident in lg._FDS, "the refused hold() did not open its private descriptor"
+    monkeypatch.undo()
+    lg.retire()
+    assert ident not in lg._FDS and ident not in lg._HANDLES

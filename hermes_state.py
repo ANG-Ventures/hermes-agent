@@ -1877,17 +1877,18 @@ class SessionDB(
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:
                         logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
-                released = _lockguard.release(self._wal_lock_guard)  # before the close: see release()
+                _lockguard.release(self._wal_lock_guard)  # before the close: see release()
                 if retire_without_close:
                     self._pin_connection(self._conn)
                     self._conn = None
                 else:
                     conn, self._conn = self._conn, None
                     self._close_connection_quietly(conn)
-                    _lockguard.retire(released)  # after SQLite's close, never before: see hermes_state_lockguard
                     # Only a clean close ends the generation; retain the recorded
                     # identity when retiring an unsafe handle.
                     self._db_sidecar_identity = {}
+        # After SQLite's close and outside self._lock: may scan the fd table (hermes_state_lockguard).
+        _lockguard.retire()
         self._read_budget.unregister(self)  # idempotent: a never-registered (failed-init) handle is a no-op
         # t_69e10010 (sibling t_aeae3fe7 owns the lockguard release above): idempotent; a handle
         # retired unclosed keeps its recorded generation in the deleted-WAL registry.

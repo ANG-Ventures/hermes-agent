@@ -31,12 +31,11 @@ well. One private ``O_RDONLY|O_CLOEXEC`` descriptor per guarded inode, shared by
 (the same per-inode handle count). ``release()`` of the last handle swaps the OFD lock for the
 process-owned POSIX lock SQLite believes it holds and leaves the descriptor OPEN: closing a
 descriptor on a live inode cancels every POSIX lock this process holds there (howtocorrupt §2.2),
-the very bug this module exists for. :func:`retire` closes it right AFTER SQLite's own close of the
-last guarded handle: by then that connection's locks are gone anyway, and a kept descriptor would
-pin a ``-shm`` a later true last close unlinks (the deleted-generation probe then refuses every
-opener) and leak one fd per database. The remaining exposure is an UNGUARDED in-process
-connection on the same file (a read-only handle), whose POSIX locks that close cancels, as any
-stray close already does. ``scan`` keeps the pre-change fd-table scan for one release; ``off`` is
+the very bug this module exists for. :func:`retire` closes it after SQLite's own close of the
+last guarded handle, and only when no other descriptor in this process references the inode (an
+unguarded reader's locks would go with it; that check is the one fd-table scan left, on the close
+path only). A kept descriptor would otherwise pin a ``-shm`` a later true last close unlinks (the
+deleted-generation probe then refuses every opener) and leak one fd per database. ``scan`` keeps the pre-change fd-table scan for one release; ``off`` is
 the no-op path.
 """
 
@@ -208,19 +207,38 @@ def _private_fd(path: str, ident: Identity) -> Optional[int]:
     return fd
 
 
-def retire(idents) -> None:
-    """Close the private descriptors of *idents* (what :func:`release` returned) that no handle
-    guards any more. Call AFTER SQLite's own close of that handle (``SessionDB.close``); before it,
-    the close would cancel the POSIX locks the still-open connection relies on. Scoped to the
-    caller's own inodes: another handle between its release() and its close is never touched, and
-    an inode re-held meanwhile is skipped. Never raises."""
-    if _MODE != "private" or not idents:
+def _inodes_with_other_fds(candidates: Dict[Identity, int]) -> Set[Identity]:
+    """Inodes in *candidates* (ident -> our private fd) that some OTHER descriptor of this process
+    still references: an unguarded in-process SQLite connection (a read-only handle, the delivery
+    ledger) or a guarded one between its release() and its close. The fd-table scan runs only
+    here, on the close path, never under ``SessionDB._lock`` and never from hold()/checkpoint."""
+    mine = set(candidates.values())
+    return {ident for fd, ident in _own_fds_for(set(candidates)) if fd not in mine}
+
+
+def retire() -> None:
+    """Close private descriptors no guarded handle counts any more, unless another descriptor in
+    this process still references the inode. Any close cancels every POSIX lock this process holds
+    on the inode (howtocorrupt §2.2), including a live in-process reader's SHARED/read-mark locks
+    (Prism 44919d3eb909), so those are kept and retried by the next retire(). A descriptor whose
+    lock was refused at hold() is swept the same way (Prism 78f32301dabd). Call it AFTER the
+    handle's own close and outside ``SessionDB._lock``. No scan when nothing is retirable. Never
+    raises."""
+    if _MODE != "private":
         return
     try:
         with _LOCK:
-            for ident in [i for i in idents if i in _FDS and _HANDLES.get(i, 0) == 0]:
+            candidates = {i: fd for i, fd in _FDS.items() if _HANDLES.get(i, 0) == 0}
+        if not candidates:
+            return
+        busy = _inodes_with_other_fds(candidates)
+        with _LOCK:
+            for ident, fd in candidates.items():
+                if ident in busy or _HANDLES.get(ident, 0) or _FDS.get(ident) != fd:
+                    continue  # still referenced, or re-armed by a hold() meanwhile
+                del _FDS[ident]
                 try:
-                    os.close(_FDS.pop(ident))
+                    os.close(fd)
                 except OSError:
                     pass
     except Exception:
@@ -298,7 +316,7 @@ def refresh_shm(db_path, held: Held) -> Held:
     return held
 
 
-def release(held: Held) -> Tuple[Identity, ...]:
+def release(held: Held) -> None:
     """Drop this handle's claim. The last handle on an inode unlocks the range on every descriptor
     still referencing it. Call BEFORE the handle's own close so SQLite's close-time reset sees only
     real holders: a sibling process's intact locks still refuse the unlink, and a true last close
@@ -308,10 +326,9 @@ def release(held: Held) -> Tuple[Identity, ...]:
     cancelled the real one): unlocked outright, the still-open connection would let a sibling's
     close take EXCLUSIVE and unlink ``-wal``/``-shm`` under it before its own close runs. SQLite's
     close upgrades or drops that process-owned lock itself, so a true last close is unaffected.
-
-    Returns the inodes this call stopped guarding, for :func:`retire` after SQLite's close."""
+    Private mode keeps the descriptor open; :func:`retire` closes it after SQLite's close."""
     if not supported() or not held:
-        return ()
+        return
     with _LOCK:
         to_unlock: Held = {}
         for ident, rng in held.items():
@@ -323,7 +340,7 @@ def release(held: Held) -> Tuple[Identity, ...]:
                 to_unlock[ident] = rng
         held.clear()
         if not to_unlock:
-            return ()
+            return
         if _MODE == "private":
             for ident, (start, length) in to_unlock.items():
                 fd = _FDS.get(ident)
@@ -334,7 +351,7 @@ def release(held: Held) -> Tuple[Identity, ...]:
                     _ofd_lock(fd, _F_UNLCK, start, length)
                 except OSError:
                     pass
-            return tuple(to_unlock)
+            return
         try:
             for fd, ident in _own_fds_for(set(to_unlock)):
                 start, length = to_unlock[ident]
@@ -342,4 +359,3 @@ def release(held: Held) -> Tuple[Identity, ...]:
                 _ofd_lock(fd, _F_UNLCK, start, length)
         except OSError:
             pass
-    return tuple(to_unlock)

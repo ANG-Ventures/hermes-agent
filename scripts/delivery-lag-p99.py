@@ -101,8 +101,9 @@ def main(argv=None) -> int:
         hours.setdefault(datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:00"), []).append(lag)
     for hour in sorted(hours):
         print(json.dumps({"hour": hour, **summarize(hours[hour])}, sort_keys=True))
-    out = {"from": int(lo), "to": int(hi), "platform": a.platform, **summarize(lag for _, lag in rows)}
-    ok = a.max_p99_s is None or out["p99_s"] < a.max_p99_s
+    lags = sorted(lag for _, lag in rows)
+    out = {"from": int(lo), "to": int(hi), "platform": a.platform, **summarize(lags)}
+    ok = a.max_p99_s is None or pct(lags, 99) < a.max_p99_s  # unrounded: rounding is display only
     out["verdict"] = "PASS" if ok else "FAIL"
     print(json.dumps(out, sort_keys=True))
     return 0 if ok else 1

@@ -80,8 +80,7 @@ def test_hold_is_constant_in_fd_count_under_gil_load(tmp_path, monkeypatch):
             held = lg.hold(db)
             timings.append(time.perf_counter() - t0)
             assert held, "hold() armed nothing on a live WAL database"
-            released = lg.release(held)
-            getattr(lg, "retire", lambda _idents: None)(released)  # absent on the fd-scan guard
+            lg.release(held)  # retire() (the close path, may scan) is not part of hold()
         monkeypatch.setattr(os, "listdir", real_listdir)
     finally:
         stop.set()
