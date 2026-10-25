@@ -1172,6 +1172,53 @@ def _state_db_write_guard(request, monkeypatch):
     yield
 
 
+# ── state.db holder scan: only this test's own processes are suspects ───────
+# ``hermes_state_holders.foreign_state_db_holders`` walks the WHOLE host's
+# /proc and, by design, counts a process it cannot inspect (fd readlink/listdir
+# EACCES) as a holder of ANY state.db when its argv looks like Hermes. On a
+# shared CI/worker host other jobs' ``python -m hermes_cli`` children (runner
+# containers, other users) are exactly that, so a test's private tmp state.db
+# read as "held" whenever one happened to be alive: 0/3/6/6/8 failures across
+# identical runs on ace-media (t_9b59804a). A process the test did not spawn
+# cannot hold a fresh tmp_path DB, so its argv is withheld from the scan
+# (``None`` = "not identifiable", the scan's own answer for an unreadable
+# cmdline). Descendants of this pytest process — the real holders the tests
+# spawn — keep the production fail-closed path. Readable-fd inode matches are
+# untouched. A test that patches ``_read_proc_argv`` itself overrides this.
+
+
+def _pid_descends_from(pid: int, ancestor: int) -> bool:
+    for _ in range(64):
+        if pid == ancestor:
+            return True
+        if pid <= 1:
+            return False
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as handle:
+                pid = int(handle.read().rsplit(b")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _holder_scan_ignores_unrelated_host_processes(monkeypatch):
+    holders = sys.modules.get("hermes_state_holders")
+    if holders is None or not sys.platform.startswith("linux"):
+        yield
+        return
+    real_read_proc_argv = holders._read_proc_argv
+    test_pid = os.getpid()
+
+    def _read_proc_argv(pid):
+        if not _pid_descends_from(pid, test_pid):
+            return None
+        return real_read_proc_argv(pid)
+
+    monkeypatch.setattr(holders, "_read_proc_argv", _read_proc_argv)
+    yield
+
+
 # ── Module-level state reset — replaced by per-file process isolation ───────
 #
 # ``scripts/run_tests_parallel.py`` runs each test FILE in its own freshly
