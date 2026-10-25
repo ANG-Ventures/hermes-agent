@@ -93,51 +93,112 @@ def _cross_process_enabled() -> bool:
         return False
 
 
-def _lock_file_for(resolved: str) -> Optional[Path]:
-    """Lock file shared by every process of this install (all profiles, like the process-wide
-    registry): ``<kanban root>/state/file-locks/<sha256 of the path>``. The kanban root is the install
-    root unless ``HERMES_KANBAN_HOME`` pins it, which the dispatcher does for every kanban-runtime unit
-    so a runner under another profile home derives the gateway's directory (spec §8 row 10). None while
-    the cross-process layer is off."""
-    import hashlib
-
-    if not _cross_process_enabled():
-        return None
+def _lock_roots() -> List[Path]:
+    """Lock directories, primary first: ``<kanban root>/state/file-locks`` (the kanban root is the install
+    root unless ``HERMES_KANBAN_HOME`` pins it, which the dispatcher does for every kanban-runtime unit so a
+    runner under another profile home derives the gateway's directory, spec §8 row 10), then the install
+    root's own directory when it differs. A detached worker (or a process from before the kanban root
+    took over) coordinates through the install root only; taking and publishing in BOTH keeps every
+    generation of sibling in one lock domain (Prism a2f98fb174ac)."""
+    roots: List[Path] = []
     try:
         from hermes_cli.kanban_db import kanban_home
 
-        root = kanban_home() / "state" / "file-locks"
-        root.mkdir(parents=True, exist_ok=True)
+        roots.append(kanban_home() / "state" / "file-locks")
     except Exception:
-        return None
-    return root / hashlib.sha256(resolved.encode("utf-8", "surrogatepass")).hexdigest()
+        pass
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        legacy = get_default_hermes_root() / "state" / "file-locks"
+        if not roots or os.path.abspath(str(legacy)) != os.path.abspath(str(roots[0])):
+            roots.append(legacy)
+    except Exception:
+        pass
+    return roots
+
+
+def _lock_files_for(resolved: str) -> List[Path]:
+    """Every lock file of *resolved* (see ``_lock_roots``), primary first; [] while the layer is off or
+    no lock directory can be created."""
+    import hashlib
+
+    if not _cross_process_enabled():
+        return []
+    name = hashlib.sha256(resolved.encode("utf-8", "surrogatepass")).hexdigest()
+    out = []
+    for root in _lock_roots():
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        out.append(root / name)
+    return out
+
+
+def _lock_file_for(resolved: str) -> Optional[Path]:
+    """The primary lock file shared by every process of this install (all profiles, like the
+    process-wide registry): ``<kanban root>/state/file-locks/<sha256 of the path>``. None while the
+    cross-process layer is off."""
+    files = _lock_files_for(resolved)
+    return files[0] if files else None
+
+
+def cross_process_locks_available() -> bool:
+    """A working exclusive ``flock`` can be taken in every lock directory (``_lock_roots``). A kanban-runtime
+    unit edits files from another process, so without one its edits and a sibling's would interleave
+    unserialized: such a unit must stay in-process (Prism 7bf4070bc0f0). Never raises."""
+    try:
+        import fcntl
+    except ImportError:
+        return False
+    roots = _lock_roots()
+    if not roots:
+        return False
+    for root in roots:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            fd = os.open(root / ".probe", os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except BlockingIOError:
+            pass  # another process holds the probe lock: flock works here
+        except OSError:
+            return False  # ENOLCK/EOPNOTSUPP: this filesystem has no working flock
+        finally:
+            os.close(fd)
+    return True
 
 
 @contextmanager
 def _cross_process_lock(resolved: str):
-    """Exclusive ``flock`` on the path's lock file; a no-op where it cannot be taken (no fcntl on
-    Windows, where detached units run in-process anyway; unwritable state dir)."""
+    """Exclusive ``flock`` on each of the path's lock files, taken in one global (sorted) order so two
+    processes never deadlock; a no-op where it cannot be taken (no fcntl on Windows, where detached
+    units run in-process anyway; unwritable state dir)."""
     try:
         import fcntl
     except ImportError:
         yield
         return
-    lock_file = _lock_file_for(resolved)
+    fds = []
     try:
-        fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600) if lock_file else None
-    except OSError:
-        fd = None
-    if fd is None:
-        yield
-        return
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError:
-            pass  # flock unsupported on this filesystem (ENOLCK/EOPNOTSUPP): the thread lock still holds
+        for lock_file in sorted(_lock_files_for(resolved), key=str):
+            try:
+                fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+            except OSError:
+                continue
+            fds.append(fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError:
+                pass  # flock unsupported on this filesystem (ENOLCK/EOPNOTSUPP): the thread lock still holds
         yield
     finally:
-        os.close(fd)  # closing the only descriptor releases the flock
+        for fd in reversed(fds):
+            os.close(fd)  # closing the only descriptor releases the flock
 
 
 # ── cross-process last writer ──────────────────────────────────────────────
@@ -161,27 +222,30 @@ def _own_start_time() -> Optional[float]:
 
 
 def _publish_writer(resolved: str, task_id: str, ts: float) -> None:
-    lock_file = _lock_file_for(resolved)
-    if lock_file is None:
-        return
-    path = lock_file.with_name(lock_file.name + ".writer")
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
-        tmp.write_text(json.dumps({"task_id": task_id, "ts": ts, "pid": os.getpid(),
-                                   "create_time": _own_start_time()}), encoding="utf-8")
-        os.replace(tmp, path)
-    except (OSError, TypeError, ValueError):
+    for lock_file in _lock_files_for(resolved):
+        path = lock_file.with_name(lock_file.name + ".writer")
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
-            tmp.unlink()
-        except OSError:
-            pass
+            tmp.write_text(json.dumps({"task_id": task_id, "ts": ts, "pid": os.getpid(),
+                                       "create_time": _own_start_time()}), encoding="utf-8")
+            os.replace(tmp, path)
+        except (OSError, TypeError, ValueError):
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _foreign_writer(resolved: str) -> Optional[Tuple[str, float]]:
-    """The last writer of *resolved* recorded by another, still-running process; else None."""
-    lock_file = _lock_file_for(resolved)
-    if lock_file is None:
-        return None
+    """The latest writer of *resolved* recorded by another, still-running process in any lock
+    directory; else None."""
+    latest = None
+    for lock_file in _lock_files_for(resolved):
+        latest = _latest(latest, _foreign_writer_in(lock_file))
+    return latest
+
+
+def _foreign_writer_in(lock_file: Path) -> Optional[Tuple[str, float]]:
     try:
         data = json.loads(lock_file.with_name(lock_file.name + ".writer").read_text(encoding="utf-8-sig"))
         pid, task_id, ts = int(data["pid"]), str(data["task_id"]), float(data["ts"])
@@ -200,16 +264,14 @@ def _foreign_writer(resolved: str) -> Optional[Tuple[str, float]]:
 
 
 def _forget_published(resolved: str, task_id: str) -> None:
-    lock_file = _lock_file_for(resolved)
-    if lock_file is None:
-        return
-    path = lock_file.with_name(lock_file.name + ".writer")
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-        if data.get("pid") == os.getpid() and data.get("task_id") == task_id:
-            path.unlink()
-    except (OSError, ValueError, AttributeError):
-        pass
+    for lock_file in _lock_files_for(resolved):
+        path = lock_file.with_name(lock_file.name + ".writer")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            if data.get("pid") == os.getpid() and data.get("task_id") == task_id:
+                path.unlink()
+        except (OSError, ValueError, AttributeError):
+            pass
 
 
 def _latest(local: Optional[Tuple[str, float]], foreign: Optional[Tuple[str, float]]):

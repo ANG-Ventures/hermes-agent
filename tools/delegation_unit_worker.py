@@ -168,9 +168,16 @@ def _parent_own_key(execution: Dict[str, Any], route: Dict[str, Any], runtime: D
         return runtime.get("api_key")
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
-    own = resolve_runtime_provider(requested=route.get("requested_provider") or None,
-                                   target_model=route.get("model") or execution.get("model") or None)
-    return own.get("api_key")
+    try:
+        own = resolve_runtime_provider(requested=route.get("requested_provider") or None,
+                                       target_model=route.get("model") or execution.get("model") or None)
+    except Exception:
+        # A URL-only custom parent has no endpoint without the recorded URL, so a URL-less re-resolve
+        # can fail: keep the key the first resolution found, as before (Prism 1b48ed1b0fa3).
+        logger.warning("delegation_unit_parent_key_unresolved requested=%s", route.get("requested_provider"),
+                       exc_info=True)
+        return runtime.get("api_key")
+    return own.get("api_key") or runtime.get("api_key")
 
 
 def build_parent(record: Dict[str, Any]):

@@ -1016,3 +1016,146 @@ def test_already_queued_completion_is_not_rewritten_every_tick(monkeypatch, tmp_
     assert ad.active_count() == 0
     _deliver(queued)
     assert _drain()["drained"] == 1
+
+
+# ── Prism round 3/4 on #2252 (t_e92403ba) ─────────────────────────────────
+
+
+def test_spawn_failure_with_a_live_runner_on_the_archived_card_is_not_fenced(monkeypatch, tmp_path):
+    """a5d56a755e4f: the archive succeeded but the card's runner still runs (between card reads) ->
+    not fenced: the unit must not also run in-process."""
+    procs = []
+
+    def spawn_then_raise(task, workspace, *, on_popen=None, **kw):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True)
+        procs.append(proc)
+        raise OSError("spawn bookkeeping failed after the worker started (test)")
+
+    runner = SimpleNamespace(pid=4321, cmdline=lambda: ["hermes", "delegation-unit"])
+    monkeypatch.setattr(akb, "lineage_processes", lambda task_id: [runner])
+    monkeypatch.setattr(akb, "FENCE_WAIT_SECONDS", 0.2)
+    try:
+        handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=spawn_then_raise)
+        rec = _record(handle["delegation_id"])
+        assert calls == [], "no in-process run beside a live runner"
+        assert rec["state"] == "failed" and rec["attempt"]["generation"] == 0
+    finally:
+        for proc in procs:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_spawn_failure_with_an_unknown_scan_is_not_fenced(monkeypatch, tmp_path):
+    """a5d56a755e4f: an unreadable process table is never proof the runner is gone."""
+    monkeypatch.setattr(akb, "lineage_processes", lambda task_id: None)
+    monkeypatch.setattr(akb, "FENCE_WAIT_SECONDS", 0.2)
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=Spawner(fail=True))
+    assert calls == [] and _record(handle["delegation_id"])["state"] == "failed"
+
+
+def test_spawn_failure_with_no_runner_still_falls_back_in_process(monkeypatch, tmp_path):
+    monkeypatch.setattr(akb, "lineage_processes", lambda task_id: [])
+    handle, calls = _dispatch(monkeypatch, tmp_path, spawn_fn=Spawner(fail=True))
+    assert len(calls) == 1 and _record(handle["delegation_id"])["state"] == "done"
+
+
+def test_parent_route_keeps_the_endpoint_of_an_anonymous_custom_route():
+    """9885df0cd889: provider=custom with no custom:<name> -> the endpoint is persisted; re-resolving
+    the bare name would land on the profile's default endpoint."""
+    parent = SimpleNamespace(requested_provider="custom", provider="custom", model="m",
+                             base_url="http://10.0.0.5:8080/v1")
+    assert akb.parent_route(parent, {"base_url": ""})["explicit_base_url"] == "http://10.0.0.5:8080/v1"
+    parent.requested_provider = None
+    assert akb.parent_route(parent, {})["explicit_base_url"] == "http://10.0.0.5:8080/v1"
+    named = SimpleNamespace(requested_provider="custom:lab", provider="custom", model="m",
+                            base_url="http://10.0.0.5:8080/v1")
+    assert akb.parent_route(named, {})["explicit_base_url"] is None, "a named endpoint re-resolves by name"
+    pinned = SimpleNamespace(requested_provider="custom", provider="custom", model="m", base_url="http://a/v1")
+    assert akb.parent_route(pinned, {"base_url": "http://deleg/v1"})["explicit_base_url"] == "http://deleg/v1"
+
+
+def test_no_working_file_lock_keeps_the_unit_in_process(eligible, monkeypatch):
+    """7bf4070bc0f0: flock unsupported (ENOLCK) in the lock directory -> the unit stays in-process."""
+    import fcntl
+
+    real = fcntl.flock
+
+    def no_lock(fd, op):
+        raise OSError(37, "No locks available")
+
+    monkeypatch.setattr(fcntl, "flock", no_lock)
+    assert akb.ineligible_reason(**eligible) == "no_file_locks"
+    monkeypatch.setattr(fcntl, "flock", real)
+    assert akb.ineligible_reason(**eligible) is None
+
+
+def test_lock_and_writer_span_the_install_root_and_the_kanban_root(home, monkeypatch, tmp_path):
+    """a2f98fb174ac: a detached worker coordinates in the install root's file-locks, a kanban unit in
+    the kanban root's: a write published by either is seen by the other, and both locks are held."""
+    import fcntl
+
+    import tools.delegate_tool_config as dtc
+    from tools import file_state
+
+    monkeypatch.setattr(dtc, "_get_detached_background", lambda: True)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kroot"))
+    monkeypatch.delenv("HERMES_KANBAN_SANDBOX", raising=False)
+    target = str(tmp_path / "f.txt")
+    files = file_state._lock_files_for(target)
+    assert len(files) == 2 and files[0].parent == tmp_path / "kroot" / "state" / "file-locks"
+    assert files[1].parent == home / "state" / "file-locks"
+    # A sibling from before the kanban root took over published only in the install root.
+    legacy = files[1].with_name(files[1].name + ".writer")
+    legacy.write_text(json.dumps({"task_id": "old-unit", "ts": time.time() + 5, "pid": 1, "create_time": None}))
+    assert file_state._foreign_writer(target)[0] == "old-unit"
+    held = []
+    with file_state.FileStateRegistry().lock_path(target):
+        for f in files:
+            fd = __import__("os").open(f, __import__("os").O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held.append(False)
+            except BlockingIOError:
+                held.append(True)
+            finally:
+                __import__("os").close(fd)
+    assert held == [True, True]
+
+
+# ── Prism round 1 on #2269 ─────────────────────────────────────────────────
+
+
+def test_boot_keeps_a_cancelled_unit_whose_card_read_was_inconclusive(monkeypatch, tmp_path, spawner):
+    """3b8946d15b24: the boot card read fails -> the cancelled unit is still observed (cancel-marked),
+    and the next drain, with SQLite back, archives its live card."""
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _no_thread(monkeypatch)
+    ad.interrupt_for_session(parent_session_id="parent-1", reason="/stop")
+    ad._reset_for_tests()
+    profile_home = Path(ad._registry_path().parent.parent)
+    real = akb._board_state
+    monkeypatch.setattr(akb, "_board_state", lambda: None)  # "database is locked" at boot
+    assert akb.observe_running(profile_home, "200:2") == 1
+    monkeypatch.setattr(akb, "_board_state", real)
+    akb.drain_profile(profile_home, "200:2")
+    assert _card(task_id)[0].status == "archived"
+    akb.drain_profile(profile_home, "200:2")
+    assert ad.active_count() == 0
+
+
+def test_permanently_inconclusive_scan_still_finalizes_an_ended_card(monkeypatch, tmp_path, spawner):
+    """42bc969f2f92: the deferral on an unknown scan is bounded: past the limit the dead runner's
+    record is failed and its error delivered once."""
+    handle, _ = _dispatch(monkeypatch, tmp_path, spawn_fn=spawner)
+    did = handle["delegation_id"]
+    task_id = _record(did)["kanban"]["task_id"]
+    _end_card(task_id, "archived")
+    profile_home = Path(ad._registry_path().parent.parent)
+    assert akb.drain_profile(profile_home, BOOT, scan=lambda t: None)["failed"] == 0
+    assert _record(did)["state"] == "running"
+    monkeypatch.setattr(akb, "INCONCLUSIVE_SCAN_LIMIT_SECONDS", 0.0)
+    assert akb.drain_profile(profile_home, BOOT, scan=lambda t: None)["failed"] == 1
+    assert _record(did)["state"] == "failed" and ad.active_count() == 0
+
