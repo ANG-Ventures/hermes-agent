@@ -876,7 +876,8 @@ def acknowledge_event_outbox(
 
 
 @_producer_scoped
-def admit_event_outbox(evt: Dict[str, Any], *, session_key: str, session_id: str = "") -> bool:
+def admit_event_outbox(evt: Dict[str, Any], *, session_key: str, session_id: str = "",
+                       admitted_at: Optional[float] = None) -> bool:
     """Gateway wake admitted (queued/steered), not yet consumed: the JSON outbox goes ``admitted``
     so the consumption sweeper can confirm or re-inject it (t_97a879af). False = no JSON receipt."""
     if evt.get("type") not in {"async_delegation", "async_delegation_restarted"} or is_interim_delegation_event(evt):
@@ -887,7 +888,8 @@ def admit_event_outbox(evt: Dict[str, Any], *, session_key: str, session_id: str
     profile_home = evt.get("_registry_profile_home")
     return acknowledge_outbox_event(
         event_id, outcome="admitted", profile_home=Path(profile_home) if profile_home else None,
-        admission={"boot_id": current_boot_id(), "session_key": session_key, "session_id": session_id})
+        admission={"boot_id": current_boot_id(), "session_key": session_key, "session_id": session_id,
+                   "admitted_at": admitted_at})
 
 
 def admitted_outbox_events(profile_home: Path) -> List[Dict[str, Any]]:
@@ -943,7 +945,8 @@ def complete_event_delivery(evt: Dict[str, Any], claim_id: Optional[str]) -> Non
         admission = evt.get("_gateway_admission")
         if not (isinstance(admission, dict) and admit_event_outbox(
                 evt, session_key=str(admission.get("session_key") or ""),
-                session_id=str(admission.get("session_id") or ""))):
+                session_id=str(admission.get("session_id") or ""),
+                admitted_at=admission.get("admitted_at"))):
             acknowledge_event_outbox(evt, outcome="delivered")
     finally:
         # A JSON storage failure must not skip the independent legacy receipt.

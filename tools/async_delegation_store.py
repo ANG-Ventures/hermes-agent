@@ -1832,6 +1832,7 @@ def admit(
     session_key: str = "",
     session_id: str = "",
     profile_home: Path | None = None,
+    admitted_at: float | None = None,
 ) -> bool:
     """Record ADAPTER ADMISSION of a gateway wake: queued or steered, not yet consumed (t_97a879af).
 
@@ -1852,7 +1853,8 @@ def admit(
                         return True  # a retried receipt: already held
                     if event.get("state") != "pending":
                         return False
-                    event.update(state="admitted", admitted_at=time.time(), admitted_boot_id=boot_id,
+                    event.update(state="admitted",
+                                 admitted_at=admitted_at if isinstance(admitted_at, (int, float)) else time.time(), admitted_boot_id=boot_id,
                                  admitted_session_key=session_key, admitted_session_id=session_id)
                     logger.info(
                         "async_delegation_outbox_admitted event_id=%s session_key=%s session_id=%s",

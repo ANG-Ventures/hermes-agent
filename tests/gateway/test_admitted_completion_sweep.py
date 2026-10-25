@@ -179,3 +179,24 @@ def test_same_event_id_in_two_profiles_keeps_separate_suspects(tmp_path, isolate
     later = time.time() + 600
     _run(runner, later)
     assert _run(runner, later + 60) == 1
+
+
+def test_missing_transcript_store_is_unknown_not_lost(tmp_path, isolated_registry):
+    """Prism a54f28d4d21a: no state.db means consumption is unverifiable; never re-inject on it."""
+    runner, _adapter, _event = _admitted(tmp_path, isolated_registry)
+    (tmp_path / "state.db").rename(tmp_path / "state.db.gone")
+    later = time.time() + 600
+    assert _run(runner, later) == 0 and _run(runner, later + 60) == 0
+    assert _json_outbox_states(tmp_path) == ["admitted"]
+
+
+def test_admitted_at_is_taken_before_the_adapter_hand_off(tmp_path, isolated_registry):
+    """Prism 9a4d46e375b4: the stamp predates the receipt write, so a row persisted during a slow
+    receipt still falls inside the probe window."""
+    from tools import async_delegation_store as store
+    before = time.time()
+    _admitted(tmp_path, isolated_registry)
+    (event,) = store.admitted_events(tmp_path)
+    assert before <= event["admitted_at"] <= time.time()
+    payload_free = {k: v for k, v in event.items() if k != "payload"}
+    assert payload_free["admitted_session_key"] == KEY

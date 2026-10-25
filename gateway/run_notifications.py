@@ -1404,9 +1404,11 @@ class GatewayNotificationsMixin:
             _prime = getattr(adapter, "prime_routing_cache", None)
             if callable(_prime):
                 _prime(synth_event)
+            admitted_at = time.time()  # before the hand-off: the consuming row can persist at once
             await admit_internal_event(adapter, synth_event)
             # Queued or steered, not consumed: the durable receipt records admission (t_97a879af).
-            evt["_gateway_admission"] = {"session_key": session_key, "session_id": parent_session_id}
+            evt["_gateway_admission"] = {"session_key": session_key, "session_id": parent_session_id,
+                                         "admitted_at": admitted_at}
             return True
         except WakeNotAccepted:
             # Durable callers refund the claim; ordinary watch callers just requeue.

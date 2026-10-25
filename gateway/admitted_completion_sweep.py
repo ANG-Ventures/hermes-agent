@@ -51,14 +51,17 @@ def _load_admitted(homes: Iterable[Path]) -> List[Tuple[Path, dict]]:
 
 
 def _in_transcript(home: Path, event: dict) -> bool:
-    """True when a user row since admission carries this wake. Fails closed to False."""
+    """True when a user row since admission carries this wake; raises when it cannot be read."""
     from tools.async_delegation import admission_receipt_needle
     from hermes_state import SessionDB
     payload = event.get("payload") or {}
     needle = admission_receipt_needle(payload)
     db_path = home / "state.db"
-    if not needle or not db_path.exists():
+    if not needle:
         return False
+    if not db_path.exists():
+        # Unverifiable is not "lost": the caller skips this candidate (Prism a54f28d4d21a).
+        raise FileNotFoundError(f"transcript store missing: {db_path}")
     db = SessionDB(db_path, read_only=True)
     try:
         session_id = str(event.get("admitted_session_id") or payload.get("parent_session_id") or "")
