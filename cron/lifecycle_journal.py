@@ -57,6 +57,12 @@ _RETENTION_DAYS = 14.0
 
 EVENT_CREATED = "created"
 EVENT_REMOVED = "removed"
+# t_3436a10c: the enabled toggle through the API (pause/resume/edit/rearm/force-fire). A row present in
+# jobs.json whose `enabled` disagrees with its last journalled toggle was flipped by a NON-API writer
+# (a hand union / snapshot copied over the store): cron-jobs-integrity-watch pages it as REWOUND.
+EVENT_PAUSED = "paused"
+EVENT_RESUMED = "resumed"
+EVENTS = (EVENT_CREATED, EVENT_REMOVED, EVENT_PAUSED, EVENT_RESUMED)
 
 
 def _journal_path() -> Path:
@@ -148,14 +154,32 @@ def _append(record: Dict[str, Any]) -> None:
 
 
 def record_created(job_id: str, *, name: Optional[str] = None,
-                   actor: Optional[str] = None) -> None:
-    """Journal an intentional job creation."""
+                   actor: Optional[str] = None, enabled: Optional[bool] = None) -> None:
+    """Journal an intentional job creation (``enabled``: the toggle it was created with)."""
     if not job_id:
         return
-    _append({
+    rec = {
         "event": EVENT_CREATED,
         "job_id": str(job_id),
         "name": name,
+        "actor": actor or _default_actor(),
+        "at": _hermes_now().isoformat(),
+    }
+    if enabled is not None:
+        rec["enabled"] = bool(enabled)
+    _append(rec)
+
+
+def record_toggled(job_id: str, enabled: bool, *, name: Optional[str] = None,
+                   reason: Optional[str] = None, actor: Optional[str] = None) -> None:
+    """Journal an intentional pause (``enabled`` False) or resume (True) of an existing job."""
+    if not job_id:
+        return
+    _append({
+        "event": EVENT_RESUMED if enabled else EVENT_PAUSED,
+        "job_id": str(job_id),
+        "name": name,
+        "reason": reason,
         "actor": actor or _default_actor(),
         "at": _hermes_now().isoformat(),
     })
@@ -226,9 +250,7 @@ def read_entries_with_health(
                 if not isinstance(rec, dict):
                     raise ValueError("lifecycle record is not an object")
                 event = rec.get("event")
-                if not isinstance(event, str) or event not in (
-                    EVENT_CREATED, EVENT_REMOVED
-                ):
+                if not isinstance(event, str) or event not in EVENTS:
                     raise ValueError("lifecycle record has an unknown event")
                 job_id = rec.get("job_id")
                 if not isinstance(job_id, str) or not job_id.strip():
@@ -504,7 +526,10 @@ def check_vanished_jobs(
 __all__ = [
     "DEFAULT_WINDOW_HOURS",
     "EVENT_CREATED",
+    "EVENT_PAUSED",
     "EVENT_REMOVED",
+    "EVENT_RESUMED",
+    "EVENTS",
     "JOURNAL_FILENAME",
     "MAX_WINDOW_HOURS",
     "STATUS_OK",
@@ -517,4 +542,5 @@ __all__ = [
     "read_entries_with_health",
     "record_created",
     "record_removed",
+    "record_toggled",
 ]

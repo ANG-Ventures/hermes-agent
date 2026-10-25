@@ -2084,9 +2084,25 @@ def _journal_created(job: Dict[str, Any]) -> None:
     try:
         from cron.lifecycle_journal import record_created
 
-        record_created(str(job.get("id") or ""), name=job.get("name"))
+        record_created(str(job.get("id") or ""), name=job.get("name"),
+                       enabled=bool(job.get("enabled", True)))
     except Exception:
         logger.debug("cron lifecycle journal (create) unavailable", exc_info=True)
+
+
+def _journal_toggled(before: Any, job: Dict[str, Any], reason: Optional[str] = None) -> None:
+    """Journal a pause/resume when an API write flipped ``enabled`` (t_3436a10c). Call INSIDE the
+    jobs lock, after the save landed (same causality rule as removals). Never raises."""
+    after = bool(job.get("enabled", True))
+    if before is not None and bool(before) == after:
+        return
+    try:
+        from cron.lifecycle_journal import record_toggled
+
+        record_toggled(str(job.get("id") or ""), after, name=job.get("name"),
+                       reason=reason or job.get("paused_reason"))
+    except Exception:
+        logger.debug("cron lifecycle journal (toggle) unavailable", exc_info=True)
 
 
 def _journal_removed(removed_ids: Optional[Collection[str]],
@@ -2925,6 +2941,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         _reject_terminal_activation(job, updated, job_id)
         jobs[i] = updated
         save_jobs(jobs)
+        _journal_toggled(job.get("enabled", True), updated)
         if updates.get("allow_flagship_reason"):
             logger.info("flagship override: cron update id=%s model=%s reason=%s", job_id, updated.get("model"), updates["allow_flagship_reason"])
         return _normalize_job_record(updated)
@@ -3190,12 +3207,14 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
             raise ValueError(_REARM_RECURRING_ERROR)
         repeat = job.get("repeat") or {}
         repeat["completed"] = 0
+        was_enabled = job.get("enabled", True)
         job.update(
             schedule=parsed_schedule, schedule_display=parsed_schedule.get("display", str(run_at)),
             repeat=repeat, run_claim=None, fire_claim=None)
         _activate_job_record(job)
         job["next_run_at"] = next_run_at
         save_jobs(jobs)
+        _journal_toggled(was_enabled, job, reason="rearmed")
         return _normalize_job_record(job)
 
     return _with_job(job_ref["id"], apply)
@@ -3766,6 +3785,7 @@ def claim_job_for_fire(
                 job["next_run_at"] = nxt
                 save_jobs(jobs)
             return False
+        was_enabled = job.get("enabled", True)
         if force:
             _activate_job_record(job)
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
@@ -3779,6 +3799,8 @@ def claim_job_for_fire(
                 _record_interval_fire(job, now)
                 job["next_run_at"] = nxt
         save_jobs(jobs)
+        if force:
+            _journal_toggled(was_enabled, job, reason="forced run")
         return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
 
     return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
@@ -3954,6 +3976,7 @@ class _DueScan:
     needs_save: bool = False
     removed: Set[str] = field(default_factory=set)
     rewound: List[str] = field(default_factory=list)  # ids behind a completed occurrence this tick
+    paused: List[Dict[str, Any]] = field(default_factory=list)  # records this scan self-disabled (journalled)
 
     def find(self, job_id: Any) -> Optional[Dict[str, Any]]:
         return next((rj for rj in self.raw_jobs if rj["id"] == job_id), None)
@@ -4011,6 +4034,7 @@ def _self_disable_half_paused(job: Dict[str, Any], scan: _DueScan) -> None:
         rj["paused_at"] = scan.now.isoformat()
     if not rj.get("paused_reason"):
         rj["paused_reason"] = "auto-disabled: enabled+paused contradiction"
+    scan.paused.append(rj)
     scan.needs_save = True
 
 
@@ -4483,6 +4507,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
 
     if scan.needs_save:
         save_jobs(raw_jobs, removed_ids=scan.removed or None)
+        for rj in scan.paused:
+            _journal_toggled(True, rj)
     return due
 
 
