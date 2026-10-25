@@ -249,6 +249,35 @@ async def test_r1_internal_wake_during_flush_is_queued_silently(monkeypatch, tmp
     assert rig.max_live == 1
 
 
+@pytest.mark.asyncio
+async def test_r1_adapter_door_inbound_behind_direct_path_holder(monkeypatch, tmp_path, caplog):
+    """Holder entered the runner directly (boot resume / slash re-dispatch: no adapter guard), so
+    the next message comes through ``adapter.handle_message`` and reaches ``_handle_message`` as a
+    fresh dispatch. It is queued, acked ONCE, re-tried by the adapter's requeue back-off without a
+    bounce, and runs as soon as the lease frees."""
+    rig = _Rig(monkeypatch, tmp_path)
+    gate = rig.hold_flush("first")
+    caplog.set_level(logging.INFO)
+
+    holder = asyncio.create_task(rig.runner._handle_message(_msg("first")))
+    await _wait_for(rig.flush_entered["first"].is_set, "first turn to reach its flush")
+    assert KEY not in rig.adapter._active_sessions, "precondition: holder has no adapter guard"
+
+    await rig.adapter.handle_message(_msg("second"))
+    await asyncio.sleep(1.5)  # several requeue back-off laps while the lease is held
+    assert rig.calls == ["first"]
+    acks = [s for s in rig.adapter.sent if "Queued for the next turn" in s]
+    assert len(acks) == 1, f"expected exactly one queued ack, got {rig.adapter.sent}"
+    assert "Rejecting turn" not in caplog.text
+
+    gate.set()
+    await asyncio.wait_for(holder, 5)
+    await rig.settle(expect_calls=2)
+    assert rig.calls == ["first", "second"]
+    assert rig.max_live == 1
+    assert not any("not processed" in s.lower() for s in rig.adapter.sent), rig.adapter.sent
+
+
 # ---------------------------------------------------------------------------
 # R-2: superseded live holder is NOT stale; /stop-invalidated holder IS
 # ---------------------------------------------------------------------------

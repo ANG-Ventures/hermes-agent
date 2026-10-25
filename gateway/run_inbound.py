@@ -793,7 +793,14 @@ class GatewayInboundMixin:
             )
             if is_internal:
                 return (None,)
-            if os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true":
+            # Same 30 s debounce as the busy ack: a message queued on a DIFFERENT adapter object
+            # than the holder's (kanban notifier vs. the chat's intake adapter) is re-dispatched by
+            # that adapter's requeue back-off (<=1 s) until the lease frees; ack it once, not per lap.
+            _ack_state = self._session_state(_quick_key).turn
+            _now = time.time()
+            if (os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
+                    and _now - (_ack_state.busy_ack_ts or 0) >= 30):
+                _ack_state.busy_ack_ts = _now
                 message = t(
                     "gateway.busy.ack", head=t("gateway.busy.queued_head"), detail="",
                     tail=t("gateway.busy.queued_tail"),
