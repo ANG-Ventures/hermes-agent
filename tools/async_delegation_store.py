@@ -16,7 +16,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -29,6 +29,8 @@ MAX_COMPLETION_REPLAY_AGE_SECONDS = 48 * 3600.0
 MAX_REGISTRY_RECORDS = 256
 TERMINAL_RETENTION_SECONDS = 7 * 24 * 60 * 60
 ABSOLUTE_RETENTION_SECONDS = 30 * 24 * 60 * 60
+# An admitted wake unconfirmed this long is lost, not pending: same horizon as completion replay.
+ADMITTED_MAX_AGE_SECONDS = MAX_COMPLETION_REPLAY_AGE_SECONDS
 ACTIVE_STALE_SECONDS = 30 * 24 * 60 * 60
 # Lifecycle breadcrumb trail cap per record (oldest entries dropped first).
 MAX_LIFECYCLE_EVENTS = 50
@@ -225,6 +227,10 @@ def _load(path: Path, *, allow_invalid_records: bool = False) -> dict[str, Any]:
                 # for every healthy delegation in the profile.
                 or (isinstance(event, dict)
                     and not _is_optional_number(event.get("created_at")))
+                # The admitted-age ceiling computes `now - admitted_at` across the whole
+                # registry; an unconvertible value would abort it for every sibling (7aaf4b17dca7).
+                or (isinstance(event, dict)
+                    and not _is_optional_number(event.get("admitted_at")))
                 or (isinstance(event, dict)
                     and isinstance(event.get("payload"), dict)
                     and not _is_optional_number(event["payload"].get("attempt_generation")))
@@ -389,7 +395,60 @@ def _terminal_pending(record: dict[str, Any]) -> bool:
     )
 
 
-def _prune(registry: dict[str, Any], now: float) -> None:
+def admitted_past_ceiling(event: dict[str, Any], now: float) -> bool:
+    """An ``admitted`` row older than the replay horizon will never be confirmed or re-injected:
+    its profile is no longer served or its transcript store is gone (t_506536db)."""
+    admitted_at = event.get("admitted_at")
+    return (event.get("state") == "admitted" and isinstance(admitted_at, (int, float))
+            and now - admitted_at > ADMITTED_MAX_AGE_SECONDS)
+
+
+def sweep_marker_path(profile_home: Path | None = None) -> Path:
+    """Touched by the admitted-completion sweeper for every home it serves (and by the gateway's boot
+    replay, before its first sweep). Its mtime is how the store tells a served home from an unserved one."""
+    return registry_path(profile_home).with_suffix(".sweep")
+
+
+def note_sweeper_serves(profile_home: Path | None = None) -> None:
+    path = sweep_marker_path(profile_home)
+    try:
+        _prepare_directory(path)
+        path.touch()
+        stamp = time.time()  # the store's clock, not the filesystem's: expiry compares against it
+        os.utime(path, (stamp, stamp))
+    except OSError:
+        logger.debug("could not touch the admitted-sweep marker %s", path, exc_info=True)
+
+
+def _sweeper_serves(path: Path, now: float) -> bool:
+    try:
+        return now - path.with_suffix(".sweep").stat().st_mtime <= ADMITTED_MAX_AGE_SECONDS
+    except OSError:
+        return False
+
+
+def _expire_admitted_unserved(registry: dict[str, Any], path: Path, now: float) -> None:
+    """Housekeeping for a home NO sweeper serves: an ``admitted`` row past the ceiling is dropped as
+    ``unverified``, not lost, since nothing checked its transcript. A served home is left to the sweep,
+    which confirms against the transcript first and only then expires (Prism 2fcb0b3d9b47)."""
+    if _sweeper_serves(path, now):
+        return
+    invalid_record_ids = set(registry.get("_invalid_record_ids", []))
+    for delegation_id, record in registry["records"].items():
+        if str(delegation_id) in invalid_record_ids or not isinstance(record, dict):
+            continue
+        for event in record.get("outbox", []):
+            if isinstance(event, dict) and admitted_past_ceiling(event, now):
+                event.update(state="dropped", drop_reason="admitted_age_ceiling_unverified", delivered_at=now)
+                logger.warning(
+                    "async_delegation_wake_unverified event_id=%s session_key=%s age_hours=%.1f: admitted, "
+                    "no sweeper serves this profile; expired unverified at the age ceiling", event.get("event_id"),
+                    event.get("admitted_session_key") or "-", (now - event["admitted_at"]) / 3600.0,
+                )
+
+
+def _prune(registry: dict[str, Any], now: float, path: Path) -> None:
+    _expire_admitted_unserved(registry, path, now)
     records = registry["records"]
     invalid_record_ids = set(registry.get("_invalid_record_ids", []))
     removable: list[tuple[float, str]] = []
@@ -497,7 +556,7 @@ def persist_dispatch(
     try:
         _assert_nonsecret_settings(durable_spec)
         with locked_registry(profile_home) as registry:
-            _prune(registry, now)
+            _prune(registry, now, path)
             if len(registry["records"]) >= record_limit:
                 logger.error(
                     "async_delegation_sync_fallback reason=registry_cap cap=%d path=%s",
@@ -1775,6 +1834,10 @@ def enqueue_pending_outbox(
 ) -> list[dict[str, Any]]:
     queued: list[dict[str, Any]] = []
     now = time.time()
+    # The gateway replaying this home's outbox also runs its admitted sweep, which owns expiry of
+    # ``admitted`` rows (transcript first, then the age ceiling). Mark it served BEFORE any write can
+    # prune, so a restart after a long outage never drops a consumed wake unchecked (2fcb0b3d9b47).
+    note_sweeper_serves(profile_home)
     with locked_registry(profile_home) as registry:
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
         for delegation_id, record in registry["records"].items():
@@ -1878,8 +1941,14 @@ def admitted_events(profile_home: Path | None = None) -> list[dict[str, Any]]:
     return out
 
 
-def reopen_admitted(event_id: str, *, reason: str, profile_home: Path | None = None) -> dict[str, Any] | None:
-    """``admitted`` -> ``pending`` for one re-injection; returns the payload, else None (settled)."""
+def reopen_admitted(event_id: str, *, reason: str, profile_home: Path | None = None,
+                    before_publish: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any] | None:
+    """``admitted`` -> ``pending`` for one re-injection; returns the payload, else None (settled).
+
+    ``before_publish(payload)`` runs under the registry lock before ``pending`` is written (the legacy
+    SQLite mirror reset). If it raises, the event stays ``admitted`` and uncounted, so a crash or failure
+    between the two writes can never leave JSON ``pending`` beside a ``delivered`` mirror (Prism
+    9057f657dd27)."""
     with locked_registry(profile_home) as registry:
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
         for delegation_id, record in registry["records"].items():
@@ -1889,13 +1958,16 @@ def reopen_admitted(event_id: str, *, reason: str, profile_home: Path | None = N
                 if isinstance(event, dict) and event.get("event_id") == event_id:
                     if event.get("state") != "admitted":
                         return None
+                    payload = copy.deepcopy(event.get("payload") or {})
+                    if before_publish is not None:
+                        before_publish(payload)
                     event["state"] = "pending"
                     event["reinjects"] = int(event.get("reinjects") or 0) + 1
                     logger.warning(
                         "async_delegation_outbox_reopened event_id=%s reason=%s reinjects=%d",
                         event_id, reason, event["reinjects"],
                     )
-                    return copy.deepcopy(event.get("payload") or {})
+                    return payload
     return None
 
 

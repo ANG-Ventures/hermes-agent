@@ -906,26 +906,37 @@ def drop_admitted_event(event_id: str, reason: str, profile_home: Path) -> bool:
 
 
 def reopen_admitted_event(event_id: str, profile_home: Path, *, reason: str) -> Optional[Dict[str, Any]]:
-    """Re-open a lost admitted wake for ONE re-injection: JSON back to ``pending`` and the legacy
-    SQLite row back to claimable, so the normal delivery path claims and admits it again. Returns
-    the payload stamped with its producer home, or None when it settled meanwhile."""
-    payload = _store.reopen_admitted(event_id, reason=reason, profile_home=profile_home)
-    if payload is None:
-        return None
-    payload["_registry_profile_home"] = str(profile_home)
-    delegation_id = str(payload.get("delegation_id") or "")
-    if delegation_id and payload.get("type") == "async_delegation":
+    """Re-open a lost admitted wake for ONE re-injection: the legacy SQLite row back to claimable, THEN
+    JSON back to ``pending``, both under the canonical registry lock, so the normal delivery path claims
+    and admits it again. Mirror first: a crash between the writes leaves JSON ``admitted`` (the sweep
+    retries) beside a claimable mirror, never JSON ``pending`` beside a ``delivered`` mirror, which the
+    replay's failed claim would reconcile back to ``delivered`` and lose for good (Prism 9057f657dd27).
+    Returns the payload stamped with its producer home, or None when it settled meanwhile."""
+
+    def _reset_mirror(payload: Dict[str, Any]) -> None:
+        delegation_id = str(payload.get("delegation_id") or "")
+        if not (delegation_id and payload.get("type") == "async_delegation"):
+            return
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         token = set_hermes_home_override(profile_home)
         try:
-            # Only this attempt's mirror row: a newer generation's receipt must not be reopened.
+            # Only this attempt's mirror row: a newer generation's receipt must not be reopened. A row
+            # still ``pending`` under the admitting consumer's claim (crash between the JSON admission and
+            # the SQLite receipt) loses that claim too, or the re-injected wake fails its own claim inside
+            # the lease and is discarded as owned elsewhere (Prism 9057f657dd27).
             _update_delivery("""UPDATE async_delegations SET delivery_state='pending', delivered_at=NULL,
                           delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
-                   WHERE delegation_id=? AND delivery_state='delivered'
+                   WHERE delegation_id=? AND delivery_state IN ('delivered', 'pending')
                      AND json_extract(event_json, '$.event_id') = ?""",
                              (time.time(), delegation_id, event_id))
         finally:
             reset_hermes_home_override(token)
+
+    payload = _store.reopen_admitted(event_id, reason=reason, profile_home=profile_home,
+                                     before_publish=_reset_mirror)
+    if payload is None:
+        return None
+    payload["_registry_profile_home"] = str(profile_home)
     return payload
 
 
