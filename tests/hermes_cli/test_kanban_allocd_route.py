@@ -110,7 +110,7 @@ class FakeAllocd:
                 hid = table.resolve(k) or k
                 resv[hid] = resv[hid].plus(v) if hid in resv else v
             d = placement.choose(table, req["consumer"], samples, reservations=resv, now=now, candidates=cands,
-                                 slots_used=placement.live_slots(req["consumer"], now=now, table=table),
+                                 admitted=placement.live_admissions(req["consumer"], now=now, table=table),
                                  footprint=req.get("footprint"), job=job, previous=req.get("previous"))
             return 200, {"shadow": True, "host": d.host, "reason": d.reason, "rule": d.rule}
         d, rid = placement.admit(table, req["consumer"], samples, ttl_s=req.get("ttl_s", 1800.0), job_id=req["job_id"],
@@ -157,7 +157,7 @@ def _replay_plan(home, dec, table_doc, mode):
                               ttl_s=86400, job_id=f"seed-{h}", path=rpath, now=at - 1)
     hosts, slots, detail, measured = [], {}, {}, {}
     for i, (h, v) in enumerate(sorted(dec["hosts"].items())):
-        n = table.hosts[table.resolve(h)].slots_for("kanban") or 1
+        n = table.hosts[table.resolve(h)].ceiling_for("kanban") or 1
         hosts.append(kwp.PoolHost(name=h, ssh_host=h, ssh_user="kanbanw", slots=n, capacity_pct=100.0,
                                   absence="optional", profiles=(dec["assignee"],), state="active",
                                   enabled=True, priority=i))

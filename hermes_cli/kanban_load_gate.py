@@ -1317,7 +1317,7 @@ def utilization_context() -> dict:
         hid = table.resolve(UTIL_HOST_ALIAS)
         if hid:
             host, spec = hid, table.hosts[hid]
-            ceiling = spec.slots_for("kanban")
+            ceiling = spec.ceiling_for("kanban")
             reason = str(((json.loads(table.path.read_text(encoding="utf-8-sig"))["hosts"][hid].get("consumers") or {})
                           .get("kanban") or {}).get("_ceiling_reason") or "")
         prior = _pl.need_of(table.footprint("kanban"))
