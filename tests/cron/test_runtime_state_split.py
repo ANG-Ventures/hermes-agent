@@ -1,4 +1,6 @@
-"""t_94e91559: hot cron runtime fields live in ``cron/runtime_state.db``, not ``jobs.json``.
+"""t_94e91559: hot cron runtime fields live in ``cron/runtime_state.db``; ``jobs.json`` is a
+coalesced, read-only mirror of the merged view (rewritten at most once per
+``HERMES_CRON_MIRROR_INTERVAL_S``, never read back for a job that has a row).
 
 Real store under a temp HERMES_HOME throughout (no mocks of the store): the assertions are on the
 actual bytes/mtime of jobs.json and the actual rows in the database.
@@ -17,8 +19,19 @@ import pytest
 def temp_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_CRON_RUNTIME_STATE", raising=False)
+    monkeypatch.delenv("HERMES_CRON_MIRROR_INTERVAL_S", raising=False)
     (tmp_path / "cron").mkdir()
     return tmp_path
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """Controls the mirror window clock (cron.runtime_state._now)."""
+    from cron import runtime_state as rs
+
+    now = [1_000_000.0]
+    monkeypatch.setattr(rs, "_now", lambda: now[0])
+    return now
 
 
 @pytest.fixture(autouse=True)
@@ -91,14 +104,16 @@ def _snapshot(path):
 
 # --- 1: runtime touches never read or write jobs.json --------------------------------------
 
-def test_700_job_store_heartbeats_and_marks_leave_jobs_json_untouched(temp_home):
-    """50 heartbeat_fire_claim + 20 mark_job_run on a 700-job store: jobs.json mtime/inode/bytes
-    unchanged, exactly 70 row upserts."""
+def test_700_job_store_heartbeats_and_marks_leave_jobs_json_untouched(temp_home, clock):
+    """50 heartbeat_fire_claim + 20 mark_job_run on a 700-job store inside one mirror window:
+    jobs.json mtime/inode/bytes unchanged, exactly 70 row upserts."""
     from cron import jobs as cj
     from cron import runtime_state as rs
 
     _write_store(temp_home, [_fixture_job(i, with_runtime=True) for i in range(700)])
-    cj.load_jobs()  # one-shot migration happens here
+    before_adopt = _snapshot(_jobs_file(temp_home))
+    cj.load_jobs()  # one-shot adoption of the file's runtime into rows happens here
+    assert _snapshot(_jobs_file(temp_home)) == before_adopt  # adoption never rewrites the file
     ids = [f"job{i:04d}abcd" for i in range(20)]
     owners = {}
     for jid in ids:
@@ -120,7 +135,7 @@ def test_700_job_store_heartbeats_and_marks_leave_jobs_json_untouched(temp_home)
     assert rec["repeat"] == {"times": None, "completed": 1}
 
 
-def test_due_scan_pending_slot_stamp_does_not_rewrite_jobs_json(temp_home):
+def test_due_scan_pending_slot_stamp_does_not_rewrite_jobs_json(temp_home, clock):
     """A tick that only stamps pending_slot / last_dispatch writes rows, not the file."""
     from cron import jobs as cj
 
@@ -135,17 +150,22 @@ def test_due_scan_pending_slot_stamp_does_not_rewrite_jobs_json(temp_home):
     assert rec.get("last_dispatch") or rec.get("next_run_at") != "2020-01-01T00:00:00+00:00"
 
 
-def test_definition_edit_still_rewrites_jobs_json_without_runtime(temp_home):
+def test_definition_edit_writes_merged_view_immediately(temp_home, clock):
+    """A definition save writes jobs.json at once as definitions + current rows, and resets the
+    mirror window (nothing left dirty)."""
     from cron import jobs as cj
+    from cron import runtime_state as rs
 
     created = cj.create_job(prompt="x", schedule="every 5m", name="edit-me")
     assert cj.claim_job_for_fire(created["id"]) is True
     cj.update_job(created["id"], {"name": "edited"})
     on_disk = json.loads(_jobs_file(temp_home).read_text(encoding="utf-8"))["jobs"][0]
+    rec = cj.get_job(created["id"])
     assert on_disk["name"] == "edited"
-    assert "fire_claim" not in on_disk and "next_run_at" not in on_disk
-    assert "completed" not in on_disk["repeat"]
-    assert cj.get_job(created["id"])["fire_claim"]["by"]  # runtime survived the definition save
+    assert on_disk["fire_claim"] == rec["fire_claim"] and rec["fire_claim"]["by"]
+    assert on_disk["next_run_at"] == rec["next_run_at"]
+    with rs.connect(temp_home / "cron") as conn:
+        assert rs.dirty_since(conn) is None
 
 
 def test_remove_job_deletes_its_row(temp_home):
@@ -243,15 +263,18 @@ def test_migration_round_trip_and_export(temp_home):
     originals[3]["run_claim"] = None  # absent vs None must both survive
     _write_store(temp_home, originals)
 
+    before = _snapshot(_jobs_file(temp_home))
     loaded = cj.load_jobs()
     assert loaded == originals  # field-for-field, through the table
-    on_disk = json.loads(_jobs_file(temp_home).read_text(encoding="utf-8"))["jobs"]
-    assert all("last_run_at" not in j and "completed" not in j["repeat"] for j in on_disk)
-    assert _db(temp_home).exists()
+    assert _snapshot(_jobs_file(temp_home)) == before  # the file already IS the merged view
+    rows = dict(sqlite3.connect(_db(temp_home)).execute("SELECT job_id, fields FROM job_runtime"))
+    assert len(rows) == 40 and json.loads(rows[originals[3]["id"]])["run_claim"] is None
 
-    # Second load: no-op (file already clean, nothing re-migrated).
-    before = _snapshot(_jobs_file(temp_home))
+    # Second load: no-op (rows exist, nothing re-adopted, file untouched).
+    from cron import runtime_state as rs
+    start = rs.UPSERT_COUNT
     assert cj.load_jobs() == originals
+    assert rs.UPSERT_COUNT == start
     assert _snapshot(_jobs_file(temp_home)) == before
 
     assert cj.export_runtime_to_json() == 40
@@ -271,7 +294,6 @@ def test_existing_row_wins_over_runtime_put_back_into_the_file(temp_home):
     live_claim = cj.get_job(job["id"])["fire_claim"]
     _write_store(temp_home, [job])  # stale snapshot with fire_claim=None
     assert cj.get_job(job["id"])["fire_claim"] == live_claim
-    assert "fire_claim" not in json.loads(_jobs_file(temp_home).read_text())["jobs"][0]
 
 
 def test_kill_switch_json_folds_rows_back(temp_home, monkeypatch):
@@ -560,6 +582,304 @@ def test_quick_snapshot_lists_runtime_db():
     from hermes_cli.backup import _QUICK_STATE_FILES
 
     assert "cron/runtime_state.db" in _QUICK_STATE_FILES
+
+
+# --- Mirror (#2287 review 21:3x): jobs.json is a coalesced read-only mirror of the merged view ---
+
+def _raw(home, jid):
+    return next(j for j in json.loads(_jobs_file(home).read_text())["jobs"] if j["id"] == jid)
+
+
+def test_mirror_coalesces_heartbeats_into_one_write_at_window_boundary(temp_home, clock):
+    """(a) 50 heartbeats inside one window -> 0 jobs.json writes; then exactly 1 at the boundary."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="mirror")
+    assert cj.claim_job_for_fire(created["id"]) is True
+    owner = cj.get_job(created["id"])["fire_claim"]["by"]
+    assert cj.maybe_flush_runtime_mirror(force=True) is True  # start from a clean mirror
+    before, writes = _snapshot(_jobs_file(temp_home)), rs.MIRROR_WRITES
+    for _ in range(50):
+        clock[0] += 0.5  # 25 s total: still inside the 30 s window
+        assert cj.heartbeat_fire_claim(created["id"], expected_owner=owner) is True
+    assert rs.MIRROR_WRITES == writes and _snapshot(_jobs_file(temp_home)) == before
+    clock[0] += 6  # window boundary passes
+    assert cj.maybe_flush_runtime_mirror() is True
+    assert rs.MIRROR_WRITES == writes + 1
+    assert cj.maybe_flush_runtime_mirror() is False  # nothing changed since: no write
+    assert rs.MIRROR_WRITES == writes + 1
+
+
+def test_mirror_raw_read_after_boundary_equals_rows(temp_home, clock):
+    """(b) after the boundary a raw json.load(jobs.json) shows the row's last_run_at/next_run_at."""
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="raw")
+    assert cj.mark_job_run(created["id"], True) is True
+    rec = cj.get_job(created["id"])
+    clock[0] += 31
+    cj.get_due_jobs()  # the scheduler tick's section exit flushes the mirror
+    raw = _raw(temp_home, created["id"])
+    assert raw["last_run_at"] == rec["last_run_at"] and raw["last_run_at"]
+    assert raw["next_run_at"] == cj.get_job(created["id"])["next_run_at"]
+    assert raw["last_status"] == "ok" and raw["repeat"].get("completed") == 1
+
+
+def test_cas_ignores_stale_claim_planted_in_mirror(temp_home):
+    """(c) a different owner planted in the mirror file does not decide the CAS; the row does."""
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="cas")
+    assert cj.claim_job_for_fire(created["id"]) is True
+    owner = cj.get_job(created["id"])["fire_claim"]["by"]
+    data = json.loads(_jobs_file(temp_home).read_text())
+    data["jobs"][0]["fire_claim"] = {"at": "2026-10-24T00:00:00+00:00", "by": "intruder:1"}
+    _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+    assert cj.heartbeat_fire_claim(created["id"], expected_owner="intruder:1") is False
+    assert cj.heartbeat_fire_claim(created["id"], expected_owner=owner) is True
+    assert cj.get_job(created["id"])["fire_claim"]["by"] == owner
+
+
+def test_git_level_with_older_runtime_loses_to_row_and_mirror_restores(temp_home, clock):
+    """(d) a git level rewrites jobs.json with older runtime: load_jobs returns the row's values,
+    and the next mirror write restores the file."""
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="level")
+    jid = created["id"]
+    cj.mark_job_run(jid, False, "old")
+    cj.maybe_flush_runtime_mirror(force=True)
+    old_file = _jobs_file(temp_home).read_text()  # merged view after the failed run
+    cj.mark_job_run(jid, True)
+    assert cj.maybe_flush_runtime_mirror(force=True) is True
+    live = cj.get_job(jid)
+    _jobs_file(temp_home).write_text(old_file, encoding="utf-8")  # the level (new inode)
+    assert json.loads(old_file)["jobs"][0]["last_status"] == "error"
+    assert cj.get_job(jid)["last_status"] == "ok"  # the row wins
+    assert cj.get_job(jid)["last_run_at"] == live["last_run_at"]
+    assert _raw(temp_home, jid)["last_status"] == "error"  # readers alone never write
+    cj.get_due_jobs()  # next tick: the replaced file is detected and rewritten (no window wait)
+    raw = _raw(temp_home, jid)
+    assert raw["last_status"] == "ok" and raw["last_run_at"] == live["last_run_at"]
+
+
+def test_mirror_interval_zero_writes_on_every_touch(temp_home, monkeypatch):
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    monkeypatch.setenv("HERMES_CRON_MIRROR_INTERVAL_S", "0")
+    created = cj.create_job(prompt="x", schedule="every 5m", name="zero")
+    assert cj.claim_job_for_fire(created["id"]) is True
+    owner = cj.get_job(created["id"])["fire_claim"]["by"]
+    writes = rs.MIRROR_WRITES
+    for _ in range(3):
+        assert cj.heartbeat_fire_claim(created["id"], expected_owner=owner) is True
+    assert rs.MIRROR_WRITES == writes + 3
+    assert _raw(temp_home, created["id"])["fire_claim"] == cj.get_job(created["id"])["fire_claim"]
+
+
+def test_stale_definition_save_keeps_sibling_row_run_state(temp_home, monkeypatch):
+    """sqlite twin of test_cron_store_concurrency's instance-3 shape: under a degraded lock a
+    sibling records a run (row) and a definition change (file) while we hold a stale snapshot;
+    our unrelated definition edit must not revert the sibling's run state, in the row or the
+    mirror."""
+    import cron.jobs as cj
+    from cron import runtime_state as rs
+
+    monkeypatch.setattr(cj, "fcntl", None)
+    monkeypatch.setattr(cj, "msvcrt", None)
+    created = cj.create_job(prompt="x", schedule="every 5m", name="stale")
+    jid = created["id"]
+    with cj._jobs_lock():
+        stale = cj.load_jobs()
+        assert _raw(temp_home, jid).get("last_run_at") is None
+        row = rs.read_all(temp_home / "cron")[jid]
+        rs.write_rows(temp_home / "cron", {jid: dict(
+            row, last_run_at="2026-09-20T16:07:28+00:00", last_status="ok")})
+        data = json.loads(_jobs_file(temp_home).read_text())
+        data["jobs"][0]["state"] = "completed"
+        _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+        stale[0]["paused_reason"] = "edited concurrently"
+        cj.save_jobs(stale)
+    rec = cj.get_job(jid)
+    assert rec["last_run_at"] == "2026-09-20T16:07:28+00:00" and rec["last_status"] == "ok"
+    assert rec["state"] == "completed" and rec["paused_reason"] == "edited concurrently"
+    raw = _raw(temp_home, jid)
+    assert raw["last_run_at"] == rec["last_run_at"] and raw["paused_reason"] == "edited concurrently"
+
+
+# --- Prism round 2 (#2287 @ 87228725) ------------------------------------------------------
+
+def _stage_crashed_generation(home, jid, field, value):
+    """Simulate a save that crashed after renaming jobs.json (naming gen G) but before applying
+    G's staged rows."""
+    from cron import runtime_state as rs
+
+    gen = "g" * 32
+    with rs.transaction(home / "cron") as conn:
+        row = rs.read_row(conn, jid) or {}
+        rs.stage_pending(conn, gen, {jid: dict(row, **{field: value})})
+    data = json.loads(_jobs_file(home).read_text())
+    data["runtime_gen"] = gen
+    _jobs_file(home).write_text(json.dumps(data), encoding="utf-8")
+    return gen
+
+
+def test_export_rolls_forward_pending_generation_first(temp_home):
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="pend-exp")
+    cj.mark_job_run(created["id"], True)
+    _stage_crashed_generation(temp_home, created["id"], "next_run_at", "2099-01-01T00:00:00+00:00")
+    cj.export_runtime_to_json()
+    assert _raw(temp_home, created["id"])["next_run_at"] == "2099-01-01T00:00:00+00:00"
+
+
+def test_save_recovers_sibling_pending_generation_before_writing(temp_home):
+    from cron import jobs as cj
+
+    a = cj.create_job(prompt="x", schedule="every 5m", name="a")
+    b = cj.create_job(prompt="x", schedule="every 5m", name="b")
+    with cj._jobs_lock():
+        snapshot = cj.load_jobs()
+        _stage_crashed_generation(temp_home, a["id"], "last_status", "sibling")
+        for job in snapshot:
+            if job["id"] == b["id"]:
+                job["name"] = "b2"
+        cj.save_jobs(snapshot)
+    assert cj.get_job(a["id"])["last_status"] == "sibling"
+    assert cj.get_job(b["id"])["name"] == "b2"
+
+
+def test_runtime_only_save_refreshes_baseline(temp_home):
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="base")
+    cj.mark_job_run(created["id"], True)
+    with cj._jobs_lock():
+        jobs = cj.load_jobs()
+        jobs[0]["last_status"] = "error"
+        cj.save_jobs(jobs)
+        jobs[0]["last_status"] = "ok"
+        cj.save_jobs(jobs)
+    assert cj.get_job(created["id"])["last_status"] == "ok"
+
+
+def test_stage_and_apply_touch_only_their_generation(temp_home):
+    from cron import runtime_state as rs
+
+    cron = temp_home / "cron"
+    with rs.transaction(cron) as conn:
+        rs.stage_pending(conn, "gA", {"j1": {"last_status": "a"}})
+        rs.stage_pending(conn, "gB", {"j2": {"last_status": "b"}})
+        assert sorted(rs.pending_gens(conn)) == ["gA", "gB"]
+        rs.apply_pending(conn, "gA")
+        assert rs.pending_gens(conn) == ["gB"]
+        rs.apply_pending(conn, "gB")
+        assert rs._rows_of(conn) == {"j1": {"last_status": "a"}, "j2": {"last_status": "b"}}
+
+
+@pytest.mark.parametrize("payload", [None, "{}", '{"jobs": 3}'], ids=["missing", "no-jobs", "bad"])
+def test_fold_staged_copy_refuses_without_definitions(temp_home, tmp_path, payload):
+    from cron import runtime_state as rs
+
+    cron = tmp_path / "staged" / "cron"
+    cron.mkdir(parents=True)
+    rs.write_rows(cron, {"j": {"last_status": "ok"}})
+    if payload is not None:
+        (cron / "jobs.json").write_text(payload, encoding="utf-8")
+    assert rs.fold_staged_copy(cron) is False
+    assert rs.db_path(cron).exists()
+
+
+def test_replace_save_is_authoritative_for_runtime(temp_home):
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="repl")
+    cj.mark_job_run(created["id"], True)
+    with cj._jobs_lock():
+        snapshot = cj.load_jobs()
+        row = rs.read_all(temp_home / "cron")[created["id"]]
+        rs.write_rows(temp_home / "cron", {created["id"]: dict(row, last_status="error")})
+        cj.save_jobs(snapshot, replace=True)
+    assert cj.get_job(created["id"])["last_status"] == "ok"
+
+
+def test_post_rename_failure_rolls_generation_forward(temp_home, monkeypatch):
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="post")
+    for _ in range(3):
+        cj.mark_job_run(created["id"], True)
+
+    def boom(*a, **kw):
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as mp:
+        mp.setattr(cj, "fsync_directory", boom)
+        with pytest.raises(KeyboardInterrupt):
+            with cj._jobs_lock():
+                jobs = cj.load_jobs()
+                jobs[0]["schedule"] = {"kind": "interval", "minutes": 7, "display": "every 7m"}
+                jobs[0]["repeat"]["completed"] = 0
+                cj.save_jobs(jobs)
+    job = cj.get_job(created["id"])
+    assert job["schedule"]["minutes"] == 7 and job["repeat"]["completed"] == 0
+
+
+@pytest.mark.parametrize("payload", ["{}", '{"jobs": 3}'], ids=["no-jobs", "bad"])
+def test_kill_switch_refuses_export_of_jobless_payload(temp_home, monkeypatch, payload):
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="ks-refuse")
+    cj.mark_job_run(created["id"], True)
+    _jobs_file(temp_home).write_text(payload, encoding="utf-8")
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+    with pytest.raises(RuntimeError, match="refusing runtime export"):
+        cj.load_jobs()
+    assert _db(temp_home).exists()
+
+
+def test_quick_snapshot_copies_jobs_and_runtime_db_under_one_cron_lock(temp_home, monkeypatch):
+    """Prism b493dcb2080d: jobs.json and runtime_state.db are copied inside ONE cron store lock
+    section, so a remove_job cannot land between the two copies."""
+    import shutil
+
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="snap")
+    cj.mark_job_run(created["id"], True)
+    held = {}
+    real_copy2, real_db = shutil.copy2, backup._safe_copy_db
+
+    def copy2(src, dst, *a, **kw):
+        if str(src).endswith("cron/jobs.json"):
+            held["jobs"] = getattr(cj._jobs_lock_state, "depth", 0)
+        return real_copy2(src, dst, *a, **kw)
+
+    def safe_copy_db(src, dst):
+        if str(src).endswith("cron/runtime_state.db"):
+            held["db"] = getattr(cj._jobs_lock_state, "depth", 0)
+            held["section"] = id(cj._jobs_lock_state)
+        return real_db(src, dst)
+
+    monkeypatch.setattr(backup.shutil, "copy2", copy2)
+    monkeypatch.setattr(backup, "_safe_copy_db", safe_copy_db)
+    assert backup.create_quick_snapshot(hermes_home=temp_home)
+    assert held.get("jobs", 0) >= 1 and held.get("db", 0) >= 1
+
+
+def test_runtime_paths_on_missing_store_return_false(temp_home):
+    """No jobs.json at all: the single-job fast path falls back cleanly (no unpack error)."""
+    from cron import jobs as cj
+
+    assert not _jobs_file(temp_home).exists()
+    assert cj.heartbeat_fire_claim("nope", expected_owner="x") is False
+    assert cj.heartbeat_run_claim("nope", expected_owner="x") is False
+    assert cj.claim_job_for_fire("nope") is False
 
 
 # --- 4: fresh profile ----------------------------------------------------------------------

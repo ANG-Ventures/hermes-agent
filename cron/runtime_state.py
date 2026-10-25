@@ -17,6 +17,23 @@ single compare-and-refresh ``UPDATE ... WHERE job_id=? AND <claim>_owner=?`` (ro
 Kill switch: ``HERMES_CRON_RUNTIME_STATE=json`` restores the pre-split behaviour; the first load in
 json mode folds any rows back into ``jobs.json`` and removes the database (see ``cron.jobs``).
 
+``jobs.json`` stays a COALESCED, READ-ONLY MIRROR of the merged view (definitions + the current
+row of every job). The database is the source of truth: no reader inside hermes-agent takes a
+runtime value from the file once the job has a row, and the claim CAS reads only the row. Every row
+write sets ``mirror_state.dirty_since`` (same transaction); ``cron.jobs.maybe_flush_runtime_mirror``
+rewrites the file at most once per ``HERMES_CRON_MIRROR_INTERVAL_S`` (default 30 s) when it is set,
+from the scheduler tick and after a write section; ``0`` = flush on every touch (the pre-split I/O
+shape, for debugging). Definition saves write the merged view at once and clear the flag.
+
+DO NOT REMOVE THE MIRROR as an optimisation. These consumers read runtime fields (last_run_at,
+next_run_at, last_status, last_error, ...) straight out of jobs.json with json.load, and would see
+every job as never-run without it (hermes-home, census 2026-10-24, PR #2287 review):
+  scripts/cron-health.py, scripts/cron-status-sweep.py, scripts/live_evidence_recheck.py,
+  scripts/cron-registry-deadman.py, scripts/cron-config-lint.py, scripts/cachehop-deadman.py,
+  scripts/cron-dashboard-refresh.py,
+  skills-shared/devops/handle-alerts-and-logs/scripts/crons-down-detail.py,
+  scripts/home-reconcile-origin.py, scripts/cron-jobs-runtime-committer.py.
+
 Callers hold ``cron.jobs._jobs_lock()`` around every write, exactly as they did for jobs.json, so
 the SQLite transaction only has to be atomic, not the serialization point.
 """
@@ -36,6 +53,8 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 DB_NAME = "runtime_state.db"
 ENV_MODE = "HERMES_CRON_RUNTIME_STATE"
+ENV_MIRROR_INTERVAL = "HERMES_CRON_MIRROR_INTERVAL_S"
+DEFAULT_MIRROR_INTERVAL_S = 30.0
 
 # Every runtime key a job record carries, enumerated from the writers (cron/jobs.py unless noted):
 #   heartbeat_fire_claim / claim_job_for_fire / mark_job_run     fire_claim
@@ -79,11 +98,17 @@ CREATE TABLE IF NOT EXISTS pending_runtime (
     job_id TEXT NOT NULL,
     fields TEXT,
     PRIMARY KEY (gen, job_id)
+);
+CREATE TABLE IF NOT EXISTS mirror_state (
+    k TEXT PRIMARY KEY,
+    v REAL NOT NULL
 )
 """
 
 # Statement counter for tests/bench (done-when 1): one per row INSERT/UPDATE that changed a row.
 UPSERT_COUNT = 0
+# jobs.json mirror rewrites performed by this process (tests/bench).
+MIRROR_WRITES = 0
 
 
 def mode() -> str:
@@ -95,6 +120,60 @@ def mode() -> str:
 
 def enabled() -> bool:
     return mode() == "sqlite"
+
+
+def mirror_interval() -> float:
+    """Seconds between jobs.json mirror rewrites (``0`` = every touch). Unset, unparsable or
+    negative reads as the default."""
+    from cron.env_settings import cron_env_setting
+
+    raw = cron_env_setting(ENV_MIRROR_INTERVAL).strip()
+    try:
+        value = float(raw) if raw else DEFAULT_MIRROR_INTERVAL_S
+    except ValueError:
+        return DEFAULT_MIRROR_INTERVAL_S
+    return value if value >= 0 else DEFAULT_MIRROR_INTERVAL_S
+
+
+def _now() -> float:
+    """Wall clock for the mirror window (indirection so tests can move it)."""
+    return time.time()
+
+
+# mirror_state keys: ``seq`` counts row writes, ``flushed`` is the seq the last jobs.json mirror
+# write reflected, ``dirty_since`` is when seq first got ahead of ``flushed`` (the window start:
+# touches inside the window coalesce into one rewrite).
+
+def _state(conn: sqlite3.Connection, key: str) -> Optional[float]:
+    row = conn.execute("SELECT v FROM mirror_state WHERE k=?", (key,)).fetchone()
+    return float(row[0]) if row is not None else None
+
+
+def mark_dirty(conn: sqlite3.Connection) -> None:
+    """The jobs.json mirror lags the rows from now on (caller owns the transaction)."""
+    conn.execute("INSERT INTO mirror_state(k, v) VALUES ('seq', 1) "
+                 "ON CONFLICT(k) DO UPDATE SET v = v + 1")
+    conn.execute("INSERT OR IGNORE INTO mirror_state(k, v) VALUES ('dirty_since', ?)", (_now(),))
+
+
+def mirror_seq(conn: sqlite3.Connection) -> float:
+    return _state(conn, "seq") or 0.0
+
+
+def dirty_since(conn: sqlite3.Connection) -> Optional[float]:
+    """Window start, or ``None`` when the mirror reflects every row write."""
+    if mirror_seq(conn) <= (_state(conn, "flushed") or 0.0):
+        return None
+    return _state(conn, "dirty_since") or 0.0
+
+
+def mark_flushed(conn: sqlite3.Connection, seq: float) -> None:
+    """A jobs.json write reflected every row write up to *seq* (read in the same snapshot as the
+    rows it wrote). A row write that landed after that snapshot keeps the mirror dirty."""
+    conn.execute("INSERT INTO mirror_state(k, v) VALUES ('flushed', ?) "
+                 "ON CONFLICT(k) DO UPDATE SET v = max(v, excluded.v)", (seq,))
+    if mirror_seq(conn) <= seq:
+        conn.execute("DELETE FROM mirror_state WHERE k='dirty_since'")
 
 
 def db_path(cron_dir: Path) -> Path:
@@ -230,9 +309,11 @@ def upsert_rows(
     *,
     delete_ids: Iterable[str] = (),
     current: Optional[Dict[str, Dict[str, Any]]] = None,
+    dirty: bool = True,
 ) -> int:
     """Upsert *rows* and delete *delete_ids* on *conn* (caller owns the transaction). Rows equal to
-    *current* (when given) are skipped. Returns the number of rows written."""
+    *current* (when given) are skipped. Returns the number of rows written. Any write marks the
+    jobs.json mirror dirty unless *dirty* is False (rows adopted FROM the file)."""
     global UPSERT_COUNT
     now = time.time()
     written = 0
@@ -248,8 +329,11 @@ def upsert_rows(
             (str(job_id), _canonical(fields), _owner(fields.get("fire_claim")),
              _owner(fields.get("run_claim")), now))
         written += 1
+    deleted = 0
     for job_id in (str(i) for i in delete_ids if i):
-        conn.execute("DELETE FROM job_runtime WHERE job_id=?", (job_id,))
+        deleted += conn.execute("DELETE FROM job_runtime WHERE job_id=?", (job_id,)).rowcount
+    if dirty and (written or deleted):
+        mark_dirty(conn)
     UPSERT_COUNT += written
     return written
 
@@ -266,10 +350,12 @@ def write_rows(
         return upsert_rows(conn, rows, delete_ids=delete_ids, current=current)
 
 
-def refresh_claim(cron_dir: Path, job_id: str, claim_key: str, expected_owner: str, at: str) -> bool:
+def refresh_claim(cron_dir: Path, job_id: str, claim_key: str, expected_owner: str,
+                  at: str) -> Optional[bool]:
     """Compare-and-refresh ``fields[claim_key].at`` for *expected_owner* (``fire_claim`` or
     ``run_claim``): one UPDATE guarded by the owner column; rowcount 0 means the claim is gone or
-    held by someone else."""
+    held by someone else. ``None`` = the job has no row yet (not adopted from jobs.json): the
+    caller must take the full load path, never read that as a lost claim."""
     global UPSERT_COUNT
     column = {"fire_claim": "fire_claim_owner", "run_claim": "run_claim_owner"}[claim_key]
     with transaction(cron_dir) as conn:
@@ -277,7 +363,9 @@ def refresh_claim(cron_dir: Path, job_id: str, claim_key: str, expected_owner: s
             f"SELECT fields FROM job_runtime WHERE job_id=? AND {column}=?",
             (str(job_id), str(expected_owner))).fetchone()
         if row is None:
-            return False
+            exists = conn.execute("SELECT 1 FROM job_runtime WHERE job_id=?",
+                                  (str(job_id),)).fetchone()
+            return False if exists else None
         fields = json.loads(row[0])
         claim = fields.get(claim_key)
         if not isinstance(claim, dict) or claim.get("by") != expected_owner:
@@ -286,6 +374,8 @@ def refresh_claim(cron_dir: Path, job_id: str, claim_key: str, expected_owner: s
         cur = conn.execute(
             f"UPDATE job_runtime SET fields=?, updated_at=? WHERE job_id=? AND {column}=?",
             (_canonical(fields), time.time(), str(job_id), str(expected_owner)))
+        if cur.rowcount:
+            mark_dirty(conn)
     if cur.rowcount:
         UPSERT_COUNT += 1
     return bool(cur.rowcount)
@@ -300,7 +390,8 @@ def refresh_claim(cron_dir: Path, job_id: str, claim_key: str, expected_owner: s
 
 def stage_pending(conn: sqlite3.Connection, gen: str, rows: Dict[str, Dict[str, Any]],
                   delete_ids: Iterable[str] = ()) -> None:
-    conn.execute("DELETE FROM pending_runtime")
+    # Only THIS generation: under a degraded jobs lock a sibling save may have its own staged.
+    conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
     for job_id, fields in rows.items():
         conn.execute("INSERT INTO pending_runtime(gen, job_id, fields) VALUES (?,?,?)",
                      (gen, str(job_id), _canonical(fields)))
@@ -314,8 +405,9 @@ def pending_gens(conn: sqlite3.Connection) -> List[str]:
     return [r[0] for r in conn.execute("SELECT DISTINCT gen FROM pending_runtime").fetchall()]
 
 
-def apply_pending(conn: sqlite3.Connection, gen: str) -> int:
-    """Move generation *gen* into job_runtime (NULL fields = delete) and clear the journal."""
+def apply_pending(conn: sqlite3.Connection, gen: str, *, dirty: bool = False) -> int:
+    """Move generation *gen* into job_runtime (NULL fields = delete) and clear its journal rows.
+    Not marked dirty by default: the jobs.json that names *gen* already carries these rows."""
     rows: Dict[str, Dict[str, Any]] = {}
     deletes: List[str] = []
     for job_id, fields in conn.execute(
@@ -324,8 +416,8 @@ def apply_pending(conn: sqlite3.Connection, gen: str) -> int:
             deletes.append(job_id)
         else:
             rows[job_id] = json.loads(fields)
-    written = upsert_rows(conn, rows, delete_ids=deletes)
-    conn.execute("DELETE FROM pending_runtime")
+    written = upsert_rows(conn, rows, delete_ids=deletes, dirty=dirty)
+    conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
     return written
 
 
@@ -380,13 +472,20 @@ def fold_staged_copy(cron_dir: Path) -> bool:
     jobs_file = cron_dir / "jobs.json"
     if not db_path(cron_dir).exists():
         return False
-    if jobs_file.exists():
-        with open(jobs_file, encoding="utf-8-sig") as fh:
-            data = json.load(fh)
-        merged = merged_jobs(jobs_file)
-        payload = dict(data) if isinstance(data, dict) else {}
-        payload["jobs"] = merged
-        jobs_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Refuse (keep the database, return False) when there are no definitions to fold into: the
+    # rows would otherwise be the only copy of the runtime state and the delete would lose them.
+    if not jobs_file.exists():
+        return False
+    with open(jobs_file, encoding="utf-8-sig") as fh:
+        data = json.load(fh)
+    jobs = data.get("jobs") if isinstance(data, dict) else data
+    if not isinstance(jobs, list):
+        return False
+    merged = merged_jobs(jobs_file)
+    payload = dict(data) if isinstance(data, dict) else {}
+    payload.pop("runtime_gen", None)
+    payload["jobs"] = merged
+    jobs_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     drop_database(cron_dir)
     return True
 

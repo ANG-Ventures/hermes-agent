@@ -1646,6 +1646,21 @@ def _newest_first(root: Path, keep_entry) -> List[Path]:
 
 # Kept in sync with ``_QUICK_STATE_FILES`` and ``cron/jobs.py``'s ``JOBS_FILE``.
 _CRON_JOBS_REL = "cron/jobs.json"
+_CRON_RUNTIME_REL = "cron/runtime_state.db"
+
+
+@contextmanager
+def _cron_store_lock(home: Path):
+    """Hold *home*'s cron jobs lock so jobs.json and runtime_state.db are captured as ONE unit
+    (t_94e91559: runtime rows live in the db; a remove_job between the two copies would
+    otherwise pair a definition with no row). Best effort: no lock when cron cannot load."""
+    try:
+        from cron.jobs import _jobs_lock, use_cron_store
+    except Exception:
+        yield
+        return
+    with use_cron_store(home), _jobs_lock():
+        yield
 
 
 # Config paths the update flow must never change (#64160): model routing and the MoA section are
@@ -1837,7 +1852,19 @@ def _create_quick_snapshot_locked(
     # recoverable database.
     oversized_skipped: list[str] = []
 
-    for rel in _QUICK_STATE_FILES:
+    def _quick_items():
+        # The cron pair is yielded together, inside the cron store lock (see _cron_store_lock).
+        for rel in _QUICK_STATE_FILES:
+            if rel == _CRON_RUNTIME_REL:
+                continue
+            if rel == _CRON_JOBS_REL:
+                with _cron_store_lock(home):
+                    yield rel
+                    yield _CRON_RUNTIME_REL
+                continue
+            yield rel
+
+    for rel in _quick_items():
         src = home / rel
         if not src.exists():
             continue

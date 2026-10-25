@@ -89,7 +89,7 @@ class TestConcurrentWriters:
         assert ids == {"OURS", "SIBLING"}, "a concurrent create was clobbered"
 
     def test_concurrent_run_state_update_is_not_reverted(
-        self, tmp_cron_dir, degraded_lock
+        self, tmp_cron_dir, degraded_lock, monkeypatch
     ):
         """Instance-3 shape: the job survives but its run state reverts.
 
@@ -97,6 +97,11 @@ class TestConcurrentWriters:
         and the pre-existing id-presence merge sees both sides holding the id,
         so without field-level reconciliation the stale copy wins outright.
         """
+        # The sibling writes run state INTO jobs.json: that is the json store (t_94e91559 kill
+        # switch). In sqlite mode run state lives in runtime_state.db and jobs.json is a mirror
+        # the row always wins over; the sqlite twin of this test is
+        # test_runtime_state_split.py::test_stale_definition_save_keeps_sibling_row_run_state.
+        monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
         _write_store_directly(tmp_cron_dir, [{
             "id": "RAN", "name": "oneshot", "schedule": {"kind": "once"},
             "last_run_at": None, "last_status": None, "state": "scheduled",
