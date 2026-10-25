@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import os
+import threading
 import time
 from agent.i18n import DEFAULT_LANGUAGE, t
 from agent.session_activity import format_iteration_progress
@@ -46,6 +47,109 @@ def approval_input_words(input_key: str) -> Tuple[str, ...]:
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+# Agent attributes for steer provenance. ``_STEER_ENTRIES_ATTR`` holds one ``(text, internal)`` entry per
+# gateway steer accepted into the agent's CURRENT steer buffer. It lives on the agent because the buffer
+# does: a recursive follow-up reuses the cached agent while the session slot may still hold the previous
+# turn's context (Prism e08366573530). Every drain of the buffer MOVES those entries into
+# ``_STEER_DRAINED_ATTR`` as a ``(drained_text, entries)`` snapshot, so a leftover is classified from the
+# entries it was built from, never from the live buffer, which a later steer may already have refilled
+# (Prism 83626dd6bc5a, 96e62751d3d9, t_506536db r5). One per-agent lock serialises steer+record against
+# the drain, so no entry can land on the wrong side of a drain.
+_STEER_ENTRIES_ATTR = "_gateway_steer_entries"
+_STEER_DRAINED_ATTR = "_gateway_steer_drained"
+_STEER_LOCK_ATTR = "_gateway_steer_lock"
+_STEER_ENTRIES_MAX = 64
+_STEER_INSTALL_LOCK = threading.Lock()
+
+
+def _steer_buffer_empty(agent: Any) -> bool:
+    """True when *agent*'s steer buffer holds nothing, i.e. every earlier entry was drained or wiped."""
+    return not getattr(agent, "_pending_steer", None)
+
+
+def _provenance_lock(agent: Any) -> Optional[threading.Lock]:
+    """The agent's provenance lock, installing the drain snapshot wrapper on first use; None when the
+    agent has no instance dict or no drain to wrap (its leftovers then always read human)."""
+    try:
+        attrs = agent.__dict__
+    except AttributeError:
+        return None
+    lock = attrs.get(_STEER_LOCK_ATTR)
+    if lock is not None:
+        return lock
+    with _STEER_INSTALL_LOCK:
+        lock = attrs.get(_STEER_LOCK_ATTR)
+        if lock is not None:
+            return lock
+        orig_drain = getattr(agent, "_drain_pending_steer", None)
+        if not callable(orig_drain):
+            return None
+        lock = threading.Lock()
+
+        def _drain_with_snapshot(_orig=orig_drain, _attrs=attrs, _lock=lock):
+            with _lock:
+                text = _orig()
+                if text:
+                    entries = _attrs.pop(_STEER_ENTRIES_ATTR, None) or []
+                    drained = _attrs.setdefault(_STEER_DRAINED_ATTR, [])
+                    drained.append((text, entries))
+                    del drained[:-_STEER_ENTRIES_MAX]
+            return text
+
+        attrs["_drain_pending_steer"] = _drain_with_snapshot
+        attrs[_STEER_LOCK_ATTR] = lock
+        return lock
+
+
+def steer_with_provenance(agent: Any, verb: Any, text: str, *, internal: bool) -> bool:
+    """``verb(text)`` (the agent's ``steer``/``redirect``) and, when accepted, record the entry."""
+    lock = _provenance_lock(agent) if agent is not None else None
+    with lock if lock is not None else contextlib.nullcontext():
+        fresh = _steer_buffer_empty(agent)
+        accepted = bool(verb(text))
+        if accepted and lock is not None:
+            _record_steer_entry(agent, text, internal=internal, fresh=fresh)
+    return accepted
+
+
+def _record_steer_entry(agent: Any, text: str, *, internal: bool, fresh: bool) -> None:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return
+    attrs = agent.__dict__
+    if fresh or not isinstance(attrs.get(_STEER_ENTRIES_ATTR), list):
+        attrs[_STEER_ENTRIES_ATTR] = []  # a buffer wiped without a drain (hard cancel) leaves stale entries
+    ledger = attrs[_STEER_ENTRIES_ATTR]
+    ledger.append((cleaned, bool(internal)))
+    del ledger[:-_STEER_ENTRIES_MAX]
+
+
+def leftover_steer_is_internal(agent: Any, leftover: Optional[str]) -> bool:
+    """True only when *leftover* is exactly the last text drained from *agent*'s steer buffer AND that
+    drain's snapshot is built entirely from internal steer entries.
+
+    Retires every drain snapshot of the turn whatever the verdict, and never touches the live buffer's
+    entries (steers still buffered for the next turn). False when no snapshot matches the leftover, when
+    any entry is human, when an entry is missing from the leftover, or when the leftover holds text no
+    entry accounts for (a steer that bypassed the gateway): the failure direction is a visible turn, never
+    a silenced one."""
+    lock = getattr(agent, "__dict__", {}).get(_STEER_LOCK_ATTR) if agent is not None else None
+    if lock is None:
+        return False
+    with lock:
+        drained = agent.__dict__.pop(_STEER_DRAINED_ATTR, None)
+    remainder = (leftover or "").strip()
+    if not remainder or not drained:
+        return False
+    text, entries = drained[-1]
+    if (text or "").strip() != remainder or not entries or not all(internal for _, internal in entries):
+        return False
+    for entry_text, _ in entries:
+        if entry_text not in remainder:
+            return False
+        remainder = remainder.replace(entry_text, "", 1)
+    return not remainder.strip()
 
 
 def _strip_slot(text: str, slot: str) -> Optional[str]:
@@ -308,10 +412,14 @@ class GatewayBusySessionMixin:
                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
         return accepted
 
-    def _steer_running_agent(self, running_agent: Any, text: str) -> bool:
+    def _steer_running_agent(self, running_agent: Any, text: str, *, internal: bool = False) -> bool:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
-        :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
-        accepted = bool(running_agent.steer(text))
+        :meth:`_steer_active_subagents`); True when the parent or any child queued it.
+
+        Every accepted steer is recorded ON THE AGENT as a buffer entry with its provenance, so it
+        follows the text to whichever turn drains it (see :func:`leftover_steer_is_internal`), never to
+        the context the slot held at steer time (Prism e08366573530, t_506536db)."""
+        accepted = steer_with_provenance(running_agent, running_agent.steer, text, internal=internal)
         return bool(self._steer_active_subagents(running_agent, text)) or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
@@ -657,8 +765,11 @@ class GatewayBusySessionMixin:
         try:
             call_text = self._steer_text_with_origin(text, event) if event else text
             if verb == "steer":
-                return self._steer_running_agent(running_agent, call_text)
-            return bool(getattr(running_agent, verb)(call_text))
+                return self._steer_running_agent(running_agent, call_text,
+                                                 internal=bool(getattr(event, "internal", False)))
+            # A redirect may land in the steer buffer (tool phase), so it is a buffer entry too.
+            return steer_with_provenance(running_agent, getattr(running_agent, verb), call_text,
+                                         internal=bool(getattr(event, "internal", False)))
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
