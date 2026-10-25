@@ -438,10 +438,13 @@ class TestJobCRUD:
         with pytest.raises(ValueError, match="Invalid repeat"):
             update_job(job["id"], {"repeat": "banana"})
 
-    def test_invalid_repeat_completed_is_normalized(self, tmp_cron_dir):
+    def test_invalid_repeat_completed_is_normalized(self, tmp_cron_dir, monkeypatch):
         """A hand-edited "completed" (null, string, float, negative, Infinity) must not kill
         mark_job_run or the whole store, and must not be carried forward by update_job."""
         import json
+        # Hand-edits runtime fields INTO jobs.json: that is the json store (t_94e91559 kill
+        # switch). In sqlite mode a runtime row wins over a runtime field put back in the file.
+        monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
         from cron.jobs import JOBS_FILE, get_job, mark_job_run, update_job
 
         job = create_job(prompt="t", schedule="every 1h", repeat=3)
@@ -1769,6 +1772,9 @@ class TestJobsJsonIdKeyedMap:
         import cron.jobs as jobs_mod
         from cron.jobs import JOBS_FILE, load_jobs, update_job
 
+        # add_junk() hand-edits next_run_at INTO jobs.json: the json store (t_94e91559 kill
+        # switch); in sqlite mode the runtime row wins over a runtime field put back in the file.
+        monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
         job = create_job(prompt="keep me", schedule="every 1h", name="survivor")
 
         def add_junk():
