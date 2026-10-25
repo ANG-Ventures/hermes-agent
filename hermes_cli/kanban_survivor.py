@@ -150,16 +150,26 @@ _probe_group = contextvars.ContextVar("kanban_survivor_probe_group", default=Non
 def _kill_group(proc):
     """SIGKILL ``proc``'s whole process group: git's transport helper
     (`git remote-https`, `remote-ext`) is a grandchild that a plain
-    ``proc.kill()`` orphans to init with its socket open."""
-    if proc.poll() is not None:
-        return
+    ``proc.kill()`` orphans to init with its socket open. The group is killed
+    even after git itself has exited: a descendant can outlive it holding
+    git's stderr pipe, and nothing else would ever end it."""
     try:
         if hasattr(os, "killpg"):
             os.killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-        else:
+        elif proc.poll() is None:
             proc.kill()
     except (ProcessLookupError, PermissionError):
         pass
+
+
+def _reap(proc):
+    """Wait for a killed ``proc`` without reading its pipes: a descendant that
+    left the group could still hold them open, so ``communicate()`` here could
+    block forever (``subprocess.run`` does the same on POSIX)."""
+    proc.wait()
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is not None:
+            pipe.close()
 
 
 def _run_network(argv, *, input, timeout, env):
@@ -178,13 +188,9 @@ def _run_network(argv, *, input, timeout, env):
     try:
         try:
             stdout, stderr = proc.communicate(input, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _kill_group(proc)
-            proc.communicate()
-            raise
         except BaseException:
             _kill_group(proc)
-            proc.wait()
+            _reap(proc)
             raise
     finally:
         if group is not None:

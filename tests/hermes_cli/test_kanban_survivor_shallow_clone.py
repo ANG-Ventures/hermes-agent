@@ -511,6 +511,45 @@ def test_hung_fetch_kills_the_transport_helper_on_timeout(tmp_path, monkeypatch)
 
 
 @pytest.mark.platforms("posix")
+def test_descendant_holding_stderr_does_not_outlive_the_timeout(tmp_path, monkeypatch):
+    """Prism f-907cd91bad517558: git exits at once but a backgrounded helper
+    child keeps git's stderr open. The probe still returns at its timeout and
+    the holder dies with the group (no unbounded communicate after the kill)."""
+    import time
+
+    import hermes_cli.kanban_survivor as survivor
+    repo, sha, _ = _helper_remote(tmp_path, monkeypatch)
+    pidfile = tmp_path / "holder.pid"
+    holder = tmp_path / "holder.sh"
+    holder.write_text(f"#!/bin/sh\nsleep 30 >/dev/null </dev/null &\necho $! > '{pidfile}'\nexit 1\n",
+                      encoding="utf-8")
+    holder.chmod(0o755)
+    git(repo, "remote", "set-url", "slow", f"ext::{holder}")
+    started = time.monotonic()
+    assert survivor._reachable_from_live(repo, "slow", "main", sha, timeout=2) is False
+    assert time.monotonic() - started < 8
+    assert _gone(_helper_pid(pidfile))
+
+
+@pytest.mark.platforms("posix")
+def test_first_live_all_hung_real_transports_end_near_the_budget(tmp_path, monkeypatch):
+    """Six real hung ext:: probes (more than the pool is wide) under a 3 s site
+    budget: no winner, and the call ends within a generous bound of the budget."""
+    import time
+
+    import hermes_cli.kanban_survivor as survivor
+    repo, sha, _ = _helper_remote(tmp_path, monkeypatch)
+    helper = git(repo, "remote", "get-url", "slow")
+    for n in range(5):
+        git(repo, "remote", "add", f"slow{n}", helper)
+    monkeypatch.setattr(survivor, "_LIVE_BASE_TIMEOUT", 3)
+    candidates = [("slow", "main")] + [(f"slow{n}", "main") for n in range(5)]
+    started = time.monotonic()
+    assert survivor._first_live(repo, candidates, sha) is None
+    assert time.monotonic() - started < 20
+
+
+@pytest.mark.platforms("posix")
 def test_first_live_kills_abandoned_probes_and_joins_its_threads(tmp_path, monkeypatch):
     """The winner returns; the hung sibling's helper dies with the call and no
     probe thread outlives it."""
