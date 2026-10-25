@@ -549,6 +549,93 @@ def test_first_live_all_hung_real_transports_end_near_the_budget(tmp_path, monke
     assert time.monotonic() - started < 20
 
 
+def _as_native_windows(monkeypatch):
+    """Native Windows as `_run_network` sees it: no ``os.killpg``, and a
+    ``spawn_server`` whose job contains every descendant whatever its parent.
+    The stand-in job is a process group closed with SIGKILL, which is what
+    KILL_ON_JOB_CLOSE does to a real job. Returns the jobs it made."""
+    import os
+    import signal
+
+    import hermes_cli.kanban_survivor as survivor
+    from hermes_cli.local_runtime import processes
+
+    jobs = []
+    killpg = os.killpg
+
+    class Job:
+        def __init__(self, pid):
+            self.pid, self.closed = pid, False
+
+        def close(self):
+            if not self.closed:
+                self.closed = True
+                try:
+                    killpg(self.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def spawn_server(argv, *, creationflags=0, **kwargs):
+        proc = subprocess.Popen(argv, process_group=0, **kwargs)
+        jobs.append(Job(proc.pid))
+        return proc, jobs[-1]
+
+    monkeypatch.setattr(processes, "spawn_server", spawn_server)
+    monkeypatch.setattr(survivor, "_POSIX_GROUPS", False, raising=False)
+    monkeypatch.delattr(os, "killpg")
+    return jobs
+
+
+@pytest.mark.platforms("posix")
+def test_windows_descendant_holding_stderr_dies_with_the_probe_job(tmp_path, monkeypatch):
+    """Prism 1fc353b3b058: on native Windows `_kill_group` fell back to
+    ``proc.kill()``, which ends git only (here git has already exited). The
+    transport child holding git's pipes must die with the probe's Job Object,
+    and the probe must still return at its timeout."""
+    import time
+
+    import hermes_cli.kanban_survivor as survivor
+    repo, sha, _ = _helper_remote(tmp_path, monkeypatch)
+    pidfile = tmp_path / "holder.pid"
+    holder = tmp_path / "holder.sh"
+    holder.write_text(f"#!/bin/sh\nsleep 30 >/dev/null </dev/null &\necho $! > '{pidfile}'\nexit 1\n",
+                      encoding="utf-8")
+    holder.chmod(0o755)
+    git(repo, "remote", "set-url", "slow", f"ext::{holder}")
+    jobs = _as_native_windows(monkeypatch)
+    started = time.monotonic()
+    assert survivor._reachable_from_live(repo, "slow", "main", sha, timeout=2) is False
+    assert time.monotonic() - started < 8
+    assert _gone(_helper_pid(pidfile))
+    assert jobs and all(job.closed for job in jobs)
+
+
+@pytest.mark.platforms("posix")
+def test_windows_hung_transport_dies_with_the_probe_job_and_a_live_remote_still_wins(
+        tmp_path, monkeypatch):
+    """Native Windows, the Prism case: a hung `slow` remote and a healthy
+    `good` one. The good one wins, the hung helper dies with its job, and the
+    successful probe's job is closed too (nothing it left behind survives)."""
+    import time
+
+    import hermes_cli.kanban_survivor as survivor
+    repo, sha, pidfile = _helper_remote(tmp_path, monkeypatch)
+    jobs = _as_native_windows(monkeypatch)
+    monkeypatch.setattr(survivor, "_LIVE_BASE_TIMEOUT", 30)
+    real = survivor._reachable_from_live
+
+    def probe(repo, remote, branch, sha, *, timeout):
+        if remote == "good":
+            _helper_pid(pidfile)            # the hung probe is really in flight
+        return real(repo, remote, branch, sha, timeout=timeout)
+    monkeypatch.setattr(survivor, "_reachable_from_live", probe)
+    started = time.monotonic()
+    assert survivor._first_live(repo, [("slow", "main"), ("good", "main")], sha) == ("good", "main")
+    assert time.monotonic() - started < 10
+    assert _gone(_helper_pid(pidfile), within=0.5)
+    assert len(jobs) == 2 and all(job.closed for job in jobs)
+
+
 @pytest.mark.platforms("posix")
 def test_first_live_kills_abandoned_probes_and_joins_its_threads(tmp_path, monkeypatch):
     """The winner returns; the hung sibling's helper dies with the call and no

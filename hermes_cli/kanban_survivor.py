@@ -146,15 +146,28 @@ class _ProbeGroup:
 
 _probe_group = contextvars.ContextVar("kanban_survivor_probe_group", default=None)
 
+# POSIX contains a probe in its own session (killpg); Windows in a Job Object.
+_POSIX_GROUPS = hasattr(os, "killpg")
+
 
 def _kill_group(proc):
     """SIGKILL ``proc``'s whole process group: git's transport helper
     (`git remote-https`, `remote-ext`) is a grandchild that a plain
     ``proc.kill()`` orphans to init with its socket open. The group is killed
     even after git itself has exited: a descendant can outlive it holding
-    git's stderr pipe, and nothing else would ever end it."""
+    git's stderr pipe, and nothing else would ever end it.
+
+    Windows has no process groups: closing the probe's Job Object
+    (KILL_ON_JOB_CLOSE) ends every process in it, ssh / remote-https included,
+    whatever their parent. ``proc.kill()`` alone would end git only."""
+    job = getattr(proc, "_kanban_job", None)
+    if job is not None:
+        try:
+            job.close()
+        except OSError:
+            pass
     try:
-        if hasattr(os, "killpg"):
+        if _POSIX_GROUPS:
             os.killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         elif proc.poll() is None:
             proc.kill()
@@ -162,14 +175,43 @@ def _kill_group(proc):
         pass
 
 
+# Windows: how long `_reap` waits for the reader threads after the job is gone.
+_REAP_DRAIN = 2.0
+
+
 def _reap(proc):
-    """Wait for a killed ``proc`` without reading its pipes: a descendant that
-    left the group could still hold them open, so ``communicate()`` here could
-    block forever (``subprocess.run`` does the same on POSIX)."""
+    """Wait for a killed ``proc`` without an unbounded read of its pipes: a
+    descendant that left the group could still hold them open, so
+    ``communicate()`` here could block forever (``subprocess.run`` does the
+    same on POSIX).
+
+    On Windows a timed-out ``communicate()`` leaves reader threads blocked in
+    ``read()``, and closing a pipe they hold waits on that read. The job close
+    has ended every writer, so a bounded ``communicate`` joins them; if one is
+    still blocked the pipes are abandoned rather than waited on."""
     proc.wait()
+    if getattr(proc, "_kanban_job", None) is not None:
+        try:
+            proc.communicate(timeout=_REAP_DRAIN)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            return
     for pipe in (proc.stdin, proc.stdout, proc.stderr):
         if pipe is not None:
             pipe.close()
+
+
+def _spawn_network(argv, **kwargs):
+    """POSIX: a new session, so `_kill_group` can killpg it. Windows: a Job
+    Object, assigned while the child is still suspended, so nothing it starts
+    can escape `_kill_group`."""
+    if _POSIX_GROUPS:
+        return subprocess.Popen(argv, start_new_session=True, **kwargs)
+    from hermes_cli._subprocess_compat import windows_hide_flags
+    from hermes_cli.local_runtime.processes import spawn_server
+
+    proc, job = spawn_server(argv, creationflags=windows_hide_flags(), **kwargs)
+    proc._kanban_job = job
+    return proc
 
 
 def _run_network(argv, *, input, timeout, env):
@@ -178,10 +220,9 @@ def _run_network(argv, *, input, timeout, env):
     group = _probe_group.get()
     if group is not None and group.stopped:
         raise subprocess.TimeoutExpired(argv, 0)
-    proc = subprocess.Popen(
+    proc = _spawn_network(
         argv, stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=_ext.neutral_cwd(), env=env,
-        start_new_session=hasattr(os, "killpg"),
     )
     if group is not None:
         group.add(proc)
@@ -195,6 +236,9 @@ def _run_network(argv, *, input, timeout, env):
     finally:
         if group is not None:
             group.discard(proc)
+    job = getattr(proc, "_kanban_job", None)
+    if job is not None:
+        job.close()     # anything git left behind goes with the job
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
