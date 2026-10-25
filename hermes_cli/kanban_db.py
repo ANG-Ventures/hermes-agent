@@ -10893,7 +10893,19 @@ def complete_task(
             from hermes_cli import kanban_handback_new_head as _nh
             no_new = _nh.verdict(conn, task_id, still_open)
             if no_new is not None:
-                return _nh.bounce(conn, task_id, no_new, expected_run_id=expected_run_id)
+                # The run's own handoff and artifacts survive the bounce (Prism 9c7fd6708b92).
+                from hermes_cli import kanban_negative_handoff as _neg
+                bounce_meta, staged = _stage_routed_scratch_artifacts(
+                    conn, task_id, dict(metadata or {}, no_new_head=no_new),
+                    summary=summary, result=result,
+                )
+                ok = _nh.bounce(
+                    conn, task_id, no_new, expected_run_id=expected_run_id,
+                    summary=_neg.routed_summary(_nh.comment(no_new["seen"]), summary, result),
+                    metadata=bounce_meta,
+                )
+                _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
+                return ok
         if still_open:
             note = _open_pr.route_note(still_open)
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[

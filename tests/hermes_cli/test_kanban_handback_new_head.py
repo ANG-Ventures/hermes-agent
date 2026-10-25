@@ -85,6 +85,19 @@ def test_no_new_head_is_not_a_handback(sent_back, monkeypatch, scenario):
     assert comments[-1] == f"no new head since {A[:10]}; the send-back stands"
 
 
+def test_bounced_run_keeps_the_workers_handoff(sent_back, monkeypatch):
+    """Prism 9c7fd6708b92: the bounce must not drop the run's own summary and metadata."""
+    monkeypatch.setattr(nh, "_default_reader", lambda: lambda repo, n, seen: VIEWS["unchanged"])
+    with kb.connect() as conn:
+        run = kb.claim_task(conn, sent_back)
+        assert kb.complete_task(conn, sent_back, summary=f"suites.json collides with t_x; {PR}",
+                                metadata={"tests_run": 3}, expected_run_id=run.current_run_id)
+        ended = kb.latest_run(conn, sent_back)
+    assert ended.outcome == nh.OUTCOME
+    assert ended.summary.startswith("no new head since") and "suites.json collides" in ended.summary
+    assert ended.metadata["tests_run"] == 3 and ended.metadata["no_new_head"]["reason"] == "unchanged"
+
+
 def test_implementer_commit_since_send_back_routes_to_review(sent_back, monkeypatch):
     status, kinds, _ = _complete_as_worker(sent_back, monkeypatch, "new_commit")
     assert status == "review"

@@ -194,10 +194,12 @@ def verdict(conn: sqlite3.Connection, task_id: str, refs: Iterable, *,
 
 
 def bounce(conn: sqlite3.Connection, task_id: str, no_new: dict, *,
-           expected_run_id: Optional[int]) -> bool:
+           expected_run_id: Optional[int], summary: Optional[str] = None,
+           metadata: Optional[dict] = None) -> bool:
     """Close the worker run and return the card to its queue with the send-back standing. No review_requested.
 
-    The run ends ``no_new_head``; :data:`EVENT` (a respawn-guard continuation kind) lets the next
+    The run ends ``no_new_head`` carrying the worker's ``summary``/``metadata`` (the caller prefixes the
+    bounce line and stages artifacts); :data:`EVENT` (a respawn-guard continuation kind) lets the next
     spawn through ``active_pr``. False when the run no longer owns the card.
     """
     from hermes_cli import kanban_db as kb
@@ -218,8 +220,8 @@ def bounce(conn: sqlite3.Connection, task_id: str, no_new: dict, *,
             (new_status, task_id, run_id),
         )
         text = comment(no_new["seen"])
-        kb._end_run(conn, task_id, outcome=OUTCOME, status=OUTCOME, summary=text,  # noqa: SLF001
-                    metadata={"no_new_head": no_new})
+        kb._end_run(conn, task_id, outcome=OUTCOME, status=OUTCOME, summary=summary or text,  # noqa: SLF001
+                    metadata=metadata or {"no_new_head": no_new})
         kb.add_comment(conn, task_id, "kanban", text)
         kb._append_event(conn, task_id, EVENT, dict(no_new, status=new_status),  # noqa: SLF001
                          run_id=run_id)
