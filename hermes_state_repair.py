@@ -590,10 +590,34 @@ def _connect_repair_durable(db_path: Path, *, timeout: float = 5.0) -> sqlite3.C
     process holds on it (sqlite.org/howtocorrupt §2.2) and lets an external writer commit mid-repair (#63386).
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
+    from hermes_state_lockguard import register_reader, unregister_reader
 
-    conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None)
+    # Counted by the WAL lock guard for the connection's whole life (Prism 230be3dd449d): the token is
+    # dropped by the tracked close(), so every caller's close path settles it.
+    token = register_reader(db_path)
+    try:
+        conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None)
+    except BaseException:
+        unregister_reader(token)
+        raise
+    _bind_reader_token(conn, token)
     _reapply_durability_barriers(conn)
     return conn
+
+
+def _bind_reader_token(conn: sqlite3.Connection, token) -> None:
+    """Drop the lock guard's reader count right after *conn* actually closes (never before)."""
+    from hermes_state_lockguard import unregister_reader
+    close = conn.close
+
+    def _close_and_unregister():
+        close()
+        unregister_reader(token)
+
+    try:
+        conn.close = _close_and_unregister  # type: ignore[method-assign]
+    except (AttributeError, TypeError):  # a C-level Connection without __dict__: keep the count (pin)
+        pass
 
 
 def _repair_conn(db_path: Path, *, timeout: float = 5.0):
@@ -736,21 +760,24 @@ def state_db_has_structural_damage(db_path: Path) -> bool:
     ``integrity_damage_is_structural`` over the result. A check that RAISES instead of
     reporting (a torn page under the walk) is structural too: no FTS-only fixture does that
     while ``messages``/``sessions`` read cleanly, and the FTS rebuild ladder cannot help.
-    Cannot-open / locked stays False so the caller keeps the FTS path."""
-    try:
-        conn = sqlite3.connect(read_only_db_uri(db_path), uri=True, timeout=1.0)
-    except sqlite3.Error:
-        return False
-    try:
-        master_rows = [tuple(r) for r in conn.execute(
-            "SELECT rootpage, type, name FROM sqlite_master WHERE rootpage > 0").fetchall()]
-        lines = [str(r[0]) for r in conn.execute("PRAGMA integrity_check").fetchall()]
-    except sqlite3.OperationalError:
-        return False
-    except sqlite3.DatabaseError:
-        return True
-    finally:
-        conn.close()
+    Cannot-open / locked stays False so the caller keeps the FTS path. A registered reader of the WAL
+    lock guard for the connection's whole life (Prism 230be3dd449d)."""
+    from hermes_state_lockguard import registered_reader
+    with registered_reader(db_path):
+        try:
+            conn = sqlite3.connect(read_only_db_uri(db_path), uri=True, timeout=1.0)
+        except sqlite3.Error:
+            return False
+        try:
+            master_rows = [tuple(r) for r in conn.execute(
+                "SELECT rootpage, type, name FROM sqlite_master WHERE rootpage > 0").fetchall()]
+            lines = [str(r[0]) for r in conn.execute("PRAGMA integrity_check").fetchall()]
+        except sqlite3.OperationalError:
+            return False
+        except sqlite3.DatabaseError:
+            return True
+        finally:
+            conn.close()
     return integrity_damage_is_structural(
         itertools.chain.from_iterable(line.splitlines() for line in lines), master_rows)
 

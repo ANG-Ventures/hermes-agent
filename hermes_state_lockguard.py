@@ -418,7 +418,9 @@ def register_reader(db_path) -> List[object]:
         with _LOCK:
             for ident in idents:
                 _READERS[ident] = _READERS.get(ident, 0) + 1
-        return idents
+        # Bound to this process (Prism 1e8ea9086d86): a fork child starts with empty counts, and an
+        # inherited token settled there would decrement the CHILD's own readers' registrations.
+        return [("pid", os.getpid())] + idents
     except Exception:
         logger.debug("WAL lock guard: reader registration failed for %s", db_path, exc_info=True)
         return []
@@ -430,9 +432,12 @@ def unregister_reader(token: List[object], *, retire_now: bool = True) -> None:
     ``SessionDB._lock`` whose connection stays open and is now counted by :func:`hold`). Never raises."""
     if not token:
         return
+    owner, idents = token[0], token[1:]
+    if not (isinstance(owner, tuple) and owner[:1] == ("pid",) and owner[1] == os.getpid()):
+        return  # minted before a fork (or malformed): its counts belong to another process
     try:
         with _LOCK:
-            _settle(_READERS, token)
+            _settle(_READERS, idents)
     except Exception:
         logger.debug("WAL lock guard: reader unregistration failed", exc_info=True)
     if retire_now:
@@ -462,9 +467,20 @@ def _arm_private(ranges: Dict[str, Tuple[Identity, Tuple[int, int]]], held: Held
         if ident in held:
             continue  # this handle already counts the inode; its descriptor stays locked
         fd = _private_fd(path, ident, db_ident)
-        if fd is not None and _ofd_lock(fd, _F_RDLCK, start, length):
-            held[ident] = (start, length)
-            _HANDLES[ident] = _HANDLES.get(ident, 0) + 1
+        if fd is None:
+            continue
+        # Counted whether or not the OFD lock is granted (Prism e63d481511da): the count is what keeps
+        # retire() from closing this descriptor, and so from cancelling the live connection's POSIX
+        # locks; it must not depend on the lock. A refused or failed lock only loses the stray-close
+        # protection for this handle (logged), never the connection-lifetime protection.
+        try:
+            locked = _ofd_lock(fd, _F_RDLCK, start, length)
+        except OSError:
+            locked = False
+        if not locked:
+            logger.debug("WAL lock guard: OFD lock on %s not granted; counting the handle unlocked", path)
+        held[ident] = (start, length)
+        _HANDLES[ident] = _HANDLES.get(ident, 0) + 1
 
 
 def _private_ranges(db_path, *, shm_only: bool = False) -> Dict[str, Tuple[Identity, Tuple[int, int]]]:

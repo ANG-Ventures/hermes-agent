@@ -155,6 +155,8 @@ def _session_db_content_sig(db_path: Path):
         return None
 
     conn = None
+    from hermes_state_lockguard import register_reader, unregister_reader
+    reader = register_reader(db_path)  # WAL lock guard: dropped after the close below (t_aeae3fe7)
     try:
         import hashlib
         from hermes_state import _connect_tracked_db
@@ -186,6 +188,7 @@ def _session_db_content_sig(db_path: Path):
     finally:
         if conn is not None:
             conn.close()
+        unregister_reader(reader)
 
     _sessions_db_sig_cache[cache_key] = (mtime, signature)
 

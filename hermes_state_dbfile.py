@@ -852,12 +852,17 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
     with contextlib.suppress(OSError):
         wal_path = Path(str(db_path) + "-wal")
         stats["wal_size_bytes"] = wal_path.stat().st_size if wal_path.exists() else 0
+    from hermes_state_lockguard import register_reader, unregister_reader
+    # A registered reader of the WAL lock guard for the connection's whole life (Prism 230be3dd449d):
+    # dropped after the close in the finally below.
+    reader = register_reader(db_path)
     try:
         # A short timeout keeps doctor snappy when a writer holds the lock.  The tracked connect
         # lets byte-probe helpers see this connection and refuse raw opens that would cancel locks.
         conn = _connect_tracked_db(read_only_db_uri(db_path), tracking_path=Path(db_path),
                                    uri=True, timeout=2.0)
     except Exception as exc:
+        unregister_reader(reader)
         logger.debug("collect_state_db_stats: cannot open %s read-only: %s", db_path, exc)
         return stats
     def _scalar(sql: str, params=()) -> Any:
@@ -906,6 +911,7 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
     finally:
         with contextlib.suppress(Exception):
             conn.close()
+        unregister_reader(reader)
     return stats
 
 
