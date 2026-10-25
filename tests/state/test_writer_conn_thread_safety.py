@@ -145,6 +145,9 @@ class TestConcurrentReadersDoNotRaceTheWriter:
             # parity 2026-10-01: upstream split the __init__ connect path into
             # helpers reachable ONLY from __init__ (verified: one call site each).
             "_open_writer", "_open_read_only",
+            # _open_writer's body, run while the lock guard counts the opener (t_aeae3fe7);
+            # one call site, inside _open_writer.
+            "_open_writer_counted",
             "_ensure_db_file_generation", "_record_db_file_identity",
         }
         # Helpers whose lock is held by the CALLER (upstream's ``*_locked`` contract,
