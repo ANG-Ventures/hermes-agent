@@ -1442,6 +1442,9 @@ async def _superseded_by_terminal(runner: Any, entry: dict, reason: str, state: 
         ok = await resurface(runner, entry, finding_text(entry, {"summary": summary}, "child surfaced"))
         logger.info("kanban boomerang-wake: %s lost reason=%s surfaced finding re-delivered=%s status=%s "
                     "delegation=%s (no lost line)", entry["task_id"], reason, ok, status, entry.get("delegation_id"))
+        if not ok:   # fail visible, as _lost does (Prism af30fe379f6c): the finding must not vanish
+            await post_line(runner, entry, f"⚠️ boomerang-wake lost {entry['task_id']} (reason: {reason}); "
+                                           f"child surfaced: {str(summary)[:300]}")
         await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="surfaced",
                                 reason=reason, resurfaced=True, resurface_delivered=ok, finished_at=_time.time())
         return True

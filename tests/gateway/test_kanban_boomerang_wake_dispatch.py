@@ -692,6 +692,29 @@ def test_restart_between_surfaced_comment_and_resurface_delivers_finding_once(en
     assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "surfaced" and claim["resurfaced"]
 
 
+def test_restart_surfaced_finding_failed_redelivery_posts_one_lost_line(env, monkeypatch):
+    """Prism af30fe379f6c: when the restart's re-delivery of the surfaced finding fails, the claim still
+    goes terminal, so the finding would vanish. Fail visible: exactly one lost line carrying the summary."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    _verdict_on_board(entry, "surfaced")
+    _kill(env, entry)
+
+    async def _undelivered(*_a, **_k):
+        return False
+
+    monkeypatch.setattr(ah, "resurface", _undelivered)
+    assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    lines = env["adapter"].sent
+    assert lines == [f"⚠️ boomerang-wake lost {tid} (reason: gateway restart); child surfaced: child surfaced it"], lines
+    assert len(env["dispatched"]) == 1
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "surfaced"
+    assert claim["resurfaced"] is True and claim["resurface_delivered"] is False
+
+
 def test_restart_completed_wake_without_verdict_redispatches_verification(env):
     """Prism d1cebc43e013: a completed wake ALWAYS finds its card done; with no verdict on the board the
     verification did not finish, so the restart redispatches it (never a silent terminal)."""
