@@ -924,6 +924,11 @@ def reopen_admitted_event(event_id: str, profile_home: Path, *, reason: str) -> 
                    WHERE delegation_id=? AND delivery_state='delivered'
                      AND json_extract(event_json, '$.event_id') = ?""",
                              (time.time(), delegation_id, event_id))
+        except Exception:
+            # JSON already reads pending, but nothing will queue it: put it back to admitted so the
+            # next sweep retries, instead of stranding it until the next boot (Prism 56af331e5986).
+            _store.restore_admitted(event_id, profile_home=profile_home)
+            raise
         finally:
             reset_hermes_home_override(token)
     return payload

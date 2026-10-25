@@ -89,7 +89,8 @@ def _parked_in_memory(runner: Any, session_key: str, needle: str) -> bool:
             queued.append(slot[session_key])
         if session_key in (getattr(adapter, "_active_sessions", None) or {}):
             return True
-    return any(needle in str(getattr(event, "text", "") or "") for event in queued)
+    # Line-terminated, like the transcript probe: ``Event: X:g1`` must not match ``Event: X:g10``.
+    return any(f"{needle}\n" in f"{getattr(event, 'text', '') or ''}\n" for event in queued)
 
 
 async def sweep_admitted_completions(runner: Any, *, now: float | None = None) -> int:
@@ -114,12 +115,36 @@ async def sweep_admitted_completions(runner: Any, *, now: float | None = None) -
     return requeued
 
 
+async def _drop_past_ceiling(ad, home, event, now) -> bool:
+    """Admitted past ``ADMITTED_MAX_AGE_SECONDS`` and still unconfirmed (state.db gone, transcript
+    never carried it): drop it as lost instead of holding it to the 30-day retention (t_506536db)."""
+    from tools.async_delegation_store import admitted_past_ceiling
+    if not admitted_past_ceiling(event, now):
+        return False
+    event_id = str(event.get("event_id") or "")
+    await asyncio.to_thread(ad.drop_admitted_event, event_id, "admitted_age_ceiling", home)
+    logger.warning("async_delegation_wake_lost event_id=%s session_key=%s age_hours=%.1f: admitted, never "
+                   "confirmed; dropped at the age ceiling", event_id, event.get("admitted_session_key") or "-",
+                   (now - float(event["admitted_at"])) / 3600.0)
+    return True
+
+
 async def _sweep_one(runner, ad, process_registry, suspects, started, now, home, event) -> int:
     event_id = str(event.get("event_id") or "")
     suspect = (str(home), event_id)
     payload = event.get("payload") or {}
-    if await asyncio.to_thread(_in_transcript, home, event):
+    try:
+        consumed = await asyncio.to_thread(_in_transcript, home, event)
+    except Exception:
+        if not await _drop_past_ceiling(ad, home, event, now):
+            raise  # unknown is not "lost" until the age ceiling says so
+        suspects.discard(suspect)
+        return 0
+    if consumed:
         await asyncio.to_thread(ad.confirm_admitted_event, event_id, home)
+        suspects.discard(suspect)
+        return 0
+    if await _drop_past_ceiling(ad, home, event, now):
         suspects.discard(suspect)
         return 0
     admitted_at = float(event.get("admitted_at") or 0.0)

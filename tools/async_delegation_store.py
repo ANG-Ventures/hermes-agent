@@ -29,6 +29,8 @@ MAX_COMPLETION_REPLAY_AGE_SECONDS = 48 * 3600.0
 MAX_REGISTRY_RECORDS = 256
 TERMINAL_RETENTION_SECONDS = 7 * 24 * 60 * 60
 ABSOLUTE_RETENTION_SECONDS = 30 * 24 * 60 * 60
+# An admitted wake unconfirmed this long is lost, not pending: same horizon as completion replay.
+ADMITTED_MAX_AGE_SECONDS = MAX_COMPLETION_REPLAY_AGE_SECONDS
 ACTIVE_STALE_SECONDS = 30 * 24 * 60 * 60
 # Lifecycle breadcrumb trail cap per record (oldest entries dropped first).
 MAX_LIFECYCLE_EVENTS = 50
@@ -389,7 +391,31 @@ def _terminal_pending(record: dict[str, Any]) -> bool:
     )
 
 
+def admitted_past_ceiling(event: dict[str, Any], now: float) -> bool:
+    """An ``admitted`` row older than the replay horizon will never be confirmed or re-injected:
+    its profile is no longer served or its transcript store is gone (t_506536db)."""
+    admitted_at = event.get("admitted_at")
+    return (event.get("state") == "admitted" and isinstance(admitted_at, (int, float))
+            and now - admitted_at > ADMITTED_MAX_AGE_SECONDS)
+
+
+def _expire_admitted(registry: dict[str, Any], now: float) -> None:
+    invalid_record_ids = set(registry.get("_invalid_record_ids", []))
+    for delegation_id, record in registry["records"].items():
+        if str(delegation_id) in invalid_record_ids or not isinstance(record, dict):
+            continue
+        for event in record.get("outbox", []):
+            if isinstance(event, dict) and admitted_past_ceiling(event, now):
+                event.update(state="dropped", drop_reason="admitted_age_ceiling", delivered_at=now)
+                logger.warning(
+                    "async_delegation_wake_lost event_id=%s session_key=%s age_hours=%.1f: admitted, "
+                    "never confirmed; dropped at the age ceiling", event.get("event_id"),
+                    event.get("admitted_session_key") or "-", (now - event["admitted_at"]) / 3600.0,
+                )
+
+
 def _prune(registry: dict[str, Any], now: float) -> None:
+    _expire_admitted(registry, now)
     records = registry["records"]
     invalid_record_ids = set(registry.get("_invalid_record_ids", []))
     removable: list[tuple[float, str]] = []
@@ -1776,6 +1802,7 @@ def enqueue_pending_outbox(
     queued: list[dict[str, Any]] = []
     now = time.time()
     with locked_registry(profile_home) as registry:
+        _expire_admitted(registry, now)
         invalid_record_ids = set(registry.get("_invalid_record_ids", []))
         for delegation_id, record in registry["records"].items():
             if str(delegation_id) in invalid_record_ids:
@@ -1897,6 +1924,25 @@ def reopen_admitted(event_id: str, *, reason: str, profile_home: Path | None = N
                     )
                     return copy.deepcopy(event.get("payload") or {})
     return None
+
+
+def restore_admitted(event_id: str, *, profile_home: Path | None = None) -> bool:
+    """Undo ``reopen_admitted`` when the re-injection could not proceed: ``pending`` -> ``admitted``,
+    the attempt uncounted. Admission fields were never cleared, so the age ceiling still holds."""
+    with locked_registry(profile_home) as registry:
+        invalid_record_ids = set(registry.get("_invalid_record_ids", []))
+        for delegation_id, record in registry["records"].items():
+            if str(delegation_id) in invalid_record_ids or not isinstance(record, dict):
+                continue
+            for event in record.get("outbox", []):
+                if isinstance(event, dict) and event.get("event_id") == event_id:
+                    if event.get("state") != "pending":
+                        return False
+                    event["state"] = "admitted"
+                    event["reinjects"] = max(0, int(event.get("reinjects") or 0) - 1)
+                    logger.warning("async_delegation_outbox_reopen_undone event_id=%s", event_id)
+                    return True
+    return False
 
 
 def acknowledge(

@@ -693,6 +693,8 @@ class GatewayBusySessionMixin:
         turn = self._session_state(session_key).turn
         if turn.agent is not running_agent:
             return None
+        if turn.ctx is not None:
+            turn.ctx.steered_internal.append(bool(getattr(event, "internal", False)))
         if turn.event is not None and turn.event is not event:
             turn.event.absorb_reply_expected(event)
             if turn.ctx is not None:

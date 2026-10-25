@@ -62,6 +62,9 @@ class TurnContext:
     # "internal_notification" for async-delegation/background notifications (#82888).
     persist_user_display_kind: Optional[str] = None
     persist_user_display_metadata: Optional[dict] = None
+    # One entry per text steered/redirected into this turn: was its event internal? A leftover
+    # steer re-seated as the next turn is internal only when every entry is True (t_506536db).
+    steered_internal: List[bool] = field(default_factory=list)
     # "🔔 wake · <label>" line opening every progress bubble of an internal turn; None for human turns.
     wake_progress_header: Optional[str] = None
     user_config: Any = None

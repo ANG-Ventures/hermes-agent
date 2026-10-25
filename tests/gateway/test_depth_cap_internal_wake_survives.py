@@ -144,7 +144,11 @@ async def test_internal_wake_admitted_at_depth_cap_runs_as_a_later_turn(monkeypa
     runner._effective_busy_input_mode = lambda source: "steer"
     monkeypatch.setattr(type(runner), "_MAX_INTERRUPT_DEPTH", 3)
 
+    kinds = []
+
     async def handler(event):
+        from gateway.response_filters import display_kind_for_event
+        kinds.append(display_kind_for_event(event))
         generation = runner._begin_session_run_generation(key)
         await runner._run_agent(message=event.text or "", context_prompt="", history=[], source=_source(),
                                 session_id="sess-depth", session_key=key, run_generation=generation)
@@ -159,3 +163,6 @@ async def test_internal_wake_admitted_at_depth_cap_runs_as_a_later_turn(monkeypa
         await asyncio.sleep(0.01)
     assert calls[:4] == ["t0", "h1", "h2", "h3"], calls
     assert len(calls) == 5 and WAKE in calls[4], calls
+    # The 5th turn runs as the internal wake it was, never as a human turn (t_506536db): before, the
+    # re-seated pending_steer was a bare internal=False event (visible fallback, auth path).
+    assert kinds[-1] == "internal_notification", kinds

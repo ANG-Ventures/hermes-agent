@@ -4139,7 +4139,8 @@ class GatewayTurnMixin:
             if callable(_mark_turn):
                 _mark_turn(turn_ctx.session_key, turn_ctx.run_generation)
 
-    def _queue_leftover_steer(self, text: str, source: SessionSource, session_key: str) -> None:
+    def _queue_leftover_steer(self, text: str, source: SessionSource, session_key: str, *,
+                              internal: bool = False) -> None:
         """Append a leftover /steer to the session's /queue overflow (behind the pending follow-up);
         a leftover "/stop" or "/new" must never reach the agent."""
         parts = text.strip().split(None, 1)
@@ -4154,7 +4155,7 @@ class GatewayTurnMixin:
                     )
                     return
         self._session_state(session_key).conversation.queued_events.append(
-            MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+            MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
         )
         logger.info(
             "Leftover /steer queued behind pending follow-up for session %s (%d chars)",
@@ -4208,15 +4209,21 @@ class GatewayTurnMixin:
                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
+        _steer_internal = bool(result and result.get("_pending_steer_internal"))
         if result and not pending and not pending_event and result.get("pending_steer"):
             pending = result.get("pending_steer")
+            if _steer_internal:
+                # A steered completion re-seated as text runs as the internal wake it was, not as a
+                # human turn (visible fallback, auth path, no silence allowance) (t_506536db).
+                pending_event = MessageEvent(text=pending, message_type=MessageType.TEXT, source=source,
+                                             internal=True)
             logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
         elif result and result.get("pending_steer") and adapter and session_key:
             # Fork (2026-09-29): a follow-up already owns the next turn. Queue the leftover steer
             # behind it instead of dropping it — on the overflow tail, never the head slot (the
             # depth-cap branch re-seats pending_event in the head slot and would overwrite it; the
             # next drain promotes the overflow head). Same slash-command guard as the pending text.
-            self._queue_leftover_steer(result["pending_steer"], source, session_key)
+            self._queue_leftover_steer(result["pending_steer"], source, session_key, internal=_steer_internal)
 
         # Safety net: a pending slash command is never passed to the agent as user input.
         if pending and pending.strip().startswith("/"):
@@ -4951,6 +4958,11 @@ class GatewayTurnMixin:
                 logger.info("PHASE=stale_drain_skipped session=%s gen=%s", session_key, turn_ctx.run_generation)
                 pending_event, pending = None, None
             else:
+                if isinstance(result, dict) and result.get("pending_steer"):
+                    # Provenance of the leftover steer: internal only when every text steered into
+                    # this turn came from an internal event (t_506536db).
+                    _steered = turn_ctx.steered_internal
+                    result["_pending_steer_internal"] = bool(_steered) and all(_steered)
                 pending_event, pending = await self._run_agent_drain_pending(
                     result, adapter, source, session_key, turn_ctx.session_id,
                 )

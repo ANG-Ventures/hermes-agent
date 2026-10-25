@@ -200,3 +200,85 @@ def test_admitted_at_is_taken_before_the_adapter_hand_off(tmp_path, isolated_reg
     assert before <= event["admitted_at"] <= time.time()
     payload_free = {k: v for k, v in event.items() if k != "payload"}
     assert payload_free["admitted_session_key"] == KEY
+
+
+def test_g1_receipt_is_not_confirmed_by_a_g10_row(tmp_path, isolated_registry):
+    """Prism 16dd0448c670 (t_506536db): the needle is line-terminated, so an admitted ``...:g1`` wake is
+    not confirmed by a transcript row that carries only ``...:g10``."""
+    runner, _adapter, event = _admitted(tmp_path, isolated_registry)
+    assert event["event_id"].endswith(":g1")
+    _persist_user_row(tmp_path, "parent-sess", f"[x] other attempt\nEvent: {event['event_id']}0")
+    _persist_user_row(tmp_path, "parent-sess", f"[x] other attempt\nEvent: {event['event_id']}0\ntrailer")
+    later = time.time() + 600
+    _run(runner, later)
+    assert _run(runner, later + 60) == 1
+    assert _json_outbox_states(tmp_path) == ["pending"]
+
+
+def test_receipt_needle_matches_at_end_of_content_and_mid_content(tmp_path, isolated_registry):
+    runner, _adapter, event = _admitted(tmp_path, isolated_registry)
+    _persist_user_row(tmp_path, "parent-sess", f"[x]\nEvent: {event['event_id']}\nmore text")
+    assert _run(runner, time.time() + 600) == 0
+    assert _json_outbox_states(tmp_path) == ["delivered"]
+
+
+def test_wake_parked_as_g10_does_not_shield_a_lost_g1(tmp_path, isolated_registry):
+    runner, adapter, event = _admitted(tmp_path, isolated_registry)
+    adapter._pending_messages[KEY] = SimpleNamespace(text=f"x\nEvent: {event['event_id']}0")
+    later = time.time() + 600
+    _run(runner, later)
+    assert _run(runner, later + 60) == 1
+
+
+def test_admitted_row_with_missing_store_is_dropped_at_the_age_ceiling(tmp_path, isolated_registry, caplog):
+    """t_506536db: unverifiable (no state.db) stays admitted only until the ceiling, then dropped + logged."""
+    from tools import async_delegation_store as store
+    runner, _adapter, _event = _admitted(tmp_path, isolated_registry)
+    (tmp_path / "state.db").rename(tmp_path / "state.db.gone")
+    past = time.time() + store.ADMITTED_MAX_AGE_SECONDS + 60
+    with caplog.at_level("WARNING"):
+        assert _run(runner, past) == 0
+    assert _json_outbox_states(tmp_path) == ["dropped"]
+    assert "async_delegation_wake_lost" in caplog.text
+    assert isolated_registry.completion_queue.empty()
+
+
+def test_admitted_row_on_an_unserved_profile_is_dropped_by_the_registry_scan(tmp_path, isolated_registry, monkeypatch, caplog):
+    """No sweeper serves this home any more; the next registry write/scan expires it at the ceiling."""
+    from tools import async_delegation_store as store
+    _admitted(tmp_path, isolated_registry)
+    real_time = time.time
+    monkeypatch.setattr(store.time, "time", lambda: real_time() + store.ADMITTED_MAX_AGE_SECONDS + 60)
+    with caplog.at_level("WARNING"):
+        assert ad.enqueue_pending_outbox(current_boot_id="next-boot", profile_home=tmp_path) == 0
+    assert _json_outbox_states(tmp_path) == ["dropped"]
+    assert "async_delegation_wake_lost" in caplog.text
+
+
+def test_admitted_row_under_the_ceiling_is_kept(tmp_path, isolated_registry):
+    from tools import async_delegation_store as store
+    _admitted(tmp_path, isolated_registry)
+    assert ad.enqueue_pending_outbox(current_boot_id="next-boot", profile_home=tmp_path) == 0
+    assert _json_outbox_states(tmp_path) == ["admitted"]
+    assert store.ADMITTED_MAX_AGE_SECONDS > sweep.MIN_AGE_S
+
+
+def test_failed_legacy_reset_leaves_the_wake_retryable_as_admitted(tmp_path, isolated_registry, monkeypatch):
+    """Prism 56af331e5986: a SQLite mirror reset that raises must not strand the JSON event as pending."""
+    import sqlite3
+    runner, _adapter, _event = _admitted(tmp_path, isolated_registry)
+    real = ad._update_delivery
+
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ad, "_update_delivery", locked)
+    later = time.time() + 600
+    _run(runner, later)
+    assert _run(runner, later + 60) == 0
+    assert _json_outbox_states(tmp_path) == ["admitted"]
+    assert isolated_registry.completion_queue.empty()
+    monkeypatch.setattr(ad, "_update_delivery", real)
+    _run(runner, later + 120)
+    assert _run(runner, later + 180) == 1
+    assert _json_outbox_states(tmp_path) == ["pending"]
