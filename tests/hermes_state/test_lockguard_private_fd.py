@@ -54,7 +54,7 @@ def test_private_hold_refuses_foreign_exclusive_until_released(tmp_path):
     shm = tmp_path / "state.db-shm"
     shm.write_bytes(b"\0" * 32768)
     held = lg.hold(db)
-    held_idents = list(held)
+    closing = []
     try:
         assert set(held) == {(os.stat(db).st_dev, os.stat(db).st_ino), (os.stat(shm).st_dev, os.stat(shm).st_ino)}
         assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED"
@@ -65,9 +65,9 @@ def test_private_hold_refuses_foreign_exclusive_until_released(tmp_path):
         assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED"
         assert _foreign_exclusive(str(shm), *_DMS) == "REFUSED"
     finally:
-        lg.release(held)
+        closing = lg.release(held)
     _sqlite_close(db, shm)
-    lg.retire()
+    lg.retire(closing)
     assert _foreign_exclusive(str(db), *_SHARED) == "ACQUIRED"
     assert _foreign_exclusive(str(shm), *_DMS) == "ACQUIRED"
     # state.db stays parked for reuse; the -shm descriptor is never parked (Prism 9016456d284b).
@@ -83,8 +83,7 @@ def test_missing_shm_is_tolerated(tmp_path):
     db.write_bytes(b"\0" * 4096)
     held = lg.hold(db)  # never raises; arms the main file only
     assert list(held) == [(os.stat(db).st_dev, os.stat(db).st_ino)]
-    lg.release(held)
-    lg.retire()
+    lg.retire(lg.release(held))
     assert lg.hold(tmp_path / "absent.db") == {}
 
 
@@ -98,7 +97,7 @@ def test_late_shm_is_armed_by_checkpoint_with_one_stat_and_no_listdir(tmp_path, 
         shm = f"{sdb.db_path}-shm"
         shm_ident = (os.stat(shm).st_dev, os.stat(shm).st_ino)
         # Simulate "-shm minted after open": drop it from this handle's guard record.
-        lg.release({shm_ident: sdb._wal_lock_guard.pop(shm_ident)})
+        lg.retire(lg.release({shm_ident: sdb._wal_lock_guard.pop(shm_ident)}))
         assert shm_ident not in sdb._wal_lock_guard
         calls = {"stat": 0, "listdir": 0}
         real_stat, real_listdir = os.stat, os.listdir
@@ -223,12 +222,11 @@ def test_mode_kill_switch_is_read_at_import(monkeypatch, tmp_path, value, mode, 
             assert bool(held) is armed
             if armed:
                 assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED"
-            guard.release(held)
+            closing = guard.release(held)
         finally:
             os.close(fd)
-        guard.retire()
+        guard.retire(closing)
         assert set(guard._FDS) <= {(os.stat(db).st_dev, os.stat(db).st_ino)}  # private: parked, reused
-        guard._close_pool_at_exit()
     finally:
         monkeypatch.delitem(sys.modules, "hermes_state_lockguard", raising=False)
         sys.modules["hermes_state_lockguard"] = lg
@@ -251,7 +249,7 @@ def test_refused_lock_descriptor_is_parked_and_reused(tmp_path, monkeypatch):
     try:
         assert ident in held and lg._FDS[ident] == fd
     finally:
-        lg.release(held)
+        lg.retire(lg.release(held))
 
 
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
@@ -290,8 +288,7 @@ def test_fork_child_closes_inherited_private_fds_and_parent_stays_guarded(tmp_pa
         assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED"
         assert _foreign_exclusive(str(shm), *_DMS) == "REFUSED"
     finally:
-        lg.release(held)
-        lg.retire()
+        lg.retire(lg.release(held))
 
 
 def _foreign_posix_exclusive(path: str, start: int, length: int) -> str:
@@ -321,7 +318,7 @@ def test_retire_never_strips_a_reader_that_opened_after_the_snapshot(tmp_path, m
     setup.execute("INSERT INTO t VALUES (1)")
     setup.commit()
     setup.close()
-    lg.release(lg.hold(db))
+    lg.retire(lg.release(lg.hold(db)))
     reader = sqlite3.connect(db)
     try:
         reader.execute("BEGIN")
@@ -359,17 +356,17 @@ def test_hold_retire_hold_reuses_one_parked_fd(tmp_path, monkeypatch):
     shm.write_bytes(b"\0" * 32768)
     monkeypatch.setattr(lg.os, "open", _open)
     held = lg.hold(db)
-    lg.release(held)
-    lg.retire()
+    lg.retire(lg.release(held))
     held = lg.hold(db)
+    closing = []
     try:
         assert opens.count(str(db)) == 1, opens
         assert opens.count(str(shm)) == 2, opens
         assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED"
     finally:
-        lg.release(held)
+        closing = lg.release(held)
         _sqlite_close(db, shm)
-        lg.retire()
+        lg.retire(closing)
     assert _foreign_exclusive(str(db), *_SHARED) == "ACQUIRED", "a parked fd must carry no OFD lock"
 
 
@@ -400,7 +397,7 @@ def test_pool_gauge_warns_once_past_the_bound(tmp_path, monkeypatch, caplog):
         for i in range(4):
             db = tmp_path / f"s{i}.db"
             db.write_bytes(b"\0" * 4096)
-            lg.release(lg.hold(db))
+            lg.retire(lg.release(lg.hold(db)))
     assert len([r for r in caplog.records if "private descriptors parked" in r.getMessage()]) == 1
 
 
@@ -483,7 +480,7 @@ def test_relative_path_survives_chdir(tmp_path, monkeypatch):
     (a / "state.db").write_bytes(b"\0" * 4096)
     ident = (os.stat(a / "state.db").st_dev, os.stat(a / "state.db").st_ino)
     monkeypatch.chdir(a)
-    lg.release(lg.hold("state.db"))
+    lg.retire(lg.release(lg.hold("state.db")))
     fd = lg._FDS[ident]
     assert lg._PATHS[ident] == str(a / "state.db")
     monkeypatch.chdir(b)
@@ -500,7 +497,7 @@ def test_retire_closes_only_on_enoent_or_identity_change(tmp_path, monkeypatch, 
     db = tmp_path / "state.db"
     db.write_bytes(b"\0" * 4096)
     ident = (os.stat(db).st_dev, os.stat(db).st_ino)
-    lg.release(lg.hold(db))
+    lg.retire(lg.release(lg.hold(db)))
     real_stat = os.stat
 
     def _eacces(path, *a, **k):
@@ -520,7 +517,7 @@ def test_retire_closes_only_on_enoent_or_identity_change(tmp_path, monkeypatch, 
     lg.retire()
     assert ident not in lg._FDS
     ident2 = (os.stat(db).st_dev, os.stat(db).st_ino)
-    lg.release(lg.hold(db))
+    lg.retire(lg.release(lg.hold(db)))
     db.unlink()  # ENOENT
     lg.retire()
     assert ident2 not in lg._FDS
