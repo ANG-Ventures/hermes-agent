@@ -654,14 +654,13 @@ def _verdict_on_board(entry, how: str) -> None:
             "action": "complete", "claim_event_id": int(entry["event_id"])})
 
 
-@pytest.mark.parametrize("how", ["surfaced", "receipt"])
-def test_restart_completed_wake_with_verdict_on_done_card_is_silent(env, caplog, how):
-    """2026-10-24 (5 false lines): the verification's verdict is already on the board and the card is
+def test_restart_completed_wake_with_receipt_on_done_card_is_silent(env, caplog):
+    """2026-10-24 (5 false lines): the verification's executor receipt is on the board and the card is
     still done, so a restart lost nothing: no ⚠️ line, no replayed notice, no redispatch."""
     tid = _card(env)
     _worker_close(tid)
     entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
-    _verdict_on_board(entry, how)
+    _verdict_on_board(entry, "receipt")
     _kill(env, entry)
     with caplog.at_level("INFO", logger="gateway.kanban_boomerang_wake"):
         assert asyncio.run(ah.reconcile(env["runner"])) == 1
@@ -672,6 +671,25 @@ def test_restart_completed_wake_with_verdict_on_done_card_is_silent(env, caplog,
     assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "superseded-by-terminal"
     assert any(f"{tid} lost reason=gateway restart superseded-by-terminal status=done" in r.getMessage()
                for r in caplog.records)
+
+
+def test_restart_between_surfaced_comment_and_resurface_delivers_finding_once(env):
+    """Prism 925507fa098b: run_entry writes the ``surfaced:`` comment BEFORE resurface() reaches the owner.
+    A restart in between leaves the finding undelivered: the reconciler delivers THAT finding once (not
+    the stale completion notice), posts no lost line, and never redispatches the child."""
+    tid = _card(env)
+    _worker_close(tid)
+    entry = _claimed_entry(env, tid, state=ah.STATE_RUNNING)
+    _verdict_on_board(entry, "surfaced")   # comment written; killed before the resurface
+    _kill(env, entry)
+    assert asyncio.run(ah.reconcile(env["runner"])) == 1
+    assert asyncio.run(ah.reconcile(env["runner"])) == 0
+    assert env["adapter"].sent == [], "a lost/warning line was posted for a known verdict"
+    [turn] = env["adapter"].handled
+    assert "child surfaced" in turn.text and "child surfaced it" in turn.text, turn.text
+    assert len(env["dispatched"]) == 1, "the child was redispatched although its verdict exists"
+    claim = ah.BoomerangWakeState().get_claim(entry["key"])
+    assert claim["state"] == ah.STATE_TERMINAL and claim["outcome"] == "surfaced" and claim["resurfaced"]
 
 
 def test_restart_completed_wake_without_verdict_redispatches_verification(env):
