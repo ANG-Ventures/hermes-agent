@@ -129,8 +129,16 @@ def parent_route(parent_agent: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
 def _anonymous_custom(parent_agent: Any, requested: Optional[str]) -> bool:
     from tools.delegate_tool_config import _RUNTIME_PROVIDER_CUSTOM
 
-    return (getattr(parent_agent, "provider", None) == _RUNTIME_PROVIDER_CUSTOM
-            and not (requested or "").startswith(f"{_RUNTIME_PROVIDER_CUSTOM}:"))
+    if getattr(parent_agent, "provider", None) != _RUNTIME_PROVIDER_CUSTOM:
+        return False
+    if (requested or "").startswith(f"{_RUNTIME_PROVIDER_CUSTOM}:"):
+        return False
+    # A configured provider requested by its raw name (``lab``) re-resolves by that name too.
+    if requested and requested.strip().lower() != _RUNTIME_PROVIDER_CUSTOM:
+        from hermes_cli.runtime_provider_custom import has_named_custom_provider
+
+        return not has_named_custom_provider(requested)
+    return True
 
 
 # ── kanban plumbing ─────────────────────────────────────────────────────────

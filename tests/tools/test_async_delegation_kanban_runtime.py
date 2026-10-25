@@ -1074,6 +1074,18 @@ def test_parent_route_keeps_the_endpoint_of_an_anonymous_custom_route():
     assert akb.parent_route(pinned, {"base_url": "http://deleg/v1"})["explicit_base_url"] == "http://deleg/v1"
 
 
+def test_parent_route_re_resolves_a_raw_named_custom_provider(monkeypatch):
+    """ad67d9f22615: a configured custom provider requested by its raw name (``lab``, not
+    ``custom:lab``) is named: its endpoint re-resolves by name, never persisted as an override."""
+    import hermes_cli.runtime_provider_custom as rpc
+
+    monkeypatch.setattr(rpc, "has_named_custom_provider", lambda name: name == "lab")
+    raw = SimpleNamespace(requested_provider="lab", provider="custom", model="m", base_url="http://10.0.0.5:8080/v1")
+    assert akb.parent_route(raw, {})["explicit_base_url"] is None, "a raw named provider re-resolves by name"
+    unknown = SimpleNamespace(requested_provider="ollama", provider="custom", model="m", base_url="http://o/v1")
+    assert akb.parent_route(unknown, {})["explicit_base_url"] == "http://o/v1", "an unconfigured alias stays anonymous"
+
+
 def test_no_working_file_lock_keeps_the_unit_in_process(eligible, monkeypatch):
     """7bf4070bc0f0: flock unsupported (ENOLCK) in the lock directory -> the unit stays in-process."""
     import fcntl
