@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS pending_runtime (
     gen TEXT NOT NULL,
     job_id TEXT NOT NULL,
     fields TEXT,
+    staged_at REAL,
     PRIMARY KEY (gen, job_id)
 );
 CREATE TABLE IF NOT EXISTS mirror_state (
@@ -249,6 +250,10 @@ def connect(cron_dir: Path, *, create: bool = True) -> Iterator[Optional[sqlite3
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         conn.executescript(_SCHEMA)
+        # A database created before pending_runtime.staged_at existed (earlier PR heads).
+        if "staged_at" not in {r[1] for r in conn.execute("PRAGMA table_info(pending_runtime)")}:
+            with contextlib.suppress(sqlite3.OperationalError):  # a sibling added it first
+                conn.execute("ALTER TABLE pending_runtime ADD COLUMN staged_at REAL")
         yield conn
     finally:
         conn.close()
@@ -392,17 +397,31 @@ def stage_pending(conn: sqlite3.Connection, gen: str, rows: Dict[str, Dict[str, 
                   delete_ids: Iterable[str] = ()) -> None:
     # Only THIS generation: under a degraded jobs lock a sibling save may have its own staged.
     conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
+    at = _now()
     for job_id, fields in rows.items():
-        conn.execute("INSERT INTO pending_runtime(gen, job_id, fields) VALUES (?,?,?)",
-                     (gen, str(job_id), _canonical(fields)))
+        conn.execute("INSERT INTO pending_runtime(gen, job_id, fields, staged_at) VALUES (?,?,?,?)",
+                     (gen, str(job_id), _canonical(fields), at))
     for job_id in delete_ids:
         if job_id:
-            conn.execute("INSERT OR REPLACE INTO pending_runtime(gen, job_id, fields)"
-                         " VALUES (?,?,NULL)", (gen, str(job_id)))
+            conn.execute("INSERT OR REPLACE INTO pending_runtime(gen, job_id, fields, staged_at)"
+                         " VALUES (?,?,NULL,?)", (gen, str(job_id), at))
 
 
 def pending_gens(conn: sqlite3.Connection) -> List[str]:
     return [r[0] for r in conn.execute("SELECT DISTINCT gen FROM pending_runtime").fetchall()]
+
+
+def pending_discard_after() -> float:
+    """Age (seconds, by ``staged_at``) past which a generation the file does NOT name is provably
+    dead: ``max(2 x mirror interval, 60)``. A younger one may belong to a sibling save still in
+    flight under a degraded jobs lock (between its stage and its rename)."""
+    return max(2.0 * mirror_interval(), 60.0)
+
+
+def pending_gen_ages(conn: sqlite3.Connection) -> Dict[str, Optional[float]]:
+    """``{gen: newest staged_at}`` (``None`` = a row staged before the column existed)."""
+    return {gen: (float(at) if at is not None else None) for gen, at in conn.execute(
+        "SELECT gen, max(staged_at) FROM pending_runtime GROUP BY gen").fetchall()}
 
 
 def apply_pending(conn: sqlite3.Connection, gen: str, *, dirty: bool = False) -> int:
@@ -435,9 +454,21 @@ def merged_jobs(jobs_file: Path) -> List[Dict[str, Any]]:
     path = db_path(jobs_file.parent)
     if not path.exists():
         return jobs
+    file_gen = data.get("runtime_gen") if isinstance(data, dict) else None
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30.0)
     try:
         rows = dict(conn.execute("SELECT job_id, fields FROM job_runtime").fetchall())
+        if isinstance(file_gen, str) and file_gen:
+            # A save that crashed after its rename left generation *file_gen* staged: the file
+            # already names it, so it is committed. Read it the way load_jobs' recovery would
+            # apply it (NULL fields = the row was deleted), without writing.
+            for job_id, fields in conn.execute(
+                    "SELECT job_id, fields FROM pending_runtime WHERE gen=?",
+                    (file_gen,)).fetchall():
+                if fields is None:
+                    rows.pop(job_id, None)
+                else:
+                    rows[job_id] = fields
     except sqlite3.Error:
         return jobs
     finally:
@@ -476,12 +507,15 @@ def fold_staged_copy(cron_dir: Path) -> bool:
     # rows would otherwise be the only copy of the runtime state and the delete would lose them.
     if not jobs_file.exists():
         return False
-    with open(jobs_file, encoding="utf-8-sig") as fh:
-        data = json.load(fh)
+    try:
+        with open(jobs_file, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return False
     jobs = data.get("jobs") if isinstance(data, dict) else data
     if not isinstance(jobs, list):
         return False
-    merged = merged_jobs(jobs_file)
+    merged = merged_jobs(jobs_file)  # applies a pending generation the file names first
     payload = dict(data) if isinstance(data, dict) else {}
     payload.pop("runtime_gen", None)
     payload["jobs"] = merged

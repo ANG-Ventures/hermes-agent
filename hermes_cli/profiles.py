@@ -2200,9 +2200,15 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
             target.write_text(content, encoding="utf-8")
         # Cron runtime fields (prompts, errors) live in cron/runtime_state.db since t_94e91559: fold
         # them back into the staged jobs.json so the text scrubber below sees them, and drop the
-        # binary db + sidecars from the archive (the scrubber skips binaries).
-        from cron.runtime_state import fold_staged_copy
-        fold_staged_copy(staged / "cron")
+        # binary db + sidecars from the archive (the scrubber skips binaries). A db the fold
+        # refused (no definitions to fold into) would ship unscrubbed: refuse the export instead.
+        from cron.runtime_state import db_path, fold_staged_copy
+        staged_cron = staged / "cron"
+        if db_path(staged_cron).exists() and not fold_staged_copy(staged_cron):
+            raise ValueError(
+                f"refusing export: {profile_dir / 'cron'} has a runtime_state.db but no readable "
+                "jobs.json definitions to fold it into (the database would ship unscrubbed); "
+                "repair cron/jobs.json or run `hermes cron runtime-export --to-json` first")
         _scrub_export_secrets(staged)
         return Path(make_targz(base, tmpdir, canon))
 

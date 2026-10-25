@@ -359,7 +359,8 @@ def test_replace_save_drops_orphan_rows(temp_home):
     a = cj.create_job(prompt="x", schedule="every 5m", name="a")
     b = cj.create_job(prompt="x", schedule="every 5m", name="b")
     assert cj.claim_job_for_fire(a["id"]) and cj.claim_job_for_fire(b["id"])
-    cj.save_jobs([j for j in cj.load_jobs() if j["id"] == a["id"]], replace=True)
+    cj.save_jobs([j for j in cj.load_jobs() if j["id"] == a["id"]], replace=True,
+                 prune_runtime=True)
     ids = {r[0] for r in sqlite3.connect(_db(temp_home)).execute("SELECT job_id FROM job_runtime")}
     assert ids == {a["id"]}
 
@@ -943,3 +944,145 @@ def test_bench_200_heartbeats_700_jobs_write_zero_bytes_to_jobs_json(temp_home):
           f"(file {size} B); sqlite {sqlite_wall:.2f}s {sqlite_bytes} B")
     assert json_bytes >= 200 * size * 0.9  # baseline really rewrote the file each time
     assert sqlite_bytes == 0
+
+
+# --- Apollo review of #2287 @ 7bab7b62 (Prism round 3 residue) -----------------------------
+
+def test_profile_export_refuses_db_without_definitions(tmp_path, monkeypatch):
+    """12e3f4b761ac: a runtime row carrying a credential plus a jobless jobs.json: the fold
+    refuses, so the export must fail and write no archive (never ship the db unscrubbed)."""
+    from cron import runtime_state as rs
+    from hermes_cli import profiles
+
+    profile_dir = tmp_path / "profiles" / "p"
+    cron = profile_dir / "cron"
+    cron.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text("model: x\n")
+    (cron / "jobs.json").write_text("{}", encoding="utf-8")
+    rs.write_rows(cron, {"j1": {"manual_run_prompt": "use ghp_" + "a" * 36}})
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: tmp_path / "profiles")
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda n: profile_dir)
+    monkeypatch.setattr(profiles, "validate_profile_name", lambda n: None)
+    out = tmp_path / "export.tar.gz"
+    with pytest.raises(ValueError, match="runtime_state.db"):
+        profiles.export_profile("p", str(out))
+    assert not out.exists()
+    assert rs.db_path(cron).exists()  # the live store is untouched
+
+
+def test_invalid_jobs_field_repair_keeps_every_row(temp_home):
+    """f4b938a70cd7: load_jobs' auto-repair of {"jobs": "invalid"} saves [] with replace=True;
+    it must not run the orphan-row prune (the rows are the only copy of the runtime)."""
+    from cron import jobs as cj
+
+    a = cj.create_job(prompt="x", schedule="every 5m", name="a")
+    b = cj.create_job(prompt="x", schedule="every 5m", name="b")
+    cj.mark_job_run(a["id"], True)
+    cj.mark_job_run(b["id"], False, "err")
+    before = {r[0] for r in sqlite3.connect(_db(temp_home)).execute(
+        "SELECT job_id FROM job_runtime")}
+    assert before == {a["id"], b["id"]}
+    _jobs_file(temp_home).write_text('{"jobs": "invalid"}', encoding="utf-8")
+    assert cj.load_jobs() == []
+    after = {r[0] for r in sqlite3.connect(_db(temp_home)).execute(
+        "SELECT job_id FROM job_runtime")}
+    assert after == before
+
+
+def test_fold_and_merged_view_apply_pending_generation_the_file_names(temp_home, tmp_path):
+    """64fce4a91b12: the file names generation g (new next_run_at), job_runtime is older, the
+    pending row for g is new: merged_jobs and fold_staged_copy show the new value."""
+    import shutil
+
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="pend-fold")
+    cj.mark_job_run(created["id"], True)
+    new = "2099-01-01T00:00:00+00:00"
+    _stage_crashed_generation(temp_home, created["id"], "next_run_at", new)
+    assert rs.read_all(temp_home / "cron")[created["id"]].get("next_run_at") != new
+    merged = rs.merged_jobs(_jobs_file(temp_home))
+    assert merged[0]["next_run_at"] == new
+    staged = tmp_path / "staged" / "cron"
+    shutil.copytree(temp_home / "cron", staged)
+    assert rs.fold_staged_copy(staged) is True
+    assert json.loads((staged / "jobs.json").read_text())["jobs"][0]["next_run_at"] == new
+
+
+def test_recovery_keeps_young_unnamed_generation_discards_old(temp_home, clock):
+    """9a7350abcc1c: under a degraded lock a sibling's save may be between its stage and its
+    rename. Recovery discards an unnamed generation only past max(2 x mirror interval, 60 s)."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="young")
+    cron = temp_home / "cron"
+    with rs.transaction(cron) as conn:
+        rs.stage_pending(conn, "s" * 32, {created["id"]: {"last_status": "sibling"}})
+
+    def pending():
+        with rs.connect(cron) as conn:
+            return rs.pending_gens(conn)
+
+    with cj._jobs_lock():
+        cj._recover_pending_runtime(None)
+    assert pending() == ["s" * 32]
+    clock[0] += rs.pending_discard_after() - 1
+    with cj._jobs_lock():
+        cj._recover_pending_runtime(None)
+    assert pending() == ["s" * 32]
+    clock[0] += 2
+    with cj._jobs_lock():
+        cj._recover_pending_runtime(None)
+    assert pending() == []
+    assert rs.pending_discard_after() == 60.0  # default interval 30 s -> max(60, 60)
+
+
+def test_definition_fast_path_save_reconciles_against_original_baseline(temp_home, monkeypatch):
+    """280901e0a164: A's single-job edit renames J; while A's callback runs a degraded-lock
+    sibling B pauses J; A then saves: J ends up paused AND renamed."""
+    from cron import jobs as cj
+
+    monkeypatch.setattr(cj, "fcntl", None)
+    monkeypatch.setattr(cj, "msvcrt", None)
+    created = cj.create_job(prompt="x", schedule="every 5m", name="orig")
+    jid = created["id"]
+    cj.maybe_flush_runtime_mirror(force=True)
+
+    def edit(jobs, i, job):
+        data = json.loads(_jobs_file(temp_home).read_text())  # sibling B: pause J
+        for rec in data["jobs"]:
+            if rec["id"] == jid:
+                rec.update(enabled=False, state="paused", paused_reason="by B")
+        _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+        job["name"] = "edited"
+        cj.save_jobs(jobs)
+        return job
+
+    cj._with_job(jid, edit)
+    rec = cj.get_job(jid)
+    assert rec["name"] == "edited"
+    assert rec["enabled"] is False and rec["state"] == "paused" and rec["paused_reason"] == "by B"
+
+
+def test_json_mode_save_with_live_db_logs_error_once(temp_home, monkeypatch, caplog):
+    """7ffd35b7bd2a (accepted by-design): json mode with runtime_state.db still present logs ONE
+    ERROR naming runtime-export."""
+    import logging
+
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="ks-warn")
+    assert _db(temp_home).exists()
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+    monkeypatch.setattr(cj, "_JSON_MODE_DB_WARNED", set())
+    with caplog.at_level(logging.ERROR, logger=cj.logger.name):
+        with cj._jobs_lock():
+            jobs = json.loads(_jobs_file(temp_home).read_text())["jobs"]
+            cj.save_jobs(jobs)
+            cj.save_jobs(jobs)
+    hits = [r for r in caplog.records if "runtime-export" in r.getMessage()
+            and r.levelno == logging.ERROR]
+    assert len(hits) == 1
+    assert created["id"]

@@ -1745,7 +1745,8 @@ def load_jobs() -> List[Dict[str, Any]]:
             logger.warning("%s", note)
         # Keep the shrink-merge (a degraded-lock sibling's create may have landed since the read)
         # unless disk is STILL a shape the merge would refuse: a sibling may have rewritten it.
-        save_jobs(jobs, replace=unmergeable and _peek_jobs_unlocked() is None)
+        save_jobs(jobs, replace=unmergeable and _peek_jobs_unlocked() is None,
+                  prune_runtime=False)  # a repair never deletes rows (see save_jobs)
         logger.warning("Auto-repaired jobs.json (%s)", repair)
         pre_read_stamp = None
     _record_load_stamp(pre_read_stamp)
@@ -1794,15 +1795,22 @@ def _runtime_pending() -> bool:
 
 
 def _recover_pending_runtime(file_gen: Optional[str]) -> None:
+    """Roll forward the generation the file names; discard another generation ONLY when it is
+    provably dead (older than ``_rs.pending_discard_after()`` by its staged_at). A younger
+    unnamed one may be a degraded-lock sibling's save between its stage and its rename: it is left
+    for a later load (that sibling applies or deletes it itself)."""
     with _defs_cache_lock:
         _defs_cache.clear()  # entries parsed while a generation was pending are marked unusable
     with _runtime_txn() as conn:
-        for gen in _rs.pending_gens(conn):
+        ages = _rs.pending_gen_ages(conn)
+        bound = _rs.pending_discard_after()
+        now = _rs._now()
+        for gen, staged_at in ages.items():
             if file_gen and gen == file_gen:
                 n = _rs.apply_pending(conn, gen)
                 logger.warning("cron runtime-state: rolled interrupted save %s forward "
                                "(%d row(s))", gen, n)
-            else:
+            elif staged_at is None or now - staged_at >= bound:
                 conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
                 logger.warning("cron runtime-state: discarded interrupted save %s (its "
                                "definitions never reached jobs.json)", gen)
@@ -2115,6 +2123,7 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
     job = definition
     _rs.apply_runtime(job, copy.deepcopy(base_runtime))
     original_def = _rs.strip_runtime(copy.deepcopy(job))
+    original_job = copy.deepcopy(job)  # the baseline *fn* started from (definition + row)
     jobs = [job]
     scope = _SingleJobScope(jobs)
     prior = getattr(_jobs_lock_state, "single_job_scope", None)
@@ -2134,7 +2143,10 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
         full = load_jobs()
         for i, existing in enumerate(full):
             if str(existing.get("id")) == str(job_id):
-                full[i] = jobs[0]
+                # Reconcile against the ORIGINAL baseline *fn* started from, not this fresh
+                # load: a degraded-lock sibling's write since then (e.g. a pause) is in the fresh
+                # baseline, so a plain replace would read our stale copy of it as our own change.
+                full[i] = _reconcile_job_fields(jobs[0], existing, original_job)
         save_jobs(full)
         return result
     with _runtime_txn() as conn:
@@ -2541,7 +2553,7 @@ def _save_jobs_unlocked(
 
 def _save_split_unlocked(
     jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-    replace: bool = False,
+    replace: bool = False, prune_runtime: bool = False,
 ) -> None:
     """sqlite-mode save (caller holds ``_jobs_lock``): runtime fields -> one row per CHANGED job;
     jobs.json -> rewritten only when a definition changed (or ids were added/removed/reordered),
@@ -2596,8 +2608,11 @@ def _save_split_unlocked(
                 row = _reconcile_job_fields(row, disk_rows[jid], base_runtime[jid])
             out[jid] = row
         deletes = [str(i) for i in (removed_ids or ()) if i]
-        if replace:
-            # Wholesale rewrite: rows for ids no longer in the store go with them.
+        if replace and prune_runtime:
+            # Intentional wholesale replace only: rows for ids no longer in the store go with
+            # them. Never on load_jobs' auto-repair, whose payload is whatever survived a
+            # malformed file (an empty list for {"jobs": "invalid"}): pruning there would wipe
+            # every row, i.e. the only copy of the runtime state.
             deletes += [jid for jid in disk_rows if jid not in runtime_rows]
         return out, deletes, disk_rows
 
@@ -2717,12 +2732,14 @@ def _journal_removed(removed_ids: Optional[Collection[str]],
 
 def save_jobs(
     jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-    replace: bool = False,
+    replace: bool = False, prune_runtime: bool = False,
 ):
     """Save all jobs to storage.
 
     See ``_save_jobs_unlocked`` for ``removed_ids`` / ``replace`` semantics
-    (shrink-merge guard against concurrent-create clobber, #80624).
+    (shrink-merge guard against concurrent-create clobber, #80624). ``prune_runtime`` (sqlite
+    mode, only with ``replace=True``) also deletes the runtime rows of ids absent from *jobs*:
+    pass it only for an intentional wholesale replace (definition import, CLI), never a repair.
     """
     # Fire the test-context guard BEFORE acquiring _jobs_lock() (which calls
     # ensure_dirs() and touches the advisory .jobs.lock). This keeps a blocked
@@ -2740,8 +2757,10 @@ def save_jobs(
         return
     with _jobs_lock():
         if _rs.enabled():
-            _save_split_unlocked(jobs, removed_ids=removed_ids, replace=replace)
+            _save_split_unlocked(jobs, removed_ids=removed_ids, replace=replace,
+                                 prune_runtime=prune_runtime)
         else:
+            _warn_json_mode_with_runtime_db()
             _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
         # Journal INSIDE the lock, after the write lands. After, because a
         # removal that raised never happened and must not leave an audit
@@ -2751,6 +2770,23 @@ def save_jobs(
         # create AFTER our removal, and the guard would then report an
         # intentionally-removed job as vanished.
         _journal_removed(removed_ids)
+
+
+_JSON_MODE_DB_WARNED: Set[str] = set()
+
+
+def _warn_json_mode_with_runtime_db() -> None:
+    """Kill-switch (json mode) save while runtime_state.db still exists: the rows are newer than
+    anything this save writes and nothing folds them in. The json mode is an operator rollback
+    entered via ``hermes cron runtime-export --to-json`` (folds and retires the db); say so,
+    once per store per process (Prism 7ffd35b7bd2a, accepted as by-design)."""
+    path = _runtime_db_path()
+    if str(path) in _JSON_MODE_DB_WARNED or not path.exists():
+        return
+    _JSON_MODE_DB_WARNED.add(str(path))
+    logger.error("cron runtime-state: %s=json but %s still exists; its runtime rows are not "
+                 "in jobs.json. Run `hermes cron runtime-export --to-json` to fold them back "
+                 "and retire the database", _rs.ENV_MODE, path)
 
 
 _MISSING = object()
