@@ -13,7 +13,9 @@ a lone ``os.stat`` measured median 25-50 ms with 12 json-churn threads on ace-me
 hold() is a handful of syscalls (2 stat, at most 2 open+fstat, 2 fcntl), so no CPython guard can
 meet a flat 50 ms there. The bench therefore measures that floor in the same run and allows
 ``50 ms + 20 x floor``: the fd-table scan is ~1000 syscalls (RED by an order of magnitude), the
-private guard is ~8. It also asserts the structural property directly: no fd-table listing.
+private guard is ~8. The floor is the p90 of stats sampled around each hold() so both see the same
+load (the median is bimodal under GIL churn). It also
+asserts the structural property directly: no fd-table listing.
 """
 
 import json
@@ -70,17 +72,25 @@ def test_hold_is_constant_in_fd_count_under_gil_load(tmp_path, monkeypatch):
         for t in threads:
             t.start()
         time.sleep(0.2)
-        for _ in range(15):
-            t0 = time.perf_counter()
-            os.stat(db)
-            floor.append(time.perf_counter() - t0)
+
+        def _sample_floor(n=5):
+            for _ in range(n):
+                t0 = time.perf_counter()
+                os.stat(db)
+                floor.append(time.perf_counter() - t0)
+
+        # The floor is sampled AROUND every hold(), not once up front: 15 back-to-back stats can all
+        # land in a quiet GIL window (median 0.1 ms on 2026-10-25 04:51 while hold() paid 0.56 s of
+        # handoffs), which collapsed the budget to ~50 ms and failed a guard that was not slower.
         monkeypatch.setattr(os, "listdir", _counting_listdir)
         for _ in range(3):
+            _sample_floor()
             t0 = time.perf_counter()
             held = lg.hold(db)
             timings.append(time.perf_counter() - t0)
             assert held, "hold() armed nothing on a live WAL database"
             lg.release(held)  # retire() (the close path, may scan) is not part of hold()
+            _sample_floor()
         monkeypatch.setattr(os, "listdir", real_listdir)
     finally:
         stop.set()
@@ -89,7 +99,10 @@ def test_hold_is_constant_in_fd_count_under_gil_load(tmp_path, monkeypatch):
         for fd in fds:
             os.close(fd)
         conn.close()
-    syscall_floor = statistics.median(floor)
+    # p90, not the median: a lone stat either lands in a quiet GIL window (~0.1 ms) or pays a full
+    # handoff (50-150 ms), and the median flips between the two (04:5x 2026-10-25, 1 run in 5 with a
+    # 0.1 ms median while hold() itself paid 0.5 s). hold()'s ~8 syscalls reliably pay the handoff.
+    syscall_floor = statistics.quantiles(floor, n=10)[-1]
     budget = _BUDGET_S + _FLOOR_MULTIPLE * syscall_floor
     print("hold() timings (s):", ["%.4f" % s for s in timings],
           "syscall floor %.4f s, budget %.4f s" % (syscall_floor, budget))
