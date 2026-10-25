@@ -2389,6 +2389,9 @@ class TurnRunner:
             "compression_deferred": result.get("compression_deferred", False),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
+            # Split or in-place compaction during this run: `messages` lost the turn boundary, so the
+            # /goal turn-effect classifier must not trust a slice of it (it reads this as unknown).
+            "compacted_during_turn": compacted_in_place or effective_session_id != ctx.session_id,
             **usage,
         }
         self._announce_chat_pin_mismatch(resolved_model, resolved_provider, result, final_response)
