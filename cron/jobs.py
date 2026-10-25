@@ -1766,9 +1766,11 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 # --- Runtime-state split (t_94e91559): hot runtime fields live in cron/runtime_state.db ---
 
-# json kill switch: db identity (path -> (ino, size, mtime_ns)) after a fold that kept only orphan
-# rows, so load_jobs does not re-fold an unchanged database on every read.
-_KILL_SWITCH_ORPHANS_ONLY: Dict[str, Tuple[int, int, int]] = {}
+# json kill switch: (db identity, jobs.json identity) after a fold that kept only orphan rows, so
+# load_jobs does not re-fold an unchanged pair on every read. jobs.json is part of the key (Prism
+# 6391b0c09102): a definition re-added for an orphan id changes the file, not the db, and must
+# trigger a re-fold that carries the row's runtime onto it.
+_KILL_SWITCH_ORPHANS_ONLY: Dict[str, Tuple[Optional[Tuple[int, int, int]], ...]] = {}
 
 
 def _db_identity(path: Path) -> Optional[Tuple[int, int, int]]:
@@ -1779,16 +1781,20 @@ def _db_identity(path: Path) -> Optional[Tuple[int, int, int]]:
     return (st.st_ino, st.st_size, st.st_mtime_ns)
 
 
+def _kill_switch_pair_identity(path: Path) -> Tuple[Optional[Tuple[int, int, int]], ...]:
+    return (_db_identity(path), _db_identity(_current_cron_store().jobs_file))
+
+
 def _kill_switch_orphans_only() -> bool:
     path = _runtime_db_path()
     known = _KILL_SWITCH_ORPHANS_ONLY.get(str(path))
-    return known is not None and known == _db_identity(path)
+    return known is not None and known == _kill_switch_pair_identity(path)
 
 
 def _note_kill_switch_orphans_only() -> None:
     path = _runtime_db_path()
-    ident = _db_identity(path)
-    if ident is not None:
+    ident = _kill_switch_pair_identity(path)
+    if ident[0] is not None:
         _KILL_SWITCH_ORPHANS_ONLY[str(path)] = ident
 
 
@@ -2101,7 +2107,7 @@ def _write_definitions_file(defs: List[Dict[str, Any]]) -> None:
         stat_before = os.stat(jobs_file)
     tmp_path = _stage_jobs_payload(jobs_file, defs)
     try:
-        replaced = Path(atomic_replace(tmp_path, jobs_file))
+        replaced = _publish_jobs_json(tmp_path, jobs_file)
     except BaseException:
         _unlink_quiet(tmp_path)
         raise
@@ -2155,7 +2161,14 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
                     f"(rows kept in {_rs.DB_NAME})")
         _guard_against_test_write_to_live_store(jobs_file)
         _recover_pending_now()  # a generation the file names is part of the rows to export
-        rows = _rs.read_all(cron_dir)
+        # Count what we could NOT read (Prism 61ba1c33f294): a row that is not a JSON object has
+        # no record to fold into, and dropping the database would delete it unread.
+        with _rs.connect(cron_dir) as conn:
+            rows, unreadable = _rs._rows_and_unreadable(conn)
+        if unreadable and retire and not keep_orphans:
+            raise RuntimeError(
+                f"{len(unreadable)} runtime row(s) in {_rs.DB_NAME} are not readable JSON objects "
+                f"({', '.join(unreadable)}); refusing to retire it (nothing written, rows kept)")
         file_ids = {str(j.get("id")) for j in jobs if isinstance(j, dict)}
         orphans = sorted(jid for jid in rows if jid not in file_ids)
         if orphans:
@@ -2165,6 +2178,11 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
                            " (%s); %s", len(orphans), ", ".join(orphans),
                            "dropped with the database" if retire and drop_orphans
                            else "kept in the database")
+        # keep_orphans (kill switch, must not raise): unreadable rows are kept like orphans.
+        kept = ([] if drop_orphans else orphans) + unreadable
+        if unreadable:
+            logger.error("cron runtime-state: %d unreadable runtime row(s) kept in %s: %s",
+                         len(unreadable), _rs.DB_NAME, ", ".join(unreadable))
         applied = 0
         merged: List[Any] = []
         for job in jobs:
@@ -2173,15 +2191,15 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
                 job = _rs.overlay_row(job, row)
                 applied += 1
             merged.append(job)
-        if applied or not orphans:
+        if applied or not kept:
             _write_definitions_file(merged)
-        if retire and orphans and not drop_orphans:  # keep_orphans: retire the folded rows only
+        if retire and kept:  # retire the folded rows only
             with _runtime_txn() as conn:
-                _rs.upsert_rows(conn, {}, delete_ids=[j for j in rows if j not in orphans],
+                _rs.upsert_rows(conn, {}, delete_ids=[j for j in rows if j not in kept],
                                 dirty=False)
             logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
-                           "jobs.json; %s kept for %d orphan row(s)", applied, _rs.DB_NAME,
-                           len(orphans))
+                           "jobs.json; %s kept for %d row(s)", applied, _rs.DB_NAME,
+                           len(kept))
             return applied
         if retire:
             _rs.drop_database(cron_dir)
@@ -2667,12 +2685,11 @@ def _save_jobs_unlocked(
     jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
     replace: bool = False, runtime_gen: Optional[str] = None,
     overlay: Optional[Callable[[List[Any]], List[Any]]] = None,
-    pre_replace: Optional[Callable[[], None]] = None,
 ):
     """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
     ``replace=True`` skips the shrink-merge guard and the corrupt-store refusal (wholesale
     rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes).
-    ``pre_replace`` (sqlite mode) runs immediately before the rename."""
+    The rename goes through ``_publish_jobs_json`` (sibling generation recovery in sqlite mode)."""
     jobs_file = _current_cron_store().jobs_file
     _guard_against_test_write_to_live_store(jobs_file)
     ensure_dirs()
@@ -2699,10 +2716,8 @@ def _save_jobs_unlocked(
                 _unlink_quiet(tmp_path)
                 tmp_path = None
                 continue
-            if pre_replace is not None:
-                pre_replace()
             # fsync the directory the rename actually landed in (atomic_replace resolves symlinks).
-            replaced = Path(atomic_replace(tmp_path, jobs_file))
+            replaced = _publish_jobs_json(tmp_path, jobs_file, own_gen=runtime_gen)
             tmp_path = None
             fsync_directory(replaced.parent)
             _secure_file(jobs_file)
@@ -2838,8 +2853,7 @@ def _save_split_two_phase(gen, defs, merged_changes, *, removed_ids, replace, ba
         _jobs_lock_state.load_baseline = base_defs
     try:
         _save_jobs_unlocked(defs, removed_ids=removed_ids, replace=replace, runtime_gen=gen,
-                            overlay=to_mirror,
-                            pre_replace=lambda: _roll_forward_published_sibling(gen))
+                            overlay=to_mirror)
     except BaseException:
         if gen is not None:
             with contextlib.suppress(Exception), _runtime_txn() as conn:
@@ -2858,6 +2872,16 @@ def _save_split_two_phase(gen, defs, merged_changes, *, removed_ids, replace, ba
         _record_mirror_written(conn, seq)
 
 
+def _publish_jobs_json(tmp_path: str, jobs_file: Path, *, own_gen: Optional[str] = None) -> Path:
+    """The one rename over jobs.json for every save (two-phase definition save AND the coalesced
+    mirror flush, Prism 093e1acfc350). In sqlite mode it first rolls forward a generation a sibling
+    published since our recovery, because the rename erases the marker that commits it. Returns
+    the path the rename landed on (``atomic_replace`` resolves symlinks)."""
+    if _rs.enabled() and _runtime_db_path().exists():
+        _roll_forward_published_sibling(own_gen)
+    return Path(atomic_replace(tmp_path, jobs_file))
+
+
 def _roll_forward_published_sibling(own_gen: Optional[str]) -> None:
     """Right before our rename replaces jobs.json: if the file on disk names ANOTHER generation
     that is still pending, a degraded-lock sibling published it after our entry recovery ran
@@ -2866,12 +2890,14 @@ def _roll_forward_published_sibling(own_gen: Optional[str]) -> None:
     owner gone, discard it (Prism 9083dea60b86). Marked dirty: the mirror we are about to write was
     computed before these rows, so the next flush rewrites it. A live sibling's own later apply
     then finds nothing left to apply."""
+    if not _runtime_pending():  # cheap: no pending generation, nothing the rename could erase
+        return
     file_gen = _file_runtime_gen()
     if not file_gen or file_gen == own_gen:
         return
     with _runtime_txn() as conn:
         if file_gen in _rs.pending_gens(conn):
-            n = _rs.apply_pending(conn, file_gen, dirty=True)
+            n = _rs.apply_pending(conn, file_gen)
             logger.warning("cron runtime-state: rolled sibling save %s forward before replacing "
                            "jobs.json (%d row(s))", file_gen, n)
 

@@ -1550,3 +1550,195 @@ def test_first_opener_read_path_runs_the_secure_pass(temp_home, monkeypatch):
     with cj._jobs_lock():
         cj._read_one_row("fixture-1")
     assert calls == [1]
+
+
+# --- Round 6 keys (Apollo send-back 2026-10-25 03:5x, OPERATOR OVERRIDE round cap) ---------------
+
+def test_mirror_flush_rolls_forward_sibling_generation_published_before_its_rename(temp_home):
+    """093e1acfc350: the coalesced mirror flush renames over jobs.json too, so it must roll forward
+    a generation a degraded-lock sibling published (and then died) after the flush read its rows,
+    exactly like a definition save. Otherwise the rename erases the only marker that commits it."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    a = cj.create_job(prompt="x", schedule="every 5m", name="a")
+    cj.mark_job_run(a["id"], True)  # mirror now dirty
+    real = cj._stage_jobs_payload
+    gen_b = "c" * 32
+    fired = []
+
+    def stage_then_sibling(jobs_file, jobs, runtime_gen=None, overlay=None):
+        out = real(jobs_file, jobs, runtime_gen, overlay)
+        if not fired:
+            fired.append(1)
+            with rs.transaction(temp_home / "cron") as conn:
+                row = rs.read_row(conn, a["id"]) or {}
+                rs.stage_pending(conn, gen_b, {a["id"]: dict(row, last_status="sibling")},
+                                 bases={a["id"]: row})
+            data = json.loads(_jobs_file(temp_home).read_text())
+            data["runtime_gen"] = gen_b
+            _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+            cj._gen_lock_path(gen_b).write_text("")  # B died: its lock file is free
+        return out
+
+    cj._stage_jobs_payload = stage_then_sibling
+    try:
+        assert cj.maybe_flush_runtime_mirror(force=True) is True
+    finally:
+        cj._stage_jobs_payload = real
+    assert fired
+    assert cj.get_job(a["id"])["last_status"] == "sibling"
+    with rs.connect(temp_home / "cron") as conn:
+        assert rs.pending_gens(conn) == []
+
+
+def test_apply_pending_dirties_the_mirror(temp_home):
+    """8f09e01d8cd4: applying a generation advances the mirror seq, so a concurrent save that read
+    seq BEFORE the apply cannot mark its (older) mirror as reflecting these rows."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="seq")
+    cron = temp_home / "cron"
+    with rs.transaction(cron) as conn:
+        seq_before = rs.mirror_seq(conn)
+        rs.mark_flushed(conn, seq_before)
+        assert rs.dirty_since(conn) is None
+        rs.stage_pending(conn, "e" * 32, {created["id"]: {"last_status": "applied"}})
+        rs.apply_pending(conn, "e" * 32)
+        assert rs.mirror_seq(conn) > seq_before
+        rs.mark_flushed(conn, seq_before)  # the stale save acknowledges only what it read
+        assert rs.dirty_since(conn) is not None
+
+
+def test_retire_refuses_on_unreadable_row(temp_home):
+    """61ba1c33f294: a row that does not parse to a JSON object cannot be exported; retiring the
+    database would delete it unread. Refuse, write nothing, keep the db (API and CLI)."""
+    from cron import jobs as cj
+    from hermes_cli.cron import cron_runtime_export
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="bad-row")
+    cj.mark_job_run(created["id"], True)
+    with sqlite3.connect(_db(temp_home)) as conn:
+        conn.execute("UPDATE job_runtime SET fields='{not json' WHERE job_id=?", (created["id"],))
+    before = _snapshot(_jobs_file(temp_home))
+    with pytest.raises(RuntimeError, match="not readable"):
+        cj.export_runtime_to_json()
+    assert _db(temp_home).exists() and _snapshot(_jobs_file(temp_home)) == before
+
+    class A:
+        retire, drop_orphans = True, True
+    assert cron_runtime_export(A()) == 1
+    assert _db(temp_home).exists()
+    with sqlite3.connect(_db(temp_home)) as conn:
+        assert conn.execute("SELECT fields FROM job_runtime WHERE job_id=?",
+                            (created["id"],)).fetchone() == ("{not json",)
+
+
+def test_merged_jobs_opens_db_under_dir_with_uri_metacharacters(temp_home, tmp_path):
+    """943ffb5fb553: '#' and '?' in the store path must not truncate the SQLite URI."""
+    from cron import runtime_state as rs
+
+    cron = tmp_path / "odd#dir?x" / "cron"
+    cron.mkdir(parents=True)
+    job = _fixture_job(1, with_runtime=False)
+    job["last_status"] = "old"
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [job]}), encoding="utf-8")
+    rs.write_rows(cron, {job["id"]: {"last_status": "success"}})
+    assert rs.merged_jobs(cron / "jobs.json")[0]["last_status"] == "success"
+
+
+def _export_profile_fixture(tmp_path, monkeypatch):
+    from hermes_cli import profiles
+
+    profile_dir = tmp_path / "profiles" / "p"
+    cron = profile_dir / "cron"
+    cron.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text("model: x\n")
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: tmp_path / "profiles")
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda n: profile_dir)
+    monkeypatch.setattr(profiles, "validate_profile_name", lambda n: None)
+    return profiles, profile_dir, cron
+
+
+def _archive_names(path):
+    import tarfile
+
+    with tarfile.open(path) as tf:
+        return tf.getnames()
+
+
+def test_profile_export_drops_stray_wal_without_db(temp_home, tmp_path, monkeypatch):
+    """789c2932efbe: a runtime_state.db-wal (binary, may hold runtime prompts/errors) with no main
+    db must not ride into the archive unscrubbed; only the STAGED copy is removed."""
+    profiles, profile_dir, cron = _export_profile_fixture(tmp_path, monkeypatch)
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "n"}]}),
+                                    encoding="utf-8")
+    (cron / "runtime_state.db-wal").write_bytes(b"ghp_" + b"a" * 36)
+    out = profiles.export_profile("p", str(tmp_path / "export.tar.gz"))
+    names = _archive_names(out)
+    assert any(n.endswith("cron/jobs.json") for n in names)
+    assert not any("runtime_state.db" in n for n in names), names
+    assert (cron / "runtime_state.db-wal").exists()  # the live dir is never touched
+
+
+def test_profile_export_rereads_pair_when_db_retired_after_copytree(temp_home, tmp_path,
+                                                                    monkeypatch):
+    """4b5951846a0e: copytree stages jobs.json + db; then a runtime-export --retire (and a
+    definition change) lands before the pair capture. The archive must carry the live store as of
+    the capture, not copytree's two-moment pair."""
+    import shutil
+    import tarfile
+
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    profiles, profile_dir, cron = _export_profile_fixture(tmp_path, monkeypatch)
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "old"}]}),
+                                    encoding="utf-8")
+    rs.write_rows(cron, {"j1": {"last_status": "ok"}})
+    real_copytree = shutil.copytree
+
+    def copytree_then_retire(src, dst, *a, **kw):
+        out = real_copytree(src, dst, *a, **kw)
+        if str(src) == str(profile_dir):
+            with cj.use_cron_store(profile_dir):
+                cj.export_runtime_to_json(retire=True)
+            data = json.loads((cron / "jobs.json").read_text())
+            data["jobs"][0]["name"] = "new"
+            (cron / "jobs.json").write_text(json.dumps(data), encoding="utf-8")
+        return out
+
+    monkeypatch.setattr(shutil, "copytree", copytree_then_retire)
+    out = profiles.export_profile("p", str(tmp_path / "export.tar.gz"))
+    assert not rs.db_path(cron).exists()
+    with tarfile.open(out) as tf:
+        member = next(m for m in tf.getmembers() if m.name.endswith("cron/jobs.json"))
+        job = json.loads(tf.extractfile(member).read())["jobs"][0]
+        assert not any("runtime_state.db" in n for n in tf.getnames())
+    assert job["name"] == "new" and job["last_status"] == "ok"
+
+
+def test_kill_switch_refolds_orphan_once_its_definition_returns(temp_home, monkeypatch):
+    """6391b0c09102: the orphans-only cache is keyed on (db, jobs.json) identity. Re-adding a
+    definition for an orphan id changes jobs.json only; the next load must fold that row in."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    a = cj.create_job(prompt="x", schedule="every 5m", name="a")
+    b = cj.create_job(prompt="x", schedule="every 5m", name="b")
+    data = json.loads(_jobs_file(temp_home).read_text())
+    b_def = next(j for j in data["jobs"] if j["id"] == b["id"])
+    data["jobs"] = [j for j in data["jobs"] if j["id"] != b["id"]]
+    _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+    rs.write_rows(temp_home / "cron", {a["id"]: {"last_status": "ok"},
+                                       b["id"]: {"last_status": "kept-b"}})
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+    cj.load_jobs()
+    assert set(rs.read_all(temp_home / "cron")) == {b["id"]}  # B is an orphan, kept
+    data = json.loads(_jobs_file(temp_home).read_text())
+    data["jobs"].append(b_def)
+    _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+    jobs = {j["id"]: j for j in cj.load_jobs()}
+    assert jobs[b["id"]]["last_status"] == "kept-b"
+    assert not _db(temp_home).exists()

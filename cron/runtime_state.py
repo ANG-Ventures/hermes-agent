@@ -279,15 +279,24 @@ def transaction(cron_dir: Path) -> Iterator[sqlite3.Connection]:
 
 
 def _rows_of(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+    return _rows_and_unreadable(conn)[0]
+
+
+def _rows_and_unreadable(conn: sqlite3.Connection) -> tuple:
+    """``(rows, unreadable_ids)``: every row that parses to a JSON object, and the ids of the rows
+    that do not (counted, never silently dropped by a caller that deletes afterwards)."""
     out: Dict[str, Dict[str, Any]] = {}
+    bad: List[str] = []
     for job_id, fields in conn.execute("SELECT job_id, fields FROM job_runtime").fetchall():
         try:
             value = json.loads(fields)
         except (TypeError, ValueError):
-            continue
+            value = None
         if isinstance(value, dict):
             out[str(job_id)] = value
-    return out
+        else:
+            bad.append(str(job_id))
+    return out, sorted(bad)
 
 
 def read_row(conn: sqlite3.Connection, job_id: str) -> Optional[Dict[str, Any]]:
@@ -504,17 +513,19 @@ def _apply_entries(rows: Dict[str, Dict[str, Any]], entries: List[tuple]) -> Dic
     return {"upsert": upsert, "delete": deletes}
 
 
-def apply_pending(conn: sqlite3.Connection, gen: str, *, dirty: bool = False) -> int:
+def apply_pending(conn: sqlite3.Connection, gen: str) -> int:
     """Move generation *gen* into job_runtime (NULL fields = delete) and clear its journal rows.
     Each staged row is three-way merged against the row it was computed from and the row as it is
     NOW (same IMMEDIATE transaction), so a key a degraded-lock sibling wrote between the stage and
     this apply (a manual-run request, a heartbeat) survives unless this save changed that key.
-    Not marked dirty by default: the jobs.json that names *gen* already carries these rows."""
+    Bumps the mirror seq on any write (Prism 8f09e01d8cd4): a concurrent save that read seq before
+    this apply wrote a mirror without these rows, so it must not be able to mark the mirror clean.
+    The cost is at most one coalesced mirror rewrite per definition save."""
     entries = _pending_entries(conn, gen)
     current = {jid: row for jid, row in ((str(e[0]), read_row(conn, str(e[0]))) for e in entries)
                if row is not None}
     plan = _apply_entries(current, entries)
-    written = upsert_rows(conn, plan["upsert"], delete_ids=plan["delete"], dirty=dirty)
+    written = upsert_rows(conn, plan["upsert"], delete_ids=plan["delete"])  # dirty=True
     conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
     return written
 
@@ -545,7 +556,9 @@ def merged_jobs(jobs_file: Path, *, strict: bool = False,
     file_gen = data.get("runtime_gen") if isinstance(data, dict) else None
     rows: Dict[str, Dict[str, Any]] = {}
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30.0,
+        # as_uri() percent-encodes '#', '?', '%' and spaces in the path (Prism 943ffb5fb553): a raw
+        # f"file:{path}" would end the path at the first '#' or '?' and open a different file.
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=30.0,
                                isolation_level=None)
         try:
             conn.execute("BEGIN")

@@ -2196,20 +2196,38 @@ def _capture_cron_pair(profile_dir: Path, staged_cron: Path) -> None:
     under the profile's cron store lock, the db through the SQLite backup API (a raw copytree of a
     live WAL database can pair a main file with a -wal from a different moment, and a remove_job
     between the two copies pairs a definition with no row). The staged -wal/-shm are dropped (the
-    backup image owns none). Raises ValueError when the db cannot be captured (t_94e91559)."""
+    backup image owns none). Raises ValueError when the db cannot be captured (t_94e91559).
+
+    Whether the live db exists is decided UNDER the lock (Prism 4b5951846a0e): a runtime-export
+    that retired the db after copytree must not leave copytree's two-moment db/jobs.json pair for
+    the fold. Staged db files are always removed first, so a stray -wal/-shm with no main db
+    (Prism 789c2932efbe) never reaches the archive. Only the STAGED copy is touched."""
     from cron.runtime_state import DB_NAME
     from hermes_cli.backup import _cron_store_lock
     from hermes_cli.backup_sqlite import _safe_copy_db
 
     src_cron = profile_dir / "cron"
-    if not staged_cron.is_dir() or not (src_cron / DB_NAME).exists():
+    if not staged_cron.is_dir():
         return
     with _cron_store_lock(profile_dir):
+        staged_had_db = (staged_cron / DB_NAME).exists()
+        live_has_db = (src_cron / DB_NAME).exists()
+        if not staged_had_db:
+            stray = [n for n in (DB_NAME + "-wal", DB_NAME + "-shm") if (staged_cron / n).exists()]
+            if stray:
+                logger.warning("profile export: dropped stray %s (no %s) from the staged copy",
+                               ", ".join(stray), DB_NAME)
         for name in (DB_NAME, DB_NAME + "-wal", DB_NAME + "-shm"):
             with contextlib.suppress(FileNotFoundError):
                 (staged_cron / name).unlink()
+        if not (staged_had_db or live_has_db):
+            return  # the store never had a db: copytree's jobs.json is one consistent file
+        # A db was involved: the live jobs.json is re-read under the lock (a retire that ran after
+        # copytree folded the runtime into it), and paired with the db captured below if any.
         if (src_cron / "jobs.json").exists():
             shutil.copy2(src_cron / "jobs.json", staged_cron / "jobs.json")
+        if not live_has_db:
+            return
         if not _safe_copy_db(src_cron / DB_NAME, staged_cron / DB_NAME):
             raise ValueError(f"refusing export: could not capture {src_cron / DB_NAME} "
                              "consistently (SQLite backup failed)")
