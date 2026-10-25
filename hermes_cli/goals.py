@@ -1669,6 +1669,7 @@ class GoalManager:
         active_delegations: int = 0, real_event: bool = False, made_tool_calls: Optional[bool] = None,
         no_progress_turns: int = DEFAULT_NO_PROGRESS_TURNS, turn_effect: Optional[str] = None,
         user_spoke: bool = False, nudge_on_read_only_turns: bool = False,
+        checkin_minutes: float = DEFAULT_CHECKIN_MINUTES, max_checkins: int = DEFAULT_MAX_IDLE_CHECKINS,
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
@@ -1683,7 +1684,10 @@ class GoalManager:
         read/none turn the user did not author (``user_spoke``) still gets the judge's done/blocked/
         wait/budget verdicts but queues no continuation, and leaves ``turns_used``/``last_turn_at``/
         ``toolless_turns`` unchanged, so the idle check-in is the next nudge.
-        ``nudge_on_read_only_turns`` (config ``goals.nudge_on_read_only_turns``) disables the gate."""
+        ``nudge_on_read_only_turns`` (config ``goals.nudge_on_read_only_turns``) disables the gate.
+        A held turn is never the last word: when no idle check-in can follow it (``checkin_minutes``
+        is the gateway's config value; 0 means the idle poller is off; see ``_idle_checkin_can_follow``)
+        the continuation is queued anyway and the decision carries ``hold_overridden``."""
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
@@ -1760,10 +1764,13 @@ class GoalManager:
         if state.turns_used >= state.max_turns:
             return self._budget_pause(state, "continue", reason)
 
+        hold_overridden = None
         if not nudge_on_read_only_turns and not user_spoke and turn_effect in _NO_NUDGE_TURN_EFFECTS:
-            state.turns_used, state.last_turn_at = prior_turns_used, prior_last_turn_at
-            self._save()
-            return {**_decision("active", False, None, "continue", reason, ""), "held": turn_effect}
+            if self._idle_checkin_can_follow(prior_last_turn_at, checkin_minutes, max_checkins):
+                state.turns_used, state.last_turn_at = prior_turns_used, prior_last_turn_at
+                self._save()
+                return {**_decision("active", False, None, "continue", reason, ""), "held": turn_effect}
+            hold_overridden = f"held: {turn_effect}-only turn, no check-in configured"
 
         if made_tool_calls is not None:
             state.toolless_turns = 0 if made_tool_calls else state.toolless_turns + 1
@@ -1777,10 +1784,27 @@ class GoalManager:
                 )
 
         self._save()
-        return _decision(
+        decision = _decision(
             "active", True, self.next_continuation_prompt(), "continue", reason,
             f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",
         )
+        if hold_overridden:
+            decision["hold_overridden"] = hold_overridden
+        return decision
+
+    def _idle_checkin_can_follow(self, last_turn_at: float, checkin_minutes: float, max_checkins: int) -> bool:
+        """Whether ``idle_wake_prompt`` will ever wake this goal after a held turn. Mirrors its gates:
+        the gateway poller runs only with a positive config interval, the goal's own interval wins,
+        the check-in budget, and the stale horizon."""
+        s = self._state
+        if s is None or not checkin_minutes or checkin_minutes <= 0:
+            return False
+        minutes = s.checkin_minutes if s.checkin_minutes >= 0 else checkin_minutes
+        if not minutes or minutes <= 0 or s.idle_wakes >= max(0, int(max_checkins)):
+            return False
+        interval = minutes * 60 * min(2 ** s.idle_wakes, _CHECKIN_BACKOFF_CAP)
+        base = max(last_turn_at, s.last_idle_wake_at, s.created_at)
+        return interval <= _IDLE_WAKE_HORIZON_S and time.time() - base <= _IDLE_WAKE_HORIZON_S
 
     def idle_wake_prompt(
         self, now: Optional[float] = None, *, checkin_minutes: float = DEFAULT_CHECKIN_MINUTES,

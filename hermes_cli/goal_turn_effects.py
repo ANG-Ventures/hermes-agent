@@ -199,6 +199,16 @@ def classify_turn_effect(messages: Iterable[Dict[str, Any]]) -> str:
     return TURN_EFFECT_READ if seen else TURN_EFFECT_NONE
 
 
+def turn_effect_for_result(agent_result: Dict[str, Any], messages: List[Dict[str, Any]]) -> Optional[str]:
+    """The effect of the turn behind a gateway agent result, or None (unknown) when the run compacted
+    the session: the compacted message list no longer marks where this turn began (a folded todo
+    snapshot is a synthetic user row after retained tool calls), so earlier writes could be lost and
+    a required continuation suppressed. Unknown is never held."""
+    if agent_result.get("compacted_during_turn"):
+        return None
+    return classify_turn_effect(current_turn_messages(messages, agent_result.get("history_offset")))
+
+
 def current_turn_messages(messages: List[Dict[str, Any]], history_offset: Optional[int]) -> List[Dict[str, Any]]:
     """This turn's slice of an agent result: past ``history_offset`` when it is usable, else after
     the last user message (compaction resets the offset to 0)."""
