@@ -221,19 +221,24 @@ class SessionTurnLeaseRegistry:
         max_entries: int = DEFAULT_MAX_LEASES,
         *,
         is_generation_current: Optional[Callable[[str, int], bool]] = None,
+        is_generation_invalidated: Optional[Callable[[str, int], bool]] = None,
         stale_wait: float = DEFAULT_STALE_LEASE_WAIT,
     ) -> None:
         self._leases: Dict[str, _SessionLease] = {}
         self._max_entries = max(1, int(max_entries))
-        # Predicate supplied by the gateway runner
-        # (``GatewayRunner._is_session_run_current``) answering "is this
-        # holder's (routing key, generation) still the session's current
-        # run?". False means the holder was already /stop'd or /new'd and is
-        # merely draining — a ZOMBIE, not a live alias-key turn. Optional so
-        # the registry stays usable standalone (tests, embedders): with no
-        # predicate every holder is treated as live, i.e. the pre-fix
-        # behavior.
+        # Predicates supplied by the gateway runner. ``is_generation_invalidated``
+        # (``GatewayRunner._is_session_run_invalidated``) answers "was this
+        # holder's (routing key, generation) explicitly INVALIDATED by /stop,
+        # /new, reset or eviction?" — True means the holder is merely draining,
+        # a ZOMBIE, not a live turn. It is the authoritative stale test.
+        # ``is_generation_current`` is the pre-t_d659b247 predicate kept as the
+        # fallback for embedders that supply only it: "not current" then reads
+        # as stale, which conflates a holder SUPERSEDED by a later inbound's own
+        # generation bump (a live turn still flushing) with a stopped one — the
+        # 2026-10-24 incident. Both optional so the registry stays usable
+        # standalone: with no predicate every holder is treated as live.
         self._is_generation_current = is_generation_current
+        self._is_generation_invalidated = is_generation_invalidated
         self._stale_wait = (
             float(stale_wait) if stale_wait and stale_wait > 0
             else DEFAULT_STALE_LEASE_WAIT
@@ -256,19 +261,30 @@ class SessionTurnLeaseRegistry:
             self._leases.pop(sid, None)
 
     def _holder_is_stale(self, holder: Optional[TurnLeaseToken]) -> bool:
-        """True when ``holder``'s run generation is no longer current.
+        """True when ``holder``'s run generation was explicitly INVALIDATED.
 
-        A stale holder is a turn whose generation was invalidated by /stop or
-        /new while its thread was still parked in a tool call — the zombie
-        case. Fail-open: with no predicate, or if the predicate raises, treat
-        the holder as LIVE so a predicate bug can never shorten the wait for a
+        A stale holder is a turn whose generation was invalidated by /stop,
+        /new, reset or eviction while its thread was still parked in a tool
+        call — the zombie case. A holder merely SUPERSEDED by a later inbound's
+        ``_begin_session_run_generation`` is NOT stale: it is a live turn (in
+        the 2026-10-24 incident, one still persisting + delivering its reply)
+        and the waiter is ordinary contention. With only the legacy
+        ``is_generation_current`` predicate the two are indistinguishable and
+        "not current" reads as stale (pre-fix semantics, kept for embedders).
+        Fail-open: with no predicate, or if the predicate raises, treat the
+        holder as LIVE so a predicate bug can never shorten the wait for a
         genuinely-running turn.
         """
-        predicate = self._is_generation_current
-        if holder is None or predicate is None:
+        if holder is None:
             return False
+        invalidated = self._is_generation_invalidated
         try:
-            return not bool(predicate(holder.owner_key, holder.generation))
+            if invalidated is not None:
+                return bool(invalidated(holder.owner_key, holder.generation))
+            current = self._is_generation_current
+            if current is None:
+                return False
+            return not bool(current(holder.owner_key, holder.generation))
         except Exception:
             logger.debug("turn lease currency predicate failed", exc_info=True)
             return False

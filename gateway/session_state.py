@@ -76,6 +76,12 @@ class PersistentState:
     # Legacy runner-level pending text (flushed on shutdown); not the adapter-level one.
     pending_command_text: Optional[str] = None
     run_generation: int = 0  # monotonic; NEVER reset (stale-run detection depends on it)
+    # Highest run generation explicitly INVALIDATED (/stop, /new, reset, eviction via
+    # ``_invalidate_session_run_generation``). A generation <= this is "stopped and draining"; a
+    # generation above it that is merely no longer current was SUPERSEDED by a later inbound's own
+    # ``_begin_session_run_generation`` and is a live turn (t_d659b247: the turn-lease stale test
+    # must read this, not currency, or a turn still flushing its reply is treated as a zombie).
+    invalidated_run_generation: int = 0
     # Consecutive hygiene compression failures (the in-agent ladder is unreachable: hygiene builds
     # a FRESH AIAgent per run).  Reset on success; process-local, mirrored to the DB by run.py.
     # Monotonic run-generation counter (#28686). NEVER reset: clearing it would break stale-run detection.

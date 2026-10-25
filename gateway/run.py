@@ -4710,8 +4710,11 @@ class GatewayRunner(
         self._turn_leases = SessionTurnLeaseRegistry(
             # Lets acquire() tell a genuinely-live alias-key holder apart from a /stop'd turn still
             # draining a tool call; without it the registry blames alias routing keys for every wait
-            # and the zombie case is invisible (2026-09-20 incident).
+            # and the zombie case is invisible (2026-09-20 incident). Staleness is INVALIDATION
+            # (/stop, /new, reset, eviction), not mere non-currency: a holder superseded by a later
+            # inbound's generation bump is a live turn still flushing (t_d659b247, 2026-10-24).
             is_generation_current=self._is_session_run_current,
+            is_generation_invalidated=self._is_session_run_invalidated,
             stale_wait=_float_env("HERMES_STALE_LEASE_WAIT", DEFAULT_STALE_LEASE_WAIT),
         )
         # Stall-notified keys clear when pending clears / activity resumes / conversation boundary.
