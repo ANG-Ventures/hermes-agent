@@ -121,8 +121,11 @@ def _assignments(scope: ast.AST) -> dict[str, list[ast.AST]]:
 
 # Modules whose functions receive the state.db path as a plain ``db_path`` (Prism 230be3dd449d): there,
 # a ``db_path`` argument names state.db too. Elsewhere ``db_path`` is any database (kanban.db, ...).
-_STATE_DB_PATH_MODULES = re.compile(r"^(hermes_state[a-z_]*\.py|tui_gateway/change_watcher\.py)$")
-_DB_PATH_NAME = re.compile(r"^(db_path|tracking_path)$")
+_STATE_DB_PATH_MODULES = re.compile(
+    r"^(hermes_state[a-z_]*\.py|tui_gateway/change_watcher\.py|hermes_cli/backup_sqlite\.py)$")
+# generic path names that carry state.db in those modules (backup_sqlite copies state.db as ``src``,
+# Prism 95ebc4a81ebe)
+_DB_PATH_NAME = re.compile(r"^(db_path|tracking_path|src|source)$")
 
 
 def _names_state_db(expr: ast.AST, assigns: dict[str, list[ast.AST]], seen: set | None = None,
@@ -181,6 +184,7 @@ _REGISTERED_IN_CODE: dict[tuple[str, str], str] = {
     ("hermes_state_repair.py", "_connect_repair_durable"): "token bound to the tracked close()",
     ("tui_gateway/change_watcher.py", "_session_db_content_sig"): "register before the try, unregister after close in finally",
     ("hermes_state_dbfile.py", "collect_state_db_stats"): "register before the connect, unregister after close in finally",
+    ("hermes_cli/backup_sqlite.py", "_safe_copy_db"): "_register_reader before the source connect, _unregister_reader after its close in finally",
 }
 
 

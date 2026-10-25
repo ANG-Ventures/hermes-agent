@@ -1001,3 +1001,137 @@ def test_surplus_descriptor_on_a_replaced_path_is_tracked_and_closed(tmp_path):
     for fd in (first, surplus):
         with pytest.raises(OSError):
             os.fstat(fd)
+
+
+def test_failed_pool_close_keeps_the_reader_token(tmp_path, monkeypatch):
+    """Prism 6ed61d49912e: a read-pool/read-only connection whose close() raised may still be open; its
+    reader registration must stay (pinned), never be dropped as if it had closed."""
+    pin_wal(monkeypatch)
+    sdb = make_db(tmp_path / "state.db", "s", "seed")
+    try:
+        key = ("path", os.path.abspath(sdb.db_path))
+
+        class _Failing:
+            def close(self):
+                raise RuntimeError("cross-thread close")
+
+        conn = _Failing()
+        token = lg.register_reader(sdb.db_path)
+        sdb.__dict__.setdefault("_reader_tokens", {})[id(conn)] = token
+        before = lg._READERS.get(key, 0)
+        sdb._close_conn_logged(conn, "test conn")
+        assert lg._READERS.get(key, 0) == before, "a failed close dropped the reader token"
+        lg.unregister_reader(token)
+    finally:
+        sdb.close()
+
+
+def test_writer_held_before_shm_existed_still_pins_the_new_shm(tmp_path):
+    """Prism 1de1d88b5bec: A holds the db before -shm exists (counted on state.db only); -shm appears;
+    B holds both and closes. B's retire() must keep the -shm fd while A is still open."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    a = lg.hold(db)
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
+    shm_ident = _ident(shm)
+    assert shm_ident not in a
+    b = lg.hold(db)
+    assert shm_ident in b
+    lg.retire(lg.release(b))
+    try:
+        assert shm_ident in lg._FDS, "B's close retired the -shm fd under writer A"
+    finally:
+        lg.retire(lg.release(a))
+    assert shm_ident not in lg._FDS
+
+
+def test_externally_unlinked_shm_with_a_live_connection_is_not_retired(tmp_path):
+    """Prism 24d6965d4428: -shm unlinked from outside while a connection here still uses the inode is a
+    LIVE deleted generation: retire_completed_shm() must keep the private fd (and the probe still sees
+    the deleted holder). After that connection closes, it is retired."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
+    shm_ident = _ident(shm)
+    with lg.registered_reader(db):
+        held = lg.hold(db)
+        lg.retire(lg.release(held))  # the -shm fd stays: the registered reader pins it
+    live = os.open(shm, os.O_RDONLY)  # a live in-process user of the inode (stands in for SQLite's fd)
+    try:
+        held = lg.hold(db)
+        closing = lg.release(held)
+        os.unlink(shm)  # external removal
+        with lg.registered_reader(db):  # keep the private fd from the normal retire path
+            lg.retire(closing)
+            lg.retire_completed_shm()
+            assert shm_ident in lg._FDS, "a live deleted generation's private fd was closed"
+    finally:
+        os.close(live)
+    lg.retire_completed_shm()
+    assert shm_ident not in lg._FDS
+
+
+def test_backup_source_is_a_registered_reader(tmp_path, monkeypatch):
+    """Prism 95ebc4a81ebe: _safe_copy_db's source connection holds a WAL read transaction for the whole
+    copy; it must be a registered reader from before its connect until after its close."""
+    import sqlite3
+    from hermes_cli import backup_sqlite as bs
+    src = tmp_path / "state.db"
+    c = sqlite3.connect(src)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("CREATE TABLE t(x)")
+    c.commit()
+    c.close()
+    key = ("path", str(src))
+    seen = []
+    real = sqlite3.connect
+
+    def _connect(target, *a, **k):
+        if "state.db" in str(target) and "dst" not in str(target):
+            seen.append(lg._READERS.get(key, 0))
+        return real(target, *a, **k)
+
+    monkeypatch.setattr(sqlite3, "connect", _connect)
+    assert bs._safe_copy_db(src, tmp_path / "dst.db")
+    assert seen and all(n >= 1 for n in seen), seen
+    assert key not in lg._READERS
+
+
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_inherited_hold_record_never_releases_a_child_claim(tmp_path):
+    """Prism bf7314233ba1: a hold() record taken before fork() and released in the child must not
+    decrement the child's own fresh claim on the same inodes."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
+    parent = lg.hold(db)
+    try:
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                child = lg.hold(db)
+                lg.release(parent)  # an inherited SessionDB closing in the child
+                ok = all(lg._HANDLES.get(i) == 1 for i in child)
+                lg.retire()
+                ok = ok and all(i in lg._FDS for i in child)
+                lg.retire(lg.release(child))
+                os.write(w, b"ok" if ok else repr(dict(lg._HANDLES)).encode()[:200])
+            finally:
+                os._exit(0)
+        os.close(w)
+        out = os.read(r, 256).decode()
+        os.close(r)
+        os.waitpid(pid, 0)
+        assert out == "ok", f"inherited hold record released the child's claim: {out}"
+    finally:
+        lg.retire(lg.release(parent))
