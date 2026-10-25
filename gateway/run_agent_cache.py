@@ -1180,6 +1180,11 @@ class GatewayAgentCacheMixin:
         if hasattr(agent, "_db_flush_scan_prefix"):
             agent._db_flush_scan_prefix = None
 
+    def _cached_agent_count(self) -> int:
+        """Live entries in the agent cache. Read lock-free by the runtime-status writer thread's
+        lcm_db_fds gauge (``len`` of an OrderedDict is atomic under the GIL)."""
+        return len(getattr(self, "_agent_cache", None) or ())
+
     def _agent_cache_bounds(self):
         """Operator-configured agent-cache bounds, resolved once per process (lazily, not in
         ``__init__``, so ``__new__``-constructed test / slash-command runners work too)."""

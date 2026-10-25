@@ -556,6 +556,21 @@
    "verdict": "kept",
    "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
    "where": "hermes_cli/kanban_worktree_port.py:73 read_mirrors"
+  },
+  "hermes_cli/kanban_db.py::complete_task::fold::repo::own_keys = {(r.repo.lower(), r.number) for r in _open_pr.split_fleet(_open_pr.extract_pr_refs(": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
+   "where": "hermes_cli/kanban_db.py:10921 complete_task (pre-PR verifier own-PR filter, t_7ff229a7)"
+  },
+  "hermes_cli/kanban_db.py::complete_task::fold::repo::own_keys |= {(r.repo.lower(), r.number) for r in branch_owned_prs}": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
+   "where": "hermes_cli/kanban_db.py:10923 complete_task (pre-PR verifier own-PR filter, t_7ff229a7)"
+  },
+  "hermes_cli/kanban_db.py::complete_task::fold::repo::[r for r in still_open if (r.repo.lower(), r.number) in own_keys],": {
+   "verdict": "kept",
+   "why": "GitHub owner/repo names are case-insensitive (GitHub resolves ANG-Ventures/x and ang-ventures/x to one repo), so the folded repo (or (repo, number) tuple) IS the canonical key; byte-exact would split one repo/PR in two.",
+   "where": "hermes_cli/kanban_db.py:10925 complete_task (pre-PR verifier own-PR filter, t_7ff229a7)"
   }
  }
 }

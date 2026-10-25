@@ -200,16 +200,17 @@ def _reap(proc):
             pipe.close()
 
 
-def _spawn_network(argv, **kwargs):
+def _spawn_network(argv, *, cwd, **kwargs):
     """POSIX: a new session, so `_kill_group` can killpg it. Windows: a Job
     Object, assigned while the child is still suspended, so nothing it starts
-    can escape `_kill_group`."""
+    can escape `_kill_group`. `cwd` is required: the survivor path never runs
+    a subprocess in the caller's cwd."""
     if _POSIX_GROUPS:
-        return subprocess.Popen(argv, start_new_session=True, **kwargs)
+        return subprocess.Popen(argv, start_new_session=True, cwd=cwd, **kwargs)
     from hermes_cli._subprocess_compat import windows_hide_flags
     from hermes_cli.local_runtime.processes import spawn_server
 
-    proc, job = spawn_server(argv, creationflags=windows_hide_flags(), **kwargs)
+    proc, job = spawn_server(argv, creationflags=windows_hide_flags(), cwd=cwd, **kwargs)
     proc._kanban_job = job
     return proc
 

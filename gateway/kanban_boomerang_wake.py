@@ -1371,9 +1371,19 @@ async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional
         return 0
     now = _time.time() if now is None else now
     handled = 0
-    for key, entry in (await asyncio.to_thread(state.claims)).items():
+    claims = await asyncio.to_thread(state.claims)
+    for key, entry in claims.items():
         st = entry.get("state")
         if st not in OPEN_STATES or entry.get("resurfaced"):
+            continue
+        successor = _restart_successor(key, claims)
+        if successor:
+            # The gateway stopped between persisting the restart redispatch and closing this claim
+            # (Prism P1 4623a20b225a): the successor owns the wake, so close this one quietly.
+            await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome="redispatched_after_restart",
+                                    redispatched_as=successor, finished_at=_time.time())
+            logger.info("kanban boomerang-wake: %s claim %s closed, superseded by restart redispatch %s",
+                        entry.get("task_id"), key, successor)
             continue
         if _alive(key):
             if st == STATE_CANCELLED:
@@ -1470,6 +1480,13 @@ def _restart_refusal(entry: dict, state: BoomerangWakeState, now: float) -> Opti
     if not entry.get("status") or card_snapshot(entry.get("board"), entry["task_id"])["status"] != entry["status"]:
         return "card moved"
     return None
+
+
+def _restart_successor(key: str, claims: dict) -> Optional[str]:
+    """The ``<key>#restartN`` claim a restart redispatch created for ``key``, if any (newest N)."""
+    prefix = f"{key}#restart"
+    found = [k for k in claims if k.startswith(prefix) and k[len(prefix):].isdigit()]
+    return max(found, key=lambda k: int(k[len(prefix):])) if found else None
 
 
 async def _restart_redispatch_or_lost(runner: Any, entry: dict, state: BoomerangWakeState, now: float) -> None:

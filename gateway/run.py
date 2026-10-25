@@ -4787,6 +4787,9 @@ class GatewayRunner(
         # Value: (AIAgent, config_signature); LRU cap in _enforce_agent_cache_cap, TTL in expiry watcher.
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = threading.Lock()
+        with suppress(Exception):  # lcm_db_fds gauge denominator (t_0d987578)
+            from gateway.status import set_cached_agents_source
+            set_cached_agents_source(self._cached_agent_count)
         # Launch-time identity of the profile that owns ``self.adapters``; ``_authorization_adapter``
         # compares against this rather than the per-turn ``_active_profile_name()``. A multiplex
         # host's primary map is always the default profile, even when a named profile launched

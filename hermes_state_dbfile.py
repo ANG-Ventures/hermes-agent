@@ -5,6 +5,27 @@ holder scans, quarantine of zeroed databases, ``collect_state_db_stats`` and
 holder-process classification.  Helpers that hermes_state itself imports and
 calls (``_connect_tracked_db`` & co) are looked up lazily from ``hermes_state`` at
 call time, so tests that monkeypatch ``hermes_state.<name>`` keep intercepting.
+
+Open-path deleted-WAL check (t_69e10010): :func:`refuse_deleted_wal_generation` runs on every
+writable ``SessionDB`` open, before ``sqlite3.connect``.  It used to enumerate the whole fd
+table (``/proc/*/fd`` on Linux, libproc on macOS: one listdir plus one stat per descriptor).
+Every stat releases the GIL, so with 20-30 GIL-busy gateway threads each descriptor waited a
+full switch interval to get it back: a live gateway thread dump on 2026-10-24 caught one open
+scanning ~500 fds, and a standalone repro measured 2.9 s with 4 busy threads and 16-28 s with
+12, while the open held the startup lock so every other opener queued behind it.  The default
+check now consults an in-process registry of live writers (:func:`register_live_writer`): each
+writable ``SessionDB`` records the ``(st_dev, st_ino)`` of its -wal/-shm at open, and the
+refusal compares those recorded generations with what the paths name now (a few ``stat``
+calls, no fd enumeration).  The registry sees writers in THIS process only, so the default
+(``HERMES_STATE_DELETED_WAL_CHECK=registry+scan``) still runs the cross-process scan after it:
+a foreign holder of a deleted generation is refused at open, as before.  What removed the stall
+is that the open path no longer runs per call: the kanban notifier's ``_session_origin`` (all
+2,002 ``SessionDB.__init__`` samples in a 30 s py-spy window) now reuses one handle, and the
+remaining opens are rare (process start, reopen after a lost generation).  ``registry`` checks
+in-process writers only (no scan; a foreign writer then detects its own lost generation on its
+next write via ``_wal_generation_was_lost`` and halts), ``scan`` is the old behaviour, and
+``off`` skips the check entirely.  The scan also stays available for diagnostics
+(``iter_deleted_sqlite_sidecar_holders``, ``hermes doctor``).
 """
 
 from __future__ import annotations
@@ -353,12 +374,114 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
     return holders
 
 
+# ── In-process registry of live writers' sidecar generations (t_69e10010) ───────────────────────
+#
+# A writable SessionDB registers itself after a successful open; its ``_db_sidecar_identity`` is
+# read live at check time, so a maintenance reopen or an adopted generation needs no extra hook.
+# Weak references: a forgotten handle must not be kept alive by the registry.  When close()
+# RETIRES a handle unclosed (lost generation, connection pinned until exit), the handle still
+# holds the old descriptors, so its recorded identity is kept as a strong snapshot instead.
+_LIVE_WRITERS_LOCK = threading.Lock()
+_LIVE_WRITERS: "weakref.WeakSet" = None  # created lazily below (weakref import kept local)
+_RETAINED_SIDECAR_GENERATIONS: "List[Tuple[str, Dict[str, tuple]]]" = []
+
+DELETED_WAL_CHECK_ENV = "HERMES_STATE_DELETED_WAL_CHECK"
+_DELETED_WAL_CHECK_DEFAULT = "registry+scan"
+_DELETED_WAL_CHECK_MODES = ("registry+scan", "registry", "scan", "off")
+
+
+def _live_writers():
+    global _LIVE_WRITERS
+    if _LIVE_WRITERS is None:
+        import weakref
+        _LIVE_WRITERS = weakref.WeakSet()
+    return _LIVE_WRITERS
+
+
+def register_live_writer(owner) -> None:
+    """Record a writable SessionDB as a live holder of its sidecar generation."""
+    with _LIVE_WRITERS_LOCK:
+        _live_writers().add(owner)
+
+
+def unregister_live_writer(owner) -> None:
+    """Drop *owner* on close.  A handle retired unclosed still holds its recorded sidecar
+    descriptors (they are pinned until process exit), so that identity is retained."""
+    identity = dict(getattr(owner, "_db_sidecar_identity", None) or {})
+    with _LIVE_WRITERS_LOCK:
+        _live_writers().discard(owner)
+        if identity and getattr(owner, "_connection_pinned", False):
+            _RETAINED_SIDECAR_GENERATIONS.append((os.fspath(owner.db_path), identity))
+
+
+def _registry_key(db_path) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(db_path))))
+
+
+def _iter_registry_sidecar_holders(db_path) -> List[Tuple[int, str]]:
+    """In-process holders of a deleted/replaced sidecar generation for *db_path*, decided from the
+    identities live writers recorded at open: no fd-table enumeration, only ``stat`` of the
+    watched paths.  Same verdict as the scan (:func:`_identity_is_truly_unlinked`)."""
+    key = _registry_key(db_path)
+    # Only copy references under the lock.  The strong snapshot ``owners`` may hold the last
+    # reference to a handle; dropping it would run SessionDB.__del__ -> close() ->
+    # unregister_live_writer(), which takes this non-reentrant lock.  So attributes are read and
+    # the snapshot is released only after the lock is gone.
+    with _LIVE_WRITERS_LOCK:
+        owners = list(_live_writers())
+        retained = list(_RETAINED_SIDECAR_GENERATIONS)
+    candidates = [(getattr(owner, "db_path", None), dict(getattr(owner, "_db_sidecar_identity", None) or {}))
+                  for owner in owners]
+    del owners
+    candidates.extend(retained)
+    holders: List[Tuple[int, str]] = []
+    pid = os.getpid()
+    for path, identity in candidates:
+        if path is None or not identity or _registry_key(path) != key:
+            continue
+        base = os.path.abspath(os.fspath(path))
+        for suffix, ident in identity.items():
+            watched = base + suffix
+            if _identity_is_truly_unlinked(tuple(ident), watched):
+                holders.append((pid, watched))
+    return holders
+
+
+def _deleted_wal_check_mode() -> str:
+    raw = (os.environ.get(DELETED_WAL_CHECK_ENV) or "").strip().lower()
+    if not raw:
+        return _DELETED_WAL_CHECK_DEFAULT
+    if raw not in _DELETED_WAL_CHECK_MODES:
+        logger.warning("%s=%r is not one of %s; using %r",
+                       DELETED_WAL_CHECK_ENV, raw, "|".join(_DELETED_WAL_CHECK_MODES),
+                       _DELETED_WAL_CHECK_DEFAULT)
+        return _DELETED_WAL_CHECK_DEFAULT
+    return raw
+
+
 def refuse_deleted_wal_generation(db_path) -> None:
     """Raise if any process holds a deleted WAL/SHM generation for *db_path*; called
-    *before* ``sqlite3.connect`` so a second opener cannot mint a replacement WAL inode."""
+    *before* ``sqlite3.connect`` so a second opener cannot mint a replacement WAL inode.
+
+    ``HERMES_STATE_DELETED_WAL_CHECK``: ``registry+scan`` (default) consults this process's live
+    writers first (no descriptor enumeration), then runs the cross-process fd-table scan;
+    ``registry`` checks in-process writers only (see the module docstring); ``scan`` runs the
+    fd-table scan only; ``off`` skips the check."""
     from hermes_state import DeletedWalGenerationError
     from hermes_state_errors import _DELETED_WAL_GENERATION_MSG
-    if not iter_deleted_sqlite_sidecar_holders(db_path):
+    mode = _deleted_wal_check_mode()
+    if mode == "off":
+        return
+    holders: List[Tuple[int, str]] = []
+    if mode in ("registry+scan", "registry"):
+        try:
+            holders = _iter_registry_sidecar_holders(db_path)
+        except Exception as exc:  # same fail-open stance as the scan
+            logger.debug("deleted-WAL registry check failed for %s: %s", db_path, exc)
+            holders = []
+    if not holders and mode in ("registry+scan", "scan"):
+        holders = iter_deleted_sqlite_sidecar_holders(db_path)
+    if not holders:
         return
     logger.error(_DELETED_WAL_GENERATION_MSG)
     raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)
