@@ -876,6 +876,26 @@ def acknowledge_event_outbox(
 
 
 @_producer_scoped
+def admit_event_outbox(evt: Dict[str, Any], *, session_key: str, session_id: str = "") -> bool:
+    """Gateway wake admitted (queued/steered), not yet consumed: the JSON outbox goes ``admitted``
+    so the consumption sweeper can confirm or re-inject it (t_97a879af). False = no JSON receipt."""
+    if evt.get("type") not in {"async_delegation", "async_delegation_restarted"}:
+        return False
+    event_id = str(evt.get("event_id") or "")
+    if not event_id:
+        return False
+    profile_home = evt.get("_registry_profile_home")
+    return _store.admit(event_id, boot_id=current_boot_id(), session_key=session_key,
+                        session_id=session_id, profile_home=Path(profile_home) if profile_home else None)
+
+
+def admission_receipt_needle(evt: Dict[str, Any]) -> str:
+    """The text a consuming turn's persisted user row must contain (the rendered banner tag)."""
+    delegation_id = str(evt.get("delegation_id") or "")
+    return f"— {delegation_id}]" if delegation_id else ""
+
+
+@_producer_scoped
 def complete_event_delivery(evt: Dict[str, Any], claim_id: Optional[str]) -> None:
     """Record consumer acceptance, not completion of the resulting model turn."""
     try:

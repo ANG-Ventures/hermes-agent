@@ -1525,6 +1525,22 @@ class SessionMessagesMixin:
             (session_id, -1 if limit is None else limit, offset, session_id),
         ).fetchall()
 
+    def user_message_contains(self, session_ids: List[str], needle: str, *, since: float = 0.0,
+                              session_key: str = "") -> bool:
+        """True when any user row (any active state) at or after ``since`` contains ``needle``, in
+        ``session_ids`` or in a session of ``session_key`` started since: the consumption receipt for
+        an admitted gateway wake (t_97a879af)."""
+        ids = [sid for sid in session_ids if sid]
+        if session_key:
+            ids += [row[0] for row in self._read_all(
+                "SELECT id FROM sessions WHERE session_key = ? AND started_at >= ?", (session_key, since))]
+        if not ids or not needle:
+            return False
+        row = self._read_one(
+            f"SELECT 1 FROM messages WHERE session_id IN ({_placeholders(ids)}) AND role = 'user'"
+            " AND timestamp >= ? AND instr(content, ?) > 0 LIMIT 1", (*ids, since, needle))
+        return row is not None
+
     def display_message_count(self, session_id: str) -> int:
         """Rows a display read of this segment paints: one per ``display_order`` group of
         ``_display_rows_from_conn``'s set. Unindexed legacy rows count as one group (the read
