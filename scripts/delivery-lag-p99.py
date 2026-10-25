@@ -62,7 +62,7 @@ def samples(lines, platform: str, unpaired=None):
     sends that could not be paired are appended to *unpaired* when given."""
     unpaired = [] if unpaired is None else unpaired
     pending = {}  # (platform, chat) -> (ready epoch, turn id or None): the LAST ready only
-    by_turn = {}  # turn id -> ((platform, chat), ready epoch)
+    by_turn = {}  # (platform, chat, turn id) -> ready epoch: two chats may reuse one turn id (Prism dceb77e823cc)
 
     def wanted(key):
         return platform == "all" or key[0] == platform
@@ -77,7 +77,7 @@ def samples(lines, platform: str, unpaired=None):
         if m:
             key = (m.group(1).lower(), m.group(2))
             if turn is not None:
-                by_turn[turn] = (key, ts)
+                by_turn[key + (turn,)] = ts
             prev = pending.get(key)
             if prev is not None and prev[1] is None and wanted(key):
                 unpaired.append(prev[0])  # superseded with no turn id: never paired with a later send
@@ -88,13 +88,12 @@ def samples(lines, platform: str, unpaired=None):
             continue
         key = (m.group(1).lower(), m.group(2))
         ready = None
-        if turn is not None and turn in by_turn:
-            # Same chat only (Prism 5d7636b702b4): a turn id seen on another chat's ready is not this
-            # send's; it stays pending for its own send and this send counts unpaired.
-            if by_turn[turn][0] == key:
-                rkey, ready = by_turn.pop(turn)
-                if pending.get(rkey, (None, None))[1] == turn:
-                    pending.pop(rkey)
+        if turn is not None and key + (turn,) in by_turn:
+            # Same chat only (Prism 5d7636b702b4, dceb77e823cc): the lookup key carries the chat, so
+            # another chat's ready with the same turn id is neither taken nor overwritten.
+            ready = by_turn.pop(key + (turn,))
+            if pending.get(key, (None, None))[1] == turn:
+                pending.pop(key)
         else:
             entry = pending.get(key)
             # Chat fallback only when at least one side has no turn id: a ready carrying a DIFFERENT
@@ -103,7 +102,7 @@ def samples(lines, platform: str, unpaired=None):
                 pending.pop(key)
                 ready = entry[0]
                 if entry[1] is not None:
-                    by_turn.pop(entry[1], None)
+                    by_turn.pop(key + (entry[1],), None)
         if not wanted(key):
             continue
         lag = _LAG.search(line)
@@ -114,7 +113,7 @@ def samples(lines, platform: str, unpaired=None):
         else:
             unpaired.append(ts)
     unpaired.extend(ts for key, (ts, t) in pending.items() if t is None and wanted(key))
-    unpaired.extend(ts for key, ts in by_turn.values() if wanted(key))
+    unpaired.extend(ts for tkey, ts in by_turn.items() if wanted(tkey[:2]))
 
 
 def pct(sorted_vals, q: float) -> float:

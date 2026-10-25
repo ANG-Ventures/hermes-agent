@@ -265,6 +265,20 @@ def test_turn_id_pairs_only_within_the_same_chat(tmp_path, capsys):
     assert rc == 0 and (out["n"], out["max_s"], out["unpaired"]) == (1, 30.0, 1), out
 
 
+def test_same_turn_id_in_two_chats_keeps_both_readies(tmp_path, capsys):
+    """Prism dceb77e823cc: chat 2's ready for turn t1 overwrote chat 1's, so chat 1's 30 s send was
+    dropped and a 5 s gate PASSed on p99=1 s. Readies are keyed by (platform, chat, turn)."""
+    _LAST[:] = [capsys]
+    mod = _script()
+    rc, out = _run(mod, tmp_path,
+        "2026-10-24 14:00:00,000 INFO x: response ready: platform=discord chat=1 turn=t1 time=1.0s\n"
+        "2026-10-24 14:00:10,000 INFO x: response ready: platform=discord chat=2 turn=t1 time=1.0s\n"
+        "2026-10-24 14:00:11,000 INFO x: [discord] Sending response (10 chars) to 2 turn=t1\n"
+        "2026-10-24 14:00:30,000 INFO x: [discord] Sending response (10 chars) to 1 turn=t1\n",
+        "--max-p99-s", "5")
+    assert rc == 1 and (out["n"], out["p99_s"], out["unpaired"]) == (2, 30.0, 0), out
+
+
 def test_dst_fall_back_hours_stay_separate(tmp_path, monkeypatch, capsys):
     """Prism fdd03dbb8e37: 08:30Z and 09:30Z on 2026-11-01 are both 01:30 in Los Angeles; a local-time
     hour key merged them into one summary."""
