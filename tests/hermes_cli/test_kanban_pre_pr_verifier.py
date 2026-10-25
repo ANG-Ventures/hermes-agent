@@ -189,3 +189,39 @@ def test_verifier_runs_with_the_assignee_profile_env(kanban_home, tmp_path, monk
     dump.unlink()
     assert kb._pre_pr_refusals(op.extract_pr_refs(PR), task_id="t_x", worker="ghost") == []
     assert not dump.exists()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("answers_for", ["daedalus-token", "launch-token"])
+def test_candidate_query_runs_as_the_assignee(kanban_home, tmp_path, monkeypatch, answers_for):
+    """Prism 2125185a24e1: the open-PR candidate set is read with the SAME assignee env the verifier gets. A fake gh
+    404s under the launch identity (another profile's token in a multiplexed gateway) and answers under the
+    assignee's; the verifier must still run and refuse (on base the candidate set was empty and it was skipped).
+    The converse (only the launch login can read it: an assignee with no login of its own) falls back to the
+    ambient read, so the candidate set is never smaller than before."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$GH_TOKEN\" = %s ]; then\n"
+        "  echo '{\"state\": \"open\", \"head\": {\"ref\": \"feature/x\"}}'; exit 0\n"
+        "fi\n"
+        "echo 'gh: Not Found (HTTP 404)' >&2; exit 1\n" % answers_for)
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("GH_TOKEN", "launch-token")
+    monkeypatch.setattr(op, "_default_query", lambda: op.query_pr_state)
+    if answers_for == "daedalus-token":
+        assert op.query_pr_state("o/r", 7) == {"state": op.NOT_FOUND}  # the launch identity cannot see it
+    monkeypatch.setattr("hermes_cli.kanban_survivor.preserve", lambda *a, **k: None)  # its own gh read: out of scope
+    calls = _stub(tmp_path, monkeypatch, 1)
+    with kb.connect() as conn:
+        tid = _card(conn)
+        with pytest.raises(kb.NotLandableError) as err:
+            kb.complete_task(conn, tid, summary="shipped", survivor_pr=PR)
+        assert err.value.prs == [PR]
+        assert "completion_blocked_pre_pr" in _kinds(conn, tid)
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "running"
+    assert calls.exists()
+
