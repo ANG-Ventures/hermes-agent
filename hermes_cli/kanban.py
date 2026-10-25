@@ -3341,7 +3341,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid}: {supersede_err}.", file=sys.stderr)
                 continue
             except (DraftPrError, StaleBaseError, ClosedUnmergedPrError, RoutedPrOpenError,
-                    StaleHandbackHeadError, SupersededContentError) as draft_err:
+                    StaleHandbackHeadError, SupersededContentError, kb.NotLandableError) as draft_err:
                 failed.append(tid)
                 print(f"cannot complete {tid}: {draft_err}", file=sys.stderr)
                 continue
