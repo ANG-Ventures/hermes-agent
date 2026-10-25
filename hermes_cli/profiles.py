@@ -2172,6 +2172,30 @@ def _scrub_export_secrets(staged: Path) -> None:
         path.write_text(redacted, encoding="utf-8")
 
 
+def _capture_cron_pair(profile_dir: Path, staged_cron: Path) -> None:
+    """Re-copy the staged ``cron/jobs.json`` + ``cron/runtime_state.db`` as ONE consistent unit:
+    under the profile's cron store lock, the db through the SQLite backup API (a raw copytree of a
+    live WAL database can pair a main file with a -wal from a different moment, and a remove_job
+    between the two copies pairs a definition with no row). The staged -wal/-shm are dropped (the
+    backup image owns none). Raises ValueError when the db cannot be captured (t_94e91559)."""
+    from cron.runtime_state import DB_NAME
+    from hermes_cli.backup import _cron_store_lock
+    from hermes_cli.backup_sqlite import _safe_copy_db
+
+    src_cron = profile_dir / "cron"
+    if not staged_cron.is_dir() or not (src_cron / DB_NAME).exists():
+        return
+    with _cron_store_lock(profile_dir):
+        for name in (DB_NAME, DB_NAME + "-wal", DB_NAME + "-shm"):
+            with contextlib.suppress(FileNotFoundError):
+                (staged_cron / name).unlink()
+        if (src_cron / "jobs.json").exists():
+            shutil.copy2(src_cron / "jobs.json", staged_cron / "jobs.json")
+        if not _safe_copy_db(src_cron / DB_NAME, staged_cron / DB_NAME):
+            raise ValueError(f"refusing export: could not capture {src_cron / DB_NAME} "
+                             "consistently (SQLite backup failed)")
+
+
 def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, str]] = None) -> Path:
     """Export a profile to a tar.gz archive; credential files are excluded and staged text is
     force-redacted first. Returns the output file path."""
@@ -2204,6 +2228,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
         # refused (no definitions to fold into) would ship unscrubbed: refuse the export instead.
         from cron.runtime_state import db_path, fold_staged_copy
         staged_cron = staged / "cron"
+        _capture_cron_pair(profile_dir, staged_cron)
         if db_path(staged_cron).exists() and not fold_staged_copy(staged_cron):
             raise ValueError(
                 f"refusing export: {profile_dir / 'cron'} has a runtime_state.db but no readable "

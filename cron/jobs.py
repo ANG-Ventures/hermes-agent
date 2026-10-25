@@ -1729,6 +1729,11 @@ def load_jobs() -> List[Dict[str, Any]]:
         # would read every row's absence as "cleared" and overwrite the rows with {}.
         jobs = [_rs.overlay_row(job, rows[str(job.get("id"))])
                 if str(job.get("id")) in rows else job for job in jobs]
+        # The row is the authority for repeat.completed now: apply the same normalization the
+        # file value got above, to the merged value (Prism a73bd19ead9a). In memory only: the
+        # next runtime save of that job persists the normalized value through the row.
+        for job in jobs:
+            _normalize_repeat_completed(job)
         if not locked and _jobs_file_stamp(jobs_file) != pre_read_stamp:
             # Unlocked read raced a writer (e.g. a runtime-export that replaced the definitions and
             # dropped the database between our two reads): retry consistently under the lock.
@@ -1756,8 +1761,26 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 # --- Runtime-state split (t_94e91559): hot runtime fields live in cron/runtime_state.db ---
 
+# runtime-export target for rows with no definition in jobs.json (see export_runtime_to_json).
+_RUNTIME_ORPHANS_NAME = "runtime_state.orphans.json"
+
+
 def _runtime_db_path() -> Path:
     return _rs.db_path(_current_cron_store().cron_dir)
+
+
+def _normalize_repeat_completed(job: Dict[str, Any]) -> bool:
+    """Same rule load_jobs applies to the file's value, for a value merged from a runtime row:
+    a non-negative int, else 0. Returns True when it changed the record."""
+    rep = job.get("repeat")
+    if not (isinstance(rep, dict) and "completed" in rep and (
+            type(rep["completed"]) is not int or rep["completed"] < 0)):
+        return False
+    try:
+        rep["completed"] = max(int(rep["completed"]), 0)
+    except (TypeError, ValueError, OverflowError):
+        rep["completed"] = 0
+    return True
 
 
 def _runtime_write_allowed() -> bool:
@@ -1794,11 +1817,61 @@ def _runtime_pending() -> bool:
         return bool(_rs.pending_gens(conn))
 
 
+def _gen_lock_path(gen: str) -> Path:
+    return _current_cron_store().cron_dir / f".runtime-gen-{gen}.lock"
+
+
+@contextlib.contextmanager
+def _gen_owner_lock(gen: str):
+    """Held (flock LOCK_EX) by the save that owns generation *gen* from BEFORE its stage until
+    after its apply/discard, so recovery can tell a live in-flight sibling (lock busy) from a
+    crashed one (lock free) without guessing from age. Best effort: with no flock backend or no
+    fd to spare it yields without a lock, and recovery falls back to the age bound."""
+    path = _gen_lock_path(gen)
+    fd = None
+    if fcntl is not None:
+        try:
+            fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if fd is not None:
+                os.close(fd)
+            fd = None
+            _unlink_quiet(str(path))
+    try:
+        yield
+    finally:
+        if fd is not None:
+            _unlink_quiet(str(path))  # unlink while held: no reader can lock a stale file
+            os.close(fd)
+
+
+def _gen_owner_alive(gen: str) -> Optional[bool]:
+    """True = the owning save holds its lock (in flight); False = the lock file exists and is free
+    (owner died); None = no lock file (staged by an earlier build, or no flock): unknown."""
+    if fcntl is None:
+        return None
+    try:
+        fd = os.open(str(_gen_lock_path(gen)), os.O_RDWR)  # never create: absence is the signal
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 def _recover_pending_runtime(file_gen: Optional[str]) -> None:
-    """Roll forward the generation the file names; discard another generation ONLY when it is
-    provably dead (older than ``_rs.pending_discard_after()`` by its staged_at). A younger
-    unnamed one may be a degraded-lock sibling's save between its stage and its rename: it is left
-    for a later load (that sibling applies or deletes it itself)."""
+    """Roll forward the generation the file names. Discard another generation ONLY when it is
+    provably dead: its owner's lock file is free (the owner died before its rename), or, when no
+    lock file exists, it is older than ``_rs.pending_discard_after()`` by its staged_at. A
+    generation whose owner still holds its lock is a degraded-lock sibling between its stage and
+    its rename, whatever its age: it is left alone (that sibling applies or deletes it itself)."""
     with _defs_cache_lock:
         _defs_cache.clear()  # entries parsed while a generation was pending are marked unusable
     with _runtime_txn() as conn:
@@ -1810,8 +1883,12 @@ def _recover_pending_runtime(file_gen: Optional[str]) -> None:
                 n = _rs.apply_pending(conn, gen)
                 logger.warning("cron runtime-state: rolled interrupted save %s forward "
                                "(%d row(s))", gen, n)
-            elif staged_at is None or now - staged_at >= bound:
+                continue
+            alive = _gen_owner_alive(gen)
+            if alive is False or (alive is None and (
+                    staged_at is None or now - staged_at >= bound)):
                 conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
+                _unlink_quiet(str(_gen_lock_path(gen)))
                 logger.warning("cron runtime-state: discarded interrupted save %s (its "
                                "definitions never reached jobs.json)", gen)
 
@@ -2035,6 +2112,20 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None) -> int:
                 job = _rs.overlay_row(job, row)
                 applied += 1
             merged.append(job)
+        file_ids = {str(j.get("id")) for j in jobs if isinstance(j, dict)}
+        orphans = {jid: row for jid, row in rows.items() if jid not in file_ids}
+        if orphans:
+            # Rows whose definition is not in jobs.json (a git level dropped a job, a definition
+            # is only temporarily missing): jobs.json has no record to carry them, and dropping
+            # the database would lose them. Keep them, 0600, next to jobs.json (Prism
+            # 747baaf507d1); a later load in sqlite mode does not read this file.
+            orphan_file = cron_dir / _RUNTIME_ORPHANS_NAME
+            atomic_write_text(orphan_file, json.dumps(
+                {"exported_at": _hermes_now().isoformat(), "rows": orphans},
+                indent=2, ensure_ascii=False, sort_keys=True), mode=0o600, fsync_dir=True)
+            _secure_file(orphan_file)
+            logger.warning("cron runtime-state: %d runtime row(s) had no definition in jobs.json; "
+                           "kept in %s", len(orphans), orphan_file)
         _write_definitions_file(merged)
         _rs.drop_database(cron_dir)
         logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
@@ -2122,6 +2213,7 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
         base_runtime = {}
     job = definition
     _rs.apply_runtime(job, copy.deepcopy(base_runtime))
+    _normalize_repeat_completed(job)  # same view load_jobs hands out (a73bd19ead9a)
     original_def = _rs.strip_runtime(copy.deepcopy(job))
     original_job = copy.deepcopy(job)  # the baseline *fn* started from (definition + row)
     jobs = [job]
@@ -2171,6 +2263,7 @@ def _locked_job_view(job_id: Any) -> Optional[Dict[str, Any]]:
             row = _read_one_row(job_id)
             if row is not None or not file_runtime:
                 _rs.apply_runtime(definition, row or {})
+                _normalize_repeat_completed(definition)
                 return definition
     return next((item for item in load_jobs() if item.get("id") == job_id), None)
 
@@ -2616,35 +2709,46 @@ def _save_split_unlocked(
             deletes += [jid for jid in disk_rows if jid not in runtime_rows]
         return out, deletes, disk_rows
 
-    def refresh_baseline(rows: Dict[str, Dict[str, Any]]) -> None:
-        # A later save of the same loaded list compares against what we just persisted, so
-        # restoring a value we changed is seen as a change again.
-        live = getattr(_jobs_lock_state, "load_baseline", None)
-        if live is None:
+    def refresh_baseline() -> None:
+        # The section's baseline becomes exactly the payload we just saved, BOTH halves, every
+        # job (Prism 60b9541dae29): a later save of the same list then diffs against what we
+        # persisted, so restoring a value we changed (definition or runtime) is a change again,
+        # while a key we never touched still yields to a sibling's value on disk. Not the merged
+        # rows: a sibling's key folded in from disk would then read as OUR change and revert it.
+        if getattr(_jobs_lock_state, "load_baseline", None) is None:
             return
-        new_defs = {str(d["id"]): d for d in defs if isinstance(d, dict) and d.get("id")}
-        for jid, row in rows.items():
-            if jid in live and jid in new_defs:
-                record = copy.deepcopy(new_defs[jid])
-                _rs.apply_runtime(record, copy.deepcopy(row))
-                live[jid] = record
+        _jobs_lock_state.load_baseline = {
+            str(j["id"]): copy.deepcopy(j) for j in jobs if isinstance(j, dict) and j.get("id")}
 
     if defs_unchanged:
         if changed:
             with _runtime_txn() as conn:
                 rows, deletes, disk_rows = merged_changes(conn)
                 _rs.upsert_rows(conn, rows, delete_ids=deletes, current=disk_rows)
-            refresh_baseline(rows)
+            refresh_baseline()
         return
 
     saved_baseline = baseline
     gen = uuid.uuid4().hex
+    with _gen_owner_lock(gen):  # held until the generation is applied or discarded
+        _save_split_two_phase(gen, defs, merged_changes, removed_ids=removed_ids,
+                              replace=replace, base_defs=base_defs,
+                              saved_baseline=saved_baseline)
+    refresh_baseline()
+
+
+def _save_split_two_phase(gen, defs, merged_changes, *, removed_ids, replace, base_defs,
+                          saved_baseline) -> None:
+    """Stage -> rename -> apply for ``_save_split_unlocked`` (caller holds the generation's owner
+    lock). Each staged row records the row it was computed from, so ``apply_pending`` merges a
+    sibling's intervening write instead of replacing it (Prism 682ece27eb8b)."""
     with _runtime_txn() as conn:
         rows, deletes, disk_rows = merged_changes(conn)
         rows = {jid: r for jid, r in rows.items()
                 if jid not in disk_rows or disk_rows[jid] != r}
         if rows or deletes:
-            _rs.stage_pending(conn, gen, rows, deletes)
+            _rs.stage_pending(conn, gen, rows, deletes,
+                              bases={jid: disk_rows.get(jid) for jid in rows})
         else:
             gen = None
         seq = _rs.mirror_seq(conn)
@@ -2679,7 +2783,6 @@ def _save_split_unlocked(
         if gen is not None:
             _rs.apply_pending(conn, gen)
         _record_mirror_written(conn, seq)
-    refresh_baseline(rows)
 
 
 def _journal_created(job: Dict[str, Any]) -> None:
@@ -4279,10 +4382,12 @@ def _refresh_claim_row(job_id: str, claim_key: str, expected_owner: str,
         return False
     if once_only and (definition.get("schedule") or {}).get("kind") != "once":
         return False
-    # Same test-context live-store guard every other cron write takes (raises in that context).
-    _guard_against_test_write_to_live_store(_current_cron_store().jobs_file)
-    return _rs.refresh_claim(_current_cron_store().cron_dir, str(job_id), claim_key,
-                             expected_owner, _hermes_now().isoformat())
+    # Same test-context live-store guard, and the same 0600/ownership pass on a new db or sidecar
+    # (a root CLI heartbeat must not leave a root-owned -wal/-shm the gateway cannot open), as
+    # every other runtime write: through _runtime_txn, never a bare connection.
+    with _runtime_txn() as conn:
+        return _rs.refresh_claim_conn(conn, str(job_id), claim_key, expected_owner,
+                                      _hermes_now().isoformat())
 
 
 def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:

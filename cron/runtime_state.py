@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS pending_runtime (
     job_id TEXT NOT NULL,
     fields TEXT,
     staged_at REAL,
+    base TEXT,
     PRIMARY KEY (gen, job_id)
 );
 CREATE TABLE IF NOT EXISTS mirror_state (
@@ -250,10 +251,12 @@ def connect(cron_dir: Path, *, create: bool = True) -> Iterator[Optional[sqlite3
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         conn.executescript(_SCHEMA)
-        # A database created before pending_runtime.staged_at existed (earlier PR heads).
-        if "staged_at" not in {r[1] for r in conn.execute("PRAGMA table_info(pending_runtime)")}:
-            with contextlib.suppress(sqlite3.OperationalError):  # a sibling added it first
-                conn.execute("ALTER TABLE pending_runtime ADD COLUMN staged_at REAL")
+        # A database created before pending_runtime.staged_at/base existed (earlier PR heads).
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_runtime)")}
+        for col, decl in (("staged_at", "REAL"), ("base", "TEXT")):
+            if col not in cols:
+                with contextlib.suppress(sqlite3.OperationalError):  # a sibling added it first
+                    conn.execute(f"ALTER TABLE pending_runtime ADD COLUMN {col} {decl}")
         yield conn
     finally:
         conn.close()
@@ -357,50 +360,101 @@ def write_rows(
 
 def refresh_claim(cron_dir: Path, job_id: str, claim_key: str, expected_owner: str,
                   at: str) -> Optional[bool]:
+    """``refresh_claim_conn`` in its own transaction."""
+    with transaction(cron_dir) as conn:
+        return refresh_claim_conn(conn, job_id, claim_key, expected_owner, at)
+
+
+def refresh_claim_conn(conn: sqlite3.Connection, job_id: str, claim_key: str,
+                       expected_owner: str, at: str) -> Optional[bool]:
     """Compare-and-refresh ``fields[claim_key].at`` for *expected_owner* (``fire_claim`` or
-    ``run_claim``): one UPDATE guarded by the owner column; rowcount 0 means the claim is gone or
-    held by someone else. ``None`` = the job has no row yet (not adopted from jobs.json): the
-    caller must take the full load path, never read that as a lost claim."""
+    ``run_claim``) on *conn* (caller owns the IMMEDIATE transaction): one UPDATE guarded by the
+    owner column; rowcount 0 means the claim is gone or held by someone else. ``None`` = the job
+    has no row yet (not adopted from jobs.json): the caller must take the full load path, never
+    read that as a lost claim."""
     global UPSERT_COUNT
     column = {"fire_claim": "fire_claim_owner", "run_claim": "run_claim_owner"}[claim_key]
-    with transaction(cron_dir) as conn:
-        row = conn.execute(
-            f"SELECT fields FROM job_runtime WHERE job_id=? AND {column}=?",
-            (str(job_id), str(expected_owner))).fetchone()
-        if row is None:
-            exists = conn.execute("SELECT 1 FROM job_runtime WHERE job_id=?",
-                                  (str(job_id),)).fetchone()
-            return False if exists else None
-        fields = json.loads(row[0])
-        claim = fields.get(claim_key)
-        if not isinstance(claim, dict) or claim.get("by") != expected_owner:
-            return False
-        claim["at"] = at
-        cur = conn.execute(
-            f"UPDATE job_runtime SET fields=?, updated_at=? WHERE job_id=? AND {column}=?",
-            (_canonical(fields), time.time(), str(job_id), str(expected_owner)))
-        if cur.rowcount:
-            mark_dirty(conn)
+    row = conn.execute(
+        f"SELECT fields FROM job_runtime WHERE job_id=? AND {column}=?",
+        (str(job_id), str(expected_owner))).fetchone()
+    if row is None:
+        exists = conn.execute("SELECT 1 FROM job_runtime WHERE job_id=?",
+                              (str(job_id),)).fetchone()
+        return False if exists else None
+    fields = json.loads(row[0])
+    claim = fields.get(claim_key)
+    if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+        return False
+    claim["at"] = at
+    cur = conn.execute(
+        f"UPDATE job_runtime SET fields=?, updated_at=? WHERE job_id=? AND {column}=?",
+        (_canonical(fields), time.time(), str(job_id), str(expected_owner)))
     if cur.rowcount:
+        mark_dirty(conn)
         UPSERT_COUNT += 1
     return bool(cur.rowcount)
 
 
 # --- two-phase commit for saves that change BOTH halves ---------------------------------------
-# 1. stage_pending: the new rows go into pending_runtime under a fresh generation id; COMMIT.
+# 1. stage_pending: the new rows go into pending_runtime under a fresh generation id, each with
+#    the row it was computed from (``base``); COMMIT.
 # 2. jobs.json is renamed into place carrying the same id as top-level "runtime_gen".
-# 3. apply_pending: pending rows move into job_runtime; COMMIT.
+# 3. apply_pending: pending rows move into job_runtime, three-way merged against ``base`` so a
+#    row write that landed between 1 and 3 (a degraded-lock sibling) survives; COMMIT.
 # recover_pending (every load): pending rows whose gen matches the file's "runtime_gen" are rolled
-# forward (crash after 2); any other gen is discarded (crash before 2: the file never changed).
+# forward (crash after 2); any other gen is discarded once provably dead (crash before 2).
+
+def merge3(ours: Dict[str, Any], current: Dict[str, Any],
+           base: Dict[str, Any]) -> Dict[str, Any]:
+    """Per-key three-way merge base -> (ours, current), the same rule as
+    ``cron.jobs._reconcile_job_fields``: a key *ours* changed wins, a key it left alone takes
+    *current* (absent stays absent). Stdlib-only so out-of-process readers resolve a pending
+    generation exactly the way ``apply_pending`` will."""
+    merged = dict(ours)
+    for key in set(current) | set(base):
+        in_ours = key in ours
+        ours_changed = (key in base) != in_ours or (in_ours and ours[key] != base.get(key))
+        if ours_changed:
+            continue
+        if key in current:
+            merged[key] = current[key]
+        else:
+            merged.pop(key, None)
+    return merged
+
+
+_NO_ROW = "null"  # pending_runtime.base for a job that had no row at stage time
+
+
+def _resolve_pending(staged: Dict[str, Any], base_text: Optional[str],
+                     current: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The row a staged entry becomes on apply. ``base_text`` NULL = staged by an earlier PR
+    head with no base recorded: the staged row wins as it did then."""
+    if base_text is None:
+        return staged
+    base = json.loads(base_text)
+    base = base if isinstance(base, dict) else {}
+    if current is None or current == base:
+        return staged
+    return merge3(staged, current, base)
+
 
 def stage_pending(conn: sqlite3.Connection, gen: str, rows: Dict[str, Dict[str, Any]],
-                  delete_ids: Iterable[str] = ()) -> None:
+                  delete_ids: Iterable[str] = (),
+                  bases: Optional[Dict[str, Optional[Dict[str, Any]]]] = None) -> None:
+    """Stage generation *gen*. ``bases[job_id]`` is the row each staged row was computed from
+    (``None`` = the job had no row); read in this same transaction by the caller."""
     # Only THIS generation: under a degraded jobs lock a sibling save may have its own staged.
     conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
     at = _now()
     for job_id, fields in rows.items():
-        conn.execute("INSERT INTO pending_runtime(gen, job_id, fields, staged_at) VALUES (?,?,?,?)",
-                     (gen, str(job_id), _canonical(fields), at))
+        if bases is None:
+            base_text = None  # no base known: the staged row wins on apply
+        else:
+            base = bases.get(str(job_id))
+            base_text = _canonical(base) if base is not None else _NO_ROW
+        conn.execute("INSERT INTO pending_runtime(gen, job_id, fields, staged_at, base)"
+                     " VALUES (?,?,?,?,?)", (gen, str(job_id), _canonical(fields), at, base_text))
     for job_id in delete_ids:
         if job_id:
             conn.execute("INSERT OR REPLACE INTO pending_runtime(gen, job_id, fields, staged_at)"
@@ -424,27 +478,57 @@ def pending_gen_ages(conn: sqlite3.Connection) -> Dict[str, Optional[float]]:
         "SELECT gen, max(staged_at) FROM pending_runtime GROUP BY gen").fetchall()}
 
 
-def apply_pending(conn: sqlite3.Connection, gen: str, *, dirty: bool = False) -> int:
-    """Move generation *gen* into job_runtime (NULL fields = delete) and clear its journal rows.
-    Not marked dirty by default: the jobs.json that names *gen* already carries these rows."""
-    rows: Dict[str, Dict[str, Any]] = {}
+def _pending_entries(conn: sqlite3.Connection, gen: str) -> List[tuple]:
+    """``[(job_id, fields_text_or_None, base_text_or_None)]`` for generation *gen* (a database
+    from an earlier PR head may lack the ``base`` column; read-only callers cannot add it)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_runtime)")}
+    base_col = "base" if "base" in cols else "NULL"
+    return conn.execute(f"SELECT job_id, fields, {base_col} FROM pending_runtime WHERE gen=?",
+                        (gen,)).fetchall()
+
+
+def _apply_entries(rows: Dict[str, Dict[str, Any]], entries: List[tuple]) -> Dict[str, Any]:
+    """Resolve pending *entries* onto *rows* (``{job_id: row}``) in place, exactly as
+    ``apply_pending`` persists them. Returns ``{"upsert": {...}, "delete": [...]}``."""
+    upsert: Dict[str, Dict[str, Any]] = {}
     deletes: List[str] = []
-    for job_id, fields in conn.execute(
-            "SELECT job_id, fields FROM pending_runtime WHERE gen=?", (gen,)).fetchall():
+    for job_id, fields, base_text in entries:
+        job_id = str(job_id)
         if fields is None:
             deletes.append(job_id)
-        else:
-            rows[job_id] = json.loads(fields)
-    written = upsert_rows(conn, rows, delete_ids=deletes, dirty=dirty)
+            rows.pop(job_id, None)
+            continue
+        resolved = _resolve_pending(json.loads(fields), base_text, rows.get(job_id))
+        upsert[job_id] = resolved
+        rows[job_id] = resolved
+    return {"upsert": upsert, "delete": deletes}
+
+
+def apply_pending(conn: sqlite3.Connection, gen: str, *, dirty: bool = False) -> int:
+    """Move generation *gen* into job_runtime (NULL fields = delete) and clear its journal rows.
+    Each staged row is three-way merged against the row it was computed from and the row as it is
+    NOW (same IMMEDIATE transaction), so a key a degraded-lock sibling wrote between the stage and
+    this apply (a manual-run request, a heartbeat) survives unless this save changed that key.
+    Not marked dirty by default: the jobs.json that names *gen* already carries these rows."""
+    entries = _pending_entries(conn, gen)
+    current = {jid: row for jid, row in ((str(e[0]), read_row(conn, str(e[0]))) for e in entries)
+               if row is not None}
+    plan = _apply_entries(current, entries)
+    written = upsert_rows(conn, plan["upsert"], delete_ids=plan["delete"], dirty=dirty)
     conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
     return written
 
 
-def merged_jobs(jobs_file: Path) -> List[Dict[str, Any]]:
+def merged_jobs(jobs_file: Path, *, strict: bool = False) -> List[Dict[str, Any]]:
     """READ-ONLY merged view for out-of-process readers (cron-health, dashboards, watchers that
     read jobs.json directly): the raw jobs list with each job's runtime row overlaid, i.e. the
     shape jobs.json had before the split. Never creates the database, never migrates, never
-    writes; a row wins over a runtime field the file still carries."""
+    writes; a row wins over a runtime field the file still carries.
+
+    The rows and the pending generation are read in ONE read transaction (one WAL snapshot), so
+    an apply landing between the two reads cannot make the committed update vanish. A database
+    error returns the raw file view for monitors (best effort) and RAISES when *strict* (callers
+    that delete the database afterwards must never treat the raw view as merged)."""
     jobs_file = Path(jobs_file)
     with open(jobs_file, encoding="utf-8-sig") as fh:
         data = json.load(fh)
@@ -455,35 +539,36 @@ def merged_jobs(jobs_file: Path) -> List[Dict[str, Any]]:
     if not path.exists():
         return jobs
     file_gen = data.get("runtime_gen") if isinstance(data, dict) else None
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30.0)
+    rows: Dict[str, Dict[str, Any]] = {}
     try:
-        rows = dict(conn.execute("SELECT job_id, fields FROM job_runtime").fetchall())
-        if isinstance(file_gen, str) and file_gen:
-            # A save that crashed after its rename left generation *file_gen* staged: the file
-            # already names it, so it is committed. Read it the way load_jobs' recovery would
-            # apply it (NULL fields = the row was deleted), without writing.
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30.0,
+                               isolation_level=None)
+        try:
+            conn.execute("BEGIN")
             for job_id, fields in conn.execute(
-                    "SELECT job_id, fields FROM pending_runtime WHERE gen=?",
-                    (file_gen,)).fetchall():
-                if fields is None:
-                    rows.pop(job_id, None)
-                else:
-                    rows[job_id] = fields
-    except sqlite3.Error:
+                    "SELECT job_id, fields FROM job_runtime").fetchall():
+                try:
+                    value = json.loads(fields)
+                except (TypeError, ValueError):
+                    if strict:
+                        raise
+                    continue
+                if isinstance(value, dict):
+                    rows[str(job_id)] = value
+            if isinstance(file_gen, str) and file_gen:
+                # A save that crashed after its rename left generation *file_gen* staged: the
+                # file already names it, so it is committed. Resolve it the way load_jobs'
+                # recovery (apply_pending) will, without writing.
+                _apply_entries(rows, _pending_entries(conn, file_gen))
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError):
+        if strict:
+            raise
         return jobs
-    finally:
-        conn.close()
-    out = []
-    for job in jobs:
-        if isinstance(job, dict) and str(job.get("id")) in rows:
-            try:
-                row = json.loads(rows[str(job["id"])])
-            except (TypeError, ValueError):
-                row = None
-            if isinstance(row, dict):
-                job = overlay_row(job, row)
-        out.append(job)
-    return out
+    return [overlay_row(job, rows[str(job.get("id"))])
+            if isinstance(job, dict) and str(job.get("id")) in rows else job for job in jobs]
 
 
 def overlay_row(job: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
@@ -498,7 +583,9 @@ def overlay_row(job: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
 def fold_staged_copy(cron_dir: Path) -> bool:
     """For a STAGED copy of a cron dir (profile export): rewrite its jobs.json as the merged view
     and delete the database + sidecars, so the archive carries runtime text only inside jobs.json,
-    where the export's secret scrubber reads it. Never call on a live store (no lock taken)."""
+    where the export's secret scrubber reads it. Never call on a live store (no lock taken).
+    Returns False (database kept, nothing written) when it cannot fold: no definitions, or the
+    database cannot be read in full (a strict read; the raw file view is never folded)."""
     cron_dir = Path(cron_dir)
     jobs_file = cron_dir / "jobs.json"
     if not db_path(cron_dir).exists():
@@ -515,7 +602,10 @@ def fold_staged_copy(cron_dir: Path) -> bool:
     jobs = data.get("jobs") if isinstance(data, dict) else data
     if not isinstance(jobs, list):
         return False
-    merged = merged_jobs(jobs_file)  # applies a pending generation the file names first
+    try:
+        merged = merged_jobs(jobs_file, strict=True)  # resolves a pending generation the file names
+    except (OSError, ValueError, sqlite3.Error):
+        return False
     payload = dict(data) if isinstance(data, dict) else {}
     payload.pop("runtime_gen", None)
     payload["jobs"] = merged

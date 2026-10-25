@@ -1086,3 +1086,287 @@ def test_json_mode_save_with_live_db_logs_error_once(temp_home, monkeypatch, cap
             and r.levelno == logging.ERROR]
     assert len(hits) == 1
     assert created["id"]
+
+
+# --- Prism round 4 @ 35479f90 (Apollo send-back, run 38922) ---------------------------------
+
+def test_two_phase_apply_keeps_sibling_row_write_between_stage_and_apply(temp_home, monkeypatch):
+    """682ece27eb8b / 7bc8d98a18ae: A stages a definition + last_status change for J; a
+    degraded-lock sibling B commits manual_run_at for J between A's stage and A's apply; A's
+    apply must merge (B's key survives), not replace the whole row."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="a")
+    jid = created["id"]
+    cj.mark_job_run(jid, True)
+    real_save = cj._save_jobs_unlocked
+
+    def sibling_then_save(*a, **kw):
+        with rs.transaction(temp_home / "cron") as conn:
+            row = rs.read_row(conn, jid) or {}
+            rs.upsert_rows(conn, {jid: dict(row, manual_run_at="2099-01-01T00:00:00+00:00")})
+        return real_save(*a, **kw)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(cj, "_save_jobs_unlocked", sibling_then_save)
+        with cj._jobs_lock():
+            jobs = cj.load_jobs()
+            jobs[0]["name"] = "renamed"
+            jobs[0]["last_status"] = "error"
+            cj.save_jobs(jobs)
+    job = cj.get_job(jid)
+    assert job["name"] == "renamed" and job["last_status"] == "error"
+    assert job.get("manual_run_at") == "2099-01-01T00:00:00+00:00"
+
+
+def test_recovery_roll_forward_merges_against_staging_base(temp_home):
+    """7bc8d98a18ae: the crash-recovery roll-forward of a file-named generation merges too: a row
+    write that landed after the stage survives unless the generation changed that key."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="rf")
+    jid = created["id"]
+    cj.mark_job_run(jid, True)
+    gen = "h" * 32
+    cron = temp_home / "cron"
+    with rs.transaction(cron) as conn:
+        base = rs.read_row(conn, jid)
+        rs.stage_pending(conn, gen, {jid: dict(base, last_status="error")}, bases={jid: base})
+    with rs.transaction(cron) as conn:  # sibling, after the stage
+        rs.upsert_rows(conn, {jid: dict(base, manual_run_at="2099-01-01T00:00:00+00:00")})
+    data = json.loads(_jobs_file(temp_home).read_text())
+    data["runtime_gen"] = gen
+    _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+    assert rs.merged_jobs(_jobs_file(temp_home))[0]["manual_run_at"].startswith("2099")
+    job = cj.get_job(jid)
+    assert job["last_status"] == "error"
+    assert job.get("manual_run_at") == "2099-01-01T00:00:00+00:00"
+
+
+def test_fold_refuses_when_database_read_fails(temp_home, tmp_path):
+    """1da94b741940: the jobs.json names a generation, job_runtime holds newer rows, the
+    pending_runtime table is missing: the fold must refuse and keep the database, never fold the
+    raw file view and delete the only copy of the rows."""
+    import shutil
+
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="unsafe-fold")
+    cj.mark_job_run(created["id"], False, "newer error")
+    staged = tmp_path / "staged" / "cron"
+    shutil.copytree(temp_home / "cron", staged)
+    data = json.loads((staged / "jobs.json").read_text())
+    data["runtime_gen"] = "z" * 32
+    for rec in data["jobs"]:
+        rec["last_error"] = "older mirror value"
+    (staged / "jobs.json").write_text(json.dumps(data), encoding="utf-8")
+    con = sqlite3.connect(staged / rs.DB_NAME)
+    con.execute("DROP TABLE pending_runtime")
+    con.commit()
+    con.close()
+    assert rs.fold_staged_copy(staged) is False
+    assert rs.db_path(staged).exists()
+    assert json.loads((staged / "jobs.json").read_text())["jobs"][0]["last_error"] == \
+        "older mirror value"  # not rewritten
+
+
+def test_merged_jobs_reads_rows_and_pending_in_one_snapshot(temp_home, monkeypatch):
+    """65a323e10656: an apply_pending that commits between merged_jobs' read of job_runtime and
+    its read of pending_runtime must not make the committed update vanish (one read snapshot)."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="snap")
+    jid = created["id"]
+    cj.mark_job_run(jid, True)
+    new = "2099-01-01T00:00:00+00:00"
+    gen = _stage_crashed_generation(temp_home, jid, "next_run_at", new)
+    real_connect = rs.sqlite3.connect
+    fired = []
+
+    class Conn:
+        def __init__(self, inner):
+            self._c = inner
+
+        def execute(self, sql, *a):
+            cur = self._c.execute(sql, *a)
+            if "FROM job_runtime" in sql and not fired:
+                rows = cur.fetchall()  # the job_runtime read is done; a writer applies now
+                fired.append(1)
+                with rs.transaction(temp_home / "cron") as w:
+                    rs.apply_pending(w, gen)
+
+                class _Done:
+                    def fetchall(self_inner):
+                        return rows
+                return _Done()
+            return cur
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    def connect(*a, **kw):
+        c = real_connect(*a, **kw)
+        return Conn(c) if "mode=ro" in str(a[0] if a else "") else c
+
+    monkeypatch.setattr(rs.sqlite3, "connect", connect)
+    merged = rs.merged_jobs(_jobs_file(temp_home))
+    assert fired
+    assert merged[0]["next_run_at"] == new
+
+
+def test_saved_definition_change_becomes_the_baseline(temp_home):
+    """60b9541dae29: in one lock section, save a definition-only edit, then save the same list
+    with the edit reverted: the revert must land (the baseline is what we saved, not the load)."""
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="orig")
+    jid = created["id"]
+    with cj._jobs_lock():
+        jobs = cj.load_jobs()
+        jobs[0]["name"] = "edited"
+        cj.save_jobs(jobs)
+        jobs[0]["name"] = "orig"
+        cj.save_jobs(jobs)
+    assert cj.get_job(jid)["name"] == "orig"
+
+
+def test_claim_heartbeat_row_write_takes_permission_pass(temp_home, monkeypatch):
+    """75ab1ed65c10: the heartbeat fast path writes through _runtime_txn, so a new db or sidecar
+    it creates (a root CLI heartbeat) gets the 0600/ownership pass like every other row write."""
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="own")
+    jid = created["id"]
+    assert cj.claim_job_for_fire(jid) is True
+    owner = cj.get_job(jid)["fire_claim"]["by"]
+    calls = []
+    real = cj._secure_runtime_db
+    monkeypatch.setattr(cj, "_secure_runtime_db", lambda: (calls.append(1), real())[1])
+    monkeypatch.setattr(cj.os, "geteuid", lambda: 0, raising=False)
+    assert cj.heartbeat_fire_claim(jid, expected_owner=owner) is True
+    assert calls
+
+
+def test_export_keeps_rows_without_a_definition(temp_home):
+    """747baaf507d1: a row whose job is not in jobs.json (a git level dropped it) is not lost when
+    runtime-export retires the database: it is kept, 0600, in runtime_state.orphans.json."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="kept")
+    rs.write_rows(temp_home / "cron", {"gone0000abcd": {"last_status": "ok", "repeat.completed": 4}})
+    cj.export_runtime_to_json()
+    assert not _db(temp_home).exists()
+    orphan = temp_home / "cron" / "runtime_state.orphans.json"
+    assert json.loads(orphan.read_text())["rows"] == {
+        "gone0000abcd": {"last_status": "ok", "repeat.completed": 4}}
+    assert oct(os.stat(orphan).st_mode & 0o777) == "0o600"
+    assert _raw(temp_home, created["id"])["id"] == created["id"]
+
+
+def test_repeat_completed_from_row_is_normalized(temp_home):
+    """a73bd19ead9a: repeat.completed comes from the row now; a non-int/negative value there gets
+    the same normalization load_jobs gives the file's value."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="rep", repeat=5)
+    jid = created["id"]
+    rs.write_rows(temp_home / "cron", {jid: {"repeat.completed": "2"}})
+    assert cj.get_job(jid)["repeat"]["completed"] == 2
+    rs.write_rows(temp_home / "cron", {jid: {"repeat.completed": -5}})
+    assert next(j for j in cj.load_jobs() if j["id"] == jid)["repeat"]["completed"] == 0
+
+
+def test_restore_json_only_snapshot_retires_newer_rows(temp_home):
+    """68eae47a394e / b493dcb2080d: restoring a snapshot that has jobs.json (with runtime) but no
+    runtime_state.db must not leave newer rows winning over the restored runtime."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="snap", repeat=10)
+    jid = created["id"]
+    for _ in range(3):
+        cj.mark_job_run(jid, True)
+    snap = backup.create_quick_snapshot(hermes_home=temp_home)
+    snap_dir = backup._quick_snapshot_root(temp_home) / snap
+    # A pre-split snapshot: jobs.json carries the runtime, no db in the manifest.
+    rec = cj.get_job(jid)
+    data = json.loads((snap_dir / "cron" / "jobs.json").read_text())
+    data["jobs"] = [rec]
+    (snap_dir / "cron" / "jobs.json").write_text(json.dumps(data), encoding="utf-8")
+    (snap_dir / "cron" / "runtime_state.db").unlink()
+    meta = json.loads((snap_dir / "manifest.json").read_text())
+    meta["files"].pop("cron/runtime_state.db", None)
+    (snap_dir / "manifest.json").write_text(json.dumps(meta), encoding="utf-8")
+    for _ in range(4):
+        cj.mark_job_run(jid, True)
+    assert cj.get_job(jid)["repeat"]["completed"] == 7
+    assert backup.restore_quick_snapshot(snap, hermes_home=temp_home)
+    assert cj.get_job(jid)["repeat"]["completed"] == 3
+    assert list((temp_home / "cron").glob("runtime_state.db.pre-restore-*"))
+
+
+def test_profile_export_captures_cron_pair_under_store_lock(tmp_path, monkeypatch):
+    """12e3f4b761ac (current body): the export captures jobs.json and runtime_state.db as one
+    unit under the profile's cron store lock, the db via the SQLite backup API."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+    from hermes_cli import backup_sqlite, profiles
+
+    profile_dir = tmp_path / "profiles" / "p"
+    cron = profile_dir / "cron"
+    cron.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text("model: x\n")
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "n"}]}),
+                                    encoding="utf-8")
+    rs.write_rows(cron, {"j1": {"last_status": "ok"}})
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: tmp_path / "profiles")
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda n: profile_dir)
+    monkeypatch.setattr(profiles, "validate_profile_name", lambda n: None)
+    held = []
+    real = backup_sqlite._safe_copy_db
+
+    def spy(src, dst, **kw):
+        if str(src).endswith(rs.DB_NAME):
+            held.append(getattr(cj._jobs_lock_state, "depth", 0))
+        return real(src, dst, **kw)
+
+    monkeypatch.setattr(backup_sqlite, "_safe_copy_db", spy)
+    out = profiles.export_profile("p", str(tmp_path / "export.tar.gz"))
+    assert out.exists()
+    assert held and held[0] >= 1
+
+
+def test_recovery_never_discards_generation_whose_owner_is_alive(temp_home, clock):
+    """e52f4613c22a (Premature discard): a generation whose owning save still holds its lock is
+    in flight however old it is; a free lock file means the owner died, discard at once."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="alive")
+    cron = temp_home / "cron"
+
+    def pending():
+        with rs.connect(cron) as conn:
+            return rs.pending_gens(conn)
+
+    gen = "a" * 32
+    with cj._gen_owner_lock(gen):
+        with rs.transaction(cron) as conn:
+            rs.stage_pending(conn, gen, {created["id"]: {"last_status": "x"}})
+        clock[0] += rs.pending_discard_after() * 10
+        with cj._jobs_lock():
+            cj._recover_pending_runtime(None)
+        assert pending() == [gen]
+    dead = "d" * 32
+    with rs.transaction(cron) as conn:
+        rs.stage_pending(conn, dead, {created["id"]: {"last_status": "y"}})
+    cj._gen_lock_path(dead).write_text("")  # its owner died holding nothing: lock free
+    with cj._jobs_lock():
+        cj._recover_pending_runtime(None)
+    assert dead not in pending()
