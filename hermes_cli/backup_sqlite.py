@@ -52,6 +52,25 @@ def _safe_copy_budget_s(src: Path) -> float:
     return _SAFE_COPY_BASE_BUDGET_S + gb * _SAFE_COPY_BUDGET_PER_GB_S
 
 
+def _register_reader(src: Path):
+    """Register *src* with the WAL lock guard when it is importable. This module also runs standalone
+    when application imports are broken (see the module docstring); that process has no SessionDB, so
+    the guard holds no private descriptor there and there is nothing to register with."""
+    try:
+        from hermes_state_lockguard import register_reader
+    except Exception:
+        return None
+    return register_reader(src)
+
+
+def _unregister_reader(token) -> None:
+    try:
+        from hermes_state_lockguard import unregister_reader
+    except Exception:
+        return
+    unregister_reader(token)
+
+
 def _close_quietly(conn: Optional[sqlite3.Connection]) -> None:
     if conn is not None:
         with suppress(Exception):
@@ -92,7 +111,7 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
     keeps moving pages but never converges (sqlite restart-thrash under continuous writes); see
     ``_SAFE_COPY_STALL_DEADLINE_S``.
     """
-    conn = backup_conn = None
+    conn = backup_conn = reader = None
     try:
         # sqlite3.connect() creates a missing destination with the process
         # umask, which is commonly 0022 (0644).  Snapshot databases contain
@@ -111,6 +130,11 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
                 os.close(secure_fd)
         # timeout=0.0 disables sqlite3's implicit busy wait so the progress callback owns the
         # full locked-source deadline instead of adding the default timeout before each callback.
+        # A registered reader of the WAL lock guard for the source connection's whole life (Prism
+        # 95ebc4a81ebe): _pin_read_snapshot holds a WAL read transaction through the copy, and a SessionDB
+        # close in this process must not close the private -shm fd under that read-mark. Dropped in the
+        # finally below, after the close.
+        reader = _register_reader(src)
         conn = sqlite3.connect(f"{src.resolve().as_uri()}?mode=ro", uri=True, timeout=0.0)
         _pin_read_snapshot(conn)
         backup_conn = sqlite3.connect(str(dst))
@@ -163,7 +187,14 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
         return False
     finally:
         _close_quietly(backup_conn)
-        _close_quietly(conn)
+        closed = True
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                closed = False  # may still be open: keep (pin) its reader registration
+        if reader is not None and closed:
+            _unregister_reader(reader)
 
 
 def preflight_state_db(home: Path) -> dict:

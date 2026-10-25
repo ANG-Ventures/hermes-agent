@@ -844,7 +844,10 @@ class SessionDB(
         try:
             conn.close()
         except Exception as exc:
+            # The connection may still be open: keep its lock-guard reader token (pinned) so no retire()
+            # closes a private -shm fd under it (Prism 6ed61d49912e, same rule as the repair path).
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
+            return
         self._unregister_reader(conn)
 
     def _unregister_reader(self, conn) -> None:
@@ -1122,8 +1125,10 @@ class SessionDB(
         # descriptor first, or this probe reads that descriptor as a deleted generation (Prism 9d02254cf252).
         with _lockguard.RETIRE_GATE:
             # A registered reader's own last SQLite close can unlink -shm before its retire() runs;
-            # settle that here so our private fd is never the "deleted holder" (Prism e5b80b447fa9).
+            # settle that here so our private fd is never the "deleted holder" (Prism e5b80b447fa9); only a
+            # proven-completed close is settled, never a live deleted generation (Prism 24d6965d4428).
             _lockguard.retire()
+            _lockguard.retire_completed_shm()
             refuse_deleted_wal_generation(self.db_path)
         # Create/tighten the main database before sqlite3.connect() so a
         # permissive process umask can never expose a fresh profile store.
@@ -1607,6 +1612,7 @@ class SessionDB(
             try:
                 with _lockguard.RETIRE_GATE:  # never mid-retire of the guard's own -shm fd (Prism 9d02254cf252)
                     _lockguard.retire()  # a reader's close may have unlinked -shm (Prism e5b80b447fa9)
+                    _lockguard.retire_completed_shm()
                     for target, fd_path in _proc_fd_targets(os.getpid()):
                         canonical = _state_holders.canonical_sqlite_path(target)
                         if (" (deleted)" in target and canonical in watched

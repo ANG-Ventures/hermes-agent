@@ -120,6 +120,16 @@ _FLOCK_FORMAT = "@qqihh" if sys.platform == "darwin" or "bsd" in sys.platform el
 Identity = Tuple[int, int]
 Held = Dict[Identity, Tuple[int, int]]  # inode this handle guards -> its (start, length) range
 
+
+class _Held(dict):
+    """A :func:`hold` record owned by the process that took it (Prism bf7314233ba1): after fork() the
+    child's counts start empty, and releasing an INHERITED record there would decrement the child's own
+    fresh claims. :func:`release` ignores a record from another pid."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.pid = os.getpid()
+
 # Handles per guarded inode in this process. Several SessionDB handles on one file share the
 # same descriptors' locks (hold() locks every matching descriptor), so the LAST handle unlocks.
 _LOCK = threading.Lock()
@@ -331,7 +341,9 @@ def _in_use(ident: Identity) -> bool:
     if _HANDLES.get(ident, 0) or _CLOSING.get(ident, 0) or _READERS.get(ident, 0):
         return True
     db = _SHM_DB.get(ident)
-    if db is not None and _READERS.get(db, 0):
+    # A writer whose hold() preceded the -shm counts only its state.db inode until refresh_shm(), yet
+    # its connection already holds POSIX locks on this -shm (Prism 1de1d88b5bec).
+    if db is not None and (_READERS.get(db, 0) or _HANDLES.get(db, 0) or _CLOSING.get(db, 0)):
         return True
     path = _PATHS.get(ident)
     if path is None:
@@ -368,22 +380,7 @@ def retire(closing: Optional[List[Identity]] = None) -> None:
         with _LOCK:
             for ident in [i for i in _SHM_IDENTS if not _in_use(i)]:
                 _close_private(ident)
-            pinned_shm = {i: (_FDS[i], _PATHS[i]) for i in _SHM_IDENTS if i in _FDS and i in _PATHS}
             parked = {i: (fd, _PATHS[i]) for i, fd in _FDS.items() if not _in_use(i) and i in _PATHS}
-        # A -shm generation SQLite already unlinked has no in-process user (SQLite unlinks only at its
-        # LAST in-process close of the inode), so the counts no longer protect anything; keeping the fd
-        # would read as a live deleted generation to every opener's probe, including one that is itself
-        # registered (Prism 9d02254cf252). Close it on a confirmed ENOENT or a different inode at the path.
-        stale_shm = set()
-        for ident, (_fd, path) in pinned_shm.items():
-            real, err = _stat_identity(path)
-            if (real is not None and real != ident) or (real is None and getattr(err, "errno", None) == errno.ENOENT):
-                stale_shm.add(ident)
-        if stale_shm:
-            with _LOCK:
-                for ident in stale_shm:
-                    if _FDS.get(ident) == pinned_shm[ident][0]:
-                        _close_private(ident)
         if not parked:
             return
         gone = set()
@@ -406,6 +403,57 @@ def retire(closing: Optional[List[Identity]] = None) -> None:
                 _close_private(ident)
     except Exception:
         logger.debug("WAL lock guard: descriptor retire failed", exc_info=True)
+
+
+def retire_completed_shm() -> None:
+    """For the deleted-generation PROBES only (under ``RETIRE_GATE``): close a private ``-shm`` fd whose
+    generation ended with a completed in-process close, even while a registered reader's block has not
+    exited yet (its connection closed last and unlinked -shm, Prism e5b80b447fa9). "Completed" is
+    proven, never assumed (Prism 24d6965d4428): the path is gone (ENOENT) or names another inode AND no
+    other descriptor in this process references the inode, so no SQLite connection here still uses it.
+    An externally unlinked -shm that a live connection still holds keeps the fd: that is the real
+    deleted-generation case and the probe must see it. The fd-table scan runs only when a candidate
+    exists (a pinned -shm whose path is gone): never on the hold/checkpoint/open fast path. Never raises."""
+    if _MODE != "private":
+        return
+    try:
+        with _LOCK:
+            pinned = {i: (_FDS[i], _PATHS[i]) for i in _SHM_IDENTS if i in _FDS and i in _PATHS}
+        candidates = {}
+        for ident, (fd, path) in pinned.items():
+            real, err = _stat_identity(path)
+            if (real is not None and real != ident) or (real is None and getattr(err, "errno", None) == errno.ENOENT):
+                candidates[ident] = fd
+        if not candidates:
+            return
+        with _LOCK:
+            mine = {fd for i in candidates for fd in [_FDS.get(i)] + _SURPLUS.get(i, []) if fd is not None}
+        others = {ident for fd, ident in _other_fds_on(set(candidates), mine)}
+        with _LOCK:
+            for ident, fd in candidates.items():
+                if ident not in others and _FDS.get(ident) == fd:
+                    _close_private(ident)
+    except Exception:
+        logger.debug("WAL lock guard: completed -shm retire failed", exc_info=True)
+
+
+def _other_fds_on(identities: Set[Identity], exclude: Set[int]):
+    """``(fd, ident)`` for this process's descriptors on *identities*, except *exclude*. Probe path only."""
+    for fd_dir in ("/proc/self/fd", "/dev/fd"):
+        try:
+            names = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for name in names:
+            if not name.isdigit() or int(name) in exclude:
+                continue
+            try:
+                st = os.stat(f"{fd_dir}/{name}")
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) in identities:
+                yield int(name), (st.st_dev, st.st_ino)
+        return
 
 
 # No atexit close of the pool (Prism c00385eecb2c / ea4900b85b87): at exit a daemon writer may still
@@ -518,7 +566,7 @@ def hold(db_path, held: Optional[Held] = None) -> Held:
     descriptor per inode, O(1) in the fd-table size). Returns the record :func:`release` needs;
     pass it back to extend an existing one (a ``-shm`` minted after open, a reopened connection).
     Idempotent per handle: an inode already in *held* is not counted twice. Never raises."""
-    held = {} if held is None else held
+    held = _Held() if held is None else held
     if not supported():
         return held
     if _MODE == "private":
@@ -578,6 +626,9 @@ def release(held: Held) -> List[Identity]:
     after that close, so a sibling's retire() cannot close a descriptor under the still-open
     connection in between (Prism 5ac4f2a27277)."""
     if not supported() or not held:
+        return []
+    if getattr(held, "pid", os.getpid()) != os.getpid():
+        held.clear()  # inherited across fork(): its claims were the parent's; the child counts none
         return []
     with _LOCK:
         closing = list(held)
