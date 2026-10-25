@@ -932,18 +932,26 @@ def finding_text(entry: dict, result: dict, header: str) -> str:
     return "\n".join(lines) + "\n---\n" + str(entry.get("wake_text") or "")
 
 
+def _surfaced_summary(kb: Any, conn: Any, task_id: str, delegation_id: str) -> Optional[str]:
+    """The summary of this delegation's executor ``surfaced:`` comment, None when there is none."""
+    head, tag = f"{MARKER} surfaced:", f"(delegation {delegation_id})"
+    for c in kb.list_comments(conn, task_id):
+        if c.author == AUTHOR and c.body.startswith(head) and c.body.endswith(tag):
+            return c.body[len(head):-len(tag)].strip()
+    return None
+
+
 def record_surface(entry: dict, summary: str) -> bool:
     """One executor-authored ``surfaced:`` comment per claim (keyed by delegation id)."""
     from hermes_cli import kanban_db as kb
 
-    tag = f"(delegation {entry['delegation_id']})"
     conn = kb.connect(board=entry.get("board"))
     try:
-        if any(c.author == AUTHOR and c.body.startswith(f"{MARKER} surfaced:") and c.body.endswith(tag)
-               for c in kb.list_comments(conn, entry["task_id"])):
+        if _surfaced_summary(kb, conn, entry["task_id"], entry["delegation_id"]) is not None:
             return False
         with kb.mutation_actor(session_ids=[], profile="default", surface="gateway"):
-            kb.add_comment(conn, entry["task_id"], AUTHOR, f"{MARKER} surfaced: {summary or 'no summary'} {tag}")
+            kb.add_comment(conn, entry["task_id"], AUTHOR,
+                           f"{MARKER} surfaced: {summary or 'no summary'} (delegation {entry['delegation_id']})")
         return True
     finally:
         conn.close()
@@ -1382,9 +1390,68 @@ async def reconcile(runner: Any, *, now: Optional[float] = None, state: Optional
                 board_has_receipt, entry.get("board"), entry["task_id"], entry["delegation_id"]):
             await asyncio.to_thread(state.update_claim, key, state=STATE_TERMINAL, outcome=entry.get("action"))
             continue
-        await _restart_redispatch_or_lost(runner, entry, state, now)
+        if not await _superseded_by_terminal(runner, entry, "gateway restart", state):
+            await _restart_redispatch_or_lost(runner, entry, state, now)
         handled += 1
     return handled
+
+
+# A completion verification whose verdict was DELIVERED (executor receipt) on a card that is still
+# closed lost nothing when a restart killed its claim: a ⚠️ line + re-surface replays a stale notice
+# as new (5 false lines on the 2026-10-24 restart). A ``surfaced:`` comment is NOT delivery proof:
+# run_entry writes it before resurface() reaches the owner (Prism 925507fa098b), so that claim gets
+# the surfaced finding delivered once, quietly. No verdict at all = the verification did not finish;
+# that claim takes the redispatch path below.
+_CLOSED_STATUSES = frozenset({"done", "archived"})
+_CLOSED_NOTICE_KINDS = frozenset({"completed", "archived"})
+
+
+def _closed_verdict(entry: dict) -> Optional[tuple]:
+    """``(status, "receipt", None)`` / ``(status, "surfaced", summary)`` when the card is closed and
+    this delegation's verdict is on the board, else None."""
+    from hermes_cli import kanban_db as kb
+
+    conn = _readonly(kb, entry.get("board"))
+    try:
+        status = getattr(kb.get_task(conn, entry["task_id"]), "status", None)
+        if status not in _CLOSED_STATUSES:
+            return None
+        if _receipt_exists(conn, entry["task_id"], entry["delegation_id"]):
+            return status, "receipt", None
+        summary = _surfaced_summary(kb, conn, entry["task_id"], entry["delegation_id"])
+        return (status, "surfaced", summary) if summary is not None else None
+    finally:
+        conn.close()
+
+
+async def _superseded_by_terminal(runner: Any, entry: dict, reason: str, state: BoomerangWakeState) -> bool:
+    """True = the claim was closed without a ⚠️ line (verdict on the board); False = take the
+    redispatch/lost path."""
+    if entry.get("kind") not in _CLOSED_NOTICE_KINDS or not entry.get("delegation_id"):
+        return False
+    try:
+        found = await asyncio.to_thread(_closed_verdict, entry)
+    except Exception as exc:   # unreadable board: keep today's visible path
+        logger.debug("kanban boomerang-wake: verdict read for %s failed (%s)", entry["task_id"], exc)
+        return False
+    if found is None:
+        return False
+    status, how, summary = found
+    if how == "surfaced":
+        # verdict known, delivery unconfirmed: deliver the child's finding once (never redispatch)
+        ok = await resurface(runner, entry, finding_text(entry, {"summary": summary}, "child surfaced"))
+        logger.info("kanban boomerang-wake: %s lost reason=%s surfaced finding re-delivered=%s status=%s "
+                    "delegation=%s (no lost line)", entry["task_id"], reason, ok, status, entry.get("delegation_id"))
+        await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL, outcome="surfaced",
+                                reason=reason, resurfaced=True, resurface_delivered=ok, finished_at=_time.time())
+        return True
+    logger.info("kanban boomerang-wake: %s lost reason=%s superseded-by-terminal status=%s kind=%s "
+                "delegation=%s (receipt on board; no line, no re-surface)", entry["task_id"], reason, status,
+                entry.get("kind"), entry.get("delegation_id"))
+    await asyncio.to_thread(state.update_claim, entry["key"], state=STATE_TERMINAL,
+                            outcome="superseded-by-terminal", reason=reason, card_status=status,
+                            finished_at=_time.time())
+    return True
 
 
 def _restart_refusal(entry: dict, state: BoomerangWakeState, now: float) -> Optional[str]:
