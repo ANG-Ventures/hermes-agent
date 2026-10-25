@@ -754,6 +754,23 @@ def _terminal_payload(record: dict[str, Any], result: dict[str, Any], status: st
     return payload
 
 
+#: ``append_terminal``'s default ``queued_boot_id``: stamp the attempt's owner boot (in-process
+#: units, whose owner gateway queues the payload itself).
+_OWNER_BOOT = object()
+
+#: ``execution.runtime`` of a unit that runs as a card on the kanban ``delegations`` board
+#: (docs/dev/delegate-background-on-kanban-runtime.md). Never re-dispatched by a restart (I3).
+KANBAN_RUNTIME = "kanban"
+
+
+def is_kanban_record(record: Any) -> bool:
+    """The record's unit runs on the kanban runtime (``execution.runtime == "kanban"``)."""
+    if not isinstance(record, dict):
+        return False
+    execution = record.get("execution")
+    return isinstance(execution, dict) and execution.get("runtime") == KANBAN_RUNTIME
+
+
 def append_terminal(
     delegation_id: str,
     attempt_id: str,
@@ -761,7 +778,13 @@ def append_terminal(
     status: str,
     *,
     profile_home: Path | None = None,
+    queued_boot_id: Any = _OWNER_BOOT,
 ) -> dict[str, Any] | None:
+    """Write the attempt's terminal result + outbox event; None when the attempt is not current.
+
+    ``queued_boot_id=None`` (a kanban unit's runner, another process than any gateway) leaves
+    the event unqueued, so the owning profile's gateway queues it (boot replay or the card-end
+    drain); the default stamps the attempt's owner boot."""
     with locked_registry(profile_home) as registry:
         if delegation_id in set(registry.get("_invalid_record_ids", [])):
             return None
@@ -829,7 +852,8 @@ def append_terminal(
                 "event_id": event_id,
                 "type": "async_delegation",
                 "state": "pending",
-                "queued_boot_id": record["attempt"].get("owner_boot_id"),
+                "queued_boot_id": (record["attempt"].get("owner_boot_id")
+                                   if queued_boot_id is _OWNER_BOOT else queued_boot_id),
                 "created_at": payload["completed_at"],
                 "delivered_at": None,
                 "drop_reason": None,
@@ -844,6 +868,7 @@ def fail_attempt(
     error: str,
     *,
     profile_home: Path | None = None,
+    queued_boot_id: Any = _OWNER_BOOT,
 ) -> dict[str, Any] | None:
     return append_terminal(
         delegation_id,
@@ -851,7 +876,92 @@ def fail_attempt(
         {"status": "error", "error": error, "summary": None},
         "error",
         profile_home=profile_home,
+        queued_boot_id=queued_boot_id,
     )
+
+
+def set_kanban_block(
+    delegation_id: str, attempt_id: str, block: dict[str, Any], *, profile_home: Path | None = None,
+) -> bool:
+    """Record the unit's kanban card (``{board, task_id}``) on the current running attempt."""
+    with locked_registry(profile_home) as registry:
+        record = registry["records"].get(delegation_id)
+        if (not isinstance(record, dict) or record.get("state") != "running"
+                or (record.get("attempt") or {}).get("attempt_id") != attempt_id):
+            return False
+        record["kanban"] = dict(block)
+        record["updated_at"] = time.time()
+        append_lifecycle_event(record, "kanban_spawned",
+                               f"task={block.get('task_id')} attempt={attempt_id}")
+        return True
+
+
+def supersede_attempt(
+    delegation_id: str, old_attempt_id: str, *, profile_home: Path | None = None,
+) -> str | None:
+    """A kanban spawn failed: hand the unit to an in-process attempt. Returns the new attempt id.
+
+    Generation + 1 and a new ``attempt_id``; ``execution.runtime`` becomes ``in_process`` and the
+    ``kanban`` block is dropped; the state stays ``running``. Nothing else of ``claim_recoveries``'
+    bump: ``redispatch_count`` is unchanged and no restart event is written (a spawn failure is
+    not a restart). A runner already launched for the old attempt then finds it not current and
+    exits without a model call (or has its terminal write refused). None when the old attempt is
+    no longer the current running one."""
+    with locked_registry(profile_home) as registry:
+        record = registry["records"].get(delegation_id)
+        if (not isinstance(record, dict) or record.get("state") != "running"
+                or not isinstance(record.get("attempt"), dict)
+                or record["attempt"].get("attempt_id") != old_attempt_id):
+            return None
+        attempt = record["attempt"]
+        generation = int(attempt.get("generation") or 0) + 1
+        new_attempt_id = _attempt_id(delegation_id, generation)
+        attempt.update({"attempt_id": new_attempt_id, "generation": generation, "submitted_at": None})
+        execution = record.get("execution")
+        if isinstance(execution, dict):
+            execution["runtime"] = "in_process"
+        record.pop("kanban", None)
+        record["updated_at"] = time.time()
+        append_lifecycle_event(record, "kanban_superseded",
+                               f"old={old_attempt_id} new={new_attempt_id}")
+        return new_attempt_id
+
+
+def enqueue_record_outbox(
+    delegation_id: str, current_boot_id: str, *, profile_home: Path | None = None,
+) -> list[dict[str, Any]]:
+    """``enqueue_pending_outbox`` restricted to ONE record (the card-end drain of a kanban unit).
+
+    Its pending events whose ``queued_boot_id`` is not this boot are stamped with this boot and
+    returned for the completion queue; no other record's events are touched."""
+    queued: list[dict[str, Any]] = []
+    now = time.time()
+    with locked_registry(profile_home) as registry:
+        if delegation_id in set(registry.get("_invalid_record_ids", [])):
+            return queued
+        record = registry["records"].get(delegation_id)
+        if not isinstance(record, dict):
+            return queued
+        try:
+            canonical_terminal(registry, delegation_id)
+        except Exception:
+            logger.warning("Could not drain delegation %s; invalid canonical evidence",
+                           delegation_id, exc_info=True)
+            return queued
+        for event in record.get("outbox", []):
+            if not isinstance(event, dict) or event.get("state") != "pending":
+                continue
+            if event.get("queued_boot_id") == current_boot_id:
+                continue
+            created_at = event.get("created_at")
+            if isinstance(created_at, (int, float)) and now - created_at > MAX_COMPLETION_REPLAY_AGE_SECONDS:
+                event.update(state="dropped", drop_reason="stale_completion", delivered_at=now)
+                continue
+            event["queued_boot_id"] = current_boot_id
+            queued.append(copy.deepcopy(event.get("payload") or {}))
+        if queued:
+            append_lifecycle_event(record, "kanban_card_ended", f"boot={current_boot_id}", now=now)
+    return queued
 
 
 def transition_owned(
@@ -920,8 +1030,13 @@ def cancel_matching(
     profile_home: Path | None = None,
     reason: str = "unspecified",
     caller: str = "",
+    include_kanban: bool = False,
 ) -> int:
     """Durably cancel active records, including resume-disabled records.
+
+    ``include_kanban``: an ``all_active`` cancel never matches a kanban-runtime record unless
+    this is set, whatever its ``owner_boot_id`` (I9: a surviving unit is cancelled only on
+    purpose, by its own session's selectors or an explicit opt-in). No existing caller sets it.
 
     ``reason``/``caller`` are Phase-0 cancel forensics: they are stamped into
     each cancelled record's additive ``cancel_attribution`` block (WHO/WHY/
@@ -970,6 +1085,8 @@ def cancel_matching(
                 )
             )
             if not matches:
+                continue
+            if all_active and not include_kanban and is_kanban_record(record):
                 continue
             if owner_boot_id:
                 record_owner = str(
@@ -1184,6 +1301,8 @@ def claim_recoveries(
                 continue  # a live detached child: adopted (claim_detached_adoptions), never re-run
             if isinstance(record.get("detached_fenced"), dict):
                 continue  # a stood-down child not yet confirmed dead: never run a second generation beside it
+            if is_kanban_record(record):
+                continue  # its own process outlives the owner; never re-dispatched (I3)
             owner = str(attempt.get("owner_boot_id") or "")
             if state == "running" and owner == current_boot_id:
                 continue

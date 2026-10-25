@@ -6021,6 +6021,10 @@ class GatewayRunner(
                         current_boot_id=boot_id,
                         profile_home=profile_home,
                     )
+                    # Kanban-runtime units outlive the gateway: observe each running one so
+                    # active_count / has_live_for_session / /stop see it (spec §5.4 Boot).
+                    from tools.async_delegation_kanban import observe_running
+                    observe_running(profile_home, boot_id)
             except Exception:
                 logger.error(
                     "Async delegation recovery failed for profile=%s home=%s",

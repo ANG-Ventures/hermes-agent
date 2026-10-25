@@ -61,6 +61,8 @@ AGENT_CONSTRUCTION_HOSTS: dict[str, str] = {
     "tools/delegate_detached.py": GATEWAY + "; the detached child (_child_main) registers the profile's hooks "
                                   "itself before building the parent",
     "tools/delegate_tool.py": CHILD,
+    "tools/delegation_unit_worker.py": GATEWAY + "; the delegation-unit worker (run) registers the profile's hooks "
+                                       "before building the parent",
     "tools/dev_probes/boomerang_v2_p2_live.py": EXEMPT + ": operator-run dev probe against a scratch home, never imported",
     "tui_gateway/methods_prompt.py": TUI_GATEWAY + "; background agents reuse the session agent's home",
     "tui_gateway/server.py": TUI_GATEWAY,

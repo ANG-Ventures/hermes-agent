@@ -1859,6 +1859,11 @@ class GatewayKanbanWatchersMixin:
         """Clear notifier-visible ownership before releasing the OS lock."""
         handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
         self._kanban_dispatcher_lock_handle = None
+        try:
+            from tools.async_delegation_kanban import set_dispatcher_active
+            set_dispatcher_active(False)
+        except Exception:
+            pass
         _release_singleton_lock(handle)
     async def _sleep_between_ticks(self, interval: float) -> None:
         """Sleep *interval* (floored to 1s) in 1s slices so stop() never waits a full interval."""
@@ -3785,6 +3790,11 @@ class GatewayKanbanWatchersMixin:
         else:
             return
         self._kanban_dispatcher_lock_handle = _lock_handle
+        try:
+            from tools.async_delegation_kanban import set_dispatcher_active
+            set_dispatcher_active(True)  # §5.1.5: a dispatcher now reaps this process's unit workers
+        except Exception:
+            logger.debug("kanban dispatcher: could not flag the delegations runtime", exc_info=True)
         if waiting_logged or unavailable_logged:
             logger.warning("kanban dispatcher: assumed leadership after standby (%s)", _lock_path)
         else:
