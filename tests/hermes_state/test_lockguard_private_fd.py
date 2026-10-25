@@ -763,7 +763,9 @@ def test_initializing_writer_is_counted_before_its_hold(tmp_path, monkeypatch):
     try:
         assert seen == {"kept": True}, "a sibling's close retired the -shm fd under an initializing writer"
         assert shm_ident in second._wal_lock_guard
-        assert not any(isinstance(k, tuple) and k and k[0] == "path" for k in lg._READERS), lg._READERS
+        # the opener's own registration was dropped once hold() counted it (other tests' leaked read
+        # connections may still be registered on THEIR paths: scope the check to this database)
+        assert ("path", str(db)) not in lg._READERS, lg._READERS
     finally:
         second.close()
 
