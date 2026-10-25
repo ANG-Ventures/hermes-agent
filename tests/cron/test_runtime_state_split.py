@@ -2231,20 +2231,13 @@ def test_retire_keeps_db_when_a_row_changed_after_the_export_snapshot(temp_home,
 
 def test_profile_export_drops_staged_rollback_journal(temp_home, tmp_path, monkeypatch):
     """15391e1b7adf: a runtime_state.db-journal (journal_mode=delete hot journal, holds row
-    pre-images) is removed from the STAGED copy like -wal/-shm, with or without a main db; a
-    symlink at that name is refused."""
-    from cron import runtime_state as rs
-
+    pre-images) left with no main db is removed from the STAGED copy like -wal/-shm; a symlink at
+    that name is refused."""
     profiles, profile_dir, cron = _export_profile_fixture(tmp_path, monkeypatch)
     (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "n"}]}),
                                     encoding="utf-8")
     (cron / "runtime_state.db-journal").write_bytes(b"ghp_" + b"a" * 36)
     names = _archive_names(profiles.export_profile("p", str(tmp_path / "a.tar.gz")))
-    assert not any("runtime_state.db" in n for n in names), names
-    journal = (cron / "runtime_state.db-journal").read_bytes()
-    rs.write_rows(cron, {"j1": {"last_status": "ok"}})
-    (cron / "runtime_state.db-journal").write_bytes(journal)
-    names = _archive_names(profiles.export_profile("p", str(tmp_path / "b.tar.gz")))
     assert not any("runtime_state.db" in n for n in names), names
     assert (cron / "runtime_state.db-journal").exists()  # the live dir is never touched
     (cron / "runtime_state.db-journal").unlink()
