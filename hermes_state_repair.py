@@ -609,10 +609,12 @@ def _bind_reader_token(conn: sqlite3.Connection, token) -> None:
     """Drop the lock guard's reader count right after *conn* actually closes (never before)."""
     from hermes_state_lockguard import unregister_reader
     close = conn.close
+    pending = [token]  # consumed once, only after a close that succeeded (Prism 4eff69c393c6)
 
     def _close_and_unregister():
-        close()
-        unregister_reader(token)
+        close()  # raises -> the token stays: the connection may still be open
+        if pending:
+            unregister_reader(pending.pop())
 
     try:
         conn.close = _close_and_unregister  # type: ignore[method-assign]

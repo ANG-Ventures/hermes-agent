@@ -1121,6 +1121,9 @@ class SessionDB(
         # guard's RETIRE_GATE: a sibling handle's clean close must finish retiring its private -shm
         # descriptor first, or this probe reads that descriptor as a deleted generation (Prism 9d02254cf252).
         with _lockguard.RETIRE_GATE:
+            # A registered reader's own last SQLite close can unlink -shm before its retire() runs;
+            # settle that here so our private fd is never the "deleted holder" (Prism e5b80b447fa9).
+            _lockguard.retire()
             refuse_deleted_wal_generation(self.db_path)
         # Create/tighten the main database before sqlite3.connect() so a
         # permissive process umask can never expose a fresh profile store.
@@ -1603,6 +1606,7 @@ class SessionDB(
             watched = _watched_sqlite_sidecar_paths(self.db_path)
             try:
                 with _lockguard.RETIRE_GATE:  # never mid-retire of the guard's own -shm fd (Prism 9d02254cf252)
+                    _lockguard.retire()  # a reader's close may have unlinked -shm (Prism e5b80b447fa9)
                     for target, fd_path in _proc_fd_targets(os.getpid()):
                         canonical = _state_holders.canonical_sqlite_path(target)
                         if (" (deleted)" in target and canonical in watched
