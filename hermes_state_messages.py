@@ -1530,8 +1530,8 @@ class SessionMessagesMixin:
         """True when any user row (any active state) at or after ``since`` contains ``needle``, in
         ``session_ids`` or in any session of ``session_key`` still open or ended since (a wake retargeted
         from an idle-ended parent runs in the key's current session): the consumption receipt for an
-        admitted gateway wake (t_97a879af). ``needle`` must be followed by a newline, a space or the end
-        of the content, so ``Event: X:g1`` never matches ``Event: X:g10`` (t_506536db) while a batch
+        admitted gateway wake (t_97a879af). ``needle`` must be followed by a newline, a CR, a space or
+        the end of the content, so ``Event: X:g1`` never matches ``Event: X:g10`` (t_506536db) while a batch
         wake's ``Event: X   Total duration: Ns`` line still matches."""
         ids = [sid for sid in session_ids if sid]
         if session_key:
@@ -1542,8 +1542,9 @@ class SessionMessagesMixin:
             return False
         row = self._read_one(
             f"SELECT 1 FROM messages WHERE session_id IN ({_placeholders(ids)}) AND role = 'user'"
-            " AND timestamp >= ? AND (instr(content || char(10), ?) > 0 OR instr(content, ?) > 0) LIMIT 1",
-            (*ids, since, needle + "\n", needle + " "))
+            " AND timestamp >= ? AND (instr(content || char(10), ?) > 0 OR instr(content, ?) > 0"
+            " OR instr(content, ?) > 0) LIMIT 1",
+            (*ids, since, needle + "\n", needle + " ", needle + "\r"))
         return row is not None
 
     def display_message_count(self, session_id: str) -> int:

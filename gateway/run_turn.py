@@ -4958,12 +4958,15 @@ class GatewayTurnMixin:
                 logger.info("PHASE=stale_drain_skipped session=%s gen=%s", session_key, turn_ctx.run_generation)
                 pending_event, pending = None, None
             else:
-                if isinstance(result, dict) and result.get("pending_steer"):
-                    # Provenance of the leftover steer: internal only when the leftover text is made
-                    # up entirely of internal steers recorded on the agent that drained it (t_506536db).
+                if isinstance(result, dict):
+                    # Provenance of the leftover steer: internal only when the leftover is built from
+                    # internal steer entries of the agent's buffer. Called on EVERY turn end, leftover
+                    # or not, so it retires entries a tool batch drained mid-turn (t_506536db).
                     from gateway.run_busy import leftover_steer_is_internal
-                    result["_pending_steer_internal"] = leftover_steer_is_internal(
-                        turn_ctx.agent_holder[0] if turn_ctx.agent_holder else None, result["pending_steer"])
+                    _internal = leftover_steer_is_internal(
+                        turn_ctx.agent_holder[0] if turn_ctx.agent_holder else None, result.get("pending_steer"))
+                    if result.get("pending_steer"):
+                        result["_pending_steer_internal"] = _internal
                 pending_event, pending = await self._run_agent_drain_pending(
                     result, adapter, source, session_key, turn_ctx.session_id,
                 )

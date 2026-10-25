@@ -47,46 +47,61 @@ def approval_input_words(input_key: str) -> Tuple[str, ...]:
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
-# Agent attribute holding the stripped texts of accepted INTERNAL steers not yet classified. It lives
-# on the agent because the steer buffer does: a recursive follow-up reuses the cached agent while the
-# session slot may still hold the previous turn's context (Prism e08366573530, t_506536db).
-_INTERNAL_STEERS_ATTR = "_gateway_internal_steers"
-_INTERNAL_STEERS_MAX = 64
+# Agent attribute holding one entry per gateway steer accepted into the agent's steer buffer:
+# ``(text, internal)``. It lives on the agent because the buffer does: a recursive follow-up reuses
+# the cached agent while the session slot may still hold the previous turn's context (Prism
+# e08366573530). Entries describe the CURRENT buffer only (Prism c87ed8b8f07d, 18ae9a407387,
+# t_506536db): a steer that finds the buffer empty starts a fresh ledger (everything before it was
+# drained), and classifying a leftover retires every entry whatever the verdict.
+_STEER_ENTRIES_ATTR = "_gateway_steer_entries"
+_STEER_ENTRIES_MAX = 64
 
 
-def record_internal_steer(agent: Any, text: str) -> None:
-    """Remember that *text* (as queued by ``agent.steer``, i.e. stripped) came from an internal event."""
+def _steer_buffer_empty(agent: Any) -> bool:
+    """True when *agent*'s steer buffer holds nothing, i.e. every earlier entry was drained."""
+    return not getattr(agent, "_pending_steer", None)
+
+
+def steer_with_provenance(agent: Any, verb: Any, text: str, *, internal: bool) -> bool:
+    """``verb(text)`` (the agent's ``steer``/``redirect``) and, when accepted, record the entry."""
+    fresh = _steer_buffer_empty(agent)
+    accepted = bool(verb(text))
+    if accepted:
+        _record_steer_entry(agent, text, internal=internal, fresh=fresh)
+    return accepted
+
+
+def _record_steer_entry(agent: Any, text: str, *, internal: bool, fresh: bool) -> None:
     cleaned = (text or "").strip()
     if not cleaned or agent is None:
         return
     try:
-        ledger = agent.__dict__.setdefault(_INTERNAL_STEERS_ATTR, [])
+        attrs = agent.__dict__
     except AttributeError:
         return
-    ledger.append(cleaned)
-    del ledger[:-_INTERNAL_STEERS_MAX]
+    if fresh or not isinstance(attrs.get(_STEER_ENTRIES_ATTR), list):
+        attrs[_STEER_ENTRIES_ATTR] = []
+    ledger = attrs[_STEER_ENTRIES_ATTR]
+    ledger.append((cleaned, bool(internal)))
+    del ledger[:-_STEER_ENTRIES_MAX]
 
 
 def leftover_steer_is_internal(agent: Any, leftover: Optional[str]) -> bool:
-    """True only when *leftover* consists entirely of internal steers recorded on *agent*.
+    """True only when *leftover* is built entirely from internal steer entries of *agent*'s buffer.
 
-    Each matched record is consumed. Any text not accounted for (a human steer, a steer recorded on
-    another agent, an unknown origin) makes the leftover human: the failure direction is a visible
-    turn, never a silenced one."""
+    Retires every entry first, so no record outlives the buffer it described. False when any entry is
+    human, when an entry is missing from the leftover (stale, or drained mid-turn), or when the leftover
+    holds text no entry accounts for (a steer that bypassed the gateway): the failure direction is a
+    visible turn, never a silenced one."""
+    entries = getattr(agent, "__dict__", {}).pop(_STEER_ENTRIES_ATTR, None) if agent is not None else None
     remainder = (leftover or "").strip()
-    ledger = getattr(agent, "__dict__", {}).get(_INTERNAL_STEERS_ATTR) if agent is not None else None
-    if not remainder or not ledger:
+    if not remainder or not entries or not all(internal for _, internal in entries):
         return False
-    matched = []
-    for idx, text in enumerate(ledger):
-        if text in remainder:
-            remainder = remainder.replace(text, "", 1)
-            matched.append(idx)
-    if remainder.strip():
-        return False
-    for idx in reversed(matched):
-        del ledger[idx]
-    return True
+    for text, _ in entries:
+        if text not in remainder:
+            return False
+        remainder = remainder.replace(text, "", 1)
+    return not remainder.strip()
 
 
 def _strip_slot(text: str, slot: str) -> Optional[str]:
@@ -353,13 +368,10 @@ class GatewayBusySessionMixin:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
         :meth:`_steer_active_subagents`); True when the parent or any child queued it.
 
-        An accepted *internal* steer is recorded ON THE AGENT, next to the buffer the text went into,
-        so provenance follows the text to whichever turn drains it (see
-        :func:`leftover_steer_is_internal`), never to the context the slot held at steer time
-        (Prism e08366573530, t_506536db)."""
-        accepted = bool(running_agent.steer(text))
-        if accepted and internal:
-            record_internal_steer(running_agent, text)
+        Every accepted steer is recorded ON THE AGENT as a buffer entry with its provenance, so it
+        follows the text to whichever turn drains it (see :func:`leftover_steer_is_internal`), never to
+        the context the slot held at steer time (Prism e08366573530, t_506536db)."""
+        accepted = steer_with_provenance(running_agent, running_agent.steer, text, internal=internal)
         return bool(self._steer_active_subagents(running_agent, text)) or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
@@ -707,10 +719,9 @@ class GatewayBusySessionMixin:
             if verb == "steer":
                 return self._steer_running_agent(running_agent, call_text,
                                                  internal=bool(getattr(event, "internal", False)))
-            accepted = bool(getattr(running_agent, verb)(call_text))
-            if accepted and getattr(event, "internal", False):
-                record_internal_steer(running_agent, call_text)  # a redirect may land in the steer buffer
-            return accepted
+            # A redirect may land in the steer buffer (tool phase), so it is a buffer entry too.
+            return steer_with_provenance(running_agent, getattr(running_agent, verb), call_text,
+                                         internal=bool(getattr(event, "internal", False)))
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False

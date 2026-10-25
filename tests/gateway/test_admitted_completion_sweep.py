@@ -222,6 +222,25 @@ def test_receipt_needle_matches_at_end_of_content_and_mid_content(tmp_path, isol
     assert _json_outbox_states(tmp_path) == ["delivered"]
 
 
+def test_receipt_needle_matches_a_crlf_row_but_not_its_g10(tmp_path, isolated_registry):
+    """Prism 058ef80fda07 (t_506536db r4): a CRLF row ``Event: X:g1\\r\\n`` confirms g1; the g10
+    boundary holds for CRLF rows too (a g10-only CRLF row confirms nothing)."""
+    runner, _adapter, event = _admitted(tmp_path, isolated_registry)
+    _persist_user_row(tmp_path, "parent-sess", f"[x]\r\nEvent: {event['event_id']}0\r\nmore")
+    later = time.time() + 600
+    _run(runner, later)
+    assert _json_outbox_states(tmp_path) != ["delivered"]
+    _persist_user_row(tmp_path, "parent-sess", f"[x]\r\nEvent: {event['event_id']}\r\nmore")
+    assert _run(runner, later + 60) == 0
+    assert _json_outbox_states(tmp_path) == ["delivered"]
+
+
+def test_parked_crlf_wake_is_seen_but_its_g10_is_not():
+    needle = "Event: deleg_x:terminal:g1"
+    assert sweep._needle_terminated_in(f"[x]\r\n{needle}\r\ntail", needle)
+    assert not sweep._needle_terminated_in(f"[x]\r\n{needle}0\r\ntail", needle)
+
+
 def test_wake_parked_as_g10_does_not_shield_a_lost_g1(tmp_path, isolated_registry):
     runner, adapter, event = _admitted(tmp_path, isolated_registry)
     adapter._pending_messages[KEY] = SimpleNamespace(text=f"x\nEvent: {event['event_id']}0")

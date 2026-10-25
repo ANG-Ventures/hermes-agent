@@ -271,3 +271,77 @@ async def test_steer_provenance_binds_to_the_receiving_turn_not_the_slot_context
     assert final["final_response"] == "NO_REPLY", final
     assert final["queued_terminal_display_kind"] is None, final
     assert not silence_allowed(final["queued_terminal_display_kind"], final.get("queued_terminal_reply_expected"))
+
+
+class _BufferAgent:
+    """The real steer buffer (``InterruptControlMixin.steer`` / ``_drain_pending_steer``) and nothing else."""
+
+    def __init__(self):
+        self._pending_steer = None
+        self._pending_steer_lock = threading.Lock()
+
+    from agent.interrupt_control import InterruptControlMixin as _icm
+    steer = _icm.steer
+    _drain_pending_steer = _icm._drain_pending_steer
+    del _icm
+
+
+def _steer(agent, text, *, internal):
+    from gateway.run_busy import GatewayBusySessionMixin
+    runner = SimpleNamespace(_steer_active_subagents=lambda running_agent, text: 0)
+    assert GatewayBusySessionMixin._steer_running_agent(runner, agent, text, internal=internal)
+
+
+def test_internal_steer_drained_without_leftover_does_not_mark_a_later_human_steer():
+    """Prism c87ed8b8f07d (t_506536db r4): an internal steer consumed by a tool batch leaves no
+    leftover, so nothing classifies it. A later HUMAN steer with the same text is still human."""
+    from gateway.run_busy import leftover_steer_is_internal
+    agent = _BufferAgent()
+    _steer(agent, "continue", internal=True)
+    assert agent._drain_pending_steer() == "continue"  # delivered mid-turn, no leftover
+    _steer(agent, "continue", internal=False)
+    leftover = agent._drain_pending_steer()  # the finalizer's leftover drain
+    assert leftover == "continue"
+    assert leftover_steer_is_internal(agent, leftover) is False
+
+
+def test_mixed_leftover_retires_its_internal_entries():
+    """Prism 18ae9a407387 (t_506536db r4): a mixed leftover is human AND retires its entries, so a
+    later human-only leftover equal to the internal part is still human."""
+    from gateway.run_busy import leftover_steer_is_internal
+    agent = _BufferAgent()
+    _steer(agent, "done", internal=True)
+    _steer(agent, "please explain", internal=False)
+    leftover = agent._drain_pending_steer()
+    assert leftover == "done\nplease explain"
+    assert leftover_steer_is_internal(agent, leftover) is False
+    _steer(agent, "done", internal=False)
+    leftover = agent._drain_pending_steer()
+    assert leftover == "done"
+    assert leftover_steer_is_internal(agent, leftover) is False
+
+
+def test_all_internal_buffer_entries_classify_internal():
+    from gateway.run_busy import leftover_steer_is_internal
+    agent = _BufferAgent()
+    _steer(agent, "human earlier", internal=False)
+    agent._drain_pending_steer()  # drained by a tool batch: not part of the next buffer
+    _steer(agent, "wake one", internal=True)
+    _steer(agent, "wake two", internal=True)
+    leftover = agent._drain_pending_steer()
+    assert leftover_steer_is_internal(agent, leftover) is True
+    # Retired: the same text steered again by a human is human.
+    _steer(agent, "wake one", internal=False)
+    assert leftover_steer_is_internal(agent, agent._drain_pending_steer()) is False
+
+
+def test_turn_end_without_leftover_retires_entries_before_a_non_gateway_steer():
+    """t_506536db r4: the turn-end call (no leftover) retires an internal entry a tool batch drained, so
+    an identical steer that bypasses the gateway ledger (kanban note, api_server) reads human."""
+    from gateway.run_busy import leftover_steer_is_internal
+    agent = _BufferAgent()
+    _steer(agent, "continue", internal=True)
+    agent._drain_pending_steer()  # delivered mid-turn
+    assert leftover_steer_is_internal(agent, None) is False  # turn end, no leftover
+    agent.steer("continue")  # producer with no gateway entry
+    assert leftover_steer_is_internal(agent, agent._drain_pending_steer()) is False

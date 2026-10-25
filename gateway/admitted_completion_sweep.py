@@ -89,13 +89,13 @@ def _parked_in_memory(runner: Any, session_key: str, needle: str) -> bool:
             queued.append(slot[session_key])
         if session_key in (getattr(adapter, "_active_sessions", None) or {}):
             return True
-    # Terminated like the transcript probe (newline, space or end): ``Event: X:g1`` must not match
+    # Terminated like the transcript probe (newline, CR, space or end): ``Event: X:g1`` must not match
     # ``Event: X:g10``, and a batch wake's ``Event: X   Total duration: Ns`` line must match.
     return any(_needle_terminated_in(getattr(event, "text", "") or "", needle) for event in queued)
 
 
 def _needle_terminated_in(text: str, needle: str) -> bool:
-    return f"{needle}\n" in f"{text}\n" or f"{needle} " in text
+    return f"{needle}\n" in f"{text}\n" or f"{needle} " in text or f"{needle}\r" in text
 
 
 async def sweep_admitted_completions(runner: Any, *, now: float | None = None) -> int:
