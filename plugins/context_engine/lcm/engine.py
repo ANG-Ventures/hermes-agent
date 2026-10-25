@@ -8117,13 +8117,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     # -- Lifecycle ---------------------------------------------------------
 
     def shutdown(self):
-        self._unregister_active_engine_binding()
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.close()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
-        if self._assertions is not None:
-            self._assertions.close()
-        if self._query_views is not None:
-            self._query_views.close()
+        """Close every store this engine opened. Idempotent: a second call is a no-op.
+
+        Called on agent eviction/close (run_agent ``_shutdown_context_engine``) and, as a
+        backstop, from ``__del__``; each store's ``close()`` also tolerates a double close.
+        """
+        self._finalize_storage(unregister=True)
+
+    def _finalize_storage(self, *, unregister: bool) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        if unregister:
+            self._unregister_active_engine_binding()
+        self._close_storage()
+
+    def __del__(self) -> None:  # backstop for an engine nobody shut down (t_0d987578)
+        # Skip the registry unregister: its WeakValueDictionary entries are already dead once
+        # __del__ runs, and taking its lock from a GC callback on an arbitrary thread is avoidable.
+        try:
+            self._finalize_storage(unregister=False)
+        except BaseException:  # never raise from a finalizer, incl. during interpreter teardown
+            pass
