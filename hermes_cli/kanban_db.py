@@ -10399,7 +10399,7 @@ def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
         argv = [sys.executable, script, "check", "--repo", ref.repo, "--pr", str(ref.number),
                 "--card", task_id, "--worker", worker or "worker", "--draft-ok"]
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=180,
+            proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180,
                                   stdin=subprocess.DEVNULL, check=False)
         except (OSError, subprocess.SubprocessError) as exc:
             _log.warning("pre-PR verifier %s#%s did not run: %s", ref.repo, ref.number, exc)
