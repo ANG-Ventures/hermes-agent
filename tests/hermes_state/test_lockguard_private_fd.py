@@ -524,3 +524,18 @@ def test_retire_closes_only_on_enoent_or_identity_change(tmp_path, monkeypatch, 
     db.unlink()  # ENOENT
     lg.retire()
     assert ident2 not in lg._FDS
+
+
+def test_lock_gauge_does_not_overwrite_a_recorded_transaction_hold(tmp_path, monkeypatch):
+    """The ledger keeps one record per pid. A write transaction long enough for hold_ended() to
+    record it already names the holder; the _lock: row must not replace it."""
+    pin_wal(monkeypatch)
+    notes = []
+    monkeypatch.setattr(lockowners, "note_lock_hold", lambda db, op, held: notes.append(op))
+    monkeypatch.setattr(lockowners, "_HOLD_RECORD_MIN_S", 1.0)
+    sdb = make_db(tmp_path / "state.db", "s", "seed")
+    try:
+        sdb._execute_write(_SlowWrite(1.2))
+        assert notes == []
+    finally:
+        sdb.close()

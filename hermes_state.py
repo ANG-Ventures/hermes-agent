@@ -533,14 +533,20 @@ _WRITE_PLUMBING_FRAMES = frozenset({
 _LOCK_HOLD_WARN_S = 1.0
 
 
-def _note_lock_hold(db_path, fn_name: str, t0: float) -> None:
-    """Log + ledger a ``SessionDB._lock`` hold over _LOCK_HOLD_WARN_S. Never raises."""
+def _note_lock_hold(db_path, fn_name: str, t0: float, txn_s: float = 0.0) -> None:
+    """Log + ledger a ``SessionDB._lock`` hold over _LOCK_HOLD_WARN_S. Never raises.
+
+    *txn_s* is the write transaction's own duration inside this hold. The ledger keeps ONE record
+    per pid, and hold_ended() already published one for a transaction of _HOLD_RECORD_MIN_S+ that
+    names the real holder op; the ``_lock:`` row would overwrite it, so it is skipped then (the
+    WARNING is still logged)."""
     held = time.monotonic() - t0
     if held <= _LOCK_HOLD_WARN_S:
         return
     try:
         logger.warning("SessionDB._lock held %.1fs in %s", held, fn_name)
-        _lockowners.note_lock_hold(db_path, f"_lock:{fn_name}", held)
+        if txn_s < _lockowners._HOLD_RECORD_MIN_S:
+            _lockowners.note_lock_hold(db_path, f"_lock:{fn_name}", held)
     except Exception:
         pass
 
@@ -1302,12 +1308,14 @@ class SessionDB(
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
                     hold = None
+                    txn_t0 = None
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
                         # Inside the rollback try: nothing between BEGIN and fn may leave the
                         # transaction open (hold_started never raises; this is the backstop).
                         caller = _write_caller_name()
                         hold = hold_started(self.db_path, caller)  # holder-side lock ledger
+                        txn_t0 = time.monotonic()
                         fn_started = True
                         result = fn(self._conn)
                         self._conn.commit()
@@ -1319,7 +1327,8 @@ class SessionDB(
                         raise
                     finally:
                         hold_ended(hold)
-                        _note_lock_hold(self.db_path, caller or "write", lock_t0)
+                        _note_lock_hold(self.db_path, caller or "write", lock_t0,
+                                        0.0 if txn_t0 is None else time.monotonic() - txn_t0)
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
