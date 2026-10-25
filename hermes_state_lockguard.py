@@ -111,10 +111,20 @@ _FDS: Dict[Identity, int] = {}
 
 
 def _reset_after_fork() -> None:
-    """A fork child shares the parent's open descriptions, so unlocking them would lift the PARENT's
-    guard: forget them (never unlock or close) and start from scratch."""
+    """A fork child shares the parent's open descriptions, so an F_UNLCK would lift the PARENT's
+    guard: never unlock. Close the inherited copies instead (Prism 377384e39385): an OFD lock lives
+    until the LAST descriptor on its description closes, and the parent still holds one, so the
+    parent stays guarded; a forgotten copy would pin a ``-shm`` the parent's last close unlinks, and
+    the deleted-generation probe would then refuse every opener until the child exits. Right after
+    fork the child holds no POSIX locks (they are not inherited), so the close cancels nothing."""
     global _LOCK, _HANDLES, _FDS
+    inherited = list(_FDS.values())
     _LOCK, _HANDLES, _FDS = threading.Lock(), {}, {}
+    for fd in inherited:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 if hasattr(os, "register_at_fork"):  # POSIX only

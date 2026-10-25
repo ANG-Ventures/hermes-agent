@@ -259,3 +259,43 @@ def test_refused_lock_descriptor_is_still_retired(tmp_path, monkeypatch):
     monkeypatch.undo()
     lg.retire()
     assert ident not in lg._FDS and ident not in lg._HANDLES
+
+
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_fork_child_closes_inherited_private_fds_and_parent_stays_guarded(tmp_path):
+    """Prism 377384e39385: the child closes (never unlocks) its inherited private fds, so it pins no
+    -shm, and the parent's OFD lock survives because the parent still holds the description."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
+    held = lg.hold(db)
+    try:
+        inodes = {(os.stat(p).st_dev, os.stat(p).st_ino) for p in (db, shm)}
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # child: after_in_child already ran
+            try:
+                left = 0
+                for name in os.listdir("/proc/self/fd"):
+                    try:
+                        st = os.stat(f"/proc/self/fd/{name}")
+                    except OSError:
+                        continue
+                    if (st.st_dev, st.st_ino) in inodes:
+                        left += 1
+                os.write(w, f"{len(lg._FDS)} {left}".encode())
+            finally:
+                os._exit(0)
+        os.close(w)
+        out = os.read(r, 64).decode()
+        os.close(r)
+        os.waitpid(pid, 0)
+        assert out == "0 0", f"child kept inherited descriptors (bookkeeping, fds on inode): {out}"
+        assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED"
+        assert _foreign_exclusive(str(shm), *_DMS) == "REFUSED"
+    finally:
+        lg.release(held)
+        lg.retire()
