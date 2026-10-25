@@ -34,8 +34,9 @@ def seeded_state_db():
         db.create_session("sess-no-origin", "cli")
     finally:
         db.close()
-    assert hermes_state_registry.stats()["live_generations"] == 0
-    yield
+    # Relative to whatever an earlier test in this worker left in the process-wide registry
+    # (other paths); every assertion below is a delta from this baseline.
+    yield hermes_state_registry.stats()
 
 
 def _ids(n=100):
@@ -66,7 +67,7 @@ def test_warmed_reader_constructs_no_sessiondb_and_matches_per_call(seeded_state
         kw._ORIGIN_READER.reset(token)
         reader.close()
     # Every reference the reader took is returned.
-    assert hermes_state_registry.stats()["live_generations"] == 0
+    assert hermes_state_registry.stats()["live_generations"] == seeded_state_db["live_generations"]
 
 
 def test_reader_shares_the_registry_handle_the_gateway_store_holds(seeded_state_db):
@@ -79,11 +80,11 @@ def test_reader_shares_the_registry_handle_the_gateway_store_holds(seeded_state_
         finally:
             kw._ORIGIN_READER.reset(token)
         assert list(reader._dbs.values()) == [held]
-        assert hermes_state_registry.stats()["total_refcounts"] == 2
+        assert hermes_state_registry.stats()["total_refcounts"] == seeded_state_db["total_refcounts"] + 2
     finally:
         reader.close()
         hermes_state_registry.release(held)
-    assert hermes_state_registry.stats()["live_generations"] == 0
+    assert hermes_state_registry.stats()["live_generations"] == seeded_state_db["live_generations"]
 
 
 def test_notifier_watcher_sets_reader_for_collect_and_closes_it(seeded_state_db, monkeypatch):
@@ -100,4 +101,4 @@ def test_notifier_watcher_sets_reader_for_collect_and_closes_it(seeded_state_db,
     assert seen["origin"] == ORIGINS["sess-1"]
     assert seen["reader"]._dbs == {}
     assert kw._ORIGIN_READER.get() is None
-    assert hermes_state_registry.stats()["live_generations"] == 0
+    assert hermes_state_registry.stats()["live_generations"] == seeded_state_db["live_generations"]
