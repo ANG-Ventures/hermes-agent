@@ -195,7 +195,44 @@ _EXCLUDED_ROOT_PATH_GLOBS = (
     # off-box copy is the weekly forensics lane (forensics-weekly-archive.sh -> NAS tank/backups/forensics,
     # forensics-archive-deadman.py), not this zip tier.
     ("forensics-archive",),                 # carried by the weekly forensics -> NAS lane
+    # 2026-10-25 (t_7da95544): the 10-25 full would have carried 1,432,791 files / 367.3 GiB and was killed at the
+    # 3600 s ceiling (~34 MB/s measured on the 09-27 and 10-04 fulls, so the ceiling carries ~115 GiB). Bytes rows:
+    ("state", "backup", "*"),               # the backup's OWN staging + August pre-restart state.db copies (13.7 GiB);
+                                            # heartbeat/receipt files directly in state/backup/ stay in
+    ("profiles", "*", "incidents"),         # profile incident captures (aegis: one 09-12 sqlite case, 82 GiB)
+    ("profiles", "*", "sessions"),          # per-profile session transcripts (restic machine lane, nightly)
+    ("var", "lcm-dedup-*"),                 # September LCM dedup/replay one-off pre/post copies (24 GiB)
+    ("var", "lcm-prune-*"),                 # September LCM prune one-off pre-prune copy (10 GiB)
+    ("state", "blackbox-backfill-bak-*"),   # 09-24 blackbox backfill rollback copies (3.3 GiB)
+    ("var", "work-delivery-drift-cache"),   # bare git mirrors work-delivery-drift.py re-fetches (6.3 GiB)
+    ("var", "ledger-snap"),                 # restic lane's integrity-checked COPY of var/ledger/ledger.db (4 GiB)
+    ("blackbox", "pre-*"),                  # blackbox pre-repair/pre-backfill rollback copies (4.4 GiB)
+    ("profiles", "*", "blackbox"),          # per-profile turn telemetry (daedalus 5.5 GiB); restic excludes it too
 )
+
+# ROOT-anchored FILE globs: one fnmatch pattern per path component and the same length as the path, so
+# ``var/oneshot/*.tgz`` matches only files directly in var/oneshot/. 2026-10-25 (t_7da95544):
+_EXCLUDED_ROOT_FILE_PATH_GLOBS = (
+    ("var", "oneshot", "*.tgz"),            # land-home-pr.sh `git archive` exports shipped to ACE-AI (~190 MB each,
+                                            # 176 of them = 28 GiB); regenerable from the PR ref
+    ("state", "gitconfig-watch", "*.ndjson"),  # gcw_es / backstop_poller append-only event logs (22 GiB); the
+                                            # restic machine lane excludes them for the same reason
+    ("var", "ledger", "*.db.bak*"),         # ledger.db rollback copies left by repair cards (3.3 GiB)
+    # Per-profile hot SQLite stores (daedalus 23 GiB, daedalus-opus 14 GiB). The quick tier snapshots the
+    # ROOT's state.db (and aegis's); a worker profile's own session/LCM history is transcript state, and the
+    # nightly restic machine lane carries profiles/*/ off-box.
+    ("profiles", "*", "state.db"),
+    ("profiles", "*", "lcm.db"),
+    ("profiles", "*", "lcm-archive.db"),
+)
+
+# Root operator worktrees (``wt/<name>``, ``worktrees/<name>``) are git checkouts: their tracked, unmodified
+# files exist in the parent repository and on its remotes. 2026-10-25 (t_7da95544): 549 k of the 1.43 M files
+# the full tier listed. For a LINKED worktree (``.git`` is a pointer file) the walk carries only what exists
+# nowhere else: tracked files that differ from HEAD plus every untracked file (t_e95deca8's unique
+# work). Unpushed commits ride as a bundle (_WORKTREE_BUNDLE_ROOTS). If git cannot answer for a worktree,
+# that worktree is walked whole as before, so a git failure never drops work.
+_DIRTY_ONLY_WORKTREE_ROOTS = ("wt", "worktrees")
 
 # Root-level rollback copies of a DB (`kanban.db.bak-notify-sweep-<ts>`, `state.db.bak-<tag>`, ...). Pre-change
 # rollback points written by sweeps and repair recipes, not state: the DB itself is in the archive (sqlite backup)
@@ -552,6 +589,9 @@ def _should_exclude(rel_path: Path) -> bool:
     name = rel_path.name
     if len(parts) == 1 and any(fnmatch.fnmatchcase(name, g) for g in _EXCLUDED_ROOT_FILE_GLOBS):
         return True
+    if any(len(parts) == len(pattern) and all(fnmatch.fnmatchcase(p, g) for p, g in zip(parts, pattern))
+           for pattern in _EXCLUDED_ROOT_FILE_PATH_GLOBS):
+        return True
     return name in _EXCLUDED_NAMES or name.startswith(_EXCLUDED_PREFIXES) or name.endswith(_EXCLUDED_SUFFIXES)
 
 
@@ -562,9 +602,16 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
     excluded tree, the root-only ``hermes-agent`` carve-out, root runtime trees, per-file rules),
     shared by ``hermes backup`` and the pre-update path so they can never drift.
     """
+    clean_by_worktree: Dict[tuple, Optional[frozenset]] = {}  # (root, name) -> clean tracked paths
     for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
         rel_dir = Path(dirpath).relative_to(hermes_root)
         is_root = rel_dir == Path(".")
+        clean: Optional[frozenset] = None
+        wt_key = rel_dir.parts[:2]
+        if len(wt_key) == 2 and wt_key[0] in _DIRTY_ONLY_WORKTREE_ROOTS:
+            if wt_key not in clean_by_worktree:
+                clean_by_worktree[wt_key] = _worktree_clean_tracked(hermes_root.joinpath(*wt_key))
+            clean = clean_by_worktree[wt_key]
         kept = [
             d for d in dirnames
             if (d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root))
@@ -585,12 +632,32 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
             # published nor as its open staging file (a re-scan runs while that file is growing).
             if _should_exclude(rel):
                 continue
+            if clean and Path(*rel.parts[2:]).as_posix() in clean:
+                continue  # tracked + unmodified in a root operator worktree: the parent repo has it
             if _is_non_regular_path(fpath):
                 continue
             with suppress(OSError, ValueError):
                 if fpath.resolve() == out_path.resolve() or _is_staging_of(fpath, out_path):
                     continue
             yield fpath, rel
+
+
+def _worktree_clean_tracked(worktree: Path) -> Optional[frozenset]:
+    """Tracked paths of a LINKED worktree that match HEAD (posix, worktree-relative); None = walk it whole.
+
+    None when ``.git`` is not a pointer file (a full clone keeps its objects in the excluded ``.git/``, so
+    its tracked files are not recoverable from elsewhere) or when git fails or times out.
+    """
+    try:
+        if not (worktree / ".git").is_file():
+            return None
+        tracked = _worktree_git(worktree, "ls-files", "-z")
+        changed = _worktree_git(worktree, "diff", "-z", "--name-only", "--no-renames", "HEAD")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    if tracked.returncode != 0 or changed.returncode != 0:
+        return None
+    return frozenset(p for p in tracked.stdout.split("\0") if p) - {p for p in changed.stdout.split("\0") if p}
 
 
 # --- SQLite safe copy ---
