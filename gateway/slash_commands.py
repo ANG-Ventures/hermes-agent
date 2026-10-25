@@ -782,7 +782,14 @@ class GatewaySlashCommandsMixin(
 
         # Idle /stop also blocks future automatic arrivals, without double-cancelling children.
         from gateway import queue_mgmt
-        self._session_state(session_key).persistent.run_generation += 1
+        # Idle /stop is an explicit invalidation (it can land in the turn-lease flush window, slot
+        # released, lease held): record the watermark before the bump so the lease registry reads
+        # the still-flushing holder as stopped, not superseded (t_d659b247 review).
+        _persistent = self._session_state(session_key).persistent
+        _persistent.invalidated_run_generation = max(
+            int(_persistent.invalidated_run_generation), int(_persistent.run_generation),
+        )
+        _persistent.run_generation += 1
         self._session_state(session_key).conversation.automatic_turns_paused = True
         queue_mgmt.hold_user_items(self, session_key, self._delivery_adapter_for(source))
         # Same contract as the busy path (run_agent_cache): a marker write failure must not abort

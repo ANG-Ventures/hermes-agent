@@ -405,3 +405,20 @@ async def test_r3_rejection_holds_queued_user_item_and_names_the_count(monkeypat
     assert [e.text for e in survivors] == ["behind"], f"queued user item dropped on rejection: {survivors}"
     assert "1 queued prompt" in response, f"bounce does not name the kept count: {response!r}"
     assert "resend" in response.lower()
+
+
+def test_r2_every_raw_generation_bump_records_the_invalidation_watermark():
+    """Source contract (t_d659b247 review): a raw ``persistent.run_generation += 1`` outside the
+    ``_begin_session_run_generation`` funnel is an invalidation (idle /stop) and must raise
+    ``invalidated_run_generation`` first, or a flushing holder reads as live after /stop."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2] / "gateway"
+    offenders = []
+    for path in root.rglob("*.py"):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for i, line in enumerate(lines):
+            if "run_generation += 1" in line and "invalidated" not in line:
+                window = "\n".join(lines[max(0, i - 8):i])
+                if "invalidated_run_generation" not in window:
+                    offenders.append(f"{path.name}:{i + 1}")
+    assert not offenders, f"generation bump without invalidation watermark: {offenders}"
