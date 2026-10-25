@@ -536,3 +536,177 @@ def test_lock_gauge_does_not_overwrite_a_recorded_transaction_hold(tmp_path, mon
         assert notes == []
     finally:
         sdb.close()
+
+
+def _ident(path) -> tuple:
+    st = os.stat(path)
+    return (st.st_dev, st.st_ino)
+
+
+def test_registered_reader_keeps_the_shm_fd_until_it_exits(tmp_path, monkeypatch):
+    """Prism f73fc9c5f6cc: a registered reader open on the inode -> a SessionDB close does NOT close
+    the private -shm descriptor (closing it would cancel the reader's POSIX read-mark on -shm); once
+    the reader exits, the descriptor is closed."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    import sqlite3
+    pin_wal(monkeypatch)
+    sdb = make_db(tmp_path / "state.db", "s", "seed")
+    require_wal(sdb)
+    shm = f"{sdb.db_path}-shm"
+    shm_ident = _ident(shm)
+    assert shm_ident in lg._FDS
+    with lg.registered_reader(sdb.db_path):
+        reader = sqlite3.connect(f"file:{sdb.db_path}?mode=ro", uri=True)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT count(*) FROM messages").fetchone()
+            sdb.close()
+            assert shm_ident in lg._FDS, "SessionDB close closed the -shm fd under a registered reader"
+            fd = lg._FDS[shm_ident]
+            os.fstat(fd)  # still open
+        finally:
+            reader.rollback()
+            reader.close()
+    assert shm_ident not in lg._FDS, "the -shm fd outlived the last registered reader"
+
+
+def test_closing_window_keeps_the_shm_fd_until_retire(tmp_path, monkeypatch):
+    """Prism 5ac4f2a27277: between a writer's release() and its retire() its SQLite connection is still
+    open. A reader arriving and leaving in that window runs retire() too; it must not close the -shm
+    descriptor (that would cancel the writer's swapped-in POSIX DMS lock). The writer's own
+    retire(token) after its close does."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    import sqlite3
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE t(x)")
+    conn.commit()
+    shm = f"{db}-shm"
+    shm_ident = _ident(shm)
+    held = lg.hold(db)
+    assert shm_ident in held
+    closing = lg.release(held)  # the writer's connection is still open
+    with lg.registered_reader(db):  # a reader arrives in the window ...
+        pass  # ... and leaves: unregister_reader() runs retire()
+    lg.retire()  # and any sibling handle's close
+    try:
+        assert shm_ident in lg._FDS, "a retire() inside the release->retire window closed the -shm fd"
+        assert _foreign_posix_exclusive(shm, *_DMS) == "REFUSED", "the writer lost its DMS lock in the window"
+    finally:
+        conn.close()
+        lg.retire(closing)
+    assert shm_ident not in lg._FDS
+
+
+_FORK_DEADLINE_S = 0.5
+
+
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_fork_mid_hold_child_owns_no_private_fds(tmp_path, monkeypatch):
+    """Prism 11061d53f43a: a fork that lands between a hold()'s os.open() and its _park() would hand the
+    child a private descriptor missing from its _FDS, which _reset_after_fork therefore never closes
+    (it would pin a -shm the parent's last close unlinks). The at-fork hook takes _LOCK, so the fork
+    waits for the park and the child closes every inherited private descriptor."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    import threading
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    inode = _ident(db)
+    opened, go = threading.Event(), threading.Event()
+    real_open = os.open
+
+    def _open(path, *a, **k):
+        fd = real_open(path, *a, **k)
+        if os.fspath(path) == str(db):
+            opened.set()
+            go.wait(10)  # hold() is now between os.open() and _park()
+        return fd
+
+    monkeypatch.setattr(lg.os, "open", _open)
+    held = {}
+    t = threading.Thread(target=lambda: held.update(lg.hold(db)))
+    t.start()
+    try:
+        assert opened.wait(10)
+        threading.Timer(_FORK_DEADLINE_S, go.set).start()  # lets the hold finish while fork() waits
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                left = 0
+                for name in os.listdir("/proc/self/fd"):
+                    try:
+                        if _ident(f"/proc/self/fd/{name}") == inode:
+                            left += 1
+                    except OSError:
+                        continue
+                os.write(w, str(left).encode())
+            finally:
+                os._exit(0)
+        os.close(w)
+        out = os.read(r, 16).decode()
+        os.close(r)
+        os.waitpid(pid, 0)
+        assert out == "0", f"fork child kept {out} private fd(s) on the inode"
+    finally:
+        go.set()
+        t.join(10)
+        monkeypatch.undo()
+        lg.retire(lg.release(held))
+
+
+_ATEXIT_CHILD = """
+import atexit, os, sys
+sys.path.insert(0, {repo!r})
+handlers = []
+_register = atexit.register
+def _capture(fn, *a, **k):
+    handlers.append((fn, a, k))
+    return _register(fn, *a, **k)
+atexit.register = _capture
+import hermes_state_wal
+hermes_state_wal.is_sqlite_wal_reset_vulnerable = lambda version_info=None: False
+hermes_state_wal.resolve_journal_mode = lambda: "wal"
+from pathlib import Path
+import hermes_state_lockguard as lg
+from hermes_state import SessionDB
+sdb = SessionDB(db_path=Path({db!r}))
+sdb.create_session("s", "cli")
+sdb.append_message("s", role="user", content="before")
+mine = [h for h in handlers if getattr(h[0], "__module__", "") == "hermes_state_lockguard"]
+for fn, a, k in mine:
+    fn(*a, **k)  # the interpreter-exit path, run while the connection is live
+print("RAN", len(mine), len(lg._FDS), flush=True)
+sys.stdin.readline()
+sdb.append_message("s", role="user", content="after")
+print("ROWS", len(sdb.get_messages("s")), flush=True)
+sdb.close()
+"""
+
+
+def test_exit_path_leaves_a_live_connection_usable_and_guarded(tmp_path):
+    """Prism c00385eecb2c / ea4900b85b87: whatever the lock guard runs at interpreter exit, a SessionDB
+    connection still live at that point stays usable AND guarded (a close of the private descriptors
+    would cancel its POSIX locks). The kernel releases descriptors and OFD locks at process exit."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    child = subprocess.Popen([sys.executable, "-c", _ATEXIT_CHILD.format(repo=repo, db=str(db))],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        ran = child.stdout.readline().split()
+        assert ran[:1] == ["RAN"], ran
+        assert int(ran[2]) >= 1, f"exit path closed the private descriptors: {ran}"
+        assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED", "live writer unguarded after the exit path"
+        child.stdin.write("\n")
+        child.stdin.flush()
+        assert child.stdout.readline().split() == ["ROWS", "2"]
+        assert child.wait(timeout=30) == 0
+    finally:
+        if child.poll() is None:
+            child.kill()
