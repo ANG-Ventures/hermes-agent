@@ -342,6 +342,226 @@ def test_replace_save_drops_orphan_rows(temp_home):
     assert ids == {a["id"]}
 
 
+# --- Prism round 1 (#2287): durability, permissions, export safety, repair, reconciliation -----
+
+def test_db_and_sidecars_created_0600_under_umask_022_by_first_save(temp_home):
+    from cron import jobs as cj
+
+    old = os.umask(0o022)
+    try:
+        cj.create_job(prompt="x", schedule="every 5m", name="perm")
+        cj.save_jobs([{"id": "j", "manual_run_prompt": "private"}])
+    finally:
+        os.umask(old)
+    base = _db(temp_home)
+    for suffix in ("", "-wal", "-shm"):
+        path = type(base)(str(base) + suffix)
+        if path.exists():
+            assert oct(os.stat(path).st_mode & 0o777) == "0o600", path
+
+
+def test_runtime_connections_use_synchronous_full(temp_home):
+    from cron import runtime_state as rs
+
+    with rs.connect(temp_home / "cron") as conn:
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
+
+
+def test_export_drops_file_runtime_keys_absent_from_row(temp_home):
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    job = _fixture_job(1, with_runtime=False)
+    _write_store(temp_home, [job])
+    cj.load_jobs()
+    rs.write_rows(temp_home / "cron", {job["id"]: {"last_status": "ok"}})
+    stale = dict(job, manual_run_at="2026-01-01T00:00:00+00:00")
+    _write_store(temp_home, [stale])  # file regained a cleared runtime key out of band
+    cj.export_runtime_to_json(jobs=[stale])
+    on_disk = json.loads(_jobs_file(temp_home).read_text())["jobs"][0]
+    assert "manual_run_at" not in on_disk and on_disk["last_status"] == "ok"
+
+
+def test_export_with_empty_row_still_strips(temp_home):
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    job = _fixture_job(1, with_runtime=False)
+    _write_store(temp_home, [job])
+    cj.load_jobs()
+    rs.write_rows(temp_home / "cron", {job["id"]: {}})
+    stale = dict(job, fire_claim={"at": "x", "by": "dead"})
+    cj.export_runtime_to_json(jobs=[stale])
+    assert "fire_claim" not in json.loads(_jobs_file(temp_home).read_text())["jobs"][0]
+
+
+@pytest.mark.parametrize("payload", [None, "{}", '{"jobs": 3}'], ids=["missing", "no-jobs", "bad-jobs"])
+def test_export_refuses_missing_or_jobless_definitions(temp_home, payload):
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="keep")
+    assert cj.claim_job_for_fire(created["id"]) is True
+    if payload is None:
+        _jobs_file(temp_home).unlink()
+    else:
+        _jobs_file(temp_home).write_text(payload, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="refusing runtime export"):
+        cj.export_runtime_to_json()
+    assert _db(temp_home).exists()
+    rows = sqlite3.connect(_db(temp_home)).execute("SELECT job_id FROM job_runtime").fetchall()
+    assert rows == [(created["id"],)]
+
+
+def test_heartbeat_fast_path_honours_live_store_test_guard(temp_home, monkeypatch):
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="guard")
+    assert cj.claim_job_for_fire(created["id"]) is True
+    owner = cj.get_job(created["id"])["fire_claim"]["by"]
+
+    def refuse(_path):
+        raise RuntimeError("Refusing to write the cron store to a NON-TEMP home")
+
+    monkeypatch.setattr(cj, "_guard_against_test_write_to_live_store", refuse)
+    with pytest.raises(RuntimeError, match="NON-TEMP"):
+        cj.heartbeat_fire_claim(created["id"], expected_owner=owner)
+
+
+def test_bare_list_repair_preserves_runtime_rows(temp_home):
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="repair")
+    assert cj.mark_job_run(created["id"], True) is True
+    before = cj.get_job(created["id"])
+    defs = json.loads(_jobs_file(temp_home).read_text())["jobs"]
+    _jobs_file(temp_home).write_text(json.dumps(defs), encoding="utf-8")  # bare list
+    after = cj.load_jobs()[0]
+    assert after["last_run_at"] == before["last_run_at"] and after["last_status"] == "ok"
+    assert after["repeat"].get("completed") == before["repeat"].get("completed")
+
+
+def test_unlocked_load_retries_when_definitions_change_between_reads(temp_home, monkeypatch):
+    """A runtime-export landing between the definitions read and the row read must not yield
+    jobs without their runtime: the unlocked load sees the stamp move and retries locked."""
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="race")
+    assert cj.claim_job_for_fire(created["id"]) is True
+    real_read = cj._read_runtime_rows
+    fired = []
+
+    def export_then_read(*a, **kw):
+        if not fired:
+            fired.append(True)
+            monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "sqlite")
+            cj.export_runtime_to_json()  # file regains runtime, db removed
+        return real_read(*a, **kw)
+
+    monkeypatch.setattr(cj, "_read_runtime_rows", export_then_read)
+    job = next(j for j in cj.load_jobs() if j["id"] == created["id"])
+    assert job["fire_claim"]["by"]
+
+
+def test_two_phase_save_crash_before_rename_is_discarded(temp_home, monkeypatch):
+    """Definition + runtime change in one save; the jobs.json rename fails: the old definitions
+    stay, the staged runtime is discarded, and the old runtime is intact."""
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="2pc")
+    for _ in range(3):
+        cj.mark_job_run(created["id"], True)
+    jid = created["id"]
+
+    def boom(*a, **kw):
+        raise OSError("disk full")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(cj, "atomic_replace", boom)
+        with pytest.raises(OSError):
+            with cj._jobs_lock():
+                jobs = cj.load_jobs()
+                jobs[0]["schedule"] = {"kind": "interval", "minutes": 7, "display": "every 7m"}
+                jobs[0]["repeat"]["completed"] = 0
+                cj.save_jobs(jobs)
+    job = cj.get_job(jid)
+    assert job["schedule"]["minutes"] == 5 and job["repeat"]["completed"] == 3
+    assert sqlite3.connect(_db(temp_home)).execute(
+        "SELECT count(*) FROM pending_runtime").fetchone()[0] == 0
+
+
+def test_two_phase_save_crash_after_rename_rolls_forward(temp_home, monkeypatch):
+    """Crash between the jobs.json rename and the row apply: next load pairs the new schedule
+    with the new counter (rolled forward from the pending generation the file names)."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="2pc-fwd")
+    for _ in range(3):
+        cj.mark_job_run(created["id"], True)
+    jid = created["id"]
+
+    def die(*a, **kw):
+        raise SystemExit("killed")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(rs, "apply_pending", die)
+        with pytest.raises(SystemExit):
+            with cj._jobs_lock():
+                jobs = cj.load_jobs()
+                jobs[0]["schedule"] = {"kind": "interval", "minutes": 7, "display": "every 7m"}
+                jobs[0]["repeat"]["completed"] = 0
+                cj.save_jobs(jobs)
+    job = cj.get_job(jid)
+    assert job["schedule"]["minutes"] == 7 and job["repeat"]["completed"] == 0
+    assert sqlite3.connect(_db(temp_home)).execute(
+        "SELECT count(*) FROM pending_runtime").fetchone()[0] == 0
+
+
+def test_fast_path_row_write_reconciles_concurrent_sibling(temp_home, monkeypatch):
+    """Degraded-lock sibling writes last_status between our row read and row write; our update to
+    an unrelated key must not revert it."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="recon")
+    jid = created["id"]
+    cj.mark_job_run(jid, False, "old error")
+    real_read = cj._read_one_row
+
+    def read_then_sibling(job_id):
+        row = real_read(job_id)
+        sibling = dict(row, last_status="ok", last_error=None)
+        rs.write_rows(temp_home / "cron", {jid: sibling})
+        return row
+
+    with monkeypatch.context() as mp:
+        mp.setattr(cj, "_read_one_row", read_then_sibling)
+        cj.update_job(jid, {"last_delivery_error": "late failure"})
+    job = cj.get_job(jid)
+    assert job["last_delivery_error"] == "late failure"
+    assert job["last_status"] == "ok" and job["last_error"] is None
+
+
+def test_profile_export_folds_runtime_into_scrubbed_json(temp_home, tmp_path):
+    from cron import runtime_state as rs
+
+    cron = tmp_path / "staged" / "cron"
+    cron.mkdir(parents=True)
+    job = _fixture_job(1, with_runtime=False)
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [job]}), encoding="utf-8")
+    rs.write_rows(cron, {job["id"]: {"manual_run_prompt": "ghp_secretsecret"}})
+    assert rs.fold_staged_copy(cron) is True
+    assert not any(p.name.startswith("runtime_state.db") for p in cron.iterdir())
+    assert json.loads((cron / "jobs.json").read_text())["jobs"][0]["manual_run_prompt"] == \
+        "ghp_secretsecret"
+
+
+def test_quick_snapshot_lists_runtime_db():
+    from hermes_cli.backup import _QUICK_STATE_FILES
+
+    assert "cron/runtime_state.db" in _QUICK_STATE_FILES
+
+
 # --- 4: fresh profile ----------------------------------------------------------------------
 
 def test_load_jobs_on_fresh_store_creates_table(temp_home):

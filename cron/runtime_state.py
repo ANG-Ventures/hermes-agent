@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -72,6 +73,12 @@ CREATE TABLE IF NOT EXISTS job_runtime (
     fire_claim_owner TEXT,
     run_claim_owner TEXT,
     updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_runtime (
+    gen TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    fields TEXT,
+    PRIMARY KEY (gen, job_id)
 )
 """
 
@@ -143,28 +150,50 @@ def _owner(claim: Any) -> Optional[str]:
 @contextlib.contextmanager
 def connect(cron_dir: Path, *, create: bool = True) -> Iterator[Optional[sqlite3.Connection]]:
     """Short-lived connection (open per operation: no per-thread fd caches in a long-lived
-    gateway). Yields ``None`` when ``create`` is False and the database does not exist."""
+    gateway). Yields ``None`` when ``create`` is False and the database does not exist.
+
+    The database file is pre-created 0600 with O_EXCL before SQLite opens it, on EVERY path: SQLite
+    would otherwise create it with the process umask (0644 under umask 022), and it holds the same
+    private prompt/error text as the 0600 jobs.json. SQLite creates its -wal/-shm sidecars with the
+    main file's mode, so they inherit 0600. ``synchronous=FULL``: a committed row is what callers
+    treat as persisted (claims, completion counters, a migration that already stripped jobs.json)."""
     path = db_path(cron_dir)
-    if not create and not path.exists():
-        yield None
-        return
-    Path(cron_dir).mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        if not create:
+            yield None
+            return
+        Path(cron_dir).mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(FileExistsError):
+            os.close(os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     conn = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute(_SCHEMA)
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.executescript(_SCHEMA)
         yield conn
     finally:
         conn.close()
 
 
-def read_all(cron_dir: Path) -> Dict[str, Dict[str, Any]]:
-    """Every row as ``{job_id: runtime_fields}``; creates the database when absent."""
+@contextlib.contextmanager
+def transaction(cron_dir: Path) -> Iterator[sqlite3.Connection]:
+    """``BEGIN IMMEDIATE`` .. ``COMMIT`` (``ROLLBACK`` on any exception). A caller that must publish
+    a second artifact atomically with the rows (the definitions file) does it INSIDE this block,
+    so a failed SQLite write never leaves new definitions behind and a crash leaves at most the
+    microseconds between the file rename and the COMMIT."""
     with connect(cron_dir) as conn:
-        rows = conn.execute("SELECT job_id, fields FROM job_runtime").fetchall()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+
+def _rows_of(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
-    for job_id, fields in rows:
+    for job_id, fields in conn.execute("SELECT job_id, fields FROM job_runtime").fetchall():
         try:
             value = json.loads(fields)
         except (TypeError, ValueError):
@@ -174,8 +203,55 @@ def read_all(cron_dir: Path) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def read_row(conn: sqlite3.Connection, job_id: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute("SELECT fields FROM job_runtime WHERE job_id=?", (str(job_id),)).fetchone()
+    if row is None:
+        return None
+    try:
+        value = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def read_all(cron_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """Every row as ``{job_id: runtime_fields}``; creates the database when absent."""
+    with connect(cron_dir) as conn:
+        return _rows_of(conn)
+
+
 def _canonical(fields: Dict[str, Any]) -> str:
     return json.dumps(fields, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def upsert_rows(
+    conn: sqlite3.Connection,
+    rows: Dict[str, Dict[str, Any]],
+    *,
+    delete_ids: Iterable[str] = (),
+    current: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> int:
+    """Upsert *rows* and delete *delete_ids* on *conn* (caller owns the transaction). Rows equal to
+    *current* (when given) are skipped. Returns the number of rows written."""
+    global UPSERT_COUNT
+    now = time.time()
+    written = 0
+    for job_id, fields in rows.items():
+        if current is not None and job_id in current and \
+                _canonical(current[job_id]) == _canonical(fields):
+            continue
+        conn.execute(
+            "INSERT INTO job_runtime(job_id, fields, fire_claim_owner, run_claim_owner,"
+            " updated_at) VALUES (?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET"
+            " fields=excluded.fields, fire_claim_owner=excluded.fire_claim_owner,"
+            " run_claim_owner=excluded.run_claim_owner, updated_at=excluded.updated_at",
+            (str(job_id), _canonical(fields), _owner(fields.get("fire_claim")),
+             _owner(fields.get("run_claim")), now))
+        written += 1
+    for job_id in (str(i) for i in delete_ids if i):
+        conn.execute("DELETE FROM job_runtime WHERE job_id=?", (job_id,))
+    UPSERT_COUNT += written
+    return written
 
 
 def write_rows(
@@ -185,93 +261,72 @@ def write_rows(
     delete_ids: Iterable[str] = (),
     current: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> int:
-    """Upsert *rows* (``{job_id: fields}``) and delete *delete_ids* in ONE transaction. Rows equal
-    to *current* (when given) are skipped. Returns the number of rows written."""
-    global UPSERT_COUNT
-    now = time.time()
-    written = 0
-    delete_ids = [str(i) for i in delete_ids if i]
-    with connect(cron_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            for job_id, fields in rows.items():
-                if current is not None and job_id in current and \
-                        _canonical(current[job_id]) == _canonical(fields):
-                    continue
-                conn.execute(
-                    "INSERT INTO job_runtime(job_id, fields, fire_claim_owner, run_claim_owner,"
-                    " updated_at) VALUES (?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET"
-                    " fields=excluded.fields, fire_claim_owner=excluded.fire_claim_owner,"
-                    " run_claim_owner=excluded.run_claim_owner, updated_at=excluded.updated_at",
-                    (str(job_id), _canonical(fields), _owner(fields.get("fire_claim")),
-                     _owner(fields.get("run_claim")), now))
-                written += 1
-            for job_id in delete_ids:
-                conn.execute("DELETE FROM job_runtime WHERE job_id=?", (job_id,))
-            conn.execute("COMMIT")
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
-    UPSERT_COUNT += written
-    return written
+    """``upsert_rows`` in its own transaction."""
+    with transaction(cron_dir) as conn:
+        return upsert_rows(conn, rows, delete_ids=delete_ids, current=current)
 
 
 def refresh_claim(cron_dir: Path, job_id: str, claim_key: str, expected_owner: str, at: str) -> bool:
     """Compare-and-refresh ``fields[claim_key].at`` for *expected_owner* (``fire_claim`` or
-    ``run_claim``). One UPDATE guarded by the owner column; rowcount 0 means the claim is gone or
+    ``run_claim``): one UPDATE guarded by the owner column; rowcount 0 means the claim is gone or
     held by someone else."""
     global UPSERT_COUNT
     column = {"fire_claim": "fire_claim_owner", "run_claim": "run_claim_owner"}[claim_key]
-    with connect(cron_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = conn.execute(
-                f"SELECT fields FROM job_runtime WHERE job_id=? AND {column}=?",
-                (str(job_id), str(expected_owner))).fetchone()
-            if row is None:
-                conn.execute("ROLLBACK")
-                return False
-            fields = json.loads(row[0])
-            claim = fields.get(claim_key)
-            if not isinstance(claim, dict) or claim.get("by") != expected_owner:
-                conn.execute("ROLLBACK")
-                return False
-            claim["at"] = at
-            cur = conn.execute(
-                f"UPDATE job_runtime SET fields=?, updated_at=? WHERE job_id=? AND {column}=?",
-                (_canonical(fields), time.time(), str(job_id), str(expected_owner)))
-            conn.execute("COMMIT")
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
+    with transaction(cron_dir) as conn:
+        row = conn.execute(
+            f"SELECT fields FROM job_runtime WHERE job_id=? AND {column}=?",
+            (str(job_id), str(expected_owner))).fetchone()
+        if row is None:
+            return False
+        fields = json.loads(row[0])
+        claim = fields.get(claim_key)
+        if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+            return False
+        claim["at"] = at
+        cur = conn.execute(
+            f"UPDATE job_runtime SET fields=?, updated_at=? WHERE job_id=? AND {column}=?",
+            (_canonical(fields), time.time(), str(job_id), str(expected_owner)))
     if cur.rowcount:
         UPSERT_COUNT += 1
     return bool(cur.rowcount)
 
 
-def clear_claim(cron_dir: Path, job_id: str, claim_key: str) -> bool:
-    """Set ``fields[claim_key] = None`` when it currently holds a non-null claim. True if cleared."""
-    global UPSERT_COUNT
-    column = {"fire_claim": "fire_claim_owner", "run_claim": "run_claim_owner"}[claim_key]
-    with connect(cron_dir) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = conn.execute(
-                "SELECT fields FROM job_runtime WHERE job_id=?", (str(job_id),)).fetchone()
-            fields = json.loads(row[0]) if row else None
-            if not isinstance(fields, dict) or fields.get(claim_key) is None:
-                conn.execute("ROLLBACK")
-                return False
-            fields[claim_key] = None
-            conn.execute(
-                f"UPDATE job_runtime SET fields=?, {column}=NULL, updated_at=? WHERE job_id=?",
-                (_canonical(fields), time.time(), str(job_id)))
-            conn.execute("COMMIT")
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
-    UPSERT_COUNT += 1
-    return True
+# --- two-phase commit for saves that change BOTH halves ---------------------------------------
+# 1. stage_pending: the new rows go into pending_runtime under a fresh generation id; COMMIT.
+# 2. jobs.json is renamed into place carrying the same id as top-level "runtime_gen".
+# 3. apply_pending: pending rows move into job_runtime; COMMIT.
+# recover_pending (every load): pending rows whose gen matches the file's "runtime_gen" are rolled
+# forward (crash after 2); any other gen is discarded (crash before 2: the file never changed).
+
+def stage_pending(conn: sqlite3.Connection, gen: str, rows: Dict[str, Dict[str, Any]],
+                  delete_ids: Iterable[str] = ()) -> None:
+    conn.execute("DELETE FROM pending_runtime")
+    for job_id, fields in rows.items():
+        conn.execute("INSERT INTO pending_runtime(gen, job_id, fields) VALUES (?,?,?)",
+                     (gen, str(job_id), _canonical(fields)))
+    for job_id in delete_ids:
+        if job_id:
+            conn.execute("INSERT OR REPLACE INTO pending_runtime(gen, job_id, fields)"
+                         " VALUES (?,?,NULL)", (gen, str(job_id)))
+
+
+def pending_gens(conn: sqlite3.Connection) -> List[str]:
+    return [r[0] for r in conn.execute("SELECT DISTINCT gen FROM pending_runtime").fetchall()]
+
+
+def apply_pending(conn: sqlite3.Connection, gen: str) -> int:
+    """Move generation *gen* into job_runtime (NULL fields = delete) and clear the journal."""
+    rows: Dict[str, Dict[str, Any]] = {}
+    deletes: List[str] = []
+    for job_id, fields in conn.execute(
+            "SELECT job_id, fields FROM pending_runtime WHERE gen=?", (gen,)).fetchall():
+        if fields is None:
+            deletes.append(job_id)
+        else:
+            rows[job_id] = json.loads(fields)
+    written = upsert_rows(conn, rows, delete_ids=deletes)
+    conn.execute("DELETE FROM pending_runtime")
+    return written
 
 
 def merged_jobs(jobs_file: Path) -> List[Dict[str, Any]]:
@@ -295,13 +350,45 @@ def merged_jobs(jobs_file: Path) -> List[Dict[str, Any]]:
         return jobs
     finally:
         conn.close()
+    out = []
     for job in jobs:
         if isinstance(job, dict) and str(job.get("id")) in rows:
             try:
-                apply_runtime(job, json.loads(rows[str(job["id"])]))
+                row = json.loads(rows[str(job["id"])])
             except (TypeError, ValueError):
-                continue
-    return jobs
+                row = None
+            if isinstance(row, dict):
+                job = overlay_row(job, row)
+        out.append(job)
+    return out
+
+
+def overlay_row(job: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
+    """The authoritative merged record for a job that HAS a row: the file's runtime keys are
+    dropped first (a key absent from the row was cleared; keeping the file's copy would resurrect
+    it), then the row is applied. An empty row still strips."""
+    merged = strip_runtime(job)
+    apply_runtime(merged, row)
+    return merged
+
+
+def fold_staged_copy(cron_dir: Path) -> bool:
+    """For a STAGED copy of a cron dir (profile export): rewrite its jobs.json as the merged view
+    and delete the database + sidecars, so the archive carries runtime text only inside jobs.json,
+    where the export's secret scrubber reads it. Never call on a live store (no lock taken)."""
+    cron_dir = Path(cron_dir)
+    jobs_file = cron_dir / "jobs.json"
+    if not db_path(cron_dir).exists():
+        return False
+    if jobs_file.exists():
+        with open(jobs_file, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        merged = merged_jobs(jobs_file)
+        payload = dict(data) if isinstance(data, dict) else {}
+        payload["jobs"] = merged
+        jobs_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    drop_database(cron_dir)
+    return True
 
 
 def drop_database(cron_dir: Path) -> None:

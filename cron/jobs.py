@@ -1695,9 +1695,31 @@ def load_jobs() -> List[Dict[str, Any]]:
             except (TypeError, ValueError, OverflowError):
                 rep["completed"] = 0
             repair = repair or "invalid repeat.completed normalized"
+    locked = bool(getattr(_jobs_lock_state, "depth", 0))
+    split = _rs.enabled()
+    if split:
+        needs_migration = any(_rs.has_runtime(j) for j in jobs)
+        if (repair or needs_migration or _runtime_pending()) and not locked:
+            with _jobs_lock():
+                return load_jobs()
+        if needs_migration:
+            jobs = _migrate_runtime_out_of_file(jobs)
+            pre_read_stamp = _jobs_file_stamp(jobs_file)
+        # Overlay rows BEFORE any repair save below: that save must see the stored runtime, or it
+        # would read every row's absence as "cleared" and overwrite the rows with {}.
+        rows = _read_runtime_rows(data.get("runtime_gen") if isinstance(data, dict) else None)
+        for job in jobs:
+            row = rows.get(str(job.get("id")))
+            if row:
+                _rs.apply_runtime(job, row)
+        if not locked and _jobs_file_stamp(jobs_file) != pre_read_stamp:
+            # Unlocked read raced a writer (e.g. a runtime-export that replaced the definitions and
+            # dropped the database between our two reads): retry consistently under the lock.
+            with _jobs_lock():
+                return load_jobs()
     # Persist even an empty result, or an all-junk store repeats the repair on every tick.
     if repair:
-        if not getattr(_jobs_lock_state, "depth", 0):
+        if not locked:
             # An unlocked snapshot may predate a locked writer's update to a job it already holds
             # (the shrink-merge only restores missing ids), so re-read and repair under the lock.
             with _jobs_lock():
@@ -1708,27 +1730,13 @@ def load_jobs() -> List[Dict[str, Any]]:
         # unless disk is STILL a shape the merge would refuse: a sibling may have rewritten it.
         save_jobs(jobs, replace=unmergeable and _peek_jobs_unlocked() is None)
         logger.warning("Auto-repaired jobs.json (%s)", repair)
-        # The repair save rewrote the file (and, in sqlite mode, moved runtime fields out of it).
         pre_read_stamp = None
-    if _rs.enabled():
-        if any(_rs.has_runtime(j) for j in jobs):
-            if not getattr(_jobs_lock_state, "depth", 0):
-                with _jobs_lock():
-                    return load_jobs()
-            _migrate_runtime_out_of_file(jobs)
-            pre_read_stamp = _jobs_file_stamp(jobs_file)
-            jobs = [_rs.strip_runtime(j) for j in jobs]
-        rows = _read_runtime_rows()
-        for job in jobs:
-            row = rows.get(str(job.get("id")))
-            if row:
-                _rs.apply_runtime(job, row)
-    elif _runtime_db_path().exists():
+    if not split and _runtime_db_path().exists():
         if not getattr(_jobs_lock_state, "depth", 0):
             with _jobs_lock():
                 return load_jobs()
         export_runtime_to_json(jobs)
-        pre_read_stamp = None
+        return load_jobs()  # re-read the folded file (the database is gone now)
     _record_load_stamp(pre_read_stamp)
     _record_load_baseline(jobs)
     return jobs
@@ -1749,20 +1757,50 @@ def _runtime_write_allowed() -> bool:
         return False
 
 
-def _read_runtime_rows() -> Dict[str, Dict[str, Any]]:
+def _read_runtime_rows(file_gen: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """All rows, after recovering an interrupted two-phase save (see ``_save_split_unlocked``):
+    a pending generation the definitions file names is rolled forward, any other is dropped."""
     cron_dir = _current_cron_store().cron_dir
-    if not _runtime_write_allowed() and not _rs.db_path(cron_dir).exists():
-        return {}
-    created = not _rs.db_path(cron_dir).exists()
-    rows = _rs.read_all(cron_dir)
-    if created:
+    if not _rs.db_path(cron_dir).exists():
+        if not _runtime_write_allowed():
+            return {}
+        _rs.read_all(cron_dir)  # creates it (0600, see runtime_state.connect)
         _secure_runtime_db()
-    return rows
+        return {}
+    with _rs.connect(cron_dir) as conn:
+        pending = _rs.pending_gens(conn)
+    if pending and _runtime_write_allowed() and getattr(_jobs_lock_state, "depth", 0):
+        # Locked only: an unlocked reader cannot tell a crashed save from one in flight.
+        _recover_pending_runtime(file_gen)
+    return _rs.read_all(cron_dir)
+
+
+def _runtime_pending() -> bool:
+    if not _runtime_db_path().exists():
+        return False
+    with _rs.connect(_current_cron_store().cron_dir) as conn:
+        return bool(_rs.pending_gens(conn))
+
+
+def _recover_pending_runtime(file_gen: Optional[str]) -> None:
+    with _defs_cache_lock:
+        _defs_cache.clear()  # entries parsed while a generation was pending are marked unusable
+    with _runtime_txn() as conn:
+        for gen in _rs.pending_gens(conn):
+            if file_gen and gen == file_gen:
+                n = _rs.apply_pending(conn, gen)
+                logger.warning("cron runtime-state: rolled interrupted save %s forward "
+                               "(%d row(s))", gen, n)
+            else:
+                conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
+                logger.warning("cron runtime-state: discarded interrupted save %s (its "
+                               "definitions never reached jobs.json)", gen)
 
 
 def _secure_runtime_db() -> None:
-    """chmod 600 like jobs.json, and hand a root-created database back to the cron dir's owner
-    (a root CLI write must not leave the gateway user unable to open it)."""
+    """chmod 600 like jobs.json (the file is already created 0600; this also covers a database
+    an older build or an operator created), and hand a root-created database back to the cron
+    dir's owner so a root CLI write cannot lock the gateway user out."""
     cron_dir = _current_cron_store().cron_dir
     try:
         owner = os.stat(cron_dir)
@@ -1780,40 +1818,53 @@ def _secure_runtime_db() -> None:
                     _preserve_file_ownership(path, owner)
 
 
+@contextlib.contextmanager
+def _runtime_txn():
+    """Guarded runtime-db write transaction (the same test-context live-store guard every
+    jobs.json write takes), then the permission/ownership pass when the db or a sidecar is new
+    or we are root."""
+    _guard_against_test_write_to_live_store(_current_cron_store().jobs_file)
+    base = _runtime_db_path()
+    fresh = not all(Path(str(base) + s).exists() for s in ("", "-wal", "-shm"))
+    with _rs.transaction(_current_cron_store().cron_dir) as conn:
+        yield conn
+    if fresh or (hasattr(os, "geteuid") and os.geteuid() == 0):
+        _secure_runtime_db()
+
+
 def _write_runtime_rows(rows: Dict[str, Dict[str, Any]], *, delete_ids: Collection[str] = (),
                         current: Optional[Dict[str, Dict[str, Any]]] = None) -> int:
-    _guard_against_test_write_to_live_store(_current_cron_store().jobs_file)
-    written = _rs.write_rows(_current_cron_store().cron_dir, rows, delete_ids=delete_ids,
-                             current=current)
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        _secure_runtime_db()
-    return written
+    with _runtime_txn() as conn:
+        return _rs.upsert_rows(conn, rows, delete_ids=delete_ids, current=current)
 
 
-def _migrate_runtime_out_of_file(jobs: List[Dict[str, Any]]) -> None:
+def _migrate_runtime_out_of_file(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """One-shot migration (caller holds ``_jobs_lock``): move every job's runtime fields from
-    jobs.json into the table, then rewrite jobs.json ONCE without them. A job that already has a
-    row keeps the row (the table is the live state; a file that still carries runtime fields was
-    put back by a git level or a json-mode writer). Idempotent: a file without runtime fields
-    never reaches here, and a crash between the two writes just repeats the migration."""
-    existing = _read_runtime_rows()
-    new_rows: Dict[str, Dict[str, Any]] = {}
-    kept = 0
-    for job in jobs:
-        jid = str(job.get("id") or "")
-        if not jid or not _rs.has_runtime(job):
-            continue
-        if jid in existing:
-            kept += 1
-            continue
-        new_rows[jid] = _rs.split_job(job)[1]
-    if new_rows:
-        _write_runtime_rows(new_rows)
+    jobs.json into the table, then rewrite jobs.json ONCE without them; returns the stripped
+    definitions. A job that already has a row keeps the row (the table is the live state; a file
+    that still carries runtime fields was put back by a git level or a json-mode writer). Rows
+    COMMIT before the file is replaced, so every crash point is lossless: before the commit the
+    file still holds everything; after it, the rows exist and a re-run keeps them. Idempotent: a
+    clean file never reaches here."""
     defs = [_rs.strip_runtime(j) for j in jobs]
+    with _runtime_txn() as conn:
+        existing = _rs._rows_of(conn)
+        new_rows: Dict[str, Dict[str, Any]] = {}
+        kept = 0
+        for job in jobs:
+            jid = str(job.get("id") or "")
+            if not jid or not _rs.has_runtime(job):
+                continue
+            if jid in existing:
+                kept += 1
+                continue
+            new_rows[jid] = _rs.split_job(job)[1]
+        _rs.upsert_rows(conn, new_rows)
     _write_definitions_file(defs)
     logger.warning(
         "cron runtime-state: moved runtime fields of %d job(s) from jobs.json into %s "
         "(%d already had a row and kept it)", len(new_rows), _rs.DB_NAME, kept)
+    return defs
 
 
 def _write_definitions_file(defs: List[Dict[str, Any]]) -> None:
@@ -1839,30 +1890,37 @@ def _write_definitions_file(defs: List[Dict[str, Any]]) -> None:
 def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None) -> int:
     """Reverse of the migration (kill switch ``HERMES_CRON_RUNTIME_STATE=json`` and
     ``hermes cron runtime-export --to-json``): write every row back into its job in jobs.json,
-    then remove the database. Row values win over any runtime field the file still carries.
-    Returns the number of jobs that received runtime fields. Safe in either mode: a sqlite-mode
-    process that loads the exported file migrates the same values straight back."""
+    then remove the database. For a job with a row (even an empty one) the row is authoritative:
+    the file's runtime keys are dropped first, so a cleared value cannot be resurrected. Refuses
+    (raises, writes nothing, deletes nothing) on a missing jobs.json or a payload without a jobs
+    list while the database exists: the definitions may only be temporarily missing, and the rows
+    are the only copy of the runtime state. Returns the number of jobs that had a row."""
     with _jobs_lock():
-        if jobs is None:
-            jobs_file = _current_cron_store().jobs_file
-            if not jobs_file.exists():
-                jobs = []
-            else:
-                data, _ = _parse_jobs_file(jobs_file)
-                jobs = data.get("jobs", []) if isinstance(data, dict) else data
-                if not isinstance(jobs, list):
-                    raise RuntimeError("Cron database corrupted; refusing runtime export")
+        jobs_file = _current_cron_store().jobs_file
         cron_dir = _current_cron_store().cron_dir
         if not _rs.db_path(cron_dir).exists():
             return 0
+        if jobs is None:
+            if not jobs_file.exists():
+                raise RuntimeError(
+                    f"{jobs_file} is missing; refusing runtime export (rows kept in {_rs.DB_NAME})")
+            data, _ = _parse_jobs_file(jobs_file)
+            jobs = data.get("jobs") if isinstance(data, dict) else data
+            if not isinstance(jobs, list):
+                raise RuntimeError(
+                    f"{jobs_file} has no jobs list; refusing runtime export "
+                    f"(rows kept in {_rs.DB_NAME})")
+        _guard_against_test_write_to_live_store(jobs_file)
         rows = _rs.read_all(cron_dir)
         applied = 0
+        merged: List[Any] = []
         for job in jobs:
             row = rows.get(str(job.get("id"))) if isinstance(job, dict) else None
-            if row:
-                _rs.apply_runtime(job, row)
+            if row is not None:
+                job = _rs.overlay_row(job, row)
                 applied += 1
-        _write_definitions_file(jobs)
+            merged.append(job)
+        _write_definitions_file(merged)
         _rs.drop_database(cron_dir)
         logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
                        "jobs.json and removed %s", applied, _rs.DB_NAME)
@@ -1894,7 +1952,8 @@ def _cached_definition(job_id: Any) -> Tuple[bool, Optional[Dict[str, Any]]]:
             return False, None
         jobs = data.get("jobs") if isinstance(data, dict) else None
         by_id: Dict[str, Dict[str, Any]] = {}
-        usable = not strict_retry and isinstance(jobs, list)
+        # A pending two-phase generation needs the full load_jobs() recovery first.
+        usable = not strict_retry and isinstance(jobs, list) and not _runtime_pending()
         for job in jobs if isinstance(jobs, list) else ():
             if not isinstance(job, dict) or not job.get("id") or str(job["id"]) in by_id \
                     or _rs.has_runtime(job):
@@ -1910,6 +1969,12 @@ def _cached_definition(job_id: Any) -> Tuple[bool, Optional[Dict[str, Any]]]:
     return True, (copy.deepcopy(found) if found is not None else None)
 
 
+def _read_one_row(job_id: Any) -> Dict[str, Any]:
+    with _rs.connect(_current_cron_store().cron_dir, create=_runtime_write_allowed()) as conn:
+        row = _rs.read_row(conn, str(job_id)) if conn is not None else None
+    return row or {}
+
+
 class _SingleJobScope:
     """Marks a ``_with_job`` fast-path list so ``save_jobs`` records the save instead of writing."""
 
@@ -1922,20 +1987,18 @@ class _SingleJobScope:
 def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
     """``_with_job`` fast path (sqlite mode, caller holds ``_jobs_lock``): build ONE record from
     the cached definition + its row, run *fn* on a one-element list, then persist only the row
-    when *fn*'s save left the definition half untouched. Any definition change or removal takes
-    the full load/save path with the record *fn* produced."""
+    when *fn*'s save left the definition half untouched. The row write re-reads the row inside its
+    IMMEDIATE transaction and three-way merges per key against what *fn* started from, so a
+    degraded-lock sibling's concurrent write to a key *fn* did not touch survives. Any definition
+    change or removal takes the full load/save path with the record *fn* produced."""
     usable, definition = _cached_definition(job_id)
     if not usable:
         return _MISSING_FAST
     if definition is None:
         return missing
-    with _rs.connect(_current_cron_store().cron_dir,
-                     create=_runtime_write_allowed()) as conn:
-        row = conn.execute("SELECT fields FROM job_runtime WHERE job_id=?",
-                           (str(job_id),)).fetchone() if conn is not None else None
-    runtime = json.loads(row[0]) if row else {}
+    base_runtime = _read_one_row(job_id)
     job = definition
-    _rs.apply_runtime(job, runtime)
+    _rs.apply_runtime(job, copy.deepcopy(base_runtime))
     original_def = _rs.strip_runtime(copy.deepcopy(job))
     jobs = [job]
     scope = _SingleJobScope(jobs)
@@ -1959,7 +2022,11 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
                 full[i] = jobs[0]
         save_jobs(full)
         return result
-    _write_runtime_rows({str(job_id): new_runtime})
+    with _runtime_txn() as conn:
+        disk = _rs.read_row(conn, str(job_id)) or {}
+        merged = _reconcile_job_fields(new_runtime, disk, base_runtime) if disk != base_runtime \
+            else new_runtime
+        _rs.upsert_rows(conn, {str(job_id): merged})
     return result
 
 
@@ -1974,12 +2041,7 @@ def _locked_job_view(job_id: Any) -> Optional[Dict[str, Any]]:
         if usable:
             if definition is None:
                 return None
-            with _rs.connect(_current_cron_store().cron_dir,
-                             create=_runtime_write_allowed()) as conn:
-                row = conn.execute("SELECT fields FROM job_runtime WHERE job_id=?",
-                                   (str(job_id),)).fetchone() if conn is not None else None
-            if row:
-                _rs.apply_runtime(definition, json.loads(row[0]))
+            _rs.apply_runtime(definition, _read_one_row(job_id))
             return definition
     return next((item for item in load_jobs() if item.get("id") == job_id), None)
 
@@ -2284,14 +2346,18 @@ def _unlink_quiet(path: Optional[str]) -> None:
             os.unlink(path)
 
 
-def _stage_jobs_payload(jobs_file: Path, jobs: List[Dict[str, Any]]) -> str:
-    """Serialize the store payload to a fsynced temp file next to *jobs_file*; return its path."""
+def _stage_jobs_payload(jobs_file: Path, jobs: List[Dict[str, Any]],
+                        runtime_gen: Optional[str] = None) -> str:
+    """Serialize the store payload to a fsynced temp file next to *jobs_file*; return its path.
+    ``runtime_gen`` (sqlite mode) names the pending runtime generation this definitions write
+    pairs with (see ``cron.runtime_state.stage_pending``)."""
+    payload: Dict[str, Any] = {"jobs": jobs, "updated_at": _hermes_now().isoformat()}
+    if runtime_gen:
+        payload["runtime_gen"] = runtime_gen
     fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(
-                {"jobs": jobs, "updated_at": _hermes_now().isoformat()},
-                f, indent=2, ensure_ascii=False)
+            json.dump(payload, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
     except BaseException:
@@ -2305,7 +2371,7 @@ _SAVE_JOBS_MERGE_ATTEMPTS = 5
 
 def _save_jobs_unlocked(
     jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-    replace: bool = False,
+    replace: bool = False, runtime_gen: Optional[str] = None,
 ):
     """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
     ``replace=True`` skips the shrink-merge guard and the corrupt-store refusal (wholesale
@@ -2326,7 +2392,7 @@ def _save_jobs_unlocked(
         for attempt in range(_SAVE_JOBS_MERGE_ATTEMPTS + 1):
             if not replace:
                 jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
-            tmp_path = _stage_jobs_payload(jobs_file, jobs)
+            tmp_path = _stage_jobs_payload(jobs_file, jobs, runtime_gen)
             # Verify-after-stage: a sibling landing during serialization forces another merge round.
             if (
                 not replace
@@ -2357,7 +2423,12 @@ def _save_split_unlocked(
 ) -> None:
     """sqlite-mode save (caller holds ``_jobs_lock``): runtime fields -> one row per CHANGED job,
     definitions -> jobs.json only when a definition changed (or ids were added/removed/reordered).
-    A tick that only stamped ``pending_slot``/``last_dispatch`` therefore never rewrites the file."""
+    A tick that only stamped ``pending_slot``/``last_dispatch`` therefore never rewrites the file.
+
+    Changed rows are three-way merged per key (load baseline -> ours, disk) inside the IMMEDIATE
+    transaction, as ``_reconcile_job_fields`` does for the file. A save that changes BOTH halves
+    is a two-phase commit: rows staged under a generation id, jobs.json renamed carrying that id,
+    then rows applied; ``_recover_pending_runtime`` rolls a crash forward or back on next load."""
     baseline = getattr(_jobs_lock_state, "load_baseline", None)
     stamp = getattr(_jobs_lock_state, "load_stamp", None)
     defs: List[Dict[str, Any]] = []
@@ -2382,34 +2453,56 @@ def _save_split_unlocked(
         and [str(d.get("id")) for d in defs if isinstance(d, dict)] == list(base_defs)
         and all(base_defs.get(str(d.get("id"))) == d for d in defs if isinstance(d, dict))
     )
-    if not defs_unchanged:
-        saved_baseline = baseline
-        if base_defs is not None:
-            # The shrink-merge reconciles DEFINITIONS against disk; give it a definitions view.
-            _jobs_lock_state.load_baseline = base_defs
-        try:
-            _save_jobs_unlocked(defs, removed_ids=removed_ids, replace=replace)
-        finally:
-            _jobs_lock_state.load_baseline = saved_baseline
     changed = {jid: row for jid, row in runtime_rows.items()
                if base_runtime is None or base_runtime.get(jid) != row}
-    disk_rows: Optional[Dict[str, Dict[str, Any]]] = None
-    if changed:
-        disk_rows = _rs.read_all(_current_cron_store().cron_dir)
-    if changed and base_runtime is not None:
-        # Field-level three-way merge per changed row, like _reconcile_job_fields does for the
-        # file: a key this writer left alone keeps whatever a degraded-lock sibling wrote.
-        for jid, row in list(changed.items()):
-            if jid in disk_rows and jid in base_runtime:
-                changed[jid] = _reconcile_job_fields(row, disk_rows[jid], base_runtime[jid])
-    if changed or removed_ids:
-        _write_runtime_rows(changed, delete_ids=removed_ids or (), current=disk_rows)
-    if replace:
-        # Wholesale rewrite: rows for ids no longer in the store are dropped with them.
-        keep = set(runtime_rows)
-        orphans = [jid for jid in _rs.read_all(_current_cron_store().cron_dir) if jid not in keep]
-        if orphans:
-            _write_runtime_rows({}, delete_ids=orphans)
+
+    def merged_changes(conn) -> Tuple[Dict[str, Dict[str, Any]], List[str], Dict[str, Any]]:
+        disk_rows = _rs._rows_of(conn)
+        out: Dict[str, Dict[str, Any]] = {}
+        for jid, row in changed.items():
+            if base_runtime is not None and jid in disk_rows and jid in base_runtime:
+                row = _reconcile_job_fields(row, disk_rows[jid], base_runtime[jid])
+            out[jid] = row
+        deletes = [str(i) for i in (removed_ids or ()) if i]
+        if replace:
+            # Wholesale rewrite: rows for ids no longer in the store go with them.
+            deletes += [jid for jid in disk_rows if jid not in runtime_rows]
+        return out, deletes, disk_rows
+
+    if defs_unchanged:
+        if changed:
+            with _runtime_txn() as conn:
+                rows, deletes, disk_rows = merged_changes(conn)
+                _rs.upsert_rows(conn, rows, delete_ids=deletes, current=disk_rows)
+        return
+
+    saved_baseline = baseline
+    gen = None
+    if changed or removed_ids or replace:
+        gen = uuid.uuid4().hex
+        with _runtime_txn() as conn:
+            rows, deletes, disk_rows = merged_changes(conn)
+            rows = {jid: r for jid, r in rows.items()
+                    if jid not in disk_rows or disk_rows[jid] != r}
+            if rows or deletes:
+                _rs.stage_pending(conn, gen, rows, deletes)
+            else:
+                gen = None
+    if base_defs is not None:
+        # The shrink-merge reconciles DEFINITIONS against disk; give it a definitions view.
+        _jobs_lock_state.load_baseline = base_defs
+    try:
+        _save_jobs_unlocked(defs, removed_ids=removed_ids, replace=replace, runtime_gen=gen)
+    except BaseException:
+        if gen is not None:
+            with contextlib.suppress(Exception), _runtime_txn() as conn:
+                conn.execute("DELETE FROM pending_runtime WHERE gen=?", (gen,))
+        raise
+    finally:
+        _jobs_lock_state.load_baseline = saved_baseline
+    if gen is not None:
+        with _runtime_txn() as conn:
+            _rs.apply_pending(conn, gen)
 
 
 def _journal_created(job: Dict[str, Any]) -> None:
@@ -3988,6 +4081,8 @@ def _refresh_claim_row(job_id: str, claim_key: str, expected_owner: str,
         return False
     if once_only and (definition.get("schedule") or {}).get("kind") != "once":
         return False
+    # Same test-context live-store guard every other cron write takes (raises in that context).
+    _guard_against_test_write_to_live_store(_current_cron_store().jobs_file)
     return _rs.refresh_claim(_current_cron_store().cron_dir, str(job_id), claim_key,
                              expected_owner, _hermes_now().isoformat())
 

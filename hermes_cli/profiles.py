@@ -2198,6 +2198,11 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
             target = staged.joinpath(*normalize_archive_parts(rel))
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
+        # Cron runtime fields (prompts, errors) live in cron/runtime_state.db since t_94e91559: fold
+        # them back into the staged jobs.json so the text scrubber below sees them, and drop the
+        # binary db + sidecars from the archive (the scrubber skips binaries).
+        from cron.runtime_state import fold_staged_copy
+        fold_staged_copy(staged / "cron")
         _scrub_export_secrets(staged)
         return Path(make_targz(base, tmpdir, canon))
 
