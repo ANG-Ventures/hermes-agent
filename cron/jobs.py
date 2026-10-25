@@ -482,7 +482,7 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
             yield False
             return
         with _jobs_lock():
-            job = next((item for item in load_jobs() if item.get("id") == job_id), None)
+            job = _locked_job_view(job_id)
             claim = job.get("fire_claim") if isinstance(job, dict) else None
             owns_claim = isinstance(claim, dict) and claim.get("by") == expected_owner
             if job is None:
@@ -1964,6 +1964,24 @@ def _with_job_runtime(job_id: Any, fn: Callable, missing: Any) -> Any:
 
 
 _MISSING_FAST = object()
+
+
+def _locked_job_view(job_id: Any) -> Optional[Dict[str, Any]]:
+    """One merged record (caller holds ``_jobs_lock``): the cached definition + its row in sqlite
+    mode (same view the ``_with_job`` writers use), else a full ``load_jobs()`` scan."""
+    if _rs.enabled():
+        usable, definition = _cached_definition(job_id)
+        if usable:
+            if definition is None:
+                return None
+            with _rs.connect(_current_cron_store().cron_dir,
+                             create=_runtime_write_allowed()) as conn:
+                row = conn.execute("SELECT fields FROM job_runtime WHERE job_id=?",
+                                   (str(job_id),)).fetchone() if conn is not None else None
+            if row:
+                _rs.apply_runtime(definition, json.loads(row[0]))
+            return definition
+    return next((item for item in load_jobs() if item.get("id") == job_id), None)
 
 
 def _guard_against_test_write_to_live_store(jobs_file: Path) -> None:

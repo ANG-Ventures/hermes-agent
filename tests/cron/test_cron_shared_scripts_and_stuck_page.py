@@ -250,6 +250,8 @@ def test_jobs_json_roundtrip_carries_streak(profile_env):
     job = create_job(prompt=None, schedule="every 60m", script="x.py", no_agent=True)
     mark_job_run(job["id"], False, "boom")
     mark_job_run(job["id"], False, "boom")
-    raw = json.loads((home / "cron" / "jobs.json").read_text())
-    jobs = raw["jobs"] if isinstance(raw, dict) else raw
+    # Runtime fields live in cron/runtime_state.db since t_94e91559; merged_jobs is the on-disk view.
+    from cron.runtime_state import merged_jobs
+
+    jobs = merged_jobs(home / "cron" / "jobs.json")
     assert [j for j in jobs if j["id"] == job["id"]][0]["error_repeat_streak"] == 2
