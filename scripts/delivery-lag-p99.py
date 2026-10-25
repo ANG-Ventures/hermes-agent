@@ -103,7 +103,7 @@ def main(argv=None) -> int:
         print(json.dumps({"hour": hour, **summarize(hours[hour])}, sort_keys=True))
     lags = sorted(lag for _, lag in rows)
     out = {"from": int(lo), "to": int(hi), "platform": a.platform, **summarize(lags)}
-    ok = a.max_p99_s is None or pct(lags, 99) < a.max_p99_s  # unrounded: rounding is display only
+    ok = a.max_p99_s is None or pct(lags, 99) <= a.max_p99_s  # at the limit passes (Prism 71fb90530d15); unrounded: rounding is display only
     out["verdict"] = "PASS" if ok else "FAIL"
     print(json.dumps(out, sort_keys=True))
     return 0 if ok else 1

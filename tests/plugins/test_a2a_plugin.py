@@ -1571,9 +1571,8 @@ class TestV1SpecRegressionFixes:
         profile_home.mkdir()
         db = profile_home / "state.db"
         import sqlite3
-        con = sqlite3.connect(db)
-        con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, title TEXT)")
-        con.commit(); con.close()
+        from hermes_state import SessionDB
+        SessionDB(db_path=db).close()  # the real schema: the title write goes through SessionDB
 
         fakebin = tmp_path / "bin"
         fakebin.mkdir()

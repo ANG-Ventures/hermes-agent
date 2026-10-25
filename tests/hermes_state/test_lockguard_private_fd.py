@@ -70,11 +70,10 @@ def test_private_hold_refuses_foreign_exclusive_until_released(tmp_path):
     lg.retire()
     assert _foreign_exclusive(str(db), *_SHARED) == "ACQUIRED"
     assert _foreign_exclusive(str(shm), *_DMS) == "ACQUIRED"
-    # Both paths still name their inodes: the descriptors stay parked (Prism 7072ffc85b72).
-    assert set(held_idents) <= set(lg._FDS)
-    shm.unlink()  # a true last close unlinks -shm: retire() then closes its parked fd
-    lg.retire()
-    assert held_idents[1] not in lg._FDS and held_idents[0] in lg._FDS
+    # state.db stays parked for reuse; the -shm descriptor is never parked (Prism 9016456d284b).
+    db_ident = (os.stat(db).st_dev, os.stat(db).st_ino)
+    shm_ident = (os.stat(shm).st_dev, os.stat(shm).st_ino)
+    assert db_ident in lg._FDS and shm_ident not in lg._FDS
 
 
 def test_missing_shm_is_tolerated(tmp_path):
@@ -343,7 +342,8 @@ def test_retire_never_strips_a_reader_that_opened_after_the_snapshot(tmp_path, m
 
 
 def test_hold_retire_hold_reuses_one_parked_fd(tmp_path, monkeypatch):
-    """hold -> release/retire -> hold on the same inode opens exactly one private descriptor."""
+    """hold -> release/retire -> hold on the same state.db opens exactly one private descriptor
+    (the main file only: a -shm descriptor is closed at retire and reopened by the next hold)."""
     if not lg.supported():
         pytest.skip("no OFD locks")
     db = tmp_path / "state.db"
@@ -355,17 +355,20 @@ def test_hold_retire_hold_reuses_one_parked_fd(tmp_path, monkeypatch):
         opens.append(os.fspath(path))
         return real_open(path, *a, **k)
 
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
     monkeypatch.setattr(lg.os, "open", _open)
     held = lg.hold(db)
     lg.release(held)
     lg.retire()
     held = lg.hold(db)
     try:
-        assert opens == [str(db)], opens
+        assert opens.count(str(db)) == 1, opens
+        assert opens.count(str(shm)) == 2, opens
         assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED"
     finally:
         lg.release(held)
-        _sqlite_close(db)
+        _sqlite_close(db, shm)
         lg.retire()
     assert _foreign_exclusive(str(db), *_SHARED) == "ACQUIRED", "a parked fd must carry no OFD lock"
 
@@ -418,5 +421,106 @@ def test_sessiondb_close_leaves_no_lock_on_parked_fds(tmp_path, monkeypatch):
     assert _foreign_posix_exclusive(str(sdb.db_path), *_SHARED) == "ACQUIRED"
     if os.path.exists(shm):
         assert _foreign_exclusive(shm, *_DMS) == "ACQUIRED"
-    else:
-        assert shm_ident not in lg._FDS
+    assert shm_ident not in lg._FDS, "the -shm descriptor is never parked"
+
+
+_FOREIGN_CHILD = """
+import os, sys
+sys.path.insert(0, {repo!r})
+import hermes_state_wal
+hermes_state_wal.is_sqlite_wal_reset_vulnerable = lambda version_info=None: False
+hermes_state_wal.resolve_journal_mode = lambda: "wal"
+from pathlib import Path
+from hermes_state import SessionDB
+b = SessionDB(db_path=Path({db!r}))
+b.append_message("s", role="user", content="b")
+print("B-open", flush=True)
+sys.stdin.readline()
+b.close()
+print("B-closed", os.path.exists({db!r} + "-shm"), flush=True)
+"""
+
+
+def test_foreign_last_close_does_not_strand_openers(tmp_path, monkeypatch):
+    """Prism 9016456d284b: process A closes while B is open, B's last close unlinks -shm, then a third
+    opener must SUCCEED. A parked -shm fd in A would pin the deleted generation and the open-path
+    probe would refuse it with DeletedWalGenerationError (RED on 14bbc5f7)."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    pin_wal(monkeypatch)
+    import hermes_state_dbfile as dbf
+    db = tmp_path / "state.db"
+    a = make_db(db, "s", "a")
+    require_wal(a)
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    child = subprocess.Popen([sys.executable, "-c", _FOREIGN_CHILD.format(repo=repo, db=str(db))],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "B-open"
+        shm_ident = (os.stat(f"{db}-shm").st_dev, os.stat(f"{db}-shm").st_ino)
+        a.close()
+        child.stdin.write("\n")
+        child.stdin.flush()
+        assert child.stdout.readline().startswith("B-closed")
+        assert child.wait(timeout=30) == 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+    c = hermes_state.SessionDB(db_path=db)  # third opener: must not raise DeletedWalGenerationError
+    c.close()
+    assert dbf.iter_deleted_sqlite_sidecar_holders(db) == []
+    assert shm_ident not in lg._FDS, "A parked its -shm descriptor"
+
+
+def test_relative_path_survives_chdir(tmp_path, monkeypatch):
+    """Prism 5214a704d594: a relative db_path is made absolute at hold() time, so retire() after a
+    chdir does not take a live state.db for a gone one and close its parked descriptor."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    (a / "state.db").write_bytes(b"\0" * 4096)
+    ident = (os.stat(a / "state.db").st_dev, os.stat(a / "state.db").st_ino)
+    monkeypatch.chdir(a)
+    lg.release(lg.hold("state.db"))
+    fd = lg._FDS[ident]
+    assert lg._PATHS[ident] == str(a / "state.db")
+    monkeypatch.chdir(b)
+    lg.retire()
+    assert lg._FDS.get(ident) == fd, "retire() after a chdir closed a live parked descriptor"
+
+
+def test_retire_closes_only_on_enoent_or_identity_change(tmp_path, monkeypatch, caplog):
+    """Prism a97a215db7d8: an inconclusive stat (EACCES/EIO) keeps the parked descriptor and logs
+    once; ENOENT or a different inode at the path closes it."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    import errno as _errno
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    ident = (os.stat(db).st_dev, os.stat(db).st_ino)
+    lg.release(lg.hold(db))
+    real_stat = os.stat
+
+    def _eacces(path, *a, **k):
+        if os.fspath(path) == str(db):
+            raise PermissionError(_errno.EACCES, "denied", str(db))
+        return real_stat(path, *a, **k)
+
+    monkeypatch.setattr(lg.os, "stat", _eacces)
+    with caplog.at_level(logging.WARNING, logger="hermes_state"):
+        lg.retire()
+        lg.retire()
+    monkeypatch.setattr(lg.os, "stat", real_stat)
+    assert ident in lg._FDS, "an inconclusive stat closed a possibly live descriptor"
+    assert len([r for r in caplog.records if "cannot stat" in r.getMessage()]) == 1
+    db.unlink()
+    db.write_bytes(b"\0" * 4096)  # a different inode at the same path
+    lg.retire()
+    assert ident not in lg._FDS
+    ident2 = (os.stat(db).st_dev, os.stat(db).st_ino)
+    lg.release(lg.hold(db))
+    db.unlink()  # ENOENT
+    lg.retire()
+    assert ident2 not in lg._FDS

@@ -20,6 +20,7 @@ import urllib.request
 from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
@@ -140,11 +141,19 @@ def _state_db(profile: str, sql: str, params: tuple, log_msg: str, *, commit: bo
     if not db or not os.path.exists(db):
         return ""
     try:
-        with contextlib.closing(sqlite3.connect(db, timeout=5)) as con:
-            cur = con.execute(sql, params)
-            row = None if commit else cur.fetchone()
-            if commit:
-                con.commit()
+        if commit:
+            # Writes go through SessionDB, never a raw connection: the WAL lock guard counts only
+            # SessionDB writers (tests/hermes_state/test_state_db_raw_writer_lint.py, t_aeae3fe7).
+            from hermes_state import SessionDB
+            sdb = SessionDB(db_path=Path(db))
+            try:
+                sdb._execute_write(lambda con: con.execute(sql, params))
+            finally:
+                sdb.close()
+            return ""
+        from hermes_state_holders import read_only_db_uri
+        with contextlib.closing(sqlite3.connect(read_only_db_uri(db), uri=True, timeout=5)) as con:
+            row = con.execute(sql, params).fetchone()
         return str(row[0]) if row else ""
     except Exception:
         logger.debug(log_msg, exc_info=True)

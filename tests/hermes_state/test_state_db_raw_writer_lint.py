@@ -1,0 +1,186 @@
+"""Every write-capable connection to state.db goes through SessionDB (t_aeae3fe7, Apollo ruling on
+Prism 7072ffc85b72).
+
+The WAL lock guard closes its private ``-shm`` descriptor when the last guarded SessionDB handle on
+the inode releases. A POSIX ``close()`` cancels every lock this process holds on that inode, so an
+UNGUARDED in-process connection on the same ``-shm`` loses its locks at that moment. That window is
+accepted only because such connections are read-only: a split WAL generation corrupts state.db
+only when a WRITER keeps writing to it, and every SessionDB writer is guarded and counted in
+``hermes_state_lockguard._HANDLES``. This lint keeps the premise true.
+
+It walks the repo (``tests/`` and ``hermes_state*.py`` excluded) and fails on any
+``sqlite3.connect(...)`` whose first argument names or resolves to state.db (a ``"state.db"``
+literal anywhere in the expression, a ``*state_db*`` name/attribute/call, or a local variable
+assigned from one) unless the call is read-only (``mode=ro`` in the expression, or ``uri=True``
+with ``?mode=ro``) or is on :data:`ALLOWLIST` with a reason.
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import re
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+_SKIP_DIRS = {".git", "tests", "node_modules", "venv", ".venv", "__pycache__", ".worktrees", "build", "dist"}
+_STATE_DB_NAME = re.compile(r"state_db", re.IGNORECASE)
+_RO_HELPERS = {"read_only_db_uri"}  # hermes_state_holders: file: URI + ?mode=ro
+
+# (repo-relative path, enclosing function name) -> why this raw connect is acceptable.
+# Every entry must be read-only in practice or a one-shot offline tool that never runs beside a
+# guarded gateway writer in the same process.
+_EVAL = "offline eval harness on a throwaway HERMES_HOME; never runs in a process beside the live gateway's guarded writer"
+ALLOWLIST: dict[tuple[str, str], str] = {
+    ("gateway/lifecycle_ledger.py", "check_state_db_integrity"):
+        "PRAGMA quick_check only, writes nothing; opened read-write because a WAL store needs its -shm to open",
+    ("hermes_cli/doctor_state.py", "_write_health_reason"):
+        "the write probe targets a snapshot copy in a TemporaryDirectory, never the live state.db",
+    ("evals/acp_empty_session_wire.py", "rows"): _EVAL,
+    ("evals/acp_empty_session_wire.py", "main"): _EVAL,
+    ("evals/delivery_flood_wire.py", "rows"): _EVAL,
+    ("evals/gateway_failure_ownership/probe.py", "rows"): _EVAL,
+    ("evals/gateway_failure_ownership/probe.py", "main"): _EVAL,
+    ("evals/desktop_bug_campaign/persistence_live.py", "main"): _EVAL,
+    ("evals/desktop_bug_campaign/leases_live.py", "main"): _EVAL,
+}
+
+
+def _py_files():
+    for root, dirs, files in os.walk(REPO):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith(".")]
+        for name in files:
+            if not name.endswith(".py") or name.startswith(("hermes_state", "test_")) or name.endswith("_test.py"):
+                continue
+            path = Path(root, name)
+            yield path, path.relative_to(REPO).as_posix()
+
+
+def _is_sqlite_connect(call: ast.Call, connect_aliases: set[str]) -> bool:
+    f = call.func
+    if isinstance(f, ast.Attribute) and f.attr == "connect" and isinstance(f.value, ast.Name):
+        return f.value.id in {"sqlite3", "_sqlite3", "sqlite"}
+    return isinstance(f, ast.Name) and f.id in connect_aliases
+
+
+def _strings(node: ast.AST):
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            yield sub.value
+
+
+def _names(node: ast.AST):
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            yield sub.id
+        elif isinstance(sub, ast.Attribute):
+            yield sub.attr
+
+
+def _assignments(scope: ast.AST) -> dict[str, list[ast.AST]]:
+    out: dict[str, list[ast.AST]] = {}
+    for sub in ast.walk(scope):
+        if isinstance(sub, ast.Assign):
+            for tgt in sub.targets:
+                if isinstance(tgt, ast.Name):
+                    out.setdefault(tgt.id, []).append(sub.value)
+        elif isinstance(sub, (ast.AnnAssign, ast.NamedExpr)) and isinstance(sub.target, ast.Name) and sub.value:
+            out.setdefault(sub.target.id, []).append(sub.value)
+    return out
+
+
+def _names_state_db(expr: ast.AST, assigns: dict[str, list[ast.AST]], seen: set | None = None) -> bool:
+    seen = set() if seen is None else seen  # shared across the walk: linear, not per-path exponential
+    if any("state.db" in s for s in _strings(expr)):
+        return True
+    for name in _names(expr):
+        if _STATE_DB_NAME.search(name):
+            return True
+        if name in assigns and name not in seen:
+            seen.add(name)
+            if any(_names_state_db(v, assigns, seen) for v in assigns[name]):
+                return True
+    return False
+
+
+def _read_only(call: ast.Call, assigns: dict[str, list[ast.AST]]) -> bool:
+    exprs = [call.args[0]] if call.args else []
+    exprs += [kw.value for kw in call.keywords if kw.arg == "database"]
+    for expr in list(exprs):
+        for name in _names(expr):
+            exprs.extend(assigns.get(name, []))
+    if any(name in _RO_HELPERS for e in exprs for name in _names(e)):
+        return True
+    return any("mode=ro" in s for e in exprs for s in _strings(e))
+
+
+def _scan(path: Path, rel: str):
+    try:
+        text = path.read_text(encoding="utf-8")
+        if "connect" not in text or "sqlite" not in text:
+            return []  # cheap pre-filter: most files never open sqlite
+        tree = ast.parse(text, filename=rel)
+    except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
+        return []
+    aliases = {a.asname or a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "sqlite3"
+               for a in n.names if a.name == "connect"}
+    hits = []
+
+    def visit(scope: ast.AST, fn_name: str, assigns):
+        for child in ast.iter_child_nodes(scope):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, child.name, {**assigns, **_assignments(child)})
+                continue
+            if isinstance(child, ast.Call) and _is_sqlite_connect(child, aliases):
+                target = child.args[0] if child.args else next(
+                    (kw.value for kw in child.keywords if kw.arg == "database"), None)
+                if target is not None and _names_state_db(target, assigns) and not _read_only(child, assigns):
+                    hits.append((rel, fn_name, child.lineno))
+            visit(child, fn_name, assigns)
+
+    visit(tree, "<module>", _assignments(tree))
+    return hits
+
+
+def _raw_state_db_writers():
+    found = []
+    for path, rel in _py_files():
+        found.extend(_scan(path, rel))
+    return found
+
+
+def test_lint_flags_a_raw_writer_and_passes_read_only(tmp_path):
+    src = tmp_path / "probe.py"
+    src.write_text(
+        "import sqlite3, os\n"
+        "from hermes_constants import get_hermes_home\n"
+        "def writer():\n"
+        "    p = os.path.join(get_hermes_home(), 'state.db')\n"
+        "    return sqlite3.connect(p)\n"
+        "def writer2():\n"
+        "    return sqlite3.connect(state_db_path())\n"
+        "def reader():\n"
+        "    return sqlite3.connect(f'file:{state_db_path()}?mode=ro', uri=True)\n"
+        "def reader2(state_db_path):\n"
+        "    return sqlite3.connect(read_only_db_uri(state_db_path), uri=True)\n"
+        "def other():\n"
+        "    return sqlite3.connect('kanban.db')\n"
+    )
+    hits = _scan(src, "probe.py")
+    assert [(fn, line) for _rel, fn, line in hits] == [("writer", 5), ("writer2", 7)]
+
+
+def test_no_raw_write_capable_state_db_connections():
+    offenders = [h for h in _raw_state_db_writers() if (h[0], h[1]) not in ALLOWLIST]
+    assert not offenders, (
+        "raw write-capable sqlite3.connect() on state.db outside SessionDB (the WAL lock guard's "
+        "residual close race is accepted only for read-only in-process connections): open it with "
+        "f'file:{path}?mode=ro', uri=True, route writes through SessionDB, or add an ALLOWLIST entry "
+        f"with the reason: {offenders}"
+    )
+
+
+def test_allowlist_has_no_stale_entries():
+    live = {(rel, fn) for rel, fn, _line in _raw_state_db_writers()}
+    stale = sorted(set(ALLOWLIST) - live)
+    assert not stale, f"ALLOWLIST entries that no longer match a raw connect: {stale}"
