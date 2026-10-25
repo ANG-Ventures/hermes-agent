@@ -267,6 +267,12 @@ def run(*, runner_factory: Optional[Callable[[Dict[str, Any], Any], Callable[[],
     status = "error"
     try:
         _isolate_process_checkpoint(task_id)
+        # A fresh process: the gateway's per-home plugin manager (and its config.yaml shell hooks)
+        # is not shared, so the unit's tool calls would run ungated.
+        from gateway.run_startup import GatewayStartupMixin
+
+        GatewayStartupMixin._register_config_hooks(
+            "shell-hook/webhook registration failed in delegation unit worker", level=logging.WARNING)
         parent = (parent_factory or build_parent)(record)
         parent_box["parent"] = parent
         if beat.cancelled.is_set():

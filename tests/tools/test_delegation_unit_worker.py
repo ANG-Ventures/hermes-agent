@@ -334,3 +334,37 @@ def test_provider_route_keeps_the_resolved_key(unit, monkeypatch):
     built = _build_with(unit, monkeypatch, {"credential_ref": {"source": "provider"}},
                         {"delegation": {"api_key": "unused"}})
     assert built["api_key"] == "parent-provider-key"
+
+
+# ── shell hooks: the unit runner is its own process, so it arms them itself ──
+def test_the_unit_runner_arms_the_profiles_shell_hooks_before_building_the_parent(unit, home, tmp_path,
+                                                                                 monkeypatch):
+    """Red without the run() registration: the gateway's per-home plugin manager is not inherited by
+    the spawned runner, so the unit's tool calls ran with no pre_tool_call policy."""
+    import shlex
+    import sys
+
+    import hermes_yaml as yaml
+    from agent import shell_hooks
+    from hermes_cli import plugins
+
+    script = tmp_path / "guard.py"
+    script.write_text('import json\nprint(json.dumps({"decision":"block","reason":"unit-policy"}))\n')
+    (home / "config.yaml").write_text(yaml.safe_dump({"hooks_auto_accept": True, "hooks": {"pre_tool_call": [
+        {"command": shlex.join([sys.executable, str(script)]), "matcher": "write_file", "fail_closed": True}]}}))
+    monkeypatch.delenv("HERMES_ACCEPT_HOOKS", raising=False)
+    plugins._reset_plugin_managers_for_tests()
+    shell_hooks.reset_for_tests()
+    seen = {}
+
+    def _build(record):
+        seen["block"] = plugins.get_pre_tool_call_block_message("write_file", {"path": "x", "content": "y"})
+        return _parent(record)
+
+    try:
+        assert duw.run(runner_factory=Model().factory, parent_factory=_build) == 0
+    finally:
+        plugins._reset_plugin_managers_for_tests()
+        shell_hooks.reset_for_tests()
+
+    assert seen["block"] == "unit-policy", "the unit's tool calls would run with no shell-hook policy"
