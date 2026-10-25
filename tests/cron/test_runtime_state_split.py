@@ -2449,3 +2449,26 @@ def test_retire_keeps_db_when_a_new_row_appeared_after_the_export_snapshot(temp_
     monkeypatch.setattr(cj, "_write_definitions_file", real_write)
     assert cj.export_runtime_to_json(retire=True, keep_orphans=True) >= 1
     assert _db(temp_home).exists() or _raw(temp_home, b["id"])["next_run_at"] == "2030-01-01T13:00:00+00:00"
+
+
+def test_stale_mirror_publication_is_not_certified(temp_home):
+    """001ff3e96a30: flush A read seq=1; a degraded sibling B published and certified seq=2 before
+    A's rename landed. A's file is stale. A must not record that stale file's identity as the known
+    mirror: the next flush has to see a mismatch and repair the file."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="stale")
+    cj.mark_job_run(created["id"], True)
+    cj.maybe_flush_runtime_mirror(force=True)
+    store = cj._current_cron_store()
+    with cj._runtime_txn() as conn:
+        rs.mark_flushed(conn, 10**9)  # sibling B certified a far newer mirror
+        before = cj._known_mirror_stamp(conn)
+    # A publishes its stale snapshot (any rewrite of the file) and records seq=1
+    store.jobs_file.write_text(store.jobs_file.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with cj._runtime_txn() as conn:
+        cj._record_mirror_written(conn, 1.0)
+        after = cj._known_mirror_stamp(conn)
+    assert after == before, "a stale publication must not be certified as the known mirror"
+    assert after != cj._mirror_stamp(store.jobs_file)

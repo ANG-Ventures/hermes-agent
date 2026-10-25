@@ -2112,7 +2112,15 @@ def _record_mirror_written(conn, seq: float) -> None:
     """jobs.json now reflects every row write up to *seq* (read in the snapshot whose rows were
     written into the file); remember the file's identity so an out-of-band replacement (a git
     level) is detected as a stale mirror."""
+    # Prism 001ff3e96a30: a degraded sibling can publish and certify a NEWER mirror between our
+    # pre-rename newer-mirror check and our rename. Our file is then stale: certifying its stamp
+    # would make every later flush see "clean rows, known file" and leave the stale file on disk
+    # for good. Record the stamp only when nothing newer was flushed; otherwise leave the
+    # identity mismatched so the next flush repairs the file.
+    already = _rs._state(conn, "flushed")
     _rs.mark_flushed(conn, seq)
+    if already is not None and float(already) > float(seq):
+        return
     stamp = _mirror_stamp(_current_cron_store().jobs_file)
     if stamp is not None:
         _store_mirror_stamp(conn, stamp)
