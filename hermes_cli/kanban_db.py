@@ -13548,7 +13548,14 @@ def request_review(
 
             _neg_result = negative_result_match(summary, metadata)
             if _neg_result is not None:
-                reviewer = HUMAN_REVIEWER_SENTINEL
+                # The board's named human lane (human:apollo) when configured;
+                # the bare sentinel only when no human lane is configured. The
+                # negative-result flag rides its own review_negative_result event.
+                _configured = configured_review_assignee()
+                reviewer = (
+                    _configured.casefold() if is_human_reviewer(_configured)
+                    else HUMAN_REVIEWER_SENTINEL
+                )
         if _skip_review and _neg_result is None:
             skip_meta = dict(metadata or {})
             skip_meta["review_skipped"] = "policy_none" if _policy == "none" else "non_milestone"
