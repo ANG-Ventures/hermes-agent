@@ -327,3 +327,17 @@ def test_if_latest_release_fails_closed_without_the_fleet_grammar(fleet):
     with pytest.raises(guard.ReleaseSuperseded):
         with kb.connect_closing() as conn:
             kb.add_comment(conn, tid, "apollo", "close-on: merged", if_latest_release=c10)
+
+
+def test_if_latest_release_fails_closed_without_the_automation_classifier(fleet):
+    """Prism 1a7315c3ea79 (round 2): with our_authors.py unavailable, an automation release line posted as
+    `default` must not become an accepted anchor that hides the operator's older hold."""
+    home, tid = fleet
+    _post(tid, "apollo", HOLD)
+    c2 = _post(tid, "default", "[review-merge-pass]\nclose-on: merged")
+    (home / "scripts" / "lib" / "our_authors.py").unlink()
+    guard._LIB_CACHE.clear()
+    with pytest.raises(guard.ReleaseSuperseded):
+        with kb.connect_closing() as conn:
+            kb.add_comment(conn, tid, "daedalus", "close-on: merged", if_latest_release=c2)
+    assert _comments(tid) == [HOLD, "[review-merge-pass]\nclose-on: merged"]

@@ -147,13 +147,18 @@ def newer_release_comment(conn, task_id: str, comment_id: int) -> Optional[str]:
     if row is None or row[0] != task_id:
         return f"comment {comment_id} is not a comment on {task_id}"
     lib, authors = _load("close_on"), _load("our_authors")
+    if authors is None:
+        # Without the automation-marker classifier a [review-merge-pass] comment posted as `default` would
+        # read as human, could be accepted as the anchor, and hide an older operator hold (Prism
+        # 1a7315c3ea79). The conditional append fails CLOSED.
+        return "the automation classifier (scripts/lib/our_authors.py) cannot be loaded; refusing the conditional append"
     line_re = getattr(lib, "LINE_RE", None) or _LINE_RE_FALLBACK
 
     def release_bearing(author, body) -> bool:
         a = str(author or "").strip().lower()
         if a.startswith("unverified:"):
             a = a.split(":", 1)[1].strip()
-        if a in MACHINE_AUTHORS or (authors is not None and authors.is_machine(body)):
+        if a in MACHINE_AUTHORS or authors.is_machine(body):
             return False
         return bool(line_re.search(str(body or "")))
 
