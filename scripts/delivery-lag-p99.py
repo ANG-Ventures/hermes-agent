@@ -72,9 +72,11 @@ def samples(lines, platform: str, unpaired=None):
     """Yield ``(send_epoch, lag_s)`` for *platform* (``all`` = every platform). Epochs of readies and
     sends that could not be paired are appended to *unpaired* when given."""
     unpaired = [] if unpaired is None else unpaired
-    pending = {}  # (platform, chat) -> (ready epoch, turn id or None): the LAST ready only
-    ambiguous_readies = set()  # epochs of readies whose local timestamp is fold-ambiguous
-    by_turn = {}  # (platform, chat, turn id) -> ready epoch: two chats may reuse one turn id (Prism dceb77e823cc)
+    # A ready is (epoch, ambiguous): the fold-ambiguity flag rides on the record itself, never keyed
+    # by epoch, so an ambiguous ready cannot void another chat's zoned ready at the same instant
+    # (Prism 226a7bd762a7 / b079624ea4b1).
+    pending = {}  # (platform, chat) -> ((epoch, ambiguous), turn id or None): the LAST ready only
+    by_turn = {}  # (platform, chat, turn id) -> (epoch, ambiguous): two chats may reuse one turn id (Prism dceb77e823cc)
 
     def wanted(key):
         return platform == "all" or key[0] == platform
@@ -88,14 +90,13 @@ def samples(lines, platform: str, unpaired=None):
         m = _READY.search(line)
         if m:
             key = (m.group(1).lower(), m.group(2))
-            if _ambiguous(line):
-                ambiguous_readies.add(ts)
+            record = (ts, _ambiguous(line))
             if turn is not None:
-                by_turn[key + (turn,)] = ts
+                by_turn[key + (turn,)] = record
             prev = pending.get(key)
             if prev is not None and prev[1] is None and wanted(key):
-                unpaired.append(prev[0])  # superseded with no turn id: never paired with a later send
-            pending[key] = (ts, turn)  # a superseded ready WITH a turn id can still pair by turn
+                unpaired.append(prev[0][0])  # superseded with no turn id: never paired with a later send
+            pending[key] = (record, turn)  # a superseded ready WITH a turn id can still pair by turn
             continue
         m = _SEND.search(line)
         if not m:
@@ -122,15 +123,15 @@ def samples(lines, platform: str, unpaired=None):
         lag = _LAG.search(line)
         if lag is not None:
             yield ts, float(lag.group(1))
-        elif ready is not None and ts >= ready and ready not in ambiguous_readies and not _ambiguous(line):
-            yield ts, ts - ready
+        elif ready is not None and ts >= ready[0] and not ready[1] and not _ambiguous(line):
+            yield ts, ts - ready[0]
         else:
             # No pair, a pair that runs BACKWARDS (a naive-local log across a DST fall-back: never a
             # fabricated 0 s sample, Prism a6da10393688), or one whose naive local time is ambiguous
             # (fall-back repeated hour: the fold is a guess, Prism 129fd71e629f): counted unpaired.
             unpaired.append(ts)
-    unpaired.extend(ts for key, (ts, t) in pending.items() if t is None and wanted(key))
-    unpaired.extend(ts for tkey, ts in by_turn.items() if wanted(tkey[:2]))
+    unpaired.extend(rec[0] for key, (rec, t) in pending.items() if t is None and wanted(key))
+    unpaired.extend(rec[0] for tkey, rec in by_turn.items() if wanted(tkey[:2]))
 
 
 def pct(sorted_vals, q: float) -> float:

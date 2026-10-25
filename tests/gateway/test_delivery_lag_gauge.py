@@ -342,3 +342,27 @@ def test_ambiguous_fall_back_hour_pair_is_not_measured(tmp_path, monkeypatch, ca
         "2026-11-01 02:11:00 INFO x: [discord] Sending response (1 chars) to c\n",
         "--max-p99-s", "120")
     assert rc == 0 and (out["n"], out["max_s"]) == (1, 60.0), out
+
+
+
+@pytest.mark.parametrize("b_ready,b_send", [
+    ("2026-11-01T05:30:00Z", "2026-11-01T05:31:00Z"),          # 226a7bd762a7: 60 s
+    ("2026-11-01 01:30:00-04:00", "2026-11-01 01:31:00-04:00"),  # b079624ea4b1: offset-qualified, 60 s
+])
+def test_ambiguous_ready_never_voids_another_chats_zoned_ready(tmp_path, monkeypatch, capsys, b_ready, b_send):
+    """Prism 226a7bd762a7 / b079624ea4b1: ambiguity was kept per EPOCH, so chat a's offset-free
+    01:30 (fold-ambiguous, same instant as 05:30Z) dropped chat b's valid zoned 60 s sample and a
+    window with one 0.1 s gauge sample PASSed 5 s. The flag now rides on each ready record."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("no time.tzset")
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    _LAST[:] = [capsys]
+    mod = _script()
+    rc, out = _run(mod, tmp_path,
+        "2026-11-01 01:30:00 INFO x: response ready: platform=discord chat=a session=a\n"
+        f"{b_ready} INFO x: response ready: platform=discord chat=b session=b\n"
+        f"{b_send} INFO x: [discord] Sending response (1 chars) to b\n"
+        "2026-11-01T05:32:00Z INFO x: [discord] Sending response (1 chars) to z delivery_lag_s=0.1\n",
+        "--max-p99-s", "5")
+    assert rc == 1 and out["n"] == 2 and out["max_s"] == 60.0, out
