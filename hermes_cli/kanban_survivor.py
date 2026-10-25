@@ -15,9 +15,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 from urllib.parse import unquote, urlsplit
 
@@ -72,17 +74,22 @@ def _git_env(env=None, *, lazy_fetch=False):
     return base
 
 
-def _git(repo, *args, env=None, check=True, input=None, timeout=30, lazy_fetch=False):
+def _git(repo, *args, env=None, check=True, input=None, timeout=30, lazy_fetch=False,
+         network=False):
     # ``-C`` names the repository; ``cwd`` is pinned to a neutral directory so
     # nothing about the CALLER's cwd (a scratch workspace under the tripwire
     # gitfile, Argus r1 F1) can influence discovery. The path is made absolute
     # against the process cwd first, so a relative ``repo`` keeps its meaning.
-    result = subprocess.run(
-        ["git", "-C", os.path.abspath(str(repo)), *args],
-        stdin=subprocess.DEVNULL if input is None else None,
-        input=input, cwd=_ext.neutral_cwd(),
-        capture_output=True, timeout=timeout, env=_git_env(env, lazy_fetch=lazy_fetch),
-    )
+    argv = ["git", "-C", os.path.abspath(str(repo)), *args]
+    git_env = _git_env(env, lazy_fetch=lazy_fetch)
+    if network:
+        result = _run_network(argv, input=input, timeout=timeout, env=git_env)
+    else:
+        result = subprocess.run(
+            argv, stdin=subprocess.DEVNULL if input is None else None,
+            input=input, cwd=_ext.neutral_cwd(),
+            capture_output=True, timeout=timeout, env=git_env,
+        )
     if check and result.returncode:
         # Git stderr can contain credential-bearing remote URLs, so it is never
         # persisted. The subcommand and returncode are safe to include in the
@@ -103,6 +110,92 @@ def _git(repo, *args, env=None, check=True, input=None, timeout=30, lazy_fetch=F
             f"survivor_unavailable: git {args[0] if args else '?'} failed (rc={result.returncode})"
         )
     return result
+
+
+class _ProbeGroup:
+    """Network git processes started for one batch of live probes.
+
+    `stop` kills every one (and any started later) so abandoned probes end
+    now instead of at their own timeout.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._procs = set()
+        self.stopped = False
+
+    def add(self, proc):
+        with self._lock:
+            if not self.stopped:
+                self._procs.add(proc)
+                return True
+        _kill_group(proc)
+        return False
+
+    def discard(self, proc):
+        with self._lock:
+            self._procs.discard(proc)
+
+    def stop(self):
+        with self._lock:
+            self.stopped = True
+            procs, self._procs = list(self._procs), set()
+        for proc in procs:
+            _kill_group(proc)
+
+
+_probe_group = contextvars.ContextVar("kanban_survivor_probe_group", default=None)
+
+
+def _kill_group(proc):
+    """SIGKILL ``proc``'s whole process group: git's transport helper
+    (`git remote-https`, `remote-ext`) is a grandchild that a plain
+    ``proc.kill()`` orphans to init with its socket open. The group is killed
+    even after git itself has exited: a descendant can outlive it holding
+    git's stderr pipe, and nothing else would ever end it."""
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        elif proc.poll() is None:
+            proc.kill()
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _reap(proc):
+    """Wait for a killed ``proc`` without reading its pipes: a descendant that
+    left the group could still hold them open, so ``communicate()`` here could
+    block forever (``subprocess.run`` does the same on POSIX)."""
+    proc.wait()
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is not None:
+            pipe.close()
+
+
+def _run_network(argv, *, input, timeout, env):
+    """`subprocess.run` for a git command that talks to a remote, in its own
+    session so a timeout (or an abandoned probe) kills the transport helper too."""
+    group = _probe_group.get()
+    if group is not None and group.stopped:
+        raise subprocess.TimeoutExpired(argv, 0)
+    proc = subprocess.Popen(
+        argv, stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=_ext.neutral_cwd(), env=env,
+        start_new_session=hasattr(os, "killpg"),
+    )
+    if group is not None:
+        group.add(proc)
+    try:
+        try:
+            stdout, stderr = proc.communicate(input, timeout=timeout)
+        except BaseException:
+            _kill_group(proc)
+            _reap(proc)
+            raise
+    finally:
+        if group is not None:
+            group.discard(proc)
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
 def _alternates(repo):
@@ -1150,7 +1243,8 @@ def _published_refs(repo, workspace, storage_cache=None):
             # loses the cheaper survivor forms, never the captured bytes.
             continue
         try:
-            advertised = _git(repo, "ls-remote", "--heads", remote, check=False, timeout=timeout)
+            advertised = _git(repo, "ls-remote", "--heads", remote, check=False, timeout=timeout,
+                              network=True)
         except subprocess.TimeoutExpired:
             continue
         if advertised.returncode:
@@ -1455,7 +1549,7 @@ def _content_advisory(repo, head, published, *, budget=_CONTENT_SCAN_BUDGET):
                     probe, "--config-env=remote.candidate.url=KANBAN_FETCH_URL",
                     "fetch", "--no-tags", "--depth", str(_CONTENT_SCAN_DEPTH + 1),
                     "candidate", f"+refs/heads/{ref['branch']}:refs/heads/candidate",
-                    env=fetch_env, check=False, timeout=timeout,
+                    env=fetch_env, check=False, timeout=timeout, network=True,
                 )
             except subprocess.TimeoutExpired:
                 continue
@@ -1757,16 +1851,36 @@ def _live_ancestor_survivor(repo, head, published):
 #: the older published base: a larger patch, never a lost one.
 _LIVE_BASE_TIMEOUT = 120
 #: Live-tip probes run concurrently, at most this many at once, so a hung
-#: first candidate cannot starve a healthy one behind it (Prism dbe35c381e8f):
-#: each probe starts with the whole remaining site budget as its floor.
+#: first candidate cannot starve a healthy one behind it (Prism dbe35c381e8f).
 _LIVE_PROBE_WORKERS = 4
+#: A probe's cap is never below 1/this of the site budget: past that many
+#: waves a share is too short to finish a fetch, so the tail goes unprobed.
+_LIVE_PROBE_MAX_WAVES = 8
 #: ONE network budget per `preserve()` call, threaded through every live probe
 #: (`ls-remote`, live-tip fetch, content-advisory fetch) of every repository.
 #: Without it one repo could spend 3 x 120 s of probes + 30 s ls-remote per
 #: remote + 300 s `_snapshot`, past the 420 s `kanban_complete` tool ceiling.
 #: 90 s + `_SNAPSHOT_TIMEOUT` keeps the network share of a call under it.
+#: ``HERMES_KANBAN_SURVIVOR_PROBE_BUDGET`` overrides it, capped at
+#: `_PROBE_BUDGET_MAX` (420 - 300 s snapshot, minus 10 s for local git work).
 _PROBE_BUDGET = 90
+_PROBE_BUDGET_MAX = 110
 _probe_deadline = contextvars.ContextVar("kanban_survivor_probe_deadline", default=None)
+#: The one live-probe thread pool of a `preserve()` call, joined when it returns.
+_probe_pool = contextvars.ContextVar("kanban_survivor_probe_pool", default=None)
+
+
+def _probe_budget():
+    """`_PROBE_BUDGET`, or the env override in (0, `_PROBE_BUDGET_MAX`]; invalid values are ignored."""
+    raw = os.environ.get("HERMES_KANBAN_SURVIVOR_PROBE_BUDGET", "").strip()
+    if raw:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return min(parsed, _PROBE_BUDGET_MAX)
+    return _PROBE_BUDGET
 
 
 def _probe_end(budget):
@@ -1785,46 +1899,80 @@ def _first_live(repo, candidates, sha):
     """The first ``(remote, branch)`` whose LIVE tip contains ``sha``, else None.
 
     One wall-clock site budget (`_LIVE_BASE_TIMEOUT`, clamped to the
-    `preserve()` deadline) covers every candidate. Up to `_LIVE_PROBE_WORKERS`
-    probes run at once and each starts with all of the time still left, so a
-    hung candidate costs its own slot, never a healthy sibling's chance.
-    Remotes are interleaved, so one hung remote's many branches cannot fill
-    every slot ahead of another remote. The first proof wins; probes still in
-    flight are abandoned (each is bounded by its own timeout and writes only
-    its throwaway probe repository).
+    `preserve()` deadline) covers every candidate, at most
+    `_LIVE_PROBE_WORKERS` probes at a time. Scheduling, so no healthy
+    candidate starves behind hung ones (Prism dbe35c381e8f, bf66bcf399d2):
+
+    - a free slot goes first to a branch of a remote that already ANSWERED
+      (finished before its own cap), then to an untried remote, then to a
+      remote whose probe is still in flight;
+    - each probe is capped at ``remaining / ceil(outstanding / workers)``
+      (floored at 1/`_LIVE_PROBE_MAX_WAVES` of the site budget), so queued candidates keep a
+      share of the budget even when every running probe hangs.
+
+    The first proof wins. Probes still in flight are killed (process group)
+    on return, so nothing outlives the call.
     """
-    by_remote = {}
-    for remote, branch in sorted(candidates):
-        by_remote.setdefault(remote, []).append((remote, branch))
-    order = [pair for rank in itertools.zip_longest(*by_remote.values()) for pair in rank if pair]
-    if not order:
+    pending = sorted(set(candidates))
+    if not pending:
         return None
     end = _probe_end(_LIVE_BASE_TIMEOUT)
+    floor = (end - time.monotonic()) / _LIVE_PROBE_MAX_WAVES
+    workers = _LIVE_PROBE_WORKERS
+    shared = _probe_pool.get()
+    pool = shared or concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="kanban-live-probe")
+    group = _ProbeGroup()
+    inflight, answered, touched = {}, set(), set()
 
-    def probe(pair):
+    def run(pair, cap):
         # The deadline is read when the probe STARTS, not when it was queued.
-        remaining = end - time.monotonic()
+        remaining = min(cap, end) - time.monotonic()
         if remaining <= 0:
             return False
-        return _reachable_from_live(repo, pair[0], pair[1], sha, timeout=remaining)
+        token = _probe_group.set(group)
+        try:
+            return _reachable_from_live(repo, pair[0], pair[1], sha, timeout=remaining)
+        finally:
+            _probe_group.reset(token)
 
-    pool = concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(_LIVE_PROBE_WORKERS, len(order)), thread_name_prefix="kanban-live-probe")
+    def pick():
+        for preferred in (lambda r: r in answered, lambda r: r not in touched):
+            for pair in pending:
+                if preferred(pair[0]):
+                    return pair
+        return pending[0]
+
     try:
-        futures = {pool.submit(probe, pair): pair for pair in order}
-        pending = set(futures)
-        while pending:
+        while pending or inflight:
+            while pending and len(inflight) < workers:
+                left = end - time.monotonic()
+                if left <= 0:
+                    break
+                pair = pick()
+                pending.remove(pair)
+                waves = -(-(len(pending) + len(inflight) + 1) // workers)
+                cap = time.monotonic() + min(left, max(left / waves, floor))
+                inflight[pool.submit(run, pair, cap)] = (pair, cap)
+                touched.add(pair[0])
             left = end - time.monotonic()
-            if left <= 0:
+            if not inflight or left <= 0:
                 break
-            done, pending = concurrent.futures.wait(
-                pending, timeout=left, return_when=concurrent.futures.FIRST_COMPLETED)
+            done, _ = concurrent.futures.wait(
+                inflight, timeout=left, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
-                if not future.exception() and future.result():
-                    return futures[future]
+                pair, cap = inflight.pop(future)
+                if future.exception() is None and future.result():
+                    return pair
+                if future.exception() is None and time.monotonic() < cap:
+                    answered.add(pair[0])
         return None
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        group.stop()
+        for future in inflight:
+            future.cancel()
+        if shared is None:
+            pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _reachable_from_live(repo, remote, branch, sha, *, timeout=_LIVE_BASE_TIMEOUT):
@@ -1859,7 +2007,7 @@ def _reachable_from_live(repo, remote, branch, sha, *, timeout=_LIVE_BASE_TIMEOU
                 "fetch", "-q", "--no-tags", "candidate",
                 f"+refs/heads/{branch}:refs/heads/candidate",
                 env=dict(env, KANBAN_FETCH_URL=url.stdout.decode().strip()),
-                check=False, timeout=timeout,
+                check=False, timeout=timeout, network=True,
             )
             if fetched.returncode:
                 return False
@@ -3054,9 +3202,16 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
     so a complete stays under the 420 s tool ceiling however many repositories
     and remotes the workspace holds. A nested call keeps the outer deadline.
     """
-    end = time.monotonic() + _PROBE_BUDGET
+    end = time.monotonic() + _probe_budget()
     outer = _probe_deadline.get()
     token = _probe_deadline.set(end if outer is None else min(end, outer))
+    # One live-probe pool per call, joined on exit: an abandoned probe thread
+    # must not hold a CLI `complete` open after the call returned.
+    pool = None
+    if _probe_pool.get() is None:
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_LIVE_PROBE_WORKERS, thread_name_prefix="kanban-live-probe")
+    pool_token = _probe_pool.set(pool) if pool is not None else None
     try:
         return _preserve(conn, task_id, metadata, cleanup=cleanup, workspace=workspace,
                          survivor_ref=survivor_ref, survivor_pr=survivor_pr,
@@ -3064,6 +3219,9 @@ def preserve(conn, task_id, metadata=None, *, cleanup=False, workspace=None,
                          survivor_none=survivor_none, survivor_reason=survivor_reason,
                          content_survivor=content_survivor)
     finally:
+        if pool is not None:
+            _probe_pool.reset(pool_token)
+            pool.shutdown(wait=True, cancel_futures=True)
         _probe_deadline.reset(token)
 
 

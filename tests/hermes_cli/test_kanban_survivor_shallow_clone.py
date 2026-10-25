@@ -396,3 +396,209 @@ def test_a_spent_complete_budget_skips_ls_remote(tmp_path, monkeypatch):
     finally:
         survivor._probe_deadline.reset(token)
     assert calls and 0 < calls[0] <= 5
+
+
+def test_queued_branch_of_an_answered_remote_is_not_starved_by_hung_remotes(tmp_path, monkeypatch):
+    """Prism bf66bcf399d2: aaa/a0 answers False at once, aaa/a1 is healthy and
+    bbb..eee hang. Four slots, five hung-or-queued candidates: aaa/a1 must still
+    be probed (and win) inside the site budget."""
+    import time
+
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_LIVE_BASE_TIMEOUT", 1)
+    ws = tmp_path / "ws"
+    git(tmp_path, "init", "-q", "-b", "main", str(ws))
+    _identity(ws)
+    shas = []
+    for n in "abc":
+        (ws / n).write_text(n, encoding="utf-8")
+        git(ws, "add", ".")
+        git(ws, "commit", "-qm", n)
+        shas.append(git(ws, "rev-parse", "HEAD"))
+    base, recorded = shas[0], shas[1]
+    pairs = [("aaa", "a0"), ("aaa", "a1")] + [(r, "main") for r in ("bbb", "ccc", "ddd", "eee")]
+    published = [{"remote": r, "branch": b, "sha": "0" * 40} for r, b in pairs]
+    for r, b in pairs:
+        git(ws, "update-ref", f"refs/remotes/{r}/{b}", recorded)
+
+    def probe(repo, remote, branch, sha, *, timeout):
+        if (remote, branch) == ("aaa", "a0"):
+            return False
+        if (remote, branch) == ("aaa", "a1"):
+            return True
+        time.sleep(timeout + 0.3)
+        return False
+    monkeypatch.setattr(survivor, "_reachable_from_live", probe)
+    assert survivor._recorded_base(ws, recorded, published, base) == recorded
+
+
+def test_queued_candidates_keep_a_share_of_the_budget_behind_hung_probes(tmp_path, monkeypatch):
+    """Eight candidates, four slots, all but the last hang: the last one is
+    still started with time left, because no probe takes the whole budget."""
+    import time
+
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setattr(survivor, "_LIVE_BASE_TIMEOUT", 2)
+    pairs = [(f"r{i}", "main") for i in range(8)]
+    started = {}
+
+    def probe(repo, remote, branch, sha, *, timeout):
+        started[remote] = timeout
+        if remote == "r7":
+            return True
+        time.sleep(timeout)
+        return False
+    monkeypatch.setattr(survivor, "_reachable_from_live", probe)
+    assert survivor._first_live(tmp_path, pairs, "0" * 40) == ("r7", "main")
+    assert started["r7"] > 0.2, started
+
+
+def _helper_remote(tmp_path, monkeypatch):
+    """A repo whose `slow` remote is an ext:: transport that records its pid and never answers."""
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "ext:file")
+    pidfile = tmp_path / "helper.pid"
+    helper = tmp_path / "helper.sh"
+    helper.write_text(f"#!/bin/sh\necho $$ > '{pidfile}'\nexec sleep 60\n", encoding="utf-8")
+    helper.chmod(0o755)
+    repo = tmp_path / "r"
+    git(tmp_path, "init", "-q", "-b", "main", str(repo))
+    _identity(repo)
+    (repo / "a").write_text("a\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "a")
+    git(repo, "remote", "add", "slow", f"ext::{helper}")
+    good = tmp_path / "good.git"
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(good))
+    git(repo, "remote", "add", "good", str(good))
+    git(repo, "push", "-q", "good", "HEAD:refs/heads/main")
+    return repo, git(repo, "rev-parse", "HEAD"), pidfile
+
+
+def _helper_pid(pidfile):
+    import time
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text(encoding="ascii").strip():
+            return int(pidfile.read_text(encoding="ascii"))
+        time.sleep(0.05)
+    raise AssertionError("transport helper never started")
+
+
+def _gone(pid, within=2.0):
+    import time
+
+    import psutil
+    stop = time.monotonic() + within
+    while time.monotonic() < stop:
+        if not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+            return True
+        time.sleep(0.05)
+    psutil.Process(pid).kill()
+    return False
+
+
+@pytest.mark.platforms("posix")
+def test_hung_fetch_kills_the_transport_helper_on_timeout(tmp_path, monkeypatch):
+    """A timed-out probe fetch kills git's whole process group, not just `git
+    fetch`: the transport helper grandchild must not be orphaned to init."""
+    import time
+
+    import hermes_cli.kanban_survivor as survivor
+    repo, sha, pidfile = _helper_remote(tmp_path, monkeypatch)
+    started = time.monotonic()
+    assert survivor._reachable_from_live(repo, "slow", "main", sha, timeout=1.5) is False
+    assert time.monotonic() - started < 5
+    assert _gone(_helper_pid(pidfile))
+
+
+@pytest.mark.platforms("posix")
+def test_descendant_holding_stderr_does_not_outlive_the_timeout(tmp_path, monkeypatch):
+    """Prism f-907cd91bad517558: git exits at once but a backgrounded helper
+    child keeps git's stderr open. The probe still returns at its timeout and
+    the holder dies with the group (no unbounded communicate after the kill)."""
+    import time
+
+    import hermes_cli.kanban_survivor as survivor
+    repo, sha, _ = _helper_remote(tmp_path, monkeypatch)
+    pidfile = tmp_path / "holder.pid"
+    holder = tmp_path / "holder.sh"
+    holder.write_text(f"#!/bin/sh\nsleep 30 >/dev/null </dev/null &\necho $! > '{pidfile}'\nexit 1\n",
+                      encoding="utf-8")
+    holder.chmod(0o755)
+    git(repo, "remote", "set-url", "slow", f"ext::{holder}")
+    started = time.monotonic()
+    assert survivor._reachable_from_live(repo, "slow", "main", sha, timeout=2) is False
+    assert time.monotonic() - started < 8
+    assert _gone(_helper_pid(pidfile))
+
+
+@pytest.mark.platforms("posix")
+def test_first_live_all_hung_real_transports_end_near_the_budget(tmp_path, monkeypatch):
+    """Six real hung ext:: probes (more than the pool is wide) under a 3 s site
+    budget: no winner, and the call ends within a generous bound of the budget."""
+    import time
+
+    import hermes_cli.kanban_survivor as survivor
+    repo, sha, _ = _helper_remote(tmp_path, monkeypatch)
+    helper = git(repo, "remote", "get-url", "slow")
+    for n in range(5):
+        git(repo, "remote", "add", f"slow{n}", helper)
+    monkeypatch.setattr(survivor, "_LIVE_BASE_TIMEOUT", 3)
+    candidates = [("slow", "main")] + [(f"slow{n}", "main") for n in range(5)]
+    started = time.monotonic()
+    assert survivor._first_live(repo, candidates, sha) is None
+    assert time.monotonic() - started < 20
+
+
+@pytest.mark.platforms("posix")
+def test_first_live_kills_abandoned_probes_and_joins_its_threads(tmp_path, monkeypatch):
+    """The winner returns; the hung sibling's helper dies with the call and no
+    probe thread outlives it."""
+    import threading
+    import time
+
+    import hermes_cli.kanban_survivor as survivor
+    repo, sha, pidfile = _helper_remote(tmp_path, monkeypatch)
+    monkeypatch.setattr(survivor, "_LIVE_BASE_TIMEOUT", 30)
+    real = survivor._reachable_from_live
+
+    def probe(repo, remote, branch, sha, *, timeout):
+        if remote == "good":
+            _helper_pid(pidfile)            # the hung probe is really in flight
+        return real(repo, remote, branch, sha, timeout=timeout)
+    monkeypatch.setattr(survivor, "_reachable_from_live", probe)
+    started = time.monotonic()
+    assert survivor._first_live(repo, [("slow", "main"), ("good", "main")], sha) == ("good", "main")
+    assert time.monotonic() - started < 10
+    assert _gone(_helper_pid(pidfile), within=0.5)
+    assert not [t for t in threading.enumerate() if t.name.startswith("kanban-live-probe")]
+
+
+def test_preserve_joins_its_probe_pool_before_returning(board, tmp_path, monkeypatch):
+    """Every live probe runs on its `preserve()` call's pool, shut down (joined)
+    before the call returns: no probe thread is left running after it."""
+    import threading
+
+    import hermes_cli.kanban_survivor as survivor
+    tid, ws, remote, clone = shallow_workspace(board, tmp_path)
+    _commit_work(clone)
+    pools = []
+    real = survivor._first_live
+
+    def spy(*a, **k):
+        pools.append(survivor._probe_pool.get())
+        return real(*a, **k)
+    monkeypatch.setattr(survivor, "_first_live", spy)
+    assert kb.complete_task(board, tid)
+    assert pools and all(p is not None and p._shutdown for p in pools)
+    assert survivor._probe_pool.get() is None
+    assert not [t for t in threading.enumerate() if t.name.startswith("kanban-live-probe")]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("", 90), ("30", 30.0), ("2.5", 2.5), ("9999", 110), ("0", 90), ("-4", 90), ("soon", 90),
+])
+def test_probe_budget_env_override_is_capped_under_the_tool_ceiling(monkeypatch, raw, expected):
+    import hermes_cli.kanban_survivor as survivor
+    monkeypatch.setenv("HERMES_KANBAN_SURVIVOR_PROBE_BUDGET", raw)
+    assert survivor._probe_budget() == expected
+    assert survivor._PROBE_BUDGET_MAX + survivor._SNAPSHOT_TIMEOUT < 420
