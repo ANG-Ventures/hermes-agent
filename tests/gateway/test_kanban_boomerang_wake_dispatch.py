@@ -998,3 +998,36 @@ def test_why_waits_comment_and_receipt_commit_together(env, monkeypatch):
         receipts = [json.loads(r[0]) for r in conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?", (tid2, ah.RECEIPT_KIND))]
     assert len(receipts) == 1 and "comment refused" in receipts[0]["comment_failed"]
+
+
+# --- t_facf0dba: the summary-mode parent carries the gateway's model --------------------------
+
+
+def test_db_parent_sends_the_configured_gateway_model(monkeypatch):
+    """Live puppet lane 2026-10-24 15:45 (t_facf0dba): after a restart there is no live parent, so the
+    redispatched child forks off _db_parent; built with no model it sent `model=""` and every turn
+    400'd (`the request carries no usable model value`), so the card was never finished."""
+    import gateway.run as gr
+    import run_agent
+
+    seen = {}
+
+    class _Agent:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+    monkeypatch.setattr(gr, "_resolve_runtime_agent_kwargs",
+                        lambda: {"provider": "p", "base_url": "u", "api_key": "k", "capabilities": {}})
+    monkeypatch.setattr(gr, "_resolve_gateway_model", lambda *a, **k: "cfg-model")
+    monkeypatch.setattr(run_agent, "AIAgent", _Agent)
+    runner = SimpleNamespace(session_store=SimpleNamespace(load_transcript=lambda sid: []))
+    ah._db_parent(runner, SimpleNamespace(session_id="s1"))
+    assert seen["model"] == "cfg-model"
+
+    # a fallback route's own model wins over config (same precedence as a gateway turn, #112600)
+    monkeypatch.setattr(gr, "_resolve_runtime_agent_kwargs",
+                        lambda: {"provider": "p2", "model": "fallback-model", "_fallback_notice": "n"})
+    seen.clear()
+    ah._db_parent(runner, SimpleNamespace(session_id="s1"))
+    assert seen["model"] == "fallback-model" and "_fallback_notice" not in seen
+
