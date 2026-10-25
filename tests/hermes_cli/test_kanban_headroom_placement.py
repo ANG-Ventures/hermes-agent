@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -261,8 +262,10 @@ def test_utilization_take_places_on_a_measured_pool_host(home):
 
 def test_vendored_placement_matches_canonical():
     """Cross-repo contract (like scripts/tests/test_ci_placement_ledger_adapter.py): the
-    vendored module equals hermes-home's scripts/lib/placement.py except the header note,
-    fleet_root() and the PLW1514 encodings. Skipped where no hermes-home checkout exists (CI)."""
+    vendored module equals hermes-home's scripts/lib/placement.py except the VENDORED header
+    paragraph, fleet_root() and the fork's encodings (utf-8-sig reads, encoding= on writes, the
+    footgun marker). PLACEMENT_CANONICAL names the canonical file; CI's tests.yml sets it from the
+    runners' hermes-home mirror. Skipped where neither exists (hosted runners, a bare dev box)."""
     # The suite's home-io guard forbids reading the real ~/.hermes, so the canonical
     # file is named explicitly: PLACEMENT_CANONICAL=<hermes-home>/scripts/lib/placement.py.
     env = os.environ.get("PLACEMENT_CANONICAL")
@@ -271,12 +274,16 @@ def test_vendored_placement_matches_canonical():
     src = Path(env)
     ours = Path(placement.__file__).read_text(encoding="utf-8")
     theirs = src.read_text(encoding="utf-8")
+    assert "\nVENDORED from hermes-home" in ours and "\nVENDORED from" not in theirs
 
     def body(text: str) -> str:
-        head, _, rest = text.partition("\nTHE RULE")
-        start = rest.index("def fleet_root()")
-        end = rest.index("def _num(")
-        return (rest[:start] + rest[end:]).replace(', encoding="utf-8")', ")")
+        head, sep, rest = text.partition("\nVENDORED from hermes-home")
+        if sep:                                   # drop the header paragraph (up to its blank line)
+            text = head + rest[rest.index("\n\n") + 1:]
+        start, end = text.index("def fleet_root()"), text.index("def _num(")
+        text = text[:start] + text[end:]
+        text = re.sub(r"  # windows-footgun: ok\b.*", "", text)
+        return text.replace('encoding="utf-8-sig"', 'encoding="utf-8"').replace(', encoding="utf-8")', ")")
 
     assert body(ours) == body(theirs)
 
@@ -540,7 +547,7 @@ def test_live_run_reservation_is_renewed_past_the_admission_ttl(home):
     assert b.renew_reservations(now=later) == {"renewed": 2, "lapsed": 0, "reaped": 0}
     past = now + kh.RESERVE_TTL_S + 600                  # well past the original TTL
     assert set(placement.live_reservations(ledger, now=past)) == {"ci-box"}
-    assert placement.live_slots("kanban", ledger, now=past)["ci-box"] == 2
+    assert placement.live_admissions("kanban", ledger, now=past)["ci-box"] == 2
     assert b.renew_reservations(now=later + 1) is None   # not due yet
     # Without renewal both rows would lapse; a lapsed row of a live run is a leak.
     with kb.connect_closing() as conn:
@@ -595,7 +602,7 @@ _BAD_CLOCKS = [float("nan"), float("inf"), float("-inf")]
 
 
 @pytest.mark.parametrize("bad", _BAD_CLOCKS)
-@pytest.mark.parametrize("call", ["release", "renew", "reserve", "live_reservations", "live_slots"])
+@pytest.mark.parametrize("call", ["release", "renew", "reserve", "live_reservations", "live_admissions"])
 def test_non_finite_now_is_refused_and_the_ledger_survives(tmp_path, call, bad):
     """``release(now=nan)`` read every row as expired and rewrote the ledger
     EMPTY, even for an unknown id; the same clock made live rows vanish from
@@ -611,12 +618,12 @@ def test_non_finite_now_is_refused_and_the_ledger_survives(tmp_path, call, bad):
         "reserve": lambda: placement.reserve("ci-box", "kanban", placement.Footprint(3, 2), ttl_s=600,
                                              path=led, now=bad, admissions_path=tmp_path / "a.jsonl"),
         "live_reservations": lambda: placement.live_reservations(led, now=bad),
-        "live_slots": lambda: placement.live_slots("kanban", led, now=bad),
+        "live_admissions": lambda: placement.live_admissions("kanban", led, now=bad),
     }
     with pytest.raises(placement.PlacementError, match="now must be a finite"):
         calls[call]()
     assert led.read_bytes() == before
-    assert placement.live_slots("kanban", led, now=T0 + 1) == {"ci-box": 1}
+    assert placement.live_admissions("kanban", led, now=T0 + 1) == {"ci-box": 1}
 
 
 @pytest.mark.parametrize("bad", _BAD_CLOCKS)

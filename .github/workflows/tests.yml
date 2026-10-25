@@ -351,6 +351,14 @@ jobs:
         # matrix job via --files. Previously each job re-discovered files and
         # re-ran LPT independently — redundant N times.
         run: |
+          # Cross-repo vendoring contract (t_4ee9c117): the fleet runners mount the private
+          # hermes-home mirror read-only at /opt/git-mirror/2; hand its main placement.py to
+          # test_vendored_placement_matches_canonical. Hosted runners have no mirror: it skips.
+          if git -c safe.directory='*' --git-dir=/opt/git-mirror/2 show main:scripts/lib/placement.py \
+               > "$RUNNER_TEMP/placement_canonical.py" 2>/dev/null; then
+            export PLACEMENT_CANONICAL="$RUNNER_TEMP/placement_canonical.py"
+            echo "PLACEMENT_CANONICAL from hermes-home mirror main $(git -c safe.directory='*' --git-dir=/opt/git-mirror/2 rev-parse --short main)"
+          fi
           # Verbose pytest output lets timeout verdicts name the last test reached.
           scripts/run_tests.sh --files '${{ matrix.slice.files }}' \
             --junit-dir ci-junit --result-file ci-junit/slice-result.json -- -v
