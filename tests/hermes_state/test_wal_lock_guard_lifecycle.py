@@ -93,7 +93,7 @@ def test_closing_writer_stays_guarded_until_sqlite_closes(tmp_path, monkeypatch)
                         f"import sqlite3; c = sqlite3.connect({str(path)!r}); "
                         "c.execute('select count(*) from messages').fetchone(); c.close()"], check=True)
         in_gap["shm"] = os.stat(f"{path}-shm").st_ino if os.path.exists(f"{path}-shm") else None
-        real_close(conn)
+        return real_close(conn)
 
     monkeypatch.setattr(db, "_close_connection_quietly", _sibling_closes_in_the_gap)
     db.close()

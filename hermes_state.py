@@ -830,14 +830,22 @@ class SessionDB(
         return data
 
     @staticmethod
-    def _close_connection_quietly(conn: Optional[sqlite3.Connection]) -> None:
-        """Close a partially initialized connection without masking its error."""
+    def _close_connection_quietly(conn: Optional[sqlite3.Connection]) -> bool:
+        """Close a connection without masking its error. True when it is closed (or was None).
+
+        False = the close raised and the connection may still be open: the caller keeps its WAL lock
+        guard registration (reader token, ``_CLOSING`` count) instead of dropping it. Only the code
+        that observed the close succeed drops it (Prism 2d8ea17ee6c0 / c3cd126492f6 / 5160bb865254 /
+        1b2a27c4097a); a leaked registration is the safe failure, it keeps the private -shm fd open."""
         if conn is None:
-            return
+            return True
         try:
             conn.close()
-        except Exception:
-            logger.debug("Could not close a SessionDB connection", exc_info=True)
+        except Exception as exc:
+            logger.warning("SessionDB connection %r close failed (%s); keeping its WAL lock guard "
+                           "registration", conn, exc)
+            return False
+        return True
 
     def _close_conn_logged(self, conn, label: str) -> None:
         """Close *conn*; a failing close leaks a tracked fd: logged at WARNING, never swallowed."""
@@ -916,6 +924,7 @@ class SessionDB(
         self._fts_cjk_loaded = self._fts_cjk_available = self._fts_unavailable_warned = False
         self._trigram_unavailable_warned = False
         self._conn = None
+        self._opening_close_failed = False  # a writer-open close raised: keep the opener's guard token
         # Async token accounting; distinct from self._lock so enqueue/flush never contends with writes.
         self._token_queue: deque = deque()
         self._token_queue_cond = threading.Condition(threading.Lock())
@@ -946,8 +955,8 @@ class SessionDB(
         finally:
             if not initialization_complete:
                 conn, self._conn = self._conn, None
-                self._close_connection_quietly(conn)
-                self._unregister_reader(conn)
+                if self._close_connection_quietly(conn):
+                    self._unregister_reader(conn)
             else:
                 # Only a successfully opened handle owns a writer connection. Failed
                 # construction must not leave a diagnostic member behind.
@@ -971,10 +980,31 @@ class SessionDB(
         # _init_schema), and a sibling handle's retire() must not close the private -shm fd under them
         # (Prism c4ca84c945ca / 8f1afbe91566). On failure the connection is closed before the drop.
         opening = _lockguard.register_reader(self.db_path)
+        self._opening_close_failed = False
         try:
             self._open_writer_counted()
-        finally:
-            _lockguard.unregister_reader(opening, retire_now=self._conn is None)
+        except BaseException:
+            # Kept until the connection is actually closed (Prism 1b2a27c4097a): close it here, so
+            # __init__'s cleanup has nothing left that this token would have to outlive.
+            conn, self._conn = self._conn, None
+            if self._close_connection_quietly(conn) and not self._opening_close_failed:
+                _lockguard.unregister_reader(opening)
+            raise
+        self._settle_opening_registration(opening)
+
+    def _settle_opening_registration(self, opening) -> None:
+        """Drop the opener's reader token once the writer is counted by hold(), never earlier
+        (Prism ca0b4382bc99: a journal_mode probe that returns None leaves ``_wal_active`` False and
+        hold() uncalled, yet the file may be WAL and the connection hold -shm locks). Uncounted, the
+        token is bound to the connection and dropped after its successful close. A connection whose
+        close failed during the open keeps it forever. Under ``self._lock`` on the reopen path:
+        settles only, never retires."""
+        if self._opening_close_failed:
+            return
+        if self._wal_lock_guard or self._conn is None:
+            _lockguard.unregister_reader(opening, retire_now=False)
+        else:
+            self.__dict__.setdefault("_reader_tokens", {})[id(self._conn)] = opening
 
     def _open_writer_counted(self) -> None:
         """:meth:`_open_writer`'s body, run while the lock guard counts this opener."""
@@ -1005,7 +1035,8 @@ class SessionDB(
                 "state.db schema is malformed (%s) — attempting automatic "
                 "repair (a backup copy is made first).", exc,
             )
-            self._close_connection_quietly(self._conn)
+            if not self._close_connection_quietly(self._conn):
+                self._opening_close_failed = True
             if not repair_state_db_schema(self.db_path).get("repaired"):
                 raise
             self._connect_and_init_with_lock_patience()
@@ -1036,8 +1067,8 @@ class SessionDB(
                         )
                 except BaseException:
                     self._conn = None
-                    self._close_connection_quietly(conn)
-                    self._unregister_reader(conn)
+                    if self._close_connection_quietly(conn):
+                        self._unregister_reader(conn)
                     raise
                 return
             except sqlite3.OperationalError as ioerr:
@@ -1114,7 +1145,8 @@ class SessionDB(
             conn.execute("PRAGMA foreign_keys=ON")
             self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
         except BaseException:
-            self._close_connection_quietly(conn)
+            if not self._close_connection_quietly(conn):
+                self._opening_close_failed = True  # the opener's token outlives this connection
             raise
         return conn
 
@@ -1155,7 +1187,9 @@ class SessionDB(
             except sqlite3.OperationalError as exc:
                 if not is_sqlite_lock_error(exc):
                     raise
-                self._close_connection_quietly(self._conn)
+                if not self._close_connection_quietly(self._conn):
+                    self._opening_close_failed = True
+                self._conn = None
                 now = time.monotonic()
                 if now >= deadline:
                     log_write_lock_holders(self.db_path, self._WRITE_PATIENCE_S)
@@ -1298,19 +1332,20 @@ class SessionDB(
         )
         # Counted from before the connect until hold() (Prism c4ca84c945ca), as in _open_writer.
         opening = _lockguard.register_reader(self.db_path)
+        self._opening_close_failed = False
         try:
-            try:
-                self._conn = self._open_writer_conn()
-            except Exception as exc:
-                raise sqlite3.OperationalError(
-                    f"state.db connection was closed while a {context} was still "
-                    f"in flight (a session-teardown path called close() before "
-                    f"this worker finished — #94736) and the automatic reopen failed: {exc}"
-                ) from exc
-            if self._wal_active:  # a reopened writer is a live generation holder like the first open
-                self._wal_lock_guard = _lockguard.hold(self.db_path)
-        finally:
-            _lockguard.unregister_reader(opening, retire_now=False)  # under self._lock: never retire here
+            self._conn = self._open_writer_conn()
+        except Exception as exc:
+            if not self._opening_close_failed:  # its connection closed: under self._lock, settle only
+                _lockguard.unregister_reader(opening, retire_now=False)
+            raise sqlite3.OperationalError(
+                f"state.db connection was closed while a {context} was still "
+                f"in flight (a session-teardown path called close() before "
+                f"this worker finished — #94736) and the automatic reopen failed: {exc}"
+            ) from exc
+        if self._wal_active:  # a reopened writer is a live generation holder like the first open
+            self._wal_lock_guard = _lockguard.hold(self.db_path)
+        self._settle_opening_registration(opening)
 
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
@@ -1950,11 +1985,16 @@ class SessionDB(
                         self._conn = None
                     else:
                         conn, self._conn = self._conn, None
-                        self._close_connection_quietly(conn)
-                        self._unregister_reader(conn)  # a read_only handle's connection (no-op otherwise)
-                        # Only a clean close ends the generation; retain the recorded
-                        # identity when retiring an unsafe handle.
-                        self._db_sidecar_identity = {}
+                        if self._close_connection_quietly(conn):
+                            # its reader token (read_only handle, or a writer hold() never counted)
+                            self._unregister_reader(conn)
+                            # Only a clean close ends the generation; retain the recorded
+                            # identity when retiring an unsafe handle.
+                            self._db_sidecar_identity = {}
+                        else:
+                            # May still be open: its inodes stay counted in _CLOSING (never settled),
+                            # so no retire() closes a private fd under it.
+                            closing = None
             # After SQLite's close and outside self._lock: settles this handle's release() and closes a
             # private -shm fd nothing in this process still uses (never parked). Still inside RETIRE_GATE.
             _lockguard.retire(closing)

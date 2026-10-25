@@ -64,6 +64,34 @@ UNREGISTERED_OK: dict[tuple[str, str], str] = {
     # A torn read there can only fail the eval run; left for the eval's owner.
     ("evals/gateway_failure_ownership/probe.py", "rows"): "eval harness on a throwaway home; finding, see comment",
     ("evals/gateway_failure_ownership/probe.py", "main"): "eval harness on a throwaway home; finding, see comment",
+    # Found by the shape rules (``.as_uri()`` + ``mode=ro``, or a read-only connect in a module that
+    # imports hermes_state*; Prism ad2e7f0783a5), and NOT state.db: the lock guard holds private
+    # descriptors only on state.db inodes, so a connect on any other file cannot lose locks to it.
+    **{site: "reads lcm.db (the LCM store), not state.db" for site in (
+        ("plugins/context_engine/lcm/vector_store.py", "_load_binary_with_deadline"),
+        ("plugins/context_engine/lcm/command.py", "_embedding_read_connection"),
+        ("plugins/context_engine/lcm/retrieval_core.py", "hydrate_chunk_hits"),
+        ("plugins/context_engine/lcm/retrieval_core.py", "hydrate_semantic_nodes"),
+        ("plugins/context_engine/lcm/tools.py", "invoke"),
+        ("plugins/context_engine/lcm/tools.py", "_lcm_recall_summary_source_hits"),
+    )},
+    **{site: "reads a kanban board db / the home index, not state.db" for site in (
+        ("hermes_cli/kanban_session_closeout.py", "_ro"),
+        ("hermes_cli/kanban_identity.py", "_worker_rows"),
+        ("hermes_cli/kanban_db.py", "_board_db_is_empty"),
+        ("hermes_cli/kanban_db.py", "connect_readonly"),
+        ("hermes_cli/kanban_home_index.py", "_board_rows"),
+        ("hermes_cli/kanban_home_index.py", "known_home"),
+        ("hermes_cli/kanban_home_index.py", "open_cards"),
+        ("hermes_cli/kanban_db_board_registry.py", "board_of_task"),
+        ("hermes_cli/kanban_db_notify.py", "count_notify_subs"),
+        ("agent/kanban_turn_recovery.py", "worker_claim_is_live"),
+    )},
+    ("hermes_cli/data_cleanup_holders.py", "_refuse_cron_writers"): "reads cron/executions.db, not state.db",
+    ("hermes_cli/browser_connect.py", "_copy_auth_file"): "copies a browser profile's auth sqlite, not state.db",
+    ("hermes_cli/backup_restore.py", "_safe_restore_db"): "reads the snapshot copy being restored, never the live state.db",
+    ("tools/read_extract.py", "_extract_sqlite"):
+        "immutable=1 user-file extraction: no -shm, no locks to lose (a state.db path reads the main file only)",
 }
 
 
@@ -197,6 +225,29 @@ def _is_registered_reader(expr: ast.AST) -> bool:
         isinstance(f, ast.Attribute) and f.attr == "registered_reader")
 
 
+def _imports_hermes_state(tree: ast.AST) -> bool:
+    """The module imports ``hermes_state`` or a ``hermes_state_*`` module (anywhere, incl. lazily)."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            if node.module.split(".")[0].startswith("hermes_state"):
+                return True
+        elif isinstance(node, ast.Import):
+            if any(a.name.split(".")[0].startswith("hermes_state") for a in node.names):
+                return True
+    return False
+
+
+def _builds_as_uri(expr: ast.AST, assigns: dict[str, list[ast.AST]], seen: frozenset = frozenset()) -> bool:
+    """The target expression (or a local it is assigned from) calls ``.as_uri()``."""
+    for sub in ast.walk(expr):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute) and sub.func.attr == "as_uri":
+            return True
+        if isinstance(sub, ast.Name) and sub.id in assigns and sub.id not in seen:
+            if any(_builds_as_uri(v, assigns, seen | {sub.id}) for v in assigns[sub.id]):
+                return True
+    return False
+
+
 def _scan_all(path: Path, rel: str):
     """Every state.db ``sqlite3.connect`` in *path*: ``(rel, fn, line, read_only, registered)``.
     ``registered`` = the call sits lexically inside a ``with registered_reader(...)`` block, or in a
@@ -212,6 +263,7 @@ def _scan_all(path: Path, rel: str):
                for a in n.names if a.name == "connect"}
     hits = []
     state_mod = bool(_STATE_DB_PATH_MODULES.match(rel))
+    imports_state = _imports_hermes_state(tree)
 
     def visit(scope: ast.AST, fn_name: str, assigns, registered: bool):
         if isinstance(scope, (ast.With, ast.AsyncWith)):
@@ -233,8 +285,15 @@ def _scan_all(path: Path, rel: str):
         if isinstance(child, ast.Call) and _is_sqlite_connect(child, aliases):
             target = child.args[0] if child.args else next(
                 (kw.value for kw in child.keywords if kw.arg == "database"), None)
-            if target is not None and _names_state_db(target, assigns, db_path_names=state_mod):
+            if target is None:
+                pass
+            elif _names_state_db(target, assigns, db_path_names=state_mod):
                 hits.append((rel, fn_name, child.lineno, _read_only(child, assigns), registered))
+            elif _read_only(child, assigns) and (imports_state or _builds_as_uri(target, assigns)):
+                # Shape, not name (Prism ad2e7f0783a5): a ``?mode=ro`` connect on ``path.as_uri()``,
+                # or any read-only connect in a module that imports hermes_state*, may be state.db
+                # under a generic variable name. Read-only only: the raw-writer check stays by name.
+                hits.append((rel, fn_name, child.lineno, True, registered))
         visit(child, fn_name, assigns, registered)
 
     visit(tree, "<module>", _assignments(tree), False)
@@ -322,6 +381,41 @@ def test_lint_requires_registered_reader_around_read_only_and_allowlisted(tmp_pa
     unregistered = [(fn, line) for _rel, fn, line, ro, reg in hits if ro and not reg]
     assert unregistered == [("bare", 4), ("wrong_order", 13), ("later", 18)], hits
     assert sorted(fn for _r, fn, _l, ro, reg in hits if reg) == ["same_with", "wrapped"]
+
+
+def test_lint_flags_read_only_connects_by_shape_not_only_by_name(tmp_path):
+    """Prism ad2e7f0783a5: ``kanban_db._home_lineage_query(path, sid)`` and the dashboard's
+    ``_viewer_home_ids`` read state.db as ``path.resolve().as_uri() + '?mode=ro'``; the name rule
+    (``state_db``) missed them. A read-only connect on ``.as_uri()``, or any read-only connect in a
+    module that imports hermes_state*, is a reader site regardless of the variable name."""
+    plain = tmp_path / "plain.py"
+    plain.write_text(
+        "import sqlite3\n"
+        "def lineage(path):\n"
+        "    conn = sqlite3.connect(f'{path.resolve().as_uri()}?mode=ro', uri=True)\n"
+        "    conn.close()\n"
+        "def vianame(path):\n"
+        "    uri = path.resolve().as_uri() + '?mode=ro'\n"
+        "    return sqlite3.connect(uri, uri=True)\n"
+        "def other(path):\n"
+        "    return sqlite3.connect(f'file:{path}?mode=ro', uri=True)\n"
+        "def writer(path):\n"
+        "    return sqlite3.connect(path.resolve().as_uri(), uri=True)\n"
+    )
+    assert [(fn, ro, reg) for _r, fn, _l, ro, reg in _scan_all(plain, "plain.py")] == [
+        ("lineage", True, False), ("vianame", True, False)]
+    importer = tmp_path / "importer.py"
+    importer.write_text(
+        "import sqlite3\n"
+        "from hermes_state_lockguard import registered_reader\n"
+        "def other(path):\n"
+        "    return sqlite3.connect(f'file:{path}?mode=ro', uri=True)\n"
+        "def wrapped(path):\n"
+        "    with registered_reader(path):\n"
+        "        sqlite3.connect(f'file:{path}?mode=ro', uri=True).close()\n"
+    )
+    assert [(fn, reg) for _r, fn, _l, _ro, reg in _scan_all(importer, "importer.py")] == [
+        ("other", False), ("wrapped", True)]
 
 
 def test_every_read_only_state_db_connect_is_a_registered_reader():

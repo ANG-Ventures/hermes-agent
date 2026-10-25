@@ -154,6 +154,7 @@ _OPEN_FAIL_WARNED: Set[str] = set()  # paths whose private open failed (logged o
 _POOL_WARN_FDS = 16  # expected: one per state.db file guarded in this process
 _POOL_WARNED = False
 _RETIRE_WARNED: Set[Identity] = set()  # inodes whose inconclusive stat was logged once
+_OTHER_FDS_WARNED = False  # retire_completed_shm() could not list the fd table (logged once)
 # Serializes "SQLite's last close unlinked -shm, our private -shm fd is not closed yet" against the
 # deleted-WAL-generation probes (Prism 9d02254cf252): SessionDB.close() holds it from just before SQLite's
 # close through retire(), and the probes (hermes_state: refuse before connect, _wal_generation_was_lost)
@@ -227,6 +228,30 @@ def _identity(path: str) -> Optional[Identity]:
     except OSError:
         return None
     return (st.st_dev, st.st_ino)
+
+
+_CANON_DIRS: Dict[str, str] = {}  # abspath of a db's parent dir -> its realpath (bounded: one per state.db dir)
+_CANON_DIRS_MAX = 64
+
+
+def _canonical(db_path) -> str:
+    """Absolute path of *db_path* with its parent directory's symlinks resolved, so a reader that
+    registers through an alias (a symlinked home) and a writer that opens the target key the same
+    path, even before the file exists and has an inode (Prism 45bacae04f3f). The basename is kept
+    as given: SQLite names the sidecars after it. The dir resolution is cached (one realpath per
+    directory, so the checkpoint path stays at one ``os.stat``). Never raises."""
+    path = os.path.abspath(os.fspath(db_path))
+    parent, name = os.path.split(path)
+    real = _CANON_DIRS.get(parent)
+    if real is None:
+        try:
+            real = os.path.realpath(parent)
+        except (OSError, ValueError):
+            return path
+        if len(_CANON_DIRS) >= _CANON_DIRS_MAX:
+            _CANON_DIRS.clear()
+        _CANON_DIRS[parent] = real
+    return os.path.join(real, name)
 
 
 def _own_fds_for(identities: Set[Identity]):
@@ -414,6 +439,7 @@ def retire_completed_shm() -> None:
     An externally unlinked -shm that a live connection still holds keeps the fd: that is the real
     deleted-generation case and the probe must see it. The fd-table scan runs only when a candidate
     exists (a pinned -shm whose path is gone): never on the hold/checkpoint/open fast path. Never raises."""
+    global _OTHER_FDS_WARNED
     if _MODE != "private":
         return
     try:
@@ -428,7 +454,16 @@ def retire_completed_shm() -> None:
             return
         with _LOCK:
             mine = {fd for i in candidates for fd in [_FDS.get(i)] + _SURPLUS.get(i, []) if fd is not None}
-        others = {ident for fd, ident in _other_fds_on(set(candidates), mine)}
+        found, conclusive = _other_fds_on(set(candidates), mine)
+        if not conclusive:
+            # Inconclusive is not proof (Prism 18a64534907c / 85e4628aedef): an unlistable fd table
+            # may hide a live connection on the inode, so the descriptor stays.
+            if not _OTHER_FDS_WARNED:
+                _OTHER_FDS_WARNED = True
+                logger.warning("WAL lock guard: cannot list this process's descriptors; keeping %d "
+                               "private -shm descriptor(s) on a gone path", len(candidates))
+            return
+        others = {ident for _fd, ident in found}
         with _LOCK:
             for ident, fd in candidates.items():
                 if ident not in others and _FDS.get(ident) == fd:
@@ -437,13 +472,16 @@ def retire_completed_shm() -> None:
         logger.debug("WAL lock guard: completed -shm retire failed", exc_info=True)
 
 
-def _other_fds_on(identities: Set[Identity], exclude: Set[int]):
-    """``(fd, ident)`` for this process's descriptors on *identities*, except *exclude*. Probe path only."""
+def _other_fds_on(identities: Set[Identity], exclude: Set[int]) -> Tuple[List[Tuple[int, Identity]], bool]:
+    """``([(fd, ident), ...], conclusive)`` for this process's descriptors on *identities*, except
+    *exclude*. ``conclusive`` is False when no fd directory could be listed: the empty list then
+    proves nothing. Probe path only."""
     for fd_dir in ("/proc/self/fd", "/dev/fd"):
         try:
             names = os.listdir(fd_dir)
         except OSError:
             continue
+        found = []
         for name in names:
             if not name.isdigit() or int(name) in exclude:
                 continue
@@ -452,8 +490,9 @@ def _other_fds_on(identities: Set[Identity], exclude: Set[int]):
             except OSError:
                 continue
             if (st.st_dev, st.st_ino) in identities:
-                yield int(name), (st.st_dev, st.st_ino)
-        return
+                found.append((int(name), (st.st_dev, st.st_ino)))
+        return found, True
+    return [], False
 
 
 # No atexit close of the pool (Prism c00385eecb2c / ea4900b85b87): at exit a daemon writer may still
@@ -471,7 +510,7 @@ def register_reader(db_path) -> List[object]:
     Takes no file lock and opens nothing: one ``os.stat``.
     Returns the token :func:`unregister_reader` needs. Never raises."""
     try:
-        path = os.path.abspath(os.fspath(db_path))
+        path = _canonical(db_path)
         ident = _identity(path)
         idents: List[object] = [("path", path)] + ([] if ident is None else [ident])
         with _LOCK:
@@ -550,7 +589,9 @@ def _arm_private(ranges: Dict[str, Tuple[Identity, Tuple[int, int]]], held: Held
 
 
 def _private_ranges(db_path, *, shm_only: bool = False) -> Dict[str, Tuple[Identity, Tuple[int, int]]]:
-    base = os.path.abspath(os.fspath(db_path))  # cached paths must survive a chdir (Prism 5214a704d594)
+    # Absolute (cached paths must survive a chdir, Prism 5214a704d594) and canonical, the same key
+    # register_reader() uses (Prism 45bacae04f3f).
+    base = _canonical(db_path)
     pairs = [] if shm_only else [(base, (_SHARED_FIRST, _SHARED_SIZE))]
     pairs.append((base + "-shm", (_SHM_DMS_BYTE, 1)))
     out = {}

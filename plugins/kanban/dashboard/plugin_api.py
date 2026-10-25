@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 from hermes_cli import kanban_db
 from hermes_cli.kanban_identity import safe_comment_provenance
 from hermes_constants import get_hermes_home
+from hermes_state_lockguard import registered_reader
 from hermes_cli.web_read_coalescing import coalesced_read
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
@@ -194,7 +195,10 @@ def _viewer_home_ids(session_id: Optional[str]) -> frozenset[str]:
         if not path.is_file():
             continue
         try:
-            with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+            # A registered reader of the WAL lock guard (t_aeae3fe7, Prism ad2e7f0783a5); closed
+            # inside the block (a bare ``with sqlite3.connect()`` only commits, never closes).
+            with registered_reader(path), closing(
+                    sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
                 found = db.execute(
                     "SELECT 1 FROM sessions WHERE id = ?", (sid,)
                 ).fetchone()
@@ -237,7 +241,8 @@ def _session_channel_origins(session_ids: set[str]) -> dict[str, tuple[str, str]
         if not remaining or not path.is_file():
             continue
         try:
-            with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+            with registered_reader(path), closing(  # see _viewer_home_ids (t_aeae3fe7)
+                    sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
                 placeholders = ",".join("?" for _ in remaining)
                 rows = db.execute(
                     f"SELECT id, source, chat_id FROM sessions WHERE id IN ({placeholders})",

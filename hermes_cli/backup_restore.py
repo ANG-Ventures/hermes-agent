@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from hermes_state_holders import read_only_db_uri
+from hermes_state_lockguard import registered_reader
 from utils import (
     _preserve_file_mode, _preserve_file_owner, _restore_file_mode, _restore_file_owner, atomic_replace,
 )
@@ -392,18 +393,20 @@ def _count_session_rows(path: Path) -> Optional[Tuple[int, int]]:
     """
     if not path.is_file():
         return None
-    try:
-        conn = sqlite3.connect(read_only_db_uri(path), uri=True)
-    except sqlite3.Error:
-        return None
-    try:
-        sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-        messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-        return int(sessions), int(messages)
-    except (sqlite3.Error, TypeError, ValueError):
-        return None
-    finally:
-        conn.close()
+    # registered reader of the WAL lock guard: state.db beside a guarded SessionDB (t_aeae3fe7, Prism ad2e7f0783a5)
+    with registered_reader(path):
+        try:
+            conn = sqlite3.connect(read_only_db_uri(path), uri=True)
+        except sqlite3.Error:
+            return None
+        try:
+            sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            return int(sessions), int(messages)
+        except (sqlite3.Error, TypeError, ValueError):
+            return None
+        finally:
+            conn.close()
 
 
 def _import_db_member(

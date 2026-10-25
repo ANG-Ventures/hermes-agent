@@ -140,20 +140,23 @@ def _chat_last_active(
         if not path.is_file():
             continue
         try:
-            sconn = sqlite3.connect(
-                f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0,
-            )
-            try:
-                # TUI subscriptions store the session KEY as chat_id.
-                row = sconn.execute(
-                    "SELECT MAX(MAX(COALESCE(last_activity_at, 0),"
-                    " COALESCE(effective_last_active, 0), started_at))"
-                    " FROM sessions WHERE (source = ? AND chat_id = ?)"
-                    " OR session_key = ?",
-                    (platform, chat_id, chat_id),
-                ).fetchone()
-            finally:
-                sconn.close()
+            from hermes_state_lockguard import registered_reader
+            # registered reader of the WAL lock guard: state.db beside a guarded SessionDB (t_aeae3fe7, Prism ad2e7f0783a5)
+            with registered_reader(path):
+                sconn = sqlite3.connect(
+                    f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0,
+                )
+                try:
+                    # TUI subscriptions store the session KEY as chat_id.
+                    row = sconn.execute(
+                        "SELECT MAX(MAX(COALESCE(last_activity_at, 0),"
+                        " COALESCE(effective_last_active, 0), started_at))"
+                        " FROM sessions WHERE (source = ? AND chat_id = ?)"
+                        " OR session_key = ?",
+                        (platform, chat_id, chat_id),
+                    ).fetchone()
+                finally:
+                    sconn.close()
         except sqlite3.Error:
             continue
         value = float(row[0]) if row and row[0] is not None else 0.0
@@ -196,18 +199,21 @@ def card_home_chat(
         if not path.is_file():
             continue
         try:
-            sconn = sqlite3.connect(
-                f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0,
-            )
-            try:
-                hit = sconn.execute(
-                    "SELECT source, chat_id, thread_id FROM sessions"
-                    " WHERE id = ? OR session_key = ?"
-                    " ORDER BY started_at DESC LIMIT 1",
-                    (sid, sid),
-                ).fetchone()
-            finally:
-                sconn.close()
+            from hermes_state_lockguard import registered_reader
+            # registered reader of the WAL lock guard: state.db beside a guarded SessionDB (t_aeae3fe7, Prism ad2e7f0783a5)
+            with registered_reader(path):
+                sconn = sqlite3.connect(
+                    f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0,
+                )
+                try:
+                    hit = sconn.execute(
+                        "SELECT source, chat_id, thread_id FROM sessions"
+                        " WHERE id = ? OR session_key = ?"
+                        " ORDER BY started_at DESC LIMIT 1",
+                        (sid, sid),
+                    ).fetchone()
+                finally:
+                    sconn.close()
         except sqlite3.Error:
             continue
         if hit and hit[0] and (hit[2] or hit[1]):

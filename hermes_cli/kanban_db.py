@@ -4445,15 +4445,18 @@ def session_owner_profile(session_id: Optional[str]) -> Optional[str]:
         if not path.is_file():
             continue
         try:
-            conn = sqlite3.connect(
-                f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0
-            )
-            try:
-                hit = conn.execute(
-                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (sid,)
-                ).fetchone()
-            finally:
-                conn.close()
+            from hermes_state_lockguard import registered_reader
+            # registered reader of the WAL lock guard: state.db beside a guarded SessionDB (t_aeae3fe7, Prism ad2e7f0783a5)
+            with registered_reader(path):
+                conn = sqlite3.connect(
+                    f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0
+                )
+                try:
+                    hit = conn.execute(
+                        "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (sid,)
+                    ).fetchone()
+                finally:
+                    conn.close()
         except Exception:
             continue
         if hit is not None:
@@ -4577,60 +4580,65 @@ def _home_lineage_query(
     path: Path, sid: str
 ) -> Optional[tuple[frozenset[str], Optional[float]]]:
     """Walk the lineage in ``path``; ``None`` = no keyed row (not cacheable)."""
-    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
-    try:
-        conn.execute("PRAGMA busy_timeout = 2000")
-        # started_at is optional: a sessions table without it (older schema,
-        # the dashboard facet fixture) still yields the lineage, start unknown.
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
-        st = "started_at" if "started_at" in cols else "NULL"
-        row = conn.execute(
-            f"SELECT session_key, parent_session_id, {st} FROM sessions WHERE id = ?",
-            (sid,),
-        ).fetchone()
-        if row is None or not row[0]:
-            return None
-        key = row[0]
-        ids = {sid}
-        starts = [row[2]]
-        parent = row[1]
-        for _ in range(HOME_LINEAGE_MAX_DEPTH):
-            if not parent or parent in ids:
-                break
-            prow = conn.execute(
-                f"SELECT parent_session_id, {st} FROM sessions "
-                "WHERE id = ? AND session_key = ?",
-                (parent, key),
-            ).fetchone()
-            if prow is None:
-                break
-            ids.add(parent)
-            starts.append(prow[1])
-            parent = prow[0]
-        frontier = [sid]
-        for _ in range(HOME_LINEAGE_MAX_DEPTH):
-            if not frontier:
-                break
-            ph = ",".join("?" * len(frontier))
-            kids = []
-            for r in conn.execute(
-                f"SELECT id, {st} FROM sessions WHERE parent_session_id IN ({ph}) "
-                "AND session_key = ?",
-                (*frontier, key),
-            ):
-                if r[0] and r[0] not in ids:
-                    kids.append(r[0])
-                    starts.append(r[1])
-            ids.update(kids)
-            frontier = kids
+    # A registered reader of the WAL lock guard (t_aeae3fe7, Prism ad2e7f0783a5): in the gateway
+    # this runs beside a guarded SessionDB on the same state.db.
+    from hermes_state_lockguard import registered_reader
+
+    with registered_reader(path):
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
         try:
-            started = min(float(x) for x in starts) if all(
-                isinstance(x, (int, float)) for x in starts) else None
-        except (TypeError, ValueError):
-            started = None
-        return frozenset(ids), started
-    finally:
-        conn.close()
+            conn.execute("PRAGMA busy_timeout = 2000")
+            # started_at is optional: a sessions table without it (older schema,
+            # the dashboard facet fixture) still yields the lineage, start unknown.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+            st = "started_at" if "started_at" in cols else "NULL"
+            row = conn.execute(
+                f"SELECT session_key, parent_session_id, {st} FROM sessions WHERE id = ?",
+                (sid,),
+            ).fetchone()
+            if row is None or not row[0]:
+                return None
+            key = row[0]
+            ids = {sid}
+            starts = [row[2]]
+            parent = row[1]
+            for _ in range(HOME_LINEAGE_MAX_DEPTH):
+                if not parent or parent in ids:
+                    break
+                prow = conn.execute(
+                    f"SELECT parent_session_id, {st} FROM sessions "
+                    "WHERE id = ? AND session_key = ?",
+                    (parent, key),
+                ).fetchone()
+                if prow is None:
+                    break
+                ids.add(parent)
+                starts.append(prow[1])
+                parent = prow[0]
+            frontier = [sid]
+            for _ in range(HOME_LINEAGE_MAX_DEPTH):
+                if not frontier:
+                    break
+                ph = ",".join("?" * len(frontier))
+                kids = []
+                for r in conn.execute(
+                    f"SELECT id, {st} FROM sessions WHERE parent_session_id IN ({ph}) "
+                    "AND session_key = ?",
+                    (*frontier, key),
+                ):
+                    if r[0] and r[0] not in ids:
+                        kids.append(r[0])
+                        starts.append(r[1])
+                ids.update(kids)
+                frontier = kids
+            try:
+                started = min(float(x) for x in starts) if all(
+                    isinstance(x, (int, float)) for x in starts) else None
+            except (TypeError, ValueError):
+                started = None
+            return frozenset(ids), started
+        finally:
+            conn.close()
 
 
 def home_guard_mode() -> str:

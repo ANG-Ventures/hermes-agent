@@ -7,9 +7,11 @@ range, so the foreign-EXCLUSIVE refusal (the reason the guard exists) must be un
 after a stray in-process open()/close() (howtocorrupt §2.2). Linux-only: OFD locks + ``/proc``.
 """
 
+import contextlib
 import importlib
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1135,3 +1137,161 @@ def test_inherited_hold_record_never_releases_a_child_claim(tmp_path):
         assert out == "ok", f"inherited hold record released the child's claim: {out}"
     finally:
         lg.retire(lg.release(parent))
+
+
+# ── round 15 (Apollo 10:3x PT, 2026-10-25) ───────────────────────────────────────────────────
+
+
+def _ident(path) -> tuple:
+    st = os.stat(path)
+    return (st.st_dev, st.st_ino)
+
+
+def test_reader_whose_close_raises_keeps_its_token(tmp_path, monkeypatch):
+    """Rule A (Prism 2d8ea17ee6c0 / c3cd126492f6 / 5160bb865254 / 1b2a27c4097a): the token is dropped
+    only by the code that observed the close succeed. A read-only handle whose close raises keeps its
+    reader token, so the writer's retire() does not close the private -shm fd under the still-open
+    connection; after a successful close it does."""
+    pin_wal(monkeypatch)
+    path = tmp_path / "state.db"
+    writer = make_db(path, "s", "seed")
+    require_wal(writer)
+    ro = hermes_state.SessionDB(db_path=path, read_only=True)
+    real = ro._conn
+    fail = {"on": True}
+
+    class _Flaky:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def close(self):
+            if fail["on"]:
+                raise sqlite3.ProgrammingError("synthetic close failure")
+            self._inner.close()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    proxy = _Flaky(real)
+    tokens = ro.__dict__["_reader_tokens"]
+    token = tokens.pop(id(real))
+    tokens[id(proxy)] = token
+    ro._conn = proxy
+    key = ("path", lg._canonical(path))
+    try:
+        before = lg._READERS.get(key, 0)
+        ro.close()
+        assert lg._READERS.get(key, 0) == before, "a failed close dropped the reader token"
+        shm = _ident(f"{path}-shm")
+        writer.close()  # release() + retire(): the -shm fd must survive (a reader still counts it)
+        assert shm in lg._FDS, "retire() closed the private -shm fd under a connection whose close failed"
+        fail["on"] = False
+        ro._close_conn_logged(proxy, "retry")  # the successful close drops the token and retires
+        assert lg._READERS.get(key, 0) == before - 1
+        assert shm not in lg._FDS, "the successful close did not let retire() close the -shm fd"
+    finally:
+        fail["on"] = False
+        with contextlib.suppress(Exception):
+            real.close()
+        lg.unregister_reader(token)
+        writer.close()
+
+
+def test_failed_open_keeps_the_opening_registration_until_closed(tmp_path, monkeypatch):
+    """Rule A, failed-init path: an open that fails AND whose connection close raises keeps the
+    opener's registration (the connection may still hold -shm locks)."""
+    pin_wal(monkeypatch)
+    path = tmp_path / "state.db"
+    seed = make_db(path, "s", "seed")
+    seed.close()
+    key = ("path", lg._canonical(path))
+    saved = dict(lg._READERS)
+    monkeypatch.setattr(hermes_state.SessionDB, "_init_schema",
+                        lambda self: (_ for _ in ()).throw(RuntimeError("synthetic init failure")))
+    monkeypatch.setattr(hermes_state.SessionDB, "_close_connection_quietly", staticmethod(lambda conn: False))
+    try:
+        with pytest.raises(RuntimeError):
+            hermes_state.SessionDB(db_path=path)
+        assert lg._READERS.get(key, 0) == saved.get(key, 0) + 1, (
+            "a failed open whose close failed dropped its registration")
+    finally:
+        monkeypatch.undo()
+        lg._READERS.clear()
+        lg._READERS.update(saved)  # the leaked (pinned) registration is this test's synthetic one
+
+
+def test_unlistable_fd_table_keeps_the_shm_fd(tmp_path, monkeypatch):
+    """Rule B (Prism 18a64534907c / 85e4628aedef): inconclusive is not proof. When neither fd
+    directory lists, retire_completed_shm() keeps the private -shm fd of a gone path."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
+    token = lg.register_reader(db)  # keeps the -shm fd parked past the writer's retire()
+    try:
+        lg.retire(lg.release(lg.hold(db)))
+        ident = _ident(shm)
+        assert ident in lg._FDS
+        os.unlink(shm)  # the generation's path is gone: a retire_completed_shm() candidate
+        real_listdir = os.listdir
+
+        def _no_listing(p):
+            if str(p) in ("/proc/self/fd", "/dev/fd"):
+                raise PermissionError(13, "synthetic", p)
+            return real_listdir(p)
+
+        monkeypatch.setattr(lg.os, "listdir", _no_listing)
+        lg.retire_completed_shm()
+        monkeypatch.setattr(lg.os, "listdir", real_listdir)
+        assert ident in lg._FDS, "an unlistable fd table was read as 'no other descriptor'"
+        lg.retire_completed_shm()  # conclusive listing, no other fd: now it closes
+        assert ident not in lg._FDS
+    finally:
+        lg.unregister_reader(token)
+
+
+def test_reader_registered_through_a_symlinked_home_matches_the_writer(tmp_path):
+    """Prism 45bacae04f3f: a reader registers through an alias before state.db exists (so there is
+    no inode yet); the writer then opens the target path. Both key the same canonical path, so the
+    writer's retire() keeps the -shm fd while the reader is registered."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    token = lg.register_reader(alias / "state.db")  # file absent: path key only
+    try:
+        (real / "state.db").write_bytes(b"\0" * 4096)
+        (real / "state.db-shm").write_bytes(b"\0" * 32768)
+        shm = _ident(real / "state.db-shm")
+        lg.retire(lg.release(lg.hold(real / "state.db")))
+        assert shm in lg._FDS, "alias registration did not match the writer's target path"
+    finally:
+        lg.unregister_reader(token)
+    assert shm not in lg._FDS
+
+
+def test_writer_whose_journal_probe_returns_none_stays_counted(tmp_path, monkeypatch):
+    """Prism ca0b4382bc99: the on-disk journal_mode probe returns None, so _wal_active is False and
+    hold() never counts the writer. Its opener registration must stay (bound to the connection) so a
+    sibling handle's close cannot retire the private -shm fd under it."""
+    pin_wal(monkeypatch)
+    path = tmp_path / "state.db"
+    sibling = make_db(path, "s", "seed")
+    require_wal(sibling)
+    real_probe = hermes_state._on_disk_journal_mode
+    monkeypatch.setattr(hermes_state, "_on_disk_journal_mode", lambda conn: None)
+    blind = hermes_state.SessionDB(db_path=path)
+    monkeypatch.setattr(hermes_state, "_on_disk_journal_mode", real_probe)
+    try:
+        assert not blind._wal_active and not blind._wal_lock_guard
+        assert id(blind._conn) in blind.__dict__.get("_reader_tokens", {}), "opener token dropped uncounted"
+        shm = _ident(f"{path}-shm")
+        sibling.close()
+        assert shm in lg._FDS, "a sibling's retire() closed the -shm fd under an uncounted writer"
+    finally:
+        blind.close()
+    assert shm not in lg._FDS

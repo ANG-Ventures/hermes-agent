@@ -25,6 +25,7 @@ from hermes_constants import (
 )
 from hermes_state_dbfile import RETIRED_GENERATION_DIR_SUFFIX
 from hermes_state_holders import read_only_db_uri
+from hermes_state_lockguard import registered_reader
 
 from hermes_cli.archive_safe import normalize_archive_parts
 from hermes_cli.backup_sqlite import (  # noqa: F401
@@ -680,13 +681,16 @@ def _checkout_clean_tracked(checkout: Path, rel_parts: tuple) -> Optional[frozen
 def _query_ro_sqlite(path: Path, fn):
     """Run ``fn(conn)`` on a read-only connection to *path*; return ``(value, None)`` or ``(None, exc)``."""
     conn = None
-    try:
-        conn = sqlite3.connect(read_only_db_uri(path), uri=True, timeout=1.0)
-        return fn(conn), None
-    except Exception as exc:
-        return None, exc
-    finally:
-        _close_quietly(conn)
+    # A registered reader of the WAL lock guard (t_aeae3fe7, Prism ad2e7f0783a5): *path* may be the
+    # live state.db beside a guarded SessionDB in this process.
+    with registered_reader(path):
+        try:
+            conn = sqlite3.connect(read_only_db_uri(path), uri=True, timeout=1.0)
+            return fn(conn), None
+        except Exception as exc:
+            return None, exc
+        finally:
+            _close_quietly(conn)
 
 
 def is_zeroed_sqlite_file(path: Path, *, probe_bytes: int = 100, force: bool = False) -> bool:

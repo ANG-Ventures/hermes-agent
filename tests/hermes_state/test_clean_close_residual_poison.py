@@ -54,11 +54,12 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
                 progress.set()
 
     def paused_close(connection):
-        close(connection)
+        ok = close(connection)
         if connection is conn:
             assert not path.with_name(path.name + "-wal").exists(), "real close did not end WAL"
             closed.set()
             assert progress.wait(10), "writer reached neither guard nor lock"
+        return ok  # True = closed (t_aeae3fe7: callers keep the guard registration on False)
 
     monkeypatch.setattr(db, "_lock", ObservedLock())
     monkeypatch.setattr(db, "_close_connection_quietly", paused_close)
