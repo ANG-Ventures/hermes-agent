@@ -697,10 +697,12 @@ class AuxiliarySessionMixin:
             return False
         try:
             uri = path.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
-            try:
-                row = conn.execute(
-                    """
+            from hermes_state_lockguard import registered_reader
+            with registered_reader(path):
+                conn = sqlite3.connect(uri, uri=True)
+                try:
+                    row = conn.execute(
+                        """
                     SELECT
                         child.parent_session_id,
                         child.started_at,
@@ -713,10 +715,10 @@ class AuxiliarySessionMixin:
                     WHERE child.id = ?
                     LIMIT 1
                     """,
-                    (session_id,),
-                ).fetchone()
-            finally:
-                conn.close()
+                        (session_id,),
+                    ).fetchone()
+                finally:
+                    conn.close()
         except Exception as exc:  # pragma: no cover - defensive against host DB drift
             logger.debug("LCM auxiliary child session probe failed: %s", exc)
             return False
@@ -760,23 +762,25 @@ class AuxiliarySessionMixin:
         current = session_id
         try:
             uri = state_db_path.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
-            try:
-                for _ in range(32):
-                    if not current or current in visited:
-                        return False
-                    if current in auxiliary_lineage_ids:
-                        return True
-                    visited.add(current)
-                    row = conn.execute(
-                        "SELECT parent_session_id FROM sessions WHERE id = ? LIMIT 1",
-                        (current,),
-                    ).fetchone()
-                    if not row:
-                        return False
-                    current = str(row[0] or "")
-            finally:
-                conn.close()
+            from hermes_state_lockguard import registered_reader
+            with registered_reader(state_db_path):
+                conn = sqlite3.connect(uri, uri=True)
+                try:
+                    for _ in range(32):
+                        if not current or current in visited:
+                            return False
+                        if current in auxiliary_lineage_ids:
+                            return True
+                        visited.add(current)
+                        row = conn.execute(
+                            "SELECT parent_session_id FROM sessions WHERE id = ? LIMIT 1",
+                            (current,),
+                        ).fetchone()
+                        if not row:
+                            return False
+                        current = str(row[0] or "")
+                finally:
+                    conn.close()
         except Exception as exc:  # pragma: no cover - defensive against host DB drift
             logger.debug("LCM auxiliary ancestor probe failed: %s", exc)
             return False

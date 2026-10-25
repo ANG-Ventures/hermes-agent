@@ -152,7 +152,8 @@ def _state_db(profile: str, sql: str, params: tuple, log_msg: str, *, commit: bo
                 sdb.close()
             return ""
         from hermes_state_holders import read_only_db_uri
-        with contextlib.closing(sqlite3.connect(read_only_db_uri(db), uri=True, timeout=5)) as con:
+        from hermes_state_lockguard import registered_reader
+        with registered_reader(db), contextlib.closing(sqlite3.connect(read_only_db_uri(db), uri=True, timeout=5)) as con:
             row = con.execute(sql, params).fetchone()
         return str(row[0]) if row else ""
     except Exception:

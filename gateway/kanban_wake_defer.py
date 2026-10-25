@@ -226,16 +226,18 @@ def _session_source(profile: Any, sid: str) -> Optional[str]:
         return None
     if not path.is_file():
         return None
-    try:
-        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
-    except sqlite3.Error:
-        return None
-    try:
-        row = db.execute("SELECT source FROM sessions WHERE id = ?", (sid,)).fetchone()
-    except sqlite3.Error:
-        return None
-    finally:
-        db.close()
+    from hermes_state_lockguard import registered_reader
+    with registered_reader(path):  # the WAL lock guard never closes a -shm fd under this read (t_aeae3fe7)
+        try:
+            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        except sqlite3.Error:
+            return None
+        try:
+            row = db.execute("SELECT source FROM sessions WHERE id = ?", (sid,)).fetchone()
+        except sqlite3.Error:
+            return None
+        finally:
+            db.close()
     return str(row[0] or "") if row else None
 
 

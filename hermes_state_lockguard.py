@@ -36,15 +36,20 @@ process-owned POSIX lock SQLite believes it holds, then:
   POSIX lock this process holds on it (howtocorrupt §2.2). :func:`retire` closes it only on a
   confirmed identity change (the path now names another inode).
 - ``-shm``: never parked. :func:`retire`, which ``SessionDB.close()`` calls right after SQLite's own
-  close, CLOSES every -shm descriptor no handle counts (Apollo ruling on Prism 9016456d284b; not in
-  release(), which runs BEFORE SQLite's close: closing there would drop the still-open
-  connection's own POSIX DMS lock early). A parked -shm
-  fd outlives its generation once ANOTHER process's last close unlinks the file, and every opener
-  then fails with ``DeletedWalGenerationError``. The close can cancel the POSIX locks of an
-  UNGUARDED in-process connection on that -shm (Prism 7072ffc85b72); that window is accepted
-  because every write-capable state.db connection goes through SessionDB (guarded and counted in
-  ``_HANDLES``), which ``tests/hermes_state/test_state_db_raw_writer_lint.py`` enforces, and a
-  read-only connection that loses its DMS lock can at worst read stale data.
+  close, CLOSES a -shm descriptor once nothing in this process still uses the inode (Apollo ruling
+  on Prism 9016456d284b). A parked -shm fd outlives its generation once ANOTHER process's last close
+  unlinks the file, and every opener then fails with ``DeletedWalGenerationError``.
+
+"Nothing still uses the inode" = three counts at 0, so the close can never cancel a live in-process
+connection's POSIX locks (Prism 7072ffc85b72 / f73fc9c5f6cc / 5ac4f2a27277):
+  * ``_HANDLES``: guarded SessionDB writers;
+  * ``_CLOSING``: writers between :func:`release` and :func:`retire` (their SQLite connection is
+    still open: release() runs BEFORE the close);
+  * ``_READERS``: every other in-process connection, registered with :func:`registered_reader`
+    (SessionDB's own read pool and read-only handles, and every raw ``sqlite3.connect`` of state.db,
+    which ``tests/hermes_state/test_state_db_raw_writer_lint.py`` requires to sit in one). A
+    read-only WAL connection that loses its -shm read-mark can have its frames checkpointed away
+    under it (a torn read), so readers count too.
 
 Paths are made absolute at hold() time, so a later chdir cannot make a live inode look gone.
 No fd-table scan in private mode. ``scan`` keeps the pre-change fd-table scan for one release;
@@ -53,14 +58,14 @@ No fd-table scan in private mode. ``scan`` keeps the pre-change fd-table scan fo
 
 from __future__ import annotations
 
-import atexit
 import errno
 import logging
 import os
 import struct
 import sys
 import threading
-from typing import Dict, Optional, Set, Tuple
+from contextlib import contextmanager
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 logger = logging.getLogger("hermes_state")
 
@@ -125,6 +130,9 @@ _HANDLES: Dict[Identity, int] = {}
 _FDS: Dict[Identity, int] = {}
 _PATHS: Dict[Identity, str] = {}  # inode in _FDS -> the absolute path that named it
 _SHM_IDENTS: Set[Identity] = set()  # the -shm inodes in _FDS (retire() closes them at count 0)
+_READERS: Dict[Identity, int] = {}  # registered_reader() connections per state.db inode (pin only)
+_SHM_DB: Dict[Identity, Identity] = {}  # -shm inode in _FDS -> its state.db inode (readers key on it)
+_CLOSING: Dict[Identity, int] = {}  # writers between release() and retire(): connection still open
 _POOL_WARN_FDS = 16  # expected: one per state.db file guarded in this process
 _POOL_WARNED = False
 _RETIRE_WARNED: Set[Identity] = set()  # inodes whose inconclusive stat was logged once
@@ -137,9 +145,11 @@ def _reset_after_fork() -> None:
     parent stays guarded; a forgotten copy would pin a ``-shm`` the parent's last close unlinks, and
     the deleted-generation probe would then refuse every opener until the child exits. Right after
     fork the child holds no POSIX locks (they are not inherited), so the close cancels nothing."""
-    global _LOCK, _HANDLES, _FDS, _PATHS, _SHM_IDENTS
+    global _LOCK, _HANDLES, _FDS, _PATHS, _SHM_IDENTS, _READERS, _CLOSING, _SHM_DB
     inherited = list(_FDS.values())
+    # The inherited _LOCK is held (_before_fork took it); a fresh one releases it for the child.
     _LOCK, _HANDLES, _FDS, _PATHS, _SHM_IDENTS = threading.Lock(), {}, {}, {}, set()
+    _READERS, _CLOSING, _SHM_DB = {}, {}, {}
     for fd in inherited:
         try:
             os.close(fd)
@@ -147,8 +157,20 @@ def _reset_after_fork() -> None:
             pass
 
 
+def _before_fork() -> None:
+    """Fork only between, never inside, an open+park (Prism 11061d53f43a): every os.open() of a
+    private descriptor and its _park() run under _LOCK, so holding it across fork() means the child's
+    _FDS lists every private descriptor it inherited, and _reset_after_fork closes all of them."""
+    _LOCK.acquire()
+
+
+def _after_fork_in_parent() -> None:
+    _LOCK.release()
+
+
 if hasattr(os, "register_at_fork"):  # POSIX only
-    os.register_at_fork(after_in_child=_reset_after_fork)
+    os.register_at_fork(before=_before_fork, after_in_parent=_after_fork_in_parent,
+                        after_in_child=_reset_after_fork)
 
 
 def supported() -> bool:
@@ -212,7 +234,7 @@ def _guard_ranges(db_path) -> Held:
     return ranges
 
 
-def _private_fd(path: str, ident: Identity) -> Optional[int]:
+def _private_fd(path: str, ident: Identity, db_ident: Optional[Identity] = None) -> Optional[int]:
     """This module's descriptor on *ident* (opened on first use), or None when the path was
     replaced between the stat and the open (the next hold()/refresh guards the new file). Callers
     hold _LOCK."""
@@ -231,18 +253,20 @@ def _private_fd(path: str, ident: Identity) -> Optional[int]:
         # POSIX locks on the new file, and a close would cancel them. Keep it for the next hold().
         if real in _FDS:
             return None  # unreachable in practice (one open per inode under _LOCK); never close
-        _park(path, real, fd)
+        _park(path, real, fd, db_ident)
         return None
-    _park(path, ident, fd)
+    _park(path, ident, fd, db_ident)
     return fd
 
 
-def _park(path: str, ident: Identity, fd: int) -> None:
+def _park(path: str, ident: Identity, fd: int, db_ident: Optional[Identity] = None) -> None:
     """Record *fd* as this module's descriptor on *ident*. Callers hold _LOCK."""
     _FDS[ident] = fd
     _PATHS[ident] = path
     if path.endswith("-shm"):
         _SHM_IDENTS.add(ident)
+        if db_ident is not None:
+            _SHM_DB[ident] = db_ident
     _note_pool_size()
 
 
@@ -251,6 +275,7 @@ def _close_private(ident: Identity) -> None:
     fd = _FDS.pop(ident, None)
     _PATHS.pop(ident, None)
     _SHM_IDENTS.discard(ident)
+    _SHM_DB.pop(ident, None)
     if fd is not None:
         try:
             os.close(fd)
@@ -277,20 +302,45 @@ def _stat_identity(path: str) -> Tuple[Optional[Identity], Optional[OSError]]:
     return (st.st_dev, st.st_ino), None
 
 
-def retire() -> None:
-    """Close every ``-shm`` descriptor no handle counts (never parked, see the module docstring),
-    and a parked ``state.db`` descriptor whose inode is CONFIRMED gone: its absolute path no longer
-    exists (ENOENT) or names a different inode. Any other stat error keeps that descriptor and logs
-    once (Prism a97a215db7d8): closing it would cancel every POSIX lock this process holds on a
-    possibly live inode. One ``os.stat`` per parked ``state.db`` fd, no fd-table scan. Call it AFTER
-    the handle's own close and outside ``SessionDB._lock``. Never raises."""
-    if _MODE != "private":
-        return
+def _in_use(ident: Identity) -> bool:
+    """A guarded writer, a writer between release() and retire(), or a registered reader still uses
+    *ident* in this process. A reader registers the state.db inode: its -shm read-mark is on whatever
+    -shm generation that file has, so a -shm counts the readers of its state.db. Callers hold _LOCK."""
+    if _HANDLES.get(ident, 0) or _CLOSING.get(ident, 0) or _READERS.get(ident, 0):
+        return True
+    db = _SHM_DB.get(ident)
+    return db is not None and bool(_READERS.get(db, 0))
+
+
+def _settle(counts: Dict[Identity, int], idents) -> None:
+    """Decrement *counts* once per ident in *idents*. Callers hold _LOCK."""
+    for ident in idents:
+        remaining = counts.get(ident, 0) - 1
+        if remaining > 0:
+            counts[ident] = remaining
+        else:
+            counts.pop(ident, None)
+
+
+def retire(closing: Optional[List[Identity]] = None) -> None:
+    """Settle *closing* (what :func:`release` returned for this handle: its SQLite connection is
+    closed now), then close every ``-shm`` descriptor nothing in this process still uses (never
+    parked, see the module docstring), and a parked ``state.db`` descriptor nothing uses whose inode
+    is CONFIRMED gone: its absolute path no longer exists (ENOENT) or names a different inode. Any
+    other stat error keeps that descriptor and logs once (Prism a97a215db7d8): closing it would
+    cancel every POSIX lock this process holds on a possibly live inode. One ``os.stat`` per parked
+    ``state.db`` fd, no fd-table scan. Call it AFTER the handle's own close and outside
+    ``SessionDB._lock``. Never raises."""
     try:
         with _LOCK:
-            for ident in [i for i in _SHM_IDENTS if _HANDLES.get(i, 0) == 0]:
+            if closing:
+                _settle(_CLOSING, closing)
+        if _MODE != "private":
+            return
+        with _LOCK:
+            for ident in [i for i in _SHM_IDENTS if not _in_use(i)]:
                 _close_private(ident)
-            parked = {i: (fd, _PATHS[i]) for i, fd in _FDS.items() if _HANDLES.get(i, 0) == 0 and i in _PATHS}
+            parked = {i: (fd, _PATHS[i]) for i, fd in _FDS.items() if not _in_use(i) and i in _PATHS}
         if not parked:
             return
         gone = set()
@@ -308,39 +358,72 @@ def retire() -> None:
             return
         with _LOCK:
             for ident in gone:
-                if _HANDLES.get(ident, 0) or _FDS.get(ident) != parked[ident][0]:
-                    continue  # re-armed by a hold() meanwhile
+                if _in_use(ident) or _FDS.get(ident) != parked[ident][0]:
+                    continue  # re-armed by a hold() or a registered reader meanwhile
                 _close_private(ident)
     except Exception:
         logger.debug("WAL lock guard: descriptor retire failed", exc_info=True)
 
 
-def _close_pool_at_exit() -> None:
-    """Interpreter exit: close the parked pool. Best effort, never raises."""
+# No atexit close of the pool (Prism c00385eecb2c / ea4900b85b87): at exit a daemon writer may still
+# be inside a transaction on a live connection, and closing our descriptor would cancel its POSIX
+# locks. The kernel releases the descriptors and their OFD locks at process exit.
+
+
+def register_reader(db_path) -> List[Identity]:
+    """Count an in-process connection on *db_path* so :func:`retire` never closes a private
+    descriptor (its ``state.db``, or any ``-shm`` generation of it) under the connection. Register
+    BEFORE the connect: the file exists then, while its ``-shm`` may appear only at the first read.
+    Takes no file lock and opens nothing: one ``os.stat``.
+    Returns the token :func:`unregister_reader` needs. Never raises."""
+    try:
+        ident = _identity(os.path.abspath(os.fspath(db_path)))
+        idents = [] if ident is None else [ident]
+        with _LOCK:
+            for ident in idents:
+                _READERS[ident] = _READERS.get(ident, 0) + 1
+        return idents
+    except Exception:
+        logger.debug("WAL lock guard: reader registration failed for %s", db_path, exc_info=True)
+        return []
+
+
+def unregister_reader(token: List[Identity]) -> None:
+    """Drop a :func:`register_reader` count (after the connection's own close), then :func:`retire`
+    whatever that leaves unused. Never raises."""
+    if not token:
+        return
     try:
         with _LOCK:
-            fds = list(_FDS.values())
-            _FDS.clear()
-            _PATHS.clear()
-            _SHM_IDENTS.clear()
-        for fd in fds:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            _settle(_READERS, token)
     except Exception:
-        pass
+        logger.debug("WAL lock guard: reader unregistration failed", exc_info=True)
+    retire()
 
 
-atexit.register(_close_pool_at_exit)
+@contextmanager
+def registered_reader(db_path) -> Iterator[None]:
+    """``with registered_reader(path): conn = sqlite3.connect(...) ... conn.close()``. Every
+    in-process state.db connection outside SessionDB's writer opens and closes inside one, so the
+    lock guard never closes a ``-shm`` descriptor under its read-mark (Prism f73fc9c5f6cc). Close the
+    connection INSIDE the block. Registration never raises."""
+    token = register_reader(db_path)
+    try:
+        yield
+    finally:
+        unregister_reader(token)
 
 
 def _arm_private(ranges: Dict[str, Tuple[Identity, Tuple[int, int]]], held: Held) -> None:
     """OFD-read-lock *ranges* (path -> (inode, range)) on private descriptors. Callers hold _LOCK."""
+    main = (_SHARED_FIRST, _SHARED_SIZE)
+    db_ident = next((i for i, rng in ranges.values() if rng == main), None)
+    if db_ident is None:  # refresh_shm: the handle's own state.db inode is in *held*
+        db_ident = next((i for i, rng in held.items() if tuple(rng) == main), None)
     for path, (ident, (start, length)) in ranges.items():
         if ident in held:
             continue  # this handle already counts the inode; its descriptor stays locked
-        fd = _private_fd(path, ident)
+        fd = _private_fd(path, ident, db_ident)
         if fd is not None and _ofd_lock(fd, _F_RDLCK, start, length):
             held[ident] = (start, length)
             _HANDLES[ident] = _HANDLES.get(ident, 0) + 1
@@ -406,7 +489,7 @@ def refresh_shm(db_path, held: Held) -> Held:
     return held
 
 
-def release(held: Held) -> None:
+def release(held: Held) -> List[Identity]:
     """Drop this handle's claim. The last handle on an inode unlocks the range on every descriptor
     still referencing it. Call BEFORE the handle's own close so SQLite's close-time reset sees only
     real holders: a sibling process's intact locks still refuse the unlink, and a true last close
@@ -417,10 +500,17 @@ def release(held: Held) -> None:
     close take EXCLUSIVE and unlink ``-wal``/``-shm`` under it before its own close runs. SQLite's
     close upgrades or drops that process-owned lock itself, so a true last close is unaffected.
     Private mode keeps the descriptor open, OFD-unlocked: ``state.db`` stays parked for reuse, a
-    ``-shm`` is closed by :func:`retire` after SQLite's close; see the module docstring."""
+    ``-shm`` is closed by :func:`retire` after SQLite's close; see the module docstring.
+
+    Returns the inodes this handle still uses until its own close: pass them to :func:`retire`
+    after that close, so a sibling's retire() cannot close a descriptor under the still-open
+    connection in between (Prism 5ac4f2a27277)."""
     if not supported() or not held:
-        return
+        return []
     with _LOCK:
+        closing = list(held)
+        for ident in closing:
+            _CLOSING[ident] = _CLOSING.get(ident, 0) + 1
         to_unlock: Held = {}
         for ident, rng in held.items():
             remaining = _HANDLES.get(ident, 1) - 1
@@ -431,7 +521,7 @@ def release(held: Held) -> None:
                 to_unlock[ident] = rng
         held.clear()
         if not to_unlock:
-            return
+            return closing
         if _MODE == "private":
             for ident, (start, length) in to_unlock.items():
                 fd = _FDS.get(ident)
@@ -442,7 +532,7 @@ def release(held: Held) -> None:
                     _ofd_lock(fd, _F_UNLCK, start, length)
                 except OSError:
                     pass
-            return
+            return closing
         try:
             for fd, ident in _own_fds_for(set(to_unlock)):
                 start, length = to_unlock[ident]
@@ -450,3 +540,4 @@ def release(held: Held) -> None:
                 _ofd_lock(fd, _F_UNLCK, start, length)
         except OSError:
             pass
+    return closing

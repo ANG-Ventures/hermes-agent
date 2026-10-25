@@ -1644,19 +1644,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return False
         try:
             uri = path.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
-            try:
-                row = conn.execute(
-                    """
+            from hermes_state_lockguard import registered_reader
+            with registered_reader(path):
+                conn = sqlite3.connect(uri, uri=True)
+                try:
+                    row = conn.execute(
+                        """
                     SELECT parent_session_id, model_config
                     FROM sessions
                     WHERE id = ?
                     LIMIT 1
                     """,
-                    (session_id,),
-                ).fetchone()
-            finally:
-                conn.close()
+                        (session_id,),
+                    ).fetchone()
+                finally:
+                    conn.close()
         except Exception:
             logger.debug("LCM foreground branch marker probe failed", exc_info=True)
             return False

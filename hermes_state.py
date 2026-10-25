@@ -845,6 +845,14 @@ class SessionDB(
             conn.close()
         except Exception as exc:
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
+        self._unregister_reader(conn)
+
+    def _unregister_reader(self, conn) -> None:
+        """Drop the WAL lock guard's reader count for a closed read-only *conn* (no-op for any other
+        connection). AFTER the close, never under self._lock: see hermes_state_lockguard."""
+        token = self.__dict__.get("_reader_tokens", {}).pop(id(conn), None) if conn is not None else None
+        if token is not None:
+            _lockguard.unregister_reader(token)
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
@@ -936,6 +944,7 @@ class SessionDB(
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+                self._unregister_reader(conn)
             else:
                 # Only a successfully opened handle owns a writer connection. Failed
                 # construction must not leave a diagnostic member behind.
@@ -1013,6 +1022,7 @@ class SessionDB(
                 except BaseException:
                     self._conn = None
                     self._close_connection_quietly(conn)
+                    self._unregister_reader(conn)
                     raise
                 return
             except sqlite3.OperationalError as ioerr:
@@ -1030,10 +1040,18 @@ class SessionDB(
     def _connect_read_only(self, timeout: float) -> sqlite3.Connection:
         """``mode=ro`` tracked connection with Row factory. check_same_thread=False: pooled connections
         are borrowed by whichever thread reads next; exclusive ownership is enforced by pool checkout."""
-        conn = _connect_tracked_db(
-            read_only_db_uri(self.db_path), tracking_path=self.db_path, uri=True,
-            check_same_thread=False, timeout=timeout, isolation_level=None,
-        )
+        # Counted by the WAL lock guard BEFORE the connect, so its close of a private -shm descriptor
+        # can never cancel this connection's read-mark (Prism f73fc9c5f6cc); dropped after its close.
+        token = _lockguard.register_reader(self.db_path)
+        try:
+            conn = _connect_tracked_db(
+                read_only_db_uri(self.db_path), tracking_path=self.db_path, uri=True,
+                check_same_thread=False, timeout=timeout, isolation_level=None,
+            )
+        except BaseException:
+            _lockguard.unregister_reader(token)
+            raise
+        self.__dict__.setdefault("_reader_tokens", {})[id(conn)] = token
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -1859,6 +1877,7 @@ class SessionDB(
             self._read_conns_closed = True
         while self._evict_one_idle_read_conn():
             pass
+        closing = None
         with self._lock:
             if self._conn:
                 generation_lost = not self.read_only and (
@@ -1886,18 +1905,20 @@ class SessionDB(
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:
                         logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
-                _lockguard.release(self._wal_lock_guard)  # before the close: see release()
+                closing = _lockguard.release(self._wal_lock_guard)  # before the close: see release()
                 if retire_without_close:
                     self._pin_connection(self._conn)
                     self._conn = None
                 else:
                     conn, self._conn = self._conn, None
                     self._close_connection_quietly(conn)
+                    self._unregister_reader(conn)  # a read_only handle's connection (no-op otherwise)
                     # Only a clean close ends the generation; retain the recorded
                     # identity when retiring an unsafe handle.
                     self._db_sidecar_identity = {}
-        # After SQLite's close and outside self._lock: closes the private -shm fd (never parked).
-        _lockguard.retire()
+        # After SQLite's close and outside self._lock: settles this handle's release() and closes a
+        # private -shm fd nothing in this process still uses (never parked).
+        _lockguard.retire(closing)
         self._read_budget.unregister(self)  # idempotent: a never-registered (failed-init) handle is a no-op
         # t_69e10010 (sibling t_aeae3fe7 owns the lockguard release above): idempotent; a handle
         # retired unclosed keeps its recorded generation in the deleted-WAL registry.

@@ -582,7 +582,8 @@ def check_state_db_integrity(home: Optional[Path] = None) -> str:
     if not path.exists():
         return "absent"
     try:
-        with closing(sqlite3.connect(str(path))) as conn:
+        from hermes_state_lockguard import registered_reader
+        with registered_reader(path), closing(sqlite3.connect(str(path))) as conn:
             _install_integrity_check_lease(conn)
             row = conn.execute("PRAGMA quick_check(1)").fetchone()
     except Exception as exc:

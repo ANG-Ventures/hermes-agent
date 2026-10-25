@@ -286,11 +286,13 @@ def _check_scratch_dir(hermes_home: Path, _DHH: str) -> None:
 def _session_count(state_db_path: Path):
     import sqlite3
     # mode=ro: doctor is a reader; a writable open of a gateway-held WAL DB is the second-writer class (#103339).
-    conn = sqlite3.connect(read_only_db_uri(state_db_path), uri=True)
-    try:
-        return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-    finally:
-        conn.close()
+    from hermes_state_lockguard import registered_reader
+    with registered_reader(state_db_path):
+        conn = sqlite3.connect(read_only_db_uri(state_db_path), uri=True)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        finally:
+            conn.close()
 
 
 # Above this the snapshot copy a held store needs costs more than the probe is worth; --fix still probes.
@@ -310,7 +312,8 @@ def _write_health_reason(state_db_path: Path, *, should_fix: bool):
         return None
     import sqlite3
     import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
+    from hermes_state_lockguard import registered_reader
+    with tempfile.TemporaryDirectory() as tmp, registered_reader(state_db_path):
         snapshot = Path(tmp) / "state.db"
         src = sqlite3.connect(read_only_db_uri(state_db_path), uri=True, timeout=1.0)
         try:

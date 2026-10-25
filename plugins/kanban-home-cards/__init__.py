@@ -299,6 +299,12 @@ def _persisted_recently_injected(session_id: str, deadline: float) -> bool:
     path = _state_db_path()
     if not path.is_file():
         return False
+    from hermes_state_lockguard import registered_reader
+    with registered_reader(path):  # the WAL lock guard never closes a -shm fd under this read
+        return _dedupe_read(path, session_id, deadline)
+
+
+def _dedupe_read(path: Path, session_id: str, deadline: float) -> bool:
     try:
         conn = sqlite3.connect(
             f"{path.resolve().as_uri()}?mode=ro", uri=True,

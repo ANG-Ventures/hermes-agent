@@ -456,11 +456,13 @@ class LifecycleStateStore:
                 stats["state_db_checked"] = True
                 try:
                     state_uri = path.resolve().as_uri() + "?mode=ro"
-                    state_conn = sqlite3.connect(state_uri, uri=True)
-                    try:
-                        state_rows = state_conn.execute("SELECT id FROM sessions WHERE id IS NOT NULL").fetchall()
-                    finally:
-                        state_conn.close()
+                    from hermes_state_lockguard import registered_reader
+                    with registered_reader(path):
+                        state_conn = sqlite3.connect(state_uri, uri=True)
+                        try:
+                            state_rows = state_conn.execute("SELECT id FROM sessions WHERE id IS NOT NULL").fetchall()
+                        finally:
+                            state_conn.close()
                     state_sessions = {str(row[0]) for row in state_rows if row[0]}
                     state_db_read_success = True
                     stats.update({
