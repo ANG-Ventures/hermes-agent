@@ -17,6 +17,7 @@ The expressions are evaluated from the real YAML, not matched as text.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -56,7 +57,8 @@ def _expr(text: str, ctx: dict):
     text = re.sub(r"!(?!=)", " not ", text)
     text = re.sub(r"\btrue\b", "True", text)
     text = re.sub(r"\bfalse\b", "False", text)
-    return eval("(" + text + ")", {"__builtins__": {}}, {})
+    funcs = {"fromJSON": json.loads, "contains": lambda haystack, needle: needle in haystack}
+    return eval("(" + text + ")", {"__builtins__": {}}, funcs)
 
 
 def _ctx(*, event="push", ref="refs/heads/main", sha="a" * 40, run_id=1, pr=None, per_sha="true",
@@ -159,3 +161,99 @@ def test_setup_pm_hosted_still_saves_by_default():
         assert _cond(steps[save]["if"], ctx), save
     for restore in ("tools-cache-restore", "python-cache-restore", "node-cache-restore", "node-cache-self-hosted"):
         assert not _cond(steps[restore]["if"], ctx), restore
+
+
+# ── t_58979a5e: the ONE self-hosted job that warms the caches ───────────────
+
+_TESTS = WORKFLOWS / "tests.yml"
+_SELF_HOSTED_LABELS = '["self-hosted","linux","x64","ci-box","hermes-ci"]'
+
+
+def _tests_jobs() -> dict:
+    return yaml.safe_load(_TESTS.read_text(encoding="utf-8"))["jobs"]
+
+
+def _setup_pm_with(job: dict) -> dict:
+    (step,) = [s for s in job["steps"] if s.get("uses") == "./.github/actions/setup-pm"]
+    return dict(step.get("with") or {})
+
+
+def test_save_on_self_hosted_turns_every_save_back_on():
+    """The warm job saves all three caches and runs none of the restore-only steps."""
+    steps = _setup_steps()
+    inputs = {**_CACHE_ON, "save-on-self-hosted": "true"}
+    ctx = {"inputs": inputs, "runner": {"environment": "self-hosted"}, "steps": {}}
+    for save in ("tools-cache", "python-cache", "node-cache"):
+        assert _cond(steps[save]["if"], ctx), save
+    for restore in ("tools-cache-restore", "python-cache-restore", "node-cache-restore", "node-cache-self-hosted"):
+        assert not _cond(steps[restore]["if"], ctx), restore
+
+
+def test_save_on_self_hosted_defaults_off():
+    raw = yaml.safe_load(SETUP_PM.read_text(encoding="utf-8"))["inputs"]["save-on-self-hosted"]
+    assert raw["default"] == "false"
+
+
+def test_exactly_one_job_saves_on_self_hosted_and_it_is_the_warm_job():
+    """A second saving job would put the 0.1 MB/s upload back on a gating job."""
+    savers = []
+    for path in sorted(WORKFLOWS.glob("*.y*ml")):
+        for name, job in (yaml.safe_load(path.read_text(encoding="utf-8")).get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                if str((step.get("with") or {}).get("save-on-self-hosted", "")).lower() == "true":
+                    savers.append(f"{path.name}:{name}")
+    assert savers == ["tests.yml:warm-selfhosted-cache"]
+
+
+def test_warm_job_writes_the_keys_the_slices_restore():
+    """Same setup-pm inputs as the slice job, so the saved keys are the restored keys."""
+    jobs = _tests_jobs()
+    warm = _setup_pm_with(jobs["warm-selfhosted-cache"])
+    assert warm.pop("save-on-self-hosted") == "true"
+    assert warm == _setup_pm_with(jobs["test"])
+
+
+def test_warm_job_has_its_own_budget_and_never_gates_main():
+    jobs = _tests_jobs()
+    warm = jobs["warm-selfhosted-cache"]
+    # ~225 MB at the measured 0.1 MB/s is ~38 min.
+    assert warm["timeout-minutes"] >= 60
+    gating = jobs["tests-complete"]["needs"]
+    assert "warm-selfhosted-cache" not in gating
+
+
+@pytest.mark.parametrize(
+    "event,ref,labels,switch,runs",
+    [
+        ("push", "refs/heads/main", _SELF_HOSTED_LABELS, None, True),
+        ("push", "refs/heads/main", _SELF_HOSTED_LABELS, "off", False),
+        ("push", "refs/heads/main", '["ubuntu-latest"]', None, False),
+        ("push", "refs/heads/main", None, None, False),
+        ("pull_request", "refs/pull/7/merge", _SELF_HOSTED_LABELS, None, False),
+        ("merge_group", "refs/heads/gh-readonly-queue/main/x", _SELF_HOSTED_LABELS, None, False),
+    ],
+)
+def test_warm_job_runs_only_on_main_pushes_to_a_self_hosted_pool(event, ref, labels, switch, runs):
+    warm = _tests_jobs()["warm-selfhosted-cache"]
+    vars_ = {k: v for k, v in {"CI_RUNNER_LABELS": labels, "CI_SELFHOSTED_CACHE_WARM": switch}.items() if v}
+    ctx = {"github": {"event_name": event, "ref": ref}, "vars": vars_}
+    assert bool(_cond(warm["if"], ctx)) is runs
+    if runs:
+        assert _eval(warm["runs-on"], ctx) == json.loads(labels)
+
+
+def test_tools_key_ignores_pm_bytecode():
+    """prepare imports pm and writes fresh .pyc files before the cache step hashes pm/**.
+
+    Mirror run 40139260526: four slices of one sha missed on four different
+    tools keys. Both the save and the restore key must exclude __pycache__.
+    """
+    steps = _setup_steps()
+    keys = {steps[i]["with"]["key"] for i in ("tools-cache", "tools-cache-restore")}
+    assert len(keys) == 1
+    (key,) = keys
+    hashed = re.search(r"hashFiles\((.*?)\)", key)[1]
+    patterns = [p.strip().strip("'") for p in hashed.split(",")]
+    assert "pm/**" in patterns
+    assert "!pm/**/__pycache__/**" in patterns
+    assert patterns.index("!pm/**/__pycache__/**") > patterns.index("pm/**")
