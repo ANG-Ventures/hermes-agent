@@ -41,8 +41,11 @@ def _profile_homes(runner: Any) -> List[Path]:
 
 def _load_admitted(homes: Iterable[Path]) -> List[Tuple[Path, dict]]:
     from tools.async_delegation import admitted_outbox_events
+    from tools.async_delegation_store import note_sweeper_serves
     out: List[Tuple[Path, dict]] = []
     for home in homes:
+        # This sweep owns expiry for the home: store-level expiry stays off while the marker is fresh.
+        note_sweeper_serves(home)
         try:
             out += [(home, event) for event in admitted_outbox_events(home)]
         except Exception:
@@ -120,17 +123,19 @@ async def sweep_admitted_completions(runner: Any, *, now: float | None = None) -
     return requeued
 
 
-async def _drop_past_ceiling(ad, home, event, now) -> bool:
-    """Admitted past ``ADMITTED_MAX_AGE_SECONDS`` and still unconfirmed (state.db gone, transcript
-    never carried it): drop it as lost instead of holding it to the 30-day retention (t_506536db)."""
+async def _drop_past_ceiling(ad, home, event, now, *, verified: bool) -> bool:
+    """Admitted past ``ADMITTED_MAX_AGE_SECONDS`` and still unconfirmed: drop it instead of holding it to
+    the 30-day retention (t_506536db). ``verified`` = the transcript was read and lacks the wake (lost);
+    otherwise the transcript could not be read and the drop is labelled unverified."""
     from tools.async_delegation_store import admitted_past_ceiling
     if not admitted_past_ceiling(event, now):
         return False
     event_id = str(event.get("event_id") or "")
-    await asyncio.to_thread(ad.drop_admitted_event, event_id, "admitted_age_ceiling", home)
-    logger.warning("async_delegation_wake_lost event_id=%s session_key=%s age_hours=%.1f: admitted, never "
-                   "confirmed; dropped at the age ceiling", event_id, event.get("admitted_session_key") or "-",
-                   (now - float(event["admitted_at"])) / 3600.0)
+    reason = "admitted_age_ceiling" if verified else "admitted_age_ceiling_unverified"
+    await asyncio.to_thread(ad.drop_admitted_event, event_id, reason, home)
+    logger.warning("async_delegation_wake_%s event_id=%s session_key=%s age_hours=%.1f: admitted, never "
+                   "confirmed; dropped at the age ceiling", "lost" if verified else "unverified", event_id,
+                   event.get("admitted_session_key") or "-", (now - float(event["admitted_at"])) / 3600.0)
     return True
 
 
@@ -141,7 +146,7 @@ async def _sweep_one(runner, ad, process_registry, suspects, started, now, home,
     try:
         consumed = await asyncio.to_thread(_in_transcript, home, event)
     except Exception:
-        if not await _drop_past_ceiling(ad, home, event, now):
+        if not await _drop_past_ceiling(ad, home, event, now, verified=False):
             raise  # unknown is not "lost" until the age ceiling says so
         suspects.discard(suspect)
         return 0
@@ -149,7 +154,7 @@ async def _sweep_one(runner, ad, process_registry, suspects, started, now, home,
         await asyncio.to_thread(ad.confirm_admitted_event, event_id, home)
         suspects.discard(suspect)
         return 0
-    if await _drop_past_ceiling(ad, home, event, now):
+    if await _drop_past_ceiling(ad, home, event, now, verified=True):
         suspects.discard(suspect)
         return 0
     admitted_at = float(event.get("admitted_at") or 0.0)
