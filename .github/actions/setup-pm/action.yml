@@ -84,7 +84,7 @@ outputs:
     value: ${{ steps.install.outputs.uv-cache-path }}
   node-cache-hit:
     description: Exact npm dependency cache hit.
-    value: ${{ steps.node-cache.outputs.cache-hit || steps.node-cache-restore.outputs.cache-hit }}
+    value: ${{ steps.node-cache.outputs.cache-hit || steps.node-cache-self-hosted.outputs.cache-hit || steps.node-cache-restore.outputs.cache-hit }}
   node-cache-key:
     description: Rolling snapshot key when save-node-cache is false.
     value: ${{ steps.node-cache-restore.outputs.cache-primary-key }}
@@ -113,9 +113,13 @@ runs:
     # The key covers the PM code and this action, not only the lock: a
     # provisioning change must re-run the cold path on every lane rather
     # than restore a store the previous code wrote.
+    # Self-hosted runners restore and never save: a post-job save from the
+    # self-hosted pool uploads at ~0.1 MB/s, so the save outlived the job's
+    # timeout-minutes and cancelled 8 jobs whose steps had passed (mirror run
+    # 40122483687; same cause as the ace-e2e-vm restore-only rule in tests.yml).
     - name: Cache verified PM tools
       id: tools-cache
-      if: inputs.cache == 'true' && inputs.save-tools-cache == 'true'
+      if: inputs.cache == 'true' && inputs.save-tools-cache == 'true' && runner.environment != 'self-hosted'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.prepare.outputs.store }}
@@ -123,7 +127,7 @@ runs:
 
     - name: Restore verified PM tools without saving
       id: tools-cache-restore
-      if: inputs.cache == 'true' && inputs.save-tools-cache == 'false'
+      if: inputs.cache == 'true' && (inputs.save-tools-cache == 'false' || runner.environment == 'self-hosted')
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.prepare.outputs.store }}
@@ -155,7 +159,7 @@ runs:
 
     - name: Cache uv dependency downloads and builds
       id: python-cache
-      if: inputs.toolchain != 'node' && inputs.cache-python == 'true' && inputs.save-python-cache == 'true' && (inputs.extras != '' || inputs.test-environment == 'true')
+      if: inputs.toolchain != 'node' && inputs.cache-python == 'true' && inputs.save-python-cache == 'true' && runner.environment != 'self-hosted' && (inputs.extras != '' || inputs.test-environment == 'true')
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.install.outputs.uv-cache-path }}
@@ -170,7 +174,7 @@ runs:
 
     - name: Restore uv dependencies for an explicit save
       id: python-cache-restore
-      if: inputs.toolchain != 'node' && inputs.cache-python == 'true' && inputs.save-python-cache == 'false'
+      if: inputs.toolchain != 'node' && inputs.cache-python == 'true' && (inputs.save-python-cache == 'false' || runner.environment == 'self-hosted')
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.install.outputs.uv-cache-path }}
@@ -183,7 +187,7 @@ runs:
 
     # Post steps run in reverse registration order: prune before cache save.
     - name: Register uv cache pruning
-      if: inputs.toolchain != 'node' && inputs.cache-python == 'true' && inputs.save-python-cache == 'true' && inputs.prune-python-cache == 'true' && steps.python-cache.outputs.cache-hit != 'true'
+      if: inputs.toolchain != 'node' && inputs.cache-python == 'true' && inputs.save-python-cache == 'true' && runner.environment != 'self-hosted' && inputs.prune-python-cache == 'true' && steps.python-cache.outputs.cache-hit != 'true'
       uses: ./.github/actions/setup-pm/prune
       with:
         python: ${{ steps.install.outputs.python-path }}
@@ -199,13 +203,25 @@ runs:
 
     - name: Cache npm dependency downloads
       id: node-cache
-      if: inputs.toolchain != 'python' && inputs.cache-node == 'true' && inputs.save-node-cache == 'true'
+      if: inputs.toolchain != 'python' && inputs.cache-node == 'true' && inputs.save-node-cache == 'true' && runner.environment != 'self-hosted'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.install.outputs.npm-cache-path }}
         key: node-cache-${{ runner.os }}-${{ steps.prepare.outputs.arch }}-npm-${{ hashFiles(inputs.node-cache-dependency-path) }}${{ inputs.cache-suffix != '' && format('-{0}', inputs.cache-suffix) || '' }}
         # A lockfile bump misses the exact key, but the previous download set
         # is still mostly valid — npm verifies every tarball it reinstalls.
+        restore-keys: |
+          node-cache-${{ runner.os }}-${{ steps.prepare.outputs.arch }}-npm-
+
+    # Self-hosted restore of the namespace node-cache writes (hosted saves it;
+    # the mirror holds node-cache-<os>-<arch>-npm-* and no setup-pm-npm-v1-*).
+    - name: Restore npm dependencies without saving on self-hosted
+      id: node-cache-self-hosted
+      if: inputs.toolchain != 'python' && inputs.cache-node == 'true' && inputs.save-node-cache == 'true' && runner.environment == 'self-hosted'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.install.outputs.npm-cache-path }}
+        key: node-cache-${{ runner.os }}-${{ steps.prepare.outputs.arch }}-npm-${{ hashFiles(inputs.node-cache-dependency-path) }}${{ inputs.cache-suffix != '' && format('-{0}', inputs.cache-suffix) || '' }}
         restore-keys: |
           node-cache-${{ runner.os }}-${{ steps.prepare.outputs.arch }}-npm-
 

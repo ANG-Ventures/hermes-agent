@@ -9,12 +9,13 @@ const save = action('../.github/actions/save-pm-cache/action.yml')
 // Evaluates the Actions expression subset these gates use, so the tests pin
 // how a gate behaves rather than how it is spelled. Status functions default
 // to a healthy, uncancelled run; `status` overrides them.
-const evaluate = (expression, { status = {}, ...context } = {}) => {
+const evaluate = (expression, { status = {}, ...rest } = {}) => {
+  const context = { ...rest, runner: { environment: 'github-hosted', ...rest.runner } }
   const lookup = path => path.split('.').reduce(
     (value, key) => (value !== null && typeof value === 'object' ? value[key] : undefined), context) ?? ''
   const statuses = { always: true, success: true, failure: false, cancelled: false, ...status }
   const body = String(expression).trim().replace(/^\$\{\{/, '').replace(/\}\}$/, '')
-    .replace(/\b(?:inputs|steps|needs|github)(?:\.[\w-]+)+/g, path => JSON.stringify(lookup(path)))
+    .replace(/\b(?:inputs|steps|needs|github|runner)(?:\.[\w-]+)+/g, path => JSON.stringify(lookup(path)))
     .replace(/\b(always|success|failure|cancelled)\(\)/g, (_, name) => String(statuses[name]))
   return Boolean(Function(`"use strict"; return (${body})`)())
 }
@@ -86,6 +87,24 @@ it('explicit npm snapshots remain replaceable and isolated from toolchain-only p
     expect(prefix).toContain(boundary)
   }
   expect(setup.outputs['node-cache-key'].value).toContain('steps.node-cache-restore.outputs.cache-primary-key')
+})
+
+// Self-hosted uploads outlive timeout-minutes (mirror run 40122483687), so
+// every setup-pm save gate stays off there and its paired restore runs.
+it.each([
+  ['tools-cache', 'tools-cache-restore'],
+  ['python-cache', 'python-cache-restore'],
+  ['node-cache', 'node-cache-self-hosted'],
+])('%s never saves on self-hosted and %s restores instead', (saveId, restoreId) => {
+  const step = id => setup.runs.steps.find(s => s.id === id)
+  const inputs = { cache: 'true', 'cache-python': 'true', 'cache-node': 'true', toolchain: 'all',
+    extras: 'voice', 'test-environment': 'false', 'save-tools-cache': 'true',
+    'save-python-cache': 'true', 'save-node-cache': 'true' }
+  const selfHosted = { inputs, runner: { environment: 'self-hosted' } }
+  expect(evaluate(step(saveId).if, selfHosted)).toBe(false)
+  expect(evaluate(step(restoreId).if, selfHosted)).toBe(true)
+  expect(evaluate(step(saveId).if, { inputs })).toBe(true)
+  expect(evaluate(step(restoreId).if, { inputs })).toBe(false)
 })
 
 // Key isolation, offline wheel/receipt relocation and the transport action are

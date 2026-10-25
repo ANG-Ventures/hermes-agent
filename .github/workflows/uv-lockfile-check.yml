@@ -53,9 +53,11 @@ on:
 permissions:
   contents: read
 
+# push:main keys by run_id and never cancels: under CI_MAIN_GROUP_PER_SHA two
+# main runs are live at once and a shared ref group would cancel one's child.
 concurrency:
-  group: uv-lockfile-check-${{ github.ref_type == 'tag' && github.run_id || github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  group: uv-lockfile-check-${{ (github.ref_type == 'tag' || github.ref == 'refs/heads/main') && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && github.ref != 'refs/heads/main' }}
 
 jobs:
   check:
