@@ -250,24 +250,32 @@ class _SessionOriginReader:
 
         self._lock = threading.Lock()
         self._dbs: dict[str, Any] = {}
+        # Prism c1643c48add2: set by close(). A ``_collect`` worker that is still running when the
+        # watcher's ``finally`` closes the reader must not park a fresh registry reference here
+        # where nothing would release it; after close, get_session() takes and returns one per call.
+        self._closed = False
 
     def _handle(self, key: str):
+        """``(db, owned)``: the cached handle (``owned`` False), or, after ``close()``, a fresh
+        reference the caller must release (``owned`` True)."""
         from hermes_state_common import stat_db_file_identity
 
         with self._lock:
             db = self._dbs.get(key)
         if db is not None and getattr(db, "_db_file_identity", None) == stat_db_file_identity(Path(key)):
-            return db
+            return db, False
         if db is not None:
             self._drop(key, db)
         from hermes_state_registry import acquire
 
         db = acquire(Path(key))
         with self._lock:
-            other = self._dbs.setdefault(key, db)
+            other = None if self._closed else self._dbs.setdefault(key, db)
+        if other is None:  # closed: the caller owns this reference and releases it itself
+            return db, True
         if other is not db:
             self._release(db)
-        return other
+        return other, False
 
     def _drop(self, key: str, db) -> None:
         with self._lock:
@@ -290,15 +298,20 @@ class _SessionOriginReader:
         from hermes_state import _default_db_path
 
         key = str(_default_db_path())
-        db = self._handle(key)
+        db, owned = self._handle(key)
         try:
             return db.get_session(session_id)
         except Exception:
-            self._drop(key, db)
+            if not owned:
+                self._drop(key, db)
             raise
+        finally:
+            if owned:  # taken after close(): nothing else will return it
+                self._release(db)
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             dbs, self._dbs = list(self._dbs.values()), {}
         for db in dbs:
             self._release(db)

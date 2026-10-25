@@ -102,3 +102,21 @@ def test_notifier_watcher_sets_reader_for_collect_and_closes_it(seeded_state_db,
     assert seen["reader"]._dbs == {}
     assert kw._ORIGIN_READER.get() is None
     assert hermes_state_registry.stats()["live_generations"] == seeded_state_db["live_generations"]
+
+
+def test_lookup_racing_close_releases_its_handle(seeded_state_db):
+    """Prism c1643c48add2: a ``_collect`` worker still running when the watcher's ``finally`` closes
+    the reader must not park a fresh registry reference in the closed reader. After ``close()``,
+    ``get_session`` still answers, but every reference it takes is released before it returns."""
+    reader = kw._SessionOriginReader()
+    reader.close()
+    before = hermes_state_registry.stats()
+    token = kw._ORIGIN_READER.set(reader)
+    try:
+        assert kw._session_origin("sess-3") == ORIGINS["sess-3"]
+    finally:
+        kw._ORIGIN_READER.reset(token)
+    assert reader._dbs == {}, "a closed reader caches nothing"
+    after = hermes_state_registry.stats()
+    assert after["total_refcounts"] == before["total_refcounts"]
+    assert after["live_generations"] == before["live_generations"]
