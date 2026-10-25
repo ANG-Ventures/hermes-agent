@@ -187,23 +187,37 @@ def test_store_close_tolerates_double_close(lcm_home):
     engine.shutdown()
 
 
-def test_del_on_never_shut_engine_closes_its_stores(lcm_home, monkeypatch):
+def test_gc_backstop_on_never_shut_engine_closes_its_stores(lcm_home, monkeypatch):
+    """D2: an engine nobody shut down has its stores closed when it is collected, including the
+    AssertionStore, which has no __del__ of its own. Driven through the guard's finalizer."""
     engine = _lcm_engine(lcm_home, "del-1")
     counts = _count_closes(engine, monkeypatch)
 
-    engine.__del__()
+    engine._storage_guard.__del__()
 
     assert counts.get("_store") == 1 and counts.get("_dag") == 1 and counts.get("_lifecycle") == 1
     assert _fds_on(lcm_home / "lcm.db") == 0
-    engine.shutdown()  # after the finalizer ran: still a no-op, still no raise
-    assert counts.get("_store") == 1
+    engine.shutdown()  # after the backstop ran: stores tolerate the second close, no raise
+    assert _fds_on(lcm_home / "lcm.db") == 0
 
 
-def test_del_never_raises_on_half_built_engine():
-    from plugins.context_engine.lcm.engine import LCMEngine
+def test_dropping_a_never_shut_engine_releases_lcm_db_fds(lcm_home):
+    engine = _lcm_engine(lcm_home, "del-2")
+    assert _fds_on(lcm_home / "lcm.db") > 0
+    del engine
+    gc.collect()
+    assert _fds_on(lcm_home / "lcm.db") == 0
 
-    engine = LCMEngine.__new__(LCMEngine)  # no stores bound, no _closed flag
-    engine.__del__()
+
+def test_gc_backstop_never_raises_on_failing_helpers():
+    from plugins.context_engine.lcm.engine import _StorageGuard
+
+    class _Boom:
+        def close(self):
+            raise RuntimeError("closed already")
+
+    _StorageGuard([_Boom(), None]).__del__()
+    _StorageGuard.__new__(_StorageGuard).__del__()  # never initialised
 
 
 def test_shallow_copy_finalizer_never_closes_the_live_engines_shared_stores(lcm_home):
@@ -233,6 +247,27 @@ def test_shallow_copy_finalizer_never_closes_the_live_engines_shared_stores(lcm_
     finally:
         engine.shutdown()
     assert _fds_on(lcm_home / "lcm.db") == 0
+
+
+def test_collecting_the_owner_never_closes_stores_a_live_copy_still_uses(lcm_home):
+    """Prism 3d290f2734c4: copy.copy(engine) keeps the owner's helpers but not the owner. Dropping
+    every ref to the owner must leave the copy's shared stores open; they close when the copy goes."""
+    import copy
+
+    engine = _lcm_engine(lcm_home, "owner-drop-1")
+    child = copy.copy(engine)
+    del engine
+    gc.collect()
+
+    assert child._lifecycle._conn is not None, "owner's finalizer closed the lifecycle store under the copy"
+    child._lifecycle._conn.execute("SELECT 1")
+    child._store._conn.execute("SELECT 1")
+    child._dag._conn.execute("SELECT 1")
+    assert _fds_on(lcm_home / "lcm.db") > 0
+
+    del child
+    gc.collect()
+    assert _fds_on(lcm_home / "lcm.db") == 0, "last reference gone: the backstop must close the stores"
 
 
 def test_failed_close_is_retried_by_the_next_shutdown(lcm_home, monkeypatch):

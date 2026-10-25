@@ -485,6 +485,31 @@ def _lifecycle_gc_due(db_path: str, interval_hours: float) -> bool:
         return True
 
 
+_STORAGE_HELPER_ATTRS = ("_adaptive_retrieval", "_store", "_dag", "_lifecycle", "_assertions", "_query_views")
+
+
+class _StorageGuard:
+    """GC backstop that closes one ``_bind_storage`` generation of SQLite helpers (t_0d987578).
+
+    Referenced only by the engine that bound the helpers and by its shallow copies (lcm_grep's
+    ``copy.copy(engine)`` copies the attribute), so it is finalized only when none of them can still
+    use the helpers. Every store connection is ``check_same_thread=False``, so closing from the GC
+    thread is legal. A store's ``close()`` is idempotent, so an explicit ``shutdown()`` first is fine.
+    """
+
+    __slots__ = ("_helpers",)
+
+    def __init__(self, helpers):
+        self._helpers = [h for h in helpers if h is not None]
+
+    def __del__(self) -> None:
+        for helper in getattr(self, "_helpers", ()):
+            try:
+                helper.close()
+            except BaseException:  # never raise from a finalizer, incl. during interpreter teardown
+                pass
+
+
 class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
@@ -864,10 +889,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
-        # Owner token for the __del__ backstop: a shallow copy (tools.py lcm_grep's read_engine)
-        # inherits this value but has a different id(), so its finalizer never closes stores it
-        # shares with the live engine.
-        self._storage_owner_id = id(self)
         self._assertions = None
         self._query_views = None
         self._adaptive_retrieval = None
@@ -915,18 +936,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         except Exception:
             self._close_storage()
             raise
+        # GC backstop for an engine nobody shut down (t_0d987578). It lives on a guard object, not
+        # on LCMEngine.__del__: a shallow copy (tools.py lcm_grep's read_engine) shares this guard
+        # along with the helpers, so the guard fires only once the owner AND every copy are gone.
+        self._storage_guard = _StorageGuard(
+            [getattr(self, a, None) for a in _STORAGE_HELPER_ATTRS])
 
     def _close_storage(self) -> bool:
         """Best-effort close of currently bound SQLite helpers; ``True`` when every close succeeded."""
         ok = True
-        for attr in (
-            "_adaptive_retrieval",
-            "_store",
-            "_dag",
-            "_lifecycle",
-            "_assertions",
-            "_query_views",
-        ):
+        for attr in _STORAGE_HELPER_ATTRS:
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
             if callable(close):
@@ -8140,16 +8159,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             except Exception:
                 logger.debug("LCM failed unregistering engine binding at shutdown", exc_info=True)
         # Marked closed only once every store closed, so a failed close is retried by the next
-        # shutdown() or by __del__ instead of leaking its connection.
+        # shutdown() instead of leaking its connection.
         if self._close_storage():
             self._closed = True
-
-    def __del__(self) -> None:  # backstop for an engine nobody shut down (t_0d987578)
-        # Skip the registry unregister: its WeakValueDictionary entries are already dead once
-        # __del__ runs, and taking its lock from a GC callback on an arbitrary thread is avoidable.
-        # Only the engine that bound the storage closes it: a shallow copy shares the live stores.
-        try:
-            if getattr(self, "_storage_owner_id", None) == id(self):
-                self._finalize_storage(unregister=False)
-        except BaseException:  # never raise from a finalizer, incl. during interpreter teardown
-            pass
