@@ -1699,15 +1699,20 @@ def load_jobs() -> List[Dict[str, Any]]:
             repair = repair or "invalid repeat.completed normalized"
     locked = bool(getattr(_jobs_lock_state, "depth", 0))
     split = _rs.enabled()
-    if not split and _runtime_db_path().exists():
+    if not split and _runtime_db_path().exists() and not _kill_switch_orphans_only():
         # Kill switch: fold the rows back BEFORE any repair save, and from the RAW file: the
         # export validates the payload itself and refuses (raises) on a missing or jobless store,
         # which must never be "repaired" to [] first and then exported over the only runtime copy.
         if not locked:
             with _jobs_lock():
                 return load_jobs()
-        export_runtime_to_json()
-        return load_jobs()  # re-read the folded file (the database is gone now)
+        export_runtime_to_json(keep_orphans=True)
+        if _runtime_db_path().exists():
+            # Only rows with no definition are left (kept, never dropped silently): remember the
+            # db's identity so later loads do not re-fold it, and say so once.
+            _note_kill_switch_orphans_only()
+            _warn_json_mode_with_runtime_db()
+        return load_jobs()  # re-read the folded file
     if split:
         # jobs.json is a read-only MIRROR of the merged view (see cron/runtime_state.py): a job
         # with a row takes its runtime ONLY from the row (file runtime keys dropped first). A job
@@ -1761,8 +1766,30 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 # --- Runtime-state split (t_94e91559): hot runtime fields live in cron/runtime_state.db ---
 
-# runtime-export target for rows with no definition in jobs.json (see export_runtime_to_json).
-_RUNTIME_ORPHANS_NAME = "runtime_state.orphans.json"
+# json kill switch: db identity (path -> (ino, size, mtime_ns)) after a fold that kept only orphan
+# rows, so load_jobs does not re-fold an unchanged database on every read.
+_KILL_SWITCH_ORPHANS_ONLY: Dict[str, Tuple[int, int, int]] = {}
+
+
+def _db_identity(path: Path) -> Optional[Tuple[int, int, int]]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _kill_switch_orphans_only() -> bool:
+    path = _runtime_db_path()
+    known = _KILL_SWITCH_ORPHANS_ONLY.get(str(path))
+    return known is not None and known == _db_identity(path)
+
+
+def _note_kill_switch_orphans_only() -> None:
+    path = _runtime_db_path()
+    ident = _db_identity(path)
+    if ident is not None:
+        _KILL_SWITCH_ORPHANS_ONLY[str(path)] = ident
 
 
 def _runtime_db_path() -> Path:
@@ -1796,18 +1823,24 @@ def _read_runtime_rows(file_gen: Optional[str] = None) -> Dict[str, Dict[str, An
     """All rows, after recovering an interrupted two-phase save (see ``_save_split_unlocked``):
     a pending generation the definitions file names is rolled forward, any other is dropped."""
     cron_dir = _current_cron_store().cron_dir
-    if not _rs.db_path(cron_dir).exists():
-        if not _runtime_write_allowed():
-            return {}
-        _rs.read_all(cron_dir)  # creates it (0600, see runtime_state.connect)
-        _secure_runtime_db()
+    existed = _rs.db_path(cron_dir).exists()
+    if not existed and not _runtime_write_allowed():
         return {}
-    with _rs.connect(cron_dir) as conn:
+    # Open first, then decide (Prism 8cd4fa44c9bb): the rows come from the same connection that
+    # created or found the database, so a sibling that creates it and writes rows after our
+    # existence check is read, not answered with {}.
+    with _rs.connect(cron_dir) as conn:  # creates it when absent (0600, see runtime_state.connect)
+        conn.execute("BEGIN")
         pending = _rs.pending_gens(conn)
+        rows = _rs._rows_of(conn)
+        conn.execute("COMMIT")
+    if not existed:
+        _secure_runtime_db()
     if pending and _runtime_write_allowed() and getattr(_jobs_lock_state, "depth", 0):
         # Locked only: an unlocked reader cannot tell a crashed save from one in flight.
         _recover_pending_runtime(file_gen)
-    return _rs.read_all(cron_dir)
+        return _rs.read_all(cron_dir)
+    return rows
 
 
 def _runtime_pending() -> bool:
@@ -2078,14 +2111,33 @@ def _write_definitions_file(defs: List[Dict[str, Any]]) -> None:
     _record_load_stamp(None)
 
 
-def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None) -> int:
+class RuntimeOrphansRefused(RuntimeError):
+    """``runtime-export --retire`` refused: rows with no definition in jobs.json would be lost."""
+
+    def __init__(self, ids: List[str]):
+        self.ids = ids
+        super().__init__(
+            f"{len(ids)} runtime row(s) have no definition in jobs.json ({', '.join(ids)}); "
+            f"refusing to retire {_rs.DB_NAME} (rows kept). Re-add the definitions, or pass "
+            "--drop-orphans to discard them")
+
+
+def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retire: bool = True,
+                           drop_orphans: bool = False, keep_orphans: bool = False) -> int:
     """Reverse of the migration (kill switch ``HERMES_CRON_RUNTIME_STATE=json`` and
-    ``hermes cron runtime-export --to-json``): write every row back into its job in jobs.json,
-    then remove the database. For a job with a row (even an empty one) the row is authoritative:
-    the file's runtime keys are dropped first, so a cleared value cannot be resurrected. Refuses
-    (raises, writes nothing, deletes nothing) on a missing jobs.json or a payload without a jobs
-    list while the database exists: the definitions may only be temporarily missing, and the rows
-    are the only copy of the runtime state. Returns the number of jobs that had a row."""
+    ``hermes cron runtime-export --to-json``): write every row back into its job in jobs.json.
+    With *retire*, then remove the database. For a job with a row (even an empty one) the row is
+    authoritative: the file's runtime keys are dropped first, so a cleared value cannot be
+    resurrected. Refuses (raises, writes nothing, deletes nothing) on a missing jobs.json or a
+    payload without a jobs list while the database exists: the definitions may only be temporarily
+    missing, and the rows are the only copy of the runtime state.
+
+    Rows whose job is not in jobs.json (a git level dropped the definition) have no record to
+    carry them: their ids are logged and the rows stay in the database. *retire* then REFUSES
+    (``RuntimeOrphansRefused``, nothing written) unless *drop_orphans* (Prism 747baaf507d1), or,
+    with *keep_orphans* (the json kill switch's automatic fold in load_jobs, which must not raise),
+    retires every row that HAS a definition and keeps only the orphan rows in the database.
+    Returns the number of jobs that had a row."""
     with _jobs_lock():
         jobs_file = _current_cron_store().jobs_file
         cron_dir = _current_cron_store().cron_dir
@@ -2104,6 +2156,15 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None) -> int:
         _guard_against_test_write_to_live_store(jobs_file)
         _recover_pending_now()  # a generation the file names is part of the rows to export
         rows = _rs.read_all(cron_dir)
+        file_ids = {str(j.get("id")) for j in jobs if isinstance(j, dict)}
+        orphans = sorted(jid for jid in rows if jid not in file_ids)
+        if orphans:
+            if retire and not (drop_orphans or keep_orphans):
+                raise RuntimeOrphansRefused(orphans)
+            logger.warning("cron runtime-state: %d runtime row(s) have no definition in jobs.json"
+                           " (%s); %s", len(orphans), ", ".join(orphans),
+                           "dropped with the database" if retire and drop_orphans
+                           else "kept in the database")
         applied = 0
         merged: List[Any] = []
         for job in jobs:
@@ -2112,24 +2173,20 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None) -> int:
                 job = _rs.overlay_row(job, row)
                 applied += 1
             merged.append(job)
-        file_ids = {str(j.get("id")) for j in jobs if isinstance(j, dict)}
-        orphans = {jid: row for jid, row in rows.items() if jid not in file_ids}
-        if orphans:
-            # Rows whose definition is not in jobs.json (a git level dropped a job, a definition
-            # is only temporarily missing): jobs.json has no record to carry them, and dropping
-            # the database would lose them. Keep them, 0600, next to jobs.json (Prism
-            # 747baaf507d1); a later load in sqlite mode does not read this file.
-            orphan_file = cron_dir / _RUNTIME_ORPHANS_NAME
-            atomic_write_text(orphan_file, json.dumps(
-                {"exported_at": _hermes_now().isoformat(), "rows": orphans},
-                indent=2, ensure_ascii=False, sort_keys=True), mode=0o600, fsync_dir=True)
-            _secure_file(orphan_file)
-            logger.warning("cron runtime-state: %d runtime row(s) had no definition in jobs.json; "
-                           "kept in %s", len(orphans), orphan_file)
-        _write_definitions_file(merged)
-        _rs.drop_database(cron_dir)
+        if applied or not orphans:
+            _write_definitions_file(merged)
+        if retire and orphans and not drop_orphans:  # keep_orphans: retire the folded rows only
+            with _runtime_txn() as conn:
+                _rs.upsert_rows(conn, {}, delete_ids=[j for j in rows if j not in orphans],
+                                dirty=False)
+            logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
+                           "jobs.json; %s kept for %d orphan row(s)", applied, _rs.DB_NAME,
+                           len(orphans))
+            return applied
+        if retire:
+            _rs.drop_database(cron_dir)
         logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
-                       "jobs.json and removed %s", applied, _rs.DB_NAME)
+                       "jobs.json%s", applied, f" and removed {_rs.DB_NAME}" if retire else "")
         return applied
 
 
@@ -2599,10 +2656,12 @@ def _save_jobs_unlocked(
     jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
     replace: bool = False, runtime_gen: Optional[str] = None,
     overlay: Optional[Callable[[List[Any]], List[Any]]] = None,
+    pre_replace: Optional[Callable[[], None]] = None,
 ):
     """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
     ``replace=True`` skips the shrink-merge guard and the corrupt-store refusal (wholesale
-    rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes)."""
+    rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes).
+    ``pre_replace`` (sqlite mode) runs immediately before the rename."""
     jobs_file = _current_cron_store().jobs_file
     _guard_against_test_write_to_live_store(jobs_file)
     ensure_dirs()
@@ -2629,6 +2688,8 @@ def _save_jobs_unlocked(
                 _unlink_quiet(tmp_path)
                 tmp_path = None
                 continue
+            if pre_replace is not None:
+                pre_replace()
             # fsync the directory the rename actually landed in (atomic_replace resolves symlinks).
             replaced = Path(atomic_replace(tmp_path, jobs_file))
             tmp_path = None
@@ -2766,7 +2827,8 @@ def _save_split_two_phase(gen, defs, merged_changes, *, removed_ids, replace, ba
         _jobs_lock_state.load_baseline = base_defs
     try:
         _save_jobs_unlocked(defs, removed_ids=removed_ids, replace=replace, runtime_gen=gen,
-                            overlay=to_mirror)
+                            overlay=to_mirror,
+                            pre_replace=lambda: _roll_forward_published_sibling(gen))
     except BaseException:
         if gen is not None:
             with contextlib.suppress(Exception), _runtime_txn() as conn:
@@ -2783,6 +2845,24 @@ def _save_split_two_phase(gen, defs, merged_changes, *, removed_ids, replace, ba
         if gen is not None:
             _rs.apply_pending(conn, gen)
         _record_mirror_written(conn, seq)
+
+
+def _roll_forward_published_sibling(own_gen: Optional[str]) -> None:
+    """Right before our rename replaces jobs.json: if the file on disk names ANOTHER generation
+    that is still pending, a degraded-lock sibling published it after our entry recovery ran
+    (I3: a generation the file names is committed). Apply it now, merged (I2), because our rename
+    erases the only marker that commits it; recovery would later find it unnamed and, with its
+    owner gone, discard it (Prism 9083dea60b86). Marked dirty: the mirror we are about to write was
+    computed before these rows, so the next flush rewrites it. A live sibling's own later apply
+    then finds nothing left to apply."""
+    file_gen = _file_runtime_gen()
+    if not file_gen or file_gen == own_gen:
+        return
+    with _runtime_txn() as conn:
+        if file_gen in _rs.pending_gens(conn):
+            n = _rs.apply_pending(conn, file_gen, dirty=True)
+            logger.warning("cron runtime-state: rolled sibling save %s forward before replacing "
+                           "jobs.json (%d row(s))", file_gen, n)
 
 
 def _journal_created(job: Dict[str, Any]) -> None:
@@ -2881,14 +2961,14 @@ _JSON_MODE_DB_WARNED: Set[str] = set()
 def _warn_json_mode_with_runtime_db() -> None:
     """Kill-switch (json mode) save while runtime_state.db still exists: the rows are newer than
     anything this save writes and nothing folds them in. The json mode is an operator rollback
-    entered via ``hermes cron runtime-export --to-json`` (folds and retires the db); say so,
+    entered via ``hermes cron runtime-export --to-json --retire`` (folds and retires the db); say so,
     once per store per process (Prism 7ffd35b7bd2a, accepted as by-design)."""
     path = _runtime_db_path()
     if str(path) in _JSON_MODE_DB_WARNED or not path.exists():
         return
     _JSON_MODE_DB_WARNED.add(str(path))
     logger.error("cron runtime-state: %s=json but %s still exists; its runtime rows are not "
-                 "in jobs.json. Run `hermes cron runtime-export --to-json` to fold them back "
+                 "in jobs.json. Run `hermes cron runtime-export --to-json --retire` to fold them back "
                  "and retire the database", _rs.ENV_MODE, path)
 
 

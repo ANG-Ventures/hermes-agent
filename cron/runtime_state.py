@@ -519,7 +519,8 @@ def apply_pending(conn: sqlite3.Connection, gen: str, *, dirty: bool = False) ->
     return written
 
 
-def merged_jobs(jobs_file: Path, *, strict: bool = False) -> List[Dict[str, Any]]:
+def merged_jobs(jobs_file: Path, *, strict: bool = False,
+                complete: bool = False) -> List[Dict[str, Any]]:
     """READ-ONLY merged view for out-of-process readers (cron-health, dashboards, watchers that
     read jobs.json directly): the raw jobs list with each job's runtime row overlaid, i.e. the
     shape jobs.json had before the split. Never creates the database, never migrates, never
@@ -528,7 +529,10 @@ def merged_jobs(jobs_file: Path, *, strict: bool = False) -> List[Dict[str, Any]
     The rows and the pending generation are read in ONE read transaction (one WAL snapshot), so
     an apply landing between the two reads cannot make the committed update vanish. A database
     error returns the raw file view for monitors (best effort) and RAISES when *strict* (callers
-    that delete the database afterwards must never treat the raw view as merged)."""
+    that delete the database afterwards must never treat the raw view as merged). With *complete*
+    (implies strict) it also raises when a row would be left out of the view: a row that is not a
+    JSON object, or a row whose job is not in the file (Prism 93002a296759)."""
+    strict = strict or complete
     jobs_file = Path(jobs_file)
     with open(jobs_file, encoding="utf-8-sig") as fh:
         data = json.load(fh)
@@ -555,6 +559,8 @@ def merged_jobs(jobs_file: Path, *, strict: bool = False) -> List[Dict[str, Any]
                     continue
                 if isinstance(value, dict):
                     rows[str(job_id)] = value
+                elif complete:
+                    raise ValueError(f"runtime row {job_id!r} is not a JSON object")
             if isinstance(file_gen, str) and file_gen:
                 # A save that crashed after its rename left generation *file_gen* staged: the
                 # file already names it, so it is committed. Resolve it the way load_jobs'
@@ -567,6 +573,11 @@ def merged_jobs(jobs_file: Path, *, strict: bool = False) -> List[Dict[str, Any]
         if strict:
             raise
         return jobs
+    if complete:
+        ids = {str(j.get("id")) for j in jobs if isinstance(j, dict)}
+        missing = sorted(jid for jid in rows if jid not in ids)
+        if missing:
+            raise ValueError(f"runtime rows with no definition in {jobs_file}: {missing}")
     return [overlay_row(job, rows[str(job.get("id"))])
             if isinstance(job, dict) and str(job.get("id")) in rows else job for job in jobs]
 
@@ -584,8 +595,10 @@ def fold_staged_copy(cron_dir: Path) -> bool:
     """For a STAGED copy of a cron dir (profile export): rewrite its jobs.json as the merged view
     and delete the database + sidecars, so the archive carries runtime text only inside jobs.json,
     where the export's secret scrubber reads it. Never call on a live store (no lock taken).
-    Returns False (database kept, nothing written) when it cannot fold: no definitions, or the
-    database cannot be read in full (a strict read; the raw file view is never folded)."""
+    All or nothing (Prism 93002a296759): returns False (database kept, nothing written) when it
+    cannot fold EVERY row: no definitions, the database cannot be read in full, a row is not a
+    JSON object, or a row's job is not in jobs.json (dropping the db would lose it, and keeping it
+    would ship it unscrubbed). jobs.json is replaced atomically before the database is removed."""
     cron_dir = Path(cron_dir)
     jobs_file = cron_dir / "jobs.json"
     if not db_path(cron_dir).exists():
@@ -603,13 +616,22 @@ def fold_staged_copy(cron_dir: Path) -> bool:
     if not isinstance(jobs, list):
         return False
     try:
-        merged = merged_jobs(jobs_file, strict=True)  # resolves a pending generation the file names
+        # complete=True: resolves a pending generation the file names, raises on any row it
+        # cannot place.
+        merged = merged_jobs(jobs_file, complete=True)
     except (OSError, ValueError, sqlite3.Error):
         return False
     payload = dict(data) if isinstance(data, dict) else {}
     payload.pop("runtime_gen", None)
     payload["jobs"] = merged
-    jobs_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp = jobs_file.with_name(jobs_file.name + ".fold-tmp")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, jobs_file)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return False
     drop_database(cron_dir)
     return True
 

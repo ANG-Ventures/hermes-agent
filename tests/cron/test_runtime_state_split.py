@@ -320,8 +320,14 @@ def test_cli_runtime_export(temp_home, capsys):
 
     created = cj.create_job(prompt="x", schedule="every 5m", name="cli")
     assert cj.claim_job_for_fire(created["id"]) is True
-    assert cron_runtime_export(None) == 0
+    assert cron_runtime_export(None) == 0  # --to-json alone: fold, keep the db
     assert "1 job(s)" in capsys.readouterr().out
+    assert _db(temp_home).exists()
+
+    class A:
+        retire, drop_orphans = True, False
+    assert cron_runtime_export(A()) == 0
+    assert "removed runtime_state.db" in capsys.readouterr().out
     assert not _db(temp_home).exists()
     assert json.loads(_jobs_file(temp_home).read_text())["jobs"][0]["fire_claim"]["by"]
 
@@ -1251,21 +1257,57 @@ def test_claim_heartbeat_row_write_takes_permission_pass(temp_home, monkeypatch)
     assert calls
 
 
-def test_export_keeps_rows_without_a_definition(temp_home):
-    """747baaf507d1: a row whose job is not in jobs.json (a git level dropped it) is not lost when
-    runtime-export retires the database: it is kept, 0600, in runtime_state.orphans.json."""
+def test_export_lists_orphan_rows_and_keeps_them_in_db(temp_home, caplog):
+    """747baaf507d1 / 36c93ec4f5fd: a row whose job is not in jobs.json (a git level dropped it) is
+    never lost and no side file is written: runtime-export lists its id and the row stays in the
+    db; --retire refuses while it exists, unless --drop-orphans."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+    from hermes_cli.cron import cron_runtime_export
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="kept")
+    cj.mark_job_run(created["id"], True)
+    orphan = {"last_status": "ok", "repeat.completed": 4}
+    rs.write_rows(temp_home / "cron", {"gone0000abcd": orphan})
+    with caplog.at_level("WARNING"):
+        assert cj.export_runtime_to_json(retire=False) == 1
+    assert any("gone0000abcd" in r.getMessage() for r in caplog.records)
+    assert rs.read_all(temp_home / "cron")["gone0000abcd"] == orphan
+    assert _raw(temp_home, created["id"])["last_status"] == "ok"
+    assert sorted(p.name for p in (temp_home / "cron").iterdir()
+                  if "orphan" in p.name) == []
+
+    before = _snapshot(_jobs_file(temp_home))
+    with pytest.raises(cj.RuntimeOrphansRefused) as exc:
+        cj.export_runtime_to_json()  # retire=True is the default
+    assert exc.value.ids == ["gone0000abcd"]
+    assert _db(temp_home).exists() and _snapshot(_jobs_file(temp_home)) == before
+    assert rs.read_all(temp_home / "cron")["gone0000abcd"] == orphan
+
+    class A:
+        retire, drop_orphans = True, False
+    assert cron_runtime_export(A()) == 2
+    assert _db(temp_home).exists()
+    A.drop_orphans = True
+    assert cron_runtime_export(A()) == 0
+    assert not _db(temp_home).exists()
+
+
+def test_kill_switch_fold_keeps_orphan_rows(temp_home, monkeypatch):
+    """The json kill switch's automatic fold must not raise on orphans and must not drop them:
+    rows with a definition are folded into jobs.json, the orphan row stays in the db."""
     from cron import jobs as cj
     from cron import runtime_state as rs
 
-    created = cj.create_job(prompt="x", schedule="every 5m", name="kept")
-    rs.write_rows(temp_home / "cron", {"gone0000abcd": {"last_status": "ok", "repeat.completed": 4}})
-    cj.export_runtime_to_json()
-    assert not _db(temp_home).exists()
-    orphan = temp_home / "cron" / "runtime_state.orphans.json"
-    assert json.loads(orphan.read_text())["rows"] == {
-        "gone0000abcd": {"last_status": "ok", "repeat.completed": 4}}
-    assert oct(os.stat(orphan).st_mode & 0o777) == "0o600"
-    assert _raw(temp_home, created["id"])["id"] == created["id"]
+    created = cj.create_job(prompt="x", schedule="every 5m", name="ks-orphan")
+    cj.mark_job_run(created["id"], True)
+    rs.write_rows(temp_home / "cron", {"gone0000abcd": {"last_status": "ok"}})
+    monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
+    assert cj.get_job(created["id"])["last_status"] == "ok"
+    assert _raw(temp_home, created["id"])["last_status"] == "ok"
+    assert rs.read_all(temp_home / "cron") == {"gone0000abcd": {"last_status": "ok"}}
+    cj.load_jobs()  # no re-fold loop on an unchanged orphans-only db
+    assert rs.read_all(temp_home / "cron") == {"gone0000abcd": {"last_status": "ok"}}
 
 
 def test_repeat_completed_from_row_is_normalized(temp_home):
@@ -1282,9 +1324,10 @@ def test_repeat_completed_from_row_is_normalized(temp_home):
     assert next(j for j in cj.load_jobs() if j["id"] == jid)["repeat"]["completed"] == 0
 
 
-def test_restore_json_only_snapshot_retires_newer_rows(temp_home):
-    """68eae47a394e / b493dcb2080d: restoring a snapshot that has jobs.json (with runtime) but no
-    runtime_state.db must not leave newer rows winning over the restored runtime."""
+def test_quick_snapshot_restore_takes_runtime_from_live_db(temp_home):
+    """Interim (t_82c613d9 owns the pair restore): restoring a quick snapshot restores
+    definitions; runtime_state.db is captured but never restored, so runtime bookkeeping comes
+    from the live db (I1) and no pre-restore db copy is written into cron/."""
     from cron import jobs as cj
     from hermes_cli import backup
 
@@ -1294,21 +1337,14 @@ def test_restore_json_only_snapshot_retires_newer_rows(temp_home):
         cj.mark_job_run(jid, True)
     snap = backup.create_quick_snapshot(hermes_home=temp_home)
     snap_dir = backup._quick_snapshot_root(temp_home) / snap
-    # A pre-split snapshot: jobs.json carries the runtime, no db in the manifest.
-    rec = cj.get_job(jid)
-    data = json.loads((snap_dir / "cron" / "jobs.json").read_text())
-    data["jobs"] = [rec]
-    (snap_dir / "cron" / "jobs.json").write_text(json.dumps(data), encoding="utf-8")
-    (snap_dir / "cron" / "runtime_state.db").unlink()
-    meta = json.loads((snap_dir / "manifest.json").read_text())
-    meta["files"].pop("cron/runtime_state.db", None)
-    (snap_dir / "manifest.json").write_text(json.dumps(meta), encoding="utf-8")
+    assert (snap_dir / "cron" / "runtime_state.db").exists()  # captured
+    cj.update_job(jid, {"name": "renamed"})
     for _ in range(4):
         cj.mark_job_run(jid, True)
-    assert cj.get_job(jid)["repeat"]["completed"] == 7
     assert backup.restore_quick_snapshot(snap, hermes_home=temp_home)
-    assert cj.get_job(jid)["repeat"]["completed"] == 3
-    assert list((temp_home / "cron").glob("runtime_state.db.pre-restore-*"))
+    job = cj.get_job(jid)
+    assert job["name"] == "snap" and job["repeat"]["completed"] == 7
+    assert not [p for p in (temp_home / "cron").iterdir() if "pre-restore" in p.name]
 
 
 def test_profile_export_captures_cron_pair_under_store_lock(tmp_path, monkeypatch):
@@ -1370,3 +1406,127 @@ def test_recovery_never_discards_generation_whose_owner_is_alive(temp_home, cloc
     with cj._jobs_lock():
         cj._recover_pending_runtime(None)
     assert dead not in pending()
+
+
+# --- Round 5 core keys (Apollo ruling 2026-10-25, option (a)) -----------------------------------
+
+def test_save_rolls_forward_sibling_generation_published_before_our_rename(temp_home):
+    """9083dea60b86 (I3), two-writer sequence: A's save recovers at entry; then a degraded-lock
+    sibling B stages generation gB, renames jobs.json naming gB and dies (lock file free); then A
+    renames over B's commit marker. B's committed rows must survive (rolled forward before the
+    marker is erased), not be discarded later as an unnamed dead generation."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    a = cj.create_job(prompt="x", schedule="every 5m", name="a")
+    b = cj.create_job(prompt="x", schedule="every 5m", name="b")
+    cj.mark_job_run(a["id"], True)
+    real = cj._stage_jobs_payload
+    gen_b = "b" * 32
+    fired = []
+
+    def stage_then_sibling(jobs_file, jobs, runtime_gen=None, overlay=None):
+        out = real(jobs_file, jobs, runtime_gen, overlay)
+        if not fired:
+            fired.append(1)
+            with rs.transaction(temp_home / "cron") as conn:
+                row = rs.read_row(conn, a["id"]) or {}
+                rs.stage_pending(conn, gen_b, {a["id"]: dict(row, last_status="sibling")},
+                                 bases={a["id"]: row})
+            data = json.loads(_jobs_file(temp_home).read_text())
+            data["runtime_gen"] = gen_b
+            _jobs_file(temp_home).write_text(json.dumps(data), encoding="utf-8")
+            cj._gen_lock_path(gen_b).write_text("")  # B died: its lock file is free
+        return out
+
+    with cj._jobs_lock():
+        jobs = cj.load_jobs()
+        for job in jobs:
+            if job["id"] == b["id"]:
+                job["name"] = "b2"
+        cj._stage_jobs_payload = stage_then_sibling
+        try:
+            cj.save_jobs(jobs)
+        finally:
+            cj._stage_jobs_payload = real
+    assert fired
+    assert cj.get_job(b["id"])["name"] == "b2"
+    assert cj.get_job(a["id"])["last_status"] == "sibling"
+    with rs.connect(temp_home / "cron") as conn:
+        assert rs.pending_gens(conn) == []
+
+
+def test_first_load_reads_rows_of_db_created_after_existence_check(temp_home, monkeypatch):
+    """8cd4fa44c9bb: the database is created (with rows) by a sibling between load_jobs'
+    existence check and its read: open first, then decide, so the sibling's row is read rather
+    than answered with {}."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    job = _fixture_job(1, with_runtime=False)
+    _write_store(temp_home, [job])
+    assert not _db(temp_home).exists()
+    real = cj._runtime_write_allowed
+    fired = []
+
+    def sibling_creates_db():
+        if not fired:
+            fired.append(1)
+            rs.write_rows(temp_home / "cron", {job["id"]: {"last_status": "sibling"}})
+        return real()
+
+    monkeypatch.setattr(cj, "_runtime_write_allowed", sibling_creates_db)
+    loaded = cj.load_jobs()
+    assert fired
+    assert loaded[0]["last_status"] == "sibling"
+
+
+@pytest.mark.parametrize("bad", ["orphan", "non_object"])
+def test_fold_is_all_or_nothing(temp_home, tmp_path, bad):
+    """93002a296759: a fold that cannot place every row (a row whose job is not in jobs.json, or
+    a row that is not a JSON object) refuses: returns False, keeps the db, leaves jobs.json."""
+    from cron import runtime_state as rs
+
+    cron = tmp_path / "staged" / "cron"
+    cron.mkdir(parents=True)
+    job = _fixture_job(1, with_runtime=False)
+    (cron / "jobs.json").write_text(json.dumps({"jobs": [job]}), encoding="utf-8")
+    rs.write_rows(cron, {job["id"]: {"last_status": "ok"}})
+    if bad == "orphan":
+        rs.write_rows(cron, {"gone0000abcd": {"manual_run_prompt": "secret text"}})
+    else:
+        with rs.transaction(cron) as conn:
+            conn.execute("INSERT INTO job_runtime(job_id, fields, updated_at) VALUES (?,?,0)",
+                         ("weird0000abc", "[1, 2]"))
+    before = (cron / "jobs.json").read_bytes()
+    assert rs.fold_staged_copy(cron) is False
+    assert rs.db_path(cron).exists()
+    assert (cron / "jobs.json").read_bytes() == before
+
+
+def test_profile_export_refuses_symlinked_staged_cron_dir(tmp_path, monkeypatch):
+    """d8715e0ffdf8: a profile whose cron/ is a symlink (copytree keeps it) must not have the fold
+    and the db removals run against the symlink target: the export refuses, the target's db and
+    jobs.json are untouched."""
+    from cron import runtime_state as rs
+    from hermes_cli import profiles
+
+    outside = tmp_path / "live-cron"
+    outside.mkdir()
+    job = _fixture_job(1, with_runtime=False)
+    (outside / "jobs.json").write_text(json.dumps({"jobs": [job]}), encoding="utf-8")
+    rs.write_rows(outside, {job["id"]: {"last_status": "ok"}})
+    jobs_before = (outside / "jobs.json").read_bytes()
+    profile_dir = tmp_path / "profiles" / "p"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text("model: x\n")
+    (profile_dir / "cron").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: tmp_path / "profiles")
+    monkeypatch.setattr(profiles, "get_profile_dir", lambda n: profile_dir)
+    monkeypatch.setattr(profiles, "validate_profile_name", lambda n: None)
+    out = tmp_path / "export.tar.gz"
+    with pytest.raises(ValueError, match="symlink"):
+        profiles.export_profile("p", str(out))
+    assert not out.exists()
+    assert rs.db_path(outside).exists()
+    assert (outside / "jobs.json").read_bytes() == jobs_before

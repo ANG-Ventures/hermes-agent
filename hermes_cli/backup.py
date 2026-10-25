@@ -2098,32 +2098,28 @@ def restore_quick_snapshot(
         meta = json.load(f)
 
     restored = 0
-    files = list(meta.get("files", {}))
-    # The cron pair is restored together under the cron store lock (t_94e91559): jobs.json first,
-    # then runtime_state.db, or, for a snapshot with NO runtime_state.db (taken before the split,
-    # or before the db existed), the live db is retired so the restored jobs.json, which carries
-    # the runtime fields, is adopted on the next load instead of losing to newer rows.
-    cron_pair = _CRON_JOBS_REL in files
-    if cron_pair:
-        files = [r for r in files if r not in (_CRON_JOBS_REL, _CRON_RUNTIME_REL)]
-    def _restore_one(rel: str) -> bool:
+    for rel in meta.get("files", {}):
+        if rel == _CRON_RUNTIME_REL:
+            # Captured, never restored (t_94e91559): runtime bookkeeping comes from the live db
+            # and schedule fields are recomputed by the scheduler. The pair restore is t_82c613d9.
+            continue
         # Security: reject absolute paths and traversals in manifest entries
         src = snap_dir / rel
         try:
             src.resolve().relative_to(snap_dir.resolve())
         except ValueError:
             logger.error("Manifest path traversal blocked: %s", rel)
-            return False
+            continue
 
         dst = home / rel
         try:
             dst.resolve().relative_to(home.resolve())
         except ValueError:
             logger.error("Manifest path traversal blocked: %s", rel)
-            return False
+            continue
 
         if not src.exists():
-            return False
+            continue
 
         dst.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2137,51 +2133,15 @@ def restore_quick_snapshot(
                     # Refused, failed, or source failed its integrity check:
                     # dst left as it was. Count as a failure, not a restore.
                     logger.error("Failed to restore %s: refused or source integrity check failed (see previous log)", rel)
-                    return False
+                    continue
             else:
                 shutil.copy2(src, dst)
-            return True
+            restored += 1
         except (OSError, PermissionError) as exc:
             logger.error("Failed to restore %s: %s", rel, exc)
-            return False
-
-    for rel in files:
-        restored += _restore_one(rel)
-
-    if cron_pair:
-        with _cron_store_lock(home):
-            if _restore_one(_CRON_JOBS_REL):
-                restored += 1
-                if _CRON_RUNTIME_REL in meta.get("files", {}):
-                    restored += _restore_one(_CRON_RUNTIME_REL)
-                else:
-                    _retire_live_cron_runtime_db(home, snapshot_id)
 
     logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
     return restored > 0
-
-
-def _retire_live_cron_runtime_db(home: Path, snapshot_id: str) -> None:
-    """After restoring a snapshot's jobs.json that has no runtime_state.db (caller holds the cron
-    store lock): move the live db aside so the restored file's runtime fields are adopted on the
-    next load. Left in place, its newer rows would win over every runtime value just restored.
-    The db is copied to ``runtime_state.db.pre-restore-<snapshot>`` first (0600), never deleted
-    unread."""
-    live = home / _CRON_RUNTIME_REL
-    if not live.exists():
-        return
-    aside = live.with_name(f"{live.name}.pre-restore-{snapshot_id}")
-    if not _safe_copy_db(live, aside):
-        logger.error("Restore: could not copy %s aside; leaving it in place (its rows will win "
-                     "over the restored jobs.json runtime fields)", live)
-        return
-    with suppress(OSError):
-        os.chmod(aside, 0o600)
-    for suffix in ("", "-wal", "-shm"):
-        with suppress(FileNotFoundError):
-            Path(str(live) + suffix).unlink()
-    logger.warning("Restore: snapshot %s has no %s; moved the live one to %s so the restored "
-                   "jobs.json runtime fields apply", snapshot_id, _CRON_RUNTIME_REL, aside)
 
 
 def _count_cron_jobs(path: Path) -> Optional[int]:

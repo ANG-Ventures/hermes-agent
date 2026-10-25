@@ -1034,16 +1034,24 @@ def cron_notepad(args) -> int:
 
 
 def cron_runtime_export(args) -> int:
-    """``hermes cron runtime-export --to-json`` (t_94e91559): fold runtime_state.db back into
-    jobs.json and remove the database. Prints the job count; idempotent (no db = 0 jobs)."""
-    from cron.jobs import export_runtime_to_json
+    """``hermes cron runtime-export --to-json [--retire [--drop-orphans]]`` (t_94e91559): fold
+    runtime_state.db back into jobs.json; ``--retire`` also removes the database (kill switch) and
+    refuses while rows without a definition exist unless ``--drop-orphans``. Orphan row ids are
+    listed; without ``--retire`` they stay in the database. Idempotent (no db = 0 jobs)."""
+    from cron.jobs import RuntimeOrphansRefused, export_runtime_to_json
 
+    retire = bool(getattr(args, "retire", False))
     try:
-        count = export_runtime_to_json()
+        count = export_runtime_to_json(
+            retire=retire, drop_orphans=bool(getattr(args, "drop_orphans", False)))
+    except RuntimeOrphansRefused as exc:
+        print(color(f"runtime-export refused: {exc}", Colors.RED))
+        return 2
     except Exception as exc:
         print(color(f"runtime-export failed: {exc}", Colors.RED))
         return 1
-    print(f"runtime-export: wrote runtime fields of {count} job(s) back into jobs.json")
+    print(f"runtime-export: wrote runtime fields of {count} job(s) back into jobs.json"
+          + ("; removed runtime_state.db" if retire else ""))
     return 0
 
 

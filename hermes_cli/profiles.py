@@ -2172,6 +2172,25 @@ def _scrub_export_secrets(staged: Path) -> None:
         path.write_text(redacted, encoding="utf-8")
 
 
+def _staged_cron_dir(staged: Path) -> Path:
+    """``staged/cron``, refused (ValueError) when it or a file the fold rewrites/removes is a
+    symlink or resolves outside the staging root: copytree keeps symlinks, so a symlinked ``cron``
+    would point the fold and the db removals below at the LIVE store (Prism d8715e0ffdf8)."""
+    from cron.runtime_state import DB_NAME
+
+    staged_cron = staged / "cron"
+    root = os.path.realpath(staged)
+    for name in ("", "jobs.json", DB_NAME, DB_NAME + "-wal", DB_NAME + "-shm"):
+        path = staged_cron / name if name else staged_cron
+        if not (path.exists() or path.is_symlink()):
+            continue
+        real = os.path.realpath(path)
+        if path.is_symlink() or os.path.commonpath([root, real]) != root:
+            raise ValueError(f"refusing export: staged cron path {path.name} is a symlink or "
+                             f"resolves outside the staging dir ({real})")
+    return staged_cron
+
+
 def _capture_cron_pair(profile_dir: Path, staged_cron: Path) -> None:
     """Re-copy the staged ``cron/jobs.json`` + ``cron/runtime_state.db`` as ONE consistent unit:
     under the profile's cron store lock, the db through the SQLite backup API (a raw copytree of a
@@ -2227,13 +2246,14 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
         # binary db + sidecars from the archive (the scrubber skips binaries). A db the fold
         # refused (no definitions to fold into) would ship unscrubbed: refuse the export instead.
         from cron.runtime_state import db_path, fold_staged_copy
-        staged_cron = staged / "cron"
+        staged_cron = _staged_cron_dir(staged)
         _capture_cron_pair(profile_dir, staged_cron)
         if db_path(staged_cron).exists() and not fold_staged_copy(staged_cron):
             raise ValueError(
-                f"refusing export: {profile_dir / 'cron'} has a runtime_state.db but no readable "
-                "jobs.json definitions to fold it into (the database would ship unscrubbed); "
-                "repair cron/jobs.json or run `hermes cron runtime-export --to-json` first")
+                f"refusing export: {profile_dir / 'cron'} has a runtime_state.db that cannot be "
+                "folded in full into readable jobs.json definitions (the database would ship "
+                "unscrubbed); "
+                "repair cron/jobs.json or run `hermes cron runtime-export --to-json --retire` first")
         _scrub_export_secrets(staged)
         return Path(make_targz(base, tmpdir, canon))
 
