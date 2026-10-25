@@ -527,6 +527,15 @@ def register_reader(db_path) -> List[object]:
         path = _canonical(db_path)
         ident = _identity(path)
         idents: List[object] = [("path", path)] + ([] if ident is None else [ident])
+        # A symlink in the FILENAME (dangling until the writer creates the target): _canonical() resolves
+        # only the parent, the reader's connect follows the link. Claim the fully resolved path too, so a
+        # writer opening the target is matched (Prism 812b7fe76389).
+        try:
+            real = _canonical(os.path.realpath(path))
+        except (OSError, ValueError):
+            real = path
+        if real != path:
+            idents.append(("path", real))
         with _LOCK:
             for ident in idents:
                 _READERS[ident] = _READERS.get(ident, 0) + 1

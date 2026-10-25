@@ -57,11 +57,23 @@ def _epoch(line: str):
     return dt.timestamp() + (float("0." + frac) if frac else 0.0)  # naive = host local time
 
 
+def _ambiguous(line: str) -> bool:
+    """True for an offset-free timestamp that names two instants in the host zone (the repeated hour
+    of a DST fall-back): ``_epoch`` would have to guess the fold, and a guessed fold can understate a
+    lag by an hour (Prism 129fd71e629f). A timestamp-difference pair touching one is not measured."""
+    m = _TS.match(line)
+    if not m or m.group(3):
+        return False
+    dt = datetime.strptime(m.group(1).replace("T", " "), "%Y-%m-%d %H:%M:%S")
+    return dt.replace(fold=0).timestamp() != dt.replace(fold=1).timestamp()
+
+
 def samples(lines, platform: str, unpaired=None):
     """Yield ``(send_epoch, lag_s)`` for *platform* (``all`` = every platform). Epochs of readies and
     sends that could not be paired are appended to *unpaired* when given."""
     unpaired = [] if unpaired is None else unpaired
     pending = {}  # (platform, chat) -> (ready epoch, turn id or None): the LAST ready only
+    ambiguous_readies = set()  # epochs of readies whose local timestamp is fold-ambiguous
     by_turn = {}  # (platform, chat, turn id) -> ready epoch: two chats may reuse one turn id (Prism dceb77e823cc)
 
     def wanted(key):
@@ -76,6 +88,8 @@ def samples(lines, platform: str, unpaired=None):
         m = _READY.search(line)
         if m:
             key = (m.group(1).lower(), m.group(2))
+            if _ambiguous(line):
+                ambiguous_readies.add(ts)
             if turn is not None:
                 by_turn[key + (turn,)] = ts
             prev = pending.get(key)
@@ -108,11 +122,12 @@ def samples(lines, platform: str, unpaired=None):
         lag = _LAG.search(line)
         if lag is not None:
             yield ts, float(lag.group(1))
-        elif ready is not None and ts >= ready:
+        elif ready is not None and ts >= ready and ready not in ambiguous_readies and not _ambiguous(line):
             yield ts, ts - ready
         else:
-            # No pair, or a pair that runs BACKWARDS (a naive-local log across a DST fall-back): never a
-            # fabricated 0 s sample that passes the gate (Prism a6da10393688); counted unpaired.
+            # No pair, a pair that runs BACKWARDS (a naive-local log across a DST fall-back: never a
+            # fabricated 0 s sample, Prism a6da10393688), or one whose naive local time is ambiguous
+            # (fall-back repeated hour: the fold is a guess, Prism 129fd71e629f): counted unpaired.
             unpaired.append(ts)
     unpaired.extend(ts for key, (ts, t) in pending.items() if t is None and wanted(key))
     unpaired.extend(ts for tkey, ts in by_turn.items() if wanted(tkey[:2]))

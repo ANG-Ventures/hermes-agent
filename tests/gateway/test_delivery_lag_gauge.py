@@ -318,3 +318,27 @@ def test_dst_fall_back_hours_stay_separate(tmp_path, monkeypatch, capsys):
         monkeypatch.delenv("TZ")
         if hasattr(time, "tzset"):
             time.tzset()
+
+
+
+def test_ambiguous_fall_back_hour_pair_is_not_measured(tmp_path, monkeypatch, capsys):
+    """Prism 129fd71e629f: offset-free 01:10 EDT (ready) and 01:11 EST (send) on the New York fall-back
+    both read as the FIRST 01:xx, so the 3660 s lag read as 60 s and PASSed a 120 s gate. Either side
+    fold-ambiguous: unpaired, BLIND."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("no time.tzset")
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    _LAST[:] = [capsys]
+    mod = _script()
+    rc, out = _run(mod, tmp_path,
+        "2026-11-01 01:10:00 INFO x: response ready: platform=discord chat=c session=a\n"
+        "2026-11-01 01:11:00 INFO x: [discord] Sending response (1 chars) to c\n",
+        "--max-p99-s", "120")
+    assert rc == 2 and out["n"] == 0 and out["unpaired"] == 1, out
+    # an unambiguous pair the same night is still measured
+    rc, out = _run(mod, tmp_path,
+        "2026-11-01 02:10:00 INFO x: response ready: platform=discord chat=c session=a\n"
+        "2026-11-01 02:11:00 INFO x: [discord] Sending response (1 chars) to c\n",
+        "--max-p99-s", "120")
+    assert rc == 0 and (out["n"], out["max_s"]) == (1, 60.0), out

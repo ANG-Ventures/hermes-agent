@@ -1573,3 +1573,27 @@ def test_private_descriptor_carries_the_guard_mark(tmp_path):
         assert flags & os.O_ACCMODE == os.O_RDONLY and flags & lg.GUARD_FD_MARK
     finally:
         lg.release(held)
+
+
+
+def test_reader_through_a_dangling_filename_symlink_pins_the_target(tmp_path):
+    """Prism 812b7fe76389: a reader registered through alias/state.db -> real/state.db (dangling at
+    registration) claimed neither the target's inode nor its path, so the writer's retire() closed the
+    target's private -shm fd under the reader. The resolved filename is claimed too."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    real, alias = tmp_path / "real", tmp_path / "alias"
+    real.mkdir()
+    alias.mkdir()
+    (alias / "state.db").symlink_to(real / "state.db")
+    token = lg.register_reader(alias / "state.db")
+    try:
+        db = real / "state.db"
+        db.write_bytes(b"\0" * 4096)
+        Path(f"{db}-shm").write_bytes(b"\0" * 32768)
+        shm_ident = (os.stat(f"{db}-shm").st_dev, os.stat(f"{db}-shm").st_ino)
+        lg.retire(lg.release(lg.hold(db)))
+        assert shm_ident in lg._FDS, "the reader's target -shm fd was retired under it"
+    finally:
+        lg.unregister_reader(token)
+    assert shm_ident not in lg._FDS
