@@ -10385,7 +10385,7 @@ def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
         except Exception:  # noqa: BLE001 -- fail-open
             return []
         try:
-            with open(root / "config" / "landing-policy.json", encoding="utf-8") as fh:
+            with open(root / "config" / "landing-policy.json", encoding="utf-8-sig") as fh:
                 cfg = json.load(fh)
         except (OSError, ValueError):
             return []
