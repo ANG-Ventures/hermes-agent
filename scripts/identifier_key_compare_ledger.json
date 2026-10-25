@@ -586,6 +586,16 @@
    "verdict": "kept",
    "why": "git blob ids are hex and case-insensitive; lowercasing canonicalizes the GitHub files-API blob sha before _SHA_RE and equality, so byte-exact would split one blob in two.",
    "where": "hermes_cli/kanban_handback_new_head.py:88 content (no-op handback, t_f716021d)"
+  },
+  "hermes_cli/kanban_handback_new_head.py::_resolve::fold::sha::full = str((commit or {}).get(\"sha\") or \"\").lower() if isinstance(commit, dict) else \"\"": {
+   "verdict": "kept",
+   "why": "git object ids are hex and case-insensitive; lowercasing canonicalizes GitHub's resolved commit sha before the full-40-hex check and the exact == compare against the PR head, so byte-exact would split one commit in two.",
+   "where": "hermes_cli/kanban_handback_new_head.py:185 _resolve (no-op handback, Prism c804beeb6820, t_f716021d)"
+  },
+  "hermes_cli/kanban_handback_new_head.py::read_view::fold::sha::head = str((pr.get(\"head\") or {}).get(\"sha\") or \"\").lower()": {
+   "verdict": "kept",
+   "why": "git object ids are hex and case-insensitive; lowercasing canonicalizes the PR head sha before the exact == compare against the resolved seen sha, so byte-exact would split one commit in two.",
+   "where": "hermes_cli/kanban_handback_new_head.py:195 read_view (no-op handback, t_f716021d)"
   }
  }
 }

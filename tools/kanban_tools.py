@@ -1040,19 +1040,19 @@ def _handle_complete(args: dict, **kw) -> str:
             _check(False, (task.last_failure_error if task else None) or
                    f"could not complete {tid}: "
                    f"{kb.explain_complete_refusal(conn, tid, expected_run_id=_worker_run_id(tid))}")
+        from hermes_cli import kanban_handback_new_head as _nh
+        # From THIS run's ended row, before the card's status: a successor can be claimed or reach
+        # review right after a bounce (Prism bec5d5358114, 35bc66834b1d). t_f716021d: NOT a handback.
+        bounced_run = _worker_run_id(tid)
+        bounced = _nh.bounced_note(conn, tid, bounced_run)
+        if bounced is not None:
+            return _ok(task_id=tid, run_id=bounced_run, status="ready", note=bounced)
         run = kb.latest_run(conn, tid)
         if getattr(task, "status", None) == "review":
             return _ok(
                 task_id=tid, run_id=run.id if run else None, status="review",
                 note=("auto-routed to review: the handoff names a PR that is still OPEN; "
                       "the card is NOT done and dependants stay gated"))
-        from hermes_cli import kanban_handback_new_head as _nh
-        # By THIS run's id: a successor can be claimed right after a bounce (Prism bec5d5358114).
-        bounced_run = _worker_run_id(tid)
-        bounced = _nh.bounced_note(conn, tid, bounced_run)
-        if bounced is not None:
-            # t_f716021d: nothing on the PR the reviewer has not seen; NOT a handback.
-            return _ok(task_id=tid, run_id=bounced_run, status=getattr(task, "status", None), note=bounced)
         # Artifact staging is atomic with the completion write, so a worker that
         # read `kanban_attachments` before completing saw an empty list and has
         # no way to observe what its completion just registered (#117360).

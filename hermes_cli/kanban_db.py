@@ -10977,6 +10977,10 @@ def complete_task(
                 still_open = [
                     r for r in still_open if f"{r.repo}#{r.number}" not in overridden
                 ]
+        if no_new is not None:
+            # The freshness gate can update-branch after the verdict; a moved head is
+            # content the verdict never judged, so it routes (Prism 4f5d7679ba58).
+            no_new = _nh.still_holds(no_new, freshness)
         if still_open and no_new is not None:
             # No-op handback (t_f716021d): nothing on the PR the reviewer has not
             # seen, so the send-back stands and the card goes back to its worker.
@@ -13111,6 +13115,12 @@ def redact_review_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact_review_value(item) for item in value)
     return redact_sensitive_json(value, force=True)
+
+
+def redact_review_handoff(summary: Any, metadata: Any) -> tuple:
+    """The ONE redaction of a review-lane handoff (summary, metadata), shared by :func:`request_review` and the
+    no-op handback bounce so the two durable paths cannot drift (Prism cde5d0610ef1, t_f716021d)."""
+    return redact_review_value(summary), redact_review_value(metadata)
 HUMAN_REVIEWER_SENTINEL = "human"
 
 
@@ -13603,8 +13613,7 @@ def request_review(
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
-    summary = redact_review_value(summary)
-    metadata = redact_review_value(metadata)
+    summary, metadata = redact_review_handoff(summary, metadata)
 
     # ── Review-round cap (kanban.max_review_rounds) ────────────────────────
     # Evaluated BEFORE the transaction because block_task opens its own.
@@ -13673,15 +13682,17 @@ def request_review(
                 conn, task_id, summary=summary, metadata=skip_meta,
                 expected_run_id=expected_run_id,
             )
-            if done and _task_status(conn, task_id) == "review":
-                return _ret(True, "open PR named in the handoff — auto-routed to review instead of done")
             if done:
                 # A no-op handback bounce (t_f716021d) left the card with its worker:
-                # neither completed nor reviewed, so no review_skipped event.
+                # neither completed nor reviewed, so no review_skipped event. Read from
+                # THIS run's ended row BEFORE the card's status, which a successor may
+                # already have moved to review (Prism 35bc66834b1d).
                 from hermes_cli import kanban_handback_new_head as _nh
                 _bounced = _nh.bounced_note(conn, task_id, expected_run_id)
                 if _bounced is not None:
                     return _ret(True, _bounced)
+            if done and _task_status(conn, task_id) == "review":
+                return _ret(True, "open PR named in the handoff — auto-routed to review instead of done")
             if not done:
                 return _ret(
                     False,

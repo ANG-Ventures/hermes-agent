@@ -205,3 +205,113 @@ def test_a_bounce_never_arms_the_sent_back_head(sent_back, monkeypatch):
     assert seen_allow == [False]
     assert _complete_as_worker(sent_back, monkeypatch, "new_commit")[0] == "review"
     assert seen_allow == [False, True]
+
+
+def test_a_freshness_update_voids_the_no_op_verdict(sent_back, monkeypatch):
+    """Prism 4f5d7679ba58 / 6dc02dcaa12e: the PR is at the sent-back head but behind main; the freshness gate
+    update-branches it (merging a main change to a PR path). The verdict judged the old head, so it routes."""
+    from hermes_cli import kanban_pr_freshness as fresh
+    key = "ANG-Ventures/example-home#670"
+    monkeypatch.setattr(fresh, "check", lambda refs, **kw: {
+        "prs": {key: {"head": A, "behind_by": 21, "update_branch": "requested"}}})
+    status, kinds, _ = _complete_as_worker(sent_back, monkeypatch, "unchanged")
+    assert status == "review" and "review_requested" in kinds and nh.EVENT not in kinds
+
+
+def test_a_head_the_gate_saw_differently_voids_the_verdict(sent_back, monkeypatch):
+    from hermes_cli import kanban_pr_freshness as fresh
+    monkeypatch.setattr(fresh, "check", lambda refs, **kw: {
+        "prs": {"ANG-Ventures/example-home#670": {"head": C}}})
+    assert _complete_as_worker(sent_back, monkeypatch, "unchanged")[0] == "review"
+
+
+def test_a_verdict_names_the_heads_it_judged():
+    no_new = {"seen": A, "reason": "unchanged", "prs": {}, "heads": {"ANG-Ventures/example-home#670": A}}
+    assert nh.still_holds(no_new, {"prs": {"ANG-Ventures/example-home#670": {"head": A, "behind_by": 0}}})
+    assert nh.still_holds(no_new, {}) is no_new
+
+
+def test_a_shared_7_char_prefix_is_not_the_reviewed_head(sent_back, monkeypatch):
+    """Prism c804beeb6820: the coverage names an abbreviated head; a new commit sharing it routes."""
+    short = A[:7]
+    collide = short + "f" * 33
+    with kb.connect() as conn:
+        kb.add_comment(conn, sent_back, "argus", _coverage(short))
+    VIEWS["collide"] = {"head": collide}
+    VIEWS["resolved_same"] = {"head": A, "seen": A}
+    try:
+        assert nh.classify({"head": collide}, short) is None
+        assert nh.classify({"head": collide, "seen": A}, short) is None
+        assert nh.classify({"head": A, "seen": A}, short) == "unchanged"
+        assert nh.classify({"head": A}, short) is None   # unresolved abbreviation: fail open
+        assert _complete_as_worker(sent_back, monkeypatch, "collide")[0] == "review"
+    finally:
+        VIEWS.pop("collide")
+        VIEWS.pop("resolved_same")
+
+
+def test_a_runless_completion_never_reads_a_historical_bounce(sent_back, monkeypatch):
+    """Prism a8fea1c5db96: an operator completing a card whose newest run is an old bounce gets no bounce note."""
+    monkeypatch.setattr(nh, "_default_reader", lambda: lambda repo, n, seen: VIEWS["unchanged"])
+    with kb.connect() as conn:
+        run = kb.claim_task(conn, sent_back).current_run_id
+        assert kb.complete_task(conn, sent_back, summary=f"r2 {PR}", expected_run_id=run)
+        assert kb.latest_run(conn, sent_back).outcome == nh.OUTCOME
+        assert nh.bounced_note(conn, sent_back, None) is None
+        assert nh.bounce(conn, sent_back, {"seen": A}, expected_run_id=None) is False
+
+
+def test_request_review_reports_its_own_bounce_when_a_successor_reached_review(sent_back, monkeypatch):
+    """Prism 35bc66834b1d: the card's status after the call is not this invocation's outcome."""
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "none")
+    monkeypatch.setattr(kb, "configured_max_review_rounds", lambda: 0)
+    monkeypatch.setattr(nh, "_default_reader", lambda: lambda repo, n, seen: VIEWS["unchanged"])
+    monkeypatch.setattr(kb, "_task_status", lambda conn, tid: "review")  # a successor got there first
+    with kb.connect() as conn:
+        run = kb.claim_task(conn, sent_back)
+        ok, note = kb.request_review(conn, sent_back, summary=f"r2 {PR}",
+                                     expected_run_id=run.current_run_id, with_reason=True)
+    assert ok and note.startswith("NOT handed back")
+
+
+def test_cli_reports_its_own_bounce_when_a_successor_claimed_the_card(sent_back, monkeypatch, capsys):
+    """Prism a0341975cd2e: a successor claimed between the bounce and the print must not read as Completed."""
+    import argparse
+    from hermes_cli import kanban as kcli
+
+    monkeypatch.setattr(nh, "_default_reader", lambda: lambda repo, n, seen: VIEWS["unchanged"])
+    real_bounce = nh.bounce
+
+    def bounce_then_successor(conn, tid, *a, **kw):
+        ok = real_bounce(conn, tid, *a, **kw)
+        kb.claim_task(conn, tid)
+        return ok
+
+    monkeypatch.setattr(nh, "bounce", bounce_then_successor)
+    with kb.connect() as conn:
+        run = kb.claim_task(conn, sent_back).current_run_id
+    monkeypatch.setattr(kcli, "_worker_run_id_for", lambda tid: run)
+    ns = argparse.Namespace(task_ids=[sent_back], result=None, summary=f"r2 {PR}", metadata=None,
+                            force=False, superseded_by=None, draft_ok=None, external=None, watcher=None,
+                            survivor_ref=None, survivor_pr=None, survivor_unbound=None,
+                            survivor_none=False, reason=None)
+    assert kcli._cmd_complete(ns) == 0
+    out = capsys.readouterr().out
+    assert "NOT handed back" in out and f"Completed {sent_back}" not in out
+
+
+def test_the_bounce_redacts_the_handoff_like_request_review(sent_back, monkeypatch):
+    """Prism cde5d0610ef1: a bounced run row feeds successor prompts; credentials must not survive into it."""
+    token = "ghp_" + "Z" * 36
+    monkeypatch.setattr(nh, "_default_reader", lambda: lambda repo, n, seen: VIEWS["unchanged"])
+    with kb.connect() as conn:
+        run = kb.claim_task(conn, sent_back).current_run_id
+        assert kb.complete_task(conn, sent_back, summary=f"used {token}; {PR}",
+                                metadata={"password": "hunter2", "note": f"tok {token}"},
+                                expected_run_id=run)
+        ended = kb.get_run(conn, run)
+        context = kb.build_worker_context(conn, sent_back)
+    assert ended.outcome == nh.OUTCOME
+    assert token not in ended.summary and token not in json.dumps(ended.metadata)
+    assert "hunter2" not in json.dumps(ended.metadata)
+    assert token not in context and "hunter2" not in context

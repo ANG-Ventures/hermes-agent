@@ -24,7 +24,9 @@ t_c9887522 fold-2): a merge commit can carry a hand conflict resolution, so comm
 
 :func:`verdict` answers ``"unchanged"`` (head == seen), ``"merge_only"`` (content unchanged) or None (route as
 today). None is also the answer for every case it cannot prove: no seen head, a ``n/a`` head, an unreadable PR, a
-file list at the REST cap, a file with no blob sha, an unreadable mode or main compare. Inside pytest there is no default reader; tests pass a stub.
+file list at the REST cap, a file with no blob sha, an unreadable mode or main compare, and a seen head that is an
+abbreviation the reader could not resolve to a full sha (Prism c804beeb6820: a new commit sharing the reviewed
+commit's 7-char prefix is not the reviewed commit). Inside pytest there is no default reader; tests pass a stub.
 """
 from __future__ import annotations
 
@@ -41,6 +43,7 @@ OUTCOME = "no_new_head"
 MAX_BOUNCES = 2
 _TIMEOUT_S = 10
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # GitHub returns at most 300 files for a compare and for pulls/N/files (3 pages of 100 here).
 _FILES_CAP = 300
 _DESCENDS = frozenset({"ahead", "identical"})
@@ -110,13 +113,17 @@ def main_touched(view: dict, paths: set) -> bool:
 
 
 def classify(view: Optional[dict], seen: str) -> Optional[str]:
-    """``"unchanged"`` / ``"merge_only"`` / None (route) for one PR."""
+    """``"unchanged"`` / ``"merge_only"`` / None (route) for one PR.
+
+    Shas are compared whole: an abbreviated ``seen`` counts only once the reader resolved it (``view["seen"]``).
+    """
     if not isinstance(view, dict):
         return None
     head = str(view.get("head") or "").lower()
-    if not head:
+    full_seen = str(view.get("seen") or seen).lower()
+    if not _FULL_SHA_RE.match(head) or not _FULL_SHA_RE.match(full_seen):
         return None
-    if head.startswith(seen) or seen.startswith(head):
+    if head == full_seen:
         return "unchanged"
     if view.get("status") not in _DESCENDS:
         return None
@@ -170,24 +177,36 @@ def _modes(repo: str, files, merge_base: str, tip: str) -> Optional[dict]:
     return out
 
 
+def _resolve(repo: str, sha: str) -> Optional[str]:
+    """The full lowercase sha ``sha`` names in ``repo`` (one REST read for an abbreviation), or None."""
+    if _FULL_SHA_RE.match(sha):
+        return sha
+    commit = _gh_json([f"repos/{repo}/commits/{sha}"])
+    full = str((commit or {}).get("sha") or "").lower() if isinstance(commit, dict) else ""
+    return full if _FULL_SHA_RE.match(full) and full.startswith(sha) else None
+
+
 def read_view(repo: str, number: int, seen: str) -> Optional[dict]:
     """REST: PR head, whether it descends from ``seen``, the PR's files and modes at ``seen`` and at the head, and
-    the files main changed between the two merge bases."""
+    the files main changed between the two merge bases. ``view["seen"]`` is ``seen`` resolved to a full sha."""
     pr = _gh_json([f"repos/{repo}/pulls/{number}"])
     if not isinstance(pr, dict):
         return None
-    head = str((pr.get("head") or {}).get("sha") or "")
+    head = str((pr.get("head") or {}).get("sha") or "").lower()
     base = str((pr.get("base") or {}).get("ref") or "")
     if not head or not base:
         return None
-    if head.lower().startswith(seen):
-        return {"head": head}
+    seen = _resolve(repo, seen)
+    if seen is None:
+        return None
+    if head == seen:
+        return {"head": head, "seen": seen}
     ahead = _gh_json([f"repos/{repo}/compare/{seen}...{head}"])
     at_seen = _gh_json([f"repos/{repo}/compare/{base}...{seen}"])
     at_head = _gh_json([f"repos/{repo}/compare/{base}...{head}"])
     if not all(isinstance(x, dict) for x in (ahead, at_seen, at_head)):
         return None
-    view = {"head": head, "status": ahead.get("status"),
+    view = {"head": head, "seen": seen, "status": ahead.get("status"),
             "seen_files": at_seen.get("files"), "head_files": at_head.get("files")}
     if ahead.get("status") not in _DESCENDS:
         return view
@@ -229,7 +248,10 @@ def bounces_since(conn: sqlite3.Connection, task_id: str, event_id: int) -> int:
 
 def verdict(conn: sqlite3.Connection, task_id: str, refs: Iterable, *,
             reader: Optional[Reader] = None) -> Optional[dict]:
-    """``{"seen", "reason", "prs"}`` when NO ref has a commit the reviewer has not seen, else None (route).
+    """``{"seen", "reason", "prs", "heads"}`` when NO ref has a commit the reviewer has not seen, else None (route).
+
+    ``heads`` maps each PR to the head this verdict judged, so a caller whose later step can move a head (the
+    freshness gate's update-branch) can tell the verdict no longer describes it (Prism 4f5d7679ba58).
 
     Applies only to a card under a pending send-back (its newest review transition is
     ``changes_requested``), and at most :data:`MAX_BOUNCES` times per send-back: past that the
@@ -250,7 +272,7 @@ def verdict(conn: sqlite3.Connection, task_id: str, refs: Iterable, *,
         reader = _default_reader()
         if reader is None:
             return None
-    reasons = {}
+    reasons, heads = {}, {}
     for ref in refs:
         try:
             view = reader(ref.repo, ref.number, seen)
@@ -260,8 +282,31 @@ def verdict(conn: sqlite3.Connection, task_id: str, refs: Iterable, *,
         if reason is None:
             return None
         reasons[f"{ref.repo}#{ref.number}"] = reason
+        heads[f"{ref.repo}#{ref.number}"] = str(view["head"]).lower()
     overall = "unchanged" if all(r == "unchanged" for r in reasons.values()) else "merge_only"
-    return {"seen": seen, "reason": overall, "prs": reasons}
+    return {"seen": seen, "reason": overall, "prs": reasons, "heads": heads}
+
+
+def still_holds(no_new: Optional[dict], freshness: Optional[dict]) -> Optional[dict]:
+    """``no_new`` if the freshness gate left every judged head as judged, else None (route).
+
+    The gate may ``PUT .../update-branch`` (merging main into the PR) after the verdict; that merge can carry a
+    main change to a PR path, the exact case :func:`main_touched` routes. A requested update, or a head the gate
+    saw that is not the judged head, voids the verdict (Prism 4f5d7679ba58, 6dc02dcaa12e).
+    """
+    if not no_new:
+        return None
+    seen_by_gate = {str(k).lower(): v for k, v in ((freshness or {}).get("prs") or {}).items()}
+    for key, judged in (no_new.get("heads") or {}).items():
+        entry = seen_by_gate.get(key.lower())
+        if not isinstance(entry, dict):
+            continue
+        if "update_branch" in entry:
+            return None
+        gate_head = str(entry.get("head") or "").lower()
+        if gate_head and gate_head != judged:
+            return None
+    return no_new
 
 
 def bounce(conn: sqlite3.Connection, task_id: str, no_new: dict, *,
@@ -271,10 +316,15 @@ def bounce(conn: sqlite3.Connection, task_id: str, no_new: dict, *,
 
     The run ends ``no_new_head`` carrying the worker's ``summary``/``metadata`` (the caller prefixes the
     bounce line and stages artifacts); :data:`EVENT` (a respawn-guard continuation kind) lets the next
-    spawn through ``active_pr``. False when the run no longer owns the card.
+    spawn through ``active_pr``. False when the run no longer owns the card, or with no ``expected_run_id``.
+    The handoff is redacted exactly as :func:`kanban_db.request_review` redacts it: the run row feeds successor
+    workers' prompts through ``build_worker_context`` (Prism cde5d0610ef1).
     """
     from hermes_cli import kanban_db as kb
 
+    if expected_run_id is None:
+        return False
+    summary, metadata = kb.redact_review_handoff(summary, metadata)
     with kb.write_txn(conn):
         row = conn.execute(
             "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
@@ -282,7 +332,7 @@ def bounce(conn: sqlite3.Connection, task_id: str, no_new: dict, *,
         if row is None or row["status"] != "running" or row["current_run_id"] is None:
             return False
         run_id = int(row["current_run_id"])
-        if expected_run_id is not None and run_id != int(expected_run_id):
+        if run_id != int(expected_run_id):
             return False
         new_status = kb._landing_status_after_parents(conn, task_id)  # noqa: SLF001
         conn.execute(
@@ -300,20 +350,20 @@ def bounce(conn: sqlite3.Connection, task_id: str, no_new: dict, *,
 
 
 def bounced_note(conn: sqlite3.Connection, task_id: str, expected_run_id: Optional[int]) -> Optional[str]:
-    """The NOT-handed-back note when ``expected_run_id`` (or, with none, the newest run) ended in a bounce, else None.
+    """The NOT-handed-back note when THIS invocation's run (``expected_run_id``) ended in a bounce, else None.
 
-    Read by the supplied run id: a bounce returns the card to ready, so a successor run can be claimed before the
-    caller gets here, and the newest run would hide the bounce (Prism bec5d5358114).
+    Only a run-owned completion can bounce (:func:`bounce` needs ``expected_run_id``) and a run ends once, so the
+    ended row for ``expected_run_id`` IS this invocation's outcome. Callers read it BEFORE the card's status: a
+    successor can be claimed, or reach review, before they get here (Prism bec5d5358114, 35bc66834b1d,
+    a0341975cd2e). A runless completion never consults a bounce: the newest run may be a historical one
+    (Prism a8fea1c5db96).
     """
     from hermes_cli import kanban_db as kb
 
-    if expected_run_id is not None:
-        run = kb.get_run(conn, int(expected_run_id))
-        if run is not None and run.task_id != task_id:
-            return None
-    else:
-        run = kb.latest_run(conn, task_id)
-    if run is None or run.outcome != OUTCOME:
+    if expected_run_id is None:
+        return None
+    run = kb.get_run(conn, int(expected_run_id))
+    if run is None or run.task_id != task_id or run.outcome != OUTCOME:
         return None
     first = (run.summary or "").splitlines()[0] if run.summary else "no new head"
     return f"NOT handed back: {first}. Push the requested changes, then complete again."
