@@ -26,6 +26,18 @@ def test_excludes_regenerable_bulk():
         assert _matches_path_glob((*Path(d).parts, "_")), d
 
 
+def test_excludes_operator_worktrees_at_root_only():
+    """Ace 2026-10-25 (t_c10109a6): root wt/ and worktrees/ are out of the full tier (548,785 of the 1,432,791
+    files that broke the 3600 s ceiling). Same-named dirs deeper in the tree are still carried."""
+    for p in ("wt/t_b2fe497d/scripts/x.py", "worktrees/lq-stopped-retire/.git/HEAD", "worktrees/a/b/c"):
+        assert _should_exclude(Path(p)), p
+    for d in ("wt", "worktrees"):
+        assert _matches_path_glob((d, "_")), d
+    for p in ("skills/foo/worktrees/README.md", "profiles/aegis/worktrees/x/y.py", "projects/wt/notes.md",
+              "wt.md", "worktrees.json"):
+        assert not _should_exclude(Path(p)), p
+
+
 def test_keeps_siblings_and_deeper_same_names():
     for p in ("var/gh-app/ang-fleet-ci-actuators.164943290.json", "var/lines-portal/generate.py",
               "runtime/active_sessions.json", "state/test-gate/remote-000b.lock", "var/scratch-notes.md",

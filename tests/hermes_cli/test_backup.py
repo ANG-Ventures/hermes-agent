@@ -221,12 +221,12 @@ class TestShouldExclude:
         assert not _should_exclude(Path("profiles/p/var/subvps-stage/a.txt"))
         assert not _should_exclude(Path("skills/git/worktrees/SKILL.md"))
         assert not _should_exclude(Path("plans/wt/notes.md"))
-        # root wt/ + worktrees/ are operator worktrees holding unique uncommitted work
-        # (t_e95deca8) — backed up, and never pruned from the walk
-        assert not _should_exclude(Path("wt/alerts-day-media-20260911/run_agent.py"))
-        assert not _should_exclude(Path("worktrees/compression-refusal/.local-evidence/HANDOFF.md"))
-        assert not _matches_path_glob(("wt", "_"))
-        assert not _matches_path_glob(("worktrees", "_"))
+        # root wt/ + worktrees/: re-ruled 2026-10-25 (t_c10109a6) — pruned from the walk; their
+        # unpushed commits still ride along as bundles (TestWorktreeUnpushedCommitBundles)
+        assert _should_exclude(Path("wt/alerts-day-media-20260911/run_agent.py"))
+        assert _should_exclude(Path("worktrees/compression-refusal/.local-evidence/HANDOFF.md"))
+        assert _matches_path_glob(("wt", "_"))
+        assert _matches_path_glob(("worktrees", "_"))
         # a FILE literally named like the dir is not an ancestor — keep it
         assert not _should_exclude(Path(".worktrees"))
         assert not _should_exclude(Path("kanban/workspaces"))
@@ -246,10 +246,10 @@ class TestShouldExclude:
         out = tmp_path / "out.zip"
         assert _write_full_zip_backup_locked(out, home) == out
         names = set(zipfile.ZipFile(out).namelist())
-        assert {"config.yaml", "var/keep.txt", "kanban/meta.json",
-                "wt/op-a/dirty.py", "worktrees/op-b/.local-evidence/HANDOFF.md"} <= names
+        assert {"config.yaml", "var/keep.txt", "kanban/meta.json"} <= names
+        # root wt/ + worktrees/ pruned too (re-ruled 2026-10-25, t_c10109a6)
         assert not any(n.startswith((".worktrees/", "kanban/workspaces/", "var/ramscratch-stage-",
-                                     "var/subvps-stage/")) for n in names), names
+                                     "var/subvps-stage/", "wt/", "worktrees/")) for n in names), names
 
     def test_root_forensics_archive_excluded(self):
         """Apollo 2026-10-18 (t_5bea54fb): root forensics-archive/ (420.6 GiB) rides the weekly forensics -> NAS
@@ -3269,7 +3269,9 @@ class TestWorktreeUnpushedCommitBundles:
 
         with zipfile.ZipFile(out_zip, "r") as zf:
             names = zf.namelist()
-            assert "wt/dirty/b.txt" in names
+            # the checkout files themselves are pruned (re-ruled 2026-10-25, t_c10109a6); only the
+            # bundle + sidecar of the unpushed commits ride along
+            assert "wt/dirty/b.txt" not in names
             # A credential in a remote URL must never reach the archive.
             assert not any(b"s3cret-tok" in zf.read(n) for n in names if n.startswith("wt/"))
             bundle = tmp_path / "restored.bundle"

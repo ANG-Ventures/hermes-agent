@@ -157,12 +157,17 @@ _EXCLUDED_PATH_GLOBS = (
 # created and reaped by the kanban/review runtimes, one-off staging copies, and the
 # sub-VPS rsync stage (its contents are backed up from the boxes by restic).
 #
-# Root ``wt/`` and ``worktrees/`` are deliberately NOT listed (~0.25M files each): they
-# are hand-made operator worktrees, not runtime-reaped. A 2026-09-27 census found 30 of
-# 77 entries holding work that exists nowhere else (dirty tracked edits, untracked
-# evidence/tests, commits on no remote), and Time Machine excludes both trees, so the
-# full tier is their only copy (t_e95deca8).
+# Root ``wt/`` and ``worktrees/`` were kept out of this list from 2026-09-27 (t_e95deca8: hand-made
+# operator worktrees; a census then found 30 of 77 holding work on no remote, and Time Machine
+# excludes both trees). Re-ruled by Ace 2026-10-25 05:19 PT (t_c10109a6): EXCLUDE them. The Sunday
+# full had failed three weeks running at the 3600 s ceiling (10-25: 1,432,791 files would-carry
+# vs 1,111,844 in the last good full); these two trees were 548,785 of those files (38 %) for
+# 8.0 GB (2 %). A 10-25 census of 71 worktrees found 70 with commits on no remote, so the loss
+# class is real but the fix is pushing branches (`git push -u origin <branch>`), not archiving
+# half a million checkout files every week.
 _EXCLUDED_ROOT_PATH_GLOBS = (
+    ("wt",),                        # operator worktrees (re-ruled 10-25; push branches instead)
+    ("worktrees",),                 # operator worktrees (same ruling)
     ("kanban", "workspaces"),       # default-board per-task scratch workspaces
     ("kanban", "worktrees"),        # default-board per-task git worktrees
     (".worktrees",),                # review/verifier worktrees (argus, per-task)
