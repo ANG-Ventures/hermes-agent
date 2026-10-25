@@ -13587,6 +13587,13 @@ def request_review(
             )
             if done and _task_status(conn, task_id) == "review":
                 return _ret(True, "open PR named in the handoff — auto-routed to review instead of done")
+            if done:
+                # A no-op handback bounce (t_f716021d) left the card with its worker:
+                # neither completed nor reviewed, so no review_skipped event.
+                from hermes_cli import kanban_handback_new_head as _nh
+                _bounced = _nh.bounced_note(conn, task_id, expected_run_id)
+                if _bounced is not None:
+                    return _ret(True, _bounced)
             if not done:
                 return _ret(
                     False,

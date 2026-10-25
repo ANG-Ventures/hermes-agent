@@ -8,13 +8,18 @@ t_f716021d (2026-10-24). A worker run that ended with nothing new on its open PR
 * t_fafca854 / hermes-home#5877: the only new commit (484605f6d5) was the fold bot merging origin/main.
 
 The reviewer's last-seen head is the ``head_sha`` of the card's newest ``review_coverage`` record (a send-back's
-coverage, or the APPROVE record). A commit is NEW when it is one of the PR's own commits (``pulls/N/commits``, so
-main's commits brought in by a merge are excluded), is not an ancestor of the seen head (``compare/<seen>...<head>``),
-and is not a merge commit. Author is not used: implementer and fold bot push under the same GitHub App identity.
+coverage, or the APPROVE record). The invariant is "the PR's own content is unchanged since ``seen``" (Apollo r1,
+t_c9887522 fold-2): a merge commit can carry a hand conflict resolution, so commit shape alone proves nothing.
 
-:func:`verdict` answers ``"unchanged"`` (head == seen), ``"merge_only"`` (only merge commits since seen) or None
-(route as today). None is also the answer for every case it cannot prove: no seen head, a ``n/a`` head, an
-unreadable PR, a compare that GitHub truncates. Inside pytest there is no default reader; tests pass a stub.
+* The head must DESCEND from ``seen`` (``compare/<seen>...<head>`` status ``ahead``/``identical``); a rewound or
+  rewritten head is a change the reviewer has not seen.
+* The PR's content at ``seen`` (``compare/<base>...<seen>`` files) and at the head (``pulls/N/files``) are compared
+  per path as the ordered patch lines with ``@@`` hunk headers dropped, because hunk offsets move when main moves.
+  Context lines are kept (see :func:`content`). Equal means a pure fold.
+
+:func:`verdict` answers ``"unchanged"`` (head == seen), ``"merge_only"`` (content unchanged) or None (route as
+today). None is also the answer for every case it cannot prove: no seen head, a ``n/a`` head, an unreadable PR, a
+file list at the REST cap, a file with no ``patch``. Inside pytest there is no default reader; tests pass a stub.
 """
 from __future__ import annotations
 
@@ -31,10 +36,12 @@ OUTCOME = "no_new_head"
 MAX_BOUNCES = 2
 _TIMEOUT_S = 10
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
-# GitHub caps both lists at 250 commits; a full page means the answer may be incomplete.
-_LIST_CAP = 250
+# GitHub returns at most 300 files for a compare and for pulls/N/files (3 pages of 100 here).
+_FILES_CAP = 300
+_DESCENDS = frozenset({"ahead", "identical"})
 
-# (repo, number, seen) -> {"head": sha, "pr_commits": [{"sha", "parents"}], "since_seen": [sha], "complete": bool}
+# (repo, number, seen) -> {"head": sha, "status": compare(seen...head).status,
+#                          "seen_files": [{"filename", "patch"}], "head_files": [...]}
 Reader = Callable[[str, int, str], Optional[dict]]
 
 
@@ -58,16 +65,21 @@ def seen_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     return head if _SHA_RE.match(head) else None
 
 
-def new_commits(view: dict, seen: str) -> Optional[list]:
-    """Non-merge PR commits not reachable from ``seen``; None when the view cannot prove the answer."""
-    if not isinstance(view, dict) or not view.get("complete"):
+def content(files) -> Optional[dict]:
+    """Per path, the ordered hunk lines (context, ``+`` and ``-``) with ``@@`` headers dropped; None when unprovable.
+
+    Context lines stay in: a conflict resolution that keeps main's adjacent insert beside the PR's own lines leaves
+    the ``+``/``-`` multiset equal and changes only the context (t_c9887522 fold-2, 44e346d675). A main change far
+    from the PR's hunks only moves the ``@@`` offsets, which are dropped.
+    """
+    if not isinstance(files, list) or len(files) >= _FILES_CAP:
         return None
-    since = {str(s).lower() for s in view.get("since_seen") or ()}
-    out = []
-    for c in view.get("pr_commits") or ():
-        sha = str(c.get("sha") or "").lower()
-        if sha in since and int(c.get("parents") or 0) < 2:
-            out.append(sha)
+    out: dict = {}
+    for f in files:
+        if not isinstance(f, dict) or not f.get("filename") or not isinstance(f.get("patch"), str):
+            return None
+        out.setdefault(str(f["filename"]), []).extend(
+            ln for ln in f["patch"].splitlines() if not ln.startswith("@@"))
     return out
 
 
@@ -80,8 +92,10 @@ def classify(view: Optional[dict], seen: str) -> Optional[str]:
         return None
     if head.startswith(seen) or seen.startswith(head):
         return "unchanged"
-    fresh = new_commits(view, seen)
-    if fresh is None or fresh:
+    if view.get("status") not in _DESCENDS:
+        return None
+    at_seen, at_head = content(view.get("seen_files")), content(view.get("head_files"))
+    if at_seen is None or at_head is None or at_seen != at_head:
         return None
     return "merge_only"
 
@@ -103,35 +117,31 @@ def _gh_json(args: list):
 
 
 def read_view(repo: str, number: int, seen: str) -> Optional[dict]:
-    """REST: PR head, the PR's own commits, and the commits reachable from head but not from ``seen``."""
+    """REST: PR head, whether it descends from ``seen``, and the PR's files at ``seen`` and at the head."""
     pr = _gh_json([f"repos/{repo}/pulls/{number}"])
-    head = str(((pr or {}).get("head") or {}).get("sha") or "") if isinstance(pr, dict) else ""
-    if not head:
+    if not isinstance(pr, dict):
         return None
-    view = {"head": head, "pr_commits": [], "since_seen": [], "complete": False}
+    head = str((pr.get("head") or {}).get("sha") or "")
+    base = str((pr.get("base") or {}).get("ref") or "")
+    if not head or not base:
+        return None
     if head.lower().startswith(seen):
-        view["complete"] = True
-        return view
-    commits = _gh_json([f"repos/{repo}/pulls/{number}/commits?per_page=100&page=1"])
-    pages = [commits] if isinstance(commits, list) else None
-    page = 2
-    while pages is not None and len(pages[-1]) == 100 and page <= 3:
-        nxt = _gh_json([f"repos/{repo}/pulls/{number}/commits?per_page=100&page={page}"])
-        if not isinstance(nxt, list):
-            pages = None
+        return {"head": head}
+    ahead = _gh_json([f"repos/{repo}/compare/{seen}...{head}"])
+    at_seen = _gh_json([f"repos/{repo}/compare/{base}...{seen}"])
+    head_files: Optional[list] = []
+    for page in range(1, _FILES_CAP // 100 + 1):
+        chunk = _gh_json([f"repos/{repo}/pulls/{number}/files?per_page=100&page={page}"])
+        if not isinstance(chunk, list):
+            head_files = None
             break
-        pages.append(nxt)
-        page += 1
-    cmp = _gh_json([f"repos/{repo}/compare/{seen}...{head}"])
-    if pages is None or not isinstance(cmp, dict) or not isinstance(cmp.get("commits"), list):
+        head_files.extend(chunk)
+        if len(chunk) < 100:
+            break
+    if not isinstance(ahead, dict) or not isinstance(at_seen, dict) or head_files is None:
         return None
-    flat = [c for p in pages for c in p if isinstance(c, dict)]
-    view["pr_commits"] = [{"sha": c.get("sha"), "parents": len(c.get("parents") or ())} for c in flat]
-    view["since_seen"] = [c.get("sha") for c in cmp["commits"] if isinstance(c, dict)]
-    total = cmp.get("total_commits")
-    view["complete"] = (len(flat) < _LIST_CAP and isinstance(total, int)
-                        and total == len(view["since_seen"]))
-    return view
+    return {"head": head, "status": ahead.get("status"),
+            "seen_files": at_seen.get("files"), "head_files": head_files}
 
 
 def _default_reader() -> Optional[Reader]:
@@ -226,3 +236,16 @@ def bounce(conn: sqlite3.Connection, task_id: str, no_new: dict, *,
         kb._append_event(conn, task_id, EVENT, dict(no_new, status=new_status),  # noqa: SLF001
                          run_id=run_id)
     return True
+
+
+def bounced_note(conn: sqlite3.Connection, task_id: str, expected_run_id: Optional[int]) -> Optional[str]:
+    """The NOT-handed-back note when ``expected_run_id`` (or the newest run) just ended in a bounce, else None."""
+    from hermes_cli import kanban_db as kb
+
+    run = kb.latest_run(conn, task_id)
+    if run is None or run.outcome != OUTCOME:
+        return None
+    if expected_run_id is not None and int(run.id) != int(expected_run_id):
+        return None
+    first = (run.summary or "").splitlines()[0] if run.summary else "no new head"
+    return f"NOT handed back: {first}. Push the requested changes, then complete again."

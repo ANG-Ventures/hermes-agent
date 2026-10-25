@@ -1046,11 +1046,11 @@ def _handle_complete(args: dict, **kw) -> str:
                 task_id=tid, run_id=run.id if run else None, status="review",
                 note=("auto-routed to review: the handoff names a PR that is still OPEN; "
                       "the card is NOT done and dependants stay gated"))
-        if run is not None and run.outcome == "no_new_head":
+        from hermes_cli import kanban_handback_new_head as _nh
+        bounced = _nh.bounced_note(conn, tid, run.id if run else None)
+        if bounced is not None:
             # t_f716021d: nothing on the PR the reviewer has not seen; NOT a handback.
-            return _ok(task_id=tid, run_id=run.id, status=getattr(task, "status", None),
-                       note=f"NOT handed back: {(run.summary or '').splitlines()[0] if run.summary else 'no new head'}. "
-                            f"Push the requested changes, then complete again.")
+            return _ok(task_id=tid, run_id=run.id, status=getattr(task, "status", None), note=bounced)
         # Artifact staging is atomic with the completion write, so a worker that
         # read `kanban_attachments` before completing saw an empty list and has
         # no way to observe what its completion just registered (#117360).
@@ -1151,6 +1151,8 @@ def _handle_request_review(args: dict, **kw) -> str:
                 f"kanban_request_review with the same handoff.")
         _check(ok, f"could not request review for {tid}: "
                    f"{fail_reason or 'unknown id or not in running/ready'}")
+        if fail_reason and fail_reason.startswith("NOT handed back"):
+            return _ok_landed(kb, conn, tid, "ready", note=fail_reason)
         return _ok_landed(kb, conn, tid, "review")
 
 
