@@ -9685,6 +9685,8 @@ _RUN_OUTCOME_TERMINAL_STATUS = {
     "external": "done",
     "review_requested": "review",
     "changes_requested": "changes_requested",
+    # A no-op handback bounce (t_f716021d): the send-back still stands.
+    "no_new_head": "changes_requested",
     "blocked": "blocked",
     "dependency_wait": "blocked",
 }
@@ -10884,6 +10886,14 @@ def complete_task(
                 still_open = [
                     r for r in still_open if f"{r.repo}#{r.number}" not in overridden
                 ]
+        if (still_open and expected_run_id is not None and candidate.status == 'running'
+                and not review_claimed and not negative_trigger):
+            # No-op handback (t_f716021d): nothing on the PR the reviewer has not
+            # seen, so the send-back stands and the card goes back to its worker.
+            from hermes_cli import kanban_handback_new_head as _nh
+            no_new = _nh.verdict(conn, task_id, still_open)
+            if no_new is not None:
+                return _nh.bounce(conn, task_id, no_new, expected_run_id=expected_run_id)
         if still_open:
             note = _open_pr.route_note(still_open)
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
@@ -16902,7 +16912,9 @@ _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
 # continuation, not a duplicate: one spawn after the newest PR comment
 # consumes it, like an operator requeue. Deliberately NOT in the operator
 # tuple above (overlap-hold release and failure staleness stay operator-only).
-_RESPAWN_GUARD_CONTINUATION_KINDS: tuple[str, ...] = ("placement_reroute",)
+# The no-op handback bounce (``kanban_handback_new_head.EVENT``, t_f716021d) is
+# one too: it returns the card to its worker with the send-back still standing.
+_RESPAWN_GUARD_CONTINUATION_KINDS: tuple[str, ...] = ("placement_reroute", "completion_no_new_head")
 
 # Event kinds that make a stamped failure STALE for the ``blocker_auth`` and
 # ``rate_limit_cooldown`` rules when they land at/after the failing run ended:

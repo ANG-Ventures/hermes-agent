@@ -1046,6 +1046,10 @@ def _handle_complete(args: dict, **kw) -> str:
                 task_id=tid, run_id=run.id if run else None, status="review",
                 note=("auto-routed to review: the handoff names a PR that is still OPEN; "
                       "the card is NOT done and dependants stay gated"))
+        if run is not None and run.outcome == "no_new_head":
+            # t_f716021d: nothing on the PR the reviewer has not seen; NOT a handback.
+            return _ok(task_id=tid, run_id=run.id, status=getattr(task, "status", None),
+                       note=f"NOT handed back: {run.summary}. Push the requested changes, then complete again.")
         # Artifact staging is atomic with the completion write, so a worker that
         # read `kanban_attachments` before completing saw an empty list and has
         # no way to observe what its completion just registered (#117360).

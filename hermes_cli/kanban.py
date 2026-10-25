@@ -3196,6 +3196,7 @@ def _last_event_id(conn, task_id: str) -> int:
 _COMPLETION_OUTCOME_EVENTS = {
     "completion_route_refused": "open-PR review route refused",
     "completion_routed_to_review": "handoff names still-OPEN PR(s)",
+    "completion_no_new_head": "no new PR head since the send-back; it stands",
     "workspace_held": "workspace held",
 }
 
@@ -3366,6 +3367,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 if getattr(after, "status", None) == "review":
                     print(f"Routed {tid} to review, NOT done: "
                           f"{outcome or 'handoff names a still-OPEN PR'}")
+                elif getattr(after, "status", None) in ("ready", "todo") and outcome:
+                    print(f"Returned {tid} to {getattr(after, 'status', None)}, NOT done: {outcome}")
                 elif external is not None:
                     print(f"Completed {tid} (external: {external.strip()}, watcher {watcher.strip()})")
                 else:
