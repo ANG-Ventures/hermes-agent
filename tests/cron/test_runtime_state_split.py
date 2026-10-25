@@ -1530,3 +1530,23 @@ def test_profile_export_refuses_symlinked_staged_cron_dir(tmp_path, monkeypatch)
     assert not out.exists()
     assert rs.db_path(outside).exists()
     assert (outside / "jobs.json").read_bytes() == jobs_before
+
+
+def test_first_opener_read_path_runs_the_secure_pass(temp_home, monkeypatch):
+    """Prism 2c3f3aae44ab: ``_read_one_row`` can be the FIRST creator of runtime_state.db (a read of a
+    runtime-free job, e.g. ``_locked_job_view`` as root). It must run the same permission/ownership
+    pass ``_runtime_txn`` runs, or a root-created 0600 db locks the profile owner out."""
+    from cron import jobs as cj
+
+    _write_store(temp_home, [_fixture_job(1, with_runtime=False)])
+    assert not _db(temp_home).exists()
+    calls = []
+    monkeypatch.setattr(cj, "_secure_runtime_db", lambda: calls.append(1))
+    with cj._jobs_lock():
+        cj._read_one_row("fixture-1")
+    assert _db(temp_home).exists(), "the read created the database"
+    assert calls == [1], "fresh db created by the read path must get the secure pass"
+    # Not fresh any more, not root: no second pass.
+    with cj._jobs_lock():
+        cj._read_one_row("fixture-1")
+    assert calls == [1]

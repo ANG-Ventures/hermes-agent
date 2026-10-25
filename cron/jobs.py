@@ -2237,9 +2237,20 @@ def _cached_definition(job_id: Any) -> Tuple[bool, Optional[Dict[str, Any]], boo
 
 
 def _read_one_row(job_id: Any) -> Optional[Dict[str, Any]]:
-    """The job's row, or ``None`` when it has none."""
-    with _rs.connect(_current_cron_store().cron_dir, create=_runtime_write_allowed()) as conn:
-        return _rs.read_row(conn, str(job_id)) if conn is not None else None
+    """The job's row, or ``None`` when it has none.
+
+    A ``create=True`` read can be the FIRST opener of the database (Prism 2c3f3aae44ab): a root
+    process reading a runtime-free job would otherwise leave a root-owned 0600 db that the profile
+    owner cannot open. Run the same permission/ownership pass ``_runtime_txn`` runs when the db or a
+    sidecar is new or we are root."""
+    base = _runtime_db_path()
+    fresh = not Path(base).exists()  # a read opens no -wal/-shm, so key freshness on the db file alone
+    create = _runtime_write_allowed()
+    with _rs.connect(_current_cron_store().cron_dir, create=create) as conn:
+        row = _rs.read_row(conn, str(job_id)) if conn is not None else None
+    if create and (fresh or (hasattr(os, "geteuid") and os.geteuid() == 0)):
+        _secure_runtime_db()
+    return row
 
 
 class _SingleJobScope:
