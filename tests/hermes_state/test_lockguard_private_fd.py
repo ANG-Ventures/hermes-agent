@@ -1322,3 +1322,102 @@ def test_legacy_room_import_reads_state_db_as_a_registered_reader(tmp_path, monk
     legacy._copy_rows(target, source)
     assert seen and all(n >= 1 for n in seen), f"legacy import read state.db unregistered: {seen}"
     assert key not in lg._READERS
+
+
+# ── round 16 ─────────────────────────────────────────────────────────────────────────────────
+
+
+def test_failed_private_open_is_retried_by_refresh_shm(tmp_path, monkeypatch):
+    """Prism 049e55321e1b: an EMFILE at the first hold() counted the inodes unarmed, and refresh_shm()
+    skipped them for good. The next refresh must arm them (foreign EXCLUSIVE refused)."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
+    real_open = lg.os.open
+
+    def _emfile(*a, **k):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(lg.os, "open", _emfile)
+    held = lg.hold(db)
+    monkeypatch.setattr(lg.os, "open", real_open)
+    try:
+        assert set(held) == {_ident(db), _ident(shm)}  # counted
+        assert _foreign_exclusive(str(db), *_SHARED) == "ACQUIRED"  # but not armed
+        lg.refresh_shm(db, held)
+        assert _foreign_exclusive(str(db), *_SHARED) == "REFUSED", "refresh_shm never retried the main-file guard"
+        assert _foreign_exclusive(str(shm), *_DMS) == "REFUSED", "refresh_shm never retried the -shm guard"
+        assert not held.unarmed
+        assert lg._HANDLES.get(_ident(db)) == 1, "a retry must not count the inode twice"
+    finally:
+        closing = lg.release(held)
+    _sqlite_close(db, shm)
+    lg.retire(closing)
+
+
+def test_unstattable_descriptor_makes_the_scan_inconclusive(tmp_path, monkeypatch):
+    """Prism 5c0c99319f38: a listed descriptor whose stat fails (EACCES/EIO) may be a live connection;
+    retire_completed_shm() must keep the private -shm fd, not read the failure as 'no other fd'."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
+    token = lg.register_reader(db)
+    try:
+        lg.retire(lg.release(lg.hold(db)))
+        ident = _ident(shm)
+        assert ident in lg._FDS
+        os.unlink(shm)
+        mine = lg._FDS[ident]
+        real_fstat = lg.os.fstat
+
+        def _eio(fd, *a, **k):
+            if fd != mine:
+                raise OSError(5, "synthetic EIO")
+            return real_fstat(fd, *a, **k)
+
+        monkeypatch.setattr(lg.os, "fstat", _eio)
+        lg.retire_completed_shm()
+        monkeypatch.setattr(lg.os, "fstat", real_fstat)
+        assert ident in lg._FDS, "an uninspectable descriptor was read as 'no other descriptor'"
+        lg.retire_completed_shm()
+        assert ident not in lg._FDS
+    finally:
+        lg.unregister_reader(token)
+
+
+def test_foreign_scan_skips_a_guard_only_deleted_shm(tmp_path):
+    """Prism ba6fa9c4a5a7: between SQLite's clean last close (which unlinks -shm) and retire(), the
+    guard's private O_RDONLY -shm fd is still open. Another process's open-time scan must not read it
+    as a live deleted generation; a process holding the deleted -shm O_RDWR (SQLite's) still counts."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    import hermes_state_dbfile as dbf
+
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
+    code = (
+        "import os, sys, time\n"
+        f"fd = os.open({str(shm)!r}, os.O_RDONLY if sys.argv[1] == 'ro' else os.O_RDWR)\n"
+        "print('open', flush=True)\n"
+        "sys.stdin.readline()\n"
+    )
+    for mode, expect_holder in (("ro", False), ("rw", True)):
+        if not shm.exists():
+            shm.write_bytes(b"\0" * 32768)
+        child = subprocess.Popen([sys.executable, "-c", code, mode], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, text=True)
+        try:
+            assert child.stdout.readline().strip() == "open"
+            os.unlink(shm)  # the clean last close's unlink, before the guard's retire()
+            holders = [pid for pid, _t in dbf.iter_deleted_sqlite_sidecar_holders(db)]
+            assert (child.pid in holders) is expect_holder, (mode, holders)
+        finally:
+            child.communicate("\n", timeout=10)

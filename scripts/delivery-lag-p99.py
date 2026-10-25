@@ -149,7 +149,8 @@ def main(argv=None) -> int:
         return 2
     hours = {}
     for ts, lag in rows:
-        hours.setdefault(datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:00"), []).append(lag)
+        # UTC: a local key merges the two fall-back hours of a DST change (Prism fdd03dbb8e37)
+        hours.setdefault(datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:00Z"), []).append(lag)
     for hour in sorted(hours):
         print(json.dumps({"hour": hour, **summarize(hours[hour])}, sort_keys=True))
     lags = sorted(lag for _, lag in rows)

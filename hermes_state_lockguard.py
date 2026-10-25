@@ -129,6 +129,10 @@ class _Held(dict):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.pid = os.getpid()
+        # Counted but not armed (private open or OFD lock failed, e.g. EMFILE): path -> (ident, range).
+        # hold()/refresh_shm() retry them, so a transient failure never disarms a long-lived writer for
+        # good (Prism 049e55321e1b). The count stays either way; only the arming is retried.
+        self.unarmed: Dict[str, Tuple[Identity, Tuple[int, int]]] = {}
 
 # Handles per guarded inode in this process. Several SessionDB handles on one file share the
 # same descriptors' locks (hold() locks every matching descriptor), so the LAST handle unlocks.
@@ -482,16 +486,19 @@ def _other_fds_on(identities: Set[Identity], exclude: Set[int]) -> Tuple[List[Tu
         except OSError:
             continue
         found = []
+        conclusive = True
         for name in names:
             if not name.isdigit() or int(name) in exclude:
                 continue
             try:
-                st = os.stat(f"{fd_dir}/{name}")
-            except OSError:
+                st = os.fstat(int(name))  # our own descriptor number: no path walk (Prism 5c0c99319f38)
+            except OSError as exc:
+                if exc.errno != errno.EBADF:  # EBADF = closed since the listing; anything else is unknown
+                    conclusive = False
                 continue
             if (st.st_dev, st.st_ino) in identities:
                 found.append((int(name), (st.st_dev, st.st_ino)))
-        return found, True
+        return found, conclusive
     return [], False
 
 
@@ -561,6 +568,7 @@ def _arm_private(ranges: Dict[str, Tuple[Identity, Tuple[int, int]]], held: Held
     db_ident = next((i for i, rng in ranges.values() if rng == main), None)
     if db_ident is None:  # refresh_shm: the handle's own state.db inode is in *held*
         db_ident = next((i for i, rng in held.items() if tuple(rng) == main), None)
+    unarmed = getattr(held, "unarmed", None)
     for path, (ident, (start, length)) in ranges.items():
         if ident in held:
             continue  # this handle already counts the inode; its descriptor stays locked
@@ -584,8 +592,37 @@ def _arm_private(ranges: Dict[str, Tuple[Identity, Tuple[int, int]]], held: Held
                 locked = False
         if not locked:
             logger.debug("WAL lock guard: OFD lock on %s not taken; counting the handle unlocked", path)
+            if unarmed is not None:
+                unarmed[path] = (ident, (start, length))
         held[ident] = (start, length)
         _HANDLES[ident] = _HANDLES.get(ident, 0) + 1
+
+
+def _retry_unarmed(held: Held) -> None:
+    """Re-try the arming of every inode *held* counts but could not lock (Prism 049e55321e1b). No new
+    count; an inode whose path now names another file is dropped from the retry set (the generation
+    it guarded is gone, and refresh_shm() arms the new one). Callers hold _LOCK."""
+    unarmed = getattr(held, "unarmed", None)
+    if not unarmed:
+        return
+    for path, (ident, (start, length)) in list(unarmed.items()):
+        if ident not in held:
+            unarmed.pop(path, None)
+            continue
+        try:
+            fd = _FDS.get(ident)
+            if fd is None:
+                if _identity(path) != ident:
+                    unarmed.pop(path, None)
+                    continue
+                db_ident = None
+                if path.endswith("-shm"):
+                    db_ident = next((i for i, rng in held.items() if tuple(rng) == (_SHARED_FIRST, _SHARED_SIZE)), None)
+                fd = _private_fd(path, ident, db_ident)
+            if fd is not None and _ofd_lock(fd, _F_RDLCK, start, length):
+                unarmed.pop(path, None)
+        except OSError:
+            continue  # still failing: retried on the next refresh
 
 
 def _private_ranges(db_path, *, shm_only: bool = False) -> Dict[str, Tuple[Identity, Tuple[int, int]]]:
@@ -614,6 +651,7 @@ def hold(db_path, held: Optional[Held] = None) -> Held:
         try:
             ranges = _private_ranges(db_path)
             with _LOCK:
+                _retry_unarmed(held)
                 _arm_private(ranges, held)
         except OSError:
             logger.debug("WAL lock guard unavailable for %s", os.fspath(db_path), exc_info=True)
@@ -641,9 +679,10 @@ def refresh_shm(db_path, held: Held) -> Held:
         return hold(db_path, held)
     try:
         ranges = _private_ranges(db_path, shm_only=True)
-        if all(ident in held for ident, _ in ranges.values()):
+        if all(ident in held for ident, _ in ranges.values()) and not getattr(held, "unarmed", None):
             return held
         with _LOCK:
+            _retry_unarmed(held)
             _arm_private(ranges, held)
     except OSError:
         logger.debug("WAL lock guard refresh unavailable for %s", os.fspath(db_path), exc_info=True)
@@ -670,6 +709,7 @@ def release(held: Held) -> List[Identity]:
         return []
     if getattr(held, "pid", os.getpid()) != os.getpid():
         held.clear()  # inherited across fork(): its claims were the parent's; the child counts none
+        getattr(held, "unarmed", {}).clear()
         return []
     with _LOCK:
         closing = list(held)
@@ -684,6 +724,7 @@ def release(held: Held) -> List[Identity]:
                 _HANDLES.pop(ident, None)
                 to_unlock[ident] = rng
         held.clear()
+        getattr(held, "unarmed", {}).clear()
         if not to_unlock:
             return closing
         if _MODE == "private":

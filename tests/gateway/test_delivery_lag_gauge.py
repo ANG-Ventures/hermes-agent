@@ -86,7 +86,9 @@ def test_script_percentiles_and_exit_codes(tmp_path, capsys):
     total = out[-1]
     # discord only: lags 2.0 (paired), 100.0 (paired), 4.0 and 1.0 (gauge); telegram's 50 s excluded
     assert (total["n"], total["p50_s"], total["p90_s"], total["p99_s"], total["max_s"]) == (4, 2.0, 100.0, 100.0, 100.0)
-    assert out[0]["hour"] == "2026-10-24 14:00" and out[0]["n"] == 4
+    from datetime import datetime, timezone
+    hour = datetime.fromtimestamp(mod._epoch("2026-10-24 14:00:00"), timezone.utc).strftime("%Y-%m-%d %H:00Z")
+    assert out[0]["hour"] == hour and out[0]["n"] == 4  # hours are UTC (Prism fdd03dbb8e37)
     assert mod.main(args + ["--max-p99-s", "5"]) == 1
     assert mod.main(args + ["--max-p99-s", "500"]) == 0
     assert mod.main(args + ["--platform", "all", "--max-p99-s", "500"]) == 0
@@ -203,6 +205,9 @@ def test_nanosecond_offset_timestamps_parse_the_timezone(tmp_path, monkeypatch):
         "2026-10-24T21:00:03.123456789Z INFO x: [discord] Sending response (10 chars) to 1\n", encoding="utf-8")
     assert mod.main(["--log", str(log), "--since", "0", "--window", "4000000000", "--max-p99-s", "1"]) == 1
     assert mod.main(["--log", str(log), "--since", "0", "--window", "4000000000", "--max-p99-s", "3.01"]) == 0
+    monkeypatch.delenv("TZ")
+    if hasattr(time, "tzset"):
+        time.tzset()
 
 
 @pytest.mark.asyncio
@@ -221,3 +226,27 @@ async def test_gauge_keeps_precision_for_the_threshold(tmp_path, caplog, monkeyp
     log.write_text(f"2026-10-24 14:00:05,040 INFO gateway.platforms.base: {line}\n", encoding="utf-8")
     assert mod.main(["--log", str(log), "--since", "0", "--window", "4000000000", "--max-p99-s", "5.01"]) == 1
     assert mod.main(["--log", str(log), "--since", "0", "--window", "4000000000", "--max-p99-s", "5.05"]) == 0
+
+
+def test_dst_fall_back_hours_stay_separate(tmp_path, monkeypatch, capsys):
+    """Prism fdd03dbb8e37: 08:30Z and 09:30Z on 2026-11-01 are both 01:30 in Los Angeles; a local-time
+    hour key merged them into one summary."""
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    if hasattr(time, "tzset"):
+        time.tzset()
+    import json
+    try:
+        mod = _script()
+        log = tmp_path / "gateway.log"
+        log.write_text(
+            "2026-11-01T08:30:00Z INFO x: [discord] Sending response (10 chars) to 1 delivery_lag_s=1\n"
+            "2026-11-01T09:30:00Z INFO x: [discord] Sending response (10 chars) to 1 delivery_lag_s=100\n",
+            encoding="utf-8")
+        assert mod.main(["--log", str(log), "--since", "0", "--window", "4000000000"]) == 0
+        rows = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert [(r["hour"], r["n"]) for r in rows if "hour" in r] == [
+            ("2026-11-01 08:00Z", 1), ("2026-11-01 09:00Z", 1)]
+    finally:
+        monkeypatch.delenv("TZ")
+        if hasattr(time, "tzset"):
+            time.tzset()

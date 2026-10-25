@@ -212,6 +212,19 @@ def _fd_is_truly_unlinked(fd_path: str, watched_path: str) -> bool:
     return _identity_is_truly_unlinked((fd_stat.st_dev, fd_stat.st_ino), watched_path)
 
 
+def _fd_is_read_only(fd_path: str) -> bool:
+    """True when ``/proc/<pid>/fdinfo/<fd>`` says O_RDONLY; False when it says otherwise or cannot be
+    read (fail closed: the caller then keeps counting the descriptor as a holder)."""
+    try:
+        with open(fd_path.replace("/fd/", "/fdinfo/", 1), encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("flags:"):
+                    return (int(line.split()[1], 8) & os.O_ACCMODE) == os.O_RDONLY
+    except (OSError, ValueError, IndexError):
+        return False
+    return False
+
+
 def _iter_proc_fd_targets():
     """Yield ``(pid, readlink target, fd path)`` for every readable ``/proc/<pid>/fd`` entry."""
     for pid_str in os.listdir("/proc"):
@@ -364,11 +377,30 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
             holders = _iter_darwin_sidecar_holders(db_path)
         elif sys.platform.startswith("linux"):
             watched = _watched_sqlite_sidecar_paths(db_path)
+            wal_pids: set = set()  # pids with ANY descriptor on a watched -wal (live or deleted)
+            shm: List[Tuple[int, str, str]] = []
             for pid, target, fd_path in _iter_proc_fd_targets():
                 canonical = canonical_sqlite_path(target)
-                if (" (deleted)" in target and canonical in watched
-                        and _fd_is_truly_unlinked(fd_path, watched[canonical])):
-                    holders.append((pid, target))
+                if canonical not in watched:
+                    continue
+                if canonical.endswith("-wal"):
+                    wal_pids.add(pid)
+                if " (deleted)" in target and _fd_is_truly_unlinked(fd_path, watched[canonical]):
+                    if canonical.endswith("-shm"):
+                        shm.append((pid, target, fd_path))
+                    else:
+                        holders.append((pid, target))
+            # t_aeae3fe7 (Prism ba6fa9c4a5a7; this scan is t_69e10010's): a clean last close unlinks
+            # -shm a moment before that process's WAL lock guard closes its PRIVATE -shm descriptor.
+            # That descriptor is no live generation: SQLite opens -shm O_RDWR and always holds the
+            # -wal open while it uses -shm, the guard opens -shm O_RDONLY and never opens -wal. So a
+            # deleted -shm whose holder has only O_RDONLY descriptors on it and no -wal descriptor is
+            # skipped; anything else (or an unreadable fdinfo) still counts.
+            guard_only = {pid for pid, _t, _f in shm if pid not in wal_pids}
+            for pid, target, fd_path in shm:
+                if pid in guard_only and all(_fd_is_read_only(f) for p, _t, f in shm if p == pid):
+                    continue
+                holders.append((pid, target))
     except Exception as exc:
         logger.debug("deleted-WAL holder scan failed for %s: %s", db_path, exc)
     return holders
