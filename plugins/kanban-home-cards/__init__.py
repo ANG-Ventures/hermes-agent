@@ -300,38 +300,34 @@ def _persisted_recently_injected(session_id: str, deadline: float) -> bool:
     if not path.is_file():
         return False
     from hermes_state_lockguard import registered_reader
-    with registered_reader(path):  # the WAL lock guard never closes a -shm fd under this read
-        return _dedupe_read(path, session_id, deadline)
-
-
-def _dedupe_read(path: Path, session_id: str, deadline: float) -> bool:
-    try:
-        conn = sqlite3.connect(
-            f"{path.resolve().as_uri()}?mode=ro", uri=True,
-            timeout=0, check_same_thread=False,
-        )
-    except sqlite3.Error as exc:
-        logger.info("kanban-home-cards: dedupe read failed (inject): %s", exc)
-        return False
-    try:
-        conn.execute("PRAGMA busy_timeout = 0")
-        conn.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
-        while True:
-            try:
-                rows = conn.execute(_DEDUPE_SQL, (session_id, DEDUPE_USER_ROWS)).fetchall()
-                break
-            except sqlite3.OperationalError as exc:
-                msg = str(exc).lower()
-                if ("locked" in msg or "busy" in msg) and time.monotonic() + 0.02 < deadline:
-                    time.sleep(0.02)
-                    continue
-                raise
-        return any(isinstance(v, str) and HEADER_PREFIX in v for row in rows for v in row)
-    except sqlite3.Error as exc:
-        logger.info("kanban-home-cards: dedupe read failed (inject): %s", exc)
-        return False
-    finally:
-        conn.close()
+    with registered_reader(path):  # the WAL lock guard never closes a -shm fd under this read (t_aeae3fe7)
+        try:
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro", uri=True,
+                timeout=0, check_same_thread=False,
+            )
+        except sqlite3.Error as exc:
+            logger.info("kanban-home-cards: dedupe read failed (inject): %s", exc)
+            return False
+        try:
+            conn.execute("PRAGMA busy_timeout = 0")
+            conn.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1000)
+            while True:
+                try:
+                    rows = conn.execute(_DEDUPE_SQL, (session_id, DEDUPE_USER_ROWS)).fetchall()
+                    break
+                except sqlite3.OperationalError as exc:
+                    msg = str(exc).lower()
+                    if ("locked" in msg or "busy" in msg) and time.monotonic() + 0.02 < deadline:
+                        time.sleep(0.02)
+                        continue
+                    raise
+            return any(isinstance(v, str) and HEADER_PREFIX in v for row in rows for v in row)
+        except sqlite3.Error as exc:
+            logger.info("kanban-home-cards: dedupe read failed (inject): %s", exc)
+            return False
+        finally:
+            conn.close()
 
 
 def _first_sighting(session_id: str) -> bool:

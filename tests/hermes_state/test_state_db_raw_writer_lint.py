@@ -45,6 +45,24 @@ ALLOWLIST: dict[tuple[str, str], str] = {
     ("evals/desktop_bug_campaign/leases_live.py", "main"): _EVAL,
 }
 
+# (repo-relative path, enclosing function name) -> why a state.db connect outside registered_reader()
+# is acceptable. The registration only matters in a process that also runs a guarded SessionDB (the
+# lock guard's private descriptors live in that process); a script with no SessionDB has none.
+_NO_SESSIONDB = "no SessionDB in this process, so the lock guard holds no private descriptor to close under it"
+UNREGISTERED_OK: dict[tuple[str, str], str] = {
+    ("scripts/e2e_internal_silence.py", "_db_rows"): _NO_SESSIONDB,
+    ("evals/acp_empty_session_wire.py", "rows"): _NO_SESSIONDB + " (the gateway runs in an acp_adapter subprocess)",
+    ("evals/acp_empty_session_wire.py", "main"): _NO_SESSIONDB + " (the gateway runs in an acp_adapter subprocess)",
+    ("evals/delivery_flood_wire.py", "rows"): _NO_SESSIONDB + " (the gateway runs in a subprocess)",
+    ("evals/desktop_bug_campaign/persistence_live.py", "main"): _NO_SESSIONDB + " (real backend subprocesses)",
+    ("evals/desktop_bug_campaign/leases_live.py", "main"): _NO_SESSIONDB + " (real backend subprocesses)",
+    # FINDING (t_aeae3fe7 PR body): this harness runs SessionDB + GatewayRunner in-process on a
+    # throwaway HERMES_HOME and reads state.db with `with sqlite3.connect(...)`, which never closes.
+    # A torn read there can only fail the eval run; left for the eval's owner.
+    ("evals/gateway_failure_ownership/probe.py", "rows"): "eval harness on a throwaway home; finding, see comment",
+    ("evals/gateway_failure_ownership/probe.py", "main"): "eval harness on a throwaway home; finding, see comment",
+}
+
 
 def _py_files():
     for root, dirs, files in os.walk(REPO):
@@ -114,7 +132,19 @@ def _read_only(call: ast.Call, assigns: dict[str, list[ast.AST]]) -> bool:
     return any("mode=ro" in s for e in exprs for s in _strings(e))
 
 
-def _scan(path: Path, rel: str):
+def _is_registered_reader(expr: ast.AST) -> bool:
+    """``registered_reader(...)`` / ``hermes_state_lockguard.registered_reader(...)``."""
+    if not isinstance(expr, ast.Call):
+        return False
+    f = expr.func
+    return (isinstance(f, ast.Name) and f.id == "registered_reader") or (
+        isinstance(f, ast.Attribute) and f.attr == "registered_reader")
+
+
+def _scan_all(path: Path, rel: str):
+    """Every state.db ``sqlite3.connect`` in *path*: ``(rel, fn, line, read_only, registered)``.
+    ``registered`` = the call sits lexically inside a ``with registered_reader(...)`` block, or in a
+    later item of the same ``with`` statement."""
     try:
         text = path.read_text(encoding="utf-8")
         if "connect" not in text or "sqlite" not in text:
@@ -126,27 +156,57 @@ def _scan(path: Path, rel: str):
                for a in n.names if a.name == "connect"}
     hits = []
 
-    def visit(scope: ast.AST, fn_name: str, assigns):
+    def visit(scope: ast.AST, fn_name: str, assigns, registered: bool):
+        if isinstance(scope, (ast.With, ast.AsyncWith)):
+            covered = registered
+            for item in scope.items:
+                visit(item, fn_name, assigns, covered)
+                covered = covered or _is_registered_reader(item.context_expr)
+            for stmt in scope.body:
+                visit_node(stmt, fn_name, assigns, covered)
+            return
         for child in ast.iter_child_nodes(scope):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                visit(child, child.name, {**assigns, **_assignments(child)})
-                continue
-            if isinstance(child, ast.Call) and _is_sqlite_connect(child, aliases):
-                target = child.args[0] if child.args else next(
-                    (kw.value for kw in child.keywords if kw.arg == "database"), None)
-                if target is not None and _names_state_db(target, assigns) and not _read_only(child, assigns):
-                    hits.append((rel, fn_name, child.lineno))
-            visit(child, fn_name, assigns)
+            visit_node(child, fn_name, assigns, registered)
 
-    visit(tree, "<module>", _assignments(tree))
+    def visit_node(child: ast.AST, fn_name: str, assigns, registered: bool):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A nested def runs when called, not where it is defined: registration does not carry in.
+            visit(child, child.name, {**assigns, **_assignments(child)}, False)
+            return
+        if isinstance(child, ast.Call) and _is_sqlite_connect(child, aliases):
+            target = child.args[0] if child.args else next(
+                (kw.value for kw in child.keywords if kw.arg == "database"), None)
+            if target is not None and _names_state_db(target, assigns):
+                hits.append((rel, fn_name, child.lineno, _read_only(child, assigns), registered))
+        visit(child, fn_name, assigns, registered)
+
+    visit(tree, "<module>", _assignments(tree), False)
     return hits
 
 
+def _scan(path: Path, rel: str):
+    """Raw write-capable state.db connects: ``(rel, fn, line)``."""
+    return [(rel, fn, line) for rel, fn, line, ro, _reg in _scan_all(path, rel) if not ro]
+
+
+_ALL_SITES = None
+
+
+def _all_state_db_connects():
+    global _ALL_SITES
+    if _ALL_SITES is None:  # one repo walk (~14 s) shared by the tests below
+        _ALL_SITES = [hit for path, rel in _py_files() for hit in _scan_all(path, rel)]
+    return _ALL_SITES
+
+
 def _raw_state_db_writers():
-    found = []
-    for path, rel in _py_files():
-        found.extend(_scan(path, rel))
-    return found
+    return [(rel, fn, line) for rel, fn, line, ro, _reg in _all_state_db_connects() if not ro]
+
+
+def _unregistered_readers():
+    """Read-only or allowlisted state.db connects outside a ``registered_reader`` block."""
+    return [(rel, fn, line) for rel, fn, line, ro, reg in _all_state_db_connects()
+            if not reg and (ro or (rel, fn) in ALLOWLIST) and (rel, fn) not in UNREGISTERED_OK]
 
 
 def test_lint_flags_a_raw_writer_and_passes_read_only(tmp_path):
@@ -170,6 +230,47 @@ def test_lint_flags_a_raw_writer_and_passes_read_only(tmp_path):
     assert [(fn, line) for _rel, fn, line in hits] == [("writer", 5), ("writer2", 7)]
 
 
+def test_lint_requires_registered_reader_around_read_only_and_allowlisted(tmp_path):
+    """Prism f73fc9c5f6cc / 5ac4f2a27277: the lock guard closes a private -shm fd once no guarded
+    writer or REGISTERED reader uses the inode, so an unregistered in-process reader would lose its
+    WAL read-mark at that close. Every read-only / allowlisted connect sits in registered_reader()."""
+    src = tmp_path / "probe.py"
+    src.write_text(
+        "import sqlite3, contextlib\n"
+        "from hermes_state_lockguard import registered_reader\n"
+        "def bare():\n"
+        "    return sqlite3.connect(f'file:{state_db_path()}?mode=ro', uri=True)\n"
+        "def wrapped():\n"
+        "    with registered_reader(state_db_path()):\n"
+        "        con = sqlite3.connect(f'file:{state_db_path()}?mode=ro', uri=True)\n"
+        "        con.close()\n"
+        "def same_with():\n"
+        "    with registered_reader(p), contextlib.closing(sqlite3.connect(read_only_db_uri(state_db), uri=True)):\n"
+        "        pass\n"
+        "def wrong_order():\n"
+        "    with contextlib.closing(sqlite3.connect(read_only_db_uri(state_db), uri=True)), registered_reader(p):\n"
+        "        pass\n"
+        "def nested_def():\n"
+        "    with registered_reader(p):\n"
+        "        def later():\n"
+        "            return sqlite3.connect(read_only_db_uri(state_db), uri=True)\n"
+        "        return later\n"
+    )
+    hits = _scan_all(src, "probe.py")
+    unregistered = [(fn, line) for _rel, fn, line, ro, reg in hits if ro and not reg]
+    assert unregistered == [("bare", 4), ("wrong_order", 13), ("later", 18)], hits
+    assert sorted(fn for _r, fn, _l, ro, reg in hits if reg) == ["same_with", "wrapped"]
+
+
+def test_every_read_only_state_db_connect_is_a_registered_reader():
+    offenders = _unregistered_readers()
+    assert not offenders, (
+        "in-process state.db connection outside hermes_state_lockguard.registered_reader(): the WAL "
+        "lock guard can close its private -shm descriptor under it and cancel the connection's POSIX "
+        f"read locks (a torn read). Wrap the connect AND its close in `with registered_reader(path):`: {offenders}"
+    )
+
+
 def test_no_raw_write_capable_state_db_connections():
     offenders = [h for h in _raw_state_db_writers() if (h[0], h[1]) not in ALLOWLIST]
     assert not offenders, (
@@ -184,3 +285,6 @@ def test_allowlist_has_no_stale_entries():
     live = {(rel, fn) for rel, fn, _line in _raw_state_db_writers()}
     stale = sorted(set(ALLOWLIST) - live)
     assert not stale, f"ALLOWLIST entries that no longer match a raw connect: {stale}"
+    unreg = {(rel, fn) for rel, fn, _l, _ro, reg in _all_state_db_connects() if not reg}
+    stale = sorted(set(UNREGISTERED_OK) - unreg)
+    assert not stale, f"UNREGISTERED_OK entries that no longer match an unregistered connect: {stale}"
