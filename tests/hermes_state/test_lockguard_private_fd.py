@@ -942,3 +942,62 @@ def test_reader_last_close_never_strands_an_opener_before_its_retire(tmp_path, m
         third = hermes_state.SessionDB(db_path=db)  # must not raise DeletedWalGenerationError
         third.close()
     assert shm_ident not in lg._FDS
+
+
+def test_failed_private_open_still_counts_the_writer(tmp_path, monkeypatch):
+    """Prism 2814ba2fca00: A's private -shm open raises (EMFILE). A must still be counted, so when a
+    sibling B later opens the private -shm fd and closes, retire() keeps that fd (closing it would
+    cancel A's POSIX locks on -shm)."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    import errno as _errno
+    db = tmp_path / "state.db"
+    db.write_bytes(b"\0" * 4096)
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
+    shm_ident = _ident(shm)
+    real_open = os.open
+
+    def _emfile(path, *a, **k):
+        if os.fspath(path).endswith("-shm"):
+            raise OSError(_errno.EMFILE, "Too many open files")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(lg.os, "open", _emfile)
+    a = lg.hold(db)
+    monkeypatch.undo()
+    assert shm_ident in a, "the writer whose private open failed is not counted"
+    b = lg.hold(db)
+    assert shm_ident in lg._FDS
+    lg.retire(lg.release(b))
+    try:
+        assert shm_ident in lg._FDS, "B's close retired the -shm fd under the still-open writer A"
+    finally:
+        lg.retire(lg.release(a))
+    assert shm_ident not in lg._FDS
+
+
+def test_surplus_descriptor_on_a_replaced_path_is_tracked_and_closed(tmp_path):
+    """Prism c8e1b4b3568d: T1 stats -shm inode A, the path is replaced by B and T2 parks B, then T1
+    opens B. The second descriptor on B must be tracked and closed with B's fd, never leaked (a leaked
+    -shm fd outlives its generation and every opener's deleted-generation probe refuses)."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"\0" * 32768)
+    stale = _ident(shm)
+    os.rename(shm, tmp_path / "keep-A")  # A stays allocated, so B cannot reuse its inode number
+    shm.write_bytes(b"\0" * 32768)  # inode B at the path
+    b_ident = _ident(shm)
+    assert b_ident != stale
+    with lg._LOCK:
+        first = lg._private_fd(str(shm), b_ident)  # T2 parks B
+        assert lg._private_fd(str(shm), stale) is None  # T1, stat said A, opens B
+        assert len(lg._SURPLUS.get(b_ident, [])) == 1, lg._SURPLUS
+        surplus = lg._SURPLUS[b_ident][0]
+    os.unlink(shm)
+    lg.retire()  # B is gone and unused: main fd AND the surplus close
+    assert b_ident not in lg._FDS and b_ident not in lg._SURPLUS
+    for fd in (first, surplus):
+        with pytest.raises(OSError):
+            os.fstat(fd)

@@ -136,6 +136,11 @@ _SHM_IDENTS: Set[Identity] = set()  # the -shm inodes in _FDS (retire() closes t
 _READERS: Dict[object, int] = {}
 _SHM_DB: Dict[Identity, Identity] = {}  # -shm inode in _FDS -> its state.db inode (readers key on it)
 _CLOSING: Dict[Identity, int] = {}  # writers between release() and retire(): connection still open
+# Extra private descriptors on an inode that already had one: a path replaced between a hold()'s stat
+# and its open can make two opens land on one inode (Prism c8e1b4b3568d). Never closed on their own (a
+# close cancels this process's POSIX locks on the inode); closed together with the inode's main fd.
+_SURPLUS: Dict[Identity, List[int]] = {}
+_OPEN_FAIL_WARNED: Set[str] = set()  # paths whose private open failed (logged once)
 _POOL_WARN_FDS = 16  # expected: one per state.db file guarded in this process
 _POOL_WARNED = False
 _RETIRE_WARNED: Set[Identity] = set()  # inodes whose inconclusive stat was logged once
@@ -154,8 +159,9 @@ def _reset_after_fork() -> None:
     parent stays guarded; a forgotten copy would pin a ``-shm`` the parent's last close unlinks, and
     the deleted-generation probe would then refuse every opener until the child exits. Right after
     fork the child holds no POSIX locks (they are not inherited), so the close cancels nothing."""
-    global _LOCK, _HANDLES, _FDS, _PATHS, _SHM_IDENTS, _READERS, _CLOSING, _SHM_DB, RETIRE_GATE
-    inherited = list(_FDS.values())
+    global _LOCK, _HANDLES, _FDS, _PATHS, _SHM_IDENTS, _READERS, _CLOSING, _SHM_DB, RETIRE_GATE, _SURPLUS
+    inherited = list(_FDS.values()) + [fd for fds in _SURPLUS.values() for fd in fds]
+    _SURPLUS = {}
     # The inherited _LOCK is held (_before_fork took it); a fresh one releases it for the child. The
     # gate may be held by a parent thread that does not exist in the child: fresh too.
     _LOCK, _HANDLES, _FDS, _PATHS, _SHM_IDENTS = threading.Lock(), {}, {}, {}, set()
@@ -263,7 +269,10 @@ def _private_fd(path: str, ident: Identity, db_ident: Optional[Identity] = None)
         # Replaced between the stat and the open. Never close it here: SQLite may already hold
         # POSIX locks on the new file, and a close would cancel them. Keep it for the next hold().
         if real in _FDS:
-            return None  # unreachable in practice (one open per inode under _LOCK); never close
+            # Another hold() already parked the replacement (stat outside _LOCK, Prism c8e1b4b3568d):
+            # keep this one tracked as a surplus of that inode, closed together with its main fd.
+            _SURPLUS.setdefault(real, []).append(fd)
+            return None
         _park(path, real, fd, db_ident)
         return None
     _park(path, ident, fd, db_ident)
@@ -287,9 +296,11 @@ def _close_private(ident: Identity) -> None:
     _PATHS.pop(ident, None)
     _SHM_IDENTS.discard(ident)
     _SHM_DB.pop(ident, None)
-    if fd is not None:
+    for extra in [fd] + _SURPLUS.pop(ident, []):
+        if extra is None:
+            continue
         try:
-            os.close(fd)
+            os.close(extra)
         except OSError:
             pass
 
@@ -466,19 +477,26 @@ def _arm_private(ranges: Dict[str, Tuple[Identity, Tuple[int, int]]], held: Held
     for path, (ident, (start, length)) in ranges.items():
         if ident in held:
             continue  # this handle already counts the inode; its descriptor stays locked
-        fd = _private_fd(path, ident, db_ident)
-        if fd is None:
-            continue
-        # Counted whether or not the OFD lock is granted (Prism e63d481511da): the count is what keeps
-        # retire() from closing this descriptor, and so from cancelling the live connection's POSIX
-        # locks; it must not depend on the lock. A refused or failed lock only loses the stray-close
-        # protection for this handle (logged), never the connection-lifetime protection.
+        # Counted whether or not the private open or the OFD lock succeeds (Prism e63d481511da,
+        # 2814ba2fca00): the count is what keeps retire() from closing any private descriptor on the
+        # inode (one a sibling opens later included), and so from cancelling this live connection's
+        # POSIX locks; it must not depend on either. A failure only loses the stray-close protection
+        # for this handle (logged once per path), never the connection-lifetime protection.
         try:
-            locked = _ofd_lock(fd, _F_RDLCK, start, length)
-        except OSError:
-            locked = False
+            fd = _private_fd(path, ident, db_ident)
+        except OSError as exc:
+            fd = None
+            if path not in _OPEN_FAIL_WARNED:
+                _OPEN_FAIL_WARNED.add(path)
+                logger.warning("WAL lock guard: cannot open %s (%s); counting the handle unlocked", path, exc)
+        locked = False
+        if fd is not None:
+            try:
+                locked = _ofd_lock(fd, _F_RDLCK, start, length)
+            except OSError:
+                locked = False
         if not locked:
-            logger.debug("WAL lock guard: OFD lock on %s not granted; counting the handle unlocked", path)
+            logger.debug("WAL lock guard: OFD lock on %s not taken; counting the handle unlocked", path)
         held[ident] = (start, length)
         _HANDLES[ident] = _HANDLES.get(ident, 0) + 1
 
