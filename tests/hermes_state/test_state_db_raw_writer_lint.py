@@ -140,15 +140,36 @@ def _names_state_db(expr: ast.AST, assigns: dict[str, list[ast.AST]], seen: set 
     return False
 
 
+def _proven_ro(expr: ast.AST, assigns: dict[str, list[ast.AST]], seen: frozenset = frozenset()) -> bool:
+    """True only when EVERY value *expr* can take is a read-only target (Prism 97721fca0cf2): a
+    ``mode=ro`` literal in the string itself, or a ``read_only_db_uri(...)`` call. A conditional is
+    read-only only if both branches are; a name only if every assignment is (a parameter, with no
+    assignment, is unproven). Anything else counts as write-capable."""
+    if isinstance(expr, ast.Constant):
+        return isinstance(expr.value, str) and "mode=ro" in expr.value
+    if isinstance(expr, ast.JoinedStr):
+        return any(isinstance(v, ast.Constant) and isinstance(v.value, str) and "mode=ro" in v.value
+                   for v in expr.values)
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):  # unconditional concatenation
+        return _proven_ro(expr.left, assigns, seen) or _proven_ro(expr.right, assigns, seen)
+    if isinstance(expr, ast.IfExp):
+        return _proven_ro(expr.body, assigns, seen) and _proven_ro(expr.orelse, assigns, seen)
+    if isinstance(expr, ast.Call):
+        f = expr.func
+        name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+        return name in _RO_HELPERS
+    if isinstance(expr, ast.Name):
+        values = assigns.get(expr.id)
+        if not values or expr.id in seen:
+            return False
+        return all(_proven_ro(v, assigns, seen | {expr.id}) for v in values)
+    return False
+
+
 def _read_only(call: ast.Call, assigns: dict[str, list[ast.AST]]) -> bool:
-    exprs = [call.args[0]] if call.args else []
-    exprs += [kw.value for kw in call.keywords if kw.arg == "database"]
-    for expr in list(exprs):
-        for name in _names(expr):
-            exprs.extend(assigns.get(name, []))
-    if any(name in _RO_HELPERS for e in exprs for name in _names(e)):
-        return True
-    return any("mode=ro" in s for e in exprs for s in _strings(e))
+    target = call.args[0] if call.args else next(
+        (kw.value for kw in call.keywords if kw.arg == "database"), None)
+    return target is not None and _proven_ro(target, assigns)
 
 
 # Connects registered in code rather than by a ``with registered_reader`` block: each function calls
@@ -306,6 +327,27 @@ def test_every_read_only_state_db_connect_is_a_registered_reader():
         "lock guard can close its private -shm descriptor under it and cancel the connection's POSIX "
         f"read locks (a torn read). Wrap the connect AND its close in `with registered_reader(path):`: {offenders}"
     )
+
+
+def test_conditional_target_is_not_read_only(tmp_path):
+    """Prism 97721fca0cf2: a ``mode=ro`` string somewhere in the target does not make it read-only."""
+    src = tmp_path / "probe.py"
+    src.write_text(
+        "import sqlite3\n"
+        "def cond(readonly):\n"
+        "    uri = f'file:{state_db_path()}?mode=ro' if readonly else str(state_db_path())\n"
+        "    return sqlite3.connect(uri, uri=True)\n"
+        "def inline(readonly):\n"
+        "    return sqlite3.connect(f'file:{state_db_path()}?mode=ro' if readonly else state_db_path())\n"
+        "def both(readonly):\n"
+        "    return sqlite3.connect(f'file:{state_db_path()}?mode=ro' if readonly else read_only_db_uri(state_db_path()), uri=True)\n"
+        "def reassigned():\n"
+        "    uri = f'file:{state_db_path()}?mode=ro'\n"
+        "    uri = str(state_db_path())\n"
+        "    return sqlite3.connect(uri, uri=True)\n"
+    )
+    hits = _scan(src, "probe.py")
+    assert [fn for _rel, fn, _line in hits] == ["cond", "inline", "reassigned"], hits
 
 
 def test_no_raw_write_capable_state_db_connections():

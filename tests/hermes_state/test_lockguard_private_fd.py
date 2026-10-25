@@ -901,3 +901,44 @@ def test_state_module_readers_connect_while_registered(tmp_path, monkeypatch, he
         cw._session_db_content_sig(db)
     assert seen and all(n >= 1 for n in seen), seen
     assert key not in lg._READERS, "registration outlived the connection"
+
+
+def test_repair_connection_double_close_settles_its_token_once(tmp_path):
+    """Prism 4eff69c393c6: close() twice on a tracked repair connection must not consume ANOTHER
+    reader's registration (SQLite allows repeated close())."""
+    import sqlite3
+    import hermes_state_repair as rep
+    db = tmp_path / "state.db"
+    sqlite3.connect(db).close()
+    key = ("path", str(db))
+    with lg.registered_reader(db):
+        conn = rep._connect_repair_durable(db)
+        assert lg._READERS.get(key) == 2
+        conn.close()
+        conn.close()
+        assert lg._READERS.get(key) == 1, "the second close() removed the live reader's count"
+    assert key not in lg._READERS
+
+
+def test_reader_last_close_never_strands_an_opener_before_its_retire(tmp_path, monkeypatch):
+    """Prism e5b80b447fa9: a registered reader outlives the last SessionDB writer; its own last SQLite
+    close unlinks -shm while the guard's private -shm fd is still open (its retire() runs at block
+    exit). A SessionDB opened in that window must succeed, not raise DeletedWalGenerationError."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    import sqlite3
+    pin_wal(monkeypatch)
+    db = tmp_path / "state.db"
+    writer = make_db(db, "s", "seed")
+    require_wal(writer)
+    shm_ident = _ident(f"{db}-shm")
+    with lg.registered_reader(db):
+        raw = sqlite3.connect(db)  # an allowlisted read-write reader (e.g. PRAGMA quick_check)
+        raw.execute("SELECT count(*) FROM messages").fetchone()
+        writer.close()
+        assert shm_ident in lg._FDS  # pinned by the reader
+        raw.close()  # the last in-process SQLite close: checkpoints and unlinks -wal/-shm
+        assert not os.path.exists(f"{db}-shm")
+        third = hermes_state.SessionDB(db_path=db)  # must not raise DeletedWalGenerationError
+        third.close()
+    assert shm_ident not in lg._FDS
