@@ -710,3 +710,107 @@ def test_exit_path_leaves_a_live_connection_usable_and_guarded(tmp_path):
     finally:
         if child.poll() is None:
             child.kill()
+
+
+def test_reader_registered_before_a_path_replacement_still_pins_the_new_files_shm(tmp_path, monkeypatch):
+    """Prism e0cbbe030829: a reader registers on inode A, the path is replaced by WAL database B, the
+    reader connects to B. A guarded writer's close on B must not close B's private -shm fd under it."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    import sqlite3
+    pin_wal(monkeypatch)
+    db = tmp_path / "state.db"
+    db.write_bytes(b"")  # inode A
+    with lg.registered_reader(db):
+        os.unlink(db)
+        sdb = make_db(db, "s", "seed")  # inode B at the same path
+        require_wal(sdb)
+        shm_ident = _ident(f"{db}-shm")
+        reader = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT count(*) FROM messages").fetchone()
+            sdb.close()
+            assert shm_ident in lg._FDS, "B's -shm fd was closed under a reader registered before the replacement"
+        finally:
+            reader.rollback()
+            reader.close()
+    assert shm_ident not in lg._FDS
+
+
+def test_initializing_writer_is_counted_before_its_hold(tmp_path, monkeypatch):
+    """Prism c4ca84c945ca / 8f1afbe91566: a second SessionDB between its connect (SQLite's POSIX locks on
+    -shm from here, the WAL write lock in _init_schema) and its hold() is counted, so a sibling's close
+    in that gap does not close the private -shm fd under it."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    pin_wal(monkeypatch)
+    db = tmp_path / "state.db"
+    first = make_db(db, "s", "seed")
+    require_wal(first)
+    shm_ident = _ident(f"{db}-shm")
+    seen = {}
+    real_init = hermes_state.SessionDB._init_schema
+
+    def _init_schema(self):
+        if not seen:  # inside the second opener's init: its connection is open, hold() not yet run
+            first.close()
+            seen["kept"] = shm_ident in lg._FDS
+        return real_init(self)
+
+    monkeypatch.setattr(hermes_state.SessionDB, "_init_schema", _init_schema)
+    second = hermes_state.SessionDB(db_path=db)
+    try:
+        assert seen == {"kept": True}, "a sibling's close retired the -shm fd under an initializing writer"
+        assert shm_ident in second._wal_lock_guard
+        assert not any(isinstance(k, tuple) and k and k[0] == "path" for k in lg._READERS), lg._READERS
+    finally:
+        second.close()
+
+
+def test_clean_close_never_reads_its_own_unretired_shm_fd_as_a_lost_generation(tmp_path, monkeypatch):
+    """Prism 9d02254cf252: between SQLite's clean last close (it unlinks -shm) and retire() the guard's
+    private -shm fd points at a deleted inode. A deleted-generation probe in that window (an independent
+    opener's refuse_deleted_wal_generation) must wait for retire() instead of refusing the open."""
+    if not lg.supported():
+        pytest.skip("no OFD locks")
+    import threading
+    import hermes_state_dbfile as dbf
+    pin_wal(monkeypatch)
+    db = tmp_path / "state.db"
+    sdb = make_db(db, "s", "seed")
+    require_wal(sdb)
+    in_window, go = threading.Event(), threading.Event()
+    real_retire = lg.retire
+
+    def _slow_retire(closing=None):
+        if closing and not in_window.is_set():  # the writer's own retire, after SQLite's close
+            in_window.set()
+            go.wait(10)
+        return real_retire(closing)
+
+    monkeypatch.setattr(lg, "retire", _slow_retire)
+    t = threading.Thread(target=sdb.close)
+    t.start()
+    try:
+        assert in_window.wait(10)
+        assert not os.path.exists(f"{db}-shm"), "the clean last close did not unlink -shm"
+        result = {}
+
+        def _open():
+            try:
+                hermes_state.SessionDB(db_path=db).close()
+                result["ok"] = True
+            except Exception as exc:  # DeletedWalGenerationError without the gate
+                result["err"] = repr(exc)
+
+        opener = threading.Thread(target=_open)
+        opener.start()
+        opener.join(0.5)
+        go.set()
+        opener.join(30)
+        assert result == {"ok": True}, result
+        assert dbf.iter_deleted_sqlite_sidecar_holders(db) == []
+    finally:
+        go.set()
+        t.join(30)
