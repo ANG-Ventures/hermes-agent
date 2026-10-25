@@ -383,7 +383,7 @@ def write_for_tests(registry: dict[str, Any], profile_home: Path | None = None) 
 
 def _terminal_pending(record: dict[str, Any]) -> bool:
     return any(
-        event.get("state") == "pending"
+        event.get("state") in {"pending", "admitted"}
         for event in record.get("outbox", [])
         if isinstance(event, dict)
     )
@@ -1823,6 +1823,75 @@ def enqueue_pending_outbox(
                     current_boot_id,
                 )
     return queued
+
+
+def admit(
+    event_id: str,
+    *,
+    boot_id: str,
+    session_key: str,
+    session_id: str = "",
+    profile_home: Path | None = None,
+) -> bool:
+    """Record ADAPTER ADMISSION of a gateway wake: queued or steered, not yet consumed (t_97a879af).
+
+    ``admitted`` is not ``delivered``: an admitted wake can still be lost in memory (depth cap,
+    eviction, /stop, crash before the drain). The consumption sweeper confirms it ``delivered`` once
+    the parent transcript carries it, or re-opens it ``pending`` for re-injection. Only a pending
+    event moves here, so a late admission never downgrades a settled receipt.
+    """
+    with locked_registry(profile_home) as registry:
+        invalid_record_ids = set(registry.get("_invalid_record_ids", []))
+        for delegation_id, record in registry["records"].items():
+            if str(delegation_id) in invalid_record_ids or not isinstance(record, dict):
+                continue
+            for event in record.get("outbox", []):
+                if isinstance(event, dict) and event.get("event_id") == event_id:
+                    if event.get("state") != "pending":
+                        return False
+                    event.update(state="admitted", admitted_at=time.time(), admitted_boot_id=boot_id,
+                                 admitted_session_key=session_key, admitted_session_id=session_id)
+                    logger.info(
+                        "async_delegation_outbox_admitted event_id=%s session_key=%s session_id=%s",
+                        event_id, session_key, session_id or "-",
+                    )
+                    return True
+    return False
+
+
+def admitted_events(profile_home: Path | None = None) -> list[dict[str, Any]]:
+    """Copies of every ``admitted`` outbox event (the consumption sweeper's work list)."""
+    out: list[dict[str, Any]] = []
+    with locked_registry(profile_home, write=False) as registry:
+        invalid_record_ids = set(registry.get("_invalid_record_ids", []))
+        for delegation_id, record in registry["records"].items():
+            if str(delegation_id) in invalid_record_ids or not isinstance(record, dict):
+                continue
+            for event in record.get("outbox", []):
+                if isinstance(event, dict) and event.get("state") == "admitted":
+                    out.append({**copy.deepcopy(event), "delegation_id": str(delegation_id)})
+    return out
+
+
+def reopen_admitted(event_id: str, *, reason: str, profile_home: Path | None = None) -> dict[str, Any] | None:
+    """``admitted`` -> ``pending`` for one re-injection; returns the payload, else None (settled)."""
+    with locked_registry(profile_home) as registry:
+        invalid_record_ids = set(registry.get("_invalid_record_ids", []))
+        for delegation_id, record in registry["records"].items():
+            if str(delegation_id) in invalid_record_ids or not isinstance(record, dict):
+                continue
+            for event in record.get("outbox", []):
+                if isinstance(event, dict) and event.get("event_id") == event_id:
+                    if event.get("state") != "admitted":
+                        return None
+                    event["state"] = "pending"
+                    event["reinjects"] = int(event.get("reinjects") or 0) + 1
+                    logger.warning(
+                        "async_delegation_outbox_reopened event_id=%s reason=%s reinjects=%d",
+                        event_id, reason, event["reinjects"],
+                    )
+                    return copy.deepcopy(event.get("payload") or {})
+    return None
 
 
 def acknowledge(
