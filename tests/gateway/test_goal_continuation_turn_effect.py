@@ -165,6 +165,80 @@ def test_judge_can_still_end_the_goal_on_a_read_only_turn(hermes_home):
     assert d["status"] == "done"
 
 
+def _queued(adapter):
+    return [e for evs in adapter._pending_messages.values() for e in (evs if isinstance(evs, list) else [evs])]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("goal_cfg, per_goal_checkin", [
+    ({"checkin_minutes": 0}, None),   # config: idle check-ins off
+    ({}, 0),                          # per-goal /goal checkin 0
+])
+async def test_held_turn_is_never_the_last_word(hermes_home, goal_cfg, per_goal_checkin):
+    """Regression for Prism 527a33ddb4e7: with no idle check-in to follow, a read-only turn (the loop's
+    own continuation, or a wake) must still queue a continuation instead of stopping silently."""
+    runner, adapter, entry, src = _runner(goal_cfg)
+
+    def _arm():
+        mgr = _set_goal(entry.session_id)
+        if per_goal_checkin is not None:
+            mgr.set_checkin_minutes(per_goal_checkin)
+        return mgr.next_continuation_prompt()
+
+    continuation = await asyncio.to_thread(_arm)
+    await _run_turn(runner, adapter, entry, src, _event(continuation, _READ_TURN, internal=True))
+    assert len(_queued(adapter)) == 1
+    adapter._pending_messages.clear()
+    await _run_turn(runner, adapter, entry, src, _event(_WAKE, _READ_TURN, internal=True))
+    assert len(_queued(adapter)) == 1
+
+
+def test_spent_checkin_budget_does_not_hold(hermes_home):
+    """No real event re-arms the check-ins and the budget is used up: holding would be a silent stop."""
+    mgr = _set_goal("spent-budget")
+    mgr.state.idle_wakes = 3
+    mgr._save()
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "k", False, None, False)):
+        d = mgr.evaluate_after_turn("ack", turn_effect="read", checkin_minutes=30, max_checkins=3)
+        assert d["should_continue"] and d["hold_overridden"]
+        mgr.state.idle_wakes = 0  # control: a check-in can still follow -> held
+        d = mgr.evaluate_after_turn("ack", turn_effect="read", checkin_minutes=30, max_checkins=3)
+        assert not d["should_continue"] and d["held"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_loop_own_read_only_continuation_keeps_going_with_checkins_on(hermes_home):
+    """The hold targets wakes/pages, not the loop's heartbeat: a read-only continuation turn continues."""
+    runner, adapter, entry, src = _runner({"checkin_minutes": 30})
+    continuation = await asyncio.to_thread(lambda: _set_goal(entry.session_id).next_continuation_prompt())
+    await _run_turn(runner, adapter, entry, src, _event(continuation, _READ_TURN, internal=True))
+    assert len(_queued(adapter)) == 1
+
+
+@pytest.mark.asyncio
+async def test_compaction_during_turn_is_unknown_and_not_held(hermes_home):
+    """Regression for Prism 3c0c66874847: after mid-turn compaction the last user row (a folded todo
+    snapshot) is not the turn start; a write before it must not be lost to a read-only slice."""
+    from hermes_cli.goal_turn_effects import turn_effect_for_result
+
+    messages = [
+        {"role": "user", "content": _WAKE},
+        _call("kanban_comment", task_id="t_1234", body="ack"),
+        {"role": "user", "content": "[todo snapshot]"},
+        _call("kanban_show", task_id="t_1234"),
+    ]
+    result = {"messages": messages, "history_offset": 0, "compacted_in_place": True, "compacted_during_turn": True}
+    assert turn_effect_for_result(result, messages) is None
+    assert turn_effect_for_result({**result, "compacted_during_turn": False}, messages) == "read"
+
+    runner, adapter, entry, src = _runner({"checkin_minutes": 30})
+    await asyncio.to_thread(_set_goal, entry.session_id)
+    ev = _event(_WAKE, messages, internal=True)
+    ev._goal_turn_effect = turn_effect_for_result(result, messages)
+    await _run_turn(runner, adapter, entry, src, ev)
+    assert len(_queued(adapter)) == 1
+
+
 @pytest.mark.parametrize("messages, effect", [
     ([], "none"),
     ([_call("read_file", path="x"), _call("terminal", command="git status && git log -3 | cat")], "read"),
