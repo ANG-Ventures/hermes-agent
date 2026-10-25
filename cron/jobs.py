@@ -2359,6 +2359,19 @@ def export_runtime_to_json(jobs: Optional[List[Dict[str, Any]]] = None, *, retir
                            len(kept))
             return applied
         if retire and _destructive_ok():
+            # Prism 40994c5a66e9: compare-and-delete covers only the rows in OUR snapshot. A sibling
+            # that entered degraded mode can commit a row we never read (a job with no row before)
+            # between the snapshot and here; dropping the file would lose it unfolded. Drop only an
+            # EMPTY table, else keep the db and refuse/log exactly as a changed row does.
+            with _runtime_txn() as conn:
+                left = [r[0] for r in conn.execute("SELECT job_id FROM job_runtime").fetchall()]
+            if left:
+                msg = (f"{len(left)} runtime row(s) appeared while exporting ({', '.join(left)}); "
+                       f"{_rs.DB_NAME} kept (not folded into jobs.json). Re-run the export")
+                if keep_orphans:
+                    logger.warning("cron runtime-state: %s", msg)
+                    return applied
+                raise RuntimeRetireRefused(msg)
             _rs.drop_database(cron_dir)
         logger.warning("cron runtime-state: exported runtime fields of %d job(s) back into "
                        "jobs.json%s", applied, f" and removed {_rs.DB_NAME}" if retire else "")

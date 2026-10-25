@@ -2418,3 +2418,34 @@ def test_export_on_degraded_lock_reads_but_never_publishes(temp_home, monkeypatc
     assert json.loads(out[out.index("{"):out.rindex("}") + 1])["jobs"]
     assert any(j["id"] == "sibling0000b" for j in json.loads(_jobs_file(temp_home).read_text())["jobs"])
     assert _db(temp_home).exists()
+
+
+def test_retire_keeps_db_when_a_new_row_appeared_after_the_export_snapshot(temp_home, monkeypatch):
+    """40994c5a66e9: compare-and-delete covers only the rows the export READ. A degraded-lock sibling
+    commits a row for a job that had none (job b) after the snapshot: every compared row deletes
+    cleanly, but the db must not be dropped with b's unfolded row inside. keep_orphans logs and keeps
+    the db; a plain retire refuses."""
+    from cron import jobs as cj
+    from cron import runtime_state as rs
+
+    a = cj.create_job(prompt="x", schedule="every 5m", name="a")
+    b = cj.create_job(prompt="y", schedule="every 5m", name="b")
+    cj.mark_job_run(a["id"], True)
+    with rs.connect(temp_home / "cron") as conn:
+        conn.execute("DELETE FROM job_runtime WHERE job_id=?", (b["id"],))
+        conn.commit()
+    real_write = cj._write_definitions_file
+
+    def write_then_sibling_adds_b(defs):
+        real_write(defs)
+        rs.write_rows(temp_home / "cron", {b["id"]: {"next_run_at": "2030-01-01T13:00:00+00:00"}})
+
+    monkeypatch.setattr(cj, "_write_definitions_file", write_then_sibling_adds_b)
+    with pytest.raises(cj.RuntimeRetireRefused, match="appeared while exporting"):
+        cj.export_runtime_to_json(retire=True)
+    assert _db(temp_home).exists()
+    with rs.connect(temp_home / "cron") as conn:
+        assert rs.read_row(conn, b["id"]) == {"next_run_at": "2030-01-01T13:00:00+00:00"}
+    monkeypatch.setattr(cj, "_write_definitions_file", real_write)
+    assert cj.export_runtime_to_json(retire=True, keep_orphans=True) >= 1
+    assert _db(temp_home).exists() or _raw(temp_home, b["id"])["next_run_at"] == "2030-01-01T13:00:00+00:00"
