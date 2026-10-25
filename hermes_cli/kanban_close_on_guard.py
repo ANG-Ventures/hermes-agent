@@ -139,25 +139,32 @@ def newer_release_comment(conn, task_id: str, comment_id: int) -> Optional[str]:
 
     Release-bearing = a ``close-on:`` line (``close_on.LINE_RE``) in a comment that is not
     automation (:data:`MACHINE_AUTHORS`, ``our_authors.is_machine``). Order is the closer's:
-    ``(created_at, id)``. Fails closed: an unknown id, or one on another card, is a refusal.
+    ``(created_at, id)``. Fails closed: an unknown id, one on another card, or an anchor that is
+    not itself release-bearing (Prism 1a7315c3ea79) is a refusal.
     Called inside the comment insert's write transaction (Prism 3406ba8bbfd9 / f3498875f176)."""
-    row = conn.execute("SELECT task_id, created_at FROM task_comments WHERE id = ?",
+    row = conn.execute("SELECT task_id, created_at, author, body FROM task_comments WHERE id = ?",
                        (int(comment_id),)).fetchone()
     if row is None or row[0] != task_id:
         return f"comment {comment_id} is not a comment on {task_id}"
     lib, authors = _load("close_on"), _load("our_authors")
     line_re = getattr(lib, "LINE_RE", None) or _LINE_RE_FALLBACK
+
+    def release_bearing(author, body) -> bool:
+        a = str(author or "").strip().lower()
+        if a.startswith("unverified:"):
+            a = a.split(":", 1)[1].strip()
+        if a in MACHINE_AUTHORS or (authors is not None and authors.is_machine(body)):
+            return False
+        return bool(line_re.search(str(body or "")))
+
+    if not release_bearing(row[2], row[3]):
+        return f"comment {comment_id} ({row[2]}) is not a release-bearing comment"
     at = int(row[1] or 0)
     for cid, author, body in conn.execute(
             "SELECT id, author, body FROM task_comments WHERE task_id = ? AND id != ? "
             "AND (created_at > ? OR (created_at = ? AND id > ?)) ORDER BY created_at, id",
             (task_id, int(comment_id), at, at, int(comment_id))):
-        a = str(author or "").strip().lower()
-        if a.startswith("unverified:"):
-            a = a.split(":", 1)[1].strip()
-        if a in MACHINE_AUTHORS or (authors is not None and authors.is_machine(body)):
-            continue
-        if line_re.search(str(body or "")):
+        if release_bearing(author, body):
             return f"comment {cid} ({author}) is a newer release-bearing comment than {comment_id}"
     return None
 

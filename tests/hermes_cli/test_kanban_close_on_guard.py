@@ -280,6 +280,21 @@ def test_if_latest_release_fails_closed_on_an_id_from_another_card(fleet, capsys
     assert rc == 3 and _comments(tid) == []
 
 
+def test_if_latest_release_refuses_an_anchor_that_is_not_release_bearing(fleet, capsys):
+    """Prism 1a7315c3ea79: hold c1, prose c2, append anchored on c2 -> rc 3, nothing written.
+    The anchor must itself be the newest release-bearing comment, not merely a newer one."""
+    _, tid = fleet
+    _post(tid, "apollo", HOLD)
+    c2 = _post(tid, "apollo", "plain prose, no release line")
+    rc, err = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c2))
+    assert rc == 3 and "not a release-bearing comment" in err, err
+    c3 = _post(tid, "default", "[review-merge-pass] LANDED o/r#1: close-on: merged quoted by automation")
+    rc, err = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c3))
+    assert rc == 3 and "not a release-bearing comment" in err, err
+    assert _comments(tid) == [HOLD, "plain prose, no release line",
+                              "[review-merge-pass] LANDED o/r#1: close-on: merged quoted by automation"]
+
+
 def test_if_latest_release_check_shares_the_insert_transaction(fleet, monkeypatch):
     """The check runs inside the insert's write_txn: a newer line committed by the time the
     check reads is seen, and a refusal leaves no row and no ``commented`` event."""
