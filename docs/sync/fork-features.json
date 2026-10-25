@@ -1258,5 +1258,25 @@
     "surfaces": [
       "gateway"
     ]
+  },
+  {
+    "feature": "turn-lease flush window: an inbound while the previous turn still holds the turn lease (slot released, persist/deliver running) is queued, not dispatched; stale holder = invalidated, not superseded; a lease rejection holds the prompts queued behind it (t_d659b247)",
+    "tests": [
+      "tests/gateway/test_turn_lease_flush_window.py"
+    ],
+    "paths": [
+      "gateway/turn_lease.py",
+      "gateway/session_state.py",
+      "gateway/run_inbound.py",
+      "gateway/run_inbound_*.py",
+      "gateway/run_agent_cache.py"
+    ],
+    "why": "2026-10-24 14:45 Apollo default gateway: _run_agent released the turn slot at 'response ready' while _handle_message held the turn lease through a ~170 s persist+deliver; a same-key kanban wake was dispatched as a fresh turn (gen 3), the registry read the live gen-2 holder as 'stopped and draining' because gen 2 was no longer current, clipped the wait to 5 s and bounced it, and Ace's voice message queued behind gen 3 was dropped with the bounce. Fixed by: _hm_queue_during_lease_flush (queue while a lease token is still held), PersistentState.invalidated_run_generation + is_generation_invalidated (supersession is not invalidation), _hm_lease_rejection_reply (hold + count queued prompts on a fail-closed rejection). The lease and its stale-holder predicate are fork-only, so a parity merge resolving these files toward upstream silently reopens all three.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway"
+    ]
   }
 ]
