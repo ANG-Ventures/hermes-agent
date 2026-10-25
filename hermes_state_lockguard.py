@@ -130,12 +130,21 @@ _HANDLES: Dict[Identity, int] = {}
 _FDS: Dict[Identity, int] = {}
 _PATHS: Dict[Identity, str] = {}  # inode in _FDS -> the absolute path that named it
 _SHM_IDENTS: Set[Identity] = set()  # the -shm inodes in _FDS (retire() closes them at count 0)
-_READERS: Dict[Identity, int] = {}  # registered_reader() connections per state.db inode (pin only)
+# registered_reader() connections (pin only), keyed by the state.db inode seen at registration AND by
+# ("path", <absolute path>): a path re-pointed at another file between the registration and the connect
+# (Prism e0cbbe030829) is still covered, since every private descriptor records the path that named it.
+_READERS: Dict[object, int] = {}
 _SHM_DB: Dict[Identity, Identity] = {}  # -shm inode in _FDS -> its state.db inode (readers key on it)
 _CLOSING: Dict[Identity, int] = {}  # writers between release() and retire(): connection still open
 _POOL_WARN_FDS = 16  # expected: one per state.db file guarded in this process
 _POOL_WARNED = False
 _RETIRE_WARNED: Set[Identity] = set()  # inodes whose inconclusive stat was logged once
+# Serializes "SQLite's last close unlinked -shm, our private -shm fd is not closed yet" against the
+# deleted-WAL-generation probes (Prism 9d02254cf252): SessionDB.close() holds it from just before SQLite's
+# close through retire(), and the probes (hermes_state: refuse before connect, _wal_generation_was_lost)
+# take it, so they never see this module's own not-yet-retired descriptor as a live deleted generation.
+# Lock order: SessionDB._lock -> RETIRE_GATE -> _LOCK. Reentrant: close() may probe while holding it.
+RETIRE_GATE = threading.RLock()
 
 
 def _reset_after_fork() -> None:
@@ -145,10 +154,12 @@ def _reset_after_fork() -> None:
     parent stays guarded; a forgotten copy would pin a ``-shm`` the parent's last close unlinks, and
     the deleted-generation probe would then refuse every opener until the child exits. Right after
     fork the child holds no POSIX locks (they are not inherited), so the close cancels nothing."""
-    global _LOCK, _HANDLES, _FDS, _PATHS, _SHM_IDENTS, _READERS, _CLOSING, _SHM_DB
+    global _LOCK, _HANDLES, _FDS, _PATHS, _SHM_IDENTS, _READERS, _CLOSING, _SHM_DB, RETIRE_GATE
     inherited = list(_FDS.values())
-    # The inherited _LOCK is held (_before_fork took it); a fresh one releases it for the child.
+    # The inherited _LOCK is held (_before_fork took it); a fresh one releases it for the child. The
+    # gate may be held by a parent thread that does not exist in the child: fresh too.
     _LOCK, _HANDLES, _FDS, _PATHS, _SHM_IDENTS = threading.Lock(), {}, {}, {}, set()
+    RETIRE_GATE = threading.RLock()
     _READERS, _CLOSING, _SHM_DB = {}, {}, {}
     for fd in inherited:
         try:
@@ -309,7 +320,13 @@ def _in_use(ident: Identity) -> bool:
     if _HANDLES.get(ident, 0) or _CLOSING.get(ident, 0) or _READERS.get(ident, 0):
         return True
     db = _SHM_DB.get(ident)
-    return db is not None and bool(_READERS.get(db, 0))
+    if db is not None and _READERS.get(db, 0):
+        return True
+    path = _PATHS.get(ident)
+    if path is None:
+        return False
+    base = path[:-len("-shm")] if ident in _SHM_IDENTS else path
+    return bool(_READERS.get(("path", base), 0))
 
 
 def _settle(counts: Dict[Identity, int], idents) -> None:
@@ -340,7 +357,22 @@ def retire(closing: Optional[List[Identity]] = None) -> None:
         with _LOCK:
             for ident in [i for i in _SHM_IDENTS if not _in_use(i)]:
                 _close_private(ident)
+            pinned_shm = {i: (_FDS[i], _PATHS[i]) for i in _SHM_IDENTS if i in _FDS and i in _PATHS}
             parked = {i: (fd, _PATHS[i]) for i, fd in _FDS.items() if not _in_use(i) and i in _PATHS}
+        # A -shm generation SQLite already unlinked has no in-process user (SQLite unlinks only at its
+        # LAST in-process close of the inode), so the counts no longer protect anything; keeping the fd
+        # would read as a live deleted generation to every opener's probe, including one that is itself
+        # registered (Prism 9d02254cf252). Close it on a confirmed ENOENT or a different inode at the path.
+        stale_shm = set()
+        for ident, (_fd, path) in pinned_shm.items():
+            real, err = _stat_identity(path)
+            if (real is not None and real != ident) or (real is None and getattr(err, "errno", None) == errno.ENOENT):
+                stale_shm.add(ident)
+        if stale_shm:
+            with _LOCK:
+                for ident in stale_shm:
+                    if _FDS.get(ident) == pinned_shm[ident][0]:
+                        _close_private(ident)
         if not parked:
             return
         gone = set()
@@ -370,15 +402,19 @@ def retire(closing: Optional[List[Identity]] = None) -> None:
 # locks. The kernel releases the descriptors and their OFD locks at process exit.
 
 
-def register_reader(db_path) -> List[Identity]:
+def register_reader(db_path) -> List[object]:
     """Count an in-process connection on *db_path* so :func:`retire` never closes a private
     descriptor (its ``state.db``, or any ``-shm`` generation of it) under the connection. Register
-    BEFORE the connect: the file exists then, while its ``-shm`` may appear only at the first read.
+    BEFORE the connect: its ``-shm`` may appear only at the first read, and the file may not exist yet
+    (a writer's first open). Counted by the inode seen now AND by the absolute path, so a file replaced
+    at the path before the connect is covered too (Prism e0cbbe030829). SessionDB's writer registers
+    for its whole open, connect through hold() (Prism c4ca84c945ca / 8f1afbe91566).
     Takes no file lock and opens nothing: one ``os.stat``.
     Returns the token :func:`unregister_reader` needs. Never raises."""
     try:
-        ident = _identity(os.path.abspath(os.fspath(db_path)))
-        idents = [] if ident is None else [ident]
+        path = os.path.abspath(os.fspath(db_path))
+        ident = _identity(path)
+        idents: List[object] = [("path", path)] + ([] if ident is None else [ident])
         with _LOCK:
             for ident in idents:
                 _READERS[ident] = _READERS.get(ident, 0) + 1
@@ -388,9 +424,10 @@ def register_reader(db_path) -> List[Identity]:
         return []
 
 
-def unregister_reader(token: List[Identity]) -> None:
+def unregister_reader(token: List[object], *, retire_now: bool = True) -> None:
     """Drop a :func:`register_reader` count (after the connection's own close), then :func:`retire`
-    whatever that leaves unused. Never raises."""
+    whatever that leaves unused (``retire_now=False``: settle only, for a caller under
+    ``SessionDB._lock`` whose connection stays open and is now counted by :func:`hold`). Never raises."""
     if not token:
         return
     try:
@@ -398,7 +435,8 @@ def unregister_reader(token: List[Identity]) -> None:
             _settle(_READERS, token)
     except Exception:
         logger.debug("WAL lock guard: reader unregistration failed", exc_info=True)
-    retire()
+    if retire_now:
+        retire()
 
 
 @contextmanager

@@ -963,6 +963,18 @@ class SessionDB(
         # Never materialize a deleted/archived named profile's home: a multiplexer or Desktop backend
         # still holding the profile's route would otherwise re-scaffold it on the next turn (#94590).
         mkdir_under_hermes_home(self.db_path.parent)
+        # Counted by the WAL lock guard from BEFORE the first connect until hold() counts it as a writer:
+        # from the connect on, SQLite holds POSIX locks on -shm (DMS, and the WAL write lock in
+        # _init_schema), and a sibling handle's retire() must not close the private -shm fd under them
+        # (Prism c4ca84c945ca / 8f1afbe91566). On failure the connection is closed before the drop.
+        opening = _lockguard.register_reader(self.db_path)
+        try:
+            self._open_writer_counted()
+        finally:
+            _lockguard.unregister_reader(opening, retire_now=self._conn is None)
+
+    def _open_writer_counted(self) -> None:
+        """:meth:`_open_writer`'s body, run while the lock guard counts this opener."""
         # Read-only file/sidecar preflight BEFORE the first connection: an actionable message
         # instead of an opaque "attempt to write a readonly database" from inside _init_schema.
         preflight_db_writability(self.db_path, db_label="state.db")
@@ -1105,8 +1117,11 @@ class SessionDB(
 
     def _connect_and_init(self) -> None:
         # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
-        # a replacement WAL while a live writer still holds a deleted sidecar inode.
-        refuse_deleted_wal_generation(self.db_path)
+        # a replacement WAL while a live writer still holds a deleted sidecar inode. Under the lock
+        # guard's RETIRE_GATE: a sibling handle's clean close must finish retiring its private -shm
+        # descriptor first, or this probe reads that descriptor as a deleted generation (Prism 9d02254cf252).
+        with _lockguard.RETIRE_GATE:
+            refuse_deleted_wal_generation(self.db_path)
         # Create/tighten the main database before sqlite3.connect() so a
         # permissive process umask can never expose a fresh profile store.
         _secure_state_db_files(self.db_path, create_main=True)
@@ -1273,16 +1288,21 @@ class SessionDB(
             "state.db connection for %s was closed while a %s was still in "
             "flight — reopening (teardown/worker race, #94736)", self.db_path, context,
         )
+        # Counted from before the connect until hold() (Prism c4ca84c945ca), as in _open_writer.
+        opening = _lockguard.register_reader(self.db_path)
         try:
-            self._conn = self._open_writer_conn()
-        except Exception as exc:
-            raise sqlite3.OperationalError(
-                f"state.db connection was closed while a {context} was still "
-                f"in flight (a session-teardown path called close() before "
-                f"this worker finished — #94736) and the automatic reopen failed: {exc}"
-            ) from exc
-        if self._wal_active:  # a reopened writer is a live generation holder like the first open
-            self._wal_lock_guard = _lockguard.hold(self.db_path)
+            try:
+                self._conn = self._open_writer_conn()
+            except Exception as exc:
+                raise sqlite3.OperationalError(
+                    f"state.db connection was closed while a {context} was still "
+                    f"in flight (a session-teardown path called close() before "
+                    f"this worker finished — #94736) and the automatic reopen failed: {exc}"
+                ) from exc
+            if self._wal_active:  # a reopened writer is a live generation holder like the first open
+                self._wal_lock_guard = _lockguard.hold(self.db_path)
+        finally:
+            _lockguard.unregister_reader(opening, retire_now=False)  # under self._lock: never retire here
 
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
@@ -1582,11 +1602,12 @@ class SessionDB(
         if sys.platform.startswith("linux"):
             watched = _watched_sqlite_sidecar_paths(self.db_path)
             try:
-                for target, fd_path in _proc_fd_targets(os.getpid()):
-                    canonical = _state_holders.canonical_sqlite_path(target)
-                    if (" (deleted)" in target and canonical in watched
-                            and _fd_is_truly_unlinked(fd_path, watched[canonical])):
-                        return True
+                with _lockguard.RETIRE_GATE:  # never mid-retire of the guard's own -shm fd (Prism 9d02254cf252)
+                    for target, fd_path in _proc_fd_targets(os.getpid()):
+                        canonical = _state_holders.canonical_sqlite_path(target)
+                        if (" (deleted)" in target and canonical in watched
+                                and _fd_is_truly_unlinked(fd_path, watched[canonical])):
+                            return True
             except OSError:
                 return False
         # Probe clean (or unavailable): adopt the current sidecar generation.
@@ -1878,47 +1899,58 @@ class SessionDB(
         while self._evict_one_idle_read_conn():
             pass
         closing = None
-        with self._lock:
-            if self._conn:
-                generation_lost = not self.read_only and (
-                    self._db_wal_generation_lost
-                    or (bool(self._db_sidecar_identity) and self._wal_generation_was_lost())
-                )
-                # Loss is settled here, not at exit: the unlinked WAL inode dies with this process's
-                # last descriptor (the capture raises and the handle stays open when it fails).
-                retire_without_close = generation_lost and self._settle_lost_generation_locked()
-                quarantine_reason = None if generation_lost else self._quarantine_reason()
-                if quarantine_reason is not None:
-                    logger.warning(
-                        "Skipping the close-time WAL checkpoint for %s: this "
-                        "handle observed %s. Take a snapshot of state.db, -wal and -shm "
-                        "before restarting, then run `hermes sessions recover --source %s --inspect-only`.",
-                        self.db_path, quarantine_reason, self.db_path,
+        gated = False
+        try:
+            with self._lock:
+                if self._conn:
+                    generation_lost = not self.read_only and (
+                        self._db_wal_generation_lost
+                        or (bool(self._db_sidecar_identity) and self._wal_generation_was_lost())
                     )
-                elif not self.read_only and not generation_lost:  # PASSIVE, not TRUNCATE (see docstring)
-                    try:
-                        # Every cron run_agent opens+closes a transient SessionDB, so a TRUNCATE here fires
-                        # a full WAL reset many times/hour, racing the gateway's long-lived writer on large
-                        # WAL databases and tearing hot B-tree pages -- the #45383 corruption this class's
-                        # own periodic checkpoint was already made PASSIVE to avoid. TRUNCATE belongs only
-                        # on a sole-opener/quiescent connection.
-                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    except Exception as exc:
-                        logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
-                closing = _lockguard.release(self._wal_lock_guard)  # before the close: see release()
-                if retire_without_close:
-                    self._pin_connection(self._conn)
-                    self._conn = None
-                else:
-                    conn, self._conn = self._conn, None
-                    self._close_connection_quietly(conn)
-                    self._unregister_reader(conn)  # a read_only handle's connection (no-op otherwise)
-                    # Only a clean close ends the generation; retain the recorded
-                    # identity when retiring an unsafe handle.
-                    self._db_sidecar_identity = {}
-        # After SQLite's close and outside self._lock: settles this handle's release() and closes a
-        # private -shm fd nothing in this process still uses (never parked).
-        _lockguard.retire(closing)
+                    # Loss is settled here, not at exit: the unlinked WAL inode dies with this process's
+                    # last descriptor (the capture raises and the handle stays open when it fails).
+                    retire_without_close = generation_lost and self._settle_lost_generation_locked()
+                    quarantine_reason = None if generation_lost else self._quarantine_reason()
+                    if quarantine_reason is not None:
+                        logger.warning(
+                            "Skipping the close-time WAL checkpoint for %s: this "
+                            "handle observed %s. Take a snapshot of state.db, -wal and -shm "
+                            "before restarting, then run `hermes sessions recover --source %s --inspect-only`.",
+                            self.db_path, quarantine_reason, self.db_path,
+                        )
+                    elif not self.read_only and not generation_lost:  # PASSIVE, not TRUNCATE (see docstring)
+                        try:
+                            # Every cron run_agent opens+closes a transient SessionDB, so a TRUNCATE here fires
+                            # a full WAL reset many times/hour, racing the gateway's long-lived writer on large
+                            # WAL databases and tearing hot B-tree pages -- the #45383 corruption this class's
+                            # own periodic checkpoint was already made PASSIVE to avoid. TRUNCATE belongs only
+                            # on a sole-opener/quiescent connection.
+                            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        except Exception as exc:
+                            logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
+                    # RETIRE_GATE from just before SQLite's close (a clean last close unlinks -shm) until
+                    # retire() has closed the guard's private -shm fd, so no deleted-generation probe reads
+                    # that fd as a lost generation in between (Prism 9d02254cf252). Lock order:
+                    # self._lock -> RETIRE_GATE -> lockguard._LOCK, the same nesting the probes use.
+                    _lockguard.RETIRE_GATE.acquire()
+                    gated = True
+                    closing = _lockguard.release(self._wal_lock_guard)  # before the close: see release()
+                    if retire_without_close:
+                        self._pin_connection(self._conn)
+                        self._conn = None
+                    else:
+                        conn, self._conn = self._conn, None
+                        self._close_connection_quietly(conn)
+                        self._unregister_reader(conn)  # a read_only handle's connection (no-op otherwise)
+                        # Only a clean close ends the generation; retain the recorded
+                        # identity when retiring an unsafe handle.
+                        self._db_sidecar_identity = {}
+            # After SQLite's close and outside self._lock: settles this handle's release() and closes a
+            # private -shm fd nothing in this process still uses (never parked). Still inside RETIRE_GATE.
+            _lockguard.retire(closing)
+        finally:
+            if gated:
+                _lockguard.RETIRE_GATE.release()
         self._read_budget.unregister(self)  # idempotent: a never-registered (failed-init) handle is a no-op
         # t_69e10010 (sibling t_aeae3fe7 owns the lockguard release above): idempotent; a handle
         # retired unclosed keeps its recorded generation in the deleted-WAL registry.
