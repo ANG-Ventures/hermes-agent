@@ -743,13 +743,86 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 # --- Handlers ---
 
+_SHOW_MAX_RUNS = 10            # newest N runs, newest first
+_SHOW_MAX_EVENTS = 50
+_SHOW_MAX_COMMENTS = 30
+_SHOW_FIELD_CHARS = 4_000      # per run summary/error/metadata
+_SHOW_COMMENT_CHARS = 2_000
+_SHOW_EVENT_PAYLOAD_CHARS = 1_000
+_SHOW_REVIEW_CHARS = 16_000    # the newest review is shown in full up to this
+# Whole-response target, well under the 100K spill threshold: a card read must never spill, or a
+# remote worker sees only a preview and misses its review (t_ad44f109).
+_SHOW_BUDGET_CHARS = 60_000
+
+
+def _cap_text(value: Any, limit: int) -> Any:
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    return value[:limit] + f"… [truncated, {len(value) - limit} chars omitted]"
+
+
+def _cap_jsonish(value: Any, limit: int) -> Any:
+    """Keep a JSON value as-is when its serialization fits, else a truncated string of it."""
+    if value is None:
+        return None
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(value)
+    return value if len(text) <= limit else _cap_text(text, limit)
+
+
+def _latest_review(kb, conn, tid: str, runs: list) -> Optional[dict[str, Any]]:
+    """The newest ``changes_requested`` run, in full, with its reviewer and whether a later handback
+    already answered it. Rendered FIRST so it never sits behind the card's history."""
+    reviewed = [r for r in runs if r.outcome == "changes_requested"]
+    if not reviewed:
+        return None
+    run = reviewed[-1]
+    reviewer = None
+    for event in reversed(kb.list_events(conn, tid)):
+        if event.kind == "changes_requested" and event.run_id == run.id:
+            reviewer = (event.payload or {}).get("reviewer") if isinstance(event.payload, dict) else None
+            break
+    later = [r for r in runs if (r.started_at or 0, r.id) > (run.started_at or 0, run.id)
+             and r.outcome == "review_requested"]
+    return {"run_id": run.id, "profile": run.profile, "reviewer": reviewer, "ended_at": run.ended_at,
+            "answered_by_later_handback": bool(later),
+            "summary": _cap_text(run.summary, _SHOW_REVIEW_CHARS)}
+
+
+def _bounded_show(out: dict[str, Any]) -> dict[str, Any]:
+    """Shrink the history lists, oldest entries first, until the response fits the budget."""
+    def size() -> int:
+        return len(json.dumps(out, default=str))
+    omitted = out.setdefault("omitted", {})
+    for key, floor in (("events", 5), ("runs", 2), ("comments", 5)):
+        while size() > _SHOW_BUDGET_CHARS and len(out[key]) > floor:
+            drop = max(1, len(out[key]) // 2)
+            # runs are newest-first; events/comments chronological (oldest first).
+            out[key] = out[key][:-drop] if key == "runs" else out[key][drop:]
+            omitted[key] = omitted.get(key, 0) + drop
+    if size() > _SHOW_BUDGET_CHARS:
+        excess = size() - _SHOW_BUDGET_CHARS
+        ctx = out.get("worker_context") or ""
+        out["worker_context"] = _cap_text(ctx, max(4_000, len(ctx) - excess - 200))
+    if not omitted:
+        out.pop("omitted")
+    return out
+
+
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, comments, runs, last 50 events."""
+    """Task state, bounded: newest review first, then the row, links, the newest comments, events
+    and runs (newest first), and the worker context. Full history via ``hermes kanban show``."""
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
-        return json.dumps({
+        runs = kb.list_runs(conn, tid)
+        comments = kb.list_comments(conn, tid)
+        events = kb.list_events(conn, tid)
+        out: dict[str, Any] = {
+            "latest_review": _latest_review(kb, conn, tid, runs),
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
@@ -760,15 +833,27 @@ def _handle_show(args: dict, **kw) -> str:
             "parent_links": [{"id": pid, "kind": kind} for pid, kind in kb.parent_links(conn, tid)],
             "child_links": [{"id": cid, "kind": kind} for cid, kind in kb.child_links(conn, tid)],
             "comments": [
-                {**_fields(c, _COMMENT_FIELDS),
+                {**_fields(c, _COMMENT_FIELDS), "body": _cap_text(c.body, _SHOW_COMMENT_CHARS),
                  "author_display": kb.format_comment_author(
                      c.author, run_id=c.run_id, session_ref=c.session_ref)}
-                for c in kb.list_comments(conn, tid)],
-            # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
-            "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
+                for c in comments[-_SHOW_MAX_COMMENTS:]],
+            "events": [{**_fields(e, _EVENT_FIELDS),
+                        "payload": _cap_jsonish(e.payload, _SHOW_EVENT_PAYLOAD_CHARS)}
+                       for e in events[-_SHOW_MAX_EVENTS:]],
+            "runs": [{**_fields(r, _RUN_FIELDS),
+                      "summary": _cap_text(r.summary, _SHOW_FIELD_CHARS),
+                      "error": _cap_text(r.error, _SHOW_FIELD_CHARS),
+                      "metadata": _cap_jsonish(r.metadata, _SHOW_FIELD_CHARS)}
+                     for r in reversed(runs[-_SHOW_MAX_RUNS:])],
+            "runs_order": "newest_first",
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+            "worker_context": kb.build_worker_context(conn, tid)}
+        omitted = {k: n for k, n in (("comments", len(comments) - _SHOW_MAX_COMMENTS),
+                                     ("events", len(events) - _SHOW_MAX_EVENTS),
+                                     ("runs", len(runs) - _SHOW_MAX_RUNS)) if n > 0}
+        if omitted:
+            out["omitted"] = omitted
+        return json.dumps(_bounded_show(out), default=str)
 
 
 @_kanban_handler("kanban_list")
