@@ -3196,6 +3196,7 @@ def _last_event_id(conn, task_id: str) -> int:
 _COMPLETION_OUTCOME_EVENTS = {
     "completion_route_refused": "open-PR review route refused",
     "completion_routed_to_review": "handoff names still-OPEN PR(s)",
+    "completion_no_new_head": "no new PR head since the send-back; it stands",
     "workspace_held": "workspace held",
 }
 
@@ -3363,7 +3364,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 )
             else:
                 after = kb.get_task(conn, tid)
-                if getattr(after, "status", None) == "review":
+                from hermes_cli import kanban_handback_new_head as _nh
+                # THIS invocation's outcome (its run's ended row), never the card's current
+                # status: a successor may already hold the card (Prism a0341975cd2e).
+                bounced = _nh.bounced_note(conn, tid, _worker_run_id_for(tid))
+                if bounced is not None:
+                    print(f"Returned {tid} to its worker, {bounced}")
+                elif getattr(after, "status", None) == "review":
                     print(f"Routed {tid} to review, NOT done: "
                           f"{outcome or 'handoff names a still-OPEN PR'}")
                 elif external is not None:

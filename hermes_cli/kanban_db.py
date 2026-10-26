@@ -9685,6 +9685,8 @@ _RUN_OUTCOME_TERMINAL_STATUS = {
     "external": "done",
     "review_requested": "review",
     "changes_requested": "changes_requested",
+    # A no-op handback bounce (t_f716021d): the send-back still stands.
+    "no_new_head": "changes_requested",
     "blocked": "blocked",
     "dependency_wait": "blocked",
 }
@@ -10385,7 +10387,7 @@ def _pre_pr_refusals(refs, *, task_id: str, worker: str) -> list:
         except Exception:  # noqa: BLE001 -- fail-open
             return []
         try:
-            with open(root / "config" / "landing-policy.json", encoding="utf-8") as fh:
+            with open(root / "config" / "landing-policy.json", encoding="utf-8-sig") as fh:
                 cfg = json.load(fh)
         except (OSError, ValueError):
             return []
@@ -10930,31 +10932,43 @@ def complete_task(
                     _append_event(conn, task_id, "completion_blocked_pre_pr",
                                   {"prs": [pr for pr, _ in refusals]})
                 raise NotLandableError(task_id, refusals)
+        # No-op handback (t_f716021d), decided BEFORE the freshness gate so a completion
+        # that will bounce never arms fleet-merge on the head the reviewer sent back
+        # (Prism 6dc02dcaa12e, r2).
+        no_new = None
+        if (still_open and expected_run_id is not None and candidate.status == 'running'
+                and not review_claimed and not negative_trigger):
+            from hermes_cli import kanban_handback_new_head as _nh
+            no_new = _nh.verdict(conn, task_id, still_open)
         if still_open:
             # Handoff freshness gate (t_14b81673): refuse a DRAFT (raises
             # DraftPrError, nothing mutated), update a stale head, arm a green
             # non-milestone PR through fleet-merge.sh.
             from hermes_cli import kanban_pr_freshness as _fresh
-            try:
-                # Arm only the card's OWN handoff PR(s), never a PR the prose
-                # merely mentions (FleetReview #1234 finding).
-                freshness = _fresh.check(
-                    still_open, task_id=task_id,
-                    allow_arm=not is_milestone_card(conn, task_id),
-                    armable={
-                        f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
-                            metadata=metadata, survivor_pr=survivor_pr,
-                        )
-                    },
-                    draft_ok=draft_ok is not None,
+            # Arm only the card's OWN handoff PR(s), never a PR the prose
+            # merely mentions (FleetReview #1234 finding).
+            armable = {
+                f"{r.repo}#{r.number}" for r in _open_pr.extract_pr_refs(
+                    metadata=metadata, survivor_pr=survivor_pr,
                 )
-            except _fresh.DraftPrError as draft_err:
-                with write_txn(conn):
-                    _append_event(
-                        conn, task_id, "completion_blocked_draft_pr",
-                        {"prs": draft_err.prs},
+            }
+            may_arm = not is_milestone_card(conn, task_id)
+
+            def _freshness_gate(refs, allow_arm):
+                try:
+                    return _fresh.check(
+                        refs, task_id=task_id, allow_arm=allow_arm, armable=armable,
+                        draft_ok=draft_ok is not None,
                     )
-                raise
+                except _fresh.DraftPrError as draft_err:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, task_id, "completion_blocked_draft_pr",
+                            {"prs": draft_err.prs},
+                        )
+                    raise
+
+            freshness = _freshness_gate(still_open, no_new is None and may_arm)
             overridden = freshness.get("draft_override") or []
             if overridden:
                 # Audited, never silent (t_f38605be): the intentionally-open
@@ -10967,6 +10981,37 @@ def complete_task(
                 still_open = [
                     r for r in still_open if f"{r.repo}#{r.number}" not in overridden
                 ]
+        if no_new is not None:
+            # The freshness gate can update-branch after the verdict; a moved head is
+            # content the verdict never judged, so it routes (Prism 4f5d7679ba58).
+            no_new = _nh.still_holds(no_new, freshness)
+            if no_new is None and still_open and may_arm:
+                # The voided verdict routes to review like any handback, so arm it as one: the gate
+                # ran with arming off for the verdict (Prism 188c162a38e9). A PR the gate just
+                # update-branched is left to fleet-merge once its fresh CI is green, as in check().
+                gated = freshness.get("prs") or {}
+                rearm = [r for r in still_open
+                         if "update_branch" not in (gated.get(f"{r.repo}#{r.number}") or {})]
+                if rearm:
+                    again = _freshness_gate(rearm, True)
+                    freshness = dict(freshness, prs={**gated, **(again.get("prs") or {})})
+        if still_open and no_new is not None:
+            # No-op handback (t_f716021d): nothing on the PR the reviewer has not
+            # seen, so the send-back stands and the card goes back to its worker.
+            from hermes_cli import kanban_handback_new_head as _nh
+            # The run's own handoff and artifacts survive the bounce (Prism 9c7fd6708b92).
+            from hermes_cli import kanban_negative_handoff as _neg
+            bounce_meta, staged = _stage_routed_scratch_artifacts(
+                conn, task_id, dict(metadata or {}, no_new_head=no_new),
+                summary=summary, result=result,
+            )
+            ok = _nh.bounce(
+                conn, task_id, no_new, expected_run_id=expected_run_id,
+                summary=_neg.routed_summary(_nh.comment(no_new["seen"]), summary, result),
+                metadata=bounce_meta,
+            )
+            _settle_routed_scratch_artifacts(conn, task_id, staged, ok)
+            return ok
         if still_open:
             note = _open_pr.route_note(still_open)
             routed_meta = dict(metadata or {}, auto_routed_open_prs=[
@@ -13084,6 +13129,12 @@ def redact_review_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact_review_value(item) for item in value)
     return redact_sensitive_json(value, force=True)
+
+
+def redact_review_handoff(summary: Any, metadata: Any) -> tuple:
+    """The ONE redaction of a review-lane handoff (summary, metadata), shared by :func:`request_review` and the
+    no-op handback bounce so the two durable paths cannot drift (Prism cde5d0610ef1, t_f716021d)."""
+    return redact_review_value(summary), redact_review_value(metadata)
 HUMAN_REVIEWER_SENTINEL = "human"
 
 
@@ -13576,8 +13627,7 @@ def request_review(
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
-    summary = redact_review_value(summary)
-    metadata = redact_review_value(metadata)
+    summary, metadata = redact_review_handoff(summary, metadata)
 
     # ── Review-round cap (kanban.max_review_rounds) ────────────────────────
     # Evaluated BEFORE the transaction because block_task opens its own.
@@ -13646,6 +13696,15 @@ def request_review(
                 conn, task_id, summary=summary, metadata=skip_meta,
                 expected_run_id=expected_run_id,
             )
+            if done:
+                # A no-op handback bounce (t_f716021d) left the card with its worker:
+                # neither completed nor reviewed, so no review_skipped event. Read from
+                # THIS run's ended row BEFORE the card's status, which a successor may
+                # already have moved to review (Prism 35bc66834b1d).
+                from hermes_cli import kanban_handback_new_head as _nh
+                _bounced = _nh.bounced_note(conn, task_id, expected_run_id)
+                if _bounced is not None:
+                    return _ret(True, _bounced)
             if done and _task_status(conn, task_id) == "review":
                 return _ret(True, "open PR named in the handoff — auto-routed to review instead of done")
             if not done:
@@ -16985,7 +17044,9 @@ _RESPAWN_GUARD_OPERATOR_REQUEUE_KINDS: tuple[str, ...] = (
 # continuation, not a duplicate: one spawn after the newest PR comment
 # consumes it, like an operator requeue. Deliberately NOT in the operator
 # tuple above (overlap-hold release and failure staleness stay operator-only).
-_RESPAWN_GUARD_CONTINUATION_KINDS: tuple[str, ...] = ("placement_reroute",)
+# The no-op handback bounce (``kanban_handback_new_head.EVENT``, t_f716021d) is
+# one too: it returns the card to its worker with the send-back still standing.
+_RESPAWN_GUARD_CONTINUATION_KINDS: tuple[str, ...] = ("placement_reroute", "completion_no_new_head")
 
 # Event kinds that make a stamped failure STALE for the ``blocker_auth`` and
 # ``rate_limit_cooldown`` rules when they land at/after the failing run ended:
