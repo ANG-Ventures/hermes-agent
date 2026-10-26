@@ -187,6 +187,36 @@ def _log_internal_silence_verdict(response, silent: bool, platform_name, source)
                     words, platform_name, chat)
 
 
+class _DeliveryStageClock:
+    """Per-stage wall time from ``response ready`` to the platform send (spec 2026-10-24 §5.4).
+
+    Thread dumps cannot see which coroutine a turn is parked on; this times each await of the
+    post-ready tail and logs ONE ``PHASE=delivery_stages`` line when the total passes the floor."""
+
+    STAGES = ("footer", "hooks", "compress", "persist", "branch", "deliver")
+    FLOOR_S = 2.0
+
+    def __init__(self):
+        self._start = self._last = time.monotonic()
+        self.laps: Dict[str, float] = {}
+
+    def lap(self, stage: str) -> None:
+        now = time.monotonic()
+        self.laps[stage] = now - self._last
+        self._last = now
+
+    def log_if_slow(self, session_key, deliver_pre_send_s=None) -> None:
+        total = self._last - self._start
+        if total <= self.FLOOR_S:
+            return
+        parts = " ".join(f"{s}={self.laps.get(s, 0.0):.2f}" for s in self.STAGES)
+        pre = f" deliver_pre_send={deliver_pre_send_s:.2f}" if deliver_pre_send_s is not None else ""
+        logger.info(
+            "PHASE=delivery_stages session=%s ready_to_send_s=%.2f %s%s",
+            session_key or "unknown", total, parts, pre,
+        )
+
+
 class GatewayTurnMixin:
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
@@ -2138,6 +2168,7 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        _entered = time.monotonic()
         # The /goal no-progress stop reads this (streamed turns return None, so not from the result).
         with suppress(Exception):
             event._goal_turn_api_calls = int(agent_result.get("api_calls", 0) or 0)
@@ -2158,6 +2189,9 @@ class GatewayTurnMixin:
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
         )
+        # Everything above runs before any platform send (voice, media, footer, or the adapter's
+        # own send of the returned text): PHASE=delivery_stages reports it as deliver_pre_send.
+        event._delivery_pre_send_s = time.monotonic() - _entered
         if not _streaming_tts_done and self._should_send_voice_reply(
             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
@@ -2604,14 +2638,17 @@ class GatewayTurnMixin:
                 reply_expected=event.reply_expected,
                 _run_start_resume_marked_at=_run_start_resume_marked_at,
             )
+            _stages = _DeliveryStageClock()
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
             _footer_line = await self._hmwa_runtime_footer_line(
                 agent_result, source, _turn_seconds, session_entry=session_entry, session_key=session_key,
             )
+            _stages.lap("footer")
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
             await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
+            _stages.lap("hooks")
 
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
@@ -2621,6 +2658,7 @@ class GatewayTurnMixin:
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )
+            _stages.lap("compress")
             _persisted_user_rows = await self._hmwa_persist_turn_transcript(
                 event=event, source=source, session_entry=session_entry, session_key=session_key,
                 agent_result=agent_result, agent_messages=agent_messages, prepared=prepared,
@@ -2628,16 +2666,21 @@ class GatewayTurnMixin:
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
             )
+            _stages.lap("persist")
             # The /branch correction rode this turn's user row; the inherited pin is adopted only once
             # that annotated row is in the transcript (a cancelled/discarded turn returned above, a
             # failed or proxy-error turn persisted no annotated row: both re-stage the note instead).
             await self._hmwa_commit_branch_pin(
                 prepared, session_key, _run_start_session_id, persisted_user_rows=_persisted_user_rows,
             )
-            return await self._hmwa_deliver_turn_response(
+            _stages.lap("branch")
+            _delivered = await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
             )
+            _stages.lap("deliver")
+            _stages.log_if_slow(session_key, getattr(event, "_delivery_pre_send_s", None))
+            return _delivered
 
         except Exception as e:
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
