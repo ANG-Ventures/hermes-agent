@@ -327,3 +327,40 @@ def test_a_worker_posted_coverage_does_not_redefine_the_seen_head(sent_back, mon
         assert nh.seen_head(conn, sent_back, nh._pending_send_back(conn, sent_back)) == A
         assert kb.complete_task(conn, sent_back, summary=f"r2 {PR}", expected_run_id=run)
         assert kb.get_task(conn, sent_back).status == "review"
+
+
+def test_a_same_second_runless_coverage_does_not_replace_the_reviewers(sent_back, monkeypatch):
+    """Prism 6ecbccbd1579: a runless comment naming C, stamped in the send-back's own second, is not "seen"."""
+    monkeypatch.setattr(nh, "_default_reader", lambda: lambda repo, n, seen: (
+        {"head": C} if seen == C else VIEWS["new_commit"]))
+    with kb.connect() as conn:
+        send_back = nh._pending_send_back(conn, sent_back)
+        cid = kb.add_comment(conn, sent_back, "builder", _coverage(C))
+        at = conn.execute("SELECT created_at FROM task_events WHERE id = ?", (send_back,)).fetchone()[0]
+        conn.execute("UPDATE task_comments SET created_at = ? WHERE id = ?", (at, cid))
+        conn.commit()
+        assert nh.seen_head(conn, sent_back, send_back) == A
+        run = kb.claim_task(conn, sent_back).current_run_id
+        assert kb.complete_task(conn, sent_back, summary=f"r2 {PR}", expected_run_id=run)
+        assert kb.get_task(conn, sent_back).status == "review"
+
+
+def test_only_operator_proven_runless_coverage_counts(tmp_path, monkeypatch):
+    """A runless coverage posted BEFORE the send-back counts only under an operator label, never unverified:*."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(op, "_default_query", lambda: lambda repo, n: {"state": "OPEN"})
+    monkeypatch.setattr(kb, "_operator_caller_profiles", lambda: frozenset({"apollo"}))
+    kb._INITIALIZED_PATHS.clear()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="impl", assignee="builder")
+        run = kb.claim_task(conn, tid)
+        assert kb.complete_task(conn, tid, summary=f"r1 {PR}", expected_run_id=run.current_run_id)
+        assert kb.claim_review_task(conn, tid)
+        kb.add_comment(conn, tid, "apollo", _coverage(A))            # operator, runless: counts
+        kb.add_comment(conn, tid, "unverified:apollo", _coverage(C))  # unproven claim: refused
+        kb.add_comment(conn, tid, "builder", _coverage(C))            # runless implementer label: refused
+        assert kb.request_changes(conn, tid, reason="BEHAVIOUR: build r7", operator="apollo: test")[0]
+        assert nh.seen_head(conn, tid, nh._pending_send_back(conn, tid)) == A

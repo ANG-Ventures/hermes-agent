@@ -63,22 +63,35 @@ def comment(seen: str) -> str:
 def seen_head(conn: sqlite3.Connection, task_id: str, send_back: Optional[int] = None) -> Optional[str]:
     """``head_sha`` of the newest parseable ``review_coverage`` record the reviewer posted, lowercased, or None.
 
-    With ``send_back`` (the pending ``changes_requested`` event id) only a record posted no later than that
-    send-back, and not from an implementer run, counts: a coverage-shaped comment the worker posts during rework
-    must not redefine what the reviewer has seen (Prism e76f9616eb30).
+    With ``send_back`` (the pending ``changes_requested`` event id) a coverage-shaped comment the worker posts
+    during rework must not redefine what the reviewer has seen (Prism e76f9616eb30), so a record counts only when:
+
+    * its comment id is at or below the send-back's ``after_comment_id``, the comment high-water mark
+      ``_append_event`` snapshots in the send-back's own transaction. A timestamp is second-granular, so a comment
+      committed in the same second as the send-back would pass a clock bound (Prism 6ecbccbd1579). A send-back
+      with no snapshot proves nothing and routes.
+    * its writer is proven: an operator label (``is_operator_label``; an unproven claim was already stored as
+      ``unverified:<name>``, which never matches), or a comment bound to a REVIEW run of this card.
     """
     from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_identity import is_operator_label
 
+    bound = None
+    if send_back is not None:
+        ev = conn.execute("SELECT payload FROM task_events WHERE id = ? AND task_id = ?",
+                          (send_back, task_id)).fetchone()
+        bound = kb._json_dict(ev[0]).get("after_comment_id") if ev is not None else None  # noqa: SLF001
+        if not isinstance(bound, int) or isinstance(bound, bool):
+            return None
+    # The bound is in the query, so comments posted after the send-back cannot crowd the reviewer's out of the LIMIT.
     rows = conn.execute(
-        "SELECT body, run_id, created_at FROM task_comments WHERE task_id = ? AND body LIKE '%review_coverage:%' "
-        "ORDER BY id DESC LIMIT 20", (task_id,),
+        "SELECT body, run_id, id, author FROM task_comments WHERE task_id = ? AND body LIKE '%review_coverage:%' "
+        "AND (? IS NULL OR id <= ?) ORDER BY id DESC LIMIT 20", (task_id, bound, bound),
     ).fetchall()
     if send_back is not None:
-        at = conn.execute("SELECT created_at FROM task_events WHERE id = ?", (send_back,)).fetchone()
-        if at is None:
-            return None
-        rows = [r for r in rows if int(r[2] or 0) <= int(at[0])
-                and (r[1] is None or kb._retry_status_for_run(conn, task_id, int(r[1])) == "review")]  # noqa: SLF001
+        rows = [r for r in rows if (
+            is_operator_label(r[3])
+            or (r[1] is not None and kb._retry_status_for_run(conn, task_id, int(r[1])) == "review"))]  # noqa: SLF001
     record, _err = kb._latest_review_coverage([{"body": r[0] or ""} for r in rows])  # noqa: SLF001 -- the one parser
     if not isinstance(record, dict):
         return None
