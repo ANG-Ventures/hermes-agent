@@ -603,6 +603,46 @@ def test_backup_rescan_archives_the_pair_of_a_renamed_profile(home, tmp_path, mo
     assert {"profiles/b/cron/jobs.json", "profiles/b/cron/runtime_state.db"} <= names, names
 
 
+def test_backup_rescan_does_not_archive_an_already_captured_store_twice(home, tmp_path, monkeypatch):
+    """Prism dafc6732ca54: the rescan deduped homes by path only, so a profile renamed AFTER its
+    pair was archived was archived again at the new path; import then ran the same schedules in
+    two stores. An unrelated vanished file is what triggers the rescan."""
+    from cron import jobs as cj
+    from hermes_cli import backup
+
+    pa = home / "profiles" / "a"
+    (pa / "cron").mkdir(parents=True)
+    (pa / "config.yaml").write_text("model: x\n")
+    with cj.use_cron_store(pa):
+        _job(cj, "pj", 2)
+    tmpfile = home / "skills" / "temporary.md"
+    tmpfile.parent.mkdir(parents=True, exist_ok=True)
+    tmpfile.write_text("gone soon\n")
+    real_entries, real_pairs, calls = backup._write_zip_entries, backup._zip_cron_pairs, []
+
+    def write_entries(zf, files, *a, **kw):
+        tmpfile.unlink(missing_ok=True)  # vanishes before the first pass writes it
+        return real_entries(zf, files, *a, **kw)
+
+    def zip_pairs(*a, **kw):
+        out = real_pairs(*a, **kw)
+        if not calls:  # pass 1 archived profiles/a's pair; now the profile is renamed
+            pa.rename(home / "profiles" / "b")
+        calls.append(1)
+        return out
+
+    monkeypatch.setattr(backup, "_write_zip_entries", write_entries)
+    monkeypatch.setattr(backup, "_zip_cron_pairs", zip_pairs)
+    zpath = tmp_path / "out" / "b.zip"
+    zpath.parent.mkdir()
+    backup.run_backup(Namespace(output=str(zpath), census_out=None, keep=0))
+    assert len(calls) == 2, "the rescan did not run"
+    with zipfile.ZipFile(zpath) as zf:
+        names = set(zf.namelist())
+    profile_pairs = sorted(n for n in names if n.startswith("profiles/") and n.endswith("cron/jobs.json"))
+    assert profile_pairs == ["profiles/a/cron/jobs.json"], names
+
+
 def _other_store(tmp_path):
     """A populated cron store OUTSIDE the home under test: (cron dir, jobs bytes, rows)."""
     from cron import jobs as cj
