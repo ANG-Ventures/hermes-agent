@@ -34,10 +34,9 @@ counted and never closed in ``_arm``; it stays until a later ``hold()`` counts i
 that db finds it at zero.
 
 Known narrowing (t_2aad1d42): a raw ``sqlite3.connect(state.db)`` reader elsewhere in the process
-(backup, open_db, kanban readers) was previously locked INCIDENTALLY by the old fd-table scan when
-some SessionDB called hold(). With per-instance fds it is covered only while a SessionDB writer is
-alive in the process, which in the gateway is always. Explicit coverage for SessionDB-less
-processes is a follow-up card (t_8f3bf459), not this module.
+(backup, open_db, kanban readers) was previously locked INCIDENTALLY by the old fd-table scan; it is
+now covered only while a SessionDB writer is alive in the process (in the gateway: always). Explicit
+coverage for SessionDB-less processes is follow-up card t_8f3bf459, not this module.
 """
 
 from __future__ import annotations
@@ -96,9 +95,24 @@ Held = Dict[Identity, Tuple[int, int]]  # inode this handle guards -> its (start
 # Process-wide, tiny: the private fd per guarded inode (+ the path it was opened at) and the number
 # of live handles on it.
 _LOCK = threading.Lock()
+
+
+def _no_live_connection(path: str) -> bool:
+    """No tracked connection (hermes_cli.sqlite_safe_read: every SessionDB writer, pool reader and
+    checkpoint connection) to *path*'s database. This, not the handle count, gates a close: the
+    count never saw pool readers, the checkpoint connection or an initialising writer (Prism
+    12297a6faa04, f4694ff962e4, 26c5daf67097, 81153d4ceb9f). Fails CLOSED without the registry."""
+    try:
+        from hermes_cli.sqlite_safe_read import has_live_connection
+    except ImportError:
+        return False
+    try:
+        return not has_live_connection(path)
+    except Exception:
+        return False
 _FDS: Dict[Identity, Tuple[int, str]] = {}
 _HANDLES: Dict[Identity, int] = {}
-_DUPS: Dict[Identity, List[int]] = {}  # extra fds on a registered inode (path-move race); closed with it
+_DUPS: Dict[Identity, List[int]] = {}  # path-move duplicates, closed with their inode
 
 
 def supported() -> bool:
@@ -150,10 +164,7 @@ def _arm(path: str, rng: Tuple[int, int], held: Held) -> None:
             except OSError:
                 return
             ident = (st.st_dev, st.st_ino)
-            if ident in _FDS:
-                # The path moved onto an inode already registered. Never close this duplicate now:
-                # closing ANY fd of a file drops every POSIX lock this process holds on it, SQLite's
-                # included. It is kept with its inode and closed with it.
+            if ident in _FDS:  # path moved onto a registered inode: keep the duplicate, close it WITH the inode
                 _DUPS.setdefault(ident, []).append(fd)
             entry = _FDS.setdefault(ident, (fd, path))
             if ident in held:
@@ -161,10 +172,8 @@ def _arm(path: str, rng: Tuple[int, int], held: Held) -> None:
         if _ofd_lock(entry[0], _F_RDLCK, start, length):
             held[ident] = rng
             _HANDLES[ident] = _HANDLES.get(ident, 0) + 1
-        # Refused: an EXCLUSIVE on this range, foreign OR this process's own POSIX lock (OFD and
-        # POSIX locks conflict within one process too), so the fd is never closed here: a close
-        # would cancel this process's own SQLite locks. It stays, uncounted, for the next hold();
-        # if the path moves on, _sweep_retired_locked closes it (Prism 30c639c0af16 / 5fa2be0eea10).
+        # Refused (foreign EXCLUSIVE, or this process's own POSIX lock): never closed here, a close
+        # would cancel our own SQLite locks. Stays uncounted for the next hold() or the retired sweep.
 
 
 def hold(db_path, held: Optional[Held] = None) -> Held:
@@ -192,9 +201,7 @@ def refresh_shm(db_path, held: Held) -> None:
 
 
 def sweep_retired() -> None:
-    """Public form of the retired sweep, for the open path: call before
-    ``refuse_deleted_wal_generation`` so this process's own uncounted fd on an inode a foreign
-    reset unlinked is not mistaken for a live deleted-generation holder. No-op without OFD locks."""
+    """Open-path sweep before ``refuse_deleted_wal_generation``: our uncounted fd on an unlinked inode is not a live holder."""
     if supported():
         with _LOCK:
             _sweep_retired_locked()
@@ -246,26 +253,45 @@ def release(db_path, held: Held) -> List[Identity]:
             except OSError:
                 pass
         held.clear()
-        out = [ident for ident in mine if ident in _FDS and not _HANDLES.get(ident)]
-        return out + [ident for ident, (_, path) in _FDS.items()
-                      if ident not in out and not _HANDLES.get(ident) and _identity(path) != ident]
+        return [ident for ident in mine if ident in _FDS and not _HANDLES.get(ident)] + [
+            ident for ident, (_, path) in _FDS.items()
+            if ident not in mine and not _HANDLES.get(ident) and _identity(path) != ident]
 
 
 def close_fds(idents: List[Identity]) -> None:
-    """Second half of :func:`release`, once the releasing handle's own connection has closed: close
-    the fds still at count zero. One counted in between belongs to that handle now."""
+    """Second half of :func:`release`, after the releasing connection closed. An fd closes only when
+    no handle counts its inode AND (the path no longer names it, or no tracked connection to the
+    database is live). Otherwise it stays parked for the next hold(), release or retired sweep."""
     with _LOCK:
         for ident in idents:
             if _HANDLES.get(ident):
                 continue
-            entry = _FDS.pop(ident, None)
-            if entry is not None:
-                _close_all(entry[0], ident)
+            entry = _FDS.get(ident)
+            if entry is None:
+                continue
+            fd, path = entry
+            retired = _identity(path) != ident
+            if not retired and not _no_live_connection(_db_path_of(path)):
+                continue
+            del _FDS[ident]
+            _close_all(fd, ident)
+
+
+def uncounted(db_path) -> List[Identity]:
+    """Uncounted inodes opened at *db_path* or its ``-shm``: :func:`close_fds` candidates for a late reader's close."""
+    if not supported():
+        return []
+    paths = (os.fspath(db_path), _shm_path(db_path))
+    with _LOCK:
+        return [ident for ident, (_, path) in _FDS.items() if path in paths and not _HANDLES.get(ident)]
+
+
+def _db_path_of(path: str) -> str:
+    return path[:-4] if path.endswith("-shm") else path
 
 
 def _close_all(fd: int, ident: Identity) -> None:
-    """Close an inode's private fd and any duplicate kept for it. Caller holds _LOCK and has checked
-    that no handle counts the inode."""
+    """Close an inode's private fd and its duplicates. Caller holds _LOCK; no handle counts the inode."""
     for each in [fd] + _DUPS.pop(ident, []):
         try:
             os.close(each)

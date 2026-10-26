@@ -421,3 +421,33 @@ def test_refused_arm_leftover_is_closed_by_the_next_release_under_any_spelling(w
     os.replace(shm + ".retired", shm)  # the foreign reset finished: the inode we refused is gone
     SessionDB(db_path=link / "state.db").close()  # a release under another spelling sweeps it
     assert leftover not in lg._FDS, "the uncounted leftover is closed by whichever release comes next"
+
+
+def _foreign_truncate_checkpoint(db_path) -> bool:
+    """A foreign wal_checkpoint(TRUNCATE) needs every reader's read-mark; True when it fully reset
+    the WAL (which it must NOT while an in-process reader is mid-transaction)."""
+    code = (f"import sqlite3\nc = sqlite3.connect({os.fspath(db_path)!r}, timeout=0)\n"
+            "r = c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()\nprint('RESET' if r[0] == 0 else 'BUSY')\n")
+    return "RESET" in subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+
+
+# Prism 12297a6faa04 / f4694ff962e4: the handle count never saw the read pool. A pooled reader
+# mid-transaction outlives close(); release()+close_fds() at "count zero" must not close the
+# private -shm fd under it (that cancels the reader's POSIX read-mark lock, and a foreign TRUNCATE
+# then resets the WAL under a live read). The fd closes when the reader finally closes.
+def test_close_with_a_live_pool_reader_keeps_the_fds_until_the_reader_closes(wal_db):
+    db = wal_db
+    for i in range(300):
+        db.append_message("s", role="user", content=f"m{i}")
+    shm_ident = lg._identity(f"{db.db_path}-shm")
+    ctx = db._read_ctx()
+    reader = ctx.__enter__()  # pooled, mode=ro, outside _lock
+    assert reader is not db._conn, "test premise: a pooled reader, not the writer"
+    reader.execute("BEGIN")
+    reader.execute("select count(*) from messages").fetchone()  # read transaction open: holds a read-mark
+    db.close()  # last counted handle; the reader is still live
+    assert shm_ident in lg._FDS, "fd must stay while a tracked connection is live"
+    assert not _foreign_truncate_checkpoint(db.db_path), "foreign TRUNCATE must be refused under the live read"
+    reader.execute("COMMIT")
+    ctx.__exit__(None, None, None)  # late reader closes itself (close() already drained the pool)
+    assert shm_ident not in lg._FDS, "the late reader's close released what close() had to leave"

@@ -1168,6 +1168,10 @@ class SessionDB(
             self._close_conn_logged(conn, "read-conn")
         finally:
             self._read_budget.release()
+        if self._read_conns_closed:
+            # A reader that outlived close(): the writer's release() left the private lock-guard fds
+            # parked because this connection was still live. Now it is not; close what is closable.
+            _lockguard.close_fds(_lockguard.uncounted(self.db_path))
 
     def _checkout_read_conn(self) -> Optional[sqlite3.Connection]:
         """Borrow a read connection, opening on a miss; None when the read path is unavailable.
