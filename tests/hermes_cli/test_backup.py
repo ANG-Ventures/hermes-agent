@@ -436,7 +436,8 @@ class TestIterBackupFiles:
         import subprocess
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
-        return subprocess.run(["git", "-C", str(cwd), *argv], check=True, capture_output=True, text=True).stdout
+        return subprocess.run(["git", "-C", str(cwd), *argv], check=True, capture_output=True, text=True,
+                              env=env).stdout
 
     def test_root_worktrees_carry_only_dirty_and_untracked(self, tmp_path, monkeypatch):
         """t_7da95544: root wt/ + worktrees/ were 549 k of the 1.43 M files the full tier listed. A checkout's
