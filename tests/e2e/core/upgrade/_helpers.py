@@ -225,6 +225,11 @@ def run(
         raise AssertionError(
             f"{list(argv)} timed out after {timeout}s\nSTDOUT tail:\n{out[-4000:]}\nSTDERR tail:\n{err[-4000:]}"
         )
+    except BaseException:
+        # The harness wall-clock stop (an async exception) lands here; a sandbox left running
+        # keeps its generation leased and poisons the next test sharing the home (t_395344c0).
+        kill_tree(proc)
+        raise
     return subprocess.CompletedProcess(list(argv), proc.returncode, out, err)
 
 
