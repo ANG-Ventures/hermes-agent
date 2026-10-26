@@ -71,6 +71,7 @@ def test_transport_failure_is_reported_as_failure(w, fault):
         f"a transport failure claims local history diverged (and writes a rescue ref):\n{w.diag(cp, mark)}")
 
 
+@pytest.mark.slow_test(300, reason="five sequential `hermes update` runs (baseline, 3 cut fetches, heal): 71-100 s on 8 ACE-AI cores")
 def test_retry_after_interrupted_fetches_heals_without_refetching_history(w):
     w.reset_clean()
     w.srv.clear_faults()
