@@ -341,6 +341,45 @@ class TestShouldExclude:
         ):
             assert not _should_exclude(Path(p)), p
 
+    def test_class_rollback_dirs_under_state_var(self):
+        """t_98bb8096 class 2: rollback DIRS directly under state/ or var/ (depth 2, root-anchored)."""
+        from hermes_cli.backup import _matches_path_glob, _matches_class_dir, _should_exclude
+        for p in ("state/kanban-bak-20261020/kanban.db", "var/ledger.pre-repair/ledger.db",
+                  "state/cron.broken-20261001/jobs.json"):
+            assert _should_exclude(Path(p)), p
+        assert _matches_class_dir(("var", "x-bak-1", "_"))
+        assert not _matches_path_glob(("var", "x-bak-1", "_"))       # a class rule, not a listed dir
+        for p in ("state/kanban-bak-notes/a.md",                     # -bak- not followed by a digit
+                  "state/sub/x-bak-1/a.db",                          # depth 3: not root-anchored at depth 2
+                  "skills/x/state/y.pre-1/a.md",                     # not under the root state/
+                  "workspace/notes.pre-release/a.md",                # `.pre-` outside var/state is user data
+                  "notes.pre-release.md", "state/plan.pre-merge.md"):  # a FILE named like it is kept
+            assert not _should_exclude(Path(p)), p
+
+    def test_class_forensic_capture_dirs_depth_le_3(self):
+        """t_98bb8096 class 3: forensic-*/forensics-*/incident-capture-* dirs at depth <= 3; carried by the
+        weekly forensics -> NAS lane. Skill trees are exempt."""
+        from hermes_cli.backup import _should_exclude
+        for p in ("forensic-20261001/state.db", "var/forensics-gateway-emfile/lsof.txt",
+                  "profiles/aegis/incident-capture-0912/state.db", "state/x/forensic-y/a.json"):
+            assert _should_exclude(Path(p)), p
+        for p in ("a/b/c/forensic-deep/x.txt",                       # depth 4
+                  "skills/x/forensics-guide/SKILL.md",               # skill content
+                  "skills-shared/dnr/forensic-recipes/a.md",
+                  "var/forensic-notes.md", "incident-capture-howto.md"):  # files, not dirs
+            assert not _should_exclude(Path(p)), p
+
+    def test_class_staging_export_artifacts(self):
+        """t_98bb8096 class 4: *.partial, *-staging/ and export-*.tgz|.tar|.zip under var/ and state/."""
+        from hermes_cli.backup import _should_exclude
+        for p in ("var/dl/model.gguf.partial", "state/sync-staging/a.json", "var/x/rsync-staging/y/z.bin",
+                  "var/export-20261026.tgz", "state/exports/export-kanban.zip", "var/export-a.tar"):
+            assert _should_exclude(Path(p)), p
+        for p in ("workspace/model.partial", "skills/x/export-demo.zip",   # outside var/state
+                  "var/export-notes.md", "var/staging/a.json",            # not the pattern
+                  "var/sync-staging"):                                    # a FILE with the dir name
+            assert not _should_exclude(Path(p)), p
+
     def test_excludes_cache_forensic_artifacts(self):
         """cache/forensic-*/ holds DELIBERATELY TORN forensic specimens — they are
         expected to fail PRAGMA integrity_check forever, by construction.
@@ -625,6 +664,55 @@ class TestIterBackupFiles:
         got = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip")}
         assert "worktrees/c/config.json" in got, got
         assert "worktrees/c/plain.py" not in got
+
+    def test_exclude_classes_walk_and_census_delta(self, tmp_path, capsys):
+        """t_98bb8096: the four exclude classes on a synthetic tree. Class 1 (DB rollback copy at any depth) is
+        dropped only while its live sibling DB exists; the walker prunes class 2-4 dirs and never yields an
+        excluded path. Prints the census delta (files and bytes, before vs after the classes)."""
+        from hermes_cli import backup as B
+        root = tmp_path / ".hermes"
+        files = {
+            # kept: live state and look-alikes the classes must not touch
+            "state.db": 10, "profiles/p/memory.db": 10, "workspace/notes.pre-release/a.md": 5,
+            "notes.pre-release.md": 5, "skills/x/forensics-guide/SKILL.md": 5, "workspace/model.partial": 5,
+            "var/lone/orphan.db.bak-20261001": 7,          # class 1 shape but no live sibling: kept
+            "profiles/p/renamed.sqlite.bak": 7,            # same, sqlite spelling
+            # dropped by class 1 (sibling exists)
+            "profiles/p/memory.db.bak-20261001": 100, "profiles/p/memory.db.pre-migrate": 100,
+            "profiles/p/memory.db.broken-1": 100, "profiles/p/memory.db-bak-2": 100,
+            "profiles/p/memory.db.t1.bak": 100, "var/x/cache.sqlite": 3, "var/x/cache.sqlite.bak.1": 100,
+            # class 2
+            "state/kanban-bak-20261020/kanban.db": 200, "var/ledger.pre-repair/ledger.db": 200,
+            # class 3
+            "forensic-20261001/state.db": 300, "profiles/p/incident-capture-1/x.db": 300,
+            # class 4
+            "var/dl/m.partial": 50, "state/sync-staging/a.json": 50, "var/export-1.tgz": 50,
+        }
+        for rel, size in files.items():
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_bytes(b"x" * size)
+        skipped: set = set()
+        got = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip", skipped)}
+        kept = {"state.db", "profiles/p/memory.db", "workspace/notes.pre-release/a.md", "notes.pre-release.md",
+                "skills/x/forensics-guide/SKILL.md", "workspace/model.partial", "var/lone/orphan.db.bak-20261001",
+                "profiles/p/renamed.sqlite.bak", "var/x/cache.sqlite"}
+        assert got == kept, got ^ kept
+        assert not any(B._should_exclude(Path(r)) for r in got)
+        assert {"state/kanban-bak-20261020", "var/ledger.pre-repair", "forensic-20261001",
+                "profiles/p/incident-capture-1", "state/sync-staging"} <= skipped, skipped
+        before_n, before_b = len(files), sum(files.values())
+        after_n, after_b = len(got), sum(files[r] for r in got)
+        with capsys.disabled():
+            print(f"\ncensus delta (synthetic): files {before_n} -> {after_n} (-{before_n - after_n}), "
+                  f"bytes {before_b} -> {after_b} (-{before_b - after_b})")
+        assert (before_n - after_n, before_b - after_b) == (13, 1750)
+
+        # Remove the live sibling: its rollback copies are the only copy now and must come back.
+        (root / "profiles/p/memory.db").unlink()
+        got2 = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip")}
+        assert {"profiles/p/memory.db.bak-20261001", "profiles/p/memory.db.pre-migrate",
+                "profiles/p/memory.db.broken-1", "profiles/p/memory.db-bak-2",
+                "profiles/p/memory.db.t1.bak"} <= got2, got2
 
     def test_manual_and_automatic_paths_share_one_walk(self, tmp_path):
         """Both backup entry points must select the identical file set.
