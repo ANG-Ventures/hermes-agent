@@ -8231,6 +8231,10 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    # gh-shim caller signature (hermes-home t_949765e3, S-D refuse-unsigned): every gh call the worker tree
+    # makes, including scripts in foreign checkouts and bare `gh`, signs as `caller:card:<id>:<assignee>`, so a
+    # GH_SHIM_REQUIRE_SIG lane never refuses a worker. Existence of env, no process walk.
+    env["GH_CALLER"] = "card:%s:%s" % (task.id, task.assignee or "-")
     # Bind this grant to the ONE process we are about to spawn. Popen cannot
     # know the child's pid before it execs, so stamp the single-use sentinel;
     # the child's CLI startup rewrites it to its own pid. Without this, every
