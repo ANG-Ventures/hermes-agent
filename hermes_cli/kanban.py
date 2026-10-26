@@ -1416,7 +1416,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         from hermes_cli import kanban_archive_read as kar
         comments, runs, events = kar.fill(kb, conn, task, comments, runs, events, **rsk)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
-        latest_summary = kb.latest_summary(conn, args.task_id)
+        latest_summary = kar.latest_summary(kb, conn, task)
         refusal = (
             kb.workspace_refusal_state(conn, [task.id]).get(task.id)
             if task.status in _REFUSAL_VISIBLE_STATUSES else None

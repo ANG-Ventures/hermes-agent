@@ -135,13 +135,72 @@ def test_live_card_never_reads_the_archive(board):
     assert out["comments"] == [] and out["runs"] == [] and out["events"] == []
 
 
-def test_board_rows_win_over_archive_rows(board):
+def test_new_note_after_archiving_keeps_the_archived_history(board):
     tid = make_card()
+    before = _strip(tool_show(tid))
     archive(board, tid)
     with kb.connect() as conn:
         kb.add_comment(conn, tid, "apollo", "fresh note after archiving")
-    bodies = [c["body"] for c in tool_show(tid)["comments"]]
-    assert bodies == ["fresh note after archiving"]
+    after = tool_show(tid)
+    assert [c["body"] for c in after["comments"]] == ["ruling: ship it", "fresh note after archiving"]
+    kinds = [e["kind"] for e in after["events"]]
+    assert kinds[:len(before["events"])] == [e["kind"] for e in before["events"]] and kinds[-1] == "commented"
+    assert after["runs"] == before["runs"]
+
+
+def test_board_row_wins_on_a_duplicate_id(board):
+    tid = make_card()
+    archive(board, tid)
+    ca = sqlite3.connect(os.path.join(os.path.dirname(board), "kanban-archive.db"))
+    cid = ca.execute("SELECT id FROM archived_comments WHERE task_id=?", (tid,)).fetchone()[0]
+    ca.close()
+    with kb.connect() as conn:
+        conn.execute("INSERT INTO task_comments (id, task_id, author, body, created_at) VALUES (?,?,?,?,?)",
+                     (cid, tid, "apollo", "board copy", 1))
+        conn.commit()
+    assert [c["body"] for c in tool_show(tid)["comments"]] == ["board copy"]
+
+
+def test_latest_summary_comes_from_archived_runs(board, capsys):
+    tid = make_card()
+    with kb.connect() as conn:
+        conn.execute("UPDATE task_runs SET summary=? WHERE task_id=?", ("headline\nfull handoff details", tid))
+        conn.commit()
+        assert kb.get_task(conn, tid).result is None
+    before = show_json(tid)["latest_summary"]
+    assert before == "headline\nfull handoff details"
+    archive(board, tid)
+    assert show_json(tid)["latest_summary"] == before
+    assert "full handoff details" in kc.run_slash(f"show {tid}")
+
+
+def test_archived_run_projection_carries_worker_started_at_and_resources(board):
+    from hermes_cli import kanban_archive_read as kar
+    tid = make_card()
+    with kb.connect() as conn:
+        conn.execute("UPDATE task_runs SET worker_started_at=123, resources=? WHERE task_id=?",
+                     ('{"cpu":2}', tid))
+        conn.commit()
+    archive(board, tid)
+    (row,) = kar.archived_rows(os.path.dirname(board), "task_runs", tid)
+    assert row["worker_started_at"] == 123 and row["resources"] == '{"cpu":2}'
+    with kb.connect() as conn:
+        board_cols = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
+    assert board_cols <= set(row.keys())
+
+
+@pytest.mark.parametrize("name", ["board%23one", "board#one", "a?b", "pct%41"])
+def test_archive_path_with_uri_special_characters(tmp_path, name):
+    from hermes_cli import kanban_archive_read as kar
+    d = tmp_path / name
+    d.mkdir()
+    ca = sqlite3.connect(str(d / "kanban-archive.db"))
+    ca.executescript(CARD_DDL)
+    ca.execute("INSERT INTO archived_comments VALUES (1, 't_x', 'apollo', ?, 5, NULL, NULL, 9)", (_z("hi"),))
+    ca.commit()
+    ca.close()
+    rows = kar.archived_rows(str(d), "task_comments", "t_x")
+    assert [r["body"] for r in rows] == ["hi"]
 
 
 def test_no_archive_file_is_a_noop(board):
