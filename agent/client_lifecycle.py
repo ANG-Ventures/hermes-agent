@@ -139,10 +139,12 @@ class ClientLifecycleMixin:
             _quietly(step)
 
     def _client_log_context(self) -> str:
+        from tools.async_delegation_store import redact_url  # userinfo/credential query never reach agent.log
+
         thread = threading.current_thread()
         return (
             f"thread={thread.name}:{thread.ident} provider={getattr(self, 'provider', 'unknown')} "
-            f"base_url={getattr(self, 'base_url', 'unknown')} model={getattr(self, 'model', 'unknown')}"
+            f"base_url={redact_url(getattr(self, 'base_url', 'unknown'))} model={getattr(self, 'model', 'unknown')}"
         )
 
     def _anthropic_log_context(self) -> str:
@@ -782,7 +784,8 @@ class ClientLifecycleMixin:
         except Exception:
             logger.debug("sync_credential_pool_entry_id after env refresh failed", exc_info=True)
         self._env_creds_seen = (base_url, api_key)
-        logger.info("Applied updated .env credentials for %s: endpoint %s", self.provider, self.base_url)
+        from tools.async_delegation_store import redact_url
+        logger.info("Applied updated .env credentials for %s: endpoint %s", self.provider, redact_url(self.base_url))
         return True
 
     def _try_refresh_vertex_client_credentials(self) -> bool:
