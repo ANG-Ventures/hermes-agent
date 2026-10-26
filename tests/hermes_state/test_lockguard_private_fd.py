@@ -76,9 +76,8 @@ def test_foreign_exclusive_refused_on_both_ranges_until_close(wal_db):
     assert os.fstat(db_fd) and os.fstat(shm_fd), "guard is not on private descriptors"
     db.close()
     assert not db._wal_lock_guard and not lg._HANDLES
-    assert os.fstat(db_fd) and db_ident in lg._FDS, "state.db is still at its path: its fd stays parked"
-    assert not os.path.exists(f"{db.db_path}-shm"), "test premise: a true last close unlinks -shm"
-    assert shm_ident not in lg._FDS, "the unlinked -shm's fd was not swept"
+    assert os.fstat(db_fd) and db_ident in lg._FDS, "state.db is still at its path: its fd may stay parked"
+    assert shm_ident not in lg._FDS, "the -shm fd must close at count zero"
     with pytest.raises(OSError):
         os.fstat(shm_fd)
     assert _db_range_free(db.db_path) and _shm_dms_free(db.db_path)
@@ -119,8 +118,7 @@ def test_sibling_close_keeps_a_peer_transactions_wal_write_lock(wal_db):
 def test_handle_opened_during_a_siblings_close_keeps_its_wal_write_lock(wal_db, monkeypatch):
     """Prism a8c10e5114f6 on the counted cut: A's close() released the guard (count 0) and a
     deferred os.close of the retired fd ran AFTER B had opened on the same inode and begun a
-    write, cancelling B's WAL write lock. Private fds are parked, never closed, so no close can
-    land under B."""
+    write, cancelling B's WAL write lock. close_fds() re-checks the count: B's count keeps the fd."""
     a = wal_db
     opened: dict = {}
     real_close = a._close_connection_quietly
@@ -143,16 +141,90 @@ def test_handle_opened_during_a_siblings_close_keeps_its_wal_write_lock(wal_db, 
         b.close()
 
 
-def test_lockguard_closes_descriptors_only_in_sweep_retired():
-    """Structural half of the two tests above: a close of a descriptor on state.db or -shm cancels
-    the process's POSIX locks on it, so the only close lives in sweep_retired() (inode no longer at
-    its path, count 0). Every other os.close in this module was a P1 (975630a37100, 30c639c0af16,
-    a8c10e5114f6)."""
+def test_shm_fd_closes_with_the_last_counted_handle_so_a_foreign_last_close_never_strands_openers(
+        tmp_path, monkeypatch):
+    """R-6 (Apollo ruling, round 3; Prism 975630a37100 / 4334da12494a on the parked cut): A and B on
+    one db; a foreign process ends the generation (new -shm inode); A checkpoints (arms the new
+    inode) and closes (old inode count 1: B still holds it, not closed); B closes (count 0: closed);
+    a third process then opens cleanly. A parked fd on the unlinked old -shm read as a
+    deleted-generation holder to refuse_deleted_wal_generation and stranded every later opener."""
+    if not lg.supported():
+        pytest.skip("no OFD locks on this runtime")
+    pin_wal(monkeypatch)
+    a = make_db(tmp_path / "state.db", "s", "seed")
+    require_wal(a)
+    shm = f"{a.db_path}-shm"
+    old_ident = lg._identity(shm)
+    b = SessionDB(db_path=a.db_path)
+    assert lg._HANDLES[old_ident] == 2
+    # A foreign process ends the generation: a fresh -shm inode at the path.
+    os.rename(shm, shm + ".retired")
+    with open(shm, "wb") as handle:
+        handle.write(b"\0" * 32768)
+    new_ident = lg._identity(shm)
+    a._try_wal_checkpoint()
+    assert new_ident in a._wal_lock_guard and new_ident not in b._wal_lock_guard
+    os.replace(shm + ".retired", shm)  # the real generation back: both close cleanly
+    old_fd = lg._FDS[old_ident][0]
+    a.close()
+    assert lg._HANDLES[old_ident] == 1 and os.fstat(old_fd), "B still counts the old inode: its fd must stay open"
+    assert new_ident not in lg._FDS, "A was the only counter of the new inode: closed at zero"
+    b.close()
+    assert old_ident not in lg._FDS and not lg._HANDLES
+    with pytest.raises(OSError):
+        os.fstat(old_fd)
+    # The sidecars are gone (true last close) and nothing in this process holds a deleted inode.
+    assert not os.path.exists(shm)
+    assert "DeletedWalGenerationError" not in _third_process_open(a.db_path)
+    SessionDB(db_path=a.db_path).close()  # and this process can open again too
+
+
+def _third_process_open(db_path) -> str:
+    code = (f"import sys\nsys.path.insert(0, {str(_REPO)!r})\n"
+            "import hermes_state_wal\n"
+            "hermes_state_wal.is_sqlite_wal_reset_vulnerable = lambda version_info=None: False\n"
+            "hermes_state_wal.resolve_journal_mode = lambda: 'wal'\n"
+            "from pathlib import Path\nfrom hermes_state import SessionDB\n"
+            f"db = SessionDB(db_path=Path({os.fspath(db_path)!r})); db.append_message('s', role='user', content='third'); db.close()\n"
+            "print('OPENED')\n")
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                          env={**os.environ, "HERMES_STATE_DB_GUARD_BYPASS": "1"})
+    assert "OPENED" in proc.stdout, proc.stderr[-2000:]
+    return proc.stderr
+
+
+def test_our_close_while_a_foreign_reader_is_open_leaves_no_shm_fd(wal_db):
+    """The original 975630a37100 repro: P closes while Q (foreign) still has the db open, Q then
+    does the true last close and unlinks -shm; P must not be left holding the unlinked inode."""
+    db = wal_db
+    shm_ident = lg._identity(f"{db.db_path}-shm")
+    q = subprocess.Popen([sys.executable, "-c",
+                          f"import sqlite3, sys\nc = sqlite3.connect({os.fspath(db.db_path)!r})\n"
+                          "c.execute('select count(*) from messages').fetchone()\n"
+                          "sys.stdout.write('open\\n'); sys.stdout.flush(); sys.stdin.readline(); c.close()\n"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert q.stdout.readline().strip() == "open"
+        db.close()
+        assert shm_ident not in lg._FDS and not lg._HANDLES
+    finally:
+        q.stdin.write("x\n")
+        q.stdin.flush()
+        q.wait(timeout=20)
+    assert not os.path.exists(f"{db.db_path}-shm"), "test premise: Q's last close unlinked -shm"
+    SessionDB(db_path=db.db_path).close()  # would raise DeletedWalGenerationError with a parked fd
+
+
+def test_lockguard_closes_descriptors_only_at_count_zero_after_the_connection():
+    """Structural half: a close of a descriptor on state.db or -shm cancels the process's POSIX locks
+    on it, so counted fds close only in close_fds() (count re-checked, after the releasing handle's
+    connection closed); _arm may close only an fd it has just opened and never locked. Every other
+    os.close in this module was a P1 (975630a37100, 30c639c0af16, a8c10e5114f6)."""
     tree = ast.parse((_REPO / "hermes_state_lockguard.py").read_text(encoding="utf-8"))
     closers = {fn.name for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)
                for n in ast.walk(fn)
                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "close"}
-    assert closers == {"sweep_retired"}, closers
+    assert closers == {"close_fds", "_arm"}, closers
 
 
 def _foreign_begin_immediate(db_path) -> bool:
@@ -237,7 +309,7 @@ def test_replaced_shm_is_rearmed_once(wal_db, monkeypatch):
     new_fd = lg._FDS[new_ident][0]
     db.close()
     assert not lg._HANDLES
-    assert new_ident not in lg._FDS and old_ident not in lg._FDS, "retired -shm fds were not swept"
+    assert new_ident not in lg._FDS and old_ident not in lg._FDS, "-shm fds at count zero were not closed"
     for fd in (old_fd, new_fd):
         with pytest.raises(OSError):
             os.fstat(fd)
@@ -256,9 +328,11 @@ def test_refused_lock_on_a_new_shm_keeps_the_parked_fd(wal_db, monkeypatch):
     monkeypatch.undo()
     new_ident = lg._identity(shm)
     assert new_ident not in db._wal_lock_guard and new_ident in lg._FDS and os.fstat(lg._FDS[new_ident][0])
-    lg.refresh_shm(db.db_path, db._wal_lock_guard)  # the next refresh re-uses the parked fd
+    lg.refresh_shm(db.db_path, db._wal_lock_guard)  # the next refresh re-uses the uncounted fd
     assert new_ident in db._wal_lock_guard
     os.replace(shm + ".retired", shm)
+    db.close()
+    assert new_ident not in lg._FDS, "an uncounted -shm fd is closed by the next release on this db"
 
 
 def test_shm_minted_after_open_is_armed_by_the_checkpoint_refresh(tmp_path, monkeypatch):

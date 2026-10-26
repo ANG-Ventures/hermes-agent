@@ -70,7 +70,7 @@ def test_guard_degrades_to_a_no_op_instead_of_killing_every_importer(monkeypatch
         # hold() hands back an empty guard so callers take the ordinary unguarded path.
         assert guard.supported() is False
         assert guard.hold(db) == {}
-        guard.release({})
+        guard.close_fds(guard.release(db, {}))
     finally:
         os.close(fd)
 

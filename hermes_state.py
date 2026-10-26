@@ -1868,14 +1868,14 @@ class SessionDB(
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:
                         logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
-                _lockguard.release(self._wal_lock_guard)  # before the close: see release()
+                retired = _lockguard.release(self.db_path, self._wal_lock_guard)  # before the close: see release()
                 if retire_without_close:
-                    self._pin_connection(self._conn)
+                    self._pin_connection(self._conn)  # its -shm fd stays with the pinned connection
                     self._conn = None
                 else:
                     conn, self._conn = self._conn, None
                     self._close_connection_quietly(conn)
-                    _lockguard.sweep_retired(self.db_path)  # after the close: see sweep_retired()
+                    _lockguard.close_fds(retired)  # after the close: see close_fds()
                     # Only a clean close ends the generation; retain the recorded
                     # identity when retiring an unsafe handle.
                     self._db_sidecar_identity = {}
