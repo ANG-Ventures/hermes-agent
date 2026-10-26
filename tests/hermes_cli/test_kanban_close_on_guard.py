@@ -84,6 +84,12 @@ OUR_AUTHORS_LIB = textwrap.dedent('''
         return isinstance(body, str) and body.lstrip().startswith("[review-merge-pass]")
 ''')
 
+OPERATOR_IDENTITY_LIB = textwrap.dedent('''
+    def is_operator(author):
+        a = str(author or "").strip().lower()
+        return a in ("apollo", "ace", "default", "human", "aegis") or a.startswith("human:")
+''')
+
 
 @pytest.fixture
 def fleet(tmp_path, monkeypatch):
@@ -91,6 +97,7 @@ def fleet(tmp_path, monkeypatch):
     (home / "scripts" / "lib").mkdir(parents=True)
     (home / "scripts" / "lib" / "close_on.py").write_text(CLOSE_ON_LIB, encoding="utf-8")
     (home / "scripts" / "lib" / "our_authors.py").write_text(OUR_AUTHORS_LIB, encoding="utf-8")
+    (home / "scripts" / "lib" / "operator_identity.py").write_text(OPERATOR_IDENTITY_LIB, encoding="utf-8")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
@@ -399,9 +406,10 @@ def test_if_latest_release_refuses_when_an_operator_coverage_gate_arrived_after_
     rc, err = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c1))
     assert rc == 3 and f"comment {c2}" in err and "review_coverage" in err, err
     assert _comments(tid) == [HOLD, gate]
-    # a HOLD verdict without close_on is a newer manual statement: same refusal
+    # a HOLD verdict without close_on is a newer manual statement: same refusal; `ace` is an operator
+    # (operator_identity.is_operator, the merge pass's write-boundary rule since Prism f9c75767e0e1)
     hold = _coverage({"verdict": "CHANGES_REQUESTED"})
-    _post(tid, "human:ace", hold)
+    _post(tid, "ace", hold)
     rc, err = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c1))
     assert rc == 3 and "review_coverage" in err, err
 
@@ -423,12 +431,16 @@ def test_if_latest_release_passes_when_the_coverage_gate_is_the_line_being_poste
     assert _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c1))[0] == 0
 
 
-def test_if_latest_release_fails_closed_without_close_on_latest(fleet, capsys):
+@pytest.mark.parametrize("gone", ["close_on.latest", "operator_identity.is_operator"])
+def test_if_latest_release_fails_closed_without_the_gate_reader(fleet, capsys, gone):
     home, tid = fleet
     c1 = _post(tid, "apollo", HOLD)
-    lib = home / "scripts" / "lib" / "close_on.py"
-    lib.write_text(CLOSE_ON_LIB.replace("def latest(", "def _gone("), encoding="utf-8")
+    if gone == "close_on.latest":
+        (home / "scripts" / "lib" / "close_on.py").write_text(CLOSE_ON_LIB.replace("def latest(", "def _gone("),
+                                                              encoding="utf-8")
+    else:
+        (home / "scripts" / "lib" / "operator_identity.py").unlink()
     guard._LIB_CACHE.clear()
     rc, err = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c1))
-    assert rc == 3 and "close_on.latest" in err, err
+    assert rc == 3 and gone in err, err
     assert _comments(tid) == [HOLD]

@@ -175,7 +175,8 @@ def newer_release_comment(conn, task_id: str, comment_id: int, new_body: str = "
     return _newer_coverage_gate(conn, task_id, int(comment_id), lib, authors, line_re, new_body)
 
 
-# Who may set a card's machine gate, the merge pass's close_on_trusted(): Apollo, a human, Argus, a conversion.
+# Who may set a card's machine gate, the merge pass's land_pr_release write-boundary rule (hermes-home#6559,
+# Prism f9c75767e0e1): close_on_trusted() (Apollo, a human, Argus, a conversion) or operator_identity.is_operator().
 _GATE_TRUSTED = ("argus", "close-on-convert")
 _COVERAGE_SRC_RE = re.compile(r"review_coverage comment (\d+) ")
 
@@ -183,16 +184,18 @@ _COVERAGE_SRC_RE = re.compile(r"review_coverage comment (\d+) ")
 def _newer_coverage_gate(conn, task_id, comment_id, lib, authors, line_re, new_body) -> Optional[str]:
     """Prism 2918b8f9f46e: an operator ``review_coverage`` record carrying ``close_on`` (or a HOLD verdict without
     one) is a gate ``close_on.release()`` never reads. When ``close_on.latest()``, with the merge pass's trust rule,
-    names such a record as the card's current gate (newest wins, so it is not older than the anchor), the append
-    would supersede it: refuse, unless that gate is the very line being appended. Fails closed when the grammar's
-    ``latest`` or ``our_authors.is_ours`` is unavailable or ``latest`` raises."""
+    names such a record (by that same trust rule) as the card's current gate (newest wins, so it is not older than the anchor), the append
+    would supersede it: refuse, unless that gate is the very line being appended. Fails closed when ``close_on.latest``,
+    ``our_authors.is_ours`` or ``operator_identity.is_operator`` is unavailable, or ``latest`` raises."""
     latest, is_ours = getattr(lib, "latest", None), getattr(authors, "is_ours", None)
-    if latest is None or is_ours is None:
-        return "close_on.latest / our_authors.is_ours cannot be loaded; refusing the conditional append"
+    is_operator = getattr(_load("operator_identity"), "is_operator", None)
+    if latest is None or is_ours is None or is_operator is None:
+        return ("close_on.latest / our_authors.is_ours / operator_identity.is_operator cannot be loaded; "
+                "refusing the conditional append")
 
     def trusted(author) -> bool:
         a = str(author or "").strip().lower()
-        return bool(is_ours(a)) or a.startswith("human:") or a in _GATE_TRUSTED
+        return bool(is_ours(a)) or a.startswith("human:") or a in _GATE_TRUSTED or bool(is_operator(a))
 
     try:
         st = latest(conn, task_id, trusted=trusted, is_machine=authors.is_machine)
