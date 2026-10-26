@@ -143,10 +143,12 @@ def board_named_by_pin(raw: str, *, home: Optional[Path] = None) -> str:
     identity, root, boards/ mtime): a new board dir changes the mtime, and a retargeted symlink
     pin changes the identity (Prism 69c969208e42), so a process pays one scan per pin target.
     ``home`` is the Hermes root whose registry names the pin (Prism f984ec16d458); default: ours.
+    ``_PINNED_BOARD_ERRORS`` describes OUR pin only, so a foreign root never writes or clears it
+    (Prism df36eaaa7231): a local memo hit would otherwise leave a foreign failure standing.
     """
     _kb = _facade()
+    foreign = home is not None
     try:
-        foreign = home is not None
         if not foreign:
             home = _kb.kanban_home()
         root = home / "kanban" / "boards"
@@ -168,10 +170,12 @@ def board_named_by_pin(raw: str, *, home: Optional[Path] = None) -> str:
         if len(_PINNED_BOARD_MEMO) > 256:
             _PINNED_BOARD_MEMO.clear()
         _PINNED_BOARD_MEMO[key] = found
-        _PINNED_BOARD_ERRORS.pop(raw, None)
+        if not foreign:
+            _PINNED_BOARD_ERRORS.pop(raw, None)
         return found
     except Exception as exc:  # RC-11: total; the pin still routes every open.
-        _PINNED_BOARD_ERRORS[raw] = f"{type(exc).__name__}: {exc}"
+        if not foreign:
+            _PINNED_BOARD_ERRORS[raw] = f"{type(exc).__name__}: {exc}"
         if raw not in _PINNED_BOARD_ERROR_LOGGED:
             _PINNED_BOARD_ERROR_LOGGED.add(raw)
             _log.warning("kanban: could not name the board HERMES_KANBAN_DB=%s pins (%s: %s); "

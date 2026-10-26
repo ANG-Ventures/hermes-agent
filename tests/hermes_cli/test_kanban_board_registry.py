@@ -189,6 +189,29 @@ def test_pinned_board_error_clears_once_the_pin_is_named(home, monkeypatch):
     assert kb.pinned_board_error() is None
 
 
+def test_foreign_root_failure_never_reports_on_our_own_pin(home, monkeypatch, tmp_path):
+    """Prism df36eaaa7231: a failed scan under ANOTHER root (``home=``, a worker env snapshot)
+    must not record an error for our pin; the local lookup is a memo hit and would never clear it.
+    Mutation: record the error for a foreign root too -> ``pinned_board_error()`` is not None."""
+    kb.create_board("subs-ace")
+    _pin(monkeypatch, kb.board_dir("subs-ace") / "kanban.db")
+    assert kb.pinned_board() == "subs-ace"  # local scan memoised
+    real = reg.board_db_layout
+
+    def layout(root=None):
+        if root is not None:
+            raise PermissionError("foreign boards/ unreadable")
+        return real()
+
+    monkeypatch.setattr(reg, "board_db_layout", layout)
+    foreign = tmp_path / "other-root"
+    (foreign / "kanban" / "boards").mkdir(parents=True)
+    raw = str(kb.board_dir("subs-ace") / "kanban.db")
+    assert reg.board_named_by_pin(raw, home=foreign) == kb.PINNED_SLUG
+    assert kb.pinned_board() == "subs-ace"  # memo hit
+    assert kb.pinned_board_error() is None
+
+
 def test_retargeted_symlink_pin_changes_the_answer_in_process(home, monkeypatch, tmp_path):
     """Prism 69c969208e42 (C1a #2202): the memo key carries the pin's resolved identity, so a
     symlink pin retargeted from board a's DB to board b's names b in the same process.
