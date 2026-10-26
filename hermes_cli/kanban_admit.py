@@ -199,6 +199,29 @@ def eligible_hosts(conn, row, pool, signal, assignee: str, board: Optional[str])
     return remote | (set() if cap_only else {LOCAL}), "portable"
 
 
+def guard_refusal(conn, task_id: str) -> Optional[str]:
+    """The dispatcher's respawn guard for this card (Prism 416e418c6ee1).
+
+    admit overrides HOST ADMISSION, never ownership: a fresh running card on
+    one of this card's PRs refuses (``pr_owner_busy``, owner named), and so does
+    a STALE owner, because the audited ``kanban reclaim`` is the only way to
+    transfer a PR from admit. Every other guard reason refuses as it would hold
+    the tick. None = the tick would spawn it."""
+    detail: dict = {}
+    reason = kbd.check_respawn_guard(conn, task_id, detail=detail)
+    stale = detail.pop("pr_owner_stale", None)
+    if reason is None and stale:
+        owner = stale[0]
+        return (f"pr_owner_busy: {owner['pr']} is owned by {owner['task_id']} (stale); "
+                f"transfer it with `kanban reclaim {owner['task_id']}` first")
+    if reason is None:
+        return None
+    if detail.get("owner"):
+        return f"{reason}: {detail.get('pr')} is owned by running card {detail['owner']}"
+    extra = ", ".join(f"{k}={v}" for k, v in detail.items())
+    return f"respawn guard holds it: {reason}" + (f" ({extra})" if extra else "")
+
+
 def browser_refusal(conn, row, host: str, assignee: str) -> Optional[str]:
     """The dispatcher's browser resolution gate for this card on ``host`` (dry,
     no lease join): None when the card has no browser need or routes legacy;
@@ -382,6 +405,9 @@ def _admit_locked(conn, task_id, host, reason, pool, signal, board, spawn_fn,
     if host not in hosts:
         raise AdmitRefused(f"{task_id}: {host} is not eligible for this card ({why}); "
                            f"eligible: {', '.join(sorted(hosts)) or 'none'}")
+    guard = guard_refusal(conn, task_id)
+    if guard is not None:
+        raise AdmitRefused(f"{task_id}: {guard}")
     browser = browser_refusal(conn, row, host, assignee)
     if browser is not None:
         raise AdmitRefused(f"{task_id}: {browser}")

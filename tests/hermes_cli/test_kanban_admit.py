@@ -163,6 +163,23 @@ def test_admit_refuses_a_locally_running_card_naming_the_canonical_host(board, m
         ka.admit(tid, "studio", "again", spawn_fn=_spawn)
 
 
+def test_admit_refuses_a_second_writer_on_a_pr_another_card_runs(board, monkeypatch):
+    """Override admission, never ownership (Prism 416e418c6ee1): card A running
+    on a PR holds it, so admit of card B naming the same PR refuses, owner named."""
+    from hermes_cli import kanban_pr_owner as kpo
+    monkeypatch.setattr(kpo, "pr_head_committed_at", lambda repo, n, **kw: None)
+    _hot_local(monkeypatch)
+    pr = "ANG-Ventures/hermes-agent#1624"
+    with kb.connect_closing() as conn:
+        a = kb.create_task(conn, title=f"parity sync {pr}", assignee="alpha")
+        assert kb.claim_task(conn, a)
+        b = kb.create_task(conn, title=f"fix red slice on {pr}", assignee="alpha")
+    SPAWNS.clear()
+    with pytest.raises(ka.AdmitRefused, match=rf"pr_owner_busy: .*#1624 is owned by running card {a}"):
+        ka.admit(b, "studio", "ruling", spawn_fn=_spawn)
+    assert SPAWNS == [] and _status(b) == "ready" and not _events(b)
+
+
 def test_floor_refuses_non_finite_measurements():
     nan, inf = float("nan"), float("inf")
     assert "unmeasured" in ka.floor_refusal(ka.Measure("h", nan, 8, nan, 4.0))
