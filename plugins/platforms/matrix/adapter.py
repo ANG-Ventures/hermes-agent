@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from html import escape as _html_escape
 from html.parser import HTMLParser
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional, Set
 
 from agent.i18n import t
@@ -2297,7 +2298,7 @@ class MatrixAdapter(BasePlatformAdapter):
         is_direct = bool(getattr(getattr(event, "content", None), "is_direct", False))
         inviter = str(getattr(event, "sender", ""))
         # Only authorized inviters — otherwise any federated user could pull the bot into rooms.
-        if not self._is_authorized_user(inviter):
+        if not self._is_authorized_inviter(inviter):
             logger.warning("Matrix: rejecting invite to %s from unauthorized user %s", room_id, inviter)
             return
         logger.info("Matrix: invited to %s — joining (is_direct=%s)", room_id, is_direct)
@@ -2364,7 +2365,7 @@ class MatrixAdapter(BasePlatformAdapter):
             # auto-join any invite from an arbitrary federated user on
             # restart. An inviter missing from the stripped invite state
             # fails closed, like an empty sender in _on_invite.
-            if not self._is_authorized_user(inviter):
+            if not self._is_authorized_inviter(inviter):
                 logger.warning(
                     "Matrix: rejecting invite to %s from unauthorized user %s",
                     room_id,
@@ -2585,6 +2586,29 @@ class MatrixAdapter(BasePlatformAdapter):
         # Scoped read — the DEFAULT profile's os.environ opt-in must not authorize on a secondary bot.
         return _get_scoped_secret("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in ("true", "1", "yes") or bool(
             self._allowed_user_ids and user_id in self._allowed_user_ids)
+
+    def _is_authorized_inviter(self, inviter: str) -> bool:
+        """Invite gate: :meth:`_is_authorized_user`, or approved in this adapter profile's PairingStore.
+
+        The env allowlist is a boot-time snapshot; the pairing store is re-read per call, so a friend
+        granted after startup (``matrix-friend-grant.py``) gets a fresh DM joined without a restart.
+        Fails closed for an empty inviter and for bridge/system identities.
+        """
+        if self._is_authorized_user(inviter):
+            return True
+        if not (inviter or "").strip() or self._is_system_or_bridge_sender(inviter):
+            return False
+        # Reuse the gateway's per-profile store resolution (secondary bot -> its own store, primary ->
+        # the active store); never construct a new global store here.
+        resolve = getattr(getattr(self, "gateway_runner", None), "_pairing_store_for", None)
+        if not callable(resolve):
+            return False
+        try:
+            store = resolve(SimpleNamespace(profile=getattr(self, "_owner_profile", None)))
+            return bool(store is not None and store.is_approved("matrix", inviter))
+        except Exception as exc:
+            logger.warning("Matrix: pairing-store check failed for inviter %s: %s", inviter, exc)
+            return False
 
     async def _validate_matrix_prompt_reactor(
         self, room_id: str, target_event_id: str, sender: str, prompt: Any, prompt_label: str) -> bool:
