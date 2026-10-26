@@ -1342,16 +1342,17 @@ class GoalManager:
         post-delivery /goal judge while the user ran /goal pause or clear) drops its write and adopts
         the stored state instead of resurrecting it. ``force``: an explicit user verb, always wins."""
         db = _get_session_db() if self.session_id and self._state is not None else None
-        if db is None or force:
-            if self._state is not None:
-                self._state.revision += 1
+        if db is None:  # not persisted (warned); _stored still mirrors the row as last seen
             save_goal(self.session_id, self._state)
-            self._stored = self._state.to_json() if self._state is not None else None
             return self._state
         self._state.revision += 1
         raw = self._state.to_json()
         try:
-            written = db.compare_and_set_meta(_meta_key(self.session_id), self._stored, raw)
+            if force:
+                db.set_meta(_meta_key(self.session_id), raw)
+                written = True
+            else:
+                written = db.compare_and_set_meta(_meta_key(self.session_id), self._stored, raw)
         except Exception as exc:
             logger.debug("GoalManager: compare_and_set_meta failed: %s", exc)
             return self._state
