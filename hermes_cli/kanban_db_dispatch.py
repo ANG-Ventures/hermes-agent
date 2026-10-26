@@ -4671,16 +4671,18 @@ def _record_placement_waits(conn, result, row_route: dict, dry_run: bool,
         _kb._log.exception("kanban dispatch: could not record placement_wait events")
 
 
-def _record_total_hold(conn, result, gate: str, dry_run: bool) -> None:
+def _record_total_hold(conn, result, gate: str, dry_run: bool, only: Optional[str] = None) -> None:
     """A total-budget gate (spec §3.1 step 1) spawns nothing this tick: every
     ready row still gets a ``placement_wait {code: total:<gate>}`` (deduped
-    like any other), and the dry run sees the same rows in ``routes``."""
+    like any other), and the dry run sees the same rows in ``routes``.
+    ``only`` (``kanban admit``) records the one card it was asked about."""
     from hermes_cli import kanban_placement_reasons as _pr
     reason = _pr.total(gate)
     try:
         rows = conn.execute(
             "SELECT id FROM tasks WHERE status = 'ready' AND claim_lock IS NULL "
-            "AND COALESCE(no_worker, 0) = 0 ORDER BY priority DESC, created_at ASC"
+            "AND COALESCE(no_worker, 0) = 0 AND (? IS NULL OR id = ?) "
+            "ORDER BY priority DESC, created_at ASC", (only, only),
         ).fetchall()
     except Exception:
         _kb._log.exception("kanban dispatch: could not enumerate ready rows for %s", reason)
@@ -5725,31 +5727,32 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
 
 ADMISSION_EVENT = "admission_override"
 ADMIT_INELIGIBLE = "admit_host_ineligible"
+ADMIT_FLOOR = "admit_floor"  # the measured-danger floor refused (placement_waits prefix)
 _FORCE_LOCAL = "studio"  # kanban_worker_pool.PIN_STUDIO: the dispatcher's own host
 
-# The ready lane's per-card gates, in loop order. ``kanban admit`` runs this
-# same loop (admit_once) with only ``host_admission`` off; the contract test
-# walks this tuple, so a gate added here is red until admit is proven to hold it.
-READY_LANE_GATES = (
-    "budget_paused", "max_spawn", "no_worker", "pause_hold", "route", "browser", "assignee", "profile",
-    "per_profile_cap", "flagship", "invalid_pin", "respawn_guard", "provider_admission",
-    "card_skills", "workspace_admission", "placement", "claim", "lane_route", "workspace",
-    "launch", "host_admission",
-)
 
-
-def _forced_host_refusal(route: str, arg, host: str, plan, cap_only) -> Optional[str]:
-    """``kanban admit``: why ``host`` is not one the card's route allows, or None.
-    The route is the dispatcher's own (``_route_row``); admit never widens it."""
+def _forced_host_refusal(route: str, arg, host: str, plan, cap_only,
+                         join_host: Optional[str] = None) -> Optional[str]:
+    """``kanban admit``: why ``host`` is not one the card's FINAL route allows, or
+    None. The route is the dispatcher's own (``_route_row``, then the pause hold
+    and the browser gate); admit never widens it. A browser-joined row keeps the
+    host its lease was cut for, as the take branch keeps it (Prism 3716538264e3);
+    with no pool plan nothing is placed remotely (Prism d18e71bf0dca)."""
     pool = list(plan.hosts) if plan is not None else []
     if route == "wait":
-        eligible, why = [], f"wait: {arg}"
-    elif route == "local":
+        return None  # the dispatcher's own _route_wait refuses it, with its own reason
+    if route == "local":
         eligible, why = [_FORCE_LOCAL], (f"local ({arg})" if arg else "local")
     elif route in ("pin", "origin"):
         eligible, why = [{n.lower(): n for n in pool}.get(str(arg).lower(), str(arg))], f"{route} {arg}"
+    elif join_host is not None:
+        # _browser_join_lease's own token for a join placed off its host.
+        eligible, why = [join_host], f"BROWSER_JOIN_HOST_MOVED: browser join cut for {join_host}"
     else:
         eligible, why = ([] if cap_only else [_FORCE_LOCAL]) + pool, "portable"
+    if plan is None and host.lower() != _FORCE_LOCAL:
+        eligible = [e for e in eligible if e.lower() == _FORCE_LOCAL]
+        why = f"{why}; no pool plan: pool_unavailable"
     if host.lower() in {e.lower() for e in eligible}:
         return None
     return (f"{ADMIT_INELIGIBLE}: {host} is not eligible for this card ({why}); "
@@ -5765,6 +5768,7 @@ def admit_once(
     spawn_fn=None,
     spillover=None,
     admission_event: Optional[dict] = None,
+    admit_floor=None,
     max_spawn: Optional[int] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Union[int, Mapping[str, Any], None] = None,
@@ -5773,7 +5777,12 @@ def admit_once(
 ) -> DispatchResult:
     """``kanban admit`` (t_32e8796a): ONE ready card onto ``host`` through the
     tick's own ready lane, with host admission the only gate off. Waits up to
-    ``lock_wait_s`` for the board's dispatch lock (``skipped_locked`` if not)."""
+    ``lock_wait_s`` for the board's dispatch lock (``skipped_locked`` if not).
+
+    ``spillover`` is the plan the dispatcher's own builder made (None = no plan,
+    exactly as a tick with none). ``admit_floor(host, plan)`` -> ``(refusal,
+    payload, boards)`` runs INSIDE the lock, after every per-card gate and before
+    take/claim, so the measurement it judges is the one the launch uses."""
     db_path = _kb.kanban_db_path(board=board)
     deadline = time.monotonic() + lock_wait_s
     while True:
@@ -5783,8 +5792,9 @@ def admit_once(
                     conn, spawn_fn=spawn_fn, board=board, max_spawn=max_spawn,
                     failure_limit=failure_limit, default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
-                    spillover=spillover, max_new=1, entry="admit", only_task=task_id,
+                    spillover=spillover, entry="admit", only_task=task_id,
                     force_host=host, skip_host_admission=True, admission_event=admission_event,
+                    admit_floor=admit_floor,
                 )
         if time.monotonic() >= deadline:
             return DispatchResult(skipped_locked=True, lock_holder=_kb._read_dispatch_lock_holder(db_path))
@@ -5820,6 +5830,7 @@ def _dispatch_once_locked(
     force_host: Optional[str] = None,
     skip_host_admission: bool = False,
     admission_event: Optional[dict] = None,
+    admit_floor=None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -6039,7 +6050,7 @@ def _dispatch_once_locked(
     # budget gate below records a ``total:<gate>`` hold on each ready row
     # before it returns, and a paused tick with no plan still routes.
     from hermes_cli import kanban_placement_reasons as _pr
-    route_first = _route_first_enabled() and not _admit
+    route_first = _route_first_enabled()
     if not dry_run:
         try:
             from hermes_cli import kanban_budget as _kbudget
@@ -6055,7 +6066,7 @@ def _dispatch_once_locked(
             ):
                 result.budget_paused = True
                 if route_first:
-                    _record_total_hold(conn, result, _pr.TOTAL_BUDGET_PAUSED, dry_run)
+                    _record_total_hold(conn, result, _pr.TOTAL_BUDGET_PAUSED, dry_run, only_task)
                 return result
         except Exception as exc:
             _kb._log.warning(
@@ -6111,7 +6122,7 @@ def _dispatch_once_locked(
                 f"max_spawn={max_spawn} reached: {running_count} running on this board"
             )
             if route_first:
-                _record_total_hold(conn, result, _pr.TOTAL_MAX_SPAWN, dry_run)
+                _record_total_hold(conn, result, _pr.TOTAL_MAX_SPAWN, dry_run, only_task)
             return result
         spawn_budget = max_spawn - running_count
 
@@ -6133,7 +6144,7 @@ def _dispatch_once_locked(
                 f"running host-wide ({running_count} on this board)"
             )
             if route_first:
-                _record_total_hold(conn, result, _pr.TOTAL_MAX_IN_PROGRESS, dry_run)
+                _record_total_hold(conn, result, _pr.TOTAL_MAX_IN_PROGRESS, dry_run, only_task)
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -6162,7 +6173,7 @@ def _dispatch_once_locked(
             "spawning no new workers this tick (deferred, not dropped)"
         )
         if route_first:
-            _record_total_hold(conn, result, _pr.TOTAL_MEMORY_CRITICAL, dry_run)
+            _record_total_hold(conn, result, _pr.TOTAL_MEMORY_CRITICAL, dry_run, only_task)
         return result
     if pressure == "elevated":
         result.memory_pressure = pressure
@@ -6183,13 +6194,14 @@ def _dispatch_once_locked(
         if _cap == 0:
             result.spawn_capped = "--max=0: no new workers this call"
             if route_first:
-                _record_total_hold(conn, result, _pr.TOTAL_MAX_NEW, dry_run)
+                _record_total_hold(conn, result, _pr.TOTAL_MAX_NEW, dry_run, only_task)
             return result
 
     from hermes_cli import kanban_continuation as _kcont_lost
     # HOST_LOST (F18) counts only ticks whose pool probe asked about the
     # running workspaces; a planless CLI dispatch is no evidence either way.
-    if (not dry_run and spillover is not None and spillover.continuation_probed
+    # A board-wide sweep: kanban admit (one card) never interrupts other cards.
+    if (not dry_run and not _admit and spillover is not None and spillover.continuation_probed
             and _kcont_lost.mode(_root_kanban_cfg()) == 'enforce'):
         _kcont_lost.interrupt_lost_hosts(
             conn, spillover.continuation_states,
@@ -6240,8 +6252,7 @@ def _dispatch_once_locked(
         _linked = _linked_ids(conn, [r["id"] for r in ready_rows], _lineage)
         _binds = _workspace_binds(conn, ready_rows, dry_run=dry_run)  # spec §2.4, per tick
         _caps = _capability_tick(spillover.config)  # kanban.placement.capabilities, per tick
-        # admit plans no probe, so an origin it cannot see is a wait, never a write (t_32e8796a).
-        spillover.continuation_dry_run = dry_run or _admit
+        spillover.continuation_dry_run = dry_run
         row_route = {r["id"]: _route_row(conn, r, spillover, _eff_default, _native, _linked,
                                          _lineage, result.placement_affinity,
                                          unknown_out=result.unknown_pins,
@@ -6331,17 +6342,20 @@ def _dispatch_once_locked(
     # review lane is never offered to the pool: its rows are always local.
     review_rows = []
     _review_pause_pins: dict = {}  # review id -> resume-origin host (Prism 01f1e61334ff)
-    if review_dispatch_enabled() and not _admit:  # admit is the ready lane only
+    # kanban admit enumerates them too, read-only, so the review-lane slot
+    # reservation below binds it exactly as it binds the tick; it never spawns one.
+    _review_dry = dry_run or _admit
+    if review_dispatch_enabled():
         review_rows = conn.execute(
             "SELECT id, assignee, no_worker, body, skills, workspace_path, workspace_kind, origin_host FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
         review_rows = _kb._drop_no_worker_rows(
-            conn, review_rows, result, dry_run=dry_run,
+            conn, review_rows, result, dry_run=_review_dry,
         )
-        review_rows = _browser_hold_review_rows(conn, review_rows, result, dry_run)
-        review_rows = _kph.gate_rows(conn, review_rows, result, row_route, dry_run, _pause_cache,
+        review_rows = _browser_hold_review_rows(conn, review_rows, result, _review_dry)
+        review_rows = _kph.gate_rows(conn, review_rows, result, row_route, _review_dry, _pause_cache,
                                      lane="review", planned=spillover is not None, entry=entry,
                                      pins_out=_review_pause_pins,
                                      pool=spillover.config if spillover is not None else None, caps=_caps)
@@ -6951,7 +6965,8 @@ def _dispatch_once_locked(
             break
         if force_host is not None:
             _forced = _forced_host_refusal(route, route_arg, force_host, spillover,
-                                           _caps_out.get("only", {}).get(row["id"]))
+                                           _caps_out.get("only", {}).get(row["id"]),
+                                           (result.browser_joins.get(row["id"]) or {}).get("source_host"))
             if _forced is not None:
                 result.placement_waits[row["id"]] = _forced
                 continue
@@ -7119,6 +7134,21 @@ def _dispatch_once_locked(
             continue
         if _kb._workspace_admission_refused(conn, row["id"], result, board=board, dry_run=dry_run):
             continue
+        if admit_floor is not None:
+            # kanban admit's measured-danger floor, under this lock, after every
+            # per-card gate and before take/claim (Prism 84845601b3b9). A probe
+            # that lists the host's boards feeds the dispatcher's board_refusal.
+            try:
+                _floor, _floor_payload, _floor_boards = admit_floor(force_host, spillover)
+            except Exception as exc:
+                _floor, _floor_payload, _floor_boards = f"floor error: {exc}; refusing, fail closed", {}, None
+            if _floor is not None:
+                result.placement_waits[row["id"]] = f"{ADMIT_FLOOR}: {_floor}"
+                continue
+            if admission_event is not None:
+                admission_event = {**admission_event, **(_floor_payload or {})}
+            if _floor_boards is not None and spillover is not None and force_host in spillover.hosts:
+                spillover.detail.setdefault(force_host, {})["boards"] = sorted(_floor_boards)
         placed_host = None
         _decision = None
         _rid = None

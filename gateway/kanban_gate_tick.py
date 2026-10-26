@@ -338,6 +338,23 @@ class GateTickBuilder:
                                    kwp.pin_aliases(self._fleet_dir())))):
             gate.pool = {"planned": False, "reason": "not_needed"}
             return None
+        plan = self.build_pool_plan(boards, remote_by_host, cfg)
+        if plan is not None:
+            plan.band, plan.spill_reason, plan.pins_only = gate.band, gate.spill_reason, pins_only
+            gate.pool = plan.snapshot()
+        return plan
+
+    def build_pool_plan(self, boards, remote_by_host: Dict[str, int],
+                        cfg: Optional[dict] = None) -> Optional[kwp.SpilloverPlan]:
+        """The plan itself (pool files, signal, the real probe with
+        ``kanban.workspaces_root``, continuation paths), None when the pool
+        refuses or has no hosts. :meth:`plan_pool` calls it once it decided a
+        plan is needed this tick; ``kanban admit`` calls it directly, since that
+        decision reads the Studio band, which is host admission (t_32e8796a)."""
+        gate = self.gate
+        cfg = (self._kanban_cfg() or {}) if cfg is None else cfg
+        default_remote = kwp.placement_default(cfg) == kwp.PLACEMENT_DEFAULT_REMOTE
+        from hermes_cli import kanban_continuation as kc
         pool = kwp.read_pool(self._fleet_dir(), kanban_cfg=cfg)
         for warning in pool.warnings:
             self._log(logger.warning, warning)
@@ -368,9 +385,7 @@ class GateTickBuilder:
         plan = kwp.plan(list(pool.pool_hosts), remote_by_host, probe=probe,
                         disabled=pool.disabled, config=pool, signal=signal,
                         workspace_paths=paths)
-        plan.band, plan.spill_reason, plan.pins_only = gate.band, gate.spill_reason, pins_only
         plan.default_remote = default_remote
-        gate.pool = plan.snapshot()
         if signal is not None:
             # WARNING (one per message per 5 min): a host with no sampler reads
             # UNKNOWN and takes nothing; that must be visible, not info noise.

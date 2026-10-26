@@ -25,7 +25,25 @@ GATE = {"enabled": True, "pause_above": 64, "resume_below": 48, "max_spawn_per_t
 LOCAL_NAME = "admit-test-box"     # this machine's hostname in every test, whatever venue runs it
 POOL_HOST = kwp.PoolHost(name="ace-ai", ssh_host="ace-ai", ssh_user=kwp.SSH_USER, slots=4, capacity_pct=0.8,
                          absence="required", profiles=("alpha",), state="active", enabled=True, priority=0)
-POOL = kwp.PoolConfig(hosts=("ace-ai",), profiles=("alpha",), pool_hosts=(POOL_HOST,))
+
+
+def _write_pool(fleet: Path, state: str = "active") -> None:
+    """The pool files the dispatcher's own plan builder reads: ace-ai, 4 slots, alpha."""
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / kwp.ROLES_FILE).write_text(json.dumps({"schema": 1, "hosts": {
+        "ace-ai": {"roles": {"kanban-worker": {"slots": 4}}, "state": state}}}))
+    (fleet / kwp.SIDECAR_FILE).write_text(json.dumps({
+        "schema": 1, "ssh_user": kwp.SSH_USER, "priority": ["ace-ai"], "profiles": ["alpha"],
+        "hosts": {"ace-ai": {"enabled": True, "absence": "required"}}}))
+
+
+PROBES: list = []
+
+
+def _probe(host, **kw):
+    """The plan's probe (never ssh): ace-ai idle, every board hostable unless asked otherwise."""
+    PROBES.append((host.name, kw))
+    return kwp.HostSample(load1=1.0, ncpu=32, boards=frozenset({"default"}) if "workspaces_root" in kw else None)
 
 
 @pytest.fixture
@@ -43,14 +61,16 @@ def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True, raising=False)
     monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "apollo", raising=False)
     monkeypatch.setattr("hermes_cli.config.load_config",
-                        lambda: {"kanban": {"dispatch_load_gate": dict(GATE)}})
+                        lambda: {"kanban": {"dispatch_load_gate": dict(GATE), "placement": {"read_signal": False}}})
     (home / "profiles" / "alpha").mkdir(parents=True, exist_ok=True)
     (home / "kanban").mkdir(exist_ok=True)
     kb.operator_token_path().write_text(TOKEN)
     monkeypatch.setenv(kb.OPERATOR_TOKEN_ENV, TOKEN)
     # Never a real worker or a real ssh probe.
     monkeypatch.setattr(kbd, "_default_spawn", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("real spawn")))
-    monkeypatch.setattr(ka, "_pool_and_signal", lambda cfg: (POOL, None, home / "fleet"))
+    _write_pool(kb.kanban_home() / "fleet")
+    PROBES.clear()
+    monkeypatch.setattr(kwp, "probe_host", _probe)
     with kb.connect_closing():
         kb.create_board(slug="default", name="Test")
     return home
@@ -248,11 +268,7 @@ def test_the_gateway_tick_does_not_rebook_its_own_spawns_or_a_seeded_run_twice(b
 
 
 def test_admit_refuses_a_draining_pool_host(board, monkeypatch):
-    import dataclasses
-
-    draining = dataclasses.replace(POOL_HOST, state="draining")
-    pool = dataclasses.replace(POOL, pool_hosts=(draining,))
-    monkeypatch.setattr(ka, "_pool_and_signal", lambda cfg: (pool, None, board / "fleet"))
+    _write_pool(kb.kanban_home() / "fleet", state="draining")
     tid = _card()
     with pytest.raises(ka.AdmitRefused, match="ace-ai is not eligible"):
         ka.admit(tid, "ace-ai", "ruling", spawn_fn=_spawn, measure_remote_fn=_remote())
@@ -368,19 +384,29 @@ def test_admit_refuses_what_the_browser_gate_would_hold(board, monkeypatch):
     monkeypatch.setattr(kbd, "_browser_gate", gate)
     tid = _card()
     SPAWNS.clear()
-    with pytest.raises(ka.AdmitRefused, match="studio is not eligible.*wait: browser_join_off"):
+    with pytest.raises(ka.AdmitRefused, match="held: browser_join_off"):
         ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
     assert SPAWNS == [] and _status(tid) == "ready" and seen["rows"] == [tid]
 
 
-def test_no_pool_still_runs_the_dispatchers_local_routing(board, monkeypatch):
+def test_no_pool_plan_routes_exactly_as_a_tick_with_none(board, monkeypatch):
+    """Prism d18e71bf0dca: with no plan the dispatcher's own no-plan branch
+    runs (known_host_ids from the pool files), so a ``host: ace-ai`` card waits
+    pool_unavailable and never admits locally; nothing is placed remotely; an
+    unpinned card still admits on the Studio."""
     _hot_local(monkeypatch)
-    monkeypatch.setattr(ka, "_pool_and_signal", lambda cfg: (None, None, board / "fleet"))
-    monkeypatch.setattr(kbd, "_route_row", lambda conn, row, plan, *a, **k: ("wait", "capability:gpu"))
-    tid = _card()
-    with pytest.raises(ka.AdmitRefused, match="studio is not eligible.*wait: capability:gpu"):
-        ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
-    assert _status(tid) == "ready"
+    monkeypatch.setattr(ka, "_dispatcher_plan", lambda cfg: (None, board / "fleet"))
+    pinned = _card(body="host: ace-ai\n")
+    SPAWNS.clear()
+    for host in ("studio", "ace-ai"):        # the tick's own no-plan wait, whatever host is asked
+        with pytest.raises(ka.AdmitRefused, match="held: pool_unavailable"):
+            ka.admit(pinned, host, "ruling", spawn_fn=_spawn, measure_remote_fn=_remote())
+    assert SPAWNS == [] and _claim(pinned) == ("ready", None) and not _events(pinned)
+    free = _card()
+    with pytest.raises(ka.AdmitRefused, match="ace-ai is not eligible.*no pool plan: pool_unavailable"):
+        ka.admit(free, "ace-ai", "ruling", spawn_fn=_spawn, measure_remote_fn=_remote())
+    assert ka.admit(free, "studio", "ruling", spawn_fn=_spawn)["host"] == "studio"
+    assert SPAWNS == [(free, None)]
 
 
 def test_kill_switch_off_refuses(board, monkeypatch):
@@ -473,181 +499,8 @@ def test_a_raising_lane_route_write_releases_the_claim(board, monkeypatch):
     assert run[0] == "spawn_failed" and run[1] is not None
 
 
-def _gate_triggers():
-    """One trigger per ready-lane gate: (setup(monkeypatch, tid, ctx) -> host, expected refusal regex).
-    ``ctx`` carries kanban_cfg / spawn_fn overrides for the admit call."""
-    from hermes_cli import kanban_budget as kbudget
-    from hermes_cli import kanban_pause_hold as kph
-    from hermes_cli import kanban_provider_health as kph_health
-    from hermes_cli import model_policy, model_registry
-    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
-
-    def budget(m, tid, ctx):
-        m.setattr(kbudget, "evaluate_board_budget", lambda *a, **k: True)
-        return "studio", "budget_paused"
-
-    def max_spawn(m, tid, ctx):
-        with kb.connect_closing() as conn:
-            assert kb.claim_task(conn, kb.create_task(conn, title="other", assignee="alpha"))
-        ctx["kanban_cfg"] = {"max_spawn": 1}
-        return "studio", "spawn_capped: max_spawn=1"
-
-    def no_worker(m, tid, ctx):
-        with kb.connect_closing() as conn:
-            conn.execute("UPDATE tasks SET no_worker=1 WHERE id=?", (tid,))
-        return "studio", "no_worker"
-
-    def pause_hold(m, tid, ctx):
-        m.setattr(kph, "held_routes", lambda rows, cache: {tid: ("wait", "pause_hold (test)")})
-        return "studio", "pause_hold"
-
-    def route(m, tid, ctx):
-        m.setattr(kbd, "_route_row", lambda conn, row, plan, *a, **k: ("wait", "capability:gpu"))
-        return "studio", "wait: capability:gpu"
-
-    def browser(m, tid, ctx):
-        def gate(conn, rows, result, rr, dry_run, *a, **k):
-            for r in rows:
-                rr[r["id"]] = ("wait", "browser_join_off")
-        m.setattr(kbd, "_browser_gate", gate)
-        return "studio", "browser_join_off"
-
-    def assignee(m, tid, ctx):
-        with kb.connect_closing() as conn:
-            conn.execute("UPDATE tasks SET assignee=NULL WHERE id=?", (tid,))
-        return "studio", "unassigned"
-
-    def profile(m, tid, ctx):
-        m.setattr(kbd, "_profile_exists_fn", lambda: (lambda name: False))
-        return "studio", "not a spawnable profile"
-
-    def per_profile_cap(m, tid, ctx):
-        with kb.connect_closing() as conn:
-            assert kb.claim_task(conn, kb.create_task(conn, title="other", assignee="alpha"))
-        ctx["kanban_cfg"] = {"max_in_progress_per_profile": 1}
-        return "studio", "per_profile_cap: alpha"
-
-    def flagship(m, tid, ctx):
-        with kb.connect_closing() as conn:
-            conn.execute("UPDATE tasks SET model_override='big-model' WHERE id=?", (tid,))
-        m.setattr(model_policy, "flagship_model_match", lambda model, cfg=None: True)
-        return "studio", "flagship"
-
-    def invalid_pin(m, tid, ctx):
-        with kb.connect_closing() as conn:
-            conn.execute("UPDATE tasks SET model_override='m', provider_override='prov' WHERE id=?", (tid,))
-        m.setattr(model_registry, "invalid_pin_reason", lambda provider, model: "unknown model m")
-        return "studio", "blocked by the dispatcher"
-
-    def respawn_guard(m, tid, ctx):
-        m.setattr(kbd, "check_respawn_guard", lambda conn, task_id, **k: "rate_limit_cooldown")
-        return "studio", "rate_limit_cooldown"
-
-    def provider_admission(m, tid, ctx):
-        with kb.connect_closing() as conn:
-            conn.execute("UPDATE tasks SET model_override='m', provider_override='prov' WHERE id=?", (tid,))
-        m.setattr(model_registry, "invalid_pin_reason", lambda provider, model: None)
-        m.setattr(kb, "cooling_providers", lambda conn, **k: {"prov": 9999999999})
-        m.setattr(kph_health, "available_profile_fallback", lambda *a, **k: None)
-        return "studio", "credential_cooldown"
-
-    def card_skills(m, tid, ctx):
-        def refused(conn, task_id, assignee, result, *, dry_run):
-            result.skill_refused.append((task_id, ["missing-skill"]))
-            return True
-        m.setattr(kb, "_card_skills_refused", refused)
-        return "studio", "card skills refused: missing-skill"
-
-    def workspace_admission(m, tid, ctx):
-        def refused(conn, task_id, result, *, board, dry_run):
-            result.workspace_refused.append((task_id, "workspaces_root_unmounted"))
-            return True
-        m.setattr(kb, "_workspace_admission_refused", refused)
-        return "studio", "workspace unavailable: workspaces_root_unmounted"
-
-    def placement(m, tid, ctx):
-        m.setattr(kwp, "board_fault", lambda host, board, **k: "board root unmounted")
-        ctx["measure_remote_fn"] = _remote()
-        return "ace-ai", "ace-ai is not eligible.*board_unhostable"
-
-    def claim(m, tid, ctx):
-        m.setattr(kb, "claim_task", lambda conn, task_id, **k: None)
-        return "studio", "did not spawn"
-
-    def lane_route(m, tid, ctx):
-        import time as _time
-        with kb.connect_closing() as conn:
-            kb.set_lane_model_override(conn, provider="lane-prov", model="lane-model",
-                                       expires_at=int(_time.time()) + 3600, reason="r", assignee="alpha")
-        real = kb._append_event
-
-        def append(conn, task_id, kind, payload=None, **kw):
-            if kind == "dispatch_lane_route":
-                raise RuntimeError("disk full")
-            return real(conn, task_id, kind, payload, **kw)
-        m.setattr(kb, "_append_event", append)
-        return "studio", "spawn failed"
-
-    def workspace(m, tid, ctx):
-        def refuse(task, board=None, conn=None, **kw):
-            if task.status == "running":                    # the post-claim check only
-                raise WorkspaceUnavailable("workspaces_root_unmounted: /Volumes/x")
-            return None
-        m.setattr(kb, "_validate_workspace_admission", refuse)
-        return "studio", "workspace unavailable"
-
-    def launch(m, tid, ctx):
-        ctx["spawn_fn"] = lambda task, workspace, *, board=None, placement=None: (_ for _ in ()).throw(
-            RuntimeError("exec failed"))
-        return "studio", "spawn failed"
-
-    return {
-        "budget_paused": budget, "max_spawn": max_spawn, "no_worker": no_worker, "pause_hold": pause_hold,
-        "route": route, "browser": browser, "assignee": assignee, "profile": profile,
-        "per_profile_cap": per_profile_cap, "flagship": flagship, "invalid_pin": invalid_pin,
-        "respawn_guard": respawn_guard, "provider_admission": provider_admission,
-        "card_skills": card_skills, "workspace_admission": workspace_admission, "placement": placement,
-        "claim": claim, "lane_route": lane_route, "workspace": workspace, "launch": launch,
-    }
-
-
-def test_admit_refuses_on_every_dispatcher_gate_except_host_admission(board, monkeypatch):
-    """The contract: walk the dispatcher's ready-lane gate list. admit refuses on
-    each gate (nothing spawned, no live claim), and host admission is the ONE it
-    skips. A gate added to kbd.READY_LANE_GATES has no trigger here, so this test
-    is red until it is proven that admit holds on it too."""
-    triggers = _gate_triggers()
-    assert set(kbd.READY_LANE_GATES) == set(triggers) | {"host_admission"}, (
-        "a dispatcher gate without an admit trigger: "
-        f"{sorted(set(kbd.READY_LANE_GATES) - set(triggers) - {'host_admission'})}")
-    for gate in kbd.READY_LANE_GATES:
-        if gate == "host_admission":
-            continue
-        with monkeypatch.context() as m:
-            _hot_local(m, load1=10.0)
-            tid = _card()
-            ctx: dict = {"spawn_fn": _spawn}
-            host, expect = triggers[gate](m, tid, ctx)
-            SPAWNS.clear()
-            with pytest.raises(ka.AdmitRefused, match=expect):
-                ka.admit(tid, host, f"gate {gate}", kanban_cfg=ctx.get("kanban_cfg", {}),
-                         spawn_fn=ctx["spawn_fn"], measure_remote_fn=ctx.get("measure_remote_fn"))
-            status, lock = _claim(tid)
-            assert SPAWNS == [] and lock is None and status != "running", (gate, status, lock)
-    # host admission: the LoadGate is PAUSED (load1 66 > 64) and the tick spawns
-    # nothing, yet admit spawns.
-    _hot_local(monkeypatch)
-    held, tid = _card(), None
-    with kb.connect_closing() as conn:
-        res = kbd.dispatch_once(conn, spawn_fn=_spawn, spawn_paused="load gate paused", spawn_limit=0)
-    assert not res.spawned and _claim(held) == ("ready", None)
-    SPAWNS.clear()
-    assert ka.admit(held, "studio", "host admission override", spawn_fn=_spawn)["host"] == "studio"
-    assert SPAWNS == [(held, None)]
-
-
 def test_admit_probes_board_roots_and_refuses_a_host_without_this_board(board, monkeypatch):
-    """Prism 9f96730083e6: admit's OWN path (measure_remote -> _admit_plan) asks
+    """Prism 9f96730083e6: admit's OWN path (measure_remote, inside the lock) asks
     the probe for kanban.workspaces_root, and a pool host whose probe lists no
     root for this board is refused by the dispatcher's board_refusal
     (no_board_root), never spawned into unprovisioned storage."""
@@ -656,7 +509,14 @@ def test_admit_probes_board_roots_and_refuses_a_host_without_this_board(board, m
 
     signal = SimpleNamespace(policy=SimpleNamespace(pressure_path="/x", stale_after_s=600.0),
                              placement_table=None, state_path=Path("/nonexistent/state.json"))
-    monkeypatch.setattr(ka, "_pool_and_signal", lambda cfg: (POOL, signal, board / "fleet"))
+    real_plan = ka._dispatcher_plan
+
+    def plan_with_signal(cfg):
+        plan, fleet = real_plan(cfg)
+        plan.signal = signal
+        return plan, fleet
+
+    monkeypatch.setattr(ka, "_dispatcher_plan", plan_with_signal)
     now = _time.time()
     asked = []
 
@@ -671,7 +531,7 @@ def test_admit_probes_board_roots_and_refuses_a_host_without_this_board(board, m
     SPAWNS.clear()
     with pytest.raises(ka.AdmitRefused, match="no_board_root"):
         ka.admit(tid, "ace-ai", "ruling", kanban_cfg={"workspaces_root": "/srv/ws"}, spawn_fn=_spawn)
-    assert asked and asked[-1].get("workspaces_root") == "/srv/ws"
+    assert asked and all(kw.get("workspaces_root") == "/srv/ws" for kw in asked)
     assert SPAWNS == [] and _claim(tid) == ("ready", None) and not _events(tid)
     # The same probe listing this board admits.
     monkeypatch.setattr(kwp, "probe_host", lambda host, **kw: kwp.HostSample(
@@ -681,3 +541,515 @@ def test_admit_probes_board_roots_and_refuses_a_host_without_this_board(board, m
     assert ka.admit(tid, "ace-ai", "ruling", kanban_cfg={"workspaces_root": "/srv/ws"},
                     spawn_fn=_spawn)["host"] == "ace-ai"
     assert SPAWNS == [(tid, "ace-ai")]
+
+
+# -- r7 (Apollo invariant): admit == the dispatcher's own route and refusal, host admission off --
+
+def _decision_sites() -> set:
+    """Every place ``_dispatch_once_locked`` can decide NOT to spawn a ready
+    card, read from its SOURCE (AST), never from a hand list: an early
+    ``return`` before the ready loop, a ``continue``/``break`` of the ready loop,
+    a fail-open/abort ``except`` in it, a pass that drops ready rows or writes
+    ``row_route``. A site added to the dispatcher is a new key here, and the
+    contract test is red until the key has a trigger."""
+    import ast
+    import inspect
+    import textwrap
+
+    fn = ast.parse(textwrap.dedent(inspect.getsource(kbd._dispatch_once_locked))).body[0]
+    loop = next(n for n in ast.walk(fn) if isinstance(n, ast.For)
+                and ast.unparse(n.iter) == "enumerate(ready_rows)")
+    parents = {c: p for p in ast.walk(fn) for c in ast.iter_child_nodes(p)}
+
+    def owner(n):
+        p = parents.get(n)
+        while p is not None and not isinstance(p, (ast.For, ast.While, ast.FunctionDef,
+                                                    ast.AsyncFunctionDef, ast.Lambda)):
+            p = parents.get(p)
+        return p
+
+    def guard(n):
+        p = parents[n]
+        while not isinstance(p, (ast.If, ast.ExceptHandler)):
+            p = parents[p]
+        if isinstance(p, ast.If):
+            return ast.unparse(p.test)
+        first = next((ast.unparse(c.func) for c in ast.walk(ast.Module(body=parents[p].body, type_ignores=[]))
+                      if isinstance(c, ast.Call)), "?")
+        return f"except {ast.unparse(p.type) if p.type else ''} (try: {first})"
+
+    out = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Return) and owner(n) is fn and n.lineno < loop.lineno:
+            out.add("return: " + guard(n))
+        elif isinstance(n, (ast.Continue, ast.Break)) and owner(n) is loop:
+            out.add(f"{type(n).__name__.lower()}: " + guard(n))
+        elif isinstance(n, ast.ExceptHandler) and owner(n) is loop and n.body and not any(
+                isinstance(x, (ast.Continue, ast.Break)) for x in ast.walk(n)):
+            out.add("fail: " + guard(n.body[0]))
+        elif isinstance(n, ast.Call) and n.lineno < loop.lineno:
+            f = ast.unparse(n.func)
+            if f in ("row_route.update", "row_route.setdefault"):
+                out.add(f"route: {f}")
+            elif any(isinstance(a, ast.Name) and a.id in ("ready_rows", "row_route") for a in n.args):
+                out.add("rows: " + f)
+        if isinstance(n, ast.Assign) and n.lineno < loop.lineno and any(
+                (isinstance(t, ast.Name) and t.id == "row_route") or
+                (isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) and t.value.id == "row_route")
+                for t in n.targets):
+            calls = [ast.unparse(c.func) for c in ast.walk(n.value) if isinstance(c, ast.Call)]
+            out.add("route: " + (calls[0] if calls else ast.unparse(n.value)))
+    return out
+
+
+# Sites that are not a per-card refusal admit could inherit, each with why. A
+# key here that no longer exists in the source is red too (no stale excuses).
+NOT_A_CARD_REFUSAL = {
+    "continue: dry_run": "the --dry-run preview; admit never dry-runs",
+    "return: _cap == 0": "`dispatch --max 0`, an operator argument; admit has no --max (spec item 5)",
+    "continue: record_only is not None": "the tail behind an EARLIER row's wall; admit routes one row",
+    "rows: sorted": "orders the rows; admit has one",
+    "rows: bool": "the placement-record gate snapshot",
+    "rows: _capabilities_unplanned": "dry-run preview only",
+    "rows: studio_affinity_unplanned": "dry-run preview only",
+    "fail: except (TypeError, ValueError) (try: inspect.signature)": "spawn_fn signature back-compat",
+    "fail: except Exception (try: _kb._load_dispatch_collision_scopes)": "collision check fails OPEN by design",
+    "fail: except Exception (try: _kb._check_dispatch_file_collisions)": "collision check fails OPEN by design",
+}
+
+
+def _browser_spawn(task, workspace, *, board=None, placement=None, browser_env=None):
+    SPAWNS.append((task.id, getattr(placement, "name", None)))
+    return 4242
+
+
+def _site_triggers():
+    """site key -> trigger(m, ctx) that puts the card(s) ``ctx["tids"]`` (or
+    the board) into the state that fires that site. It returns ``(host, kind,
+    expect)``: kind ``twin`` = admit refuses with exactly the reason the tick
+    gives a twin card (``refusal_from`` over the tick's own result), ``admit`` =
+    a check only admit has (forced host, floor), ``host`` = HOST ADMISSION: the
+    tick refuses and admit spawns."""
+    from hermes_cli import kanban_budget as kbudget
+    from hermes_cli import kanban_continuation as kcont
+    from hermes_cli import kanban_pause_hold as kph
+    from hermes_cli import kanban_provider_health as kph_health
+    from hermes_cli import model_policy, model_registry
+    from hermes_cli import profiles
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+
+    def upd(sql, ctx, *args):
+        with kb.connect_closing() as conn:
+            for tid in ctx["tids"]:
+                conn.execute(sql, (*args, tid))
+
+    def budget(m, ctx):
+        m.setattr(kbudget, "evaluate_board_budget", lambda *a, **k: True)
+        return "studio", "twin", "budget_paused"
+
+    def max_spawn(m, ctx):
+        with kb.connect_closing() as conn:
+            assert kb.claim_task(conn, kb.create_task(conn, title="other", assignee="alpha"))
+        ctx["kanban_cfg"] = {"max_spawn": 1}
+        return "studio", "twin", "spawn_capped: max_spawn=1"
+
+    def review_reservation(m, ctx):
+        with kb.connect_closing() as conn:
+            rid = kb.create_task(conn, title="review", assignee="alpha")
+            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (rid,))
+        ctx["kanban_cfg"] = {"max_spawn": 1}
+        return "studio", "twin", "total:ready_budget"
+
+    def no_worker(m, ctx):
+        upd("UPDATE tasks SET no_worker=1 WHERE id=?", ctx)
+        return "studio", "twin", "no_worker"
+
+    def human_lane(m, ctx):
+        upd("UPDATE tasks SET assignee='human:apollo' WHERE id=?", ctx)
+        m.setattr(profiles, "profile_exists", lambda name: not str(name).startswith("human"))
+        return "studio", "twin", "not a spawnable profile"
+
+    def pause_pre(m, ctx):
+        m.setattr(kph, "held_routes", lambda rows, cache: {r["id"]: ("wait", "pause_hold (test)") for r in rows})
+        return "studio", "twin", "pause_hold"
+
+    def pause_post(m, ctx):
+        real = kph.gate_rows
+
+        def gate(conn, rows, result, row_route, *a, lane, **k):
+            out = real(conn, rows, result, row_route, *a, lane=lane, **k)
+            if lane == "ready":
+                for r in rows:
+                    row_route[r["id"]] = ("wait", "pause_hold (post-route)")
+            return out
+        m.setattr(kph, "gate_rows", gate)
+        return "studio", "twin", "pause_hold \\(post-route\\)"
+
+    def browser(m, ctx):
+        def gate(conn, rows, result, rr, dry_run, *a, **k):
+            for r in rows:
+                rr[r["id"]] = ("wait", "browser_join_off")
+        m.setattr(kbd, "_browser_gate", gate)
+        return "studio", "twin", "browser_join_off"
+
+    def route_row(m, ctx):
+        m.setattr(kbd, "_route_row", lambda conn, row, plan, *a, **k: ("wait", "capability:gpu"))
+        return "studio", "twin", "capability:gpu"
+
+    def bind(m, ctx):
+        # A workspace bound to a directory on ace-ai pins the card there.
+        m.setattr(kbd, "_workspace_binds", lambda conn, rows, **k: {
+            r["id"]: ("workspace_of:t_x", "t_x", "ace-ai") for r in rows})
+        return "studio", "admit", "studio is not eligible.*pin ace-ai"
+
+    def no_plan_pin(m, ctx):
+        upd("UPDATE tasks SET body='host: ace-ai' WHERE id=?", ctx)
+        ctx["plan"] = None
+        return "studio", "twin", "pool_unavailable"
+
+    def no_plan_unknown_pin(m, ctx):
+        upd("UPDATE tasks SET body='host: nosuch-box' WHERE id=?", ctx)
+        ctx["plan"] = None
+        return "studio", "twin", "pin_unknown_host:nosuch-box"
+
+    def no_plan_identity(m, ctx):
+        m.setattr(kbd, "_identity_only_unplanned", lambda rows: {r["id"]: "requires_unsatisfied:docker"
+                                                                 for r in rows})
+        ctx["plan"] = None
+        return "studio", "twin", "requires_unsatisfied:docker"
+
+    def no_plan_origin(m, ctx):
+        upd("UPDATE tasks SET origin_host='ace-ai' WHERE id=?", ctx)
+        m.setattr(kbd, "_root_kanban_cfg", lambda: {"placement": {"continuation": "enforce"}})
+        m.setattr(kcont, "origin_route", lambda conn, row, pool, **k: ("wait", "origin_host_absent"))
+        ctx["plan"] = None
+        return "studio", "twin", "origin_host_absent"
+
+    def unassigned(m, ctx):
+        upd("UPDATE tasks SET assignee=NULL WHERE id=?", ctx)
+        return "studio", "twin", "unassigned"
+
+    def default_assignee_write(m, ctx):
+        upd("UPDATE tasks SET assignee=NULL WHERE id=?", ctx)
+        ctx["kanban_cfg"] = {"default_assignee": "alpha"}
+        real = kb._append_event
+
+        def append(conn, task_id, kind, payload=None, **kw):
+            if kind == "assigned":
+                raise RuntimeError("disk full")
+            return real(conn, task_id, kind, payload, **kw)
+        m.setattr(kb, "_append_event", append)
+        return "studio", "twin", "unassigned"
+
+    def profile(m, ctx):
+        m.setattr(kbd, "_profile_exists_fn", lambda: (lambda name: False))
+        return "studio", "twin", "not a spawnable profile"
+
+    def per_profile_cap(m, ctx):
+        with kb.connect_closing() as conn:
+            assert kb.claim_task(conn, kb.create_task(conn, title="other", assignee="alpha"))
+        ctx["kanban_cfg"] = {"max_in_progress_per_profile": 1}
+        return "studio", "twin", "per_profile_cap"
+
+    def flagship(m, ctx):
+        upd("UPDATE tasks SET model_override='big-model' WHERE id=?", ctx)
+        m.setattr(model_policy, "flagship_model_match", lambda model, cfg=None: True)
+        return "studio", "twin", "flagship"
+
+    def invalid_pin(m, ctx):
+        upd("UPDATE tasks SET model_override='m', provider_override='prov' WHERE id=?", ctx)
+        m.setattr(model_registry, "invalid_pin_reason", lambda provider, model: "unknown model m")
+        return "studio", "twin", "blocked by the dispatcher"
+
+    def respawn_guard(m, ctx):
+        m.setattr(kbd, "check_respawn_guard", lambda conn, task_id, **k: "rate_limit_cooldown")
+        return "studio", "twin", "rate_limit_cooldown"
+
+    def provider_admission(m, ctx):
+        upd("UPDATE tasks SET model_override='m', provider_override='prov' WHERE id=?", ctx)
+        m.setattr(model_registry, "invalid_pin_reason", lambda provider, model: None)
+        m.setattr(kb, "cooling_providers", lambda conn, **k: {"prov": 9999999999})
+        m.setattr(kph_health, "available_profile_fallback", lambda *a, **k: None)
+        return "studio", "twin", "credential_cooldown"
+
+    def card_skills(m, ctx):
+        def refused(conn, task_id, assignee, result, *, dry_run):
+            result.skill_refused.append((task_id, ["missing-skill"]))
+            return True
+        m.setattr(kb, "_card_skills_refused", refused)
+        return "studio", "twin", "card skills refused: missing-skill"
+
+    def workspace_admission(m, ctx):
+        def refused(conn, task_id, result, *, board, dry_run):
+            result.workspace_refused.append((task_id, "workspaces_root_unmounted"))
+            return True
+        m.setattr(kb, "_workspace_admission_refused", refused)
+        return "studio", "twin", "workspace unavailable: workspaces_root_unmounted"
+
+    def floor(m, ctx):
+        _hot_local(m, load1=200.0)
+        return "studio", "admit", "refused on measured danger: studio: load1 200.0"
+
+    def floor_error(m, ctx):
+        m.setattr(ka, "measure_local", lambda: (_ for _ in ()).throw(RuntimeError("probe died")))
+        return "studio", "admit", "refused on measured danger: floor error: probe died"
+
+    def reach(m, ctx):
+        m.setattr(kbd, "_portable_only", lambda *a, **k: (("ace-media",), None))
+        ctx["measure_remote_fn"] = _remote()
+        return "ace-ai", "admit", "ace-ai is not eligible.*host_reach"
+
+    def forced_take(m, ctx):
+        m.setattr(kwp, "board_fault", lambda host, board, **k: "board root unmounted")
+        ctx["measure_remote_fn"] = _remote()
+        return "ace-ai", "admit", "ace-ai is not eligible.*board_unhostable"
+
+    def forced_host(m, ctx):
+        return "nope-box", "admit", "nope-box is not eligible"
+
+    def layer0b(m, ctx):
+        m.setattr(kbd, "_attached_skill_gap", lambda row, host, caps: "gpu")
+        ctx["measure_remote_fn"] = _remote()
+        return "ace-ai", "admit", "requires:gpu\\+layer0b:ace-ai"
+
+    def claim(m, ctx):
+        m.setattr(kb, "claim_task", lambda conn, task_id, **k: None)
+        return "studio", "twin", "did not spawn"
+
+    def claim_pause(m, ctx):
+        def held(conn, task_id, **k):
+            raise kph.PauseHeld("studio", "m-1", task_id)
+        m.setattr(kb, "claim_task", held)
+        return "studio", "twin", "pause_hold \\(studio:m-1 stage=claim\\)"
+
+    def lane_route(m, ctx):
+        import time as _time
+        with kb.connect_closing() as conn:
+            kb.set_lane_model_override(conn, provider="lane-prov", model="lane-model",
+                                       expires_at=int(_time.time()) + 3600, reason="r", assignee="alpha")
+        real = kb._append_event
+
+        def append(conn, task_id, kind, payload=None, **kw):
+            if kind == "dispatch_lane_route":
+                raise RuntimeError("disk full")
+            return real(conn, task_id, kind, payload, **kw)
+        m.setattr(kb, "_append_event", append)
+        return "studio", "twin", "spawn failed"
+
+    def workspace_unavailable(m, ctx):
+        def refuse(task, board=None, conn=None, **kw):
+            if task.status == "running":                    # the post-claim check only
+                raise WorkspaceUnavailable("workspaces_root_unmounted: /Volumes/x")
+            return None
+        m.setattr(kb, "_validate_workspace_admission", refuse)
+        return "studio", "twin", "workspace unavailable"
+
+    def workspace_error(m, ctx):
+        from hermes_cli import kanban_db_workspace as kbw
+        m.setattr(kbw, "resolve_workspace", lambda task, **k: (_ for _ in ()).throw(RuntimeError("no dir")))
+        return "studio", "twin", "spawn failed"
+
+    def claim_lost_before(m, ctx):
+        m.setattr(kb, "_claim_still_held", lambda conn, task: False)
+        m.setattr(kb, "_abort_lost_claim_spawn", lambda conn, task, pid: _release(task.id))
+        return "studio", "twin", "did not spawn"
+
+    def _join(m, ctx):
+        def gate(conn, rows, result, rr, dry_run, *a, **k):
+            for r in rows:
+                result.browser_joins[r["id"]] = {"plans": [{"host": "ci-box"}], "source_host": "studio"}
+        m.setattr(kbd, "_browser_gate", gate)
+        m.setattr(kbd, "_browser_release_joined", lambda *a, **k: None)
+        ctx["spawn_fn"] = _browser_spawn
+
+    def join_refused(m, ctx):
+        _join(m, ctx)
+        m.setattr(kbd, "_browser_join_lease", lambda conn, claimed, join, host: (None, "BROWSER_REFUSED"))
+        return "studio", "twin", "browser_refused:BROWSER_REFUSED"
+
+    def join_claim_lost(m, ctx):
+        _join(m, ctx)
+
+        def lease(conn, claimed, join, host):
+            _release(claimed.id)                             # the relay took minutes; the claim went
+            return {"X": "1"}, None
+        m.setattr(kbd, "_browser_join_lease", lease)
+        m.setattr(kb, "_abort_lost_claim_spawn", lambda conn, task, pid: None)
+        return "studio", "twin", "did not spawn"
+
+    def launch(m, ctx):
+        ctx["admitted"] = True
+        ctx["spawn_fn"] = lambda task, workspace, *, board=None, placement=None: (_ for _ in ()).throw(
+            RuntimeError("exec failed"))
+        return "studio", "twin", "spawn failed"
+
+    def launch_not_owned(m, ctx):
+        ctx["admitted"] = True
+        m.setattr(kcont, "record_placement", lambda conn, task_id, run_id, host: _release(task_id) or False)
+        return "studio", "twin", "did not spawn"
+
+    def launch_claim_lost(m, ctx):
+        ctx["admitted"] = True
+        m.setattr(kbd, "_set_worker_pid", lambda conn, task_id, pid, **k: _release(task_id) or False)
+        m.setattr(kb, "_abort_lost_claim_spawn", lambda conn, task, pid: None)
+        m.setattr(kbd, "_stop_own_spawn", lambda proc, grace=5.0: None)
+        ctx["launched"] = True                               # spawned, then the claim was gone
+        return "studio", "twin", "did not spawn"
+
+    # HOST ADMISSION: the one axis admit turns off. The tick refuses, admit spawns.
+    def load_gate_paused(m, ctx):
+        m.setattr(kbd, "_route_first_enabled", lambda: False)
+        ctx["tick_kw"] = {"spawn_paused": "load gate paused", "spawn_limit": 0}
+        ctx["plan"] = None
+        return "studio", "host", None
+
+    def load_gate_zero(m, ctx):
+        ctx["tick_kw"] = {"spawn_limit": 0}
+        ctx["plan"] = None
+        return "studio", "host", None
+
+    def max_in_progress(m, ctx):
+        with kb.connect_closing() as conn:
+            assert kb.claim_task(conn, kb.create_task(conn, title="other", assignee="alpha"))
+        ctx["tick_kw"] = {"max_in_progress": 1}
+        return "studio", "host", None
+
+    def memory_critical(m, ctx):
+        m.setattr(kbd, "_memory_pressure_level", lambda sample=None: "critical")
+        return "studio", "host", None
+
+    def pool_capacity(m, ctx):
+        # A card pinned to ace-ai, ace-ai with no free slot (band hot) while the
+        # pool as a whole has room: the tick's take refuses pin_host_full and no
+        # last resort applies; admit's forced take skips band/slots and places it.
+        upd("UPDATE tasks SET body='host: ace-ai' WHERE id=?", ctx)
+        real = ka._dispatcher_plan
+
+        def full():
+            plan, _ = real({})
+            plan.slots = {"ace-ai": 0, "ace-media": 1}
+            return plan
+        ctx["plan_fn"] = full
+        ctx["measure_remote_fn"] = _remote()
+        return "ace-ai", "host", None
+
+    return {
+        "return: _kbudget.evaluate_board_budget(board, _kb.kanban_db_path(board=board), "
+        "_kb.board_state_dir(board), cache=budget_cache)": budget,
+        "return: running_count >= max_spawn": max_spawn,
+        "break: ready_budget is not None and spawned >= ready_budget": review_reservation,
+        "continue: route_first": review_reservation,
+        "rows: _kb._drop_no_worker_rows": no_worker,
+        "rows: _drop_human_lane_rows": human_lane,
+        "rows: _kph.held_routes": pause_pre,
+        "route: row_route.update": pause_pre,
+        "rows: _kph.gate_rows": pause_post,
+        "rows: _browser_gate": browser,
+        "route: _route_row": route_row,
+        "rows: _workspace_binds": bind,
+        "route: ('wait', 'pool_unavailable')": no_plan_pin,
+        "route: _pr_np.pin_unknown_host": no_plan_unknown_pin,
+        "rows: _identity_only_unplanned": no_plan_identity,
+        "route: row_route.setdefault": no_plan_identity,
+        "route: _origin_route or ('local', None)": no_plan_origin,
+        "continue: wait is not None": route_row,
+        "continue: _default_assignee and _default_assignee_resolved": unassigned,
+        "continue: except Exception (try: _kbc.write_txn)": default_assignee_write,
+        "continue: profile_exists is not None and (not profile_exists(row_assignee))": profile,
+        "continue: current >= _row_cap": per_profile_cap,
+        "continue: flagship_refused(row['id'], row_assignee)": flagship,
+        "continue: invalid_pin_refused(row['id'])": invalid_pin,
+        "continue: guard_reason is not None": respawn_guard,
+        "continue: deferred": provider_admission,
+        "continue: _kb._card_skills_refused(conn, row['id'], row_assignee, result, dry_run=dry_run)": card_skills,
+        "continue: _kb._workspace_admission_refused(conn, row['id'], result, board=board, dry_run=dry_run)":
+            workspace_admission,
+        "continue: _forced is not None": forced_host,
+        "continue: _floor is not None": floor,
+        "fail: except Exception (try: admit_floor)": floor_error,
+        "continue: _only is not None and force_host.lower() not in {h.lower() for h in _only}": reach,
+        "continue: _forced_remote": forced_take,
+        "continue: _gap is not None": layer0b,
+        "continue: claimed is None": claim,
+        "fail: except _kph.PauseHeld (try: _kb.claim_task)": claim_pause,
+        "continue: except Exception (try: _kb.apply_lane_model_override)": lane_route,
+        "continue: except WorkspaceUnavailable (try: _kb._validate_workspace_admission)": workspace_unavailable,
+        "continue: except Exception (try: _kb._validate_workspace_admission)": workspace_error,
+        "continue: not _kb._claim_still_held(conn, claimed)": claim_lost_before,
+        "continue: _btok is not None": join_refused,
+        "continue: _btok is None and (not _kb._claim_still_held(conn, claimed))": join_claim_lost,
+        "fail: except Exception (try: result.browser_joins.get)": launch,
+        "continue: outcome == _LAUNCH_NOT_OWNED": launch_not_owned,
+        "continue: outcome == _LAUNCH_CLAIM_LOST": launch_claim_lost,
+        "return: (spillover is None or spillover.budget <= 0) and (not route_first)": load_gate_paused,
+        "break: not local_free and (not pool_free)": load_gate_zero,
+        "return: total_running >= max_in_progress": max_in_progress,
+        "return: pressure == 'critical'": memory_critical,
+        "continue: not _last_resort_allowed(route, local_free, _cap_only, spillover)": pool_capacity,
+    }
+
+
+def _release(task_id):
+    """Somebody else released the claim (the lost-claim shapes)."""
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, current_run_id=NULL WHERE id=?",
+                     (task_id,))
+
+
+def _norm(text: str, tid: str) -> str:
+    return text.replace(tid, "<card>")
+
+
+def test_every_dispatcher_decision_site_has_a_trigger():
+    """Built from the dispatcher's source: a site with no trigger and no
+    recorded reason fails here, so the next seam cannot be missed."""
+    sites = _decision_sites()
+    triggers = _site_triggers()
+    assert not sites - set(triggers) - set(NOT_A_CARD_REFUSAL), (
+        f"dispatcher decision site(s) with no admit trigger: {sorted(sites - set(triggers) - set(NOT_A_CARD_REFUSAL))}")
+    stale = (set(triggers) | set(NOT_A_CARD_REFUSAL)) - sites
+    assert not stale, f"trigger(s) for sites the dispatcher no longer has: {sorted(stale)}"
+
+
+@pytest.mark.parametrize("site", sorted(_site_triggers()))
+def test_admit_returns_the_dispatchers_own_refusal_at_every_site(board, monkeypatch, site):
+    """INVARIANT (Apollo r7): admit produces exactly the route and refusal the
+    dispatcher produces for this card on this host, with ONE axis disabled:
+    host-capacity admission. ``twin``: admit's refusal == refusal_from(the tick's
+    own result) for an identical card. ``host``: the tick refuses, admit spawns.
+    ``admit``: a check only admit makes (forced host, floor) refuses."""
+    with monkeypatch.context() as m:
+        _hot_local(m, load1=10.0)
+        a, b = _card(), _card()
+        ctx: dict = {"tids": [a, b], "spawn_fn": _spawn}
+        host, kind, expect = _site_triggers()[site](m, ctx)
+        cfg = ctx.get("kanban_cfg", {})
+        if "plan_fn" in ctx or "plan" in ctx:
+            plan_fn = ctx.get("plan_fn") or (lambda: ctx["plan"])
+            m.setattr(ka, "_dispatcher_plan", lambda c: (plan_fn(), board / "fleet"))
+        SPAWNS.clear()
+        if kind == "host":
+            with kb.connect_closing() as conn:
+                res = kbd.dispatch_once(conn, spawn_fn=ctx["spawn_fn"], spillover=ka._dispatcher_plan(cfg)[0],
+                                        **ka._tick_knobs(cfg), **ctx.get("tick_kw", {}))
+            assert not res.spawned and SPAWNS == [], (site, res.spawned)
+            assert ka.admit(b, host, f"site {site}", kanban_cfg=cfg, spawn_fn=ctx["spawn_fn"],
+                            measure_remote_fn=ctx.get("measure_remote_fn"))["host"] == host
+            assert SPAWNS == [(b, None if host == "studio" else host)]
+            return
+        with pytest.raises(ka.AdmitRefused, match=expect) as got:
+            ka.admit(a, host, f"site {site}", kanban_cfg=cfg, spawn_fn=ctx["spawn_fn"],
+                     measure_remote_fn=ctx.get("measure_remote_fn"))
+        status, lock = _claim(a)
+        assert SPAWNS == ([(a, None)] if ctx.get("launched") else []), (site, SPAWNS)
+        assert lock is None and status != "running", (site, status, lock)
+        SPAWNS.clear()
+        # An admission_override event exists only once the run reached launch
+        # (the audit of the override exercised); every earlier refusal has none.
+        assert bool(_events(a)) == bool(ctx.get("admitted")), site
+        if kind == "twin":
+            with kb.connect_closing() as conn:
+                res = kbd.dispatch_once(conn, spawn_fn=ctx["spawn_fn"], spillover=ka._dispatcher_plan(cfg)[0],
+                                        **ka._tick_knobs(cfg), **ctx.get("tick_kw", {}))
+            assert b not in [s[0] for s in res.spawned], (site, res.spawned)
+            assert _norm(str(got.value), a) == _norm(f"{b}: {ka.refusal_from(res, b)}", b), site

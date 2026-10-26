@@ -11,13 +11,19 @@ hold, the browser gate, the respawn guard, provider admission, the lane-model
 override, workspace admission, the claim and the guarded launch are the tick's
 own code, so a gate added to the tick binds admit too (Apollo r5).
 
+The pool plan is the dispatcher's own (``GateTickBuilder.build_pool_plan``:
+pool files, signal, the real probe with ``kanban.workspaces_root``); None when
+the pool refuses, exactly as a tick with no plan (Apollo r7). The forced host is
+checked against the card's FINAL route, after the pause hold and browser gate.
+
 What stays here: the operator token (``KANBAN_OPERATOR_TOKEN`` equal to the
 board's ``operator-token`` file), the kill switch ``kanban.admin_admit.enabled``,
-the measured-danger floor on the target host (memory available below the
-host's ``mem_reserve_gb``, or load1 above threads x 1.5, refuses; unmeasured
-refuses too, fail closed; the refusal prints the number and the threshold), and
-the ``admission_override`` audit event (written by the dispatcher just before
-launch).
+the canonical host name, the measured-danger floor callable (memory available
+below the host's ``mem_reserve_gb``, or load1 above threads x 1.5, refuses;
+unmeasured refuses too, fail closed; the refusal prints the number and the
+threshold) and the ``admission_override`` event payload. The dispatcher runs the
+floor INSIDE its tick lock right before take/claim, so the measurement it judges
+is the one the launch uses (Prism 84845601b3b9).
 
 There is no bulk form, no ``--max`` and no reordering: the 09-29 load-243
 incident was a bulk override (t_689b81b7). Every admission writes an
@@ -100,22 +106,25 @@ def floor_refusal(m: Measure) -> Optional[str]:
 
 # -- host names ---------------------------------------------------------------
 
-def _pool_and_signal(kanban_cfg: dict):
-    """``(pool, signal, fleet_dir)``; ``pool`` None when the pool files refuse."""
-    from gateway.kanban_gate_tick import standalone_builder
+def _dispatcher_plan(kanban_cfg: dict):
+    """``(plan, fleet_dir)``: the pool plan the dispatcher's own builder makes
+    (``GateTickBuilder.build_pool_plan``, the call ``plan_pool`` makes once it
+    decided a plan is needed; that decision reads the Studio band, which is host
+    admission). ``plan`` is None when the pool refuses or has no hosts, or the
+    plan fails: the dispatcher then routes exactly as a tick with no plan."""
+    from gateway.kanban_gate_tick import live_boards, running_split, standalone_builder
     from hermes_cli import kanban_load_gate as klg
-    from hermes_cli import kanban_worker_pool as kwp
 
     fleet_dir = kb.kanban_home() / "fleet"
-    pool = kwp.read_pool(fleet_dir, kanban_cfg=kanban_cfg)
-    if pool.refused is not None or not (pool.pool_hosts or pool.hosts):
-        return None, None, fleet_dir
-    builder = standalone_builder(klg.gate_from_config({"kanban": kanban_cfg}), lambda: kanban_cfg)
+    cfg = kanban_cfg if isinstance(kanban_cfg, dict) else {}
     try:
-        signal = builder.target_signal(kanban_cfg)
+        builder = standalone_builder(klg.gate_from_config({"kanban": cfg}), lambda: cfg)
+        boards = live_boards()
+        _local, remote_by_host = running_split(builder._ledger(boards))
+        builder._remote_by_host = dict(remote_by_host)
+        return builder.build_pool_plan(boards, remote_by_host, cfg), fleet_dir
     except Exception:
-        signal = None
-    return pool, signal, fleet_dir
+        return None, fleet_dir
 
 
 def canonical_host(word: str, pool, fleet_dir) -> str:
@@ -126,7 +135,7 @@ def canonical_host(word: str, pool, fleet_dir) -> str:
     w = (word or "").strip().lower()
     if w in kwp._studio_words():
         return LOCAL
-    known = {h.lower(): h for h in ((pool.hosts if pool is not None else ()) or ())}
+    known = {h.lower(): h for h in ((getattr(pool, "hosts", None) if pool is not None else ()) or ())}
     if w in known:
         return known[w]
     try:
@@ -269,86 +278,56 @@ def admit(task_id: str, host_word: str, reason: str, *, kanban_cfg: Optional[dic
     state = kb._operator_token_state()
     if state != "ok":
         raise AdmitRefused(f"kanban admit is operator-only: {kb.OPERATOR_TOKEN_ENV} {state.replace('_', ' ')}")
-    pool, signal, fleet_dir = _pool_and_signal(kanban_cfg)
-    host = canonical_host(host_word, pool, fleet_dir)
+    plan, fleet_dir = _dispatcher_plan(kanban_cfg)
+    host = canonical_host(host_word, plan.config if plan is not None else None, fleet_dir)
     if measure_remote_fn is None:
         root = (kanban_cfg or {}).get("workspaces_root") if isinstance(kanban_cfg, dict) else None
         # The same root the gateway tick probes with (kanban_gate_tick.plan_pool).
         measure_remote_fn = functools.partial(
             measure_remote, workspaces_root=root if isinstance(root, str) and root.startswith("/") else None)
-    deadline = time.monotonic() + _LOCK_WAIT_SECONDS
+    canon = lambda w: canonical_host(w, plan.config if plan is not None else None, fleet_dir)  # noqa: E731
     with kbc.connect_closing(board=board) as conn:
-        while True:
-            try:
-                return _admit_locked(conn, task_id, host, reason.strip(), pool, signal, board,
-                                     spawn_fn, measure_local_fn or measure_local,
-                                     measure_remote_fn,
-                                     canon=lambda w: canonical_host(w, pool, fleet_dir),
-                                     kanban_cfg=kanban_cfg)
-            except kbc_LockBusy:
-                pass
-            if time.monotonic() >= deadline:
-                raise AdmitRefused(f"{task_id}: board tick lock busy for {_LOCK_WAIT_SECONDS:.0f}s; retry")
-            time.sleep(0.2)
-
-
-def _admit_locked(conn, task_id, host, reason, pool, signal, board, spawn_fn,
-                  measure_local_fn, measure_remote_fn, canon: Callable[[str], str] = lambda w: w,
-                  kanban_cfg: Optional[dict] = None) -> dict:
-    task = kb.get_task(conn, task_id)
-    if task is None:
-        raise AdmitRefused(f"{task_id}: no such card")
-    if task.status == "running" or (task.current_run_id is not None and task.claim_lock):
-        raise AdmitRefused(f"{task_id}: already running on {_running_host(conn, task, canon)}")
-    if task.status != "ready" or task.claim_lock:
-        raise AdmitRefused(f"{task_id}: status is {task.status}, admit takes a ready card only")
-    pool_hosts = {h.name: h for h in (pool.pool_hosts if pool is not None else ())}
-    if host != LOCAL and host not in pool_hosts:
-        raise AdmitRefused(f"{task_id}: {host} is not eligible for this card (not a pool host); "
-                           f"eligible hosts are {LOCAL} and the pool: {', '.join(sorted(pool_hosts)) or 'none'}")
-    pool_host = pool_hosts.get(host)
-    m = measure_local_fn() if pool_host is None else measure_remote_fn(pool_host, signal)
-    danger = floor_refusal(m)
-    if danger is not None:
-        raise AdmitRefused(f"{task_id}: refused on measured danger: {danger}")
-    payload = {
-        "source": "cli admit", "actor": _actor(), "host": host, "reason": reason,
-        "load1": None if m.load1 is None else round(m.load1, 2), "threads": m.threads,
-        "load_limit": None if not m.threads else m.threads * LOAD_FACTOR,
-        "mem_available_gb": None if m.mem_available_gb is None else round(m.mem_available_gb, 2),
-        "mem_reserve_gb": m.mem_reserve_gb, **m.extra,
-    }
-    res = kbd.admit_once(conn, task_id, host, board=board, spawn_fn=spawn_fn,
-                         spillover=_admit_plan(pool, signal, host, m.boards), admission_event=payload,
-                         **_tick_knobs(kanban_cfg), lock_wait_s=0.0)
-    if res.skipped_locked:
-        raise kbc_LockBusy()
-    spawned = [s for s in res.spawned if s[0] == task_id]
-    if not spawned:
-        raise AdmitRefused(f"{task_id}: {refusal_from(res, task_id)}")
-    after = kb.get_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            raise AdmitRefused(f"{task_id}: no such card")
+        if task.status == "running" or (task.current_run_id is not None and task.claim_lock):
+            raise AdmitRefused(f"{task_id}: already running on {_running_host(conn, task, canon)}")
+        if task.status != "ready" or task.claim_lock:
+            raise AdmitRefused(f"{task_id}: status is {task.status}, admit takes a ready card only")
+        payload = {"source": "cli admit", "actor": _actor(), "host": host, "reason": reason.strip()}
+        floor = _floor(measure_local_fn or measure_local, measure_remote_fn, payload)
+        res = kbd.admit_once(conn, task_id, host, board=board, spawn_fn=spawn_fn, spillover=plan,
+                             admission_event=payload, admit_floor=floor,
+                             **_tick_knobs(kanban_cfg), lock_wait_s=_LOCK_WAIT_SECONDS)
+        if res.skipped_locked:
+            raise AdmitRefused(f"{task_id}: board tick lock busy for {_LOCK_WAIT_SECONDS:.0f}s; retry")
+        spawned = [x for x in res.spawned if x[0] == task_id]
+        if not spawned:
+            raise AdmitRefused(f"{task_id}: {refusal_from(res, task_id)}")
+        after = kb.get_task(conn, task_id)
     return {"task_id": task_id, "host": host, "pid": getattr(after, "worker_pid", None),
             "workspace": spawned[0][2], "payload": payload}
 
 
-class kbc_LockBusy(Exception):
-    """The board's dispatch lock is held by a tick; admit retries."""
-
-
-def _admit_plan(pool, signal, host: Optional[str] = None, boards=None):
-    """The plan the dispatcher routes this card against: the pool config and
-    signal, no slots (admit skips the band/slots). The probed ``boards`` of
-    ``host`` go into ``detail[host]`` exactly as _plan_v01 puts them, so the
-    dispatcher's own board_refusal refuses ``no_board_root`` (Prism 9f96730083e6)."""
-    from hermes_cli import kanban_worker_pool as kwp
-
-    if pool is None:
-        # An EMPTY plan, not None: the tick's _route_row still runs (capabilities,
-        # waits) and the forced-host check reads its route (Prism 4cc3d57f613b).
-        return kwp.SpilloverPlan(hosts={}, slots={}, config=kwp.PoolConfig(), signal=None)
-    detail = {host: {"boards": sorted(boards)}} if host and boards is not None else {}
-    return kwp.SpilloverPlan(hosts={h.name: h for h in pool.pool_hosts}, slots={}, detail=detail,
-                             config=pool, signal=signal)
+def _floor(measure_local_fn, measure_remote_fn, payload: dict):
+    """The measured-danger floor the dispatcher calls INSIDE its tick lock, right
+    before take/claim: ``(host, plan) -> (refusal, measured payload, boards)``.
+    The measurement also lands in ``payload`` (the operator's return line)."""
+    def floor(host: str, plan):
+        pool_host = (plan.hosts.get(host) if plan is not None else None)
+        if host != LOCAL and pool_host is None:
+            return f"{host}: not a pool host of this plan; nothing measured", {}, None
+        m = measure_local_fn() if host == LOCAL else measure_remote_fn(
+            pool_host, getattr(plan, "signal", None))
+        measured = {
+            "load1": None if not _finite(m.load1) else round(m.load1, 2), "threads": m.threads,
+            "load_limit": None if not _finite(m.threads) else m.threads * LOAD_FACTOR,
+            "mem_available_gb": None if not _finite(m.mem_available_gb) else round(m.mem_available_gb, 2),
+            "mem_reserve_gb": m.mem_reserve_gb, **m.extra,
+        }
+        payload.update(measured)
+        return floor_refusal(m), measured, m.boards
+    return floor
 
 
 def _tick_knobs(kanban_cfg: Optional[dict]) -> dict:
@@ -380,6 +359,8 @@ def refusal_from(res, task_id: str) -> str:
     wait = res.placement_waits.get(task_id)
     if wait is not None:
         why = str(wait)
+        if why.startswith(kbd.ADMIT_FLOOR + ": "):
+            return f"refused on measured danger: {why[len(kbd.ADMIT_FLOOR) + 2:]}"
         if why.startswith(kbd.ADMIT_INELIGIBLE + ": "):
             return why[len(kbd.ADMIT_INELIGIBLE) + 2:]
         return f"held: {why}"
