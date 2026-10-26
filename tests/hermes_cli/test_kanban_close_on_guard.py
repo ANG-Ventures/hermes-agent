@@ -349,9 +349,9 @@ def test_if_latest_release_check_shares_the_insert_transaction(fleet, monkeypatc
     seen = []
     real = guard.newer_release_comment
 
-    def spy(conn, task_id, cid, new_body=""):
+    def spy(conn, task_id, cid, *rest):
         seen.append(conn.in_transaction)
-        return real(conn, task_id, cid, new_body)
+        return real(conn, task_id, cid, *rest)
 
     monkeypatch.setattr(guard, "newer_release_comment", spy)
     with kb.connect_closing() as conn:
@@ -424,11 +424,17 @@ def test_if_latest_release_ignores_a_coverage_record_the_closer_does_not_trust(f
     assert _comments(tid)[-1] == "close-on: merged"
 
 
-def test_if_latest_release_passes_when_the_coverage_gate_is_the_line_being_posted(fleet, capsys):
+def test_if_latest_release_passes_when_the_coverage_gate_is_the_line_being_posted(fleet):
+    """The merge pass posts as the hold's (operator) author; a restate counts only when close_on.latest() would read
+    the appended comment itself as the card's gate, so an author the closer does not trust cannot restate."""
     _, tid = fleet
     c1 = _post(tid, "apollo", HOLD)
     _post(tid, "apollo", _coverage({"verdict": "APPROVE", "close_on": "merged"}))
-    assert _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c1))[0] == 0
+    with kb.connect_closing() as conn:
+        with pytest.raises(guard.ReleaseSuperseded):
+            kb.add_comment(conn, tid, "daedalus", "close-on: merged", if_latest_release=c1)
+        kb.add_comment(conn, tid, "apollo", "close-on: merged", if_latest_release=c1)
+    assert _comments(tid)[-1] == "close-on: merged"
 
 
 @pytest.mark.parametrize("gone", ["close_on.latest", "operator_identity.is_operator"])
@@ -444,3 +450,54 @@ def test_if_latest_release_fails_closed_without_the_gate_reader(fleet, capsys, g
     rc, err = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c1))
     assert rc == 3 and gone in err, err
     assert _comments(tid) == [HOLD]
+
+
+# --- one trust predicate, gate_setter (Prism 70d6e09af5e2 / 85d133b843df, t_fc712261 final round) ---------------
+def test_if_latest_release_counts_a_newer_conversion_gate(fleet, capsys):
+    """Prism 70d6e09af5e2: the merge pass read operator hold c1, then close-on-convert posted c2, a gate the closer
+    trusts. The append anchored on c1 must refuse (rc 3); the append anchored on c2 is a valid anchor."""
+    _, tid = fleet
+    c1 = _post(tid, "apollo", "close-on: manual: hold")
+    c2 = _post(tid, "close-on-convert", "close-on: pr-merged o/r#9")
+    rc, err = _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c1))
+    assert rc == 3 and f"comment {c2}" in err, err
+    assert _comments(tid) == ["close-on: manual: hold", "close-on: pr-merged o/r#9"]
+    assert _cli_args(tid, "close-on: merged", capsys, "--if-latest-release", str(c2))[0] == 0
+
+
+def test_gate_setter_is_the_one_trust_predicate(fleet):
+    """Both scans read one predicate: the merge pass's land_pr_release rule, automation excluded by BODY marker."""
+    authors, ops = guard._load("our_authors"), guard._load("operator_identity")
+    gs = guard.gate_setter_from(authors, ops)
+    for who in ("apollo", "default", "human:ace", "argus", "close-on-convert", "ace", "aegis"):
+        assert gs(who, "close-on: merged"), who
+        assert not gs(who, "[review-merge-pass] close-on: merged"), who
+    for who in ("daedalus", "kanban", "fleetreview-route", "unverified:apollo"):
+        assert not gs(who, "close-on: merged"), who
+
+
+def test_if_latest_release_restate_must_not_carry_a_different_coverage_gate(fleet, capsys):
+    """Prism 85d133b843df: the appended body restates the operator's coverage gate in its close-on line but carries
+    its own review_coverage record with a different close_on, which close_on.latest() ranks above the line. The
+    effective gate would become `merged`: refuse, nothing written."""
+    _, tid = fleet
+    c1 = _post(tid, "apollo", "close-on: merged")
+    gate = _coverage({"close_on": "manual: acceptance pending"})
+    _post(tid, "apollo", gate)
+    body = "close-on: manual: acceptance pending\n" + _coverage({"close_on": "merged"})
+    rc, err = _cli_args(tid, body, capsys, "--if-latest-release", str(c1))
+    assert rc == 3 and "review_coverage" in err, err
+    assert _comments(tid) == ["close-on: merged", gate]
+
+
+def test_if_latest_release_restate_must_restate_on_every_close_on_line(fleet, capsys):
+    """Only the body's LAST close-on line was compared; close_on.latest() takes the FIRST of equal-time statements,
+    so a `merged` line ahead of the restated one became the effective gate. Judge the whole body: refuse."""
+    _, tid = fleet
+    c1 = _post(tid, "apollo", "close-on: merged")
+    gate = _coverage({"close_on": "manual: acceptance pending"})
+    _post(tid, "apollo", gate)
+    body = "close-on: merged\nclose-on: manual: acceptance pending"
+    rc, err = _cli_args(tid, body, capsys, "--if-latest-release", str(c1))
+    assert rc == 3, err
+    assert _comments(tid) == ["close-on: merged", gate]
