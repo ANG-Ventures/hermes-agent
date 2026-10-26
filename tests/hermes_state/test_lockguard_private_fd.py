@@ -76,10 +76,10 @@ def test_foreign_exclusive_refused_on_both_ranges_until_close(wal_db):
     assert os.fstat(db_fd) and os.fstat(shm_fd), "guard is not on private descriptors"
     db.close()
     assert not db._wal_lock_guard and not lg._HANDLES
-    assert os.fstat(db_fd) and db_ident in lg._FDS, "state.db is still at its path: its fd may stay parked"
-    assert shm_ident not in lg._FDS, "the -shm fd must close at count zero"
-    with pytest.raises(OSError):
-        os.fstat(shm_fd)
+    assert not lg._FDS, "a private fd parked past count zero makes this process a phantom holder"
+    for fd in (db_fd, shm_fd):
+        with pytest.raises(OSError):
+            os.fstat(fd)
     assert _db_range_free(db.db_path) and _shm_dms_free(db.db_path)
     SessionDB(db_path=db.db_path).close()  # a parked fd on a deleted -shm would read as a deleted-generation holder
 

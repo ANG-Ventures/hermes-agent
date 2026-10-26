@@ -16,21 +16,22 @@ on ANY description of the inode refuses a foreign EXCLUSIVE exactly like SQLite'
 ``close()`` elsewhere cannot cancel it. No-op on Windows and on runtimes without OFD locks.
 
 Ownership model (ruled, t_2aad1d42 round 3): one private fd per guarded inode in this process,
-handles counted per inode. The ``-shm`` fd is CLOSED when its count reaches zero; it is never parked
-past zero, because a parked fd on a ``-shm`` that a foreign last close later unlinks is exactly a
-deleted-generation holder to ``refuse_deleted_wal_generation``, and in the gateway no handle ever
-closes, so every later opener in every process would be stranded. Closing at zero is safe against
-the §2.2 trap (closing any descriptor of a file cancels every POSIX lock this process holds on it):
-a counted handle is a live SessionDB connection, so at zero no SessionDB in this process has a
-connection on that inode (``hold()`` runs in ``_open_writer`` before the connection's first write,
-so a connection cannot write before it is counted; raw readers are the narrowing below). The close
-itself runs just AFTER the releasing handle's own connection has closed (``release()`` hands the
-fds to ``close_fds()``), because closing before it would cancel the POSIX lock swapped in for that
-very connection; ``close_fds()`` re-checks the count under the lock, so a handle that counted the
-inode in between keeps the fd and closes it on its own release. The main ``state.db`` fd MAY stay
-parked at zero (a replaced main file is ``_raise_if_db_replaced``'s business, and ``state.db`` is
-not a watched sidecar). An fd whose lock was refused is never counted and never closed in ``_arm``;
-it stays until a later ``hold()`` counts it or a release on that db finds it at zero.
+handles counted per inode, and the fd is CLOSED when its count reaches zero; never parked past
+zero. A parked fd on a ``-shm`` that a foreign last close later unlinks is exactly a
+deleted-generation holder to ``refuse_deleted_wal_generation``, and a parked fd on ``state.db``
+makes a process that has closed every SessionDB a foreign holder to the repair preflight
+(``hermes_state_holders``); in the gateway no handle ever closes, so either would strand every
+later opener in every process. Closing at zero is safe against the §2.2 trap (closing any
+descriptor of a file cancels every POSIX lock this process holds on it): a counted handle is a
+live SessionDB connection, so at zero no SessionDB in this process has a connection on that inode
+(``hold()`` runs in ``_open_writer`` before the connection's first write, so a connection cannot
+write before it is counted; raw readers are the narrowing below). The close itself runs just AFTER
+the releasing handle's own connection has closed (``release()`` hands the inodes to
+``close_fds()``), because closing before it would cancel the POSIX lock swapped in for that very
+connection; ``close_fds()`` re-checks the count under the lock, so a handle that counted the inode
+in between keeps the fd and closes it on its own release. An fd whose lock was refused is never
+counted and never closed in ``_arm``; it stays until a later ``hold()`` counts it or a release on
+that db finds it at zero.
 
 Known narrowing (t_2aad1d42): a raw ``sqlite3.connect(state.db)`` reader elsewhere in the process
 (backup, open_db, kanban readers) was previously locked INCIDENTALLY by the old fd-table scan when
@@ -190,11 +191,11 @@ def release(db_path, held: Held) -> List[Identity]:
     holders: a sibling's intact locks still refuse the unlink, and a true last close ends the
     generation, so a later ``state.db`` replace never pairs with a stale WAL.
 
-    Returns the ``-shm`` inodes of *db_path* now at count zero (this handle's and any uncounted
-    leftover); pass them to :func:`close_fds` AFTER the connection closes."""
+    Returns the inodes of *db_path* or its ``-shm`` now at count zero (this handle's and any
+    uncounted leftover); pass them to :func:`close_fds` AFTER the connection closes."""
     if not supported():
         return []
-    shm = _shm_path(db_path)
+    paths = (os.fspath(db_path), _shm_path(db_path))
     with _LOCK:
         for ident, (start, length) in held.items():
             remaining = _HANDLES.get(ident, 1) - 1
@@ -211,12 +212,12 @@ def release(db_path, held: Held) -> List[Identity]:
             except OSError:
                 pass
         held.clear()
-        return [ident for ident, (_, path) in _FDS.items() if path == shm and not _HANDLES.get(ident)]
+        return [ident for ident, (_, path) in _FDS.items() if path in paths and not _HANDLES.get(ident)]
 
 
 def close_fds(idents: List[Identity]) -> None:
     """Second half of :func:`release`, once the releasing handle's own connection has closed: close
-    the ``-shm`` fds still at count zero. One counted in between belongs to that handle now."""
+    the fds still at count zero. One counted in between belongs to that handle now."""
     with _LOCK:
         for ident in idents:
             if _HANDLES.get(ident):
