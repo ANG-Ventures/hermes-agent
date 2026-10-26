@@ -1278,5 +1278,26 @@
     "surfaces": [
       "gateway"
     ]
+  },
+  {
+    "feature": "WAL lock guard on per-instance private fds; no fd-table scan under SessionDB._lock; lock-hold gauge (t_2aad1d42)",
+    "tests": [
+      "tests/hermes_state/test_lockguard_private_fd.py",
+      "tests/hermes_state/test_wal_lock_guard_lifecycle.py",
+      "tests/perf_guards/test_lockguard_hold_under_gil_load.py"
+    ],
+    "paths": [
+      "hermes_state_lockguard.py",
+      "hermes_state.py",
+      "scripts/delivery-lag-p99.py"
+    ],
+    "why": "2026-10-24 Mac Studio gateway: hermes_state_lockguard.hold() enumerated /dev/fd + one fstat per descriptor INSIDE SessionDB._lock on every 50th write and every open; under 12-30 GIL-busy threads a 0.3 ms scan took 16-28 s and every Discord reply queued behind the transcript persist (p50 103 s, max 963 s). Each SessionDB now takes OFD F_RDLCK on its own private O_RDONLY fds for state.db and -shm (I1 kept: a foreign EXCLUSIVE is still refused), _try_wal_checkpoint re-arms a replaced -shm on one stat, and a _lock hold > 1 s logs one WARNING naming the caller + a _lock:<op> ledger row. Fork-only module: a parity merge dropping it reopens the DeletedWalGenerationError class AND the stall.",
+    "lifecycle": "fork-permanent",
+    "upstream_ref": null,
+    "absorbed_date": null,
+    "surfaces": [
+      "gateway",
+      "cli"
+    ]
   }
 ]

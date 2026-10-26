@@ -521,6 +521,8 @@ _NETWORK_DRIVE_ACTION = (
 )
 
 
+_LOCK_HOLD_WARN_S = 1.0  # SessionDB._lock held longer than this is logged (spec §5.4)
+
 _WRITE_PLUMBING_FRAMES = frozenset({
     "_execute_write", "_execute_transcript_write", "_write_sql", "_write_rowcount", "_attempt", "_do", "wrapped",
 })
@@ -1241,6 +1243,24 @@ class SessionDB(
         if self._wal_active:  # a reopened writer is a live generation holder like the first open
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
+    @contextmanager
+    def _lock_hold_gauge(self, op: str) -> Iterator[None]:
+        """Times the enclosing ``with self._lock`` body (nest it directly inside). A hold past
+        _LOCK_HOLD_WARN_S logs one WARNING naming *op* and reaches the holder ledger as
+        ``_lock:<op>`` (``held_s`` on the row). The ledger used to see only the BEGIN IMMEDIATE
+        window, so a long hold BEFORE it (the 2026-10-24 fd-table scan in _try_wal_checkpoint:
+        16-28 s per hold, every Discord reply queued behind it) was invisible to every instrument
+        (t_2aad1d42, spec §5.4)."""
+        started = time.monotonic()
+        token = hold_started(self.db_path, f"_lock:{op}")
+        try:
+            yield
+        finally:
+            hold_ended(token)
+            held = time.monotonic() - started
+            if held > _LOCK_HOLD_WARN_S:
+                logger.warning("SessionDB._lock held %.1fs in %s (%s)", held, op, self.db_path)
+
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
     ) -> T:
@@ -1274,8 +1294,9 @@ class SessionDB(
             # later writes (#105567). Inside the lock the probe only ever sees the
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
+            caller = _write_caller_name()
             try:
-                with self._lock:
+                with self._lock, self._lock_hold_gauge(caller):
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
@@ -1284,7 +1305,7 @@ class SessionDB(
                     try:
                         # Inside the rollback try: nothing between BEGIN and fn may leave the
                         # transaction open (hold_started never raises; this is the backstop).
-                        hold = hold_started(self.db_path, _write_caller_name())  # holder-side lock ledger
+                        hold = hold_started(self.db_path, caller)  # holder-side lock ledger
                         fn_started = True
                         result = fn(self._conn)
                         self._conn.commit()
@@ -1766,11 +1787,11 @@ class SessionDB(
         if self._quarantine_reason() is not None:
             return
         try:
-            with self._lock:
+            with self._lock, self._lock_hold_gauge("_try_wal_checkpoint"):
                 if self._conn is None:
                     return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
                 if self._wal_lock_guard:
-                    _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
+                    _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted/replaced after open: O(1)
                 result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 if result and result[1] > 0:
                     logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
@@ -1847,13 +1868,14 @@ class SessionDB(
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:
                         logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
-                _lockguard.release(self._wal_lock_guard)  # before the close: see release()
+                guard_fds = _lockguard.release(self._wal_lock_guard)  # before the close: see release()
                 if retire_without_close:
-                    self._pin_connection(self._conn)
+                    self._pin_connection(self._conn)  # the private fds stay open with the pinned connection
                     self._conn = None
                 else:
                     conn, self._conn = self._conn, None
                     self._close_connection_quietly(conn)
+                    _lockguard.close_fds(guard_fds)  # after the close: see lockguard._unlock()
                     # Only a clean close ends the generation; retain the recorded
                     # identity when retiring an unsafe handle.
                     self._db_sidecar_identity = {}
