@@ -1043,10 +1043,9 @@ def _handle_complete(args: dict, **kw) -> str:
         from hermes_cli import kanban_handback_new_head as _nh
         # From THIS run's ended row, before the card's status: a successor can be claimed or reach
         # review right after a bounce (Prism bec5d5358114, 35bc66834b1d). t_f716021d: NOT a handback.
-        bounced_run = _worker_run_id(tid)
-        bounced = _nh.bounced_note(conn, tid, bounced_run)
-        if bounced is not None:
-            return _ok(task_id=tid, run_id=bounced_run, status="ready", note=bounced)
+        receipt = _nh.bounce_receipt(conn, tid, _worker_run_id(tid))
+        if receipt is not None:
+            return _ok(**receipt)
         run = kb.latest_run(conn, tid)
         if getattr(task, "status", None) == "review":
             return _ok(
@@ -1153,10 +1152,12 @@ def _handle_request_review(args: dict, **kw) -> str:
                 f"kanban_request_review with the same handoff.")
         _check(ok, f"could not request review for {tid}: "
                    f"{fail_reason or 'unknown id or not in running/ready'}")
-        if fail_reason and fail_reason.startswith("NOT handed back"):
-            # This invocation's own bounce, never a re-read: a successor may already hold the card
-            # (Prism 42d6d2f869f5; same receipt as _handle_complete).
-            return _ok(task_id=tid, run_id=_worker_run_id(tid), status="ready", note=fail_reason)
+        # This invocation's own bounce, never a re-read: a successor may already hold the card
+        # (Prism 42d6d2f869f5, 4b395dc75349; the same receipt _handle_complete returns).
+        from hermes_cli import kanban_handback_new_head as _nh
+        receipt = _nh.bounce_receipt(conn, tid, _worker_run_id(tid))
+        if receipt is not None:
+            return _ok(**receipt)
         return _ok_landed(kb, conn, tid, "review")
 
 

@@ -428,3 +428,48 @@ def test_request_review_tool_reports_its_own_bounce_when_a_successor_claimed(sen
     assert successor.status == "running" and successor.current_run_id != run
     assert out["ok"] and out["note"].startswith("NOT handed back")
     assert out["run_id"] == run and out["status"] == "ready"
+
+
+def _bounce_through_tool(tid, monkeypatch, handler):
+    """Bounce ``tid`` through a kanban tool while its parent reopens mid-read; return (response, run id)."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kb, "configured_review_policy", lambda: "none")
+    monkeypatch.setattr(kb, "configured_max_review_rounds", lambda: 0)
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="builder")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+        conn.execute("INSERT INTO task_links (parent_id, child_id, kind) VALUES (?, ?, 'blocks')", (parent, tid))
+        conn.commit()
+        run = kb.claim_task(conn, tid).current_run_id
+
+    def reader(repo, n, seen):
+        with kb.connect() as c:   # Prism 4b395dc75349: the parent goes unfinished during the remote checks
+            c.execute("UPDATE tasks SET status='todo' WHERE id=?", (parent,))
+            c.commit()
+        return VIEWS["unchanged"]
+
+    monkeypatch.setattr(nh, "_default_reader", lambda: reader)
+    monkeypatch.setattr(kt, "_worker_guard", lambda name, args: tid)
+    monkeypatch.setattr(kt, "_worker_run_id", lambda t: run)
+    return json.loads(getattr(kt, handler)({"summary": f"r2 {PR}"})), run
+
+
+def test_both_tool_paths_return_the_recorded_bounce_receipt(sent_back, tmp_path, monkeypatch):
+    """Prism 4b395dc75349: one receipt, the landing status bounce() recorded (todo here), from both tools."""
+    out_c, run_c = _bounce_through_tool(sent_back, monkeypatch, "_handle_complete")
+    with kb.connect() as conn:
+        twin = kb.create_task(conn, title="impl", assignee="builder")
+        r = kb.claim_task(conn, twin)
+        assert kb.complete_task(conn, twin, summary=f"r1 {PR}", expected_run_id=r.current_run_id)
+        assert kb.claim_review_task(conn, twin)
+        kb.add_comment(conn, twin, "argus", _coverage(A), run_id=kb.get_task(conn, twin).current_run_id)
+        assert kb.request_changes(conn, twin, reason="BEHAVIOUR: build r7")[0]
+    out_r, run_r = _bounce_through_tool(twin, monkeypatch, "_handle_request_review")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, sent_back).status == "todo" and kb.get_task(conn, twin).status == "todo"
+        assert out_c == {"ok": True, **nh.bounce_receipt(conn, sent_back, run_c)}
+        assert out_r == {"ok": True, **nh.bounce_receipt(conn, twin, run_r)}
+    assert out_c["status"] == out_r["status"] == "todo"
+    strip = lambda o: {k: v for k, v in o.items() if k not in ("task_id", "run_id")}  # noqa: E731
+    assert strip(out_c) == strip(out_r)

@@ -391,3 +391,23 @@ def bounced_note(conn: sqlite3.Connection, task_id: str, expected_run_id: Option
         return None
     first = (run.summary or "").splitlines()[0] if run.summary else "no new head"
     return f"NOT handed back: {first}. Push the requested changes, then complete again."
+
+
+def bounce_receipt(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> Optional[dict]:
+    """``{task_id, run_id, status, note}`` for THIS invocation's bounce, else None. Every caller returns it verbatim.
+
+    ``status`` is the landing status :func:`bounce` recorded on this run's :data:`EVENT` (``todo`` when a parent
+    went unfinished during the remote checks), never a literal and never the card's mutable status, which a
+    successor may already own (Prism 4b395dc75349).
+    """
+    if run_id is None:
+        return None
+    note = bounced_note(conn, task_id, run_id)
+    if note is None:
+        return None
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+        (task_id, int(run_id), EVENT),
+    ).fetchone()
+    status = json.loads(row[0] or "{}").get("status") if row is not None else None
+    return {"task_id": task_id, "run_id": int(run_id), "status": status, "note": note}
