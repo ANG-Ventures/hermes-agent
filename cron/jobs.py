@@ -2177,8 +2177,13 @@ def _complete_job_record(job: Dict[str, Any]) -> None:
 
 
 def _activate_job_record(job: Dict[str, Any]) -> None:
-    """Clear pause markers in place so *job* is runnable again."""
-    job.update(enabled=True, state="scheduled", paused_at=None, paused_reason=None)
+    """Clear pause markers in place so *job* is runnable again. A row that was not enabled is graded
+    by the home write guard first (op "activate"): a row created paused is never graded, and
+    rearm_oneshot / claim_job_for_fire(force=True) enable it without going through update_job."""
+    activated = dict(enabled=True, state="scheduled", paused_at=None, paused_reason=None)
+    if not job.get("enabled", True):
+        _run_cron_write_guard({**job, **activated}, "activate")
+    job.update(activated)
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
