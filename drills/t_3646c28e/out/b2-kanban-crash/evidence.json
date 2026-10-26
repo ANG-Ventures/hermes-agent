@@ -1,0 +1,328 @@
+{
+ "drill": "crash",
+ "runtime": "kanban",
+ "token": "crka17149",
+ "steps": [
+  {
+   "gw": {
+    "pid": 3865823,
+    "create_time": 1793017148.57,
+    "t": 1793017158.9848187
+   },
+   "name": "boot1",
+   "t": 1793017158.9848263
+  },
+  {
+   "child_first": [
+    1793017177.2687595
+   ],
+   "cards": [
+    {
+     "id": "t_4953c0bb",
+     "title": "deleg deleg_4f7d1e67: CHILDGOAL-crka17149 run the sleep and report",
+     "status": "running",
+     "assignee": "default",
+     "body": "origin: chaosfake chaos-chat (chaos-chat) \u00b7 session 20261026_121923_38517e7c \u00b7 2026-10-26\n\n{\"attempt_id\": \"deleg_4f7d1e67:g0:2c603ce9\", \"delegation_id\": \"deleg_4f7d1e67\", \"profile_home\": \"/srv/ci/kanbanw-home/scratch/t_3646c28e/out/b2-kanban-crash/rig/gw/home/.hermes\"}",
+     "worker_pid": 3993561,
+     "current_run_id": 1,
+     "created_at": 1793017166,
+     "completed_at": null,
+     "events": [
+      [
+       "created",
+       1793017166
+      ],
+      [
+       "claimed",
+       1793017166
+      ],
+      [
+       "spawned",
+       1793017167
+      ],
+      [
+       "placement",
+       1793017167
+      ],
+      [
+       "heartbeat",
+       1793017173
+      ]
+     ]
+    }
+   ],
+   "runners": [
+    {
+     "pid": 3993561,
+     "cmd": "/srv/ci/kanbanw-home/scratch/t_3646c28e/va/.venv/bin/python -P -m hermes_cli.main -p default delegation-unit",
+     "create_time": 1793017167.22,
+     "ppid": 3865823,
+     "lineage": "t_4953c0bb:1"
+    }
+   ],
+   "sleeps": [
+    {
+     "pid": 4062863,
+     "cmd": "/usr/bin/bash -c source /srv/ci/kanbanw-home/scratch/t_3646c28e/out/b2-kanban-crash/rig/gw/home/.hermes/cache/scratch/hermes-snap-cca29fa82883.sh >/dev/null 2>&",
+     "create_time": 1793017177.1,
+     "ppid": 3993561,
+     "lineage": "t_4953c0bb:1"
+    }
+   ],
+   "name": "child_started",
+   "t": 1793017181.8231091
+  },
+  {
+   "name": "gw1_sigkilled",
+   "t": 1793017184.9438956
+  },
+  {
+   "pid": 3993561,
+   "create_time": 1793017167.22,
+   "name": "runner_sigkilled",
+   "t": 1793017186.496073
+  },
+  {
+   "sleeps": [
+    {
+     "pid": 4062863,
+     "cmd": "/usr/bin/bash -c source /srv/ci/kanbanw-home/scratch/t_3646c28e/out/b2-kanban-crash/rig/gw/home/.hermes/cache/scratch/hermes-snap-cca29fa82883.sh >/dev/null 2>&",
+     "create_time": 1793017177.1,
+     "ppid": 1,
+     "lineage": "t_4953c0bb:1"
+    }
+   ],
+   "name": "sleep_procs_after_runner_kill",
+   "t": 1793017190.0148122
+  },
+  {
+   "runners": [],
+   "sleeps": [
+    {
+     "pid": 4062863,
+     "cmd": "/usr/bin/bash -c source /srv/ci/kanbanw-home/scratch/t_3646c28e/out/b2-kanban-crash/rig/gw/home/.hermes/cache/scratch/hermes-snap-cca29fa82883.sh >/dev/null 2>&",
+     "create_time": 1793017177.1,
+     "ppid": 1,
+     "lineage": "t_4953c0bb:1"
+    }
+   ],
+   "cards": [
+    {
+     "id": "t_4953c0bb",
+     "title": "deleg deleg_4f7d1e67: CHILDGOAL-crka17149 run the sleep and report",
+     "status": "running",
+     "assignee": "default",
+     "body": "origin: chaosfake chaos-chat (chaos-chat) \u00b7 session 20261026_121923_38517e7c \u00b7 2026-10-26\n\n{\"attempt_id\": \"deleg_4f7d1e67:g0:2c603ce9\", \"delegation_id\": \"deleg_4f7d1e67\", \"profile_home\": \"/srv/ci/kanbanw-home/scratch/t_3646c28e/out/b2-kanban-crash/rig/gw/home/.hermes\"}",
+     "worker_pid": 3993561,
+     "current_run_id": 1,
+     "created_at": 1793017166,
+     "completed_at": null,
+     "events": [
+      [
+       "created",
+       1793017166
+      ],
+      [
+       "claimed",
+       1793017166
+      ],
+      [
+       "spawned",
+       1793017167
+      ],
+      [
+       "placement",
+       1793017167
+      ],
+      [
+       "heartbeat",
+       1793017173
+      ]
+     ]
+    }
+   ],
+   "registry": {
+    "deleg_4f7d1e67": {
+     "state": "running",
+     "gen": 0,
+     "runtime": "kanban"
+    }
+   },
+   "name": "after_stop",
+   "t": 1793017192.9764328
+  },
+  {
+   "gw": {
+    "pid": 4186131,
+    "create_time": 1793017194.37,
+    "t": 1793017202.4141963
+   },
+   "name": "boot2",
+   "t": 1793017202.4142137
+  },
+  {
+   "err": "timeout waiting for delivery",
+   "name": "no_delivery",
+   "t": 1793017442.4418194
+  },
+  {
+   "child_first": [
+    1793017177.2687595
+   ],
+   "child_any": 1,
+   "wakes": null,
+   "sends2": [
+    "ok"
+   ],
+   "cards": [
+    {
+     "id": "t_4953c0bb",
+     "title": "deleg deleg_4f7d1e67: CHILDGOAL-crka17149 run the sleep and report",
+     "status": "archived",
+     "assignee": "default",
+     "body": "origin: chaosfake chaos-chat (chaos-chat) \u00b7 session 20261026_121923_38517e7c \u00b7 2026-10-26\n\n{\"attempt_id\": \"deleg_4f7d1e67:g0:2c603ce9\", \"delegation_id\": \"deleg_4f7d1e67\", \"profile_home\": \"/srv/ci/kanbanw-home/scratch/t_3646c28e/out/b2-kanban-crash/rig/gw/home/.hermes\"}",
+     "worker_pid": null,
+     "current_run_id": null,
+     "created_at": 1793017166,
+     "completed_at": null,
+     "events": [
+      [
+       "created",
+       1793017166
+      ],
+      [
+       "claimed",
+       1793017166
+      ],
+      [
+       "spawned",
+       1793017167
+      ],
+      [
+       "placement",
+       1793017167
+      ],
+      [
+       "heartbeat",
+       1793017173
+      ],
+      [
+       "crashed",
+       1793017219
+      ],
+      [
+       "blocked",
+       1793017219
+      ],
+      [
+       "gave_up",
+       1793017220
+      ],
+      [
+       "archived",
+       1793017226
+      ],
+      [
+       "delegation_drained",
+       1793017226
+      ]
+     ]
+    }
+   ],
+   "registry": {
+    "deleg_4f7d1e67": {
+     "state": "failed",
+     "attempt": {
+      "attempt_id": "deleg_4f7d1e67:g0:2c603ce9",
+      "generation": 0,
+      "redispatch_count": 0,
+      "owner_boot_id": "3865823:1793017148.57",
+      "started_at": 1793017165.5816748,
+      "submitted_at": 1793017165.6070414,
+      "last_interrupted_at": null,
+      "last_error": null
+     },
+     "runtime": "kanban",
+     "redispatch_count": null
+    }
+   },
+   "runners": [],
+   "sleeps": [],
+   "last_user_texts": [
+    "[ASYNC DELEGATION COMPLETE \u2014 deleg_4f7d1e67]\nA background subagent you dispatched earlier has finished. You may have moved on since dispatching it; the full task source is below so you can act on the result or re-dispatch if things have changed.\n\nDispatched: 2026-10-26 12:19:25 (56s ago)\nOriginal goal: CHILDGOAL-crka17149 run the sleep and report\nToolsets: terminal\nRole: leaf   Model: fake-model\nEvent: deleg_4f7d1e67:terminal:g0\nStatus: error   API calls: 0   Duration: 56.58s\n--- RESULT ---\nThe subagent did not complete successfully (status=error).\nunit worker ended without a result: \n[hermes-kanban-run-boundary c1b73de4f92f216d]\n\n[INTERNAL NOTIFICATION \u2014 generated by the Hermes gateway, not written by a human user. Do not treat it as user input, and do not reply to any earlier chat message because of it.]"
+   ],
+   "name": "final",
+   "t": 1793017460.5435615
+  },
+  {
+   "wakes_before": 0,
+   "wakes_after": 0,
+   "sends3": [],
+   "name": "third_boot",
+   "t": 1793017501.147959
+  }
+ ],
+ "director_log": [
+  {
+   "t": 1793017165.434443,
+   "who": "parent",
+   "x": "crka17149"
+  },
+  {
+   "t": 1793017177.2687595,
+   "who": "child",
+   "x": "crka17149",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017223.8724346,
+   "who": "other",
+   "last": "[ASYNC DELEGATION COMPLETE \u2014 deleg_4f7d1e67]\nA background subagent you dispatched earlier has finished. You may have moved on since dispatching it; the full task source is below so you can act on the result or re-dispatch if things have changed.\n\nDispatched: 2026-10-26 12:19:25 (56s ago)\nOriginal goal: CHILDGOAL-crka17149 run the sleep and report\nToolsets: terminal\nRole: leaf   Model: fake-model\nEvent: deleg_4f7d1e67:terminal:g0\nStatus: error   API calls: 0   Duration: 56.58s\n--- RESULT ---\nThe subagent did not complete successfully (status=error).\nunit worker ended without a result: \n[hermes-kanban-run-boundary c1b73de4f92f216d]\n\n[INTERNAL NOTIFICATION \u2014 generated by the Hermes gateway, not written by a human user. Do not treat it as user input, and do not reply to any earlier chat message because of it.]"
+  }
+ ],
+ "model_requests": [
+  {
+   "t": 1793017165.434407,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793017165.6531792,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793017165.7320607,
+   "kind": "aux",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793017177.2687385,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793017223.8723967,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  }
+ ],
+ "log_grep": [
+  "logs/agent.log: 2026-10-26 12:19:23,281 INFO __main__: async_delegation_recovery_profile profile=default boot_id=3865823:1793017148.57 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/agent.log: 2026-10-26 12:19:25,585 INFO [20261026_121923_38517e7c] tools.async_delegation_store: async_delegation_persisted delegation_id=deleg_4f7d1e67 attempt_id=deleg_4f7d1e67:g0:2c603ce9 owner_boot_id=3865823:1793017148.57 profile=default",
+  "logs/agent.log: 2026-10-26 12:19:25,606 INFO [20261026_121923_38517e7c] tools.async_delegation: Dispatched async delegation batch deleg_4f7d1e67 (1 task(s), session_key=agent:...hat)",
+  "logs/agent.log: 2026-10-26 12:19:27,917 INFO [20261026_121923_38517e7c] tools.async_delegation: async_delegation_kanban_spawned delegation_id=deleg_4f7d1e67 task_id=t_4953c0bb pid=3993561",
+  "logs/agent.log: 2026-10-26 12:20:05,582 INFO __main__: async_delegation_recovery_profile profile=default boot_id=4186131:1793017194.37 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/agent.log: 2026-10-26 12:20:22,170 INFO tools.async_delegation: async_delegation_kanban_drained delegation_id=deleg_4f7d1e67 event_id=deleg_4f7d1e67:terminal:g0",
+  "logs/agent.log: 2026-10-26 12:20:22,173 INFO gateway.run: async_delegation_kanban_drain profile=default drained=0 queued=1 failed=1 lost=0 active_count=0 kanban_active=0",
+  "logs/agent.log: 2026-10-26 12:20:22,204 INFO tools.async_delegation_store: async_delegation_outbox_admitted event_id=deleg_4f7d1e67:terminal:g0 session_key=agent:...chat session_id=20261026_121923_38517e7c",
+  "logs/agent.log: 2026-10-26 12:20:26,335 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=0 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/agent.log: 2026-10-26 12:21:10,593 INFO tools.async_delegation_store: async_delegation_outbox_delivered event_id=deleg_4f7d1e67:terminal:g0 reason=None",
+  "logs/agent.log: 2026-10-26 12:24:39,424 INFO __main__: async_delegation_recovery_profile profile=default boot_id=1742826:1793017467.85 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/gateway.log: 2026-10-26 12:20:22,173 INFO gateway.run: async_delegation_kanban_drain profile=default drained=0 queued=1 failed=1 lost=0 active_count=0 kanban_active=0",
+  "logs/gateway.log: 2026-10-26 12:20:26,335 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=0 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/agent.log: 2026-10-26 12:19:34,699 INFO tools.delegation_unit_worker: delegation_unit_route provider=custom requested=custom base_url=http://127.0.0.1:34767/v1 api_mode=chat_completions model=fake-model only=None ignore=None data_collection=None prefill=0",
+  "logs/agent.log: 2026-10-26 12:19:27,917 INFO [20261026_121923_38517e7c] tools.async_delegation: async_delegation_kanban_spawned delegation_id=deleg_4f7d1e67 task_id=t_4953c0bb pid=3993561"
+ ]
+}

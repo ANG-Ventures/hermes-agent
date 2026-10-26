@@ -1,0 +1,324 @@
+{
+ "drill": "sigkill",
+ "runtime": "kanban",
+ "token": "sika16598",
+ "steps": [
+  {
+   "gw": {
+    "pid": 4107145,
+    "create_time": 1793016598.09,
+    "t": 1793016608.1336427
+   },
+   "name": "boot1",
+   "t": 1793016608.1336515
+  },
+  {
+   "child_first": [
+    1793016624.5360692
+   ],
+   "cards": [
+    {
+     "id": "t_87c121c5",
+     "title": "deleg deleg_fd7ce1b7: CHILDGOAL-sika16598 run the sleep and report",
+     "status": "running",
+     "assignee": "default",
+     "body": "origin: chaosfake chaos-chat (chaos-chat) \u00b7 session 20261026_121012_05b8fac7 \u00b7 2026-10-26\n\n{\"attempt_id\": \"deleg_fd7ce1b7:g0:3a3431f7\", \"delegation_id\": \"deleg_fd7ce1b7\", \"profile_home\": \"/srv/ci/kanbanw-home/scratch/t_3646c28e/out/b-kanban-sigkill/rig/gw/home/.hermes\"}",
+     "worker_pid": 44640,
+     "current_run_id": 1,
+     "created_at": 1793016614,
+     "completed_at": null,
+     "events": [
+      [
+       "created",
+       1793016614
+      ],
+      [
+       "claimed",
+       1793016614
+      ],
+      [
+       "spawned",
+       1793016616
+      ],
+      [
+       "placement",
+       1793016616
+      ],
+      [
+       "heartbeat",
+       1793016620
+      ]
+     ]
+    }
+   ],
+   "runners": [
+    {
+     "pid": 44640,
+     "cmd": "/srv/ci/kanbanw-home/scratch/t_3646c28e/va/.venv/bin/python -P -m hermes_cli.main -p default delegation-unit",
+     "create_time": 1793016615.8,
+     "ppid": 4107145,
+     "lineage": "t_87c121c5:1"
+    }
+   ],
+   "sleeps": [
+    {
+     "pid": 106588,
+     "cmd": "/usr/bin/bash -c source /srv/ci/kanbanw-home/scratch/t_3646c28e/out/b-kanban-sigkill/rig/gw/home/.hermes/cache/scratch/hermes-snap-aeb5e4e80524.sh >/dev/null 2>",
+     "create_time": 1793016624.32,
+     "ppid": 44640,
+     "lineage": "t_87c121c5:1"
+    }
+   ],
+   "name": "child_started",
+   "t": 1793016628.4463017
+  },
+  {
+   "name": "gw1_sigkilled",
+   "t": 1793016631.564347
+  },
+  {
+   "runners": [
+    {
+     "pid": 44640,
+     "cmd": "/srv/ci/kanbanw-home/scratch/t_3646c28e/va/.venv/bin/python -P -m hermes_cli.main -p default delegation-unit",
+     "create_time": 1793016615.8,
+     "ppid": 1,
+     "lineage": "t_87c121c5:1"
+    }
+   ],
+   "sleeps": [
+    {
+     "pid": 106588,
+     "cmd": "/usr/bin/bash -c source /srv/ci/kanbanw-home/scratch/t_3646c28e/out/b-kanban-sigkill/rig/gw/home/.hermes/cache/scratch/hermes-snap-aeb5e4e80524.sh >/dev/null 2>",
+     "create_time": 1793016624.32,
+     "ppid": 44640,
+     "lineage": "t_87c121c5:1"
+    }
+   ],
+   "cards": [
+    {
+     "id": "t_87c121c5",
+     "title": "deleg deleg_fd7ce1b7: CHILDGOAL-sika16598 run the sleep and report",
+     "status": "running",
+     "assignee": "default",
+     "body": "origin: chaosfake chaos-chat (chaos-chat) \u00b7 session 20261026_121012_05b8fac7 \u00b7 2026-10-26\n\n{\"attempt_id\": \"deleg_fd7ce1b7:g0:3a3431f7\", \"delegation_id\": \"deleg_fd7ce1b7\", \"profile_home\": \"/srv/ci/kanbanw-home/scratch/t_3646c28e/out/b-kanban-sigkill/rig/gw/home/.hermes\"}",
+     "worker_pid": 44640,
+     "current_run_id": 1,
+     "created_at": 1793016614,
+     "completed_at": null,
+     "events": [
+      [
+       "created",
+       1793016614
+      ],
+      [
+       "claimed",
+       1793016614
+      ],
+      [
+       "spawned",
+       1793016616
+      ],
+      [
+       "placement",
+       1793016616
+      ],
+      [
+       "heartbeat",
+       1793016620
+      ]
+     ]
+    }
+   ],
+   "registry": {
+    "deleg_fd7ce1b7": {
+     "state": "running",
+     "gen": 0,
+     "runtime": "kanban"
+    }
+   },
+   "name": "after_stop",
+   "t": 1793016634.0022457
+  },
+  {
+   "gw": {
+    "pid": 192182,
+    "create_time": 1793016635.4,
+    "t": 1793016642.9718652
+   },
+   "name": "boot2",
+   "t": 1793016642.9718866
+  },
+  {
+   "child_first": [
+    1793016624.5360692
+   ],
+   "child_any": 2,
+   "wakes": [
+    1793016705.0463731
+   ],
+   "sends2": [
+    "PARENT-ACK sika16598"
+   ],
+   "cards": [
+    {
+     "id": "t_87c121c5",
+     "title": "deleg deleg_fd7ce1b7: CHILDGOAL-sika16598 run the sleep and report",
+     "status": "archived",
+     "assignee": "default",
+     "body": "origin: chaosfake chaos-chat (chaos-chat) \u00b7 session 20261026_121012_05b8fac7 \u00b7 2026-10-26\n\n{\"attempt_id\": \"deleg_fd7ce1b7:g0:3a3431f7\", \"delegation_id\": \"deleg_fd7ce1b7\", \"profile_home\": \"/srv/ci/kanbanw-home/scratch/t_3646c28e/out/b-kanban-sigkill/rig/gw/home/.hermes\"}",
+     "worker_pid": null,
+     "current_run_id": null,
+     "created_at": 1793016614,
+     "completed_at": 1793016701,
+     "events": [
+      [
+       "created",
+       1793016614
+      ],
+      [
+       "claimed",
+       1793016614
+      ],
+      [
+       "spawned",
+       1793016616
+      ],
+      [
+       "placement",
+       1793016616
+      ],
+      [
+       "heartbeat",
+       1793016620
+      ],
+      [
+       "heartbeat",
+       1793016652
+      ],
+      [
+       "heartbeat",
+       1793016680
+      ],
+      [
+       "completed",
+       1793016701
+      ],
+      [
+       "archived",
+       1793016709
+      ],
+      [
+       "delegation_drained",
+       1793016709
+      ]
+     ]
+    }
+   ],
+   "registry": {
+    "deleg_fd7ce1b7": {
+     "state": "done",
+     "attempt": {
+      "attempt_id": "deleg_fd7ce1b7:g0:3a3431f7",
+      "generation": 0,
+      "redispatch_count": 0,
+      "owner_boot_id": "4107145:1793016598.09",
+      "started_at": 1793016614.35467,
+      "submitted_at": 1793016614.3768888,
+      "last_interrupted_at": null,
+      "last_error": null
+     },
+     "runtime": "kanban",
+     "redispatch_count": null
+    }
+   },
+   "runners": [],
+   "name": "final",
+   "t": 1793016723.2968984
+  },
+  {
+   "wakes_before": 1,
+   "wakes_after": 1,
+   "sends3": [],
+   "name": "third_boot",
+   "t": 1793016757.022705
+  }
+ ],
+ "director_log": [
+  {
+   "t": 1793016614.1944704,
+   "who": "parent",
+   "x": "sika16598"
+  },
+  {
+   "t": 1793016624.5360692,
+   "who": "child",
+   "x": "sika16598",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793016700.455586,
+   "who": "child",
+   "x": "sika16598",
+   "cont": true,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793016705.0463731,
+   "who": "wake",
+   "x": [
+    "sika16598"
+   ]
+  }
+ ],
+ "model_requests": [
+  {
+   "t": 1793016614.1944404,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793016614.4256134,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793016614.5030718,
+   "kind": "aux",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793016624.536042,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793016700.4555018,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793016705.0463436,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  }
+ ],
+ "log_grep": [
+  "logs/agent.log: 2026-10-26 12:10:12,139 INFO __main__: async_delegation_recovery_profile profile=default boot_id=4107145:1793016598.09 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/agent.log: 2026-10-26 12:10:14,357 INFO [20261026_121012_05b8fac7] tools.async_delegation_store: async_delegation_persisted delegation_id=deleg_fd7ce1b7 attempt_id=deleg_fd7ce1b7:g0:3a3431f7 owner_boot_id=4107145:1793016598.09 profile=default",
+  "logs/agent.log: 2026-10-26 12:10:14,376 INFO [20261026_121012_05b8fac7] tools.async_delegation: Dispatched async delegation batch deleg_fd7ce1b7 (1 task(s), session_key=agent:...hat)",
+  "logs/agent.log: 2026-10-26 12:10:16,551 INFO [20261026_121012_05b8fac7] tools.async_delegation: async_delegation_kanban_spawned delegation_id=deleg_fd7ce1b7 task_id=t_87c121c5 pid=44640",
+  "logs/agent.log: 2026-10-26 12:10:46,008 INFO __main__: async_delegation_recovery_profile profile=default boot_id=192182:1793016635.4 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/agent.log: 2026-10-26 12:11:43,308 INFO tools.async_delegation: async_delegation_kanban_drained delegation_id=deleg_fd7ce1b7 event_id=deleg_fd7ce1b7:terminal:g0",
+  "logs/agent.log: 2026-10-26 12:11:43,310 INFO gateway.run: async_delegation_kanban_drain profile=default drained=0 queued=1 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/agent.log: 2026-10-26 12:11:43,384 INFO tools.async_delegation_store: async_delegation_outbox_admitted event_id=deleg_fd7ce1b7:terminal:g0 session_key=agent:...chat session_id=20261026_121012_05b8fac7",
+  "logs/agent.log: 2026-10-26 12:11:49,567 INFO tools.async_delegation_store: async_delegation_outbox_delivered event_id=deleg_fd7ce1b7:terminal:g0 reason=None",
+  "logs/agent.log: 2026-10-26 12:11:49,619 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=0 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/agent.log: 2026-10-26 12:12:14,959 INFO __main__: async_delegation_recovery_profile profile=default boot_id=897506:1793016724.72 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/gateway.log: 2026-10-26 12:11:43,310 INFO gateway.run: async_delegation_kanban_drain profile=default drained=0 queued=1 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/gateway.log: 2026-10-26 12:11:49,619 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=0 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/agent.log: 2026-10-26 12:10:22,235 INFO tools.delegation_unit_worker: delegation_unit_route provider=custom requested=custom base_url=http://127.0.0.1:42535/v1 api_mode=chat_completions model=fake-model only=None ignore=None data_collection=None prefill=0",
+  "logs/agent.log: 2026-10-26 12:10:16,551 INFO [20261026_121012_05b8fac7] tools.async_delegation: async_delegation_kanban_spawned delegation_id=deleg_fd7ce1b7 task_id=t_87c121c5 pid=44640"
+ ]
+}

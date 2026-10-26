@@ -1,0 +1,73 @@
+{
+ "drill": "d-userinfo",
+ "runtime": "kanban",
+ "token": "duska17785",
+ "steps": [
+  {
+   "text": "model:\n  provider: custom\n  base_url: http://u:<SECRET>@127.0.0.1:42845/v1\n  default: fake-model\n  context_length: 128000\nagent:\n  api_max_retries: 2\n  auto_recovery_cycles: 0\n  max_turns: 8\n  restart_drain_timeout: 2\nproviders:\n  custom:\n    request_timeout_seconds: 5\n    stale_timeout_seconds: 3\ncompression:\n  enabled: false\nmemory:\n  memory_enabled: false\n  user_profile_enabled: false\nupdates:\n  check: false\nplugins:\n  enabled: [chaos-fake]\nplatforms:\n  chaosfake:\n    enabled: true\nplatform_toolsets:\n  chaosfake: [terminal, delegation]\nterminal:\n  backend: local\n  cwd: /srv/ci/kanbanw-home/scratch/t_3646c28e/out/d-kanban-userinfo/rig/work\napprovals:\n  destructive_slash_confirm: false\ndelegation:\n  background_runtime: kanban\n  max_concurrent_children: 3\nkanban:\n  dispatch_in_gateway: true\n  dispatch_interval_seconds: 5\n",
+   "name": "config",
+   "t": 1793017796.1214027
+  },
+  {
+   "cards": [],
+   "registry": {},
+   "secret_in_registry": false,
+   "secret_in_cards": false,
+   "child_auth_on_parent_srv": [
+    "Basic dTpwd2R1c2thMTc3ODV6eg=="
+   ],
+   "child_auth_on_deleg_srv": [],
+   "deleg_srv_requests": 0,
+   "sends": [
+    "\u23f3 Still starting up \u2014 your message is queued and I'll get to it in a moment.",
+    "\ud83d\udcec No home channel is set for Chaosfake. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType /sethome to make this chat your home channel, or ignore to skip.",
+    "\ud83d\udd00 Delegating CHILDGOAL-duska17785 run the sleep an...",
+    "PARENT-DISPATCHED"
+   ],
+   "wakes": null,
+   "name": "final",
+   "t": 1793017812.1244998
+  }
+ ],
+ "director_log": [
+  {
+   "t": 1793017803.5271678,
+   "who": "parent",
+   "x": "duska17785"
+  },
+  {
+   "t": 1793017804.0871117,
+   "who": "child",
+   "x": "duska17785",
+   "cont": false,
+   "auth": "Basic dTpwd2"
+  },
+  {
+   "t": 1793017809.8184536,
+   "who": "child",
+   "x": "duska17785",
+   "cont": true,
+   "auth": "Basic dTpwd2"
+  }
+ ],
+ "log_grep": [
+  "gateway-0.log: 2026-10-26 12:30:03,867 ERROR tools.async_delegation_store: async_delegation_persist_failed delegation_id=deleg_e2eb622a path=/srv/ci/kanbanw-home/scratch/t_3646c28e/out/d-kanban-userinfo/rig/gw/home/.hermes/state/async-delegations.json reason=credential-bearing base_url cannot be persisted",
+  "logs/agent.log: 2026-10-26 12:30:01,055 INFO __main__: async_delegation_recovery_profile profile=default boot_id=3851731:1793017784.66 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/agent.log: 2026-10-26 12:30:03,867 ERROR [20261026_123000_f8ac45a4] tools.async_delegation_store: async_delegation_persist_failed delegation_id=deleg_e2eb622a path=/srv/ci/kanbanw-home/scratch/t_3646c28e/out/d-kanban-userinfo/rig/gw/home/.hermes/state/async-delegations.json reason=credential-bearing base_url cannot be persisted",
+  "logs/errors.log: 2026-10-26 12:30:03,867 ERROR [20261026_123000_f8ac45a4] tools.async_delegation_store: async_delegation_persist_failed delegation_id=deleg_e2eb622a path=/srv/ci/kanbanw-home/scratch/t_3646c28e/out/d-kanban-userinfo/rig/gw/home/.hermes/state/async-delegations.json reason=credential-bearing base_url cannot be persisted",
+  "gateway-0.log: 2026-10-26 12:30:03,867 ERROR tools.async_delegation_store: async_delegation_persist_failed delegation_id=deleg_e2eb622a path=/srv/ci/kanbanw-home/scratch/t_3646c28e/out/d-kanban-userinfo/rig/gw/home/.hermes/state/async-delegations.json reason=credential-bearing base_url cannot be persisted",
+  "logs/agent.log: 2026-10-26 12:30:03,867 ERROR [20261026_123000_f8ac45a4] tools.async_delegation_store: async_delegation_persist_failed delegation_id=deleg_e2eb622a path=/srv/ci/kanbanw-home/scratch/t_3646c28e/out/d-kanban-userinfo/rig/gw/home/.hermes/state/async-delegations.json reason=credential-bearing base_url cannot be persisted",
+  "logs/agent.log: 2026-10-26 12:30:12,285 INFO gateway.run: Gateway stopped by an unexpected signal \u2014 persisting gateway_state=running so container_boot auto-starts on the next boot (issue #42675)",
+  "logs/agent.log: 2026-10-26 12:30:12,295 INFO gateway.run: Shutdown phase: post-drain teardown completed in 0.08s (persistence complete; total 0.09s)",
+  "logs/errors.log: 2026-10-26 12:30:03,867 ERROR [20261026_123000_f8ac45a4] tools.async_delegation_store: async_delegation_persist_failed delegation_id=deleg_e2eb622a path=/srv/ci/kanbanw-home/scratch/t_3646c28e/out/d-kanban-userinfo/rig/gw/home/.hermes/state/async-delegations.json reason=credential-bearing base_url cannot be persisted",
+  "logs/gateway.log: 2026-10-26 12:30:12,285 INFO gateway.run: Gateway stopped by an unexpected signal \u2014 persisting gateway_state=running so container_boot auto-starts on the next boot (issue #42675)",
+  "logs/gateway.log: 2026-10-26 12:30:12,295 INFO gateway.run: Shutdown phase: post-drain teardown completed in 0.08s (persistence complete; total 0.09s)"
+ ],
+ "files_containing_secret": [
+  "gw/home/.hermes/config.yaml",
+  "gw/home/.hermes/state.db",
+  "gw/home/.hermes/logs/agent.log",
+  "gw/home/.hermes/backups/config/config.yaml.good.20261026-122950",
+  "gw/home/.hermes/backups/config/config.yaml.good.20261026-123001"
+ ]
+}

@@ -1,0 +1,203 @@
+{
+ "drill": "restart",
+ "runtime": "in_process",
+ "token": "rein16526",
+ "steps": [
+  {
+   "gw": {
+    "pid": 3622713,
+    "create_time": 1793016525.43,
+    "t": 1793016535.1296692
+   },
+   "name": "boot1",
+   "t": 1793016535.1297076
+  },
+  {
+   "child_first": [
+    1793016542.167892,
+    1793016568.3846524
+   ],
+   "cards": [],
+   "runners": [],
+   "sleeps": [
+    {
+     "pid": 3717517,
+     "cmd": "/usr/bin/bash -c source /srv/ci/kanbanw-home/scratch/t_3646c28e/out/a-inproc/rig/gw/home/.hermes/cache/scratch/hermes-snap-ec67dd088c4b.sh >/dev/null 2>&1 || tr",
+     "create_time": 1793016541.95,
+     "ppid": 3622713,
+     "lineage": null
+    }
+   ],
+   "name": "child_started",
+   "t": 1793016546.4534605
+  },
+  {
+   "exit_code": 1,
+   "shutdown_s": 1.874032634004834,
+   "name": "gw1_stopped",
+   "t": 1793016551.3281314
+  },
+  {
+   "runners": [],
+   "sleeps": [],
+   "cards": [],
+   "registry": {
+    "deleg_346f3cab": {
+     "state": "recoverable",
+     "gen": 0,
+     "runtime": null
+    }
+   },
+   "name": "after_stop",
+   "t": 1793016554.2408235
+  },
+  {
+   "gw": {
+    "pid": 3805596,
+    "create_time": 1793016555.64,
+    "t": 1793016563.421213
+   },
+   "name": "boot2",
+   "t": 1793016563.4212272
+  },
+  {
+   "child_first": [
+    1793016542.167892,
+    1793016568.3846524
+   ],
+   "child_any": 3,
+   "wakes": [
+    1793016646.8900566
+   ],
+   "sends2": [
+    "ok",
+    "PARENT-ACK rein16526"
+   ],
+   "cards": [],
+   "registry": {
+    "deleg_346f3cab": {
+     "state": "done",
+     "attempt": {
+      "attempt_id": "deleg_346f3cab:g1:e4519679",
+      "generation": 1,
+      "redispatch_count": 1,
+      "owner_boot_id": "3805596:1793016555.64",
+      "started_at": 1793016566.3861213,
+      "submitted_at": 1793016567.2403848,
+      "last_interrupted_at": 1793016541.9010818,
+      "last_error": null
+     },
+     "runtime": null,
+     "redispatch_count": null
+    }
+   },
+   "runners": [],
+   "name": "final",
+   "t": 1793016663.8541212
+  },
+  {
+   "wakes_before": 1,
+   "wakes_after": 1,
+   "sends3": [],
+   "name": "third_boot",
+   "t": 1793016697.3707395
+  }
+ ],
+ "director_log": [
+  {
+   "t": 1793016541.7141008,
+   "who": "parent",
+   "x": "rein16526"
+  },
+  {
+   "t": 1793016542.167892,
+   "who": "child",
+   "x": "rein16526",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793016568.3846524,
+   "who": "child",
+   "x": "rein16526",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793016570.6906161,
+   "who": "other",
+   "last": "[IMPORTANT: 2 background subagent delegations completed for this session. Treat these results as one completion batch an"
+  },
+  {
+   "t": 1793016644.0379992,
+   "who": "child",
+   "x": "rein16526",
+   "cont": true,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793016646.8900566,
+   "who": "wake",
+   "x": [
+    "rein16526"
+   ]
+  }
+ ],
+ "model_requests": [
+  {
+   "t": 1793016541.7140636,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793016541.9791455,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793016542.0720665,
+   "kind": "aux",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793016542.1678643,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793016568.3846185,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793016570.6905966,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793016644.0379767,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  },
+  {
+   "t": 1793016646.890032,
+   "kind": "main",
+   "auth": "Bearer no-key-"
+  }
+ ],
+ "log_grep": [
+  "logs/agent.log: 2026-10-26 12:08:59,411 INFO __main__: async_delegation_recovery_profile profile=default boot_id=3622713:1793016525.43 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/agent.log: 2026-10-26 12:09:01,905 INFO [20261026_120859_089c509e] tools.async_delegation_store: async_delegation_persisted delegation_id=deleg_346f3cab attempt_id=deleg_346f3cab:g0:5c62edd8 owner_boot_id=3622713:1793016525.43 profile=default",
+  "logs/agent.log: 2026-10-26 12:09:01,930 INFO [20261026_120859_089c509e] tools.async_delegation: Dispatched async delegation batch deleg_346f3cab (1 task(s), session_key=agent:...hat)",
+  "logs/agent.log: 2026-10-26 12:09:10,054 INFO tools.async_delegation: Interrupted 1 async delegation(s) (gateway shutdown (final-cleanup))",
+  "logs/agent.log: 2026-10-26 12:09:26,386 INFO tools.async_delegation_store: async_delegation_recovery_claimed delegation_id=deleg_346f3cab attempt_id=deleg_346f3cab:g1:e4519679 owner_boot_id=3805596:1793016555.64 redispatch_count=1",
+  "logs/agent.log: 2026-10-26 12:09:27,248 INFO tools.async_delegation: async_delegation_redispatched delegation_id=deleg_346f3cab attempt_id=deleg_346f3cab:g1:e4519679 current_boot_id=3805596:1793016555.64",
+  "logs/agent.log: 2026-10-26 12:09:27,256 INFO tools.async_delegation_store: async_delegation_outbox_queued delegation_id=deleg_346f3cab event_id=deleg_346f3cab:restart:g1 current_boot_id=3805596:1793016555.64",
+  "logs/agent.log: 2026-10-26 12:09:27,374 INFO __main__: async_delegation_recovery_profile profile=default boot_id=3805596:1793016555.64 claimed=1 queued=1 exhausted=0 failed_validation=0",
+  "logs/agent.log: 2026-10-26 12:09:30,502 INFO tools.async_delegation_store: async_delegation_outbox_admitted event_id=deleg_346f3cab:restart:g1 session_key=agent:...chat session_id=20261026_120859_089c509e",
+  "logs/agent.log: 2026-10-26 12:10:30,614 INFO tools.async_delegation_store: async_delegation_outbox_delivered event_id=deleg_346f3cab:restart:g1 reason=None",
+  "logs/agent.log: 2026-10-26 12:10:46,671 INFO tools.async_delegation_store: async_delegation_outbox_admitted event_id=deleg_346f3cab:terminal:g1 session_key=agent:...chat session_id=20261026_120859_089c509e",
+  "logs/agent.log: 2026-10-26 12:11:15,499 INFO __main__: async_delegation_recovery_profile profile=default boot_id=424045:1793016664.72 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/agent.log: 2026-10-26 12:11:18,626 INFO tools.async_delegation_store: async_delegation_outbox_delivered event_id=deleg_346f3cab:terminal:g1 reason=None"
+ ]
+}

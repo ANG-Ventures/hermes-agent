@@ -1,0 +1,12 @@
+{"gw": {"pid": 212814, "create_time": 1793016638.08, "t": 1793016648.1888957}, "name": "boot1", "t": 1793016648.1889071}
+{"child_first": [1793016666.6878047], "cards": [{"id": "t_d8a793ae", "title": "deleg deleg_9d071a14: CHILDGOAL-loka16638 run the sleep and report", "status": "running", "assignee": "default", "body": "origin: chaosfake chaos-chat (chaos-chat) \u00b7 session 20261026_121052_1dd7f7f5 \u00b7 2026-10-26\n\n{\"attempt_id\": \"deleg_9d071a14:g0:f737f937\", \"delegation_id\": \"deleg_9d071a14\", \"profile_home\": \"/srv/ci/kanbanw-home/scratch/t_3646c28e/out/b-kanban-lostcard/rig/gw/home/.hermes\"}", "worker_pid": 363918, "current_run_id": 1, "created_at": 1793016656, "completed_at": null, "events": 
+{"name": "gw1_sigkilled", "t": 1793016673.6534908}
+{"pid": 363918, "create_time": 1793016657.32, "name": "runner_sigkilled", "t": 1793016674.8996048}
+{"sleeps": [{"pid": 438213, "cmd": "/usr/bin/bash -c source /srv/ci/kanbanw-home/scratch/t_3646c28e/out/b-kanban-lostcard/rig/gw/home/.hermes/cache/scratch/hermes-snap-af0400c1ca92.sh >/dev/null 2", "create_time": 1793016666.46, "ppid": 1, "lineage": "t_d8a793ae:1"}], "name": "sleep_procs_after_runner_kill", "t": 1793016678.086072}
+{"ids": ["t_d8a793ae"], "name": "card_rows_deleted", "t": 1793016678.1102636}
+{"runners": [], "sleeps": [{"pid": 438213, "cmd": "/usr/bin/bash -c source /srv/ci/kanbanw-home/scratch/t_3646c28e/out/b-kanban-lostcard/rig/gw/home/.hermes/cache/scratch/hermes-snap-af0400c1ca92.sh >/dev/null 2", "create_time": 1793016666.46, "ppid": 1, "lineage": "t_d8a793ae:1"}], "cards": [], "registry": {"deleg_9d071a14": {"state": "running", "gen": 0, "runtime": "kanban"}}, "name": "after_stop", "t": 1793016680.6922638}
+{"gw": {"pid": 569071, "create_time": 1793016682.09, "t": 1793016689.7780445}, "name": "boot2", "t": 1793016689.7780564}
+{"err": "timeout waiting for delivery", "name": "no_delivery", "t": 1793016929.8101366}
+{"child_first": [1793016666.6878047], "child_any": 1, "wakes": null, "sends2": ["ok"], "cards": [], "registry": {"deleg_9d071a14": {"state": "failed", "attempt": {"attempt_id": "deleg_9d071a14:g0:f737f937", "generation": 0, "redispatch_count": 0, "owner_boot_id": "212814:1793016638.08", "started_at": 1793016655.4488618, "submitted_at": 1793016655.4948683, "last_interrupted_at": null, "last_error": null}, "runtime": "kanban", "redispatch_count": null}}, "runners": [], "name": "final", "t": 1793016946.4481785}
+{"wakes_before": 0, "wakes_after": 0, "sends3": [], "name": "third_boot", "t": 1793016983.5911727}
+rc=0

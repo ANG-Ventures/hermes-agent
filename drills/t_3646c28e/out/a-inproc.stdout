@@ -1,0 +1,8 @@
+{"gw": {"pid": 3622713, "create_time": 1793016525.43, "t": 1793016535.1296692}, "name": "boot1", "t": 1793016535.1297076}
+{"child_first": [1793016542.167892], "cards": [], "runners": [], "sleeps": [{"pid": 3717517, "cmd": "/usr/bin/bash -c source /srv/ci/kanbanw-home/scratch/t_3646c28e/out/a-inproc/rig/gw/home/.hermes/cache/scratch/hermes-snap-ec67dd088c4b.sh >/dev/null 2>&1 || tr", "create_time": 1793016541.95, "ppid": 3622713, "lineage": null}], "name": "child_started", "t": 1793016546.4534605}
+{"exit_code": 1, "shutdown_s": 1.874032634004834, "name": "gw1_stopped", "t": 1793016551.3281314}
+{"runners": [], "sleeps": [], "cards": [], "registry": {"deleg_346f3cab": {"state": "recoverable", "gen": 0, "runtime": null}}, "name": "after_stop", "t": 1793016554.2408235}
+{"gw": {"pid": 3805596, "create_time": 1793016555.64, "t": 1793016563.421213}, "name": "boot2", "t": 1793016563.4212272}
+{"child_first": [1793016542.167892, 1793016568.3846524], "child_any": 3, "wakes": [1793016646.8900566], "sends2": ["ok", "PARENT-ACK rein16526"], "cards": [], "registry": {"deleg_346f3cab": {"state": "done", "attempt": {"attempt_id": "deleg_346f3cab:g1:e4519679", "generation": 1, "redispatch_count": 1, "owner_boot_id": "3805596:1793016555.64", "started_at": 1793016566.3861213, "submitted_at": 1793016567.2403848, "last_interrupted_at": 1793016541.9010818, "last_error": null}, "runtime": null, "redispatch_count": null}}, "runners": [], "name": "final", "t": 1793016663.8541212}
+{"wakes_before": 1, "wakes_after": 1, "sends3": [], "name": "third_boot", "t": 1793016697.3707395}
+rc=0

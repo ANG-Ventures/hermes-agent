@@ -1,0 +1,296 @@
+{
+ "drill": "e",
+ "runtime": "in_process",
+ "tokens": [
+  "ein17873n0",
+  "ein17873n1",
+  "ein17873n2",
+  "ein17873n3"
+ ],
+ "steps": [
+  {
+   "rc": 0,
+   "out": "Created t_9bf09de0  (ready, assignee=default)\n",
+   "err": "\n\u26a0  No gateway is running \u2014 the task will sit in 'ready' until you start it. Run:\n    hermes gateway start\nThe gateway hosts an embedded dispatcher (tick interval 60s by default); your task will be picked up on the next tick after the gateway comes up.\n",
+   "name": "control_card_created",
+   "t": 1793017890.3222148
+  },
+  {
+   "cards": [],
+   "runners": [],
+   "name": "three_running",
+   "t": 1793017901.101991
+  },
+  {
+   "cards": [],
+   "fourth_sleep_procs": [
+    {
+     "pid": 504485,
+     "cmd": "/usr/bin/bash -c source /srv/ci/kanbanw-home/scratch/t_3646c28e/out/e-inproc/rig/gw/home/.hermes/cache/scratch/hermes-snap-f8de19dd5e87.sh >/dev/null 2>&1 || tr",
+     "create_time": 1793017901.48,
+     "ppid": 304794,
+     "lineage": null
+    }
+   ],
+   "gateway_pid": 304794,
+   "name": "fourth_started",
+   "t": 1793017906.631008
+  },
+  {
+   "wakes": {
+    "ein17873n0": [
+     1793017956.722336
+    ],
+    "ein17873n1": [
+     1793017955.6946614
+    ],
+    "ein17873n2": [
+     1793017958.142286
+    ],
+    "ein17873n3": null
+   },
+   "child_first": {
+    "ein17873n0": [
+     1793017894.0567636
+    ],
+    "ein17873n1": [
+     1793017894.0311587
+    ],
+    "ein17873n2": [
+     1793017895.170253
+    ],
+    "ein17873n3": [
+     1793017901.698133
+    ]
+   },
+   "cards": [],
+   "control_board": [
+    [
+     "t_9bf09de0",
+     "e-control card",
+     "ready",
+     null
+    ]
+   ],
+   "control_events": [
+    [
+     "t_9bf09de0",
+     "created",
+     1793017889
+    ],
+    [
+     "t_9bf09de0",
+     "placement_wait",
+     1793017899
+    ]
+   ],
+   "sends": [
+    [
+     "chat-0",
+     "\ud83d\udcec No home channel is set for Chaosfake. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType /sethome to make this chat your home channel, or ignore to skip."
+    ],
+    [
+     "chat-1",
+     "\ud83d\udcec No home channel is set for Chaosfake. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType /sethome to make this chat your home channel, or ignore to skip."
+    ],
+    [
+     "chat-1",
+     "\ud83d\udd00 Delegating CHILDGOAL-ein17873n1 run the sleep an..."
+    ],
+    [
+     "chat-0",
+     "\ud83d\udd00 Delegating CHILDGOAL-ein17873n0 run the sleep an..."
+    ],
+    [
+     "chat-2",
+     "\ud83d\udcec No home channel is set for Chaosfake. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType /sethome to make this chat your home channel, or ignore to skip."
+    ],
+    [
+     "chat-1",
+     "PARENT-DISPATCHED"
+    ],
+    [
+     "chat-0",
+     "PARENT-DISPATCHED"
+    ],
+    [
+     "chat-2",
+     "\ud83d\udd00 Delegating CHILDGOAL-ein17873n2 run the sleep an..."
+    ],
+    [
+     "chat-2",
+     "\ud83d\udd00 Delegating CHILDGOAL-ein17873n2 run the sleep an..."
+    ],
+    [
+     "chat-2",
+     "PARENT-DISPATCHED"
+    ],
+    [
+     "chat-3",
+     "\ud83d\udcec No home channel is set for Chaosfake. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType /sethome to make this chat your home channel, or ignore to skip."
+    ],
+    [
+     "chat-3",
+     "\ud83d\udd00 Delegating CHILDGOAL-ein17873n3 run the sleep an..."
+    ],
+    [
+     "chat-1",
+     "PARENT-ACK ein17873n1"
+    ],
+    [
+     "chat-0",
+     "PARENT-ACK ein17873n0"
+    ],
+    [
+     "chat-2",
+     "PARENT-ACK ein17873n2"
+    ],
+    [
+     "chat-3",
+     "PARENT-DISPATCHED"
+    ]
+   ],
+   "registry": {
+    "deleg_d61e491a": {
+     "state": "done",
+     "runtime": null
+    },
+    "deleg_c84ccf1e": {
+     "state": "done",
+     "runtime": null
+    },
+    "deleg_4e8ac771": {
+     "state": "done",
+     "runtime": null
+    }
+   },
+   "name": "final",
+   "t": 1793017970.6391144
+  }
+ ],
+ "director_log": [
+  {
+   "t": 1793017892.7557666,
+   "who": "parent",
+   "x": "ein17873n1"
+  },
+  {
+   "t": 1793017892.7565942,
+   "who": "parent",
+   "x": "ein17873n0"
+  },
+  {
+   "t": 1793017894.0311587,
+   "who": "child",
+   "x": "ein17873n1",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017894.0567636,
+   "who": "child",
+   "x": "ein17873n0",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017894.5595262,
+   "who": "parent",
+   "x": "ein17873n2"
+  },
+  {
+   "t": 1793017895.170253,
+   "who": "child",
+   "x": "ein17873n2",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017901.413036,
+   "who": "parent",
+   "x": "ein17873n3"
+  },
+  {
+   "t": 1793017901.698133,
+   "who": "child",
+   "x": "ein17873n3",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017955.0471728,
+   "who": "child",
+   "x": "ein17873n0",
+   "cont": true,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017955.0669556,
+   "who": "child",
+   "x": "ein17873n1",
+   "cont": true,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017955.6946614,
+   "who": "wake",
+   "x": [
+    "ein17873n1"
+   ]
+  },
+  {
+   "t": 1793017955.9031157,
+   "who": "child",
+   "x": "ein17873n2",
+   "cont": true,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017956.722336,
+   "who": "wake",
+   "x": [
+    "ein17873n0"
+   ]
+  },
+  {
+   "t": 1793017958.142286,
+   "who": "wake",
+   "x": [
+    "ein17873n2"
+   ]
+  },
+  {
+   "t": 1793017962.2710702,
+   "who": "child",
+   "x": "ein17873n3",
+   "cont": true,
+   "auth": "Bearer no-ke"
+  }
+ ],
+ "log_grep": [
+  "logs/agent.log: 2026-10-26 12:31:30,007 INFO __main__: async_delegation_recovery_profile profile=default boot_id=304794:1793017872.76 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/agent.log: 2026-10-26 12:31:33,001 INFO [20261026_123130_798c930f] tools.async_delegation_store: async_delegation_persisted delegation_id=deleg_d61e491a attempt_id=deleg_d61e491a:g0:96e8f2e0 owner_boot_id=304794:1793017872.76 profile=default",
+  "logs/agent.log: 2026-10-26 12:31:33,035 INFO [20261026_123131_834e650b] tools.async_delegation_store: async_delegation_persisted delegation_id=deleg_c84ccf1e attempt_id=deleg_c84ccf1e:g0:00ace9fb owner_boot_id=304794:1793017872.76 profile=default",
+  "logs/agent.log: 2026-10-26 12:31:33,058 INFO [20261026_123130_798c930f] tools.async_delegation: Dispatched async delegation batch deleg_d61e491a (1 task(s), session_key=agent:...t-0)",
+  "logs/agent.log: 2026-10-26 12:31:33,096 INFO [20261026_123131_834e650b] tools.async_delegation: Dispatched async delegation batch deleg_c84ccf1e (1 task(s), session_key=agent:...t-1)",
+  "logs/agent.log: 2026-10-26 12:31:34,766 INFO [20261026_123133_2c6d11b9] tools.async_delegation_store: async_delegation_persisted delegation_id=deleg_4e8ac771 attempt_id=deleg_4e8ac771:g0:c6f7ed85 owner_boot_id=304794:1793017872.76 profile=default",
+  "logs/agent.log: 2026-10-26 12:31:34,790 INFO [20261026_123133_2c6d11b9] tools.async_delegation: Dispatched async delegation batch deleg_4e8ac771 (1 task(s), session_key=agent:...t-2)",
+  "logs/agent.log: 2026-10-26 12:32:35,489 INFO tools.async_delegation_store: async_delegation_outbox_admitted event_id=deleg_c84ccf1e:terminal:g0 session_key=agent:...at-1 session_id=20261026_123131_834e650b",
+  "logs/agent.log: 2026-10-26 12:32:35,792 INFO tools.async_delegation_store: async_delegation_outbox_admitted event_id=deleg_d61e491a:terminal:g0 session_key=agent:...at-0 session_id=20261026_123130_798c930f",
+  "logs/agent.log: 2026-10-26 12:32:37,970 INFO tools.async_delegation_store: async_delegation_outbox_admitted event_id=deleg_4e8ac771:terminal:g0 session_key=agent:...at-2 session_id=20261026_123133_2c6d11b9",
+  "gateway-0.log: 2026-10-26 12:31:39,887 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.3 load5=268.7 (load 275.3 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=886/959408 band=paused/load",
+  "logs/agent.log: 2026-10-26 12:31:30,042 INFO gateway.run: kanban dispatcher: load gate armed pause_above=0.0 resume_below=0.0 ncpu=256 worker_load_cost=2.0 ramp_seconds=600 max_spawn_per_tick=4 load5_floor=True",
+  "logs/agent.log: 2026-10-26 12:31:39,887 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.3 load5=268.7 (load 275.3 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=886/959408 band=paused/load",
+  "logs/errors.log: 2026-10-26 12:31:39,887 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.3 load5=268.7 (load 275.3 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=886/959408 band=paused/load",
+  "logs/gateway.log: 2026-10-26 12:31:30,042 INFO gateway.run: kanban dispatcher: load gate armed pause_above=0.0 resume_below=0.0 ncpu=256 worker_load_cost=2.0 ramp_seconds=600 max_spawn_per_tick=4 load5_floor=True",
+  "logs/gateway.log: 2026-10-26 12:31:39,887 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.3 load5=268.7 (load 275.3 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=886/959408 band=paused/load",
+  "gateway-0.log: 2026-10-26 12:31:39,887 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.3 load5=268.7 (load 275.3 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=886/959408 band=paused/load",
+  "logs/agent.log: 2026-10-26 12:31:30,042 INFO gateway.run: kanban dispatcher: load gate armed pause_above=0.0 resume_below=0.0 ncpu=256 worker_load_cost=2.0 ramp_seconds=600 max_spawn_per_tick=4 load5_floor=True",
+  "logs/agent.log: 2026-10-26 12:31:39,887 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.3 load5=268.7 (load 275.3 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=886/959408 band=paused/load",
+  "logs/errors.log: 2026-10-26 12:31:39,887 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.3 load5=268.7 (load 275.3 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=886/959408 band=paused/load",
+  "logs/gateway.log: 2026-10-26 12:31:30,042 INFO gateway.run: kanban dispatcher: load gate armed pause_above=0.0 resume_below=0.0 ncpu=256 worker_load_cost=2.0 ramp_seconds=600 max_spawn_per_tick=4 load5_floor=True",
+  "logs/gateway.log: 2026-10-26 12:31:39,887 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.3 load5=268.7 (load 275.3 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=886/959408 band=paused/load",
+  "logs/agent.log: 2026-10-26 12:31:41,502 INFO [20261026_123141_13ba423a] tools.delegate_tool: delegate_task: async pool at capacity (Async delegation capacity reached (3 running). Wait for one to finish (its result will re-enter the chat), or raise delegation.max_concurrent_children in config.yaml to allow more concurrent background units.); running the whole batch synchronously instead.",
+  "logs/agent.log: 2026-10-26 12:31:41,502 INFO [20261026_123141_13ba423a] tools.delegate_tool: delegate_task: async pool at capacity (Async delegation capacity reached (3 running). Wait for one to finish (its result will re-enter the chat), or raise delegation.max_concurrent_children in config.yaml to allow more concurrent background units.); running the whole batch synchronously instead."
+ ]
+}

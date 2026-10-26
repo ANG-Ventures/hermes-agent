@@ -1,0 +1,212 @@
+{
+ "drill": "c-stop",
+ "runtime": "kanban",
+ "token": "cstka17164",
+ "steps": [
+  {
+   "cards": [
+    {
+     "id": "t_9ba87c93",
+     "title": "deleg deleg_7a863c73: CHILDGOAL-cstka17164 run the sleep and report",
+     "status": "running",
+     "assignee": "default",
+     "body": "origin: chaosfake chaos-chat (chaos-chat) \u00b7 session 20261026_121938_0ff38dfd \u00b7 2026-10-26\n\n{\"attempt_id\": \"deleg_7a863c73:g0:7f448c11\", \"delegation_id\": \"deleg_7a863c73\", \"profile_home\": \"/srv/ci/kanbanw-home/scratch/t_3646c28e/out/c-kanban-stop/rig/gw/home/.hermes\"}",
+     "worker_pid": 4102941,
+     "current_run_id": 1,
+     "created_at": 1793017181,
+     "completed_at": null,
+     "events": [
+      [
+       "created",
+       1793017181
+      ],
+      [
+       "claimed",
+       1793017181
+      ],
+      [
+       "spawned",
+       1793017183
+      ],
+      [
+       "placement",
+       1793017183
+      ],
+      [
+       "heartbeat",
+       1793017187
+      ]
+     ]
+    }
+   ],
+   "runners": [
+    {
+     "pid": 4102941,
+     "cmd": "/srv/ci/kanbanw-home/scratch/t_3646c28e/va/.venv/bin/python -P -m hermes_cli.main -p default delegation-unit",
+     "create_time": 1793017182.78,
+     "ppid": 3968000,
+     "lineage": "t_9ba87c93:1"
+    }
+   ],
+   "sleeps": [
+    {
+     "pid": 4165618,
+     "cmd": "/usr/bin/bash -c source /srv/ci/kanbanw-home/scratch/t_3646c28e/out/c-kanban-stop/rig/gw/home/.hermes/cache/scratch/hermes-snap-8e737b745111.sh >/dev/null 2>&1 ",
+     "create_time": 1793017191.65,
+     "ppid": 4102941,
+     "lineage": "t_9ba87c93:1"
+    }
+   ],
+   "registry": {
+    "deleg_7a863c73": {
+     "state": "running",
+     "runtime": "kanban",
+     "cancel_attribution": null,
+     "kanban": {
+      "board": "delegations",
+      "task_id": "t_9ba87c93"
+     }
+    }
+   },
+   "name": "child_running",
+   "t": 1793017199.1285763
+  },
+  {
+   "stop_to_gone_s": 3.0387063026428223,
+   "cards": [
+    {
+     "id": "t_9ba87c93",
+     "title": "deleg deleg_7a863c73: CHILDGOAL-cstka17164 run the sleep and report",
+     "status": "archived",
+     "assignee": "default",
+     "body": "origin: chaosfake chaos-chat (chaos-chat) \u00b7 session 20261026_121938_0ff38dfd \u00b7 2026-10-26\n\n{\"attempt_id\": \"deleg_7a863c73:g0:7f448c11\", \"delegation_id\": \"deleg_7a863c73\", \"profile_home\": \"/srv/ci/kanbanw-home/scratch/t_3646c28e/out/c-kanban-stop/rig/gw/home/.hermes\"}",
+     "worker_pid": null,
+     "current_run_id": null,
+     "created_at": 1793017181,
+     "completed_at": null,
+     "events": [
+      [
+       "created",
+       1793017181
+      ],
+      [
+       "claimed",
+       1793017181
+      ],
+      [
+       "spawned",
+       1793017183
+      ],
+      [
+       "placement",
+       1793017183
+      ],
+      [
+       "heartbeat",
+       1793017187
+      ],
+      [
+       "archived",
+       1793017199
+      ],
+      [
+       "delegation_drained",
+       1793017200
+      ],
+      [
+       "archive_worker_terminated",
+       1793017201
+      ]
+     ]
+    }
+   ],
+   "registry": {
+    "deleg_7a863c73": {
+     "state": "cancelled",
+     "runtime": "kanban",
+     "cancel_attribution": {
+      "reason": "stop_command",
+      "caller": "slash_commands.py:808:_handle_stop_command",
+      "via": "cancel_matching",
+      "cancelled_at": 1793017199.1753905,
+      "stack": [
+       "runners.py:127:run",
+       "base_events.py:706:run_until_complete",
+       "base_events.py:677:run_forever",
+       "base_events.py:2057:_run_once",
+       "events.py:94:_run",
+       "base.py:5543:_process_message_background",
+       "run_adapters.py:1740:_handler",
+       "run_inbound.py:1535:_handle_message",
+       "run_inbound.py:1426:_hm_dispatch_idle_commands",
+       "run_inbound.py:1198:_hm_dispatch_canonical_command",
+       "slash_commands.py:808:_handle_stop_command",
+       "async_delegation.py:2680:interrupt_for_session"
+      ],
+      "selector": {
+       "session_key": "agent:main:chaosfake:dm:chaos-chat",
+       "parent_session_id": "20261026_121938_0ff38dfd"
+      }
+     },
+     "kanban": {
+      "board": "delegations",
+      "task_id": "t_9ba87c93"
+     }
+    }
+   },
+   "runners": [],
+   "sleeps": [],
+   "child_requests": [
+    1793017191.8462722
+   ],
+   "child_requests_after_stop_plus_6s": [],
+   "wakes": null,
+   "sends": [
+    "\u23f3 Still starting up \u2014 your message is queued and I'll get to it in a moment.",
+    "\ud83d\udcec No home channel is set for Chaosfake. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType /sethome to make this chat your home channel, or ignore to skip.",
+    "\ud83d\udd00 Delegating CHILDGOAL-cstka17164 run the sleep an...",
+    "\ud83d\udd00 Delegating CHILDGOAL-cstka17164 run the sleep an...",
+    "PARENT-DISPATCHED",
+    "\u26a1 Stopping \u2014 finishing the current step and halting. You can continue this session."
+   ],
+   "name": "final",
+   "t": 1793017215.2374663
+  }
+ ],
+ "director_log": [
+  {
+   "t": 1793017180.8933246,
+   "who": "parent",
+   "x": "cstka17164"
+  },
+  {
+   "t": 1793017191.8462722,
+   "who": "child",
+   "x": "cstka17164",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  }
+ ],
+ "log_grep": [
+  "gateway-0.log: 2026-10-26 12:20:12,108 WARNING tools.async_delegation: Terminal delegation deleg_7a863c73 lacks execution evidence; retaining mirror",
+  "logs/agent.log: 2026-10-26 12:19:38,775 INFO __main__: async_delegation_recovery_profile profile=default boot_id=3968000:1793017163.46 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/agent.log: 2026-10-26 12:19:41,113 INFO [20261026_121938_0ff38dfd] tools.async_delegation_store: async_delegation_persisted delegation_id=deleg_7a863c73 attempt_id=deleg_7a863c73:g0:7f448c11 owner_boot_id=3968000:1793017163.46 profile=default",
+  "logs/agent.log: 2026-10-26 12:19:41,143 INFO [20261026_121938_0ff38dfd] tools.async_delegation: Dispatched async delegation batch deleg_7a863c73 (1 task(s), session_key=agent:...hat)",
+  "logs/agent.log: 2026-10-26 12:19:43,526 INFO [20261026_121938_0ff38dfd] tools.async_delegation: async_delegation_kanban_spawned delegation_id=deleg_7a863c73 task_id=t_9ba87c93 pid=4102941",
+  "logs/agent.log: 2026-10-26 12:19:59,195 INFO tools.async_delegation_store: async_delegation_cancelled delegation_id=deleg_7a863c73 reason=stop_command caller=slash_commands.py:808:_handle_stop_command via=cancel_matching",
+  "logs/agent.log: 2026-10-26 12:19:59,212 INFO tools.async_delegation: Interrupted 1 async delegation(s) for ending session (stop_command)",
+  "logs/agent.log: 2026-10-26 12:20:00,082 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=0 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/agent.log: 2026-10-26 12:20:12,108 WARNING tools.async_delegation: Terminal delegation deleg_7a863c73 lacks execution evidence; retaining mirror",
+  "logs/errors.log: 2026-10-26 12:20:12,108 WARNING tools.async_delegation: Terminal delegation deleg_7a863c73 lacks execution evidence; retaining mirror",
+  "logs/gateway.log: 2026-10-26 12:20:00,082 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=0 failed=0 lost=0 active_count=0 kanban_active=0",
+  "gateway-0.log: 2026-10-26 12:20:15,800 ERROR gateway.run: kanban dispatcher: service cancelled at loop teardown; leadership retained until process exit to protect in-flight writes",
+  "logs/agent.log: 2026-10-26 12:19:59,195 INFO tools.async_delegation_store: async_delegation_cancelled delegation_id=deleg_7a863c73 reason=stop_command caller=slash_commands.py:808:_handle_stop_command via=cancel_matching",
+  "logs/agent.log: 2026-10-26 12:20:15,259 INFO gateway.run: Shutdown phase: pending boot-resume cancel done at +0.01s",
+  "logs/agent.log: 2026-10-26 12:20:15,800 ERROR gateway.run: kanban dispatcher: service cancelled at loop teardown; leadership retained until process exit to protect in-flight writes",
+  "logs/errors.log: 2026-10-26 12:20:15,800 ERROR gateway.run: kanban dispatcher: service cancelled at loop teardown; leadership retained until process exit to protect in-flight writes",
+  "logs/gateway.log: 2026-10-26 12:20:15,259 INFO gateway.run: Shutdown phase: pending boot-resume cancel done at +0.01s",
+  "logs/gateway.log: 2026-10-26 12:20:15,800 ERROR gateway.run: kanban dispatcher: service cancelled at loop teardown; leadership retained until process exit to protect in-flight writes",
+  "logs/agent.log: 2026-10-26 12:19:59,195 INFO tools.async_delegation_store: async_delegation_cancelled delegation_id=deleg_7a863c73 reason=stop_command caller=slash_commands.py:808:_handle_stop_command via=cancel_matching",
+  "logs/agent.log: 2026-10-26 12:19:59,212 INFO tools.async_delegation: Interrupted 1 async delegation(s) for ending session (stop_command)"
+ ]
+}

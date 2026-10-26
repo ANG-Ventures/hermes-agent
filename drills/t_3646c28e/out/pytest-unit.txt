@@ -1,0 +1,15 @@
+[test-gate] placement (pool client: no fleet table/allocd on this host): ace-media load1 33.63 / 24c.32t, avail 74.6 GB; ace-ai load1 20.04 / 16c.32t, avail 80.0 GB; ci load1 378 / 128c.256t, avail 164.3 GB (this machine) -> all_remote_busy
+PHASE=test_gate_queued reason=all_remote_busy waited_s=0 budget_s=600 -> re-admit every 15s
+[test-gate] placement (pool client: no fleet table/allocd on this host): ace-media load1 32.89 / 24c.32t, avail 74.8 GB; ace-ai load1 18.69 / 16c.32t, avail 79.9 GB; ci load1 362.87 / 128c.256t, avail 165.1 GB (this machine) -> all_remote_busy
+[test-gate] placement (pool client: no fleet table/allocd on this host): ace-media load1 33.61 / 24c.32t, avail 74.0 GB; ace-ai load1 17.69 / 16c.32t, avail 79.8 GB; ci load1 351.55 / 128c.256t, avail 165.3 GB (this machine) -> all_remote_busy
+PHASE=test_gate_queued reason=all_remote_busy waited_s=31 budget_s=600 -> re-admit every 15s
+[test-gate] placement (pool client: no fleet table/allocd on this host): ace-media load1 33.25 / 24c.32t, avail 75.1 GB; ace-ai load1 16.28 / 16c.32t, avail 79.4 GB; ci load1 350.72 / 128c.256t, avail 165.4 GB (this machine) -> all_remote_busy
+[test-gate] placement (pool client: no fleet table/allocd on this host): ace-media load1 33.29 / 24c.32t, avail 74.3 GB; ace-ai load1 15.56 / 16c.32t, avail 79.3 GB; ci load1 341.06 / 128c.256t, avail 167.3 GB (this machine) -> ace-ai
+[test-gate] remote: .venv/bin/python -m pytest -q -p no:cacheprovider tests/tools/test_delegation_unit_worker.py tests/tools/test_async_delegation_kanban_runtime.py on ace-ai (synced in 0.6s)
+PHASE=test_gate_remote_run host=ACE-AI slot=0/4 waited_s=0 load1=9.0 load="9.0 tasks / 16c·32t"
+PHASE=test_gate_remote_cgroup host=ACE-AI applied=yes memory_max=16G tasks_max=512 unit=-
+........................................................................ [ 66%]
+.....................................                                    [100%]
+109 passed in 59.33s
+PHASE=test_gate_remote_actual host=ACE-AI measured=no reason=no_unit
+rc=0

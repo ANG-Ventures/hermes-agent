@@ -1,0 +1,149 @@
+{
+ "drill": "d-ownkey",
+ "runtime": "kanban",
+ "token": "dowka18538",
+ "steps": [
+  {
+   "text": "model:\n  provider: custom\n  base_url: http://127.0.0.1:38521/v1\n  api_key: <PARENT_KEY>\n  default: fake-model\n  context_length: 128000\nagent:\n  api_max_retries: 2\n  auto_recovery_cycles: 0\n  max_turns: 8\n  restart_drain_timeout: 2\nproviders:\n  custom:\n    request_timeout_seconds: 5\n    stale_timeout_seconds: 3\ncompression:\n  enabled: false\nmemory:\n  memory_enabled: false\n  user_profile_enabled: false\nupdates:\n  check: false\nplugins:\n  enabled: [chaos-fake]\nplatforms:\n  chaosfake:\n    enabled: true\nplatform_toolsets:\n  chaosfake: [terminal, delegation]\nterminal:\n  backend: local\n  cwd: /srv/ci/kanbanw-home/scratch/t_3646c28e/out/d-kanban-ownkey/rig/work\napprovals:\n  destructive_slash_confirm: false\ndelegation:\n  background_runtime: kanban\n  max_concurrent_children: 3\n  base_url: http://127.0.0.1:43899/v1\nkanban:\n  dispatch_in_gateway: true\n  dispatch_interval_seconds: 5\n",
+   "name": "config",
+   "t": 1793018551.8451033
+  },
+  {
+   "cards": [
+    [
+     "t_52b62be5",
+     "archived",
+     [
+      [
+       "created",
+       1793018561
+      ],
+      [
+       "claimed",
+       1793018561
+      ],
+      [
+       "spawned",
+       1793018564
+      ],
+      [
+       "placement",
+       1793018564
+      ],
+      [
+       "heartbeat",
+       1793018570
+      ],
+      [
+       "completed",
+       1793018582
+      ],
+      [
+       "archived",
+       1793018590
+      ],
+      [
+       "delegation_drained",
+       1793018590
+      ]
+     ]
+    ]
+   ],
+   "registry": {
+    "deleg_a9ca28b7": {
+     "state": "done",
+     "runtime": "kanban",
+     "route": {
+      "requested_provider": "custom",
+      "model": "fake-model",
+      "explicit_base_url": "http://127.0.0.1:43899/v1",
+      "parent_base_url": "http://127.0.0.1:38521/v1"
+     }
+    }
+   },
+   "secret_in_registry": false,
+   "secret_in_cards": false,
+   "child_auth_on_parent_srv": [
+    "Bearer <PARENT_KEY>"
+   ],
+   "child_auth_on_deleg_srv": [
+    "Bearer no-key-required"
+   ],
+   "deleg_srv_requests": 2,
+   "sends": [
+    "\u23f3 Still starting up \u2014 your message is queued and I'll get to it in a moment.",
+    "\ud83d\udcec No home channel is set for Chaosfake. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType /sethome to make this chat your home channel, or ignore to skip.",
+    "\ud83d\udd00 Delegating CHILDGOAL-dowka18538 run the sleep an...",
+    "PARENT-DISPATCHED",
+    "PARENT-ACK dowka18538"
+   ],
+   "wakes": [
+    1793018584.653514
+   ],
+   "all_auth_by_server": {
+    "parent_srv": [
+     "Bearer <PARENT_KEY>"
+    ],
+    "deleg_srv": [
+     "Bearer no-key-required"
+    ]
+   },
+   "delivered": [],
+   "name": "final",
+   "t": 1793018593.8555605
+  }
+ ],
+ "director_log": [
+  {
+   "t": 1793018559.6437542,
+   "who": "parent",
+   "x": "dowka18538"
+  },
+  {
+   "t": 1793018575.5442228,
+   "who": "child",
+   "x": "dowka18538",
+   "cont": false,
+   "auth": "Bearer no-ke",
+   "host": "127.0.0.1:43899"
+  },
+  {
+   "t": 1793018581.3960779,
+   "who": "child",
+   "x": "dowka18538",
+   "cont": true,
+   "auth": "Bearer no-ke",
+   "host": "127.0.0.1:43899"
+  },
+  {
+   "t": 1793018584.653514,
+   "who": "wake",
+   "x": [
+    "dowka18538"
+   ]
+  }
+ ],
+ "log_grep": [
+  "logs/agent.log: 2026-10-26 12:42:36,985 INFO __main__: async_delegation_recovery_profile profile=default boot_id=1148823:1793018538.27 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/agent.log: 2026-10-26 12:42:40,052 INFO [20261026_124236_699f21a7] tools.async_delegation_store: async_delegation_persisted delegation_id=deleg_a9ca28b7 attempt_id=deleg_a9ca28b7:g0:56bfc8f9 owner_boot_id=1148823:1793018538.27 profile=default",
+  "logs/agent.log: 2026-10-26 12:42:40,092 INFO [20261026_124236_699f21a7] tools.async_delegation: Dispatched async delegation batch deleg_a9ca28b7 (1 task(s), session_key=agent:...hat)",
+  "logs/agent.log: 2026-10-26 12:42:45,433 INFO [20261026_124236_699f21a7] tools.async_delegation: async_delegation_kanban_spawned delegation_id=deleg_a9ca28b7 task_id=t_52b62be5 pid=1320249",
+  "logs/agent.log: 2026-10-26 12:43:04,200 INFO tools.async_delegation: async_delegation_kanban_drained delegation_id=deleg_a9ca28b7 event_id=deleg_a9ca28b7:terminal:g0",
+  "logs/agent.log: 2026-10-26 12:43:04,205 INFO gateway.run: async_delegation_kanban_drain profile=default drained=0 queued=1 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/agent.log: 2026-10-26 12:43:04,280 INFO tools.async_delegation_store: async_delegation_outbox_admitted event_id=deleg_a9ca28b7:terminal:g0 session_key=agent:...chat session_id=20261026_124236_699f21a7",
+  "logs/agent.log: 2026-10-26 12:43:10,612 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=0 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/gateway.log: 2026-10-26 12:43:04,205 INFO gateway.run: async_delegation_kanban_drain profile=default drained=0 queued=1 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/gateway.log: 2026-10-26 12:43:10,612 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=0 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/agent.log: 2026-10-26 12:42:52,246 INFO tools.delegation_unit_worker: delegation_unit_route provider=custom requested=custom base_url=http://127.0.0.1:43899/v1 api_mode=chat_completions model=fake-model only=None ignore=None data_collection=None prefill=0",
+  "logs/agent.log: 2026-10-26 12:42:40,052 INFO [20261026_124236_699f21a7] tools.async_delegation_store: async_delegation_persisted delegation_id=deleg_a9ca28b7 attempt_id=deleg_a9ca28b7:g0:56bfc8f9 owner_boot_id=1148823:1793018538.27 profile=default",
+  "logs/agent.log: 2026-10-26 12:43:14,328 INFO gateway.run: Gateway stopped by an unexpected signal \u2014 persisting gateway_state=running so container_boot auto-starts on the next boot (issue #42675)",
+  "logs/agent.log: 2026-10-26 12:43:14,331 INFO gateway.run: Shutdown phase: post-drain teardown completed in 0.46s (persistence complete; total 0.46s)",
+  "logs/gateway.log: 2026-10-26 12:43:14,328 INFO gateway.run: Gateway stopped by an unexpected signal \u2014 persisting gateway_state=running so container_boot auto-starts on the next boot (issue #42675)",
+  "logs/gateway.log: 2026-10-26 12:43:14,331 INFO gateway.run: Shutdown phase: post-drain teardown completed in 0.46s (persistence complete; total 0.46s)"
+ ],
+ "files_containing_secret": [
+  "gw/home/.hermes/config.yaml",
+  "gw/home/.hermes/backups/config/config.yaml.good.20261026-124224",
+  "gw/home/.hermes/backups/config/config.yaml.good.20261026-124237"
+ ]
+}

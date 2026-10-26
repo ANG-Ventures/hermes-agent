@@ -1,0 +1,502 @@
+{
+ "drill": "e",
+ "runtime": "kanban",
+ "tokens": [
+  "eka17863n0",
+  "eka17863n1",
+  "eka17863n2",
+  "eka17863n3"
+ ],
+ "steps": [
+  {
+   "rc": 0,
+   "out": "Created t_d5a2e11e  (ready, assignee=default)\n",
+   "err": "\n\u26a0  No gateway is running \u2014 the task will sit in 'ready' until you start it. Run:\n    hermes gateway start\nThe gateway hosts an embedded dispatcher (tick interval 60s by default); your task will be picked up on the next tick after the gateway comes up.\n",
+   "name": "control_card_created",
+   "t": 1793017882.648038
+  },
+  {
+   "cards": [
+    [
+     "t_231ea25c",
+     "running",
+     "deleg deleg_27faaa06: CHILDGOAL-eka17863"
+    ],
+    [
+     "t_019b3fc8",
+     "running",
+     "deleg deleg_52a3cedd: CHILDGOAL-eka17863"
+    ],
+    [
+     "t_19a11892",
+     "running",
+     "deleg deleg_06e367ca: CHILDGOAL-eka17863"
+    ]
+   ],
+   "runners": [
+    {
+     "pid": 426322,
+     "cmd": "/srv/ci/kanbanw-home/scratch/t_3646c28e/va/.venv/bin/python -P -m hermes_cli.main -p default delegation-unit",
+     "create_time": 1793017890.16,
+     "ppid": 237089,
+     "lineage": "t_231ea25c:1"
+    },
+    {
+     "pid": 459632,
+     "cmd": "/srv/ci/kanbanw-home/scratch/t_3646c28e/va/.venv/bin/python -P -m hermes_cli.main -p default delegation-unit",
+     "create_time": 1793017894.8,
+     "ppid": 237089,
+     "lineage": "t_019b3fc8:2"
+    },
+    {
+     "pid": 486821,
+     "cmd": "/srv/ci/kanbanw-home/scratch/t_3646c28e/va/.venv/bin/python -P -m hermes_cli.main -p default delegation-unit",
+     "create_time": 1793017898.77,
+     "ppid": 237089,
+     "lineage": "t_19a11892:3"
+    }
+   ],
+   "name": "three_running",
+   "t": 1793017914.6651573
+  },
+  {
+   "cards": [
+    [
+     "t_231ea25c",
+     "running",
+     "deleg deleg_27faaa06: CHILDGOAL-eka17863"
+    ],
+    [
+     "t_019b3fc8",
+     "running",
+     "deleg deleg_52a3cedd: CHILDGOAL-eka17863"
+    ],
+    [
+     "t_19a11892",
+     "running",
+     "deleg deleg_06e367ca: CHILDGOAL-eka17863"
+    ]
+   ],
+   "fourth_sleep_procs": [
+    {
+     "pid": 592129,
+     "cmd": "/usr/bin/bash -c source /srv/ci/kanbanw-home/scratch/t_3646c28e/out/e-kanban/rig/gw/home/.hermes/cache/scratch/hermes-snap-4d960124d7ae.sh >/dev/null 2>&1 || tr",
+     "create_time": 1793017915.11,
+     "ppid": 237089,
+     "lineage": null
+    }
+   ],
+   "gateway_pid": 237089,
+   "name": "fourth_started",
+   "t": 1793017920.2387388
+  },
+  {
+   "wakes": {
+    "eka17863n0": [
+     1793017964.4473546
+    ],
+    "eka17863n1": [
+     1793017970.7534604
+    ],
+    "eka17863n2": [
+     1793017977.2649496
+    ],
+    "eka17863n3": null
+   },
+   "child_first": {
+    "eka17863n0": [
+     1793017900.6804457
+    ],
+    "eka17863n1": [
+     1793017905.1504014
+    ],
+    "eka17863n2": [
+     1793017909.0783384
+    ],
+    "eka17863n3": [
+     1793017915.228544
+    ]
+   },
+   "cards": [
+    [
+     "t_231ea25c",
+     "archived",
+     "deleg deleg_27faaa06: CHILDGOAL-eka17863",
+     [
+      [
+       "created",
+       1793017886
+      ],
+      [
+       "claimed",
+       1793017886
+      ],
+      [
+       "spawned",
+       1793017890
+      ],
+      [
+       "placement",
+       1793017890
+      ],
+      [
+       "heartbeat",
+       1793017896
+      ],
+      [
+       "heartbeat",
+       1793017928
+      ],
+      [
+       "heartbeat",
+       1793017956
+      ],
+      [
+       "completed",
+       1793017962
+      ],
+      [
+       "archived",
+       1793017970
+      ],
+      [
+       "delegation_drained",
+       1793017970
+      ]
+     ]
+    ],
+    [
+     "t_019b3fc8",
+     "archived",
+     "deleg deleg_52a3cedd: CHILDGOAL-eka17863",
+     [
+      [
+       "created",
+       1793017886
+      ],
+      [
+       "claimed",
+       1793017891
+      ],
+      [
+       "spawned",
+       1793017895
+      ],
+      [
+       "placement",
+       1793017895
+      ],
+      [
+       "heartbeat",
+       1793017900
+      ],
+      [
+       "heartbeat",
+       1793017933
+      ],
+      [
+       "heartbeat",
+       1793017960
+      ],
+      [
+       "completed",
+       1793017966
+      ],
+      [
+       "archived",
+       1793017976
+      ],
+      [
+       "delegation_drained",
+       1793017976
+      ]
+     ]
+    ],
+    [
+     "t_19a11892",
+     "archived",
+     "deleg deleg_06e367ca: CHILDGOAL-eka17863",
+     [
+      [
+       "created",
+       1793017887
+      ],
+      [
+       "claimed",
+       1793017895
+      ],
+      [
+       "spawned",
+       1793017899
+      ],
+      [
+       "placement",
+       1793017899
+      ],
+      [
+       "heartbeat",
+       1793017904
+      ],
+      [
+       "heartbeat",
+       1793017937
+      ],
+      [
+       "heartbeat",
+       1793017964
+      ],
+      [
+       "completed",
+       1793017970
+      ],
+      [
+       "archived",
+       1793017983
+      ],
+      [
+       "delegation_drained",
+       1793017983
+      ]
+     ]
+    ]
+   ],
+   "control_board": [
+    [
+     "t_d5a2e11e",
+     "e-control card",
+     "ready",
+     null
+    ]
+   ],
+   "control_events": [
+    [
+     "t_d5a2e11e",
+     "created",
+     1793017882
+    ],
+    [
+     "t_d5a2e11e",
+     "placement_wait",
+     1793017899
+    ]
+   ],
+   "sends": [
+    [
+     "chat-0",
+     "\ud83d\udcec No home channel is set for Chaosfake. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType /sethome to make this chat your home channel, or ignore to skip."
+    ],
+    [
+     "chat-1",
+     "\ud83d\udcec No home channel is set for Chaosfake. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType /sethome to make this chat your home channel, or ignore to skip."
+    ],
+    [
+     "chat-0",
+     "\ud83d\udd00 Delegating CHILDGOAL-eka17863n0 run the sleep an..."
+    ],
+    [
+     "chat-1",
+     "\ud83d\udd00 Delegating CHILDGOAL-eka17863n1 run the sleep an..."
+    ],
+    [
+     "chat-2",
+     "\ud83d\udcec No home channel is set for Chaosfake. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType /sethome to make this chat your home channel, or ignore to skip."
+    ],
+    [
+     "chat-1",
+     "PARENT-DISPATCHED"
+    ],
+    [
+     "chat-0",
+     "PARENT-DISPATCHED"
+    ],
+    [
+     "chat-2",
+     "\ud83d\udd00 Delegating CHILDGOAL-eka17863n2 run the sleep an..."
+    ],
+    [
+     "chat-2",
+     "PARENT-DISPATCHED"
+    ],
+    [
+     "chat-3",
+     "\ud83d\udcec No home channel is set for Chaosfake. A home channel is where Hermes delivers cron job results and cross-platform messages.\n\nType /sethome to make this chat your home channel, or ignore to skip."
+    ],
+    [
+     "chat-3",
+     "\ud83d\udd00 Delegating CHILDGOAL-eka17863n3 run the sleep an..."
+    ],
+    [
+     "chat-0",
+     "PARENT-ACK eka17863n0"
+    ],
+    [
+     "chat-1",
+     "PARENT-ACK eka17863n1"
+    ],
+    [
+     "chat-3",
+     "PARENT-DISPATCHED"
+    ],
+    [
+     "chat-2",
+     "PARENT-ACK eka17863n2"
+    ]
+   ],
+   "registry": {
+    "deleg_52a3cedd": {
+     "state": "done",
+     "runtime": "kanban"
+    },
+    "deleg_27faaa06": {
+     "state": "done",
+     "runtime": "kanban"
+    },
+    "deleg_06e367ca": {
+     "state": "done",
+     "runtime": "kanban"
+    }
+   },
+   "name": "final",
+   "t": 1793017990.2481558
+  }
+ ],
+ "director_log": [
+  {
+   "t": 1793017885.2523406,
+   "who": "parent",
+   "x": "eka17863n0"
+  },
+  {
+   "t": 1793017885.2535875,
+   "who": "parent",
+   "x": "eka17863n1"
+  },
+  {
+   "t": 1793017886.5384524,
+   "who": "parent",
+   "x": "eka17863n2"
+  },
+  {
+   "t": 1793017900.6804457,
+   "who": "child",
+   "x": "eka17863n0",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017905.1504014,
+   "who": "child",
+   "x": "eka17863n1",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017909.0783384,
+   "who": "child",
+   "x": "eka17863n2",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017914.9663262,
+   "who": "parent",
+   "x": "eka17863n3"
+  },
+  {
+   "t": 1793017915.228544,
+   "who": "child",
+   "x": "eka17863n3",
+   "cont": false,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017961.4854403,
+   "who": "child",
+   "x": "eka17863n0",
+   "cont": true,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017964.4473546,
+   "who": "wake",
+   "x": [
+    "eka17863n0"
+   ]
+  },
+  {
+   "t": 1793017965.8258324,
+   "who": "child",
+   "x": "eka17863n1",
+   "cont": true,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017969.7771173,
+   "who": "child",
+   "x": "eka17863n2",
+   "cont": true,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017970.7534604,
+   "who": "wake",
+   "x": [
+    "eka17863n1"
+   ]
+  },
+  {
+   "t": 1793017975.962868,
+   "who": "child",
+   "x": "eka17863n3",
+   "cont": true,
+   "auth": "Bearer no-ke"
+  },
+  {
+   "t": 1793017977.2649496,
+   "who": "wake",
+   "x": [
+    "eka17863n2"
+   ]
+  }
+ ],
+ "log_grep": [
+  "logs/agent.log: 2026-10-26 12:31:21,779 INFO __main__: async_delegation_recovery_profile profile=default boot_id=237089:1793017863.01 claimed=0 queued=0 exhausted=0 failed_validation=0",
+  "logs/agent.log: 2026-10-26 12:31:25,560 INFO [20261026_123124_a3ddff2b] tools.async_delegation_store: async_delegation_persisted delegation_id=deleg_52a3cedd attempt_id=deleg_52a3cedd:g0:522e2bc7 owner_boot_id=237089:1793017863.01 profile=default",
+  "logs/agent.log: 2026-10-26 12:31:25,574 INFO [20261026_123122_0d1e4c80] tools.async_delegation_store: async_delegation_persisted delegation_id=deleg_27faaa06 attempt_id=deleg_27faaa06:g0:b49ac9a6 owner_boot_id=237089:1793017863.01 profile=default",
+  "logs/agent.log: 2026-10-26 12:31:25,616 INFO [20261026_123124_a3ddff2b] tools.async_delegation: Dispatched async delegation batch deleg_52a3cedd (1 task(s), session_key=agent:...t-1)",
+  "logs/agent.log: 2026-10-26 12:31:25,669 INFO [20261026_123122_0d1e4c80] tools.async_delegation: Dispatched async delegation batch deleg_27faaa06 (1 task(s), session_key=agent:...t-0)",
+  "logs/agent.log: 2026-10-26 12:31:26,788 INFO [20261026_123125_4da853fc] tools.async_delegation_store: async_delegation_persisted delegation_id=deleg_06e367ca attempt_id=deleg_06e367ca:g0:03d201bf owner_boot_id=237089:1793017863.01 profile=default",
+  "logs/agent.log: 2026-10-26 12:31:27,019 INFO [20261026_123125_4da853fc] tools.async_delegation: Dispatched async delegation batch deleg_06e367ca (1 task(s), session_key=agent:...t-2)",
+  "logs/agent.log: 2026-10-26 12:31:31,577 INFO [20261026_123122_0d1e4c80] tools.async_delegation: async_delegation_kanban_spawned delegation_id=deleg_27faaa06 task_id=t_231ea25c pid=426322",
+  "logs/agent.log: 2026-10-26 12:31:35,525 INFO [20261026_123124_a3ddff2b] tools.async_delegation: async_delegation_kanban_spawned delegation_id=deleg_52a3cedd task_id=t_019b3fc8 pid=459632",
+  "logs/agent.log: 2026-10-26 12:31:39,956 INFO [20261026_123125_4da853fc] tools.async_delegation: async_delegation_kanban_spawned delegation_id=deleg_06e367ca task_id=t_19a11892 pid=486821",
+  "logs/agent.log: 2026-10-26 12:32:44,249 INFO tools.async_delegation: async_delegation_kanban_drained delegation_id=deleg_27faaa06 event_id=deleg_27faaa06:terminal:g0",
+  "logs/agent.log: 2026-10-26 12:32:44,253 INFO gateway.run: async_delegation_kanban_drain profile=default drained=0 queued=1 failed=0 lost=0 active_count=2 kanban_active=2",
+  "logs/agent.log: 2026-10-26 12:32:44,287 INFO tools.async_delegation_store: async_delegation_outbox_admitted event_id=deleg_27faaa06:terminal:g0 session_key=agent:...at-0 session_id=20261026_123122_0d1e4c80",
+  "logs/agent.log: 2026-10-26 12:32:50,498 INFO tools.async_delegation: async_delegation_kanban_drained delegation_id=deleg_52a3cedd event_id=deleg_52a3cedd:terminal:g0",
+  "logs/agent.log: 2026-10-26 12:32:50,506 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=1 failed=0 lost=0 active_count=1 kanban_active=1",
+  "logs/agent.log: 2026-10-26 12:32:50,556 INFO tools.async_delegation_store: async_delegation_outbox_admitted event_id=deleg_52a3cedd:terminal:g0 session_key=agent:...at-1 session_id=20261026_123124_a3ddff2b",
+  "logs/agent.log: 2026-10-26 12:32:56,945 INFO tools.async_delegation: async_delegation_kanban_drained delegation_id=deleg_06e367ca event_id=deleg_06e367ca:terminal:g0",
+  "logs/agent.log: 2026-10-26 12:32:56,961 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=1 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/agent.log: 2026-10-26 12:32:57,091 INFO tools.async_delegation_store: async_delegation_outbox_admitted event_id=deleg_06e367ca:terminal:g0 session_key=agent:...at-2 session_id=20261026_123125_4da853fc",
+  "logs/agent.log: 2026-10-26 12:33:03,233 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=0 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/gateway.log: 2026-10-26 12:32:44,253 INFO gateway.run: async_delegation_kanban_drain profile=default drained=0 queued=1 failed=0 lost=0 active_count=2 kanban_active=2",
+  "logs/gateway.log: 2026-10-26 12:32:50,506 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=1 failed=0 lost=0 active_count=1 kanban_active=1",
+  "logs/gateway.log: 2026-10-26 12:32:56,961 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=1 failed=0 lost=0 active_count=0 kanban_active=0",
+  "logs/gateway.log: 2026-10-26 12:33:03,233 INFO gateway.run: async_delegation_kanban_drain profile=default drained=1 queued=0 failed=0 lost=0 active_count=0 kanban_active=0",
+  "gateway-0.log: 2026-10-26 12:31:39,234 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.7 load5=268.5 (load 275.7 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=864/959408 band=paused/load",
+  "logs/agent.log: 2026-10-26 12:31:21,813 INFO gateway.run: kanban dispatcher: load gate armed pause_above=0.0 resume_below=0.0 ncpu=256 worker_load_cost=2.0 ramp_seconds=600 max_spawn_per_tick=4 load5_floor=True",
+  "logs/agent.log: 2026-10-26 12:31:39,234 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.7 load5=268.5 (load 275.7 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=864/959408 band=paused/load",
+  "logs/errors.log: 2026-10-26 12:31:39,234 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.7 load5=268.5 (load 275.7 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=864/959408 band=paused/load",
+  "logs/gateway.log: 2026-10-26 12:31:21,813 INFO gateway.run: kanban dispatcher: load gate armed pause_above=0.0 resume_below=0.0 ncpu=256 worker_load_cost=2.0 ramp_seconds=600 max_spawn_per_tick=4 load5_floor=True",
+  "logs/gateway.log: 2026-10-26 12:31:39,234 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.7 load5=268.5 (load 275.7 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=864/959408 band=paused/load",
+  "gateway-0.log: 2026-10-26 12:31:39,234 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.7 load5=268.5 (load 275.7 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=864/959408 band=paused/load",
+  "logs/agent.log: 2026-10-26 12:31:21,813 INFO gateway.run: kanban dispatcher: load gate armed pause_above=0.0 resume_below=0.0 ncpu=256 worker_load_cost=2.0 ramp_seconds=600 max_spawn_per_tick=4 load5_floor=True",
+  "logs/agent.log: 2026-10-26 12:31:39,234 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.7 load5=268.5 (load 275.7 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=864/959408 band=paused/load",
+  "logs/errors.log: 2026-10-26 12:31:39,234 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.7 load5=268.5 (load 275.7 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=864/959408 band=paused/load",
+  "logs/gateway.log: 2026-10-26 12:31:21,813 INFO gateway.run: kanban dispatcher: load gate armed pause_above=0.0 resume_below=0.0 ncpu=256 worker_load_cost=2.0 ramp_seconds=600 max_spawn_per_tick=4 load5_floor=True",
+  "logs/gateway.log: 2026-10-26 12:31:39,234 WARNING gateway.run: kanban load gate: start -> state=paused load1=275.7 load5=268.5 (load 275.7 tasks / 128c\u00b7256t) pending_ramp=0.0 ramp_workers=0 allowance=0 admitted=0 pause_above=0.0 cost=2.00/prior running=0 cpu_busy=? procs=864/959408 band=paused/load",
+  "logs/agent.log: 2026-10-26 12:31:55,075 INFO [20261026_123154_53dcf14b] tools.delegate_tool: delegate_task: async pool at capacity (Async delegation capacity reached (3 running). Wait for one to finish (its result will re-enter the chat), or raise delegation.max_concurrent_children in config.yaml to allow more concurrent background units.); running the whole batch synchronously instead.",
+  "logs/agent.log: 2026-10-26 12:31:55,075 INFO [20261026_123154_53dcf14b] tools.delegate_tool: delegate_task: async pool at capacity (Async delegation capacity reached (3 running). Wait for one to finish (its result will re-enter the chat), or raise delegation.max_concurrent_children in config.yaml to allow more concurrent background units.); running the whole batch synchronously instead."
+ ]
+}
