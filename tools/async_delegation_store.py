@@ -524,20 +524,56 @@ def _assert_nonsecret_settings(durable_spec: dict[str, Any]) -> None:
         for item in args
     ):
         raise RegistryError("credential-shaped ACP argument cannot be persisted")
-    base_url = str(execution.get("base_url") or "")
-    if "://" in base_url:
-        from urllib.parse import parse_qsl, urlsplit
+    if url_has_credentials(execution.get("base_url")):
+        raise RegistryError("credential-bearing base_url cannot be persisted")
+    # The kanban runtime's route copies the parent's own URL (parent_base_url, and explicit_base_url when
+    # no delegation endpoint is set): the same value guard applies (Prism c631db36b404).
+    route = execution.get("route") or {}
+    if isinstance(route, dict):
+        for field in ("parent_base_url", "explicit_base_url"):
+            if url_has_credentials(route.get(field)):
+                raise RegistryError(f"credential-bearing route.{field} cannot be persisted")
 
-        parsed = urlsplit(base_url)
-        sensitive_query = any(
-            any(
-                part in key.lower().replace("-", "_")
-                for part in _SECRET_FIELD_PARTS
-            )
-            for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
-        )
-        if parsed.username or parsed.password or sensitive_query:
-            raise RegistryError("credential-bearing base_url cannot be persisted")
+
+def _sensitive_query_key(key: str) -> bool:
+    normalized = key.lower().replace("-", "_")
+    return any(part in normalized for part in _SECRET_FIELD_PARTS) or normalized in {"key", "token"}
+
+
+def url_has_credentials(url: Any) -> bool:
+    """True when a URL carries userinfo (``user:pass@``) or a credential-shaped query parameter."""
+    text = str(url or "")
+    if "://" not in text:
+        return False
+    from urllib.parse import parse_qsl, urlsplit
+
+    try:
+        parsed = urlsplit(text)
+        userinfo = bool(parsed.username or parsed.password)
+    except ValueError:
+        return True  # unparseable: fail closed
+    return userinfo or any(_sensitive_query_key(k) for k, _ in parse_qsl(parsed.query, keep_blank_values=True))
+
+
+def redact_url(url: Any) -> str:
+    """The URL with userinfo dropped and credential-shaped query values masked, safe for errors/logs."""
+    text = str(url or "")
+    if "://" not in text:
+        return text
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    try:
+        parsed = urlsplit(text)
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+    except ValueError:
+        return "(unparseable url)"
+    query = urlencode([(k, "***" if _sensitive_query_key(k) else v)
+                       for k, v in parse_qsl(parsed.query, keep_blank_values=True)], safe="*")
+    return urlunsplit((parsed.scheme, host, parsed.path, query, ""))
 
 
 def persist_dispatch(
