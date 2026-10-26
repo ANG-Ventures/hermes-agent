@@ -643,9 +643,29 @@ def _is_json_object(text: str) -> bool:
         return False
 
 
+def _terminal_session_cwd(kwargs: Dict[str, Any]) -> Optional[str]:
+    """The calling session's recorded terminal cwd, keyed exactly as terminal_tool keys it
+    (approval session key, else task_id). Payload ``cwd`` is the hosting process's cwd, so a
+    pre_tool_call hook has no other way to know where a no-workdir command starts. None when the
+    terminal tool is not loaded (nothing can be recorded) or nothing is recorded."""
+    terminal_tool = sys.modules.get("tools.terminal_tool")
+    if terminal_tool is None:
+        return None
+    from tools.approval_context import get_current_session_key
+    return terminal_tool.get_session_cwd(get_current_session_key(default="") or kwargs.get("task_id") or "")
+
+
 def _serialize_payload(event: str, kwargs: Dict[str, Any]) -> str:
-    """Render the stdin JSON payload; unserialisable values are stringified."""
-    return json.dumps({"hook_event_name": event, **_payload_fields(kwargs)}, ensure_ascii=False, default=str)
+    """Render the stdin JSON payload; unserialisable values are stringified.
+
+    ``pre_tool_call`` for ``terminal`` carries a top-level ``session_cwd`` when the session has a
+    recorded cwd; the key is absent otherwise."""
+    fields = _payload_fields(kwargs)
+    if event == "pre_tool_call" and kwargs.get("tool_name") == "terminal":
+        session_cwd = _terminal_session_cwd(kwargs)
+        if session_cwd:
+            fields["session_cwd"] = session_cwd
+    return json.dumps({"hook_event_name": event, **fields}, ensure_ascii=False, default=str)
 
 
 def _block_message(primary: Any, secondary: Any) -> str:

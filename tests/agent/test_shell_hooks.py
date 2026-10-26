@@ -78,6 +78,25 @@ class TestSerializePayload:
         payload = json.loads(raw)
         assert payload["tool_input"] is None
 
+    def test_terminal_pre_tool_call_carries_recorded_session_cwd(self, tmp_path):
+        """Payload ``cwd`` is the host process's cwd; a policy hook needs the session's own
+        recorded terminal cwd to know where a no-workdir command starts. Present (top level,
+        beside tool_input) only when recorded; never a key with no value."""
+        from tools import terminal_tool
+        task = "task-session-cwd"
+        kwargs = {"tool_name": "terminal", "args": {"command": "git status"}, "task_id": task}
+        terminal_tool.clear_session_cwd(task)
+        try:
+            assert "session_cwd" not in json.loads(shell_hooks._serialize_payload("pre_tool_call", kwargs))
+            terminal_tool.record_session_cwd(task, str(tmp_path))
+            payload = json.loads(shell_hooks._serialize_payload("pre_tool_call", kwargs))
+            assert payload["session_cwd"] == str(tmp_path)
+            assert payload["session_cwd"] != payload["cwd"]
+            other = json.loads(shell_hooks._serialize_payload("pre_tool_call", {**kwargs, "task_id": "other-task"}))
+            assert "session_cwd" not in other
+        finally:
+            terminal_tool.clear_session_cwd(task)
+
 
 # ── Matcher behaviour ─────────────────────────────────────────────────────
 
