@@ -358,6 +358,54 @@ def test_lease_expired_during_the_backoff_blocks_model_reentry(
     assert "no longer holds a live run/claim" in emitted[-1]
 
 
+@pytest.mark.parametrize(
+    "lost_during_persist",
+    [
+        pytest.param({"clock": 1_700}, id="lease-expired-while-persisting"),
+        pytest.param({"status": "ready"}, id="reclaimed-while-persisting"),
+        pytest.param({"run_ended": 12345}, id="settled-while-persisting"),
+    ],
+)
+def test_claim_lost_during_the_pending_write_blocks_model_reentry(
+    lost_during_persist, clear_kanban_env, tmp_path, monkeypatch
+):
+    """Prism P1 06234f7f93c4: the pending-transcript write can block on SQLite contention
+    long enough for the run to expire, be reclaimed or be settled. A write that then
+    SUCCEEDS must not carry the old worker into the model: ownership is re-proved after
+    the persist step, on the real board proof."""
+    import agent.kanban_turn_recovery as rec
+
+    db = _make_board(tmp_path, task_pid=os.getpid(), run_pid=os.getpid(),
+                     task_expires=1_600, run_expires=1_600)
+    _pin_carrier(clear_kanban_env, db, run_id="1", lock="lk")
+    now = {"t": 1_000}
+    monkeypatch.setattr(rec, "_now", lambda: now["t"])
+    turns: list[str] = []
+    emitted: list[str] = []
+
+    def persist_pending() -> bool:
+        # The blocking write: while it waits, the board moves on without us.
+        now["t"] = lost_during_persist.get("clock", now["t"])
+        cols = {k: v for k, v in lost_during_persist.items() if k != "clock"}
+        if cols:
+            conn = sqlite3.connect(db)
+            if "status" in cols:
+                conn.execute("UPDATE tasks SET status = ?", (cols["status"],))
+            if "run_ended" in cols:
+                conn.execute("UPDATE task_runs SET ended_at = ?", (cols["run_ended"],))
+            conn.commit()
+            conn.close()
+        return True  # the write eventually succeeded
+
+    attempts = rec.recover_failed_kanban_turns(
+        turns.append, lambda: _failed(), sleep_fn=lambda s: None, emit=emitted.append,
+        persist_pending=persist_pending,  # default claim_check: the real proof
+    )
+    assert attempts == 1
+    assert turns == []  # authority ended during the write: no model re-entry
+    assert "no longer holds a live run/claim" in emitted[-1]
+
+
 # ── the loop ─────────────────────────────────────────────────────────
 
 
@@ -435,6 +483,18 @@ def test_recovery_loop_order_is_check_sleep_check_turn(clear_kanban_env):
     )
     assert attempts == 1
     assert events == ["check", "sleep", "check", "turn"]
+
+    # With a persist step, the proof is re-taken after the (blocking) write, right before
+    # the model: check → sleep → check → persist → check → turn.
+    events.clear()
+    latest["r"] = _failed()
+    attempts = recover_failed_kanban_turns(
+        turn_fn, lambda: latest["r"], sleep_fn=lambda s: events.append("sleep"),
+        emit=lambda m: None, claim_check=lambda: (events.append("check"), True)[1],
+        persist_pending=lambda: (events.append("persist"), True)[1],
+    )
+    assert attempts == 1
+    assert events == ["check", "sleep", "check", "persist", "check", "turn"]
 
 
 def test_nudge_terminal_contract(clear_kanban_env):
