@@ -78,7 +78,9 @@ import os
 import re
 import subprocess
 import sqlite3
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -544,16 +546,107 @@ def _is_repo_toplevel(workspace_path: str) -> bool:
     worktree's ``.git`` is a file, and its toplevel is itself, so a worktree
     workspace still resolves normally.
     """
+    sig = _repo_probe_signature(workspace_path)
+    hit = _repo_probe_get(("toplevel", workspace_path), sig)
+    if hit is not None:
+        return hit
     out = _git(workspace_path, "rev-parse", "--show-toplevel")
-    if not out:
-        return False
-    toplevel = out.strip()
-    if not toplevel:
-        return False
+    answer = False
+    if out and out.strip():
+        try:
+            answer = Path(out.strip()).resolve() == Path(workspace_path).resolve()
+        except OSError:
+            answer = False
+    # A failed probe on a path that HAS a ``.git`` may be transient (timeout, held
+    # lock, stale mount): do not pin it. With no ``.git`` entry the answer is
+    # structural (the walk-up case) and stays valid until ``.git`` appears.
+    if out is not None or (sig is not None and sig[1] is None):
+        _repo_probe_put(("toplevel", workspace_path), sig, answer)
+    return answer
+
+
+# Per-process memo of the two git probes above, keyed on a cheap stat signature
+# of every file their answers depend on. The dispatcher re-asks for every gated
+# card's workspace on every tick (2 git forks per card per tick, ~12 % of the
+# gateway's GIL samples on a 760-card board, 2026-10-26).
+_REPO_PROBE_CACHE_MAX = 4096
+_REPO_PROBE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_REPO_PROBE_LOCK = threading.Lock()
+
+
+def _stat_sig(path: str, *, full: bool = True) -> Optional[tuple]:
+    """``(dev, ino[, mtime_ns, ctime_ns, size])`` of ``path``; ``None`` when absent."""
     try:
-        return Path(toplevel).resolve() == Path(workspace_path).resolve()
-    except OSError:
-        return False
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None
+    if not full:
+        return (st.st_dev, st.st_ino)
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+
+
+def _repo_probe_signature(workspace_path: str) -> Optional[tuple]:
+    """What the toplevel/remotes answers for ``workspace_path`` depend on; ``None`` = uncacheable.
+
+    ``sig[1]`` is ``None`` exactly when the path has no ``.git`` entry. A ``.git``
+    DIRECTORY contributes identity only (its mtime moves on every index write);
+    a linked worktree's ``.git`` FILE contributes its full signature and leads to
+    the COMMON dir, whose ``config`` holds the remotes.
+    """
+    try:
+        parts: list = [_stat_sig(workspace_path, full=False)]
+        if parts[0] is None:
+            return None
+        dotgit = os.path.join(workspace_path, ".git")
+        if os.path.isdir(dotgit):
+            parts.append(("dir", *_stat_sig(dotgit, full=False)))
+            gitdir = common = dotgit
+        else:
+            fsig = _stat_sig(dotgit)
+            parts.append(fsig)
+            if fsig is None:
+                gitdir = common = None
+            else:
+                with open(dotgit, encoding="utf-8", errors="replace") as fh:
+                    head = fh.read(4096).strip()
+                if not head.startswith("gitdir:"):
+                    return None
+                gitdir = os.path.join(workspace_path, head[len("gitdir:"):].strip())
+                common = gitdir
+                try:
+                    with open(os.path.join(gitdir, "commondir"), encoding="utf-8",
+                              errors="replace") as fh:
+                        common = os.path.join(gitdir, fh.read(4096).strip())
+                except FileNotFoundError:
+                    pass
+        if common is not None:
+            parts.append(_stat_sig(os.path.join(common, "config")))
+            parts.append(_stat_sig(os.path.join(gitdir, "config.worktree")))
+        parts.append(_stat_sig(os.path.expanduser("~/.gitconfig")))
+        return tuple(parts)
+    except (OSError, ValueError):
+        return None
+
+
+def _repo_probe_get(key: tuple, sig: Optional[tuple]):
+    if sig is None:
+        return None
+    with _REPO_PROBE_LOCK:
+        entry = _REPO_PROBE_CACHE.get(key)
+        if entry is None or entry[0] != sig:
+            return None
+        _REPO_PROBE_CACHE.move_to_end(key)
+        return entry[1]
+
+
+def _repo_probe_put(key: tuple, sig: Optional[tuple], value) -> None:
+    if sig is None:
+        return
+    with _REPO_PROBE_LOCK:
+        _REPO_PROBE_CACHE[key] = (sig, value)
+        _REPO_PROBE_CACHE.move_to_end(key)
+        while len(_REPO_PROBE_CACHE) > _REPO_PROBE_CACHE_MAX:
+            _REPO_PROBE_CACHE.popitem(last=False)
 
 
 def _remotes_for(workspace_path: str) -> set[str]:
@@ -565,6 +658,10 @@ def _remotes_for(workspace_path: str) -> set[str]:
     """
     if not _is_repo_toplevel(workspace_path):
         return set()
+    sig = _repo_probe_signature(workspace_path)
+    hit = _repo_probe_get(("remotes", workspace_path), sig)
+    if hit is not None:
+        return set(hit)
     stdout = _git(workspace_path, "remote", "-v")
     if stdout is None:
         return set()
@@ -576,6 +673,7 @@ def _remotes_for(workspace_path: str) -> set[str]:
         match = _GIT_REMOTE_RE.search(parts[1])
         if match:
             slugs.add(match.group(1).removesuffix(".git"))
+    _repo_probe_put(("remotes", workspace_path), sig, frozenset(slugs))
     return slugs
 
 

@@ -13,6 +13,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from dataclasses import field
@@ -681,6 +682,32 @@ def reap_worker_zombies() -> "list[int]":
     return reaped
 
 
+# The terminal-workspace orphan sweep walks every process on the host and
+# realpaths each candidate's cwd (~4 % of the gateway's GIL samples when run
+# every 60 s tick, 2026-10-26). It is a backstop for strays of cards that have
+# been terminal >= ORPHAN_SWEEP_MIN_TERMINAL_AGE_SECONDS (300 s), so running it
+# at most once per window per board loses nothing.
+ORPHAN_SWEEP_INTERVAL_SECONDS = 300.0
+_ORPHAN_SWEEP_LAST: dict = {}
+_ORPHAN_SWEEP_LOCK = threading.Lock()
+_orphan_sweep_clock = time.monotonic
+
+
+def _orphan_sweep_due(board: Optional[str], *, now: Optional[float] = None) -> bool:
+    """True (and the window restarts) when this board's sweep has not run in the window."""
+    try:
+        key = (str(_kb.kanban_home()), board)
+    except Exception:
+        key = (None, board)
+    t = _orphan_sweep_clock() if now is None else now
+    with _ORPHAN_SWEEP_LOCK:
+        last = _ORPHAN_SWEEP_LAST.get(key)
+        if last is not None and t - last < ORPHAN_SWEEP_INTERVAL_SECONDS:
+            return False
+        _ORPHAN_SWEEP_LAST[key] = t
+        return True
+
+
 def _pid_alive(pid: Optional[int]) -> bool:
     """Return True if ``pid`` is still running on this host.
 
@@ -691,8 +718,8 @@ def _pid_alive(pid: Optional[int]) -> bool:
 
     Zombies (exited, not yet reaped) still pass the existence check, so a
     worker would look "alive" forever between exit and reap. Linux: peek at
-    ``/proc/<pid>/status`` and treat ``State: Z`` as dead; macOS: ask ``ps``
-    for the BSD ``stat`` field and treat ``Z`` as dead.
+    ``/proc/<pid>/status`` and treat ``State: Z`` as dead; macOS: ``_pid_exists``
+    itself reports a zombie dead (psutil status, no subprocess).
     """
     if not pid or pid <= 0:
         return False
@@ -711,23 +738,10 @@ def _pid_alive(pid: Optional[int]) -> bool:
         except (FileNotFoundError, PermissionError, OSError):
             # proc entry gone → already reaped; treat as dead.
             pass
-    elif sys.platform == "darwin":
-        try:
-            proc = subprocess.run(
-                ["ps", "-o", "stat=", "-p", str(int(pid))],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=1,
-                check=False,
-            )
-            if proc.returncode != 0:
-                return False
-            if "Z" in (proc.stdout or "").strip():
-                return False
-        except (OSError, subprocess.SubprocessError, TimeoutError):
-            # If the secondary probe fails, keep the kill(0) answer.
-            pass
+    # macOS: no extra probe. ``_pid_exists`` above already reads the BSD status
+    # in-process (psutil -> sysctl KERN_PROC_PID) and answers False for a zombie;
+    # the ``ps -o stat=`` fork that used to follow it re-asked the same question
+    # per pid per tick (~8 % of the gateway's GIL samples, 2026-10-26).
     return True
 
 # ``worker_started_at`` value for a spawn whose fingerprint could not be captured. Distinct from the
@@ -5761,10 +5775,11 @@ def _dispatch_once_locked(
         # A worker that exited (cleanly or not) leaves its servers behind; reap them now, and sweep
         # init-parented strays in terminal cards' workspaces no retained handle can reach (fork t_446b6b99).
         result.worker_leftovers_reaped = _kb.reap_exited_worker_leftovers(conn, exited_workers)
-        try:
-            result.orphans_reaped = _kb.sweep_terminal_workspace_orphans(conn, board=board)
-        except Exception as exc:  # never break a dispatcher tick
-            _kb._log.warning("kanban orphan sweep failed: %s", exc)
+        if _orphan_sweep_due(board):
+            try:
+                result.orphans_reaped = _kb.sweep_terminal_workspace_orphans(conn, board=board)
+            except Exception as exc:  # never break a dispatcher tick
+                _kb._log.warning("kanban orphan sweep failed: %s", exc)
 
     # ---- lane-model overrides (board-level, time-boxed routing) ----
     # One clock read for the whole tick so every card in this pass sees the
