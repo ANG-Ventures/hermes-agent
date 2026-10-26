@@ -217,14 +217,15 @@ def test_our_close_while_a_foreign_reader_is_open_leaves_no_shm_fd(wal_db):
 
 def test_lockguard_closes_descriptors_only_at_count_zero_after_the_connection():
     """Structural half: a close of a descriptor on state.db or -shm cancels the process's POSIX locks
-    on it, so counted fds close only in close_fds() (count re-checked, after the releasing handle's
-    connection closed); _arm may close only an fd it has just opened and never locked. Every other
-    os.close in this module was a P1 (975630a37100, 30c639c0af16, a8c10e5114f6)."""
+    on it, so ONE function closes fds: _close_all, called only for an inode no handle counts, from
+    close_fds() (after the releasing connection closed) and the retired sweep (path no longer names
+    the inode). Every other os.close this module ever had was a P1 (975630a37100, 30c639c0af16,
+    a8c10e5114f6), including _arm closing a duplicate fd (it drops SQLite's own locks)."""
     tree = ast.parse((_REPO / "hermes_state_lockguard.py").read_text(encoding="utf-8"))
     closers = {fn.name for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)
                for n in ast.walk(fn)
                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "close"}
-    assert closers == {"close_fds", "_arm"}, closers
+    assert closers == {"_close_all"}, closers
 
 
 def _foreign_begin_immediate(db_path) -> bool:
@@ -315,9 +316,11 @@ def test_replaced_shm_is_rearmed_once(wal_db, monkeypatch):
             os.fstat(fd)
 
 
-def test_refused_lock_on_a_new_shm_keeps_the_parked_fd(wal_db, monkeypatch):
-    """Prism 30c639c0af16: a refused OFD lock on a freshly minted -shm must not close the fd just
-    opened for it; live connections may hold POSIX locks on that inode already."""
+def test_refused_lock_keeps_the_fd_until_its_inode_is_retired(wal_db, monkeypatch):
+    """Prism 30c639c0af16 + 5fa2be0eea10: a refused arm must not close the fd it just opened (the
+    refusal may be this process's own POSIX lock, and closing drops SQLite's locks), and must not
+    park it forever either. It stays uncounted; the next refresh re-uses it, or, once the path names
+    another inode, the sweep closes it."""
     db = wal_db
     shm = f"{db.db_path}-shm"
     os.rename(shm, shm + ".retired")
@@ -326,14 +329,15 @@ def test_refused_lock_on_a_new_shm_keeps_the_parked_fd(wal_db, monkeypatch):
     monkeypatch.setattr(lg, "_ofd_lock", lambda *a, **k: False)
     lg.refresh_shm(db.db_path, db._wal_lock_guard)
     monkeypatch.undo()
-    new_ident = lg._identity(shm)
-    assert new_ident not in db._wal_lock_guard and new_ident in lg._FDS and os.fstat(lg._FDS[new_ident][0])
-    lg.refresh_shm(db.db_path, db._wal_lock_guard)  # the next refresh re-uses the uncounted fd
-    assert new_ident in db._wal_lock_guard
+    refused = lg._identity(shm)
+    assert refused not in db._wal_lock_guard and refused in lg._FDS, "kept, not closed, on refusal"
+    os.remove(shm)  # the foreign reset unlinks the inode we were refused on
+    with open(shm, "wb") as handle:
+        handle.write(b"\0" * 32768)
+    lg.refresh_shm(db.db_path, db._wal_lock_guard)  # next checkpoint: arms the new one, sweeps the old
+    assert refused not in lg._FDS, "a retired, uncounted fd is closed by the next refresh"
+    assert lg._identity(shm) in db._wal_lock_guard
     os.replace(shm + ".retired", shm)
-    db.close()
-    assert new_ident not in lg._FDS, "an uncounted -shm fd is closed by the next release on this db"
-
 
 def test_shm_minted_after_open_is_armed_by_the_checkpoint_refresh(tmp_path, monkeypatch):
     if not lg.supported():
@@ -378,3 +382,42 @@ def test_checkpoint_lock_hold_is_gauged(wal_db, caplog, monkeypatch):
         db._try_wal_checkpoint()
     msgs = [r.getMessage() for r in caplog.records if "SessionDB._lock held" in r.getMessage()]
     assert len(msgs) == 1 and "_try_wal_checkpoint" in msgs[0]
+
+
+# Prism 49110a024c0e: release() must find count-zero fds by COUNT, not by the path string the
+# releasing handle used. A handle opened under another spelling of the same db (symlink, relative
+# path) counts onto the same inode; when it is the last one out, the fd closes.
+def test_last_handle_under_another_path_spelling_still_closes_the_fds(wal_db, tmp_path):
+    db = wal_db
+    link = tmp_path / "alias"
+    link.symlink_to(tmp_path)
+    alias = link / "state.db"
+    other = SessionDB(db_path=alias)
+    other._execute_write(lambda c: c.execute("select 1").fetchone())  # make it a live writer
+    db_ident, shm_ident = lg._identity(os.fspath(db.db_path)), lg._identity(f"{db.db_path}-shm")
+    assert lg._HANDLES.get(db_ident) == 2 and lg._HANDLES.get(shm_ident) == 2, "same inode, two counts"
+    db.close()  # first out: counts drop to 1, fds stay (other still holds them)
+    assert db_ident in lg._FDS and shm_ident in lg._FDS
+    other.close()  # last out, under the alias spelling
+    assert db_ident not in lg._FDS and shm_ident not in lg._FDS
+    assert not lg._HANDLES.get(db_ident) and not lg._HANDLES.get(shm_ident)
+
+
+# Prism 5fa2be0eea10: a refused -shm arm leaves an uncounted fd; it must be closed by the next
+# release on ANY handle in the process, not only one that spelled the same path.
+def test_refused_arm_leftover_is_closed_by_the_next_release_under_any_spelling(wal_db, tmp_path, monkeypatch):
+    db = wal_db
+    shm = f"{db.db_path}-shm"
+    os.rename(shm, shm + ".retired")
+    with open(shm, "wb") as handle:
+        handle.write(b"\0" * 32768)
+    monkeypatch.setattr(lg, "_ofd_lock", lambda *a, **k: False)
+    lg.refresh_shm(db.db_path, db._wal_lock_guard)
+    monkeypatch.undo()
+    leftover = lg._identity(shm)
+    assert leftover in lg._FDS and not lg._HANDLES.get(leftover)
+    link = tmp_path / "alias2"
+    link.symlink_to(tmp_path)
+    os.replace(shm + ".retired", shm)  # the foreign reset finished: the inode we refused is gone
+    SessionDB(db_path=link / "state.db").close()  # a release under another spelling sweeps it
+    assert leftover not in lg._FDS, "the uncounted leftover is closed by whichever release comes next"

@@ -47,7 +47,7 @@ import os
 import struct
 import sys
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("hermes_state")
 
@@ -98,6 +98,7 @@ Held = Dict[Identity, Tuple[int, int]]  # inode this handle guards -> its (start
 _LOCK = threading.Lock()
 _FDS: Dict[Identity, Tuple[int, str]] = {}
 _HANDLES: Dict[Identity, int] = {}
+_DUPS: Dict[Identity, List[int]] = {}  # extra fds on a registered inode (path-move race); closed with it
 
 
 def supported() -> bool:
@@ -149,17 +150,21 @@ def _arm(path: str, rng: Tuple[int, int], held: Held) -> None:
             except OSError:
                 return
             ident = (st.st_dev, st.st_ino)
-            if ident in _FDS:  # the path moved onto an inode already registered: this fd was never locked
-                os.close(fd)
+            if ident in _FDS:
+                # The path moved onto an inode already registered. Never close this duplicate now:
+                # closing ANY fd of a file drops every POSIX lock this process holds on it, SQLite's
+                # included. It is kept with its inode and closed with it.
+                _DUPS.setdefault(ident, []).append(fd)
             entry = _FDS.setdefault(ident, (fd, path))
             if ident in held:
                 return
-        # Refused only while a foreign close-time EXCLUSIVE is in flight; the fd stays, uncounted,
-        # for the next hold() (an OFD re-lock on an already-locked description is idempotent). It is
-        # never closed here: live connections may already hold POSIX locks on this inode.
         if _ofd_lock(entry[0], _F_RDLCK, start, length):
             held[ident] = rng
             _HANDLES[ident] = _HANDLES.get(ident, 0) + 1
+        # Refused: an EXCLUSIVE on this range, foreign OR this process's own POSIX lock (OFD and
+        # POSIX locks conflict within one process too), so the fd is never closed here: a close
+        # would cancel this process's own SQLite locks. It stays, uncounted, for the next hold();
+        # if the path moves on, _sweep_retired_locked closes it (Prism 30c639c0af16 / 5fa2be0eea10).
 
 
 def hold(db_path, held: Optional[Held] = None) -> Held:
@@ -182,6 +187,32 @@ def refresh_shm(db_path, held: Held) -> None:
     business, not a new file to lock). The old ``-shm`` entry stays counted until release()."""
     if supported() and held:
         _arm(_shm_path(db_path), (_SHM_DMS_BYTE, 1), held)
+        with _LOCK:
+            _sweep_retired_locked()
+
+
+def sweep_retired() -> None:
+    """Public form of the retired sweep, for the open path: call before
+    ``refuse_deleted_wal_generation`` so this process's own uncounted fd on an inode a foreign
+    reset unlinked is not mistaken for a live deleted-generation holder. No-op without OFD locks."""
+    if supported():
+        with _LOCK:
+            _sweep_retired_locked()
+
+
+def _sweep_retired_locked() -> None:
+    """Close every fd that NO handle counts and whose path no longer names its inode. Safe without a
+    connection-level check: SQLite holds the -shm DMS byte SHARED for a connection's whole life, so a
+    foreign close-time reset that unlinked the inode was granted EXCLUSIVE only while no connection
+    in this process had it open, and no new one can reach an unlinked inode by path. Runs from the
+    checkpoint refresh as well as release(), because a long-lived gateway never releases: a parked
+    fd on an unlinked -shm would read as a deleted-generation holder and refuse every later opener
+    in every process (Prism 975630a37100 / 5fa2be0eea10). O(len(_FDS)) stats, a handful."""
+    for ident, (fd, path) in list(_FDS.items()):
+        if _HANDLES.get(ident) or _identity(path) == ident:
+            continue
+        del _FDS[ident]
+        _close_all(fd, ident)
 
 
 def release(db_path, held: Held) -> List[Identity]:
@@ -191,12 +222,15 @@ def release(db_path, held: Held) -> List[Identity]:
     holders: a sibling's intact locks still refuse the unlink, and a true last close ends the
     generation, so a later ``state.db`` replace never pairs with a stale WAL.
 
-    Returns the inodes of *db_path* or its ``-shm`` now at count zero (this handle's and any
-    uncounted leftover); pass them to :func:`close_fds` AFTER the connection closes."""
+    Returns the inodes to close AFTER the connection closes (:func:`close_fds`): this handle's own
+    that reached count zero, matched by inode not by path string (a handle opened under another
+    spelling of the file counts onto the same inode, Prism 49110a024c0e), plus any uncounted inode
+    the path no longer names (retired). An uncounted fd still AT its path (a refused arm) is left:
+    a live sibling may hold SQLite locks on it that a close would drop."""
     if not supported():
         return []
-    paths = (os.fspath(db_path), _shm_path(db_path))
     with _LOCK:
+        mine = list(held)
         for ident, (start, length) in held.items():
             remaining = _HANDLES.get(ident, 1) - 1
             if remaining > 0:
@@ -212,7 +246,9 @@ def release(db_path, held: Held) -> List[Identity]:
             except OSError:
                 pass
         held.clear()
-        return [ident for ident, (_, path) in _FDS.items() if path in paths and not _HANDLES.get(ident)]
+        out = [ident for ident in mine if ident in _FDS and not _HANDLES.get(ident)]
+        return out + [ident for ident, (_, path) in _FDS.items()
+                      if ident not in out and not _HANDLES.get(ident) and _identity(path) != ident]
 
 
 def close_fds(idents: List[Identity]) -> None:
@@ -224,7 +260,14 @@ def close_fds(idents: List[Identity]) -> None:
                 continue
             entry = _FDS.pop(ident, None)
             if entry is not None:
-                try:
-                    os.close(entry[0])
-                except OSError:
-                    pass
+                _close_all(entry[0], ident)
+
+
+def _close_all(fd: int, ident: Identity) -> None:
+    """Close an inode's private fd and any duplicate kept for it. Caller holds _LOCK and has checked
+    that no handle counts the inode."""
+    for each in [fd] + _DUPS.pop(ident, []):
+        try:
+            os.close(each)
+        except OSError:
+            pass

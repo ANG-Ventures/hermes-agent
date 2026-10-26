@@ -1064,7 +1064,10 @@ class SessionDB(
 
     def _connect_and_init(self) -> None:
         # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
-        # a replacement WAL while a live writer still holds a deleted sidecar inode.
+        # a replacement WAL while a live writer still holds a deleted sidecar inode. First close
+        # this process's own uncounted lock-guard fds on unlinked inodes (no handle counts them, so
+        # they are not a live writer; left open they would refuse this open: Prism 5fa2be0eea10).
+        _lockguard.sweep_retired()
         refuse_deleted_wal_generation(self.db_path)
         # Create/tighten the main database before sqlite3.connect() so a
         # permissive process umask can never expose a fresh profile store.
