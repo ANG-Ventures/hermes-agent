@@ -168,13 +168,14 @@ def _record_checksum(record: dict[str, Any]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-# Process-wide parse cache: {path: (st_mtime_ns, st_size, st_ino, content_sha256, cached_at,
-# registry, strict_error)}. The registry is the lenient (quarantining) parse; ``strict_error`` is
+# Process-wide parse cache: {path: ((st_mtime_ns, st_size, st_ino, st_ctime_ns), content_sha256,
+# cached_at, registry, strict_error)}. st_ctime_ns is kernel-owned: any write, or an os.utime that
+# restores an old mtime, moves it, so a same-size in-place rewrite never keeps the stat key. The registry is the lenient (quarantining) parse; ``strict_error`` is
 # the RegistryError a strict load of the same bytes raises (None when every record is valid).
 # The cached object is READ-ONLY: ``locked_registry(write=False)`` and ``read_registry`` hand it
 # out as is, ``write=True`` callers get a private copy. Integrity checksums are verified on every
 # miss (the first load after any change), so a corrupted file is still caught once it changes.
-_REGISTRY_CACHE: dict[str, tuple[int, int, int, str, float, dict[str, Any], str | None]] = {}
+_REGISTRY_CACHE: dict[str, tuple[tuple[int, int, int, int], str, float, dict[str, Any], str | None]] = {}
 _REGISTRY_CACHE_LOCK = threading.Lock()
 # A same-size rewrite inside one mtime tick keeps (mtime_ns, size, ino) equal on coarse
 # filesystems; inside this window a hit is confirmed against the content hash.
@@ -203,7 +204,7 @@ def _load(
 ) -> dict[str, Any]:
     """Load a registry; strict mode raises on the first invalid record, lenient quarantines.
 
-    Served from ``_REGISTRY_CACHE`` while the file's (mtime_ns, size, inode) is unchanged. A
+    Served from ``_REGISTRY_CACHE`` while the file's (mtime_ns, size, inode, ctime_ns) is unchanged. A
     ``private=False`` result may be the SHARED cached object and must be treated as read-only;
     ``private=True`` (the write path) always returns an object nobody else holds.
     ``trusted_records`` (the records this process just wrote and hashed) forces a re-parse and
@@ -217,24 +218,25 @@ def _load(
         return empty_registry()
     with handle:
         st = os.fstat(handle.fileno())  # the inode we read, even if the path is replaced meanwhile
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
         now = time.time()
         with _REGISTRY_CACHE_LOCK:
             cached = _REGISTRY_CACHE.get(key)
         raw: bytes | None = None
         if (trusted_records is None and cached is not None
-                and cached[:3] == (st.st_mtime_ns, st.st_size, st.st_ino)):
+                and cached[0] == stamp):
             # The entry was taken within one coarse mtime tick of the file's mtime: a same-size
             # rewrite in that tick would leave the stat key unchanged, so confirm by content.
-            # Once a confirmed hit lands past the window, any later rewrite moves the mtime.
-            mtime = st.st_mtime_ns / 1e9
-            if cached[4] - mtime < _CACHE_HASH_WINDOW_SECONDS:
+            # Once a confirmed hit lands past the window, any later rewrite moves the ctime.
+            changed = max(st.st_mtime_ns, st.st_ctime_ns) / 1e9
+            if cached[2] - changed < _CACHE_HASH_WINDOW_SECONDS:
                 raw = handle.read()
-            if raw is None or hashlib.sha256(raw).hexdigest() == cached[3]:
-                if raw is not None and now - mtime >= _CACHE_HASH_WINDOW_SECONDS:
+            if raw is None or hashlib.sha256(raw).hexdigest() == cached[1]:
+                if raw is not None and now - changed >= _CACHE_HASH_WINDOW_SECONDS:
                     with _REGISTRY_CACHE_LOCK:
                         if _REGISTRY_CACHE.get(key) is cached:
-                            _REGISTRY_CACHE[key] = cached[:4] + (now,) + cached[5:]
-                registry, strict_error = cached[5], cached[6]
+                            _REGISTRY_CACHE[key] = cached[:2] + (now,) + cached[3:]
+                registry, strict_error = cached[3], cached[4]
                 if strict_error is not None and not allow_invalid_records:
                     raise RegistryError(strict_error)
                 return _copy_registry(registry) if private else registry
@@ -242,8 +244,7 @@ def _load(
             raw = handle.read()
     data, strict_error = _parse_registry(raw, path, trusted_records=trusted_records)
     with _REGISTRY_CACHE_LOCK:
-        _REGISTRY_CACHE[key] = (st.st_mtime_ns, st.st_size, st.st_ino,
-                                hashlib.sha256(raw).hexdigest(), now, data, strict_error)
+        _REGISTRY_CACHE[key] = (stamp, hashlib.sha256(raw).hexdigest(), now, data, strict_error)
     if strict_error is not None and not allow_invalid_records:
         raise RegistryError(strict_error)
     return _copy_registry(data) if private else data
@@ -573,7 +574,7 @@ def is_compacted_payload(payload: Any) -> bool:
     return isinstance(payload, dict) and isinstance(payload.get("payload_sha256"), str)
 
 
-def _compact_delivered_event(record: dict[str, Any], event: Any) -> bool:
+def _compact_delivered_event(record: dict[str, Any], event: Any, *, dry_run: bool = False) -> bool:
     """Drop the body of one DELIVERED event of a TERMINAL record, stamping ``payload_sha256``
     (the canonical hash of the full envelope) into the payload so a consumer that needed the body
     fails loudly rather than silently. Never touches a pending/admitted/dropped event or a
@@ -589,13 +590,15 @@ def _compact_delivered_event(record: dict[str, Any], event: Any) -> bool:
         digest = _canonical_sha256(payload)
     except (TypeError, ValueError):
         return False
+    if dry_run:
+        return True
     for key in _DELIVERED_PAYLOAD_BODY_FIELDS:
         payload.pop(key, None)
     payload["payload_sha256"] = digest
     return True
 
 
-def _compact_terminal_result(record: dict[str, Any], now: float) -> bool:
+def _compact_terminal_result(record: dict[str, Any], now: float, *, dry_run: bool = False) -> bool:
     """Strip per-child tool traces from a settled terminal record older than 24 h.
 
     The result text (``summary``), status, error and task identity stay: the SQLite mirror is
@@ -616,45 +619,84 @@ def _compact_terminal_result(record: dict[str, Any], now: float) -> bool:
         if isinstance(child, dict):
             for key in _TERMINAL_RESULT_CHILD_BODY_FIELDS:
                 if key in child:
+                    if dry_run:
+                        return True
                     child.pop(key)
                     changed = True
     return changed
 
 
-def _backup_before_first_compaction(path: Path) -> None:
-    """One-time ``<registry>.pre-compact-<ts>`` copy (0600) of the file as it was on disk."""
+def _backup_before_first_compaction(path: Path) -> bool:
+    """One-time ``<registry>.pre-compact-<ts>`` copy (0600) of the file as it was on disk.
+
+    True only when a completed backup exists.
+    The copy is written and fsynced under a hidden temp name and only then renamed to its
+    ``pre-compact-*`` name, so a failed attempt (ENOSPC, EIO) never publishes a partial file that a
+    later run would mistake for the backup; the temp file is removed on failure. Callers compact
+    nothing unless this returns True."""
+    tmp: Path | None = None
     try:
-        if not path.exists() or any(path.parent.glob(f"{path.name}.pre-compact-*")):
-            return
+        if any(path.parent.glob(f"{path.name}.pre-compact-*")):
+            return True
+        if not path.exists():
+            return False
         backup = path.with_name(f"{path.name}.pre-compact-{int(time.time())}")
-        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        tmp = path.with_name(f".{path.name}.pre-compact-tmp-{os.getpid()}-{threading.get_ident()}")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as out:
             out.write(path.read_bytes())
             out.flush()
             os.fsync(out.fileno())
+        os.replace(tmp, backup)
+        tmp = None
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
         logger.info("async_delegation_registry_precompact_backup path=%s", backup)
+        return True
     except OSError:
-        logger.warning("could not write the pre-compaction registry backup for %s", path, exc_info=True)
+        logger.warning("could not write the pre-compaction registry backup for %s; not compacting",
+                       path, exc_info=True)
+        return False
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _compact(registry: dict[str, Any], now: float, path: Path) -> int:
-    """D5 compaction of every valid record; returns how many records changed."""
+    """D5 compaction of every valid record; returns how many records changed.
+
+    Nothing is compacted until a complete pre-compaction backup exists on disk."""
     invalid_record_ids = set(registry.get("_invalid_record_ids", []))
-    changed: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     for delegation_id, record in registry["records"].items():
         if str(delegation_id) in invalid_record_ids or not isinstance(record, dict):
             continue
+        outbox = record.get("outbox")
+        if ((isinstance(outbox, list)
+                and any(_compact_delivered_event(record, event, dry_run=True) for event in outbox))
+                or _compact_terminal_result(record, now, dry_run=True)):
+            candidates.append(record)
+    if not candidates or not _backup_before_first_compaction(path):
+        return 0
+    changed = 0
+    for record in candidates:
         outbox = record.get("outbox")
         hit = False
         if isinstance(outbox, list):
             hit = any([_compact_delivered_event(record, event) for event in outbox])
         if _compact_terminal_result(record, now):
             hit = True
-        if hit:
-            changed.append(record)
-    if changed:
-        _backup_before_first_compaction(path)
-    return len(changed)
+        changed += hit
+    return changed
 
 
 def _prune(registry: dict[str, Any], now: float, path: Path) -> None:
@@ -2362,8 +2404,10 @@ def acknowledge(
                     event["delivered_at"] = time.time()
                     event["drop_reason"] = reason if outcome == "dropped" else None
                     # D5: a delivered event's body is never read again (identity stays).
-                    if _compact_delivered_event(record, event):
-                        _backup_before_first_compaction(registry_path(profile_home))
+                    # Never without a complete pre-compaction backup on disk first.
+                    if (_compact_delivered_event(record, event, dry_run=True)
+                            and _backup_before_first_compaction(registry_path(profile_home))):
+                        _compact_delivered_event(record, event)
                     logger.info(
                         "async_delegation_outbox_%s event_id=%s reason=%s",
                         outcome,

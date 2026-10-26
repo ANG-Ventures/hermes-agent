@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -346,4 +347,80 @@ def test_completion_delivered_then_compacted_still_renders_result(monkeypatch):
     mirror_event = json.loads(mirror["event_json"])
     assert mirror_event["summary"] == "receipt-nonce", "the mirror keeps the full envelope"
     assert "receipt-nonce" in format_process_notification(mirror_event)
+    assert ad.get_durable_delegation(identifier)["result"] == result
+
+
+# Prism 9d8a4707d7f0 / 2b1de7b230df / 2f3977f2d1cf ─────────────────────────────
+
+def test_in_place_rewrite_with_restored_mtime_is_not_served_stale():
+    """Past the hash window, a same-size in-place rewrite that restores the old mtime (os.utime) keeps
+    (mtime, size, inode) equal; the kernel-owned ctime still moves, so the cache must miss."""
+    path, _ = _seed(time.time())
+    old = time.time() - 60
+    os.utime(path, (old, old))
+    _clear_cache()
+    with store.locked_registry(write=False) as registry:  # cached well past the hash window
+        assert "_invalid_record_ids" not in registry
+    with store.locked_registry(write=False):
+        pass  # a confirmed hit: from here on hits skip the content hash
+    st = path.stat()
+    raw = path.read_bytes()
+    needle = b'"last_error": null'
+    at = raw.index(needle)
+    forged = raw[:at] + b'"last_error": 1234' + raw[at + len(needle):]
+    assert len(forged) == len(raw)
+    with open(path, "r+b") as fh:  # in place: same inode, same size
+        fh.write(forged)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))  # the old mtime, past the hash window
+    assert (path.stat().st_mtime_ns, path.stat().st_ino) == (st.st_mtime_ns, st.st_ino)
+    with store.locked_registry(write=False) as registry:
+        assert registry.get("_invalid_record_ids"), "the rewritten bytes must be re-read and re-validated"
+
+
+def test_failed_backup_leaves_no_artifact_and_blocks_compaction(monkeypatch):
+    now = time.time()
+    path, _ = _seed(now)
+    real_fsync = os.fsync
+
+    def disk_full(fd):  # ENOSPC on the backup copy only; the registry's own writes still succeed
+        if sys._getframe(1).f_code.co_name == "_backup_before_first_compaction":
+            raise OSError(28, "No space left on device")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(store.os, "fsync", disk_full)
+    with store.locked_registry() as registry:
+        store._prune(registry, now, path)
+    assert not list(path.parent.glob(f"{path.name}.pre-compact-*")), "no partial backup may be published"
+    assert not [p for p in path.parent.iterdir() if "pre-compact" in p.name or "precompact" in p.name]
+    on_disk = store.read_registry()
+    assert not any(_compacted(e["payload"]) for r in on_disk["records"].values() for e in r["outbox"]), \
+        "without a backup nothing may be compacted"
+
+    monkeypatch.setattr(store.os, "fsync", real_fsync)
+    original_size = path.stat().st_size
+    with store.locked_registry() as registry:
+        store._prune(registry, now, path)
+    backups = list(path.parent.glob(f"{path.name}.pre-compact-*"))
+    assert len(backups) == 1 and backups[0].stat().st_size == original_size
+    assert oct(backups[0].stat().st_mode & 0o777) == "0o600"
+
+
+def test_compacted_resync_onto_empty_mirror_row_never_reopens_delivery(monkeypatch):
+    """A compacted canonical envelope resynced onto a mirror row whose event_json is gone must leave
+    the row settled (``delivered``), never ``pending`` with a body-less replay source."""
+    identifier, worker, result = helpers.dispatch(monkeypatch)
+    worker()
+    event = helpers.process_registry.completion_queue.get_nowait()
+    claim = ad.claim_event_delivery(event, "renderer")
+    ad.complete_event_delivery(event, claim)
+    assert _compacted(helpers.registry_record(identifier)["outbox"][0]["payload"])
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET event_json=NULL WHERE delegation_id=?", (identifier,))
+    _clear_cache()
+    ad.recover_abandoned_delegations()
+    assert ad.claim_completion_delivery(identifier, "late", event=event) is False
+    assert helpers.row(identifier)["delivery_state"] == "delivered"
+    q = queue.Queue()
+    ad.restore_undelivered_completions(q)
+    assert q.empty(), "a delivered completion is never replayed"
     assert ad.get_durable_delegation(identifier)["result"] == result
