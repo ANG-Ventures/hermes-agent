@@ -2330,8 +2330,9 @@ def _r3_store(temp_home):
 
 
 def test_json_mode_save_on_degraded_lock_is_not_overlaid_by_the_old_row(temp_home, monkeypatch):
-    """b696f63bccc1, ruling R3: while runtime_state.db exists, a json-mode save writes the row
-    (sqlite-mode save), so the next merged read returns the value just saved, not the old row."""
+    """R3 + R4: json mode with the db present reads as sqlite mode; a save in a DEGRADED section
+    refuses (nothing written, db kept). Once a section holds the lock the fold runs."""
+    import pytest
     from cron import jobs as cj
 
     jid = _r3_store(temp_home)
@@ -2343,34 +2344,38 @@ def test_json_mode_save_on_degraded_lock_is_not_overlaid_by_the_old_row(temp_hom
             job = next(j for j in jobs if j["id"] == jid)
             assert job["last_status"] == "from-row"
             job["last_status"] = "saved"
-            cj.save_jobs(jobs)
-        assert cj.get_job(jid)["last_status"] == "saved"
+            with pytest.raises(cj.CronLockDegraded):
+                cj.save_jobs(jobs)
+        assert cj.get_job(jid)["last_status"] == "from-row"
         assert _db(temp_home).exists()
     monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
-    assert cj.get_job(jid)["last_status"] == "saved"  # locked load: the fold keeps it
+    assert cj.get_job(jid)["last_status"] == "from-row"  # locked load: the fold keeps the row's value
     assert not _db(temp_home).exists()
 
 
 def test_json_mode_degraded_write_survives_the_later_fold(temp_home, monkeypatch):
-    """ef86e5d00d84, ruling R3: a runtime write made in json mode on a degraded lock is not
-    hidden by the row and is not overwritten by the fold once a load holds the lock."""
+    """ef86e5d00d84 under R4: a runtime write attempted in json mode on a degraded lock REFUSES;
+    the later locked fold carries the row's value, and nothing of the refused write exists."""
+    import pytest
     from cron import jobs as cj
 
     jid = _r3_store(temp_home)
     monkeypatch.setenv("HERMES_CRON_RUNTIME_STATE", "json")
     with monkeypatch.context() as mp:
         mp.setattr(cj, "_acquire_flock", lambda fd, timeout: False)
-        cj.update_job(jid, {"last_status": "degraded-write"})
-        assert cj.get_job(jid)["last_status"] == "degraded-write"
-    assert cj.get_job(jid)["last_status"] == "degraded-write"  # locked load: fold happens
+        with pytest.raises(cj.CronLockDegraded):
+            cj.update_job(jid, {"last_status": "degraded-write"})
+        assert cj.get_job(jid)["last_status"] == "from-row"
+    assert cj.get_job(jid)["last_status"] == "from-row"  # locked load: fold happens
     assert not _db(temp_home).exists()
-    assert _raw(temp_home, jid)["last_status"] == "degraded-write"
+    assert _raw(temp_home, jid)["last_status"] == "from-row"
 
 
 def test_json_mode_degraded_runtime_save_leaves_jobs_json_untouched(temp_home, monkeypatch):
-    """Ruling R3, READ half: with the db present a json-mode load on a degraded lock is the
-    sqlite-mode load (load stamp + baseline recorded), so a runtime-only save writes the row and
-    leaves jobs.json alone, exactly as in sqlite mode."""
+    """R3 READ half + R4: a json-mode load on a degraded lock with the db present is the
+    sqlite-mode merged view; the runtime-only save in that section REFUSES, so jobs.json AND the
+    row are untouched."""
+    import pytest
     from cron import jobs as cj
     from cron import runtime_state as rs
 
@@ -2381,9 +2386,11 @@ def test_json_mode_degraded_runtime_save_leaves_jobs_json_untouched(temp_home, m
         mp.setenv("HERMES_CRON_RUNTIME_STATE", "json")
         with cj._jobs_lock():
             jobs = cj.load_jobs()
+            assert next(j for j in jobs if j["id"] == jid)["last_status"] == "from-row"
             next(j for j in jobs if j["id"] == jid)["last_status"] = "row-only"
-            cj.save_jobs(jobs)
-    assert rs.read_all(temp_home / "cron")[jid]["last_status"] == "row-only"
+            with pytest.raises(cj.CronLockDegraded):
+                cj.save_jobs(jobs)
+    assert rs.read_all(temp_home / "cron")[jid]["last_status"] == "from-row"
     assert _snapshot(_jobs_file(temp_home)) == before
 
 
@@ -2701,3 +2708,112 @@ def test_fold_race_recovery_applies_to_an_empty_baseline_row(temp_home, monkeypa
     merged = next(j for j in cj.load_jobs() if j["id"] == created["id"])
     assert merged.get("last_run_at"), merged
     assert merged["next_run_at"] == "2030-01-01T00:00:00+00:00"
+
+
+# --- ruling R4 (Apollo 2026-10-25 23:0x): a degraded lock permits NO write ------------------------
+
+def _degrade_lock(monkeypatch, cj):
+    """Make every _jobs_lock section degraded: another holder keeps the flock and our wait times
+    out (the #60703 shape). Returns the holder fd (kept open by the caller's monkeypatch scope)."""
+    import fcntl
+    cj.ensure_dirs()
+    holder = open(cj._jobs_lock_file(), "a+")
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(cj, "_JOBS_LOCK_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(cj, "_holder_for_test", holder, raising=False)
+    return holder
+
+
+def test_r4_degraded_lock_refuses_every_write_and_writes_nothing(temp_home, monkeypatch):
+    """R4: a section that could not take the cross-process lock may read but not write, on EITHER
+    store. Both choke points (_runtime_txn, _publish_jobs_json) refuse; nothing on disk changes."""
+    import pytest
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="r4")
+    cj.mark_job_run(created["id"], True)
+    before_file = _snapshot(_jobs_file(temp_home))
+    before_db = _db(temp_home).read_bytes()
+    _degrade_lock(monkeypatch, cj)
+    # reads work
+    assert [j["id"] for j in cj.load_jobs()] == [created["id"]]
+    # a runtime (sqlite) write refuses
+    with pytest.raises(cj.CronLockDegraded):
+        cj.mark_job_run(created["id"], False, error="degraded")
+    # a definition (jobs.json) write refuses
+    with pytest.raises(cj.CronLockDegraded):
+        cj.create_job(prompt="y", schedule="every 5m", name="r4-b")
+    # the mirror flush refuses too (it is a jobs.json write): dirty the mirror from outside the
+    # lock (as a sibling process would), then a degraded flush must not publish it
+    from cron import runtime_state as rs
+    rs.write_rows(temp_home / "cron", {created["id"]: {"last_error": "dirty-from-sibling"}})
+    with pytest.raises(cj.CronLockDegraded):
+        cj.maybe_flush_runtime_mirror(force=True)  # takes its own (degraded) section
+    before_db = _db(temp_home).read_bytes()
+    assert _snapshot(_jobs_file(temp_home)) == before_file
+    assert _db(temp_home).read_bytes() == before_db
+    assert [j["id"] for j in cj.load_jobs()] == [created["id"]]
+
+
+def test_r4_knob_restores_proceed_torn(temp_home, monkeypatch):
+    """CRON_DEGRADED_LOCK_WRITES=proceed is the operator escape hatch back to #60703 behaviour."""
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="r4-knob")
+    _degrade_lock(monkeypatch, cj)
+    monkeypatch.setenv("CRON_DEGRADED_LOCK_WRITES", "proceed")
+    cj.mark_job_run(created["id"], False, error="torn-but-written")
+    assert next(j for j in cj.load_jobs() if j["id"] == created["id"])["last_error"] == "torn-but-written"
+
+
+def test_r4_cli_prints_lock_degraded_rc2(temp_home, monkeypatch):
+    from cron import jobs as cj
+    from hermes_cli.cron import cron_runtime_export
+    import argparse
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="r4-cli")
+    cj.mark_job_run(created["id"], True)
+    _degrade_lock(monkeypatch, cj)
+    rc = cron_runtime_export(argparse.Namespace(to_json=True, retire=False, drop_orphans=False))
+    assert rc == 2
+    assert _db(temp_home).exists()
+
+
+def test_r4_closes_round17_mid_export_sibling_write(temp_home, monkeypatch):
+    """e4e7e90440b3 / 4d66f06efe8a: both repros need a SIBLING PROCESS that writes a row or
+    replaces jobs.json while the export holds the lock. Under R4 that sibling's section is
+    contended and its write refuses (rc 2, nothing written), so the export's retire sees exactly
+    what it snapshotted: no 'kept because changed' db, no older runtime value surviving."""
+    import subprocess
+    import sys
+    from cron import jobs as cj
+
+    created = cj.create_job(prompt="x", schedule="every 5m", name="r17")
+    cj.mark_job_run(created["id"], True)
+    child_src = (
+        "import os, sys\n"
+        "os.environ['HERMES_HOME'] = sys.argv[1]\n"
+        "import cron.jobs as cj\n"
+        "cj._JOBS_LOCK_TIMEOUT_SECONDS = 0.2\n"
+        "try:\n"
+        "    cj.mark_job_run(sys.argv[2], False, error='sibling-mid-export')\n"
+        "    print('WRITTEN')\n"
+        "except cj.CronLockDegraded:\n"
+        "    print('REFUSED')\n"
+    )
+    real_retire = cj._retire_runtime_rows
+    seen = {}
+
+    def sibling_between_snapshot_and_retire(conn, texts):
+        # we hold the cross-process lock here: the child cannot take it
+        out = subprocess.run([sys.executable, "-c", child_src, str(temp_home), created["id"]],
+                             capture_output=True, text=True, timeout=60,
+                             env={**os.environ, "PYTHONPATH": os.getcwd()})
+        seen["child"] = (out.stdout.strip().splitlines() or ["?"])[-1] + " | " + out.stderr[-1200:]
+        return real_retire(conn, texts)
+
+    monkeypatch.setattr(cj, "_retire_runtime_rows", sibling_between_snapshot_and_retire)
+    cj.export_runtime_to_json(retire=True)
+    assert seen["child"].startswith("REFUSED"), seen  # with CRON_DEGRADED_LOCK_WRITES=proceed the child dies on "database is locked" instead
+    assert not _db(temp_home).exists()
+    assert not any(j.get("last_error") == "sibling-mid-export" for j in cj.load_jobs())

@@ -308,6 +308,44 @@ def _destructive_ok() -> bool:
     return bool(getattr(_jobs_lock_state, "depth", 0)) and not _jobs_lock_degraded()
 
 
+# Apollo ruling R4 (t_94e91559, 2026-10-25): a DEGRADED jobs lock permits NO WRITE to either store,
+# not only no destructive one (R1). 36 of the 128 Prism findings on the split described a sibling
+# that proceeded after a lock failure and wrote between our read and our write; with two stores
+# every interleaving of that sibling is a new finding. One writer by construction removes the
+# actor. Reads stay allowed. Measured: in production the lock degrades only on EMFILE (every logged
+# line is Errno 24), where the proceeding sibling mostly cannot open sqlite or a temp file either.
+# Knob (operator escape hatch, not a mode): CRON_DEGRADED_LOCK_WRITES=proceed restores #60703's
+# torn-write-beats-dead-scheduler behaviour.
+_DEGRADED_LOCK_WRITES_ENV = "CRON_DEGRADED_LOCK_WRITES"
+
+
+class CronLockDegraded(RuntimeError):
+    """A write was attempted inside a ``_jobs_lock`` section that holds only the in-process lock
+    (ruling R4). Nothing was written. The CLI prints the message and exits 2."""
+
+
+def _degraded_writes_proceed() -> bool:
+    return os.environ.get(_DEGRADED_LOCK_WRITES_ENV, "refuse").strip().lower() == "proceed"
+
+
+def _write_refused_by_r4() -> bool:
+    """True inside a section that holds only the in-process lock although a flock backend EXISTS
+    (timeout or open/lock error): a sibling process may be writing. A platform with no backend
+    at all is not this case (``no_backend``), nor is the operator knob."""
+    return (_jobs_lock_degraded() and not getattr(_jobs_lock_state, "no_backend", False)
+            and not _degraded_writes_proceed())
+
+
+def _refuse_write_if_degraded(what: str) -> None:
+    """The single choke point every store write passes (``_runtime_txn`` for sqlite,
+    ``_publish_jobs_json`` for jobs.json). Raises ``CronLockDegraded`` under R4."""
+    if _write_refused_by_r4():
+        raise CronLockDegraded(
+            f"the cron jobs lock is degraded (no cross-process lock on {_jobs_lock_file()}); "
+            f"refusing to write {what} (ruling R4: one writer by construction; nothing written). "
+            f"Retry when no other process holds the lock, or set {_DEGRADED_LOCK_WRITES_ENV}=proceed")
+
+
 def _jobs_lock_file() -> Path:
     """Return the advisory lock path for the current cron directory."""
     return _current_cron_store().cron_dir / ".jobs.lock"
@@ -393,10 +431,15 @@ def _jobs_lock():
             except (OSError, IOError) as e:
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
-                               "proceeding with in-process lock only", e)
+                               "proceeding with in-process lock only (reads only: writes in this "
+                               "section refuse, ruling R4)", e)
             # Degraded = no cross-process exclusion this section (timeout, open/lock failure, or
             # no flock backend); irreversible operator steps read it (``_jobs_lock_degraded``).
             _jobs_lock_state.degraded = not acquired
+            # R4 distinguishes "the lock exists and we could not take it" (timeout, EMFILE: a
+            # sibling may be writing; refuse) from "this platform has no flock backend" (nothing
+            # to take; the #80624 shrink-merge is the only cross-process guard and stays in force).
+            _jobs_lock_state.no_backend = acquired is None
             try:
                 yield
             finally:
@@ -407,6 +450,7 @@ def _jobs_lock():
             _jobs_lock_state.load_stamp = None
             _jobs_lock_state.load_baseline = None
             _jobs_lock_state.degraded = False
+            _jobs_lock_state.no_backend = False
     # Outside the lock: the coalesced jobs.json mirror (t_94e91559) takes its own section.
     _mirror_after_section()
 
@@ -1982,6 +2026,12 @@ def _recover_pending_runtime(file_gen: Optional[str]) -> None:
     lock is a sibling between its stage and its publish, whatever its age: it is left alone."""
     with _defs_cache_lock:
         _defs_cache.clear()  # entries parsed while a generation was pending are marked unusable
+    if _write_refused_by_r4():
+        # R4: recovery applies or discards rows, i.e. writes. A degraded section reads the merged
+        # view with the generation still pending; the next section holding the lock resolves it.
+        logger.warning("cron runtime-state: pending generation(s) left for the next locked "
+                       "section (jobs lock degraded, ruling R4)")
+        return
     with _runtime_txn() as conn:
         ages = _rs.pending_gen_ages(conn)
         committed = _rs.published_gens(conn)
@@ -2033,6 +2083,7 @@ def _runtime_txn():
     jobs.json write takes), then the permission/ownership pass when the db or a sidecar is new
     or we are root."""
     _guard_against_test_write_to_live_store(_current_cron_store().jobs_file)
+    _refuse_write_if_degraded(_rs.DB_NAME)
     base = _runtime_db_path()
     fresh = not all(Path(str(base) + s).exists() for s in ("", "-wal", "-shm"))
     with _rs.transaction(_current_cron_store().cron_dir) as conn:
@@ -2254,7 +2305,7 @@ class RuntimeRetireRefused(RuntimeError):
     """``runtime-export --retire`` refused (operator rollback step, nothing written)."""
 
 
-class RuntimeExportNotWritten(RuntimeError):
+class RuntimeExportNotWritten(CronLockDegraded):
     """``runtime-export`` on a degraded jobs lock (ruling R1, Prism 0e7b265dc160): the export may
     READ but not PUBLISH, since the definitions it read may already be stale. ``jobs`` is the
     merged payload it would have written; nothing is on disk."""
@@ -3173,6 +3224,11 @@ def _publish_jobs_json(tmp_path: str, jobs_file: Path, *, own_gen: Optional[str]
     already carries a NEWER seq of the same database epoch (a concurrent flush under a degraded
     lock published a later snapshot), the stale tmp is dropped and None returned: the caller leaves
     the mirror dirty."""
+    try:
+        _refuse_write_if_degraded(jobs_file.name)  # R4: the one jobs.json write choke point
+    except CronLockDegraded:
+        _unlink_quiet(tmp_path)
+        raise
     if newer_than is not None:
         on_disk = _file_mirror_mark(jobs_file)
         if on_disk is not None and on_disk[0] == newer_than[0] and on_disk[1] > newer_than[1]:
