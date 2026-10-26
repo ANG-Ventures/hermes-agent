@@ -266,7 +266,7 @@ def _select_due_holds() -> Optional[List[dict]]:
 def _publish_holding(hold: dict) -> None:
     with _publish_lock:
         if not hold["ended"]:  # hold_ended() already published "released": never resurrect it
-            _write_record(hold, state="holding")
+            _write_record(hold, state="holding", **_phase_fields(hold, time.monotonic()))
 
 
 def _watchdog_loop() -> None:
@@ -289,7 +289,7 @@ def hold_started(db_path, op: str) -> Optional[int]:
             token = _hold_seq
             _active_holds[token] = {"db_path": db_path, "op": op, "t0": time.monotonic(), "since": time.time(),
                                     "marked": False, "ended": False, "pid": os.getpid(), "who": None,
-                                    "ledger": None, "seq": token}
+                                    "ledger": None, "seq": token, "commit_t0": None}
             if not _watchdog_running or _watchdog_pid != os.getpid():
                 try:
                     _Thread(target=_watchdog_loop, name="state-db-lock-ledger", daemon=True).start()
@@ -302,6 +302,44 @@ def hold_started(db_path, op: str) -> Optional[int]:
         return None
 
 
+def hold_committing(token: Optional[int]) -> None:
+    """The caller's statements are done and ``commit()`` starts now. A long hold then says whether the
+    time went to the callback or to SQLite's commit (WAL sync, autocheckpoint): t_d9caaea3, where a
+    trivial SELECT+UPDATE was recorded as a 212 s hold with nothing to tell the two apart."""
+    if token is None:
+        return
+    try:
+        with _holds_lock:
+            hold = _active_holds.get(token)
+            if hold is None:
+                return
+            hold["commit_t0"], hold["commit_since"] = time.monotonic(), time.time()
+            republish = hold["marked"]  # already published "holding" without the phase
+        if republish:
+            _publish_holding(hold)
+    except Exception:
+        logger.debug("state.db lock-holder commit mark failed", exc_info=True)  # never breaks the write
+
+
+def _phase_fields(hold: dict, now: float) -> dict:
+    """``commit_since`` (wall) and ``commit_s`` (so far): absent while the callback still runs."""
+    if hold.get("commit_t0") is None:
+        return {}
+    return {"commit_since": hold["commit_since"], "commit_s": round(now - hold["commit_t0"], 1)}
+
+
+def _phase_suffix(rec: dict, now: float, *, released: bool) -> str:
+    """``, Ns of it in commit`` when the record says commit() had started; empty for older records."""
+    if released:
+        commit_s = rec.get("commit_s")
+    else:
+        since = rec.get("commit_since")
+        commit_s = None if since is None else now - float(since)
+    if commit_s is None:
+        return ""
+    return f", {float(commit_s):.0f}s of it in commit"
+
+
 def hold_ended(token: Optional[int]) -> None:
     """Close a hold; one of >= _HOLD_RECORD_MIN_S is written to the ledger with its duration."""
     if token is None:
@@ -312,10 +350,12 @@ def hold_ended(token: Optional[int]) -> None:
             hold["ended"] = True
     if hold is None:
         return
-    held = time.monotonic() - hold["t0"]
+    now = time.monotonic()
+    held = now - hold["t0"]
     if held >= _HOLD_RECORD_MIN_S or hold["marked"]:
         with _publish_lock:
-            _write_record(hold, state="released", held_s=round(held, 1), released_at=time.time())
+            _write_record(hold, state="released", held_s=round(held, 1), released_at=time.time(),
+                          **_phase_fields(hold, now))
 
 
 def _pid_alive(pid: int) -> bool:
@@ -351,12 +391,14 @@ def recent_ledger_holders(db_path, window_s: float, *, exclude_pid: Optional[int
         who = rec.get("who") or f"PID {pid}"
         since = float(rec.get("since") or 0.0)
         if rec.get("state") == "holding" and _pid_alive(pid):
-            found.append((now, f"{who} has held the write lock for {now - since:.0f}s ({op}, still holding)"))
+            phase = _phase_suffix(rec, now, released=False)
+            found.append((now, f"{who} has held the write lock for {now - since:.0f}s ({op}{phase}, still holding)"))
         elif rec.get("state") == "released":
             released = float(rec.get("released_at") or 0.0)
             if now - released <= window_s:
+                phase = _phase_suffix(rec, now, released=True)
                 found.append((released, f"{who} held the write lock for {float(rec.get('held_s') or 0):.0f}s "
-                                         f"({op}), released {now - released:.0f}s ago"))
+                                         f"({op}{phase}), released {now - released:.0f}s ago"))
     return [line for _, line in sorted(found, reverse=True)]
 
 

@@ -8,6 +8,7 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
 import logging
 import time
@@ -71,6 +72,35 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.warning("%s: session DB warm-up failed: %s", label, exc)
 
+    async def _claim_off_loop(self, claim, give_back):
+        """Run a state.db CLAIM (``claim()``: a heartbeat fire, a /loop tick) in the executor and return
+        its result. A worker thread cannot be stopped: if the caller is cancelled while the claim waits on
+        the SessionDB lock, the thread still persists it, and nobody would dispatch or abandon it (Prism
+        fd214c8b7386). So the hop is shielded, and on cancel ``give_back(result)`` runs off the loop once
+        the claim lands, under the caller's contextvars (profile home)."""
+        hop = asyncio.ensure_future(self._run_in_executor_with_context(claim))
+        try:
+            return await asyncio.shield(hop)
+        except asyncio.CancelledError:
+            ctx = contextvars.copy_context()
+
+            def _orphaned(done):
+                if done.cancelled() or done.exception() is not None:
+                    return
+                result = done.result()
+
+                def _run():
+                    try:
+                        give_back(result)
+                    except Exception:
+                        logger.warning("giving back an orphaned claim failed", exc_info=True)
+
+                with suppress(RuntimeError):  # loop already closed: nothing left to run it on
+                    done.get_loop().run_in_executor(None, ctx.run, _run)
+
+            hop.add_done_callback(_orphaned)
+            raise
+
     async def _session_entry_for_manager(self, event: "MessageEvent", label: str):
         """Session entry for a /goal or /heartbeat manager, or None when lookup fails. Warms the
         SessionDB cache first (a cold cache drops the first write while the reply claims it was
@@ -96,7 +126,8 @@ class GatewayGoalsMixin:
         session_entry = await self._session_entry_for_manager(event, f"{kind} manager")
         if session_entry is None:
             return None, None
-        return factory(session_entry.session_id), session_entry
+        # Construction reads state.db (SessionDB.get_meta on the db lock): off the loop thread.
+        return await self._run_in_executor_with_context(factory, session_entry.session_id), session_entry
 
     async def _get_goal_manager_for_event(self, event: "MessageEvent"):
         """Return ``(GoalManager, session_entry)`` for this event, or ``(None, None)``."""
@@ -165,11 +196,20 @@ class GatewayGoalsMixin:
             return  # keep missed intervals due until user work has drained
         from hermes_cli.heartbeat import HeartbeatManager
 
-        mgr = HeartbeatManager(session_id=session_id)
+        def _claim():
+            # load_heartbeat (get_meta) and the due_prompt write both take the SessionDB lock.
+            m = HeartbeatManager(session_id=session_id)
+            return m, (m.due_prompt() if m.has_heartbeat() else None)
+
+        def _give_back(claimed):
+            m, p = claimed
+            if p:
+                m.abandon_fire()
+
+        mgr, prompt = await self._claim_off_loop(_claim, _give_back)
         if not mgr.has_heartbeat():
             watch.pop(quick_key, None)
             return
-        prompt = mgr.due_prompt()
         if not prompt:
             return
         event = self._synthetic_prompt_event(source, prompt)
@@ -188,7 +228,7 @@ class GatewayGoalsMixin:
                 from gateway.run_heartbeat_acceptance import settle_heartbeat_attempt
                 task.add_done_callback(lambda done: settle_heartbeat_attempt(event, mgr))
             elif quick_key not in adapter._active_sessions:
-                mgr.abandon_fire()
+                await self._run_in_executor_with_context(mgr.abandon_fire)
 
     def _start_heartbeat_poller(self) -> None:
         """Start the single gateway-wide heartbeat poll task (idempotent)."""
@@ -281,7 +321,7 @@ class GatewayGoalsMixin:
         if not sid:
             return None
         await self._warm_goals_session_db(label)
-        return factory(sid)
+        return await self._run_in_executor_with_context(factory, sid)
 
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str, event: Any = None,
@@ -479,16 +519,17 @@ class GatewayGoalsMixin:
             return  # busy — stays due, next scan retries
         if session_key and self._stop_latched(session_key):
             return  # /stop latched: hold the tick (stays due) instead of firing it into the held queue
-        if goal_blocks_loop_tick(sid):
-            return
+        def _load():
+            # Both read state.db under the SessionDB lock; a writer holding it would freeze the loop.
+            return None if goal_blocks_loop_tick(sid) else LoopManager(session_id=sid)
 
-        mgr = LoopManager(session_id=sid)
-        if not mgr.is_due(now):
+        mgr = await self._run_in_executor_with_context(_load)
+        if mgr is None or not mgr.is_due(now):
             return
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
-        wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
+        wakeup = await self._claim_off_loop(mgr.fire_tick, lambda w: w and mgr.abandon_tick())
         if not wakeup:
             return
         # #85957: after the parent turn's event.complete the CLIENT owns the next turn on this stateless
@@ -510,7 +551,7 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
             with suppress(Exception):
-                mgr.abandon_tick()
+                await self._run_in_executor_with_context(mgr.abandon_tick)
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups for idle gateway sessions: a coarse ticker scans persisted loops
@@ -637,13 +678,18 @@ class GatewayGoalsMixin:
             return  # busy: the running turn's own post-turn judge owns the next step
         if getattr(entry, "user_stopped_at", None) is not None or self._stop_latched(quick_key):
             return  # /stop latched: only a human turn resumes automatic work
-        with self._profile_scope_for_source(source):
+        max_turns = self._goal_max_turns_from_config()
+
+        def _wake():
             from hermes_cli.goals import GoalManager
 
-            mgr = GoalManager(session_id=session_id, default_max_turns=self._goal_max_turns_from_config())
-            prompt = await self._run_in_executor_with_context(
-                lambda: mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins),
-            )
+            # GoalManager() loads the goal via SessionDB.get_meta, which waits on the db lock while
+            # another thread writes: build it in the hop with idle_wake_prompt, never on the loop.
+            mgr = GoalManager(session_id=session_id, default_max_turns=max_turns)
+            return mgr, mgr.idle_wake_prompt(checkin_minutes=checkin_minutes, max_checkins=max_checkins)
+
+        with self._profile_scope_for_source(source):
+            mgr, prompt = await self._run_in_executor_with_context(_wake)
         if not prompt:
             return
         logger.info(

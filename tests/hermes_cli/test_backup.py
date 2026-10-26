@@ -312,6 +312,35 @@ class TestShouldExclude:
         ):
             assert not _should_exclude(Path(p)), p
 
+    def test_full_tier_file_count_cut(self):
+        """t_87fd92a8: derived indexes, API caches and git mirrors are pruned root-anchored; queue files and the
+        measurements stay in. Land-request pairs are not a path rule (Prism cc81fb1d8a06, see the walker test)."""
+        from hermes_cli.backup import _matches_path_glob, _should_exclude
+        for p in (
+            "var/prism/index/0000dc38de09.json",
+            "state/ci-job-durations/jobs/ANG-Ventures/hermes-home/123.json",
+            "var/pr-git-mirror/ANG-Ventures__hermes-home.git/objects/pack/p.pack",
+            "var/mirror-ci/hermes-agent.git/HEAD",
+        ):
+            assert _should_exclude(Path(p)), p
+        for d in ("var/prism/index", "state/ci-job-durations/jobs", "var/pr-git-mirror", "var/mirror-ci"):
+            assert _matches_path_glob((*Path(d).parts, "_")), d
+        for p in (
+            "var/land-requests/01M3E86FMP308T4MAYWA5ENT7H.done.json",       # judged by the walker, not the path
+            "var/land-requests/01M3E86FMP308T4MAYWA5ENT7H.result.json",
+            "var/land-requests/01M3E86FMP308T4MAYWA5ENT7H.json",            # queued request
+            "var/land-requests/01M3E86FMP308T4MAYWA5ENT7H.inflight",
+            "var/land-requests/01M3E86FMP308T4MAYWA5ENT7H.parked.json",
+            "var/land-requests/01M3E86FMP308T4MAYWA5ENT7H.unparked.json",
+            "var/land-requests/sub/x.done.json",                            # file glob is depth-exact
+            "state/merge-ledger.jsonl",
+            "var/ci-job-durations.json",
+            "state/ci-job-durations/state.json",
+            "var/prism/ledger.jsonl",
+            "skills/x/var/prism/index/a.json",                              # root-anchored
+        ):
+            assert not _should_exclude(Path(p)), p
+
     def test_excludes_cache_forensic_artifacts(self):
         """cache/forensic-*/ holds DELIBERATELY TORN forensic specimens — they are
         expected to fail PRAGMA integrity_check forever, by construction.
@@ -436,7 +465,8 @@ class TestIterBackupFiles:
         import subprocess
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
-        return subprocess.run(["git", "-C", str(cwd), *argv], check=True, capture_output=True, text=True).stdout
+        return subprocess.run(["git", "-C", str(cwd), *argv], check=True, capture_output=True, text=True,
+                              env=env).stdout
 
     def test_root_worktrees_carry_only_dirty_and_untracked(self, tmp_path, monkeypatch):
         """t_7da95544: root wt/ + worktrees/ were 549 k of the 1.43 M files the full tier listed. A checkout's
@@ -490,6 +520,59 @@ class TestIterBackupFiles:
         monkeypatch.setattr(B, "_worktree_git", _boom)
         got = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip")}
         assert {"wt/op/clean.py", "wt/op/sub/clean2.py", "wt/op/mod.py"} <= got
+
+    def test_land_request_pairs_kept_while_a_live_reader_can_need_them(self, tmp_path):
+        """Prism cc81fb1d8a06: an ARMED/QUEUED <ulid>.result.json + <ulid>.done.json pair is a live auto-merge intent
+        that kanban_terminal_pending reads for 6 h (and land-autopilot / merge-horizon for 72 h); a restore that drops
+        it reclaims the approved card. Only pairs older than every reader's horizon are pruned, both halves together;
+        a half-pair, a still-parked request and the queue files always ride."""
+        import time as _t
+        from hermes_cli import backup as B
+        root = tmp_path / ".hermes"
+        d = root / "var" / "land-requests"
+        d.mkdir(parents=True)
+        now = _t.time()
+        old = now - 8 * 86400              # past every reader horizon (max 72 h) and the 7-day keep
+
+        def put(name, mtime, body=None):
+            f = d / name
+            f.write_text(json.dumps(body or {}))
+            os.utime(f, (mtime, mtime))
+
+        put("LIVE.done.json", now - 600, {"card": "t_x", "repo": "o/r", "pr": 1, "review_head_sha": "abc1234"})
+        put("LIVE.result.json", now - 600, {"status": "ARMED", "finished_at": now - 600, "ulid": "LIVE"})
+        put("OLD.done.json", old)
+        put("OLD.result.json", old)
+        put("MIXED.done.json", old)
+        put("MIXED.result.json", now - 600)      # newer half inside the horizon: keep both
+        put("HALF.done.json", old)               # no result: not provably finished
+        put("PARK.done.json", old)
+        put("PARK.result.json", old)
+        put("PARK.parked.json", old)             # parked, never unparked: still live
+        put("UNPARK.done.json", old)
+        put("UNPARK.result.json", old)
+        put("UNPARK.parked.json", old)
+        put("UNPARK.unparked.json", old)
+        put("QUEUED.json", old)
+
+        got = {r.as_posix() for _, r in B._iter_backup_files(root, tmp_path / "out.zip")}
+        lr = "var/land-requests/"
+        assert {lr + n for n in ("LIVE.done.json", "LIVE.result.json", "MIXED.done.json", "MIXED.result.json",
+                                 "HALF.done.json", "PARK.done.json", "PARK.result.json", "PARK.parked.json",
+                                 "UNPARK.parked.json", "UNPARK.unparked.json", "QUEUED.json")} <= got, got
+        assert not {lr + n for n in ("OLD.done.json", "OLD.result.json",
+                                     "UNPARK.done.json", "UNPARK.result.json")} & got, got
+
+        # the restored pair is what the claim sweep reads: it still recognizes the live ARMED intent
+        from hermes_cli.kanban_terminal_pending import _land_requests
+        restored = tmp_path / "restored"
+        for rel in got:
+            dst = restored / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes((root / rel).read_bytes())
+            os.utime(dst, ((root / rel).stat().st_mtime,) * 2)
+        hit = _land_requests(restored, "t_x", "abc1234", now)
+        assert hit and hit["state"] == "armed", hit
 
     def test_skip_worktree_and_assume_unchanged_files_are_never_clean(self, tmp_path):
         """Prism a5c80df2341e on #2299: `git diff HEAD` does not report edits to files flagged skip-worktree (S) or

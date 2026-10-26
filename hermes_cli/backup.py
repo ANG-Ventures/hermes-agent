@@ -212,6 +212,14 @@ _EXCLUDED_ROOT_PATH_GLOBS = (
     ("blackbox", "pre-*"),                  # blackbox pre-repair/pre-backfill rollback copies (4.4 GiB)
     ("profiles", "*", "blackbox"),          # per-profile turn telemetry (daedalus 5.5 GiB); restic excludes it too
     ("var", "detached"),                    # detached-run.py run dirs + logs, self-pruned at 7 days (54 k files)
+    # 2026-10-26 (t_87fd92a8): still 680 k files after the bytes cut against a 400 k target. File-count rows, each
+    # a derived index, an API cache or a git mirror whose source of record is elsewhere:
+    ("var", "prism", "index"),              # one json per Prism finding key (56 k); rebuilt from the signed record
+                                            # mirror + route ledger by `prism-findings-route.py --index-backfill`
+    ("state", "ci-job-durations", "jobs"),  # per-run GitHub Actions jobs cache (22 k), re-read from the API; the
+                                            # measurement itself (var/ci-job-durations.json) stays in
+    ("var", "pr-git-mirror"),               # bare GitHub mirrors for PR git facts (16 k), same class as mirrors/
+    ("var", "mirror-ci"),                   # bare hermes-agent mirror for CI (8.7 k), same class as mirrors/
 )
 
 # ROOT-anchored FILE globs: one fnmatch pattern per path component and the same length as the path, so
@@ -230,7 +238,38 @@ _EXCLUDED_ROOT_FILE_PATH_GLOBS = (
     ("profiles", "*", "state.db"),
     ("profiles", "*", "lcm.db"),
     ("profiles", "*", "lcm-archive.db"),
+    # var/land-requests/<ulid>.done.json + .result.json pairs are NOT a path rule: see _is_stale_land_pair.
 )
+
+# 2026-10-26 (t_87fd92a8, Prism cc81fb1d8a06): one <ulid>.done.json + <ulid>.result.json pair per land request
+# (26 k files). A done pair is NOT always history: a result whose status is ARMED/QUEUED is a live auto-merge
+# intent, and readers decide current state from the pair files themselves, not from state/merge-ledger.jsonl:
+# kanban_terminal_pending (6 h, extends an approved card's claim), apollo-land-autopilot re-arm (72 h),
+# fleet-merge-horizon-watch (72 h), mq_eviction_watch (48 h). So only pairs whose NEWER half is older than every
+# such horizon are pruned, both halves together, and a pair with a half missing or a <ulid>.parked.json (park()
+# finishes the request but it stays live until .unparked.json) is kept. Queue files are never pruned.
+_LAND_REQUEST_DIR = ("var", "land-requests")
+_LAND_PAIR_SUFFIXES = (".done.json", ".result.json")
+_LAND_PAIR_KEEP_S = 7 * 86400
+
+
+def _is_stale_land_pair(hermes_root: Path, rel_path: Path, now: Optional[float] = None) -> bool:
+    """True when *rel_path* is half of a finished land-request pair that no live reader can still need."""
+    parts = rel_path.parts
+    if len(parts) != 3 or parts[:2] != _LAND_REQUEST_DIR:
+        return False
+    sfx = next((s for s in _LAND_PAIR_SUFFIXES if parts[2].endswith(s)), None)
+    uid = parts[2][: -len(sfx)] if sfx else ""
+    if not uid:
+        return False
+    d = hermes_root.joinpath(*_LAND_REQUEST_DIR)
+    if (d / f"{uid}.parked.json").exists() and not (d / f"{uid}.unparked.json").exists():
+        return False
+    try:
+        newest = max((d / f"{uid}{s}").stat().st_mtime for s in _LAND_PAIR_SUFFIXES)
+    except OSError:
+        return False  # a half is missing: not provably a finished pair
+    return (time.time() if now is None else now) - newest > _LAND_PAIR_KEEP_S
 
 # Git checkouts below the root (any dir holding a ``.git`` file or dir, the root's own checkout excluded) carry
 # only what exists nowhere else: tracked files that differ from HEAD plus every untracked file (t_e95deca8's
@@ -640,7 +679,7 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
             # zipfile.write() follows file symlinks, so skip links before any archive write can
             # copy data from outside HERMES_HOME; never archive the output zip into itself, neither
             # published nor as its open staging file (a re-scan runs while that file is growing).
-            if _should_exclude(rel):
+            if _should_exclude(rel) or _is_stale_land_pair(hermes_root, rel):
                 continue
             if clean and Path(*rel.parts[len(co_parts):]).as_posix() in clean:
                 continue  # tracked + unmodified in a git checkout: the repository and its remotes have it
@@ -1624,6 +1663,7 @@ def run_import(args) -> Optional[int]:
 # outside state.db, so it is listed explicitly — ``hermes update`` snapshots this set (#15733).
 _QUICK_STATE_FILES = (
     "state.db", "config.yaml", ".env", "auth.json", "cron/jobs.json", "cron/executions.db",
+    "cron/runtime_state.db",  # cron runtime fields (t_94e91559): jobs.json is definitions-only
     "gateway_state.json", "channel_directory.json", "channel_aliases.json", "processes.json",
     "gateway/discord_message_recovery.db",  # Discord reconnect replay ledger
     # Per-profile user stores, destroyed if the update flow replaces the file and the post-update
@@ -1657,6 +1697,28 @@ def _newest_first(root: Path, keep_entry) -> List[Path]:
 
 # Kept in sync with ``_QUICK_STATE_FILES`` and ``cron/jobs.py``'s ``JOBS_FILE``.
 _CRON_JOBS_REL = "cron/jobs.json"
+_CRON_RUNTIME_REL = "cron/runtime_state.db"
+
+
+@contextmanager
+def _cron_store_lock(home: Path):
+    """Hold *home*'s cron jobs lock so jobs.json and runtime_state.db are captured as ONE unit
+    (t_94e91559: runtime rows live in the db; a remove_job between the two copies would
+    otherwise pair a definition with no row). Best effort: no lock when cron cannot load."""
+    try:
+        from cron.jobs import CronLockDegraded, _jobs_lock, _write_refused_by_r4, use_cron_store
+    except Exception:
+        yield
+        return
+    with use_cron_store(home), _jobs_lock():
+        if _write_refused_by_r4():
+            # Prism d893e459f0ce, ruling R4: a section that could not take the cross-process lock
+            # is not exclusive; the real holder may be mid-write across the two files. A pair
+            # copied now could pair old definitions with newer runtime. Refuse the capture.
+            raise CronLockDegraded(
+                f"the cron jobs lock is degraded (another process holds {home / 'cron' / '.jobs.lock'}); "
+                "refusing to capture jobs.json + runtime_state.db as a pair (nothing copied). Retry")
+        yield
 
 
 # Config paths the update flow must never change (#64160): model routing and the MoA section are
@@ -1848,7 +1910,19 @@ def _create_quick_snapshot_locked(
     # recoverable database.
     oversized_skipped: list[str] = []
 
-    for rel in _QUICK_STATE_FILES:
+    def _quick_items():
+        # The cron pair is yielded together, inside the cron store lock (see _cron_store_lock).
+        for rel in _QUICK_STATE_FILES:
+            if rel == _CRON_RUNTIME_REL:
+                continue
+            if rel == _CRON_JOBS_REL:
+                with _cron_store_lock(home):
+                    yield rel
+                    yield _CRON_RUNTIME_REL
+                continue
+            yield rel
+
+    for rel in _quick_items():
         src = home / rel
         if not src.exists():
             continue
@@ -2083,6 +2157,10 @@ def restore_quick_snapshot(
 
     restored = 0
     for rel in meta.get("files", {}):
+        if rel == _CRON_RUNTIME_REL:
+            # Captured, never restored (t_94e91559): runtime bookkeeping comes from the live db
+            # and schedule fields are recomputed by the scheduler. The pair restore is t_82c613d9.
+            continue
         # Security: reject absolute paths and traversals in manifest entries
         src = snap_dir / rel
         try:

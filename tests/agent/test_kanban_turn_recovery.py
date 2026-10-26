@@ -27,6 +27,7 @@ _REAL_START_PRELOADED_SKILLS = HermesCLI.start_preloaded_skills
 from agent.kanban_turn_recovery import (
     DEFAULT_MAX_RECOVERY_ATTEMPTS,
     RECOVERY_DELAYS_SECONDS,
+    STORAGE_BUSY_REASON,
     build_recovery_nudge,
     kanban_task_id,
     kanban_turn_recovery_enabled,
@@ -76,6 +77,14 @@ def _failed(*, retryable: bool = True, reason: str = "timeout",
     return {"failed": True, "failure_retryable": retryable, "failure_reason": reason,
             "error": error, "final_response": f"API call failed after 3 retries: {error}",
             "completed": False, "messages": []}
+
+
+def _storage_busy() -> dict:
+    """The 2026-10-26 00:31 shape (t_d9caaea3): another process held the state.db write lock past
+    the patience, so the turn stopped as ``session_persistence_failed:locked``. The finalizer stamps
+    no ``failure_retryable`` on this path; the cause alone is the retry authority."""
+    return {"failed": True, "failure_reason": STORAGE_BUSY_REASON, "completed": False,
+            "error": "session storage could not be written", "final_response": "", "messages": []}
 
 
 def _success() -> dict:
@@ -183,6 +192,22 @@ def test_should_recover_turn_refuses(result, clear_kanban_env):
     429 is the same quota-class wall as a direct one — the dispatcher owns the cooldown."""
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
     assert should_recover_turn(result, attempt=0) is False
+
+
+def test_storage_busy_turn_is_eligible(clear_kanban_env):
+    """A busy state.db is transient and the conversation is still in memory: retry in place."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
+    assert should_recover_turn(_storage_busy(), attempt=0) is True
+    assert should_recover_turn(_storage_busy(), attempt=3) is False  # same budget as provider failures
+    other = {**_storage_busy(), "failure_reason": "session_persistence_failed:disk"}
+    assert should_recover_turn(other, attempt=0) is False  # a full disk is not a wait-and-retry
+
+
+def test_storage_busy_nudge_names_the_cause(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_probe")
+    nudge = build_recovery_nudge(_storage_busy(), attempt=1, max_attempts=3)
+    assert "session storage was busy" in nudge and "API call failed" not in nudge
+    assert "Do NOT start over" in nudge and "kanban_complete" in nudge
 
 
 # ── live run/claim proof (the adversarial boundaries) ────────────────
@@ -589,6 +614,22 @@ def test_budget_exhausted_stops_and_releases(driver, cli_harness, live_claim, mo
 
     assert _drive(cli_mod, driver) == KANBAN_RATE_LIMIT_EXIT_CODE
     assert len(entered) == 2  # original + one recovery attempt
+
+
+@pytest.mark.parametrize("driver", DRIVERS)
+def test_storage_busy_turn_recovers_in_place_instead_of_exiting_1(driver, cli_harness, live_claim,
+                                                                   monkeypatch):
+    """t_d9caaea3: two workers exited rc=1 ("crashed") at 00:31 because a turn stopped on a busy
+    state.db. The worker now backs off and retries the same session."""
+    import agent.kanban_turn_recovery as rec
+
+    _worker_env(monkeypatch)
+    monkeypatch.setattr(rec, "RECOVERY_DELAYS_SECONDS", (0.0,))
+    cli_mod, entered, ui = cli_harness(driver, [_storage_busy(), _success()])
+
+    assert _drive(cli_mod, driver) == 0
+    assert len(entered) == 2
+    assert "session storage was busy" in entered[1]
 
 
 def _single_turn_cases():

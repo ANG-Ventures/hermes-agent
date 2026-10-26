@@ -78,7 +78,9 @@ from hermes_state_profile_repair import SessionProfileRepairMixin
 from hermes_state_schema import SessionSchemaMixin, _FTS_TRIGRAM_TRIGGERS
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
-from hermes_state_lockowners import describe_write_lock_holders, hold_ended, hold_started, log_write_lock_holders
+from hermes_state_lockowners import (
+    describe_write_lock_holders, hold_committing, hold_ended, hold_started, log_write_lock_holders,
+)
 from hermes_state_dbfile import (
     _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
     _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
@@ -1294,6 +1296,7 @@ class SessionDB(
                         hold = hold_started(self.db_path, _write_caller_name())  # holder-side lock ledger
                         fn_started = True
                         result = fn(self._conn)
+                        hold_committing(hold)  # a long hold then says callback vs commit I/O
                         self._conn.commit()
                     except BaseException:
                         try:
@@ -1793,19 +1796,26 @@ class SessionDB(
         The PRAGMA runs on a dedicated connection OUTSIDE self._lock: SQLite's PASSIVE mode does not block
         writers, but holding the process-wide Python write lock around it did (every writer queued for the
         whole checkpoint). Only the guard refresh and the connection lookup take self._lock.
+        The guard refresh (an fd-table scan) runs only on the checkpoint conn's first use or a new -shm inode.
         """
         if self._quarantine_reason() is not None:
             return
         with self._ckpt_lock:
             try:
+                try:  # stat outside _lock: under GIL load one syscall pays a full handoff
+                    st = os.stat(f"{self.db_path}-shm")
+                    shm_ident = (st.st_dev, st.st_ino)
+                except OSError:
+                    shm_ident = None
                 with self._lock:
                     if self._conn is None or self._db_replaced:
                         return  # closed or replaced underneath the timer: nothing to checkpoint
-                    if self._wal_lock_guard:
-                        _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
+                    first_use = self._ckpt_conn is None
                     conn = self._checkpoint_conn_locked()
-                    if self._wal_lock_guard:
-                        _lockguard.hold(self.db_path, self._wal_lock_guard)  # cover the checkpoint conn's fds
+                    guard = self._wal_lock_guard
+                    if guard and (first_use or (shm_ident is not None and shm_ident not in guard)):
+                        # a -shm minted after open, and/or the checkpoint conn's new fds
+                        _lockguard.hold(self.db_path, guard)
                 result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 if result and result[1] > 0:
                     logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])

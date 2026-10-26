@@ -611,10 +611,14 @@ def non_terminal(home: Path, ignore: Iterable[str] = ()) -> List[dict]:
 
 
 def store_jobs(home: Path) -> List[dict]:
+    """Jobs as the scheduler sees them: jobs.json definitions + cron/runtime_state.db rows
+    (t_94e91559 split hot runtime fields such as next_run_at out of the file)."""
+    from cron.runtime_state import merged_jobs
+
     path = Path(home) / "cron" / "jobs.json"
     if not path.exists():
         return []
-    return json.loads(path.read_text(encoding="utf-8")).get("jobs", [])
+    return merged_jobs(path)
 
 
 def _child_main(control_root: str) -> None:

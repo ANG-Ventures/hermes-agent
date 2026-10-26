@@ -356,3 +356,82 @@ def test_older_hold_end_never_overwrites_a_newer_holding_record(db, monkeypatch)
     lockowners.hold_ended(token_b)
     rec = json.loads((_ledger(db.db_path) / f"{os.getpid()}.json").read_text(encoding="utf-8-sig"))
     assert rec["op"] == "writer_b" and rec["state"] == "released", rec
+
+
+class _SlowCommitConn:
+    """The writer connection with a slow ``commit()``: the 2026-10-26 00:25-00:29 shape, where a
+    one-row ``_write_model_config_patch`` was recorded as a 212 s hold (t_d9caaea3). Everything but
+    commit is the real connection."""
+
+    def __init__(self, conn, commit_s):
+        self._real, self._commit_s = conn, commit_s
+
+    def commit(self):
+        time.sleep(self._commit_s)
+        return self._real.commit()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_long_hold_names_the_commit_phase_and_the_patch_body_is_short(db, monkeypatch):
+    """t_d9caaea3: a long hold must say whether the time went to the caller's statements or to
+    SQLite's commit. The model-config patch body (SELECT + UPDATE of one row) holds the lock for well
+    under a second; the slow step here is commit(), and both the live and the released ledger lines
+    attribute the time to it."""
+    monkeypatch.setattr(lockowners, "state_db_write_lock_holders", lambda _p: [])
+    monkeypatch.setattr(lockowners, "_HOLD_RECORD_MIN_S", 0.2)
+    db.create_session("s1", "cli")
+    real = db._conn
+    db._conn = _SlowCommitConn(real, 2.0)
+    try:
+        writer = threading.Thread(target=db.patch_session_model_config, args=("s1", {"k": "v"}))
+        writer.start()
+        live = []
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not live:
+            live = [line for line in lockowners.recent_ledger_holders(db.db_path, 60.0)
+                    if "still holding" in line and "in commit" in line]
+            time.sleep(0.05)
+        writer.join(timeout=15)
+    finally:
+        db._conn = real
+    assert live and "_write_model_config_patch" in live[0], live
+    rec = json.loads((_ledger(db.db_path) / f"{os.getpid()}.json").read_text(encoding="utf-8-sig"))
+    assert rec["state"] == "released" and rec["op"] == "_write_model_config_patch", rec
+    assert rec["commit_s"] >= 1.9, rec
+    assert rec["held_s"] - rec["commit_s"] < 1.0, rec  # the patch body itself: well under 1 s
+    detail = lockowners.describe_write_lock_holders(db.db_path, 60.0)
+    assert "of it in commit" in detail and "_write_model_config_patch" in detail, detail
+    assert db.get_session_model_config_value("s1", "k") == "v"
+
+
+def test_hold_marked_before_commit_republishes_the_commit_phase(db, monkeypatch):
+    """A hold the watchdog already published as "holding" (slow callback) is republished when commit
+    starts, so the live line does not keep saying nothing about the phase."""
+    monkeypatch.setattr(lockowners, "_HOLD_RECORD_MIN_S", 0.0)
+    monkeypatch.setattr(lockowners, "_watchdog_running", True)  # no real watchdog: we play it by hand
+    monkeypatch.setattr(lockowners, "_watchdog_pid", os.getpid())
+    token = lockowners.hold_started(db.db_path, "slow_body")
+    for hold in lockowners._select_due_holds():
+        lockowners._publish_holding(hold)
+    path = _ledger(db.db_path) / f"{os.getpid()}.json"
+    assert "commit_since" not in json.loads(path.read_text(encoding="utf-8-sig"))
+    lockowners.hold_committing(token)
+    rec = json.loads(path.read_text(encoding="utf-8-sig"))
+    assert rec["state"] == "holding" and "commit_since" in rec, rec
+    lockowners.hold_ended(token)
+    assert "commit_s" in json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def test_records_without_a_commit_phase_still_render(db, monkeypatch):
+    """Ledger files written by an older process carry no phase: the line is the old one."""
+    ledger = _ledger(db.db_path)
+    ledger.mkdir(mode=0o700, exist_ok=True)
+    now = time.time()
+    (ledger / "424242.json").write_text(json.dumps({
+        "pid": 424242, "seq": 1, "who": "PID 424242 (old)", "op": "append_messages_batch",
+        "since": now - 10, "state": "released", "held_s": 9.0, "released_at": now - 1,
+    }), encoding="utf-8")
+    lines = lockowners.recent_ledger_holders(db.db_path, 60.0)
+    assert lines == ["PID 424242 (old) held the write lock for 9s (append_messages_batch), released 1s ago"], lines
