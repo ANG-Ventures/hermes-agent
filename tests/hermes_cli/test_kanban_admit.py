@@ -196,7 +196,7 @@ def test_admit_refuses_when_the_workspace_admission_refuses(board, monkeypatch):
     _hot_local(monkeypatch)
     tid = _card()
 
-    def refuse(task, board=None, conn=None):
+    def refuse(task, board=None, conn=None, **kw):
         raise WorkspaceUnavailable("workspaces_root_unmounted: /Volumes/x")
 
     monkeypatch.setattr(kb, "_validate_workspace_admission", refuse)
@@ -357,20 +357,20 @@ def test_the_board_owner_root_config_kill_switch_refuses(board, monkeypatch):
 
 
 def test_admit_refuses_what_the_browser_gate_would_hold(board, monkeypatch):
+    """The tick's own browser gate runs (not a dry copy): its wait refuses."""
     _hot_local(monkeypatch)
     seen = {}
 
     def gate(conn, rows, result, route, dry_run, assignee=None, *, park=True, join=True):
-        seen.update(dry_run=dry_run, park=park, join=join, route=dict(route))
+        seen.update(rows=[r["id"] for r in rows])
         route[rows[0]["id"]] = ("wait", "browser_join_off")
 
     monkeypatch.setattr(kbd, "_browser_gate", gate)
     tid = _card()
     SPAWNS.clear()
-    with pytest.raises(ka.AdmitRefused, match="browser admission refuses on studio: browser_join_off"):
+    with pytest.raises(ka.AdmitRefused, match="studio is not eligible.*wait: browser_join_off"):
         ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
-    assert SPAWNS == [] and _status(tid) == "ready"
-    assert seen["dry_run"] is True and seen["park"] is False and seen["join"] is False
+    assert SPAWNS == [] and _status(tid) == "ready" and seen["rows"] == [tid]
 
 
 def test_no_pool_still_runs_the_dispatchers_local_routing(board, monkeypatch):
@@ -416,3 +416,231 @@ def test_cli_verb_is_wired_with_no_bulk_form(board, monkeypatch, capsys):
     monkeypatch.setattr(ka, "admit", lambda t, h, r: (_ for _ in ()).throw(ka.AdmitRefused(f"{t}: test refusal")))
     assert ka.cmd_admit(ns) == 1
     assert "kanban admit: REFUSED t_x: test refusal" in capsys.readouterr().err
+
+
+# -- r5 (Apollo shape ruling): admit IS the tick's ready lane, minus host admission --
+
+def _claim(tid):
+    with kb.connect_closing() as conn:
+        t = kb.get_task(conn, tid)
+        return t.status, t.claim_lock
+
+
+def test_a_board_over_its_budget_ceiling_refuses_admit_like_dispatch(board, monkeypatch):
+    """Prism c4eed7905e67: the board's usd_per_24h ceiling binds admit with the
+    reason dispatch gives (budget_paused)."""
+    from hermes_cli import kanban_budget as kbudget
+
+    _hot_local(monkeypatch)
+    monkeypatch.setattr(kbudget, "configured_ceiling_usd", lambda: 1.0)
+    monkeypatch.setattr(kbudget, "board_spend_usd", lambda *a, **k: 5.0)
+    monkeypatch.setattr(kbudget, "_page_paused", lambda *a, **k: None)
+    tid = _card()
+    SPAWNS.clear()
+    with pytest.raises(ka.AdmitRefused, match="budget_paused"):
+        ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
+    assert SPAWNS == [] and _claim(tid) == ("ready", None) and not _events(tid)
+    with kb.connect_closing() as conn:                       # the tick holds it the same way
+        assert kbd.dispatch_once(conn, spawn_fn=_spawn).budget_paused is True
+    assert SPAWNS == []
+
+
+def test_a_raising_lane_route_write_releases_the_claim(board, monkeypatch):
+    """Prism 739dc0878823: the claim and every write after it are guarded; a
+    raising dispatch_lane_route write leaves the card ready with no live claim."""
+    import time as _time
+
+    _hot_local(monkeypatch)
+    with kb.connect_closing() as conn:
+        kb.set_lane_model_override(conn, provider="lane-prov", model="lane-model",
+                                   expires_at=int(_time.time()) + 3600, reason="capacity", assignee="alpha")
+    real = kb._append_event
+
+    def append(conn, task_id, kind, payload=None, **kw):
+        if kind == "dispatch_lane_route":
+            raise RuntimeError("disk full")
+        return real(conn, task_id, kind, payload, **kw)
+
+    monkeypatch.setattr(kb, "_append_event", append)
+    tid = _card()
+    SPAWNS.clear()
+    with pytest.raises(ka.AdmitRefused, match="spawn failed"):
+        ka.admit(tid, "studio", "ruling", spawn_fn=_spawn)
+    assert SPAWNS == [] and _claim(tid) == ("ready", None)
+    with kb.connect_closing() as conn:
+        run = conn.execute("SELECT outcome, ended_at FROM task_runs WHERE task_id=? ORDER BY id DESC",
+                           (tid,)).fetchone()
+    assert run[0] == "spawn_failed" and run[1] is not None
+
+
+def _gate_triggers():
+    """One trigger per ready-lane gate: (setup(monkeypatch, tid, ctx) -> host, expected refusal regex).
+    ``ctx`` carries kanban_cfg / spawn_fn overrides for the admit call."""
+    from hermes_cli import kanban_budget as kbudget
+    from hermes_cli import kanban_pause_hold as kph
+    from hermes_cli import kanban_provider_health as kph_health
+    from hermes_cli import model_policy, model_registry
+    from hermes_cli.kanban_workspace_policy import WorkspaceUnavailable
+
+    def budget(m, tid, ctx):
+        m.setattr(kbudget, "evaluate_board_budget", lambda *a, **k: True)
+        return "studio", "budget_paused"
+
+    def max_spawn(m, tid, ctx):
+        with kb.connect_closing() as conn:
+            assert kb.claim_task(conn, kb.create_task(conn, title="other", assignee="alpha"))
+        ctx["kanban_cfg"] = {"max_spawn": 1}
+        return "studio", "spawn_capped: max_spawn=1"
+
+    def no_worker(m, tid, ctx):
+        with kb.connect_closing() as conn:
+            conn.execute("UPDATE tasks SET no_worker=1 WHERE id=?", (tid,))
+        return "studio", "no_worker"
+
+    def pause_hold(m, tid, ctx):
+        m.setattr(kph, "held_routes", lambda rows, cache: {tid: ("wait", "pause_hold (test)")})
+        return "studio", "pause_hold"
+
+    def route(m, tid, ctx):
+        m.setattr(kbd, "_route_row", lambda conn, row, plan, *a, **k: ("wait", "capability:gpu"))
+        return "studio", "wait: capability:gpu"
+
+    def browser(m, tid, ctx):
+        def gate(conn, rows, result, rr, dry_run, *a, **k):
+            for r in rows:
+                rr[r["id"]] = ("wait", "browser_join_off")
+        m.setattr(kbd, "_browser_gate", gate)
+        return "studio", "browser_join_off"
+
+    def assignee(m, tid, ctx):
+        with kb.connect_closing() as conn:
+            conn.execute("UPDATE tasks SET assignee=NULL WHERE id=?", (tid,))
+        return "studio", "unassigned"
+
+    def profile(m, tid, ctx):
+        m.setattr(kbd, "_profile_exists_fn", lambda: (lambda name: False))
+        return "studio", "not a spawnable profile"
+
+    def per_profile_cap(m, tid, ctx):
+        with kb.connect_closing() as conn:
+            assert kb.claim_task(conn, kb.create_task(conn, title="other", assignee="alpha"))
+        ctx["kanban_cfg"] = {"max_in_progress_per_profile": 1}
+        return "studio", "per_profile_cap: alpha"
+
+    def flagship(m, tid, ctx):
+        with kb.connect_closing() as conn:
+            conn.execute("UPDATE tasks SET model_override='big-model' WHERE id=?", (tid,))
+        m.setattr(model_policy, "flagship_model_match", lambda model, cfg=None: True)
+        return "studio", "flagship"
+
+    def invalid_pin(m, tid, ctx):
+        with kb.connect_closing() as conn:
+            conn.execute("UPDATE tasks SET model_override='m', provider_override='prov' WHERE id=?", (tid,))
+        m.setattr(model_registry, "invalid_pin_reason", lambda provider, model: "unknown model m")
+        return "studio", "blocked by the dispatcher"
+
+    def respawn_guard(m, tid, ctx):
+        m.setattr(kbd, "check_respawn_guard", lambda conn, task_id, **k: "rate_limit_cooldown")
+        return "studio", "rate_limit_cooldown"
+
+    def provider_admission(m, tid, ctx):
+        with kb.connect_closing() as conn:
+            conn.execute("UPDATE tasks SET model_override='m', provider_override='prov' WHERE id=?", (tid,))
+        m.setattr(model_registry, "invalid_pin_reason", lambda provider, model: None)
+        m.setattr(kb, "cooling_providers", lambda conn, **k: {"prov": 9999999999})
+        m.setattr(kph_health, "available_profile_fallback", lambda *a, **k: None)
+        return "studio", "credential_cooldown"
+
+    def card_skills(m, tid, ctx):
+        def refused(conn, task_id, assignee, result, *, dry_run):
+            result.skill_refused.append((task_id, ["missing-skill"]))
+            return True
+        m.setattr(kb, "_card_skills_refused", refused)
+        return "studio", "card skills refused: missing-skill"
+
+    def workspace_admission(m, tid, ctx):
+        def refused(conn, task_id, result, *, board, dry_run):
+            result.workspace_refused.append((task_id, "workspaces_root_unmounted"))
+            return True
+        m.setattr(kb, "_workspace_admission_refused", refused)
+        return "studio", "workspace unavailable: workspaces_root_unmounted"
+
+    def placement(m, tid, ctx):
+        m.setattr(kwp, "board_fault", lambda host, board, **k: "board root unmounted")
+        ctx["measure_remote_fn"] = _remote()
+        return "ace-ai", "ace-ai is not eligible.*board_unhostable"
+
+    def claim(m, tid, ctx):
+        m.setattr(kb, "claim_task", lambda conn, task_id, **k: None)
+        return "studio", "did not spawn"
+
+    def lane_route(m, tid, ctx):
+        import time as _time
+        with kb.connect_closing() as conn:
+            kb.set_lane_model_override(conn, provider="lane-prov", model="lane-model",
+                                       expires_at=int(_time.time()) + 3600, reason="r", assignee="alpha")
+        real = kb._append_event
+
+        def append(conn, task_id, kind, payload=None, **kw):
+            if kind == "dispatch_lane_route":
+                raise RuntimeError("disk full")
+            return real(conn, task_id, kind, payload, **kw)
+        m.setattr(kb, "_append_event", append)
+        return "studio", "spawn failed"
+
+    def workspace(m, tid, ctx):
+        def refuse(task, board=None, conn=None, **kw):
+            if task.status == "running":                    # the post-claim check only
+                raise WorkspaceUnavailable("workspaces_root_unmounted: /Volumes/x")
+            return None
+        m.setattr(kb, "_validate_workspace_admission", refuse)
+        return "studio", "workspace unavailable"
+
+    def launch(m, tid, ctx):
+        ctx["spawn_fn"] = lambda task, workspace, *, board=None, placement=None: (_ for _ in ()).throw(
+            RuntimeError("exec failed"))
+        return "studio", "spawn failed"
+
+    return {
+        "budget_paused": budget, "max_spawn": max_spawn, "no_worker": no_worker, "pause_hold": pause_hold,
+        "route": route, "browser": browser, "assignee": assignee, "profile": profile,
+        "per_profile_cap": per_profile_cap, "flagship": flagship, "invalid_pin": invalid_pin,
+        "respawn_guard": respawn_guard, "provider_admission": provider_admission,
+        "card_skills": card_skills, "workspace_admission": workspace_admission, "placement": placement,
+        "claim": claim, "lane_route": lane_route, "workspace": workspace, "launch": launch,
+    }
+
+
+def test_admit_refuses_on_every_dispatcher_gate_except_host_admission(board, monkeypatch):
+    """The contract: walk the dispatcher's ready-lane gate list. admit refuses on
+    each gate (nothing spawned, no live claim), and host admission is the ONE it
+    skips. A gate added to kbd.READY_LANE_GATES has no trigger here, so this test
+    is red until it is proven that admit holds on it too."""
+    triggers = _gate_triggers()
+    assert set(kbd.READY_LANE_GATES) == set(triggers) | {"host_admission"}, (
+        "a dispatcher gate without an admit trigger: "
+        f"{sorted(set(kbd.READY_LANE_GATES) - set(triggers) - {'host_admission'})}")
+    for gate in kbd.READY_LANE_GATES:
+        if gate == "host_admission":
+            continue
+        with monkeypatch.context() as m:
+            _hot_local(m, load1=10.0)
+            tid = _card()
+            ctx: dict = {"spawn_fn": _spawn}
+            host, expect = triggers[gate](m, tid, ctx)
+            SPAWNS.clear()
+            with pytest.raises(ka.AdmitRefused, match=expect):
+                ka.admit(tid, host, f"gate {gate}", kanban_cfg=ctx.get("kanban_cfg", {}),
+                         spawn_fn=ctx["spawn_fn"], measure_remote_fn=ctx.get("measure_remote_fn"))
+            status, lock = _claim(tid)
+            assert SPAWNS == [] and lock is None and status != "running", (gate, status, lock)
+    # host admission: the LoadGate is PAUSED (load1 66 > 64) and the tick spawns
+    # nothing, yet admit spawns.
+    _hot_local(monkeypatch)
+    held, tid = _card(), None
+    with kb.connect_closing() as conn:
+        res = kbd.dispatch_once(conn, spawn_fn=_spawn, spawn_paused="load gate paused", spawn_limit=0)
+    assert not res.spawned and _claim(held) == ("ready", None)
+    SPAWNS.clear()
+    assert ka.admit(held, "studio", "host admission override", spawn_fn=_spawn)["host"] == "studio"
+    assert SPAWNS == [(held, None)]
