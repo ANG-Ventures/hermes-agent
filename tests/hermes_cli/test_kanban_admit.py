@@ -644,3 +644,40 @@ def test_admit_refuses_on_every_dispatcher_gate_except_host_admission(board, mon
     SPAWNS.clear()
     assert ka.admit(held, "studio", "host admission override", spawn_fn=_spawn)["host"] == "studio"
     assert SPAWNS == [(held, None)]
+
+
+def test_admit_probes_board_roots_and_refuses_a_host_without_this_board(board, monkeypatch):
+    """Prism 9f96730083e6: admit's OWN path (measure_remote -> _admit_plan) asks
+    the probe for kanban.workspaces_root, and a pool host whose probe lists no
+    root for this board is refused by the dispatcher's board_refusal
+    (no_board_root), never spawned into unprovisioned storage."""
+    import time as _time
+    from types import SimpleNamespace
+
+    signal = SimpleNamespace(policy=SimpleNamespace(pressure_path="/x", stale_after_s=600.0),
+                             placement_table=None, state_path=Path("/nonexistent/state.json"))
+    monkeypatch.setattr(ka, "_pool_and_signal", lambda cfg: (POOL, signal, board / "fleet"))
+    now = _time.time()
+    asked = []
+
+    def probe(host, **kw):
+        asked.append(kw)
+        return kwp.HostSample(load1=1.0, ncpu=32, remote_now=now,
+                              pressure_text=json.dumps({"at": now, "mem_available_gb": 100.0}),
+                              boards=frozenset({"other"}))
+
+    monkeypatch.setattr(kwp, "probe_host", probe)
+    tid = _card()
+    SPAWNS.clear()
+    with pytest.raises(ka.AdmitRefused, match="no_board_root"):
+        ka.admit(tid, "ace-ai", "ruling", kanban_cfg={"workspaces_root": "/srv/ws"}, spawn_fn=_spawn)
+    assert asked and asked[-1].get("workspaces_root") == "/srv/ws"
+    assert SPAWNS == [] and _claim(tid) == ("ready", None) and not _events(tid)
+    # The same probe listing this board admits.
+    monkeypatch.setattr(kwp, "probe_host", lambda host, **kw: kwp.HostSample(
+        load1=1.0, ncpu=32, remote_now=now,
+        pressure_text=json.dumps({"at": now, "mem_available_gb": 100.0}),
+        boards=frozenset({"default"})))
+    assert ka.admit(tid, "ace-ai", "ruling", kanban_cfg={"workspaces_root": "/srv/ws"},
+                    spawn_fn=_spawn)["host"] == "ace-ai"
+    assert SPAWNS == [(tid, "ace-ai")]

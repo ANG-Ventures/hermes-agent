@@ -27,6 +27,7 @@ headroom it overrode.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 import time
@@ -58,6 +59,7 @@ class Measure:
     mem_reserve_gb: float
     extra: dict = field(default_factory=dict)   # band / headroom the admission overrides
     threshold_error: Optional[str] = None       # why mem_reserve_gb is unknown (names the table)
+    boards: Optional[frozenset] = None          # boards the host can host (None = not asked)
 
 
 def enabled(kanban_cfg: Optional[dict]) -> bool:
@@ -180,19 +182,25 @@ def measure_local() -> Measure:
     }, threshold_error=terr)
 
 
-def measure_remote(host, signal) -> Measure:
+def measure_remote(host, signal, workspaces_root: Optional[str] = None) -> Measure:
     """One fresh probe of pool host ``host``: load1/ncpu plus, with the target
     signal, its pressure file (memory, band); threads + mem_reserve_gb from its
-    placement-table row (ncpu / 0 GB without one); hot streak from the state file."""
+    placement-table row (ncpu / 0 GB without one); hot streak from the state file.
+    With ``workspaces_root`` (the tick's ``kanban.workspaces_root``) the same
+    round-trip lists the boards the host can host, so the dispatcher's own
+    board_refusal sees them (Prism 9f96730083e6)."""
     from hermes_cli import kanban_headroom as kh
     from hermes_cli import kanban_worker_pool as kwp
 
     kw = {"pressure_path": signal.policy.pressure_path} if signal is not None else {}
+    if workspaces_root:
+        kw["workspaces_root"] = workspaces_root
     sample = kwp.probe_host(host, **kw)
     load1 = ncpu = mem = None
     band = pressure = None
+    boards = None
     if isinstance(sample, kwp.HostSample):
-        load1, ncpu = sample.load1, sample.ncpu
+        load1, ncpu, boards = sample.load1, sample.ncpu, sample.boards
         if signal is not None:
             stale = signal.policy.stale_after_s
             fields = kh.sample_fields(sample.load5, sample.remote_now, sample.pressure_text or "",
@@ -213,7 +221,7 @@ def measure_remote(host, signal) -> Measure:
         hot = bool(st.get("hot")) if isinstance(st, dict) else None
     return Measure(host.name, load1, threads, mem, reserve, extra={
         "band": band, "hot": hot, "pressure": pressure or None, "ncpu": ncpu,
-    }, threshold_error=terr)
+    }, threshold_error=terr, boards=boards)
 
 
 # -- the verb -------------------------------------------------------------------
@@ -263,13 +271,18 @@ def admit(task_id: str, host_word: str, reason: str, *, kanban_cfg: Optional[dic
         raise AdmitRefused(f"kanban admit is operator-only: {kb.OPERATOR_TOKEN_ENV} {state.replace('_', ' ')}")
     pool, signal, fleet_dir = _pool_and_signal(kanban_cfg)
     host = canonical_host(host_word, pool, fleet_dir)
+    if measure_remote_fn is None:
+        root = (kanban_cfg or {}).get("workspaces_root") if isinstance(kanban_cfg, dict) else None
+        # The same root the gateway tick probes with (kanban_gate_tick.plan_pool).
+        measure_remote_fn = functools.partial(
+            measure_remote, workspaces_root=root if isinstance(root, str) and root.startswith("/") else None)
     deadline = time.monotonic() + _LOCK_WAIT_SECONDS
     with kbc.connect_closing(board=board) as conn:
         while True:
             try:
                 return _admit_locked(conn, task_id, host, reason.strip(), pool, signal, board,
                                      spawn_fn, measure_local_fn or measure_local,
-                                     measure_remote_fn or measure_remote,
+                                     measure_remote_fn,
                                      canon=lambda w: canonical_host(w, pool, fleet_dir),
                                      kanban_cfg=kanban_cfg)
             except kbc_LockBusy:
@@ -306,7 +319,7 @@ def _admit_locked(conn, task_id, host, reason, pool, signal, board, spawn_fn,
         "mem_reserve_gb": m.mem_reserve_gb, **m.extra,
     }
     res = kbd.admit_once(conn, task_id, host, board=board, spawn_fn=spawn_fn,
-                         spillover=_admit_plan(pool, signal), admission_event=payload,
+                         spillover=_admit_plan(pool, signal, host, m.boards), admission_event=payload,
                          **_tick_knobs(kanban_cfg), lock_wait_s=0.0)
     if res.skipped_locked:
         raise kbc_LockBusy()
@@ -322,17 +335,20 @@ class kbc_LockBusy(Exception):
     """The board's dispatch lock is held by a tick; admit retries."""
 
 
-def _admit_plan(pool, signal):
+def _admit_plan(pool, signal, host: Optional[str] = None, boards=None):
     """The plan the dispatcher routes this card against: the pool config and
-    signal, no probe (admit skips the band/slots)."""
+    signal, no slots (admit skips the band/slots). The probed ``boards`` of
+    ``host`` go into ``detail[host]`` exactly as _plan_v01 puts them, so the
+    dispatcher's own board_refusal refuses ``no_board_root`` (Prism 9f96730083e6)."""
     from hermes_cli import kanban_worker_pool as kwp
 
     if pool is None:
         # An EMPTY plan, not None: the tick's _route_row still runs (capabilities,
         # waits) and the forced-host check reads its route (Prism 4cc3d57f613b).
         return kwp.SpilloverPlan(hosts={}, slots={}, config=kwp.PoolConfig(), signal=None)
-    return kwp.SpilloverPlan(hosts={h.name: h for h in pool.pool_hosts}, slots={}, config=pool,
-                             signal=signal)
+    detail = {host: {"boards": sorted(boards)}} if host and boards is not None else {}
+    return kwp.SpilloverPlan(hosts={h.name: h for h in pool.pool_hosts}, slots={}, detail=detail,
+                             config=pool, signal=signal)
 
 
 def _tick_knobs(kanban_cfg: Optional[dict]) -> dict:
