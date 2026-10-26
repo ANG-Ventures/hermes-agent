@@ -287,3 +287,32 @@ def test_malformed_journal_line_does_not_discard_removal_evidence(hermes_env, ba
         jobs._save_jobs_unlocked(stale)
 
     assert gone["id"] not in {j["id"] for j in load_jobs()}, "malformed line let a stale save resurrect a removed job"
+
+
+@pytest.mark.parametrize("terminator", [b"\r", b"\r\n", b"\n"])
+def test_cr_delimited_journal_keeps_removal_evidence(hermes_env, terminator):
+    """t_e6448717 (Prism 699c883ef2fd on #2349): the binary reader split on b"\\n" only, so a
+    CR-delimited journal fused every record into one unparseable line, last_removed() returned an
+    empty set, and a stale save resurrected the removed job. The text reader it replaced split on
+    universal newlines; every terminator it accepted must still separate records."""
+    import cron.jobs as jobs
+    from cron.jobs import create_job, load_jobs
+    from cron.lifecycle_journal import JOURNAL_FILENAME, last_removed
+
+    gone = create_job(prompt="gone", schedule="every 5m", name="gone", deliver="local")
+    jobs_file = jobs._current_cron_store().jobs_file
+    journal = hermes_env / "cron" / JOURNAL_FILENAME
+    jid = gone["id"].encode()
+
+    with jobs._jobs_lock():
+        stale = jobs.load_jobs()
+        data = json.loads(jobs_file.read_text(encoding="utf-8"))
+        data["jobs"] = [j for j in data["jobs"] if j["id"] != gone["id"]]
+        jobs_file.write_text(json.dumps(data), encoding="utf-8")
+        journal.write_bytes(
+            b'{"job_id":"' + jid + b'","event":"created"}' + terminator
+            + b'{"job_id":"' + jid + b'","event":"removed"}' + terminator)
+        assert last_removed([gone["id"]]) == {gone["id"]}
+        jobs._save_jobs_unlocked(stale)
+
+    assert gone["id"] not in {j["id"] for j in load_jobs()}, "CR-delimited journal let a stale save resurrect a removed job"
