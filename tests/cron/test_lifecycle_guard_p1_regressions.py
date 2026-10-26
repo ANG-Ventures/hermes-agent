@@ -261,3 +261,40 @@ def test_a_window_at_retention_is_still_allowed(store):
     report = journal.check_vanished_jobs(window_hours=journal.MAX_WINDOW_HOURS)
 
     assert report.status == journal.STATUS_OK
+
+
+# ------------------------------------------------------- t_19a16be2 (class)
+# One non-UTF-8 line raised UnicodeDecodeError out of the text-mode file iterator, so every reader
+# of the journal lost the WHOLE file to one bad line instead of skipping that line.
+_NON_UTF8 = b'\xff\xfe {"event": "created", "job_id": "BAD"} \x80\n'
+
+
+def test_non_utf8_line_is_one_malformed_record_not_a_lost_read(store):
+    journal.record_created("BEFORE")
+    with open(_journal(store), "ab") as f:
+        f.write(_NON_UTF8)
+    journal.record_removed("AFTER")
+
+    entries, malformed = journal.read_entries_with_health()
+
+    assert [e["job_id"] for e in entries] == ["BEFORE", "AFTER"]
+    assert malformed == 1
+    report = journal.check_vanished_jobs()
+    assert report.status == journal.STATUS_UNAVAILABLE
+    assert "invalid or unparseable" in (report.detail or "")
+
+
+def test_prune_survives_and_keeps_a_non_utf8_line(store):
+    old = (journal._hermes_now() - timedelta(days=journal._RETENTION_DAYS + 1)).isoformat()
+    _journal(store).parent.mkdir(parents=True, exist_ok=True)
+    with open(_journal(store), "ab") as f:
+        f.write(json.dumps({"event": "created", "job_id": "OLD", "at": old}).encode() + b"\n")
+        f.write(_NON_UTF8)
+    journal.record_created("NEW")
+
+    assert journal.prune() == 1
+
+    lines = _journal(store).read_bytes().splitlines()
+    assert lines[0] == _NON_UTF8.strip(), "the unparseable line must be kept verbatim"
+    assert json.loads(lines[1])["job_id"] == "NEW"
+    assert len(lines) == 2

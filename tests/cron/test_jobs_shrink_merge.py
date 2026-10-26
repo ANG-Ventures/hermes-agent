@@ -259,7 +259,7 @@ def test_stale_save_keeps_a_row_the_journal_does_not_say_was_removed(hermes_env)
 @pytest.mark.parametrize("bad_line", [
     b'{"job_id": [], "event": "created"}',        # unhashable job_id: TypeError on `in wanted`
     b'{"job_id": {"a": 1}, "event": "removed"}',  # unhashable job_id (dict)
-    b'{"job_id": "x", "event": []}',              # unhashable event: TypeError on `in EVENTS`
+    b'{"job_id": "JID", "event": []}',            # unhashable event on a wanted id: TypeError on `in EVENTS`
     b'\xff\xfe not utf-8 \x80',                   # undecodable bytes: UnicodeDecodeError from the iterator
     b'[1, 2, 3]',                                 # valid JSON, not an object
 ])
@@ -282,7 +282,7 @@ def test_malformed_journal_line_does_not_discard_removal_evidence(hermes_env, ba
         jobs_file.write_text(json.dumps(data), encoding="utf-8")
         record_removed(gone["id"])
         with open(journal, "ab") as f:
-            f.write(bad_line + b"\n")
+            f.write(bad_line.replace(b"JID", gone["id"].encode()) + b"\n")
         assert last_removed([gone["id"]]) == {gone["id"]}
         jobs._save_jobs_unlocked(stale)
 
