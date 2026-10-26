@@ -225,14 +225,15 @@ class TestBusyHandlerDemotesInterruptForSubagents:
         sk = build_session_key(event.source)
         parent = _make_parent_with_subagents()
         parent.steer = MagicMock(return_value=True)
+        steer = parent.steer  # the gateway wraps agent.steer in place (#2301); assert on the mock itself
         runner._running_agents[sk] = parent
         runner.adapters[event.source.platform] = adapter
 
         with patch("gateway.platforms.base.merge_pending_message_event"):
             await runner._handle_active_session_busy_message(event, sk)
 
-        parent.steer.assert_called_once()
-        injected = parent.steer.call_args.args[0]
+        steer.assert_called_once()
+        injected = steer.call_args.args[0]
         assert injected.endswith("course-correct")
         assert '"chat_id": "123"' in injected
         parent.interrupt.assert_not_called()
