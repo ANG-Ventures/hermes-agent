@@ -3342,9 +3342,7 @@ def _roll_forward_published_sibling(own_gen: Optional[str]) -> None:
     owner gone, discard it (Prism 9083dea60b86). Marked dirty: the mirror we are about to write was
     computed before these rows, so the next flush rewrites it. A live sibling's own later apply
     then finds nothing left to apply."""
-    with _rs.connect(_current_cron_store().cron_dir, create=False) as conn:
-        others = set(_rs.pending_gens(conn)) - {own_gen} if conn is not None else set()
-    if not others:  # cheap: only our own generation (or none) pending, nothing the rename erases
+    if not _runtime_pending():  # cheap: no pending generation, nothing the rename could erase
         return
     file_gen = _file_runtime_gen()
     if not file_gen or file_gen == own_gen:

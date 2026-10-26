@@ -68,10 +68,10 @@ def test_fires_do_not_copy_the_registry(store):
     # O(ticks), not O(fires): only single-record copies (a few per fire), never the 700-job
     # registry. Before: 25 one-shots x 2 x 700 + 400 = 35,400 copies.
     assert n["record_copies"] <= 10 * N_FIRES < N_JOBS, n
-    # A one-shot completion parses once for its save (load_jobs) and once to rebuild the
-    # single-job cache after the rename; no extra decode to look for a sibling generation
-    # when the only pending one is its own. Before: 3 per one-shot (76 total).
-    assert n["parses"] <= 2 * (N_FIRES // 2) + 1, n
+    # A one-shot completion parses for its save (load_jobs), to check for a sibling generation
+    # before the rename (Prism dff5d592a655: that check stays, a snapshot of the pending set is
+    # not proof), and to rebuild the single-job cache. Parses are not what this card cuts.
+    assert n["parses"] <= 3 * (N_FIRES // 2) + 1, n
     view = {j["id"]: j for j in cj.load_jobs()}
     once, rec = view["job0000abcd"], view[f"job{N_FIRES - 1:04d}abcd"]
     assert (once["state"], once["enabled"], once["last_status"]) == ("completed", False, "ok")
